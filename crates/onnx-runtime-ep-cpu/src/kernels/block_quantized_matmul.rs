@@ -487,7 +487,12 @@ impl BlockQuantizedMatMulKernel {
                     workspace,
                 )
             }?;
-            let result = linear_packed_prepared(
+            let elements = m.checked_mul(self.n).ok_or_else(|| {
+                error("streamed output element count overflows; reduce projection dimensions")
+            })?;
+            let mut result =
+                super::decoded_projection::zeroed_f32(OP, "final output staging", elements)?;
+            linear_packed_prepared(
                 self.format,
                 &packed,
                 &activations,
@@ -497,6 +502,7 @@ impl BlockQuantizedMatMulKernel {
                 bias.as_deref(),
                 self.projection_plan,
                 scratch.initialized(),
+                &mut result,
             )?;
             return write_dense_f32_narrow(OP, &mut outputs[0], &result);
         };
@@ -910,6 +916,9 @@ pub(super) fn projection_plan() -> super::decoded_projection::DecodedProjectionP
     )
 }
 
+/// Write one projection into caller-owned initialized staging. Geometry errors
+/// are rejected before calculation; a decoder/compute failure may alter staging.
+/// Callers publish their actual tensor output only after this succeeds.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn linear_packed_prepared(
     format: BlockFormat,
@@ -921,9 +930,10 @@ pub(super) fn linear_packed_prepared(
     bias: Option<&[f32]>,
     plan: super::decoded_projection::DecodedProjectionPlan,
     scratch: &mut [f32],
-) -> Result<Vec<f32>> {
+    output: &mut [f32],
+) -> Result<()> {
     if super::matmul::serial_projection_is_portable() {
-        linear_packed_tiled::<4>(
+        linear_packed_prepared_tiled::<4>(
             format,
             packed,
             input,
@@ -931,10 +941,12 @@ pub(super) fn linear_packed_prepared(
             in_features,
             out_features,
             bias,
-            Some((plan, scratch)),
+            plan,
+            scratch,
+            output,
         )
     } else {
-        linear_packed_tiled::<1>(
+        linear_packed_prepared_tiled::<1>(
             format,
             packed,
             input,
@@ -942,7 +954,9 @@ pub(super) fn linear_packed_prepared(
             in_features,
             out_features,
             bias,
-            Some((plan, scratch)),
+            plan,
+            scratch,
+            output,
         )
     }
 }
@@ -961,30 +975,126 @@ fn linear_packed_grouped(
     bias: Option<&[f32]>,
 ) -> Result<Vec<f32>> {
     if super::matmul::serial_projection_is_portable() {
-        linear_packed_tiled::<4>(
-            format,
-            packed,
-            input,
-            rows,
-            in_features,
-            out_features,
-            bias,
-            None,
-        )
+        linear_packed_tiled::<4>(format, packed, input, rows, in_features, out_features, bias)
     } else {
-        linear_packed_tiled::<1>(
-            format,
-            packed,
-            input,
-            rows,
-            in_features,
-            out_features,
-            bias,
-            None,
-        )
+        linear_packed_tiled::<1>(format, packed, input, rows, in_features, out_features, bias)
     }
 }
 
+/// Validated packed rows and their resolved canonical decoder. Storage policy
+/// does not choose another representation parser or arithmetic implementation.
+#[derive(Clone, Copy)]
+struct PackedProjectionRows<'a> {
+    packed: &'a [u8],
+    stride: usize,
+    in_features: usize,
+    block_values: usize,
+    block_bytes: usize,
+    decode: fn(&[u8], &mut [f32]),
+}
+impl<'a> PackedProjectionRows<'a> {
+    fn new(
+        format: BlockFormat,
+        packed: &'a [u8],
+        input: &[f32],
+        rows: usize,
+        in_features: usize,
+        out_features: usize,
+        bias: Option<&[f32]>,
+    ) -> Result<Self> {
+        let stride = in_features
+            .div_ceil(format.qk())
+            .checked_mul(format.block_bytes())
+            .ok_or_else(|| error("streamed packed row byte count overflow"))?;
+        let expected = out_features
+            .checked_mul(stride)
+            .ok_or_else(|| error("streamed packed projection byte count overflow"))?;
+        if packed.len() != expected
+            || rows.checked_mul(in_features) != Some(input.len())
+            || bias.is_some_and(|bias| bias.len() != out_features)
+        {
+            return Err(error(format!(
+                "streamed projection geometry mismatch: packed={} (expected {expected}), input={} for [{rows},{in_features}], bias={:?} for {out_features} outputs",
+                packed.len(),
+                input.len(),
+                bias.map(<[f32]>::len)
+            )));
+        }
+        Ok(Self {
+            packed,
+            stride,
+            in_features,
+            block_values: format.qk(),
+            block_bytes: format.block_bytes(),
+            decode: format.decoder(),
+        })
+    }
+
+    fn decoder(self) -> impl FnMut(usize, &mut [f32]) -> Result<()> + 'a {
+        let mut block = [0.0f32; IQ_SUPER_QK];
+        move |feature, weight_row: &mut [f32]| {
+            let packed_row = &self.packed[feature * self.stride..(feature + 1) * self.stride];
+            for (index, bytes) in packed_row.chunks_exact(self.block_bytes).enumerate() {
+                (self.decode)(bytes, &mut block[..self.block_values]);
+                let start = index * self.block_values;
+                let count = self.block_values.min(self.in_features - start);
+                weight_row[start..start + count].copy_from_slice(&block[..count]);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn project_packed_tile<const FEATURE_TILE: usize>(
+    input: &[f32],
+    decoded: &[f32],
+    output: &mut [f32],
+    rows: usize,
+    k: usize,
+    features: usize,
+) -> Result<()> {
+    // C^T = decoded_rows * input^T writes the column-major tile directly.
+    // Keep the established reference/AVX2 geometry and portable K order.
+    if FEATURE_TILE == 1 {
+        super::matmul::gemm_bt_serial(input, decoded, output, rows, k, 1)
+    } else {
+        super::matmul::gemm_bt_serial(decoded, input, output, features, k, rows)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn linear_packed_prepared_tiled<const FEATURE_TILE: usize>(
+    format: BlockFormat,
+    packed: &[u8],
+    input: &[f32],
+    rows: usize,
+    in_features: usize,
+    out_features: usize,
+    bias: Option<&[f32]>,
+    plan: super::decoded_projection::DecodedProjectionPlan,
+    scratch: &mut [f32],
+    output: &mut [f32],
+) -> Result<()> {
+    let packed_rows =
+        PackedProjectionRows::new(format, packed, input, rows, in_features, out_features, bias)?;
+    let make_decoder = || packed_rows.decoder();
+    let project = project_packed_tile::<FEATURE_TILE>;
+    let (columns, decoded) = plan.split_scratch(rows, in_features, out_features, scratch)?;
+    plan.project::<FEATURE_TILE, _>(
+        input,
+        rows,
+        in_features,
+        out_features,
+        bias,
+        output,
+        columns,
+        decoded,
+        make_decoder,
+        project,
+    )
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn linear_packed_tiled<const FEATURE_TILE: usize>(
     format: BlockFormat,
@@ -994,83 +1104,22 @@ fn linear_packed_tiled<const FEATURE_TILE: usize>(
     in_features: usize,
     out_features: usize,
     bias: Option<&[f32]>,
-    prepared: Option<(super::decoded_projection::DecodedProjectionPlan, &mut [f32])>,
 ) -> Result<Vec<f32>> {
-    let blocks = in_features.div_ceil(format.qk());
-    let packed_stride = blocks
-        .checked_mul(format.block_bytes())
-        .ok_or_else(|| error("streamed packed row byte count overflow"))?;
-    let expected = out_features
-        .checked_mul(packed_stride)
-        .ok_or_else(|| error("streamed packed projection byte count overflow"))?;
-    if packed.len() != expected
-        || rows.checked_mul(in_features) != Some(input.len())
-        || bias.is_some_and(|bias| bias.len() != out_features)
-    {
-        return Err(error(format!(
-            "streamed projection geometry mismatch: packed={} (expected {expected}), input={} for [{rows},{in_features}], bias={:?} for {out_features} outputs",
-            packed.len(),
-            input.len(),
-            bias.map(<[f32]>::len)
-        )));
-    }
-    let decoder = format.decoder();
-    let make_decoder = || {
-        let mut block = [0.0f32; IQ_SUPER_QK];
-        move |feature, weight_row: &mut [f32]| {
-            let packed_row = &packed[feature * packed_stride..(feature + 1) * packed_stride];
-            for (index, bytes) in packed_row.chunks_exact(format.block_bytes()).enumerate() {
-                decoder(bytes, &mut block[..format.qk()]);
-                let start = index * format.qk();
-                let count = format.qk().min(in_features - start);
-                weight_row[start..start + count].copy_from_slice(&block[..count]);
-            }
-            Ok(())
-        }
-    };
-    let project = // C^T = decoded_rows * input^T writes the column-major tile directly.
-        // Independent decoded rows provide SIMD outputs even for one token.
-        |input: &[f32], decoded: &[f32], output: &mut [f32], rows, k, features| {
-            if FEATURE_TILE == 1 {
-                // Preserve the established reference/AVX2 operand geometry.
-                super::matmul::gemm_bt_serial(input, decoded, output, rows, k, 1)
-            } else {
-                super::matmul::gemm_bt_serial(decoded, input, output, features, k, rows)
-            }
-        };
-    if let Some((plan, scratch)) = prepared {
-        let (columns, decoded) = plan.split_scratch(rows, in_features, out_features, scratch)?;
-        let elements = rows.checked_mul(out_features).ok_or_else(|| {
-            error("streamed output element count overflows; reduce projection dimensions")
-        })?;
-        let mut output =
-            super::decoded_projection::zeroed_f32(OP, "final output staging", elements)?;
-        plan.project::<FEATURE_TILE, _>(
-            input,
-            rows,
-            in_features,
-            out_features,
-            bias,
-            &mut output,
-            columns,
-            decoded,
-            make_decoder,
-            project,
-        )?;
-        Ok(output)
-    } else {
-        super::decoded_projection::linear_decoded_grouped::<FEATURE_TILE, _>(
-            "block-quantized projection",
-            input,
-            rows,
-            in_features,
-            out_features,
-            bias,
-            make_decoder,
-            project,
-            super::decoded_projection::rayon_decoded_columns,
-        )
-    }
+    let packed_rows =
+        PackedProjectionRows::new(format, packed, input, rows, in_features, out_features, bias)?;
+    let make_decoder = || packed_rows.decoder();
+    let project = project_packed_tile::<FEATURE_TILE>;
+    super::decoded_projection::linear_decoded_grouped::<FEATURE_TILE, _>(
+        "block-quantized projection",
+        input,
+        rows,
+        in_features,
+        out_features,
+        bias,
+        make_decoder,
+        project,
+        super::decoded_projection::rayon_decoded_columns,
+    )
 }
 
 fn decode_mxfp4_block(block: &[u8], output: &mut [f32]) {
@@ -1788,7 +1837,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_projection_overwrites_poisoned_reused_scratch_and_keeps_outputs_owned() {
+    fn prepared_projection_fills_caller_destination_and_preserves_separate_previous_output() {
         for format in [BlockFormat::Mxfp4, BlockFormat::Q8_0] {
             for (rows, k, n) in [
                 (0, 32, 13),
@@ -1806,7 +1855,8 @@ mod tests {
                         .unwrap();
                 let plan = projection_plan();
                 let mut scratch = vec![f32::NAN; plan.layout(rows, k, n).unwrap().bytes() / 4];
-                let actual = linear_packed_prepared(
+                let mut actual = vec![f32::NAN; rows * n];
+                linear_packed_prepared(
                     format,
                     &packed,
                     &input,
@@ -1816,6 +1866,7 @@ mod tests {
                     Some(&bias),
                     plan,
                     &mut scratch,
+                    &mut actual,
                 )
                 .unwrap();
                 assert_eq!(
@@ -1824,7 +1875,8 @@ mod tests {
                     "{format:?} rows={rows} K={k} N={n}"
                 );
                 scratch.fill(f32::NEG_INFINITY);
-                let next = linear_packed_prepared(
+                let mut next = vec![f32::NEG_INFINITY; rows * n];
+                linear_packed_prepared(
                     format,
                     &packed,
                     &input,
@@ -1834,6 +1886,7 @@ mod tests {
                     Some(&bias),
                     plan,
                     &mut scratch,
+                    &mut next,
                 )
                 .unwrap();
                 assert_eq!(
@@ -1841,6 +1894,78 @@ mod tests {
                     "later projection overwrites scratch without modifying previous owned output"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn prepared_projection_bounds_caller_target_and_rejects_invalid_extents_before_writes() {
+        let (rows, k, n) = (3, 35, 13);
+        let format = BlockFormat::Mxfp4;
+        let packed = packed_for_format(format, 1, n, k);
+        let input = vec![0.125; rows * k];
+        let bias = vec![0.5; n];
+        let expected =
+            linear_packed_grouped(format, &packed, &input, rows, k, n, Some(&bias)).unwrap();
+        let plan = projection_plan();
+        let scratch_len = plan.layout(rows, k, n).unwrap().bytes() / 4;
+        let mut scratch = vec![f32::NAN; scratch_len];
+        let guard = 123.5f32;
+        let elements = rows * n;
+        let mut backing = vec![guard; elements + 2];
+        linear_packed_prepared(
+            format,
+            &packed,
+            &input,
+            rows,
+            k,
+            n,
+            Some(&bias),
+            plan,
+            &mut scratch,
+            &mut backing[1..1 + elements],
+        )
+        .unwrap();
+        assert_eq!(backing[0], guard);
+        assert_eq!(backing[elements + 1], guard);
+        assert_eq!(&backing[1..1 + elements], expected);
+        for (packed_len, input_len, output_len, workspace_len, extra_bias) in [
+            (packed.len() - 1, input.len(), elements, scratch_len, false),
+            (packed.len(), input.len() - 1, elements, scratch_len, false),
+            (packed.len(), input.len(), elements, scratch_len, true),
+            (packed.len(), input.len(), 0, scratch_len, false),
+            (packed.len(), input.len(), elements - 1, scratch_len, false),
+            (packed.len(), input.len(), elements + 1, scratch_len, false),
+            (packed.len(), input.len(), elements, 0, false),
+            (packed.len(), input.len(), elements, scratch_len - 1, false),
+        ] {
+            let mut output = vec![guard; output_len];
+            let bias = vec![0.5; n + usize::from(extra_bias)];
+            let error = linear_packed_prepared(
+                format,
+                &packed[..packed_len],
+                &input[..input_len],
+                rows,
+                k,
+                n,
+                Some(&bias),
+                plan,
+                &mut scratch[..workspace_len],
+                &mut output,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("geometry mismatch")
+                    || error.contains("disagree with plan")
+                    || error.contains("initialized scratch"),
+                "{error}"
+            );
+            assert!(
+                output
+                    .iter()
+                    .all(|value| value.to_bits() == guard.to_bits()),
+                "invalid geometry modified caller staging: {error}"
+            );
         }
     }
 
