@@ -33,6 +33,9 @@ mod image_input;
 mod lease;
 mod lora;
 mod metrics;
+mod model_cache;
+mod model_hub;
+mod model_management;
 mod models_config;
 pub mod multimodal;
 mod reasoning_request;
@@ -108,8 +111,8 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/models",
             get(routes::models)
-                .post(routes::llama::disabled_feature)
-                .delete(routes::llama::disabled_feature),
+                .post(routes::model_management::download)
+                .delete(routes::model_management::delete),
         )
         .route("/models/sse", get(routes::llama::model_events))
         .route(
@@ -197,10 +200,13 @@ pub fn app(state: AppState) -> Router {
                 get(routes::debug_trace_perfetto),
             );
     }
-    if state.config.enable_admin_endpoints {
+    if state.config.enable_admin_endpoints || state.model_manager.is_some() {
         router = router
             .route("/models/load", post(routes::llama::load_model))
-            .route("/models/unload", post(routes::llama::unload_model))
+            .route("/models/unload", post(routes::llama::unload_model));
+    }
+    if state.config.enable_admin_endpoints {
+        router = router
             .route("/v1/admin/models", get(routes::admin_list_models))
             .route("/v1/admin/models/{id}/load", post(routes::admin_load_model))
             .route(
