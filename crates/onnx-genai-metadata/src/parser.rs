@@ -322,6 +322,19 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
                     ),
                 )
                 .map_err(crate::MetadataError::Parse)?;
+                crate::version::gate_feature_field(
+                    version,
+                    crate::version::SchemaFeature::DecisionInputPolicies,
+                    &format!(
+                        "profiles.{}.decision.input_policy",
+                        name.as_str().unwrap_or("<invalid-name>")
+                    ),
+                    profile
+                        .get("decision")
+                        .and_then(|d| d.get("input_policy"))
+                        .is_some(),
+                )
+                .map_err(crate::MetadataError::Parse)?;
             }
         }
     }

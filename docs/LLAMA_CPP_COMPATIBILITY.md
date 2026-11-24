@@ -432,8 +432,9 @@ parity. These upstream protocols are still unimplemented:
 
 `/v1/systemone` executes text/structured-state decision profiles, with explicit
 model-authored prompting, calibration outputs, variants and answer policies.
-Model-specific defaults, multimodal/joint heads and shared generation/decision
-entry points remain open; see [SystemOne](SYSTEMONE.md). Route presence does not
+Core schema v1.11 declares input defaults, instruction/payload rules, option
+ordering, score ranges and canonical legends. Multimodal/joint heads and shared
+generation/decision entry points remain open; see [SystemOne](SYSTEMONE.md). Route presence does not
 claim every upstream decision-model format is admitted.
 
 Model download/delete remain disabled. `--props` enables `POST /props`, matching
