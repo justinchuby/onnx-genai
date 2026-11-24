@@ -453,9 +453,21 @@ fn prepare_engine_worker<DropProbe>(
     drop_probe: DropProbe,
     worker_count: usize,
 ) -> anyhow::Result<(EngineWorkerState<DropProbe>, EngineWorkerReady)> {
+    let embedding_service = engine.embedding_adapter_service()?;
     let adapters = engine
         .adapter_service()
-        .map(|contract| crate::lora::LoraState::new(contract, engine.supports_adapter_sessions()))
+        .or(embedding_service)
+        .map(|contract| {
+            crate::lora::LoraState::new(
+                contract,
+                crate::lora::AdapterCapabilities {
+                    generation: engine.adapter_service().is_some(),
+                    sessions: engine.adapter_service().is_some()
+                        && engine.supports_adapter_sessions(),
+                    embeddings: embedding_service.is_some(),
+                },
+            )
+        })
         .transpose()?;
     let reranking =
         onnx_genai_metadata::task_profiles::reranking_contract(engine.metadata())?.map(Arc::new);

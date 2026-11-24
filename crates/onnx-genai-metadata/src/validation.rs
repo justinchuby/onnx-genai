@@ -893,6 +893,9 @@ const KNOWN_PROFILE_KINDS: &[&str] = &[
 /// A required profile must be executable by this reader; an ignorable profile
 /// may be skipped. Unknown core fields still fail through `deny_unknown_fields`.
 fn validate_profiles(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
+    if let Err(error) = crate::task_profiles::embedding_contract(metadata) {
+        errors.push(error.to_string());
+    }
     if let Err(error) = crate::task_profiles::reranking_contract(metadata) {
         errors.push(error.to_string());
     }
@@ -910,7 +913,7 @@ fn validate_profiles(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
             ));
             continue;
         }
-        if !known {
+        if !known || crate::task_profiles::skip_unsupported_version(profile) {
             continue;
         }
         for (role, output) in &profile.outputs {
@@ -935,7 +938,9 @@ fn validate_profiles(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
 /// `decoding` block (if any) is never interpreted either.
 fn validate_profile_decoding(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
     for (name, profile) in &metadata.profiles {
-        if !KNOWN_PROFILE_KINDS.contains(&profile.kind.as_str()) {
+        if !KNOWN_PROFILE_KINDS.contains(&profile.kind.as_str())
+            || crate::task_profiles::skip_unsupported_version(profile)
+        {
             continue;
         }
         if profile.kind == "transcription" && profile.decoding.is_none() {

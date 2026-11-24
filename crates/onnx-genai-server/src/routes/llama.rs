@@ -99,7 +99,8 @@ pub(crate) async fn props(
             "resumable_streams": true, "reasoning_control": true,
             "tools": handle.tool_protocol.is_some(), "custom_sampler_order": handle.engine.runtime_sampling,
             "lora": handle.engine.adapters.is_some(),
-            "lora_sessions": handle.engine.adapters.as_ref().is_some_and(|state|state.supports_sessions),
+            "lora_embeddings": handle.engine.adapters.as_ref().is_some_and(|state|state.capabilities.embeddings),
+            "lora_sessions": handle.engine.adapters.as_ref().is_some_and(|state|state.capabilities.sessions),
             "reranking": handle.engine.reranking.is_some()
         }
     });

@@ -161,3 +161,131 @@ fn replayed_conversation_can_switch_adapters_without_stale_state() -> anyhow::Re
     assert_eq!(engine.generate(next)?.token_ids, result.token_ids);
     Ok(())
 }
+
+#[test]
+fn native_embedding_executes_adapter_workflow_without_ort() -> anyhow::Result<()> {
+    const CHILD: &str = "NXRT_ADAPTER_EMBEDDING_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "native_embedding_executes_adapter_workflow_without_ort",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(
+                "ONNX_GENAI_ORT_LIB",
+                "/missing/nxrt-native-embedding/onnxruntime",
+            )
+            .env("ONNX_GENAI_EP", "cpu")
+            .env_remove("ONNX_GENAI_BACKEND")
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        anyhow::ensure!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "child did not execute embedding test"
+        );
+        return Ok(());
+    }
+    let package = tempfile::tempdir()?;
+    fixture::embedding(package.path(), &fixtures())?;
+    let mut engine = Engine::from_dir(package.path(), EngineConfig::default())?;
+    let base = engine.embed(&[2, 4])?;
+    for (alias, index) in [("red", 4), ("blue", 5)] {
+        let actual = engine.embed_with_options(
+            &[2, 4],
+            onnx_genai_engine::EmbeddingOptions {
+                adapter_selection: Some(
+                    AdapterSelection::default().with_row([AdapterActivation::new(alias, 0.5)]),
+                ),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(base.len(), actual.len());
+        for (i, (a, b)) in actual.iter().zip(&base).enumerate() {
+            assert!(
+                (a - b - if i == index { 5000.0 } else { 0.0 }).abs() < 0.01,
+                "{alias} column {i}: {a} vs {b}"
+            );
+        }
+    }
+    assert_eq!(engine.embed(&[2, 4])?, base);
+    let mut bad = Engine::from_dir(&fixtures().join("tiny-mtp-full"), EngineConfig::default())?;
+    let error = bad
+        .embed_with_options(
+            &[2, 4],
+            onnx_genai_engine::EmbeddingOptions {
+                adapter_selection: Some(
+                    AdapterSelection::default().with_row([AdapterActivation::new("red", 1.0)]),
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("no admitted adapter service"));
+    Ok(())
+}
+
+#[test]
+fn embedding_profiles_execute_declared_sequence_pooling() -> anyhow::Result<()> {
+    let package = tempfile::tempdir()?;
+    std::fs::copy(
+        fixtures().join("tiny-llm/tokenizer.json"),
+        package.path().join("tokenizer.json"),
+    )?;
+    std::fs::write(
+        package.path().join("encoder.onnx.textproto"),
+        r#"
+ir_version: 11
+opset_import { domain: "" version: 24 }
+graph { name: "sequence_features"
+  node { input: "ids" output: "numbers" op_type: "Cast" attribute { name: "to" i: 1 type: INT } }
+  node { input: "numbers" input: "axis" output: "features" op_type: "Unsqueeze" }
+  initializer { name: "axis" dims: 1 data_type: 7 int64_data: 2 }
+  input { name: "ids" type { tensor_type { elem_type: 7 shape { dim {dim_param:"batch"} dim {dim_param:"sequence"} } } } }
+  output { name: "features" type { tensor_type { elem_type: 1 shape { dim {dim_param:"batch"} dim {dim_param:"sequence"} dim {dim_value:1} } } } }
+}
+"#,
+    )?;
+    for (kind, expected) in [
+        ("mean", 3.0),
+        ("max", 4.0),
+        ("cls", 2.0),
+        ("last_token", 4.0),
+    ] {
+        let doc = serde_json::json!({
+            "schema_version":"v1.2",
+            "profiles":{"vectors":{"kind":"embedding","version":"1","outputs":{"embedding":"vector"},"pooling":{"kind":kind,"axis":1}}},
+            "pipeline":{"workflow":{
+                "manifest":{},
+                "inputs":{"ids":{"contract":{"dtype":"int64","shape":["batch","sequence"],"batch_layout":{"kind":"request_aligned","axis":0}},"role":{"kind":"runtime","version":"1.0","role":"prompt_tokens"},"source":{"kind":"request"}}},
+                "outputs":{"vector":{"contract":{"dtype":"float32","shape":["batch","sequence",1],"batch_layout":{"kind":"request_aligned","axis":0}},"role":"tensor","stage":"pre_adapter"}},
+                "components":{"encoder":{"implementation":{"kind":"onnx","artifact":"encoder.onnx.textproto"}}},
+                "steps":[{"kind":"invoke","component":"encoder","inputs":{"ids":"ids"},"outputs":{"features":"hidden"}},{"kind":"emit","value":"hidden","output":"vector","mode":"replace"}]
+            }}
+        });
+        std::fs::write(
+            package.path().join("inference_metadata.yaml"),
+            serde_yaml::to_string(&doc)?,
+        )?;
+        let mut engine = Engine::from_dir(package.path(), EngineConfig::default())?;
+        assert_eq!(engine.embed(&[2, 4])?, vec![expected], "{kind}");
+        assert_eq!(
+            engine.embed_with_options(
+                &[2, 4],
+                onnx_genai_engine::EmbeddingOptions {
+                    normalize: true,
+                    ..Default::default()
+                }
+            )?,
+            vec![1.0],
+            "{kind}"
+        );
+    }
+    Ok(())
+}
