@@ -4,6 +4,12 @@ use std::ffi::CStr;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OrtError {
+    #[error("{operation}: {source}")]
+    Context {
+        operation: String,
+        #[source]
+        source: Box<OrtError>,
+    },
     #[error("ORT error: {message} (code: {code})")]
     Runtime { code: i32, message: String },
     #[error("Null pointer returned from ORT API")]
