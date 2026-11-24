@@ -12395,6 +12395,9 @@ mod weight_cache_accounting {
             "Expm1" | "GeGLU" | "Log1p" | "LogCumSumExp" | "SwiGLU" => {
                 NoWeightCache("elementwise and scan buffers are local to each execution")
             }
+            "RegexFullMatch" | "StringConcat" | "StringSplit" => {
+                NoWeightCache("processes managed strings without transposing tensor weights")
+            }
             "Pack" | "Unpack" => {
                 NoWeightCache("packing and unpacking write outputs without retaining packed data")
             }
