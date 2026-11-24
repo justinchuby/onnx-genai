@@ -1,4 +1,5 @@
-//! ONNX pooling: cuDNN `MaxPool`/`AveragePool` and NVRTC `LpPool`.
+//! ONNX pooling: cuDNN for undilated 2-D pooling, NVRTC for dilated
+//! AveragePool and LpPool.
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -8,17 +9,17 @@ use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
     WorkspacePreparation, WorkspaceView,
 };
-use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_ir::{DataType, Node, Shape, as_static_shape};
 
 use crate::cudnn::{CudnnBufferPair, CudnnPoolingMode, CudnnPoolingSpec, CudnnTensorType};
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
-use super::metadata_workspace::MetadataWorkspace;
+use super::metadata_workspace::{MetadataWorkspace, checked_tensor_bytes};
 const METADATA_WORDS_PER_AXIS: usize = 6;
 
 const BLOCK: u32 = 256;
-const LP_SOURCE: &str = r#"
+const WINDOW_POOL_SOURCE: &str = r#"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
@@ -36,7 +37,8 @@ __device__ __forceinline__ void store_pool_value(
   else ((__nv_bfloat16*)values)[index] = __float2bfloat16_rn(value);
 }
 
-extern "C" __global__ void lp_pool(
+template <bool Average>
+__device__ void window_pool(
     const void* input, void* output, const unsigned long long* metadata,
     int spatial_rank, int dtype, int p, unsigned long long output_elements,
     unsigned long long input_spatial, unsigned long long output_spatial,
@@ -54,40 +56,73 @@ extern "C" __global__ void lp_pool(
     const unsigned long long group = output_index / output_spatial;
     const unsigned long long spatial_index = output_index % output_spatial;
     float sum = 0.0f;
+    unsigned long long valid_count = 0;
+    // Decode flat tap indices in reverse axis order to avoid recomputing
+    // the kernel's suffix products inside each window.
     for (unsigned long long kernel_index = 0;
          kernel_index < kernel_elements; ++kernel_index) {
-      unsigned long long output_remaining = spatial_index;
+      unsigned long long tap = kernel_index;
       unsigned long long input_index = 0;
+      unsigned long long input_stride = 1;
       bool valid = true;
-      for (int axis = 0; axis < spatial_rank; ++axis) {
+      for (int axis = spatial_rank - 1; axis >= 0; --axis) {
+        const unsigned long long output_dim =
+            axis == 0 ? output_spatial / output_strides[0]
+                      : output_strides[axis - 1] / output_strides[axis];
         const unsigned long long output_coordinate =
-            output_remaining / output_strides[axis];
-        output_remaining %= output_strides[axis];
-        unsigned long long kernel_stride = 1;
-        for (int inner_axis = axis + 1; inner_axis < spatial_rank; ++inner_axis)
-          kernel_stride *= kernel[inner_axis];
-        const unsigned long long kernel_coordinate =
-            (kernel_index / kernel_stride) % kernel[axis];
-        const long long source =
-            (long long)(output_coordinate * strides[axis])
-            + (long long)(kernel_coordinate * dilations[axis])
-            - (long long)pads[axis];
-        if (source < 0 || source >= (long long)input_dimensions[axis]) {
+            (spatial_index / output_strides[axis]) % output_dim;
+        const unsigned long long kernel_coordinate = tap % kernel[axis];
+        tap /= kernel[axis];
+        const unsigned long long position = output_coordinate * strides[axis]
+            + kernel_coordinate * dilations[axis];
+        const unsigned long long source = position - pads[axis];
+        if (position < pads[axis] || source >= input_dimensions[axis]) {
           valid = false;
           break;
         }
-        input_index =
-            input_index * input_dimensions[axis] + (unsigned long long)source;
+        input_index += source * input_stride;
+        input_stride *= input_dimensions[axis];
       }
       if (valid) {
         const float value =
-            fabsf(load_pool_value(input, dtype, group * input_spatial + input_index));
-        sum += p == 1 ? value : powf(value, (float)p);
+            load_pool_value(input, dtype, group * input_spatial + input_index);
+        if (Average) {
+          sum += value;
+          ++valid_count;
+        } else {
+          const float magnitude = fabsf(value);
+          sum += p == 1 ? magnitude : powf(magnitude, (float)p);
+        }
       }
     }
-    store_pool_value(output, dtype, output_index,
-                     p == 1 ? sum : powf(sum, 1.0f / (float)p));
+    if (Average) {
+      // Include-padding uses the number of taps, not the effective kernel
+      // area, and treats ceil-mode overhang the same as explicit zero pads.
+      const unsigned long long divisor = p != 0 ? kernel_elements : valid_count;
+      store_pool_value(output, dtype, output_index, divisor > 0 ? sum / (float)divisor : 0.0f);
+    } else {
+      store_pool_value(output, dtype, output_index,
+                       p == 1 ? sum : powf(sum, 1.0f / (float)p));
+    }
   }
+}
+
+extern "C" __global__ void lp_pool(
+    const void* input, void* output, const unsigned long long* metadata,
+    int spatial_rank, int dtype, int p, unsigned long long output_elements,
+    unsigned long long input_spatial, unsigned long long output_spatial,
+    unsigned long long kernel_elements) {
+  window_pool<false>(input, output, metadata, spatial_rank, dtype, p,
+                     output_elements, input_spatial, output_spatial, kernel_elements);
+}
+
+extern "C" __global__ void dilated_average_pool(
+    const void* input, void* output, const unsigned long long* metadata,
+    int spatial_rank, int dtype, int include_pad, unsigned long long output_elements,
+    unsigned long long input_spatial, unsigned long long output_spatial,
+    unsigned long long kernel_elements) {
+  window_pool<true>(input, output, metadata, spatial_rank, dtype, include_pad,
+                    output_elements, input_spatial, output_spatial, kernel_elements);
 }
 "#;
 
@@ -100,12 +135,42 @@ pub enum PoolKind {
 pub struct PoolFactory {
     pub kind: PoolKind,
     pub runtime: Arc<CudaRuntime>,
+    pub average_supports_dilation: bool,
 }
 
 impl KernelFactory for PoolFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let op = self.kind.name();
-        if self.kind == PoolKind::Max && node.outputs.len() > 1 {
+        if self.kind == PoolKind::Average
+            && let Some(rank) = dilated_average_rank(node, self.average_supports_dilation)?
+        {
+            return Ok(Box::new(WindowPoolKernel {
+                runtime: self.runtime.clone(),
+                reduction: WindowReduction::Average(count_include_pad(node, op)?),
+                params: WindowParams::parse(node, op, Some(rank))?,
+            }));
+        }
+        Ok(Box::new(PoolKernel {
+            runtime: self.runtime.clone(),
+            params: CudnnPoolParams::parse(node, self.kind)?,
+        }))
+    }
+}
+
+fn count_include_pad(node: &Node, op: &str) -> Result<bool> {
+    match int_attr(node, op, "count_include_pad", 0)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        value => Err(EpError::KernelFailed(format!(
+            "cuda_ep {op}: count_include_pad must be 0 or 1, got {value}"
+        ))),
+    }
+}
+
+impl CudnnPoolParams {
+    fn parse(node: &Node, kind: PoolKind) -> Result<Self> {
+        let op = kind.name();
+        if kind == PoolKind::Max && node.outputs.len() > 1 {
             return Err(EpError::KernelFailed(
                 "cuda_ep unsupported: MaxPool Indices output; cuDNN pooling forward does not produce ONNX flat indices"
                     .into(),
@@ -126,7 +191,7 @@ impl KernelFactory for PoolFactory {
                 "{op} dilations={dilations:?} (cuDNN pooling descriptor has no dilation)"
             )));
         }
-        if self.kind == PoolKind::Max {
+        if kind == PoolKind::Max {
             let storage_order = int_attr(node, op, "storage_order", 0)?;
             if storage_order != 0 {
                 return Err(not_implemented(format!(
@@ -134,15 +199,7 @@ impl KernelFactory for PoolFactory {
                 )));
             }
         }
-        let count_include_pad = match int_attr(node, op, "count_include_pad", 0)? {
-            0 => false,
-            1 => true,
-            value => {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep {op}: count_include_pad must be 0 or 1, got {value}"
-                )));
-            }
-        };
+        let count_include_pad = count_include_pad(node, op)?;
         let auto_pad = node
             .attr("auto_pad")
             .map(|attr| {
@@ -154,15 +211,14 @@ impl KernelFactory for PoolFactory {
             .unwrap_or("NOTSET")
             .to_owned();
 
-        Ok(Box::new(PoolKernel {
-            runtime: self.runtime.clone(),
-            kind: self.kind,
+        Ok(Self {
+            kind,
             kernel_shape,
             strides,
             pads,
             auto_pad,
             count_include_pad,
-        }))
+        })
     }
 }
 
@@ -200,6 +256,11 @@ fn int_attr(node: &Node, op: &str, name: &str, default: i64) -> Result<i64> {
 #[derive(Debug)]
 pub struct PoolKernel {
     runtime: Arc<CudaRuntime>,
+    params: CudnnPoolParams,
+}
+
+#[derive(Debug)]
+struct CudnnPoolParams {
     kind: PoolKind,
     kernel_shape: Vec<i64>,
     strides: Vec<i64>,
@@ -216,7 +277,7 @@ struct PoolPlan {
     strides: [usize; 2],
 }
 
-impl PoolKernel {
+impl CudnnPoolParams {
     fn plan(&self, input: &[usize]) -> Result<PoolPlan> {
         let op = self.kind.name();
         if input.len() != 4 {
@@ -310,9 +371,11 @@ impl PoolKernel {
             strides,
         })
     }
+}
 
+impl PoolKernel {
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        let op = self.kind.name();
+        let op = self.params.kind.name();
         if inputs.len() != 1 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep {op}: expected one input and one output, got {} inputs and {} outputs",
@@ -342,7 +405,7 @@ impl PoolKernel {
                 "{op} with non-contiguous input or output; materialise the tensor first"
             )));
         }
-        let plan = self.plan(input.shape)?;
+        let plan = self.params.plan(input.shape)?;
         if output.shape != plan.output_shape {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep {op}: output shape {:?}, expected {:?}",
@@ -352,9 +415,11 @@ impl PoolKernel {
         if output.numel() == 0 {
             return Ok(());
         }
-        let mode = match self.kind {
+        let mode = match self.params.kind {
             PoolKind::Max => CudnnPoolingMode::Max,
-            PoolKind::Average if self.count_include_pad => CudnnPoolingMode::AverageIncludePadding,
+            PoolKind::Average if self.params.count_include_pad => {
+                CudnnPoolingMode::AverageIncludePadding
+            }
             PoolKind::Average => CudnnPoolingMode::AverageExcludePadding,
         };
         let spec = CudnnPoolingSpec {
@@ -467,50 +532,169 @@ impl KernelFactory for LpPoolFactory {
             .ok_or_else(|| {
                 EpError::KernelFailed("cuda_ep LpPool: p must be a positive 32-bit integer".into())
             })?;
-        Ok(Box::new(LpPoolKernel {
+        Ok(Box::new(WindowPoolKernel {
             runtime: self.runtime.clone(),
-            p,
-            kernel_shape: ints_attr(node, "LpPool", "kernel_shape", None)?,
-            strides: node
-                .attr("strides")
-                .and_then(|attribute| attribute.as_ints())
-                .map(<[i64]>::to_vec),
-            dilations: node
-                .attr("dilations")
-                .and_then(|attribute| attribute.as_ints())
-                .map(<[i64]>::to_vec),
-            pads: node
-                .attr("pads")
-                .and_then(|attribute| attribute.as_ints())
-                .map(<[i64]>::to_vec),
+            reduction: WindowReduction::Lp(p),
+            params: WindowParams::parse(node, "LpPool", None)?,
+        }))
+    }
+}
+
+fn dilated_average_rank(node: &Node, supported_opset: bool) -> Result<Option<usize>> {
+    let Some(dilations) = node.attr("dilations") else {
+        return Ok(None);
+    };
+    if !supported_opset {
+        return Err(not_implemented(
+            "AveragePool attribute dilations requires ONNX opset 19 or later",
+        ));
+    }
+    let dilations = dilations.as_ints().ok_or_else(|| {
+        EpError::KernelFailed("cuda_ep AveragePool: dilations must be an integer list".into())
+    })?;
+    if dilations.is_empty() || dilations.iter().any(|&value| value <= 0) {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep AveragePool: dilations must contain positive values, got {dilations:?}"
+        )));
+    }
+    Ok(dilations
+        .iter()
+        .any(|&value| value != 1)
+        .then_some(dilations.len()))
+}
+
+pub(super) fn validate_average_claim(
+    node: &Node,
+    opset: u64,
+    input_shapes: &[Shape],
+    input_dtypes: &[DataType],
+) -> Result<()> {
+    let rank = dilated_average_rank(node, opset >= 19)?;
+    let op = "AveragePool";
+    if node.inputs.len() != 1
+        || node.inputs[0].is_none()
+        || node.outputs.len() != 1
+        || node.outputs[0].is_none()
+    {
+        return Err(EpError::KernelFailed(
+            "cuda_ep AveragePool: expected one present input and one present output".into(),
+        ));
+    }
+    if let Some(&dtype) = input_dtypes.first() {
+        window_dtype(op, dtype)?;
+        if dtype == DataType::BFloat16 && opset < 22 {
+            return Err(not_implemented(
+                "AveragePool bfloat16 requires ONNX opset 22 or later",
+            ));
+        }
+    }
+    if let Some(rank) = rank {
+        count_include_pad(node, op)?;
+        let params = WindowParams::parse(node, op, Some(rank))?;
+        if let Some(shape) = input_shapes.first() {
+            if shape.len().checked_sub(2) != Some(rank) {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep AveragePool: {} dilations require rank {} input, got rank {}",
+                    rank,
+                    rank + 2,
+                    shape.len()
+                )));
+            }
+            if let Some(shape) = as_static_shape(shape) {
+                params.geometry(op, &shape[2..])?;
+            }
+        }
+    } else {
+        let params = CudnnPoolParams::parse(node, PoolKind::Average)?;
+        if let Some(shape) = input_shapes.first() {
+            if shape.len() != 4 {
+                return Err(not_implemented(
+                    "unit-dilation AveragePool requires rank 4 (cuDNN supports 2-D NCHW only)",
+                ));
+            }
+            if let Some(shape) = as_static_shape(shape) {
+                params.plan(&shape)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum WindowReduction {
+    Lp(i32),
+    Average(bool),
+}
+
+impl WindowReduction {
+    fn op(self) -> &'static str {
+        match self {
+            Self::Lp(_) => "LpPool",
+            Self::Average(_) => "AveragePool",
+        }
+    }
+
+    fn entry(self) -> (&'static str, i32) {
+        match self {
+            Self::Lp(p) => ("lp_pool", p),
+            Self::Average(include_pad) => ("dilated_average_pool", i32::from(include_pad)),
+        }
+    }
+}
+
+struct WindowPoolKernel {
+    runtime: Arc<CudaRuntime>,
+    reduction: WindowReduction,
+    params: WindowParams,
+}
+
+impl WindowParams {
+    fn parse(node: &Node, op: &str, rank: Option<usize>) -> Result<Self> {
+        let list = |name| {
+            node.attr(name)
+                .map(|_| ints_attr(node, op, name, None))
+                .transpose()
+        };
+        let params = Self {
+            kernel_shape: ints_attr(node, op, "kernel_shape", None)?,
+            strides: list("strides")?,
+            dilations: list("dilations")?,
+            pads: list("pads")?,
             auto_pad: node
                 .attr("auto_pad")
                 .map(|attribute| {
                     attribute.as_str().ok_or_else(|| {
-                        EpError::KernelFailed(
-                            "cuda_ep LpPool: auto_pad must be a UTF-8 string".into(),
-                        )
+                        EpError::KernelFailed(format!(
+                            "cuda_ep {op}: auto_pad must be a UTF-8 string"
+                        ))
                     })
                 })
                 .transpose()?
                 .unwrap_or("NOTSET")
                 .to_owned(),
-            ceil_mode: match int_attr(node, "LpPool", "ceil_mode", 0)? {
+            ceil_mode: match int_attr(node, op, "ceil_mode", 0)? {
                 0 => false,
                 1 => true,
                 value => {
                     return Err(EpError::KernelFailed(format!(
-                        "cuda_ep LpPool: ceil_mode must be 0 or 1, got {value}"
+                        "cuda_ep {op}: ceil_mode must be 0 or 1, got {value}"
                     )));
                 }
             },
-        }))
+        };
+        if let Some(rank) = rank {
+            if params.pads.is_some() && !matches!(params.auto_pad.as_str(), "" | "NOTSET") {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep {op}: use either explicit pads or auto_pad, not both"
+                )));
+            }
+            params.geometry(op, &vec![0; rank])?;
+        }
+        Ok(params)
     }
 }
 
-struct LpPoolKernel {
-    runtime: Arc<CudaRuntime>,
-    p: i32,
+struct WindowParams {
     kernel_shape: Vec<i64>,
     strides: Option<Vec<i64>>,
     dilations: Option<Vec<i64>>,
@@ -520,6 +704,7 @@ struct LpPoolKernel {
 }
 
 fn positive_spatial(
+    op: &str,
     values: Option<&[i64]>,
     rank: usize,
     default: i64,
@@ -530,176 +715,119 @@ fn positive_spatial(
         .unwrap_or_else(|| vec![default; rank]);
     if values.len() != rank || values.iter().any(|&value| value <= 0) {
         return Err(EpError::KernelFailed(format!(
-            "cuda_ep LpPool: {name} must contain {rank} positive values"
+            "cuda_ep {op}: {name} must contain {rank} positive values, got {values:?}"
         )));
     }
     Ok(values.into_iter().map(|value| value as u64).collect())
 }
 
-fn lp_dtype(dtype: DataType) -> Result<i32> {
+fn window_dtype(op: &str, dtype: DataType) -> Result<i32> {
     match dtype {
         DataType::Float32 => Ok(0),
         DataType::Float16 => Ok(1),
         DataType::BFloat16 => Ok(2),
         other => Err(not_implemented(format!(
-            "LpPool dtype {other:?} (supported: Float32, Float16, BFloat16)"
+            "{op} dtype {other:?} (supported: Float32, Float16, BFloat16)"
         ))),
     }
 }
 
-impl LpPoolKernel {
+impl WindowPoolKernel {
     fn run(
         &self,
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
         workspace: Option<WorkspaceView>,
     ) -> Result<()> {
+        let op = self.reduction.op();
         if inputs.len() != 1 || outputs.len() != 1 {
-            return Err(EpError::KernelFailed(
-                "cuda_ep LpPool: expected 1 input and 1 output".into(),
-            ));
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: expected 1 input and 1 output"
+            )));
         }
         if self.runtime.is_capturing()? {
-            return Err(not_implemented(
-                "LpPool during CUDA graph capture: borrowed shape metadata requires an eager host upload",
-            ));
+            return Err(not_implemented(format!(
+                "{op} during CUDA graph capture: borrowed shape metadata requires an eager host upload"
+            )));
         }
         let input = &inputs[0];
         let output = &mut outputs[0];
         if input.shape.len() < 3 {
-            return Err(EpError::KernelFailed(
-                "cuda_ep LpPool: input rank must be at least 3".into(),
-            ));
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: input rank must be at least 3"
+            )));
         }
         if input.dtype != output.dtype || !input.is_contiguous() || !output.is_contiguous() {
-            return Err(not_implemented(
-                "LpPool requires contiguous input/output with matching dtypes",
-            ));
+            return Err(not_implemented(format!(
+                "{op} requires contiguous input/output with matching dtypes"
+            )));
         }
-        let dtype = lp_dtype(input.dtype)?;
+        let dtype = window_dtype(op, input.dtype)?;
+        checked_tensor_bytes(op, "input", input.dtype, input.shape)?;
+        checked_tensor_bytes(op, "output", output.dtype, output.shape)?;
         if dtype != 0 {
-            self.runtime.require_nvrtc_half_headers("LpPool")?;
+            self.runtime.require_nvrtc_half_headers(op)?;
         }
-        let rank = input.shape.len() - 2;
-        let kernel = positive_spatial(Some(&self.kernel_shape), rank, 1, "kernel_shape")?;
-        let strides = positive_spatial(self.strides.as_deref(), rank, 1, "strides")?;
-        let dilations = positive_spatial(self.dilations.as_deref(), rank, 1, "dilations")?;
-        let mut pads = match self.pads.as_deref() {
-            None => vec![0_u64; rank * 2],
-            Some(values) if values.len() == rank * 2 && values.iter().all(|&value| value >= 0) => {
-                values.iter().map(|&value| value as u64).collect()
-            }
-            Some(_) => {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep LpPool: pads must contain {} non-negative values",
-                    rank * 2
-                )));
-            }
-        };
-        let spatial = input.shape[2..]
-            .iter()
-            .map(|&value| value as u64)
-            .collect::<Vec<_>>();
-        let mut output_spatial = Vec::with_capacity(rank);
-        match self.auto_pad.as_str() {
-            "" | "NOTSET" => {
-                for axis in 0..rank {
-                    let effective = dilations[axis] * (kernel[axis] - 1) + 1;
-                    let numerator =
-                        spatial[axis] as i64 + pads[axis] as i64 + pads[axis + rank] as i64
-                            - effective as i64;
-                    let mut extent = if self.ceil_mode {
-                        ((numerator + strides[axis] as i64 - 1) / strides[axis] as i64 + 1).max(0)
-                            as u64
-                    } else {
-                        (numerator / strides[axis] as i64 + 1).max(0) as u64
-                    };
-                    if self.ceil_mode
-                        && extent > 0
-                        && (extent - 1) * strides[axis] >= spatial[axis] + pads[axis]
-                    {
-                        extent -= 1;
-                    }
-                    output_spatial.push(extent);
-                }
-            }
-            "VALID" => {
-                pads.fill(0);
-                for axis in 0..rank {
-                    let effective = dilations[axis] * (kernel[axis] - 1) + 1;
-                    output_spatial.push(
-                        ((spatial[axis] as i64 - effective as i64) / strides[axis] as i64 + 1)
-                            .max(0) as u64,
-                    );
-                }
-            }
-            "SAME_UPPER" | "SAME_LOWER" => {
-                for axis in 0..rank {
-                    let extent = spatial[axis].div_ceil(strides[axis]);
-                    let effective = dilations[axis] * (kernel[axis] - 1) + 1;
-                    let total = (extent.saturating_sub(1) * strides[axis] + effective)
-                        .saturating_sub(spatial[axis]);
-                    let begin = if self.auto_pad == "SAME_LOWER" {
-                        total.div_ceil(2)
-                    } else {
-                        total / 2
-                    };
-                    pads[axis] = begin;
-                    pads[axis + rank] = total - begin;
-                    output_spatial.push(extent);
-                }
-            }
-            other => {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep LpPool: unsupported auto_pad {other:?}"
-                )));
-            }
-        }
+        let spatial = &input.shape[2..];
+        let rank = spatial.len();
+        let WindowGeometry {
+            kernel,
+            strides,
+            dilations,
+            pads,
+            output_spatial,
+            kernel_elements,
+        } = self.params.geometry(op, spatial)?;
         let expected = [input.shape[0], input.shape[1]]
             .into_iter()
             .chain(output_spatial.iter().map(|&value| value as usize))
             .collect::<Vec<_>>();
         if output.shape != expected {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep LpPool: output shape {:?}, expected {expected:?}",
+                "cuda_ep {op}: output shape {:?}, expected {expected:?}",
                 output.shape
             )));
         }
-        if output.numel() == 0 {
+        if output.shape.contains(&0) {
             return Ok(());
         }
         let mut output_strides = vec![1_u64; rank];
-        for axis in (0..rank.saturating_sub(1)).rev() {
+        for axis in (0..rank - 1).rev() {
             output_strides[axis] = output_strides[axis + 1] * output_spatial[axis + 1];
         }
         let metadata = spatial
             .iter()
-            .chain(&output_strides)
-            .chain(&kernel)
-            .chain(&strides)
-            .chain(&dilations)
-            .chain(&pads[..rank])
-            .copied()
+            .map(|&dim| dim as u64)
+            .chain(output_strides.into_iter())
+            .chain(kernel)
+            .chain(strides)
+            .chain(dilations)
+            .chain(pads[..rank].iter().copied())
             .collect::<Vec<_>>();
         let metadata_pointer = MetadataWorkspace::for_records(
-            "LpPool",
+            op,
             rank,
             METADATA_WORDS_PER_AXIS,
             &OutputMetadata::from_view(output),
         )?
         .bind(workspace)?
         .upload(&self.runtime, &metadata)?;
+        let (entry, parameter) = self.reduction.entry();
         let function = self
             .runtime
-            .nvrtc_function("lp_pool_v1", LP_SOURCE, "lp_pool")?;
+            .nvrtc_function("window_pool_v1", WINDOW_POOL_SOURCE, entry)?;
         let input_pointer = cuptr(input.data_ptr::<u8>() as *const c_void);
         let output_pointer = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
-        let spatial_rank = i32::try_from(rank)
-            .map_err(|_| EpError::KernelFailed("cuda_ep LpPool: rank exceeds i32".into()))?;
+        let spatial_rank = i32::try_from(rank).map_err(|_| {
+            EpError::KernelFailed(format!("cuda_ep {op}: spatial rank exceeds i32"))
+        })?;
         let output_elements = output.numel() as u64;
-        let input_spatial = spatial.iter().product::<u64>();
+        let input_spatial = if spatial.contains(&0) {
+            0
+        } else {
+            spatial.iter().map(|&dim| dim as u64).product()
+        };
         let output_spatial_elements = output_spatial.iter().product::<u64>();
-        let kernel_elements = kernel.iter().product::<u64>();
         let mut builder = self.runtime.stream().launch_builder(&function);
         builder
             .arg(&input_pointer)
@@ -707,7 +835,7 @@ impl LpPoolKernel {
             .arg(&metadata_pointer)
             .arg(&spatial_rank)
             .arg(&dtype)
-            .arg(&self.p)
+            .arg(&parameter)
             .arg(&output_elements)
             .arg(&input_spatial)
             .arg(&output_spatial_elements)
@@ -723,12 +851,107 @@ impl LpPoolKernel {
                 shared_mem_bytes: 0,
             })
         }
-        .map_err(|error| driver_err("launch LpPool", error));
+        .map_err(|error| driver_err(entry, error));
         launch.and_then(|_| self.runtime.synchronize())
     }
 }
 
-impl Kernel for LpPoolKernel {
+struct WindowGeometry {
+    kernel: Vec<u64>,
+    strides: Vec<u64>,
+    dilations: Vec<u64>,
+    pads: Vec<u64>,
+    output_spatial: Vec<u64>,
+    kernel_elements: u64,
+}
+
+impl WindowParams {
+    fn geometry(&self, op: &str, spatial: &[usize]) -> Result<WindowGeometry> {
+        let rank = spatial.len();
+        let kernel = positive_spatial(op, Some(&self.kernel_shape), rank, 1, "kernel_shape")?;
+        let strides = positive_spatial(op, self.strides.as_deref(), rank, 1, "strides")?;
+        let dilations = positive_spatial(op, self.dilations.as_deref(), rank, 1, "dilations")?;
+        let mut pads = match self.pads.as_deref() {
+            None => vec![0_u64; rank * 2],
+            Some(values) if values.len() == rank * 2 && values.iter().all(|&value| value >= 0) => {
+                values.iter().map(|&value| value as u64).collect()
+            }
+            Some(_) => {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep {op}: pads must contain {} non-negative values",
+                    rank * 2
+                )));
+            }
+        };
+        let mut output_spatial = Vec::with_capacity(rank);
+        for axis in 0..rank {
+            let overflow = || {
+                EpError::KernelFailed(format!(
+                    "cuda_ep {op}: window geometry overflows on spatial axis {axis}; reduce the extent, dilation or padding"
+                ))
+            };
+            let input = spatial[axis] as i128;
+            let stride = i128::from(strides[axis]);
+            let effective = i128::from(dilations[axis]) * (i128::from(kernel[axis]) - 1) + 1;
+            let extent = match self.auto_pad.as_str() {
+                "SAME_UPPER" | "SAME_LOWER" => {
+                    let extent = (input + stride - 1) / stride;
+                    let total = ((extent - 1).max(0) * stride + effective - input).max(0);
+                    let begin = (total + i128::from(self.auto_pad == "SAME_LOWER")) / 2;
+                    pads[axis] = u64::try_from(begin).map_err(|_| overflow())?;
+                    extent
+                }
+                auto @ ("" | "NOTSET" | "VALID") => {
+                    // Executable ONNX AveragePool shape inference applies
+                    // ceil_mode after resolving VALID to zero pads.
+                    let ceil = self.ceil_mode && (auto != "VALID" || op == "AveragePool");
+                    if auto == "VALID" {
+                        pads[axis] = 0;
+                        pads[axis + rank] = 0;
+                    }
+                    let begin = i128::from(pads[axis]);
+                    let numerator = input + begin + i128::from(pads[axis + rank]) - effective;
+                    let quotient = if op == "LpPool" {
+                        // Preserve the existing LpPool signed-division behavior.
+                        (numerator + if ceil { stride - 1 } else { 0 }) / stride
+                    } else {
+                        numerator.div_euclid(stride)
+                            + i128::from(ceil && numerator.rem_euclid(stride) != 0)
+                    };
+                    let mut extent = (quotient + 1).max(0);
+                    if ceil && extent > 0 && (extent - 1) * stride >= input + begin {
+                        extent -= 1;
+                    }
+                    extent
+                }
+                other => {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep {op}: unsupported auto_pad {other:?}"
+                    )));
+                }
+            };
+            if extent > 0 && (extent - 1) * stride + effective - 1 > i128::from(u64::MAX) {
+                return Err(overflow());
+            }
+            output_spatial.push(isize::try_from(extent).map_err(|_| overflow())? as u64);
+        }
+        let kernel_elements = kernel.iter().try_fold(1_u64, |count, &dim| {
+            count.checked_mul(dim).ok_or_else(|| EpError::KernelFailed(format!(
+                "cuda_ep {op}: kernel_shape {:?} exceeds addressable tap count; reduce the window size", self.kernel_shape
+            )))
+        })?;
+        Ok(WindowGeometry {
+            kernel,
+            strides,
+            dilations,
+            pads,
+            output_spatial,
+            kernel_elements,
+        })
+    }
+}
+
+impl Kernel for WindowPoolKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         self.run(inputs, outputs, None)
     }
@@ -750,11 +973,14 @@ impl Kernel for LpPoolKernel {
             || !inputs[0].present
             || inputs[0].shape.len() < 3
         {
-            return Err(EpError::KernelFailed("cuda_ep LpPool: workspace planning requires one present input of rank >= 3 and one output".into()));
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {}: workspace planning requires one present input of rank >= 3 and one output",
+                self.reduction.op()
+            )));
         }
         Ok(WorkspacePreparation::Ready(
             MetadataWorkspace::for_records(
-                "LpPool",
+                self.reduction.op(),
                 inputs[0].shape.len() - 2,
                 METADATA_WORDS_PER_AXIS,
                 &outputs[0],
@@ -764,7 +990,7 @@ impl Kernel for LpPoolKernel {
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "LpPool uploads borrowed shape metadata from the host on each eager call",
+            "window pooling uploads borrowed shape metadata from the host on each eager call",
         )
     }
 }

@@ -16,6 +16,11 @@ pub(crate) fn unsupported_reason_at_opset(
     let result = match node.op_type.as_str() {
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
         "GatherND" => gather_nd(node, opset, input_dtypes),
+        "AveragePool" => {
+            return super::pooling::validate_average_claim(node, opset, input_shapes, input_dtypes)
+                .err()
+                .map(|error| error.to_string());
+        }
         _ => return unsupported_reason(node, input_shapes, input_dtypes),
     };
     result
