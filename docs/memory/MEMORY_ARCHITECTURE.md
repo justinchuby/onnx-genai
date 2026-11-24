@@ -817,6 +817,34 @@ when in fact it is 1955 lines.
 | Prefix reuse | — | **implemented and measured** | The one part of this document with an unambiguous end-to-end win. On qwen2.5-0.5b with a 5,122-token shared prefix, a warm request prefilled **9 tokens instead of 5,131** and TTFT fell from 137,850 ms to **2,758 ms** — a 44x reduction. Served by native-session KV rewind; the recurrent-state snapshots of #650/#672 are a separate path that native CUDA does not currently hit (`lookups=0`). Confirmed on the HTTP server too: hit rate **0.9886** across a concurrency sweep |
 | Paged attention (vLLM-style) | — | **not built, and not the plan** | Verified against the tree: `block_table` does not appear in any CUDA attention kernel. `GroupQueryAttention` takes `past_key`/`past_value` as ordinary contiguous tensors and `CompressedSparseAttention` reads a flat pointer with a computed stride, so there is no input through which a page index could be passed. Making every kernel walk a block table cannot be made uniform across backends — we do not own ORT's kernels — so vAttention-style commit-on-demand under a contiguous virtual range is the chosen route instead (#656) |
 
+### Skip-RMSNorm BF16 staging uses the caller lane
+
+`SkipSimplifiedLayerNormalization` declares metadata workspace planning. One
+checked eight-region layout covers up to four widened BF16 inputs and four
+present F32 output staging regions, aligned to 16 bytes inside the shared
+SessionPersistent peak. F32 parameters are forwarded; omitted outputs occupy
+zero bytes. Input geometry proves Y/residual-sum and per-group statistic counts,
+including unresolved output declarations; contradictory known output facts fail
+before staging. Empty groups require no workspace. Native BF16 and direct
+F16/F32 routes also declare zero scratch.
+
+The native-header capability is resolved when constructing the kernel and the
+same route rule drives preparation and dispatch. Fallback binds the full caller
+span before its first cast; capture requires a real owner pin covering the used
+span. There is no private staging allocation, growth lock, scratch rollback or
+per-region grant. Broadcast metadata remains an independently owned reusable
+artifact. Failed execution clears capture readiness rather than restoring an
+older success. Native BF16 statistics carry separate precision bits, so mixed
+Mean/InvStdDev output dtypes retain native residual rounding and use the correct
+write widths. Absent statistic/residual slots are skipped.
+
+Host tests cover layout isolation, alignment/capacity refusal, output-presence
+and dtype rules, inferred counts, overflow, zero demand and independent stat
+precision. Device fixtures cover numerical results, holes, missing pins, dirty
+workspace replay, native byte-exact activations with mixed statistics, and warm
+proof revocation; they are compiled here, not executed. No GPU performance
+conclusion follows from these checks.
+
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
 The dated audit and measurements below preserve historical evidence. The current

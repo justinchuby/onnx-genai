@@ -39,8 +39,9 @@ use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 use onnx_runtime_ep_api::{
-    DeviceGraphResource, DevicePtr, DevicePtrMut, EpError, Kernel, KernelFactory, Result,
-    TensorMut, TensorView,
+    DeviceGraphResource, DevicePtr, EpError, Kernel, KernelFactory, OutputMetadata, Result,
+    TensorMetadata, TensorMut, TensorView, WorkspaceLayout, WorkspaceLifetime,
+    WorkspacePreparation, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
 
@@ -652,7 +653,7 @@ __device__ __forceinline__ void skip_rmsnorm_bf16_tpl(
     const int     dense_skip,
     const int     gamma_is_bf16,
     const int     bias_is_bf16,
-    const int     stat_is_bf16,
+    const int     stat_bf16_mask,
     const float   epsilon)
 {
     const int g = blockIdx.x;
@@ -703,11 +704,11 @@ __device__ __forceinline__ void skip_rmsnorm_bf16_tpl(
     const float inv_std = 1.0f / sqrtf(reduced / (float)norm_size + epsilon);
     if (tid == 0) {
         if (mean_out) {
-            if (stat_is_bf16) ((__nv_bfloat16*)mean_out)[g] = __float2bfloat16_rn(0.0f);
+            if (stat_bf16_mask & 1) ((__nv_bfloat16*)mean_out)[g] = __float2bfloat16_rn(0.0f);
             else ((float*)mean_out)[g] = 0.0f;
         }
         if (invstd_out) {
-            if (stat_is_bf16) ((__nv_bfloat16*)invstd_out)[g] = __float2bfloat16_rn(inv_std);
+            if (stat_bf16_mask & 2) ((__nv_bfloat16*)invstd_out)[g] = __float2bfloat16_rn(inv_std);
             else ((float*)invstd_out)[g] = inv_std;
         }
     }
@@ -738,12 +739,12 @@ extern "C" __global__ void skip_rmsnorm_bf16(
     const int     dense_skip,
     const int     gamma_is_bf16,
     const int     bias_is_bf16,
-    const int     stat_is_bf16,
+    const int     stat_bf16_mask,
     const float   epsilon)
 {
     skip_rmsnorm_bf16_tpl<false>(input, skip, gamma, bias, y, sum_out, mean_out,
         invstd_out, metadata, rank, num_groups, norm_size, has_bias, dense_skip,
-        gamma_is_bf16, bias_is_bf16, stat_is_bf16, epsilon);
+        gamma_is_bf16, bias_is_bf16, stat_bf16_mask, epsilon);
 }
 
 extern "C" __global__ void skip_rmsnorm_bf16_warp(
@@ -763,12 +764,12 @@ extern "C" __global__ void skip_rmsnorm_bf16_warp(
     const int     dense_skip,
     const int     gamma_is_bf16,
     const int     bias_is_bf16,
-    const int     stat_is_bf16,
+    const int     stat_bf16_mask,
     const float   epsilon)
 {
     skip_rmsnorm_bf16_tpl<true>(input, skip, gamma, bias, y, sum_out, mean_out,
         invstd_out, metadata, rank, num_groups, norm_size, has_bias, dense_skip,
-        gamma_is_bf16, bias_is_bf16, stat_is_bf16, epsilon);
+        gamma_is_bf16, bias_is_bf16, stat_bf16_mask, epsilon);
 }
 
 union SkipHalf4 {
@@ -2045,9 +2046,11 @@ impl KernelFactory for SkipSimplifiedLayerNormFactory {
             epsilon,
             runtime: self.runtime.clone(),
             metadata: Mutex::new(SkipBroadcastMetadataCache::new(self.runtime.clone())),
-            bf16_scratch: Mutex::new(NormBf16Scratch::new(self.runtime.clone())),
+            native_bf16_available: self
+                .runtime
+                .require_nvrtc_half_headers("SkipSimplifiedLayerNormalization")
+                .is_ok(),
             last_call_capture_safe: AtomicBool::new(false),
-            last_call_used_bf16_scratch: AtomicBool::new(false),
         }))
     }
 }
@@ -2058,20 +2061,211 @@ pub struct SkipSimplifiedLayerNormKernel {
     epsilon: f32,
     runtime: Arc<CudaRuntime>,
     metadata: Mutex<SkipBroadcastMetadataCache>,
-    /// Persistent f32 staging arena for the BFloat16-via-Float32 path. Reused
-    /// across decode steps so the widen/narrow casts never `cudaMalloc`/`cudaFree`
-    /// on the hot path, which is what keeps the bf16 path graph-capture safe.
-    bf16_scratch: Mutex<NormBf16Scratch>,
+    /// Cold capability selection is shared by planning and execution. Missing
+    /// native support must never cause a late, unadmitted staging allocation.
+    native_bf16_available: bool,
     last_call_capture_safe: AtomicBool,
-    last_call_used_bf16_scratch: AtomicBool,
+}
+
+/// Fixed scratch partitioning, never independent region grants or owners.
+// Keep this bounded layout on the stack: boxing it would add a heap
+// allocation to every staged dispatch just to shrink the zero-scratch variants.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+enum SkipNormRoute {
+    Direct,
+    Bf16Native,
+    Bf16Staged(WorkspaceLayout<8>),
+}
+
+impl SkipNormRoute {
+    fn requirement(&self) -> WorkspaceRequirement {
+        match self {
+            Self::Bf16Staged(layout) if layout.bytes() != 0 => WorkspaceRequirement {
+                bytes: layout.bytes() as u64,
+                alignment: layout.alignment(),
+                lifetime: WorkspaceLifetime::SessionPersistent,
+            },
+            _ => WorkspaceRequirement::NONE,
+        }
+    }
+}
+
+fn skip_norm_elements(shape: &[usize], label: &str) -> Result<usize> {
+    if shape.contains(&0) {
+        return Ok(0);
+    }
+    shape.iter().try_fold(1usize, |count, &dimension| count.checked_mul(dimension)).ok_or_else(|| EpError::KernelFailed(format!("cuda_ep SkipSimplifiedLayerNormalization: {label} shape {shape:?} element count exceeds usize; reduce the shape")))
+}
+
+/// The input geometry proves every present output's element count, even when
+/// its declared shape is unresolved. Known output facts must agree with it.
+fn skip_norm_route(
+    inputs: &[TensorMetadata<'_>],
+    outputs: &[OutputMetadata<'_>],
+    native_bf16_available: bool,
+) -> Result<SkipNormRoute> {
+    if inputs
+        .first()
+        .is_none_or(|input| input.dtype != DataType::BFloat16)
+    {
+        return Ok(SkipNormRoute::Direct);
+    }
+    let error = |message: String| {
+        EpError::KernelFailed(format!(
+            "cuda_ep SkipSimplifiedLayerNormalization: {message}; check BF16 input/output geometry before preparing workspace"
+        ))
+    };
+    if !(3..=4).contains(&inputs.len()) || outputs.is_empty() || outputs.len() > 4 {
+        return Err(error(format!(
+            "expected 3-4 inputs and 1-4 outputs, got {} and {}",
+            inputs.len(),
+            outputs.len()
+        )));
+    }
+    for (index, input) in inputs[..3].iter().enumerate() {
+        if !input.present {
+            return Err(error(format!("required input slot {index} is absent")));
+        }
+    }
+    let shape = inputs[0].shape;
+    let hidden = *shape
+        .last()
+        .ok_or_else(|| error("input must have rank >= 1".into()))?;
+    if hidden == 0 {
+        return Err(error("empty hidden (last) dimension".into()));
+    }
+    if inputs[1].dtype != DataType::BFloat16 {
+        return Err(error(format!(
+            "skip dtype {:?} must match BF16 input",
+            inputs[1].dtype
+        )));
+    }
+    for (index, input) in inputs
+        .iter()
+        .enumerate()
+        .skip(2)
+        .filter(|(_, input)| input.present)
+    {
+        if !matches!(input.dtype, DataType::BFloat16 | DataType::Float32) || input.shape != [hidden]
+        {
+            return Err(error(format!(
+                "parameter slot {index} must be BF16 or F32 with shape [{hidden}], got {:?} {:?}",
+                input.dtype, input.shape
+            )));
+        }
+    }
+    let broadcast =
+        onnx_runtime_ir::broadcast_shapes(shape, inputs[1].shape).map_err(EpError::Ir)?;
+    if broadcast != shape {
+        return Err(error(format!(
+            "skip shape {:?} does not broadcast to input {shape:?}",
+            inputs[1].shape
+        )));
+    }
+    let elements = skip_norm_elements(shape, "input")?;
+    let groups = skip_norm_elements(&shape[..shape.len() - 1], "group")?;
+    let mut output_counts = [0usize; 4];
+    for (index, output) in outputs.iter().enumerate() {
+        let (dtype, known) = match output {
+            OutputMetadata::Absent if index == 0 => {
+                return Err(error("required output slot 0 is absent".into()));
+            }
+            OutputMetadata::Absent => continue,
+            OutputMetadata::Unresolved { dtype } => (*dtype, None),
+            OutputMetadata::Tensor { dtype, shape } => (*dtype, Some(shape.as_ref())),
+        };
+        let count = if index == 0 || index == 3 {
+            elements
+        } else {
+            groups
+        };
+        let dtype_valid = if index == 0 || index == 3 {
+            dtype == DataType::BFloat16
+        } else {
+            matches!(dtype, DataType::BFloat16 | DataType::Float32)
+        };
+        if !dtype_valid {
+            return Err(error(format!(
+                "output slot {index} has unsupported dtype {dtype:?} for BF16 normalization"
+            )));
+        }
+        if let Some(output_shape) = known
+            && (skip_norm_elements(output_shape, &format!("output slot {index}"))? != count
+                || ((index == 0 || index == 3) && output_shape != shape))
+        {
+            return Err(error(format!(
+                "output slot {index} shape {output_shape:?} must contain {count} elements{}",
+                if index == 0 || index == 3 {
+                    " and equal the input shape"
+                } else {
+                    ""
+                }
+            )));
+        }
+        output_counts[index] = count;
+    }
+    if native_bf16_available
+        && elements == skip_norm_elements(inputs[1].shape, "skip")?
+        && inputs.get(3).is_none_or(|bias| !bias.present)
+    {
+        return Ok(SkipNormRoute::Bf16Native);
+    }
+    let mut regions = [std::alloc::Layout::from_size_align(0, 16).expect("fixed alignment"); 8];
+    if elements != 0 {
+        for (index, input) in inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, input)| input.present && input.dtype == DataType::BFloat16)
+        {
+            let bytes = skip_norm_elements(input.shape, &format!("input slot {index}"))?
+                .checked_mul(4)
+                .ok_or_else(|| {
+                    error(format!(
+                        "input slot {index} F32 staging byte count exceeds usize"
+                    ))
+                })?;
+            regions[index] = std::alloc::Layout::from_size_align(bytes, 16).map_err(|_| {
+                error(format!(
+                    "input slot {index} F32 staging exceeds addressable capacity"
+                ))
+            })?;
+        }
+        for (index, count) in output_counts.into_iter().enumerate() {
+            let bytes = count.checked_mul(4).ok_or_else(|| {
+                error(format!(
+                    "output slot {index} F32 staging byte count exceeds usize"
+                ))
+            })?;
+            regions[index + 4] = std::alloc::Layout::from_size_align(bytes, 16).map_err(|_| {
+                error(format!(
+                    "output slot {index} F32 staging exceeds addressable capacity"
+                ))
+            })?;
+        }
+    }
+    Ok(SkipNormRoute::Bf16Staged(WorkspaceLayout::new(regions)?))
+}
+
+fn skip_stat_bf16_mask(outputs: &[TensorMut]) -> i32 {
+    [1, 2]
+        .into_iter()
+        .enumerate()
+        .fold(0, |mask, (bit, index)| {
+            mask | if outputs
+                .get(index)
+                .is_some_and(|output| !output.is_absent() && output.dtype == DataType::BFloat16)
+            {
+                1 << bit
+            } else {
+                0
+            }
+        })
 }
 
 struct SkipNormWarmRollback<'a> {
     kernel: &'a SkipSimplifiedLayerNormKernel,
     metadata: Option<SkipBroadcastMetadataCache>,
-    scratch: Option<NormBf16Scratch>,
-    capture_safe: bool,
-    used_bf16_scratch: bool,
     committed: bool,
 }
 
@@ -2090,20 +2284,6 @@ impl<'a> SkipNormWarmRollback<'a> {
                     })?
                     .clone(),
             ),
-            scratch: Some(
-                kernel
-                    .bf16_scratch
-                    .lock()
-                    .map_err(|_| {
-                        EpError::KernelFailed(
-                            "cuda_ep SkipSimplifiedLayerNormalization: scratch lock poisoned"
-                                .into(),
-                        )
-                    })?
-                    .clone(),
-            ),
-            capture_safe: kernel.last_call_capture_safe.load(Ordering::Relaxed),
-            used_bf16_scratch: kernel.last_call_used_bf16_scratch.load(Ordering::Relaxed),
             kernel,
             committed: false,
         })
@@ -2128,66 +2308,9 @@ impl Drop for SkipNormWarmRollback<'_> {
         {
             *current = metadata;
         }
-        if let Some(scratch) = self.scratch.take()
-            && let Ok(mut current) = self.kernel.bf16_scratch.lock()
-        {
-            *current = scratch;
-        }
         self.kernel
             .last_call_capture_safe
-            .store(self.capture_safe, Ordering::Relaxed);
-        self.kernel
-            .last_call_used_bf16_scratch
-            .store(self.used_bf16_scratch, Ordering::Relaxed);
-    }
-}
-
-/// Persistent device arena that stages BFloat16 operands through Float32 without
-/// per-call allocation. Mirrors the `Bf16Scratch` pattern in `matmul_nbits`: a
-/// single grow-only buffer whose base address stays fixed across decode steps,
-/// so the casts recorded into a CUDA graph replay against a stable pointer.
-#[derive(Clone, Debug)]
-struct NormBf16Scratch {
-    runtime: Arc<CudaRuntime>,
-    allocation: Option<Arc<GraphDeviceAllocation>>,
-    cap: usize,
-}
-
-impl NormBf16Scratch {
-    fn new(runtime: Arc<CudaRuntime>) -> Self {
-        Self {
-            runtime,
-            allocation: None,
-            cap: 0,
-        }
-    }
-
-    /// Ensure the arena holds at least `bytes`, returning its base pointer and
-    /// whether it had to (re)allocate. A growth event means the base pointer
-    /// moved, so a call that grows the arena is not capture-safe; steady decode
-    /// (fixed shapes) never grows after the first warm call.
-    fn ensure(&mut self, bytes: usize) -> Result<(CUdeviceptr, bool)> {
-        if bytes <= self.cap
-            && let Some(allocation) = self.allocation.as_ref()
-        {
-            return Ok((allocation.ptr(), false));
-        }
-        if self.allocation.is_some() {
-            self.runtime.drain_for_unmap()?;
-        }
-        let allocation = GraphDeviceAllocation::allocate(&self.runtime, bytes.max(1))?;
-        self.runtime
-            .staged_warm_cache_mutation("SkipSimplifiedLayerNorm bf16 scratch allocation")?;
-        let ptr = allocation.ptr();
-        self.allocation = Some(allocation);
-        self.cap = bytes;
-        Ok((ptr, true))
-    }
-
-    fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
-        self.allocation
-            .as_ref()
-            .map(GraphDeviceAllocation::device_graph_resource)
+            .store(false, Ordering::Relaxed);
     }
 }
 
@@ -2254,124 +2377,95 @@ impl SkipBroadcastMetadataCache {
 }
 
 impl SkipSimplifiedLayerNormKernel {
-    /// BFloat16 activations: the fused Skip-RMS kernels are implemented for
-    /// Float16 and Float32 only, so the BFloat16 case is staged through Float32.
-    /// Every BFloat16 operand is losslessly widened into a scratch f32 buffer,
-    /// the f32 kernel path runs, and each result is narrowed back to its original
-    /// dtype. SkipSimplifiedLayerNormalization appears once per token (the final
-    /// norm), so the extra pointwise casts are negligible.
-    ///
-    /// The staging arena is **persistent** (a grow-only `NormBf16Scratch` reused
-    /// across decode steps), so the widen/narrow casts and the reused f32 kernel
-    /// issue no per-call `cudaMalloc`/`cudaFree` — a `cuMemFree` would otherwise
-    /// force a stream synchronize every token and serialize decode. With a stable
-    /// arena base and fixed decode shapes this whole path records and replays
-    /// inside a CUDA graph, so the final bf16 norm no longer forms an eager seam
-    /// that splits (and defeats) the captured decode graph.
-    fn run_bf16_via_f32(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        // Byte offset of each staged buffer within the persistent arena. bf16
-        // inputs and every output are widened to f32; non-bf16 inputs forward
-        // in place. Each buffer is 16-byte aligned so vectorized casts stay
-        // aligned.
-        let align = |bytes: usize| bytes.div_ceil(16) * 16;
-        let mut total = 0usize;
-        let mut input_offsets: Vec<Option<usize>> = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            if input.dtype == DataType::BFloat16 && !input.is_absent() {
-                input_offsets.push(Some(total));
-                total += align(input.numel().max(1) * 4);
+    /// Borrow one caller-funded staging layout for the complete widen/compute/
+    /// narrow sequence. The common lane retains capacity and capture ownership.
+    fn run_bf16_via_f32(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        layout: WorkspaceLayout<8>,
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        let regions = layout.bind(workspace).map_err(|source| EpError::Backend {
+            operation: "bind complete caller workspace for SkipSimplifiedLayerNormalization BF16 staging",
+            source: Box::new(source),
+        })?;
+        if self.runtime.is_capturing()? && layout.bytes() != 0 {
+            let used = WorkspaceView::new(
+                workspace
+                    .expect("nonempty layout binding required backing")
+                    .ptr(),
+                layout.bytes(),
+            );
+            self.runtime.require_registered_workspace_capture(
+                used,
+                "SkipSimplifiedLayerNormalization BF16 staging",
+            )?;
+        }
+        let mut f32_inputs = Vec::with_capacity(inputs.len());
+        for (index, input) in inputs.iter().enumerate() {
+            if input.dtype == DataType::BFloat16
+                && !input.is_absent()
+                && regions[index].bytes() != 0
+            {
+                let ptr = cuptr(regions[index].ptr().0);
+                super::cast::launch_cast_raw(
+                    &self.runtime,
+                    cuptr(input.data_ptr::<u8>().cast()),
+                    DataType::BFloat16,
+                    ptr,
+                    DataType::Float32,
+                    input.numel(),
+                )?;
+                f32_inputs.push(TensorView::new(
+                    DevicePtr(raw_ptr(ptr).cast_const()),
+                    DataType::Float32,
+                    input.shape,
+                    input.strides,
+                    input.device,
+                ));
             } else {
-                input_offsets.push(None);
-            }
-        }
-        let mut output_offsets: Vec<usize> = Vec::with_capacity(outputs.len());
-        for output in outputs.iter() {
-            output_offsets.push(total);
-            total += align(output.numel().max(1) * 4);
-        }
-
-        // Hold the arena for the whole call: the widening casts, the reused f32
-        // kernel, and the narrowing casts all run stream-ordered against it.
-        let mut arena = self
-            .bf16_scratch
-            .lock()
-            .expect("cuda_ep SkipSimplifiedLayerNormalization bf16 scratch mutex poisoned");
-        let (base, grew) = arena.ensure(total)?;
-
-        let staged = (|| -> Result<()> {
-            // Widen every BFloat16 input into the arena; forward the rest.
-            let mut f32_inputs: Vec<TensorView> = Vec::with_capacity(inputs.len());
-            for (input, offset) in inputs.iter().zip(input_offsets.iter()) {
-                match offset {
-                    Some(off) => {
-                        let ptr = base + *off as CUdeviceptr;
-                        super::cast::launch_cast_raw(
-                            &self.runtime,
-                            cuptr(input.data_ptr::<u8>() as *const c_void),
-                            DataType::BFloat16,
-                            ptr,
-                            DataType::Float32,
-                            input.numel(),
-                        )?;
-                        f32_inputs.push(TensorView::new(
-                            DevicePtr(raw_ptr(ptr) as *const c_void),
-                            DataType::Float32,
-                            input.shape,
-                            input.strides,
-                            input.device,
-                        ));
-                    }
-                    None => f32_inputs.push(*input),
+                // Empty BF16 views still need the F32 dispatch dtype; no bytes
+                // are read and the direct body exits for an empty batch.
+                let mut view = *input;
+                if !view.is_absent() && view.dtype == DataType::BFloat16 {
+                    view.dtype = DataType::Float32;
                 }
+                f32_inputs.push(view);
             }
-
-            // Point every output slot at its f32 scratch region so the f32
-            // kernel writes into it; present outputs are narrowed back afterward.
-            let mut f32_outputs: Vec<TensorMut> = Vec::with_capacity(outputs.len());
-            for (output, off) in outputs.iter().zip(output_offsets.iter()) {
-                let ptr = base + *off as CUdeviceptr;
-                f32_outputs.push(TensorMut::new(
-                    DevicePtrMut(raw_ptr(ptr)),
+        }
+        let mut f32_outputs = outputs
+            .iter()
+            .enumerate()
+            .map(|(index, output)| {
+                let view = TensorMut::new(
+                    regions[index + 4].ptr(),
                     DataType::Float32,
                     output.shape,
                     output.strides,
                     output.device,
-                ));
-            }
-
-            self.run(&f32_inputs, &mut f32_outputs)?;
-
-            // Narrow each present output back to its original dtype.
-            for (output, off) in outputs.iter_mut().zip(output_offsets.iter()) {
-                if output.is_absent() || output.numel() == 0 {
-                    continue;
+                );
+                if output.is_absent() {
+                    view.mark_absent()
+                } else {
+                    view
                 }
-                let n = output.numel();
+            })
+            .collect::<Vec<_>>();
+        self.run_direct(&f32_inputs, &mut f32_outputs)?;
+        for (index, output) in outputs.iter_mut().enumerate() {
+            if !output.is_absent() && output.numel() != 0 {
                 super::cast::launch_cast_raw(
                     &self.runtime,
-                    base + *off as CUdeviceptr,
+                    cuptr(regions[index + 4].ptr().0),
                     DataType::Float32,
-                    cuptr(output.data_ptr_mut::<u8>() as *const c_void),
+                    cuptr(output.data_ptr_mut::<u8>().cast()),
                     output.dtype,
-                    n,
+                    output.numel(),
                 )?;
             }
-            Ok(())
-        })();
-
-        // The inner `run` already latched `last_call_capture_safe` from its
-        // (f32) num_groups. A growth moves the arena base pointer, so a graph
-        // recorded against the old address would replay stale — but only a grow
-        // that happens *during capture recording* can corrupt a live graph. The
-        // first warm call (outside capture) always grows the arena to size it for
-        // the decode shape; that is expected and leaves the base fixed for every
-        // steady captured step, so it must stay capture-safe. Demote only when the
-        // grow races an in-progress capture (an un-pre-warmed shape). Steady
-        // decode never grows after warmup, so this never demotes on the hot path.
-        if staged.is_ok() && grew && self.runtime.is_capturing().unwrap_or(true) {
-            self.last_call_capture_safe.store(false, Ordering::Relaxed);
         }
-        staged
+        Ok(())
     }
 
     /// Native byte-exact bf16 fused Skip-RMSNorm. Preconditions (checked by the
@@ -2453,15 +2547,8 @@ impl SkipSimplifiedLayerNormKernel {
         // typically unused); track their precision so the kernel narrows.
         let mean_ptr = optional_bf16_stat_ptr(op, "Mean", outputs, 1, num_groups)?;
         let invstd_ptr = optional_bf16_stat_ptr(op, "InvStdDev", outputs, 2, num_groups)?;
-        let stat_is_bf16 = i32::from(
-            outputs
-                .get(1)
-                .is_some_and(|t| t.dtype == DataType::BFloat16)
-                || outputs
-                    .get(2)
-                    .is_some_and(|t| t.dtype == DataType::BFloat16),
-        );
-        let sum_ptr = match outputs.get_mut(3) {
+        let stat_bf16_mask = skip_stat_bf16_mask(outputs);
+        let sum_ptr = match outputs.get_mut(3).filter(|output| !output.is_absent()) {
             None => 0u64,
             Some(t) => {
                 if t.dtype != DataType::BFloat16 {
@@ -2527,7 +2614,7 @@ impl SkipSimplifiedLayerNormKernel {
             .arg(&dense_skip)
             .arg(&gamma_is_bf16)
             .arg(&bias_is_bf16)
-            .arg(&stat_is_bf16)
+            .arg(&stat_bf16_mask)
             .arg(&self.epsilon);
         // Match `rmsnorm_bf16` exactly (same block-tree reduction and f32
         // shared-memory bytes/thread) so the summation order is bit-identical:
@@ -2553,42 +2640,80 @@ impl SkipSimplifiedLayerNormKernel {
         Ok(())
     }
 
-    fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        let rollback = SkipNormWarmRollback::new(self)?;
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         self.last_call_capture_safe.store(false, Ordering::Relaxed);
-        self.last_call_used_bf16_scratch
-            .store(false, Ordering::Relaxed);
+        let rollback = SkipNormWarmRollback::new(self)?;
         let op = "SkipSimplifiedLayerNormalization";
         if !(3..=4).contains(&inputs.len()) || outputs.is_empty() || outputs.len() > 4 {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep {op}: expected 3-4 inputs (input, skip, gamma[, bias]) and 1-4 outputs, got {} and {}",
+                "cuda_ep {op}: expected 3-4 inputs and 1-4 outputs, got {} and {}; preserve optional slots",
                 inputs.len(),
                 outputs.len()
             )));
         }
+        let result = if inputs[0].dtype == DataType::BFloat16 {
+            let metadata: [_; 4] = std::array::from_fn(|index| {
+                inputs.get(index).map_or(
+                    TensorMetadata::new(DataType::Float32, &[], false),
+                    |input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()),
+                )
+            });
+            let output_metadata: [_; 4] = std::array::from_fn(|index| {
+                outputs
+                    .get(index)
+                    .map_or(OutputMetadata::Absent, OutputMetadata::from_view)
+            });
+            let route = skip_norm_route(
+                &metadata[..inputs.len()],
+                &output_metadata[..outputs.len()],
+                self.native_bf16_available,
+            )?;
+            for (index, input) in inputs
+                .iter()
+                .enumerate()
+                .filter(|(_, input)| !input.is_absent())
+            {
+                require_contiguous(
+                    op,
+                    ["input", "skip", "gamma", "bias"][index],
+                    input.is_contiguous(),
+                )?;
+            }
+            for (index, output) in outputs
+                .iter()
+                .enumerate()
+                .filter(|(_, output)| !output.is_absent())
+            {
+                require_contiguous(
+                    op,
+                    ["Y", "Mean", "InvStdDev", "residual sum"][index],
+                    output.is_contiguous(),
+                )?;
+            }
+            match route {
+                SkipNormRoute::Bf16Native => self.run_bf16_native(inputs, outputs),
+                SkipNormRoute::Bf16Staged(layout) => {
+                    self.run_bf16_via_f32(inputs, outputs, layout, workspace)
+                }
+                SkipNormRoute::Direct => unreachable!("BF16 route classified above"),
+            }
+        } else {
+            self.run_direct(inputs, outputs)
+        };
+        rollback.finish(result)
+    }
+
+    fn run_direct(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let op = "SkipSimplifiedLayerNormalization";
         let input = &inputs[0];
         let skip = &inputs[1];
         let gamma = &inputs[2];
         let bias = inputs.get(3).filter(|bias| !bias.is_absent());
-        if input.dtype == DataType::BFloat16 {
-            // Native byte-exact fused bf16 skip-RMSNorm: rounds the residual sum
-            // to bf16 before the RMS reduction (so `y`/sum match a standalone
-            // `Add(bf16)` bit-for-bit) and reuses the identical block-tree
-            // reduction of `rmsnorm_bf16`. This is what lets `optimizer.rs` fold
-            // `Add → SimplifiedLayerNormalization` into a single skip node without
-            // perturbing the greedy token stream. Requires the bf16 NVRTC headers
-            // and (for the byte-exact contract) a dense skip with no bias; any
-            // exotic case falls back to the f32 staging path (Rule 11).
-            if self.runtime.require_nvrtc_half_headers(op).is_ok()
-                && skip.numel() == input.numel()
-                && bias.is_none()
-            {
-                return rollback.finish(self.run_bf16_native(inputs, outputs));
-            }
-            self.last_call_used_bf16_scratch
-                .store(true, Ordering::Relaxed);
-            return rollback.finish(self.run_bf16_via_f32(inputs, outputs));
-        }
         require_f16_or_f32(op, "input", input.dtype)?;
         let is_half = input.dtype == DataType::Float16;
         if skip.dtype != input.dtype {
@@ -2681,7 +2806,7 @@ impl SkipSimplifiedLayerNormKernel {
             let (mean, invstd) = optional_stat_ptrs(op, outputs, num_groups)?;
             (mean, invstd, 0)
         };
-        let sum_ptr = match outputs.get_mut(3) {
+        let sum_ptr = match outputs.get_mut(3).filter(|output| !output.is_absent()) {
             None => 0u64,
             Some(t) => {
                 if t.dtype != input.dtype {
@@ -2830,31 +2955,41 @@ impl SkipSimplifiedLayerNormKernel {
         // pre-warmed M=K shape records and replays safely just like decode's
         // M=1; the earlier `num_groups == 1` restriction was conservative, not a
         // real capture hazard, and kept every batched (speculative-verify /
-        // prefill) node declaring KernelCaptureUnsupported. The bf16 staging path
-        // additionally demotes when its arena grows during capture (see
-        // `run_bf16_via_f32`).
+        // prefill) node declaring KernelCaptureUnsupported. BF16 staging binds
+        // the admitted caller lane and verifies its real capture pin.
         self.last_call_capture_safe.store(true, Ordering::Relaxed);
-        rollback.finish(Ok(()))
+        Ok(())
     }
 }
 
 impl Kernel for SkipSimplifiedLayerNormKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.run(inputs, outputs)
+        self.run(inputs, outputs, None)
+    }
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
+    }
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        Ok(WorkspacePreparation::Ready(
+            skip_norm_route(inputs, outputs, self.native_bf16_available)?.requirement(),
+        ))
     }
     fn supports_strided_input(&self, _idx: usize) -> bool {
         false
     }
     fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        let mut resources = Vec::with_capacity(2);
+        let mut resources = Vec::with_capacity(1);
         if let Ok(metadata) = self.metadata.lock()
             && let Some(resource) = metadata.device_graph_resource()
-        {
-            resources.push(resource);
-        }
-        if self.last_call_used_bf16_scratch.load(Ordering::Relaxed)
-            && let Ok(scratch) = self.bf16_scratch.lock()
-            && let Some(resource) = scratch.device_graph_resource()
         {
             resources.push(resource);
         }
@@ -3158,7 +3293,7 @@ fn optional_stat_ptrs_typed(
     // either and tell the kernel which storage to write.
     let mut stat_dtype = DataType::Float32;
     for idx in [1, 2] {
-        if let Some(t) = outputs.get(idx) {
+        if let Some(t) = outputs.get(idx).filter(|output| !output.is_absent()) {
             if t.dtype != DataType::Float32 && t.dtype != dtype {
                 return Err(EpError::KernelFailed(format!(
                     "cuda_ep {op}: stat output {idx} dtype {:?} must be Float32 or the input dtype {dtype:?}",
@@ -3189,7 +3324,7 @@ fn optional_out_ptr_typed(
     expect: usize,
     dtype: DataType,
 ) -> Result<CUdeviceptr> {
-    match outputs.get_mut(idx) {
+    match outputs.get_mut(idx).filter(|output| !output.is_absent()) {
         None => Ok(0),
         Some(t) => {
             if t.dtype != dtype {
@@ -3239,7 +3374,7 @@ fn optional_out_ptr(
     idx: usize,
     expect: usize,
 ) -> Result<CUdeviceptr> {
-    match outputs.get_mut(idx) {
+    match outputs.get_mut(idx).filter(|output| !output.is_absent()) {
         None => Ok(0),
         Some(t) => {
             require_f32(op, name, t.dtype)?;
@@ -3293,7 +3428,7 @@ fn optional_half_stat_ptr(
     idx: usize,
     expect: usize,
 ) -> Result<CUdeviceptr> {
-    match outputs.get_mut(idx) {
+    match outputs.get_mut(idx).filter(|output| !output.is_absent()) {
         None => Ok(0),
         Some(t) => {
             require_f16_or_f32(op, name, t.dtype)?;
@@ -3318,7 +3453,7 @@ fn optional_bf16_stat_ptr(
     idx: usize,
     expect: usize,
 ) -> Result<CUdeviceptr> {
-    match outputs.get_mut(idx) {
+    match outputs.get_mut(idx).filter(|output| !output.is_absent()) {
         None => Ok(0),
         Some(t) => {
             if !matches!(t.dtype, DataType::BFloat16 | DataType::Float32) {
@@ -3713,11 +3848,12 @@ mod tests {
                 epsilon: 1e-5,
                 runtime: runtime.clone(),
                 metadata: Mutex::new(SkipBroadcastMetadataCache::new(runtime.clone())),
-                bf16_scratch: Mutex::new(NormBf16Scratch::new(runtime.clone())),
+                native_bf16_available: runtime
+                    .require_nvrtc_half_headers("SkipSimplifiedLayerNormalization")
+                    .is_ok(),
                 last_call_capture_safe: AtomicBool::new(false),
-                last_call_used_bf16_scratch: AtomicBool::new(false),
             };
-            kernel.run(&inputs, &mut [output]).unwrap();
+            kernel.run(&inputs, &mut [output], None).unwrap();
         }
 
         let mut output_bytes = vec![0u8; hidden * std::mem::size_of::<f16>()];
@@ -3857,11 +3993,12 @@ mod tests {
             epsilon: 1e-5,
             runtime: runtime.clone(),
             metadata: Mutex::new(SkipBroadcastMetadataCache::new(runtime.clone())),
-            bf16_scratch: Mutex::new(NormBf16Scratch::new(runtime.clone())),
+            native_bf16_available: runtime
+                .require_nvrtc_half_headers("SkipSimplifiedLayerNormalization")
+                .is_ok(),
             last_call_capture_safe: AtomicBool::new(false),
-            last_call_used_bf16_scratch: AtomicBool::new(false),
         };
-        kernel.run(&inputs, &mut outputs).unwrap();
+        kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
 
         let mut output = vec![0.0f32; hidden];
@@ -3915,7 +4052,7 @@ mod tests {
     /// the numeric contract Chew gates: the fold only fires because the fused
     /// kernel rounds the residual sum to bf16 before the RMS reduction and reuses
     /// the identical block-tree summation, so no greedy token can diverge.
-    fn assert_bf16_skip_byte_exact(gamma_bf16: bool) {
+    fn assert_bf16_skip_byte_exact(gamma_bf16: bool, stat_dtypes: [DataType; 2]) {
         let Ok(ep) = CudaExecutionProvider::new(0) else {
             eprintln!("skipping bf16 skip RMSNorm byte-exactness test: CUDA unavailable");
             return;
@@ -3962,6 +4099,14 @@ mod tests {
         let mut mean_buffer = ep.allocate(std::mem::size_of::<f32>(), 256).unwrap();
         let mut invstd_buffer = ep.allocate(std::mem::size_of::<f32>(), 256).unwrap();
 
+        unsafe {
+            runtime
+                .htod(&f32::NAN.to_ne_bytes(), cuptr(mean_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(&f32::NAN.to_ne_bytes(), cuptr(invstd_buffer.as_ptr()))
+                .unwrap();
+        }
         let gamma_bf16_vec: Vec<bf16> = gamma_f32.iter().map(|v| bf16::from_f32(*v)).collect();
         unsafe {
             runtime
@@ -4031,9 +4176,10 @@ mod tests {
             epsilon: 1e-5,
             runtime: runtime.clone(),
             metadata: Mutex::new(SkipBroadcastMetadataCache::new(runtime.clone())),
-            bf16_scratch: Mutex::new(NormBf16Scratch::new(runtime.clone())),
+            native_bf16_available: runtime
+                .require_nvrtc_half_headers("SkipSimplifiedLayerNormalization")
+                .is_ok(),
             last_call_capture_safe: AtomicBool::new(false),
-            last_call_used_bf16_scratch: AtomicBool::new(false),
         };
         kernel
             .run(
@@ -4064,14 +4210,14 @@ mod tests {
                     ),
                     TensorMut::new(
                         DevicePtrMut(mean_buffer.as_mut_ptr()),
-                        DataType::Float32,
+                        stat_dtypes[0],
                         &[1usize],
                         &[1i64],
                         ep.device_id(),
                     ),
                     TensorMut::new(
                         DevicePtrMut(invstd_buffer.as_mut_ptr()),
-                        DataType::Float32,
+                        stat_dtypes[1],
                         &[1usize],
                         &[1i64],
                         ep.device_id(),
@@ -4084,6 +4230,7 @@ mod tests {
                         ep.device_id(),
                     ),
                 ],
+                None,
             )
             .unwrap();
         runtime.synchronize().unwrap();
@@ -4091,6 +4238,37 @@ mod tests {
             kernel.last_call_capture_safe.load(Ordering::Relaxed),
             "native bf16 skip must stay capture-safe at num_groups==1"
         );
+
+        let expected_inv = 1.0
+            / (residual_ref.iter().map(|v| v.to_f32().powi(2)).sum::<f32>() / hidden as f32 + 1e-5)
+                .sqrt();
+        for (index, buffer) in [&mean_buffer, &invstd_buffer].into_iter().enumerate() {
+            let mut bytes = [0; 4];
+            unsafe {
+                runtime.dtoh(&mut bytes, cuptr(buffer.as_ptr())).unwrap();
+            }
+            let got = if stat_dtypes[index] == DataType::BFloat16 {
+                assert_eq!(
+                    &bytes[2..],
+                    &f32::NAN.to_ne_bytes()[2..],
+                    "BF16 stat must write exactly two bytes"
+                );
+                bf16::from_bits(u16::from_ne_bytes(bytes[..2].try_into().unwrap())).to_f32()
+            } else {
+                f32::from_ne_bytes(bytes)
+            };
+            let expected = if index == 0 { 0.0 } else { expected_inv };
+            assert!(
+                (got - expected).abs()
+                    < if stat_dtypes[index] == DataType::BFloat16 {
+                        0.01
+                    } else {
+                        2e-5
+                    },
+                "stat {index} {:?}: got {got}, expected {expected}",
+                stat_dtypes[index]
+            );
+        }
 
         let read_bf16 = |buffer: &onnx_runtime_ep_api::DeviceBuffer| -> Vec<u16> {
             let mut raw = vec![0u8; bytes];
@@ -4132,12 +4310,26 @@ mod tests {
 
     #[test]
     fn bf16_native_skip_rmsnorm_is_byte_exact_with_bf16_gamma() {
-        assert_bf16_skip_byte_exact(true);
+        assert_bf16_skip_byte_exact(true, [DataType::Float32; 2]);
     }
 
     #[test]
     fn bf16_native_skip_rmsnorm_is_byte_exact_with_f32_gamma() {
-        assert_bf16_skip_byte_exact(false);
+        assert_bf16_skip_byte_exact(false, [DataType::Float32; 2]);
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable gpu-tests on a CUDA runner"
+    )]
+    fn bf16_native_skip_mixed_stat_widths_preserve_byte_exact_activations() {
+        for stats in [
+            [DataType::BFloat16, DataType::Float32],
+            [DataType::Float32, DataType::BFloat16],
+        ] {
+            assert_bf16_skip_byte_exact(true, stats);
+        }
     }
 
     fn f32_bytes_mut(values: &mut [f32]) -> &mut [u8] {
@@ -4380,11 +4572,12 @@ mod tests {
                 epsilon: 1e-5,
                 runtime: runtime.clone(),
                 metadata: Mutex::new(SkipBroadcastMetadataCache::new(runtime.clone())),
-                bf16_scratch: Mutex::new(NormBf16Scratch::new(runtime.clone())),
+                native_bf16_available: runtime
+                    .require_nvrtc_half_headers("SkipSimplifiedLayerNormalization")
+                    .is_ok(),
                 last_call_capture_safe: AtomicBool::new(false),
-                last_call_used_bf16_scratch: AtomicBool::new(false),
             };
-            kernel.run(&inputs, &mut [output]).unwrap();
+            kernel.run(&inputs, &mut [output], None).unwrap();
         }
         let mut output_bytes = vec![0u8; hidden * std::mem::size_of::<f16>()];
         unsafe {
@@ -4947,3 +5140,7 @@ mod claim_probes {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "skip_norm_workspace_tests.rs"]
+mod skip_norm_workspace_tests;

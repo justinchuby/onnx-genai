@@ -1731,7 +1731,7 @@ pub fn build_cuda_registry_with_metrics(
     );
     reg.register(
         OpKey::new("SkipSimplifiedLayerNormalization", "com.microsoft", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(normalization::SkipSimplifiedLayerNormFactory {
             runtime: runtime.clone(),
         }),
