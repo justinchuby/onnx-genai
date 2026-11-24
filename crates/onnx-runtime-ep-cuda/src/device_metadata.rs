@@ -95,8 +95,12 @@ impl<K> DeviceMetadataCache<K> {
         }
         let (key, bytes) =
             build().map_err(|error| contextual("encoding replacement metadata", error))?;
-        let allocation = GraphDeviceAllocation::allocate(&self.runtime, bytes.len())
-            .map_err(|error| contextual("allocating replacement metadata", error))?;
+        let allocation = GraphDeviceAllocation::allocate(
+            &self.runtime,
+            bytes.len(),
+            onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
+        )
+        .map_err(|error| contextual("allocating replacement metadata", error))?;
         // SAFETY: the new owner covers the complete synchronous upload. The
         // builder's Host bytes can be released after htod returns.
         unsafe { self.runtime.htod(&bytes, allocation.ptr()) }
@@ -169,8 +173,8 @@ mod tests {
         ignore = "requires CUDA device; enable gpu-tests"
     )]
     fn metadata_hits_are_lazy_and_replacements_preserve_published_entries() {
-        let runtime =
-            Arc::new(CudaRuntime::new(0).expect("CUDA device required for metadata cache test"));
+        let (_provider, runtime) = crate::test_support::maybe_native_runtime()
+            .expect("metadata cache requires native CUDA provider backing");
         runtime.set_defer_eager_sync(true);
         let mut cache = DeviceMetadataCache::new(Arc::clone(&runtime));
         let pointer = cache
