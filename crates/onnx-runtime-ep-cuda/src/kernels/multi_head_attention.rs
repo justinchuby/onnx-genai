@@ -86,7 +86,7 @@ fn mha_error(detail: impl Into<String>) -> EpError {
     EpError::KernelFailed(format!("cuda_ep MultiHeadAttention: {}", detail.into()))
 }
 
-fn checked_add(left: usize, right: usize, name: &str) -> Result<usize> {
+fn checked_add(left: usize, right: usize, name: impl std::fmt::Display) -> Result<usize> {
     left.checked_add(right).ok_or_else(|| {
         mha_error(format!(
             "{name} addition {left} + {right} exceeds usize limits"
@@ -94,7 +94,7 @@ fn checked_add(left: usize, right: usize, name: &str) -> Result<usize> {
     })
 }
 
-fn checked_product(factors: &[usize], name: &str) -> Result<usize> {
+fn checked_product(factors: &[usize], name: impl std::fmt::Display) -> Result<usize> {
     factors.iter().try_fold(1usize, |product, &factor| {
         product
             .checked_mul(factor)
@@ -146,9 +146,14 @@ fn checked_pointer_offset(base: CUdeviceptr, offset: usize, name: &str) -> Resul
         .ok_or_else(|| mha_error(format!("{name} device pointer offset overflows u64")))
 }
 
-fn checked_index2(row: usize, column: usize, width: usize, name: &str) -> Result<usize> {
+fn checked_index2(
+    row: usize,
+    column: usize,
+    width: usize,
+    name: impl std::fmt::Display,
+) -> Result<usize> {
     checked_add(
-        checked_product(&[row, width], &format!("{name} row offset"))?,
+        checked_product(&[row, width], format_args!("{name} row offset"))?,
         column,
         name,
     )
@@ -160,12 +165,12 @@ fn checked_index3(
     column: usize,
     rows: usize,
     columns: usize,
-    name: &str,
+    name: impl std::fmt::Display,
 ) -> Result<usize> {
     let plane_row = checked_add(
-        checked_product(&[plane, rows], &format!("{name} plane offset"))?,
+        checked_product(&[plane, rows], format_args!("{name} plane offset"))?,
         row,
-        &format!("{name} row"),
+        format_args!("{name} row"),
     )?;
     checked_index2(plane_row, column, columns, name)
 }
@@ -183,7 +188,7 @@ fn validate_static_shape(name: &str, shape: &Shape, dtype: DataType) -> Result<(
                 checked_i32(value, &format!("{name} dim {axis}"))?;
                 known_product = checked_product(
                     &[known_product, value],
-                    &format!("{name} known-dimension element count"),
+                    format_args!("{name} known-dimension element count"),
                 )?;
             }
             None => fully_static = false,
@@ -268,7 +273,7 @@ impl MhaGeometry {
                 checked_i32(dim, &format!("{name} dim {axis}"))?;
             }
             checked_bytes(
-                checked_product(input.shape, &format!("{name} element count"))?,
+                checked_product(input.shape, format_args!("{name} element count"))?,
                 dtype.element_size() as usize,
                 name,
             )?;
@@ -343,7 +348,7 @@ impl MhaGeometry {
                         checked_i32(dim, &format!("{name} dim {axis}"))?;
                     }
                     checked_bytes(
-                        checked_product(input.shape, &format!("{name} element count"))?,
+                        checked_product(input.shape, format_args!("{name} element count"))?,
                         dtype.element_size() as usize,
                         name,
                     )?;
@@ -2041,6 +2046,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn mask_indices_format_diagnostics_only_after_overflow() {
+        struct Context<'a>(&'a Cell<usize>);
+        impl std::fmt::Display for Context<'_> {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.set(self.0.get() + 1);
+                formatter.write_str("padding mask index")
+            }
+        }
+        let formats = Cell::new(0);
+        let context = Context(&formats);
+        for plane in 0..3 {
+            for row in 0..5 {
+                for column in 0..7 {
+                    assert_eq!(
+                        checked_index3(plane, row, column, 5, 7, &context).unwrap(),
+                        (plane * 5 + row) * 7 + column
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            formats.get(),
+            0,
+            "successful per-cell index checks must not construct diagnostic strings"
+        );
+        let error = checked_index3(usize::MAX, 0, 0, 2, 7, &context)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(formats.get(), 1, "overflow must retain its lazy context");
+        assert!(
+            error.contains("padding mask index plane offset") && error.contains("exceeds usize"),
+            "{error}"
+        );
+        let index = checked_index2(0, 1, 7, &context).unwrap();
+        assert_eq!(index, 1);
+        assert_eq!(
+            formats.get(),
+            1,
+            "valid addition must not format its context either"
+        );
     }
 
     #[test]
