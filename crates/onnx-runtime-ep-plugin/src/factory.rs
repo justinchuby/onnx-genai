@@ -462,7 +462,7 @@ pub enum SharedEpTeardown {
 /// holds an `Arc` clone, so **no single `Release*` callback may call
 /// `shutdown()`**: doing so would tear down the CUDA runtime/context another
 /// live session still needs. That is exactly why
-/// [`crate::ep::EpHandle::shutdown_if_owned`] is a no-op for the shared variant.
+/// a shared [`crate::ep::EpHandle`] never shuts down on facade release.
 ///
 /// `ReleaseEpFactory` is the one point in the ORT lifecycle that happens after
 /// every other surface has been released, so it is where explicit shutdown
@@ -488,18 +488,12 @@ pub enum SharedEpTeardown {
 ///
 /// # Audit: what else can keep EP-derived state alive
 ///
-/// `ExportedComputeInfo` (the `OrtNodeComputeInfo` ORT holds per compiled
-/// subgraph) deliberately holds **no** reference to the EP: workspaces and
-/// fused-subgraph intermediates come from ORT scratch
-/// (`KernelContext_GetScratchBuffer`), not from the EP allocator, so a live
-/// compute info can never keep the EP alive or block this teardown. What a
-/// compiled kernel *does* capture is its own backend runtime handle (the CUDA
-/// EP's kernels hold `Arc<CudaRuntime>`), so the CUDA context outlives
-/// `ReleaseEpFactory` until ORT releases the compute infos — which is correct,
-/// since those kernels may still be executing. `ExecutionProvider::shutdown()`
-/// on the CUDA EP clears a flag and does not destroy the runtime, so ordering
-/// between this call and compute-info release is not a use-after-free hazard in
-/// either direction.
+/// Compiled info and compute states retain their original provider. A late
+/// shared compute/state owner therefore participates in the same Arc checks as
+/// allocators, streams and transfers: the factory cannot shut it down early.
+/// If those owners outlive the factory, the established Drop-only rule applies.
+/// Owned providers instead shut down exactly once when their final facade,
+/// compute-info or state keepalive is released.
 ///
 /// # Safety
 ///
@@ -914,12 +908,9 @@ unsafe extern "C" fn factory_release_ep(_factory: *mut ort::OrtEpFactory, ep: *m
         }
         // SAFETY: ep was created by factory_create_ep via Box::into_raw.
         unsafe {
-            let mut exported_ep = Box::from_raw(ep.cast::<ExportedEp>());
-            // Best-effort shutdown — only for owned EPs. A shared EP belongs to
-            // the factory and is shut down when the factory is released; see
-            // `release_ep_factory_with_teardown` for the full contract and for
-            // why exactly one site may call `shutdown()` on a shared EP.
-            exported_ep.ep.shutdown_if_owned();
+            // Release only this facade. Compiled info/state may still require
+            // the original provider to retire their resources.
+            drop(Box::from_raw(ep.cast::<ExportedEp>()));
         }
     }));
 }
@@ -1289,6 +1280,7 @@ mod tests {
         drops: Arc<AtomicUsize>,
         shutdown_result: Result<(), &'static str>,
         initialize_result: Result<(), &'static str>,
+        panic_on_shutdown: bool,
         deallocations: Arc<AtomicUsize>,
         drains: Arc<AtomicUsize>,
     }
@@ -1315,6 +1307,7 @@ mod tests {
         }
         fn shutdown(&mut self) -> EpResult<()> {
             self.shutdowns.fetch_add(1, Ordering::SeqCst);
+            assert!(!self.panic_on_shutdown, "planned mock shutdown panic");
             match self.shutdown_result {
                 Ok(()) => Ok(()),
                 Err(msg) => Err(EpError::KernelFailed(msg.into())),
@@ -1394,6 +1387,7 @@ mod tests {
             drops: Arc::clone(drops),
             shutdown_result,
             initialize_result: Ok(()),
+            panic_on_shutdown: false,
             deallocations: Arc::new(AtomicUsize::new(0)),
             drains: Arc::new(AtomicUsize::new(0)),
         });
@@ -1423,6 +1417,7 @@ mod tests {
             drops: Arc::clone(drops),
             shutdown_result: Ok(()),
             initialize_result,
+            panic_on_shutdown: false,
             deallocations: Arc::clone(deallocations),
             drains: Arc::clone(drains),
         })
@@ -1494,6 +1489,196 @@ mod tests {
         assert_eq!(deallocations.load(Ordering::SeqCst), 0);
         assert_eq!(drains.load(Ordering::SeqCst), 0);
         unsafe { release_ep_factory_with_teardown(raw) };
+    }
+
+    fn owned_counting_facade(
+        shutdowns: &Arc<AtomicUsize>,
+        drops: &Arc<AtomicUsize>,
+        result: Result<(), &'static str>,
+        panic_on_shutdown: bool,
+    ) -> ExportedEp {
+        ExportedEp::new(Box::new(CountingEp {
+            shutdowns: shutdowns.clone(),
+            drops: drops.clone(),
+            shutdown_result: result,
+            initialize_result: Ok(()),
+            panic_on_shutdown,
+            deallocations: Arc::new(AtomicUsize::new(0)),
+            drains: Arc::new(AtomicUsize::new(0)),
+        }))
+    }
+
+    #[test]
+    fn owned_provider_keepalive_survives_facade_info_and_state_release_orders() {
+        for info_first in [false, true] {
+            let shutdowns = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let facade = owned_counting_facade(&shutdowns, &drops, Ok(()), false);
+            let provider = facade.ep.clone();
+            assert_eq!(provider.name(), "counting_ep");
+            let raw = Box::into_raw(Box::new(facade)).cast::<ort::OrtEp>();
+            let mut info = Box::new(crate::compute::ExportedComputeInfo::new(
+                Vec::new(),
+                Some(provider),
+            ));
+            let create = info.vtable.CreateState.unwrap();
+            let release = info.vtable.ReleaseState.unwrap();
+            let mut states = [ptr::null_mut(); 2];
+            for state in &mut states {
+                assert!(unsafe { create(&mut info.vtable, ptr::null_mut(), state) }.is_null());
+                assert!(!state.is_null());
+            }
+            if info_first {
+                drop(info);
+                unsafe {
+                    factory_release_ep(ptr::null_mut(), raw);
+                }
+            } else {
+                unsafe {
+                    factory_release_ep(ptr::null_mut(), raw);
+                }
+                drop(info);
+            }
+            assert_eq!(shutdowns.load(Ordering::SeqCst), 0);
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            unsafe {
+                release(ptr::null_mut(), states[0]);
+            }
+            assert_eq!(
+                shutdowns.load(Ordering::SeqCst),
+                0,
+                "second state independently retains its provider"
+            );
+            unsafe {
+                release(ptr::null_mut(), states[1]);
+            }
+            assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    struct DropOrderKernel {
+        shutdowns: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+        saw_shutdown: Arc<AtomicUsize>,
+    }
+    impl Kernel for DropOrderKernel {
+        fn execute(
+            &self,
+            _inputs: &[onnx_runtime_ep_api::TensorView],
+            _outputs: &mut [onnx_runtime_ep_api::TensorMut],
+        ) -> EpResult<()> {
+            Ok(())
+        }
+    }
+    impl Drop for DropOrderKernel {
+        fn drop(&mut self) {
+            self.saw_shutdown
+                .store(self.shutdowns.load(Ordering::SeqCst), Ordering::SeqCst);
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn owned_provider_keepalive_outlives_compiled_kernel_resources() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let kernel_drops = Arc::new(AtomicUsize::new(0));
+        let saw_shutdown = Arc::new(AtomicUsize::new(0));
+        let facade = owned_counting_facade(&shutdowns, &drops, Ok(()), false);
+        let provider = facade.ep.clone();
+        let entry = crate::compute::CompiledKernelEntry {
+            kernel: Box::new(DropOrderKernel {
+                shutdowns: shutdowns.clone(),
+                drops: kernel_drops.clone(),
+                saw_shutdown: saw_shutdown.clone(),
+            }),
+            num_inputs: 0,
+            num_outputs: 0,
+            output_dtypes: Vec::new(),
+            absent_output_slots: Default::default(),
+            shape_inference: crate::compute::ShapeInference::ElementwiseBroadcast,
+            input_slots: Vec::new(),
+        };
+        let info = crate::compute::ExportedComputeInfo::new(vec![entry], Some(provider));
+        let raw = Box::into_raw(Box::new(facade)).cast::<ort::OrtEp>();
+        unsafe {
+            factory_release_ep(ptr::null_mut(), raw);
+        }
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 0);
+        drop(info);
+        assert_eq!(kernel_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(saw_shutdown.load(Ordering::SeqCst), 0);
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn shared_provider_keepalive_retains_existing_late_factory_drop_policy() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let shared = counting_ep(&shutdowns, &drops, Ok(()));
+        let factory = raw_shared_factory(Some(shared.clone()));
+        let facade = ExportedEp::new_shared(shared, "counting_ep", None, Vec::new());
+        let mut info = Box::new(crate::compute::ExportedComputeInfo::new(
+            Vec::new(),
+            Some(facade.ep.clone()),
+        ));
+        let raw = Box::into_raw(Box::new(facade)).cast::<ort::OrtEp>();
+        let mut state = ptr::null_mut();
+        let release = info.vtable.ReleaseState.unwrap();
+        assert!(
+            unsafe {
+                info.vtable.CreateState.unwrap()(&mut info.vtable, ptr::null_mut(), &mut state)
+            }
+            .is_null()
+        );
+        unsafe {
+            factory_release_ep(ptr::null_mut(), raw);
+        }
+        drop(info);
+        let (outcome, status) = unsafe { release_ep_factory_with_teardown(factory) };
+        assert!(matches!(outcome, SharedEpTeardown::StillReferenced { .. }));
+        assert!(status.is_null());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 0);
+        unsafe {
+            release(ptr::null_mut(), state);
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            shutdowns.load(Ordering::SeqCst),
+            0,
+            "late Shared owners retain the established Drop-only policy"
+        );
+    }
+
+    #[test]
+    fn owned_provider_keepalive_shutdown_failure_still_drops_once() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        drop(owned_counting_facade(
+            &shutdowns,
+            &drops,
+            Err("planned final shutdown failure"),
+            false,
+        ));
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn owned_provider_keepalive_shutdown_panic_is_contained_during_unwind() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let facade = owned_counting_facade(&shutdowns, &drops, Ok(()), true);
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _facade = facade;
+            panic!("request unwind");
+        }));
+        assert!(result.is_err());
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     /// Normal teardown: ORT releases every other surface first, so the factory

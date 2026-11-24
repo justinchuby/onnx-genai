@@ -1505,6 +1505,10 @@ pub struct ExportedComputeInfo {
     /// right answer -- whether to borrow ORT's threads or use our own -- is
     /// the opposite for each. See `onnx_runtime_ep_api::host_parallel`.
     host_pool_probe: std::sync::atomic::AtomicU32,
+    /// Drop after kernels and other compute-owned resources. Production compile
+    /// always retains the original provider; standalone synthetic kernels may
+    /// omit it and cannot request provider-owned persistent workspace.
+    provider: Option<crate::ep::EpHandle>,
 }
 
 /// Everything `Compute` needs to stage host-resident boundary inputs onto the
@@ -1558,11 +1562,12 @@ impl Drop for ReconstructedMemInfo {
 
 /// Per-session state created by `CreateState`.
 struct ComputeState {
-    _placeholder: u8,
+    // Resource/lane fields must precede this final provider keepalive.
+    _provider: Option<crate::ep::EpHandle>,
 }
 
 impl ExportedComputeInfo {
-    pub fn new(entries: Vec<CompiledKernelEntry>) -> Self {
+    pub fn new(entries: Vec<CompiledKernelEntry>, provider: Option<crate::ep::EpHandle>) -> Self {
         let workspace_plans = entries.iter().map(|_| WorkspacePlanCache::new()).collect();
         Self {
             vtable: ort::OrtNodeComputeInfo {
@@ -1577,6 +1582,7 @@ impl ExportedComputeInfo {
             device_staging: None,
             host_accessible: false,
             host_pool_probe: std::sync::atomic::AtomicU32::new(0),
+            provider,
         }
     }
 
@@ -1624,7 +1630,7 @@ impl ExportedComputeInfo {
 
 /// CreateState: allocate per-session compute state.
 unsafe extern "C" fn compute_create_state(
-    _info: *mut ort::OrtNodeComputeInfo,
+    info: *mut ort::OrtNodeComputeInfo,
     _compute_context: *mut ort::OrtNodeComputeContext,
     out_state: *mut *mut c_void,
 ) -> *mut ort::OrtStatus {
@@ -1632,7 +1638,19 @@ unsafe extern "C" fn compute_create_state(
         if out_state.is_null() {
             return fail_status("CreateState: out_state is null");
         }
-        let state = Box::new(ComputeState { _placeholder: 0 });
+        if info.is_null() {
+            unsafe {
+                *out_state = std::ptr::null_mut();
+            }
+            return fail_status(
+                "CreateState: compute info is null; use the callback from a compiled node compute info",
+            );
+        }
+        // SAFETY: ORT passes the compute info that owns this callback.
+        let exported = unsafe { &*info.cast::<ExportedComputeInfo>() };
+        let state = Box::new(ComputeState {
+            _provider: exported.provider.clone(),
+        });
         unsafe { *out_state = Box::into_raw(state).cast::<c_void>() };
         ok_status()
     }));
@@ -6433,7 +6451,7 @@ mod tests {
     }
 
     fn kernel_sized_info() -> ExportedComputeInfo {
-        let mut info = ExportedComputeInfo::new(Vec::new());
+        let mut info = ExportedComputeInfo::new(Vec::new(), None);
         info.set_host_accessible(true);
         info
     }
@@ -6543,7 +6561,7 @@ mod tests {
             &[1],
             DeviceId::cpu(),
         );
-        let device_output_info = ExportedComputeInfo::new(Vec::new());
+        let device_output_info = ExportedComputeInfo::new(Vec::new(), None);
         let error = run_kernel_sized(
             &device_output_info,
             &kernel,
@@ -9116,14 +9134,25 @@ fn after() {}
     #[test]
     fn create_and_release_state_lifecycle() {
         let mut state_ptr: *mut c_void = std::ptr::null_mut();
-        let status = unsafe {
-            compute_create_state(std::ptr::null_mut(), std::ptr::null_mut(), &mut state_ptr)
-        };
+        let mut info = ExportedComputeInfo::new(Vec::new(), None);
+        let status =
+            unsafe { compute_create_state(&mut info.vtable, std::ptr::null_mut(), &mut state_ptr) };
         assert!(status.is_null(), "ok_status returns null");
         assert!(!state_ptr.is_null());
         unsafe {
             compute_release_state(std::ptr::null_mut(), state_ptr);
         }
+    }
+
+    #[test]
+    fn create_state_null_info_never_publishes_a_state() {
+        let mut state = std::ptr::dangling_mut::<c_void>();
+        let _status =
+            unsafe { compute_create_state(std::ptr::null_mut(), std::ptr::null_mut(), &mut state) };
+        assert!(
+            state.is_null(),
+            "missing compute info must fail before allocating/publishing state"
+        );
     }
 
     #[test]
@@ -9266,7 +9295,7 @@ fn after() {}
         use std::ffi::c_void;
 
         // Construct a state pointer the same way create_state would.
-        let state = Box::new(ComputeState { _placeholder: 0 });
+        let state = Box::new(ComputeState { _provider: None });
         let raw: *mut c_void = Box::into_raw(state).cast::<c_void>();
 
         // Exercise the catch_unwind guard for the normal (non-panic) path.
@@ -11248,7 +11277,7 @@ mod mem_info_cost {
     /// correctness.
     #[test]
     fn compute_info_assumes_device_placement_until_told_otherwise() {
-        let mut info = ExportedComputeInfo::new(Vec::new());
+        let mut info = ExportedComputeInfo::new(Vec::new(), None);
         assert!(
             !info.host_accessible,
             "default must be the conservative 'assume device', so an unset \

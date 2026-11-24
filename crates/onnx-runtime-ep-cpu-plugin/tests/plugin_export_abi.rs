@@ -450,7 +450,7 @@ fn compute_add_end_to_end() {
         shape_inference: ShapeInference::ElementwiseBroadcast,
         input_slots: vec![Some(0), Some(1)],
     };
-    let mut info = ExportedComputeInfo::new(vec![entry]);
+    let mut info = ExportedComputeInfo::new(vec![entry], None);
     let compute_fn = info.vtable.Compute.expect("Compute is null");
     let info_ptr = &mut info.vtable as *mut ort::OrtNodeComputeInfo;
     // Use a dummy kernel context pointer — our mocks use thread-local state.
@@ -514,7 +514,7 @@ fn compute_add_broadcast() {
         shape_inference: ShapeInference::ElementwiseBroadcast,
         input_slots: vec![Some(0), Some(1)],
     };
-    let mut info = ExportedComputeInfo::new(vec![entry]);
+    let mut info = ExportedComputeInfo::new(vec![entry], None);
 
     let compute_fn = info.vtable.Compute.unwrap();
     let info_ptr = &mut info.vtable as *mut ort::OrtNodeComputeInfo;
@@ -646,7 +646,7 @@ fn run_node(
         },
         input_slots: slots,
     };
-    let mut info = ExportedComputeInfo::new(vec![entry]);
+    let mut info = ExportedComputeInfo::new(vec![entry], None);
     let compute_fn = info.vtable.Compute.unwrap();
     let info_ptr = &mut info.vtable as *mut ort::OrtNodeComputeInfo;
     let dummy_ctx = 0xDEAD_BEEFusize as *mut ort::OrtKernelContext;

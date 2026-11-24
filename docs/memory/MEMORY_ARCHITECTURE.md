@@ -160,6 +160,38 @@ referencing graph slots. This preserves the old owner on refusal. Host contracts
 cover the ownership, pressure and failure paths; CUDA execution and throughput
 still require a device runner.
 
+### ORT persistent workspace adapter: integration boundary
+
+The ORT adapter currently serves `StepScoped` workspace from ORT scratch and
+still declines `SessionPersistent` backing. Native workspace migration does not
+establish plugin support. Compiled info and each compute state now retain the
+original provider independently; facade release cannot shut down an owned
+provider before those references end. Kernel resources drop before that final
+provider reference. Shared factory owners retain their existing teardown policy.
+
+The planned adapter owns one workspace lane per `ComputeState`, with exclusive
+access throughout `Compute`. Sequential nodes reuse the same capacity; concurrent
+states own independent capacity. Fitting requests borrow views without provider
+or issuer calls. Only growth uses the existing consuming `replace_workspace`
+operation, and teardown uses the original provider's release path. A failed
+replacement must not resurrect a consumed owner or refund unsettled storage.
+No per-node pool, quota ledger or new kernel resource protocol is needed.
+
+Host exclusivity does not establish device execution order. Persistent reuse
+requires an explicit registration contract: synchronous completion, or one
+ordered execution domain covering every use of the workspace, including helper
+streams through explicit dependencies. The current shared-provider reference and
+native stream handle alone do not establish that contract. Unknown ordering must
+reject persistent requests; it must not add per-token synchronization. Growth and
+release still respect provider settlement and capture ownership.
+
+Keep the shared-provider mutex out of ORT callbacks and pressure callbacks.
+A responder that reacquires the same provider mutex during allocation would
+deadlock. Do not register a new pressure responder through that wrapper until
+its release capability can run without reentering the outer mutex. These adapter
+steps remain implementation work; Host lifecycle tests are not CUDA ordering or
+performance evidence.
+
 ### Workspace capture ownership
 
 The canonical owned-capture hook accepts caller resources alongside kernels.
