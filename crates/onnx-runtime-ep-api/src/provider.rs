@@ -517,6 +517,19 @@ impl DeviceValidationToken {
     }
 }
 
+/// Host-only observation of one exact validation generation. Completion proves
+/// all workspace users in that submission have finished, including helper-stream
+/// dependencies. Nonzero flags are a completed failure, never reusable clean work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceValidationCompletion {
+    /// The provider offers no nonblocking completion proof.
+    Unavailable,
+    Pending,
+    Complete {
+        flags: u32,
+    },
+}
+
 /// Exact identity of one installed device-graph generation.
 ///
 /// All replay, liveness, reset, and invalidation operations require this token.
@@ -2066,6 +2079,18 @@ pub trait ExecutionProvider: Send + Sync {
     /// Whether top-level execution defers validation until a host-visible read.
     fn defers_device_validation(&self) -> bool {
         false
+    }
+
+    /// Observe a previously submitted generation without waiting, synchronizing,
+    /// consuming/resetting validation, issuing device work, or allocating.
+    /// Implementations validate registration, owner and generation and preserve
+    /// sticky failures. Unavailable never authorizes pending workspace reuse.
+    fn poll_device_validation_completion(
+        &self,
+        _registration: &DeviceValidationRegistration,
+        _token: DeviceValidationToken,
+    ) -> Result<DeviceValidationCompletion> {
+        Ok(DeviceValidationCompletion::Unavailable)
     }
 
     /// Consume the exact top-level device-validation generation after a host

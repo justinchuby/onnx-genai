@@ -21,6 +21,7 @@ impl Executor {
     pub(super) fn begin_device_validation_submission(
         &mut self,
     ) -> Result<DeviceValidationSubmission> {
+        self.resolve_awaiting_validation()?;
         self.workspace_completion = WorkspaceCompletion::Pending;
         let registration = self
             .validation_registration
@@ -36,6 +37,7 @@ impl Executor {
         &mut self,
         bindings: &mut [DeviceIoBinding],
     ) -> Result<DeviceValidationSubmission> {
+        self.resolve_awaiting_validation()?;
         self.workspace_completion = WorkspaceCompletion::Pending;
         let registration = self
             .validation_registration
@@ -76,6 +78,7 @@ impl Executor {
         validation_submission: Option<DeviceValidationSubmission>,
         artifact_requirement: Option<CapturedProviderArtifactRequirement>,
     ) -> Result<ScopedRunResult> {
+        self.resolve_awaiting_validation()?;
         self.workspace_completion = WorkspaceCompletion::Pending;
         // Distinguish the outermost (top-level graph) run from nested
         // control-flow subgraph runs so the phase profiler can attribute
@@ -220,6 +223,7 @@ impl Executor {
         route_residency: ExecutorRouteResidency,
     ) -> Result<()> {
         if defer_until_binding_read && self.ep.defers_device_validation() {
+            self.workspace_completion = WorkspaceCompletion::AwaitingValidation;
             return Ok(());
         }
         self.finish_device_validation_boundary_with(route_residency)
@@ -239,6 +243,7 @@ impl Executor {
         // This is the one request-level host boundary for deferred eager work
         // and for captured replay. The CUDA EP's explicit sync is unconditional,
         // so the latch read observes every kernel from this request.
+        self.workspace_completion = WorkspaceCompletion::Pending;
         self.ep.sync()?;
         self.finish_device_validation_boundary_after_sync(route_residency)
     }
@@ -247,6 +252,7 @@ impl Executor {
         &mut self,
         route_residency: ExecutorRouteResidency,
     ) -> Result<()> {
+        self.workspace_completion = WorkspaceCompletion::Pending;
         let flags = match self.pending_device_validation.take() {
             Some(token) => match self.ep.consume_device_validation_error(
                 self.validation_registration

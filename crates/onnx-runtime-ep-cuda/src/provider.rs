@@ -5387,6 +5387,15 @@ impl ExecutionProvider for CudaExecutionProvider {
         self.runtime.has_graph_executable_in(slot)
     }
 
+    fn poll_device_validation_completion(
+        &self,
+        registration: &onnx_runtime_ep_api::DeviceValidationRegistration,
+        token: onnx_runtime_ep_api::DeviceValidationToken,
+    ) -> Result<onnx_runtime_ep_api::DeviceValidationCompletion> {
+        self.runtime
+            .poll_device_validation_completion(registration, token)
+    }
+
     fn consume_device_validation_error(
         &self,
         registration: &onnx_runtime_ep_api::DeviceValidationRegistration,

@@ -10,6 +10,8 @@ use std::sync::{Mutex, Weak};
 pub(super) enum WorkspaceCompletion {
     #[default]
     Pending,
+    /// Successful execution deferred only its same-generation validation.
+    AwaitingValidation,
     Completed,
 }
 
@@ -227,6 +229,39 @@ pub(super) fn workspace_high_water(
 }
 
 impl Executor {
+    /// Only successful deferred runs can promote from a host-only receipt.
+    /// Unknown/error/prepare-only Pending work keeps the provider retirement path.
+    pub(super) fn resolve_awaiting_validation(&mut self) -> Result<()> {
+        if self.parent_workspace_policy.is_some()
+            || self.workspace_completion != WorkspaceCompletion::AwaitingValidation
+        {
+            return Ok(());
+        }
+        self.refresh_awaiting_workspace_completion()?;
+        match self.workspace_completion {
+            WorkspaceCompletion::AwaitingValidation => Err(EpError::KernelFailed(format!("{}: previous deferred workspace validation is still pending; read a bound output or finish its request boundary before preparing/submitting another generation", self.ep.name())).into()),
+            WorkspaceCompletion::Pending => self.release_step_workspace(),
+            WorkspaceCompletion::Completed => Ok(()),
+        }
+    }
+
+    /// One classification for both release and the next submission. Only the
+    /// successful-deferred state may be upgraded by an exact clean receipt.
+    pub(super) fn refresh_awaiting_workspace_completion(&mut self) -> Result<()> {
+        if self.workspace_completion != WorkspaceCompletion::AwaitingValidation {
+            return Ok(());
+        }
+        let token = self.pending_device_validation.ok_or_else(|| SessionError::Internal("successful deferred workspace is missing its exact validation token; recreate the session instead of reusing unproven backing".into()))?;
+        let registration = self.validation_registration.as_ref().ok_or_else(|| SessionError::Internal("successful deferred workspace is missing its validation registration; recreate the session".into()))?;
+        match self.ep.poll_device_validation_completion(registration, token)? {
+            onnx_runtime_ep_api::DeviceValidationCompletion::Complete { flags: 0 } => self.workspace_completion = WorkspaceCompletion::Completed,
+            onnx_runtime_ep_api::DeviceValidationCompletion::Complete { flags } => return Err(EpError::KernelFailed(format!("{}: previous workspace submission failed device validation (flags=0x{flags:x}); finish its failed request boundary before submitting another generation", self.ep.name())).into()),
+            onnx_runtime_ep_api::DeviceValidationCompletion::Pending => {}
+            onnx_runtime_ep_api::DeviceValidationCompletion::Unavailable => self.workspace_completion = WorkspaceCompletion::Pending,
+        }
+        Ok(())
+    }
+
     pub(super) fn workspace_replacement(&self) -> WorkspaceReplacement {
         WorkspaceReplacement::for_captures(&self.slot_capture)
             .including(self.parent_workspace_policy)

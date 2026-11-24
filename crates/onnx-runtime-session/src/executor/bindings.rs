@@ -617,6 +617,7 @@ impl Executor {
                 "workspace preparation with persistent device bindings",
             ));
         }
+        self.resolve_awaiting_validation()?;
         let external = self.prepare_external_bindings_mode(bindings, true)?;
         let symbols = self.bind_symbols(inputs, &external)?;
         let stats = self.cache.stats();
@@ -1035,6 +1036,16 @@ impl Executor {
             )
         {
             return Ok(());
+        }
+        if self.step_workspace.is_some()
+            && self.workspace_completion == WorkspaceCompletion::AwaitingValidation
+        {
+            self.refresh_awaiting_workspace_completion()?;
+            if self.workspace_completion == WorkspaceCompletion::AwaitingValidation {
+                // Still pending: retain the original active owner and charge,
+                // outside the pressure-reclaimable completed idle cell.
+                return Ok(());
+            }
         }
         if let Some(workspace) = self.step_workspace.take() {
             if self.workspace_completion == WorkspaceCompletion::Completed {

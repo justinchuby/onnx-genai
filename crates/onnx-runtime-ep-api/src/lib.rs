@@ -67,14 +67,15 @@ pub use kernel::{
 pub use onnx_runtime_optimizer::OptimizationPass as OptimizerPass;
 pub use provider::{
     ArgmaxTieBreak, BoundBufferOwnership, CaptureRegionShapeStatus, DeviceBuffer, DeviceGraphOwner,
-    DeviceGraphSlot, DeviceGraphToken, DeviceValidationOwner, DeviceValidationRegistration,
-    DeviceValidationToken, EpConfig, EpId, ExecutionProvider, ExecutorArtifactGeneration,
-    ExecutorArtifactPending, ExecutorArtifactPolicy, ExecutorArtifactProviderId,
-    ExecutorArtifactReadinessEpoch, ExecutorArtifactReport, ExecutorArtifactRequirementState,
-    ExecutorArtifactState, ExecutorArtifactUseGuard, ExecutorInstanceId, ExecutorKernelScope,
-    ExecutorRouteResidencyConfig, Fence, GraphKernelClaims, GraphKernelRequest, GraphKernelScope,
-    HostToDeviceCopier, RawDeviceAllocationSiteStats, SealedDeviceAllocation,
-    StructuralCaptureDecline, WorkspaceAllocation,
+    DeviceGraphSlot, DeviceGraphToken, DeviceValidationCompletion, DeviceValidationOwner,
+    DeviceValidationRegistration, DeviceValidationToken, EpConfig, EpId, ExecutionProvider,
+    ExecutorArtifactGeneration, ExecutorArtifactPending, ExecutorArtifactPolicy,
+    ExecutorArtifactProviderId, ExecutorArtifactReadinessEpoch, ExecutorArtifactReport,
+    ExecutorArtifactRequirementState, ExecutorArtifactState, ExecutorArtifactUseGuard,
+    ExecutorInstanceId, ExecutorKernelScope, ExecutorRouteResidencyConfig, Fence,
+    GraphKernelClaims, GraphKernelRequest, GraphKernelScope, HostToDeviceCopier,
+    RawDeviceAllocationSiteStats, SealedDeviceAllocation, StructuralCaptureDecline,
+    WorkspaceAllocation,
 };
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
 pub use tensor::{

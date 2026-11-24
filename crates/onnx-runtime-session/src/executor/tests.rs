@@ -79,6 +79,7 @@ struct DeferredValidationKernel {
     workspace_bytes: Arc<AtomicUsize>,
     fail_next: Arc<AtomicBool>,
     panic_next: Arc<AtomicBool>,
+    host_failure_next: Arc<AtomicBool>,
     validation_latch: Arc<AtomicU32>,
     executions: Arc<AtomicUsize>,
 }
@@ -143,6 +144,11 @@ impl Kernel for DeferredValidationKernel {
             );
         }
         self.executions.fetch_add(1, Ordering::Relaxed);
+        if self.host_failure_next.swap(false, Ordering::Relaxed) {
+            return Err(EpError::KernelFailed(
+                "forced host kernel failure without device flags".into(),
+            ));
+        }
         if self.fail_next.swap(false, Ordering::Relaxed) {
             self.validation_latch.store(0x40, Ordering::Relaxed);
         }
@@ -159,6 +165,8 @@ struct DeferredValidationEp {
     workspace_allocations: AtomicUsize,
     workspace_releases: AtomicUsize,
     workspace_registry_calls: AtomicUsize,
+    completion_observation_enabled: AtomicBool,
+    completion_observations: AtomicUsize,
     fail_workspace_release: AtomicBool,
     cpu: CpuExecutionProvider,
     fail_next: Arc<AtomicBool>,
@@ -172,6 +180,7 @@ struct DeferredValidationEp {
     validation_consume_attempts: Arc<AtomicUsize>,
     sync_calls: Arc<AtomicUsize>,
     panic_next: Arc<AtomicBool>,
+    host_failure_next: Arc<AtomicBool>,
     graph_reset_failure: Arc<AtomicBool>,
     graph_reset_calls: Arc<AtomicUsize>,
     route_boundary_calls: Arc<AtomicUsize>,
@@ -257,6 +266,8 @@ impl DeferredValidationEp {
             workspace_allocations: AtomicUsize::new(0),
             workspace_releases: AtomicUsize::new(0),
             workspace_registry_calls: AtomicUsize::new(0),
+            completion_observation_enabled: AtomicBool::new(false),
+            completion_observations: AtomicUsize::new(0),
             fail_workspace_release: AtomicBool::new(false),
             fail_next: Arc::new(AtomicBool::new(true)),
             validation_latch: Arc::new(AtomicU32::new(0)),
@@ -269,6 +280,7 @@ impl DeferredValidationEp {
             validation_consume_attempts: Arc::new(AtomicUsize::new(0)),
             sync_calls: Arc::new(AtomicUsize::new(0)),
             panic_next: Arc::new(AtomicBool::new(false)),
+            host_failure_next: Arc::new(AtomicBool::new(false)),
             graph_reset_failure: Arc::new(AtomicBool::new(false)),
             graph_reset_calls: Arc::new(AtomicUsize::new(0)),
             route_boundary_calls: Arc::new(AtomicUsize::new(0)),
@@ -385,6 +397,7 @@ impl ExecutionProvider for DeferredValidationEp {
             workspace_bytes: Arc::clone(&self.workspace_bytes),
             fail_next: Arc::clone(&self.fail_next),
             panic_next: Arc::clone(&self.panic_next),
+            host_failure_next: Arc::clone(&self.host_failure_next),
             validation_latch: Arc::clone(&self.validation_latch),
             executions: Arc::clone(&self.executions),
         }))
@@ -568,6 +581,39 @@ impl ExecutionProvider for DeferredValidationEp {
         token: onnx_runtime_ep_api::DeviceValidationToken,
     ) -> onnx_runtime_ep_api::Result<u32> {
         self.consume_validation_token(token)
+    }
+
+    fn poll_device_validation_completion(
+        &self,
+        registration: &onnx_runtime_ep_api::DeviceValidationRegistration,
+        token: onnx_runtime_ep_api::DeviceValidationToken,
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::DeviceValidationCompletion> {
+        use onnx_runtime_ep_api::DeviceValidationCompletion as Completion;
+        self.completion_observations.fetch_add(1, Ordering::Relaxed);
+        if !self.completion_observation_enabled.load(Ordering::Relaxed) {
+            return Ok(Completion::Unavailable);
+        }
+        if token.owner() != registration.owner() {
+            return Err(EpError::KernelFailed(
+                "foreign completion token owner".into(),
+            ));
+        }
+        let state = self.validation_state.lock().unwrap();
+        if let Some(Some((generation, flags))) = state.owners.get(&token.owner())
+            && *generation == token.generation()
+        {
+            return Ok(Completion::Complete { flags: *flags });
+        }
+        if state
+            .active
+            .is_some_and(|active| active.generation() == token.generation())
+            && state.recipients.contains(&token.owner())
+        {
+            return Ok(Completion::Pending);
+        }
+        Err(EpError::KernelFailed(
+            "stale completion generation; retain the original token".into(),
+        ))
     }
 
     fn consume_device_validation_error(
@@ -18227,3 +18273,6 @@ mod workspace_loan_tests;
 
 #[path = "workspace_report_tests.rs"]
 mod workspace_report_tests;
+
+#[path = "workspace_completion_tests.rs"]
+mod workspace_completion_tests;
