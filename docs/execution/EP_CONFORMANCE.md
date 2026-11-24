@@ -109,7 +109,7 @@ Current CI baseline against `cbourjau/onnx-tests` commit `856e89b`.
 | Status | Operators |
 |---|---|
 | PASS | MatMul, Add, Relu, Reshape, Transpose, Gather, LayerNormalization, Sub, Mul, Div, Pow, Min, Max, Sqrt, Erf, Tanh, Cast, ReduceMean, Softmax, Shape, Unsqueeze, Expand, Slice, Constant, Gemm, Abs, Conv, Sigmoid |
-| UNSUPPORTED | SyntheticUnsupportedDet (`Det`) |
+| UNSUPPORTED | SyntheticUnsupportedMeanVarianceNormalization (`MeanVarianceNormalization`) |
 | MISMATCH | None |
 | ERROR | None |
 

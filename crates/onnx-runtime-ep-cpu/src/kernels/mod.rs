@@ -521,6 +521,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         // IsInf, IsNaN: float inputs.
         ("IsInf", "") | ("IsNaN", "") => FLOAT_DTYPES,
         ("EyeLike", "") => onnx_runtime_ir::eye_like::DTYPES,
+        ("Det", "") => onnx_runtime_ep_api::det::DTYPES,
 
         // Quantization: specific types but advertise broad.
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
@@ -655,6 +656,7 @@ pub mod constant;
 pub mod constant_of_shape;
 pub mod contrib_fused;
 pub mod dense_elementwise;
+mod det;
 pub mod dft;
 pub mod dropout;
 pub mod dsa_index_select;
@@ -904,6 +906,7 @@ pub const PHASE1_OPS: &[&str] = &[
     "TopK",
     "NonZero",
     "NonMaxSuppression",
+    "Det",
     // GEMM.
     "Gemm",
     "QuantizeLinear",
@@ -2239,6 +2242,11 @@ pub(crate) fn build_cpu_registry_with_resources(
         OpKey::new("BlackmanWindow", "", 17),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(window::BlackmanWindowFactory),
+    );
+    rec.register(
+        OpKey::new("Det", "", 11),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(det::Factory),
     );
     rec.register(
         OpKey::new("DFT", "", 17),
