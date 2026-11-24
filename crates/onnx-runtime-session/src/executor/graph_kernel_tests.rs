@@ -888,9 +888,11 @@ fn claimed_dynamic_outputs_use_prepared_scratch_without_lending_it_to_outputs() 
         let cond = Tensor::from_raw(DataType::Bool, vec![], &[u8::from(condition)]).unwrap();
         let requirement = executor
             .prepare_with_device_bindings(&[("x", &x), ("condition", &cond)], &mut [])
+            .unwrap()
+            .require_complete()
             .unwrap();
-        assert_eq!(requirement.bytes, 64);
-        assert_eq!(requirement.lifetime, WorkspaceLifetime::StepScoped);
+        assert_eq!(requirement.step().bytes, 64);
+        assert_eq!(requirement.step().lifetime, WorkspaceLifetime::StepScoped);
         let address = executor.step_workspace.as_ref().unwrap().buffer.as_ptr() as usize;
         if let Some(first) = first_address {
             assert_eq!(
@@ -933,6 +935,8 @@ fn claimed_dynamic_outputs_reject_short_frozen_or_misaligned_backing_before_exec
     let cond = Tensor::from_raw(DataType::Bool, vec![], &[1]).unwrap();
     executor
         .prepare_with_device_bindings(&[("x", &x), ("condition", &cond)], &mut [])
+        .unwrap()
+        .require_complete()
         .unwrap();
     if let Some(old) = executor.step_workspace.take() {
         ep.deallocate_workspace(old.buffer).unwrap();

@@ -5935,8 +5935,11 @@ fn prepare_reserves_static_nested_qmoe_workspace_and_child_reuses_it() {
     let cond = Tensor::from_raw(DataType::Bool, vec![], &[1]).unwrap();
     let requirement = executor
         .prepare_with_device_bindings(&[("cond", &cond)], &mut [])
+        .unwrap()
+        .require_complete()
         .unwrap();
-    assert_eq!(requirement.bytes, 4096);
+    assert_eq!(requirement.persistent().bytes, 4096);
+    assert_eq!(requirement.step().bytes, 0);
     assert_eq!(executor.persistent_workspace.as_ref().unwrap().bytes, 4096);
 
     let output = executor.run(&[("cond", &cond)]).unwrap();
@@ -5988,10 +5991,13 @@ fn prepare_reserves_static_index_share_workspace() {
             ],
             &mut [],
         )
+        .unwrap()
+        .require_complete()
         .unwrap();
-    assert_eq!(requirement.bytes, 768);
+    assert_eq!(requirement.persistent().bytes, 768);
+    assert_eq!(requirement.step().bytes, 0);
     assert_eq!(
-        requirement.role(),
+        requirement.persistent().role(),
         MemoryRole::Workspace { step_scoped: false }
     );
     assert_eq!(executor.persistent_workspace.as_ref().unwrap().bytes, 768);
@@ -6151,13 +6157,15 @@ fn prepared_session_reprepares_workspace_when_execution_rebuckets() {
     session
         .exec
         .prepare_with_device_bindings(&[("input", &bucket_a)], &mut [])
+        .unwrap()
+        .require_complete()
         .unwrap();
     let reserved = session.exec.persistent_workspace.as_ref().unwrap();
     assert_eq!(reserved.bytes, 2048);
     assert_eq!(reserved.alignment, 256);
     assert!(
-        session.exec.workspace_preparation_required,
-        "prepare must latch the prepared-workspace invariant"
+        session.exec.workspace_preparation_memo.is_some(),
+        "complete preparation publishes a reusable metadata memo"
     );
 
     // In-bucket execution still fits under the reservation.
@@ -6179,8 +6187,8 @@ fn prepared_session_reprepares_workspace_when_execution_rebuckets() {
     assert_eq!(grown.bytes, 4096);
     assert_eq!(grown.alignment, 512);
     assert!(
-        session.exec.workspace_preparation_required,
-        "re-preparing on rebucket must not drop the prepared-workspace invariant"
+        session.exec.workspace_preparation_memo.is_some(),
+        "eager growth must preserve the original metadata memo for its matching bindings"
     );
 
     // Rebucketing back down reuses the grown slot (a slot only ever grows).
@@ -6592,6 +6600,8 @@ fn optional_input_slots_agree_through_claim_compile_and_public_execution() {
                 if prepared {
                     session
                         .prepare_with_device_bindings(&bindings, &mut [])
+                        .unwrap()
+                        .require_complete()
                         .unwrap();
                 }
                 let output = session.run(&bindings).unwrap();
@@ -6701,6 +6711,8 @@ fn public_block_moe_accepts_preserved_trailing_optional_inputs() {
             if prepared {
                 session
                     .prepare_with_device_bindings(&bindings, &mut [])
+                    .unwrap()
+                    .require_complete()
                     .unwrap();
             }
             let output = session.run(&bindings).unwrap();
@@ -8691,7 +8703,11 @@ fn lazy_weight_execution_borrows_prepared_workspace_with_logical_geometry() {
         ep.workspace_bytes_per_row = 16;
         let mut executor = Executor::build(graph, weights, Arc::new(ep), None).unwrap();
         if prepare {
-            executor.prepare_with_device_bindings(&[], &mut []).unwrap();
+            executor
+                .prepare_with_device_bindings(&[], &mut [])
+                .unwrap()
+                .require_complete()
+                .unwrap();
             assert_eq!(executor.persistent_workspace.as_ref().unwrap().bytes, 64);
         }
         let mut address = None;
@@ -14071,9 +14087,12 @@ mod einsum_workspace_tests {
         for _ in 0..8 {
             let requirement = executor
                 .prepare_with_device_bindings(&[("input", &input)], &mut [])
+                .unwrap()
+                .require_complete()
                 .unwrap();
             assert_eq!(
-                requirement.bytes, 24,
+                requirement.step().bytes,
+                24,
                 "max(24,8), never a sum or a fixed process budget"
             );
             let output = executor.run(&[("input", &input)]).unwrap();
@@ -14130,6 +14149,9 @@ mod einsum_workspace_tests {
                 executor
                     .prepare_with_device_bindings(&[("cond", &cond)], &mut [])
                     .unwrap()
+                    .require_complete()
+                    .unwrap()
+                    .step()
                     .bytes,
                 8
             );
@@ -14288,6 +14310,8 @@ fn check_qlinear_prepared_graph_peak(plugin_fallback: bool) {
         let before = executor.cache.stats();
         let requirement = executor
             .prepare_with_device_bindings(&[("a", &input)], &mut [])
+            .unwrap()
+            .require_complete()
             .unwrap();
         let after = executor.cache.stats();
         if iteration > 0 {
@@ -14297,7 +14321,8 @@ fn check_qlinear_prepared_graph_peak(plugin_fallback: bool) {
             );
         }
         assert_eq!(
-            requirement.bytes, 24,
+            requirement.step().bytes,
+            24,
             "the graph uses max(16,24), never their sum or a fixed process reserve"
         );
         let outputs = executor.run(&[("a", &input)]).unwrap();
@@ -14317,6 +14342,9 @@ fn check_qlinear_prepared_graph_peak(plugin_fallback: bool) {
         executor
             .prepare_with_device_bindings(&[("a", &input)], &mut [])
             .unwrap()
+            .require_complete()
+            .unwrap()
+            .step()
             .bytes,
         24
     );
@@ -14327,6 +14355,9 @@ fn check_qlinear_prepared_graph_peak(plugin_fallback: bool) {
         executor
             .prepare_with_device_bindings(&[("a", &small)], &mut [])
             .unwrap()
+            .require_complete()
+            .unwrap()
+            .step()
             .bytes,
         12
     );
@@ -14353,6 +14384,9 @@ fn check_qlinear_prepared_graph_peak(plugin_fallback: bool) {
         executor
             .prepare_with_device_bindings(&[("a", &input)], &mut [])
             .unwrap()
+            .require_complete()
+            .unwrap()
+            .step()
             .bytes,
         24
     );
@@ -14504,6 +14538,8 @@ fn nested_gemm_uses_step_peak_without_clobbering_persistent_workspace() {
             let inputs = [("cond", &cond)];
             executor
                 .prepare_with_device_bindings(&inputs, &mut [])
+                .unwrap()
+                .require_complete()
                 .unwrap();
             assert_eq!(executor.step_workspace.as_ref().unwrap().bytes, 24);
             let outputs = executor.run(&inputs).unwrap();
@@ -14589,12 +14625,16 @@ fn sequential_gemm_layouts_share_managed_peak_and_reuse_on_next_run() {
     let inputs = [("a", &a), ("b", &b), ("c", &c)];
     let requirement = executor
         .prepare_with_device_bindings(&inputs, &mut [])
+        .unwrap()
+        .require_complete()
         .unwrap();
-    assert_eq!(requirement.bytes, 32, "max(24,32), not their sum");
+    assert_eq!(requirement.step().bytes, 32, "max(24,32), not their sum");
     let identity = manager.snapshot().unwrap().allocations[0].identity;
     for _ in 0..8 {
         executor
             .prepare_with_device_bindings(&inputs, &mut [])
+            .unwrap()
+            .require_complete()
             .unwrap();
         let outputs = executor.run(&inputs).unwrap();
         assert_eq!(outputs[0].try_as_slice_f32().unwrap(), &[6.; 12]);
@@ -14689,9 +14729,12 @@ fn sequential_nbits_half_activations_share_one_funded_peak() {
     for _ in 0..8 {
         let requirement = executor
             .prepare_with_device_bindings(&inputs, &mut [])
+            .unwrap()
+            .require_complete()
             .unwrap();
         assert_eq!(
-            requirement.bytes, 128,
+            requirement.step().bytes,
+            128,
             "max(128,64), not the sum of per-node conversions"
         );
         let output = executor.run(&inputs).unwrap();
@@ -14714,6 +14757,9 @@ fn sequential_nbits_half_activations_share_one_funded_peak() {
         executor
             .prepare_with_device_bindings(&inputs, &mut [])
             .unwrap()
+            .require_complete()
+            .unwrap()
+            .step()
             .bytes,
         128
     );
@@ -14846,7 +14892,7 @@ fn prepare_workspace_binds_unresolved_axis_to_configured_max() {
 // context/sequence axis nor an axis with a configured maximum — must keep
 // failing. Reserving against a guess there would silently under-reserve.
 #[test]
-fn prepare_workspace_fails_on_unresolved_unbounded_axis() {
+fn prepare_workspace_defers_unresolved_unbounded_axis() {
     let mut exec = minimal_workspace_executor();
     let mystery = exec.graph.create_symbol(Some("data_dependent".into()));
     let v = exec.graph.create_named_value(
@@ -14858,10 +14904,12 @@ fn prepare_workspace_fails_on_unresolved_unbounded_axis() {
         .insert(v, exec.graph.value(v).tensor_shape().cloned());
     let symbols = HashMap::new();
     let node = Node::new(NodeId(7), "Attention", vec![Some(v)], vec![]);
-    let err = exec
+    let planned = exec
         .resolve_planned_workspace_input_shape(v, &symbols, NodeId(7), &node, 0)
-        .expect_err("a genuinely unbounded unresolved dim must still error");
-    let msg = err.to_string();
+        .unwrap();
+    let PlannedInputShape::Deferred(msg) = planned else {
+        panic!("unbounded dimensions must remain explicitly deferred");
+    };
     assert!(
         msg.contains("genuinely unknown"),
         "the error must name the unbounded-guess hazard, got: {msg}"
@@ -14892,7 +14940,7 @@ fn prepare_workspace_exact_resolution_is_unchanged() {
         .resolve_planned_workspace_input_shape(v, &symbols, NodeId(3), &node, 0)
         .unwrap();
     assert_eq!(resolved, PlannedInputShape::Exact(vec![1, 12, 8]));
-    assert_eq!(resolved.dims(), &[1, 12, 8]);
+    assert_eq!(resolved.dims(), Some(&[1, 12, 8][..]));
 }
 
 // DeepSeek-V2-Lite's MoE gate flattens `[batch, sequence, hidden]` through
@@ -16475,10 +16523,12 @@ fn streamed_projection_strict_prepare_and_run_use_the_declared_step_workspace() 
         .unwrap();
         let requirement = executor
             .prepare_with_device_bindings(&[("a", &input)], &mut [])
+            .unwrap()
+            .require_complete()
             .unwrap();
-        assert!(requirement.bytes > 0);
-        assert_eq!(requirement.lifetime, WorkspaceLifetime::StepScoped);
-        assert!(manager.process_used(Tier::Host) >= requirement.bytes);
+        assert!(requirement.step().bytes > 0);
+        assert_eq!(requirement.step().lifetime, WorkspaceLifetime::StepScoped);
+        assert!(manager.process_used(Tier::Host) >= requirement.step().bytes);
         let output = executor.run(&[("a", &input)]).unwrap();
         assert_eq!(output[0].shape, [rows, 13]);
         assert_eq!(
@@ -16605,9 +16655,11 @@ fn streamed_moe_strict_prepare_funds_one_reused_workspace_across_shapes() {
         let inputs = [("a", &input), ("router", &router)];
         let req = executor
             .prepare_with_device_bindings(&inputs, &mut [])
+            .unwrap()
+            .require_complete()
             .unwrap();
-        assert!(req.bytes > 0);
-        assert_eq!(req.lifetime, WorkspaceLifetime::StepScoped);
+        assert!(req.step().bytes > 0);
+        assert_eq!(req.step().lifetime, WorkspaceLifetime::StepScoped);
         let funded = books.used(Tier::Host);
         for _ in 0..8 {
             let output = executor.run(&inputs).unwrap();
@@ -16772,6 +16824,9 @@ fn symbolic_capability_decline_cannot_become_a_no_workspace_promise() {
         executor
             .prepare_with_device_bindings(&[("a", &input)], &mut [])
             .unwrap()
+            .require_complete()
+            .unwrap()
+            .step()
             .bytes
             > 0
     );
@@ -16805,6 +16860,9 @@ fn a_false_no_workspace_declaration_is_rejected_before_late_allocation() {
         executor
             .prepare_with_device_bindings(&[("a", &input)], &mut [])
             .unwrap()
+            .require_complete()
+            .unwrap()
+            .step()
             .bytes,
         0
     );
@@ -17072,6 +17130,8 @@ fn completed_workspace_deferred_binding_run_retires_without_new_sync() {
         .unwrap();
     executor
         .prepare_with_device_bindings(&[], &mut bindings)
+        .unwrap()
+        .require_complete()
         .unwrap();
     let syncs = ep.sync_calls.load(Ordering::Relaxed);
     executor
@@ -17207,6 +17267,8 @@ fn completed_workspace_preparation_without_execution_stays_active_until_drop() {
     let (mut executor, ep, books, _) = completed_workspace_fixture(true);
     executor
         .prepare_with_device_bindings(&[("input", &completed_workspace_input(2))], &mut [])
+        .unwrap()
+        .require_complete()
         .unwrap();
     assert!(executor.step_workspace.is_some());
     assert_eq!(
@@ -17248,6 +17310,9 @@ fn completed_workspace_capture_refuses_prepare_growth_until_all_slots_retire() {
         executor
             .prepare_with_device_bindings(&[("input", &bigger)], &mut [])
             .unwrap()
+            .require_complete()
+            .unwrap()
+            .step()
             .bytes,
         128
     );
@@ -17505,7 +17570,8 @@ impl ExecutionProvider for OutputWorkspaceProbeEp {
     ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
         if matches!(node.op_type.as_str(), "Attention" | "OutputWorkspaceProbe") {
             Ok(Box::new(OutputWorkspaceProbeKernel {
-                deferred: self.deferred,
+                deferred: self.deferred
+                    && node.attr("workspace_known").and_then(Attribute::as_int) != Some(1),
                 failure: self.failure.clone(),
                 origin: AtomicUsize::new(0),
                 slots: node.outputs.iter().map(Option::is_some).collect(),
@@ -17611,6 +17677,8 @@ fn deferred_workspace_strict_prepare_does_not_publish_memo_or_poison_eager_execu
         Executor::build(graph, Arc::new(WeightStore::new()), ep.clone(), None).unwrap();
     let error = executor
         .prepare_with_device_bindings(&[], &mut [])
+        .unwrap()
+        .require_complete()
         .unwrap_err()
         .to_string();
     assert!(
@@ -17618,7 +17686,6 @@ fn deferred_workspace_strict_prepare_does_not_publish_memo_or_poison_eager_execu
         "{error}"
     );
     assert!(executor.workspace_preparation_memo.is_none());
-    assert!(!executor.workspace_preparation_required);
     assert!(executor.step_workspace.is_none());
     assert!(executor.persistent_workspace.is_none());
     for _ in 0..3 {
@@ -17673,15 +17740,20 @@ fn output_workspace_metadata_tracks_physical_bindings_and_memo() {
         ];
         let requirement = executor
             .prepare_with_device_bindings(&[("input", &input)], &mut bindings)
+            .unwrap()
+            .require_complete()
             .unwrap();
-        assert_eq!(requirement.bytes, 8 + capacity as u64 * 32);
+        assert_eq!(requirement.step().bytes, 8 + capacity as u64 * 32);
         let plans = ep.plans.lock().unwrap().len();
         assert_eq!(
             executor
                 .prepare_with_device_bindings(&[("input", &input)], &mut bindings)
                 .unwrap()
+                .require_complete()
+                .unwrap()
+                .step()
                 .bytes,
-            requirement.bytes
+            requirement.step().bytes
         );
         assert_eq!(
             ep.plans.lock().unwrap().len(),
@@ -17727,6 +17799,9 @@ fn output_workspace_metadata_matches_lowered_trailing_outputs() {
         executor
             .prepare_with_device_bindings(&[], &mut [])
             .unwrap()
+            .require_complete()
+            .unwrap()
+            .step()
             .bytes,
         24
     );
@@ -17777,6 +17852,9 @@ fn output_workspace_metadata_reaches_nested_control_flow_preparation() {
             executor
                 .prepare_with_device_bindings(&[("condition", &condition)], &mut [])
                 .unwrap()
+                .require_complete()
+                .unwrap()
+                .step()
                 .bytes,
             24
         );
@@ -17800,6 +17878,8 @@ fn workspace_capture_pins_use_existing_lane_without_issuer_callbacks() {
     let input = completed_workspace_input(2);
     executor
         .prepare_with_device_bindings(&[("input", &input)], &mut [])
+        .unwrap()
+        .require_complete()
         .unwrap();
     let callbacks = books.callbacks();
     let first = executor.workspace_capture_resources().unwrap();
@@ -17839,6 +17919,8 @@ fn workspace_capture_default_cannot_silently_discard_real_pins() {
     let (mut executor, ep, _books, _manager) = completed_workspace_fixture(true);
     executor
         .prepare_with_device_bindings(&[("input", &completed_workspace_input(2))], &mut [])
+        .unwrap()
+        .require_complete()
         .unwrap();
     let resources = executor.workspace_capture_resources().unwrap();
     let error = ep
@@ -18142,3 +18224,6 @@ fn run_storage_preparation_excludes_real_external_input_backing() {
 
 #[path = "workspace_loan_tests.rs"]
 mod workspace_loan_tests;
+
+#[path = "workspace_report_tests.rs"]
+mod workspace_report_tests;

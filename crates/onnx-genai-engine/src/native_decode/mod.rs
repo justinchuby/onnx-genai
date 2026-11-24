@@ -2081,18 +2081,30 @@ impl NativeDecodeSession {
         )
     }
 
+    fn unprepared_workspace_report(&self) -> onnx_runtime_session::WorkspacePreparationReport {
+        let pending = self.session.workspace_node_locations();
+        if pending.is_empty() {
+            onnx_runtime_session::WorkspacePreparationReport::NONE
+        } else {
+            onnx_runtime_session::WorkspacePreparationReport::Deferred {
+                known: onnx_runtime_session::WorkspaceBounds::NONE,
+                pending: pending.to_vec(),
+            }
+        }
+    }
+
     pub(crate) fn prepare_generation_workspace_for_query_rows(
         &mut self,
         prompt_tokens: &[TokenId],
         query_rows: usize,
-    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+    ) -> anyhow::Result<onnx_runtime_session::WorkspacePreparationReport> {
         self.prepare_generation_workspace_inner(prompt_tokens, query_rows, true)
     }
 
     pub(crate) fn prepare_generation_workspace_preserving_state(
         &mut self,
         prompt_tokens: &[TokenId],
-    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+    ) -> anyhow::Result<onnx_runtime_session::WorkspacePreparationReport> {
         self.prepare_generation_workspace_inner(prompt_tokens, prompt_tokens.len(), false)
     }
 
@@ -2102,14 +2114,14 @@ impl NativeDecodeSession {
         tokens: &[TokenId],
         past_len: usize,
         step_inputs: &[(String, Tensor)],
-    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+    ) -> anyhow::Result<onnx_runtime_session::WorkspacePreparationReport> {
         if tokens.is_empty() {
             bail!("native workspace preparation requires at least one input token");
         }
         if self.cuda.is_some() {
             self.prepare_cuda_prefill_workspace_with_step_inputs(tokens, past_len, step_inputs)
         } else {
-            Ok(onnx_runtime_session::WorkspaceRequirement::NONE)
+            Ok(self.unprepared_workspace_report())
         }
     }
 
@@ -2118,7 +2130,7 @@ impl NativeDecodeSession {
         prompt_tokens: &[TokenId],
         query_rows: usize,
         reset: bool,
-    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+    ) -> anyhow::Result<onnx_runtime_session::WorkspacePreparationReport> {
         if prompt_tokens.is_empty() {
             bail!("native workspace preparation requires at least one prompt token");
         }
@@ -2135,7 +2147,7 @@ impl NativeDecodeSession {
                 self.prepare_cuda_prefill_workspace(&planning_tokens)
             }
         } else {
-            Ok(onnx_runtime_session::WorkspaceRequirement::NONE)
+            Ok(self.unprepared_workspace_report())
         }
     }
 
@@ -2270,6 +2282,28 @@ fn slice_step_inputs(
         sliced.push((port.clone(), slice));
     }
     Ok(sliced)
+}
+
+/// Scheduler admission is not a proof that all workspace has been reserved.
+/// Exact deferred demands remain governed at eager dispatch, and failures use
+/// the existing turn-abort path rather than becoming preparation success.
+pub(crate) fn accept_eager_workspace_preparation(
+    report: onnx_runtime_session::WorkspacePreparationReport,
+) {
+    use onnx_runtime_session::WorkspacePreparationReport;
+    match report {
+        WorkspacePreparationReport::Complete(known) => {
+            tracing::debug!(
+                persistent_bytes = known.persistent().bytes,
+                step_bytes = known.step().bytes,
+                "native metadata workspace bounds reserved"
+            );
+        }
+        WorkspacePreparationReport::Deferred { known, pending } => {
+            tracing::debug!(persistent_bytes = known.persistent().bytes, step_bytes = known.step().bytes,
+                pending_nodes = ?pending, "native workspace preparation deferred; exact demands will be admitted at eager dispatch");
+        }
+    }
 }
 
 #[cfg(test)]

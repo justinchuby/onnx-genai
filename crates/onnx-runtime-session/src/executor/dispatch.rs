@@ -637,8 +637,6 @@ impl Executor {
             capturing: matches!(capture, OpCaptureTrace::Captured),
             persistent_workspace: &mut self.persistent_workspace,
             step_workspace: &mut self.step_workspace,
-            workspace_preparation_required: self.workspace_preparation_required,
-            eager_workspace_growth: matches!(capture, OpCaptureTrace::Eager),
             workspace_replacement,
         };
 
@@ -1759,16 +1757,6 @@ struct KernelDispatchContext<'a> {
     capturing: bool,
     persistent_workspace: &'a mut Option<PreparedWorkspace>,
     step_workspace: &'a mut Option<PreparedWorkspace>,
-    workspace_preparation_required: bool,
-    /// True when this node is dispatched on a plain eager run (no device-graph
-    /// capture in progress). Growth also checks `workspace_replacement` to
-    /// exclude installed graphs from every slot. This is
-    /// what lets a prepared session re-prepare (grow) its governed workspace when
-    /// execution rebuckets to a larger shape bucket than preparation reserved
-    /// for, instead of failing the prepared-workspace invariant (#1223). It is
-    /// false while recording a captured segment ([`OpCaptureTrace::Captured`]),
-    /// where the workspace pointer must stay fixed for replay.
-    eager_workspace_growth: bool,
     workspace_replacement: WorkspaceReplacement,
 }
 
@@ -2034,21 +2022,13 @@ impl KernelDispatchContext<'_> {
                 self.workspace_replacement
                     .check(prepared.as_ref(), requirement)?;
             }
-            // A prepared session normally refuses to allocate at execution
-            // time — its governed workspace must be reserved up front so a
-            // captured device graph can bake a stable pointer. That invariant
-            // only holds *within* one shape bucket, though: when execution
-            // rebuckets to a larger bucket than preparation reserved for, the
-            // reserved slot may be absent or undersized for the new geometry
-            // (#1223). Re-run preparation in place on the eager (non-capture)
-            // dispatch that a rebucket forces before any re-capture — growing
-            // the slot there is safe because no captured graph references it
-            // yet. This generalizes the in-bucket reservation fix from #1221
-            // to the cross-bucket case, for every governed-workspace operator
-            // rather than any one op-type.
-            if needs_replacement
-                && (!self.workspace_preparation_required || self.eager_workspace_growth)
-            {
+            if needs_replacement && self.capturing {
+                return Err(EpError::KernelFailed(format!(
+                    "node #{} ('{}::{}') cannot grow workspace while recording a device graph; eagerly warm the exact route and its workspace before capture",
+                    node.id.0, node.domain, node.op_type
+                )).into());
+            }
+            if needs_replacement {
                 // Sequential dispatch is the scratch hand-off boundary. An
                 // EP may enqueue asynchronous device work, so synchronize
                 // before retiring the old disposable workspace. Release it

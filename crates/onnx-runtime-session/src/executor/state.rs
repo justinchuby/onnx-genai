@@ -776,7 +776,6 @@ pub(crate) struct Executor {
     /// Present only during a scoped loan of the enclosing executor's actual
     /// workspace owners. This carries growth/capture policy, never raw addresses.
     pub(super) parent_workspace_policy: Option<WorkspaceReplacement>,
-    pub(super) workspace_preparation_required: bool,
     pub(super) workspace_preparation_memo: Option<WorkspacePreparationMemo>,
     pub(super) workspace_node_locations: Vec<String>,
 }

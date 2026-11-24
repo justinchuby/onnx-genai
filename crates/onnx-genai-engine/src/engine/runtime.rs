@@ -1121,6 +1121,7 @@ impl Engine {
             .as_mut()
             .context("native decoder session is unavailable")?
             .prepare_generation_workspace_for_query_rows(&prompt_tokens, workspace_query_rows)
+            .map(crate::native_decode::accept_eager_workspace_preparation)
         {
             self.scheduler.complete(scheduler_session_id);
             return match turn.abort(self, crate::pipeline::TurnAbortReason::ExecutionFailure) {
@@ -1636,7 +1637,8 @@ impl Engine {
                     .native_session
                     .as_mut()
                     .context("native prefill executor is unavailable")?;
-                native.prepare_generation_workspace_preserving_state(tokens)?;
+                let workspace = native.prepare_generation_workspace_preserving_state(tokens)?;
+                crate::native_decode::accept_eager_workspace_preparation(workspace);
                 native.reset()?;
                 native.bind_logical_state(identity)?;
                 self.native_active_session = Some(session);
@@ -2105,6 +2107,8 @@ impl Engine {
 
     /// Generate text, notifying `admission_callback` after scheduler admission
     /// and before backend execution, then streaming tokens to `token_callback`.
+    /// This notification is scheduler acceptance, not proof that every deferred
+    /// workspace demand has been admitted; execution failures still abort the turn.
     pub fn generate_with_callbacks(
         &mut self,
         request: GenerateRequest,
@@ -4175,6 +4179,7 @@ impl Engine {
             .as_mut()
             .context("native decoder session is unavailable")?
             .prepare_generation_workspace_preserving_state(&prompt_tokens)
+            .map(crate::native_decode::accept_eager_workspace_preparation)
         {
             self.scheduler.complete(session_id);
             return match turn.abort(self, crate::pipeline::TurnAbortReason::ExecutionFailure) {
