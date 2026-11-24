@@ -580,7 +580,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
 
         // CNN ops (feature-gated). `Conv` computes through MLAS in f32 and
         // rejects f64 in `ConvKernel::execute`, so it must not advertise it.
-        ("Conv", "") => FLOAT_COMPUTE_DTYPES,
+        ("Conv", "") => onnx_runtime_ir::conv::DTYPES,
         ("DeformConv", "") => onnx_runtime_ir::deform_conv::DTYPES,
 
         // The rest of the CNN family dispatches through `dispatch_float!` and
@@ -964,8 +964,14 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
             Box::new(deform_conv::Factory(version)),
         );
     }
-    registry.register(
+    registry.register_through(
         OpKey::new("Conv", "", 1),
+        onnx_runtime_ir::conv::BF16_SINCE_OPSET - 1,
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(conv::ConvFactory),
+    );
+    registry.register(
+        OpKey::new("Conv", "", onnx_runtime_ir::conv::BF16_SINCE_OPSET),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(conv::ConvFactory),
     );
@@ -1089,12 +1095,20 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
                         .iter()
                         .any(|dtype| !matches!(dtype, DataType::String | DataType::Undefined))
                 });
+            let supported_dtypes = if key.op_type == "Conv"
+                && key.domain.is_empty()
+                && key.since_version < onnx_runtime_ir::conv::BF16_SINCE_OPSET
+            {
+                onnx_runtime_ir::conv::PRE_BF16_DTYPES
+            } else {
+                supported_dtypes_for_op(&key.op_type, &key.domain)
+            };
             CpuOpDescriptor {
                 op_type: key.op_type.clone(),
                 domain: key.domain.clone(),
                 since_version: key.since_version,
                 end_version: reg.explicit_end_version(key),
-                supported_dtypes: supported_dtypes_for_op(&key.op_type, &key.domain),
+                supported_dtypes,
                 supports_raw_tensor_abi,
             }
         })
@@ -3828,6 +3842,23 @@ mod tests {
         for want in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
             assert!(dtypes.contains(&want), "Conv must still advertise {want:?}");
         }
+    }
+
+    #[test]
+    fn conv_descriptors_advertise_bf16_only_from_opset_22() {
+        let (_, descriptors) = shared_registry_with_descriptors();
+        let conv = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.domain.is_empty() && descriptor.op_type == "Conv")
+            .collect::<Vec<_>>();
+        assert_eq!(conv.len(), 2);
+        assert_eq!((conv[0].since_version, conv[0].end_version), (1, 21));
+        assert_eq!(
+            conv[0].supported_dtypes,
+            onnx_runtime_ir::conv::PRE_BF16_DTYPES
+        );
+        assert_eq!((conv[1].since_version, conv[1].end_version), (22, u64::MAX));
+        assert_eq!(conv[1].supported_dtypes, onnx_runtime_ir::conv::DTYPES);
     }
 
     #[test]

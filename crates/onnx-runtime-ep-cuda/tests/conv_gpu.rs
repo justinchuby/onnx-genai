@@ -521,6 +521,41 @@ fn cuda_conv1d_matches_cpu_for_standard_grouped_and_causal_geometry() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
+fn cuda_conv_opset22_bf16_matches_independent_reference() {
+    let ep = common::require_cuda();
+    let dtype = DataType::BFloat16;
+    let inputs = [
+        common::float_input(
+            dtype,
+            &[1, 1, 3, 3],
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+        ),
+        common::float_input(dtype, &[1, 1, 2, 2], &[1.0, 2.0, -1.0, 0.5]),
+        common::float_input(dtype, &[1], &[0.25]),
+    ];
+    let got = common::run_cuda(
+        &ep,
+        "Conv",
+        "",
+        22,
+        &inputs,
+        &[(dtype, vec![1, 1, 2, 2])],
+        &[],
+    );
+    common::assert_close(
+        "Conv-22 BF16",
+        dtype,
+        &common::decode_floats(&got[0], dtype),
+        &[3.75, 6.25, 11.25, 13.75],
+        0.02,
+    );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
 fn cudnn_conv_prepared_workspace_reuses_the_injected_allocator_and_captures() {
     let injected = Arc::new(common::ExternalEagerAllocator::new(
         common::require_context("cuDNN Conv prepared-workspace allocator substitution"),

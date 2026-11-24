@@ -735,12 +735,22 @@ pub fn build_cuda_registry_descriptors(runtime: Arc<CudaRuntime>) -> Vec<CudaOpD
     let registry = build_cuda_registry(runtime);
     let mut descriptors: Vec<CudaOpDescriptor> = registry
         .keys()
-        .map(|key| CudaOpDescriptor {
-            op_type: key.op_type.clone(),
-            domain: key.domain.clone(),
-            since_version: key.since_version,
-            end_version: registry.explicit_end_version(key),
-            supported_dtypes: cuda_supported_dtypes_for_op(&key.op_type, &key.domain),
+        .map(|key| {
+            let supported_dtypes = if key.op_type == "Conv"
+                && key.domain.is_empty()
+                && key.since_version < onnx_runtime_ir::conv::BF16_SINCE_OPSET
+            {
+                onnx_runtime_ir::conv::PRE_BF16_DTYPES
+            } else {
+                cuda_supported_dtypes_for_op(&key.op_type, &key.domain)
+            };
+            CudaOpDescriptor {
+                op_type: key.op_type.clone(),
+                domain: key.domain.clone(),
+                since_version: key.since_version,
+                end_version: registry.explicit_end_version(key),
+                supported_dtypes,
+            }
         })
         .collect();
     // Deterministic order so the advertisement is stable across runs.
@@ -1470,8 +1480,16 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
-    reg.register(
+    reg.register_through(
         OpKey::new("Conv", "", 1),
+        onnx_runtime_ir::conv::BF16_SINCE_OPSET - 1,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+        Box::new(conv::ConvFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Conv", "", onnx_runtime_ir::conv::BF16_SINCE_OPSET),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(conv::ConvFactory {
             runtime: runtime.clone(),
