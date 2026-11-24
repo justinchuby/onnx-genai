@@ -3,9 +3,19 @@ use onnx_runtime_loader::{Model, encode_model};
 use onnx_runtime_session::{DevicePreference, InferenceSession, SessionError, Tensor};
 
 fn model(opset: u64, dtype: DataType, axis: Option<i64>, mask_len: usize) -> Vec<u8> {
+    model_with_dtypes(opset, dtype, dtype, axis, mask_len)
+}
+
+fn model_with_dtypes(
+    opset: u64,
+    input_dtype: DataType,
+    output_dtype: DataType,
+    axis: Option<i64>,
+    mask_len: usize,
+) -> Vec<u8> {
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), opset);
-    let x = graph.create_named_value("X", dtype, static_shape([2, 3]));
+    let x = graph.create_named_value("X", input_dtype, static_shape([2, 3]));
     let mask = graph.create_named_value("mask", DataType::Bool, static_shape([mask_len]));
     graph.add_input(x);
     graph.add_input(mask);
@@ -15,7 +25,7 @@ fn model(opset: u64, dtype: DataType, axis: Option<i64>, mask_len: usize) -> Vec
     } else {
         vec![selected]
     };
-    let y = graph.create_named_value("Y", dtype, shape);
+    let y = graph.create_named_value("Y", output_dtype, shape);
     let mut node = Node::new(NodeId(0), "Compress", vec![Some(x), Some(mask)], vec![y]);
     node.name = "select_values".into();
     if let Some(axis) = axis {
@@ -83,21 +93,28 @@ fn compress_28_bf16_cpu() {
 }
 
 #[test]
-fn compress_27_rejects_bf16_but_runs_legacy_dtype() {
+fn compress_pre_28_rejects_bf16_but_runs_legacy_dtype() {
     let device = DeviceId::cpu();
-    let invalid = model(27, DataType::BFloat16, Some(-1), 2);
-    let err = load(&invalid, device)
-        .err()
-        .expect("opset 27 must not admit BF16");
-    let message = err.to_string();
-    for detail in [
-        "select_values",
-        "BFloat16",
-        "Compress-11",
-        "opset 27",
-        "28+",
+    for (opset, schema, input_dtype, port) in [
+        (9, 9, DataType::BFloat16, "input"),
+        (11, 11, DataType::BFloat16, "input"),
+        (27, 11, DataType::BFloat16, "input"),
+        (27, 11, DataType::Uint8, "output"),
     ] {
-        assert!(message.contains(detail), "{message}");
+        let invalid = model_with_dtypes(opset, input_dtype, DataType::BFloat16, Some(-1), 2);
+        let err = load(&invalid, device)
+            .err()
+            .expect("pre-28 Compress must not admit BF16");
+        let message = err.to_string();
+        for detail in [
+            "select_values",
+            &format!("{port} dtype BFloat16"),
+            &format!("Compress-{schema}"),
+            &format!("opset {opset}"),
+            "28+",
+        ] {
+            assert!(message.contains(detail), "{message}");
+        }
     }
 
     let legacy = model(27, DataType::Uint8, Some(-1), 2);
