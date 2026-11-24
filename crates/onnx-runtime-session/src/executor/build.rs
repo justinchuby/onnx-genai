@@ -401,6 +401,7 @@ pub(super) fn cuda_fallback_report(
     ep: &dyn ExecutionProvider,
     artifact_config: ExecutorArtifactConfig,
     ordered_probe: bool,
+    require_cuda: bool,
 ) -> Result<Option<ExecutionProviderFallbackReport>> {
     if ep.device_type() != DeviceType::Cuda {
         return Ok(None);
@@ -415,6 +416,7 @@ pub(super) fn cuda_fallback_report(
         "graph",
         &mut issues,
         ordered_probe,
+        require_cuda,
     )?;
     for value_id in super::host_strings::producerless_string_outputs(graph) {
         let value = graph.value(value_id);
@@ -488,6 +490,7 @@ pub(super) fn format_cuda_coverage_issues(issues: &[ExecutionProviderDecline]) -
         .join("; ")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn collect_cuda_coverage_issues(
     graph: &Graph,
     opset_graph: &Graph,
@@ -496,6 +499,7 @@ pub(super) fn collect_cuda_coverage_issues(
     scope: &str,
     issues: &mut Vec<ExecutionProviderDecline>,
     ordered_probe: bool,
+    require_cuda: bool,
 ) -> Result<()> {
     let graph_claims = onnx_runtime_ep_api::GraphKernelClaims::query(ep, graph)?;
     for (node_id, node) in graph.nodes.iter() {
@@ -572,6 +576,14 @@ pub(super) fn collect_cuda_coverage_issues(
             &concrete_shapes,
             opset,
         ) {
+            if require_cuda {
+                return Err(SessionError::CudaKernelCreationFailed {
+                    node: format_node_identity(scope, node_id, node),
+                    op_type: node.op_type.clone(),
+                    opset,
+                    source: error,
+                });
+            }
             if ordered_probe && !matches!(error, onnx_runtime_ep_api::EpError::NoEpForOp { .. }) {
                 return Err(SessionError::unsupported_op(
                     node,
@@ -603,6 +615,7 @@ pub(super) fn collect_cuda_coverage_issues(
             &sub_scope,
             issues,
             ordered_probe,
+            require_cuda,
         )?;
     }
     Ok(())
@@ -1680,6 +1693,7 @@ impl Executor {
             ep.as_ref(),
             artifact_transaction.config(),
             ordered_probe,
+            require_cuda,
         )?;
         let fallback_declines = execution_provider_fallback_report
             .as_ref()
@@ -3189,6 +3203,16 @@ impl Executor {
     /// context-cache model with compiled partitions spliced out.
     pub(crate) fn graph(&self) -> &Graph {
         &self.graph
+    }
+
+    pub(crate) fn host_graph_op(&self) -> Option<&Node> {
+        self.plan.iter().find_map(|planned| {
+            let node = self.graph.node(planned.node_id);
+            (planned.managed_strings
+                || is_sequence_op(&node.op_type, &node.domain)
+                || (!planned.graph_kernel && is_control_flow_op(&node.op_type, &node.domain)))
+            .then_some(node)
+        })
     }
 
     pub(crate) fn execution_provider_fallback_report(

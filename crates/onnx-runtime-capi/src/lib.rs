@@ -136,6 +136,7 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         E::NoModelSource => OrtErrorCode::NoModel,
         E::UnsupportedOp { .. } | E::UnsupportedModel { .. } => OrtErrorCode::NotImplemented,
         E::Ep(_)
+        | E::CudaKernelCreationFailed { .. }
         | E::ExecutionProviderUnavailable(_)
         | E::OrderedProviderDeclined { .. }
         | E::ExecutionProviderArtifactsPending { .. }

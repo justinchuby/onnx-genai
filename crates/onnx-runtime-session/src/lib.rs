@@ -191,6 +191,16 @@ mod error {
         )]
         HeterogeneousPlacementRequired { unsupported_nodes: String },
 
+        #[error(
+            "strict CUDA kernel creation failed for {op_type} at {node}, opset {opset}: {source}"
+        )]
+        CudaKernelCreationFailed {
+            node: String,
+            op_type: String,
+            opset: OpsetVersion,
+            source: onnx_runtime_ep_api::EpError,
+        },
+
         #[error("the ordered provider cannot cover the whole graph: {reason}")]
         OrderedProviderDeclined { reason: String },
 
@@ -2037,6 +2047,13 @@ impl InferenceSession {
     /// heterogeneous session. `None` for the single-EP path.
     pub fn heterogeneous_placement_report(&self) -> Option<&str> {
         self.exec.heterogeneous_placement_report()
+    }
+
+    /// The first graph operation dispatched by the session's host executor
+    /// rather than through an EP kernel, if any. Host-side tensor transfers
+    /// are not graph operations.
+    pub fn host_graph_op(&self) -> Option<&onnx_runtime_ir::Node> {
+        self.exec.host_graph_op()
     }
 
     /// Input metadata.

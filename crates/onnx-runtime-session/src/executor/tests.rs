@@ -9094,6 +9094,7 @@ fn coverage_collector_surfaces_ep_decline_reason() {
         "graph",
         &mut issues,
         false,
+        false,
     )
     .unwrap();
 
@@ -9162,7 +9163,7 @@ fn cuda_coverage_report_groups_all_distinct_failure_classes_deterministically() 
     )
     .unwrap();
     let report = || {
-        cuda_fallback_report(&graph, &ep, artifact_config, false)
+        cuda_fallback_report(&graph, &ep, artifact_config, false, false)
             .unwrap()
             .expect("CUDA declines must produce a fallback report")
             .to_string()
@@ -10585,11 +10586,12 @@ fn strict_cuda_partial_multinode_admission_rolls_back_once() {
         Ok(_) => panic!("strict CUDA must reject partial multi-node admission"),
         Err(error) => error,
     };
-    assert!(
-        error
-            .to_string()
-            .contains("injected kernel admission failure at decline_after_two_publications")
-    );
+    let SessionError::CudaKernelCreationFailed { node, source, .. } = error else {
+        panic!("expected a kernel creation failure, not a provider decline: {error}");
+    };
+    assert!(node.contains("decline_after_two_publications"), "{node}");
+    assert!(matches!(source, EpError::KernelFailed(message)
+        if message.contains("injected kernel admission failure at decline_after_two_publications")));
     assert_probe_rolled_back_once(&ep, 3);
 }
 

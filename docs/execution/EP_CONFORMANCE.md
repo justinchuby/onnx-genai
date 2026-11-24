@@ -12,9 +12,10 @@ Rust process bridge:
 
 1. load an ONNX model with `InferenceSession::load`;
 2. read any graph inputs from `input_N.nxrt`;
-3. run the session (currently the default `onnx-runtime-ep-cpu`);
+3. run the session (default: `onnx-runtime-ep-cpu`);
 4. write ordered outputs to `output_N.nxrt`; and
-5. print one machine-readable status: `OK`, `UNSUPPORTED_OP`, or `ERROR`.
+5. print one machine-readable status: `OK`, `UNSUPPORTED_OP`, or `ERROR`
+   (strict CUDA also emits `UNSUPPORTED_FIXTURE` for unencodable I/O).
 
 The `.nxrt` tensor interchange is intentionally small: an eight-byte magic,
 ONNX dtype byte, rank, `u64` dimensions, payload length, and contiguous
@@ -27,7 +28,9 @@ examples from the external `cbourjau/onnx-tests` Hypothesis strategies, runs the
 ONNX reference evaluator, invokes the Rust bridge, and classifies each case:
 
 - `PASS`: shapes, dtypes, and values agree (`rtol=1e-4`, `atol=1e-5`);
-- `UNSUPPORTED`: the session returned its unsupported-op error;
+- `UNSUPPORTED`: the selected EP declined an operator;
+- `UNSUPPORTED_FIXTURE`: the fixture cannot be represented by the bridge;
+- `SKIP`: the graph has no EP operation to verify or uses host graph dispatch;
 - `MISMATCH`: nxrt ran but returned different values; or
 - `ERROR`: generation, parsing, execution, or process failure.
 
@@ -40,7 +43,7 @@ cover CPU registrations not suitable for this first generator slice:
 suite generator; `ReduceMean` and `Unsqueeze` currently exercise nxrt's legacy
 attribute-form kernels; and the upstream `Gather` strategy can raise while
 constructing an empty-axis case before the driver's non-empty predicate applies.
-`Conv` is a focused passing case. A synthetic focused `Celu` model is expected to
+`Conv` is a focused passing case. A synthetic focused `Det` model is expected to
 remain `UNSUPPORTED` so the unsupported-op classification is exercised without
 allowing any current passing operator to regress silently.
 
@@ -61,9 +64,35 @@ python3 conformance/run_onnx_tests.py \
 Scratch models and tensor files are written under ignored `target/ep-conformance`.
 Use `--json PATH` only when a disposable machine-readable report is wanted.
 The driver exits non-zero when any operator's exact expected status changes:
-the 28 current baseline cases must stay `PASS`, and only the synthetic `Celu`
+the 28 current baseline cases must stay `PASS`, and only the synthetic `Det`
 case is expected to stay `UNSUPPORTED`. `.github/workflows/ci.yml` runs this
 gate in the `EP conformance (Linux x86_64)` job.
+
+### Native CUDA smoke
+
+Build the same example with CUDA and run the focused profile. These fixtures
+use NumPy and ONNX only; no external generators or host ORT plugin are needed.
+Pass the executable as `--runner` if it is in a custom Cargo target directory
+or has a platform-specific name such as `conformance_runner.exe`.
+
+```bash
+cargo build --locked -p onnx-runtime-session --example conformance_runner --features cuda
+python3 conformance/run_onnx_tests.py --smoke
+python3 conformance/run_onnx_tests.py --cuda
+```
+
+In the CPU smoke profile, both float32 `Relu` and float64 `Sigmoid` must pass.
+In the strict CUDA profile, float32 `Relu` must run on CUDA device 0 with matching
+outputs, while float64 `Sigmoid` must be declined. The double fixture is
+transportable and runs on CPU, so it detects an accidental CPU fallback.
+The runner's direct invocation is `conformance_runner --cuda MODEL.onnx CASE_DIR`.
+The switch enforces `ONNX_GENAI_REQUIRE_CUDA=1` even if inherited as `0` and
+rejects CPU or mixed placement. A graph that uses host sequence or control-flow
+dispatch is reported as `SKIP`, not as a CUDA pass or a provider decline. The
+float32 fixture binds an actual `input_0.nxrt` tensor. CUDA success includes `on CUDA:0` in the
+status; a missing feature/device, kernel creation failure, or incorrect
+placement is an `ERROR`, not a decline or skip. The CUDA profile only selects
+these two fixtures; it does not skip failed checks or establish broader opset coverage.
 
 ## Results
 
@@ -86,23 +115,8 @@ Current CI baseline against `cbourjau/onnx-tests` commit `856e89b`.
 
 Each operator has one baseline case. This proves the end-to-end harness,
 enumerates every default-domain op in `PHASE1_OPS`, and proves unsupported
-classification with a synthetic `Celu` case; it does not yet cover all dtypes,
+classification with a synthetic `Det` case; it does not yet cover all dtypes,
 shapes, attributes, opsets, optional inputs, or contrib-domain fused kernels.
-
-## Diagnostic finding
-
-The runner preserves the current nxrt diagnostic:
-
-```text
-op type not supported by any available EP: Celu
-```
-
-and adds that the selected EP has no registered kernel. The underlying session
-message is understandable but does **not** yet satisfy `RULES.md` section 1:
-it omits the node name, domain, opset, selected/available EPs, and a concrete
-remediation (for example, choose an EP that registers the op or implement the
-kernel). Improving `SessionError::UnsupportedOp` to carry and display that
-context is a follow-up exposed by this harness.
 
 ## Next steps
 
