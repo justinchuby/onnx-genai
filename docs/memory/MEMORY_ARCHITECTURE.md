@@ -1631,6 +1631,37 @@ unregistered caller capture refusal, numerical parity and replay after kernel
 drop. CUDA execution and throughput remain unmeasured. The new Host layout/bind
 and capture-owner checks are not claimed to have zero cost.
 
+### Native CUDA retirement has one consuming core
+
+Provider buffers and sealed allocations now use the same private
+`enqueue_native_release` function after their caller-specific validation. The
+provider still rejects foreign devices, missing ownership and foreign
+context/mechanism identities; sealed owners still verify their exact generation.
+Each caller invalidates its derived interleave entries before transferring
+ownership. These provenance checks are not weakened by sharing retirement.
+
+The core consumes binding or managed ownership, prepares one release and pairs
+its exact settlement token with the existing queue observer. Acceptance reports
+ordering, not physical unmapping: `deallocate_with_unmapped` still returns zero.
+A refused enqueue quarantines the same returned request and settles that
+outcome once. Preparation failures keep typed BindingError or
+AllocationTransactionError sources; their consumed owners follow existing
+quarantine semantics. In particular, dropping the last outstanding view cannot
+retry that owner or refund retained bytes.
+
+No runtime, new registry, quota authority, pool or per-region lease is stored in
+this core. It introduces no hot execution path. This is the shared retirement
+boundary for the next native allocation-domain extraction; runtime-private raw
+artifacts have not yet migrated.
+
+Host regressions drive this production function with real binding/managed Host
+owners and independently controlled compute/copy fences. They verify pending
+charges, complete settlement and exactly-once observers, closed/failed-fence
+refusal with retained charges, typed outstanding-view failure without enqueue,
+and the binding-only branch. Existing workspace-barrier tests now also use this
+core instead of a test-specific settlement observer. GPU fixtures compile
+against both callers; no CUDA execution or performance measurement was available.
+
 ### Sealed weights and workspace share cold native admission
 
 The CUDA provider's private `allocate_governed` function is the common cold
