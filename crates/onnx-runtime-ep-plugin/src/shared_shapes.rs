@@ -95,7 +95,9 @@ pub(crate) fn native_shape_operands(node: &Node) -> Option<&'static [usize]> {
     let opset = node.local_opset()?;
     let op = node.op_type.as_str();
     if node.is_default_domain() {
-        if op == "DeformConv" && opset >= 19 {
+        if (op == "DeformConv" && opset >= 19)
+            || (opset >= 26 && matches!(op, "BitCast" | "CumProd"))
+        {
             return Some(&[]);
         }
         if onnx_runtime_ir::standard_math::OPS

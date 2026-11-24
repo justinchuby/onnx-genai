@@ -1777,8 +1777,36 @@ fn quick_gelu_cases() -> Vec<Case> {
     cases
 }
 
-/// `CumProd` parity vs the CPU scan: f32 (exclusive/reverse/axis variants,
-/// float-close) and i64 (byte-exact) over multi-dimensional inputs.
+fn bitcast_cases() -> Vec<Case> {
+    use DataType::*;
+    [
+        (Int32, Float32, vec![2], vec![1, 0, 192, 127, 0, 0, 0, 128]),
+        (Uint8, Bool, vec![3], vec![0, 1, 255]),
+        (Uint4, Float4E2M1, vec![3], vec![0x21, 0x03]),
+        (Uint2, Int2, vec![5], vec![0xe4, 0x03]),
+        (Complex128, Complex128, vec![], (0..16).collect()),
+        (Uint64, Float64, vec![0, 4], vec![]),
+    ]
+    .into_iter()
+    .map(|(from, to, shape, bytes)| Case {
+        label: format!("BitCast[{from:?}->{to:?}]"),
+        op: "BitCast",
+        domain: "",
+        opset: 26,
+        inputs: vec![Tensor {
+            dtype: from,
+            shape: shape.clone(),
+            bytes,
+            absent: false,
+        }],
+        outputs: vec![(to, shape)],
+        attrs: vec![("to", Attribute::Int(i64::from(to.to_onnx())))],
+        compare: Compare::ExactBytes,
+    })
+    .collect()
+}
+
+/// `CumProd` parity across numeric dtypes, directions, axes, and scan modes.
 fn cumprod_cases() -> Vec<Case> {
     let f = |label: &str,
              shape: &[usize],
@@ -1840,6 +1868,39 @@ fn cumprod_cases() -> Vec<Case> {
         attrs: vec![("reverse", Attribute::Int(1))],
         compare: Compare::ExactBytes,
     });
+    for dtype in [
+        DataType::Float16,
+        DataType::BFloat16,
+        DataType::Float64,
+        DataType::Int32,
+        DataType::Uint32,
+        DataType::Uint64,
+    ] {
+        let shape = vec![2, 5];
+        let values = match dtype {
+            DataType::Float16 | DataType::BFloat16 => float_input(dtype, &shape, &[1.13; 10]),
+            DataType::Float64 => input(dtype, &shape, &[1.13_f64; 10]),
+            DataType::Int32 => input(dtype, &shape, &[i32::MAX, 2, -3, 5, 0, -5, 4, 3, 2, 1]),
+            DataType::Uint32 => input(dtype, &shape, &[u32::MAX, 2, 3, 5, 0, 5, 4, 3, 2, 1]),
+            DataType::Uint64 => input(dtype, &shape, &[u64::MAX, 2, 3, 5, 0, 5, 4, 3, 2, 1]),
+            _ => unreachable!(),
+        };
+        for (exclusive, reverse) in [(0, 0), (1, 1)] {
+            cases.push(Case {
+                label: format!("CumProd[{dtype:?},axis-1,exclusive={exclusive},reverse={reverse}]"),
+                op: "CumProd",
+                domain: "",
+                opset: 26,
+                inputs: vec![values.clone(), input(DataType::Int32, &[], &[-1_i32])],
+                outputs: vec![(dtype, shape.clone())],
+                attrs: vec![
+                    ("exclusive", Attribute::Int(exclusive)),
+                    ("reverse", Attribute::Int(reverse)),
+                ],
+                compare: Compare::ExactBytes,
+            });
+        }
+    }
     cases
 }
 
@@ -2447,6 +2508,7 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     }));
     p.push(sweep("QuickGelu", quick_gelu_cases()));
     p.push(sweep("CumProd", cumprod_cases()));
+    p.push(sweep("BitCast", bitcast_cases()));
     p.push(sweep("ArgMax", arg_reduce_cases("ArgMax")));
     p.push(sweep("ArgMin", arg_reduce_cases("ArgMin")));
 
@@ -3154,4 +3216,13 @@ fn conformance_sweep_matches_cpu() {
     }
     assert!(ran > 0, "expected at least one inline conformance case");
     eprintln!("conformance sweep: {ran} inline CUDA-vs-CPU parity cases passed");
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
+fn opset26_native_cuda_conformance() {
+    let ep = require_cuda();
+    for case in bitcast_cases().into_iter().chain(cumprod_cases()) {
+        run_case(&ep, &case);
+    }
 }
