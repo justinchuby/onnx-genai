@@ -271,6 +271,47 @@ impl DeviceValidationSlot {
     }
 }
 
+/// No CUDA calls: only the setup-owned host slot can prove this generation's
+/// completion. Recheck after reading flags so a later submission cannot lend its
+/// result to an older token.
+fn completed_validation_slot(
+    slot: &DeviceValidationSlot,
+    token: DeviceValidationToken,
+) -> Result<Option<u32>> {
+    if slot.owner != token.owner() {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep: validation token owner={} is foreign to slot owner={}; use the submitting owner's registration",
+            token.owner().get(),
+            slot.owner.get()
+        )));
+    }
+    let pending = validation_slot_word(ValidationSlotPhase::Pending, token.generation());
+    let complete = validation_slot_word(ValidationSlotPhase::Complete, token.generation());
+    loop {
+        let state = slot.state.load(Ordering::Acquire);
+        if state == pending {
+            return Ok(None);
+        }
+        if state == complete {
+            // If this reads a later generation's payload, its Release store
+            // also orders that generation's Pending transition before our
+            // verification load, which must then reject the old Complete word.
+            let flags = slot.flags.load(Ordering::Acquire);
+            if slot.state.load(Ordering::Acquire) == complete {
+                return Ok(Some(flags));
+            }
+            continue;
+        }
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep: validation token owner={} generation={} is stale for slot phase {:?} generation {}; observe the original generation before beginning another submission",
+            token.owner().get(),
+            token.generation(),
+            validation_slot_phase(state),
+            validation_generation(state)
+        )));
+    }
+}
+
 /// Whether a failed measured H2D operation can still be using its source and
 /// destination.
 #[derive(Debug)]
@@ -1694,7 +1735,7 @@ impl CudaRuntime {
             // generation's sole `Consuming` authority.
             let slot = unsafe { &*slot_ptr };
             let next = slot.next.load(Ordering::Relaxed);
-            slot.flags.store(flags, Ordering::Relaxed);
+            slot.flags.store(flags, Ordering::Release);
             let pending = validation_slot_word(ValidationSlotPhase::Pending, generation);
             let complete = validation_slot_word(ValidationSlotPhase::Complete, generation);
             // Release makes the flags payload visible to a sticky reader's
@@ -1742,6 +1783,18 @@ impl CudaRuntime {
         self.consume_device_validation_slot(slot, token)
     }
 
+    pub(crate) fn poll_device_validation_completion(
+        &self,
+        registration: &DeviceValidationRegistration,
+        token: DeviceValidationToken,
+    ) -> Result<onnx_runtime_ep_api::DeviceValidationCompletion> {
+        let slot = self.validation_slot(registration)?;
+        Ok(match completed_validation_slot(slot, token)? {
+            Some(flags) => onnx_runtime_ep_api::DeviceValidationCompletion::Complete { flags },
+            None => onnx_runtime_ep_api::DeviceValidationCompletion::Pending,
+        })
+    }
+
     pub(crate) fn abort_device_validation_submission(
         &self,
         token: DeviceValidationToken,
@@ -1772,30 +1825,10 @@ impl CudaRuntime {
         slot: &DeviceValidationSlot,
         token: DeviceValidationToken,
     ) -> Result<u32> {
-        let pending = validation_slot_word(ValidationSlotPhase::Pending, token.generation());
-        let complete = validation_slot_word(ValidationSlotPhase::Complete, token.generation());
         let mut spins = 0_u32;
         loop {
-            let owner_state = slot.state.load(Ordering::Acquire);
-            if owner_state == complete {
-                let flags = slot.flags.load(Ordering::Relaxed);
-                // An owner may begin a later generation immediately after the
-                // first Acquire; the second rejects that reuse instead of
-                // returning the later generation's flags for this token.
-                if slot.state.load(Ordering::Acquire) == complete {
-                    return Ok(flags);
-                }
-                continue;
-            }
-            if owner_state != pending {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep: validation token owner={} generation={} is stale for slot phase \
-                     {:?} generation {}",
-                    token.owner().get(),
-                    token.generation(),
-                    validation_slot_phase(owner_state),
-                    validation_generation(owner_state)
-                )));
+            if let Some(flags) = completed_validation_slot(slot, token)? {
+                return Ok(flags);
             }
 
             let coordinator = self.validation_state.load(Ordering::Acquire);
@@ -4787,5 +4820,101 @@ mod workspace_capture_resources_tests {
         drop(pin);
         foreign_owner.release_now().unwrap();
         local_owner.release_now().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod validation_completion_tests {
+    use super::*;
+
+    #[test]
+    fn host_poll_preserves_pending_and_sticky_success_or_failure() {
+        let owner = DeviceValidationOwner::new();
+        let slot = DeviceValidationSlot::new(owner);
+        let token = DeviceValidationToken::new(owner, 7);
+        slot.flags.store(0xdead, Ordering::Relaxed);
+        slot.state.store(
+            validation_slot_word(ValidationSlotPhase::Pending, 7),
+            Ordering::Release,
+        );
+        assert_eq!(completed_validation_slot(&slot, token).unwrap(), None);
+        assert_eq!(slot.flags.load(Ordering::Relaxed), 0xdead);
+        for flags in [0, 0x40] {
+            slot.flags.store(flags, Ordering::Release);
+            let complete = validation_slot_word(ValidationSlotPhase::Complete, 7);
+            slot.state.store(complete, Ordering::Release);
+            for _ in 0..3 {
+                assert_eq!(
+                    completed_validation_slot(&slot, token).unwrap(),
+                    Some(flags)
+                );
+                assert_eq!(slot.state.load(Ordering::Acquire), complete);
+                assert_eq!(slot.flags.load(Ordering::Relaxed), flags);
+            }
+        }
+    }
+
+    #[test]
+    fn host_poll_refuses_foreign_stale_idle_and_retired_generations() {
+        let owner = DeviceValidationOwner::new();
+        let slot = DeviceValidationSlot::new(owner);
+        let token = DeviceValidationToken::new(owner, 7);
+        for phase in [
+            ValidationSlotPhase::Idle,
+            ValidationSlotPhase::Retired,
+            ValidationSlotPhase::Pending,
+            ValidationSlotPhase::Complete,
+        ] {
+            slot.state
+                .store(validation_slot_word(phase, 8), Ordering::Release);
+            let error = completed_validation_slot(&slot, token)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("stale") && error.contains("generation=7"),
+                "{error}"
+            );
+        }
+        let foreign = DeviceValidationToken::new(DeviceValidationOwner::new(), 8);
+        assert!(
+            completed_validation_slot(&slot, foreign)
+                .unwrap_err()
+                .to_string()
+                .contains("foreign")
+        );
+    }
+
+    #[test]
+    fn host_poll_never_borrows_a_replacement_generations_flags() {
+        let owner = DeviceValidationOwner::new();
+        let slot = Arc::new(DeviceValidationSlot::new(owner));
+        let writer = slot.clone();
+        let update = std::thread::spawn(move || {
+            for generation in 1..=2048u64 {
+                writer.state.store(
+                    validation_slot_word(ValidationSlotPhase::Pending, generation),
+                    Ordering::Release,
+                );
+                writer
+                    .flags
+                    .store(generation as u32 ^ 0x1234, Ordering::Release);
+                writer.state.store(
+                    validation_slot_word(ValidationSlotPhase::Complete, generation),
+                    Ordering::Release,
+                );
+            }
+        });
+        for generation in 1..=2048u64 {
+            if let Ok(Some(flags)) =
+                completed_validation_slot(&slot, DeviceValidationToken::new(owner, generation))
+            {
+                assert_eq!(flags, generation as u32 ^ 0x1234);
+            }
+        }
+        update.join().unwrap();
+        assert_eq!(
+            completed_validation_slot(&slot, DeviceValidationToken::new(owner, 2048)).unwrap(),
+            Some(2048 ^ 0x1234)
+        );
     }
 }

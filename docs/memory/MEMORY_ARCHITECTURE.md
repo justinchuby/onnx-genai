@@ -135,25 +135,45 @@ capture-referenced owners never enter the idle cell. Pending device-binding runs
 continue through provider deferred retirement, so zero warm issuer calls are not
 claimed for that path. No per-token completion synchronization is added.
 
-Pending reuse needs a completion proof, not another allocation API. CUDA's
-`begin_device_validation` rejects an outstanding coordinator generation, but a
-successful begin overwrites the old owner slot: it cannot serve as a receipt for
-the previous generation's validation flags. The generic provider default also
-has no such completion guarantee. Consuming a still-pending validation token can
-perform device work, so polling through the consuming operation would introduce
-a new completion boundary. Binding reads consume validation after the existing
-host-transfer boundary, but do not currently publish a generation-specific
-completion receipt back to the executor.
+Successful device-binding execution now distinguishes `AwaitingValidation` from
+unknown/error/prepare-only `Pending`. Only the successful state may retain an
+unpinned active step owner awaiting its exact validation generation. It remains
+charged and outside pressure-reclaimable idle storage. Existing full, partial
+and zero-byte output-binding reads establish their normal host boundary and
+consume validation; reading an unrelated input or another executor's completed
+output does not manufacture this receipt.
 
-A future reuse change must expose the same generation's completed-and-clean
-receipt before replacing it, preserve failed outcomes, and leave unresolved work
-outside pressure-reclaimable idle storage. It must cover cross-binding and
-cross-executor isolation, stale generations, partial and zero-byte reads, errors,
-and teardown without adding synchronization to the fitting warm path. Until
-then, keep deferred retirement and retain GQA's persistent capacity; do not infer
-completion from DeviceId, a default fence, successful begin, or a prior binding
-read alone.
+The provider's optional `poll_device_validation_completion` observes an existing
+registration/owner/generation without synchronizing, consuming/resetting validation,
+issuing device work or allocating. Its default is Unavailable, which preserves
+the original provider retirement path. CUDA uses setup-owned host slots and
+Acquire/Release-published flags with a generation recheck; the same classification
+serves both observing and consuming completed results. Pending never becomes
+completed merely because begin succeeds, DeviceId matches, a fence defaults, or
+a physical transfer has finished without clean validation.
 
+Before the next submission can replace the token, and before public metadata
+preparation can reuse/replace the old owner, the executor resolves the previous
+successful deferred generation, including executions with only persistent or
+zero workspace. Failure preservation is independent of whether a Step slot
+exists. Complete/clean permits fitting capacity reuse
+without issuer or synchronization calls. Pending asks the caller to read a bound
+output or finish the existing request boundary. Nonzero flags, stale/foreign
+identity and observation errors cannot publish idle capacity or open a new
+workspace generation. Unknown/error `Pending`, including host failure with zero
+device flags, keeps the original retirement/settlement/quarantine path. Explicit
+boundary failure also removes successful-deferred eligibility.
+
+Capture pins and parent loans keep their existing ownership priority. A child
+cannot observe a root receipt or move a parent owner into its idle cell. No
+per-region ticket, new budget or per-token completion synchronization is added.
+Host regressions prove one physical owner/charge across full/partial/zero output
+reads, zero warm issuer callbacks and no new consume/sync calls, pending/failed
+refusal, cross-executor isolation, and pressure eligibility only after exact
+completion. The CUDA fixture covers receipt scope over a stream-ordered caller
+workspace write and stale/foreign generations; it is compile-checked here, not
+run on a device. CUDA replay, asynchronous behavior and throughput remain
+unmeasured.
 Installed capture addresses also prevent workspace replacement: preparation or
 runtime refinement that needs larger capacity or alignment must first retire all
 referencing graph slots. This preserves the old owner on refusal. Host contracts
