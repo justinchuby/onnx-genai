@@ -145,3 +145,29 @@ input{{{input}}} output{{{base}}} output{{{activation}}}
     std::fs::write(root.join("adapter_projection.onnx.textproto"), graph)?;
     Ok(())
 }
+
+// The same projection package, exposing its adapted vector without sampling.
+pub fn embedding(root: &Path, fixtures: &Path) -> anyhow::Result<()> {
+    build(root, fixtures)?;
+    let file = root.join("inference_metadata.yaml");
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(&file)?)?;
+    let w = &mut doc["pipeline"]["workflow"];
+    let mut steps = w["steps"][0]["setup"].as_sequence().unwrap().clone();
+    steps.push(serde_yaml::to_value(serde_json::json!({"kind":"emit","value":"decoder.setup.last_logits","output":"embedding","mode":"replace"}))?);
+    w["steps"] = serde_yaml::Value::Sequence(steps);
+    w.as_mapping_mut()
+        .unwrap()
+        .remove(serde_yaml::Value::String("state".into()));
+    w.as_mapping_mut()
+        .unwrap()
+        .remove(serde_yaml::Value::String("serving".into()));
+    let contract = w["components"]["overlay"]["ports"]["outputs"]["output"].clone();
+    w["outputs"] = serde_yaml::to_value(
+        serde_json::json!({"embedding":{"contract":serde_json::to_value(contract)?,"role":"tensor","stage":"pre_adapter"}}),
+    )?;
+    doc["profiles"] = serde_yaml::to_value(
+        serde_json::json!({"vectors":{"kind":"embedding","version":"1","outputs":{"embedding":"embedding"}}}),
+    )?;
+    std::fs::write(file, serde_yaml::to_string(&doc)?)?;
+    Ok(())
+}

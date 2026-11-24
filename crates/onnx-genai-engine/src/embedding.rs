@@ -13,10 +13,14 @@ pub enum EmbeddingPooling {
     Mean,
     /// Use the final token position's hidden state.
     LastToken,
+    /// First sequence position.
+    Cls,
+    /// Maximum of each feature over sequence positions.
+    Max,
 }
 
 /// Options controlling hidden-state embedding extraction.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EmbeddingOptions {
     /// How per-token hidden states are reduced to one vector.
     pub pooling: EmbeddingPooling,
@@ -24,6 +28,8 @@ pub struct EmbeddingOptions {
     pub normalize: bool,
     /// Explicit hidden-state output name, or `None` to auto-detect it.
     pub hidden_state_output: Option<String>,
+    /// Explicit adapter composition; an empty row selects the base model.
+    pub adapter_selection: Option<crate::AdapterSelection>,
 }
 
 impl Engine {
@@ -58,6 +64,110 @@ impl Engine {
         if input_ids.is_empty() {
             anyhow::bail!("embedding input must contain at least one token");
         }
+
+        let generation_options = crate::GenerateOptions {
+            adapter_selection: options.adapter_selection.clone(),
+            max_new_tokens: 1,
+            ..Default::default()
+        };
+        if let Some(contract) =
+            onnx_genai_metadata::task_profiles::embedding_contract(self.metadata())?
+        {
+            anyhow::ensure!(
+                options
+                    .adapter_selection
+                    .as_ref()
+                    .is_none_or(|selection| selection.rows.iter().all(Vec::is_empty))
+                    || self.embedding_adapter_service()?.is_some(),
+                "this embedding workflow has no admitted adapter service; declare an adapter-aware workflow or omit adapter_selection"
+            );
+            anyhow::ensure!(
+                options
+                    .hidden_state_output
+                    .as_ref()
+                    .is_none_or(|name| name == &contract.output),
+                "hidden_state_output must name the declared embedding output '{}'; change the profile to select a different output",
+                contract.output
+            );
+            if let Some(limit) = self.effective_max_context(&generation_options) {
+                anyhow::ensure!(
+                    input_ids.len() <= limit,
+                    "embedding has {} input tokens, exceeding model context {limit}; shorten the input",
+                    input_ids.len()
+                );
+            }
+            let outputs = self
+                .run_pipeline_outputs(crate::PipelineGenerateRequest::new(
+                    crate::GenerateRequest {
+                        prompt: crate::GeneratePrompt::TokenIds(input_ids.to_vec()),
+                        options: generation_options,
+                    },
+                ))
+                .context("embedding workflow execution failed")?;
+            let value=outputs.aggregate(&contract.output).with_context(||format!("embedding workflow did not emit declared output '{}'; emit one aggregate tensor",contract.output))?;
+            let shape = value.shape();
+            let (positions, features, pooling, normalize) = if let Some(pooling) = contract.pooling
+            {
+                anyhow::ensure!(
+                    (2..=3).contains(&shape.len()) && (shape.len() != 3 || shape[0] == 1),
+                    "embedding output '{}' must contain one sequence batch row, got {shape:?}",
+                    contract.output
+                );
+                let kind = match pooling.kind {
+                    onnx_genai_metadata::PoolingKind::Mean => EmbeddingPooling::Mean,
+                    onnx_genai_metadata::PoolingKind::Max => EmbeddingPooling::Max,
+                    onnx_genai_metadata::PoolingKind::Cls => EmbeddingPooling::Cls,
+                    onnx_genai_metadata::PoolingKind::LastToken => EmbeddingPooling::LastToken,
+                };
+                (
+                    usize::try_from(shape[shape.len() - 2])?,
+                    usize::try_from(shape[shape.len() - 1])?,
+                    kind,
+                    pooling.normalize || options.normalize,
+                )
+            } else {
+                anyhow::ensure!(
+                    (1..=2).contains(&shape.len()) && (shape.len() != 2 || shape[0] == 1),
+                    "embedding output '{}' must contain one final vector, got {shape:?}",
+                    contract.output
+                );
+                (
+                    1,
+                    usize::try_from(shape[shape.len() - 1])?,
+                    EmbeddingPooling::Mean,
+                    options.normalize,
+                )
+            };
+            let copied = if value.dtype() == DataType::Float32 {
+                0
+            } else {
+                value.numel()
+            };
+            let bytes=copied.checked_add(features).and_then(|n|n.checked_mul(4)).context("embedding conversion/pooling allocation size overflow; reduce the output shape")?;
+            let holder = crate::engine::memory_plan::Holder::Activations;
+            let _staging = onnx_runtime_memory_governor::MemoryGovernor::reserve(
+                self.governor.memory(),
+                onnx_runtime_memory_api::Tier::Host,
+                u64::try_from(bytes)?,
+                holder.role(),
+                holder.id(),
+            )
+            .context("reserve host memory for embedding conversion and pooling")?;
+            let data = if value.dtype() == DataType::Float32 {
+                std::borrow::Cow::Borrowed(value.as_slice_f32().with_context(||format!("embedding output '{}' must be host-readable; declare an explicit host output boundary",contract.output))?)
+            } else {
+                std::borrow::Cow::Owned(value.to_vec_f32_lossy().with_context(||format!("embedding output '{}' must be host-readable float16/bfloat16; declare an explicit host output boundary",contract.output))?)
+            };
+            return pool_hidden_states(&data, positions, features, pooling, normalize);
+        }
+        self.validate_adapter_request(&generation_options)?;
+        anyhow::ensure!(
+            options
+                .adapter_selection
+                .as_ref()
+                .is_none_or(|selection| selection.rows.iter().all(Vec::is_empty)),
+            "adapter-aware embeddings require an embedding v1 workflow profile; declare profiles.<name>.outputs.embedding instead of bypassing the adapter workflow"
+        );
 
         #[cfg(feature = "native-backend")]
         if self.decode_backend == crate::EngineDecodeBackend::Native {
@@ -217,13 +327,20 @@ fn pool_hidden_states(
     pooling: EmbeddingPooling,
     normalize: bool,
 ) -> anyhow::Result<Vec<f32>> {
-    if positions == 0 || hidden_size == 0 || hidden.len() != positions * hidden_size {
+    if positions == 0
+        || hidden_size == 0
+        || positions.checked_mul(hidden_size) != Some(hidden.len())
+    {
         anyhow::bail!(
             "invalid hidden-state matrix: {} values for {positions} positions and hidden size {hidden_size}",
             hidden.len()
         );
     }
 
+    anyhow::ensure!(
+        hidden.iter().all(|value| value.is_finite()),
+        "embedding hidden-state matrix contains non-finite values; inspect model weights and upstream workflow outputs"
+    );
     let mut pooled = match pooling {
         EmbeddingPooling::Mean => {
             let mut pooled = vec![0.0f32; hidden_size];
@@ -239,8 +356,22 @@ fn pool_hidden_states(
             pooled
         }
         EmbeddingPooling::LastToken => hidden[(positions - 1) * hidden_size..].to_vec(),
+        EmbeddingPooling::Cls => hidden[..hidden_size].to_vec(),
+        EmbeddingPooling::Max => {
+            let mut pooled = hidden[..hidden_size].to_vec();
+            for row in hidden[hidden_size..].chunks_exact(hidden_size) {
+                for (value, next) in pooled.iter_mut().zip(row) {
+                    *value = value.max(*next);
+                }
+            }
+            pooled
+        }
     };
 
+    anyhow::ensure!(
+        pooled.iter().all(|value| value.is_finite()),
+        "embedding pooling produced non-finite values; reduce activation magnitudes or perform stable pooling in the workflow"
+    );
     if normalize {
         let norm = pooled
             .iter()
@@ -296,6 +427,22 @@ mod tests {
     }
 
     #[test]
+    fn pooling_refuses_nonfinite_matrices_and_arithmetic_overflow() {
+        assert!(
+            pool_hidden_states(&[f32::NAN], 1, 1, EmbeddingPooling::Max, false)
+                .unwrap_err()
+                .to_string()
+                .contains("non-finite")
+        );
+        assert!(
+            pool_hidden_states(&[f32::MAX, f32::MAX], 2, 1, EmbeddingPooling::Mean, false)
+                .unwrap_err()
+                .to_string()
+                .contains("pooling")
+        );
+    }
+
+    #[test]
     fn pools_synthetic_hidden_states_exactly() -> anyhow::Result<()> {
         let hidden = [1.0, 2.0, 3.0, 5.0, 8.0, 13.0];
         assert_eq!(
@@ -304,6 +451,14 @@ mod tests {
         );
         assert_eq!(
             pool_hidden_states(&hidden, 2, 3, EmbeddingPooling::LastToken, false)?,
+            vec![5.0, 8.0, 13.0]
+        );
+        assert_eq!(
+            pool_hidden_states(&hidden, 2, 3, EmbeddingPooling::Cls, false)?,
+            vec![1.0, 2.0, 3.0]
+        );
+        assert_eq!(
+            pool_hidden_states(&hidden, 2, 3, EmbeddingPooling::Max, false)?,
             vec![5.0, 8.0, 13.0]
         );
         assert_close(
@@ -395,6 +550,7 @@ mod tests {
                 pooling: EmbeddingPooling::Mean,
                 normalize: true,
                 hidden_state_output: None,
+                ..Default::default()
             },
         )?;
         let norm = normalized
@@ -482,6 +638,7 @@ mod tests {
             pooling: EmbeddingPooling::Mean,
             normalize: true,
             hidden_state_output: None,
+            ..Default::default()
         };
         let via_ids = engine.embed_with_options(&ids, options.clone())?;
         let via_text = engine.embed_text_with_options(text, options)?;

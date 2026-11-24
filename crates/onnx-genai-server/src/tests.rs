@@ -10159,6 +10159,230 @@ mod lora_http {
     fn generation() -> Value {
         json!({"prompt":[2,4],"n_predict":2,"temperature":0,"ignore_eos":true,"return_tokens":true})
     }
+    fn embedding_state(root: &std::path::Path) -> AppState {
+        fixture::embedding(
+            root,
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures"),
+        )
+        .unwrap();
+        AppState::load_with_config(
+            root,
+            Some("adapted".into()),
+            ServerConfig {
+                lora_init_without_apply: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn embedding_failures_preserve_the_actual_workflow_cause() {
+        let root = tempfile::tempdir().unwrap();
+        let state = embedding_state(root.path());
+        std::fs::remove_file(root.path().join("adapters/red/adapter.json")).unwrap();
+        let (status, error) = call(
+            app(state),
+            "POST",
+            "/v1/embeddings",
+            json!({"model":"adapted","input":[2,4],"lora":[{"id":1,"scale":1}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{error}");
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("embedding workflow execution failed"),
+            "{message}"
+        );
+        assert!(
+            message.contains("failed to resolve adapter artifact")
+                && message.contains("adapter.json"),
+            "{message}"
+        );
+    }
+    #[tokio::test]
+    async fn admitted_embedding_batch_keeps_defaults_while_global_settings_change() {
+        let root = tempfile::tempdir().unwrap();
+        let state = embedding_state(root.path());
+        let driver = state
+            .registry
+            .lookup_loaded("")
+            .unwrap()
+            .unwrap()
+            .engine
+            .clone();
+        let router = app(state);
+        let (status, result) = call(
+            router.clone(),
+            "POST",
+            "/lora-adapters",
+            json!([{"id":1,"scale":0.5}]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        let (entered, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+        driver
+            .workers
+            .primary_sender()
+            .unwrap()
+            .send(DriverCommand::Block {
+                entered,
+                release: release_rx,
+            })
+            .await
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let initial = driver.generation_capacity.available_permits();
+        let task = tokio::spawn(call(
+            router.clone(),
+            "POST",
+            "/v1/embeddings",
+            json!({"model":"adapted","input":[[2,4],[2,4]]}),
+        ));
+        timeout(Duration::from_secs(5), async {
+            while driver.generation_capacity.available_permits() == initial {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (status, result) = call(
+            router.clone(),
+            "POST",
+            "/lora-adapters",
+            json!([{"id":0,"scale":0.5}]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        release.send(()).unwrap();
+        let (status, result) = timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{result}");
+        fn strongest(value: &Value) -> usize {
+            value
+                .as_array()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.as_f64().unwrap().total_cmp(&b.as_f64().unwrap()))
+                .unwrap()
+                .0
+        }
+        for row in result["data"].as_array().unwrap() {
+            assert_eq!(strongest(&row["embedding"]), 4, "{row}");
+        }
+        let (status, next) = call(
+            router.clone(),
+            "POST",
+            "/v1/embeddings",
+            json!({"model":"adapted","input":[2,4]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{next}");
+        assert_eq!(strongest(&next["data"][0]["embedding"]), 5);
+        let (_, props) = call(router, "GET", "/props", Value::Null).await;
+        assert_eq!(props["nxrt_capabilities"]["lora_embeddings"], true);
+    }
+    #[tokio::test]
+    async fn generation_adapters_cannot_silently_bypass_the_embedding_workflow() {
+        let root = tempfile::tempdir().unwrap();
+        let router = app(state(root.path(), true));
+        for (path, body) in [
+            (
+                "/v1/embeddings",
+                json!({"model":"adapted","input":[2,4],"lora":[{"id":1,"scale":1}]}),
+            ),
+            (
+                "/embedding",
+                json!({"content":[2,4],"lora":[{"id":1,"scale":1}]}),
+            ),
+        ] {
+            let (status, error) = call(router.clone(), "POST", path, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("embedding v1"),
+                "{error}"
+            );
+        }
+        let (_, props) = call(router, "GET", "/props", Value::Null).await;
+        assert_eq!(props["nxrt_capabilities"]["lora_embeddings"], false);
+    }
+    #[tokio::test]
+    async fn embeddings_snapshot_defaults_and_execute_request_overrides() {
+        let root = tempfile::tempdir().unwrap();
+        fixture::embedding(
+            root.path(),
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures"),
+        )
+        .unwrap();
+        let router = app(AppState::load_with_config(
+            root.path(),
+            Some("adapted".into()),
+            ServerConfig {
+                lora_init_without_apply: true,
+                ..Default::default()
+            },
+        )
+        .unwrap());
+        let req = json!({"model":"adapted","input":[2,4]});
+        let (status, base) = call(router.clone(), "POST", "/v1/embeddings", req.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{base}");
+        let (status, body) = call(
+            router.clone(),
+            "POST",
+            "/lora-adapters",
+            json!([{"id":1,"scale":0.5}]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, red) = call(router.clone(), "POST", "/v1/embeddings", req.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{red}");
+        let a = red["data"][0]["embedding"].as_array().unwrap();
+        let b = base["data"][0]["embedding"].as_array().unwrap();
+        assert!((a[4].as_f64().unwrap() - b[4].as_f64().unwrap() - 5000.0).abs() < 0.01);
+        let mut override_req = req.clone();
+        override_req["lora"] = json!([]);
+        let (status, overridden) =
+            call(router.clone(), "POST", "/v1/embeddings", override_req).await;
+        assert_eq!(status, StatusCode::OK, "{overridden}");
+        assert_eq!(overridden, base);
+        let (status, native) = call(
+            router.clone(),
+            "POST",
+            "/embedding",
+            json!({"content":[2,4],"embd_normalize":-1,"lora":[{"id":0,"scale":0.5}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{native}");
+        assert!(
+            (native[0]["embedding"][0][5].as_f64().unwrap() - b[5].as_f64().unwrap() - 5000.0)
+                .abs()
+                < 0.01,
+            "{native}"
+        );
+        let mut invalid = req;
+        invalid["lora"] = json!([{"id":99,"scale":1}]);
+        assert_eq!(
+            call(router.clone(), "POST", "/v1/embeddings", invalid)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        let (_, again) = call(
+            router,
+            "POST",
+            "/v1/embeddings",
+            json!({"model":"adapted","input":[[2,4],[2,4]]}),
+        )
+        .await;
+        assert_eq!(again["data"][0]["embedding"], red["data"][0]["embedding"]);
+        assert_eq!(again["data"][0]["embedding"], again["data"][1]["embedding"]);
+    }
     #[tokio::test]
     async fn global_defaults_and_request_override_execute_selected_adapters() {
         let root = tempfile::tempdir().unwrap();

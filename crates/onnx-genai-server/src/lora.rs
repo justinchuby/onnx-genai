@@ -48,17 +48,23 @@ struct Entry {
     alias: String,
     path: String,
 }
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AdapterCapabilities {
+    pub(crate) generation: bool,
+    pub(crate) sessions: bool,
+    pub(crate) embeddings: bool,
+}
 #[derive(Debug)]
 pub(crate) struct LoraState {
     entries: Vec<Entry>,
     max_active: usize,
-    pub(crate) supports_sessions: bool,
+    pub(crate) capabilities: AdapterCapabilities,
     defaults: RwLock<Vec<AdapterActivation>>,
 }
 impl LoraState {
     pub(crate) fn new(
         contract: &AdapterServiceContract,
-        supports_sessions: bool,
+        capabilities: AdapterCapabilities,
     ) -> anyhow::Result<Arc<Self>> {
         let mut entries = Vec::new();
         for (alias, artifact) in &contract.artifacts {
@@ -73,7 +79,7 @@ impl LoraState {
         entries.sort_by_key(|e| e.id);
         Ok(Arc::new(Self {
             entries,
-            supports_sessions,
+            capabilities,
             max_active: contract
                 .selection
                 .max_adapters
@@ -180,9 +186,41 @@ pub(crate) fn apply_request(
     has_session: bool,
 ) -> Result<(), crate::routes::ApiError> {
     use crate::routes::ApiError;
-    let requested = request
-        .extensions
-        .get("lora")
+    if has_session
+        && handle
+            .engine
+            .adapters
+            .as_ref()
+            .is_some_and(|state| !state.capabilities.sessions)
+    {
+        return Err(ApiError::invalid_request(
+            "LoRA requests cannot reuse this model's session-scoped tensors; send the full conversation stateless, or use a workflow that replays token history",
+        ));
+    }
+    options.adapter_selection = resolve_request(request.extensions.get("lora"), handle)?;
+    if options
+        .adapter_selection
+        .as_ref()
+        .is_some_and(|selection| selection.rows.iter().any(|row| !row.is_empty()))
+        && handle
+            .engine
+            .adapters
+            .as_ref()
+            .is_some_and(|state| !state.capabilities.generation)
+    {
+        return Err(ApiError::invalid_request(
+            "this model admits adapters only for embedding workflows; select an adapter-aware generation workflow or send lora: []",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn resolve_request(
+    value: Option<&serde_json::Value>,
+    handle: &crate::registry::ModelHandle,
+) -> Result<Option<AdapterSelection>, crate::routes::ApiError> {
+    use crate::routes::ApiError;
+    let requested = value
         .map(|value| serde_json::from_value::<Vec<Activation>>(value.clone()))
         .transpose()
         .map_err(|e| {
@@ -191,15 +229,9 @@ pub(crate) fn apply_request(
             ))
         })?;
     match &handle.engine.adapters {
-        Some(state) => {
-            if has_session && !state.supports_sessions {
-                return Err(ApiError::invalid_request(
-                    "LoRA requests cannot reuse this model's session-scoped tensors; send the full conversation stateless, or use a workflow that replays token history",
-                ));
-            }
-            options.adapter_selection =
-                Some(state.selection(requested.as_deref()).map_err(api_error)?);
-        }
+        Some(state) => Ok(Some(
+            state.selection(requested.as_deref()).map_err(api_error)?,
+        )),
         None => {
             if requested.as_ref().is_some_and(|values| !values.is_empty()) {
                 return Err(ApiError::invalid_request(format!(
@@ -207,9 +239,9 @@ pub(crate) fn apply_request(
                     handle.id
                 )));
             }
+            Ok(None)
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -224,7 +256,15 @@ mod tests {
             .unwrap();
         let mut contract = contract.adapters.take().unwrap();
         contract.cache.max_entries = 1;
-        let state = LoraState::new(&contract, true).unwrap();
+        let state = LoraState::new(
+            &contract,
+            AdapterCapabilities {
+                generation: true,
+                sessions: true,
+                embeddings: false,
+            },
+        )
+        .unwrap();
         assert!(
             state
                 .initialize(false)

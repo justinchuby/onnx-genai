@@ -1838,3 +1838,15 @@ Token-history replay supports named adapter sessions; other retained state is
 refused before mutation. Native generated-token tests run with ORT unavailable.
 See [LoRA serving](LORA_SERVING.md) for the executed contract and remaining
 source-format, device and embedding gaps. The overall acceptance rows stay open.
+
+
+### Adapter-aware embedding workflows
+
+Embedding v1 profiles now resolve an explicit floating workflow output and optional
+sequence pooling. Embedding calls execute that workflow, so its declared LoRA
+updates affect returned vectors. Model defaults and per-request selections share
+the generation parser and snapshot once per batch. Native and OpenAI embedding
+transports forward overrides rather than dropping them. Decoder-only extraction
+refuses nonempty adapter selections, and model properties expose embedding-specific
+adapter admission. The compatibility goal remains active for the remaining loader,
+device, model-management, tools and full-matrix acceptance items.

@@ -31,7 +31,7 @@ Each target maps to explicit workflow component/initializer metadata. JSON
 `targets.<weight_key>.a` is row-major `[rank, input_features]`; `b` is row-major
 `[output_features, rank]` (or `[output_slice.width, rank]` for a declared fused slice). The static factor follows the declared
 `alpha_over_rank` or `baked` encoding. Alternative HF PEFT, safetensors and ORT
-GenAI source loaders and device-fused application remain unfinished. Selection currently applies to generation routes, including Responses and Messages; embedding extraction does not yet execute adapter-aware workflows.
+GenAI source loaders and device-fused application remain unfinished. Selection applies to generation routes, including Responses and Messages, and embedding routes backed by an embedding v1 workflow profile.
 
 `onnx-genai.parameter-overlay@1` requires separate `input`, `base`, and `output`
 contract bindings. `input` is the source activation; `base` is the actual base
@@ -68,3 +68,34 @@ Tests execute real Native ONNX projections and generated tokens, including a
 missing-ORT-library subprocess, non-square/non-identity math, default/override
 isolation, model discovery, replayed sessions, invalid updates, host-budget
 refusal and no-copy lease lifetime.
+
+## Embedding workflows
+
+An embedding package declares its executable tensor explicitly:
+
+```yaml
+profiles:
+  vectors:
+    kind: embedding
+    version: '1'
+    outputs: {embedding: vector}
+    # For a [batch, sequence, features] tensor; omit for a final vector.
+    pooling: {kind: mean, axis: 1, normalize: true}
+```
+
+`vector` names a floating workflow output. Without `pooling` it is a final
+`[features]` or `[batch, features]` vector. With pooling it is
+`[sequence, features]` or `[batch, sequence, features]`, and the declared axis
+is the sequence axis. Mean, max, first-token (`cls`) and last-token reductions
+are executed; no output, axis or model architecture is guessed. One invocation
+processes one input sequence. Unsupported required versions, ambiguous profiles,
+non-floating outputs and invalid axes fail at package validation.
+
+`/v1/embeddings` and `/embedding`/`/embeddings` snapshot the model's current LoRA
+composition once for the whole request. An explicit `lora: []` uses base weights;
+a nonempty override replaces defaults. Adapter-aware embeddings execute the
+complete admitted workflow before pooling. A legacy decoder hidden-state path
+cannot apply arbitrary LoRA selections and refuses them with guidance to declare
+an embedding profile. `/props` advertises `lora_embeddings` separately from named
+session support. Host float32 tensors are borrowed for pooling; lower-precision
+conversion and the reduced vector reserve model-governed host staging first.

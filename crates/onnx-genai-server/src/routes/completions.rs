@@ -129,6 +129,24 @@ pub(crate) async fn embeddings(
     let handle = resolve_model(&state.registry, &request.model).await?;
     validate_embedding_request(&request, &handle.tokenizer)?;
 
+    let adapter_selection = crate::lora::resolve_request(request.extensions.get("lora"), &handle)?;
+    if adapter_selection
+        .as_ref()
+        .is_some_and(|selection| selection.rows.iter().any(|row| !row.is_empty()))
+        && handle
+            .engine
+            .adapters
+            .as_ref()
+            .is_some_and(|state| !state.capabilities.embeddings)
+    {
+        return Err(ApiError::invalid_request(
+            "adapter-aware embeddings require an embedding v1 workflow profile; declare profiles.<name>.outputs.embedding on this model",
+        ));
+    }
+    let options = EmbeddingOptions {
+        adapter_selection,
+        ..Default::default()
+    };
     let encoding_format = request.encoding_format;
     let model = request.model.clone();
 
@@ -160,9 +178,9 @@ pub(crate) async fn embeddings(
     for (index, input_ids) in inputs.into_iter().enumerate() {
         let vector = handle
             .engine
-            .embed(input_ids, EmbeddingOptions::default())
+            .embed(input_ids, options.clone())
             .await
-            .map_err(|err| ApiError::internal(format!("embedding failed: {err}")))?;
+            .map_err(|err| ApiError::internal(format!("embedding failed: {err:#}")))?;
         data.push(EmbeddingData {
             object: "embedding",
             embedding: EmbeddingVector::from_floats(vector, encoding_format),

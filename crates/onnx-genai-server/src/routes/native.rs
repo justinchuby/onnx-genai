@@ -774,6 +774,7 @@ pub(crate) async fn embeddings(
         )
     })?;
     let model = body.remove("model").unwrap_or_else(|| json!(""));
+    let lora = body.remove("lora");
     let norm = match body.remove("embd_normalize") {
         None => 2,
         Some(value) => value.as_i64().filter(|value| *value >= -1).ok_or_else(|| {
@@ -788,7 +789,11 @@ pub(crate) async fn embeddings(
             body.keys().collect::<Vec<_>>()
         )));
     }
-    let request: EmbeddingRequest = serde_json::from_value(json!({"model":model,"input":content}))
+    let mut mapped = json!({"model":model,"input":content});
+    if let Some(lora) = lora {
+        mapped["lora"] = lora;
+    }
+    let request: EmbeddingRequest = serde_json::from_value(mapped)
         .map_err(|err| ApiError::invalid_request(format!("invalid embedding content: {err}")))?;
     let response = super::completions::embeddings(State(state), ApiJson(request))
         .await?

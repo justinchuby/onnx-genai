@@ -3135,12 +3135,22 @@ impl Engine {
         }
     }
 
+    /// Adapter service admitted specifically for the declared embedding workflow.
+    pub fn embedding_adapter_service(
+        &self,
+    ) -> anyhow::Result<Option<&onnx_genai_metadata::AdapterServiceContract>> {
+        Ok(
+            onnx_genai_metadata::task_profiles::embedding_contract(self.metadata())?
+                .and_then(|_| self.workflow.adapter_service()),
+        )
+    }
+
     /// Whether named adapter requests can reconstruct every dependent tensor.
     pub fn supports_adapter_sessions(&self) -> bool {
         self.adapter_service().is_none() || self.workflow.supports_adapter_sessions()
     }
 
-    pub(super) fn validate_adapter_request(&self, options: &GenerateOptions) -> anyhow::Result<()> {
+    pub(crate) fn validate_adapter_request(&self, options: &GenerateOptions) -> anyhow::Result<()> {
         if let Some(selection) = &options.adapter_selection {
             anyhow::ensure!(
                 self.adapter_service().is_some() || selection.rows.iter().all(Vec::is_empty),

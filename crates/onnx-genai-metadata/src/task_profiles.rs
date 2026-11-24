@@ -4,6 +4,13 @@ use crate::{
     WorkflowInputSource, WorkflowOutputRole,
 };
 
+/// Unsupported versions of an ignorable task contract have no semantic effect.
+pub(crate) fn skip_unsupported_version(profile: &crate::TaskProfile) -> bool {
+    profile.requirement == ProfileRequirement::Ignorable
+        && matches!(profile.kind.as_str(), "embedding" | "reranking")
+        && profile.version != "1"
+}
+
 /// A tokenizer-produced feature bound by its declared application role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairFeature {
@@ -35,25 +42,25 @@ impl RerankingContract {
 }
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
-pub struct RerankingContractError(String);
-fn invalid(message: impl Into<String>) -> RerankingContractError {
-    RerankingContractError(message.into())
+pub struct TaskProfileContractError(String);
+fn invalid(message: impl Into<String>) -> TaskProfileContractError {
+    TaskProfileContractError(message.into())
 }
 
 /// Resolve the v1 token-pair ABI from task kind/version, semantic input sources
 /// and the explicit score output. No graph/port/model name is guessed.
 pub fn reranking_contract(
     metadata: &InferenceMetadata,
-) -> Result<Option<RerankingContract>, RerankingContractError> {
+) -> Result<Option<RerankingContract>, TaskProfileContractError> {
     let mut resolved = None;
     for (name, profile) in &metadata.profiles {
+        if skip_unsupported_version(profile) {
+            continue;
+        }
         if profile.kind != "reranking" {
             continue;
         }
         if profile.version != "1" {
-            if profile.requirement == ProfileRequirement::Ignorable {
-                continue;
-            }
             return Err(invalid(format!(
                 "profiles.{name}.version '{}' is unsupported for reranking; declare version '1' for the token-pair ABI, or make an unsupported profile ignorable",
                 profile.version
@@ -276,5 +283,239 @@ mod tests {
         inputs.get_mut("pair.segments").unwrap().contract.shape[1] = TensorDimension::Fixed(16);
         let error = reranking_contract(&document).unwrap_err().to_string();
         assert!(error.contains("disagree"), "{error}");
+    }
+}
+
+/// Resolved workflow embedding output and optional sequence reduction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddingContract {
+    pub output: String,
+    pub pooling: Option<crate::PoolingSpec>,
+}
+
+/// An embedding profile names an executable floating workflow output. A sequence
+/// reduction is explicit; without one the output is already one final vector.
+pub fn embedding_contract(
+    metadata: &InferenceMetadata,
+) -> Result<Option<EmbeddingContract>, TaskProfileContractError> {
+    let mut resolved = None;
+    for (name, profile) in &metadata.profiles {
+        if skip_unsupported_version(profile) {
+            continue;
+        }
+        if profile.kind != "embedding" {
+            continue;
+        }
+        if profile.version != "1" {
+            return Err(invalid(format!(
+                "profiles.{name}.version '{}' is unsupported for embedding; declare version '1' or mark an unsupported profile ignorable",
+                profile.version
+            )));
+        }
+        if resolved.is_some() {
+            return Err(invalid(
+                "more than one embedding v1 profile is declared; retain one embedding output contract per served package",
+            ));
+        }
+        if profile.decoding.is_some() {
+            return Err(invalid(format!(
+                "profiles.{name}.decoding is incompatible with embedding vectors; declare pooling or emit a final vector"
+            )));
+        }
+        let workflow = &metadata
+            .pipeline
+            .as_ref()
+            .ok_or_else(|| invalid(format!("profiles.{name} requires pipeline.workflow")))?
+            .workflow;
+        let output_name = profile.outputs.get("embedding").ok_or_else(|| {
+            invalid(format!(
+                "profiles.{name}.outputs.embedding must name the workflow's embedding tensor"
+            ))
+        })?;
+        let output=workflow.outputs.get(output_name).ok_or_else(||invalid(format!("profiles.{name}.outputs.embedding references undeclared workflow output '{output_name}'")))?;
+        let shape = &output.contract.shape;
+        if output.role != WorkflowOutputRole::Tensor
+            || !matches!(
+                output.contract.dtype.as_str(),
+                "float16" | "bfloat16" | "float32"
+            )
+        {
+            return Err(invalid(format!(
+                "profiles.{name}.outputs.embedding '{output_name}' must be a float16/bfloat16/float32 tensor; declare a floating embedding output"
+            )));
+        }
+        match &profile.pooling {
+            Some(pooling) if !(2..=3).contains(&shape.len()) || pooling.axis != shape.len() - 2 => {
+                return Err(invalid(format!(
+                    "profiles.{name}.pooling.axis must reduce the sequence axis of [sequence,features] or [batch,sequence,features]; found axis {} and shape {shape:?}",
+                    pooling.axis
+                )));
+            }
+            None if !(1..=2).contains(&shape.len()) => {
+                return Err(invalid(format!(
+                    "profiles.{name}.outputs.embedding must be a final [features] or [batch,features] vector without pooling; declare pooling for a sequence tensor"
+                )));
+            }
+            _ => {}
+        }
+        if shape
+            .iter()
+            .any(|dim| matches!(dim,TensorDimension::Fixed(n) if *n<=0))
+        {
+            return Err(invalid(format!(
+                "profiles.{name} embedding output '{output_name}' must have positive fixed dimensions; found {shape:?}"
+            )));
+        }
+        let has_batch = shape.len() == if profile.pooling.is_some() { 3 } else { 2 };
+        if has_batch && matches!(shape[0],TensorDimension::Fixed(n) if n!=1) {
+            return Err(invalid(format!(
+                "profiles.{name} output '{output_name}' must accept one request batch row; found {shape:?}"
+            )));
+        }
+        resolved = Some(EmbeddingContract {
+            output: output_name.clone(),
+            pooling: profile.pooling.clone(),
+        });
+    }
+    Ok(resolved)
+}
+
+#[cfg(test)]
+mod embedding_tests {
+    use super::*;
+    fn metadata() -> InferenceMetadata {
+        let mut doc = crate::parser::parse_metadata(
+            include_str!(
+                "../../../tests/fixtures/onnx_genai_workflows/adapter/inference_metadata.yaml"
+            ),
+            Some("yaml"),
+        )
+        .unwrap();
+        doc.profiles.insert(
+            "vectors".into(),
+            serde_yaml::from_str("kind: embedding\nversion: '1'\noutputs: {embedding: result}\n")
+                .unwrap(),
+        );
+        doc
+    }
+    #[test]
+    fn embedding_profile_resolves_vectors_and_explicit_pooling() {
+        let mut doc = metadata();
+        let contract = embedding_contract(&doc).unwrap().unwrap();
+        assert_eq!(contract.output, "result");
+        assert!(contract.pooling.is_none());
+        doc.pipeline
+            .as_mut()
+            .unwrap()
+            .workflow
+            .outputs
+            .get_mut("result")
+            .unwrap()
+            .contract
+            .shape = vec![
+            TensorDimension::Fixed(1),
+            TensorDimension::Symbol("positions".into()),
+            TensorDimension::Symbol("features".into()),
+        ];
+        assert!(
+            embedding_contract(&doc)
+                .unwrap_err()
+                .to_string()
+                .contains("declare pooling")
+        );
+        doc.profiles.get_mut("vectors").unwrap().pooling = Some(crate::PoolingSpec {
+            kind: crate::PoolingKind::Mean,
+            axis: 1,
+            normalize: true,
+        });
+        assert!(
+            embedding_contract(&doc)
+                .unwrap()
+                .unwrap()
+                .pooling
+                .unwrap()
+                .normalize
+        );
+        doc.profiles
+            .get_mut("vectors")
+            .unwrap()
+            .pooling
+            .as_mut()
+            .unwrap()
+            .axis = 2;
+        assert!(
+            embedding_contract(&doc)
+                .unwrap_err()
+                .to_string()
+                .contains("sequence axis")
+        );
+    }
+    #[test]
+    fn embedding_profile_refuses_ambiguity_versions_types_and_missing_outputs() {
+        let mut doc = metadata();
+        doc.profiles
+            .insert("duplicate".into(), doc.profiles["vectors"].clone());
+        assert!(
+            embedding_contract(&doc)
+                .unwrap_err()
+                .to_string()
+                .contains("more than one")
+        );
+        doc.profiles.remove("duplicate");
+        doc.profiles.get_mut("vectors").unwrap().version = "2".into();
+        assert!(
+            embedding_contract(&doc)
+                .unwrap_err()
+                .to_string()
+                .contains("version")
+        );
+        doc.profiles.get_mut("vectors").unwrap().requirement = ProfileRequirement::Ignorable;
+        assert!(embedding_contract(&doc).unwrap().is_none());
+        doc.profiles.get_mut("vectors").unwrap().version = "1".into();
+        doc.profiles.get_mut("vectors").unwrap().outputs.clear();
+        assert!(
+            embedding_contract(&doc)
+                .unwrap_err()
+                .to_string()
+                .contains("outputs.embedding")
+        );
+        doc.profiles
+            .get_mut("vectors")
+            .unwrap()
+            .outputs
+            .insert("embedding".into(), "result".into());
+        doc.pipeline
+            .as_mut()
+            .unwrap()
+            .workflow
+            .outputs
+            .get_mut("result")
+            .unwrap()
+            .contract
+            .dtype = "int64".into();
+        assert!(
+            embedding_contract(&doc)
+                .unwrap_err()
+                .to_string()
+                .contains("float16/bfloat16/float32")
+        );
+    }
+}
+
+#[cfg(test)]
+mod ignored_profile_tests {
+    #[test]
+    fn unsupported_ignorable_profile_skips_its_output_and_decoding_contract() {
+        let mut doc = crate::parser::parse_metadata(
+            include_str!(
+                "../../../tests/fixtures/onnx_genai_workflows/adapter/inference_metadata.yaml"
+            ),
+            Some("yaml"),
+        )
+        .unwrap();
+        for kind in ["embedding", "reranking"] {
+            doc.profiles.insert("future".into(),serde_yaml::from_str(&format!("kind: {kind}\nversion: '99'\nrequirement: ignorable\noutputs: {{embedding: absent}}\npooling: {{kind: mean, axis: 999}}\ndecoding: {{kind: ctc, time_axis: 0, class_axis: 0}}\n")).unwrap());
+            crate::validation::validate_metadata(&doc).unwrap();
+        }
     }
 }

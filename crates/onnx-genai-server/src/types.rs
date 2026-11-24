@@ -36,6 +36,8 @@ pub struct EmbeddingRequest {
     pub encoding_format: EmbeddingEncodingFormat,
     #[serde(default)]
     pub dimensions: Option<usize>,
+    #[serde(flatten)]
+    pub extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
