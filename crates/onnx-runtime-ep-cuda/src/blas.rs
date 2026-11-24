@@ -943,7 +943,7 @@ pub struct CaptureGemmPlan(PlannedMatmul);
 
 // SAFETY: cuBLASLt layout/descriptor handles are context-independent host
 // objects; the algorithm is a plain value. Launches are serialized by the
-// owning kernel's plan mutex (same rationale as `F32GemvPlan`).
+// owning kernel's plan mutex.
 unsafe impl Send for CaptureGemmPlan {}
 
 impl CaptureGemmPlan {

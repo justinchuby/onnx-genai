@@ -325,6 +325,31 @@ is disabled. Host and NVRTC limits are emitted from one definition, and the
 partial/merge arguments share the same borrowed backing. No extra pool, quota
 transaction, or per-launch allocation is introduced.
 
+### CUDA dense MatMul cached-plan preparation boundary
+
+F32 single-row decode and the other single-matrix cuBLASLt paths now share one
+internal cached-plan representation. The single decode slot and bounded dense
+MRU retain their original policies, actual-pointer algorithm selection and
+capture resources; this consolidation does not yet govern their private device
+scratch. Plan reuse still checks the selected alignment contract before launch.
+
+A complete scratch migration must first provide actual output layout facts
+before admission. The metadata helper selects with TypedMinimum alignment, while
+capture plans select with ActualAddress alignment; their selected workspace sizes
+need not order monotonically. The current execution-refinement hook has input
+views and canonical output metadata, but no output origin/alignment. Treating its
+metadata-only answer as an upper bound for the cached algorithm is unsound.
+
+Do not resolve this by claiming unknown capacity is zero, choosing a different
+algorithm, or reserving the fixed 32-MiB performance ceiling. Exhaustively planning
+all finite pointer-alignment classes is a possible true bound but introduces
+hundreds of cold heuristic queries per shape. The intended next boundary is an
+explicit deferred preparation result followed by exact planning from actual
+output storage, with the same selected host plan used by the borrowed-workspace
+launch. Native, eager and ORT dispatch must all preserve that ordering; ORT's
+metadata-plan cache must not memoize address-dependent refinements as geometry.
+No performance or CUDA numerical claim follows from this representation cleanup.
+
 ### CUDA quantized MatMul prefill temporary storage
 
 The portable FP16 RMSNorm, gate/up, and combined prefill paths borrow three
