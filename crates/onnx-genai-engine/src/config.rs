@@ -7,6 +7,7 @@ use onnx_genai_metadata::{GenerationContract, GenerationDefaults};
 use onnx_genai_ort::{Eagle3DraftKvMode, MtpDraftKvMode};
 use onnx_genai_scheduler::{Priority, ResourceLimit, ResourceLimits, SchedulerConfig};
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Error returned when a user-facing resource limit cannot be parsed.
@@ -1382,6 +1383,8 @@ pub struct GenerateOptions {
     pub eos_token_ids: Vec<TokenId>,
     /// Whether an end token terminates generation.
     pub stop_on_eos: bool,
+    /// Special IDs retained in output text; stopping roles remain unchanged.
+    pub preserved_tokens: BTreeSet<TokenId>,
     /// Optional maximum total context length (prompt + generated tokens).
     /// Used when model metadata does not declare `model.max_sequence_length`.
     pub max_context: Option<usize>,
@@ -1443,6 +1446,7 @@ impl Default for GenerateOptions {
             eot_token_id: None,
             eos_token_ids: Vec::new(),
             stop_on_eos: true,
+            preserved_tokens: BTreeSet::new(),
             max_context: None,
             num_speculative_tokens: None,
             speculative_mode: None,
@@ -1746,6 +1750,34 @@ pub enum GenerateConstraint {
 }
 
 impl GenerateOptions {
+    /// The request's selections plus the resolved model framing symbols.
+    pub fn effective_preserved_tokens(&self) -> BTreeSet<TokenId> {
+        let mut selected = self.preserved_tokens.clone();
+        if let Some(ids) = self
+            .response_projection
+            .as_ref()
+            .and_then(|projection| projection.preserved_tokens())
+        {
+            selected.extend(ids);
+        }
+        selected
+    }
+    /// Validate output token selection against the actual model vocabulary.
+    pub fn validate_preserved_tokens(
+        &self,
+        tokenizer: &onnx_genai_ort::Tokenizer,
+    ) -> anyhow::Result<()> {
+        if let Some(projection) = &self.response_projection {
+            projection.validate_tokenizer(tokenizer)?;
+        }
+        for id in self.effective_preserved_tokens() {
+            anyhow::ensure!(
+                tokenizer.inner().id_to_token(id).is_some(),
+                "preserved_tokens contains absent token ID {id}; choose IDs from the model tokenizer vocabulary"
+            );
+        }
+        Ok(())
+    }
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.max_new_tokens == 0 {
             anyhow::bail!("max_new_tokens must be greater than zero");
@@ -2139,6 +2171,8 @@ pub struct GenerationBudgetCap {
 pub struct GenerateResult {
     /// Detokenized generated text.
     pub text: String,
+    /// Resolved output policy used when reconstructing per-token publication.
+    pub preserved_tokens: BTreeSet<TokenId>,
     /// Generated token ids, excluding prompt tokens.
     pub token_ids: Vec<TokenId>,
     /// Termination reason.

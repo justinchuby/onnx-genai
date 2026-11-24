@@ -800,7 +800,7 @@ async fn run_chat_completion(
     let logprobs = chat_logprobs(&result, &tokenizer, requested_top_logprobs)
         .map_err(|error| ApiError::internal(format!("logprobs conversion failed: {error}")))?;
     let output = projection
-        .buffered(&result, &tokenizer)
+        .buffered(&result)
         .map_err(|error| ApiError::internal(format!("response parsing failed: {error:#}")))?;
     let tool_calls = committed_chat_tool_calls(&result);
     let content = if tool_calls.is_some() {
@@ -946,11 +946,10 @@ async fn stream_chat_completion(
                 event = driver_rx.recv() => event,
             } {
                 Some(DriverEvent::Token(token)) => {
-                    let revealed =
-                        match channel_gate.push_token(&tokenizer, token.token_id, &token.text) {
-                            Ok(delta) => delta,
-                            Err(error) => break Err(StreamOutputFailure::Projection(error)),
-                        };
+                    let revealed = match channel_gate.push_text(&token.text) {
+                        Ok(delta) => delta,
+                        Err(error) => break Err(StreamOutputFailure::Projection(error)),
+                    };
                     if !revealed.reasoning.is_empty() {
                         send_stream_chunk(
                             &tx,
@@ -1007,7 +1006,7 @@ async fn stream_chat_completion(
                     )
                     .await?;
                 } else {
-                    let remaining = match channel_gate.finish(&tokenizer) {
+                    let remaining = match channel_gate.finish(&result.text) {
                         Ok(delta) => delta,
                         Err(error) => {
                             send_projection_error(&tx, error).await?;
@@ -1099,8 +1098,7 @@ async fn stream_declared_tool_chat_completion(
             event = driver_rx.recv() => event,
         } {
             Some(DriverEvent::Token(token)) => {
-                let revealed = match channel_gate.push_token(tokenizer, token.token_id, &token.text)
-                {
+                let revealed = match channel_gate.push_text(&token.text) {
                     Ok(delta) => delta,
                     Err(error) => break Err(StreamOutputFailure::Projection(error)),
                 };
@@ -1127,7 +1125,7 @@ async fn stream_declared_tool_chat_completion(
 
     match result {
         Ok(result) => {
-            let remaining = match channel_gate.finish(tokenizer) {
+            let remaining = match channel_gate.finish(&result.text) {
                 Ok(delta) => delta,
                 Err(error) => {
                     send_projection_error(tx, error).await?;
@@ -2159,6 +2157,7 @@ fn prepare_generate_request(
                 template.clone(),
                 prompt.clone(),
                 response_buffer_bytes,
+                Some(tokenizer),
             )?,
         );
     }
@@ -2471,6 +2470,23 @@ pub(super) fn build_generate_options_with_tokenizer(
             }
         }
     }
+    for spelling in &request.preserved_tokens {
+        let ids = tokenizer
+            .encode_with_options(
+                spelling,
+                onnx_genai_ort::TokenizationOptions {
+                    add_special: false,
+                    parse_special: true,
+                },
+            )
+            .with_context(|| {
+                format!("preserved_tokens spelling {spelling:?} could not be tokenized")
+            })?;
+        if let [id] = ids.as_slice() {
+            options.preserved_tokens.insert(*id);
+        }
+    }
+    options.validate_preserved_tokens(tokenizer)?;
     options.validate_logit_bias(tokenizer)?;
     if let Some(dry) = &mut options.dry {
         for (index, breaker) in request.dry_sequence_breakers.iter().enumerate() {
@@ -2837,28 +2853,15 @@ impl ChatProjection {
                 })
                 .transpose()?,
             stop_buffer: StopBoundaryBuffer::new(self.stop_sequences.clone()),
-            decoder: onnx_genai_engine::tokenization::TokenTextDecoder::new(
-                onnx_genai_engine::tokenization::SpecialTokenHandling::Preserve,
-            ),
+            generated: String::new(),
         })
     }
-    fn buffered(
-        &self,
-        result: &GenerateResult,
-        tokenizer: &Tokenizer,
-    ) -> anyhow::Result<ChannelDelta> {
+    fn buffered(&self, result: &GenerateResult) -> anyhow::Result<ChannelDelta> {
         let Some(template) = &self.template else {
             return Ok(ChannelDelta {
                 content: text_before_stop(&result.text, &self.stop_sequences).to_owned(),
                 reasoning: String::new(),
             });
-        };
-        let raw = if result.token_ids.is_empty() {
-            result.text.clone()
-        } else {
-            tokenizer
-                .decode_with_special_tokens(&result.token_ids)
-                .context("decode generated response with declared protocol markers")?
         };
         let mut parser = response_template::ResponseParser::new(
             template.clone(),
@@ -2866,7 +2869,7 @@ impl ChatProjection {
             self.prefix_output,
             self.max_bytes,
         )?;
-        let output = parser.preview(text_before_stop(&raw, &self.stop_sequences), true)?;
+        let output = parser.preview(text_before_stop(&result.text, &self.stop_sequences), true)?;
         Ok(ChannelDelta {
             content: output.content,
             reasoning: output.reasoning,
@@ -2877,7 +2880,7 @@ impl ChatProjection {
 struct ChannelGate {
     stop_buffer: StopBoundaryBuffer,
     parser: Option<response_template::ResponseParser>,
-    decoder: onnx_genai_engine::tokenization::TokenTextDecoder,
+    generated: String,
 }
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ChannelDelta {
@@ -2885,39 +2888,35 @@ struct ChannelDelta {
     reasoning: String,
 }
 impl ChannelGate {
-    fn push_token(
-        &mut self,
-        tokenizer: &Tokenizer,
-        id: u32,
-        plain: &str,
-    ) -> anyhow::Result<ChannelDelta> {
+    fn push_text(&mut self, text: &str) -> anyhow::Result<ChannelDelta> {
+        self.generated.push_str(text);
+        let safe = self.stop_buffer.push(text);
         let Some(parser) = &mut self.parser else {
             return Ok(ChannelDelta {
-                content: self.stop_buffer.push(plain),
+                content: safe,
                 reasoning: String::new(),
             });
         };
-        let raw = self.decoder.step(tokenizer, id)?;
-        let delta = parser.feed(&self.stop_buffer.push(&raw))?;
+        let delta = parser.feed(&safe)?;
         Ok(ChannelDelta {
             content: delta.content,
             reasoning: delta.reasoning,
         })
     }
-    fn finish(mut self, tokenizer: &Tokenizer) -> anyhow::Result<ChannelDelta> {
+    fn finish(mut self, final_text: &str) -> anyhow::Result<ChannelDelta> {
+        let tail=final_text.strip_prefix(&self.generated).context("committed response text does not extend its published token text; repair the tokenizer's incremental output contract")?;
+        let mut safe = self.stop_buffer.push(tail);
+        safe.push_str(&self.stop_buffer.flush());
         let Some(mut parser) = self.parser.take() else {
             return Ok(ChannelDelta {
-                content: self.stop_buffer.flush(),
+                content: safe,
                 reasoning: String::new(),
             });
         };
-        let raw = self.decoder.finish(tokenizer)?;
-        let mut safe = self.stop_buffer.push(&raw);
-        safe.push_str(&self.stop_buffer.flush());
         let mut output = parser.feed(&safe)?;
-        let tail = parser.finish()?;
-        output.content.push_str(&tail.content);
-        output.reasoning.push_str(&tail.reasoning);
+        let end = parser.finish()?;
+        output.content.push_str(&end.content);
+        output.reasoning.push_str(&end.reasoning);
         Ok(ChannelDelta {
             content: output.content,
             reasoning: output.reasoning,
@@ -3052,8 +3051,11 @@ async fn send_completion_logprob_chunks(
     let (id, created, model, choice_index) = response;
     let logprobs = completion_logprobs(result, tokenizer, Some(requested_top_logprobs))?
         .context("requested completion logprobs were not built")?;
-    let stream_text =
-        onnx_genai_engine::tokenization::token_texts(Some(tokenizer), &result.token_ids)?;
+    let stream_text = onnx_genai_engine::tokenization::token_texts(
+        Some(tokenizer),
+        &result.token_ids,
+        &result.preserved_tokens,
+    )?;
     let visible_text = truncate_tokens_at_stop(&stream_text, stop_sequences);
     for (index, text) in visible_text.into_iter().enumerate() {
         if text.is_empty() {
@@ -3096,15 +3098,18 @@ async fn send_chat_logprob_chunks(
     // logprob entry aligned by index, rather than being dropped here.
     let prepare = || -> anyhow::Result<(Vec<String>, String)> {
         let mut gate = projection.start()?;
-        let plain =
-            onnx_genai_engine::tokenization::token_texts(Some(tokenizer), &result.token_ids)?;
+        let plain = onnx_genai_engine::tokenization::token_texts(
+            Some(tokenizer),
+            &result.token_ids,
+            &result.preserved_tokens,
+        )?;
         let mut reasoning = String::new();
         let mut text = Vec::with_capacity(result.token_ids.len());
-        for (&token_id, plain) in result.token_ids.iter().zip(&plain) {
-            let delta = gate.push_token(tokenizer, token_id, plain)?;
+        for plain in &plain {
+            let delta = gate.push_text(plain)?;
             text.push(delta.content);
         }
-        let tail = gate.finish(tokenizer)?;
+        let tail = gate.finish(&result.text)?;
         if let Some(last) = text.last_mut() {
             last.push_str(&tail.content);
         }
@@ -3885,12 +3890,8 @@ mod channel_gate_tests {
             max_bytes: 4096,
             stop_sequences: Vec::new(),
         };
-        let tokenizer = Tokenizer::from_file(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tests/fixtures/tiny-llm/tokenizer.json"),
-        )
-        .unwrap();
         let result = GenerateResult {
+            preserved_tokens: Default::default(),
             text: "</c><c>".into(),
             token_ids: Vec::new(),
             finish_reason: onnx_genai_engine::FinishReason::MaxTokens,
@@ -3900,7 +3901,7 @@ mod channel_gate_tests {
             budget_cap: None,
         };
         assert_eq!(
-            projection.buffered(&result, &tokenizer).unwrap(),
+            projection.buffered(&result).unwrap(),
             ChannelDelta::default()
         );
     }
@@ -3915,14 +3916,9 @@ mod channel_gate_tests {
             stop_sequences: Vec::new(),
         };
         let mut gate = projection.start().unwrap();
-        let tokenizer = Tokenizer::from_file(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tests/fixtures/tiny-llm/tokenizer.json"),
-        )
-        .unwrap();
         let text = "to=self<|message|>ordinary text";
-        assert_eq!(gate.push_token(&tokenizer, 0, text).unwrap().content, text);
-        assert_eq!(gate.finish(&tokenizer).unwrap(), ChannelDelta::default());
+        assert_eq!(gate.push_text(text).unwrap().content, text);
+        assert_eq!(gate.finish(text).unwrap(), ChannelDelta::default());
     }
 }
 

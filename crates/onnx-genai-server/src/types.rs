@@ -185,7 +185,7 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub grammar_triggers: Vec<serde_json::Value>,
     #[serde(default)]
-    pub preserved_tokens: Vec<serde_json::Value>,
+    pub preserved_tokens: Vec<String>,
     #[serde(default)]
     pub tools: Option<Vec<ChatTool>>,
     #[serde(default)]
@@ -383,10 +383,6 @@ impl ChatCompletionRequest {
         anyhow::ensure!(
             self.grammar_triggers.is_empty(),
             "grammar_triggers are not supported yet; send [] or omit grammar triggers"
-        );
-        anyhow::ensure!(
-            self.preserved_tokens.is_empty(),
-            "preserved_tokens for grammar decoding are not supported yet; send [] or omit the field"
         );
         let Some(grammar) = self
             .grammar

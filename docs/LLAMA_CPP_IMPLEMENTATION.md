@@ -1416,3 +1416,38 @@ and floating-point-underflow encoding assertions. Lazy activation,
 preserved tokens, slot/adapter persistence, model management/audio and the full
 acceptance matrix remain open; neither this increment nor a parent PR merge
 completes the overall goal.
+
+
+### Preserved-token prerequisite for lazy activation
+
+The pinned `common_sampling_add_grammar_triggers` requires a single-token word
+trigger to appear in `preserved_tokens`. That option also affects rendered
+special-token output; accepting it only as a grammar flag would lose real
+semantics. This increment resolves the spellings against actual model vocabulary
+and carries an immutable selection through live decoding and result publication.
+
+`TokenTextDecoder` filters unselected special IDs before its request-local stream
+decoder. Retained IDs are decoded together, preserving codec lookbehind without
+changing shared tokenizer flags. Final text and per-token replay use the same
+selection, including ordinary/native speculative verification, continuous rows,
+candidate-tree and DFlash publication. Results retain the resolved policy so
+protocol logprob chunks cannot reconstruct text using a different policy.
+
+A projection binds model-declared framing symbols to its tokenizer and unions
+those IDs with request selections. Literal boundaries resolve canonically;
+regex fragments can declare `response_template.preserved_tokens` explicitly.
+The chat channel gate consumes the engine's filtered text instead of decoding
+token IDs through an independent special-token policy. Buffered projection uses
+the committed result text. This keeps undeclared special tokens out of content
+without dropping the model's declared reasoning and tool frames.
+
+Validation passed: engine 952 / 1 inherited ignore, server 450 / 2 inherited
+ignores, HTTP 37 and CLI 71. Coverage includes ByteLevel/ByteFallback Unicode,
+decoder forks, invalid engine IDs, continuous-result policy and actual Native
+CPU/ORT requests across three endpoints with buffered/SSE and probability output.
+Self-review also fenced malformed framing decoder panics with actionable errors;
+the full engine suite passed again after that regression was added. Strict
+all-target engine/server/CLI Clippy passed on the final source. The Native
+benchmark API consumer compiled, without running a benchmark. Formatting and
+diff checks passed. Active lazy activation and triggers remain required
+follow-ups; the broader goal is open.

@@ -502,8 +502,8 @@ actionable capability error before SSE.
 
 Both raw grammar forms conflict with JSON `response_format`, forced `tool_choice`, and
 `ignore_eos=true`. Neutral `grammar_lazy=false`, `grammar_triggers=[]` and
-`preserved_tokens=[]` are accepted. Active lazy grammars, triggers, preserved
-tokens remain open compatibility work. Native probability reporting is described below.
+`preserved_tokens=[]` are accepted. Active lazy grammars and triggers remain
+open compatibility work. Request-local token preservation is described below. Native probability reporting is described below.
 
 
 ## Native token probabilities
@@ -522,3 +522,22 @@ their own IDs, decoded byte pieces and score. Invalid UTF-8 suffixes are omitted
 from `token` while original `bytes` remain intact. Zero probabilities use a
 finite lowest log-probability in JSON; processed alternatives with zero mass
 are excluded.
+
+
+## Preserved output tokens
+
+`preserved_tokens` accepts token spellings on chat, legacy and native completion
+requests. Each spelling is encoded with the requested model, without automatic
+BOS/EOS and with registered special tokens enabled. A spelling that resolves to
+one ID is retained in output; spellings resolving to multiple or no tokens are
+ignored, matching the pinned upstream normalization. Duplicate selections are
+collapsed. Token ending roles and stopping controls are unchanged.
+
+Preservation belongs to the request. A resolved `response_template` also retains
+its declared model framing symbols so reasoning/content/tool projection receives
+the same decoded text as generation. Literal boundary tokens are resolved from
+the tokenizer; regex boundaries can declare individual registered spellings in
+`response_template.preserved_tokens`. Other special IDs remain hidden. The model
+tokenizer is not mutated, and buffered/SSE output uses the same policy, including
+logprob delivery and transactional publication. UTF-8 decoder lookbehind remains
+request-local. Raw grammar recognition continues to inspect model bytes and IDs.
