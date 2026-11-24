@@ -892,6 +892,14 @@ fn gather_elements_negative_axis_and_indices() {
     assert_eq!(f32s(&out[0]), vec![3., 1., 6., 5.]);
 }
 
+fn legacy_scatter_elements_opset(reduction: &str) -> u64 {
+    match reduction {
+        "none" => 11,
+        "max" | "min" => 18,
+        _ => 16,
+    }
+}
+
 fn scatter(reduction: &str) -> Vec<f32> {
     let attrs = if reduction == "none" {
         vec![("axis", Attribute::Int(-1))]
@@ -903,11 +911,7 @@ fn scatter(reduction: &str) -> Vec<f32> {
     };
     let out = run(
         "ScatterElements",
-        match reduction {
-            "none" => 11,
-            "max" | "min" => 18,
-            _ => 16,
-        },
+        legacy_scatter_elements_opset(reduction),
         &[
             tensor(DataType::Float32, &[3], &[10_f32, 20., 30.]),
             tensor(DataType::Int64, &[3], &[1_i64, 1, -3]),
@@ -1203,7 +1207,7 @@ fn scatter_elements_fp16_data_matches_cpu_oracle() {
                 ("reduction", Attribute::String(reduction.into())),
             ]
         };
-        let opset = if reduction == "none" { 11 } else { 16 };
+        let opset = legacy_scatter_elements_opset(reduction);
         let gpu = run(
             "ScatterElements",
             opset,
@@ -1245,7 +1249,7 @@ fn scatter_elements_int32_indices_match_cpu_oracle() {
                 ("reduction", Attribute::String(reduction.into())),
             ]
         };
-        let opset = if reduction == "none" { 11 } else { 16 };
+        let opset = legacy_scatter_elements_opset(reduction);
         let gpu = run(
             "ScatterElements",
             opset,
