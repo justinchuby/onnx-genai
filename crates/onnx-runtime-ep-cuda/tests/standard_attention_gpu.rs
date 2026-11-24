@@ -15,17 +15,18 @@
 //! CUDA conformance tests for router/mask indexing and scan operators.
 
 mod common;
+#[path = "fixtures/standard_attention_windows.rs"]
+mod standard_attention_windows;
 
 use half::f16;
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, EpError, ExecutionProvider, KernelMatch, Result,
     TensorMut, TensorView,
 };
-use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ir::{
-    Attribute, DataType, DeviceId, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
+    Attribute, DataType, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
 };
 use onnx_runtime_loader::Model;
 
@@ -623,109 +624,6 @@ fn run_result_core_inner(
         )));
     }
     Ok(result)
-}
-
-fn run_cpu_opt(
-    op: &str,
-    opset: u64,
-    inputs: &[Option<Tensor>],
-    outputs: &[(DataType, Vec<usize>)],
-    attrs: &[(&str, Attribute)],
-) -> Vec<Vec<u8>> {
-    let mut graph = Graph::new();
-    graph.opset_imports.insert(String::new(), opset);
-    let input_values = inputs
-        .iter()
-        .enumerate()
-        .map(|(i, input)| {
-            input.as_ref().map(|input| {
-                let value = graph.create_named_value(
-                    format!("input_{i}"),
-                    input.dtype,
-                    static_shape(input.shape.iter().copied()),
-                );
-                graph.add_input(value);
-                value
-            })
-        })
-        .collect::<Vec<_>>();
-    let output_values = outputs
-        .iter()
-        .enumerate()
-        .map(|(i, (dtype, shape))| {
-            graph.create_named_value(
-                format!("output_{i}"),
-                *dtype,
-                static_shape(shape.iter().copied()),
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut node = Node::new(
-        NodeId(0),
-        op,
-        input_values.into_iter().collect(),
-        output_values.clone(),
-    );
-    for (name, value) in attrs {
-        node.attributes.insert((*name).into(), value.clone());
-    }
-    let node_id = graph.insert_node(node);
-    for output in output_values {
-        graph.add_output(output);
-    }
-    let model = Model::new(&graph);
-    let kernel = CpuExecutionProvider::new()
-        .get_kernel(model.graph.node(node_id), &[], opset)
-        .unwrap();
-
-    let input_strides = inputs
-        .iter()
-        .map(|input| {
-            input
-                .as_ref()
-                .map(|input| compute_contiguous_strides(&input.shape))
-                .unwrap_or_default()
-        })
-        .collect::<Vec<_>>();
-    let input_views = inputs
-        .iter()
-        .zip(&input_strides)
-        .map(|(input, strides)| match input {
-            Some(input) => TensorView::new(
-                DevicePtr(input.bytes.as_ptr().cast()),
-                input.dtype,
-                &input.shape,
-                strides,
-                DeviceId::cpu(),
-            ),
-            None => TensorView::absent(DataType::Float32),
-        })
-        .collect::<Vec<_>>();
-    let mut output_buffers = outputs
-        .iter()
-        .map(|(dtype, shape)| vec![0; dtype.storage_bytes(shape.iter().product())])
-        .collect::<Vec<_>>();
-    let output_strides = outputs
-        .iter()
-        .map(|(_, shape)| compute_contiguous_strides(shape))
-        .collect::<Vec<_>>();
-    let mut output_views = outputs
-        .iter()
-        .zip(output_buffers.iter_mut())
-        .zip(&output_strides)
-        .map(|(((dtype, shape), bytes), strides)| {
-            TensorMut::new(
-                DevicePtrMut(bytes.as_mut_ptr().cast()),
-                *dtype,
-                shape,
-                strides,
-                DeviceId::cpu(),
-            )
-        })
-        .collect::<Vec<_>>();
-    kernel.execute(&input_views, &mut output_views).unwrap();
-    drop(output_views);
-    output_buffers
 }
 
 fn f32s(bytes: &[u8]) -> Vec<f32> {
@@ -2053,113 +1951,25 @@ fn standard_attention_opset24_nonpad_kv_seqlen_masks_padding_and_offsets_causal(
     );
 }
 
-// Zero Q/K makes every allowed key equally weighted, so these oracles are
-// independent of either kernel's score calculations and mask implementation.
-fn assert_attention25_window_cases(
-    run: impl Fn(
-        &str,
-        u64,
-        &[Option<Tensor>],
-        &[(DataType, Vec<usize>)],
-        &[(&str, Attribute)],
-    ) -> Vec<Vec<u8>>,
-) {
-    let f = DataType::Float32;
-    let t = |b, s, values: &[f32]| Some(tensor(f, &[b, 1, s, 1], values));
-    let attrs = |left, right, causal| {
-        [
-            ("left_window_size", Attribute::Int(left)),
-            ("right_window_size", Attribute::Int(right)),
-            ("is_causal", Attribute::Int(causal)),
-        ]
-    };
-    let no_cache = [
-        t(1, 3, &[0.; 3]),
-        t(1, 4, &[0.; 4]),
-        t(1, 4, &[2., 4., 8., 16.]),
-    ];
-    let shape = [(f, vec![1, 1, 3, 1])];
-    for (left, right, expected) in [
-        (0, 1, [3., 6., 12.]),
-        (1, 0, [2., 3., 6.]),
-        (-1, 0, [2., 3., 14. / 3.]),
-        (0, i64::MAX, [7.5, 28. / 3., 12.]),
-    ] {
-        let out = run("Attention", 25, &no_cache, &shape, &attrs(left, right, 0));
-        assert_close(&f32s(&out[0]), &expected);
-    }
-
-    // Internal cache shifts the center by two past keys. A boolean mask
-    // removes the current key of query 0; causal removes its future key.
-    let internal = [
-        t(1, 2, &[1., 2.]),
-        t(1, 2, &[3., 4.]),
-        t(1, 2, &[8., 16.]),
-        Some(tensor(DataType::Bool, &[4], &[1u8, 1, 0, 1])),
-        t(1, 2, &[1., 2.]),
-        t(1, 2, &[2., 4.]),
-    ];
-    let output_shapes = [
-        (f, vec![1, 1, 2, 1]),
-        (f, vec![1, 1, 4, 1]),
-        (f, vec![1, 1, 4, 1]),
-        (f, vec![1, 1, 2, 4]),
-    ];
-    for mode in 0..=3 {
-        let mut a = attrs(1, 2, 1).to_vec();
-        a.push(("qk_matmul_output_mode", Attribute::Int(mode)));
-        let result = run("Attention", 25, &internal, &output_shapes, &a);
-        assert_close(&f32s(&result[0]), &[4., 16.]);
-        assert_eq!(f32s(&result[1]), [1., 2., 3., 4.]);
-        assert_eq!(f32s(&result[2]), [2., 4., 8., 16.]);
-        let n = f32::NEG_INFINITY;
-        let expected = match mode {
-            0 | 1 => [1., 2., 3., 4., 2., 4., 6., 8.],
-            2 => [n, 2., n, n, n, n, n, 8.],
-            3 => [0., 1., 0., 0., 0., 0., 0., 1.],
-            _ => unreachable!(),
-        };
-        assert_eq!(f32s(&result[3]), expected);
-    }
-    // External offsets differ per batch (+2, -1), including an empty row.
-    // Additive rank-1 mask excludes key 1; out-of-padding V has large values.
-    let external = [
-        t(2, 2, &[0.; 4]),
-        t(2, 5, &[0.; 10]),
-        t(2, 5, &[2., 4., 8., 16., 256., 32., 64., 128., 256., 512.]),
-        Some(tensor(f, &[5], &[0., f32::NEG_INFINITY, 0., 0., 0.])),
-        None,
-        None,
-        Some(tensor(DataType::Int64, &[2], &[4i64, 1])),
-    ];
-    let result = run(
-        "Attention",
-        25,
-        &external,
-        &[(f, vec![2, 1, 2, 1])],
-        &attrs(1, 0, 0),
-    );
-    assert_close(&f32s(&result[0]), &[8., 12., 0., 32.]);
-}
-
-// This CPU oracle belongs to the cross-EP CUDA conformance target. Run it
-// explicitly with gpu-tests even on Host; ordinary Host runs skip this target.
-#[cfg_attr(
-    not(feature = "gpu-tests"),
-    ignore = "cross-EP conformance oracle; enable gpu-tests to run the CPU reference"
-)]
-#[test]
-fn standard_attention_opset25_windows_cpu() {
-    assert_attention25_window_cases(run_cpu_opt);
-}
-
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
 fn standard_attention_opset25_windows_cuda() {
-    assert_attention25_window_cases(run_opt);
+    standard_attention_windows::assert_cases(|inputs, outputs, attrs| {
+        let inputs = inputs
+            .iter()
+            .map(|input| {
+                (!input.absent).then(|| Tensor {
+                    dtype: input.dtype,
+                    shape: input.shape.clone(),
+                    bytes: input.bytes.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        run_opt("Attention", 25, &inputs, outputs, attrs)
+    });
 }
 
 #[test]
