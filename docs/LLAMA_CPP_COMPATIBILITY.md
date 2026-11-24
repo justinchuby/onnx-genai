@@ -1,5 +1,9 @@
 # llama.cpp protocol compatibility
 
+The [generated endpoint registration matrix](LLAMA_CPP_ENDPOINT_MATRIX.md) inventories
+all 55 static upstream method/path contracts, including aliases and conditional routes.
+Its route-presence results are separate from the behavioral evidence below.
+
 Native execution is enabled and selected by default in the engine, facade, CLI
 and server. ORT is an explicitly selected reference backend for tests and
 comparisons: use `--backend ort` or `EngineDecodeBackend::Ort`. Native failures
