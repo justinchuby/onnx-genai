@@ -838,7 +838,7 @@ fn cudnn_rewarm_execution_failure_preserves_a_capture_snapshot() {
 /// private resources belonging to the last successful warm.
 ///
 /// Sequence:
-/// 1. warm signature A and record its exact three metadata owners;
+/// 1. warm signature A and record its one combined metadata owner;
 /// 2. fail before arity/shape validation can establish a replacement;
 /// 3. capture A, proving the same owners were retained at begin-capture;
 /// 4. drop A's kernel, warm a different signature B, then replay A;
@@ -897,8 +897,8 @@ fn failed_reduce_call_preserves_capture_signature_resources_through_drop_rewarm_
         let resources = kernel_a.device_graph_resources();
         assert_eq!(
             resources.len(),
-            3,
-            "NVRTC reduction warm must publish base, delta, and axes owners"
+            1,
+            "NVRTC reduction warm must publish one owner covering base, delta, and axes"
         );
         resources
             .iter()
@@ -1016,7 +1016,7 @@ fn failed_reduce_call_preserves_capture_signature_resources_through_drop_rewarm_
     assert!(
         runtime.allocation_counts().frees > counts_before_reset.frees
             || runtime.raw_pool_retained_bytes() > pooled_before_reset,
-        "graph reset must release A's retained base/delta/axes owners"
+        "graph reset must release A's retained base/delta/axes payload owner"
     );
 
     if let Some(workspace) = workspace_a.take() {
@@ -1205,4 +1205,124 @@ fn float_reduce_shape_change_under_capture_is_rejected() {
     for buffer in [out_b, data_b, out_a, data_a, axes] {
         ep.deallocate(buffer).expect("free CUDA test buffer");
     }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable gpu-tests"
+)]
+#[test]
+fn nvrtc_reduce_uses_one_metadata_payload_upload_and_capture_owner() {
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let shape = [2usize, 3];
+    let input_values = [1i64, -3, 7, 5, 2, 4];
+    let input = ep
+        .allocate(std::mem::size_of_val(&input_values), 256)
+        .unwrap();
+    let output = ep.allocate(2 * std::mem::size_of::<i64>(), 256).unwrap();
+    // SAFETY: real input storage exactly covers the synchronous upload.
+    unsafe {
+        runtime
+            .htod(&bytes(&input_values), cuptr(input.as_ptr()))
+            .unwrap();
+    }
+    let input_strides = compute_contiguous_strides(&shape);
+    let input_view = TensorView::new(
+        DevicePtr(input.as_ptr()),
+        DataType::Int64,
+        &shape,
+        &input_strides,
+        ep.device_id(),
+    );
+    // Retain each completed kernel so a previous payload cannot be recycled
+    // from the raw pool and hide another cold driver's allocation.
+    let mut kernels = Vec::new();
+    for axes in [Some(vec![1i64]), None] {
+        let (out_shape, expected) = if axes.is_some() {
+            (vec![2usize], vec![7i64, 5])
+        } else {
+            (vec![], vec![7i64])
+        };
+        let mut attributes = vec![("keepdims", Attribute::Int(0))];
+        if let Some(axes) = axes {
+            attributes.push(("axes", Attribute::Ints(axes)));
+        }
+        let tensor = common::input(DataType::Int64, &shape, &input_values);
+        let (graph, node) = common::build_graph(
+            "ReduceMax",
+            "",
+            11,
+            &[tensor],
+            &[(DataType::Int64, out_shape.clone())],
+            &attributes,
+        );
+        let model = Model::new(&graph);
+        let kernel = ep
+            .get_kernel(model.graph.node(node), &[shape.to_vec()], 11)
+            .unwrap();
+        let out_strides = compute_contiguous_strides(&out_shape);
+        let execute = || {
+            kernel.execute(
+                std::slice::from_ref(&input_view),
+                &mut [TensorMut::new(
+                    DevicePtrMut(output.as_ptr() as *mut _),
+                    DataType::Int64,
+                    &out_shape,
+                    &out_strides,
+                    ep.device_id(),
+                )],
+            )
+        };
+        let before = runtime.allocation_counts();
+        let transfers = runtime.transfer_counts();
+        execute().unwrap();
+        assert_eq!(
+            runtime.allocation_counts().allocations,
+            before.allocations + 1,
+            "base/delta/axes share one new immutable owner"
+        );
+        assert_eq!(
+            runtime.transfer_counts().host_to_device,
+            transfers.host_to_device + 1,
+            "all metadata tables share one synchronous upload"
+        );
+        let resources = kernel.device_graph_resources();
+        assert_eq!(resources.len(), 1);
+        let identity = resources[0].identity();
+        drop(resources);
+        let warmed = runtime.allocation_counts();
+        let transfers = runtime.transfer_counts();
+        for _ in 0..8 {
+            execute().unwrap();
+        }
+        assert_eq!(runtime.allocation_counts(), warmed);
+        assert_eq!(
+            runtime.transfer_counts(),
+            transfers,
+            "attribute-axes warm calls transfer no metadata or controls"
+        );
+        assert_eq!(kernel.device_graph_resources()[0].identity(), identity);
+        runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+        let recording = runtime.transfer_counts();
+        execute().unwrap();
+        assert_eq!(runtime.transfer_counts(), recording);
+        runtime.end_graph_capture().unwrap();
+        runtime.replay_graph().unwrap();
+        let mut result = vec![0; expected.len() * 8];
+        // SAFETY: live real output storage covers the synchronous readback.
+        unsafe {
+            runtime.dtoh(&mut result, cuptr(output.as_ptr())).unwrap();
+        }
+        let actual = result
+            .chunks_exact(8)
+            .map(|bytes| i64::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert!(runtime.reset_graph().unwrap());
+        kernels.push(kernel);
+    }
+    drop(kernels);
+    ep.deallocate(input).unwrap();
+    ep.deallocate(output).unwrap();
 }

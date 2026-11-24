@@ -56,8 +56,8 @@ use cudarc::driver::PushKernelArg;
 use cudarc::driver::sys::CUdeviceptr;
 
 use onnx_runtime_ep_api::{
-    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut,
-    TensorView, WorkspaceRequirement, WorkspaceView,
+    DeviceGraphResource, DevicePtrMut, EpError, Kernel, KernelFactory, Result, TensorMetadata,
+    TensorMut, TensorView, WorkspaceLayout, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
 
@@ -859,24 +859,59 @@ struct ReductionMetadataCache {
     current: Option<PreparedReductionMetadata>,
 }
 
+/// One immutable physical owner for the three tables consumed together.
 #[derive(Clone, Debug)]
 struct PreparedReductionMetadata {
     key: ReductionMetadataKey,
-    base: Arc<GraphDeviceAllocation>,
-    delta: Arc<GraphDeviceAllocation>,
-    axes: Arc<GraphDeviceAllocation>,
+    payload: Arc<GraphDeviceAllocation>,
+    base: CUdeviceptr,
+    delta: CUdeviceptr,
+    axes: CUdeviceptr,
 }
 
 impl PreparedReductionMetadata {
     fn pointers(&self) -> (CUdeviceptr, CUdeviceptr, CUdeviceptr) {
-        (self.base.ptr(), self.delta.ptr(), self.axes.ptr())
+        (self.base, self.delta, self.axes)
     }
-
     fn resources(&self) -> Vec<DeviceGraphResource> {
-        [&self.base, &self.delta, &self.axes]
-            .into_iter()
-            .map(GraphDeviceAllocation::device_graph_resource)
-            .collect()
+        vec![GraphDeviceAllocation::device_graph_resource(&self.payload)]
+    }
+}
+
+/// Cold host payload only: checked layout and one contiguous upload. Empty
+/// table slots get an initialized i64 sentinel, keeping every ABI pointer in
+/// the same owner even when an axes list is empty.
+struct ReductionMetadataPayload {
+    layout: WorkspaceLayout<3>,
+    bytes: Vec<u8>,
+}
+impl ReductionMetadataPayload {
+    fn layout_for(counts: [usize; 3]) -> Result<WorkspaceLayout<3>> {
+        let region = |label, count: usize| {
+            std::alloc::Layout::array::<i64>(count.max(1)).map_err(|_| EpError::KernelFailed(format!(
+                "cuda_ep reduction metadata {label} table count {count} exceeds addressable i64 storage; reduce the tensor or axes extent",
+            )))
+        };
+        WorkspaceLayout::new([
+            region("base", counts[0])?,
+            region("delta", counts[1])?,
+            region("axes", counts[2])?,
+        ])
+    }
+    fn new(base: &[i64], delta: &[i64], axes: &[i64]) -> Result<Self> {
+        let layout = Self::layout_for([base.len(), delta.len(), axes.len()])?;
+        let mut bytes = Vec::with_capacity(layout.bytes());
+        for table in [base, delta, axes] {
+            if table.is_empty() {
+                bytes.extend_from_slice(&0i64.to_ne_bytes());
+            } else {
+                for value in table {
+                    bytes.extend_from_slice(&value.to_ne_bytes());
+                }
+            }
+        }
+        debug_assert_eq!(bytes.len(), layout.bytes());
+        Ok(Self { layout, bytes })
     }
 }
 
@@ -962,11 +997,12 @@ impl ReductionMetadataCache {
 
     fn prepare(
         &mut self,
+        op: &str,
         input_shape: &[usize],
         reduce: &[bool],
         keepdims: bool,
         axes: &[i64],
-        plan: &ReductionPlan,
+        geometry: &ReductionGeometry,
     ) -> Result<PreparedReductionMetadata> {
         let key = ReductionMetadataKey {
             input_shape: input_shape.to_vec(),
@@ -980,33 +1016,33 @@ impl ReductionMetadataCache {
             return Ok(current.clone());
         }
         if self.runtime.is_capturing()? {
-            return Err(EpError::KernelFailed(
-                "cuda_ep ReduceSum: int64 reduction metadata changed during CUDA graph capture; warm the fixed decode shape before capture".into(),
-            ));
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: reduction metadata changed during CUDA graph capture; abort recording and eagerly warm the exact shape/axes before capture",
+            )));
         }
         if self.current.is_some() {
             self.runtime.synchronize()?;
         }
 
-        let base_bytes = as_i64_bytes(&plan.base);
-        let delta_bytes = as_i64_bytes(&plan.delta);
-        let axes_bytes = as_i64_bytes(axes);
-        let base = GraphDeviceAllocation::allocate(&self.runtime, base_bytes.len().max(1))?;
-        let delta = GraphDeviceAllocation::allocate(&self.runtime, delta_bytes.len().max(1))?;
-        let axes = GraphDeviceAllocation::allocate(&self.runtime, axes_bytes.len().max(1))?;
-        let upload = (|| {
-            // SAFETY: all fresh allocations cover their corresponding slices.
-            unsafe { self.runtime.htod(&base_bytes, base.ptr()) }?;
-            unsafe { self.runtime.htod(&delta_bytes, delta.ptr()) }?;
-            unsafe { self.runtime.htod(&axes_bytes, axes.ptr()) }
-        })();
-        upload?;
-
+        // The cache key determines the complete offset geometry. A hit above
+        // reuses its already-validated tables without rebuilding large Host
+        // base/delta vectors; cold plans retain all checked geometry guards.
+        let plan = build_plan(op, input_shape, reduce, keepdims, geometry)?;
+        let payload = ReductionMetadataPayload::new(&plan.base, &plan.delta, axes)?;
+        let allocation = GraphDeviceAllocation::allocate(&self.runtime, payload.bytes.len())?;
+        let [base, delta, axes] = payload.layout.bind(Some(WorkspaceView::new(
+            DevicePtrMut(allocation.ptr() as *mut c_void),
+            allocation.bytes(),
+        )))?;
+        // SAFETY: the fresh immutable owner covers the complete contiguous
+        // payload. The synchronous upload proves the Host bytes may retire.
+        unsafe { self.runtime.htod(&payload.bytes, allocation.ptr()) }?;
         let prepared = PreparedReductionMetadata {
             key,
-            base,
-            delta,
-            axes,
+            base: cuptr(base.ptr().0.cast_const()),
+            delta: cuptr(delta.ptr().0.cast_const()),
+            axes: cuptr(axes.ptr().0.cast_const()),
+            payload: allocation,
         };
         Ok(prepared)
     }
@@ -1683,7 +1719,6 @@ impl ReduceKernel {
             return Ok(());
         }
 
-        let plan = build_plan(op, x.shape, &reduce, self.keepdims, &prepared.geometry)?;
         let out_count = prepared.geometry.out_count;
         let reduce_count = prepared.geometry.reduce_count;
 
@@ -1710,7 +1745,14 @@ impl ReduceKernel {
         let mut metadata = self.reduce_metadata.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep ReduceSum: metadata cache lock was poisoned".into())
         })?;
-        let prepared = metadata.prepare(x.shape, &reduce, self.keepdims, axes, &plan)?;
+        let prepared = metadata.prepare(
+            op,
+            x.shape,
+            &reduce,
+            self.keepdims,
+            axes,
+            &prepared.geometry,
+        )?;
         drop(metadata);
         let (base_buf, delta_buf, expected_axes) = prepared.pointers();
         let resources = prepared.resources();
@@ -1884,15 +1926,6 @@ impl ReduceKernel {
     }
 }
 
-/// Reinterpret an `i64` slice as native-endian bytes for an H2D upload.
-fn as_i64_bytes(v: &[i64]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(v.len() * 8);
-    for &x in v {
-        out.extend_from_slice(&x.to_ne_bytes());
-    }
-    out
-}
-
 impl Kernel for ReduceKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         self.run(inputs, outputs, None)
@@ -1963,6 +1996,98 @@ impl Kernel for ReduceKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reduction_metadata_payload_preserves_table_order_values_and_alignment() {
+        let base = [0i64, 3];
+        let delta = [0i64, 1, 2];
+        let axes = [-1i64];
+        let payload = ReductionMetadataPayload::new(&base, &delta, &axes).unwrap();
+        assert_eq!(payload.bytes.len(), 48);
+        let mut backing = [0u64; 6];
+        let address = backing.as_mut_ptr() as usize;
+        let views = payload
+            .layout
+            .bind(Some(WorkspaceView::new(
+                DevicePtrMut(address as *mut c_void),
+                48,
+            )))
+            .unwrap();
+        assert_eq!(
+            views.map(|view| view.ptr().0 as usize - address),
+            [0, 16, 40]
+        );
+        for (view, expected) in
+            views
+                .into_iter()
+                .zip([base.as_slice(), delta.as_slice(), axes.as_slice()])
+        {
+            let offset = view.ptr().0 as usize - address;
+            let values = payload.bytes[offset..offset + view.bytes()]
+                .chunks_exact(8)
+                .map(|bytes| i64::from_ne_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(values, expected);
+        }
+    }
+
+    #[test]
+    fn reduction_metadata_empty_slots_have_initialized_in_owner_sentinels() {
+        let payload = ReductionMetadataPayload::new(&[], &[0], &[]).unwrap();
+        assert_eq!(payload.bytes, vec![0; 24]);
+        let mut backing = [0u64; 3];
+        let pointer = DevicePtrMut(backing.as_mut_ptr().cast());
+        let views = payload
+            .layout
+            .bind(Some(WorkspaceView::new(pointer, 24)))
+            .unwrap();
+        assert_eq!(views.map(|view| view.bytes()), [8, 8, 8]);
+        assert_eq!(
+            views.map(|view| view.ptr().0 as usize - pointer.0 as usize),
+            [0, 8, 16]
+        );
+        for offered in [
+            None,
+            Some(WorkspaceView::new(pointer, 23)),
+            Some(WorkspaceView::new(
+                DevicePtrMut(pointer.0.cast::<u8>().wrapping_add(1).cast()),
+                24,
+            )),
+        ] {
+            assert!(
+                payload
+                    .layout
+                    .bind(offered)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("prepare and pass")
+            );
+        }
+    }
+
+    #[test]
+    fn reduction_metadata_layout_rejects_overflow_before_encoding() {
+        for (index, label) in ["base", "delta", "axes"].into_iter().enumerate() {
+            let mut counts = [0; 3];
+            counts[index] = usize::MAX;
+            let message = ReductionMetadataPayload::layout_for(counts)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains(label)
+                    && message.contains("exceeds addressable")
+                    && message.contains("reduce the tensor"),
+                "{message}"
+            );
+        }
+        let message = ReductionMetadataPayload::layout_for([isize::MAX as usize / 8, 1, 0])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("workspace region") && message.contains("addressable"),
+            "{message}"
+        );
+    }
 
     #[test]
     fn entry_point_present_in_source() {
