@@ -230,13 +230,14 @@ fn check_projection<const K: usize, const N: usize>(device: DevicePreference, cu
                     let captured = f32::from_le_bytes(bytes.try_into().unwrap());
                     assert_eq!(captured, expected, "{kind}: captured projection");
                 }
-                // The first synchronized read can retire buffers from before capture.
-                // It must not allocate, and subsequent replays must keep both counters stable.
-                let warmed = session.device_allocation_counts().unwrap();
-                assert_eq!(warmed.allocations, allocations_after_capture);
+                // Deferred releases from earlier eager runs can complete on any replay.
+                // The invariant is that replay makes no new allocation requests.
                 assert!(session.replay_device_graph(&mut bindings).unwrap());
                 assert_eq!(bindings[1].read_bytes().unwrap(), readback);
-                assert_eq!(session.device_allocation_counts().unwrap(), warmed);
+                assert_eq!(
+                    session.device_allocation_counts().unwrap().allocations,
+                    allocations_after_capture
+                );
                 #[cfg(feature = "cuda")]
                 if let Some(ep) = &timing_ep {
                     use cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
@@ -301,6 +302,8 @@ fn float6_safetensors_projection_cpu() {
     check_projection::<1024, 2048>(DevicePreference::Cpu, false);
     if std::env::var_os("NXRT_TEST_FLOAT6_TIMING").is_some() {
         check_projection::<4096, 4096>(DevicePreference::Cpu, false);
+    } else {
+        check_projection::<14, 132>(DevicePreference::Cpu, false);
     }
 }
 
@@ -312,5 +315,7 @@ fn float6_safetensors_projection_cuda() {
     check_projection::<1024, 2048>(device.clone(), true);
     if std::env::var_os("NXRT_TEST_FLOAT6_TIMING").is_some() {
         check_projection::<4096, 4096>(device, true);
+    } else {
+        check_projection::<14, 132>(device, true);
     }
 }
