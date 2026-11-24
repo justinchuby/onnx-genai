@@ -1106,7 +1106,6 @@ fn scatter_opset29_claims_admit_mean_and_new_nd_index_type_only_since_29() {
     }
 }
 
-#[cfg(feature = "gpu-tests")]
 #[test]
 #[ignore = "CUDA event probe; run on an idle device under the benchmark lock"]
 fn scatter_opset29_mean_gpu_timing() {
