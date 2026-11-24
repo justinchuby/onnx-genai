@@ -98,8 +98,8 @@ every call, including repeated growing shapes. Positive growth evidence alone
 therefore does not select mutable metadata storage. Such a policy needs device
 measurements of both changing and repeated shapes before changing the default.
 
-Broadcast arithmetic, comparison/logical, integer bitwise/shift and PRelu
-kernels publish immutable metadata and the successful launch signature together.
+Broadcast arithmetic, comparison/logical, integer bitwise/shift, PRelu and
+TensorScatter kernels publish immutable metadata and the successful launch signature together.
 Preparation and GPU submission use a private snapshot outside the shared state
 lock; only successful submission replaces the published pair. A failed candidate
 preserves the previous proof and owner. Replacement retirement happens after
@@ -112,6 +112,31 @@ over preparation or GPU work. An inactive bias (absent C or beta=0) does not
 consult that cache, including on the K=0 empty-product path. Existing Gemm
 synchronization and eager-only capture policy remain in place; this transaction
 does not establish a cuBLASLt/bias capture contract.
+
+TensorScatter uses this same one-record publication rule for its persistent
+stride descriptor and exact dtype/cache/update/optional-index signature. It
+snapshots only after ordinary input validation, checking the old proof and
+cloning its immutable metadata owner under the same lock. The already-built
+invocation signature moves into the private candidate, avoiding deep copies of
+the old signature vectors. Both metadata staging and the
+launch run outside the state lock, and successful eager submission publishes
+one pair; capture only consumes its validated snapshot. A zero-update copy
+publishes after the copy submission succeeds, while empty output publishes
+without device work. These paths may retain an unused old descriptor but never
+consume it under the new empty signature. Nonempty capture still validates the
+actual graph-held allocation owner as well as the exact signature. Existing
+exclusive kernel execution/capture contracts remain required; this is not a
+new execution-concurrency authority.
+
+The TensorScatter device regression covers linear/circular updates, optional
+indices, A→failed B→A→B, stable warm allocation/transfer/drain counters, missing
+capture-owner refusal, capture-signature mismatch, and independent A/B graph
+replay after kernel destruction and old-graph reset. It also covers zero-update
+copy and empty-output publication. On the CPU-only development host this test
+is compiled/listed and default-ignored, not executed. No CUDA numerical,
+lifetime or performance result is claimed from those checks. The CUDA source,
+metadata format, physical owner, quota authority and allocation policy are
+unchanged.
 
 ### Resource allocation granularity
 
@@ -136,6 +161,20 @@ preserves the charge at its retained physical capacity; a smaller logical view
 does not refund those bytes. Idle capacity can be reclaimed under pressure.
 Pending asynchronous work, active readers and capture pins prevent reuse, and
 quarantined backing retains its charge until physical release is settled.
+
+CPU derived-weight payloads also treat zero bytes as an explicit empty grant.
+An empty grant cannot split off positive bytes; a zero-byte split of any grant
+produces another empty value without cloning an accountant lease. Positive
+governed payloads still claim and retain their exact physical capacity, and
+partially split owners return only their own bytes. This removes empty
+projection-group admission callbacks without relabeling zero capacity as the
+unbounded local/ungoverned mode. The configured source's one-time zero-byte
+authority anchor remains validated at construction; it is not a payload claim.
+QMoE uses the same empty-owner conversion for on-demand and transient experts.
+Direct issuer-counter tests cover empty groups, full-capacity pressure, mixed
+zero/nonzero groups, positive construction peaks for empty final payloads,
+positive splitting/retirement and zero-capacity rejection.
+This establishes callback behavior, not a measured inference speedup.
 
 Cold replacement borrows the caller's `Option<WorkspaceAllocation>`. The option
 retains the original owner until the provider actually takes it for retirement.
@@ -881,19 +920,90 @@ tiles. The logical shard count is fixed when the kernel is created and is used
 by both planning and execution, even when a different Rayon pool runs it.
 Dense-cache admission may decline, so the bound always covers streamed fallback.
 
-One exclusive scratch lane is borrowed by sequential projection calls, which
-return owned results. A private dispatch-local owner lazily initializes the
-required f32 prefix at the first streamed apply; later applies receive short,
-exclusive initialized slices and partition their own prefixes safely. Dense
-resident hits leave the streamed-projection regions untouched, and unused
-capacity in a larger pool slot is not initialized. The initialization proof ends with the dispatch and
-is never cached across pool borrowers. FC1/FC3 results survive subsequent
-scratch overwrites for gating. BlockQuantizedMoE grouped inputs also borrow an
-input-sized region in that admitted layout; singleton groups can borrow their
-original row. Routing, activation/output staging and owned intermediate results
-remain separate allocations, so this is not a complete process-memory bound. Dense resident-set admission remains a
-separate existing weight-cache operation. No new public EP API is required.
+The decode region is borrowed by sequential projection calls. A private
+dispatch-local owner lazily initializes its required f32 span at the first
+streamed apply; later applies reuse initialized prefixes. Dense resident hits
+leave it untouched, and a larger pool slot's unused capacity is not initialized.
+The proof ends with the dispatch, never surviving across pool borrowers.
 
+BlockQuantizedMoE now composes four regions in that one admission: maximum
+decode scratch, two FC banks, and an input-sized accumulator. The FC banks share
+the float MoE's private expert driver and checked width rules. For rows R,
+hidden H and intermediate I, nongated banks are R*H and R*I f32 values; gated
+banks are R*max(H,I) and R*max(FC1+separate_FC3,H). Experts remain serial, so
+these banks have no expert-count or top-k multiplier. Singleton groups borrow
+the original input row; other groups gather into bank A. All FC1/optional FC3
+reads finish before A becomes activation storage; gated FC2 then overwrites B.
+Nongated FC1 activates in B before FC2 overwrites A. The accumulator remains
+disjoint across all experts. Destination prefixes are initialized before each
+projection, including zero-K bias results, and final tensor publication still
+occurs only after every expert succeeds.
+
+This deliberately charges retained FC capacity that the former owned Vec path
+allocated outside the lane. The conservative physical bound can be larger than
+the previous declared workspace; it is not an RSS-saving claim. Admission may
+refuse a cap that previously omitted those intermediates. Routing, tensor
+widening, strided compressed copies, final tensor storage and GEMM internals
+remain separate; this is not a process-memory cap. Standalone MatMul retains
+its caller-owned output staging. Dense weight residency keeps its existing
+weight-cache authority. No allocator, pool or public EP API is added.
+
+[Public-session evidence](../benchmarks/block-moe-projection-banks/README.md)
+retains the initial measured gated regression and the inline-hint refinement,
+with complete output identity, actual funding, setup/doubled-work and A/A
+controls. Host resource tests count zero warm issuer requests/returns, including
+zero-byte calls; physical backing remains charged through idle retention and
+returns to zero only after trim. CPU fixture results do not establish model
+throughput, CUDA correctness or universal zero overhead.
+
+
+### Caller-owned row-decoded destinations
+
+The shared dynamic row-decoded projection core writes an initialized caller
+destination instead of returning an owned Vec. Complete input/bias/output
+geometry is checked before any dispatch or write. Unit axes let the column
+producer write that destination directly; multirow/multicolumn execution keeps
+its temporary column-major buffer and transposes only after successful work.
+Later decoder/dispatch errors may modify staging, so staging is not permission
+to publish a partial tensor.
+
+QMoE streams projections directly into its expert banks; the block-format
+owned test oracle allocates its reference staging at the ownership edge.
+MatMulNBits deliberately retains independent staging and copies into its
+possibly direct Float32 tensor output only after success. Decoder state,
+bounded tile allocation, scheduling, K reduction and bias order remain.
+No old returned-Vec alias or public EP interface is retained/added.
+
+### CPU integer QMoE projection banks
+
+Integer QMoE reuses the same private two-bank driver as float MoE and
+BlockQuantizedMoE. One StepScoped lane covers grouped input, FC1/optional FC3,
+activation and expert output, reused serially across expert groups. Nongated
+banks are R*H and R*I f32 values; gated banks are R*max(H,I) and
+R*max(FC1+separate_FC3,H), for total input rows R. There is no expert-count or
+top-k multiplier. A singleton still borrows its contiguous original input row,
+but now declares the capacity for its FC intermediates.
+
+Preparation and execution share checked geometry: inter is FC2's packed input
+axis times 8/bits, never inferred backward from FC1. FC2 metadata is therefore
+required during preparation. Zero rows have zero banks; zero hidden retains
+input/weight/routing validation and can still need nonempty FC1 storage.
+The prefetch worker owns weights independently; only the main compute thread
+borrows the lane. Weight request/read/join order and final contribution
+accumulation/publication order remain unchanged.
+
+This accounts retained FC capacity previously allocated as per-expert Vecs;
+it does not establish RSS savings or a process-memory cap. Contributions,
+final output accumulator, tensor widening, decoded-row and column-major decode
+staging remain outside this lane. Transient/retained weight grants retain
+their existing authority. Warm workspace checkout/return does not call its
+issuer; this is distinct from unchanged positive transient weight admissions.
+
+The [public-session study](../benchmarks/qmoe-fc-projection-banks/README.md)
+retains144 terminal-process CPU receipts, complete outputs and actual path
+traces, plus setup/doubled-work/A/A controls. All six aggregate cells qualify;
+small single-row CPU costs are not excluded. This is not CUDA, mmap-prefetch
+performance or full-model throughput evidence.
 
 ### CPU float MoE projection banks
 

@@ -1604,12 +1604,336 @@
       ],
       "type": "string"
     },
+    "DecisionBoolean": {
+      "additionalProperties": false,
+      "properties": {
+        "criteria": {
+          "$ref": "#/$defs/DecisionBooleanCriteria"
+        },
+        "order": {
+          "$ref": "#/$defs/DecisionBooleanOrder"
+        }
+      },
+      "required": [
+        "order",
+        "criteria"
+      ],
+      "type": "object"
+    },
+    "DecisionBooleanCriteria": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "forbidden",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "descriptions": {
+              "$ref": "#/$defs/DecisionPayload"
+            },
+            "kind": {
+              "const": "strict",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "descriptions"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "permissive",
+              "type": "string"
+            },
+            "no_yes_aliases": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "no_yes_aliases"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DecisionBooleanOrder": {
+      "enum": [
+        "false_first",
+        "true_first",
+        "criteria_true_first"
+      ],
+      "type": "string"
+    },
+    "DecisionChoices": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "descriptions": {
+              "$ref": "#/$defs/DecisionPayload"
+            },
+            "kind": {
+              "const": "dynamic",
+              "type": "string"
+            },
+            "minimum": {
+              "format": "uint",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "nonempty_keys": {
+              "type": "boolean"
+            },
+            "order": {
+              "$ref": "#/$defs/DecisionOrder"
+            }
+          },
+          "required": [
+            "kind",
+            "minimum",
+            "order",
+            "descriptions",
+            "nonempty_keys"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "fixed",
+              "type": "string"
+            },
+            "options": {
+              "items": {
+                "$ref": "#/$defs/DecisionOption"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "options"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "DecisionConfidence": {
       "enum": [
         "uniform_margin",
         "mode_distance",
         "normalized_entropy",
         "maximum_probability"
+      ],
+      "type": "string"
+    },
+    "DecisionInputPolicy": {
+      "additionalProperties": false,
+      "description": "Complete model-authored request rules. Absent task policies disable that type.",
+      "properties": {
+        "choice": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionChoices"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "default_type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "instructions": {
+          "$ref": "#/$defs/DecisionInstructions"
+        },
+        "max_questions": {
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "noul": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionBoolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "score": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionLevels"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/DecisionPayload"
+        }
+      },
+      "required": [
+        "state",
+        "instructions"
+      ],
+      "type": "object"
+    },
+    "DecisionInstructions": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "required",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/DecisionPayload"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "default": true,
+            "kind": {
+              "const": "optional",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/DecisionPayload"
+            }
+          },
+          "required": [
+            "kind",
+            "default",
+            "payload"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "forbidden",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DecisionKind": {
+      "description": "Decision question categories shared by metadata, preparation and transport.",
+      "enum": [
+        "choice",
+        "score",
+        "noul"
+      ],
+      "type": "string"
+    },
+    "DecisionLegend": {
+      "enum": [
+        "structured",
+        "canonical_json_text"
+      ],
+      "type": "string"
+    },
+    "DecisionLevels": {
+      "additionalProperties": false,
+      "properties": {
+        "descriptions": {
+          "$ref": "#/$defs/DecisionPayload"
+        },
+        "legend": {
+          "$ref": "#/$defs/DecisionLegend"
+        },
+        "maximum": {
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "minimum": {
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "minimum",
+        "maximum",
+        "descriptions",
+        "legend"
+      ],
+      "type": "object"
+    },
+    "DecisionOption": {
+      "additionalProperties": false,
+      "properties": {
+        "description": true,
+        "key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "description"
+      ],
+      "type": "object"
+    },
+    "DecisionOrder": {
+      "enum": [
+        "lexical",
+        "request"
+      ],
+      "type": "string"
+    },
+    "DecisionPayload": {
+      "enum": [
+        "any",
+        "any_non_null",
+        "payload",
+        "payload_or_null",
+        "nonempty_payload",
+        "text"
       ],
       "type": "string"
     },
@@ -1626,6 +1950,17 @@
       "properties": {
         "choice_confidence": {
           "$ref": "#/$defs/DecisionConfidence"
+        },
+        "input_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionInputPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Request semantics authored explicitly in schema v1.11 and newer."
         },
         "max_options": {
           "format": "uint",

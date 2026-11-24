@@ -26,6 +26,7 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
 
 use super::movement::PersistentMetadata;
+use crate::device_metadata::{WarmMetadata, publish_metadata_candidate};
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
@@ -93,7 +94,7 @@ extern "C" __global__ void tensor_scatter(
 }
 "#;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 struct TensorScatterCaptureSignature {
     dtype: DataType,
     cache_shape: Vec<usize>,
@@ -120,8 +121,9 @@ impl KernelFactory for TensorScatterFactory {
             runtime: self.runtime.clone(),
             raw_axis: node.attr("axis").and_then(Attribute::as_int).unwrap_or(-2),
             circular,
-            metadata: Mutex::new(PersistentMetadata::new(self.runtime.clone())),
-            warmed_signature: Mutex::new(None),
+            warm: Mutex::new(WarmMetadata::new(PersistentMetadata::new(
+                self.runtime.clone(),
+            ))),
         }))
     }
 }
@@ -130,8 +132,7 @@ struct TensorScatterKernel {
     runtime: Arc<CudaRuntime>,
     raw_axis: i64,
     circular: bool,
-    metadata: Mutex<PersistentMetadata>,
-    warmed_signature: Mutex<Option<TensorScatterCaptureSignature>>,
+    warm: Mutex<WarmMetadata<PersistentMetadata, TensorScatterCaptureSignature>>,
 }
 
 impl Kernel for TensorScatterKernel {
@@ -230,18 +231,24 @@ impl Kernel for TensorScatterKernel {
             update_shape: update.shape.to_vec(),
             has_write_indices: write_indices.is_some(),
         };
-        let mut warmed_signature = self.warmed_signature.lock().map_err(|_| {
-            EpError::KernelFailed(
-                "cuda_ep TensorScatter: capture signature lock was poisoned".into(),
-            )
-        })?;
-        if capturing && warmed_signature.as_ref() != Some(&signature) {
-            return Err(EpError::KernelFailed(
-                "cuda_ep TensorScatter: shape or dtype changed during CUDA graph capture; warm \
-                 the exact signature first"
-                    .into(),
-            ));
-        }
+        // Validate the old proof and snapshot its owner under the same lock.
+        // Move the already-built invocation signature into the candidate instead
+        // of deep-cloning the old shape vectors. Nothing is published yet.
+        let mut candidate = {
+            let warm = self.warm.lock().map_err(|_| EpError::KernelFailed(
+                "cuda_ep TensorScatter: metadata/signature state is poisoned; rebuild the provider before warming again".into(),
+            ))?;
+            if capturing && warm.signature.as_ref() != Some(&signature) {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep TensorScatter: shape or dtype changed during CUDA graph capture; warm \
+                     the exact signature first".into(),
+                ));
+            }
+            WarmMetadata {
+                metadata: warm.metadata.clone(),
+                signature: Some(signature),
+            }
+        };
 
         let elements = past.numel();
         if elements == 0 || sequence_length == 0 {
@@ -256,7 +263,7 @@ impl Kernel for TensorScatterKernel {
                 };
             }
             if !capturing {
-                *warmed_signature = Some(signature);
+                publish_metadata_candidate(&self.warm, candidate, "TensorScatter")?;
             }
             return Ok(());
         }
@@ -270,12 +277,10 @@ impl Kernel for TensorScatterKernel {
                 .into_iter()
                 .map(|value| value as u64),
         );
-        let mut metadata_cache = self.metadata.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep TensorScatter: metadata lock was poisoned".into())
-        })?;
-        let metadata_candidate =
-            metadata_cache.stage(&metadata_values, "TensorScatter metadata")?;
-        let metadata_ptr = metadata_candidate.ptr("TensorScatter")?;
+        candidate.metadata = candidate
+            .metadata
+            .stage(&metadata_values, "TensorScatter metadata")?;
+        let metadata_ptr = candidate.metadata.ptr("TensorScatter")?;
 
         let function =
             self.runtime
@@ -329,8 +334,7 @@ impl Kernel for TensorScatterKernel {
         }
         .map_err(|error| driver_err("launch tensor_scatter", error))?;
         if !capturing {
-            *metadata_cache = metadata_candidate;
-            *warmed_signature = Some(signature);
+            publish_metadata_candidate(&self.warm, candidate, "TensorScatter")?;
         }
         Ok(())
     }
@@ -339,22 +343,26 @@ impl Kernel for TensorScatterKernel {
         false
     }
     fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        self.metadata
+        self.warm
             .lock()
             .ok()
-            .and_then(|metadata| metadata.device_graph_resource())
+            .and_then(|warm| warm.metadata.device_graph_resource())
             .into_iter()
             .collect()
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        match self.warmed_signature.lock() {
-            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+        match self.warm.lock() {
+            Ok(warm) if warm.signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
             Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
                 "TensorScatter must warm its exact shape/dtype signature before capture",
             ),
             Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "TensorScatter capture signature lock was poisoned",
+                "TensorScatter metadata/signature state is poisoned; rebuild the provider before warming again",
             ),
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tensor_scatter_warm_tests.rs"]
+mod warm_tests;

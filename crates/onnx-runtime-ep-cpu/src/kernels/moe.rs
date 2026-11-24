@@ -278,25 +278,8 @@ impl MoEKernel {
         } else {
             rows
         };
-        let separate_gate = self.attributes.uses_separate_gate(has_fc3);
-        let widths = if self.attributes.is_gated(has_fc3) {
-            // A: gather -> activated; B: FC1+FC3 -> expert output.
-            [
-                hidden.max(inter),
-                fc1.checked_add(if separate_gate { inter } else { 0 })
-                    .ok_or_else(invalid)?
-                    .max(hidden),
-            ]
-        } else {
-            // A: gather -> expert output; B: FC1 -> in-place activation.
-            [hidden, inter]
-        };
-        let regions = widths.map(|width| {
-            let elements = bound.checked_mul(width).ok_or_else(invalid)?;
-            std::alloc::Layout::array::<f32>(elements).map_err(|_| invalid())
-        });
-        let [a, b] = regions;
-        WorkspaceLayout::new([a?, b?, accumulator])
+        let [a, b] = MoeWorkspace::bank_layouts(bound, hidden, inter, &self.attributes, has_fc3)?;
+        WorkspaceLayout::new([a, b, accumulator])
     }
 }
 
@@ -930,7 +913,7 @@ fn run_moe_per_expert<'out>(
         let slots = group.start..group.start + group.len;
         let expert_out = scratch.run_dense_expert(
             x,
-            &plan.slot_row[slots.clone()],
+            plan.slot_row[slots.clone()].iter().map(|&row| row as usize),
             DenseExpertWeights {
                 fc1: &fc1_weights[expert * fc1_size * hidden..(expert + 1) * fc1_size * hidden],
                 fc1_bias: fc1_bias.map(|b| &b[expert * fc1_size..(expert + 1) * fc1_size]),
@@ -1123,6 +1106,7 @@ impl ActivationBias for PendingActivationBias<'_> {
     }
 }
 
+#[inline]
 fn gated_activation_row(
     output: &mut [f32],
     fc1: &[f32],
@@ -1174,67 +1158,157 @@ fn apply_gated_activation(
 }
 
 /// Two exclusive banks, reused only after the previous phase's final read.
-struct MoeWorkspace<'a> {
-    input: ProjectionScratch<'a>,
-    projection: ProjectionScratch<'a>,
+pub(super) struct MoeWorkspace<'a> {
+    pub(super) input: ProjectionScratch<'a>,
+    pub(super) projection: ProjectionScratch<'a>,
 }
-struct DenseExpertWeights<'a> {
-    fc1: &'a [f32],
-    fc1_bias: Option<&'a [f32]>,
-    fc2: &'a [f32],
-    fc2_bias: Option<&'a [f32]>,
-    fc3: Option<&'a [f32]>,
-    fc3_bias: Option<&'a [f32]>,
+pub(super) struct DenseExpertWeights<'a> {
+    pub(super) fc1: &'a [f32],
+    pub(super) fc1_bias: Option<&'a [f32]>,
+    pub(super) fc2: &'a [f32],
+    pub(super) fc2_bias: Option<&'a [f32]>,
+    pub(super) fc3: Option<&'a [f32]>,
+    pub(super) fc3_bias: Option<&'a [f32]>,
 }
 impl MoeWorkspace<'_> {
+    /// One bank layout shared by dense and compressed expert execution.
+    /// The bound is routed rows; only whole-operator batching may multiply it.
+    pub(super) fn bank_layouts(
+        rows: usize,
+        hidden: usize,
+        inter: usize,
+        attributes: &MoeAttributes,
+        has_fc3: bool,
+    ) -> Result<[std::alloc::Layout; 2]> {
+        let invalid = || {
+            EpError::KernelFailed(format!(
+                "MoE expert workspace overflows for rows={rows}, hidden={hidden}, inter={inter}; reduce batch or projection dimensions"
+            ))
+        };
+        let fc1 = attributes.checked_fc1_size(inter, "MoE expert workspace")?;
+        let widths = if attributes.is_gated(has_fc3) {
+            [
+                hidden.max(inter),
+                fc1.checked_add(if attributes.uses_separate_gate(has_fc3) {
+                    inter
+                } else {
+                    0
+                })
+                .ok_or_else(invalid)?
+                .max(hidden),
+            ]
+        } else {
+            [hidden, inter]
+        };
+        let [a, b] = widths.map(|width| {
+            std::alloc::Layout::array::<f32>(rows.checked_mul(width).ok_or_else(invalid)?)
+                .map_err(|_| invalid())
+        });
+        Ok([a?, b?])
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn run_dense_expert(
+    pub(super) fn run_dense_expert(
         &mut self,
         x: &[f32],
-        row_indices: &[u32],
+        row_indices: impl ExactSizeIterator<Item = usize>,
         weights: DenseExpertWeights<'_>,
         fc1_size: usize,
         hidden: usize,
         inter: usize,
         attributes: &MoeAttributes,
     ) -> Result<&[f32]> {
+        let fc1 = DenseExpertProjection {
+            weights: weights.fc1,
+            out_features: fc1_size,
+            in_features: hidden,
+        };
+        let fc2 = DenseExpertProjection {
+            weights: weights.fc2,
+            out_features: hidden,
+            in_features: inter,
+        };
+        let fc3 = weights.fc3.map(|weights| DenseExpertProjection {
+            weights,
+            out_features: inter,
+            in_features: hidden,
+        });
+        self.run_expert_projections(
+            x,
+            row_indices,
+            &fc1,
+            weights.fc1_bias,
+            &fc2,
+            weights.fc2_bias,
+            fc3.as_ref(),
+            weights.fc3_bias,
+            attributes,
+            |projection, input, rows, bias, output| {
+                linear_grouped_into(
+                    input,
+                    rows,
+                    projection.weights,
+                    bias,
+                    projection.out_features,
+                    projection.in_features,
+                    output,
+                )
+            },
+        )
+    }
+
+    /// Each projection fills a caller bank; one exclusive decode lane may be
+    /// reused by the callback. Returned expert output borrows only these banks.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_expert_projections<P: ExpertProjection>(
+        &mut self,
+        x: &[f32],
+        mut row_indices: impl ExactSizeIterator<Item = usize>,
+        fc1_projection: &P,
+        fc1_bias: Option<&[f32]>,
+        fc2: &P,
+        fc2_bias: Option<&[f32]>,
+        fc3: Option<&P>,
+        fc3_bias: Option<&[f32]>,
+        attributes: &MoeAttributes,
+        mut apply: impl FnMut(&P, &[f32], usize, Option<&[f32]>, &mut [f32]) -> Result<()>,
+    ) -> Result<&[f32]> {
+        let hidden = fc1_projection.in_features();
+        let inter = fc2.in_features();
+        let fc1_size = fc1_projection.out_features();
+        let has_fc3 = fc3.is_some();
         let rows = row_indices.len();
         let input = if rows == 1 {
-            let start = row_indices[0] as usize * hidden;
-            &x[start..start + hidden]
+            let row = row_indices.next().expect("one routed row");
+            let input = row
+                .checked_mul(hidden)
+                .and_then(|start| x.get(start..))
+                .and_then(|tail| tail.get(..hidden));
+            input.ok_or_else(|| EpError::KernelFailed(format!(
+                "MoE expert input row {row} with hidden width {hidden} exceeds {} input values; validate routed row indices", x.len()
+            )))?
         } else {
-            self.input
-                .gather_rows(x, hidden, row_indices.iter().map(|&row| row as usize))?
+            self.input.gather_rows(x, hidden, row_indices)?
         };
-        let separate = attributes.uses_separate_gate(weights.fc3.is_some());
+        let separate = attributes.uses_separate_gate(fc3.is_some());
         let projections = self
             .projection
             .zeroed_prefix(rows * (fc1_size + if separate { inter } else { 0 }))?;
-        let (fc1, fc3) = projections.split_at_mut(rows * fc1_size);
-        linear_grouped_into(
-            input,
-            rows,
-            weights.fc1,
-            weights.fc1_bias,
-            fc1_size,
-            hidden,
-            fc1,
-        )?;
+        let (fc1, fc3_output) = projections.split_at_mut(rows * fc1_size);
+        apply(fc1_projection, input, rows, fc1_bias, fc1)?;
         let fc3 = if separate {
-            linear_grouped_into(
+            apply(
+                fc3.expect("validated separate FC3"),
                 input,
                 rows,
-                weights.fc3.expect("validated separate FC3"),
-                weights.fc3_bias,
-                inter,
-                hidden,
-                fc3,
+                fc3_bias,
+                fc3_output,
             )?;
-            Some(&*fc3)
+            Some(&*fc3_output)
         } else {
             None
         };
-        if attributes.is_gated(weights.fc3.is_some()) {
+        if attributes.is_gated(has_fc3) {
             let activated = self.input.zeroed_prefix(rows * inter)?;
             // Keep the per-expert activation serial, as before.
             if inter != 0 {
@@ -1250,30 +1324,14 @@ impl MoeWorkspace<'_> {
                 }
             }
             let output = self.projection.zeroed_prefix(rows * hidden)?;
-            linear_grouped_into(
-                activated,
-                rows,
-                weights.fc2,
-                weights.fc2_bias,
-                hidden,
-                inter,
-                output,
-            )?;
+            apply(fc2, activated, rows, fc2_bias, output)?;
             Ok(output)
         } else {
             for value in fc1.iter_mut() {
                 *value = activate(attributes.activation, *value);
             }
             let output = self.input.zeroed_prefix(rows * hidden)?;
-            linear_grouped_into(
-                fc1,
-                rows,
-                weights.fc2,
-                weights.fc2_bias,
-                hidden,
-                inter,
-                output,
-            )?;
+            apply(fc2, fc1, rows, fc2_bias, output)?;
             Ok(output)
         }
     }
@@ -1353,6 +1411,7 @@ pub(super) fn run_expert(
     linear(&activated, fc2_weights, fc2_bias, hidden, inter)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_expert_grouped(
     input: &[f32],
@@ -1417,6 +1476,7 @@ impl ExpertProjection for DenseExpertProjection<'_> {
         self.in_features
     }
 }
+#[cfg(test)]
 impl DenseExpertProjection<'_> {
     fn apply(&self, input: &[f32], rows: usize, bias: Option<&[f32]>) -> Result<Vec<f32>> {
         linear_grouped(
@@ -1430,6 +1490,7 @@ impl DenseExpertProjection<'_> {
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_expert_projections<P: ExpertProjection>(
     input: &[f32],
@@ -1464,15 +1525,20 @@ pub(super) fn run_expert_projections<P: ExpertProjection>(
             } else {
                 let mut gate = Vec::with_capacity(rows * inter);
                 let mut linear = Vec::with_capacity(rows * inter);
-                for row in fc1_out.chunks_exact(fc1_size) {
-                    if attributes.swiglu_fusion == 1 {
-                        for pair in row.as_chunks::<2>().0 {
-                            gate.push(pair[0]);
-                            linear.push(pair[1]);
+                // A zero-width projection has no gate/linear values. Avoid
+                // constructing a zero-sized chunk iterator; FC2 still runs for
+                // every routed row and supplies its zero-K bias result.
+                if fc1_size != 0 {
+                    for row in fc1_out.chunks_exact(fc1_size) {
+                        if attributes.swiglu_fusion == 1 {
+                            for pair in row.as_chunks::<2>().0 {
+                                gate.push(pair[0]);
+                                linear.push(pair[1]);
+                            }
+                        } else {
+                            gate.extend_from_slice(&row[..inter]);
+                            linear.extend_from_slice(&row[inter..]);
                         }
-                    } else {
-                        gate.extend_from_slice(&row[..inter]);
-                        linear.extend_from_slice(&row[inter..]);
                     }
                 }
                 (gate, linear)
@@ -1515,6 +1581,7 @@ pub(super) fn run_expert_projections<P: ExpertProjection>(
 /// for both operands. Neither materializes the `[in_features, out_features]`
 /// copy the old portable path built - a 29 MiB strided scatter per call for a
 /// Mixtral-sized expert, previously the single largest term in the operator.
+#[cfg(test)]
 fn linear_grouped(
     input: &[f32],
     rows: usize,
@@ -1795,10 +1862,26 @@ mod tests {
 
     #[test]
     fn gated_row_bias_states_preserve_layouts_and_signed_zero() {
-        let gate = [-0.0, -2.0, 3.0];
-        let linear = [1.0, 2.0, -3.0];
-        let gate_bias = [0.0, 0.25, -0.5];
-        let linear_bias = [0.0, -0.5, 0.75];
+        let gate = black_box([-0.0, -2.0, 3.0]);
+        let linear = black_box([1.0, 2.0, -3.0]);
+        let gate_bias = black_box([0.0, 0.25, -0.5]);
+        let linear_bias = black_box([0.0, -0.5, 0.75]);
+        // Observe rounding at the bias boundary itself. Once inlined through
+        // min/clamp, optimized activation code can fold zero expressions
+        // differently from a compile-time-constant scalar oracle.
+        let zero = black_box(-0.0_f32);
+        assert_eq!(
+            AppliedActivationBias.value(false, 0, zero).to_bits(),
+            (-0.0_f32).to_bits()
+        );
+        for fc1 in [None, Some(&gate_bias[..])] {
+            assert_eq!(
+                PendingActivationBias { fc1, linear: None }
+                    .value(false, 0, zero)
+                    .to_bits(),
+                0.0_f32.to_bits()
+            );
+        }
         for fusion in 0..=2 {
             let attributes = MoeAttributes {
                 k: 1,
@@ -1825,8 +1908,9 @@ mod tests {
                 &attributes,
                 AppliedActivationBias,
             );
-            let expected =
-                std::array::from_fn::<_, 3, _>(|i| attributes.swiglu(gate[i], linear[i]));
+            let expected = std::array::from_fn::<_, 3, _>(|i| {
+                attributes.swiglu(black_box(gate[i]), black_box(linear[i]))
+            });
             assert_eq!(applied.map(f32::to_bits), expected.map(f32::to_bits));
             assert_eq!(applied[0].to_bits(), (-0.0f32).to_bits());
             for biased in [false, true] {
@@ -1849,12 +1933,17 @@ mod tests {
                 );
                 let expected = std::array::from_fn::<_, 3, _>(|i| {
                     attributes.swiglu(
-                        gate[i] + if biased { gate_bias[i] } else { 0.0 },
-                        linear[i] + if biased { linear_bias[i] } else { 0.0 },
+                        black_box(gate[i]) + if biased { black_box(gate_bias[i]) } else { 0.0 },
+                        black_box(linear[i])
+                            + if biased {
+                                black_box(linear_bias[i])
+                            } else {
+                                0.0
+                            },
                     )
                 });
                 assert_eq!(pending.map(f32::to_bits), expected.map(f32::to_bits));
-                assert_eq!(pending[0].to_bits(), 0.0f32.to_bits());
+                assert_eq!(pending[0], 0.0);
             }
         }
     }

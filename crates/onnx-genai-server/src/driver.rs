@@ -2403,7 +2403,7 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             if !reply.is_closed() {
                 let result = engine.decide(*request);
                 if let Ok(result) = &result {
-                    crate::metrics::add_prompt_tokens(result.prompt_tokens);
+                    crate::metrics::add_prompt_tokens(result.prompt_tokens());
                 }
                 let _ = reply.send(result);
             }

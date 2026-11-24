@@ -29,15 +29,18 @@ The response contains `model`, `answers` keyed by question ID, and
 `usage: {input_tokens, output_tokens: 0}`. A choice answer has `choice`,
 `probabilities` and `confidence`. A score has `score`, `probabilities`,
 `confidence` and `legend`. A `noul` answer has its probability under `noul`.
-Choice keys are lexically ordered; score levels are zero-based in array order;
-`noul` options are `false`, then `true`. Ties select the first option. All prompt
+Option ordering and defaults come from the package input policy. Score levels
+are zero-based in array order; `noul` returns the probability of the `true` key
+regardless of option order. Ties select the first option. All prompt
 variants count toward input usage; tokenizer padding does not.
 
 ## Package contract
 
-The new core declaration requires `schema_version: v1.10`. Both parsed documents
-and programmatically constructed metadata enforce this floor. Older schema
-versions retain their previous meanings.
+Decision profiles require at least `schema_version: v1.10`. New packages using
+`schema_version: v1.11` must explicitly declare `input_policy`. Both parsed and
+programmatically constructed metadata enforce the version gates. A v1.10
+package retains its defined rules: required instructions, explicit question
+type, lexical choices, score levels 2–10, and strict false-first boolean options.
 
 ```yaml
 profiles:
@@ -52,12 +55,59 @@ profiles:
         {{ instructions | tojson }}
         {% for option in options %}{{ option.key }}: {{ option.description | tojson }}
         {% endfor %}
+      input_policy:
+        state: payload_or_null
+        instructions:
+          kind: optional
+          default: ""
+          payload: payload
+        default_type: choice
+        max_questions: 64
+        choice:
+          kind: dynamic
+          minimum: 2
+          order: request
+          descriptions: payload_or_null
+          nonempty_keys: true
+        score:
+          minimum: 1
+          maximum: 16
+          descriptions: payload
+          legend: canonical_json_text
+        noul:
+          order: criteria_true_first
+          criteria:
+            kind: permissive
+            no_yes_aliases: true
       max_options: 16
       variants: direct
       choice_confidence: uniform_margin
       score_confidence: mode_distance
       score: expected_level
 ```
+
+The example uses core schema v1.11. Omit a question kind from `input_policy` to
+disable it. Instructions may be required, optional with an authored default, or
+forbidden. Payload admission may allow any JSON, any non-null JSON, text only,
+text/object/array (`payload`), those types plus null (`payload_or_null`), or
+nonempty text/object/array (`nonempty_payload`; empty containers remain valid).
+State is always present even when its policy permits null. Missing/null/non-string
+question types use `default_type` when declared; unknown strings are rejected.
+
+Dynamic choices declare their minimum cardinality, description payload, key
+validation and request/lexical ordering. A fixed choice policy instead declares
+`kind: fixed` and an ordered `options` array of `{key, description}`; requests
+must provide that exact set. Score ranges are authored, further constrained by
+the model head and operator limits. `structured` legends retain JSON values;
+`canonical_json_text` keeps strings unchanged and serializes other values with
+recursively sorted object keys. Boolean order may be `false_first`, `true_first`,
+or `criteria_true_first` (true first when it is the first of two criteria).
+Boolean criteria may be forbidden, strict with a declared description payload,
+or permissive. Permissive criteria ignore unrelated keys and optionally accept
+`no`/`yes` aliases only when the corresponding canonical key is absent; explicit
+canonical null takes precedence. Missing optional instructions use the authored
+default; explicit null is validated normally. Unknown request/question fields
+are ignored, matching the upstream transport.
 
 The model author supplies the prompt; there is no model-name or architecture
 lookup. Its Jinja context contains `state`, `instructions`, `type`, `options`
@@ -100,8 +150,7 @@ The package's exact tokenizer padding/truncation contract remains authoritative.
 
 This v1 execution path supports text and structured JSON state/instructions.
 Files/images/video, chat media parts and spoken instructions are refused before
-execution. Multimodal decision preparation, model-specific input/default/score-range policies,
-canonical legend policies, joint/packed decision heads and shared generative /
+execution. Multimodal decision preparation, joint/packed decision heads and shared generative /
 decision workflow entry points still need explicit metadata and runtime support.
 GGUF decision-head import is not implemented by registering this HTTP route.
 The small native ONNX fixture proves actual input-dependent head execution,

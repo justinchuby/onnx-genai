@@ -1,0 +1,4 @@
+{
+  "recorded_utc": "2026-11-24T19:49:43.040503+00:00",
+  "pre_measurement_review": "Original row-body control bypasses public equal-length/complete-row Result validation. Candidate/AA call the public native entry; short-row comparisons cannot establish before/after operator regression. This is a mechanism screen only, not sufficient to ship by itself. Preserve data and require matched-entry default comparison if promising."
+}

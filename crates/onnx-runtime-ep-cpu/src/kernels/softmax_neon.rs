@@ -64,13 +64,35 @@ unsafe fn exp4<const NEUTRAL_SCALE: bool>(x: float32x4_t) -> float32x4_t {
 /// disjoint. Each vector load precedes its corresponding destination store.
 #[target_feature(enable = "neon")]
 #[inline]
-unsafe fn softmax_row_impl<const NEUTRAL_SCALE: bool>(src: *const f32, dst: *mut f32, d: usize) {
+unsafe fn softmax_row_impl<const NEUTRAL_SCALE: bool, const UNROLL: bool>(
+    src: *const f32,
+    dst: *mut f32,
+    d: usize,
+) {
     #[cfg(test)]
     SOFTMAX_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: all complete-vector and scalar accesses are bounded by d.
     unsafe {
         let mut maximum = vdupq_n_f32(f32::NEG_INFINITY);
         let mut i = 0;
+        if UNROLL && d >= 16 {
+            let mut maximum1 = maximum;
+            let mut maximum2 = maximum;
+            let mut maximum3 = maximum;
+            while i + 16 <= d {
+                let x0 = vld1q_f32(src.add(i));
+                let x1 = vld1q_f32(src.add(i + 4));
+                let x2 = vld1q_f32(src.add(i + 8));
+                let x3 = vld1q_f32(src.add(i + 12));
+                maximum = vbslq_f32(vcgtq_f32(x0, maximum), x0, maximum);
+                maximum1 = vbslq_f32(vcgtq_f32(x1, maximum1), x1, maximum1);
+                maximum2 = vbslq_f32(vcgtq_f32(x2, maximum2), x2, maximum2);
+                maximum3 = vbslq_f32(vcgtq_f32(x3, maximum3), x3, maximum3);
+                i += 16;
+            }
+            // All four maxima ignored NaNs through ordered comparisons.
+            maximum = vmaxq_f32(vmaxq_f32(maximum, maximum1), vmaxq_f32(maximum2, maximum3));
+        }
         while i + 4 <= d {
             let value = vld1q_f32(src.add(i));
             // Ordered compare/select ignores quiet AND signalling NaNs, just
@@ -89,6 +111,20 @@ unsafe fn softmax_row_impl<const NEUTRAL_SCALE: bool>(src: *const f32, dst: *mut
         let vmax = vdupq_n_f32(max);
         let mut sums = vdupq_n_f32(0.0);
         i = 0;
+        if UNROLL {
+            while i + 8 <= d {
+                let x0 = vld1q_f32(src.add(i));
+                let x1 = vld1q_f32(src.add(i + 4));
+                let e0 = exp4::<NEUTRAL_SCALE>(vsubq_f32(x0, vmax));
+                let e1 = exp4::<NEUTRAL_SCALE>(vsubq_f32(x1, vmax));
+                vst1q_f32(dst.add(i), e0);
+                vst1q_f32(dst.add(i + 4), e1);
+                // Preserve the original vector summation order exactly.
+                sums = vaddq_f32(sums, e0);
+                sums = vaddq_f32(sums, e1);
+                i += 8;
+            }
+        }
         while i + 4 <= d {
             let e = exp4::<NEUTRAL_SCALE>(vsubq_f32(vld1q_f32(src.add(i)), vmax));
             vst1q_f32(dst.add(i), e);
@@ -105,6 +141,19 @@ unsafe fn softmax_row_impl<const NEUTRAL_SCALE: bool>(src: *const f32, dst: *mut
         let inverse = 1.0 / sum;
         let inv = vdupq_n_f32(inverse);
         i = 0;
+        if UNROLL {
+            while i + 16 <= d {
+                let y0 = vmulq_f32(vld1q_f32(dst.add(i)), inv);
+                let y1 = vmulq_f32(vld1q_f32(dst.add(i + 4)), inv);
+                let y2 = vmulq_f32(vld1q_f32(dst.add(i + 8)), inv);
+                let y3 = vmulq_f32(vld1q_f32(dst.add(i + 12)), inv);
+                vst1q_f32(dst.add(i), y0);
+                vst1q_f32(dst.add(i + 4), y1);
+                vst1q_f32(dst.add(i + 8), y2);
+                vst1q_f32(dst.add(i + 12), y3);
+                i += 16;
+            }
+        }
         while i + 4 <= d {
             vst1q_f32(dst.add(i), vmulq_f32(vld1q_f32(dst.add(i)), inv));
             i += 4;
@@ -119,14 +168,14 @@ unsafe fn softmax_row_impl<const NEUTRAL_SCALE: bool>(src: *const f32, dst: *mut
 #[target_feature(enable = "neon")]
 pub(super) unsafe fn softmax_row(src: *const f32, dst: *mut f32, d: usize) {
     // SAFETY: forward the caller's NEON and identical/disjoint row contract.
-    unsafe { softmax_row_impl::<true>(src, dst, d) };
+    unsafe { softmax_row_impl::<true, true>(src, dst, d) };
 }
 
 #[cfg(all(test, feature = "mlas"))]
 fn initial_neon(src: &[f32], dst: &mut [f32], d: usize) {
     for (input, output) in src.chunks_exact(d).zip(dst.chunks_exact_mut(d)) {
         // SAFETY: NEON test host; disjoint equal-length complete rows.
-        unsafe { softmax_row_impl::<false>(input.as_ptr(), output.as_mut_ptr(), d) };
+        unsafe { softmax_row_impl::<false, false>(input.as_ptr(), output.as_mut_ptr(), d) };
     }
 }
 
@@ -147,7 +196,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
-    fn standard_fpcr() -> u64 {
+    pub(super) fn standard_fpcr() -> u64 {
         let value: u64;
         // SAFETY: reading FPCR changes no floating-point or memory state.
         unsafe {
@@ -507,3 +556,7 @@ mod tests {
         eprintln!("NEON_SOFTMAX_FPCR,{}", standard_fpcr());
     }
 }
+
+#[cfg(test)]
+#[path = "softmax_neon_unroll_tests.rs"]
+mod unroll_tests;
