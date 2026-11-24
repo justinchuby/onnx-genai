@@ -367,6 +367,44 @@ fn opset_28_29_and_affine_rules_resolve_through_the_plugin() {
         ],
         &[3, 2, 2],
     );
+    let mut packed_gather = node("DequantizePackedGather", 2, &[], 1);
+    packed_gather.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+    packed_gather
+        .attributes
+        .insert("format".into(), Attribute::String(b"gguf:q8_0".to_vec()));
+    packed_gather
+        .attributes
+        .insert("shape".into(), Attribute::Ints(vec![3, 32]));
+    let packed = [0u8; 102];
+    shape_only(
+        &packed_gather,
+        &[view(DataType::Uint8, &[102], &[1], packed.as_ptr()), route],
+        &[2, 2, 32],
+    );
+    let mut packed_grouped = node("PackedGroupedMatMul", 3, &[], 1);
+    packed_grouped.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+    packed_grouped
+        .attributes
+        .insert("format".into(), Attribute::String(b"gguf:q8_0".to_vec()));
+    packed_grouped
+        .attributes
+        .insert("shape".into(), Attribute::Ints(vec![2, 3, 32]));
+    let packed_experts = [0u8; 204];
+    let activations = [0.0f32; 64];
+    shape_only(
+        &packed_grouped,
+        &[
+            view(
+                DataType::Float32,
+                &[2, 32],
+                &[32, 1],
+                activations.as_ptr().cast(),
+            ),
+            view(DataType::Uint8, &[204], &[1], packed_experts.as_ptr()),
+            route,
+        ],
+        &[2, 2, 3],
+    );
     let mut grouped = node(
         "AffineQuantizedGroupedMatMul",
         4,

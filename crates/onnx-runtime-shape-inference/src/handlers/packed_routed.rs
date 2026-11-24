@@ -126,4 +126,26 @@ pub fn register(reg: &mut InferenceRegistry) {
             Ok(())
         },
     );
+    reg.register(
+        onnx_runtime_ir::RUNTIME_DOMAIN,
+        onnx_runtime_ir::quantized_grouped::PACKED_OP,
+        1,
+        |ctx| {
+            let metadata = onnx_runtime_ir::dequantize_packed::Metadata::from_node(ctx.node)
+                .map_err(|detail| ShapeInferError::Invalid {
+                    op: ctx.node.op_type.clone(),
+                    detail,
+                })?;
+            if let ([_, n, _], Some([m, _]), Some([_, selections])) =
+                (metadata.shape(), ctx.input_shape(0), ctx.input_shape(2))
+            {
+                ctx.set_output(
+                    0,
+                    metadata.dtype(),
+                    vec![m.clone(), selections.clone(), DimExpr::constant(*n as i64)],
+                );
+            }
+            Ok(())
+        },
+    );
 }

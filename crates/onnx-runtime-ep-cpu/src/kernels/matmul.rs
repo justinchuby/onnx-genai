@@ -12410,10 +12410,10 @@ mod weight_cache_accounting {
             "GroupedMatMul" => NoWeightCache(
                 "indexes weight layouts directly using execution-local dense views or copies",
             ),
-            "AffineQuantizedGather" => NoWeightCache(
+            "AffineQuantizedGather" | "DequantizePackedGather" => NoWeightCache(
                 "dequantizes selected codes per call without retaining decoded weights",
             ),
-            "AffineQuantizedGroupedMatMul" => NoWeightCache(
+            "AffineQuantizedGroupedMatMul" | "PackedGroupedMatMul" => NoWeightCache(
                 "decodes packed weights on demand in the dot product without prepacking",
             ),
 
