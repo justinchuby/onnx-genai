@@ -557,34 +557,49 @@ fn check_opset29_cases(
     // state, and tracks snapshots in the activation dtype when S is omitted.
     let dtype = DataType::BFloat16;
     let inputs = [
-        float_input(dtype, &[1, 2, 4], &[1., 0., 0., 1., 1., 1., 2., 1.]),
-        float_input(dtype, &[1, 2, 2], &[1., 0., 0., 1.]),
-        float_input(dtype, &[1, 2, 1], &[4., 8.]),
+        float_input(
+            dtype,
+            &[1, 2, 8],
+            &[
+                1., 0., 0., 1., 1., 0., 0., 1., 1., 1., 2., 1., 1., 1., 1., 2.,
+            ],
+        ),
+        float_input(dtype, &[1, 2, 4], &[1., 0., 1., 0., 0., 1., 0., 1.]),
+        float_input(dtype, &[1, 2, 2], &[4., 6., 8., 10.]),
         common::absent_input(dtype),
-        float_input(dtype, &[1, 2, 2], &[0., 0., f32::NEG_INFINITY, 0.]),
+        float_input(
+            dtype,
+            &[1, 2, 4],
+            &[0., 0., 0., 0., f32::NEG_INFINITY, 0., 0., 0.],
+        ),
         float_input(dtype, &[1, 2, 1], &[0.5, 0.5]),
     ];
     let outputs = [
-        (dtype, vec![1, 2, 2]),
-        (dtype, vec![1, 1, 2, 1]),
-        (dtype, vec![1, 2, 1, 2, 1]),
+        (dtype, vec![1, 2, 4]),
+        (dtype, vec![1, 2, 2, 1]),
+        (dtype, vec![1, 2, 2, 2, 1]),
     ];
     let attrs = [
-        ("q_num_heads", Attribute::Int(2)),
-        ("kv_num_heads", Attribute::Int(1)),
+        ("q_num_heads", Attribute::Int(4)),
+        ("kv_num_heads", Attribute::Int(2)),
         ("v_num_heads", Attribute::Int(0)),
         ("scale", Attribute::Float(1.0)),
         ("chunk_size", Attribute::Int(1)),
     ];
     let got = run(&inputs, &outputs, &attrs);
-    for (bytes, expected) in got
-        .iter()
-        .zip([&[2., 0., 4., 4.][..], &[0., 4.], &[2., 0., 0., 4.]])
-    {
+    for (bytes, expected) in got.iter().zip([
+        &[2., 0., 3., 0., 4., 4., 8., 13.][..],
+        &[0., 4., 3., 5.],
+        &[2., 0., 3., 0., 0., 4., 3., 5.],
+    ]) {
         assert_eq!(decode_floats(bytes, dtype), expected);
     }
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "CUDA suite; this case runs on CPU"
+)]
 #[test]
 fn linear_attention_29_cpu_onnx_conformance() {
     check_opset29_cases(|inputs, outputs, attrs| {
@@ -599,6 +614,70 @@ fn linear_attention_29_cuda_onnx_conformance() {
     check_opset29_cases(|inputs, outputs, attrs| {
         run_cuda(&ep, "LinearAttention", "", 29, inputs, outputs, attrs)
     });
+    check_opset29_rejects_aliased_trajectory(&ep);
+}
+
+fn check_opset29_rejects_aliased_trajectory(ep: &CudaExecutionProvider) {
+    let dtype = DataType::Float32;
+    let qkv = [1, 2, 1];
+    let present = [1, 1, 1, 1];
+    let states = [1, 2, 1, 1, 1];
+    let inputs = [0; 3].map(|_| float_input(dtype, &qkv, &[1., 2.]));
+    let outputs = [
+        (dtype, qkv.to_vec()),
+        (dtype, present.to_vec()),
+        (dtype, states.to_vec()),
+    ];
+    let attrs = [
+        ("q_num_heads", Attribute::Int(1)),
+        ("kv_num_heads", Attribute::Int(1)),
+        ("update_rule", Attribute::String(b"linear".to_vec())),
+    ];
+    let (graph, id) = build_graph("LinearAttention", "", 29, &inputs, &outputs, &attrs);
+    let input_shapes = inputs.each_ref().map(|t| t.shape.clone());
+    let kernel = ep.get_kernel(graph.node(id), &input_shapes, 29).unwrap();
+    let mut buffer = ep.allocate(6 * 256, 256).unwrap();
+    let ptr = buffer.as_mut_ptr();
+    let [qkv_stride, present_stride, states_stride] =
+        [&qkv[..], &present, &states].map(compute_contiguous_strides);
+    let views = [0, 256, 512].map(|offset| {
+        TensorView::new(
+            DevicePtr(ptr.cast_const()),
+            dtype,
+            &qkv,
+            &qkv_stride,
+            ep.device_id(),
+        )
+        .with_byte_offset(offset)
+    });
+    let mut outputs = [
+        TensorMut::new(DevicePtrMut(ptr), dtype, &qkv, &qkv_stride, ep.device_id())
+            .with_byte_offset(768),
+        TensorMut::new(
+            DevicePtrMut(ptr),
+            dtype,
+            &present,
+            &present_stride,
+            ep.device_id(),
+        )
+        .with_byte_offset(1024),
+        // The first snapshot would overwrite V for token 1.
+        TensorMut::new(
+            DevicePtrMut(ptr),
+            dtype,
+            &states,
+            &states_stride,
+            ep.device_id(),
+        )
+        .with_byte_offset(516),
+    ];
+    let result = kernel.execute(&views, &mut outputs);
+    ep.deallocate(buffer).unwrap();
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("states overlaps value") && err.contains("non-overlapping device buffer"),
+        "{err}"
+    );
 }
 
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA")]

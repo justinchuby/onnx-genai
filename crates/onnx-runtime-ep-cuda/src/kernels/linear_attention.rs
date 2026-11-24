@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ir::linear_attention::{Heads, has_trajectory};
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::{driver_err, not_implemented};
@@ -39,6 +40,16 @@ const LA_WARP: u32 = 32;
 /// heads use `d_k = 128`; the claim gate rejects anything larger so we never
 /// claim an op this kernel cannot run.
 const MAX_D_K: usize = 256;
+
+fn ranges_overlap(a: usize, a_bytes: usize, b: usize, b_bytes: usize) -> bool {
+    a_bytes != 0
+        && b_bytes != 0
+        && if a <= b {
+            b - a < a_bytes
+        } else {
+            a - b < b_bytes
+        }
+}
 
 /// Private markers set by `CudaLinearAttentionGatingFusion` (see `optimizer.rs`)
 /// on a `LinearAttention` node whose standalone gate chains have been folded
@@ -625,8 +636,6 @@ impl UpdateRule {
     }
 }
 
-use onnx_runtime_ir::linear_attention::{Heads, has_trajectory};
-
 /// Claim gate. Returns `Some(reason)` when the CUDA EP cannot run this node, so
 /// placement declines cleanly instead of claiming then failing at execute time.
 pub(crate) fn unsupported_reason(
@@ -982,6 +991,37 @@ impl Kernel for LinearAttentionKernel {
             return Err(not_implemented(
                 "LinearAttention requires contiguous tensors, one activation dtype and matching past/present state dtypes",
             ));
+        }
+
+        let (required_outputs, optional_outputs) = outputs.split_at_mut(2);
+        if let Some(states) = optional_outputs.first_mut().filter(|s| !s.is_absent()) {
+            // Snapshots are written during the recurrence, while later tokens
+            // (and other CUDA threads) may still read inputs or write outputs.
+            let origin = states.data_ptr_mut::<u8>().addr();
+            let bytes = states.byte_size();
+            let overlaps = |ptr, len| ranges_overlap(origin, bytes, ptr, len);
+            let overlap = inputs
+                .iter()
+                .zip(["query", "key", "value", "past_state", "decay", "beta"])
+                .find_map(|(input, name)| {
+                    (!input.is_absent()
+                        && overlaps(input.data_ptr::<u8>().addr(), input.byte_size()))
+                    .then_some(name)
+                })
+                .or_else(|| {
+                    required_outputs
+                        .iter_mut()
+                        .zip(["output", "present_state"])
+                        .find_map(|(out, name)| {
+                            overlaps(out.data_ptr_mut::<u8>().addr(), out.byte_size())
+                                .then_some(name)
+                        })
+                });
+            if let Some(name) = overlap {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep LinearAttention: states overlaps {name}; bind states to a separate, non-overlapping device buffer"
+                )));
+            }
         }
 
         let total = (batch * kv_num_heads * d_v) as u64;
