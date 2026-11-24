@@ -977,12 +977,16 @@ No old returned-Vec alias or public EP interface is retained/added.
 ### CPU integer QMoE projection banks
 
 Integer QMoE reuses the same private two-bank driver as float MoE and
-BlockQuantizedMoE. One StepScoped lane covers grouped input, FC1/optional FC3,
-activation and expert output, reused serially across expert groups. Nongated
-banks are R*H and R*I f32 values; gated banks are R*max(H,I) and
+BlockQuantizedMoE. One StepScoped composite covers grouped input, FC1/optional FC3,
+activation, expert output and route-ordered contributions. FC banks are reused
+serially across expert groups. Nongated banks are R*H and R*I f32 values; gated banks are R*max(H,I) and
 R*max(FC1+separate_FC3,H), for total input rows R. There is no expert-count or
-top-k multiplier. A singleton still borrows its contiguous original input row,
-but now declares the capacity for its FC intermediates.
+top-k multiplier for the FC banks. Contributions additionally retain R*k*H
+f32 values in their original route slots. Once all experts and the prefetch
+scope finish, bank A is dead; its R*H prefix is zeroed to +0 and reused for the
+final accumulator, preserving row/route-slot += order before publication. No
+separate accumulator region is added. A singleton still borrows its contiguous
+original input row and declares FC and contribution capacity.
 
 Preparation and execution share checked geometry: inter is FC2's packed input
 axis times 8/bits, never inferred backward from FC1. FC2 metadata is therefore
@@ -992,18 +996,20 @@ The prefetch worker owns weights independently; only the main compute thread
 borrows the lane. Weight request/read/join order and final contribution
 accumulation/publication order remain unchanged.
 
-This accounts retained FC capacity previously allocated as per-expert Vecs;
-it does not establish RSS savings or a process-memory cap. Contributions,
-final output accumulator, tensor widening, decoded-row and column-major decode
-staging remain outside this lane. Transient/retained weight grants retain
-their existing authority. Warm workspace checkout/return does not call its
+This accounts retained FC and contribution capacity previously allocated as
+per-expert or per-dispatch Vecs;
+it does not establish RSS savings or a process-memory cap. Tensor widening,
+routing, decoded-row and column-major decode staging remain outside this lane.
+Transient/retained weight grants retain their existing authority. Warm workspace checkout/return does not call its
 issuer; this is distinct from unchanged positive transient weight admissions.
 
 The [public-session study](../benchmarks/qmoe-fc-projection-banks/README.md)
 retains144 terminal-process CPU receipts, complete outputs and actual path
 traces, plus setup/doubled-work/A/A controls. All six aggregate cells qualify;
 small single-row CPU costs are not excluded. This is not CUDA, mmap-prefetch
-performance or full-model throughput evidence.
+performance or full-model throughput evidence. The subsequent
+[contribution/bank-A reuse study](../benchmarks/qmoe-routed-bank-reuse/README.md)
+compares the full three-region composite against that merged FC-bank baseline.
 
 ### CPU float MoE projection banks
 
