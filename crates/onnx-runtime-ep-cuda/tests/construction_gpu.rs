@@ -606,6 +606,45 @@ fn where_metadata_rewarm_is_transactional_and_preserves_captured_payload() {
         assert_eq!(kernel.device_graph_resources()[0].identity(), identity_b);
         assert!(kernel.cuda_graph_compatible());
     }
+    // Failed candidates retire asynchronously. Settle prior work before
+    // measuring the empty call, rather than attributing old frees to it.
+    ep.wait_for_deferred_releases().unwrap();
+    let counts = (
+        runtime.allocation_counts(),
+        runtime.transfer_counts(),
+        runtime.forced_synchronization_count(),
+    );
+    execute(&[0, 1], &[1, 3], &[0, 3]).unwrap();
+    assert_eq!(
+        (
+            runtime.allocation_counts(),
+            runtime.transfer_counts(),
+            runtime.forced_synchronization_count()
+        ),
+        counts,
+        "empty Where changes its signature without preparing or consuming metadata"
+    );
+    assert_eq!(kernel.device_graph_resources()[0].identity(), identity_b);
+    runtime
+        .begin_graph_capture_in(
+            onnx_runtime_ep_api::DeviceGraphSlot::Verify,
+            &[kernel.as_ref()],
+        )
+        .unwrap();
+    let mismatch = execute(&[1, 2], &[3, 1], &[3, 2]).unwrap_err().to_string();
+    runtime
+        .abort_graph_capture_in(onnx_runtime_ep_api::DeviceGraphSlot::Verify)
+        .unwrap();
+    assert!(mismatch.contains("dtype or shape changed"), "{mismatch}");
+    assert_eq!(
+        (
+            runtime.allocation_counts(),
+            runtime.transfer_counts(),
+            runtime.forced_synchronization_count()
+        ),
+        counts
+    );
+    execute(&[1, 2], &[3, 1], &[3, 2]).unwrap();
     drop(kernel);
     runtime.replay_graph().unwrap();
     let mut observed = [0u8; 48];
@@ -2403,4 +2442,168 @@ fn tile_rejects_signature_change_during_capture() {
     ep.deallocate(b_repeats_buffer).unwrap();
     ep.deallocate(a_output_buffer).unwrap();
     ep.deallocate(b_output_buffer).unwrap();
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable gpu-tests"
+)]
+fn binary_metadata_and_signature_publish_together_and_preserve_old_graph() {
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    runtime.set_defer_eager_sync(true);
+    let a = ep.allocate(12, 256).unwrap();
+    let b = ep.allocate(12, 256).unwrap();
+    let output = ep.allocate(24, 256).unwrap();
+    // SAFETY: each allocation covers exactly its three input values.
+    unsafe {
+        runtime
+            .htod(&raw(&[1_f32, 2., 3.]), cuptr(a.as_ptr()))
+            .unwrap();
+        runtime
+            .htod(&raw(&[10_f32, 20., 30.]), cuptr(b.as_ptr()))
+            .unwrap();
+    }
+    let mut kernel = ep
+        .get_kernel(&Node::new(NodeId(0), "Add", vec![], vec![]), &[], 13)
+        .unwrap();
+    kernel.set_capture_seq_independent(true);
+    let execute = |a_shape: &[usize], b_shape: &[usize], out_shape: &[usize]| {
+        let a_strides = compute_contiguous_strides(a_shape);
+        let b_strides = compute_contiguous_strides(b_shape);
+        let out_strides = compute_contiguous_strides(out_shape);
+        kernel.execute(
+            &[
+                TensorView::new(
+                    DevicePtr(a.as_ptr()),
+                    DataType::Float32,
+                    a_shape,
+                    &a_strides,
+                    ep.device_id(),
+                ),
+                TensorView::new(
+                    DevicePtr(b.as_ptr()),
+                    DataType::Float32,
+                    b_shape,
+                    &b_strides,
+                    ep.device_id(),
+                ),
+            ],
+            &mut [TensorMut::new(
+                DevicePtrMut(output.as_ptr().cast_mut()),
+                DataType::Float32,
+                out_shape,
+                &out_strides,
+                ep.device_id(),
+            )],
+        )
+    };
+    let shape_a = (&[2usize, 1][..], &[1usize, 3][..], &[2usize, 3][..]);
+    let shape_b = (&[1usize, 2][..], &[3usize, 1][..], &[3usize, 2][..]);
+    execute(shape_a.0, shape_a.1, shape_a.2).unwrap();
+    assert!(kernel.cuda_graph_compatible());
+    let identity_a = kernel.device_graph_resources()[0].identity();
+    let counts = (
+        runtime.allocation_counts(),
+        runtime.transfer_counts(),
+        runtime.forced_synchronization_count(),
+    );
+    for _ in 0..8 {
+        execute(shape_a.0, shape_a.1, shape_a.2).unwrap();
+    }
+    assert_eq!(
+        (
+            runtime.allocation_counts(),
+            runtime.transfer_counts(),
+            runtime.forced_synchronization_count()
+        ),
+        counts
+    );
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute(shape_a.0, shape_a.1, shape_a.2).unwrap();
+    runtime.end_graph_capture().unwrap();
+    #[cfg(feature = "gpu-tests")]
+    {
+        runtime.fail_warm_transaction_at_for_test(1);
+        let failure = execute(shape_b.0, shape_b.1, shape_b.2)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            failure.contains("injected staged warm-cache failure"),
+            "{failure}"
+        );
+        assert_eq!(kernel.device_graph_resources()[0].identity(), identity_a);
+        assert!(
+            kernel.cuda_graph_compatible(),
+            "a failed candidate preserves the successful A proof"
+        );
+    }
+    // Quiesce the failed B candidate before the capture-refusal counters.
+    ep.wait_for_deferred_releases().unwrap();
+    runtime
+        .begin_graph_capture_in(
+            onnx_runtime_ep_api::DeviceGraphSlot::Verify,
+            &[kernel.as_ref()],
+        )
+        .unwrap();
+    let before = (
+        runtime.allocation_counts(),
+        runtime.transfer_counts(),
+        runtime.forced_synchronization_count(),
+    );
+    let mismatch = execute(shape_b.0, shape_b.1, shape_b.2)
+        .unwrap_err()
+        .to_string();
+    runtime
+        .abort_graph_capture_in(onnx_runtime_ep_api::DeviceGraphSlot::Verify)
+        .unwrap();
+    assert!(
+        mismatch.contains("dtype or shape changed"),
+        "old signature must remain A: {mismatch}"
+    );
+    assert_eq!(
+        (
+            runtime.allocation_counts(),
+            runtime.transfer_counts(),
+            runtime.forced_synchronization_count()
+        ),
+        before
+    );
+    execute(shape_b.0, shape_b.1, shape_b.2).unwrap();
+    assert_ne!(kernel.device_graph_resources()[0].identity(), identity_a);
+    assert!(kernel.cuda_graph_compatible());
+    runtime
+        .begin_graph_capture_in(
+            onnx_runtime_ep_api::DeviceGraphSlot::Verify,
+            &[kernel.as_ref()],
+        )
+        .unwrap();
+    execute(shape_b.0, shape_b.1, shape_b.2).unwrap();
+    runtime
+        .end_graph_capture_in(onnx_runtime_ep_api::DeviceGraphSlot::Verify)
+        .unwrap();
+    drop(kernel);
+    let mut actual = [0u8; 24];
+    runtime.replay_graph().unwrap();
+    // SAFETY: the live output allocation covers exactly six Float32 values.
+    unsafe {
+        runtime.dtoh(&mut actual, cuptr(output.as_ptr())).unwrap();
+    }
+    assert_eq!(actual.as_slice(), raw(&[11_f32, 21., 31., 12., 22., 32.]));
+    runtime
+        .replay_graph_in(onnx_runtime_ep_api::DeviceGraphSlot::Verify)
+        .unwrap();
+    // SAFETY: the same output allocation is still live for graph B.
+    unsafe {
+        runtime.dtoh(&mut actual, cuptr(output.as_ptr())).unwrap();
+    }
+    assert_eq!(actual.as_slice(), raw(&[11_f32, 12., 21., 22., 31., 32.]));
+    runtime.reset_graph().unwrap();
+    runtime
+        .reset_graph_in(onnx_runtime_ep_api::DeviceGraphSlot::Verify)
+        .unwrap();
+    for buffer in [a, b, output] {
+        ep.deallocate(buffer).unwrap();
+    }
 }
