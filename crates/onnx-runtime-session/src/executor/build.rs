@@ -1409,6 +1409,13 @@ impl Executor {
             super::bindings::collect_workspace_node_locations(ep.as_ref(), &graph, &plan)?;
         let plan_len = plan.len();
         let capture_growing_symbols = compute_capture_disqualifying_symbols(&graph);
+        let classifier = ShapeEvolutionClassifier::new(&graph, &HashSet::new());
+        let kernel_shape_facts = plan
+            .iter()
+            .map(|entry| {
+                classifier.facts(&graph, graph.node(entry.node_id), &capture_growing_symbols)
+            })
+            .collect();
         let mut exec = Self {
             instance_id,
             artifact_config: artifact_transaction.config(),
@@ -1447,6 +1454,7 @@ impl Executor {
             slot_capture: std::array::from_fn(|_| SlotCaptureState::default()),
             control_flow_output_values,
             capture_growing_symbols,
+            kernel_shape_facts,
             capacity_pinned_kv_symbols: HashSet::new(),
             last_capture_failed_node: None,
             views: HashMap::new(),
@@ -2816,6 +2824,7 @@ impl Executor {
             }
             if self.kernel_bindings[i].as_ref().is_some_and(|binding| {
                 self.cache.contains(binding)
+                    && binding.shape_facts == self.kernel_shape_facts[i]
                     && binding.shapes.len() == self.plan[i].inputs.len()
                     && binding.shapes.iter().zip(&self.plan[i].inputs).all(
                         |(bound_shape, input)| match input {
@@ -2846,8 +2855,7 @@ impl Executor {
             )?;
             let node = self.graph.node(node_id);
             let opset = effective_opset(&self.graph, node);
-            let seq_independent =
-                node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols);
+            let shape_facts = self.kernel_shape_facts[i];
             let graph_tokens = self.captured_graph_tokens_for_plan_index(i);
             let (_, key) = self.cache.get_or_create(
                 node_id,
@@ -2857,7 +2865,7 @@ impl Executor {
                 &constant_inputs,
                 &constant_values,
                 opset,
-                seq_independent,
+                shape_facts,
                 self.artifact_config,
                 &mut self.provider_artifact_readiness,
                 self.ep.as_ref(),

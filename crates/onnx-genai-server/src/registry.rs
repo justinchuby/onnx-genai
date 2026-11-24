@@ -924,6 +924,7 @@ mod tests {
             adapters: None,
             native_slot: None,
             reranking: None,
+            decision: None,
             runtime_sampling: false,
             workflow_facts: crate::driver::WorkflowFacts {
                 components: 0,

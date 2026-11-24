@@ -461,8 +461,14 @@ impl Kernel for BinaryIntKernel {
         }
     }
 
-    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
-        self.capture_seq_independent = seq_independent;
+    fn configure_shape_facts(&mut self, facts: onnx_runtime_ep_api::KernelShapeFacts) {
+        if self.capture_seq_independent != facts.capture_eligible {
+            self.warm
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .signature = None;
+        }
+        self.capture_seq_independent = facts.capture_eligible;
     }
 }
 

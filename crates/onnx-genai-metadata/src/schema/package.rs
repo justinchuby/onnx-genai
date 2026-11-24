@@ -212,10 +212,47 @@ pub struct TaskProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoding: Option<SequenceDecodingSpec>,
 
+    /// Explicit non-generative decision prompting and answer interpretation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<DecisionSpec>,
+
     /// Whether this profile changes generated output and therefore participates
     /// in cache correctness dependencies.
     #[serde(default)]
     pub generation_affecting: bool,
+}
+
+/// Model-authored decision semantics; calibration belongs to the workflow.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionSpec {
+    /// Jinja context: state, instructions, type, options (key/description), variant.
+    pub prompt_template: String,
+    pub max_options: std::num::NonZeroUsize,
+    pub variants: DecisionVariants,
+    pub choice_confidence: DecisionConfidence,
+    pub score_confidence: DecisionConfidence,
+    pub score: DecisionScore,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionVariants {
+    Direct,
+    ReverseAverage,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionConfidence {
+    UniformMargin,
+    ModeDistance,
+    NormalizedEntropy,
+    MaximumProbability,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionScore {
+    ExpectedLevel,
+    MedianLevel,
 }
 
 /// Whether a reader may ignore a profile it does not understand.
