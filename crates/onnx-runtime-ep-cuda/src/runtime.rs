@@ -2067,8 +2067,14 @@ impl CudaRuntime {
     }
 
     /// Driver-reported capture status for the EP stream.
-    pub fn graph_capture_status(&self) -> Result<cudarc::driver::sys::CUstreamCaptureStatus> {
-        self.graph.capture_status()
+    /// Observe the actual compute stream without acquiring a graph lifecycle
+    /// mutex. This is a driver observation, not an ownership/installation proof.
+    /// In particular it must remain callable inside a process synchronizing
+    /// section: capture begin holds lifecycle state while waiting for that gate.
+    pub fn stream_capture_status(&self) -> Result<cudarc::driver::sys::CUstreamCaptureStatus> {
+        self.stream
+            .capture_status()
+            .map_err(|error| driver_err("query CUDA stream capture status", error))
     }
 
     /// The [`CudaGraphLifecycle`] backing a given [`DeviceGraphSlot`]. Both slots
@@ -2982,7 +2988,7 @@ impl CudaRuntime {
     /// A stream synchronize is illegal during capture, so device-resident kernels
     /// use this to skip the trailing sync while a graph is being recorded.
     pub fn is_capturing(&self) -> Result<bool> {
-        Ok(self.graph_capture_status()?
+        Ok(self.stream_capture_status()?
             != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE)
     }
 
@@ -2991,14 +2997,12 @@ impl CudaRuntime {
     /// thread and cannot observe externally started capture on this stream.
     /// Call only after a cache/pool miss so warm reuse adds no driver query.
     fn require_eager_resource_preparation(&self, resource: impl std::fmt::Display) -> Result<()> {
-        // Never enter the graph lifecycle mutex while holding the process
-        // gate: begin() holds that mutex while waiting for the gate's readers.
-        let status = self.stream.capture_status().map_err(|error| {
-            driver_err(
-                &format!("query CUDA capture before preparing {resource}"),
-                error,
-            )
-        })?;
+        let status = self
+            .stream_capture_status()
+            .map_err(|source| EpError::Backend {
+                operation: "observe CUDA capture before resource preparation",
+                source: Box::new(source),
+            })?;
         if status != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep: cannot prepare {resource} during CUDA graph capture; \
@@ -5126,6 +5130,120 @@ mod cold_resource_capture_tests {
                 .unwrap();
             let fresh = runtime.alloc_raw(16 << 20).unwrap();
             unsafe { runtime.free_raw(fresh) }.unwrap();
+        }
+    }
+}
+
+#[cfg(all(test, feature = "gpu-tests"))]
+mod stream_capture_observation_tests {
+    use super::*;
+    use cudarc::driver::sys::CUstreamCaptureStatus;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn stream_observation_and_h2d_progress_while_lifecycle_mutexes_are_held() {
+        let runtime = Arc::new(CudaRuntime::new(0).expect("CUDA device required with gpu-tests"));
+        let allocation = runtime.alloc_raw(4).unwrap();
+        let (worker, progressed, locks) = runtime
+            .graph
+            .test_with_lock(|| {
+                runtime
+                    .verify_graph
+                    .test_with_lock(|| {
+                        let locks = runtime.graph_lifecycle_lock_acquisition_count();
+                        let (done_tx, done_rx) = mpsc::channel();
+                        let worker_runtime = runtime.clone();
+                        let worker = std::thread::spawn(move || -> Result<()> {
+                            assert_eq!(
+                                worker_runtime.stream_capture_status()?,
+                                CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
+                            );
+                            assert!(!worker_runtime.is_capturing()?);
+                            // This acquires the process synchronizing gate before
+                            // observing stream state: the former inverted lock edge.
+                            unsafe { worker_runtime.htod(&[3, 5, 7, 11], allocation) }?;
+                            // A regression may have timed out and released the
+                            // locks; the main thread reports that failure after join.
+                            let _ = done_tx.send(());
+                            Ok(())
+                        });
+                        // On a regression release both lifecycle locks BEFORE joining
+                        // the blocked worker, so failure is bounded rather than a hang.
+                        let progressed = done_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+                        (worker, progressed, locks)
+                    })
+                    .unwrap()
+            })
+            .unwrap();
+        worker.join().expect("observation worker panicked").unwrap();
+        assert!(
+            progressed,
+            "stream status and synchronous H2D must not wait for either lifecycle mutex"
+        );
+        assert_eq!(runtime.graph_lifecycle_lock_acquisition_count(), locks);
+        let mut observed = [0; 4];
+        unsafe { runtime.dtoh(&mut observed, allocation) }.unwrap();
+        assert_eq!(observed, [3, 5, 7, 11]);
+        unsafe { runtime.free_raw(allocation) }.unwrap();
+    }
+
+    #[test]
+    fn h2d_capture_refusal_preserves_stream_and_uses_no_lifecycle_lock() {
+        for registered in [false, true] {
+            let runtime = CudaRuntime::new(0).expect("CUDA device required with gpu-tests");
+            let allocation = runtime.alloc_raw(4).unwrap();
+            unsafe { runtime.htod(&[1, 2, 3, 4], allocation) }.unwrap();
+            if registered {
+                runtime.begin_graph_capture(&[]).unwrap();
+            } else {
+                runtime.stream.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL).unwrap();
+            }
+            let locks = runtime.graph_lifecycle_lock_acquisition_count();
+            let transfers = runtime.transfer_counts();
+            let syncs = runtime.forced_synchronization_count();
+            let allocations = runtime.allocation_counts();
+            assert_eq!(
+                runtime.stream_capture_status().unwrap(),
+                CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
+            );
+            assert!(runtime.is_capturing().unwrap());
+            let message = unsafe { runtime.htod(&[9; 4], allocation) }
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains("synchronous H2D upload is illegal during CUDA graph capture")
+                    && message.contains("warm the host data before capture"),
+                "{message}"
+            );
+            assert_eq!(
+                runtime.stream_capture_status().unwrap(),
+                CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
+            );
+            assert_eq!(runtime.graph_lifecycle_lock_acquisition_count(), locks);
+            assert_eq!(runtime.transfer_counts(), transfers);
+            assert_eq!(runtime.forced_synchronization_count(), syncs);
+            assert_eq!(runtime.allocation_counts(), allocations);
+            if registered {
+                runtime.abort_graph_capture().unwrap();
+            } else {
+                runtime.test_end_unregistered_graph_capture().unwrap();
+            }
+            assert_eq!(
+                runtime.stream_capture_status().unwrap(),
+                CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
+            );
+            let mut observed = [0; 4];
+            unsafe { runtime.dtoh(&mut observed, allocation) }.unwrap();
+            assert_eq!(
+                observed,
+                [1, 2, 3, 4],
+                "rejected H2D must not overwrite destination"
+            );
+            unsafe { runtime.htod(&[9; 4], allocation) }.unwrap();
+            unsafe { runtime.dtoh(&mut observed, allocation) }.unwrap();
+            assert_eq!(observed, [9; 4], "H2D must recover after capture ends");
+            unsafe { runtime.free_raw(allocation) }.unwrap();
         }
     }
 }

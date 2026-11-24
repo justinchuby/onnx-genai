@@ -5,9 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::ThreadId;
 
 use arc_swap::ArcSwapOption;
-use cudarc::driver::sys::{
-    CUgraph, CUgraphExec, CUgraphInstantiate_flags, CUstreamCaptureMode, CUstreamCaptureStatus,
-};
+use cudarc::driver::sys::{CUgraph, CUgraphExec, CUgraphInstantiate_flags, CUstreamCaptureMode};
 use cudarc::driver::{CudaStream, result};
 use onnx_runtime_cuda_memory::capture_gate::CaptureExclusion;
 use onnx_runtime_ep_api::{
@@ -727,11 +725,10 @@ impl CudaGraphLifecycle {
         self.segment_count(token)
     }
 
-    pub(crate) fn capture_status(&self) -> Result<CUstreamCaptureStatus> {
+    #[cfg(all(test, feature = "gpu-tests"))]
+    pub(crate) fn test_with_lock<T>(&self, action: impl FnOnce() -> T) -> Result<T> {
         let _state = self.lock()?;
-        self.stream
-            .capture_status()
-            .map_err(|error| driver_err("query CUDA graph capture status", error))
+        Ok(action())
     }
 
     pub(crate) fn test_acquire_lock(&self) -> Result<()> {
@@ -744,6 +741,7 @@ impl CudaGraphLifecycle {
 mod tests {
     use std::sync::Arc;
 
+    use cudarc::driver::sys::CUstreamCaptureStatus;
     use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
     use onnx_runtime_ep_api::{Kernel, TensorMut, TensorView};
 
@@ -1324,7 +1322,7 @@ extern "C" __global__ void add_one(const float* x, float* y, unsigned long long 
         let error = runtime.begin_graph_capture(&[&incompatible]).unwrap_err();
         assert!(error.to_string().contains("rejected before begin_capture"));
         assert_eq!(
-            runtime.graph_capture_status().unwrap(),
+            runtime.stream_capture_status().unwrap(),
             CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
         );
         assert!(!runtime.has_graph_executable().unwrap());

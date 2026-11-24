@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use crate::runtime::GraphDeviceAllocation;
 use onnx_runtime_ep_api::{DeviceId, DevicePtrMut};
