@@ -1658,3 +1658,19 @@ The replay test covers continuation bytes, invalid leading bytes and malformed
 sequences, independent clones and recovery after rejecting a wrong next piece.
 The production processor-chain test now covers both token and literal successors
 when a byte pattern activates inside a multibyte model token.
+
+### Lazy raw GBNF validation completed
+
+The byte VM and UTF-8 recovery fixes passed the complete local functional graph
+on the current-main restack: engine 979 / one inherited ignore, server 451 / two
+inherited ignores, CLI 71, HTTP 37 and both CLI profile subprocesses. Strict
+engine/server/CLI all-target Clippy with the ORT CUDA feature, formatting and diff
+checks passed. The earlier capture/reset and truncated-byte failures above are
+resolved, with their regression coverage retained. Execution fuel also charges
+state/capture copying and sequence expansion, rather than just VM dispatch.
+
+PR #2525 lands this raw-GBNF compatibility increment after local self-review;
+the owner explicitly requested bypassing blocked remote CI. Lazy JSON, C++
+collating/equivalence classes, remaining model/slot/adapter protocols and complete
+Native Value/MTP isolation remain broader goal work. These CPU functional and
+compile checks do not establish GPU execution or performance results.
