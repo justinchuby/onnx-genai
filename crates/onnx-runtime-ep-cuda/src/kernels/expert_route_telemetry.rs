@@ -99,6 +99,38 @@ pub fn words_for(num_experts: usize) -> usize {
     num_experts.div_ceil(32)
 }
 
+// Preserve the original minimum separation between the independent 512-byte
+// retained allocations. This is an ABI layout choice, not a measured claim
+// about cache-line contention; owner and transfer scopes remain coarse.
+const BITMAP_WORD_OFFSET: usize = 128;
+const BITMAP_BYTE_OFFSET: usize = BITMAP_WORD_OFFSET * 4;
+
+/// Header, zeroed isolation gap, then bitmap in one u32 payload. The returned
+/// Layout proves that the complete span fits Rust's addressable capacity.
+fn record_layout(num_experts: usize) -> Result<std::alloc::Layout> {
+    let words = words_for(num_experts).checked_add(BITMAP_WORD_OFFSET).ok_or_else(|| {
+        EpError::KernelFailed(format!("route telemetry num_experts={num_experts} overflows record word count; reduce the expert domain"))
+    })?;
+    std::alloc::Layout::array::<u32>(words).map_err(|source| EpError::Backend {
+        operation: "plan contiguous route telemetry header and bitmap; reduce expert domain if the record exceeds addressable capacity",
+        source: Box::new(source),
+    })
+}
+
+fn window_payload(words: usize, header: [u32; HEADER_LEN]) -> Vec<u32> {
+    let mut payload = vec![0; words];
+    payload[..HEADER_LEN].copy_from_slice(&header);
+    payload
+}
+
+fn split_payload(mut payload: Vec<u32>) -> ([u32; HEADER_LEN], Vec<u32>) {
+    let header = payload[..HEADER_LEN]
+        .try_into()
+        .expect("owned record includes fixed header");
+    let bitmap = payload.split_off(BITMAP_WORD_OFFSET);
+    (header, bitmap)
+}
+
 // ---------------------------------------------------------------------------
 // Device source.
 // ---------------------------------------------------------------------------
@@ -269,14 +301,12 @@ pub(crate) struct ArmedTelemetry {
     device_id: u32,
     num_experts: usize,
     routes_per_row: u32,
-    words: usize,
-    bitmap: Arc<GraphDeviceAllocation>,
-    header: Arc<GraphDeviceAllocation>,
+    // Header and bitmap share an armed lifetime and one physical owner.
+    record: Arc<GraphDeviceAllocation>,
     /// Host-side window/epoch counter. Stamped into `header[H_EPOCH]` at arm
     /// (window 1) and at every `reset_boundary`; held fixed for the whole
     /// window. There is no device epoch counter and no reset kernel.
     epoch: AtomicU32,
-    bitmap_bytes: usize,
 }
 
 impl ArmedTelemetry {
@@ -314,11 +344,10 @@ impl ArmedTelemetry {
             }
         })?;
 
-        let words = words_for(config.num_experts);
-        let bitmap_bytes = words * 4;
-        let bitmap = GraphDeviceAllocation::allocate(runtime, bitmap_bytes.max(1))
-            .map_err(|error| TelemetryUnsupported::Alloc(error.to_string()))?;
-        let header = GraphDeviceAllocation::allocate(runtime, HEADER_BYTES)
+        let record_bytes = record_layout(config.num_experts)
+            .map_err(|error| TelemetryUnsupported::Alloc(error.to_string()))?
+            .size();
+        let record = GraphDeviceAllocation::allocate(runtime, record_bytes)
             .map_err(|error| TelemetryUnsupported::Alloc(error.to_string()))?;
 
         let armed = Self {
@@ -326,12 +355,9 @@ impl ArmedTelemetry {
             device_id: config.device_id,
             num_experts: config.num_experts,
             routes_per_row,
-            words,
-            bitmap,
-            header,
+            record,
             // Arm opens window 1. `reset_boundary` bumps this to 2, 3, ...
             epoch: AtomicU32::new(1),
-            bitmap_bytes,
         };
         // Open the first window: stamp identity + epoch 1 and zero the record.
         if let Err(error) = armed.open_window(runtime) {
@@ -353,18 +379,13 @@ impl ArmedTelemetry {
             0,
             0,
         ];
-        let mut header_bytes = [0u8; HEADER_BYTES];
-        for (word, chunk) in header_words.iter().zip(header_bytes.chunks_exact_mut(4)) {
-            chunk.copy_from_slice(&word.to_ne_bytes());
-        }
-        // SAFETY: `header` is a live `HEADER_BYTES` allocation from this runtime;
-        // `bitmap` is a live `bitmap_bytes` allocation. Both cover the sources.
+        let payload = window_payload(self.record.bytes() / 4, header_words);
+        // SAFETY: the record is one contiguous u32 payload, covers both header
+        // and bitmap, and remains owned until the synchronous upload completes.
         unsafe {
-            runtime.htod(&header_bytes, self.header.ptr())?;
-            if self.bitmap_bytes > 0 {
-                let zeros = vec![0u8; self.bitmap_bytes];
-                runtime.htod(&zeros, self.bitmap.ptr())?;
-            }
+            let bytes =
+                std::slice::from_raw_parts(payload.as_ptr().cast::<u8>(), self.record.bytes());
+            runtime.htod(bytes, self.header_ptr())?;
         }
         Ok(())
     }
@@ -417,46 +438,40 @@ impl ArmedTelemetry {
 
     /// Device pointer to the route bitmap passed to the fused route kernel.
     pub(crate) fn bitmap_ptr(&self) -> CUdeviceptr {
-        self.bitmap.ptr()
+        self.record.ptr() + BITMAP_BYTE_OFFSET as u64
     }
 
     /// Device pointer to the header passed to the fused route kernel.
     pub(crate) fn header_ptr(&self) -> CUdeviceptr {
-        self.header.ptr()
+        self.record.ptr()
     }
 
-    /// Total device bytes held by this record (for teardown/accounting tests).
-    /// Bitmap + 6-word header; there is no device epoch buffer (the epoch is a
-    /// host-side window counter).
+    /// Effective header + bitmap bytes, excluding the isolation gap and raw
+    /// pool rounding. There is no device epoch buffer (the epoch is host-side).
     pub(crate) fn footprint_bytes(&self) -> usize {
-        self.bitmap_bytes + HEADER_BYTES
+        HEADER_BYTES + words_for(self.num_experts) * 4
     }
 
     /// Device virtual address of the bitmap (stable for the armed lifetime).
     /// Used by capture/replay tests to prove the pointer never moves.
     pub(crate) fn bitmap_addr(&self) -> CUdeviceptr {
-        self.bitmap.ptr()
+        self.record.ptr() + BITMAP_BYTE_OFFSET as u64
     }
 
     /// Copy the header and bitmap back to the host (test/observability only —
     /// this is *not* the production CONSUME path). `dtoh` self-synchronizes, so
     /// this must never be called on the capture/decode critical path.
     pub(crate) fn snapshot(&self, runtime: &CudaRuntime) -> Result<TelemetrySnapshot> {
-        let mut header = [0u32; HEADER_LEN];
-        let mut bitmap = vec![0u32; self.words];
-        // SAFETY: destinations exactly cover the device records.
+        let mut payload = vec![0u32; self.record.bytes() / 4];
+        // SAFETY: the destination covers the complete live contiguous record.
         unsafe {
-            let header_bytes =
-                std::slice::from_raw_parts_mut(header.as_mut_ptr() as *mut u8, HEADER_BYTES);
-            runtime.dtoh(header_bytes, self.header.ptr())?;
-            if self.words > 0 {
-                let bitmap_bytes = std::slice::from_raw_parts_mut(
-                    bitmap.as_mut_ptr() as *mut u8,
-                    self.bitmap_bytes,
-                );
-                runtime.dtoh(bitmap_bytes, self.bitmap.ptr())?;
-            }
+            let bytes = std::slice::from_raw_parts_mut(
+                payload.as_mut_ptr().cast::<u8>(),
+                self.record.bytes(),
+            );
+            runtime.dtoh(bytes, self.header_ptr())?;
         }
+        let (header, bitmap) = split_payload(payload);
         Ok(TelemetrySnapshot {
             header,
             bitmap,
@@ -518,8 +533,7 @@ impl ArmedTelemetry {
             EpError::KernelFailed("cuda_ep: telemetry test header offset overflow".into())
         })?;
         let destination = self
-            .header
-            .ptr()
+            .header_ptr()
             .checked_add(byte_offset as u64)
             .ok_or_else(|| {
                 EpError::KernelFailed("cuda_ep: telemetry test header address overflow".into())
@@ -528,11 +542,8 @@ impl ArmedTelemetry {
         unsafe { runtime.htod(&value.to_ne_bytes(), destination) }
     }
 
-    pub(crate) fn device_graph_resources(&self) -> [DeviceGraphResource; 2] {
-        [
-            GraphDeviceAllocation::device_graph_resource(&self.bitmap),
-            GraphDeviceAllocation::device_graph_resource(&self.header),
-        ]
+    pub(crate) fn device_graph_resource(&self) -> DeviceGraphResource {
+        GraphDeviceAllocation::device_graph_resource(&self.record)
     }
 }
 
@@ -732,6 +743,131 @@ impl From<TelemetryUnsupported> for EpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contiguous_record_preserves_header_bitmap_and_isolation_gap() {
+        let header = [17, 23, 1, 0, 0, 0];
+        for experts in [1usize, 31, 32, 33, 64, 4096, 4097] {
+            let layout = record_layout(experts).unwrap();
+            assert_eq!(layout.size(), BITMAP_BYTE_OFFSET + words_for(experts) * 4);
+            assert_eq!(layout.align(), 4);
+            let mut payload = window_payload(layout.size() / 4, header);
+            assert_eq!(&payload[..HEADER_LEN], &header);
+            assert!(payload[HEADER_LEN..].iter().all(|&word| word == 0));
+            payload[BITMAP_WORD_OFFSET] = 1;
+            *payload.last_mut().unwrap() |= 1 << ((experts - 1) % 32);
+            let (decoded_header, bitmap) = split_payload(payload);
+            assert_eq!(decoded_header, header);
+            assert_eq!(bitmap.len(), words_for(experts));
+            assert_ne!(bitmap[0] & 1, 0);
+            assert_ne!(bitmap.last().unwrap() & (1 << ((experts - 1) % 32)), 0);
+            let old_class = 512 + (words_for(experts) * 4).div_ceil(512) * 512;
+            assert_eq!(layout.size().div_ceil(512) * 512, old_class);
+        }
+        // Check representability without allocating a payload of this size.
+        let largest = record_layout(usize::MAX).unwrap();
+        assert_eq!(
+            largest.size(),
+            BITMAP_BYTE_OFFSET + words_for(usize::MAX) * 4
+        );
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    #[test]
+    fn one_record_upload_snapshot_and_graph_retained_owner() {
+        let runtime = Arc::new(CudaRuntime::new(0).expect("CUDA device required with gpu-tests"));
+        runtime.test_drain_raw_pool();
+        let allocations = runtime.allocation_counts();
+        let transfers = runtime.transfer_counts();
+        let armed = ArmedTelemetry::arm(
+            &runtime,
+            RouteTelemetryConfig {
+                request_id: 73,
+                device_id: runtime.ordinal(),
+                num_experts: 33,
+                routes_per_row: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.allocation_counts().allocations,
+            allocations.allocations + 1
+        );
+        assert_eq!(
+            runtime.transfer_counts().host_to_device,
+            transfers.host_to_device + 1
+        );
+        assert_eq!(
+            armed.bitmap_ptr() - armed.header_ptr(),
+            BITMAP_BYTE_OFFSET as u64
+        );
+        assert_eq!(armed.footprint_bytes(), HEADER_BYTES + 8);
+        let transfers = runtime.transfer_counts();
+        let syncs = runtime.forced_synchronization_count();
+        let initial = armed.snapshot(&runtime).unwrap();
+        assert_eq!(initial.header, [1, 73, runtime.ordinal(), 0, 0, 0]);
+        assert_eq!(initial.bitmap, [0, 0]);
+        assert_eq!(
+            runtime.transfer_counts().device_to_host,
+            transfers.device_to_host + 1
+        );
+        assert_eq!(runtime.forced_synchronization_count(), syncs + 1);
+        let transfers = runtime.transfer_counts();
+        assert!(armed.inject_header_word(&runtime, HEADER_LEN, 9).is_err());
+        assert_eq!(runtime.transfer_counts(), transfers);
+        armed.inject_header_word(&runtime, H_COUNT, 9).unwrap();
+        let injected = armed.snapshot(&runtime).unwrap();
+        assert_eq!(injected.header[H_COUNT], 9);
+        assert_eq!(
+            injected.bitmap, initial.bitmap,
+            "header injection cannot reach bitmap"
+        );
+        let transfers = runtime.transfer_counts();
+        armed.reset_boundary(&runtime).unwrap();
+        assert_eq!(
+            runtime.transfer_counts().host_to_device,
+            transfers.host_to_device + 1
+        );
+        let reset = armed.snapshot(&runtime).unwrap();
+        assert_eq!(reset.header, [2, 73, runtime.ordinal(), 0, 0, 0]);
+        assert_eq!(reset.bitmap, initial.bitmap);
+
+        let output = runtime.alloc_raw(HEADER_BYTES).unwrap();
+        let owner = Arc::downgrade(&armed.record);
+        let resource = armed.device_graph_resource();
+        assert_eq!(resource.identity(), Arc::as_ptr(&armed.record) as usize);
+        runtime
+            .begin_graph_capture_with_resources(&[], vec![resource])
+            .unwrap();
+        // Output stays caller-owned through reset. Source lifetime is retained
+        // solely by the real record pin after the armed handle is dropped.
+        unsafe { runtime.dtod_async(armed.header_ptr(), output, HEADER_BYTES) }.unwrap();
+        runtime.end_graph_capture().unwrap();
+        drop(armed);
+        assert!(
+            owner.upgrade().is_some(),
+            "installed graph must own the complete record"
+        );
+        let allocations = runtime.allocation_counts();
+        let transfers = runtime.transfer_counts();
+        runtime.replay_graph().unwrap();
+        assert_eq!(runtime.allocation_counts(), allocations);
+        assert_eq!(runtime.transfer_counts(), transfers);
+        let mut observed = [0u32; HEADER_LEN];
+        unsafe {
+            let bytes =
+                std::slice::from_raw_parts_mut(observed.as_mut_ptr().cast::<u8>(), HEADER_BYTES);
+            runtime.dtoh(bytes, output)
+        }
+        .unwrap();
+        assert_eq!(observed, reset.header);
+        runtime.reset_graph().unwrap();
+        assert!(
+            owner.upgrade().is_none(),
+            "reset must release the final record pin"
+        );
+        unsafe { runtime.free_raw(output) }.unwrap();
+    }
 
     #[test]
     fn words_for_rounds_up() {

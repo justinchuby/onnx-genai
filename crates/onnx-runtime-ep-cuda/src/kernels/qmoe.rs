@@ -1765,12 +1765,10 @@ impl QMoERouteTelemetry {
         match telemetry.as_ref() {
             Some(armed) if armed.matches_experts(experts) => {
                 if self.runtime.is_capturing()? {
-                    for resource in armed.device_graph_resources() {
-                        self.runtime.require_captured_address_owner(
-                            resource.identity(),
-                            "QMoE route telemetry allocation",
-                        )?;
-                    }
+                    self.runtime.require_captured_address_owner(
+                        armed.device_graph_resource().identity(),
+                        "QMoE route telemetry allocation",
+                    )?;
                 }
                 self.last_call_used.store(true, Ordering::Relaxed);
                 Ok((armed.bitmap_ptr(), armed.header_ptr()))
@@ -1790,13 +1788,7 @@ impl QMoERouteTelemetry {
                 telemetry
                     .as_ref()
                     .filter(|armed| armed.matches_experts(experts))
-                    .map(|armed| {
-                        armed
-                            .device_graph_resources()
-                            .iter()
-                            .map(|resource| resource.identity())
-                            .collect()
-                    })
+                    .map(|armed| vec![armed.device_graph_resource().identity()])
             })
             .unwrap_or_default()
     }
@@ -1811,7 +1803,7 @@ impl QMoERouteTelemetry {
             .and_then(|telemetry| {
                 telemetry
                     .as_ref()
-                    .map(|armed| armed.device_graph_resources().into_iter().collect())
+                    .map(|armed| vec![armed.device_graph_resource()])
             })
             .unwrap_or_default()
     }
