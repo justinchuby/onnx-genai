@@ -560,6 +560,17 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        // The numeric extrema kernel predates BOOL, which entered both schemas in opset 20.
+        if opset < 20
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && matches!(op.op_type.as_str(), "ReduceMax" | "ReduceMin")
+            && input_dtypes.first() == Some(&DataType::Bool)
+        {
+            deny!(
+                "{} does not accept BOOL data at opset {opset}; export at opset 20 or later, or supply a numeric tensor",
+                op.op_type
+            );
+        }
         if op.op_type == "DeformConv"
             && domain.is_empty()
             && let Err(reason) =
