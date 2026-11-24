@@ -885,7 +885,7 @@ pub fn build_cuda_registry_with_metrics(
     for opset in [11, 16, 18, 29] {
         reg.register(
             OpKey::new("ScatterElements", "", opset),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
             Box::new(indexing::ScatterElementsFactory {
                 runtime: runtime.clone(),
                 opset,
@@ -895,7 +895,7 @@ pub fn build_cuda_registry_with_metrics(
     for opset in [11, 16, 18, 29] {
         reg.register(
             OpKey::new("ScatterND", "", opset),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
             Box::new(indexing::ScatterNdFactory {
                 runtime: runtime.clone(),
                 opset,

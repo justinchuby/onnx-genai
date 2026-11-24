@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
 use onnx_runtime_ep_api::{
-    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut,
+    TensorView, WorkspaceLayout, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::scatter::{ScatterReduction as Reduction, validate_nd_index_type};
 use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
@@ -951,104 +952,122 @@ fn copy_scatter_data(
     }
 }
 
-#[derive(Default)]
-struct ScatterMeanScratch(Mutex<Option<Arc<GraphDeviceAllocation>>>);
-
-impl ScatterMeanScratch {
-    fn resource(&self) -> Option<DeviceGraphResource> {
-        self.0
-            .lock()
-            .ok()?
-            .as_ref()
-            .map(GraphDeviceAllocation::device_graph_resource)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn launch(
-        &self,
-        runtime: &Arc<CudaRuntime>,
-        capturing: bool,
-        prefix: &str,
-        data: &TensorView,
-        index_dtype: DataType,
-        output: CUdeviceptr,
-        indices: CUdeviceptr,
-        updates: CUdeviceptr,
-        meta: CUdeviceptr,
-        rank: i32,
-        axis_or_depth: i32,
-        elements: u64,
-        slice_length: u64,
-        capture_error: CUdeviceptr,
-    ) -> Result<()> {
-        let output_elements = data.numel() as u64;
-        if output_elements == 0 {
-            // The caller already validated indices; no output values exist.
-            return Ok(());
+/// Mean state is disposable within one stream-ordered call, not a kernel cache.
+/// Each floating output has a double sum/u64 count; Int64 adds a second sum limb.
+fn mean_workspace_layout(
+    reduction: Reduction,
+    inputs: &[TensorMetadata<'_>],
+) -> Result<WorkspaceLayout<1>> {
+    let count = |shape: &[usize]| -> Result<usize> {
+        if shape.contains(&0) {
+            return Ok(0);
         }
-        let state_bytes = if data.dtype == DataType::Int64 {
-            24
-        } else {
-            16
+        shape.iter().try_fold(1usize, |n, dim| n.checked_mul(*dim)).ok_or_else(|| EpError::KernelFailed("cuda_ep Scatter mean: shape element count exceeds addressable capacity; reduce data/update dimensions".into()))
+    };
+    let region = if reduction != Reduction::Mean {
+        std::alloc::Layout::new::<()>()
+    } else {
+        let [data, indices, updates] = inputs else {
+            return Err(EpError::KernelFailed("cuda_ep Scatter mean: workspace planning needs data, indices and updates; provide all three input metadata slots".into()));
         };
-        let bytes = data.numel().checked_mul(state_bytes).ok_or_else(|| {
-            EpError::KernelFailed("cuda_ep Scatter mean: workspace size overflow".into())
-        })?;
-        let mut allocation = self.0.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep Scatter mean: workspace lock was poisoned".into())
-        })?;
-        if allocation
-            .as_ref()
-            .is_none_or(|value| value.bytes() < bytes)
-        {
-            if capturing {
-                return Err(EpError::KernelFailed(
-                    "cuda_ep Scatter mean: warm the exact shape before capture to allocate workspace".into(),
-                ));
+        if !data.present || !indices.present || !updates.present {
+            return Err(EpError::KernelFailed("cuda_ep Scatter mean: required data/indices/updates metadata is absent; bind all three inputs before preparing workspace".into()));
+        }
+        let elements = count(data.shape)?;
+        let updates = count(updates.shape)?;
+        let elements = if updates == 0 { 0 } else { elements };
+        let layout = match data.dtype {
+            DataType::Int64 => std::alloc::Layout::array::<[u64; 3]>(elements),
+            DataType::Float16 | DataType::BFloat16 | DataType::Float32 => {
+                std::alloc::Layout::array::<[u64; 2]>(elements)
             }
-            let fresh = GraphDeviceAllocation::allocate(runtime, bytes)?;
-            runtime.staged_warm_cache_mutation("Scatter mean workspace allocation")?;
-            *allocation = Some(fresh);
-        }
-        let scratch = allocation.as_ref().expect("workspace reserved").ptr();
-        let scatter_entry = scatter_entry(&format!("{prefix}_mean"), data.dtype, index_dtype);
-        let finish_entry = format!("scatter_mean_finish_{}", scatter_data_suffix(data.dtype));
-        let scatter = runtime.nvrtc_function("indexing_ops_v4", SOURCE, &scatter_entry)?;
-        let finish = runtime.nvrtc_function("indexing_ops_v4", SOURCE, &finish_entry)?;
-        let config = |n: u64| LaunchConfig {
-            grid_dim: (n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32, 1, 1),
-            block_dim: (BLOCK, 1, 1),
-            shared_mem_bytes: 0,
+            dtype => {
+                return Err(not_implemented(format!(
+                    "Scatter mean data dtype {dtype:?}; use Float16, BFloat16, Float32, or Int64"
+                )));
+            }
         };
-        runtime.bind()?;
-        // SAFETY: the workspace covers every output and remains owned through
-        // completion, including graph replay. All three commands share a stream.
-        unsafe { cudarc::driver::result::memset_d8_async(scratch, 0, bytes, runtime.stream_ptr()) }
-            .map_err(|err| driver_err("zero Scatter mean workspace", err))?;
-        let mut builder = runtime.stream().launch_builder(&scatter);
-        builder
-            .arg(&scratch)
-            .arg(&indices)
-            .arg(&updates)
-            .arg(&meta)
-            .arg(&rank)
-            .arg(&axis_or_depth)
-            .arg(&elements)
-            .arg(&slice_length)
-            .arg(&capture_error);
-        unsafe { builder.launch(config(elements)) }
-            .map_err(|err| driver_err(&format!("launch {scatter_entry}"), err))?;
-        let original = cuptr(data.data_ptr::<u8>() as *const c_void);
-        let mut builder = runtime.stream().launch_builder(&finish);
-        builder
-            .arg(&output)
-            .arg(&original)
-            .arg(&scratch)
-            .arg(&output_elements);
-        unsafe { builder.launch(config(output_elements)) }
-            .map_err(|err| driver_err(&format!("launch {finish_entry}"), err))?;
-        Ok(())
+        layout.map_err(|_| EpError::KernelFailed("cuda_ep Scatter mean: accumulator state exceeds addressable capacity; reduce the output shape".into()))?
+    };
+    WorkspaceLayout::new([region])
+}
+
+fn mean_workspace_requirement(
+    reduction: Reduction,
+    inputs: &[TensorMetadata<'_>],
+) -> Result<WorkspaceRequirement> {
+    let layout = mean_workspace_layout(reduction, inputs)?;
+    Ok(if layout.bytes() == 0 {
+        WorkspaceRequirement::NONE
+    } else {
+        WorkspaceRequirement {
+            bytes: layout.bytes() as u64,
+            alignment: layout.alignment(),
+            lifetime: WorkspaceLifetime::SessionPersistent,
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_scatter_mean(
+    runtime: &CudaRuntime,
+    used: WorkspaceView,
+    prefix: &str,
+    data: &TensorView,
+    index_dtype: DataType,
+    output: CUdeviceptr,
+    indices: CUdeviceptr,
+    updates: CUdeviceptr,
+    meta: CUdeviceptr,
+    rank: i32,
+    axis_or_depth: i32,
+    elements: u64,
+    slice_length: u64,
+    capture_error: CUdeviceptr,
+) -> Result<()> {
+    let output_elements = data.numel() as u64;
+    if output_elements == 0 {
+        return Ok(());
     }
+    let bytes = used.bytes();
+    let scratch = cuptr(used.ptr().0.cast_const());
+    let scatter_entry = scatter_entry(&format!("{prefix}_mean"), data.dtype, index_dtype);
+    let finish_entry = format!("scatter_mean_finish_{}", scatter_data_suffix(data.dtype));
+    let scatter = runtime.nvrtc_function("indexing_ops_v4", SOURCE, &scatter_entry)?;
+    let finish = runtime.nvrtc_function("indexing_ops_v4", SOURCE, &finish_entry)?;
+    let config = |n: u64| LaunchConfig {
+        grid_dim: (n.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32, 1, 1),
+        block_dim: (BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    runtime.bind()?;
+    // SAFETY: the workspace covers every output and remains owned through
+    // completion, including graph replay. All three commands share a stream.
+    unsafe { cudarc::driver::result::memset_d8_async(scratch, 0, bytes, runtime.stream_ptr()) }
+        .map_err(|err| driver_err("zero Scatter mean workspace", err))?;
+    let mut builder = runtime.stream().launch_builder(&scatter);
+    builder
+        .arg(&scratch)
+        .arg(&indices)
+        .arg(&updates)
+        .arg(&meta)
+        .arg(&rank)
+        .arg(&axis_or_depth)
+        .arg(&elements)
+        .arg(&slice_length)
+        .arg(&capture_error);
+    unsafe { builder.launch(config(elements)) }
+        .map_err(|err| driver_err(&format!("launch {scatter_entry}"), err))?;
+    let original = cuptr(data.data_ptr::<u8>() as *const c_void);
+    let mut builder = runtime.stream().launch_builder(&finish);
+    builder
+        .arg(&output)
+        .arg(&original)
+        .arg(&scratch)
+        .arg(&output_elements);
+    unsafe { builder.launch(config(output_elements)) }
+        .map_err(|err| driver_err(&format!("launch {finish_entry}"), err))?;
+    Ok(())
 }
 
 pub struct ScatterElementsFactory {
@@ -1067,7 +1086,6 @@ impl KernelFactory for ScatterNdFactory {
             runtime: self.runtime.clone(),
             reduction: Reduction::parse(node, self.opset).map_err(EpError::KernelFailed)?,
             opset: self.opset,
-            mean: ScatterMeanScratch::default(),
             metadata: Mutex::new(PersistentMetadata::new(self.runtime.clone())),
             warmed_signature: Mutex::new(None),
         }))
@@ -1078,13 +1096,24 @@ struct ScatterNdKernel {
     runtime: Arc<CudaRuntime>,
     reduction: Reduction,
     opset: u64,
-    mean: ScatterMeanScratch,
     metadata: Mutex<PersistentMetadata>,
     warmed_signature: Mutex<Option<ScatterNdCaptureSignature>>,
 }
 
-impl Kernel for ScatterNdKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+impl ScatterNdKernel {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        let mut warmed_signature = self.warmed_signature.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep ScatterND: capture signature lock was poisoned; recreate the kernel"
+                    .into(),
+            )
+        })?;
+        let previous_signature = warmed_signature.take();
         if inputs.len() != 3 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(
                 "cuda_ep ScatterND: expected 3 inputs and 1 output".into(),
@@ -1135,7 +1164,17 @@ impl Kernel for ScatterNdKernel {
             self.runtime.require_nvrtc_half_headers("ScatterND")?;
         }
 
+        let metadata = std::array::from_fn::<_, 3, _>(|i| {
+            TensorMetadata::new(inputs[i].dtype, inputs[i].shape, !inputs[i].is_absent())
+        });
+        let [mean_scratch] = mean_workspace_layout(self.reduction, &metadata)?.bind(workspace).map_err(|cause| EpError::KernelFailed(format!("cuda_ep ScatterND mean: {cause}; prepare and pass the complete accumulator workspace")))?;
         let capturing = self.runtime.is_capturing()?;
+        if capturing && mean_scratch.bytes() != 0 {
+            self.runtime.require_registered_workspace_capture(
+                mean_scratch,
+                "ScatterND mean accumulators",
+            )?;
+        }
         let signature = ScatterNdCaptureSignature {
             data_dtype: data.dtype,
             indices_dtype: indices.dtype,
@@ -1143,10 +1182,7 @@ impl Kernel for ScatterNdKernel {
             indices_shape: indices.shape.to_vec(),
             updates_shape: updates.shape.to_vec(),
         };
-        let mut warmed_signature = self.warmed_signature.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep ScatterND: capture signature lock was poisoned".into())
-        })?;
-        if capturing && warmed_signature.as_ref() != Some(&signature) {
+        if capturing && previous_signature.as_ref() != Some(&signature) {
             return Err(EpError::KernelFailed(
                 "cuda_ep ScatterND: shape or dtype changed during CUDA graph capture; warm the exact signature first".into(),
             ));
@@ -1181,9 +1217,7 @@ impl Kernel for ScatterNdKernel {
             copy_scatter_data(&self.runtime, data, output)?;
         }
         if tuples == 0 || (slice_length == 0 && index_depth == 0) {
-            if !capturing {
-                *warmed_signature = Some(signature);
-            }
+            *warmed_signature = Some(signature);
             return Ok(());
         }
 
@@ -1227,9 +1261,9 @@ impl Kernel for ScatterNdKernel {
             0
         };
         if mean && slice_length != 0 {
-            self.mean.launch(
+            launch_scatter_mean(
                 &self.runtime,
-                capturing,
+                mean_scratch,
                 "scatter_nd",
                 data,
                 indices.dtype,
@@ -1271,9 +1305,31 @@ impl Kernel for ScatterNdKernel {
         }
         if !capturing {
             *metadata_cache = metadata_candidate;
-            *warmed_signature = Some(signature);
         }
+        *warmed_signature = Some(signature);
         Ok(())
+    }
+}
+
+impl Kernel for ScatterNdKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
+    }
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
+        mean_workspace_requirement(self.reduction, inputs)
+            .map(onnx_runtime_ep_api::WorkspacePreparation::Ready)
     }
 
     fn supports_strided_input(&self, _: usize) -> bool {
@@ -1285,7 +1341,6 @@ impl Kernel for ScatterNdKernel {
             .ok()
             .and_then(|metadata| metadata.device_graph_resource())
             .into_iter()
-            .chain(self.mean.resource())
             .collect()
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
@@ -1307,7 +1362,6 @@ impl KernelFactory for ScatterElementsFactory {
             runtime: self.runtime.clone(),
             axis: node.attr("axis").and_then(Attribute::as_int).unwrap_or(0),
             reduction: Reduction::parse(node, self.opset).map_err(EpError::KernelFailed)?,
-            mean: ScatterMeanScratch::default(),
             metadata: Mutex::new(ScatterMetadataCache::new(self.runtime.clone())),
             warmed_signature: Mutex::new(None),
         }))
@@ -1318,13 +1372,24 @@ struct ScatterElementsKernel {
     runtime: Arc<CudaRuntime>,
     axis: i64,
     reduction: Reduction,
-    mean: ScatterMeanScratch,
     metadata: Mutex<ScatterMetadataCache>,
     warmed_signature: Mutex<Option<ScatterCaptureSignature>>,
 }
 
-impl Kernel for ScatterElementsKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+impl ScatterElementsKernel {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        let mut warmed_signature = self.warmed_signature.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep ScatterElements: capture signature lock was poisoned; recreate the kernel"
+                    .into(),
+            )
+        })?;
+        let previous_signature = warmed_signature.take();
         if inputs.len() != 3 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(
                 "cuda_ep ScatterElements: expected 3 inputs and 1 output".into(),
@@ -1378,19 +1443,24 @@ impl Kernel for ScatterElementsKernel {
                 "cuda_ep ScatterElements: indices must be empty when data axis {axis} has length zero"
             )));
         }
+        let metadata = std::array::from_fn::<_, 3, _>(|i| {
+            TensorMetadata::new(inputs[i].dtype, inputs[i].shape, !inputs[i].is_absent())
+        });
+        let [mean_scratch] = mean_workspace_layout(self.reduction, &metadata)?.bind(workspace).map_err(|cause| EpError::KernelFailed(format!("cuda_ep ScatterElements mean: {cause}; prepare and pass the complete accumulator workspace")))?;
         let capturing = self.runtime.is_capturing()?;
+        if capturing && mean_scratch.bytes() != 0 {
+            self.runtime.require_registered_workspace_capture(
+                mean_scratch,
+                "ScatterElements mean accumulators",
+            )?;
+        }
         let signature = ScatterCaptureSignature {
             data_dtype: data.dtype,
             indices_dtype: indices.dtype,
             data_shape: data.shape.to_vec(),
             indices_shape: indices.shape.to_vec(),
         };
-        let mut warmed_signature = self.warmed_signature.lock().map_err(|_| {
-            EpError::KernelFailed(
-                "cuda_ep ScatterElements: capture signature lock was poisoned".into(),
-            )
-        })?;
-        if capturing && warmed_signature.as_ref() != Some(&signature) {
+        if capturing && previous_signature.as_ref() != Some(&signature) {
             return Err(EpError::KernelFailed(
                 "cuda_ep ScatterElements: shape or dtype changed during CUDA graph capture; warm the exact signature first".into(),
             ));
@@ -1403,9 +1473,7 @@ impl Kernel for ScatterElementsKernel {
             copy_scatter_data(&self.runtime, data, output)?;
         }
         if indices.numel() == 0 {
-            if !capturing {
-                *warmed_signature = Some(signature);
-            }
+            *warmed_signature = Some(signature);
             return Ok(());
         }
         let mut metadata = self.metadata.lock().map_err(|_| {
@@ -1430,9 +1498,9 @@ impl Kernel for ScatterElementsKernel {
             0
         };
         if mean {
-            self.mean.launch(
+            launch_scatter_mean(
                 &self.runtime,
-                capturing,
+                mean_scratch,
                 "scatter",
                 data,
                 indices.dtype,
@@ -1475,9 +1543,31 @@ impl Kernel for ScatterElementsKernel {
         }
         if !capturing {
             *metadata = metadata_candidate;
-            *warmed_signature = Some(signature);
         }
+        *warmed_signature = Some(signature);
         Ok(())
+    }
+}
+
+impl Kernel for ScatterElementsKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
+    }
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
+        mean_workspace_requirement(self.reduction, inputs)
+            .map(onnx_runtime_ep_api::WorkspacePreparation::Ready)
     }
 
     fn supports_strided_input(&self, _: usize) -> bool {
@@ -1489,7 +1579,6 @@ impl Kernel for ScatterElementsKernel {
             .ok()
             .and_then(|metadata| metadata.device_graph_resource())
             .into_iter()
-            .chain(self.mean.resource())
             .collect()
     }
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
@@ -1502,5 +1591,115 @@ impl Kernel for ScatterElementsKernel {
                 "ScatterElements capture signature lock was poisoned",
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+    use onnx_runtime_ep_api::DevicePtrMut;
+
+    fn metadata<'a>(
+        dtype: DataType,
+        data: &'a [usize],
+        indices: &'a [usize],
+        updates: &'a [usize],
+    ) -> [TensorMetadata<'a>; 3] {
+        [
+            TensorMetadata::new(dtype, data, true),
+            TensorMetadata::new(DataType::Int64, indices, true),
+            TensorMetadata::new(dtype, updates, true),
+        ]
+    }
+
+    #[test]
+    fn mean_uses_one_peak_with_exact_float_or_integer_state() {
+        for (dtype, size) in [
+            (DataType::Float16, 16),
+            (DataType::BFloat16, 16),
+            (DataType::Float32, 16),
+            (DataType::Int64, 24),
+        ] {
+            let inputs = metadata(dtype, &[3, 5], &[2, 1], &[2, 5]);
+            let requirement = mean_workspace_requirement(Reduction::Mean, &inputs).unwrap();
+            assert_eq!(requirement.bytes, 15 * size);
+            assert_eq!(requirement.alignment, std::mem::align_of::<u64>());
+            assert_eq!(requirement.lifetime, WorkspaceLifetime::SessionPersistent);
+        }
+    }
+
+    #[test]
+    fn nd_depth_zero_keeps_nonempty_mean_updates_and_true_empty_work_is_zero() {
+        let depth_zero = metadata(DataType::Float32, &[4], &[2, 0], &[2, 4]);
+        assert_eq!(
+            mean_workspace_requirement(Reduction::Mean, &depth_zero)
+                .unwrap()
+                .bytes,
+            64
+        );
+        for inputs in [
+            metadata(DataType::Float32, &[4], &[0, 1], &[0]),
+            metadata(DataType::Float32, &[4, 0], &[2, 1], &[2, 0]),
+        ] {
+            assert_eq!(
+                mean_workspace_requirement(Reduction::Mean, &inputs).unwrap(),
+                WorkspaceRequirement::NONE
+            );
+        }
+        assert_eq!(
+            mean_workspace_requirement(Reduction::Add, &depth_zero).unwrap(),
+            WorkspaceRequirement::NONE
+        );
+    }
+
+    #[test]
+    fn mean_rejects_absent_inputs_and_unaddressable_shapes_before_reservation() {
+        assert!(
+            mean_workspace_requirement(Reduction::Mean, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("all three input")
+        );
+        let mut inputs = metadata(DataType::Float32, &[4], &[1], &[1]);
+        inputs[2].present = false;
+        assert!(
+            mean_workspace_requirement(Reduction::Mean, &inputs)
+                .unwrap_err()
+                .to_string()
+                .contains("absent")
+        );
+        for shape in [&[usize::MAX, 2][..], &[isize::MAX as usize / 8][..]] {
+            let inputs = metadata(DataType::Int64, shape, &[1], &[1]);
+            let error = mean_workspace_requirement(Reduction::Mean, &inputs)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("capacity") && error.contains("reduce"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn mean_borrows_exact_used_span_and_rejects_missing_short_or_unaligned_views() {
+        let inputs = metadata(DataType::Int64, &[4], &[1], &[1]);
+        let layout = mean_workspace_layout(Reduction::Mean, &inputs).unwrap();
+        let base = DevicePtrMut(0x1000usize as *mut _);
+        for view in [
+            None,
+            Some(WorkspaceView::new(base, 95)),
+            Some(WorkspaceView::new(DevicePtrMut(0x1001usize as *mut _), 96)),
+        ] {
+            assert!(
+                layout
+                    .bind(view)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("prepare and pass")
+            );
+        }
+        let [used] = layout.bind(Some(WorkspaceView::new(base, 1024))).unwrap();
+        assert_eq!(used.bytes(), 96);
+        assert_eq!(used.ptr().0, base.0);
     }
 }
