@@ -469,6 +469,72 @@ impl ReleaseObserver for ManagedCudaReleaseAccounting {
     }
 }
 
+/// The single consuming retirement path after the caller validates provenance.
+/// This core owns neither the runtime nor another quota authority. Queue success
+/// is accepted ordering only; settlement observes the eventual physical outcome.
+fn enqueue_native_release(
+    queue: &CudaDeferredReleaseQueue,
+    ownership: BoundBufferOwnership,
+    accounting: Arc<dyn ReleaseObserver>,
+) -> Result<()> {
+    let identity = ownership.owner().identity();
+    let (prepared, settlement, observer) = match ownership {
+        BoundBufferOwnership::Binding(owner) => {
+            let prepared = owner.prepare_release().map_err(|error| {
+                    let (error, _owner) = error.into_parts();
+                    // Nothing was mutated and the owner is handed back to its
+                    // `Drop`, which quarantines rather than frees.
+                    EpError::Backend {
+                        operation: "prepare native CUDA allocation retirement; retire all views before consuming the owner",
+                        source: Box::new(error),
+                    }
+                })?;
+            (prepared, None, Arc::clone(&accounting))
+        }
+        BoundBufferOwnership::Managed(owner) => {
+            let prepared = owner.prepare_release().map_err(|error| {
+                    let (error, _owner) = error.into_parts();
+                    EpError::Backend {
+                        operation: "prepare managed CUDA allocation retirement; retire all views before consuming the owner",
+                        source: Box::new(AllocationTransactionError::Binding(error)),
+                    }
+                })?;
+            // SAFETY: the request and settlement remain paired in the queue
+            // observer and in the enqueue-refusal branch below.
+            let (prepared, settlement) = unsafe { prepared.into_parts() };
+            let observer: Arc<dyn ReleaseObserver> = Arc::new(ManagedCudaReleaseAccounting {
+                provider: Arc::clone(&accounting),
+                settlement: settlement.clone(),
+            });
+            (prepared, Some(settlement), observer)
+        }
+    };
+    match queue.enqueue_prepared(prepared, Some(observer)) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let rejection = error.rejection();
+            // The queue refused, so the exact request is quarantined at its
+            // mechanism: the bytes stay owned, stay charged, and are never
+            // handed out again.
+            let outcome = error.quarantine();
+            if let Some(settlement) = settlement {
+                // SAFETY: this outcome came from the exact refused request
+                // paired with the settlement token.
+                unsafe { settlement.settle(&outcome) };
+            }
+            Err(EpError::KernelFailed(format!(
+                "cuda_ep: the deferred release queue refused allocation {identity:?} ({}); \
+                     its ownership is quarantined ({}) and {} byte(s) remain charged; inspect retained-release diagnostics and do not retry this consumed owner",
+                rejection.name(),
+                outcome.state(),
+                outcome
+                    .residual()
+                    .map_or(0, |residual| residual.retained_bytes)
+            )))
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error(
     "immutable CUDA weight upload failed: {upload}; retiring its unpublished owner also failed: {retirement}; stop using the failed admission and inspect the provider's retained-release diagnostics"
@@ -548,54 +614,12 @@ impl CudaSealedAllocation {
                 ownership.owner().identity()
             )));
         }
-        let (prepared, settlement, observer) = match ownership {
-            BoundBufferOwnership::Binding(owner) => {
-                let prepared = owner.prepare_release().map_err(|error| {
-                    let (error, _owner) = error.into_parts();
-                    binding_failure("cannot prepare a sealed CUDA allocation release", error)
-                })?;
-                (prepared, None, Some(Arc::clone(&self.observer)))
+        enqueue_native_release(&queue, ownership, Arc::clone(&self.observer)).map_err(|source| {
+            EpError::Backend {
+                operation: "retire sealed CUDA allocation through its provider queue",
+                source: Box::new(source),
             }
-            BoundBufferOwnership::Managed(owner) => {
-                let prepared = owner.prepare_release().map_err(|error| {
-                    let (error, _owner) = error.into_parts();
-                    manager_failure(
-                        "cannot prepare a managed sealed CUDA allocation release",
-                        AllocationTransactionError::Binding(error),
-                    )
-                })?;
-                // SAFETY: the request and settlement remain paired in the queue
-                // observer and in the enqueue-refusal branch below.
-                let (prepared, settlement) = unsafe { prepared.into_parts() };
-                let observer: Arc<dyn ReleaseObserver> = Arc::new(ManagedCudaReleaseAccounting {
-                    provider: Arc::clone(&self.observer),
-                    settlement: settlement.clone(),
-                });
-                (prepared, Some(settlement), Some(observer))
-            }
-        };
-        match queue.enqueue_prepared(prepared, observer) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                let rejection = error.rejection();
-                let outcome = error.quarantine();
-                if let Some(settlement) = settlement {
-                    // SAFETY: this outcome came from the exact refused request
-                    // paired with the settlement token.
-                    unsafe { settlement.settle(&outcome) };
-                }
-                Err(EpError::KernelFailed(format!(
-                    "cuda_ep: the deferred release queue refused sealed allocation {:?} ({}); \
-                     ownership is quarantined ({}) and {} byte(s) remain charged",
-                    self.identity,
-                    rejection.name(),
-                    outcome.state(),
-                    outcome
-                        .residual()
-                        .map_or(0, |residual| residual.retained_bytes)
-                )))
-            }
-        }
+        })
     }
 }
 
@@ -4918,60 +4942,8 @@ impl ExecutionProvider for CudaExecutionProvider {
                 self.device.index
             )));
         }
-        let (identity, prepared, settlement, observer) = match ownership {
-            BoundBufferOwnership::Binding(owner) => {
-                let identity = owner.identity();
-                let prepared = owner.prepare_release().map_err(|error| {
-                    let (error, _owner) = error.into_parts();
-                    // Nothing was mutated and the owner is handed back to its
-                    // `Drop`, which quarantines rather than frees.
-                    binding_failure("cannot prepare a CUDA allocation release", error)
-                })?;
-                (identity, prepared, None, Some(self.release_accounting()))
-            }
-            BoundBufferOwnership::Managed(owner) => {
-                let identity = owner.identity();
-                let prepared = owner.prepare_release().map_err(|error| {
-                    let (error, _owner) = error.into_parts();
-                    manager_failure(
-                        "cannot prepare a managed CUDA allocation release",
-                        AllocationTransactionError::Binding(error),
-                    )
-                })?;
-                // SAFETY: the request and settlement remain paired in the queue
-                // observer and in the enqueue-refusal branch below.
-                let (prepared, settlement) = unsafe { prepared.into_parts() };
-                let observer: Arc<dyn ReleaseObserver> = Arc::new(ManagedCudaReleaseAccounting {
-                    provider: self.release_accounting(),
-                    settlement: settlement.clone(),
-                });
-                (identity, prepared, Some(settlement), Some(observer))
-            }
-        };
-        match self.release_queue.enqueue_prepared(prepared, observer) {
-            Ok(()) => Ok(0),
-            Err(error) => {
-                let rejection = error.rejection();
-                // The queue refused, so the exact request is quarantined at its
-                // mechanism: the bytes stay owned, stay charged, and are never
-                // handed out again.
-                let outcome = error.quarantine();
-                if let Some(settlement) = settlement {
-                    // SAFETY: this outcome came from the exact refused request
-                    // paired with the settlement token.
-                    unsafe { settlement.settle(&outcome) };
-                }
-                Err(EpError::KernelFailed(format!(
-                    "cuda_ep: the deferred release queue refused allocation {identity:?} ({}); \
-                     its ownership is quarantined ({}) and {} byte(s) remain charged",
-                    rejection.name(),
-                    outcome.state(),
-                    outcome
-                        .residual()
-                        .map_or(0, |residual| residual.retained_bytes)
-                )))
-            }
-        }
+        enqueue_native_release(&self.release_queue, ownership, self.release_accounting())
+            .map(|()| 0)
     }
 
     fn wait_for_deferred_releases(&self) -> Result<()> {
@@ -6432,14 +6404,18 @@ extern "C" __global__ void spin_delay(long long spin) {
         }
     }
 
-    #[derive(Debug)]
-    struct TestSettlementObserver(AllocationSettlementToken);
+    #[derive(Debug, Default)]
+    struct NativeReleaseProbe {
+        calls: std::sync::atomic::AtomicUsize,
+        completed: std::sync::atomic::AtomicUsize,
+    }
 
-    impl ReleaseObserver for TestSettlementObserver {
+    impl ReleaseObserver for NativeReleaseProbe {
         fn released(&self, outcome: &AllocationReleaseOutcome) {
-            // SAFETY: this observer is enqueued with the exact prepared release
-            // paired with this token below.
-            unsafe { self.0.settle(outcome) };
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            if outcome.is_complete() {
+                self.completed.fetch_add(1, Ordering::AcqRel);
+            }
         }
     }
 
@@ -6447,16 +6423,197 @@ extern "C" __global__ void spin_delay(long long spin) {
         queue: &CudaDeferredReleaseQueue,
         workspace: WorkspaceAllocation,
     ) {
-        let buffer = workspace.into_buffer();
-        let BoundBufferOwnership::Managed(owner) = buffer.into_bound_ownership().unwrap() else {
-            panic!("test workspace lost manager ownership");
+        enqueue_native_release(
+            queue,
+            workspace.into_buffer().into_bound_ownership().unwrap(),
+            Arc::new(NativeReleaseProbe::default()),
+        )
+        .unwrap();
+    }
+
+    #[derive(Debug)]
+    struct NativeReleaseFence(Arc<AtomicBool>);
+    impl crate::deferred_release::ReleaseFence for NativeReleaseFence {
+        fn is_complete(&self) -> bool {
+            self.0.load(Ordering::Acquire)
+        }
+    }
+
+    #[derive(Debug)]
+    struct NativeReleaseFences {
+        ready: [Arc<AtomicBool>; 2],
+        refuse_recording: bool,
+    }
+    impl crate::deferred_release::ReleaseFenceSource for NativeReleaseFences {
+        fn record(
+            &self,
+        ) -> std::result::Result<Vec<Box<dyn crate::deferred_release::ReleaseFence>>, String>
+        {
+            if self.refuse_recording {
+                return Err("test completion event unavailable".into());
+            }
+            Ok(self
+                .ready
+                .iter()
+                .map(|ready| {
+                    Box::new(NativeReleaseFence(ready.clone()))
+                        as Box<dyn crate::deferred_release::ReleaseFence>
+                })
+                .collect())
+        }
+    }
+
+    fn native_release_queue(
+        refuse_recording: bool,
+    ) -> (Arc<CudaDeferredReleaseQueue>, [Arc<AtomicBool>; 2]) {
+        let ready = std::array::from_fn(|_| Arc::new(AtomicBool::new(false)));
+        let queue = CudaDeferredReleaseQueue::manual(
+            Box::new(NativeReleaseFences {
+                ready: ready.clone(),
+                refuse_recording,
+            }),
+            4,
+        );
+        (queue, ready)
+    }
+
+    #[test]
+    fn native_retirement_refunds_only_after_both_fences_and_observes_once() {
+        let workspace = managed_host_workspace(128);
+        let wait = workspace.managed_settlement_wait().unwrap();
+        let (queue, ready) = native_release_queue(false);
+        let probe = Arc::new(NativeReleaseProbe::default());
+        enqueue_native_release(
+            &queue,
+            workspace.into_buffer().into_bound_ownership().unwrap(),
+            probe.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            wait.wait(Duration::ZERO),
+            AllocationSettlementStatus::Pending
+        );
+        assert_eq!(wait.charged_bytes(), 128);
+        assert_eq!(queue.poll(), 0);
+        ready[0].store(true, Ordering::Release);
+        assert_eq!(queue.poll(), 0);
+        assert_eq!(wait.charged_bytes(), 128);
+        assert_eq!(probe.calls.load(Ordering::Acquire), 0);
+        ready[1].store(true, Ordering::Release);
+        assert_eq!(queue.poll(), 1);
+        assert_eq!(
+            wait.wait(Duration::ZERO),
+            AllocationSettlementStatus::Released
+        );
+        assert_eq!(wait.charged_bytes(), 0);
+        assert_eq!(probe.calls.load(Ordering::Acquire), 1);
+        assert_eq!(probe.completed.load(Ordering::Acquire), 1);
+        assert_eq!(queue.poll(), 0);
+        assert_eq!(probe.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn native_retirement_refusal_keeps_exact_owner_charged_without_success_observer() {
+        for refuse_recording in [false, true] {
+            let workspace = managed_host_workspace(128);
+            let wait = workspace.managed_settlement_wait().unwrap();
+            let (queue, _) = native_release_queue(refuse_recording);
+            if !refuse_recording {
+                queue.close();
+            }
+            let probe = Arc::new(NativeReleaseProbe::default());
+            let error = enqueue_native_release(
+                &queue,
+                workspace.into_buffer().into_bound_ownership().unwrap(),
+                probe.clone(),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("quarantined")
+                    && error.to_string().contains("do not retry"),
+                "{error}"
+            );
+            assert!(matches!(
+                wait.wait(Duration::ZERO),
+                AllocationSettlementStatus::Retained(_)
+            ));
+            assert_eq!(wait.charged_bytes(), 128);
+            assert_eq!(queue.pending(), 0);
+            assert_eq!(queue.poll(), 0);
+            assert_eq!(probe.calls.load(Ordering::Acquire), 0);
+            assert_eq!(wait.charged_bytes(), 128);
+        }
+    }
+
+    #[test]
+    fn native_retirement_outstanding_view_keeps_typed_failure_and_does_not_enqueue() {
+        let workspace = managed_host_workspace(128);
+        let wait = workspace.managed_settlement_wait().unwrap();
+        let pin = workspace.device_graph_resource().unwrap().unwrap();
+        let (queue, _) = native_release_queue(false);
+        let probe = Arc::new(NativeReleaseProbe::default());
+        let error = enqueue_native_release(
+            &queue,
+            workspace.into_buffer().into_bound_ownership().unwrap(),
+            probe.clone(),
+        )
+        .unwrap_err();
+        let EpError::Backend { source, .. } = &error else {
+            panic!("prepare failure must preserve a typed source: {error}");
         };
-        let prepared = owner.prepare_release().unwrap();
-        // SAFETY: the request and token remain paired in the observer.
-        let (request, settlement) = unsafe { prepared.into_parts() };
-        queue
-            .enqueue_prepared(request, Some(Arc::new(TestSettlementObserver(settlement))))
+        assert!(matches!(
+            source.downcast_ref::<AllocationTransactionError>().unwrap(),
+            AllocationTransactionError::Binding(BindingError::OutstandingViews { .. })
+        ));
+        assert_eq!(queue.stats().accepted, 0);
+        assert_eq!(probe.calls.load(Ordering::Acquire), 0);
+        assert!(matches!(
+            wait.wait(Duration::ZERO),
+            AllocationSettlementStatus::Retained(_)
+        ));
+        drop(pin);
+        assert_eq!(queue.poll(), 0);
+        assert_eq!(
+            wait.charged_bytes(),
+            128,
+            "dropping the final view cannot retry a consumed owner"
+        );
+    }
+
+    #[test]
+    fn native_retirement_binding_owner_uses_the_same_queue_without_managed_settlement() {
+        use onnx_runtime_memory_api::{BindingRegistry, DeviceKey, HostAllocator};
+        let registry = BindingRegistry::new().unwrap();
+        let context = registry
+            .register_provider_context(DeviceKey::HOST, Arc::new(WorkspaceTestPin))
             .unwrap();
+        let authority = registry
+            .register_authority(DeviceKey::HOST, Arc::new(WorkspaceTestPin))
+            .unwrap();
+        registry
+            .register_allocator(context, authority, Arc::new(HostAllocator))
+            .unwrap();
+        let owner = registry
+            .bind(DeviceKey::HOST)
+            .unwrap()
+            .allocate_owning(128, 16)
+            .unwrap();
+        let (queue, ready) = native_release_queue(false);
+        let probe = Arc::new(NativeReleaseProbe::default());
+        enqueue_native_release(
+            &queue,
+            BoundBufferOwnership::Binding(Box::new(owner)),
+            probe.clone(),
+        )
+        .unwrap();
+        assert_eq!(queue.poll(), 0);
+        for ready in &ready {
+            ready.store(true, Ordering::Release);
+        }
+        assert_eq!(queue.poll(), 1);
+        assert_eq!(probe.calls.load(Ordering::Acquire), 1);
+        assert_eq!(probe.completed.load(Ordering::Acquire), 1);
+        assert_eq!(queue.poll(), 0);
     }
 
     #[test]
