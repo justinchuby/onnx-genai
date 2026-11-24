@@ -98,8 +98,8 @@ every call, including repeated growing shapes. Positive growth evidence alone
 therefore does not select mutable metadata storage. Such a policy needs device
 measurements of both changing and repeated shapes before changing the default.
 
-Broadcast arithmetic, comparison/logical, integer bitwise/shift and PRelu
-kernels publish immutable metadata and the successful launch signature together.
+Broadcast arithmetic, comparison/logical, integer bitwise/shift, PRelu and
+TensorScatter kernels publish immutable metadata and the successful launch signature together.
 Preparation and GPU submission use a private snapshot outside the shared state
 lock; only successful submission replaces the published pair. A failed candidate
 preserves the previous proof and owner. Replacement retirement happens after
@@ -112,6 +112,31 @@ over preparation or GPU work. An inactive bias (absent C or beta=0) does not
 consult that cache, including on the K=0 empty-product path. Existing Gemm
 synchronization and eager-only capture policy remain in place; this transaction
 does not establish a cuBLASLt/bias capture contract.
+
+TensorScatter uses this same one-record publication rule for its persistent
+stride descriptor and exact dtype/cache/update/optional-index signature. It
+snapshots only after ordinary input validation, checking the old proof and
+cloning its immutable metadata owner under the same lock. The already-built
+invocation signature moves into the private candidate, avoiding deep copies of
+the old signature vectors. Both metadata staging and the
+launch run outside the state lock, and successful eager submission publishes
+one pair; capture only consumes its validated snapshot. A zero-update copy
+publishes after the copy submission succeeds, while empty output publishes
+without device work. These paths may retain an unused old descriptor but never
+consume it under the new empty signature. Nonempty capture still validates the
+actual graph-held allocation owner as well as the exact signature. Existing
+exclusive kernel execution/capture contracts remain required; this is not a
+new execution-concurrency authority.
+
+The TensorScatter device regression covers linear/circular updates, optional
+indices, A→failed B→A→B, stable warm allocation/transfer/drain counters, missing
+capture-owner refusal, capture-signature mismatch, and independent A/B graph
+replay after kernel destruction and old-graph reset. It also covers zero-update
+copy and empty-output publication. On the CPU-only development host this test
+is compiled/listed and default-ignored, not executed. No CUDA numerical,
+lifetime or performance result is claimed from those checks. The CUDA source,
+metadata format, physical owner, quota authority and allocation policy are
+unchanged.
 
 ### Resource allocation granularity
 
