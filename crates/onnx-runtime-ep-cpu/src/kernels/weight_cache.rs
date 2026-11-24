@@ -1368,4 +1368,99 @@ mod tests {
             "warm hits must not consult the grant source"
         );
     }
+    #[test]
+    fn zero_derived_projection_groups_skip_admission_and_mixed_groups_fund_only_payloads() {
+        use crate::kernels::testutil::RecordingGovernor;
+        let books = RecordingGovernor::new_host(8);
+        let source = books.weight_memory(HolderId::new(13));
+        let cache = WeightCache::<DenseWeightCacheKey>::new(source, 0);
+        let baseline = (books.claims(), books.releases());
+        let mut built = 0;
+        for _ in 0..16 {
+            let loaded = ready(
+                cache
+                    .load_group(
+                        &[WeightSpec::transient(0), WeightSpec::transient(0)],
+                        |_, output| {
+                            assert!(output.is_empty());
+                            built += 1;
+                            Ok(())
+                        },
+                    )
+                    .unwrap(),
+            );
+            assert_eq!(loaded.weights.len(), 2);
+            assert!(loaded.weights.iter().all(|weight| weight.values.is_empty()));
+            drop(loaded);
+            assert_eq!((books.claims(), books.releases()), baseline);
+            assert_eq!(books.used(Tier::Host), 0);
+        }
+        assert_eq!(
+            built, 32,
+            "zero-byte results must still be constructed, not silently skipped"
+        );
+        let loaded = ready(
+            cache
+                .load_group(
+                    &[
+                        WeightSpec::transient(0),
+                        WeightSpec::transient(8),
+                        WeightSpec::transient(0),
+                    ],
+                    |index, output| {
+                        output.fill(index as f32);
+                        Ok(())
+                    },
+                )
+                .unwrap(),
+        );
+        assert_eq!(loaded.weights[1].values, [1., 1.]);
+        assert!(loaded.weights[0].values.is_empty() && loaded.weights[2].values.is_empty());
+        assert_eq!(books.used(Tier::Host), 8);
+        assert_eq!(books.claims(), baseline.0 + 1);
+        assert_eq!(books.releases(), baseline.1);
+        drop(loaded);
+        assert_eq!(books.used(Tier::Host), 0);
+        assert_eq!(books.releases(), baseline.1 + 1);
+
+        // Empty final storage does not erase positive construction demand.
+        let before_peak = (books.claims(), books.releases());
+        let loaded = ready(
+            cache
+                .load_group_owned(
+                    &[WeightSpec {
+                        key: None,
+                        bytes: 0,
+                        build_peak_bytes: 8,
+                    }],
+                    |_| {
+                        assert_eq!(
+                            books.used(Tier::Host),
+                            8,
+                            "construction peak must be funded before building"
+                        );
+                        let temporary = vec![1.0f32, 2.0];
+                        std::hint::black_box(&temporary);
+                        Ok(Vec::new())
+                    },
+                )
+                .unwrap(),
+        );
+        assert!(loaded.weights[0].values.is_empty());
+        assert_eq!(
+            books.used(Tier::Host),
+            0,
+            "temporary construction grant returns at the end of the build"
+        );
+        assert_eq!(
+            (books.claims(), books.releases()),
+            (before_peak.0 + 1, before_peak.1 + 1)
+        );
+        drop(loaded);
+        assert_eq!(
+            (books.claims(), books.releases()),
+            (before_peak.0 + 1, before_peak.1 + 1)
+        );
+        assert_eq!(cache.stats(), (0, 0));
+    }
 }

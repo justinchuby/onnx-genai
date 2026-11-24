@@ -162,6 +162,20 @@ does not refund those bytes. Idle capacity can be reclaimed under pressure.
 Pending asynchronous work, active readers and capture pins prevent reuse, and
 quarantined backing retains its charge until physical release is settled.
 
+CPU derived-weight payloads also treat zero bytes as an explicit empty grant.
+An empty grant cannot split off positive bytes; a zero-byte split of any grant
+produces another empty value without cloning an accountant lease. Positive
+governed payloads still claim and retain their exact physical capacity, and
+partially split owners return only their own bytes. This removes empty
+projection-group admission callbacks without relabeling zero capacity as the
+unbounded local/ungoverned mode. The configured source's one-time zero-byte
+authority anchor remains validated at construction; it is not a payload claim.
+QMoE uses the same empty-owner conversion for on-demand and transient experts.
+Direct issuer-counter tests cover empty groups, full-capacity pressure, mixed
+zero/nonzero groups, positive construction peaks for empty final payloads,
+positive splitting/retirement and zero-capacity rejection.
+This establishes callback behavior, not a measured inference speedup.
+
 Cold replacement borrows the caller's `Option<WorkspaceAllocation>`. The option
 retains the original owner until the provider actually takes it for retirement.
 CUDA rejects real stream capture before release-barrier waiting, growth grants,
