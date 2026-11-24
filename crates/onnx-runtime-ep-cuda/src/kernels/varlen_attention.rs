@@ -66,11 +66,16 @@
 
 use std::borrow::Cow;
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use cudarc::driver::sys::CUdeviceptr;
+use super::varlen_workspace::{
+    InvocationBindings, array_layout, product, requirement, scratch_layout, validate_tensor_span,
+};
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceExecutionPreparation, WorkspaceLayout, WorkspacePreparation, WorkspaceView,
+};
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::driver_err;
@@ -319,6 +324,7 @@ impl KernelFactory for VarlenAttentionFactory {
             scale,
             is_causal,
             softcap,
+            prepared: Mutex::new(None),
         }))
     }
 }
@@ -331,6 +337,24 @@ struct VarlenAttentionKernel {
     scale: Option<f32>,
     is_causal: bool,
     softcap: f32,
+    prepared: Mutex<Option<PreparedInvocation>>,
+}
+
+#[derive(Debug)]
+struct PreparedInvocation {
+    bindings: InvocationBindings,
+    layout: WorkspaceLayout<2>,
+    controls: Vec<i32>,
+    dtype_code: i32,
+    group: usize,
+    kv_num_heads: usize,
+    head_size: usize,
+    v_head_size: usize,
+    total_rows: usize,
+    batch: usize,
+    q_seq: usize,
+    kv_seq: usize,
+    max_valid_kv: usize,
 }
 
 /// Resolved `[batch, seq, dim]` extents of a padded Q/K/V input. A rank-3
@@ -398,7 +422,7 @@ fn read_nonpad(runtime: &CudaRuntime, view: &TensorView) -> Result<Vec<i64>> {
         )));
     }
     let count = view.shape[0];
-    let mut bytes = vec![0u8; count * 8];
+    let mut bytes = vec![0u8; array_layout::<i64>(count)?.size()];
     // SAFETY: `view` is a live, contiguous int64 device allocation of `count`
     // elements; the destination matches its byte length exactly.
     unsafe {
@@ -410,8 +434,12 @@ fn read_nonpad(runtime: &CudaRuntime, view: &TensorView) -> Result<Vec<i64>> {
         .collect())
 }
 
-impl Kernel for VarlenAttentionKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+impl VarlenAttentionKernel {
+    fn prepare_invocation(
+        &self,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+    ) -> Result<PreparedInvocation> {
         if inputs.len() != 4 || outputs.len() != 1 {
             return Err(error(format!(
                 "expected 4 inputs and 1 output, got {} inputs and {} outputs",
@@ -419,6 +447,10 @@ impl Kernel for VarlenAttentionKernel {
                 outputs.len()
             )));
         }
+        for (index, input) in inputs.iter().enumerate() {
+            validate_tensor_span(input.dtype, input.shape, format_args!("input {index}"))?;
+        }
+        validate_tensor_span(outputs[0].dtype, outputs[0].shape, "output 0")?;
         let dtype = inputs[0].dtype;
         let dtype_code = match dtype {
             DataType::Float32 => 0i32,
@@ -469,25 +501,80 @@ impl Kernel for VarlenAttentionKernel {
         // Validate the per-batch valid KV lengths and size the score scratch by
         // the widest valid sequence so no in-kernel index escapes its row.
         let mut max_valid_kv = 0usize;
+        let mut controls = Vec::with_capacity(batch);
         for (b, &n) in nonpad.iter().enumerate() {
             if n < 0 || n as usize > kv_seq {
                 return Err(error(format!(
                     "nonpad_kv_seqlen[{b}] = {n} must be in [0, kv_seq={kv_seq}]"
                 )));
             }
+            let n = i32::try_from(n).map_err(|_| error(format!("nonpad_kv_seqlen[{b}]={n} exceeds int32 control capacity; reduce valid KV length")))?;
             max_valid_kv = max_valid_kv.max(n as usize);
+            controls.push(n);
         }
 
-        let y_expected = batch * q_seq * num_heads * v_head_size;
+        let y_expected = product(&[batch, q_seq, num_heads, v_head_size], "output elements")?;
         if outputs[0].dtype != dtype
             || !outputs[0].is_contiguous()
-            || outputs[0].numel() != y_expected
+            || product(outputs[0].shape, "offered output elements")? != y_expected
         {
             return Err(error(
                 "output must be contiguous, use the Q/K/V dtype, and have shape [batch, q_seq, num_heads, v_head_size]",
             ));
         }
 
+        let total_rows = if y_expected == 0 {
+            0
+        } else {
+            product(&[batch, q_seq, num_heads], "query rows")?
+        };
+        let layout = scratch_layout(batch, total_rows, max_valid_kv)?;
+        Ok(PreparedInvocation {
+            bindings: InvocationBindings::new(inputs, outputs),
+            layout,
+            controls,
+            dtype_code,
+            group,
+            kv_num_heads,
+            head_size,
+            v_head_size,
+            total_rows,
+            batch,
+            q_seq,
+            kv_seq,
+            max_valid_kv,
+        })
+    }
+
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        let prepared = self.prepared.lock().map_err(|_| error("prepared invocation lock poisoned; recreate the kernel"))?.take().ok_or_else(|| error("missing prepared invocation; call execution workspace preparation and pass its admitted caller workspace before executing"))?;
+        prepared.bindings.validate(inputs, outputs)?;
+        if self.runtime.is_capturing()? {
+            return Err(error(
+                "device control snapshots and synchronous uploads require eager execution; finish CUDA graph capture before preparing or executing variable-length attention",
+            ));
+        }
+        let PreparedInvocation {
+            controls: nonpad,
+            layout,
+            dtype_code,
+            group,
+            kv_num_heads,
+            head_size,
+            v_head_size,
+            total_rows,
+            batch,
+            q_seq,
+            kv_seq,
+            max_valid_kv,
+            ..
+        } = prepared;
+        let num_heads = self.num_heads;
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             // 2 * QK + 2 * PV flops over each row's VALID (i, j) pairs.
             let mut pairs = 0u64;
@@ -497,13 +584,14 @@ impl Kernel for VarlenAttentionKernel {
             }
             pairs
                 .saturating_mul(num_heads as u64)
-                .saturating_mul((head_size + v_head_size) as u64)
+                .saturating_mul(head_size.saturating_add(v_head_size) as u64)
                 .saturating_mul(2)
         });
 
-        if y_expected == 0 || batch == 0 || q_seq == 0 {
+        if total_rows == 0 {
             return Ok(());
         }
+        let total_rows = total_rows as u64;
 
         let scale = self
             .scale
@@ -516,33 +604,22 @@ impl Kernel for VarlenAttentionKernel {
         let v_ptr = cuptr(inputs[2].data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
-        // Host-narrowed int32 valid-length control array (bounds validated above
-        // to fit i32). Bulk data stays on the device; only this small array is
-        // uploaded.
-        let nonpad_i32: Vec<i32> = nonpad.iter().map(|&n| n as i32).collect();
-
-        let total_rows = (batch * q_seq * num_heads) as u64;
+        let regions = layout.bind(workspace).map_err(|source| EpError::Backend {
+            operation: "bind VarlenAttention complete caller workspace",
+            source: Box::new(source),
+        })?;
+        let control_ptr = cuptr(regions[0].ptr().0.cast_const());
+        let scores_ptr = cuptr(regions[1].ptr().0.cast_const());
+        let nonpad_ptr = control_ptr;
         let stride = max_valid_kv.max(1) as u64;
-        let scores_elems = total_rows.saturating_mul(stride);
-
-        let mut owned: Vec<CUdeviceptr> = Vec::new();
         let result = (|| -> Result<()> {
-            let alloc = |bytes: usize, owned: &mut Vec<CUdeviceptr>| -> Result<CUdeviceptr> {
-                let ptr = self.runtime.alloc_raw(bytes.max(1))?;
-                owned.push(ptr);
-                Ok(ptr)
-            };
-            let nonpad_ptr = alloc(batch * 4, &mut owned)?;
-            let scores_ptr = alloc(scores_elems as usize * 4, &mut owned)?;
-            // SAFETY: `nonpad_ptr` covers `batch` int32 slots exactly.
+            // SAFETY: the checked control region covers the prepared snapshot;
+            // no raw input control is re-read by the device launch.
             unsafe {
-                let bytes = std::slice::from_raw_parts(
-                    nonpad_i32.as_ptr().cast::<u8>(),
-                    nonpad_i32.len() * 4,
-                );
-                self.runtime.htod(bytes, nonpad_ptr)?;
+                let bytes =
+                    std::slice::from_raw_parts(nonpad.as_ptr().cast::<u8>(), nonpad.len() * 4);
+                self.runtime.htod(bytes, control_ptr)?;
             }
-
             let caps = self.runtime.capabilities();
             let block_threads = ROW_THREADS.min(caps.max_threads_per_block().max(1));
             // Device-cap-driven grid: enough resident blocks to fill the SMs,
@@ -604,15 +681,54 @@ impl Kernel for VarlenAttentionKernel {
         } else {
             Ok(())
         };
-        let mut free_result = Ok(());
-        for ptr in owned {
-            // SAFETY: every pointer came from this runtime's `alloc_raw` above.
-            let freed = unsafe { self.runtime.free_raw(ptr) };
-            if free_result.is_ok() {
-                free_result = freed;
-            }
+        result.and(sync_result)
+    }
+}
+
+impl Kernel for VarlenAttentionKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+
+    fn workspace_requirement(
+        &self,
+        _inputs: &[TensorMetadata<'_>],
+        _outputs: &[OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        Ok(WorkspacePreparation::Deferred)
+    }
+
+    fn workspace_requirement_for_execution(
+        &self,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+        _metadata: &[TensorMetadata<'_>],
+        _output_metadata: &[OutputMetadata<'_>],
+        _cached: Option<WorkspacePreparation>,
+    ) -> Result<WorkspaceExecutionPreparation> {
+        let mut slot = self
+            .prepared
+            .lock()
+            .map_err(|_| error("prepared invocation lock poisoned; recreate the kernel"))?;
+        *slot = None;
+        if self.runtime.is_capturing()? {
+            return Err(error(
+                "device control readback is illegal during CUDA graph capture; finish capture before execution workspace preparation",
+            ));
         }
-        result.and(sync_result).and(free_result)
+        let prepared = self.prepare_invocation(inputs, outputs)?;
+        let request = requirement(&prepared.layout)?;
+        *slot = Some(prepared);
+        Ok(WorkspaceExecutionPreparation::Ready(request))
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {

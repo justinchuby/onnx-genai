@@ -431,13 +431,11 @@ fn allowlisted_unconditional_syncs() -> BTreeSet<String> {
         // allocate the dynamic output before materialize. The per-kernel audit
         // below binds this entry to that explicit capture refusal.
         "non_max_suppression.rs::materialize".to_string(),
-        "packed_varlen_attention.rs::execute".to_string(),
         "pooling.rs::run".to_string(),
         "sparse_kv_gather.rs::execute".to_string(),
         // Same two-phase DeviceWorkspace contract as NonMaxSuppression: the
         // output extent is known only after a scalar count D2H and ORT allocates.
         "unique.rs::materialize".to_string(),
-        "varlen_attention.rs::execute".to_string(),
     ])
 }
 
