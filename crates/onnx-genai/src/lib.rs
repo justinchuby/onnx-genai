@@ -16,11 +16,11 @@ pub use onnx_genai_scheduler as scheduler;
 
 pub use onnx_genai_engine::{
     CategoricalSampler, Constraint, ConstraintProcessor, DryConfig, Engine, EngineConfig,
-    FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken,
-    GenerateTokenCallback, GenerationBudgetCap, GreedySampler, LogitProcessor, MirostatConfig,
-    MirostatVersion, ProcessorChain, ProcessorChainBuilder, ProcessorContext, ProcessorSignal,
-    Sampler, SamplingOverrides, SessionForkError, SessionForkParticipant,
-    SessionForkParticipantKind, SessionForkPlan, SessionId, SessionPosition,
-    SpeculativeAcceptContext, SpeculativeProposal, SpeculativeProposer, SpeculativeProposerContext,
-    StopSequence, TokenId, XtcConfig, validate_json_prefix,
+    FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest,
+    GenerateResult, GenerateToken, GenerateTokenCallback, GenerationBudgetCap, GrammarActivation,
+    GrammarTrigger, GreedySampler, LogitProcessor, MirostatConfig, MirostatVersion, ProcessorChain,
+    ProcessorChainBuilder, ProcessorContext, ProcessorSignal, Sampler, SamplingOverrides,
+    SessionForkError, SessionForkParticipant, SessionForkParticipantKind, SessionForkPlan,
+    SessionId, SessionPosition, SpeculativeAcceptContext, SpeculativeProposal, SpeculativeProposer,
+    SpeculativeProposerContext, StopSequence, TokenId, XtcConfig, validate_json_prefix,
 };

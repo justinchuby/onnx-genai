@@ -100,6 +100,54 @@ pub struct EmbeddingUsage {
     pub total_tokens: usize,
 }
 
+/// Native llama.cpp trigger tags are numeric. Keep malformed tags and missing
+/// token IDs out of the typed inference request instead of deferring JSON errors
+/// into sampling or treating an unknown trigger as inactive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrammarTriggerRequest {
+    Token(u32),
+    Word(String),
+    Pattern(String),
+    PatternFull(String),
+}
+impl<'de> Deserialize<'de> for GrammarTriggerRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(rename = "type")]
+            kind: u8,
+            value: String,
+            #[serde(default)]
+            token: Option<u32>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        match wire.kind {
+            0 => wire.token.map(Self::Token).ok_or_else(|| {
+                D::Error::custom(
+                    "grammar_triggers type 0 requires a non-negative u32 token ID in 'token'",
+                )
+            }),
+            1 => Ok(Self::Word(wire.value)),
+            2 => Ok(Self::Pattern(wire.value)),
+            3 => Ok(Self::PatternFull(wire.value)),
+            kind => Err(D::Error::custom(format!(
+                "grammar_triggers type {kind} is unknown; use 0 (token), 1 (word), 2 (pattern) or 3 (full pattern)"
+            ))),
+        }
+    }
+}
+impl GrammarTriggerRequest {
+    fn lower(&self) -> onnx_genai_engine::config::GrammarTrigger {
+        use onnx_genai_engine::config::GrammarTrigger;
+        match self {
+            Self::Token(id) => GrammarTrigger::Token(*id),
+            Self::Word(word) => GrammarTrigger::Word(word.clone()),
+            Self::Pattern(pattern) => GrammarTrigger::Pattern(pattern.clone()),
+            Self::PatternFull(pattern) => GrammarTrigger::PatternFull(pattern.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
     #[serde(default)]
@@ -179,11 +227,11 @@ pub struct ChatCompletionRequest {
     /// llama.cpp GBNF over the raw newly generated stream.
     #[serde(default)]
     pub grammar: Option<String>,
-    /// Lazy grammar activation is not implemented; false is accepted explicitly.
+    /// Delay raw GBNF until a declared grammar trigger is accepted.
     #[serde(default)]
     pub grammar_lazy: bool,
     #[serde(default)]
-    pub grammar_triggers: Vec<serde_json::Value>,
+    pub grammar_triggers: Vec<GrammarTriggerRequest>,
     #[serde(default)]
     pub preserved_tokens: Vec<String>,
     #[serde(default)]
@@ -375,14 +423,37 @@ impl ReasoningEffort {
 }
 
 impl ChatCompletionRequest {
-    pub(crate) fn validate_grammar(&self) -> anyhow::Result<()> {
+    pub(crate) fn grammar_activation(
+        &self,
+    ) -> anyhow::Result<Option<onnx_genai_engine::config::GrammarActivation>> {
         anyhow::ensure!(
-            !self.grammar_lazy,
-            "grammar_lazy=true is not supported yet; use false or omit lazy grammar activation"
+            !self.grammar_lazy || !self.grammar_triggers.is_empty(),
+            "grammar_lazy=true requires nonempty grammar_triggers; provide a token, word or pattern trigger"
         );
+        if self.grammar_triggers.is_empty() {
+            return Ok(None);
+        }
+        onnx_genai_engine::config::GrammarActivation::new(
+            self.grammar_triggers
+                .iter()
+                .map(GrammarTriggerRequest::lower)
+                .collect(),
+        )
+        .map(Some)
+    }
+    pub(crate) fn validate_grammar(&self) -> anyhow::Result<()> {
+        self.grammar_activation()?;
         anyhow::ensure!(
-            self.grammar_triggers.is_empty(),
-            "grammar_triggers are not supported yet; send [] or omit grammar triggers"
+            !self.grammar_lazy
+                || self
+                    .grammar
+                    .as_deref()
+                    .is_some_and(|grammar| !grammar.is_empty())
+                || self
+                    .response_format
+                    .as_ref()
+                    .is_none_or(|format| matches!(format, ResponseFormat::Text)),
+            "grammar_lazy with a JSON response_format is not implemented yet; provide a raw GBNF grammar or disable lazy activation"
         );
         let Some(grammar) = self
             .grammar

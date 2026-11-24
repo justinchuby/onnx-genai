@@ -89,20 +89,7 @@ pub(crate) fn build_processor_chain(
             }
         };
         let grammar: Box<dyn crate::logits::Constraint> = match constraint {
-            GenerateConstraint::Gbnf { grammar } | GenerateConstraint::RawLark { grammar } => {
-                let lark = match constraint {
-                    GenerateConstraint::RawLark { .. } => {
-                        anyhow::ensure!(
-                            options.max_constraint_bytes > 0
-                                && grammar.len() <= options.max_constraint_bytes,
-                            "raw Lark grammar is {} bytes with max_constraint_bytes={}; shorten grammar or configure a positive sufficient budget",
-                            grammar.len(),
-                            options.max_constraint_bytes
-                        );
-                        grammar.clone()
-                    }
-                    _ => crate::gbnf::compile(grammar, options.max_constraint_bytes, tokenizer)?,
-                };
+            GenerateConstraint::Gbnf { grammar, .. } | GenerateConstraint::RawLark { grammar } => {
                 let contract = crate::byte_stream::ByteStreamContract::resolve(
                     tokenizer, crate::tokenization::SpecialTokenHandling::Preserve,
                 ).context("resolve tokenizer.decoder byte contract for raw grammar")?.context("raw grammar requires a resolved lossless tokenizer.decoder byte contract; use a tokenizer with supported byte decoding instead of contextual decoded-token guesses")?;
@@ -115,12 +102,46 @@ pub(crate) fn build_processor_chain(
                 // The shared byte contract proves density and exact decoder
                 // transforms without adapter guesses based on token spelling.
                 let endings = terminal_token_ids(options);
-                Box::new(llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    LlguidanceConstraint::from_token_bytes(
-                        GrammarConstraintKind::Lark, &lark, contract.pieces, &endings, "",
-                    )
-                })).map(|constraint| constraint.with_completion_only_eos(endings)).context("compile raw grammar against the resolved model byte vocabulary; repair the grammar or tokenizer.decoder")?)
+                if let GenerateConstraint::Gbnf {
+                    activation: Some(activation),
+                    ..
+                } = constraint
+                {
+                    Box::new(crate::gbnf::lazy::LazyGbnfConstraint::new(
+                        grammar,
+                        tokenizer,
+                        options,
+                        contract.pieces,
+                        endings,
+                        activation,
+                    )?)
+                } else {
+                    let lark = match constraint {
+                        GenerateConstraint::RawLark { .. } => {
+                            anyhow::ensure!(
+                                options.max_constraint_bytes > 0
+                                    && grammar.len() <= options.max_constraint_bytes,
+                                "raw Lark grammar is {} bytes with max_constraint_bytes={}; shorten grammar or configure a positive sufficient budget",
+                                grammar.len(),
+                                options.max_constraint_bytes
+                            );
+                            grammar.clone()
+                        }
+                        _ => {
+                            crate::gbnf::compile(grammar, options.max_constraint_bytes, tokenizer)?
+                        }
+                    };
+                    let constraint = llguidance::panic_utils::catch_unwind(
+                        std::panic::AssertUnwindSafe(|| {
+                            LlguidanceConstraint::from_token_bytes(
+                                GrammarConstraintKind::Lark, &lark, contract.pieces, &endings, "",
+                            )
+                        }),
+                    ).context("compile raw grammar against the resolved model byte vocabulary; repair the grammar or tokenizer.decoder")?;
+                    Box::new(constraint.with_completion_only_eos(endings))
+                }
             }
+
             GenerateConstraint::Json { prefix: plain } => {
                 Box::new(crate::response_constraint::ContentConstraint::json_schema(
                     tokenizer,
@@ -1687,6 +1708,7 @@ mod lark_prefill_tests {
                     }
                 } else {
                     GenerateConstraint::Gbnf {
+                        activation: None,
                         grammar: grammar.into(),
                     }
                 }),
@@ -1755,6 +1777,7 @@ mod lark_prefill_tests {
         let tokenizer = Tokenizer::from_file(path).unwrap();
         let options = GenerateOptions {
             constraint: Some(GenerateConstraint::Gbnf {
+                activation: None,
                 grammar: "root ::= <think> !<[31]> <[31]>".into(),
             }),
             eos_token_id: Some(3),
@@ -1805,6 +1828,7 @@ mod lark_prefill_tests {
         for (literal, expected) in [("<think>", 31), ("<ordinary>", 29)] {
             let mut literal_options = options.clone();
             literal_options.constraint = Some(GenerateConstraint::Gbnf {
+                activation: None,
                 grammar: format!("root ::= {literal:?}"),
             });
             let literal_chain =
@@ -1858,6 +1882,7 @@ mod lark_prefill_tests {
         for grammar in ["root ::= <[32]>", "root ::= <not-in-vocabulary>"] {
             let mut invalid = options.clone();
             invalid.constraint = Some(GenerateConstraint::Gbnf {
+                activation: None,
                 grammar: grammar.into(),
             });
             let error = build_processor_chain(&invalid, Some(&tokenizer), false)

@@ -248,6 +248,12 @@ impl GbnfReplay {
         Ok(ready)
     }
 
+    pub(crate) fn fits_piece(&self, bytes: usize) -> bool {
+        self.bytes
+            .checked_add(bytes)
+            .is_some_and(|count| count <= self.max_bytes)
+    }
+
     /// Whether an ending is legal. As in llama.cpp, completed token-reference
     /// branches may end independently of partial UTF-8 in the token's spelling.
     pub fn is_accepting(&self) -> bool {

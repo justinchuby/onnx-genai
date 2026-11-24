@@ -191,14 +191,15 @@ struct Node {
 }
 struct Matcher {
     nodes: Vec<Node>,
+    sequences: Vec<Vec<TokenId>>,
 }
 impl Matcher {
     fn new(sequences: Vec<Vec<TokenId>>) -> Self {
         let mut nodes = vec![Node::default()];
         let lengths = sequences.iter().map(Vec::len).collect::<Vec<_>>();
-        for (index, sequence) in sequences.into_iter().enumerate() {
+        for (index, sequence) in sequences.iter().enumerate() {
             let mut at = 0;
-            for id in sequence {
+            for &id in sequence {
                 at = if let Some(&child) = nodes[at].next.get(&id) {
                     child
                 } else {
@@ -236,7 +237,7 @@ impl Matcher {
                 queue.push_back(child);
             }
         }
-        Self { nodes }
+        Self { nodes, sequences }
     }
     fn advance(&self, at: &mut usize, id: TokenId) -> Option<usize> {
         while *at != 0 && !self.nodes[*at].next.contains_key(&id) {
@@ -270,6 +271,7 @@ struct Machine {
     start: usize,
     end: usize,
     control_revision: u64,
+    end_match: Option<usize>,
 }
 impl Machine {
     fn activate(&mut self, contract: &Contract) {
@@ -315,6 +317,7 @@ impl Machine {
         complete: bool,
         generated: bool,
     ) -> anyhow::Result<()> {
+        self.end_match = None;
         match self.phase.clone() {
             Phase::Idle | Phase::Done => {
                 if contract.start.advance(&mut self.start, id).is_some() {
@@ -326,7 +329,8 @@ impl Machine {
                     Phase::Counting { remaining } => remaining,
                     _ => None,
                 };
-                if contract.end.advance(&mut self.end, id).is_some() {
+                if let Some(index) = contract.end.advance(&mut self.end, id) {
+                    self.end_match = Some(index);
                     self.phase = Phase::Done;
                     return Ok(());
                 }
@@ -358,7 +362,8 @@ impl Machine {
                         "reasoning history token {id} violates the forced closer at generated boundary; replay tokens admitted by the same reasoning budget"
                     );
                 }
-                if contract.end.advance(&mut self.end, id).is_some() {
+                if let Some(index) = contract.end.advance(&mut self.end, id) {
+                    self.end_match = Some(index);
                     self.phase = Phase::Done;
                 } else if generated {
                     self.phase = match NonZeroUsize::new(remaining.get() - 1) {
@@ -424,6 +429,84 @@ struct State {
     checkpoints: Vec<Machine>,
     bytes: BytesState,
 }
+/// Protocol-only grammar visibility. Live-control revisions affect which
+/// closer the budget forces, but never retroactively change accepted history.
+/// Reuse the reasoning machine with forced-history validation disabled: actual
+/// accepted closing markers determine when grammar resumes.
+pub(crate) struct GrammarCursor {
+    budget: ReasoningBudget,
+    machine: Machine,
+    bytes: BytesState,
+    history: Vec<TokenId>,
+    visible: Vec<TokenId>,
+    failed: bool,
+}
+pub(crate) struct GrammarView<'a> {
+    pub(crate) tokens: &'a [TokenId],
+    pub(crate) apply: bool,
+}
+impl GrammarCursor {
+    pub(crate) fn new(budget: ReasoningBudget) -> anyhow::Result<Self> {
+        let mut initial = budget.initial_state()?;
+        let machine = initial.checkpoints.pop().context("reasoning grammar gate has no initial protocol checkpoint; resolve the reasoning contract again")?;
+        Ok(Self {
+            budget,
+            machine,
+            bytes: initial.bytes,
+            history: Vec::new(),
+            visible: Vec::new(),
+            failed: false,
+        })
+    }
+    fn apply(&self) -> bool {
+        matches!(self.machine.phase, Phase::Idle | Phase::Done)
+    }
+    pub(crate) fn synchronize(
+        &mut self,
+        history: &[TokenId],
+        max_tokens: usize,
+    ) -> anyhow::Result<GrammarView<'_>> {
+        if self.failed || !history.starts_with(&self.history) {
+            *self = Self::new(self.budget.clone())?;
+        }
+        let result = (|| -> anyhow::Result<()> {
+            for &id in &history[self.history.len()..] {
+                let apply = self.apply();
+                let complete = self.bytes.accept(&self.budget.contract, id)?;
+                self.machine
+                    .accept(&self.budget.contract, id, complete, false)?;
+                let replay = if apply {
+                    std::slice::from_ref(&id)
+                } else if let Some(index) = self.machine.end_match {
+                    self.budget.contract.end.sequences[index].as_slice()
+                } else {
+                    &[]
+                };
+                ensure!(
+                    self.visible
+                        .len()
+                        .checked_add(replay.len())
+                        .is_some_and(|count| count <= max_tokens),
+                    "lazy grammar reasoning-visible history exceeds {max_tokens} tokens; shorten output or use a smaller closing protocol"
+                );
+                self.visible.extend_from_slice(replay);
+                self.history.push(id);
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.failed = true;
+            return Err(error).context(
+                "resolve lazy grammar visibility through the declared reasoning protocol",
+            );
+        }
+        Ok(GrammarView {
+            tokens: &self.visible,
+            apply: self.apply(),
+        })
+    }
+}
+
 pub(crate) struct BudgetProcessor {
     budget: ReasoningBudget,
     state: Mutex<State>,

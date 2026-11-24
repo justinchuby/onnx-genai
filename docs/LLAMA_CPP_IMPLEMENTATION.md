@@ -1587,3 +1587,39 @@ trigger resolution, token-aware constraint ownership, reasoning suppression and
 HTTP conformance remain open. C++ collating/equivalence bracket forms also still
 need explicit conformance and implementation; the current matcher does not
 establish complete coverage of every platform-specific std::regex extension.
+
+### Runtime lazy-GBNF integration — self-review in progress
+
+Typed nonempty `GrammarActivation` and four `GrammarTrigger` variants now lower
+through the actual processor chain and HTTP request builders. The runtime
+preserves trigger priority and authored pattern order, uses model-backed word
+resolution, replays truncated token pieces and reconstructs activation after
+rollback. Combined source/program/history budgets are enforced. Errors retain
+the original `grammar_triggers[index]` even after token triggers are separated
+from patterns. The earlier token-only llguidance activation path was removed;
+the unified runtime owns activation.
+
+A protocol-only reasoning cursor reuses the existing reasoning machine. It
+hides accepted thinking tokens from the lazy grammar, suppresses its mask while
+reasoning is active, and replays the complete matched ending sequence. The
+matcher retains its original sequences to recover the longest matched closer.
+Forced-history validation remains with the existing budget processor; the
+grammar cursor does not reinterpret old accepted tokens with the current live
+control revision. Unit coverage includes manual control, finite budgets, partial
+closers, existing prefill, longest endings and speculative rollback.
+
+Positive validation passed before the additional adversarial matcher case:
+engine 978 / one inherited ignore, server 451 / two inherited ignores, HTTP 37,
+CLI 71 and both profile subprocesses. Strict engine/server/CLI all-target Clippy
+with the ORT CUDA feature and formatting passed. Real Native and ORT HTTP tests
+cover all four trigger tags on five route spellings, buffered and SSE output,
+pre-SSE invalid-field rejection, reasoning-budget-zero closure and the pinned
+raw-Lark behavior. These are functional CPU tests, not performance/GPU claims.
+
+The change is not ready to merge. Independent upstream std::regex comparison
+found that `x(?:(a)|b)+` on `xab` must clear its capture in the final repetition
+and return byte offset 0; the current fancy-regex backend returns 1. Finite and
+unbounded repetition and a backreference variant reproduce the same semantic
+gap. The formal capture-oracle regression now selects one test and fails on
+this mismatch. Correct repetition capture clearing is required before landing;
+passing ordinary HTTP cases does not establish that compatibility.

@@ -51,12 +51,58 @@ mod gbnf_wire {
         }
         let options = onnx_genai_engine::GenerateOptions {
             constraint: Some(onnx_genai_engine::GenerateConstraint::Gbnf {
+                activation: None,
                 grammar: "root ::= \"hello\"".into(),
             }),
             ..Default::default()
         };
         let error = options.validate_processors(&tokenizer).unwrap_err();
         assert!(format!("{error:#}").contains("decoder"), "{error:#}");
+    }
+
+    #[test]
+    fn lazy_wire_trigger_tags_are_typed_and_require_valid_fields() {
+        for (wire, expected) in [
+            (
+                json!({"type":0,"value":"hello","token":4}),
+                onnx_genai_engine::GrammarTrigger::Token(4),
+            ),
+            (
+                json!({"type":1,"value":"hello"}),
+                onnx_genai_engine::GrammarTrigger::Word("hello".into()),
+            ),
+            (
+                json!({"type":2,"value":"(hello)"}),
+                onnx_genai_engine::GrammarTrigger::Pattern("(hello)".into()),
+            ),
+            (
+                json!({"type":3,"value":"hello"}),
+                onnx_genai_engine::GrammarTrigger::PatternFull("hello".into()),
+            ),
+        ] {
+            let request: ChatCompletionRequest = serde_json::from_value(
+                json!({"messages":[],"grammar_lazy":true,"grammar_triggers":[wire]}),
+            )
+            .unwrap();
+            assert_eq!(
+                request.grammar_activation().unwrap().unwrap().triggers(),
+                &[expected]
+            );
+        }
+        for wire in [
+            json!({"type":0,"value":"hello"}),
+            json!({"type":0,"value":"hello","token":-1}),
+            json!({"type":4,"value":"hello"}),
+            json!({"type":"0","value":"hello","token":4}),
+            json!({"type":1}),
+        ] {
+            assert!(
+                serde_json::from_value::<ChatCompletionRequest>(
+                    json!({"messages":[],"grammar_triggers":[wire]})
+                )
+                .is_err()
+            );
+        }
     }
 
     #[tokio::test]
@@ -197,6 +243,114 @@ mod gbnf_wire {
                 }
             }
         }
+        // Exercise all native trigger tags through real generation and SSE.
+        // A large bias selects the unconstrained trigger; grammar alone then
+        // selects the different successor and permits only a completed EOS.
+        for path in [
+            "/completion",
+            "/completions",
+            "/v1/completions",
+            "/v1/chat/completions",
+            "/chat/completions",
+        ] {
+            let chat = path.ends_with("/chat/completions");
+            let id = if chat { 23 } else { 4 };
+            let word = if chat { "tok23" } else { "hello" };
+            for kind in 0..=3 {
+                for stream in [false, true] {
+                    let trigger = match kind {
+                        0 => json!({"type":0,"value":word,"token":id}),
+                        1 => json!({"type":1,"value":word}),
+                        2 => json!({"type":2,"value":if chat {"tok(23)"} else {"h(ello)"}}),
+                        _ => json!({"type":3,"value":word}),
+                    };
+                    let mut body = if chat {
+                        json!({"messages":[{"role":"user","content":"hello"}],"grammar":"root ::= <[23]> <[4]> <[5]>","reasoning_budget_tokens":0})
+                    } else {
+                        json!({"prompt":"hello","grammar":"root ::= <[4]> <[5]>"})
+                    };
+                    body["grammar_lazy"] = json!(true);
+                    body["grammar_triggers"] = json!([trigger]);
+                    body["preserved_tokens"] = json!([word]);
+                    body["logit_bias"] = json!({"4":100.0});
+                    body["max_tokens"] = json!(4);
+                    body["temperature"] = json!(0);
+                    body["stream"] = json!(stream);
+                    let response = router
+                        .clone()
+                        .oneshot(
+                            Request::post(path)
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(Body::from(body.to_string()))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    let status = response.status();
+                    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                    let text = String::from_utf8_lossy(&bytes);
+                    assert_eq!(
+                        status,
+                        StatusCode::OK,
+                        "{backend:?} {path} lazy kind={kind} stream={stream}: {text}"
+                    );
+                    let content = if stream {
+                        let events = sse_json_events(&bytes);
+                        assert!(
+                            !events.iter().any(|event| event.get("error").is_some()),
+                            "{text}"
+                        );
+                        events
+                            .iter()
+                            .filter_map(|event| {
+                                if matches!(path, "/completion" | "/completions") {
+                                    event["content"].as_str()
+                                } else if chat {
+                                    event["choices"][0]["delta"]["content"].as_str()
+                                } else {
+                                    event["choices"][0]["text"].as_str()
+                                }
+                            })
+                            .collect::<String>()
+                    } else {
+                        let value: Value = serde_json::from_slice(&bytes).unwrap();
+                        if matches!(path, "/completion" | "/completions") {
+                            value["content"].as_str()
+                        } else if chat {
+                            value["choices"][0]["message"]["content"].as_str()
+                        } else {
+                            value["choices"][0]["text"].as_str()
+                        }
+                        .unwrap()
+                        .to_owned()
+                    };
+                    assert_eq!(
+                        content.trim(),
+                        "helloworld",
+                        "{backend:?} {path} lazy kind={kind} stream={stream}: {text}"
+                    );
+                }
+            }
+        }
+        // The pinned %llguidance branch is eager even with lazy flags; token
+        // and pattern effects are deliberately ignored there, not reinterpreted.
+        let response = router.clone().oneshot(Request::post("/completion")
+            .header(header::CONTENT_TYPE,"application/json")
+            .body(Body::from(json!({"prompt":"hello", "grammar":"%llguidance {\"no_forcing\":true}\nstart: <[4]> <[5]>",
+                "grammar_lazy":true,"grammar_triggers":[{"type":2,"value":"(?<=x)y"}],
+                "max_tokens":4,"temperature":0,"logit_bias":{"4":100.0}}).to_string())).unwrap()).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["content"],
+            "helloworld"
+        );
         for stream in [false, true] {
             let body = json!({"messages":[{"role":"user","content":"hello"}],
                 "grammar":"root ::= <[4]> <[23]> <[5]>", "reasoning_budget_tokens":1,
@@ -434,6 +588,12 @@ mod gbnf_wire {
         for fields in [
             json!({"grammar":"root ::= \"hello\"", "grammar_lazy":true}),
             json!({"grammar":"root ::= \"hello\"", "grammar_triggers":[{"type":0,"value":"hello"}]}),
+            json!({"grammar":"root ::= \"hello\"", "grammar_lazy":true,"grammar_triggers":[{"type":0,"value":"absent","token":9999}]}),
+            json!({"grammar":"root ::= \"hello\"", "grammar_lazy":true,"grammar_triggers":[{"type":2,"value":"(?<=x)y"}]}),
+            json!({"grammar":"root ::= \"hello\"", "grammar_triggers":[{"type":1,"value":"hello"}]}),
+            json!({"grammar":"root ::= \"hello\"", "grammar_triggers":[{"type":4,"value":"hello"}]}),
+            json!({"response_format":{"type":"json_object"},"grammar_lazy":true,"grammar_triggers":[{"type":2,"value":"[{]"}]}),
+            json!({"grammar":"%llguidance {}\nstart: <[4]>", "grammar_lazy":true,"grammar_triggers":[{"type":1,"value":"hello"}]}),
             json!({"grammar":"root ::= \"hello\"", "ignore_eos":true}),
             json!({"grammar":"%llguidance {}\nstart: missing"}),
             json!({"grammar":"%llguidance {}\nstart: <[9999]>"}),

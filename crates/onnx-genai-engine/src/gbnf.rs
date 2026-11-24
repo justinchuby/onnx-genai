@@ -3,6 +3,7 @@
 //! This grammar describes the raw generated stream, independently of response
 //! channel projection. Token references are resolved against the actual model.
 
+pub(crate) mod lazy;
 pub mod replay;
 pub mod trigger;
 
@@ -646,8 +647,14 @@ pub(crate) fn compile(
     tokenizer: &onnx_genai_ort::Tokenizer,
 ) -> Result<String> {
     let parsed = parse(source, max_bytes)?;
+    render_rules(&parsed, &mut token_resolver(tokenizer))
+}
+
+pub(crate) fn token_resolver(
+    tokenizer: &onnx_genai_ort::Tokenizer,
+) -> impl FnMut(&str) -> Result<u32> + '_ {
     let vocabulary: HashSet<_> = tokenizer.inner().get_vocab(true).into_values().collect();
-    let mut resolve = |spelling: &str| -> Result<u32> {
+    move |spelling: &str| -> Result<u32> {
         let id = if let Some(number) = spelling
             .strip_prefix("<[")
             .and_then(|s| s.strip_suffix("]>"))
@@ -675,8 +682,7 @@ pub(crate) fn compile(
             "grammar token ID {id} is not present in the model vocabulary"
         );
         Ok(id)
-    };
-    render_rules(&parsed, &mut resolve)
+    }
 }
 
 fn render_rules(

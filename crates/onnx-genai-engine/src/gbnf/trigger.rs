@@ -15,6 +15,7 @@ const PROGRAM_BYTES: usize = 1 << 20;
 pub struct EcmaBytePattern {
     regex: Regex,
     max_bytes: usize,
+    program_bytes: usize,
 }
 impl EcmaBytePattern {
     pub fn compile(pattern: &str, max_bytes: usize) -> Result<Self> {
@@ -46,7 +47,15 @@ impl EcmaBytePattern {
             .delegate_size_limit(1 << 20)
             .delegate_dfa_size_limit(1 << 20)
             .build().context("compile grammar trigger ECMAScript pattern; repair its syntax or simplify the expression")?;
-        Ok(Self { regex, max_bytes })
+        Ok(Self {
+            regex,
+            max_bytes,
+            program_bytes: translated.len(),
+        })
+    }
+
+    pub(crate) fn program_bytes(&self) -> usize {
+        self.program_bytes
     }
 
     /// First nonempty captured group's byte offset, falling back to the whole
@@ -435,6 +444,12 @@ mod tests {
             ("(a*)b", "free b", Some(5)),
             ("x(a)?(b)", "xxb", Some(2)),
             ("(a(b)?)+", "aba", Some(2)),
+            // Captures not participating in the final repetition are cleared
+            // by the pinned std::regex oracle; retained captures move replay.
+            ("x(?:(a)|b)+", "xab", Some(0)),
+            ("x(?:a|(b))*", "xba", Some(0)),
+            ("x(?:(a)|b){2}", "xab", Some(0)),
+            (r"x(?:(a)|b)+\1", "xaba", None),
             ("a(?=(b))", "ab", Some(1)),
             ("^.*?(<tool>)", "junk<tool>tail", Some(4)),
             ("(é)", "pré", Some(2)),
