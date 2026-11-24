@@ -1270,6 +1270,20 @@ impl std::fmt::Debug for CudaExecutionProvider {
 }
 
 impl CudaExecutionProvider {
+    fn require_workspace_admission_outside_capture(
+        &self,
+        operation: &str,
+        size: usize,
+        alignment: usize,
+    ) -> Result<()> {
+        if self.runtime.is_capturing()? {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: cannot {operation} workspace ({size} bytes aligned to {alignment}) during CUDA graph capture; abort recording and eagerly prepare retained backing before capture"
+            )));
+        }
+        Ok(())
+    }
+
     fn artifact_policy(&self) -> ExecutorArtifactPolicy {
         ExecutorArtifactPolicy::new(
             self.artifact_provider_id,
@@ -4471,6 +4485,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         alignment: usize,
         role: MemoryRole,
     ) -> Result<WorkspaceAllocation> {
+        self.require_workspace_admission_outside_capture("allocate", size, alignment)?;
         Self::wait_for_workspace_release_barrier(
             &self.workspace_release_barrier,
             std::time::Duration::from_secs(30),
@@ -4488,13 +4503,17 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     fn replace_workspace(
         &self,
-        old: Option<WorkspaceAllocation>,
+        old: &mut Option<WorkspaceAllocation>,
         size: usize,
         alignment: usize,
         role: MemoryRole,
     ) -> Result<WorkspaceAllocation> {
-        if let Some(old) = old {
-            self.deallocate_workspace(old)?;
+        self.require_workspace_admission_outside_capture("replace", size, alignment)?;
+        if old.is_some() {
+            self.sync()?;
+        }
+        if let Some(previous) = old.take() {
+            self.deallocate_workspace(previous)?;
             Self::wait_for_workspace_release_barrier(
                 &self.workspace_release_barrier,
                 std::time::Duration::from_secs(30),

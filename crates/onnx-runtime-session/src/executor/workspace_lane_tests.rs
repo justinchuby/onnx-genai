@@ -424,3 +424,121 @@ fn failed_enrollment_retires_step_but_preserves_persistent_for_retry() {
     );
     assert_eq!(books.used(Tier::Host), 0);
 }
+
+#[test]
+fn workspace_replacement_sync_refusal_and_unwind_preserve_the_original_funded_owner() {
+    let (_executor, ep, books, _manager) = mixed_fixture(true);
+    let demand = WorkspaceRequirement {
+        bytes: 64,
+        alignment: 64,
+        lifetime: WorkspaceLifetime::SessionPersistent,
+    };
+    let mut slot = None;
+    Executor::reserve_prepared_workspace(ep.as_ref(), &mut slot, demand).unwrap();
+    let pointer = slot.as_ref().unwrap().buffer.as_ptr();
+    let callbacks = books.callbacks();
+    let allocations = ep.workspace_allocations.load(Ordering::Relaxed);
+    let releases = ep.workspace_releases.load(Ordering::Relaxed);
+    ep.fail_workspace_sync.store(true, Ordering::Relaxed);
+    let larger = WorkspaceRequirement {
+        bytes: 128,
+        ..demand
+    };
+    let error = Executor::reserve_prepared_workspace(ep.as_ref(), &mut slot, larger)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("workspace preflight sync failure"),
+        "{error}"
+    );
+    let retained = slot
+        .as_ref()
+        .expect("a refusal before take must restore the exact old owner");
+    assert_eq!(retained.buffer.as_ptr(), pointer);
+    assert_eq!((retained.bytes, retained.alignment), (64, 64));
+    assert_eq!(books.used(Tier::Host), 64);
+    assert_eq!(books.callbacks(), callbacks);
+    assert_eq!(
+        ep.workspace_allocations.load(Ordering::Relaxed),
+        allocations
+    );
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), releases);
+    ep.panic_workspace_sync.store(true, Ordering::Relaxed);
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Executor::reserve_prepared_workspace(ep.as_ref(), &mut slot, larger)
+    }));
+    assert!(unwind.is_err());
+    let retained = slot
+        .as_ref()
+        .expect("preflight unwind must restore the funded owner");
+    assert_eq!(retained.buffer.as_ptr(), pointer);
+    assert_eq!((retained.bytes, retained.alignment), (64, 64));
+    assert_eq!(books.used(Tier::Host), 64);
+    assert_eq!(books.callbacks(), callbacks);
+    assert_eq!(
+        ep.workspace_allocations.load(Ordering::Relaxed),
+        allocations
+    );
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), releases);
+    let syncs = ep.sync_calls.load(Ordering::Relaxed);
+    for _ in 0..8 {
+        Executor::reserve_prepared_workspace(ep.as_ref(), &mut slot, demand).unwrap();
+    }
+    assert_eq!(
+        ep.sync_calls.load(Ordering::Relaxed),
+        syncs,
+        "fitting demands must not enter replacement preflight"
+    );
+    assert_eq!(books.callbacks(), callbacks);
+    Executor::reserve_prepared_workspace(ep.as_ref(), &mut slot, larger).unwrap();
+    assert_eq!(slot.as_ref().unwrap().bytes, 128);
+    ep.deallocate_workspace(slot.take().unwrap().buffer)
+        .unwrap();
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn workspace_replacement_consuming_failure_never_restores_or_retries_the_old_owner() {
+    let (_executor, ep, books, _manager) = mixed_fixture(true);
+    let demand = WorkspaceRequirement {
+        bytes: 64,
+        alignment: 64,
+        lifetime: WorkspaceLifetime::SessionPersistent,
+    };
+    let mut slot = None;
+    Executor::reserve_prepared_workspace(ep.as_ref(), &mut slot, demand).unwrap();
+    let allocations = ep.workspace_allocations.load(Ordering::Relaxed);
+    ep.fail_workspace_release.store(true, Ordering::Relaxed);
+    let larger = WorkspaceRequirement {
+        bytes: 128,
+        ..demand
+    };
+    let error = Executor::reserve_prepared_workspace(ep.as_ref(), &mut slot, larger)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("workspace release failure"), "{error}");
+    assert!(
+        slot.is_none(),
+        "a taken owner must not be recreated on release failure"
+    );
+    assert_eq!(
+        ep.workspace_allocations.load(Ordering::Relaxed),
+        allocations
+    );
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        books.used(Tier::Host),
+        64,
+        "quarantine must retain the failed physical charge"
+    );
+    Executor::reserve_prepared_workspace(ep.as_ref(), &mut slot, larger).unwrap();
+    assert_eq!(
+        ep.workspace_releases.load(Ordering::Relaxed),
+        1,
+        "retry allocates new backing without releasing the consumed owner again"
+    );
+    assert_eq!(books.used(Tier::Host), 192);
+    ep.deallocate_workspace(slot.take().unwrap().buffer)
+        .unwrap();
+    assert_eq!(books.used(Tier::Host), 64);
+}

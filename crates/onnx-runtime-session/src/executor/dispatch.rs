@@ -2042,27 +2042,10 @@ impl KernelDispatchContext<'_> {
                 )).into());
             }
             if needs_replacement {
-                // Sequential dispatch is the scratch hand-off boundary. An
-                // EP may enqueue asynchronous device work, so synchronize
-                // before retiring the old disposable workspace. Release it
-                // before acquiring the replacement to avoid charging both.
-                self.ep.sync()?;
-                let peak = workspace_high_water(requirement, prepared.as_ref());
-                let peak_bytes = usize::try_from(peak.bytes).map_err(|_| {
-                    EpError::KernelFailed(format!(
-                        "workspace peak {} does not fit usize; reduce the execution shape",
-                        peak.bytes
-                    ))
-                })?;
-                let old = prepared.take().map(|workspace| workspace.buffer);
-                let buffer =
-                    self.ep
-                        .replace_workspace(old, peak_bytes, peak.alignment, peak.role())?;
-                *prepared = Some(PreparedWorkspace {
-                    bytes: buffer.len(),
-                    alignment: buffer.alignment(),
-                    buffer,
-                });
+                // Provider replacement owns the cold preflight, completion
+                // boundary and release transaction. It can refuse without
+                // consuming the previous owner or synchronizing a capture.
+                Executor::reserve_prepared_workspace(self.ep.as_ref(), prepared, requirement)?;
             }
             let prepared = prepared.as_mut().ok_or_else(|| {
                 EpError::KernelFailed(format!(

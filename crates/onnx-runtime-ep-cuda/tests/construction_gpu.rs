@@ -50,6 +50,80 @@ fn require_cuda() -> CudaExecutionProvider {
     CudaExecutionProvider::new_default().expect("CUDA runtime must be available")
 }
 
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable gpu-tests"
+)]
+fn raw_capture_refuses_cold_workspace_admission_without_consuming_the_old_owner() {
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    runtime.set_defer_eager_sync(true);
+    let role = onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false };
+    let mut old = Some(ep.allocate_workspace(128, 256, role).unwrap());
+    let address = old.as_ref().unwrap().as_ptr();
+    let manager = ep.process_memory_manager();
+    let fingerprint = || {
+        manager
+            .snapshot()
+            .unwrap()
+            .allocations
+            .into_iter()
+            .map(|allocation| {
+                (
+                    allocation.identity,
+                    allocation.state,
+                    allocation.charged_bytes,
+                    allocation.process_reserved_bytes,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = fingerprint();
+    let counts = runtime.allocation_counts();
+    let syncs = runtime.forced_synchronization_count();
+    runtime
+        .stream()
+        .begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )
+        .unwrap();
+    let error = ep
+        .allocate_workspace(256, 256, role)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("cannot allocate workspace") && error.contains("eagerly prepare"),
+        "{error}"
+    );
+    let error = ep
+        .replace_workspace(&mut old, 256, 256, role)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("cannot replace workspace"), "{error}");
+    let mut empty = None;
+    assert!(ep.replace_workspace(&mut empty, 256, 256, role).is_err());
+    assert!(empty.is_none());
+    assert_eq!(old.as_ref().unwrap().as_ptr(), address);
+    assert_eq!(old.as_ref().unwrap().len(), 128);
+    assert_eq!(runtime.allocation_counts(), counts);
+    assert_eq!(
+        runtime.forced_synchronization_count(),
+        syncs,
+        "capture refusal must precede replacement synchronization"
+    );
+    assert_eq!(
+        fingerprint(),
+        before,
+        "capture refusal must not admit or retire manager allocations"
+    );
+    runtime.test_end_unregistered_graph_capture().unwrap();
+    let fresh = ep.replace_workspace(&mut old, 256, 256, role).unwrap();
+    assert!(old.is_none());
+    assert_eq!(fresh.len(), 256);
+    ep.deallocate_workspace(fresh).unwrap();
+}
+
 fn run(
     ep: &CudaExecutionProvider,
     op: &str,

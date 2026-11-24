@@ -863,7 +863,7 @@ impl Executor {
 
     /// Reserve `peak` into `slot` against the device authority, reusing a
     /// large-enough existing preparation. A zero requirement is a no-op.
-    fn reserve_prepared_workspace(
+    pub(super) fn reserve_prepared_workspace(
         ep: &dyn ExecutionProvider,
         slot: &mut Option<PreparedWorkspace>,
         peak: WorkspaceRequirement,
@@ -890,13 +890,21 @@ impl Executor {
                 peak.bytes
             ))
         })?;
-        let old = slot.take().map(|workspace| workspace.buffer);
-        let fresh = ep.replace_workspace(old, bytes, peak.alignment, peak.role())?;
-        *slot = Some(PreparedWorkspace {
-            bytes: fresh.len(),
-            alignment: fresh.alignment(),
-            buffer: fresh,
-        });
+        // Restore the owner on normal errors and unwind. Once the provider
+        // takes it, the empty option prevents resurrecting a consumed release.
+        struct RestoreSlot<'a> {
+            slot: &'a mut Option<PreparedWorkspace>,
+            owner: Option<WorkspaceAllocation>,
+        }
+        impl Drop for RestoreSlot<'_> {
+            fn drop(&mut self) {
+                *self.slot = self.owner.take().map(PreparedWorkspace::from_buffer);
+            }
+        }
+        let owner = slot.take().map(|workspace| workspace.buffer);
+        let mut restore = RestoreSlot { slot, owner };
+        let fresh = ep.replace_workspace(&mut restore.owner, bytes, peak.alignment, peak.role())?;
+        restore.owner = Some(fresh);
         Ok(())
     }
 
