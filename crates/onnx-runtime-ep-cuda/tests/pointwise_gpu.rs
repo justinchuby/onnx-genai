@@ -736,7 +736,10 @@ fn binary_static_shape_metadata_captures_replays_and_tracks_signatures() {
     let mut kernel = ep
         .get_kernel(&Node::new(NodeId(0), "Add", vec![], vec![]), &[], 17)
         .unwrap();
-    kernel.set_capture_seq_independent(true);
+    kernel.configure_shape_facts(onnx_runtime_ep_api::KernelShapeFacts {
+        capture_eligible: true,
+        ..Default::default()
+    });
     assert!(!kernel.cuda_graph_compatible());
 
     let output = TensorMut::new(
@@ -936,7 +939,7 @@ fn binary_static_shape_metadata_captures_replays_and_tracks_signatures() {
 /// collapse to 1 — e.g. a head-major `[heads=32, feat=128]` decode tensor — is
 /// rejected by the runtime-extent heuristic (`is_fixed_decode_shape`) but must be
 /// admitted to capture once the executor reports the node's IR output shape is
-/// fully static via `set_capture_seq_independent(true)`. The same shape with the
+/// fully static via `configure_shape_facts` with capture permission. The same shape with the
 /// flag left `false` (as the executor does for a symbolic/growing seq axis) must
 /// stay eager. This is the metadata-driven gate that distinguishes
 /// `[heads=32, feat=128]` (capturable) from `[tokens=32, feat=128]` (unsafe),
@@ -1015,7 +1018,10 @@ fn seq_independent_static_shape_is_capture_eligible_via_metadata_flag() {
     let mut capture_kernel = ep
         .get_kernel(&Node::new(NodeId(0), "Add", vec![], vec![]), &[], 17)
         .unwrap();
-    capture_kernel.set_capture_seq_independent(true);
+    capture_kernel.configure_shape_facts(onnx_runtime_ep_api::KernelShapeFacts {
+        capture_eligible: true,
+        ..Default::default()
+    });
     let output = TensorMut::new(
         DevicePtrMut(y_buf.as_mut_ptr()),
         DataType::Float32,
@@ -1164,7 +1170,10 @@ fn exercise_broadcast_capture_owner(ep: &CudaExecutionProvider, case: BroadcastC
             case.opset,
         )
         .unwrap();
-    kernel.set_capture_seq_independent(true);
+    kernel.configure_shape_facts(onnx_runtime_ep_api::KernelShapeFacts {
+        capture_eligible: true,
+        ..Default::default()
+    });
     assert!(
         !kernel.cuda_graph_compatible(),
         "{} must remain capture-unsupported until its metadata is warmed",
@@ -1268,7 +1277,10 @@ fn exercise_broadcast_capture_owner(ep: &CudaExecutionProvider, case: BroadcastC
             case.opset,
         )
         .unwrap();
-    rewarm_kernel.set_capture_seq_independent(true);
+    rewarm_kernel.configure_shape_facts(onnx_runtime_ep_api::KernelShapeFacts {
+        capture_eligible: true,
+        ..Default::default()
+    });
     execute_broadcast(
         ep,
         rewarm_kernel.as_ref(),

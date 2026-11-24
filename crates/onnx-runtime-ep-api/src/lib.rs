@@ -58,12 +58,12 @@ pub use kernel::{
     ARG_BYTES, ARG_DEVICE, ARG_FLOPS, ARG_KERNEL_VARIANT, ARG_KERNEL_VARIANT_REASON,
     BlockQuantizedMoeTraffic, CAT_KERNEL_WORKER, CaptureSupport, Cost, DeviceGraphResource,
     HostKernelData, HostKernelOutput, HostStringInput, Kernel, KernelConstantInput, KernelInput,
-    KernelMatch, KernelSizedOutput, KernelSizedOutputMetadata, KernelSizedOutputPolicy,
-    KernelVariantSelection, OutputMetadata, TensorMetadata, ViewOutput, WorkspaceCaptureSpan,
-    WorkspaceExecutionPreparation, WorkspaceLifetime, WorkspacePlanning, WorkspacePreparation,
-    WorkspaceRequirement, WorkspaceView, kernel_variant_tracing_enabled, kernel_worker_span,
-    record_kernel_metrics, record_kernel_variant_selection, record_kernel_variant_stage_selection,
-    structural_input_bytes,
+    KernelMatch, KernelShapeFacts, KernelSizedOutput, KernelSizedOutputMetadata,
+    KernelSizedOutputPolicy, KernelVariantSelection, OutputMetadata, ShapeEvolution,
+    TensorMetadata, ViewOutput, WorkspaceCaptureSpan, WorkspaceExecutionPreparation,
+    WorkspaceLifetime, WorkspacePlanning, WorkspacePreparation, WorkspaceRequirement,
+    WorkspaceView, kernel_variant_tracing_enabled, kernel_worker_span, record_kernel_metrics,
+    record_kernel_variant_selection, record_kernel_variant_stage_selection, structural_input_bytes,
 };
 pub use onnx_runtime_optimizer::OptimizationPass as OptimizerPass;
 pub use provider::{
