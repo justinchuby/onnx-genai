@@ -207,8 +207,26 @@ receive the same borrowed pointer; their reduction order and launch geometry are
 unchanged. Actual CUDA parity, NVRTC compilation and throughput require a device
 runner and are not established by Rust compilation.
 
-The separate MHA prepared-composite migration is tracked in
-[PR #2481](https://github.com/justinchuby/onnx-genai/pull/2481).
+`com.microsoft::MultiHeadAttention` also borrows one SessionPersistent composite:
+Q/output BNSH staging, optional temporary K/V, additive mask, padding upload,
+and the complete Phase-2a scores/cuBLASLt region. Compile-time optional slots
+and supplied output metadata are checked before omitting K/V regions. Planning
+and execution share geometry and output validation; regions receive no separate
+grants. Retained capacity permits fitting device-binding runs to avoid repeated
+admission even when the existing synchronization policy defers completion.
+
+MHA no longer allocates or frees device scratch. Its stream-use guard preserves
+the existing synchronization policy and both execution/policy errors; a deferred
+sync returning Ok is not a completion witness. Provider fences and settlement
+still own physical retirement. A failed legacy-default-stream padding upload
+latches that stream into subsequent release fences, so compute/copy completion
+alone cannot release an unsettled destination. The host padding mask remains an
+owned Vec; this is not a complete process-memory bound. Capture stays refused.
+
+All Phase-2a callers now pass typed, checked caller scratch. Its raw-allocation
+fallback and runtime-private shared BLAS allocation are removed. Borrowed score
+capacity is validated against the actual invocation before launches. This is a
+source/Host-tested contract, with CUDA execution and performance still pending.
 
 The fallback retains the existing runtime synchronization policy and capture
 exclusion. The parity tests use the public provider workspace preparation path.

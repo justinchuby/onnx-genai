@@ -524,3 +524,177 @@ fn bias_mask_and_present_together_match_cpu() {
         );
     }
 }
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn mha_prepared_workspace_reuses_backing_and_preserves_present_output_holes() {
+    use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView};
+    use onnx_runtime_ir::{Node, NodeId, ValueId, compute_contiguous_strides};
+    let _guard = lock_mha_gpu();
+    let ep = require_cuda();
+    let shape = [1usize, 2, 4];
+    let input_shapes = vec![shape.to_vec(); 3];
+    let strides = compute_contiguous_strides(&shape);
+    let cache_shape = [1usize, 1, 2, 4];
+    let cache_strides = compute_contiguous_strides(&cache_shape);
+    let mut qk = ep.allocate(32, 256).unwrap();
+    let mut value = ep.allocate(32, 256).unwrap();
+    let mut output = ep.allocate(32, 256).unwrap();
+    let mut present_value = ep.allocate(32, 256).unwrap();
+    ep.copy_from_host(&common::raw(&[0f32; 8]), &mut qk)
+        .unwrap();
+    ep.copy_from_host(
+        &common::raw(&[1f32, 2., 3., 4., 5., 6., 7., 8.]),
+        &mut value,
+    )
+    .unwrap();
+    let inputs = [
+        TensorView::new(
+            DevicePtr(qk.as_ptr()),
+            DataType::Float32,
+            &shape,
+            &strides,
+            ep.device_id(),
+        ),
+        TensorView::new(
+            DevicePtr(qk.as_ptr()),
+            DataType::Float32,
+            &shape,
+            &strides,
+            ep.device_id(),
+        ),
+        TensorView::new(
+            DevicePtr(value.as_ptr()),
+            DataType::Float32,
+            &shape,
+            &strides,
+            ep.device_id(),
+        ),
+    ];
+    let node = |outputs| {
+        let mut node = Node::new_with_output_slots(
+            NodeId(0),
+            OP,
+            vec![Some(ValueId(0)), Some(ValueId(1)), Some(ValueId(2))],
+            outputs,
+        );
+        node.domain = DOMAIN.into();
+        node.attributes
+            .insert("num_heads".into(), Attribute::Int(1));
+        node
+    };
+    let only_y = node(vec![Some(ValueId(10))]);
+    let kernel = ep.get_kernel(&only_y, &input_shapes, OPSET).unwrap();
+    let error = kernel
+        .execute(
+            &inputs,
+            &mut [TensorMut::new(
+                DevicePtrMut(output.as_mut_ptr()),
+                DataType::Float32,
+                &shape,
+                &strides,
+                ep.device_id(),
+            )],
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("execute_with_workspace"),
+        "{error}"
+    );
+    let mut workspace = None;
+    ep.copy_from_host(&common::raw(&[-31f32; 8]), &mut output)
+        .unwrap();
+    common::execute_kernel(
+        &ep,
+        kernel.as_ref(),
+        &inputs,
+        &mut [TensorMut::new(
+            DevicePtrMut(output.as_mut_ptr()),
+            DataType::Float32,
+            &shape,
+            &strides,
+            ep.device_id(),
+        )],
+        &mut workspace,
+    )
+    .unwrap();
+    let identity = workspace.as_ref().unwrap().as_ptr();
+    let mut bytes = [0u8; 32];
+    ep.copy_to_host(&output, &mut bytes).unwrap();
+    assert_eq!(
+        decode_floats(&bytes, DataType::Float32),
+        [3f32, 4., 5., 6., 3., 4., 5., 6.]
+    );
+
+    let with_hole = node(vec![Some(ValueId(10)), None, Some(ValueId(12))]);
+    let kernel = ep.get_kernel(&with_hole, &input_shapes, OPSET).unwrap();
+    let error = kernel
+        .execute(
+            &inputs,
+            &mut [TensorMut::new(
+                DevicePtrMut(output.as_mut_ptr()),
+                DataType::Float32,
+                &shape,
+                &strides,
+                ep.device_id(),
+            )],
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("compiled slots"), "{error}");
+    ep.copy_from_host(&common::raw(&[-31f32; 8]), &mut output)
+        .unwrap();
+    ep.copy_from_host(&common::raw(&[-19f32; 8]), &mut present_value)
+        .unwrap();
+    common::execute_kernel(
+        &ep,
+        kernel.as_ref(),
+        &inputs,
+        &mut [
+            TensorMut::new(
+                DevicePtrMut(output.as_mut_ptr()),
+                DataType::Float32,
+                &shape,
+                &strides,
+                ep.device_id(),
+            ),
+            TensorMut::new(
+                DevicePtrMut(std::ptr::null_mut()),
+                DataType::Undefined,
+                &[],
+                &[],
+                ep.device_id(),
+            ),
+            TensorMut::new(
+                DevicePtrMut(present_value.as_mut_ptr()),
+                DataType::Float32,
+                &cache_shape,
+                &cache_strides,
+                ep.device_id(),
+            ),
+        ],
+        &mut workspace,
+    )
+    .unwrap();
+    assert_eq!(
+        workspace.as_ref().unwrap().as_ptr(),
+        identity,
+        "the fitting workspace must retain its physical backing"
+    );
+    ep.copy_to_host(&output, &mut bytes).unwrap();
+    assert_eq!(
+        decode_floats(&bytes, DataType::Float32),
+        [3f32, 4., 5., 6., 3., 4., 5., 6.]
+    );
+    ep.copy_to_host(&present_value, &mut bytes).unwrap();
+    assert_eq!(
+        decode_floats(&bytes, DataType::Float32),
+        [1f32, 2., 3., 4., 5., 6., 7., 8.]
+    );
+    ep.deallocate_workspace(workspace.unwrap()).unwrap();
+    for buffer in [qk, value, output, present_value] {
+        ep.deallocate(buffer).unwrap();
+    }
+}

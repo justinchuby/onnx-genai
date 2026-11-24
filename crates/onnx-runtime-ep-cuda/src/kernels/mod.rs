@@ -1645,7 +1645,7 @@ pub fn build_cuda_registry_with_metrics(
     );
     reg.register(
         OpKey::new("MultiHeadAttention", "com.microsoft", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(multi_head_attention::MultiHeadAttentionFactory {
             runtime: runtime.clone(),
         }),

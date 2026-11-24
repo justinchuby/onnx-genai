@@ -859,17 +859,6 @@ pub struct CudaRuntime {
     /// safely key on one. It refuses to cache at all when this is set; see
     /// [`crate::interleave_cache::InterleaveDevice::interleave_frees_are_observed`].
     weights_may_be_paged: std::sync::atomic::AtomicBool,
-    /// The one cuBLASLt workspace shared by every GEMM on this runtime's
-    /// compute stream. Allocated on first use and never freed until the
-    /// runtime drops.
-    ///
-    /// cuBLASLt scratch does not carry state between calls, and work on a
-    /// single stream is serial, so one buffer per stream is exactly as correct
-    /// as one per call — while a per-call allocation costs
-    /// [`WORKSPACE_BYTES`] for every attention op in flight. Measured on a
-    /// 32-layer 1.8B model, the per-call path put hundreds of MiB of raw
-    /// device memory behind a prefill that needed 32 MiB.
-    shared_blas_workspace: Mutex<Option<CUdeviceptr>>,
     raw_allocation_profile: RawAllocationProfile,
     host_to_device_copies: AtomicU64,
     device_to_host_copies: AtomicU64,
@@ -923,6 +912,10 @@ pub struct CudaRuntime {
     /// default (eager decode is made consistent with the captured path, which
     /// already elides these); disable via `ONNX_GENAI_DEFER_EAGER_SYNC=0`.
     defer_eager_sync: AtomicBool,
+    /// Latched after a legacy-default-stream upload fails without a completion
+    /// proof. Future final releases also fence that stream; success cannot clear
+    /// an earlier failure's pending use.
+    legacy_upload_unsettled: AtomicBool,
     /// Capture-gate section covering this runtime's teardown, acquired in
     /// [`Drop::drop`] rather than at construction.
     ///
@@ -1170,7 +1163,6 @@ impl CudaRuntime {
             runtime_id: NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed),
             interleave: crate::interleave_cache::InterleaveCache::default(),
             weights_may_be_paged: std::sync::atomic::AtomicBool::new(false),
-            shared_blas_workspace: Mutex::new(None),
             raw_allocation_profile: RawAllocationProfile::new(raw_allocation_profile_enabled()),
             host_to_device_copies: AtomicU64::new(0),
             device_to_host_copies: AtomicU64::new(0),
@@ -1198,6 +1190,7 @@ impl CudaRuntime {
             validation_reset_pause: AtomicBool::new(false),
             #[cfg(feature = "gpu-tests")]
             validation_reset_claimed: AtomicBool::new(false),
+            legacy_upload_unsettled: AtomicBool::new(false),
             defer_eager_sync: AtomicBool::new(
                 // On by default; only an explicit falsey value restores the old
                 // always-sync eager path (escape hatch for debugging).
@@ -3092,28 +3085,6 @@ impl CudaRuntime {
         self.raw_pool_retained.load(Ordering::Relaxed)
     }
 
-    /// The cuBLASLt workspace shared by every GEMM on this runtime's stream.
-    ///
-    /// Allocated on first use and retained for the runtime's lifetime, so a
-    /// warm call makes no allocation and stays CUDA-graph capture-safe. Callers
-    /// must not free the returned pointer.
-    ///
-    /// Sharing is sound because cuBLASLt scratch carries nothing between calls
-    /// and work on one stream is serial: two GEMMs on this runtime cannot be
-    /// mid-flight at once, so they cannot observe each other's scratch.
-    pub fn shared_blas_workspace(&self, bytes: usize) -> Result<CUdeviceptr> {
-        let mut slot = self
-            .shared_blas_workspace
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(ptr) = *slot {
-            return Ok(ptr);
-        }
-        let ptr = self.alloc_raw(bytes)?;
-        *slot = Some(ptr);
-        Ok(ptr)
-    }
-
     fn take_pooled(&self, class: usize) -> Option<CUdeviceptr> {
         let mut pool = self.raw_pool.lock().unwrap_or_else(|e| e.into_inner());
         let ptr = pool.get_mut(&class)?.pop()?;
@@ -3252,19 +3223,22 @@ impl CudaRuntime {
             )
         })?;
         // SAFETY: bound context; `dst` covers `src.len()` bytes per the contract.
-        unsafe { cudarc::driver::result::memcpy_htod_sync(dst, src) }
-            .map_err(|e| driver_err("cuMemcpyHtoD", e))?;
+        let copy = unsafe { cudarc::driver::result::memcpy_htod_sync(dst, src) }
+            .map_err(|e| driver_err("cuMemcpyHtoD", e));
+        track_legacy_upload(&self.legacy_upload_unsettled, copy)?;
         // SAFETY: a null CUstream selects the current context's legacy default
         // stream. Calling the raw API avoids constructing an allocating Arc
         // wrapper on every request-boundary validation reset.
-        unsafe { cudarc::driver::result::stream::synchronize(std::ptr::null_mut()) }.map_err(
-            |e| {
-                driver_err(
-                    "cuStreamSynchronize(default) after synchronous cuMemcpyHtoD",
-                    e,
-                )
-            },
-        )?;
+        let completion =
+            unsafe { cudarc::driver::result::stream::synchronize(std::ptr::null_mut()) }.map_err(
+                |e| {
+                    driver_err(
+                        "cuStreamSynchronize(default) after synchronous cuMemcpyHtoD",
+                        e,
+                    )
+                },
+            );
+        track_legacy_upload(&self.legacy_upload_unsettled, completion)?;
         self.host_to_device_copies.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -3338,6 +3312,13 @@ impl CudaRuntime {
     // stream after a prior consumer (`copy_wait_fence`). No primitive blocks the
     // host; ordering is entirely through CUDA events so a prefetch of the next
     // expert's weights overlaps the current wave's kernels.
+
+    /// Release queues must fence the legacy default stream after a failed
+    /// synchronous upload. This is not a completion witness and is never reset
+    /// within the same runtime/context.
+    pub(crate) fn legacy_upload_needs_release_fence(&self) -> bool {
+        self.legacy_upload_unsettled.load(Ordering::Acquire)
+    }
 
     /// Enqueue an asynchronous host → device copy of `src` on the dedicated
     /// transfer stream (not the compute stream), so it overlaps compute.
@@ -3790,10 +3771,38 @@ pub fn raw_ptr(dptr: CUdeviceptr) -> *mut c_void {
     dptr as usize as *mut c_void
 }
 
+fn track_legacy_upload<T>(unsettled: &AtomicBool, result: Result<T>) -> Result<T> {
+    if result.is_err() {
+        unsettled.store(true, Ordering::Release);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cudarc::driver::PushKernelArg;
+
+    #[test]
+    fn failed_legacy_upload_latches_release_fence_until_context_retirement() {
+        let unsettled = AtomicBool::new(false);
+        track_legacy_upload(&unsettled, Ok(())).unwrap();
+        assert!(!unsettled.load(Ordering::Acquire));
+        let error = track_legacy_upload::<()>(
+            &unsettled,
+            Err(EpError::KernelFailed(
+                "injected legacy completion failure".into(),
+            )),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("legacy completion failure"));
+        assert!(unsettled.load(Ordering::Acquire));
+        track_legacy_upload(&unsettled, Ok(())).unwrap();
+        assert!(
+            unsettled.load(Ordering::Acquire),
+            "success must not erase an earlier unsettled transfer"
+        );
+    }
 
     #[test]
     fn validation_generation_exhaustion_fails_without_wrap_or_aba() {
