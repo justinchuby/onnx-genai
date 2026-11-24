@@ -29,18 +29,20 @@ pub fn unsupported_reason(
     opset: u64,
     shapes: &[Shape],
     dtypes: &[DataType],
-    allowed: &[DataType],
+    allowed: Option<&[DataType]>,
 ) -> Option<String> {
     if !node.is_default_domain() || node.op_type != "Gemm" {
         return None;
     }
-    if let Err(reason) = validate_dtypes(
-        allowed,
-        dtypes
-            .iter()
-            .copied()
-            .filter(|&dtype| dtype != DataType::Undefined),
-    ) {
+    if let Some(allowed) = allowed
+        && let Err(reason) = validate_dtypes(
+            allowed,
+            dtypes
+                .iter()
+                .copied()
+                .filter(|&dtype| dtype != DataType::Undefined),
+        )
+    {
         return Some(reason);
     }
     let [a, b, ..] = shapes else { return None };
@@ -87,7 +89,7 @@ mod tests {
         let cpu = &[Float16, Float32];
         let cuda = &[Float32];
         let claim = |dtypes: &[DataType], allowed: &[DataType]| {
-            unsupported_reason(&node, 29, &shapes, dtypes, allowed)
+            unsupported_reason(&node, 29, &shapes, dtypes, Some(allowed))
         };
         assert_eq!(claim(&[Float32, Float32, Undefined], cuda), None);
         assert_eq!(claim(&[Float16, Float16, Float16], cpu), None);

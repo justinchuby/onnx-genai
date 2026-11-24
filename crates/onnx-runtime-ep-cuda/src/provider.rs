@@ -4099,7 +4099,7 @@ impl ExecutionProvider for CudaExecutionProvider {
             opset,
             shapes,
             input_dtypes,
-            crate::kernels::gemm::DTYPES,
+            Some(crate::kernels::gemm::DTYPES),
         ) {
             return KernelMatch::unsupported(reason);
         }

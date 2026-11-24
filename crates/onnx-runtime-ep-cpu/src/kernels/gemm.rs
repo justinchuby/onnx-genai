@@ -13,6 +13,11 @@ use onnx_runtime_ir::{DataType, Node};
 
 use std::alloc::Layout;
 
+pub(crate) fn strict_dtypes(nd: bool) -> Option<&'static [DataType]> {
+    // Older CPU kernels intentionally accept widening into f32 outputs.
+    nd.then_some(super::FLOAT_DTYPES)
+}
+
 use super::add::broadcast_apply;
 use super::check_arity;
 use super::half_gemm::{self, HalfFormat, MatrixLayout};
@@ -337,13 +342,15 @@ impl GemmKernel {
     ) -> Result<()> {
         check_arity("Gemm", inputs, outputs, 2, 3, 1)?;
         let bias = inputs.get(2).filter(|c| !c.is_absent());
-        onnx_runtime_ep_api::gemm::validate_dtypes(
-            super::FLOAT_DTYPES,
-            [inputs[0].dtype, inputs[1].dtype, outputs[0].dtype]
-                .into_iter()
-                .chain(bias.map(|c| c.dtype)),
-        )
-        .map_err(EpError::KernelFailed)?;
+        if let Some(allowed) = strict_dtypes(self.nd) {
+            onnx_runtime_ep_api::gemm::validate_dtypes(
+                allowed,
+                [inputs[0].dtype, inputs[1].dtype, outputs[0].dtype]
+                    .into_iter()
+                    .chain(bias.map(|c| c.dtype)),
+            )
+            .map_err(EpError::KernelFailed)?;
+        }
         let a_shape = inputs[0].shape;
         let b_shape = inputs[1].shape;
         let geometry = self.geometry(a_shape, b_shape)?;

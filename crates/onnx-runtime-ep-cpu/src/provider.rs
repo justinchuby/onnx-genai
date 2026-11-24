@@ -477,7 +477,7 @@ impl ExecutionProvider for CpuExecutionProvider {
             opset,
             shapes,
             input_dtypes,
-            crate::kernels::FLOAT_DTYPES,
+            crate::kernels::gemm::strict_dtypes(opset >= onnx_runtime_ir::gemm::ND_GEMM_OPSET),
         ) {
             return KernelMatch::unsupported(reason);
         }
@@ -1279,6 +1279,27 @@ mod tests {
         assert!(!ep.registry().supports("UnregisteredCustom", "", 17));
         assert!(ep.registry().supports("Relu", "", 17));
         assert!(!claims.iter().any(|claim| claim.node_ids.contains(&custom)));
+    }
+
+    #[test]
+    fn gemm_29_claim_is_strict_without_changing_legacy_widening() {
+        let ep = CpuExecutionProvider::new();
+        let node = Node::new(NodeId(0), "Gemm", vec![], vec![]);
+        let shapes = [static_shape([2, 3]), static_shape([3, 4])];
+        let mixed = [DataType::Float64, DataType::Float32];
+        let homogeneous = [DataType::Float64, DataType::Float64];
+        assert!(
+            ep.supports_op(&node, 28, &shapes, &mixed, &[])
+                .is_supported()
+        );
+        assert!(
+            !ep.supports_op(&node, 29, &shapes, &mixed, &[])
+                .is_supported()
+        );
+        assert!(
+            ep.supports_op(&node, 29, &shapes, &homogeneous, &[])
+                .is_supported()
+        );
     }
 
     #[test]
