@@ -79,12 +79,12 @@ use onnx_runtime_shape_inference::{
 };
 use onnx_runtime_tracer::{Args, SpanGuard, TraceContext, annotate_current_span_with};
 
-use crate::SessionOutput;
 use crate::error::{Result, SessionError};
 use crate::sequence::{
     ConcatPlan, SeqTensor, SequenceError, SequenceValue, SplitSpec, split_tensor, stack_new_axis,
 };
 use crate::tensor::{DeviceBindingSpec, DeviceIoBinding, SharedTensorBuffer, Tensor};
+use crate::{SessionOutput, WorkspaceBounds, WorkspacePreparationReport};
 
 static NEXT_EXECUTOR_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_ARTIFACT_GENERATION: AtomicU64 = AtomicU64::new(1);

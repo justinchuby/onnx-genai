@@ -155,11 +155,11 @@ impl AxisBound {
 /// (the ONLY outcome for graphs that already resolved before this change — so
 /// their reservations stay byte-identical). [`Self::Bounded`] means at least one
 /// context/sequence-axis dim was unresolved and reserved against a provable
-/// upper bound; the remaining outcome — unresolved *and* unbounded — is a hard
-/// error, never a silent guess.
+/// upper bound. Unresolved and unbounded shapes remain Deferred, never guessed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PlannedInputShape {
     Exact(Vec<usize>),
+    Deferred(String),
     Bounded {
         dims: Vec<usize>,
         /// `(axis, symbol, applied bound)` for each over-reserved dim.
@@ -169,15 +169,10 @@ pub(super) enum PlannedInputShape {
 
 impl PlannedInputShape {
     #[cfg(test)]
-    pub(super) fn dims(&self) -> &[usize] {
+    pub(super) fn dims(&self) -> Option<&[usize]> {
         match self {
-            PlannedInputShape::Exact(dims) | PlannedInputShape::Bounded { dims, .. } => dims,
-        }
-    }
-
-    pub(super) fn into_dims(self) -> Vec<usize> {
-        match self {
-            PlannedInputShape::Exact(dims) | PlannedInputShape::Bounded { dims, .. } => dims,
+            Self::Exact(dims) | Self::Bounded { dims, .. } => Some(dims),
+            Self::Deferred(_) => None,
         }
     }
 }
@@ -562,17 +557,12 @@ impl Executor {
         if let Some(dims) = self.exact_runtime_value_shape(value, symbols, 0) {
             return Ok(PlannedInputShape::Exact(dims));
         }
-        let shape = self
-            .value_shapes
-            .get(&value)
-            .and_then(Option::as_ref)
-            .ok_or_else(|| {
-                SessionError::Internal(format!(
-                    "prepare-only workspace planning has no loader shape for input {index} of \
-                 node {} ('{}::{}')",
-                    node_id.0, node.domain, node.op_type
-                ))
-            })?;
+        let Some(shape) = self.value_shapes.get(&value).and_then(Option::as_ref) else {
+            return Ok(PlannedInputShape::Deferred(format!(
+                "node #{} ('{}::{}') input {index} has unknown rank/shape; resolve runtime bindings before admission",
+                node_id.0, node.domain, node.op_type
+            )));
+        };
         let mut dims = Vec::with_capacity(shape.len());
         let mut applied = Vec::new();
         for (axis, dim) in shape.iter().enumerate() {
@@ -595,7 +585,7 @@ impl Executor {
                         let symbol_name = self
                             .symbol_name(*symbol)
                             .unwrap_or_else(|| format!("symbol#{}", symbol.0));
-                        return Err(SessionError::Internal(format!(
+                        return Ok(PlannedInputShape::Deferred(format!(
                             "prepare-only workspace planning cannot resolve input {index} \
                              '{value_name}' for node {} ('{}::{}'): axis {axis} is symbolic \
                              ('{symbol_name}') and unresolved, and is neither a context/sequence \
@@ -621,7 +611,7 @@ impl Executor {
         &mut self,
         inputs: &[(&str, &Tensor)],
         bindings: &mut [DeviceIoBinding],
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<WorkspacePreparationReport> {
         if self.heterogeneous.is_some() {
             return Err(heterogeneous_api_error(
                 "workspace preparation with persistent device bindings",
@@ -644,15 +634,17 @@ impl Executor {
             && std::env::var_os("ONNX_GENAI_LOG_WORKSPACE_BOUND").is_none()
         {
             let (persistent, step) = (memo.persistent, memo.step);
-            let requirement = self.reserve_prepared_workspaces(persistent, step)?;
-            self.workspace_preparation_required = true;
-            return Ok(requirement);
+            self.reserve_prepared_workspaces(persistent, step)?;
+            return Ok(WorkspacePreparationReport::Complete(
+                WorkspaceBounds::from_requirements([persistent, step]),
+            ));
         }
         // Track one peak per lifetime class: session-persistent and step-scoped
         // scratch live in separate executor slots, so a single peak cannot stand
         // in for both when a graph mixes governed ops (e.g. QMoE + Attention).
         let mut peak_persistent = WorkspaceRequirement::NONE;
         let mut peak_step = WorkspaceRequirement::NONE;
+        let mut pending = Vec::new();
 
         for pi in 0..self.plan.len() {
             let node_id = self.plan[pi].node_id;
@@ -682,10 +674,22 @@ impl Executor {
                     }
                 }
             }
-            let input_shapes = planned_shapes
-                .into_iter()
-                .map(PlannedInputShape::into_dims)
-                .collect::<Vec<_>>();
+            let mut input_shapes = Vec::with_capacity(planned_shapes.len());
+            let mut deferred_shape = false;
+            for shape in planned_shapes {
+                match shape {
+                    PlannedInputShape::Exact(dims) | PlannedInputShape::Bounded { dims, .. } => {
+                        input_shapes.push(dims)
+                    }
+                    PlannedInputShape::Deferred(reason) => {
+                        pending.push(reason);
+                        deferred_shape = true;
+                    }
+                }
+            }
+            if deferred_shape {
+                continue;
+            }
             // Preparation uses the same specialization binding as dispatch.
             // Reuse it before resolving constants or constructing a cache key:
             // both are cold-path work when concrete metadata has not changed.
@@ -773,15 +777,16 @@ impl Executor {
             } else {
                 workspace_output_metadata(&self.graph, node, &symbols, Some(&external))
             };
-            let requirement = kernel
-                .workspace_requirement(&metadata, &output_metadata)?
-                .require_ready()
-                .map_err(|cause| {
-                    SessionError::Internal(format!(
-                        "prepare-only workspace for node #{} ('{}::{}') cannot complete: {cause}",
+            let requirement = match kernel.workspace_requirement(&metadata, &output_metadata)? {
+                onnx_runtime_ep_api::WorkspacePreparation::Ready(requirement) => requirement,
+                onnx_runtime_ep_api::WorkspacePreparation::Deferred => {
+                    pending.push(format!(
+                        "node #{} ('{}::{}') requires live tensor bindings or runtime values",
                         node.id.0, node.domain, node.op_type
-                    ))
-                })?;
+                    ));
+                    continue;
+                }
+            };
             if requirement.bytes == 0 {
                 continue;
             }
@@ -801,21 +806,27 @@ impl Executor {
                     .iter()
                     .any(|node| node.node_id == *owner && node.graph_kernel)
             })
-            .map(|(_, child)| child)
+            .map(|((owner, attribute), child)| (format!("node#{}/{attribute}/", owner.0), child))
             .collect::<Vec<_>>();
-        for child in child_graphs {
+        for (scope, child) in child_graphs {
             self.collect_nested_workspace_requirement(
                 child,
                 &symbols,
-                "control-flow/",
+                &scope,
                 &mut peak_persistent,
                 &mut peak_step,
+                &mut pending,
             )?;
         }
 
         // Publish only a fully successful plan and reservation. A failed
         // attempt leaves the previous signature intact and cannot become a hit.
-        let result = self.reserve_prepared_workspaces(peak_persistent, peak_step)?;
+        self.reserve_prepared_workspaces(peak_persistent, peak_step)?;
+        let known = WorkspaceBounds::from_requirements([peak_persistent, peak_step]);
+        if !pending.is_empty() {
+            self.workspace_preparation_memo = None;
+            return Ok(WorkspacePreparationReport::Deferred { known, pending });
+        }
         let stats = self.cache.stats();
         self.workspace_preparation_memo = Some(WorkspacePreparationMemo {
             output_bindings: WorkspaceOutputBindings::from_external(&external),
@@ -827,15 +838,14 @@ impl Executor {
             persistent: peak_persistent,
             step: peak_step,
         });
-        self.workspace_preparation_required = true;
-        Ok(result)
+        Ok(WorkspacePreparationReport::Complete(known))
     }
 
     fn reserve_prepared_workspaces(
         &mut self,
         peak_persistent: WorkspaceRequirement,
         peak_step: WorkspaceRequirement,
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<()> {
         if peak_step.bytes != 0 {
             self.restore_completed_step_workspace();
         }
@@ -849,13 +859,7 @@ impl Executor {
         )?;
         Self::reserve_prepared_workspace(self.ep.as_ref(), &mut self.step_workspace, peak_step)?;
 
-        // Return the dominant requirement for callers that assert on a single
-        // reserved workspace; the two slots are prepared independently above.
-        Ok(if peak_persistent.bytes >= peak_step.bytes {
-            peak_persistent
-        } else {
-            peak_step
-        })
+        Ok(())
     }
 
     /// Reserve `peak` into `slot` against the device authority, reusing a
@@ -904,6 +908,7 @@ impl Executor {
         scope: &str,
         peak_persistent: &mut WorkspaceRequirement,
         peak_step: &mut WorkspaceRequirement,
+        pending: &mut Vec<String>,
     ) -> Result<()> {
         let claims = onnx_runtime_ep_api::GraphKernelClaims::query(self.ep.as_ref(), graph)?;
         let captures = graph.captured_inputs_by_node();
@@ -921,27 +926,18 @@ impl Executor {
             };
             let input_shapes = inputs
                 .iter()
-                .enumerate()
-                .map(|(index, input)| {
-                    match input {
-                    None => Ok(Vec::new()),
-                    Some(value) => substitute(&graph.value(*value).shape, symbols).ok_or_else(|| {
-                        let value_name = graph
-                            .value(*value)
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| format!("value#{}", value.0));
-                        SessionError::Internal(format!(
-                            "prepare-only workspace planning cannot resolve nested input {index} \
-                             '{value_name}' for {scope}node#{} ('{}::{}'); its formal/captured \
-                             shape is runtime-dependent and no exact graph-metadata bound is \
-                             available",
-                            node_id.0, node.domain, node.op_type
-                        ))
-                    }),
-                }
+                .map(|input| match input {
+                    None => Some(Vec::new()),
+                    Some(value) => graph
+                        .value(*value)
+                        .tensor_shape()
+                        .and_then(|shape| substitute(shape, symbols)),
                 })
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Option<Vec<_>>>();
+            let Some(input_shapes) = input_shapes else {
+                pending.push(format!("{scope}node #{} ('{}::{}') has runtime-dependent formal/captured shapes; resolve actual child bindings before admission", node_id.0, node.domain, node.op_type));
+                continue;
+            };
             let mut kernel = if graph_kernel {
                 self.ep.get_graph_kernel(
                     onnx_runtime_ep_api::GraphKernelRequest {
@@ -994,15 +990,13 @@ impl Executor {
             } else {
                 workspace_output_metadata(graph, node, symbols, None)
             };
-            let requirement = kernel
-                .workspace_requirement(&metadata, &output_metadata)?
-                .require_ready()
-                .map_err(|cause| {
-                    SessionError::Internal(format!(
-                        "prepare-only workspace for node #{} ('{}::{}') cannot complete: {cause}",
-                        node.id.0, node.domain, node.op_type
-                    ))
-                })?;
+            let requirement = match kernel.workspace_requirement(&metadata, &output_metadata)? {
+                onnx_runtime_ep_api::WorkspacePreparation::Ready(requirement) => requirement,
+                onnx_runtime_ep_api::WorkspacePreparation::Deferred => {
+                    pending.push(format!("{scope}node #{} ('{}::{}') requires live tensor bindings or runtime values", node.id.0, node.domain, node.op_type));
+                    continue;
+                }
+            };
             if requirement.bytes == 0 {
                 continue;
             }
@@ -1022,6 +1016,7 @@ impl Executor {
                 &format!("{scope}node#{}/{attribute}/", node_id.0),
                 peak_persistent,
                 peak_step,
+                pending,
             )?;
         }
         Ok(())

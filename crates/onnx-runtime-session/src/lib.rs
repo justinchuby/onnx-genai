@@ -41,6 +41,8 @@ pub use executor::{
 pub use onnx_runtime_ep_api::DeviceBuffer;
 pub use onnx_runtime_ep_api::DeviceGraphSlot;
 pub use onnx_runtime_ep_api::WorkspaceRequirement;
+pub use workspace::{WorkspaceBounds, WorkspacePreparationReport};
+mod workspace;
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
 };
@@ -1111,7 +1113,7 @@ impl BlockQuantizedMoeTrafficObserver<'_> {
         &mut self,
         inputs: &[(&str, &Tensor)],
         bindings: &mut [DeviceIoBinding],
-    ) -> Result<onnx_runtime_ep_api::WorkspaceRequirement> {
+    ) -> Result<WorkspacePreparationReport> {
         self.session
             .exec
             .prepare_with_device_bindings(inputs, bindings)
@@ -1495,12 +1497,14 @@ impl InferenceSession {
         })
     }
 
-    /// Prepare exact kernel workspace for a bound run without launching kernels.
+    /// Reserve known metadata workspace bounds without launching kernels. Inspect
+    /// Complete versus Deferred; unresolved demand is admitted at actual eager
+    /// dispatch, and neither report grants capture readiness.
     pub fn prepare_with_device_bindings(
         &mut self,
         inputs: &[(&str, &Tensor)],
         bindings: &mut [DeviceIoBinding],
-    ) -> Result<onnx_runtime_ep_api::WorkspaceRequirement> {
+    ) -> Result<WorkspacePreparationReport> {
         self.exec.prepare_with_device_bindings(inputs, bindings)
     }
 

@@ -1683,7 +1683,7 @@ impl NativeDecodeSession {
     pub(crate) fn prepare_cuda_prefill_workspace(
         &mut self,
         token_ids: &[TokenId],
-    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+    ) -> anyhow::Result<onnx_runtime_session::WorkspacePreparationReport> {
         self.prepare_cuda_prefill_workspace_with_step_inputs(token_ids, 0, &[])
     }
 
@@ -1692,7 +1692,7 @@ impl NativeDecodeSession {
         token_ids: &[TokenId],
         past_len: usize,
         step_inputs: &[(String, Tensor)],
-    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+    ) -> anyhow::Result<onnx_runtime_session::WorkspacePreparationReport> {
         // A generation runs *two* forward shapes against the same session with
         // distinct governed-workspace lifetimes: the multi-token prefill/verify
         // shape here, and the steady-state single-token decode step. The
@@ -1726,11 +1726,13 @@ impl NativeDecodeSession {
             Some(padded) => (padded.tokens.as_slice(), padded.step_inputs.as_slice()),
             None => (token_ids, step_inputs),
         };
-        let prefill = self.run_cuda_workspace_prepare_pass(token_ids, past_len, step_inputs)?;
+        let mut prefill = self.run_cuda_workspace_prepare_pass(token_ids, past_len, step_inputs)?;
         if token_ids.len() > 1 {
             let last_token = &token_ids[token_ids.len() - 1..];
-            self.run_cuda_workspace_prepare_pass(last_token, 0, &[])
+            let decode = self
+                .run_cuda_workspace_prepare_pass(last_token, 0, &[])
                 .context("prepare native CUDA single-token decode workspace")?;
+            prefill = prefill.merge(decode);
         }
         Ok(prefill)
     }
@@ -1746,11 +1748,11 @@ impl NativeDecodeSession {
         token_ids: &[TokenId],
         past_len: usize,
         step_inputs: &[(String, Tensor)],
-    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+    ) -> anyhow::Result<onnx_runtime_session::WorkspacePreparationReport> {
         if self.has_eager_step_inputs() {
             let workspace_nodes = self.session.workspace_node_locations();
             if workspace_nodes.is_empty() {
-                return Ok(onnx_runtime_session::WorkspaceRequirement::NONE);
+                return Ok(onnx_runtime_session::WorkspacePreparationReport::NONE);
             }
         }
         let position_input = self
@@ -5994,6 +5996,7 @@ impl DecodeCudaState {
         if grew {
             session
                 .prepare_with_device_bindings(&[], &mut self.bindings)
+                .map(super::accept_eager_workspace_preparation)
                 .context("prepare native CUDA decode workspace after KV capacity growth")?;
         }
         Ok(())

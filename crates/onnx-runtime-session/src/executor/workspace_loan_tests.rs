@@ -195,6 +195,8 @@ fn workspace_peak_keeps_bytes_when_alignment_grows_in_prepare_and_dispatch() {
         if prepare_first {
             executor
                 .prepare_with_device_bindings(&[("input", &input)], &mut [])
+                .unwrap()
+                .require_complete()
                 .unwrap();
         } else {
             executor.run(&[("input", &input)]).unwrap();

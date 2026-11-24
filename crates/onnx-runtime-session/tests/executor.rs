@@ -2842,7 +2842,9 @@ fn binding_preparation_cache_misses_revoke_fast_replay_until_terminal() {
                     .last_mut()
                     .expect("just pushed prepared bindings"),
             )
-            .expect("binding preparation publishes a new specialization");
+            .expect("binding preparation publishes a new specialization")
+            .require_complete()
+            .expect("binding metadata must be fully resolved");
         assert_eq!(scoped_count(&compiles, executor), expected_epoch);
 
         let result = session.replay_device_graph(&mut captured_bindings);

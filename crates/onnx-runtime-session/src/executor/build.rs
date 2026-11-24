@@ -1423,7 +1423,6 @@ impl Executor {
             workspace_completion: WorkspaceCompletion::Pending,
             pin_step_workspace: false,
             parent_workspace_policy: None,
-            workspace_preparation_required: false,
             workspace_preparation_memo: None,
             workspace_node_locations,
         };

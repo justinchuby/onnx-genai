@@ -226,8 +226,8 @@ Cold growth uses the original provider's synchronization and consuming replaceme
 path; bytes and alignment both retain their high-water marks. Every enclosing
 capture slot's replacement policy is propagated through all nesting levels.
 Independent child capture is refused; installed graphs keep their original
-address-growth protection. Complete prepared requirements still work normally,
-and strict metadata preparation has not been converted to an incomplete promise.
+address-growth protection. Preparation reports distinguish complete metadata
+bounds from deferred execution-time demands; neither is a capture-readiness proof.
 
 Host regressions cover nested cold growth, one real authority owner, warm zero
 issuer callbacks, parent Verify-slot refusal, consuming replacement failure,
@@ -443,8 +443,10 @@ scratch. Plan reuse still checks the selected alignment contract before launch.
 Metadata preparation now returns `WorkspacePreparation::Ready(requirement)` or
 `Deferred`. `Ready(NONE)` means an actual zero demand; `Deferred` requires live
 storage or runtime values and never grants zero-capacity admission. Strict
-metadata-only preparation refuses it with node context and publishes its memo
-and strict-preparation flag only after a complete successful reservation.
+metadata-only callers can explicitly require a complete report and receive an
+actionable error with pending-node context. Only complete preparation publishes
+the reusable metadata memo; deferred preparation reserves known demand without
+turning unknown demand into zero capacity.
 
 Native, eager and ORT execution pass real input and output views to the execution
 refiner before admission. Output storage is uninitialized: only layout and
@@ -467,11 +469,23 @@ heuristic calls and is not required by this contract.
 
 Native eager dispatch already supports cold growth of its governed lane. A full
 static storage/alias epoch is therefore not a prerequisite for precise admission.
-The simpler next boundary is an explicit complete/deferred preparation report:
-reserve the known metadata peak without claiming unknown demand is zero, then
-resolve the remaining demand at actual dispatch after view/in-place decisions.
-Dense MatMul migration still needs this report and matching host-plan selection;
-the current strict metadata-only public prepare continues to refuse Deferred.
+The public preparation report is `Complete(WorkspaceBounds)` or
+`Deferred { known, pending }`. Both lifetime peaks remain inspectable, and known
+peaks are reserved before returning. Unresolved shapes, including unknown rank,
+and address/value-dependent kernels remain deferred. Genuine scalar shapes are
+kept distinct from unknown-rank placeholders. Deferred reports do not publish a
+complete memo or reset installed capture state. Prefill/decode preparation merges
+both lifetime bounds and preserves either pass's deferral.
+
+The engine explicitly accepts deferred eager admission under its existing
+scheduler contract. Its admission callback reports scheduler acceptance, not
+completion of every possible workspace demand. CPU paths that skip metadata
+preparation report pending workspace nodes unless capability metadata proves
+there are none. Actual dispatch resolves remaining demand after view/in-place
+decisions. Recording a device graph cannot grow workspace even without a prior
+metadata preparation; eager warmup must establish fitting backing first. There
+is no duplicate preparation-required or eager-growth permission flag. Dense
+MatMul migration still needs matching host-plan selection and borrowed scratch.
 ActualAddress workspace sizes across shapes need not be monotonic, and neither
 physical-capacity symbols nor the observational activation plan establish a bound
 for all selected algorithms. Capture still requires a successful warm route and
@@ -481,7 +495,12 @@ parent demand.
 Resource accounting stays coarse: each concurrent workspace lane owns its
 physical peak, serial kernels share the maximum, and simultaneously live regions
 are laid out within that owner. Regions carry no individual quota tickets.
-Kernels borrow the workspace rather than maintain pools or issuer callbacks.
+EPs declare workspace capability, report metadata demand (or Deferred), and
+refine only address/value-dependent plans at execution. Execute reuses the same
+plan with borrowed workspace; EPs do not implement pools, quota callbacks or
+per-region tickets. Weight artifacts and KV physical blocks retain their own
+independently reclaimable ownership granularity. Idle pressure recovery belongs
+at safe completion boundaries, not in per-token quota return/reclaim cycles.
 Zero demand and warm fitting capacity bypass allocation/quota callbacks; retained
 physical capacity remains charged until actual release. Pending work, capture
 pins and quarantine still govern retirement. Host and ORT regressions verify
