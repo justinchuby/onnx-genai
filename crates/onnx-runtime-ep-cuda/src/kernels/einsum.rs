@@ -17,8 +17,9 @@ use std::time::Instant;
 
 use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{
-    CaptureSupport, DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMut,
-    TensorView, ViewOutput,
+    CaptureSupport, DeviceGraphResource, EpError, Kernel, KernelFactory, OutputMetadata, Result,
+    TensorMetadata, TensorMut, TensorView, ViewOutput, WorkspaceLayout, WorkspacePreparation,
+    WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{
     DataType, DeviceId, EinsumContractionPlan, EinsumInput, EinsumOperandPlan,
@@ -32,9 +33,9 @@ use crate::blas::{
     StridedBatchedGemmParams, WORKSPACE_BYTES,
 };
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
+use crate::runtime::{CudaRuntime, cuptr};
 pub use plan::CudaEinsumRoute;
-use plan::{CudaEinsumPlan, RequestedRoute};
+use plan::{CudaEinsumPlan, CudaEinsumRecipe, RequestedRoute};
 
 /// Counters proving which CUDA Einsum route executed and what persistent state
 /// it established. Values are process-global diagnostics, so GPU tests serialize
@@ -421,8 +422,8 @@ impl KernelFactory for EinsumFactory {
         Ok(Box::new(EinsumKernel {
             runtime: self.runtime.clone(),
             input_shapes: input_shapes.to_vec(),
-            plan,
-            arithmetic_execution: Mutex::new(None),
+            plan: Arc::new(plan),
+            arithmetic_execution: Mutex::new(ArithmeticWarmState::default()),
             view_metadata: Mutex::new(PersistentMetadata::new(self.runtime.clone())),
             view_materialization: Mutex::new(None),
             view_alias_warmed: AtomicBool::new(false),
@@ -804,7 +805,6 @@ struct CachedExecution {
 
 struct CachedGemm {
     plan: CaptureStridedBatchedGemmPlan,
-    workspace: Option<Arc<GraphDeviceAllocation>>,
 }
 
 impl CachedGemm {
@@ -848,21 +848,27 @@ impl CachedGemm {
         a: CUdeviceptr,
         b: CUdeviceptr,
         c: CUdeviceptr,
-    ) -> Result<()> {
+        workspace: Option<WorkspaceView>,
+    ) -> Result<CUdeviceptr> {
         let params = self.params(layout, a, b, c)?;
-        // SAFETY: the cached layout was admitted against these exact contiguous
-        // input/output shapes; aliasing was rejected by the caller; workspace
-        // is the exact persistent allocation selected during warmup.
-        unsafe {
-            self.plan.launch(
-                runtime.blas(),
-                runtime.stream_ptr(),
-                &params,
-                self.workspace
-                    .as_ref()
-                    .map_or(0, |workspace| workspace.ptr()),
-            )
+        let bytes = self.plan.workspace_bytes();
+        let used = direct_workspace(bytes, workspace)?;
+        let pointer = if bytes == 0 {
+            0
+        } else {
+            cuptr(used.ptr().0.cast_const())
+        };
+        if runtime.capture_active() && bytes != 0 {
+            runtime
+                .require_registered_workspace_capture(used, "Einsum direct cuBLASLt workspace")?;
         }
+        // SAFETY: exact actual-I/O algorithm/layout proof, disjoint outputs and
+        // complete caller backing; stream/request completion belongs to caller.
+        unsafe {
+            self.plan
+                .launch(runtime.blas(), runtime.stream_ptr(), &params, pointer)
+        }?;
+        Ok(pointer)
     }
 
     fn algorithm_contract(&self) -> RowMajorGemmAlgorithmContract {
@@ -872,28 +878,18 @@ impl CachedGemm {
     fn workspace_bytes(&self) -> usize {
         self.plan.workspace_bytes()
     }
+}
 
-    fn workspace_ptr(&self) -> CUdeviceptr {
-        self.workspace
-            .as_ref()
-            .map_or(0, |workspace| workspace.ptr())
-    }
-
-    fn resource(&self) -> Option<DeviceGraphResource> {
-        self.workspace
-            .as_ref()
-            .map(GraphDeviceAllocation::device_graph_resource)
-    }
-
-    fn require_capture_resource(&self, runtime: &CudaRuntime) -> Result<()> {
-        if let Some(resource) = self.resource() {
-            runtime.require_registered_address_capture(
-                resource.identity(),
-                "Einsum direct cuBLASLt workspace",
-            )?;
-        }
-        Ok(())
-    }
+fn direct_workspace(bytes: usize, workspace: Option<WorkspaceView>) -> Result<WorkspaceView> {
+    let layout = std::alloc::Layout::from_size_align(bytes, blas::WORKSPACE_ALIGNMENT)
+        .map_err(|_| EpError::KernelFailed(format!("cuda_ep Einsum: direct workspace {bytes} bytes exceeds addressable capacity; reduce the contraction")))?;
+    let [used] = WorkspaceLayout::new([layout])?
+        .bind(workspace)
+        .map_err(|source| EpError::Backend {
+            operation: "bind Einsum direct caller workspace",
+            source: Box::new(source),
+        })?;
+    Ok(used)
 }
 
 enum ArithmeticExecution {
@@ -991,31 +987,74 @@ impl ArithmeticExecutionSnapshot {
         }
     }
 
-    fn resources(&self) -> Vec<DeviceGraphResource> {
+    fn requirement(&self) -> WorkspaceRequirement {
         match &self.execution {
             ArithmeticExecution::Direct(CachedExecution {
                 kind: ExecutionKind::Gemm(gemm),
                 ..
-            }) => gemm.resource().into_iter().collect(),
-            ArithmeticExecution::Direct(CachedExecution {
-                kind: ExecutionKind::NoOp | ExecutionKind::ZeroFill,
-                ..
-            }) => Vec::new(),
+            }) => blas::governed_workspace_requirement(gemm.workspace_bytes()),
+            _ => WorkspaceRequirement::NONE,
+        }
+    }
+    fn resources(&self) -> Vec<DeviceGraphResource> {
+        match &self.execution {
+            ArithmeticExecution::Direct(_) => Vec::new(),
             ArithmeticExecution::Semantic(plan) => plan.resources(),
         }
     }
-
     fn require_capture_resources(&self, runtime: &CudaRuntime) -> Result<()> {
         match &self.execution {
-            ArithmeticExecution::Direct(CachedExecution {
-                kind: ExecutionKind::Gemm(gemm),
-                ..
-            }) => gemm.require_capture_resource(runtime),
-            ArithmeticExecution::Direct(CachedExecution {
-                kind: ExecutionKind::NoOp | ExecutionKind::ZeroFill,
-                ..
-            }) => Ok(()),
+            ArithmeticExecution::Direct(_) => Ok(()),
             ArithmeticExecution::Semantic(plan) => plan.require_capture_resources(runtime),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ArithmeticWarmState {
+    published: Option<ArithmeticExecutionSnapshot>,
+    prepared: Option<PreparedArithmetic>,
+}
+
+enum PreparedArithmetic {
+    Direct {
+        snapshot: Box<ArithmeticExecutionSnapshot>,
+        setup_ns: u64,
+    },
+    Semantic {
+        request: ArithmeticRequest,
+        signature: ArithmeticExecutionSignature,
+        setup_ns: u64,
+    },
+}
+impl PreparedArithmetic {
+    fn setup_ns(&self) -> u64 {
+        match self {
+            Self::Direct { setup_ns, .. } | Self::Semantic { setup_ns, .. } => *setup_ns,
+        }
+    }
+    fn matches(
+        &self,
+        request: ArithmeticRequest,
+        eligibility: &DirectRouteEligibility,
+        signature: &ArithmeticExecutionSignature,
+        pointers: ContractionPointers,
+    ) -> Result<bool> {
+        match self {
+            Self::Direct { snapshot, .. } => Ok(snapshot
+                .mismatch_reason(request, eligibility, signature, pointers)?
+                .is_none()),
+            Self::Semantic {
+                request: prepared,
+                signature: previous,
+                ..
+            } => Ok(*prepared == request && *previous == *signature),
+        }
+    }
+    fn requirement(&self) -> WorkspaceRequirement {
+        match self {
+            Self::Direct { snapshot, .. } => snapshot.requirement(),
+            Self::Semantic { .. } => WorkspaceRequirement::NONE,
         }
     }
 }
@@ -1041,8 +1080,8 @@ impl ViewMaterialization {
 pub struct EinsumKernel {
     runtime: Arc<CudaRuntime>,
     input_shapes: Vec<Vec<usize>>,
-    plan: EinsumShapePlan,
-    arithmetic_execution: Mutex<Option<ArithmeticExecutionSnapshot>>,
+    plan: Arc<EinsumShapePlan>,
+    arithmetic_execution: Mutex<ArithmeticWarmState>,
     view_metadata: Mutex<PersistentMetadata>,
     view_materialization: Mutex<Option<ViewMaterialization>>,
     view_alias_warmed: AtomicBool,
@@ -1384,80 +1423,143 @@ impl EinsumKernel {
                     self.plan.equation()
                 )));
             }
-            let workspace = if workspace_bytes == 0 {
-                None
-            } else {
-                Some(GraphDeviceAllocation::allocate(
-                    &self.runtime,
-                    workspace_bytes,
-                )?)
-            };
-            ExecutionKind::Gemm(CachedGemm { plan, workspace })
+            ExecutionKind::Gemm(CachedGemm { plan })
         };
         Ok(CachedExecution { metadata, kind })
     }
 
-    fn build_arithmetic_execution(
+    fn ensure_arithmetic_prepared(
         &self,
+        state: &mut ArithmeticWarmState,
         request: ArithmeticRequest,
         pointers: ContractionPointers,
         signature: &ArithmeticExecutionSignature,
         direct_eligibility: &DirectRouteEligibility,
-    ) -> Result<ArithmeticExecutionSnapshot> {
-        let execution = match request.route {
-            EinsumRouteOverride::CudaCublas => {
-                let metadata = match direct_eligibility {
-                    DirectRouteEligibility::Eligible(metadata) => metadata,
-                    DirectRouteEligibility::Ineligible(reason) => {
+    ) -> Result<bool> {
+        let mismatch = match state.published.as_ref() {
+            Some(snapshot) => {
+                snapshot.mismatch_reason(request, direct_eligibility, signature, pointers)?
+            }
+            None => Some("no arithmetic execution snapshot has been warmed".into()),
+        };
+        if mismatch.is_none() {
+            state.prepared = None;
+            return Ok(true);
+        }
+        if self.runtime.capture_active() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Einsum `{}`: cannot reuse the warmed arithmetic snapshot during CUDA graph capture because {}. HOW: abort capture and eagerly warm this exact route/layout first",
+                self.plan.equation(),
+                mismatch.unwrap()
+            )));
+        }
+        if let Some(prepared) = state.prepared.as_ref()
+            && prepared.matches(request, direct_eligibility, signature, pointers)?
+        {
+            return Ok(false);
+        }
+        let start = Instant::now();
+        let direct = match request.route {
+            EinsumRouteOverride::Auto | EinsumRouteOverride::CudaCublas => match direct_eligibility
+            {
+                DirectRouteEligibility::Eligible(metadata) => {
+                    match self.compile_contraction(metadata.clone(), pointers) {
+                        Ok(cached) => Some(cached),
+                        Err(_) if request.route == EinsumRouteOverride::Auto => None,
+                        Err(error) => return Err(error),
+                    }
+                }
+                DirectRouteEligibility::Ineligible(reason) => {
+                    if request.route == EinsumRouteOverride::CudaCublas {
                         return Err(not_implemented(format!(
                             "Einsum `{}` cannot take the forced cuBLASLt route: {reason}",
                             self.plan.equation()
                         )));
                     }
-                };
-                ArithmeticExecution::Direct(self.compile_contraction(metadata.clone(), pointers)?)
-            }
-            EinsumRouteOverride::GenericNative => {
-                ArithmeticExecution::Semantic(CudaEinsumPlan::build(
-                    &self.plan,
-                    signature.clone(),
-                    &self.runtime,
-                    RequestedRoute::GenericNative,
-                    request.memory_ceiling_bytes,
-                )?)
-            }
-            EinsumRouteOverride::Optimized => ArithmeticExecution::Semantic(CudaEinsumPlan::build(
-                &self.plan,
-                signature.clone(),
-                &self.runtime,
-                RequestedRoute::Optimized,
-                request.memory_ceiling_bytes,
-            )?),
-            EinsumRouteOverride::Auto => match direct_eligibility {
-                DirectRouteEligibility::Eligible(metadata) => {
-                    match self.compile_contraction(metadata.clone(), pointers) {
-                        Ok(execution) => ArithmeticExecution::Direct(execution),
-                        Err(_) => ArithmeticExecution::Semantic(CudaEinsumPlan::build(
-                            &self.plan,
-                            signature.clone(),
-                            &self.runtime,
-                            RequestedRoute::Auto,
-                            request.memory_ceiling_bytes,
-                        )?),
-                    }
-                }
-                DirectRouteEligibility::Ineligible(_) => {
-                    ArithmeticExecution::Semantic(CudaEinsumPlan::build(
-                        &self.plan,
-                        signature.clone(),
-                        &self.runtime,
-                        RequestedRoute::Auto,
-                        request.memory_ceiling_bytes,
-                    )?)
+                    None
                 }
             },
+            EinsumRouteOverride::GenericNative | EinsumRouteOverride::Optimized => None,
         };
-        Ok(ArithmeticExecutionSnapshot { request, execution })
+        let setup_ns = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        state.prepared = Some(match direct {
+            Some(cached) => PreparedArithmetic::Direct {
+                snapshot: Box::new(ArithmeticExecutionSnapshot {
+                    request,
+                    execution: ArithmeticExecution::Direct(cached),
+                }),
+                setup_ns,
+            },
+            None => PreparedArithmetic::Semantic {
+                request,
+                signature: signature.clone(),
+                setup_ns,
+            },
+        });
+        Ok(false)
+    }
+
+    fn prepare_workspace_for_request(
+        &self,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+        route: EinsumRouteOverride,
+        memory_ceiling_bytes: u128,
+    ) -> Result<WorkspaceRequirement> {
+        let result = (|| {
+            self.validate_common(inputs, outputs)?;
+            if route == EinsumRouteOverride::Auto && self.is_view_dispatch(inputs, outputs) {
+                return Ok(WorkspaceRequirement::NONE);
+            }
+            let signature = self.semantic_signature(inputs, &outputs[0])?;
+            let eligibility = self.direct_route_eligibility(inputs, &outputs[0], signature.clone());
+            let mut state = self.arithmetic_execution.lock().map_err(|_| {
+                EpError::KernelFailed("cuda_ep Einsum: arithmetic preparation lock poisoned".into())
+            })?;
+            let hit = self.ensure_arithmetic_prepared(
+                &mut state,
+                ArithmeticRequest {
+                    route,
+                    memory_ceiling_bytes,
+                },
+                signature.pointers(),
+                &signature,
+                &eligibility,
+            )?;
+            Ok(if hit {
+                state.published.as_ref().unwrap().requirement()
+            } else {
+                state.prepared.as_ref().unwrap().requirement()
+            })
+        })();
+        if result.is_err() {
+            self.last_call_capture_safe.store(false, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn build_semantic_execution(
+        &self,
+        request: ArithmeticRequest,
+        signature: &ArithmeticExecutionSignature,
+    ) -> Result<ArithmeticExecutionSnapshot> {
+        let requested = match request.route {
+            EinsumRouteOverride::Auto => RequestedRoute::Auto,
+            EinsumRouteOverride::GenericNative => RequestedRoute::GenericNative,
+            EinsumRouteOverride::Optimized => RequestedRoute::Optimized,
+            EinsumRouteOverride::CudaCublas => return Err(EpError::KernelFailed("cuda_ep Einsum: forced cuBLASLt lost its prepared host plan; repeat actual-view refinement".into())),
+        };
+        let recipe = CudaEinsumRecipe::build(
+            Arc::clone(&self.plan),
+            signature.clone(),
+            requested,
+            request.memory_ceiling_bytes,
+        )?;
+        let plan = recipe.bind_private_workspace(&self.runtime)?;
+        Ok(ArithmeticExecutionSnapshot {
+            request,
+            execution: ArithmeticExecution::Semantic(plan),
+        })
     }
 
     fn run_arithmetic(
@@ -1466,6 +1568,7 @@ impl EinsumKernel {
         outputs: &mut [TensorMut],
         requested: EinsumRouteOverride,
         memory_ceiling_bytes: u128,
+        workspace: Option<WorkspaceView>,
     ) -> Result<()> {
         self.validate_common(inputs, outputs)?;
         let signature = self.semantic_signature(inputs, &outputs[0])?;
@@ -1477,46 +1580,41 @@ impl EinsumKernel {
             memory_ceiling_bytes,
         };
         let capturing = self.runtime.capture_active();
-        let mut published = self.arithmetic_execution.lock().map_err(|_| {
+        let mut state = self.arithmetic_execution.lock().map_err(|_| {
             EpError::KernelFailed(format!(
                 "cuda_ep Einsum `{}`: arithmetic execution-snapshot lock was poisoned",
                 self.plan.equation()
             ))
         })?;
-        let mismatch_reason = match published.as_ref() {
-            Some(snapshot) => {
-                snapshot.mismatch_reason(request, &direct_eligibility, &signature, pointers)?
-            }
-            None => Some("no arithmetic execution snapshot has been warmed".into()),
-        };
-        let cache_hit = mismatch_reason.is_none();
-        if let Some(reason) = mismatch_reason
-            && capturing
-        {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep Einsum `{}`: cannot reuse the warmed arithmetic snapshot during CUDA \
-                 graph capture because {reason}. HOW: abort capture and eagerly warm this exact \
-                 route/layout first",
-                self.plan.equation(),
-            )));
-        }
-
+        let cache_hit = self.ensure_arithmetic_prepared(
+            &mut state,
+            request,
+            pointers,
+            &signature,
+            &direct_eligibility,
+        )?;
         let start = Instant::now();
         let candidate = if cache_hit {
             PLAN_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
             None
         } else {
-            Some(self.build_arithmetic_execution(
-                request,
-                pointers,
-                &signature,
-                &direct_eligibility,
-            )?)
+            let staged = state
+                .prepared
+                .take()
+                .expect("host preparation must stage a choice");
+            let setup_ns = staged.setup_ns();
+            let snapshot = match staged {
+                PreparedArithmetic::Direct { snapshot, .. } => *snapshot,
+                PreparedArithmetic::Semantic { .. } => {
+                    self.build_semantic_execution(request, &signature)?
+                }
+            };
+            Some((snapshot, setup_ns))
         };
         let prepared = if cache_hit {
-            published.as_ref()
+            state.published.as_ref()
         } else {
-            candidate.as_ref()
+            candidate.as_ref().map(|(snapshot, _)| snapshot)
         }
         .expect("an existing or staged arithmetic snapshot is present");
         if capturing {
@@ -1559,7 +1657,14 @@ impl EinsumKernel {
                             (0, 0, None)
                         }
                         ExecutionKind::Gemm(gemm) => {
-                            gemm.launch(layout, &self.runtime, pointers.a, pointers.b, pointers.c)?;
+                            let used_pointer = gemm.launch(
+                                layout,
+                                &self.runtime,
+                                pointers.a,
+                                pointers.b,
+                                pointers.c,
+                                workspace,
+                            )?;
                             GEMM_LAUNCHES.fetch_add(1, Ordering::Relaxed);
                             if layout.left_order == StorageOrder::Transposed
                                 || layout.right_order == StorageOrder::Transposed
@@ -1570,7 +1675,7 @@ impl EinsumKernel {
                             }
                             (
                                 gemm.workspace_bytes(),
-                                gemm.workspace_ptr(),
+                                used_pointer,
                                 Some(gemm.algorithm_contract()),
                             )
                         }
@@ -1622,13 +1727,17 @@ impl EinsumKernel {
                     )
                 }
             };
-        if let Some(candidate) = candidate {
-            if published.is_some() {
+        if let Some((candidate, preparation_ns)) = candidate {
+            if state.published.is_some() {
                 PLAN_REWARMS.fetch_add(1, Ordering::Relaxed);
             }
-            *published = Some(candidate);
+            state.published = Some(candidate);
             PLAN_BUILDS.fetch_add(1, Ordering::Relaxed);
-            SETUP_NS_LAST.store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let execution_ns = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            SETUP_NS_LAST.store(
+                preparation_ns.saturating_add(execution_ns),
+                Ordering::Relaxed,
+            );
         }
         WORKSPACE_BYTES_LAST.store(workspace_bytes as u64, Ordering::Relaxed);
         WORKSPACE_PTR_LAST.store(workspace_ptr, Ordering::Relaxed);
@@ -1899,17 +2008,30 @@ impl EinsumKernel {
 }
 
 impl EinsumKernel {
+    fn is_view_dispatch(&self, inputs: &[TensorView], outputs: &[TensorMut]) -> bool {
+        matches!(
+            self.plan.planning_classification(),
+            EinsumPlanningClassification::ViewOnlyPermutation(_)
+                | EinsumPlanningClassification::DiagonalView(_)
+        ) && inputs
+            .first()
+            .is_some_and(|input| input.strides.iter().all(|&stride| stride >= 0))
+            && outputs.first().is_some_and(TensorMut::is_contiguous)
+    }
+
     fn execute_with_override(
         &self,
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
         route: EinsumRouteOverride,
+        workspace: Option<WorkspaceView>,
     ) -> Result<()> {
         self.execute_with_override_and_ceiling(
             inputs,
             outputs,
             route,
             plan::DEFAULT_MEMORY_CEILING_BYTES,
+            workspace,
         )
     }
 
@@ -1919,30 +2041,51 @@ impl EinsumKernel {
         outputs: &mut [TensorMut],
         route: EinsumRouteOverride,
         memory_ceiling_bytes: u128,
+        workspace: Option<WorkspaceView>,
     ) -> Result<()> {
-        match route {
-            EinsumRouteOverride::GenericNative
-            | EinsumRouteOverride::Optimized
-            | EinsumRouteOverride::CudaCublas => {
-                self.run_arithmetic(inputs, outputs, route, memory_ceiling_bytes)
-            }
-            EinsumRouteOverride::Auto => match self.plan.planning_classification() {
-                EinsumPlanningClassification::ViewOnlyPermutation(_)
-                | EinsumPlanningClassification::DiagonalView(_)
-                    if inputs[0].strides.iter().all(|&stride| stride >= 0)
-                        && outputs[0].is_contiguous() =>
-                {
-                    self.run_view(inputs, outputs)
-                }
-                _ => self.run_arithmetic(inputs, outputs, route, memory_ceiling_bytes),
-            },
+        self.last_call_capture_safe.store(false, Ordering::Relaxed);
+        if route == EinsumRouteOverride::Auto && self.is_view_dispatch(inputs, outputs) {
+            self.run_view(inputs, outputs)
+        } else {
+            self.run_arithmetic(inputs, outputs, route, memory_ceiling_bytes, workspace)
         }
     }
 }
 
 impl Kernel for EinsumKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.execute_with_override(inputs, outputs, EinsumRouteOverride::Auto)
+        self.execute_with_override(inputs, outputs, EinsumRouteOverride::Auto, None)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.execute_with_override(inputs, outputs, EinsumRouteOverride::Auto, workspace)
+    }
+    fn workspace_requirement(
+        &self,
+        _inputs: &[TensorMetadata<'_>],
+        _outputs: &[OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        Ok(WorkspacePreparation::Deferred)
+    }
+    fn workspace_requirement_for_execution(
+        &self,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+        _metadata: &[TensorMetadata<'_>],
+        _output_metadata: &[OutputMetadata<'_>],
+        _cached: Option<WorkspacePreparation>,
+    ) -> Result<WorkspaceRequirement> {
+        self.prepare_workspace_for_request(
+            inputs,
+            outputs,
+            EinsumRouteOverride::Auto,
+            plan::DEFAULT_MEMORY_CEILING_BYTES,
+        )
     }
 
     fn view_outputs(
@@ -1985,8 +2128,8 @@ impl Kernel for EinsumKernel {
 
     fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
         let mut resources = Vec::with_capacity(2);
-        if let Ok(execution) = self.arithmetic_execution.lock()
-            && let Some(execution) = execution.as_ref()
+        if let Ok(state) = self.arithmetic_execution.lock()
+            && let Some(execution) = state.published.as_ref()
         {
             resources.extend(execution.resources());
         }
@@ -2002,7 +2145,7 @@ impl Kernel for EinsumKernel {
         let arithmetic_warmed = self
             .arithmetic_execution
             .lock()
-            .is_ok_and(|execution| execution.is_some());
+            .is_ok_and(|state| state.published.is_some());
         if arithmetic_warmed && self.last_call_capture_safe.load(Ordering::Relaxed) {
             return CaptureSupport::Supported;
         }
@@ -2065,6 +2208,7 @@ pub fn execute_einsum_with_route(
     inputs: &[TensorView],
     outputs: &mut [TensorMut],
     route: EinsumRouteOverride,
+    workspace: Option<WorkspaceView>,
 ) -> Result<()> {
     let kernel = kernel
         .as_any()
@@ -2074,7 +2218,7 @@ pub fn execute_einsum_with_route(
                 "cuda_ep Einsum route override received a non-Einsum kernel".into(),
             )
         })?;
-    kernel.execute_with_override(inputs, outputs, route)
+    kernel.execute_with_override(inputs, outputs, route, workspace)
 }
 
 /// Execute with an explicit optimizer workspace ceiling.
@@ -2085,6 +2229,7 @@ pub fn execute_einsum_with_route_and_memory_ceiling(
     outputs: &mut [TensorMut],
     route: EinsumRouteOverride,
     memory_ceiling_bytes: u128,
+    workspace: Option<WorkspaceView>,
 ) -> Result<()> {
     let kernel = kernel
         .as_any()
@@ -2094,12 +2239,68 @@ pub fn execute_einsum_with_route_and_memory_ceiling(
                 "cuda_ep Einsum route override received a non-Einsum kernel".into(),
             )
         })?;
-    kernel.execute_with_override_and_ceiling(inputs, outputs, route, memory_ceiling_bytes)
+    kernel.execute_with_override_and_ceiling(
+        inputs,
+        outputs,
+        route,
+        memory_ceiling_bytes,
+        workspace,
+    )
+}
+
+/// Host-only actual-view preparation for explicit route probes.
+#[doc(hidden)]
+pub fn einsum_workspace_requirement_for_route(
+    kernel: &dyn Kernel,
+    inputs: &[TensorView],
+    outputs: &[TensorMut],
+    route: EinsumRouteOverride,
+    memory_ceiling_bytes: Option<u128>,
+) -> Result<WorkspaceRequirement> {
+    let kernel = kernel
+        .as_any()
+        .downcast_ref::<EinsumKernel>()
+        .ok_or_else(|| {
+            EpError::KernelFailed(
+                "cuda_ep Einsum workspace preparation received a non-Einsum kernel".into(),
+            )
+        })?;
+    kernel.prepare_workspace_for_request(
+        inputs,
+        outputs,
+        route,
+        memory_ceiling_bytes.unwrap_or(plan::DEFAULT_MEMORY_CEILING_BYTES),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_scratch_requires_exact_aligned_caller_backing() {
+        use onnx_runtime_ep_api::DevicePtrMut;
+        let view = WorkspaceView::new(DevicePtrMut(0x1000usize as *mut _), 8192);
+        let used = direct_workspace(1024, Some(view)).unwrap();
+        assert_eq!(used.ptr().0, view.ptr().0);
+        assert_eq!(used.bytes(), 1024);
+        for offered in [
+            None,
+            Some(WorkspaceView::new(view.ptr(), 1023)),
+            Some(WorkspaceView::new(
+                DevicePtrMut(0x1001usize as *mut _),
+                8192,
+            )),
+        ] {
+            let error = direct_workspace(1024, offered).unwrap_err().to_string();
+            assert!(
+                error.contains("1024 bytes") && error.contains("prepare and pass"),
+                "{error}"
+            );
+        }
+        assert_eq!(direct_workspace(0, None).unwrap().bytes(), 0);
+        assert!(direct_workspace(usize::MAX, None).is_err());
+    }
 
     fn plan(equation: &str, shapes: &[&[usize]]) -> EinsumPlan {
         let inputs = shapes

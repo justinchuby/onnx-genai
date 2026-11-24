@@ -25,7 +25,7 @@ use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ep_cuda::{
     CudaExecutionProvider, EinsumRouteOverride, build_cuda_registry_descriptors,
     cuda_supported_dtypes_for_op, einsum_execution_stats, execute_einsum_with_route,
-    execute_einsum_with_route_and_memory_ceiling, reset_einsum_execution_stats,
+    reset_einsum_execution_stats,
 };
 use onnx_runtime_ir::{
     Attribute, DataType, DeviceId, TensorLayout, compute_contiguous_strides, static_shape,
@@ -268,6 +268,7 @@ impl SemanticIdentityFixture {
                 output_device,
             )],
             self.route,
+            None,
         )
     }
 
@@ -771,6 +772,7 @@ fn generic_reduction_multilinear_and_integer_routes_execute_natively() {
 fn integer_generic_multiply_is_exact_width_without_signed_overflow() {
     let _lock = suite_lock();
     let ep = require_cuda();
+    let caller = common::EinsumCallerLane::new(&ep);
     let runtime = ep.runtime();
 
     let run = |equation: &str,
@@ -801,34 +803,36 @@ fn integer_generic_multiply_is_exact_width_without_signed_overflow() {
         }
         let input_strides = compute_contiguous_strides(input_shape);
         let output_strides = compute_contiguous_strides(output_shape);
-        execute_einsum_with_route(
-            kernel.as_ref(),
-            &[
-                TensorView::new(
-                    DevicePtr(a.as_ptr()),
+        caller
+            .execute(
+                kernel.as_ref(),
+                &[
+                    TensorView::new(
+                        DevicePtr(a.as_ptr()),
+                        dtype,
+                        input_shape,
+                        &input_strides,
+                        ep.device_id(),
+                    ),
+                    TensorView::new(
+                        DevicePtr(b.as_ptr()),
+                        dtype,
+                        input_shape,
+                        &input_strides,
+                        ep.device_id(),
+                    ),
+                ],
+                &mut [TensorMut::new(
+                    DevicePtrMut(output.as_mut_ptr()),
                     dtype,
-                    input_shape,
-                    &input_strides,
+                    output_shape,
+                    &output_strides,
                     ep.device_id(),
-                ),
-                TensorView::new(
-                    DevicePtr(b.as_ptr()),
-                    dtype,
-                    input_shape,
-                    &input_strides,
-                    ep.device_id(),
-                ),
-            ],
-            &mut [TensorMut::new(
-                DevicePtrMut(output.as_mut_ptr()),
-                dtype,
-                output_shape,
-                &output_strides,
-                ep.device_id(),
-            )],
-            EinsumRouteOverride::GenericNative,
-        )
-        .unwrap();
+                )],
+                EinsumRouteOverride::GenericNative,
+                None,
+            )
+            .unwrap();
         runtime.synchronize().unwrap();
         let mut bytes = vec![0u8; dtype.storage_bytes(output_shape.iter().product())];
         unsafe { runtime.dtoh(&mut bytes, cuptr(output.as_ptr())).unwrap() };
@@ -875,6 +879,7 @@ fn integer_generic_multiply_is_exact_width_without_signed_overflow() {
 fn misaligned_contiguous_subviews_use_a_proven_cublaslt_alignment_contract() {
     let _lock = suite_lock();
     let ep = require_cuda();
+    let caller = common::EinsumCallerLane::new(&ep);
     let runtime = ep.runtime();
     let a_shape = [2usize, 3];
     let b_shape = [3usize, 2];
@@ -925,26 +930,30 @@ fn misaligned_contiguous_subviews_use_a_proven_cublaslt_alignment_contract() {
         .with_byte_offset(offset),
     ];
     let execute = |output: &mut onnx_runtime_ep_api::DeviceBuffer| {
-        execute_einsum_with_route(
-            kernel.as_ref(),
-            &views,
-            &mut [TensorMut::new(
-                DevicePtrMut(output.as_mut_ptr()),
-                DataType::Float32,
-                &output_shape,
-                &output_strides,
-                ep.device_id(),
+        caller
+            .execute(
+                kernel.as_ref(),
+                &views,
+                &mut [TensorMut::new(
+                    DevicePtrMut(output.as_mut_ptr()),
+                    DataType::Float32,
+                    &output_shape,
+                    &output_strides,
+                    ep.device_id(),
+                )
+                .with_byte_offset(offset)],
+                EinsumRouteOverride::CudaCublas,
+                None,
             )
-            .with_byte_offset(offset)],
-            EinsumRouteOverride::CudaCublas,
-        )
-        .unwrap();
+            .unwrap();
     };
 
     reset_einsum_execution_stats();
     execute(&mut output);
     assert!(kernel.capture_support().is_supported());
-    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    runtime
+        .begin_graph_capture_with_resources(&[kernel.as_ref()], caller.resources())
+        .unwrap();
     execute(&mut output);
     runtime.end_graph_capture().unwrap();
     runtime.replay_graph().unwrap();
@@ -986,6 +995,7 @@ fn misaligned_contiguous_subviews_use_a_proven_cublaslt_alignment_contract() {
 fn forced_f16_cublaslt_narrows_once_and_rejects_unregistered_workspace_capture() {
     let _lock = suite_lock();
     let ep = require_cuda();
+    let caller = common::EinsumCallerLane::new(&ep);
     let runtime = ep.runtime();
     let k = 4096usize;
     let a_shape = [1usize, k];
@@ -1035,7 +1045,7 @@ fn forced_f16_cublaslt_narrows_once_and_rejects_unregistered_workspace_capture()
         ),
     ];
     let execute = |route: EinsumRouteOverride, output: &mut onnx_runtime_ep_api::DeviceBuffer| {
-        execute_einsum_with_route(
+        caller.execute(
             kernel.as_ref(),
             &views,
             &mut [TensorMut::new(
@@ -1046,10 +1056,54 @@ fn forced_f16_cublaslt_narrows_once_and_rejects_unregistered_workspace_capture()
                 ep.device_id(),
             )],
             route,
+            None,
         )
     };
 
     execute(EinsumRouteOverride::GenericNative, &mut generic_output).unwrap();
+    let output_view = || {
+        TensorMut::new(
+            DevicePtrMut(cublas_output.as_ptr() as *mut c_void),
+            DataType::Float16,
+            &output_shape,
+            &output_strides,
+            ep.device_id(),
+        )
+    };
+    let planning_counts = runtime.allocation_counts();
+    let requirement = onnx_runtime_ep_cuda::einsum_workspace_requirement_for_route(
+        kernel.as_ref(),
+        &views,
+        &[output_view()],
+        EinsumRouteOverride::CudaCublas,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        runtime.allocation_counts(),
+        planning_counts,
+        "actual-address direct preparation must allocate no private device scratch"
+    );
+    assert!(
+        kernel.device_graph_resources().len() <= 1,
+        "only the previous generic snapshot may still own immutable metadata"
+    );
+    if requirement.bytes != 0 {
+        let missing = execute_einsum_with_route(
+            kernel.as_ref(),
+            &views,
+            &mut [output_view()],
+            EinsumRouteOverride::CudaCublas,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            missing.contains("workspace needs") && missing.contains("prepare and pass"),
+            "{missing}"
+        );
+        assert!(!kernel.capture_support().is_supported());
+    }
     reset_einsum_execution_stats();
     execute(EinsumRouteOverride::CudaCublas, &mut cublas_output).unwrap();
     runtime.synchronize().unwrap();
@@ -1102,23 +1156,27 @@ fn forced_f16_cublaslt_narrows_once_and_rejects_unregistered_workspace_capture()
     #[cfg(feature = "gpu-tests")]
     if einsum_execution_stats().workspace_bytes != 0 {
         assert_eq!(
-            kernel.device_graph_resources().len(),
+            caller.resources().len(),
             1,
-            "the direct cuBLASLt workspace must be exposed as a graph resource"
+            "the caller must expose its real cuBLASLt workspace owner"
         );
         runtime.test_begin_unregistered_graph_capture().unwrap();
         let error = execute(EinsumRouteOverride::CudaCublas, &mut cublas_output)
-            .expect_err("unregistered capture must reject a private cuBLASLt workspace");
+            .expect_err("unregistered capture must reject borrowed scratch without its real owner");
         assert!(
-            error.to_string().contains("no registered ownership token"),
+            error.to_string().contains("real workspace owner"),
             "{error}"
         );
         runtime.test_end_unregistered_graph_capture().unwrap();
+        execute(EinsumRouteOverride::CudaCublas, &mut cublas_output).unwrap();
 
-        runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+        runtime
+            .begin_graph_capture_with_resources(&[kernel.as_ref()], caller.resources())
+            .unwrap();
         execute(EinsumRouteOverride::CudaCublas, &mut cublas_output).unwrap();
         runtime.end_graph_capture().unwrap();
         let counts_before_drop = runtime.allocation_counts();
+        drop(caller);
         drop(kernel);
         assert_eq!(
             runtime.allocation_counts(),
@@ -1165,6 +1223,7 @@ fn auto_fallback_snapshot_is_reused_for_capture_and_replay() {
 fn auto_fallback_snapshot_is_reused_for_capture_and_replay_gpu() {
     let _lock = suite_lock();
     let ep = require_cuda();
+    let caller = common::EinsumCallerLane::new(&ep);
     let runtime = ep.runtime();
     let input_shapes = [vec![16usize, 64], vec![64usize, 8]];
     let output_shape = [16usize, 8];
@@ -1190,7 +1249,8 @@ fn auto_fallback_snapshot_is_reused_for_capture_and_replay_gpu() {
         })
         .collect::<Vec<_>>();
     let execute = |output: &mut onnx_runtime_ep_api::DeviceBuffer| {
-        kernel.execute(
+        caller.execute_auto(
+            kernel.as_ref(),
             &views,
             &mut [TensorMut::new(
                 DevicePtrMut(output.as_mut_ptr()),
@@ -1217,7 +1277,9 @@ fn auto_fallback_snapshot_is_reused_for_capture_and_replay_gpu() {
     assert_eq!(warm.plan_builds, 1);
     assert!(kernel.capture_support().is_supported());
 
-    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    runtime
+        .begin_graph_capture_with_resources(&[kernel.as_ref()], caller.resources())
+        .unwrap();
     execute(&mut output).unwrap();
     runtime.end_graph_capture().unwrap();
     runtime.replay_graph().unwrap();
@@ -1278,12 +1340,14 @@ fn execute_layout_matrix(
     b: &onnx_runtime_ep_api::DeviceBuffer,
     output: &mut onnx_runtime_ep_api::DeviceBuffer,
     output_strides: &[i64],
+    caller: &common::EinsumCallerLane<'_>,
 ) -> onnx_runtime_ep_api::Result<()> {
     let a_shape = [2usize, 3];
     let b_shape = [3usize, 2];
     let output_shape = [2usize, 2];
     let b_strides = compute_contiguous_strides(&b_shape);
-    kernel.execute(
+    caller.execute_auto(
+        kernel,
         &[
             TensorView::new(
                 DevicePtr(a.as_ptr()),
@@ -1319,6 +1383,7 @@ fn assert_auto_reselects_for_input_layout(
     a_byte_offset: usize,
     logical_a: &[f32],
 ) {
+    let caller = common::EinsumCallerLane::new(ep);
     let runtime = ep.runtime();
     let a_shape = [2usize, 3];
     let b_shape = [3usize, 2];
@@ -1342,6 +1407,7 @@ fn assert_auto_reselects_for_input_layout(
         &buffers[1],
         &mut output,
         &output_strides,
+        &caller,
     )
     .expect("contiguous warm must select direct cuBLASLt");
     let warm = einsum_execution_stats();
@@ -1368,6 +1434,7 @@ fn assert_auto_reselects_for_input_layout(
         &buffers[1],
         &mut output,
         &output_strides,
+        &caller,
     )
     .unwrap_or_else(|error| panic!("{label}: Auto semantic reselection failed: {error}"));
     runtime.synchronize().unwrap();
@@ -1451,6 +1518,7 @@ fn direct_snapshot_reselects_semantic_for_positive_and_negative_strides() {
 fn direct_snapshot_reselects_semantic_for_output_layout_change() {
     let _lock = suite_lock();
     let ep = require_cuda();
+    let caller = common::EinsumCallerLane::new(&ep);
     let runtime = ep.runtime();
     let a_shape = [2usize, 3];
     let b_shape = [3usize, 2];
@@ -1477,6 +1545,7 @@ fn direct_snapshot_reselects_semantic_for_output_layout_change() {
         &buffers[1],
         &mut contiguous_output,
         &output_strides,
+        &caller,
     )
     .unwrap();
     assert_eq!(
@@ -1503,6 +1572,7 @@ fn direct_snapshot_reselects_semantic_for_output_layout_change() {
         &buffers[1],
         &mut strided_output,
         &strided_output_strides,
+        &caller,
     )
     .unwrap();
     runtime.synchronize().unwrap();
@@ -1558,6 +1628,7 @@ fn direct_snapshot_reselects_semantic_for_output_layout_change() {
 fn direct_zero_fill_snapshot_reselects_semantic_for_output_layout_change() {
     let _lock = suite_lock();
     let ep = require_cuda();
+    let caller = common::EinsumCallerLane::new(&ep);
     let runtime = ep.runtime();
     let a_shape = [2usize, 0];
     let b_shape = [0usize, 2];
@@ -1573,8 +1644,9 @@ fn direct_zero_fill_snapshot_reselects_semantic_for_output_layout_change() {
     let output_strides = compute_contiguous_strides(&output_shape);
 
     reset_einsum_execution_stats();
-    kernel
-        .execute(
+    caller
+        .execute_auto(
+            kernel.as_ref(),
             &[
                 TensorView::new(
                     DevicePtr(buffers[0].as_ptr()),
@@ -1617,8 +1689,9 @@ fn direct_zero_fill_snapshot_reselects_semantic_for_output_layout_change() {
             )
             .unwrap()
     };
-    kernel
-        .execute(
+    caller
+        .execute_auto(
+            kernel.as_ref(),
             &[
                 TensorView::new(
                     DevicePtr(buffers[0].as_ptr()),
@@ -1684,6 +1757,7 @@ fn direct_zero_fill_snapshot_reselects_semantic_for_output_layout_change() {
 fn direct_snapshot_layout_mismatch_fails_closed_during_capture() {
     let _lock = suite_lock();
     let ep = require_cuda();
+    let caller = common::EinsumCallerLane::new(&ep);
     let runtime = ep.runtime();
     let a_shape = [2usize, 3];
     let b_shape = [3usize, 2];
@@ -1717,9 +1791,12 @@ fn direct_snapshot_layout_mismatch_fails_closed_during_capture() {
         &buffers[1],
         &mut output,
         &output_strides,
+        &caller,
     )
     .unwrap();
-    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    runtime
+        .begin_graph_capture_with_resources(&[kernel.as_ref()], caller.resources())
+        .unwrap();
     execute_layout_matrix(
         &ep,
         kernel.as_ref(),
@@ -1729,6 +1806,7 @@ fn direct_snapshot_layout_mismatch_fails_closed_during_capture() {
         &buffers[1],
         &mut output,
         &output_strides,
+        &caller,
     )
     .unwrap();
     let launches_before_mismatch = einsum_execution_stats().gemm_launches;
@@ -1741,6 +1819,7 @@ fn direct_snapshot_layout_mismatch_fails_closed_during_capture() {
         &buffers[1],
         &mut output,
         &output_strides,
+        &caller,
     )
     .expect_err("capture must reject a layout that was not warmed");
     let message = error.to_string();
@@ -1775,6 +1854,7 @@ fn direct_snapshot_layout_mismatch_fails_closed_during_capture() {
 fn failed_layout_rewarm_preserves_complete_direct_snapshot() {
     let _lock = suite_lock();
     let ep = require_cuda();
+    let caller = common::EinsumCallerLane::new(&ep);
     let runtime = ep.runtime();
     let a_shape = [2usize, 3];
     let b_shape = [3usize, 2];
@@ -1808,6 +1888,7 @@ fn failed_layout_rewarm_preserves_complete_direct_snapshot() {
         &buffers[1],
         &mut output,
         &output_strides,
+        &caller,
     )
     .unwrap();
     assert!(kernel.capture_support().is_supported());
@@ -1828,6 +1909,7 @@ fn failed_layout_rewarm_preserves_complete_direct_snapshot() {
         &buffers[1],
         &mut output,
         &output_strides,
+        &caller,
     )
     .expect_err("injected semantic rewarm failure must be reported");
     assert!(
@@ -1848,7 +1930,9 @@ fn failed_layout_rewarm_preserves_complete_direct_snapshot() {
         "failed rewarm must retain the complete prior resource snapshot"
     );
 
-    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    runtime
+        .begin_graph_capture_with_resources(&[kernel.as_ref()], caller.resources())
+        .unwrap();
     execute_layout_matrix(
         &ep,
         kernel.as_ref(),
@@ -1858,6 +1942,7 @@ fn failed_layout_rewarm_preserves_complete_direct_snapshot() {
         &buffers[1],
         &mut output,
         &output_strides,
+        &caller,
     )
     .unwrap();
     runtime.end_graph_capture().unwrap();
@@ -1884,6 +1969,7 @@ fn failed_layout_rewarm_preserves_complete_direct_snapshot() {
 fn optimizer_memory_ceiling_selects_generic_native_without_intermediates() {
     let _lock = suite_lock();
     let ep = require_cuda();
+    let caller = common::EinsumCallerLane::new(&ep);
     let shapes = [vec![2], vec![2, 2], vec![2]];
     let output_shape: [usize; 0] = [];
     let (kernel, inputs, buffers, mut output) =
@@ -1908,20 +1994,21 @@ fn optimizer_memory_ceiling_selects_generic_native_without_intermediates() {
         })
         .collect::<Vec<_>>();
     reset_einsum_execution_stats();
-    execute_einsum_with_route_and_memory_ceiling(
-        kernel.as_ref(),
-        &views,
-        &mut [TensorMut::new(
-            DevicePtrMut(output.as_mut_ptr()),
-            DataType::Float32,
-            &output_shape,
-            &output_strides,
-            ep.device_id(),
-        )],
-        EinsumRouteOverride::Auto,
-        0,
-    )
-    .unwrap();
+    caller
+        .execute(
+            kernel.as_ref(),
+            &views,
+            &mut [TensorMut::new(
+                DevicePtrMut(output.as_mut_ptr()),
+                DataType::Float32,
+                &output_shape,
+                &output_strides,
+                ep.device_id(),
+            )],
+            EinsumRouteOverride::Auto,
+            Some(0),
+        )
+        .unwrap();
     let stats = einsum_execution_stats();
     assert_eq!(
         stats.last_route,
@@ -1943,6 +2030,7 @@ fn optimizer_memory_ceiling_selects_generic_native_without_intermediates() {
 fn generic_native_consumes_strided_and_negative_stride_views() {
     let _lock = suite_lock();
     let ep = require_cuda();
+    let caller = common::EinsumCallerLane::new(&ep);
     let runtime = ep.runtime();
 
     let vector_shape = [3usize];
@@ -1959,19 +2047,21 @@ fn generic_native_consumes_strided_and_negative_stride_views() {
         ep.device_id(),
     )
     .with_byte_offset(2 * std::mem::size_of::<f32>());
-    execute_einsum_with_route(
-        reverse.as_ref(),
-        std::slice::from_ref(&reverse_view),
-        &mut [TensorMut::new(
-            DevicePtrMut(reverse_output.as_mut_ptr()),
-            DataType::Float32,
-            &vector_output_shape,
-            &output_strides,
-            ep.device_id(),
-        )],
-        EinsumRouteOverride::GenericNative,
-    )
-    .unwrap();
+    caller
+        .execute(
+            reverse.as_ref(),
+            std::slice::from_ref(&reverse_view),
+            &mut [TensorMut::new(
+                DevicePtrMut(reverse_output.as_mut_ptr()),
+                DataType::Float32,
+                &vector_output_shape,
+                &output_strides,
+                ep.device_id(),
+            )],
+            EinsumRouteOverride::GenericNative,
+            None,
+        )
+        .unwrap();
     runtime.synchronize().unwrap();
     let mut reverse_bytes = vec![0u8; 3 * 4];
     unsafe {
@@ -2011,25 +2101,27 @@ fn generic_native_consumes_strided_and_negative_stride_views() {
     };
     let diagonal_strides = [3i64, 1];
     let diagonal_output_strides = compute_contiguous_strides(&diagonal_output_shape);
-    execute_einsum_with_route(
-        diagonal.as_ref(),
-        &[TensorView::new(
-            DevicePtr(diagonal_buffer.as_ptr()),
-            DataType::Float32,
-            &diagonal_shape,
-            &diagonal_strides,
-            ep.device_id(),
-        )],
-        &mut [TensorMut::new(
-            DevicePtrMut(diagonal_output.as_mut_ptr()),
-            DataType::Float32,
-            &diagonal_output_shape,
-            &diagonal_output_strides,
-            ep.device_id(),
-        )],
-        EinsumRouteOverride::GenericNative,
-    )
-    .unwrap();
+    caller
+        .execute(
+            diagonal.as_ref(),
+            &[TensorView::new(
+                DevicePtr(diagonal_buffer.as_ptr()),
+                DataType::Float32,
+                &diagonal_shape,
+                &diagonal_strides,
+                ep.device_id(),
+            )],
+            &mut [TensorMut::new(
+                DevicePtrMut(diagonal_output.as_mut_ptr()),
+                DataType::Float32,
+                &diagonal_output_shape,
+                &diagonal_output_strides,
+                ep.device_id(),
+            )],
+            EinsumRouteOverride::GenericNative,
+            None,
+        )
+        .unwrap();
     runtime.synchronize().unwrap();
     let mut diagonal_result = vec![0u8; 8];
     unsafe {
@@ -2234,6 +2326,7 @@ fn make_direct_kernel(
 fn warm_plan_is_allocation_free_with_stable_workspace_through_capture_and_replay() {
     let _lock = suite_lock();
     let ep = require_cuda();
+    let caller = common::EinsumCallerLane::new(&ep);
     let runtime = ep.runtime();
     let input_shapes = [vec![32, 64], vec![4, 64, 48]];
     let output_shape = [4, 32, 48];
@@ -2261,8 +2354,9 @@ fn warm_plan_is_allocation_free_with_stable_workspace_through_capture_and_replay
         })
         .collect::<Vec<_>>();
     let execute = |output: &mut onnx_runtime_ep_api::DeviceBuffer| {
-        kernel
-            .execute(
+        caller
+            .execute_auto(
+                kernel.as_ref(),
                 &views,
                 &mut [TensorMut::new(
                     DevicePtrMut(output.as_mut_ptr()),
@@ -2297,7 +2391,9 @@ fn warm_plan_is_allocation_free_with_stable_workspace_through_capture_and_replay
     assert_eq!(runtime.allocation_counts(), allocations);
 
     let graph_before = runtime.graph_execution_counts();
-    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    runtime
+        .begin_graph_capture_with_resources(&[kernel.as_ref()], caller.resources())
+        .unwrap();
     execute(&mut output);
     assert!(runtime.is_capturing().unwrap());
     assert_eq!(runtime.allocation_counts(), allocations);
@@ -2346,6 +2442,7 @@ fn warm_plan_is_allocation_free_with_stable_workspace_through_capture_and_replay
 fn captured_private_resources_outlive_dropped_einsum_kernels() {
     let _lock = suite_lock();
     let ep = require_cuda();
+    let caller = common::EinsumCallerLane::new(&ep);
     let runtime = ep.runtime();
 
     let gemm_shapes = [vec![32, 64], vec![4, 64, 48]];
@@ -2373,8 +2470,9 @@ fn captured_private_resources_outlive_dropped_einsum_kernels() {
         .collect::<Vec<_>>();
     let execute_gemm = |kernel: &dyn onnx_runtime_ep_api::Kernel,
                         output: &mut onnx_runtime_ep_api::DeviceBuffer| {
-        kernel
-            .execute(
+        caller
+            .execute_auto(
+                kernel,
                 &gemm_views,
                 &mut [TensorMut::new(
                     DevicePtrMut(output.as_mut_ptr()),
@@ -2402,8 +2500,9 @@ fn captured_private_resources_outlive_dropped_einsum_kernels() {
     );
     let execute_view = |kernel: &dyn onnx_runtime_ep_api::Kernel,
                         output: &mut onnx_runtime_ep_api::DeviceBuffer| {
-        kernel
-            .execute(
+        caller
+            .execute_auto(
+                kernel,
                 std::slice::from_ref(&view_input),
                 &mut [TensorMut::new(
                     DevicePtrMut(output.as_mut_ptr()),
@@ -2420,11 +2519,8 @@ fn captured_private_resources_outlive_dropped_einsum_kernels() {
     execute_gemm(gemm.as_ref(), &mut gemm_output);
     execute_view(view.as_ref(), &mut view_output);
     let workspace_bytes = einsum_execution_stats().workspace_bytes;
-    assert_eq!(
-        gemm.device_graph_resources().len(),
-        usize::from(workspace_bytes != 0),
-        "only an allocated cuBLASLt workspace needs graph ownership"
-    );
+    assert!(gemm.device_graph_resources().is_empty());
+    assert_eq!(caller.resources().len(), usize::from(workspace_bytes != 0));
     assert_eq!(
         view.device_graph_resources().len(),
         1,
@@ -2434,7 +2530,7 @@ fn captured_private_resources_outlive_dropped_einsum_kernels() {
     assert!(view.capture_support().is_supported());
 
     runtime
-        .begin_graph_capture(&[gemm.as_ref(), view.as_ref()])
+        .begin_graph_capture_with_resources(&[gemm.as_ref(), view.as_ref()], caller.resources())
         .unwrap();
     execute_gemm(gemm.as_ref(), &mut gemm_output);
     execute_view(view.as_ref(), &mut view_output);
@@ -2442,6 +2538,7 @@ fn captured_private_resources_outlive_dropped_einsum_kernels() {
 
     let counts_before_drop = runtime.allocation_counts();
     let pooled_before_drop = runtime.raw_pool_retained_bytes();
+    drop(caller);
     drop(gemm);
     drop(view);
     assert_eq!(
@@ -2531,6 +2628,7 @@ fn materialized_view_failed_rewarm_preserves_capture_ready_snapshot() {
 fn materialized_view_failed_rewarm_preserves_capture_ready_snapshot_gpu() {
     let _lock = suite_lock();
     let ep = require_cuda();
+    let caller = common::EinsumCallerLane::new(&ep);
     let runtime = ep.runtime();
     let shape = [2usize, 3];
     let output_shape = [3usize, 2];
@@ -2546,7 +2644,8 @@ fn materialized_view_failed_rewarm_preserves_capture_ready_snapshot_gpu() {
         ep.device_id(),
     );
     let run_a = |output: &mut onnx_runtime_ep_api::DeviceBuffer| {
-        kernel.execute(
+        caller.execute_auto(
+            kernel.as_ref(),
             std::slice::from_ref(&a_view),
             &mut [TensorMut::new(
                 DevicePtrMut(output.as_mut_ptr()),
@@ -2581,7 +2680,8 @@ fn materialized_view_failed_rewarm_preserves_capture_ready_snapshot_gpu() {
         ep.device_id(),
     );
     let run_b = |output: &mut onnx_runtime_ep_api::DeviceBuffer| {
-        kernel.execute(
+        caller.execute_auto(
+            kernel.as_ref(),
             std::slice::from_ref(&b_view),
             &mut [TensorMut::new(
                 DevicePtrMut(output.as_mut_ptr()),
@@ -2617,7 +2717,9 @@ fn materialized_view_failed_rewarm_preserves_capture_ready_snapshot_gpu() {
     );
 
     run_a(&mut a_output).unwrap();
-    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    runtime
+        .begin_graph_capture_with_resources(&[kernel.as_ref()], caller.resources())
+        .unwrap();
     run_a(&mut a_output).unwrap();
     runtime.end_graph_capture().unwrap();
 
@@ -2656,6 +2758,7 @@ fn materialized_view_failed_rewarm_preserves_capture_ready_snapshot_gpu() {
 fn generic_failed_rewarm_preserves_capture_ready_snapshot() {
     let _lock = suite_lock();
     let ep = require_cuda();
+    let caller = common::EinsumCallerLane::new(&ep);
     let runtime = ep.runtime();
     let shape = [2usize, 3];
     let output_shape = [2usize];
@@ -2671,7 +2774,7 @@ fn generic_failed_rewarm_preserves_capture_ready_snapshot() {
         ep.device_id(),
     );
     let run = |input: &TensorView, output: &mut onnx_runtime_ep_api::DeviceBuffer| {
-        execute_einsum_with_route(
+        caller.execute(
             kernel.as_ref(),
             std::slice::from_ref(input),
             &mut [TensorMut::new(
@@ -2682,6 +2785,7 @@ fn generic_failed_rewarm_preserves_capture_ready_snapshot() {
                 ep.device_id(),
             )],
             EinsumRouteOverride::GenericNative,
+            None,
         )
     };
     run(&a_view, &mut a_output).unwrap();
@@ -2728,7 +2832,9 @@ fn generic_failed_rewarm_preserves_capture_ready_snapshot() {
     };
     assert_eq!(decode_floats(&untouched, DataType::Float32), [123.0, 456.0]);
 
-    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    runtime
+        .begin_graph_capture_with_resources(&[kernel.as_ref()], caller.resources())
+        .unwrap();
     run(&a_view, &mut a_output).unwrap();
     runtime.end_graph_capture().unwrap();
     runtime.replay_graph().unwrap();
@@ -3040,6 +3146,7 @@ fn failed_semantic_rewarm_preserves_complete_snapshot_for_both_routes() {
 fn captured_generic_resources_outlive_dropped_kernel() {
     let _lock = suite_lock();
     let ep = require_cuda();
+    let caller = common::EinsumCallerLane::new(&ep);
     let runtime = ep.runtime();
     let shape = [2usize, 3];
     let output_shape = [2usize];
@@ -3056,23 +3163,27 @@ fn captured_generic_resources_outlive_dropped_kernel() {
     );
     let execute = |kernel: &dyn onnx_runtime_ep_api::Kernel,
                    output: &mut onnx_runtime_ep_api::DeviceBuffer| {
-        execute_einsum_with_route(
-            kernel,
-            std::slice::from_ref(&input),
-            &mut [TensorMut::new(
-                DevicePtrMut(output.as_mut_ptr()),
-                DataType::Float32,
-                &output_shape,
-                &output_strides,
-                ep.device_id(),
-            )],
-            EinsumRouteOverride::GenericNative,
-        )
-        .unwrap();
+        caller
+            .execute(
+                kernel,
+                std::slice::from_ref(&input),
+                &mut [TensorMut::new(
+                    DevicePtrMut(output.as_mut_ptr()),
+                    DataType::Float32,
+                    &output_shape,
+                    &output_strides,
+                    ep.device_id(),
+                )],
+                EinsumRouteOverride::GenericNative,
+                None,
+            )
+            .unwrap();
     };
     execute(kernel.as_ref(), &mut output);
     assert_eq!(kernel.device_graph_resources().len(), 1);
-    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    runtime
+        .begin_graph_capture_with_resources(&[kernel.as_ref()], caller.resources())
+        .unwrap();
     execute(kernel.as_ref(), &mut output);
     runtime.end_graph_capture().unwrap();
     let counts_before_drop = runtime.allocation_counts();
@@ -3103,6 +3214,7 @@ fn captured_generic_resources_outlive_dropped_kernel() {
 fn captured_optimized_plan_resources_outlive_dropped_kernel() {
     let _lock = suite_lock();
     let ep = require_cuda();
+    let caller = common::EinsumCallerLane::new(&ep);
     let runtime = ep.runtime();
     let shapes = [vec![2], vec![2, 2], vec![2]];
     let output_shape: [usize; 0] = [];
@@ -3129,19 +3241,21 @@ fn captured_optimized_plan_resources_outlive_dropped_kernel() {
         .collect::<Vec<_>>();
     let execute = |kernel: &dyn onnx_runtime_ep_api::Kernel,
                    output: &mut onnx_runtime_ep_api::DeviceBuffer| {
-        execute_einsum_with_route(
-            kernel,
-            &views,
-            &mut [TensorMut::new(
-                DevicePtrMut(output.as_mut_ptr()),
-                DataType::Float32,
-                &output_shape,
-                &output_strides,
-                ep.device_id(),
-            )],
-            EinsumRouteOverride::Optimized,
-        )
-        .unwrap();
+        caller
+            .execute(
+                kernel,
+                &views,
+                &mut [TensorMut::new(
+                    DevicePtrMut(output.as_mut_ptr()),
+                    DataType::Float32,
+                    &output_shape,
+                    &output_strides,
+                    ep.device_id(),
+                )],
+                EinsumRouteOverride::Optimized,
+                None,
+            )
+            .unwrap();
     };
     reset_einsum_execution_stats();
     execute(kernel.as_ref(), &mut output);
@@ -3152,7 +3266,9 @@ fn captured_optimized_plan_resources_outlive_dropped_kernel() {
     );
     assert!(stats.optimized_cublas_launches > 0);
     assert!(!kernel.device_graph_resources().is_empty());
-    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    runtime
+        .begin_graph_capture_with_resources(&[kernel.as_ref()], caller.resources())
+        .unwrap();
     execute(kernel.as_ref(), &mut output);
     runtime.end_graph_capture().unwrap();
 
@@ -3192,6 +3308,7 @@ fn captured_optimized_plan_resources_outlive_dropped_kernel() {
 fn contraction_rejects_output_alias_before_launch() {
     let _lock = suite_lock();
     let ep = require_cuda();
+    let caller = common::EinsumCallerLane::new(&ep);
     let runtime = ep.runtime();
     let input_shapes = [vec![2, 2], vec![2, 2]];
     let output_shape = [2, 2];
@@ -3214,8 +3331,9 @@ fn contraction_rejects_output_alias_before_launch() {
         ep.device_id(),
     );
     let before = einsum_execution_stats().gemm_launches;
-    let error = kernel
-        .execute(
+    let error = caller
+        .execute_auto(
+            kernel.as_ref(),
             &[a, b],
             &mut [TensorMut::new(
                 DevicePtrMut(buffers[0].as_mut_ptr()),
@@ -3243,6 +3361,7 @@ fn contraction_rejects_output_alias_before_launch() {
 fn materialized_view_rejects_partial_offset_overlap_before_mutation() {
     let _lock = suite_lock();
     let ep = require_cuda();
+    let caller = common::EinsumCallerLane::new(&ep);
     let runtime = ep.runtime();
     let input_shape = [2, 3];
     let output_shape = [3, 2];
@@ -3276,8 +3395,9 @@ fn materialized_view_rejects_partial_offset_overlap_before_mutation() {
 
     reset_einsum_execution_stats();
     let allocations_before = runtime.allocation_counts();
-    let error = kernel
-        .execute(
+    let error = caller
+        .execute_auto(
+            kernel.as_ref(),
             std::slice::from_ref(&input),
             &mut [TensorMut::new(
                 DevicePtrMut(shared.as_mut_ptr()),
@@ -3301,8 +3421,9 @@ fn materialized_view_rejects_partial_offset_overlap_before_mutation() {
     assert_eq!(einsum_execution_stats().materialization_bytes, 0);
 
     for (label, output_offset) in [("adjacent", 32usize), ("gapped", 40usize)] {
-        kernel
-            .execute(
+        caller
+            .execute_auto(
+                kernel.as_ref(),
                 std::slice::from_ref(&input),
                 &mut [TensorMut::new(
                     DevicePtrMut(shared.as_mut_ptr()),
@@ -3351,6 +3472,7 @@ fn materialized_view_rejects_partial_offset_overlap_before_mutation() {
 fn materialized_view_address_overflow_is_actionable_and_pre_mutation() {
     let _lock = suite_lock();
     let ep = require_cuda();
+    let caller = common::EinsumCallerLane::new(&ep);
     let runtime = ep.runtime();
     let input_shape = [2, 3];
     let output_shape = [3, 2];
@@ -3370,8 +3492,9 @@ fn materialized_view_address_overflow_is_actionable_and_pre_mutation() {
 
     reset_einsum_execution_stats();
     let allocations_before = runtime.allocation_counts();
-    let error = kernel
-        .execute(
+    let error = caller
+        .execute_auto(
+            kernel.as_ref(),
             std::slice::from_ref(&input),
             &mut [TensorMut::new(
                 DevicePtrMut(output.as_mut_ptr()),
@@ -3409,6 +3532,7 @@ enum BenchMode {
 }
 
 struct BenchFixture {
+    workspace: common::EinsumCallerWorkspace,
     mode: BenchMode,
     a: Tensor,
     b: Tensor,
@@ -3450,6 +3574,10 @@ impl BenchArm {
 }
 
 impl BenchFixture {
+    fn resources(&self) -> Vec<onnx_runtime_ep_api::DeviceGraphResource> {
+        self.workspace.resources()
+    }
+
     fn kernel_refs(&self) -> Vec<&dyn onnx_runtime_ep_api::Kernel> {
         match &self.mode {
             BenchMode::Einsum(kernel) => vec![kernel.as_ref()],
@@ -3487,7 +3615,17 @@ impl BenchFixture {
             )
         };
         match &self.mode {
-            BenchMode::Einsum(kernel) => kernel.execute(&[a, b], &mut [output()]).unwrap(),
+            BenchMode::Einsum(kernel) => self
+                .workspace
+                .execute(
+                    ep,
+                    kernel.as_ref(),
+                    &[a, b],
+                    &mut [output()],
+                    EinsumRouteOverride::Auto,
+                    None,
+                )
+                .unwrap(),
             BenchMode::Materialized { transpose, einsum } => {
                 let temporary = self.temporary.as_ref().unwrap();
                 let temporary_shape = [self.a.shape[1], self.a.shape[0]];
@@ -3511,14 +3649,22 @@ impl BenchFixture {
                     &temporary_strides,
                     ep.device_id(),
                 );
-                einsum
-                    .execute(&[temporary_view, b], &mut [output()])
+                self.workspace
+                    .execute(
+                        ep,
+                        einsum.as_ref(),
+                        &[temporary_view, b],
+                        &mut [output()],
+                        EinsumRouteOverride::Auto,
+                        None,
+                    )
                     .unwrap();
             }
         }
     }
 
     fn finish(self, ep: &CudaExecutionProvider) {
+        self.workspace.retire(ep).unwrap();
         let Self {
             mode,
             a_buffer,
@@ -3637,6 +3783,7 @@ fn bench_fixture(
             &[("equation", Attribute::String(b"ik,kj->ij".to_vec()))],
         );
         BenchFixture {
+            workspace: Default::default(),
             mode: BenchMode::Materialized { transpose, einsum },
             a,
             b,
@@ -3661,6 +3808,7 @@ fn bench_fixture(
             &[("equation", Attribute::String(equation.to_vec()))],
         );
         BenchFixture {
+            workspace: Default::default(),
             mode: BenchMode::Einsum(einsum),
             a,
             b,
@@ -3970,7 +4118,9 @@ fn measure_bench_arm(
     let allocations_after_warm = runtime.allocation_counts();
     let graph_before_capture = runtime.graph_execution_counts();
     let capture = Instant::now();
-    runtime.begin_graph_capture(&fixture.kernel_refs()).unwrap();
+    runtime
+        .begin_graph_capture_with_resources(&fixture.kernel_refs(), fixture.resources())
+        .unwrap();
     fixture.execute(ep);
     runtime.end_graph_capture().unwrap();
     let capture_us = capture.elapsed().as_secs_f64() * 1e6;
@@ -4223,7 +4373,7 @@ fn einsum_benchmark_arms_match_exact_f64_oracle() {
             fixture.execute(&ep);
             let allocations = ep.runtime().allocation_counts();
             ep.runtime()
-                .begin_graph_capture(&fixture.kernel_refs())
+                .begin_graph_capture_with_resources(&fixture.kernel_refs(), fixture.resources())
                 .unwrap();
             fixture.execute(&ep);
             ep.runtime().end_graph_capture().unwrap();

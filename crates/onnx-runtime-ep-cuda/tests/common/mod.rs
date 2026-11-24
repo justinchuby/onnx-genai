@@ -733,3 +733,100 @@ pub fn assert_close(label: &str, dtype: DataType, got: &[f32], expected: &[f32],
         );
     }
 }
+
+/// One caller-owned lane for explicit Einsum route probes. Preparation is the
+/// production host-only refiner; fitting backing is reused across calls.
+#[derive(Default)]
+pub struct EinsumCallerWorkspace {
+    owner: std::cell::RefCell<Option<WorkspaceAllocation>>,
+}
+impl EinsumCallerWorkspace {
+    pub fn execute(
+        &self,
+        ep: &CudaExecutionProvider,
+        kernel: &dyn Kernel,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        route: onnx_runtime_ep_cuda::EinsumRouteOverride,
+        ceiling: Option<u128>,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        let requirement = onnx_runtime_ep_cuda::einsum_workspace_requirement_for_route(
+            kernel, inputs, outputs, route, ceiling,
+        )?;
+        let view = prepare_workspace(ep, requirement, &mut self.owner.borrow_mut())?;
+        match ceiling {
+            Some(ceiling) => onnx_runtime_ep_cuda::execute_einsum_with_route_and_memory_ceiling(
+                kernel, inputs, outputs, route, ceiling, view,
+            ),
+            None => onnx_runtime_ep_cuda::execute_einsum_with_route(
+                kernel, inputs, outputs, route, view,
+            ),
+        }
+    }
+    pub fn resources(&self) -> Vec<onnx_runtime_ep_api::DeviceGraphResource> {
+        self.owner
+            .borrow()
+            .as_ref()
+            .and_then(|owner| owner.device_graph_resource().unwrap())
+            .into_iter()
+            .collect()
+    }
+    pub fn retire(&self, ep: &CudaExecutionProvider) -> onnx_runtime_ep_api::Result<()> {
+        if let Some(owner) = self.owner.borrow_mut().take() {
+            ep.deallocate_workspace(owner)?;
+        }
+        Ok(())
+    }
+}
+
+pub struct EinsumCallerLane<'a> {
+    ep: &'a CudaExecutionProvider,
+    workspace: EinsumCallerWorkspace,
+}
+impl<'a> EinsumCallerLane<'a> {
+    pub fn new(ep: &'a CudaExecutionProvider) -> Self {
+        Self {
+            ep,
+            workspace: Default::default(),
+        }
+    }
+    pub fn execute(
+        &self,
+        kernel: &dyn Kernel,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        route: onnx_runtime_ep_cuda::EinsumRouteOverride,
+        ceiling: Option<u128>,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.workspace
+            .execute(self.ep, kernel, inputs, outputs, route, ceiling)
+    }
+    pub fn execute_auto(
+        &self,
+        kernel: &dyn Kernel,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.execute(
+            kernel,
+            inputs,
+            outputs,
+            onnx_runtime_ep_cuda::EinsumRouteOverride::Auto,
+            None,
+        )
+    }
+    pub fn resources(&self) -> Vec<onnx_runtime_ep_api::DeviceGraphResource> {
+        self.workspace.resources()
+    }
+}
+impl Drop for EinsumCallerLane<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.workspace.retire(self.ep) {
+            if std::thread::panicking() {
+                eprintln!("retire Einsum fixture caller workspace during unwind: {error}");
+            } else {
+                panic!("retire Einsum fixture caller workspace: {error}");
+            }
+        }
+    }
+}

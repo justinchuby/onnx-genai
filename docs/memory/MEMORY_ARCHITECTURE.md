@@ -1031,6 +1031,51 @@ CUDA source strings remain unchanged. No device numerical/lifetime/performance
 validation was possible locally, and fewer upload calls alone is not a measured
 throughput result.
 
+### Keep resource admission coarse and EP integration small
+
+The physical reclaimable owner is the unit of quota. Each concurrent root lane
+retains its existing lifetime capacities: serial nodes share a peak, and regions
+that are live together add within one checked composite. Regions are offsets,
+not tickets. Independently reclaimable weight artifacts/groups and KV blocks keep
+their physical ownership boundaries rather than becoming one session-wide slab.
+
+A warm fitting owner is borrowed without issuer acquire/return; zero demand also
+skips the issuer. Growth and reconstruction after pressure are cold paths. Retained
+capacity stays charged until physical retirement and settlement, including graph
+pins, control-flow loans and pending releases. Pending or failed completion never
+proves an idle reclaimable lane.
+
+An EP declares/refines requirements, supplies actual backing allocation/replacement/
+release and provides real completion/capture evidence. Kernels bind borrowed spans
+and submit work; they implement no pool, budget or retirement policy. Control flow
+borrows the root owner through `ChildWorkspaceLoan`. This uses the existing APIs;
+no per-region grants, extra allocator layer or parallel plan cache is needed.
+
+### Einsum direct GEMM borrows caller scratch
+
+Einsum now refines Deferred requirements from actual input/output addresses before
+admission. Direct cuBLASLt candidates contain host descriptors only; the exact
+algorithm workspace requirement belongs to the SessionPersistent caller peak.
+Execution binds the used span, requires its real owner pin during capture, and
+publishes a new arithmetic snapshot only after successful submission. The old
+published snapshot remains owned if candidate preparation or launch fails. Warm
+reuse neither replans nor allocates private direct scratch. Empty/zero-fill direct
+cases require no scratch.
+
+The semantic multi-step route is **not migrated**: its arithmetic and BLAS scratch
+still use private owners, and its caller requirement NONE describes only that
+current API behavior. `CudaEinsumRecipe` separates pure host tree/slot planning from
+the bound device snapshot. Full migration needs a canonical bound-workspace
+refinement: obtain actual arithmetic addresses, select ActualAddress BLAS plans,
+admit the serial BLAS tail, and revalidate address contracts after any relocation.
+No fabricated scratch pointer, TypedMinimum substitution or blind workspace upper
+bound closes that gap. Immutable metadata and installed graph pins must be formed
+only from the final binding.
+
+Host tests cover exact direct-span refusal and pure recipe tree/ceiling selection.
+Device fixtures compile caller reuse and real-pin capture/replay lifetimes, but no
+CUDA device was available to execute them or measure inference overhead.
+
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
 The dated audit and measurements below preserve historical evidence. The current
