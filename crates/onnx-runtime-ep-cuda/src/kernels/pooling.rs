@@ -608,6 +608,8 @@ pub(super) fn validate_average_claim(
     input_shapes: &[Shape],
     input_dtypes: &[DataType],
 ) -> Result<()> {
+    onnx_runtime_ir::pooling::validate_dtype_at_opset(node, opset, input_dtypes)
+        .map_err(not_implemented)?;
     let rank = dilated_average_rank(node, opset >= 19)?;
     let op = "AveragePool";
     if node.inputs.len() != 1
@@ -621,11 +623,6 @@ pub(super) fn validate_average_claim(
     }
     if let Some(&dtype) = input_dtypes.first() {
         window_dtype(op, dtype)?;
-        if dtype == DataType::BFloat16 && opset < 22 {
-            return Err(not_implemented(
-                "AveragePool bfloat16 requires ONNX opset 22 or later",
-            ));
-        }
     }
     if let Some(rank) = rank {
         count_include_pad(node, op)?;

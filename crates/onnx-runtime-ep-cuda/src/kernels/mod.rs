@@ -1601,13 +1601,24 @@ pub(crate) fn build_cuda_registry_for_contract(
             }),
         );
     }
+    for version in [19, 22] {
+        reg.register(
+            OpKey::new("AveragePool", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+            Box::new(pooling::PoolFactory {
+                kind: pooling::PoolKind::Average,
+                runtime: runtime.clone(),
+                average_supports_dilation: true,
+            }),
+        );
+    }
     reg.register(
-        OpKey::new("AveragePool", "", 19),
-        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+        OpKey::new("MaxPool", "", 22),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(pooling::PoolFactory {
-            kind: pooling::PoolKind::Average,
+            kind: pooling::PoolKind::Max,
             runtime: runtime.clone(),
-            average_supports_dilation: true,
+            average_supports_dilation: false,
         }),
     );
     reg.register(

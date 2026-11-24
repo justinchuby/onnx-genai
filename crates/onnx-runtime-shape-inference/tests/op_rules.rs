@@ -679,7 +679,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     );
     assert_eq!(
         registry.entry_count(),
-        301,
+        303,
         "shape-inference entry count moved: `left` is the live registry, `right` is this pin. \
          One operator can carry several opset-versioned entries, so this count does not always \
          move in step with the operator count -- read both numbers off the failure rather than \
@@ -7528,6 +7528,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Atanh", 9),
     ("", "Attention", 23),
     ("", "AveragePool", 1),
+    ("", "AveragePool", 22),
     ("", "BatchNormalization", 9),
     ("", "BatchNormalization", 14),
     ("", "BatchNormalization", 15),
@@ -7635,6 +7636,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "MatMul", 1),
     ("", "Max", 1),
     ("", "MaxPool", 1),
+    ("", "MaxPool", 22),
     ("", "MaxRoiPool", 1),
     ("", "MaxRoiPool", 22),
     ("", "MaxUnpool", 9),

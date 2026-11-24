@@ -24,7 +24,7 @@ use common::{FloatDType, PreparedKernel, Tensor};
 use half::bf16;
 use onnx_runtime_ep_api::{ExecutionProvider, TensorView};
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
-use onnx_runtime_ir::{Attribute, DataType, Node, NodeId};
+use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, static_shape};
 
 /// One positional operator input.
 enum Inp {
@@ -122,6 +122,61 @@ fn assert_bf16_matches_f32(case: &OpCase) {
             "{}: element {i} bf16={a} vs f32={r} exceeds tol {tol}",
             case.op
         );
+    }
+}
+
+#[test]
+fn window_pool_bf16_starts_at_opset_22_and_executes_natively() {
+    let ep = CpuExecutionProvider::new();
+    let input_values: Vec<f32> = (1..=16).map(|value| value as f32).collect();
+    let shape = static_shape([1, 1, 4, 4]);
+
+    for (op_type, expected) in [
+        ("AveragePool", vec![3.5, 5.5, 11.5, 13.5]),
+        ("MaxPool", vec![6.0, 8.0, 14.0, 16.0]),
+    ] {
+        let mut node = Node::new(NodeId(0), op_type, vec![], vec![]);
+        node.attributes
+            .insert("kernel_shape".into(), Attribute::Ints(vec![2, 2]));
+        node.attributes
+            .insert("strides".into(), Attribute::Ints(vec![2, 2]));
+
+        let legacy = ep.supports_op(
+            &node,
+            21,
+            std::slice::from_ref(&shape),
+            &[DataType::BFloat16],
+            &[],
+        );
+        let reason = legacy.reason().expect("opset 21 BF16 must be declined");
+        assert!(
+            reason.contains("requires ONNX opset 22"),
+            "{op_type}: {reason}"
+        );
+        assert!(
+            ep.supports_op(
+                &node,
+                22,
+                std::slice::from_ref(&shape),
+                &[DataType::BFloat16],
+                &[],
+            )
+            .is_supported(),
+            "{op_type}-22 BF16 must be admitted"
+        );
+
+        let kernel = ep.get_kernel(&node, &[vec![1, 1, 4, 4]], 22).unwrap();
+        let input = Tensor::floats(FloatDType::Bf16, &[1, 1, 4, 4], &input_values);
+        let mut output = Tensor::zeros(FloatDType::Bf16, &[1, 1, 2, 2]);
+        kernel
+            .execute(&[input.view()], &mut [output.view_mut()])
+            .unwrap();
+        for (index, (&actual, &expected)) in output.to_f32().iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 0.05,
+                "{op_type} output {index}: got {actual}, expected {expected}"
+            );
+        }
     }
 }
 

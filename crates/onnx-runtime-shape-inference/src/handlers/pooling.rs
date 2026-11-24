@@ -622,7 +622,9 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "MaxRoiPool", 1, max_roi_pool);
     reg.register("", "MaxRoiPool", 22, max_roi_pool);
     reg.register("", "MaxPool", 1, pool);
+    reg.register("", "MaxPool", 22, pool);
     reg.register("", "AveragePool", 1, pool);
+    reg.register("", "AveragePool", 22, pool);
     // `LpPool` shares `MaxPool`/`AveragePool`'s windowed spatial formula (it
     // has the same `kernel_shape`/`strides`/`pads`/`auto_pad` attributes, plus
     // `dilations`/`ceil_mode` from opset 18), so it reuses `pool`.

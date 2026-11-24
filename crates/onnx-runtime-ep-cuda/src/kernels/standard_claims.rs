@@ -37,6 +37,10 @@ pub(crate) fn unsupported_reason_at_opset(
                 .err()
                 .map(|error| error.to_string());
         }
+        "MaxPool" => {
+            return onnx_runtime_ir::pooling::validate_dtype_at_opset(node, opset, input_dtypes)
+                .err();
+        }
         "ConvTranspose" => conv_transpose(
             node,
             opset,
