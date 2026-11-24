@@ -64,7 +64,7 @@ use onnx_runtime_ep_api::{DeviceGraphResource, EpError, Result};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation};
+use crate::runtime::{CudaRuntime, NativeDeviceAllocation};
 
 // ---------------------------------------------------------------------------
 // Header layout (design §2.3). Six u32 words, device-resident, one per armed
@@ -302,7 +302,7 @@ pub(crate) struct ArmedTelemetry {
     num_experts: usize,
     routes_per_row: u32,
     // Header and bitmap share an armed lifetime and one physical owner.
-    record: Arc<GraphDeviceAllocation>,
+    record: Arc<NativeDeviceAllocation>,
     /// Host-side window/epoch counter. Stamped into `header[H_EPOCH]` at arm
     /// (window 1) and at every `reset_boundary`; held fixed for the whole
     /// window. There is no device epoch counter and no reset kernel.
@@ -347,7 +347,7 @@ impl ArmedTelemetry {
         let record_bytes = record_layout(config.num_experts)
             .map_err(|error| TelemetryUnsupported::Alloc(error.to_string()))?
             .size();
-        let record = GraphDeviceAllocation::allocate(
+        let record = NativeDeviceAllocation::allocate_shared(
             runtime,
             record_bytes,
             onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
@@ -547,7 +547,7 @@ impl ArmedTelemetry {
     }
 
     pub(crate) fn device_graph_resource(&self) -> DeviceGraphResource {
-        GraphDeviceAllocation::device_graph_resource(&self.record)
+        NativeDeviceAllocation::device_graph_resource(&self.record)
     }
 }
 
