@@ -1491,15 +1491,9 @@ impl CudaExecutionProvider {
     ) -> Result<Self> {
         validate_offload_policy(&offload_policy)?;
         let runtime = Arc::new(CudaRuntime::new(ordinal)?);
-        // B6.2: thread the process governor into the CSA telemetry surface so
-        // every CSA device state-group reservation charges the one accounting
-        // authority (`MemoryGovernor::used(Tier::Device)`) instead of a private
-        // ledger. Without a governor the surface uses an unlimited reference
-        // governor, keeping the disarmed path byte-identical.
-        let csa_metrics = Arc::new(match governor.as_ref() {
-            Some(governor) => CsaMetrics::with_governor(Arc::clone(governor)),
-            None => CsaMetrics::default(),
-        });
+        // CSA telemetry has no allocation authority; its scratch uses the same
+        // caller workspace owner/admission/settlement as other kernels.
+        let csa_metrics = Arc::new(CsaMetrics::default());
         let artifact_provider_id = issue_artifact_provider_id()?;
         let route_telemetry_registry = Arc::new(
             crate::kernels::qmoe::RouteTelemetrySourceRegistry::new(route_residency_config),
