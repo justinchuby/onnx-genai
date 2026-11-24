@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
 use onnx_runtime_ep_api::{
-    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,
+    DeviceGraphResource, DevicePtrMut, EpError, Kernel, KernelFactory, Result, TensorMut,
+    TensorView, ViewOutput, WorkspaceLayout, WorkspaceView,
 };
 use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
 
@@ -939,6 +940,64 @@ fn slice_plan(
     Ok(plan)
 }
 
+/// The two tables are read together and share one physical lifetime. This
+/// invocation-local description owns no device memory or cached binding state.
+struct SliceMetadataPayload {
+    layout: WorkspaceLayout<2>,
+    values: Vec<u64>,
+}
+
+impl SliceMetadataPayload {
+    fn layout_for(rank: usize) -> Result<WorkspaceLayout<2>> {
+        let table = std::alloc::Layout::array::<u64>(rank.max(1)).map_err(|_| {
+            EpError::KernelFailed(format!(
+                "cuda_ep Slice: metadata rank {rank} exceeds addressable u64 table capacity; reduce the prepared tensor rank"
+            ))
+        })?;
+        WorkspaceLayout::new([table; 2]).map_err(|source| EpError::Backend {
+            operation: "plan CUDA Slice metadata tables",
+            source: Box::new(source),
+        })
+    }
+
+    fn new(dims: &[usize], strides: &[i64]) -> Result<Self> {
+        if dims.len() != strides.len() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Slice: metadata dimensions rank {} differs from signed-strides rank {}; rebuild both tables from the same slice plan",
+                dims.len(),
+                strides.len()
+            )));
+        }
+        let layout = Self::layout_for(dims.len())?;
+        let mut values = Vec::with_capacity(layout.bytes() / std::mem::size_of::<u64>());
+        if dims.is_empty() {
+            values.extend([0, 0]);
+        } else {
+            values.extend(dims.iter().map(|&value| value as u64));
+            values.extend(strides.iter().map(|&value| value as u64));
+        }
+        Ok(Self { layout, values })
+    }
+
+    fn pointers(&self, metadata: &PersistentMetadata) -> Result<(CUdeviceptr, CUdeviceptr)> {
+        let ptr = metadata.ptr("Slice")?;
+        let [dims, strides] = self
+            .layout
+            .bind(Some(WorkspaceView::new(
+                DevicePtrMut(ptr as *mut c_void),
+                metadata.allocation_bytes(),
+            )))
+            .map_err(|source| EpError::Backend {
+                operation: "bind CUDA Slice metadata tables",
+                source: Box::new(source),
+            })?;
+        Ok((
+            cuptr(dims.ptr().0.cast_const()),
+            cuptr(strides.ptr().0.cast_const()),
+        ))
+    }
+}
+
 pub struct SliceFactory {
     pub runtime: Arc<CudaRuntime>,
 }
@@ -946,8 +1005,7 @@ impl KernelFactory for SliceFactory {
     fn create(&self, _: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(SliceKernel {
             runtime: self.runtime.clone(),
-            dims: Mutex::new(PersistentMetadata::new(self.runtime.clone())),
-            strides: Mutex::new(PersistentMetadata::new(self.runtime.clone())),
+            metadata: Mutex::new(PersistentMetadata::new(self.runtime.clone())),
             warmed_signature: Mutex::new(None),
         }))
     }
@@ -962,8 +1020,7 @@ struct SliceCaptureSignature {
 #[derive(Debug)]
 struct SliceKernel {
     runtime: Arc<CudaRuntime>,
-    dims: Mutex<PersistentMetadata>,
-    strides: Mutex<PersistentMetadata>,
+    metadata: Mutex<PersistentMetadata>,
     warmed_signature: Mutex<Option<SliceCaptureSignature>>,
 }
 impl Kernel for SliceKernel {
@@ -1040,7 +1097,6 @@ impl Kernel for SliceKernel {
             return Ok(());
         }
         let contiguous = compute_contiguous_strides(inputs[0].shape);
-        let dims = expected.iter().map(|&v| v as u64).collect::<Vec<_>>();
         let strides = plan
             .iter()
             .zip(&contiguous)
@@ -1054,21 +1110,12 @@ impl Kernel for SliceKernel {
         let func = self
             .runtime
             .nvrtc_function("movement_ops", MOVEMENT_SOURCE, "slice_bytes")?;
-        let mut dims_cache = self
-            .dims
-            .lock()
-            .map_err(|_| EpError::KernelFailed("cuda_ep Slice: dims lock was poisoned".into()))?;
-        let dims_candidate = dims_cache.stage(&dims, "Slice metadata")?;
-        let dims_ptr = dims_candidate.ptr("Slice")?;
-        let stride_bits = strides
-            .iter()
-            .map(|&value| value as u64)
-            .collect::<Vec<_>>();
-        let mut strides_cache = self.strides.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep Slice: strides lock was poisoned".into())
+        let payload = SliceMetadataPayload::new(&expected, &strides)?;
+        let mut metadata_cache = self.metadata.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep Slice: metadata lock was poisoned".into())
         })?;
-        let strides_candidate = strides_cache.stage(&stride_bits, "Slice metadata")?;
-        let strides_ptr = strides_candidate.ptr("Slice")?;
+        let metadata_candidate = metadata_cache.stage(&payload.values, "Slice metadata")?;
+        let (dims_ptr, strides_ptr) = payload.pointers(&metadata_candidate)?;
         let input_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
         let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
         let rank = expected.len() as i32;
@@ -1093,8 +1140,7 @@ impl Kernel for SliceKernel {
         }
         .map_err(|e| driver_err("launch slice_bytes", e))?;
         if !capturing {
-            *dims_cache = dims_candidate;
-            *strides_cache = strides_candidate;
+            *metadata_cache = metadata_candidate;
             *warmed_signature = Some(SliceCaptureSignature {
                 dtype: inputs[0].dtype,
                 input_shape: inputs[0].shape.to_vec(),
@@ -1108,19 +1154,14 @@ impl Kernel for SliceKernel {
         false
     }
     fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        let mut resources = Vec::with_capacity(2);
-        if let Ok(dims) = self.dims.lock()
-            && let Some(resource) = dims.device_graph_resource()
-        {
-            resources.push(resource);
-        }
-        if let Ok(strides) = self.strides.lock()
-            && let Some(resource) = strides.device_graph_resource()
-        {
-            resources.push(resource);
-        }
-        resources
+        self.metadata
+            .lock()
+            .ok()
+            .and_then(|metadata| metadata.device_graph_resource())
+            .into_iter()
+            .collect()
     }
+
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         match self.warmed_signature.lock() {
             Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
@@ -1755,6 +1796,84 @@ impl Kernel for SplitKernel {
 #[cfg(test)]
 mod metadata_tests {
     use super::*;
+
+    #[test]
+    fn slice_payload_preserves_dims_signed_strides_and_aligned_regions() {
+        let payload = SliceMetadataPayload::new(&[2, 2], &[8, -2]).unwrap();
+        assert_eq!(payload.values, [2, 2, 8, (-2i64) as u64]);
+        assert_eq!(payload.layout.bytes(), 32);
+        let mut backing = [0u64; 4];
+        let start = backing.as_mut_ptr() as usize;
+        let regions = payload
+            .layout
+            .bind(Some(WorkspaceView::new(
+                DevicePtrMut(start as *mut c_void),
+                32,
+            )))
+            .unwrap();
+        assert_eq!(regions.map(|region| region.bytes()), [16, 16]);
+        assert_eq!(
+            regions.map(|region| region.ptr().0 as usize - start),
+            [0, 16]
+        );
+        let signed = persistent_metadata_payload(&payload.values)
+            .chunks_exact(8)
+            .map(|bytes| i64::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(signed, [2, 2, 8, -2]);
+    }
+
+    #[test]
+    fn slice_payload_sentinels_and_complete_span_are_checked() {
+        let payload = SliceMetadataPayload::new(&[], &[]).unwrap();
+        assert_eq!(payload.values, [0, 0]);
+        assert_eq!(payload.layout.bytes(), 16);
+        let mut backing = [0u64; 2];
+        let ptr = DevicePtrMut(backing.as_mut_ptr().cast());
+        assert_eq!(
+            payload
+                .layout
+                .bind(Some(WorkspaceView::new(ptr, 16)))
+                .unwrap()
+                .map(|region| region.bytes()),
+            [8, 8]
+        );
+        for offered in [
+            None,
+            Some(WorkspaceView::new(ptr, 15)),
+            Some(WorkspaceView::new(
+                DevicePtrMut(ptr.0.cast::<u8>().wrapping_add(1).cast()),
+                16,
+            )),
+        ] {
+            assert!(payload.layout.bind(offered).is_err());
+        }
+        let error = SliceMetadataPayload::new(&[2, 3], &[1])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("dimensions rank 2")
+                && error.contains("signed-strides rank 1")
+                && error.contains("same slice plan")
+        );
+    }
+
+    #[test]
+    fn slice_payload_rejects_individual_and_composite_layout_overflow() {
+        let message = SliceMetadataPayload::layout_for(usize::MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("Slice") && message.contains("reduce the prepared tensor rank"));
+        let message = SliceMetadataPayload::layout_for(isize::MAX as usize / 8)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("plan CUDA Slice metadata")
+                && message.contains("addressable")
+                && message.contains("reduce the prepared shape")
+        );
+    }
 
     #[test]
     fn persistent_payload_preserves_initialized_scalar_and_signed_bits() {

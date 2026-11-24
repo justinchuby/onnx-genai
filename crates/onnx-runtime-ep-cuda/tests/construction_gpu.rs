@@ -1725,6 +1725,7 @@ fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop_gpu() {
 fn slice_captured_metadata_outlives_rewarm_and_kernel_drop() {
     let ep = require_cuda();
     let runtime = ep.runtime();
+    runtime.set_defer_eager_sync(true);
     let device = ep.device_id();
     let a_data_shape = [3usize, 4];
     let a_output_shape = [2usize, 2];
@@ -1800,16 +1801,55 @@ fn slice_captured_metadata_outlives_rewarm_and_kernel_drop() {
         )
     };
 
+    let cold_allocations = runtime.allocation_counts();
+    let cold_transfers = runtime.transfer_counts();
     run_a().unwrap();
+    assert_eq!(
+        runtime.allocation_counts().allocations,
+        cold_allocations.allocations + 1,
+        "Slice tables must share one cold owner"
+    );
+    assert_eq!(
+        runtime.transfer_counts().host_to_device,
+        cold_transfers.host_to_device + 1,
+        "Slice tables must share one cold upload"
+    );
+    let warm_allocations = runtime.allocation_counts();
+    let warm_transfers = runtime.transfer_counts();
+    let warm_syncs = runtime.forced_synchronization_count();
+    for _ in 0..8 {
+        run_a().unwrap();
+    }
+    assert_eq!(runtime.allocation_counts(), warm_allocations);
+    assert_eq!(
+        runtime.transfer_counts().host_to_device,
+        warm_transfers.host_to_device
+    );
+    assert_eq!(
+        runtime.transfer_counts().device_to_host,
+        warm_transfers.device_to_host + 32,
+        "eager Slice still validates its four dynamic bounds tensors each time"
+    );
+    assert_eq!(
+        runtime.forced_synchronization_count(),
+        warm_syncs + 32,
+        "fixed metadata must add no drain beyond the four control D2H barriers per call"
+    );
     let mut a_resource_ids = kernel
         .device_graph_resources()
         .into_iter()
         .map(|resource| resource.identity())
         .collect::<Vec<_>>();
     a_resource_ids.sort_unstable();
-    assert_eq!(a_resource_ids.len(), 2);
+    assert_eq!(a_resource_ids.len(), 1);
     runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    let recording_transfers = runtime.transfer_counts();
     run_a().unwrap();
+    assert_eq!(
+        runtime.transfer_counts(),
+        recording_transfers,
+        "capture must reuse the warmed complete payload without control readback or upload"
+    );
     runtime.end_graph_capture().unwrap();
 
     let b_data_shape = [2usize, 6];
@@ -1857,8 +1897,8 @@ fn slice_captured_metadata_outlives_rewarm_and_kernel_drop() {
         )
     }))
     .collect::<Vec<_>>();
-    kernel
-        .execute(
+    let mut run_b = || {
+        kernel.execute(
             &b_inputs,
             &mut [TensorMut::new(
                 DevicePtrMut(b_output_buffer.as_mut_ptr()),
@@ -1868,19 +1908,59 @@ fn slice_captured_metadata_outlives_rewarm_and_kernel_drop() {
                 device,
             )],
         )
-        .unwrap();
+    };
+    #[cfg(feature = "gpu-tests")]
+    {
+        runtime.fail_warm_transaction_at_for_test(1);
+        assert!(
+            run_b()
+                .unwrap_err()
+                .to_string()
+                .contains("injected staged warm-cache failure after Slice metadata")
+        );
+        let retained = kernel
+            .device_graph_resources()
+            .into_iter()
+            .map(|resource| resource.identity())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retained, a_resource_ids,
+            "failed combined upload must retain the entire original payload"
+        );
+        assert!(kernel.cuda_graph_compatible());
+    }
+    let allocations_before_rewarm = runtime.allocation_counts().allocations;
+    let hits_before_rewarm = runtime.raw_pool_hits();
+    let transfers_before_rewarm = runtime.transfer_counts();
+    let syncs_before_rewarm = runtime.forced_synchronization_count();
+    run_b().unwrap();
+    assert_eq!(
+        (runtime.allocation_counts().allocations - allocations_before_rewarm)
+            + (runtime.raw_pool_hits() - hits_before_rewarm),
+        1,
+        "rewarm must acquire one owner from the pool or driver"
+    );
+    assert_eq!(
+        runtime.transfer_counts().host_to_device,
+        transfers_before_rewarm.host_to_device + 1
+    );
+    assert_eq!(
+        runtime.forced_synchronization_count(),
+        syncs_before_rewarm + 5,
+        "rewarm has four unchanged control-read barriers plus one payload retirement drain"
+    );
     let mut b_resource_ids = kernel
         .device_graph_resources()
         .into_iter()
         .map(|resource| resource.identity())
         .collect::<Vec<_>>();
     b_resource_ids.sort_unstable();
-    assert_eq!(b_resource_ids.len(), 2);
+    assert_eq!(b_resource_ids.len(), 1);
     assert!(
         a_resource_ids
             .iter()
             .all(|identity| !b_resource_ids.contains(identity)),
-        "both Slice metadata allocations must be independently replaced"
+        "Slice dimensions and signed strides must be replaced as one payload"
     );
 
     drop(kernel);
@@ -1896,10 +1976,12 @@ fn slice_captured_metadata_outlives_rewarm_and_kernel_drop() {
     let counts_before_reset = runtime.allocation_counts();
     let pooled_before_reset = runtime.raw_pool_retained_bytes();
     assert!(runtime.reset_graph().unwrap());
-    assert!(
-        runtime.allocation_counts().frees >= counts_before_reset.frees + 2
-            || runtime.raw_pool_retained_bytes() > pooled_before_reset,
-        "reset must release both Slice metadata owners retained by the graph"
+    let driver_frees = runtime.allocation_counts().frees - counts_before_reset.frees;
+    let retained = runtime.raw_pool_retained_bytes() - pooled_before_reset;
+    assert_eq!(
+        driver_frees * 512 + retained,
+        512,
+        "graph retirement must return exactly one 512-byte artifact class, either to the driver or existing pool"
     );
 
     ep.deallocate(a_data_buffer).unwrap();
