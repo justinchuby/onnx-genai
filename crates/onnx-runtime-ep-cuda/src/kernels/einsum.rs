@@ -2079,13 +2079,14 @@ impl Kernel for EinsumKernel {
         _metadata: &[TensorMetadata<'_>],
         _output_metadata: &[OutputMetadata<'_>],
         _cached: Option<WorkspacePreparation>,
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspaceExecutionPreparation> {
         self.prepare_workspace_for_request(
             inputs,
             outputs,
             EinsumRouteOverride::Auto,
             plan::DEFAULT_MEMORY_CEILING_BYTES,
         )
+        .map(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready)
     }
 
     fn view_outputs(

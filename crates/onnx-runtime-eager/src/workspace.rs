@@ -137,60 +137,50 @@ impl PreparedKernel {
             .iter()
             .map(onnx_runtime_ep_api::OutputMetadata::from_view)
             .collect();
-        let requirement = self.kernel.workspace_requirement_for_execution(
+        let preparation = self.kernel.workspace_requirement_for_execution(
             inputs,
             outputs,
             &metadata,
             &output_metadata,
             None,
         )?;
-        if requirement.bytes == 0 {
-            self.kernel.execute_with_workspace(inputs, outputs, None)?;
-            return Ok(());
-        }
-        match requirement.lifetime {
-            WorkspaceLifetime::StepScoped => {
-                let mut owner = WorkspaceOwner::allocate(provider, requirement)?;
-                // The registration witness proves completion on both success
-                // and error, so returning this owner to the pool is now safe.
-                let execution = (|| -> Result<()> {
-                    let view = owner.view(requirement)?;
-                    self.kernel
-                        .execute_with_workspace(inputs, outputs, Some(view))?;
-                    Ok(())
-                })();
-                let release = owner.release();
-                match (execution, release) {
-                    (Ok(()), Ok(())) => Ok(()),
-                    (Err(error), Ok(())) => Err(error),
-                    (Ok(()), Err(error)) => Err(error),
-                    (Err(execution), Err(release)) => Err(EagerError::WorkspaceRelease {
-                        op: op.into(),
-                        execution: Box::new(execution),
-                        release: Box::new(release),
-                    }),
-                }
-            }
-            WorkspaceLifetime::SessionPersistent => {
-                if self
-                    .persistent
+        let mut step = None;
+        let execution = (|| -> Result<()> {
+            let (_, workspace) = preparation.resolve(self.kernel.as_ref(), |requirement| {
+                let owner = match requirement.lifetime {
+                    WorkspaceLifetime::StepScoped => &mut step,
+                    WorkspaceLifetime::SessionPersistent => &mut self.persistent,
+                };
+                if owner
                     .as_ref()
-                    .is_none_or(|owner| !owner.fits(requirement))
+                    .is_none_or(|owner: &WorkspaceOwner| !owner.fits(requirement))
                 {
-                    if let Some(old) = self.persistent.take() {
+                    if let Some(old) = owner.take() {
                         old.release()?;
                     }
-                    self.persistent = Some(WorkspaceOwner::allocate(provider, requirement)?);
+                    *owner = Some(WorkspaceOwner::allocate(provider, requirement)?);
                 }
-                let view = self
-                    .persistent
+                owner
                     .as_mut()
-                    .expect("persistent workspace was prepared")
-                    .view(requirement)?;
-                self.kernel
-                    .execute_with_workspace(inputs, outputs, Some(view))?;
-                Ok(())
-            }
+                    .expect("nonzero workspace was prepared")
+                    .view(requirement)
+                    .map(Some)
+            })?;
+            self.kernel
+                .execute_with_workspace(inputs, outputs, workspace)?;
+            Ok(())
+        })();
+        // The synchronous registration witness also covers preparation/launch
+        // errors. Retire a step prefix on failure as well as the final backing.
+        let release = step.map_or(Ok(()), WorkspaceOwner::release);
+        match (execution, release) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(execution), Err(release)) => Err(EagerError::WorkspaceRelease {
+                op: op.into(),
+                execution: Box::new(execution),
+                release: Box::new(release),
+            }),
         }
     }
 }
@@ -275,6 +265,7 @@ mod tests {
         panic: AtomicBool,
         release_error: AtomicBool,
         short_backing: AtomicBool,
+        fail_allocation: AtomicBool,
         allocations: AtomicUsize,
         releases: AtomicUsize,
         addresses: Mutex<Vec<usize>>,
@@ -290,6 +281,7 @@ mod tests {
                 panic: AtomicBool::new(false),
                 release_error: AtomicBool::new(false),
                 short_backing: AtomicBool::new(false),
+                fail_allocation: AtomicBool::new(false),
                 allocations: AtomicUsize::new(0),
                 releases: AtomicUsize::new(0),
                 addresses: Mutex::new(Vec::new()),
@@ -418,6 +410,11 @@ mod tests {
             role: MemoryRole,
         ) -> onnx_runtime_ep_api::Result<WorkspaceAllocation> {
             self.probe.allocations.fetch_add(1, Ordering::Relaxed);
+            if self.probe.fail_allocation.swap(false, Ordering::Relaxed) {
+                return Err(EpError::KernelFailed(
+                    "injected final workspace admission failure".into(),
+                ));
+            }
             let bytes = if self.probe.short_backing.load(Ordering::Relaxed) {
                 bytes / 2
             } else {
@@ -494,6 +491,161 @@ mod tests {
         (provider, probe, books, pool, manager)
     }
 
+    struct PrefixBoundProbe {
+        probe: Arc<Probe>,
+        bound_calls: Arc<AtomicUsize>,
+        warmed: std::sync::atomic::AtomicBool,
+        failure: u8,
+    }
+    impl Kernel for PrefixBoundProbe {
+        fn execute(
+            &self,
+            _: &[TensorView],
+            _: &mut [TensorMut],
+        ) -> onnx_runtime_ep_api::Result<()> {
+            panic!("prefix probe requires prepared dispatch")
+        }
+        fn workspace_requirement_for_execution(
+            &self,
+            _: &[TensorView],
+            _: &[TensorMut],
+            _: &[TensorMetadata<'_>],
+            _: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+            _: Option<onnx_runtime_ep_api::WorkspacePreparation>,
+        ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspaceExecutionPreparation>
+        {
+            let requirement = WorkspaceRequirement {
+                bytes: if self.warmed.load(Ordering::Relaxed) {
+                    64
+                } else {
+                    16
+                },
+                alignment: 16,
+                lifetime: self.probe.lifetime,
+            };
+            Ok(if self.warmed.load(Ordering::Relaxed) {
+                onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready(requirement)
+            } else {
+                onnx_runtime_ep_api::WorkspaceExecutionPreparation::Bind(requirement)
+            })
+        }
+        fn workspace_requirement_for_bound_execution(
+            &self,
+            binding: Option<WorkspaceView>,
+        ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+            let binding = binding.expect("a real prefix is required");
+            assert_eq!(binding.bytes(), 16);
+            assert_eq!(binding.ptr().0 as usize % 16, 0);
+            self.bound_calls.fetch_add(1, Ordering::Relaxed);
+            if self.failure == 1 {
+                return Err(EpError::KernelFailed(
+                    "injected bound planning failure".into(),
+                ));
+            }
+            if self.failure == 2 {
+                self.probe.fail_allocation.store(true, Ordering::Relaxed);
+            }
+            Ok(WorkspaceRequirement {
+                bytes: 64,
+                alignment: 16,
+                lifetime: self.probe.lifetime,
+            })
+        }
+        fn execute_with_workspace(
+            &self,
+            inputs: &[TensorView],
+            outputs: &mut [TensorMut],
+            workspace: Option<WorkspaceView>,
+        ) -> onnx_runtime_ep_api::Result<()> {
+            ProbeKernel(self.probe.clone()).execute_with_workspace(inputs, outputs, workspace)?;
+            self.warmed.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn bound_workspace_eager_grows_one_owner_then_skips_warm_binding_and_quota() {
+        let (provider, probe, books, pool, _manager) =
+            fixture(WorkspaceLifetime::SessionPersistent);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut kernel = PreparedKernel::new(Box::new(PrefixBoundProbe {
+            probe: probe.clone(),
+            bound_calls: calls.clone(),
+            warmed: false.into(),
+            failure: 0,
+        }));
+        kernel
+            .execute(&provider, "PrefixBound", &[], &mut [])
+            .unwrap();
+        assert_eq!(probe.allocations.load(Ordering::Relaxed), 2);
+        assert_eq!(probe.releases.load(Ordering::Relaxed), 1);
+        let callbacks = books.callbacks();
+        for _ in 0..8 {
+            kernel
+                .execute(&provider, "PrefixBound", &[], &mut [])
+                .unwrap();
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(books.callbacks(), callbacks);
+        drop(kernel);
+        assert_eq!(probe.releases.load(Ordering::Relaxed), 2);
+        pool.trim_idle(4096).unwrap();
+        assert_eq!(books.inner.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn bound_workspace_eager_retires_prefix_on_bound_and_final_admission_failure() {
+        for failure in [1, 2] {
+            let (provider, probe, _books, pool, _manager) = fixture(WorkspaceLifetime::StepScoped);
+            let mut kernel = PreparedKernel::new(Box::new(PrefixBoundProbe {
+                probe: probe.clone(),
+                bound_calls: Default::default(),
+                warmed: false.into(),
+                failure,
+            }));
+            let message = kernel
+                .execute(&provider, "PrefixBound", &[], &mut [])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains(if failure == 1 {
+                    "bound planning failure"
+                } else {
+                    "final workspace admission failure"
+                }),
+                "{message}"
+            );
+            assert_eq!(probe.releases.load(Ordering::Relaxed), 1);
+            drop(kernel);
+            assert_eq!(probe.releases.load(Ordering::Relaxed), 1);
+            pool.trim_idle(4096).unwrap();
+        }
+    }
+
+    #[test]
+    fn bound_workspace_eager_preserves_bound_failure_and_consuming_release_failure() {
+        let (provider, probe, _, _, _manager) = fixture(WorkspaceLifetime::StepScoped);
+        probe.release_error.store(true, Ordering::Relaxed);
+        let mut kernel = PreparedKernel::new(Box::new(PrefixBoundProbe {
+            probe: probe.clone(),
+            bound_calls: Default::default(),
+            warmed: false.into(),
+            failure: 1,
+        }));
+        let message = kernel
+            .execute(&provider, "PrefixBound", &[], &mut [])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("bound planning failure")
+                && message.contains("consuming workspace release failure"),
+            "{message}"
+        );
+        assert_eq!(probe.releases.load(Ordering::Relaxed), 1);
+        drop(kernel);
+        assert_eq!(probe.releases.load(Ordering::Relaxed), 1);
+    }
+
     struct OutputBoundProbe(Arc<Probe>);
     impl Kernel for OutputBoundProbe {
         fn execute(
@@ -559,7 +711,8 @@ mod tests {
             _: &[TensorMetadata<'_>],
             metadata: &[onnx_runtime_ep_api::OutputMetadata<'_>],
             cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
-        ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+        ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspaceExecutionPreparation>
+        {
             assert!(cached.is_none());
             let [output] = outputs else {
                 return Err(EpError::KernelFailed(
@@ -574,11 +727,13 @@ mod tests {
             self.origin.store(origin, Ordering::Relaxed);
             let bytes = if output.byte_offset == 0 { 64 } else { 80 };
             self.probe.bytes.store(bytes, Ordering::Relaxed);
-            Ok(WorkspaceRequirement {
-                bytes: bytes as u64,
-                alignment: 16,
-                lifetime: WorkspaceLifetime::SessionPersistent,
-            })
+            Ok(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready(
+                WorkspaceRequirement {
+                    bytes: bytes as u64,
+                    alignment: 16,
+                    lifetime: WorkspaceLifetime::SessionPersistent,
+                },
+            ))
         }
         fn execute_with_workspace(
             &self,

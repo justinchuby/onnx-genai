@@ -33,7 +33,9 @@ impl PreparedKernel {
             .collect();
         let req = kernel
             .workspace_requirement_for_execution(inputs, &[], &metadata, outputs, None)
-            .expect("benchmark workspace planning must succeed");
+            .expect("benchmark workspace planning must succeed")
+            .require_ready()
+            .expect("CPU benchmark plan must be ready");
         assert!(req.alignment <= std::mem::align_of::<u128>());
         let bytes = usize::try_from(req.bytes).expect("benchmark workspace must be addressable");
         Self {

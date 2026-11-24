@@ -49,7 +49,9 @@ pub fn runtime_workspace_requirement(
         .iter()
         .map(|input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()))
         .collect::<Vec<_>>();
-    kernel.workspace_requirement_for_execution(inputs, output_views, &metadata, outputs, None)
+    kernel
+        .workspace_requirement_for_execution(inputs, output_views, &metadata, outputs, None)?
+        .require_ready()
 }
 
 /// Ensure `workspace` satisfies `requirement`, reusing or replacing it through
@@ -97,8 +99,16 @@ pub fn prepare_kernel_workspace(
         .iter()
         .map(onnx_runtime_ep_api::OutputMetadata::from_view)
         .collect::<Vec<_>>();
-    let requirement = runtime_workspace_requirement(kernel, inputs, &output_metadata, outputs)?;
-    prepare_workspace(ep, requirement, workspace)
+    let metadata = inputs
+        .iter()
+        .map(|input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()))
+        .collect::<Vec<_>>();
+    kernel
+        .workspace_requirement_for_execution(inputs, outputs, &metadata, &output_metadata, None)?
+        .resolve(kernel, |requirement| {
+            prepare_workspace(ep, requirement, workspace)
+        })
+        .map(|(_, view)| view)
 }
 
 /// Execute one kernel through the same prepared-workspace path the session

@@ -17645,7 +17645,7 @@ impl Kernel for OutputWorkspaceProbeKernel {
         metadata: &[TensorMetadata<'_>],
         facts: &[OutputMetadata<'_>],
         cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
-    ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspaceExecutionPreparation> {
         if self
             .failure
             .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
@@ -17660,7 +17660,8 @@ impl Kernel for OutputWorkspaceProbeKernel {
                 Some(preparation) => preparation,
                 None => self.workspace_requirement(metadata, facts)?,
             }
-            .require_ready();
+            .require_ready()
+            .map(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready);
         }
         assert!(
             !outputs.is_empty(),
@@ -17683,11 +17684,13 @@ impl Kernel for OutputWorkspaceProbeKernel {
                 .map(OutputMetadata::into_owned)
                 .collect(),
         );
-        Ok(WorkspaceRequirement {
-            bytes: self.bytes(&actual)?,
-            alignment: 8,
-            ..WorkspaceRequirement::NONE
-        })
+        Ok(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready(
+            WorkspaceRequirement {
+                bytes: self.bytes(&actual)?,
+                alignment: 8,
+                ..WorkspaceRequirement::NONE
+            },
+        ))
     }
     fn execute(&self, _: &[TensorView], _: &mut [TensorMut]) -> onnx_runtime_ep_api::Result<()> {
         Err(EpError::KernelFailed(
@@ -17737,6 +17740,146 @@ impl Kernel for OutputWorkspaceProbeKernel {
         Ok(())
     }
 }
+struct PrefixBoundOutputKernel {
+    inner: OutputWorkspaceProbeKernel,
+    final_requirement: std::sync::Mutex<Option<WorkspaceRequirement>>,
+    warmed: AtomicBool,
+}
+impl Kernel for PrefixBoundOutputKernel {
+    fn workspace_requirement(
+        &self,
+        _: &[TensorMetadata<'_>],
+        _: &[OutputMetadata<'_>],
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspacePreparation> {
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Deferred)
+    }
+    fn workspace_requirement_for_execution(
+        &self,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+        metadata: &[TensorMetadata<'_>],
+        facts: &[OutputMetadata<'_>],
+        cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspaceExecutionPreparation> {
+        let requirement = self
+            .inner
+            .workspace_requirement_for_execution(inputs, outputs, metadata, facts, cached)?
+            .require_ready()?;
+        if self.warmed.load(Ordering::Relaxed) {
+            return Ok(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready(
+                requirement,
+            ));
+        }
+        *self.final_requirement.lock().unwrap() = Some(requirement);
+        Ok(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Bind(
+            WorkspaceRequirement {
+                bytes: requirement.bytes / 2,
+                ..requirement
+            },
+        ))
+    }
+    fn workspace_requirement_for_bound_execution(
+        &self,
+        binding: Option<WorkspaceView>,
+    ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+        let final_requirement = self.final_requirement.lock().unwrap().unwrap();
+        assert!(binding.is_some_and(|view| view.bytes() as u64 >= final_requirement.bytes / 2));
+        if self
+            .inner
+            .failure
+            .compare_exchange(7, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Err(EpError::KernelFailed(
+                "forced bound workspace planning failure; retry preparation".into(),
+            ));
+        }
+        // Ask the existing allocator injection to reject the second admission.
+        let _ = self
+            .inner
+            .failure
+            .compare_exchange(8, 4, Ordering::SeqCst, Ordering::SeqCst);
+        Ok(final_requirement)
+    }
+    fn execute(&self, _: &[TensorView], _: &mut [TensorMut]) -> onnx_runtime_ep_api::Result<()> {
+        panic!("bound probe requires caller workspace")
+    }
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.inner
+            .execute_with_workspace(inputs, outputs, workspace)?;
+        self.warmed.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[test]
+fn bound_workspace_session_retries_failures_and_reuses_final_root_capacity() {
+    use onnx_runtime_memory_api::DeviceKey;
+    use onnx_runtime_memory_governor::{
+        HolderId, HostWorkspacePool, LeaseLedger, LedgerGovernor, MemoryGovernor,
+        ProcessMemoryManager,
+    };
+    let books = Arc::new(WorkspaceCountingAuthority(Arc::new(WorkspaceAccounting {
+        inner: LedgerGovernor::new(LeaseLedger::new_for_device(DeviceKey::HOST, 0, 4096, 0)),
+        claims: AtomicUsize::new(0),
+        returns: AtomicUsize::new(0),
+    })));
+    let manager = ProcessMemoryManager::new().unwrap();
+    let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+    let resources = onnx_runtime_ep_cpu::CpuMemoryResources::new(
+        onnx_runtime_ep_cpu::DerivedWeightMemory::governed(books.as_ref(), HolderId::new(19))
+            .unwrap(),
+        Default::default(),
+    )
+    .unwrap()
+    .with_workspace_pool(pool.clone())
+    .unwrap();
+    let ep = Arc::new(OutputWorkspaceProbeEp {
+        failure: Default::default(),
+        deferred: true,
+        cpu: CpuExecutionProvider::initialized_with_resources(resources).unwrap(),
+        plans: Default::default(),
+    });
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([3]));
+    graph.add_output(output);
+    let mut node = Node::new(NodeId(0), "OutputWorkspaceProbe", vec![], vec![output]);
+    node.attributes
+        .insert("bound_workspace".into(), Attribute::Int(1));
+    graph.insert_node(node);
+    let mut executor =
+        Executor::build(graph, Arc::new(WeightStore::new()), ep.clone(), None).unwrap();
+    for (failure, expected) in [
+        (7, "bound workspace planning failure"),
+        (8, "workspace admission failure"),
+    ] {
+        ep.failure.store(failure, Ordering::SeqCst);
+        let message = executor.run(&[]).unwrap_err().to_string();
+        assert!(message.contains(expected), "{message}");
+    }
+    assert_eq!(executor.run(&[]).unwrap()[0].as_bytes(), &[0x5A; 12]);
+    let callbacks = books.callbacks();
+    ep.failure.store(7, Ordering::SeqCst);
+    for _ in 0..8 {
+        assert_eq!(executor.run(&[]).unwrap()[0].as_bytes(), &[0x5A; 12]);
+    }
+    assert_eq!(
+        ep.failure.load(Ordering::SeqCst),
+        7,
+        "warm Ready must skip the bound hook"
+    );
+    assert_eq!(books.callbacks(), callbacks);
+    drop(executor);
+    pool.trim_idle(4096).unwrap();
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
 impl ExecutionProvider for OutputWorkspaceProbeEp {
     fn name(&self) -> &str {
         "output_workspace_probe"
@@ -17779,14 +17922,23 @@ impl ExecutionProvider for OutputWorkspaceProbeEp {
         opset: u64,
     ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
         if matches!(node.op_type.as_str(), "Attention" | "OutputWorkspaceProbe") {
-            Ok(Box::new(OutputWorkspaceProbeKernel {
+            let kernel = OutputWorkspaceProbeKernel {
                 deferred: self.deferred
                     && node.attr("workspace_known").and_then(Attribute::as_int) != Some(1),
                 failure: self.failure.clone(),
                 origin: AtomicUsize::new(0),
                 slots: node.outputs.iter().map(Option::is_some).collect(),
                 plans: self.plans.clone(),
-            }))
+            };
+            if node.attr("bound_workspace").and_then(Attribute::as_int) == Some(1) {
+                Ok(Box::new(PrefixBoundOutputKernel {
+                    inner: kernel,
+                    final_requirement: Default::default(),
+                    warmed: AtomicBool::new(false),
+                }))
+            } else {
+                Ok(Box::new(kernel))
+            }
         } else {
             self.cpu.get_kernel(node, shapes, opset)
         }

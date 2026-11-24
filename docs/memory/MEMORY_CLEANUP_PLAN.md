@@ -1215,7 +1215,10 @@ suballocator.
 ### Reuse the existing workspace seam
 
 `onnx-runtime-ep-api/src/kernel.rs` already supplies `workspace_requirement`,
-`workspace_requirement_for_execution` and `execute_with_workspace`.
+`workspace_requirement_for_execution` and `execute_with_workspace`. Execution
+returns Ready or Bind; only Bind uses the optional host-only
+`workspace_requirement_for_bound_execution` hook. The shared resolver uses the
+same caller owner for prefix and final admission, and permits no planning loop.
 `onnx-runtime-session/src/executor/bindings.rs` collects workspace peaks and
 `executor/dispatch.rs` passes `WorkspaceView`. Keep this single execution seam.
 An EP describes checked size/alignment/layout and consumes borrowed regions;

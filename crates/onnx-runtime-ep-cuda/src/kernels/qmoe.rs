@@ -1490,7 +1490,7 @@ impl Kernel for SharedQMoEKernel {
         metadata: &[TensorMetadata<'_>],
         output_metadata: &[OutputMetadata<'_>],
         cached: Option<WorkspacePreparation>,
-    ) -> Result<onnx_runtime_ep_api::WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspaceExecutionPreparation> {
         self.0.workspace_requirement_for_execution(
             inputs,
             outputs,

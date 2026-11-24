@@ -766,6 +766,101 @@ impl WorkspacePreparation {
     }
 }
 
+/// Execution preparation either has a complete requirement or needs one real
+/// prefix binding before it can choose its final layout/algorithm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceExecutionPreparation {
+    Ready(WorkspaceRequirement),
+    Bind(WorkspaceRequirement),
+}
+
+impl WorkspaceExecutionPreparation {
+    /// For callers that cannot bind address-dependent plans. Never treat an
+    /// unbound prefix as a complete workspace requirement.
+    pub fn require_ready(self) -> Result<WorkspaceRequirement> {
+        match self {
+            Self::Ready(requirement) => Ok(requirement),
+            Self::Bind(_) => Err(crate::EpError::KernelFailed(
+                "workspace planning requires a real prefix binding; use WorkspaceExecutionPreparation::resolve with the caller's workspace owner before executing".into(),
+            )),
+        }
+    }
+
+    /// Resolve through the caller's existing owner. Ready plans have one
+    /// admission and no bound hook; Bind plans have exactly one bound hook and
+    /// at most two admissions. Zero demand never calls `prepare`. For nonzero
+    /// demand, `prepare` supplies a validated live enclosing view from its owner.
+    ///
+    /// Preparation borrows geometry only: it may select host algorithms but may
+    /// not submit device work, upload metadata, or retain a prefix address as
+    /// live storage. Final admission may relocate the owner. A Bind kernel must
+    /// prove that final binding preserves its algorithm contract, then rebuild
+    /// parameters/metadata from that binding before executing. Kernels needing
+    /// stable addresses across admission cannot use this protocol. The caller
+    /// holds exclusive kernel ownership through preparation, both admissions,
+    /// and execution. A zero-byte prefix still declares its final lifetime and
+    /// alignment: Bind(NONE) cannot later change StepScoped to Persistent.
+    pub fn resolve<E: From<crate::EpError>>(
+        self,
+        kernel: &dyn Kernel,
+        mut prepare: impl FnMut(WorkspaceRequirement) -> std::result::Result<Option<WorkspaceView>, E>,
+    ) -> std::result::Result<(WorkspaceRequirement, Option<WorkspaceView>), E> {
+        let mut admit = |requirement: WorkspaceRequirement| {
+            if requirement.bytes == 0 {
+                Ok(None)
+            } else {
+                prepare(requirement)
+            }
+        };
+        match self {
+            Self::Ready(requirement) => Ok((requirement, admit(requirement)?)),
+            Self::Bind(prefix) => {
+                if prefix.alignment == 0 || !prefix.alignment.is_power_of_two() {
+                    return Err(crate::EpError::KernelFailed(format!(
+                        "bound workspace prefix requested invalid alignment {}; declare a nonzero power-of-two alignment before binding",
+                        prefix.alignment,
+                    )).into());
+                }
+                let prefix_layout = if prefix.bytes != 0 {
+                    let bytes = usize::try_from(prefix.bytes).map_err(|_| crate::EpError::KernelFailed(
+                        format!("bound workspace prefix {} bytes exceeds addressable capacity; reduce the workspace geometry", prefix.bytes),
+                    ))?;
+                    let layout = std::alloc::Layout::from_size_align(bytes, prefix.alignment)
+                        .map_err(|_| crate::EpError::KernelFailed(format!("bound workspace prefix {} bytes aligned to {} cannot form an addressable layout; reduce the workspace geometry or alignment", prefix.bytes, prefix.alignment)))?;
+                    Some(layout)
+                } else {
+                    None
+                };
+                let binding = admit(prefix)?;
+                let binding = match prefix_layout {
+                    Some(layout) => {
+                        let [used] = crate::WorkspaceLayout::new([layout])?.bind(binding)?;
+                        Some(used)
+                    }
+                    None => None,
+                };
+                let final_requirement =
+                    kernel.workspace_requirement_for_bound_execution(binding)?;
+                if final_requirement.lifetime != prefix.lifetime
+                    || final_requirement.bytes < prefix.bytes
+                    || final_requirement.alignment < prefix.alignment
+                    || !final_requirement.alignment.is_power_of_two()
+                {
+                    return Err(crate::EpError::KernelFailed(format!(
+                        "bound workspace refinement changed prefix {prefix:?} to incompatible final requirement {final_requirement:?}; preserve lifetime, prefix offsets and alignment, and include all prefix bytes in the final layout",
+                    )).into());
+                }
+                let final_binding = if final_requirement == prefix {
+                    binding
+                } else {
+                    admit(final_requirement)?
+                };
+                Ok((final_requirement, final_binding))
+            }
+        }
+    }
+}
+
 /// Executor-owned prepared workspace handed to a kernel for one dispatch.
 #[derive(Clone, Copy, Debug)]
 pub struct WorkspaceView {
@@ -1174,13 +1269,28 @@ pub trait Kernel: Send + KernelType {
         metadata: &[TensorMetadata<'_>],
         output_metadata: &[crate::OutputMetadata<'_>],
         cached: Option<WorkspacePreparation>,
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<WorkspaceExecutionPreparation> {
         let _ = (inputs, outputs);
         match cached {
             Some(preparation) => preparation,
             None => self.workspace_requirement(metadata, output_metadata)?,
         }
         .require_ready()
+        .map(WorkspaceExecutionPreparation::Ready)
+    }
+
+    /// Refine one staged Bind plan using an admitted prefix. The final owner
+    /// may move; preserve the prefix's layout/alignment contract and return a
+    /// complete requirement. This hook must not submit device work or upload
+    /// address-bearing metadata. Warm plans should return Ready directly from
+    /// execution preparation. Exclusive kernel ownership spans all phases.
+    fn workspace_requirement_for_bound_execution(
+        &self,
+        _workspace: Option<WorkspaceView>,
+    ) -> Result<WorkspaceRequirement> {
+        Err(crate::EpError::KernelFailed(
+            "kernel requested bound workspace preparation without implementing its binding hook; implement workspace_requirement_for_bound_execution or return a complete Ready requirement".into(),
+        ))
     }
 
     /// Execute using workspace prepared before request admission.
@@ -1633,6 +1743,8 @@ mod output_workspace_metadata_tests {
         assert_eq!(
             kernel
                 .workspace_requirement_for_execution(&[], &[], &[], &[], Some(zero))
+                .unwrap()
+                .require_ready()
                 .unwrap(),
             WorkspaceRequirement::NONE
         );
@@ -1640,6 +1752,8 @@ mod output_workspace_metadata_tests {
         assert_eq!(
             kernel
                 .workspace_requirement_for_execution(&[], &[], &[], &[], None)
+                .unwrap()
+                .require_ready()
                 .unwrap(),
             WorkspaceRequirement::NONE
         );
@@ -1683,17 +1797,17 @@ mod output_workspace_metadata_tests {
                 _: &[TensorMetadata<'_>],
                 metadata: &[OutputMetadata<'_>],
                 cached: Option<WorkspacePreparation>,
-            ) -> Result<WorkspaceRequirement> {
+            ) -> Result<WorkspaceExecutionPreparation> {
                 assert_eq!(cached, Some(WorkspacePreparation::Deferred));
                 let [output] = outputs else {
                     return Err(crate::EpError::KernelFailed("bound planner requires one actual output allocation; do not substitute unresolved geometry".into()));
                 };
                 assert_eq!(metadata, [OutputMetadata::from_view(output)]);
                 let origin = output.data.0 as usize + output.byte_offset;
-                Ok(WorkspaceRequirement {
+                Ok(WorkspaceExecutionPreparation::Ready(WorkspaceRequirement {
                     bytes: origin.trailing_zeros() as u64,
                     ..WorkspaceRequirement::NONE
-                })
+                }))
             }
         }
         let mut backing = [0u64; 4];
@@ -1713,6 +1827,8 @@ mod output_workspace_metadata_tests {
         assert!(preparation.require_ready().is_err());
         let requirement = kernel
             .workspace_requirement_for_execution(&[], &[output], &[], &metadata, Some(preparation))
+            .unwrap()
+            .require_ready()
             .unwrap();
         assert_eq!(requirement.bytes, expected);
         assert!(
@@ -1779,6 +1895,8 @@ mod output_workspace_metadata_tests {
             OutputBound
                 .workspace_requirement_for_execution(&[], &[], &[], &outputs, None)
                 .unwrap()
+                .require_ready()
+                .unwrap()
                 .bytes,
             60
         );
@@ -1793,5 +1911,236 @@ mod output_workspace_metadata_tests {
                 .workspace_requirement_for_execution(&[], &[], &[], &unknown, None)
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod bound_workspace_tests {
+    use super::*;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct BoundProbe {
+        final_requirement: WorkspaceRequirement,
+        bindings: Mutex<Vec<Option<(usize, usize)>>>,
+        fail: bool,
+    }
+    impl Kernel for BoundProbe {
+        fn execute(&self, _: &[TensorView], _: &mut [TensorMut]) -> Result<()> {
+            panic!("preparation must not execute a kernel")
+        }
+        fn workspace_requirement_for_bound_execution(
+            &self,
+            binding: Option<WorkspaceView>,
+        ) -> Result<WorkspaceRequirement> {
+            self.bindings
+                .lock()
+                .unwrap()
+                .push(binding.map(|view| (view.ptr().0 as usize, view.bytes())));
+            if self.fail {
+                return Err(crate::EpError::KernelFailed(
+                    "injected bound planner failure; retry preparation".into(),
+                ));
+            }
+            Ok(self.final_requirement)
+        }
+    }
+    fn requirement(bytes: u64) -> WorkspaceRequirement {
+        WorkspaceRequirement {
+            bytes,
+            alignment: 16,
+            lifetime: WorkspaceLifetime::SessionPersistent,
+        }
+    }
+    fn probe(final_requirement: WorkspaceRequirement) -> BoundProbe {
+        BoundProbe {
+            final_requirement,
+            bindings: Default::default(),
+            fail: false,
+        }
+    }
+
+    #[test]
+    fn bound_workspace_protocol_has_one_hook_and_at_most_two_admissions() {
+        for (prefix_bytes, final_bytes, expected_admissions) in
+            [(0, 0, 0), (0, 64, 1), (16, 16, 1), (16, 64, 2)]
+        {
+            let kernel = probe(requirement(final_bytes));
+            let mut prefix = [0u128; 4];
+            let mut final_backing = [0u128; 4];
+            let mut calls = 0;
+            let (resolved, view) = WorkspaceExecutionPreparation::Bind(requirement(prefix_bytes))
+                .resolve::<crate::EpError>(&kernel, |_req| {
+                    calls += 1;
+                    let pointer = if calls == 1 && prefix_bytes != 0 {
+                        prefix.as_mut_ptr()
+                    } else {
+                        final_backing.as_mut_ptr()
+                    };
+                    Ok(Some(WorkspaceView::new(
+                        crate::DevicePtrMut(pointer.cast()),
+                        64,
+                    )))
+                })
+                .unwrap();
+            assert_eq!(resolved, requirement(final_bytes));
+            assert_eq!(calls, expected_admissions);
+            let bindings = kernel.bindings.lock().unwrap();
+            assert_eq!(bindings.len(), 1);
+            if prefix_bytes == 0 {
+                assert_eq!(bindings[0], None);
+            } else {
+                assert_eq!(
+                    bindings[0],
+                    Some((prefix.as_ptr() as usize, prefix_bytes as usize))
+                );
+            }
+            if final_bytes == 0 {
+                assert!(view.is_none());
+            } else {
+                assert_eq!(view.unwrap().bytes(), final_bytes as usize);
+                if calls == 2 {
+                    assert_eq!(
+                        view.unwrap().ptr().0 as usize,
+                        final_backing.as_ptr() as usize
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ready_workspace_never_calls_bound_hook_and_zero_never_admits() {
+        for bytes in [0, 64] {
+            let kernel = probe(requirement(999));
+            let calls = AtomicUsize::new(0);
+            let mut backing = [0u128; 4];
+            WorkspaceExecutionPreparation::Ready(requirement(bytes))
+                .resolve::<crate::EpError>(&kernel, |_| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(Some(WorkspaceView::new(
+                        crate::DevicePtrMut(backing.as_mut_ptr().cast()),
+                        64,
+                    )))
+                })
+                .unwrap();
+            assert_eq!(calls.load(Ordering::Relaxed), usize::from(bytes != 0));
+            assert!(kernel.bindings.lock().unwrap().is_empty());
+        }
+        let error = WorkspaceExecutionPreparation::Bind(requirement(16))
+            .require_ready()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("real prefix binding"), "{error}");
+    }
+
+    #[test]
+    fn bound_workspace_rejects_incompatible_final_contract_before_second_admission() {
+        for final_requirement in [
+            requirement(8),
+            WorkspaceRequirement {
+                alignment: 8,
+                ..requirement(64)
+            },
+            WorkspaceRequirement {
+                alignment: 24,
+                ..requirement(64)
+            },
+            WorkspaceRequirement {
+                lifetime: WorkspaceLifetime::StepScoped,
+                ..requirement(64)
+            },
+        ] {
+            let kernel = probe(final_requirement);
+            let mut backing = [0u128; 4];
+            let mut calls = 0;
+            let error = WorkspaceExecutionPreparation::Bind(requirement(16))
+                .resolve::<crate::EpError>(&kernel, |_| {
+                    calls += 1;
+                    Ok(Some(WorkspaceView::new(
+                        crate::DevicePtrMut(backing.as_mut_ptr().cast()),
+                        64,
+                    )))
+                })
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("incompatible final requirement")
+                    && error.contains("preserve lifetime"),
+                "{error}"
+            );
+            assert_eq!(calls, 1);
+            assert_eq!(kernel.bindings.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn bound_workspace_rejects_invalid_prefix_layout_before_admission() {
+        for prefix in [
+            WorkspaceRequirement {
+                alignment: 0,
+                ..requirement(16)
+            },
+            WorkspaceRequirement {
+                alignment: 24,
+                ..requirement(16)
+            },
+            requirement(u64::MAX),
+        ] {
+            let kernel = probe(requirement(64));
+            let error = WorkspaceExecutionPreparation::Bind(prefix)
+                .resolve::<crate::EpError>(&kernel, |_| {
+                    panic!("invalid prefix must not call admission")
+                })
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("bound workspace prefix")
+                    && (error.contains("alignment") || error.contains("addressable")),
+                "{error}"
+            );
+            assert!(kernel.bindings.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn bound_workspace_refuses_bad_prefix_before_planning_and_propagates_failures() {
+        let kernel = probe(requirement(64));
+        let error = WorkspaceExecutionPreparation::Bind(requirement(16))
+            .resolve::<crate::EpError>(&kernel, |_| Ok(None))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("workspace needs"), "{error}");
+        assert!(kernel.bindings.lock().unwrap().is_empty());
+        let error = WorkspaceExecutionPreparation::Bind(requirement(16))
+            .resolve::<crate::EpError>(&kernel, |_| {
+                Err(crate::EpError::KernelFailed(
+                    "injected admission failure".into(),
+                ))
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("injected admission failure"), "{error}");
+        assert!(kernel.bindings.lock().unwrap().is_empty());
+        let kernel = BoundProbe {
+            fail: true,
+            ..probe(requirement(64))
+        };
+        let mut backing = [0u128; 4];
+        let mut calls = 0;
+        let error = WorkspaceExecutionPreparation::Bind(requirement(16))
+            .resolve::<crate::EpError>(&kernel, |_| {
+                calls += 1;
+                Ok(Some(WorkspaceView::new(
+                    crate::DevicePtrMut(backing.as_mut_ptr().cast()),
+                    64,
+                )))
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("injected bound planner failure"), "{error}");
+        assert_eq!(calls, 1);
     }
 }

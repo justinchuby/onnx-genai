@@ -2377,7 +2377,7 @@ unsafe fn prepare_workspace(
         .iter()
         .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
         .collect();
-    let requirement = kernel
+    let execution_preparation = kernel
         .workspace_requirement_for_execution(
             inputs,
             output_views,
@@ -2388,6 +2388,23 @@ unsafe fn prepare_workspace(
         .map_err(|cause| {
             format!("{node_label}: execution-time workspace planning failed: {cause}")
         })?;
+    execution_preparation
+        .resolve::<onnx_runtime_ep_api::EpError>(kernel, |requirement| {
+            prepare_workspace_requirement(api, ctx, placement, lane, requirement, node_label)
+                .map_err(onnx_runtime_ep_api::EpError::KernelFailed)
+        })
+        .map(|(_, view)| view)
+        .map_err(|cause| format!("{node_label}: workspace binding failed: {cause}"))
+}
+
+fn prepare_workspace_requirement(
+    api: &ort::OrtApi,
+    ctx: *mut ort::OrtKernelContext,
+    placement: PlacementSources<'_>,
+    lane: &mut crate::workspace::WorkspaceLane,
+    requirement: onnx_runtime_ep_api::WorkspaceRequirement,
+    node_label: impl std::fmt::Display + Copy,
+) -> Result<Option<WorkspaceView>, String> {
     if requirement.bytes == 0 {
         return Ok(None);
     }

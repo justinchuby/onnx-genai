@@ -854,8 +854,9 @@ impl Kernel for MatMulKernel {
         metadata: &[TensorMetadata<'_>],
         _output_metadata: &[onnx_runtime_ep_api::OutputMetadata<'_>],
         cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspaceExecutionPreparation> {
         self.prepare_execution(inputs, outputs, metadata, cached)
+            .map(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready)
     }
 
     fn execute_with_workspace(

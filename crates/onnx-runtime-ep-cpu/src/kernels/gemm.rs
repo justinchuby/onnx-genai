@@ -307,13 +307,15 @@ impl Kernel for GemmKernel {
         metadata: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
         _cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspaceExecutionPreparation> {
         let plan = self.layout_plan(metadata, Some(inputs))?;
-        Ok(WorkspaceRequirement {
-            bytes: plan.bytes() as u64,
-            alignment: plan.alignment(),
-            ..WorkspaceRequirement::NONE
-        })
+        Ok(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready(
+            WorkspaceRequirement {
+                bytes: plan.bytes() as u64,
+                alignment: plan.alignment(),
+                ..WorkspaceRequirement::NONE
+            },
+        ))
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -786,6 +788,8 @@ mod tests {
         ];
         let request = kernel
             .workspace_requirement_for_execution(&[a.view(), b.view()], &[], &metadata, &[], None)
+            .unwrap()
+            .require_ready()
             .unwrap();
         let first = provider
             .allocate_workspace(request.bytes as usize, request.alignment, request.role())
@@ -975,6 +979,8 @@ mod tests {
                         None
                     )
                     .unwrap()
+                    .require_ready()
+                    .unwrap()
                     .bytes,
                 0
             );
@@ -992,6 +998,8 @@ mod tests {
                         &[],
                         None
                     )
+                    .unwrap()
+                    .require_ready()
                     .unwrap(),
                 bound
             );
@@ -1065,6 +1073,8 @@ mod tests {
             let view = a.view().with_byte_offset(offset);
             let requirement = kernel
                 .workspace_requirement_for_execution(&[view, b.view()], &[], &metadata, &[], None)
+                .unwrap()
+                .require_ready()
                 .unwrap();
             assert_eq!(requirement.bytes, 12);
             assert!(requirement.bytes <= bound.bytes);

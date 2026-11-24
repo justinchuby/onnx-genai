@@ -525,7 +525,7 @@ impl Kernel for WorkspaceAddKernel {
         metadata: &[TensorMetadata<'_>],
         output_metadata: &[onnx_runtime_ep_api::OutputMetadata<'_>],
         cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
-    ) -> EpResult<WorkspaceRequirement> {
+    ) -> EpResult<onnx_runtime_ep_api::WorkspaceExecutionPreparation> {
         let output = outputs.first().ok_or_else(|| {
             EpError::KernelFailed(
                 "WorkspaceAddKernel: execution-time workspace planning needs the real output binding before admission".into(),
@@ -549,6 +549,7 @@ impl Kernel for WorkspaceAddKernel {
             None => self.workspace_requirement(metadata, output_metadata)?,
         }
         .require_ready()
+        .map(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready)
     }
 
     fn execute_with_workspace(

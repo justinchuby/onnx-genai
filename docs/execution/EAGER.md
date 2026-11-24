@@ -737,9 +737,13 @@ still deferred; the implementation does not expose placeholder compatibility API
 A dispatch resolves the opset/device, constructs an ephemeral ONNX node, looks up
 or compiles its kernel, infers concrete outputs, and allocates final tensors. It
 then builds tensor views and calls `workspace_requirement_for_execution` with
-both actual inputs and their metadata. The prepared entry validates the layout,
-obtains the provider-owned scratch, and invokes `execute_with_workspace` even
-when the requirement is zero. Step ownership is returned on success, error, or
+actual input/output views and metadata. A Ready result goes directly through
+workspace admission. A Bind result first borrows its declared prefix, performs
+one host-only bound refinement, and admits the complete final requirement through
+the same owner. Final admission may move backing; address-dependent kernels must
+preserve their algorithm contract and bind final parameters before submission.
+Warm Ready results skip the bound hook. Zero bytes never request backing. The
+prepared entry then invokes `execute_with_workspace`, including zero demand. Step ownership is returned on success, error, or
 panic. Execution and consuming-release errors are both preserved; a consuming
 release is never retried. Persistent ownership survives ordinary dispatches.
 

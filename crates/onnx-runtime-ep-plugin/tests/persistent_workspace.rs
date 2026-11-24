@@ -88,7 +88,11 @@ unsafe extern "C" fn api(_: u32) -> *const ort::OrtApi {
 }
 
 struct ScratchKernel {
+    bound_warmed: AtomicBool,
     deferred: Arc<AtomicBool>,
+    bound: Arc<AtomicBool>,
+    bound_fail: Arc<AtomicBool>,
+    bound_calls: Arc<AtomicUsize>,
     requested: Arc<AtomicUsize>,
     metadata_calls: Arc<AtomicUsize>,
     refinements: Arc<AtomicUsize>,
@@ -106,7 +110,7 @@ impl Kernel for ScratchKernel {
         _: &[OutputMetadata<'_>],
     ) -> EpResult<onnx_runtime_ep_api::WorkspacePreparation> {
         self.metadata_calls.fetch_add(1, Ordering::SeqCst);
-        if self.deferred.load(Ordering::SeqCst) {
+        if self.deferred.load(Ordering::SeqCst) || self.bound.load(Ordering::SeqCst) {
             return Ok(onnx_runtime_ep_api::WorkspacePreparation::Deferred);
         }
         Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
@@ -124,17 +128,61 @@ impl Kernel for ScratchKernel {
         _: &[TensorMetadata<'_>],
         facts: &[OutputMetadata<'_>],
         cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
-    ) -> EpResult<WorkspaceRequirement> {
+    ) -> EpResult<onnx_runtime_ep_api::WorkspaceExecutionPreparation> {
         self.refinements.fetch_add(1, Ordering::SeqCst);
         assert!(outputs.is_empty() && facts.is_empty());
-        match cached.expect("ORT must carry its cached metadata preparation") {
-            onnx_runtime_ep_api::WorkspacePreparation::Ready(requirement) => Ok(requirement),
-            onnx_runtime_ep_api::WorkspacePreparation::Deferred => Ok(WorkspaceRequirement {
+        if self.bound.load(Ordering::SeqCst) {
+            let requirement = WorkspaceRequirement {
                 bytes: self.requested.load(Ordering::SeqCst) as u64,
                 alignment: 16,
                 lifetime: WorkspaceLifetime::SessionPersistent,
-            }),
+            };
+            return Ok(if self.bound_warmed.load(Ordering::SeqCst) {
+                onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready(requirement)
+            } else {
+                onnx_runtime_ep_api::WorkspaceExecutionPreparation::Bind(WorkspaceRequirement {
+                    bytes: requirement.bytes.min(16),
+                    ..requirement
+                })
+            });
         }
+        match cached.expect("ORT must carry its cached metadata preparation") {
+            onnx_runtime_ep_api::WorkspacePreparation::Ready(requirement) => Ok(
+                onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready(requirement),
+            ),
+            onnx_runtime_ep_api::WorkspacePreparation::Deferred => Ok(
+                onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready(WorkspaceRequirement {
+                    bytes: self.requested.load(Ordering::SeqCst) as u64,
+                    alignment: 16,
+                    lifetime: WorkspaceLifetime::SessionPersistent,
+                }),
+            ),
+        }
+    }
+    fn workspace_requirement_for_bound_execution(
+        &self,
+        binding: Option<WorkspaceView>,
+    ) -> EpResult<WorkspaceRequirement> {
+        let bytes = self.requested.load(Ordering::SeqCst) as u64;
+        if bytes == 0 {
+            assert!(binding.is_none());
+        } else {
+            assert!(
+                binding.is_some_and(|view| view.bytes() >= bytes.min(16) as usize
+                    && (view.ptr().0 as usize).is_multiple_of(16))
+            );
+        }
+        self.bound_calls.fetch_add(1, Ordering::SeqCst);
+        if self.bound_fail.swap(false, Ordering::SeqCst) {
+            return Err(EpError::KernelFailed(
+                "injected ORT bound planner failure; retry preparation".into(),
+            ));
+        }
+        Ok(WorkspaceRequirement {
+            bytes,
+            alignment: 16,
+            lifetime: WorkspaceLifetime::SessionPersistent,
+        })
     }
     fn execute(&self, _: &[TensorView<'_>], _: &mut [TensorMut<'_>]) -> EpResult<()> {
         Err(EpError::KernelFailed(
@@ -181,11 +229,15 @@ impl Kernel for ScratchKernel {
                 "planned post-submission failure".into(),
             ));
         }
+        self.bound_warmed.store(true, Ordering::SeqCst);
         Ok(())
     }
 }
 struct Fixture {
     deferred: Arc<AtomicBool>,
+    bound: Arc<AtomicBool>,
+    bound_fail: Arc<AtomicBool>,
+    bound_calls: Arc<AtomicUsize>,
     requested: Arc<AtomicUsize>,
     metadata_calls: Arc<AtomicUsize>,
     refinements: Arc<AtomicUsize>,
@@ -243,6 +295,9 @@ impl Fixture {
         );
         assert!(!facade.is_null());
         let deferred = Arc::new(AtomicBool::new(false));
+        let bound = Arc::new(AtomicBool::new(false));
+        let bound_fail = Arc::new(AtomicBool::new(false));
+        let bound_calls = Arc::new(AtomicUsize::new(0));
         let requested = Arc::new(AtomicUsize::new(64));
         let metadata_calls = Arc::new(AtomicUsize::new(0));
         let refinements = Arc::new(AtomicUsize::new(0));
@@ -253,6 +308,10 @@ impl Fixture {
         let panic_next = Arc::new(AtomicBool::new(false));
         let entry = CompiledKernelEntry {
             kernel: Box::new(ScratchKernel {
+                bound_warmed: AtomicBool::new(false),
+                bound: bound.clone(),
+                bound_fail: bound_fail.clone(),
+                bound_calls: bound_calls.clone(),
                 deferred: deferred.clone(),
                 requested: requested.clone(),
                 metadata_calls: metadata_calls.clone(),
@@ -274,6 +333,9 @@ impl Fixture {
         let info =
             Box::new(unsafe { &*facade.cast::<ExportedEp>() }.wrap_compiled_kernels(vec![entry]));
         Self {
+            bound,
+            bound_fail,
+            bound_calls,
             deferred,
             requested,
             metadata_calls,
@@ -638,6 +700,10 @@ fn persistent_workspace_serial_nodes_share_peak_capacity_and_one_preflight_per_c
     let mut entries = std::mem::take(&mut fixture.info.entries);
     entries.push(CompiledKernelEntry {
         kernel: Box::new(ScratchKernel {
+            bound_warmed: AtomicBool::new(false),
+            bound: fixture.bound.clone(),
+            bound_fail: fixture.bound_fail.clone(),
+            bound_calls: fixture.bound_calls.clone(),
             deferred: fixture.deferred.clone(),
             requested: Arc::new(AtomicUsize::new(128)),
             metadata_calls: Arc::new(AtomicUsize::new(0)),
@@ -759,4 +825,84 @@ fn persistent_workspace_kernel_panic_rejects_other_states_of_same_compiled_info(
     );
     fixture.release(first);
     fixture.release(second);
+}
+
+#[test]
+fn bound_workspace_ort_retires_failed_state_then_warms_replacement_without_quota() {
+    let books = Arc::new(RecordingGovernor::new_host(512));
+    let manager = ProcessMemoryManager::new().unwrap();
+    let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+    let resources = CpuMemoryResources::new(
+        DerivedWeightMemory::governed(books.as_ref(), HolderId::new(13)).unwrap(),
+        Default::default(),
+    )
+    .unwrap()
+    .with_workspace_pool(pool.clone())
+    .unwrap();
+    let mut fixture = Fixture::new(resources, true, None);
+    fixture.bound.store(true, Ordering::SeqCst);
+    fixture.bound_fail.store(true, Ordering::SeqCst);
+    let state = fixture.state();
+    assert!(!fixture.compute(state).is_null());
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    LAST_ERROR.with(|error| {
+        assert!(
+            error.borrow().contains("bound planner failure"),
+            "{}",
+            error.borrow()
+        )
+    });
+    // Preserve the bridge's existing conservative rule: every Compute error
+    // retires that state, even if this fixture failed before submission.
+    assert!(!fixture.compute(state).is_null());
+    assert_eq!(fixture.bound_calls.load(Ordering::SeqCst), 1);
+    fixture.release(state);
+    let state = fixture.state();
+    assert!(fixture.compute(state).is_null());
+    assert_eq!(fixture.bound_calls.load(Ordering::SeqCst), 2);
+    let callbacks = (books.claims(), books.releases());
+    fixture.bound_fail.store(true, Ordering::SeqCst);
+    for _ in 0..8 {
+        assert!(fixture.compute(state).is_null());
+    }
+    assert_eq!(fixture.bound_calls.load(Ordering::SeqCst), 2);
+    assert!(fixture.bound_fail.load(Ordering::SeqCst));
+    assert_eq!((books.claims(), books.releases()), callbacks);
+    fixture.release(state);
+    drop(fixture);
+    drop(pool);
+    assert_eq!(manager.process_used(Tier::Host), 0);
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn bound_workspace_ort_final_admission_failure_never_launches_and_retires_prefix() {
+    let books = Arc::new(RecordingGovernor::new_host(32));
+    let manager = ProcessMemoryManager::new().unwrap();
+    let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+    let resources = CpuMemoryResources::new(
+        DerivedWeightMemory::governed(books.as_ref(), HolderId::new(13)).unwrap(),
+        Default::default(),
+    )
+    .unwrap()
+    .with_workspace_pool(pool.clone())
+    .unwrap();
+    let mut fixture = Fixture::new(resources, true, None);
+    fixture.bound.store(true, Ordering::SeqCst);
+    let state = fixture.state();
+    assert!(!fixture.compute(state).is_null());
+    assert_eq!(fixture.bound_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    LAST_ERROR.with(|error| {
+        assert!(
+            error.borrow().contains("workspace") && error.borrow().contains("64"),
+            "{}",
+            error.borrow()
+        )
+    });
+    fixture.release(state);
+    drop(fixture);
+    drop(pool);
+    assert_eq!(manager.process_used(Tier::Host), 0);
+    assert_eq!(books.used(Tier::Host), 0);
 }
