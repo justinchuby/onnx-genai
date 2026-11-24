@@ -726,11 +726,10 @@ pub extern "C" fn nxrt_ep_nms_workspace_bytes() -> u64 {
 
 /// Number of workspace **placement resolutions** since the last reset.
 ///
-/// One resolution happens per served `StepScoped` workspace and nowhere else: a
-/// zero-byte requirement and a declined `SessionPersistent` request both return
-/// before placement is resolved. A non-zero delta across a `Run` is therefore
-/// evidence that the governed-workspace path actually served this node — the
-/// property issue #768 asks hardware to confirm.
+/// One resolution happens per served `StepScoped` workspace and nowhere else.
+/// Zero demand and provider-owned `SessionPersistent` lanes return before ORT
+/// operand placement is queried. A nonzero delta proves Step placement was
+/// resolved; this counter says nothing about Persistent admission or release.
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_ep_workspace_placement_queries() -> usize {
     onnx_runtime_ep_plugin::compute::workspace_placement_queries()
@@ -740,36 +739,6 @@ pub extern "C" fn nxrt_ep_workspace_placement_queries() -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_ep_reset_workspace_placement_queries() {
     onnx_runtime_ep_plugin::compute::reset_workspace_placement_queries()
-}
-
-#[cfg(feature = "cuda")]
-#[unsafe(no_mangle)]
-pub extern "C" fn nxrt_cuda_dsa_workspace_allocations() -> u64 {
-    onnx_runtime_ep_cuda::dsa_workspace_stats().allocations
-}
-
-#[cfg(feature = "cuda")]
-#[unsafe(no_mangle)]
-pub extern "C" fn nxrt_cuda_dsa_workspace_releases() -> u64 {
-    onnx_runtime_ep_cuda::dsa_workspace_stats().releases
-}
-
-#[cfg(feature = "cuda")]
-#[unsafe(no_mangle)]
-pub extern "C" fn nxrt_cuda_dsa_workspace_live_bytes() -> u64 {
-    onnx_runtime_ep_cuda::dsa_workspace_stats().live_bytes
-}
-
-#[cfg(feature = "cuda")]
-#[unsafe(no_mangle)]
-pub extern "C" fn nxrt_cuda_dsa_workspace_last_ptr() -> u64 {
-    onnx_runtime_ep_cuda::dsa_workspace_stats().last_ptr
-}
-
-#[cfg(feature = "cuda")]
-#[unsafe(no_mangle)]
-pub extern "C" fn nxrt_cuda_reset_dsa_workspace_stats() -> bool {
-    onnx_runtime_ep_cuda::reset_dsa_workspace_stats()
 }
 
 #[cfg(feature = "cuda")]
@@ -806,30 +775,6 @@ pub extern "C" fn nxrt_cuda_dsa_last_selection_grid_x() -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_cuda_reset_dsa_launch_stats() {
     onnx_runtime_ep_cuda::reset_dsa_launch_stats()
-}
-
-#[cfg(feature = "gpu-tests")]
-#[unsafe(no_mangle)]
-pub extern "C" fn nxrt_cuda_set_dsa_capture_replays_for_test(replays: u64) {
-    onnx_runtime_ep_cuda::set_dsa_plugin_capture_replays_for_test(replays)
-}
-
-#[cfg(feature = "gpu-tests")]
-#[unsafe(no_mangle)]
-pub extern "C" fn nxrt_cuda_dsa_capture_count_for_test() -> u64 {
-    onnx_runtime_ep_cuda::dsa_plugin_capture_stats_for_test().0
-}
-
-#[cfg(feature = "gpu-tests")]
-#[unsafe(no_mangle)]
-pub extern "C" fn nxrt_cuda_dsa_captured_replays_for_test() -> u64 {
-    onnx_runtime_ep_cuda::dsa_plugin_capture_stats_for_test().1
-}
-
-#[cfg(feature = "gpu-tests")]
-#[unsafe(no_mangle)]
-pub extern "C" fn nxrt_cuda_dsa_capture_error_for_test() -> u64 {
-    onnx_runtime_ep_cuda::dsa_plugin_capture_stats_for_test().2
 }
 
 #[cfg(test)]

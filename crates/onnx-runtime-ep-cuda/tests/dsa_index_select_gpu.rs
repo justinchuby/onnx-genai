@@ -30,15 +30,14 @@ use common::reset_capture_error_for_isolated_test;
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMetadata,
-    TensorMut, TensorView, WorkspaceView,
+    TensorMut, TensorView, WorkspaceAllocation, WorkspaceView,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::kernels::dsa_index_select::DsaIndexSelectFactory;
 use onnx_runtime_ep_cuda::runtime::cuptr;
-use onnx_runtime_ep_cuda::{
-    dsa_launch_stats, dsa_workspace_stats, reset_dsa_launch_stats, reset_dsa_workspace_stats,
-};
+#[cfg(feature = "gpu-tests")]
+use onnx_runtime_ep_cuda::{dsa_launch_stats, reset_dsa_launch_stats};
 use onnx_runtime_ir::{
     Attribute, DataType, DeviceId, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
 };
@@ -259,7 +258,7 @@ fn run_cpu(
 fn workspace_view_for(
     kernel: &dyn onnx_runtime_ep_api::Kernel,
     input_views: &[TensorView],
-    buffer: &mut Option<DeviceBuffer>,
+    buffer: &mut Option<WorkspaceAllocation>,
     ep: &CudaExecutionProvider,
 ) -> onnx_runtime_ep_api::Result<Option<WorkspaceView>> {
     let metadata = input_views
@@ -283,9 +282,9 @@ fn workspace_view_for(
         .is_none_or(|buffer| buffer.len() < bytes || buffer.alignment() < requirement.alignment)
     {
         if let Some(old) = buffer.take() {
-            ep.deallocate(old)?;
+            ep.deallocate_workspace(old)?;
         }
-        *buffer = Some(ep.allocate(bytes.max(1), requirement.alignment)?);
+        *buffer = Some(ep.allocate_workspace(bytes, requirement.alignment, requirement.role())?);
     }
     Ok(buffer
         .as_mut()
@@ -354,6 +353,21 @@ fn run_gpu_with_kernel(
     inputs: &[Option<HostTensor>],
     output_specs: &[OutputSpec],
 ) -> onnx_runtime_ep_api::Result<Vec<Vec<u8>>> {
+    let mut workspace = None;
+    let result = run_gpu_with_workspace_owner(ep, kernel, inputs, output_specs, &mut workspace);
+    if let Some(workspace) = workspace {
+        ep.deallocate_workspace(workspace)?;
+    }
+    result
+}
+
+fn run_gpu_with_workspace_owner(
+    ep: &CudaExecutionProvider,
+    kernel: &dyn onnx_runtime_ep_api::Kernel,
+    inputs: &[Option<HostTensor>],
+    output_specs: &[OutputSpec],
+    workspace_buffer: &mut Option<WorkspaceAllocation>,
+) -> onnx_runtime_ep_api::Result<Vec<Vec<u8>>> {
     let runtime = ep.runtime();
 
     let buffers = upload_inputs(ep, inputs)?;
@@ -388,8 +402,7 @@ fn run_gpu_with_kernel(
             )
         })
         .collect();
-    let mut workspace_buffer = None;
-    let workspace = workspace_view_for(kernel, &views, &mut workspace_buffer, ep)?;
+    let workspace = workspace_view_for(kernel, &views, workspace_buffer, ep)?;
     let result = kernel.execute_with_workspace(&views, &mut out_views, workspace);
     drop(out_views);
     drop(views);
@@ -411,9 +424,6 @@ fn run_gpu_with_kernel(
     for buffer in out_buffers.drain(..) {
         ep.deallocate(buffer)?;
     }
-    if let Some(buffer) = workspace_buffer {
-        ep.deallocate(buffer)?;
-    }
     result.map(|()| outputs)
 }
 
@@ -431,11 +441,6 @@ fn run_gpu_capture_replay(
     output_specs: &[OutputSpec],
     replays: usize,
 ) -> onnx_runtime_ep_api::Result<Vec<Vec<Vec<u8>>>> {
-    use cudarc::driver::sys::{
-        CUgraph, CUgraphExec, CUstreamCaptureMode, cuGraphDestroy, cuGraphExecDestroy,
-        cuGraphInstantiateWithFlags, cuGraphLaunch, cuStreamBeginCapture_v2, cuStreamEndCapture,
-    };
-
     let model = Model::new(graph);
     let kernel = ep.get_kernel(model.graph.node(node), &concrete_shapes(inputs), 1)?;
     let runtime = ep.runtime();
@@ -504,56 +509,87 @@ fn run_gpu_capture_replay(
         "DsaIndexSelect must advertise CUDA-graph capture eligibility after warmup"
     );
 
+    if let Some(full) = workspace {
+        let short = WorkspaceView::new(full.ptr(), full.bytes() - 1);
+        let misaligned = WorkspaceView::new(
+            DevicePtrMut(full.ptr().0.cast::<u8>().wrapping_add(1).cast()),
+            full.bytes(),
+        );
+        for invalid in [None, Some(short), Some(misaligned)] {
+            let error = kernel
+                .execute_with_workspace(&views, &mut make_out_views(&mut out_buffers), invalid)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("bind caller workspace"),
+                "{error}"
+            );
+            assert!(
+                !kernel.cuda_graph_compatible(),
+                "failed binding must revoke old warm proof"
+            );
+        }
+        kernel.execute_with_workspace(&views, &mut make_out_views(&mut out_buffers), workspace)?;
+        runtime.synchronize()?;
+        runtime.begin_graph_capture(&[kernel.as_ref()])?;
+        let refused =
+            kernel.execute_with_workspace(&views, &mut make_out_views(&mut out_buffers), workspace);
+        runtime.abort_graph_capture()?;
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("real workspace owner")
+        );
+        assert!(!kernel.cuda_graph_compatible());
+        kernel.execute_with_workspace(&views, &mut make_out_views(&mut out_buffers), workspace)?;
+        runtime.synchronize()?;
+    }
+
     zero_outputs(&out_buffers)?;
 
-    let stream = runtime.stream_ptr();
-    let mut graph_handle: CUgraph = std::ptr::null_mut();
-    let mut graph_exec: CUgraphExec = std::ptr::null_mut();
-
     let captured = (|| -> onnx_runtime_ep_api::Result<Vec<Vec<Vec<u8>>>> {
-        // SAFETY: `stream` is the EP's live compute stream.
-        unsafe {
-            cuStreamBeginCapture_v2(
-                stream,
-                CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )
-            .result()
-            .map_err(|error| {
-                onnx_runtime_ep_api::EpError::KernelFailed(format!(
-                    "cuStreamBeginCapture_v2: {error:?}"
-                ))
-            })?;
+        let resource = workspace_buffer
+            .as_ref()
+            .map(|owner| owner.device_graph_resource())
+            .transpose()?
+            .flatten();
+        runtime.begin_graph_capture_with_resources(
+            &[kernel.as_ref()],
+            resource.into_iter().collect(),
+        )?;
+        let record =
+            kernel.execute_with_workspace(&views, &mut make_out_views(&mut out_buffers), workspace);
+        if let Err(error) = record {
+            let _ = runtime.abort_graph_capture();
+            return Err(error);
         }
-        let mut out_views = make_out_views(&mut out_buffers);
-        let record = kernel.execute_with_workspace(&views, &mut out_views, workspace);
-        drop(out_views);
-        // Always end capture to leave the stream clean, even on error.
-        // SAFETY: `stream` is capturing; `graph_handle` is a valid out-pointer.
-        let end = unsafe { cuStreamEndCapture(stream, &mut graph_handle) }
-            .result()
-            .map_err(|error| {
-                onnx_runtime_ep_api::EpError::KernelFailed(format!("cuStreamEndCapture: {error:?}"))
-            });
-        record?;
-        end?;
-        // SAFETY: `graph_handle` is a freshly captured non-null graph.
-        unsafe { cuGraphInstantiateWithFlags(&mut graph_exec, graph_handle, 0) }
-            .result()
-            .map_err(|error| {
-                onnx_runtime_ep_api::EpError::KernelFailed(format!(
-                    "cuGraphInstantiateWithFlags: {error:?}"
-                ))
-            })?;
-
+        runtime.end_graph_capture()?;
+        drop(kernel);
+        // Graph ownership, not kernel lifetime or a borrowed pointer, keeps the
+        // caller allocation alive even after its original handle is retired.
+        let settlement = workspace_buffer
+            .as_ref()
+            .and_then(|owner| owner.managed_settlement_wait());
+        if let Some(owner) = workspace_buffer.take() {
+            ep.deallocate_workspace(owner)?;
+        }
+        if let Some(wait) = &settlement {
+            assert_ne!(
+                wait.wait(std::time::Duration::ZERO),
+                onnx_runtime_memory_governor::AllocationSettlementStatus::Released
+            );
+        }
         let mut replay_outputs = Vec::with_capacity(replays);
         for _ in 0..replays {
             zero_outputs(&out_buffers)?;
-            // SAFETY: `graph_exec` is instantiated; `stream` is the EP stream.
-            unsafe { cuGraphLaunch(graph_exec, stream) }
-                .result()
-                .map_err(|error| {
-                    onnx_runtime_ep_api::EpError::KernelFailed(format!("cuGraphLaunch: {error:?}"))
-                })?;
+            if let Some(scratch) = workspace {
+                // The graph's real pin still owns this retired caller handle's
+                // physical span. Replay must overwrite dirty scores/masks.
+                unsafe {
+                    runtime.htod(&vec![0xa5; scratch.bytes()], cuptr(scratch.ptr().0))?;
+                }
+            }
+            runtime.replay_graph()?;
             runtime.synchronize()?;
             let mut this = Vec::new();
             for (buffer, len) in out_buffers.iter().zip(&out_lens) {
@@ -566,17 +602,18 @@ fn run_gpu_capture_replay(
             }
             replay_outputs.push(this);
         }
+        runtime.reset_graph()?;
+        if let Some(wait) = settlement {
+            assert_eq!(
+                wait.wait(std::time::Duration::from_secs(30)),
+                onnx_runtime_memory_governor::AllocationSettlementStatus::Released
+            );
+        }
         Ok(replay_outputs)
     })();
 
-    if !graph_exec.is_null() {
-        // SAFETY: `graph_exec` was instantiated above and is destroyed once.
-        let _ = unsafe { cuGraphExecDestroy(graph_exec) }.result();
-    }
-    if !graph_handle.is_null() {
-        // SAFETY: `graph_handle` was captured above and is destroyed once.
-        let _ = unsafe { cuGraphDestroy(graph_handle) }.result();
-    }
+    let _ = runtime.abort_graph_capture();
+    runtime.reset_graph()?;
     drop(views);
     for buffer in buffers.into_iter().flatten() {
         ep.deallocate(buffer)?;
@@ -585,7 +622,7 @@ fn run_gpu_capture_replay(
         ep.deallocate(buffer)?;
     }
     if let Some(buffer) = workspace_buffer {
-        ep.deallocate(buffer)?;
+        ep.deallocate_workspace(buffer)?;
     }
     captured
 }
@@ -1086,39 +1123,45 @@ fn forced_small_grid_stride_executes_every_row() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn kernel_owned_workspace_is_stable_without_reallocation() {
+fn caller_workspace_is_stable_without_reallocation_and_kernel_owns_none() {
     let ep = require_cuda();
     let case = glm_case(4, 12);
     let inputs = glm_inputs(case, 0x0051_A81E);
     let (graph, node, specs) = build_node(&inputs, case);
-    let factory = DsaIndexSelectFactory {
+    let kernel = DsaIndexSelectFactory {
         runtime: ep.runtime().clone(),
-    };
-    let kernel = factory
-        .create_kernel_with_grid_limit(graph.node(node), 2)
-        .expect("create DsaIndexSelect");
-
-    let allocations_before = ep.runtime().allocation_counts().allocations;
-    run_gpu_with_kernel(&ep, &kernel, &inputs, &specs).expect("first eager run");
-    let first = kernel.workspace_snapshot();
-    assert_ne!(first.0, 0);
-    assert_eq!(first.1, 512);
-    assert_eq!(
-        ep.runtime().allocation_counts().allocations,
-        allocations_before + 1
+    }
+    .create_kernel_with_grid_limit(graph.node(node), 2)
+    .unwrap();
+    let mut workspace = None;
+    run_gpu_with_workspace_owner(&ep, &kernel, &inputs, &specs, &mut workspace).unwrap();
+    let owner = workspace.as_ref().unwrap();
+    let first = (owner.as_ptr(), owner.managed_owner().unwrap().identity());
+    let allocations = ep.runtime().allocation_counts();
+    for _ in 0..4 {
+        run_gpu_with_workspace_owner(&ep, &kernel, &inputs, &specs, &mut workspace).unwrap();
+        let owner = workspace.as_ref().unwrap();
+        assert_eq!(
+            (owner.as_ptr(), owner.managed_owner().unwrap().identity()),
+            first
+        );
+        assert_eq!(ep.runtime().allocation_counts(), allocations);
+    }
+    let settlement = workspace
+        .as_ref()
+        .unwrap()
+        .managed_settlement_wait()
+        .unwrap();
+    assert!(settlement.charged_bytes() > 0);
+    drop(kernel);
+    assert_ne!(
+        settlement.wait(std::time::Duration::ZERO),
+        onnx_runtime_memory_governor::AllocationSettlementStatus::Released
     );
-
-    run_gpu_with_kernel(&ep, &kernel, &inputs, &specs).expect("second eager run");
-    let second = kernel.workspace_snapshot();
+    ep.deallocate_workspace(workspace.take().unwrap()).unwrap();
     assert_eq!(
-        second.0, first.0,
-        "fixed-shape warm runs must reuse the exact workspace pointer"
-    );
-    assert_eq!(second.1, first.1);
-    assert_eq!(
-        ep.runtime().allocation_counts().allocations,
-        allocations_before + 1,
-        "steady-state execution must not allocate another workspace"
+        settlement.wait(std::time::Duration::from_secs(30)),
+        onnx_runtime_memory_governor::AllocationSettlementStatus::Released
     );
 }
 
@@ -1447,6 +1490,7 @@ fn supports_op_declines_malformed_nodes_at_capability_time() {
 // mask in the executor-owned SessionPersistent workspace.
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "gpu-tests")]
 struct BenchResult {
     kernel_us_median: f32,
     kernel_us_min: f32,
@@ -1464,12 +1508,14 @@ struct BenchResult {
     selection_grid_x: u64,
 }
 
+#[cfg(feature = "gpu-tests")]
 fn median_min_max(samples: &mut [f32]) -> (f32, f32, f32) {
     samples.sort_by(|a, b| a.total_cmp(b));
     let median = samples[samples.len() / 2];
     (median, samples[0], samples[samples.len() - 1])
 }
 
+#[cfg(feature = "gpu-tests")]
 fn gpu_clock_witness(phase: &str) {
     let physical_gpu = std::env::var("ONNX_GENAI_DSA_PHYSICAL_GPU").unwrap_or_else(|_| "0".into());
     let out = std::process::Command::new("nvidia-smi")
@@ -1593,6 +1639,7 @@ fn real_glm_perf_case(key_seq: usize, top_k: usize) -> Case {
     }
 }
 
+#[cfg(feature = "gpu-tests")]
 fn real_glm_perf_inputs(key_seq: usize) -> [Option<HostTensor>; 4] {
     let shape = PerfInputShape::from(real_glm_perf_case(key_seq, 2048));
     perf_inputs(shape, 0x2076_5eba ^ key_seq as u64, DataType::Float16)
@@ -1628,6 +1675,7 @@ fn real_glm_perf_controls_are_byte_identical_across_top_k() {
 
 /// Capture the single-node DsaIndexSelect graph, ramp the device for
 /// `ramp_secs`, then time `repeats` batches of `batch` captured-graph launches.
+#[cfg(feature = "gpu-tests")]
 fn bench_config(
     ep: &CudaExecutionProvider,
     label: &str,
@@ -1638,19 +1686,11 @@ fn bench_config(
     repeats: usize,
 ) -> BenchResult {
     use cudarc::driver::result::event;
-    use cudarc::driver::sys::{
-        CUevent_flags, CUgraph, CUgraphExec, CUstreamCaptureMode, cuGraphDestroy,
-        cuGraphExecDestroy, cuGraphGetNodes, cuGraphInstantiateWithFlags, cuGraphLaunch,
-        cuStreamBeginCapture_v2, cuStreamEndCapture,
-    };
+    use cudarc::driver::sys::{CUevent_flags, CUgraphExec, cuGraphLaunch};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
 
-    assert!(
-        reset_dsa_workspace_stats(),
-        "DsaIndexSelect workspace accounting must be idle before the perf run"
-    );
     reset_dsa_launch_stats();
     let setup_start = Instant::now();
     let input_digest = perf_input_digest(inputs);
@@ -1716,37 +1756,29 @@ fn bench_config(
         "kernel must advertise capture eligibility after warmup"
     );
 
-    let stream = runtime.stream_ptr();
-    let mut graph_handle: CUgraph = std::ptr::null_mut();
-    let mut graph_exec: CUgraphExec = std::ptr::null_mut();
-    // SAFETY: `stream` is the EP's live compute stream; capture is balanced by
-    // the matching `cuStreamEndCapture` below.
-    unsafe {
-        cuStreamBeginCapture_v2(
-            stream,
-            CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-        )
-        .result()
-        .expect("begin capture");
-    }
-    {
-        let mut out_views = make_out_views(&mut out_buffers);
-        let record = kernel.execute_with_workspace(&views, &mut out_views, workspace);
-        // SAFETY: `stream` is capturing; `graph_handle` is a valid out-pointer.
-        let end = unsafe { cuStreamEndCapture(stream, &mut graph_handle) }.result();
-        record.expect("captured execute");
-        end.expect("end capture");
-    }
-    // SAFETY: `graph_handle` is a freshly captured non-null graph.
-    unsafe { cuGraphInstantiateWithFlags(&mut graph_exec, graph_handle, 0) }
-        .result()
-        .expect("instantiate graph");
-    let mut graph_nodes = 0usize;
-    unsafe { cuGraphGetNodes(graph_handle, std::ptr::null_mut(), &mut graph_nodes) }
-        .result()
+    let resource = workspace_buffer
+        .as_ref()
+        .unwrap()
+        .device_graph_resource()
+        .unwrap()
+        .expect("caller workspace pin");
+    runtime
+        .begin_graph_capture_with_resources(&[kernel.as_ref()], vec![resource])
+        .expect("begin owned capture");
+    kernel
+        .execute_with_workspace(&views, &mut make_out_views(&mut out_buffers), workspace)
+        .expect("captured execute");
+    runtime.end_graph_capture().expect("end owned capture");
+    let graph_lease = runtime
+        .benchmark_graph()
+        .expect("retain raw timing graph and actual pins");
+    let graph_exec = graph_lease.raw_exec();
+    let graph_nodes = graph_lease
+        .node_count()
         .expect("count captured graph nodes");
+    let stream = runtime.stream_ptr();
     let setup_ms = setup_start.elapsed().as_secs_f64() * 1e3;
-    let workspace_bytes = dsa_workspace_stats().live_bytes;
+    let workspace_bytes = workspace.map_or(0, |view| view.bytes() as u64);
     let launch_stats = dsa_launch_stats();
 
     let launch = |exec: CUgraphExec| {
@@ -1816,9 +1848,11 @@ fn bench_config(
     unsafe {
         let _ = event::destroy(start_ev);
         let _ = event::destroy(end_ev);
-        let _ = cuGraphExecDestroy(graph_exec).result();
-        let _ = cuGraphDestroy(graph_handle).result();
     }
+    runtime
+        .reset_graph()
+        .expect("retire installed benchmark graph");
+    drop(graph_lease); // Raw launches completed; release handles and real pins first.
     drop(views);
     for buffer in buffers.into_iter().flatten() {
         ep.deallocate(buffer).expect("free input");
@@ -1827,7 +1861,7 @@ fn bench_config(
         ep.deallocate(buffer).expect("free output");
     }
     if let Some(buffer) = workspace_buffer {
-        ep.deallocate(buffer).expect("free workspace");
+        ep.deallocate_workspace(buffer).expect("free workspace");
     }
 
     let kernel_us_first = kernel_us[0];
@@ -1855,11 +1889,6 @@ fn bench_config(
         launch_stats.last_selection_grid_x,
     );
     drop(kernel);
-    assert_eq!(
-        dsa_workspace_stats().live_bytes,
-        0,
-        "perf runner must release the kernel-owned workspace"
-    );
 
     BenchResult {
         kernel_us_median: kmed,
@@ -1881,6 +1910,7 @@ fn bench_config(
 
 #[ignore = "perf probe; run explicitly: cargo test -p onnx-runtime-ep-cuda --features gpu-tests --test dsa_index_select_gpu -- --ignored --nocapture measure_dsa_index_select"]
 #[test]
+#[cfg(feature = "gpu-tests")]
 fn measure_dsa_index_select_kernel_and_host_enqueue() {
     let ep = require_cuda();
     gpu_clock_witness("start");
@@ -1983,6 +2013,7 @@ fn measure_dsa_index_select_kernel_and_host_enqueue() {
 
 #[ignore = "real GLM paired perf probe; set T=2048/8192 and order=real-first/control-first"]
 #[test]
+#[cfg(feature = "gpu-tests")]
 fn measure_dsa_index_select_real_glm_decode() {
     let key_seq = std::env::var("ONNX_GENAI_DSA_PERF_T")
         .expect("set ONNX_GENAI_DSA_PERF_T to 2048 or 8192")

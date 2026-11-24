@@ -217,21 +217,37 @@ row is approximately `O(H·D + 32·T/256 + T/256)`. Output initialization adds
 
 ### Workspace, capture, and lifetime
 
-The kernel owns persistent device scratch: one f32 score and one u8 allowed flag
-per cell, with each segment and the total allocation aligned to 256 bytes. For
-the measured decode shapes this is 10,240 B at T=2048 and 40,960 B at T=8192.
-The slot grows only outside capture; growth drains prior users before replacing
-the allocation. It is shared by native and ORT-plugin execution, stays
-pointer-stable through warmup/capture/replay, and is released with the compiled
-kernel/session (teardown evidence: 0 B live). The kernel declares no external
-workspace, allocates no KV pages, and does not compete with `onnx-genai-kv` for
-page/slot/lifetime authority.
+Scores and allowed flags now borrow one caller-funded SessionPersistent peak.
+Metadata planning reports `B*S*T*sizeof(f32)` score bytes followed by one u8 per
+cell, with each region aligned to 256 bytes; unused trailing allocation padding
+is not part of the logical requirement. Empty cells require zero scratch, while
+selection may still emit `-1` sentinels for rows with no keys. Native Session and
+the ORT adapter manage the physical owner, retained charge, completion and
+retirement through the common workspace contract. The kernel has no arena,
+allocation wrapper, mutex, private allocation statistics or KV-page authority.
 
-There is no D2H, stream synchronization, allocation, free, or NVRTC compilation
-on the captured path. `capture_support()` remains unsupported until one eager
-execution has compiled both kernels and sized the fixed-shape persistent slot.
-Capture then contains exactly two graph nodes and replay changes only device
-buffer contents.
+A fixed-shape eager pass warms both NVRTC kernels. Recording binds the complete
+caller span and requires a real allocation pin before either kernel launches;
+every call rewrites all scratch that selection reads. Failures revoke warm
+readiness. The existing eager completion barrier is preserved, with no added
+synchronization on the captured path. Capture retains the actual caller owner
+independently of kernel lifetime, and charge returns only after graph pins and
+pending work retire.
+
+CUDA correctness fixtures use the runtime's owned capture API, including replay
+after dropping the kernel and retiring the original workspace handle. The raw
+CUDA-event benchmark still submits raw graph launches for timing, but obtains
+its graph through the same owned capture path and retains a test-only graph
+lease through completion and handle destruction. It never registers a naked
+pointer or an arbitrary identity as ownership proof. Historical measurements
+below predate this ownership migration; no new throughput result is claimed.
+
+The Python ORT validation script checks real Compute, numerical parity, repeated
+execution and use of admitted caller workspace. Its old kernel-internal graph
+capture seam and private allocation counters were removed: a borrowed Compute
+view cannot manufacture an independent capture owner. Graph replay and physical
+retirement coverage lives in the caller-owning Rust GPU fixtures. These fixtures
+are compiled here; CUDA execution and performance remain unverified locally.
 
 ### Schema and capability
 

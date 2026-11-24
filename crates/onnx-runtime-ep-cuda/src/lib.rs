@@ -124,14 +124,7 @@ pub use kernels::block_quantized_moe::{
 pub use kernels::csa_checkpoint::{
     CsaAttentionMode, CsaCheckpoint, CsaCheckpointJournal, CsaCursors, CsaLayerMetrics, CsaMetrics,
 };
-pub use kernels::dsa_index_select::{
-    DsaLaunchStats, DsaWorkspaceStats, dsa_launch_stats, dsa_workspace_stats,
-    reset_dsa_launch_stats, reset_dsa_workspace_stats,
-};
-#[cfg(feature = "gpu-tests")]
-pub use kernels::dsa_index_select::{
-    dsa_plugin_capture_stats_for_test, set_dsa_plugin_capture_replays_for_test,
-};
+pub use kernels::dsa_index_select::{DsaLaunchStats, dsa_launch_stats, reset_dsa_launch_stats};
 pub use kernels::einsum::{
     CudaEinsumRoute, EinsumExecutionStats, EinsumRouteOverride, einsum_execution_stats,
     execute_einsum_with_route, execute_einsum_with_route_and_memory_ceiling,

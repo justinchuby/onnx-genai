@@ -845,6 +845,26 @@ workspace replay, native byte-exact activations with mixed statistics, and warm
 proof revocation; they are compiled here, not executed. No GPU performance
 conclusion follows from these checks.
 
+### DSA index-selection scratch uses the caller lane
+
+`DsaIndexSelect` metadata planning reports the real scores/allowed-mask composite
+instead of zero demand followed by private allocation. Two disjoint 256-aligned
+regions share one SessionPersistent root peak, with checked geometry and byte
+bounds. Zero score cells need no scratch. No per-kernel arena, mutex, budget,
+allocation-stat ledger or kernel-owned capture resource remains. Capture binds
+the complete used span and requires a real caller allocation pin before launch;
+failed execution revokes readiness. The numerical pipeline and existing eager
+completion boundary are unchanged.
+
+The caller-owning GPU fixtures verify stable owner identity, charge settlement,
+missing/short/misaligned backing, and capture/replay after kernel drop and caller
+handle retirement. Raw-event timing retains an owning graph lease around the
+existing driver launches; pin checks are never bypassed. The ORT Python script
+continues to validate Compute with admitted workspace and numerical parity,
+without claiming its borrowed kernel view can own a graph. Local Host checks
+cover layout, zero demand and typed metadata rejection. Device tests and the
+Python CUDA/ORT script require hardware and are not executed here.
+
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
 The dated audit and measurements below preserve historical evidence. The current

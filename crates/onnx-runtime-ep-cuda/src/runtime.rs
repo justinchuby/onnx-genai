@@ -28,6 +28,8 @@ use crate::blas::CublasLt;
 use crate::cudnn::CudnnBackend;
 use crate::dynamic_library::{CudaLibrary, require, wheel_cuda_include_paths};
 use crate::error::{driver_err, nvrtc_err};
+#[cfg(feature = "gpu-tests")]
+pub use crate::graph::CapturedGraphBenchmark;
 use crate::graph::CudaGraphLifecycle;
 use crate::kernel_cache;
 use onnx_runtime_cuda_memory::capture_gate;
@@ -1354,6 +1356,13 @@ impl CudaRuntime {
     /// Number of installed captured segments (1 for a whole-subgraph capture).
     pub fn graph_segment_count(&self) -> Result<usize> {
         self.graph.current_segment_count()
+    }
+
+    /// Retain real graph/resource ownership while an isolated GPU benchmark
+    /// times raw driver launches. Raw handles remain borrowed from the lease.
+    #[cfg(feature = "gpu-tests")]
+    pub fn benchmark_graph(&self) -> Result<CapturedGraphBenchmark> {
+        self.graph.benchmark_graph()
     }
 
     /// Snapshot successful primary-slot graph captures and executable launches.
