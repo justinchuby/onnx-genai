@@ -183,6 +183,8 @@ fn concrete_tensor_dtype(type_str: &str) -> Option<onnx_runtime_ir::DataType> {
         "uint4" => onnx_runtime_ir::DataType::Uint4,
         "int4" => onnx_runtime_ir::DataType::Int4,
         "float4e2m1" => onnx_runtime_ir::DataType::Float4E2M1,
+        "float6e2m3" => onnx_runtime_ir::DataType::Float6E2M3,
+        "float6e3m2" => onnx_runtime_ir::DataType::Float6E3M2,
         "float8e8m0" => onnx_runtime_ir::DataType::Float8E8M0,
         "uint2" => onnx_runtime_ir::DataType::Uint2,
         "int2" => onnx_runtime_ir::DataType::Int2,

@@ -886,6 +886,7 @@ fn resolve_initializer(
         let weight = ordinary_external_reference(init, dtype, dims, model_dir, &fields)?;
         let WeightRef::External {
             ref path,
+            ref dims,
             offset,
             length,
             ..
@@ -907,6 +908,7 @@ fn resolve_initializer(
                     mmap.mmap.len()
                 )));
             }
+            validate_float6_tail(dtype, dims, &mmap.mmap[offset..offset + length], &init.name)?;
         }
         Ok(weight)
     } else {
@@ -991,6 +993,23 @@ fn ordinary_external_reference(
 
 /// Resolve nested graph initializers without putting graph-local ValueIds into
 /// the root weight map. Mappings are shared by path; descriptors stay in scope.
+fn validate_float6_tail(
+    dtype: DataType,
+    dims: &[usize],
+    bytes: &[u8],
+    name: &str,
+) -> Result<(), LoaderError> {
+    if dtype.is_float6()
+        && onnx_runtime_ir::checked_numel(dims)
+            .is_some_and(|count| dtype.has_invalid_float6_padding(count, bytes))
+    {
+        return Err(LoaderError::GraphBuild(format!(
+            "external initializer {name:?} has nonzero FLOAT6 tail padding; clear the unused high bits of the final byte"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn resolve_nested_weights(
     graph: &mut onnx_runtime_ir::Graph,
     model_dir: &Path,
@@ -1006,7 +1025,8 @@ pub(crate) fn resolve_nested_weights(
                 path,
                 offset,
                 length,
-                ..
+                dtype,
+                dims,
             } = weight
             else {
                 continue;
@@ -1023,6 +1043,12 @@ pub(crate) fn resolve_nested_weights(
                     resolved.display()
                 )));
             }
+            validate_float6_tail(
+                *dtype,
+                dims,
+                &store.mmaps[&resolved].mmap[*offset..*offset + *length],
+                relative,
+            )?;
             *path = resolved;
         }
         resolve_nested_weights(graph, model_dir, store)
@@ -1081,6 +1107,18 @@ pub(crate) fn tensor_data_from_proto(
 
     // Prefer raw_data when present (the common, mmap-friendly encoding).
     if !proto.raw_data.is_empty() && dtype != DataType::Undefined {
+        if dtype.is_float6()
+            && (td.checked_expected_bytes() != Some(proto.raw_data.len())
+                || td
+                    .checked_numel()
+                    .is_some_and(|count| dtype.has_invalid_float6_padding(count, &proto.raw_data)))
+        {
+            return Err(LoaderError::GraphBuild(format!(
+                "FLOAT6 tensor {:?} with shape {dims:?} has an invalid raw_data length ({}) or nonzero tail padding; supply exactly ceil(6 × element count / 8) bytes with unused high bits zero",
+                proto.name,
+                proto.raw_data.len()
+            )));
+        }
         td.data = proto.raw_data.clone();
         return Ok(td);
     }
@@ -1150,6 +1188,36 @@ pub(crate) fn tensor_data_from_proto(
         | DataType::Float4E2M1
         | DataType::Int2
         | DataType::Uint2 => proto.int32_data.iter().map(|v| *v as u8).collect(),
+        DataType::Float6E2M3 | DataType::Float6E3M2 => {
+            let size = td.checked_expected_bytes().ok_or_else(|| {
+                LoaderError::GraphBuild(format!(
+                    "FLOAT6 tensor {:?}: shape {dims:?} overflows storage; reduce the dimensions",
+                    proto.name
+                ))
+            })?;
+            if td.checked_numel() != Some(proto.int32_data.len()) {
+                return Err(LoaderError::GraphBuild(format!(
+                    "FLOAT6 tensor {:?}: shape {dims:?} does not match {} int32_data codes; supply one code per element",
+                    proto.name,
+                    proto.int32_data.len()
+                )));
+            }
+            let mut packed = Vec::with_capacity(size);
+            for group in proto.int32_data.chunks(4) {
+                let mut word = 0u32;
+                for (lane, &code) in group.iter().enumerate() {
+                    if !(0..64).contains(&code) {
+                        return Err(LoaderError::GraphBuild(format!(
+                            "FLOAT6 tensor {:?}: int32_data code {code} is out of range; supply unsigned 6-bit codes (0..63)",
+                            proto.name
+                        )));
+                    }
+                    word |= (code as u32) << (lane * 6);
+                }
+                packed.extend_from_slice(&word.to_le_bytes()[..(group.len() * 6).div_ceil(8)]);
+            }
+            packed
+        }
         DataType::String => unreachable!("STRING tensors returned above"),
     };
     Ok(td)
@@ -1202,6 +1270,93 @@ mod tests {
         let data = tensor_data_from_proto(&proto, DataType::Int2, &[5]).expect("tensor data");
         assert_eq!(data.data, [0b11_10_01_00, 0b0000_0001]);
         assert_eq!(data.data.len(), DataType::Int2.storage_bytes(5));
+    }
+
+    #[test]
+    fn float6_typed_codes_match_raw_bytes_and_validate_each_code() {
+        for dtype in [DataType::Float6E2M3, DataType::Float6E3M2] {
+            let mut proto = TensorProto {
+                name: "W".into(),
+                data_type: dtype.to_onnx(),
+                dims: vec![5],
+                int32_data: vec![36, 8, 12, 16, 63],
+                ..Default::default()
+            };
+            let expected = [0x24, 0xc2, 0x40, 0x3f];
+            assert_eq!(
+                tensor_data_from_proto(&proto, dtype, &[5]).unwrap().data,
+                expected
+            );
+            proto.int32_data[4] = 64;
+            assert!(
+                tensor_data_from_proto(&proto, dtype, &[5])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unsigned 6-bit codes")
+            );
+            proto.int32_data.clear();
+            assert!(
+                tensor_data_from_proto(&proto, dtype, &[5])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("one code per element")
+            );
+            proto.raw_data = expected.to_vec();
+            assert_eq!(
+                tensor_data_from_proto(&proto, dtype, &[5]).unwrap().data,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn float6_ordinary_external_maps_tail_bytes_without_repacking() {
+        let dir = std::env::temp_dir();
+        let name = format!("nxrt-float6-tail-{}.bin", std::process::id());
+        let path = dir.join(&name);
+        // Three codes use three bytes; only the last two bits of byte 3 are data.
+        let packed = [0x81, 0xfb, 0x01];
+        std::fs::write(&path, [0xff, packed[0], packed[1], packed[2]]).unwrap();
+        for dtype in [DataType::Float6E2M3, DataType::Float6E3M2] {
+            let mut proto = TensorProto {
+                name: "tail".into(),
+                data_type: dtype.to_onnx(),
+                dims: vec![3],
+                data_location: tensor_proto::DataLocation::External as i32,
+                external_data: [
+                    ("location", name.as_str()),
+                    ("offset", "1"),
+                    ("length", "3"),
+                ]
+                .into_iter()
+                .map(|(key, value)| crate::proto::onnx::StringStringEntryProto {
+                    key: key.into(),
+                    value: value.into(),
+                })
+                .collect(),
+                ..Default::default()
+            };
+            let mut store = WeightStore::new();
+            let reference = resolve_initializer(&mut store, &proto, &dir, None).unwrap();
+            let WeightRef::External {
+                path: mapped,
+                offset,
+                length,
+                ..
+            } = &reference
+            else {
+                panic!("expected an mmap-backed ONNX weight");
+            };
+            assert_eq!((*offset, *length), (1, 3));
+            assert_eq!(
+                store.external_bytes(mapped, *offset, *length),
+                Some(packed.as_slice())
+            );
+            proto.external_data[2].value = "2".into();
+            let error = resolve_initializer(&mut store, &proto, &dir, None).unwrap_err();
+            assert!(error.to_string().contains("3 numeric tensor bytes"));
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
