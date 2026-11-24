@@ -472,10 +472,12 @@ Playwright module path to save an image of the baseline chat. Coordinate this
 inference workload with other sessions using the shared host lock.
 
 
-## Raw GBNF constraints
+## Raw GBNF and llguidance constraints
 
 The chat, legacy completion and native completion endpoints accept the llama.cpp
-`grammar` field as GBNF over newly generated raw output. Existing assistant
+`grammar` field as GBNF over newly generated raw output. A source beginning
+with `%llguidance` instead uses llguidance Lark, preserving its header and
+options. Existing assistant
 prefill is not consumed, and declared reasoning/content projection does not
 remove markers before this grammar sees them. This follows the pinned upstream
 [sampling contract](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/common/sampling.cpp).
@@ -498,9 +500,44 @@ receive terminal semantics. Token names and angle brackets do not guess roles.
 Non-byte contextual decoders and stream-initial stripping currently return an
 actionable capability error before SSE.
 
-GBNF conflicts with JSON `response_format`, forced `tool_choice`, and
+Both raw grammar forms conflict with JSON `response_format`, forced `tool_choice`, and
 `ignore_eos=true`. Neutral `grammar_lazy=false`, `grammar_triggers=[]` and
-`preserved_tokens=[]` are accepted. Active lazy grammars, triggers, preserved
-tokens and raw `%llguidance` input remain open compatibility work. Native
-`n_probs` and `completion_probabilities` also remain open; native GBNF acceptance
-does not imply support for those reporting fields.
+`preserved_tokens=[]` are accepted. Active lazy grammars and triggers remain
+open compatibility work. Request-local token preservation is described below. Native probability reporting is described below.
+
+
+## Native token probabilities
+
+`/completion` and `/infill` accept nonnegative `n_probs` (0 disables reporting)
+and boolean `post_sampling_probs`. Counts are clamped to the actual vocabulary.
+The default reports the original model distribution before grammar masks,
+penalties, temperature or truncation. Setting `post_sampling_probs=true` reports
+the processed distribution instead. The sampling path and random stream are
+unchanged by reporting.
+
+Buffered responses contain `completion_probabilities`; streaming token events
+contain their own probability item. Each item includes `id`, `token`, `bytes` and
+either `logprob`/`top_logprobs` or `prob`/`top_probs`. Alternative entries carry
+their own IDs, decoded byte pieces and score. Invalid UTF-8 suffixes are omitted
+from `token` while original `bytes` remain intact. Zero probabilities use a
+finite lowest log-probability in JSON; processed alternatives with zero mass
+are excluded.
+
+
+## Preserved output tokens
+
+`preserved_tokens` accepts token spellings on chat, legacy and native completion
+requests. Each spelling is encoded with the requested model, without automatic
+BOS/EOS and with registered special tokens enabled. A spelling that resolves to
+one ID is retained in output; spellings resolving to multiple or no tokens are
+ignored, matching the pinned upstream normalization. Duplicate selections are
+collapsed. Token ending roles and stopping controls are unchanged.
+
+Preservation belongs to the request. A resolved `response_template` also retains
+its declared model framing symbols so reasoning/content/tool projection receives
+the same decoded text as generation. Literal boundary tokens are resolved from
+the tokenizer; regex boundaries can declare individual registered spellings in
+`response_template.preserved_tokens`. Other special IDs remain hidden. The model
+tokenizer is not mutated, and buffered/SSE output uses the same policy, including
+logprob delivery and transactional publication. UTF-8 decoder lookbehind remains
+request-local. Raw grammar recognition continues to inspect model bytes and IDs.

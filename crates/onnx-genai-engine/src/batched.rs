@@ -6,7 +6,8 @@ use crate::config::{
 };
 use crate::decode::ModelDecodePath;
 use crate::decode_loop::{
-    DecodeLoopState, commit_selected_token, finish_result, logprob_for_token, reached_context_limit,
+    DecodeLoopState, ProbabilitySnapshot, commit_selected_token, finish_result,
+    reached_context_limit,
 };
 use crate::engine::Engine;
 use crate::logits::{ProcessorChain, ProcessorContext, TokenId};
@@ -459,7 +460,14 @@ impl<'a> ContinuousBatchManager<'a> {
 
             self.events.push_back(ContinuousBatchEvent::Finished {
                 handle,
-                result: finish_result(self.tokenizer, &[], FinishReason::Length, 0, None)?,
+                result: finish_result(
+                    self.tokenizer,
+                    &[],
+                    FinishReason::Length,
+                    0,
+                    None,
+                    &options.effective_preserved_tokens(),
+                )?,
             });
             return Ok(handle);
         }
@@ -1078,6 +1086,7 @@ impl<'a> ContinuousBatchManager<'a> {
             RowPending::DeviceToken(token_id) => token_id,
             RowPending::HostLogits(mut logits) => {
                 let context = row.processor_context();
+                let probabilities = ProbabilitySnapshot::capture(&row.options, &logits);
                 let token_id = select_next_token_with_rng(
                     &mut logits,
                     &context,
@@ -1088,7 +1097,7 @@ impl<'a> ContinuousBatchManager<'a> {
                 if let (Some(top_logprobs), Some(logprobs)) =
                     (row.options.top_logprobs, row.state.logprobs.as_mut())
                 {
-                    logprobs.push(logprob_for_token(&logits, token_id, top_logprobs));
+                    logprobs.push(probabilities.for_token(&logits, token_id, top_logprobs));
                 }
                 token_id
             }
@@ -1132,6 +1141,7 @@ impl<'a> ContinuousBatchManager<'a> {
                 reason,
                 row.state.prefix_cache_hit_len,
                 row.state.logprobs.as_deref(),
+                &row.options.effective_preserved_tokens(),
             )?;
             row.turn.stage_finished(row.handle, result);
             Ok((token_id, true))
@@ -2808,6 +2818,77 @@ mod tests {
                 max_new_tokens: 6,
                 ..Default::default()
             },
+        }
+    }
+
+    #[test]
+    fn continuous_batch_probability_source_matches_committed_stream_metadata() {
+        for source in [crate::LogprobSource::Model, crate::LogprobSource::Processed] {
+            let tokenizer = test_tokenizer();
+            let decode = ScriptedBatchDecode::new(vec![vec![0.0; 8]], 8, true);
+            let mut manager = ContinuousBatchManager::new(
+                Box::new(decode),
+                &tokenizer,
+                crate::engine::EndTokenPolicy::new(Vec::new(), None).unwrap(),
+                None,
+                1,
+                batch_runtime(),
+            )
+            .unwrap();
+            let mut request = greedy_req(1);
+            request.options.max_new_tokens = 1;
+            request.options.top_logprobs = Some(1);
+            request.options.preserved_tokens.insert(4);
+            request.options.logprob_source = source;
+            request
+                .options
+                .logit_bias
+                .insert(4, crate::logits::LogitBias::Add(1000.0));
+            manager.submit(request).unwrap();
+            let mut events = Vec::new();
+            for _ in 0..8 {
+                if manager.is_idle() {
+                    break;
+                }
+                manager.step().unwrap();
+                events.extend(manager.poll());
+            }
+            let token = events
+                .iter()
+                .find_map(|event| match event {
+                    ContinuousBatchEvent::Token { token, .. } => Some(token),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("one committed streaming token: {events:?}"));
+            let result = events
+                .iter()
+                .find_map(|event| match event {
+                    ContinuousBatchEvent::Finished { result, .. } => Some(result),
+                    _ => None,
+                })
+                .expect("completed single-token request");
+            assert_eq!(
+                result.preserved_tokens,
+                std::collections::BTreeSet::from([4])
+            );
+            let probability = token
+                .logprob
+                .as_ref()
+                .expect("stream carries requested distribution");
+            assert_eq!(probability.token_id, 4);
+            assert_eq!(
+                result.logprobs.as_ref().unwrap(),
+                &vec![probability.clone()]
+            );
+            let expected = if source == crate::LogprobSource::Model {
+                -(8.0_f32).ln()
+            } else {
+                0.0
+            };
+            assert!(
+                (probability.logprob - expected).abs() < 1e-5,
+                "{source:?}: {probability:?}"
+            );
         }
     }
 

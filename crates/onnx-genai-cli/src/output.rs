@@ -624,6 +624,7 @@ mod tests {
             .into_iter()
             .map(|(token_id, text)| {
                 stream.push(&GenerateToken {
+                    logprob: None,
                     token_id,
                     text: text.to_string(),
                     finish_reason: None,
@@ -712,6 +713,7 @@ mod tests {
             .into_iter()
             .map(|(token_id, text)| {
                 stream.push(&GenerateToken {
+                    logprob: None,
                     token_id,
                     text: text.to_string(),
                     finish_reason: None,
@@ -813,6 +815,7 @@ mod tests {
         };
         config.set_marker_token_ids(Some(151667), Some(151668));
         let token = GenerateToken {
+            logprob: None,
             token_id: 151667,
             text: String::new(),
             finish_reason: None,
@@ -836,6 +839,7 @@ mod tests {
         };
         config.set_marker_token_ids(Some(151667), Some(151668));
         let eos = GenerateToken {
+            logprob: None,
             token_id: 151645,
             text: String::new(),
             finish_reason: None,

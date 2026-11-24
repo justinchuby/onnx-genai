@@ -772,6 +772,16 @@ pub(crate) fn run_declared_generation(
         Some(core) => core.hosted_contracts(),
         None => &[],
     };
+    if !request
+        .request
+        .options
+        .effective_preserved_tokens()
+        .is_empty()
+        || request.request.options.response_projection.is_some()
+    {
+        request.request.options.validate_preserved_tokens(tokenizer.context("preserved_tokens requires a package tokenizer; declare one before preserving output tokens")?)?;
+    }
+    let preserved_tokens = request.request.options.effective_preserved_tokens();
     let mut plan = WorkflowExecutionPlan::new_hosted(runtime, request, hosted)?;
     let generic_execution = core.is_none();
     let (outputs, host_stop_reason) = {
@@ -907,17 +917,24 @@ pub(crate) fn run_declared_generation(
     };
 
     let text = tokenizer
-        .map(|tokenizer| tokenizer.decode(&token_ids))
+        .map(|tokenizer| {
+            crate::tokenization::decode_output(tokenizer, &token_ids, &preserved_tokens)
+        })
         .transpose()?
         .unwrap_or_default();
 
     // A core that scored each token already delivered it. Replaying the stream
     // here would double every token a server streamed.
+    let logprobs = core.as_deref().and_then(GenerationCore::logprobs);
     let already_streamed = core.as_deref().is_some_and(GenerationCore::streams_tokens);
     if let (Some(callback), false) = (callback.as_mut(), already_streamed) {
-        let pieces = crate::tokenization::token_texts(tokenizer, &token_ids)?;
+        let pieces = crate::tokenization::token_texts(tokenizer, &token_ids, &preserved_tokens)?;
         for (index, (token_id, token_text)) in token_ids.iter().copied().zip(pieces).enumerate() {
             callback(crate::config::GenerateToken {
+                logprob: logprobs
+                    .as_ref()
+                    .and_then(|values| values.get(index))
+                    .cloned(),
                 token_id,
                 text: token_text,
                 finish_reason: (index + 1 == token_ids.len()).then(|| finish_reason.clone()),
@@ -927,6 +944,7 @@ pub(crate) fn run_declared_generation(
 
     Ok(GenerateResult {
         text,
+        preserved_tokens,
         token_ids,
         finish_reason,
         tool_calls: match stop_reason {
@@ -941,7 +959,7 @@ pub(crate) fn run_declared_generation(
         // Logprobs are the scoring core's record. A package whose sampler is an
         // ONNX component never scored on the host, so it has none to report —
         // which is a fact about the package, not a missing feature.
-        logprobs: core.as_deref().and_then(GenerationCore::logprobs),
+        logprobs,
         budget_cap: None,
     })
 }
@@ -1007,6 +1025,7 @@ pub(crate) fn generate_with_decode_core_and_staged_observer<B: DecodeLoopBackend
             finish_reason,
             state.prefix_cache_hit_len,
             state.logprobs.as_deref(),
+            &request.options.effective_preserved_tokens(),
         )?;
         result.tool_calls = tool_calls;
         return Ok(result);

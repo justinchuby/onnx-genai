@@ -144,10 +144,15 @@ pub struct ToolCallStagedOutputObserver {
     baseline: Option<StagedOutputCheckpoint>,
     projection: Option<crate::response_template::ResponseProjection>,
     codec: Option<ProjectionTokenCodec>,
+    preserved_tokens: std::collections::BTreeSet<u32>,
 }
 
 impl ToolCallStagedOutputObserver {
-    pub fn new(protocol: ToolProtocol, policy: ToolCallPolicy) -> Self {
+    pub fn new(
+        protocol: ToolProtocol,
+        policy: ToolCallPolicy,
+        preserved_tokens: std::collections::BTreeSet<u32>,
+    ) -> Self {
         debug_assert!(policy.observes_output());
         Self {
             protocol,
@@ -161,6 +166,7 @@ impl ToolCallStagedOutputObserver {
             baseline: None,
             projection: None,
             codec: None,
+            preserved_tokens,
         }
     }
 
@@ -181,14 +187,22 @@ impl ToolCallStagedOutputObserver {
         {
             return Err(self.projection_error(anyhow::anyhow!("response projection must be configured before tool observation starts; create a fresh observer")));
         }
+        if let Some(ids) = projection.preserved_tokens() {
+            self.preserved_tokens.extend(ids);
+        }
+        if let Some(tokenizer) = tokenizer {
+            projection
+                .validate_tokenizer(tokenizer)
+                .map_err(|source| self.projection_error(source))?;
+        }
         let content = projection
             .project(b"", false)
             .map_err(|source| self.projection_error(source))?;
         self.codec =
-            tokenizer.map(|tokenizer| {
-                match crate::byte_stream::ByteStreamContract::resolve(
+            tokenizer.map(
+                |tokenizer| match crate::byte_stream::ByteStreamContract::resolve_output(
                     tokenizer,
-                    crate::tokenization::SpecialTokenHandling::Preserve,
+                    &self.preserved_tokens,
                 ) {
                     Ok(Some(contract)) => {
                         ProjectionTokenCodec::Bytes(std::sync::Arc::new(contract))
@@ -200,8 +214,8 @@ impl ToolCallStagedOutputObserver {
                         tokenizer: std::sync::Arc::new(tokenizer.clone()),
                         reason: std::sync::Arc::new(reason),
                     },
-                }
-            });
+                },
+            );
         self.projection = Some(projection);
         self.replace_content(content)?;
         Ok(self)
@@ -233,8 +247,8 @@ impl ToolCallStagedOutputObserver {
                 }
                 bytes
             }
-            Some(ProjectionTokenCodec::Canonical(tokenizer)) => self.decode_tokens(tokenizer, crate::tokenization::SpecialTokenHandling::Preserve)?.into_bytes(),
-            Some(ProjectionTokenCodec::Deferred { tokenizer, .. }) if terminal => self.decode_tokens(tokenizer, crate::tokenization::SpecialTokenHandling::Preserve)?.into_bytes(),
+            Some(ProjectionTokenCodec::Canonical(tokenizer)) => self.decode_tokens(tokenizer)?.into_bytes(),
+            Some(ProjectionTokenCodec::Deferred { tokenizer, .. }) if terminal => self.decode_tokens(tokenizer)?.into_bytes(),
             Some(ProjectionTokenCodec::Deferred { .. }) => return Ok(None),
             None => return Err(self.projection_error(anyhow::anyhow!("token observation requires a tokenizer bound by with_projection; provide the model tokenizer before observing token IDs"))),
         };
@@ -338,8 +352,7 @@ impl ToolCallStagedOutputObserver {
             self.raw = bytes;
             self.replace_content(content)
         } else {
-            let decoded =
-                self.decode_tokens(tokenizer, crate::tokenization::SpecialTokenHandling::Skip)?;
+            let decoded = self.decode_tokens(tokenizer)?;
             self.raw = decoded.as_bytes().to_vec();
             self.replace_content(decoded)
         }
@@ -456,20 +469,8 @@ impl ToolCallStagedOutputObserver {
         }
     }
 
-    fn decode_tokens(
-        &self,
-        tokenizer: &Tokenizer,
-        special: crate::tokenization::SpecialTokenHandling,
-    ) -> Result<String, StagedOutputObservationError> {
-        llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            match special {
-                crate::tokenization::SpecialTokenHandling::Preserve => {
-                    tokenizer.decode_with_special_tokens(&self.tokens)
-                }
-                crate::tokenization::SpecialTokenHandling::Skip => tokenizer.decode(&self.tokens),
-            }
-            .map_err(anyhow::Error::from)
-        }))
+    fn decode_tokens(&self, tokenizer: &Tokenizer) -> Result<String, StagedOutputObservationError> {
+        crate::tokenization::decode_output(tokenizer, &self.tokens, &self.preserved_tokens)
         .map_err(|source| self.decode_error(source.context(format!(
             "decode staged tool token {:?} through tokenizer.decoder ({} generated tokens); repair the decoder or vocabulary",
             self.tokens.last(), self.tokens.len()
@@ -552,11 +553,16 @@ mod tests {
             template,
             prefix.to_owned(),
             4096,
+            None,
         )
         .unwrap();
-        ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto)
-            .with_projection(projection, None)
-            .unwrap()
+        ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        )
+        .with_projection(projection, None)
+        .unwrap()
     }
 
     #[test]
@@ -614,12 +620,16 @@ mod tests {
             template,
             "A[r]thought".to_owned(),
             4096,
+            Some(&tokenizer),
         )
         .unwrap();
-        let mut observer =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto)
-                .with_projection(projection, Some(&tokenizer))
-                .unwrap();
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        )
+        .with_projection(projection, Some(&tokenizer))
+        .unwrap();
         assert_eq!(
             observer.observe_tokens(&tokenizer, &[3]).unwrap(),
             StagedOutputObservation::Continue
@@ -705,11 +715,13 @@ mod tests {
                     template,
                     "A".to_owned(),
                     4096,
+                    Some(&tokenizer),
                 )
                 .unwrap();
                 let mut observer = ToolCallStagedOutputObserver::new(
                     protocol("tagged-json"),
                     ToolCallPolicy::Auto,
+                    Default::default(),
                 )
                 .with_projection(projection, Some(&tokenizer))
                 .unwrap();
@@ -756,6 +768,21 @@ mod tests {
         let path = scratch.path().join("tokenizer.json");
         std::fs::write(&path, value.to_string()).unwrap();
         let tokenizer = Tokenizer::from_file(path).unwrap();
+        let broken_frame = crate::response_template::ResponseTemplate::compile(
+            &serde_json::json!({"start_anchor":"A","fields":{"content":{"open":"x"}}}),
+        )
+        .unwrap();
+        let error = crate::response_template::ResponseProjection::resolve(
+            broken_frame,
+            "A".to_owned(),
+            4096,
+            Some(&tokenizer),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("tokenizer.decoder"),
+            "{error:#}"
+        );
         let template = crate::response_template::ResponseTemplate::compile(
             &serde_json::json!({"start_anchor":"A","fields":{"content":{}}}),
         )
@@ -764,19 +791,27 @@ mod tests {
             crate::response_template::ResponseProjection::resolve(
                 template.clone(),
                 "A".to_owned(),
-                0
+                0,
+                Some(&tokenizer)
             )
             .unwrap_err()
             .to_string()
             .contains("positive")
         );
-        let projection =
-            crate::response_template::ResponseProjection::resolve(template, "A".to_owned(), 4096)
-                .unwrap();
-        let mut observer =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto)
-                .with_projection(projection.clone(), Some(&tokenizer))
-                .unwrap();
+        let projection = crate::response_template::ResponseProjection::resolve(
+            template,
+            "A".to_owned(),
+            4096,
+            Some(&tokenizer),
+        )
+        .unwrap();
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        )
+        .with_projection(projection.clone(), Some(&tokenizer))
+        .unwrap();
         let error = observer.observe_tokens(&tokenizer, &[4]).unwrap_err();
         assert!(matches!(error, StagedOutputObservationError::Decode { .. }));
         assert!(
@@ -803,8 +838,11 @@ mod tests {
 
     #[test]
     fn incomplete_staged_text_keeps_the_loop_running() {
-        let mut observer =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        );
         assert_eq!(
             observer
                 .observe_text(r#"<tool_call>{"name":"read","arguments":{"path":"src/"#)
@@ -819,8 +857,11 @@ mod tests {
 
     #[test]
     fn complete_calls_are_pending_until_an_independent_terminal_boundary() {
-        let mut observer =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        );
         let StagedOutputObservation::CompleteSoFar(calls) = observer
             .observe_text(r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#)
             .unwrap()
@@ -839,8 +880,11 @@ mod tests {
             FinishReason::ToolCalls
         );
 
-        let mut observer =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        );
         let StagedOutputObservation::CompleteSoFar(calls) = observer
             .observe_text(concat!(
                 r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#,
@@ -860,8 +904,11 @@ mod tests {
 
     #[test]
     fn malformed_text_is_a_typed_precommit_failure() {
-        let mut observer =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        );
         assert!(matches!(
             observer.observe_text("<tool_call>{bad}</tool_call>"),
             Err(StagedOutputObservationError::Malformed { .. })
@@ -870,8 +917,11 @@ mod tests {
 
     #[test]
     fn text_after_a_complete_envelope_remains_malformed() {
-        let mut observer =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        );
         assert!(matches!(
             observer.observe_text(r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#),
             Ok(StagedOutputObservation::CompleteSoFar(_))
@@ -884,8 +934,11 @@ mod tests {
 
     #[test]
     fn abort_restores_incremental_decoder_and_parser_state_for_retry() {
-        let mut observer =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        );
         observer.begin_turn();
         assert_eq!(
             observer
@@ -905,8 +958,11 @@ mod tests {
 
     #[test]
     fn abort_after_complete_call_does_not_duplicate_the_retry() {
-        let mut observer =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        );
         observer.begin_turn();
         assert!(matches!(
             observer.observe_text(r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#),
@@ -926,8 +982,11 @@ mod tests {
 
     #[test]
     fn request_policy_is_enforced_only_at_the_terminal_boundary() {
-        let mut required =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Required);
+        let mut required = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Required,
+            Default::default(),
+        );
         assert_eq!(
             required.observe_text("ordinary assistant text").unwrap(),
             StagedOutputObservation::Continue
@@ -943,6 +1002,7 @@ mod tests {
             ToolCallPolicy::Specific {
                 function: "weather".to_string(),
             },
+            Default::default(),
         );
         specific
             .observe_text(r#"<tool_call>{"name":"calendar","arguments":{}}</tool_call>"#)
@@ -953,16 +1013,22 @@ mod tests {
                 if reason.contains("weather") && reason.contains("calendar")
         ));
 
-        let mut auto =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        let mut auto = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        );
         auto.observe_text("ordinary assistant text").unwrap();
         assert!(auto.finish("semantic commit").is_ok());
     }
 
     #[test]
     fn oversized_staged_output_fails_before_commit() {
-        let mut observer =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        );
         let oversized = "x".repeat(onnx_genai_metadata::MAX_TOOL_PAYLOAD_BYTES + 1);
         assert!(matches!(
             observer.observe_text(&oversized),
@@ -980,13 +1046,19 @@ mod tests {
         let text = r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#;
         let tokens = tokenizer.encode(text)?;
         let expected = {
-            let mut observer =
-                ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+            let mut observer = ToolCallStagedOutputObserver::new(
+                protocol("tagged-json"),
+                ToolCallPolicy::Auto,
+                Default::default(),
+            );
             observer.observe_tokens(&tokenizer, &tokens)?
         };
         for split in 0..=tokens.len() {
-            let mut observer =
-                ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+            let mut observer = ToolCallStagedOutputObserver::new(
+                protocol("tagged-json"),
+                ToolCallPolicy::Auto,
+                Default::default(),
+            );
             observer.observe_tokens(&tokenizer, &tokens[..split])?;
             assert_eq!(
                 observer.observe_tokens(&tokenizer, &tokens[split..])?,
@@ -998,8 +1070,11 @@ mod tests {
 
     #[test]
     fn complete_so_far_never_requests_host_stop_before_finish() -> anyhow::Result<()> {
-        let mut observer =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        );
         for chunk in [
             r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#,
             "\n<tool_call>",
