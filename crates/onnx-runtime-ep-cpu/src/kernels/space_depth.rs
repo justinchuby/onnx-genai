@@ -207,33 +207,32 @@ mod tests {
                     .unwrap();
                 assert_eq!(output.to_f32(), expected, "{op}-{opset} {mode:?}");
             }
+        }
+    }
 
-            #[test]
-            fn space_depth_claims_reject_bad_mode_and_geometry() {
-                use onnx_runtime_ep_api::ExecutionProvider;
-                use onnx_runtime_ir::{DataType, ValueId, static_shape};
+    #[test]
+    fn space_depth_claims_reject_bad_mode_and_geometry() {
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_ir::{DataType, ValueId, static_shape};
 
-                let cpu = crate::CpuExecutionProvider::new();
-                for (op, first, valid, invalid) in [
-                    ("SpaceToDepth", 28, [1, 2, 4, 6], [1, 2, 4, 5]),
-                    ("DepthToSpace", 11, [1, 8, 2, 3], [1, 6, 2, 3]),
-                ] {
-                    let mut node =
-                        Node::new(NodeId(0), op, vec![Some(ValueId(0))], vec![ValueId(1)]);
-                    node.attributes
-                        .insert("blocksize".into(), Attribute::Int(2));
-                    node.attributes
-                        .insert("mode".into(), Attribute::String(b"CRD".to_vec()));
-                    let claims = |opset, dims, dtype| {
-                        cpu.supports_op(&node, opset, &[static_shape(dims)], &[dtype], &[])
-                            .is_supported()
-                    };
-                    assert!(claims(first, valid, DataType::Int64), "{op}");
-                    assert!(!claims(first - 1, valid, DataType::Int64), "{op}");
-                    assert!(!claims(first, invalid, DataType::Int64), "{op}");
-                    assert!(!claims(first, valid, DataType::String), "{op}");
-                }
-            }
+        let cpu = crate::CpuExecutionProvider::new();
+        for (op, first, valid, invalid) in [
+            ("SpaceToDepth", 28, [1, 2, 4, 6], [1, 2, 4, 5]),
+            ("DepthToSpace", 11, [1, 8, 2, 3], [1, 6, 2, 3]),
+        ] {
+            let mut node = Node::new(NodeId(0), op, vec![Some(ValueId(0))], vec![ValueId(1)]);
+            node.attributes
+                .insert("blocksize".into(), Attribute::Int(2));
+            node.attributes
+                .insert("mode".into(), Attribute::String(b"CRD".to_vec()));
+            let claims = |opset, dims, dtype| {
+                cpu.supports_op(&node, opset, &[static_shape(dims)], &[dtype], &[])
+                    .is_supported()
+            };
+            assert!(claims(first, valid, DataType::Int64), "{op}");
+            assert!(!claims(first - 1, valid, DataType::Int64), "{op}");
+            assert!(!claims(first, invalid, DataType::Int64), "{op}");
+            assert!(!claims(first, valid, DataType::String), "{op}");
         }
     }
 }
