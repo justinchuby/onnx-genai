@@ -1465,6 +1465,39 @@ strings cannot exclude a production file. Three stale unguarded entries were
 removed after verifying their current early capture refusals. The remaining
 allowlist and transitive synchronization checks remain enforced.
 
+### Route telemetry uses one armed record owner
+
+The immutable allocation scope of an armed route record now covers its six-word
+header and expert bitmap together. `ArmedTelemetry` keeps one
+`GraphDeviceAllocation`; QMoE publishes/validates one capture resource, while
+BlockQuantizedMoE continues to pin its existing outer telemetry owner. Header
+injection remains bounded to its six words. Kernel sources and two-pointer ABI
+are unchanged: header is at the owner base and bitmap at byte offset 512.
+
+The 488B gap preserves the previous minimum separation of the independently
+allocated 512B classes rather than packing hot atomic fields adjacently without
+measurement. The whole span is checked with `Layout::array::<u32>` before
+allocation. Its rounded physical capacity equals the previous sum of the two
+rounded classes; this change does not claim a VRAM-capacity saving. It changes
+pool reuse from two classes/entries to one combined entry. The existing
+`footprint_bytes` reports effective header + bitmap bytes, excluding both gap
+and allocator rounding; actual allocation and transfer use the complete span.
+
+Arm/reset build a complete zeroed payload and upload it once. Snapshot performs
+one ordered D2H, then separates header and bitmap on the Host; it remains an
+explicit boundary observation, not an atomic snapshot against concurrent
+producers. These boundaries transfer an extra 488B but make one runtime copy
+call instead of two. Execute/replay gain no upload, reset, grant or refund.
+Epoch advancement and failure handling are unchanged.
+
+Host tests cover header layout, zeroed gap/bitmap, last expert bits, maximum
+representable domain and class equivalence at bitmap boundaries. A GPU fixture
+covers one allocation/upload/readback, injection bounds, reset, and the complete
+owner surviving handle drop until graph reset. Existing QMoE and
+BlockQuantizedMoE route/capture suites are compiled for integration coverage.
+Device execution, atomic-contention impact and throughput remain unmeasured;
+512B separation is a conservative layout choice, not proof of equal performance.
+
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
 The dated audit and measurements below preserve historical evidence. The current
