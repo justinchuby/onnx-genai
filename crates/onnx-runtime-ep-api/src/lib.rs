@@ -44,6 +44,7 @@ pub mod kernel;
 pub mod packed_routed;
 pub mod provider;
 pub mod registry;
+pub mod rnn;
 pub mod standard_math;
 pub mod tensor;
 pub mod weight;

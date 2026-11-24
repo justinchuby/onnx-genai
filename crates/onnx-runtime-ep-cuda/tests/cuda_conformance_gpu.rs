@@ -3048,6 +3048,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(dedicated("TopK", "indexing_gpu.rs", "top-k"));
     p.push(dedicated("CumSum", "indexing_gpu.rs", "prefix scan"));
     p.push(dedicated(
+        "RNN",
+        "rnn_gpu.rs",
+        "native recurrence, layouts, lengths and dtypes",
+    ));
+    p.push(dedicated(
         "GatherElements",
         "indexing_gpu.rs",
         "gather along axis",

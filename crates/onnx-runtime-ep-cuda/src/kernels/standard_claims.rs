@@ -14,6 +14,7 @@ pub(crate) fn unsupported_reason_at_opset(
     input_dtypes: &[DataType],
 ) -> Option<String> {
     let result = match node.op_type.as_str() {
+        "RNN" => return onnx_runtime_ep_api::rnn::unsupported_reason(node, opset, input_dtypes),
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
         "GatherND" => gather_nd(node, opset, input_dtypes),
         _ => return unsupported_reason(node, input_shapes, input_dtypes),

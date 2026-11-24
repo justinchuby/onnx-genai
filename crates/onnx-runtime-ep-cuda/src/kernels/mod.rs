@@ -121,6 +121,7 @@ pub mod quantization;
 pub mod range;
 pub mod reduce;
 pub mod resize;
+mod rnn;
 pub mod rotary_embedding;
 pub mod shape;
 pub mod size;
@@ -368,6 +369,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "EyeLike",
     "Pad",
     "Range",
+    "RNN",
     "ScatterND",
     "TensorScatter",
     "HannWindow",
@@ -567,6 +569,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("CumProd", "") => CUM_PROD_TYPES,
         ("DFT", "") => CUDA_DFT_DTYPES,
         ("STFT", "") => CUDA_STFT_DTYPES,
+        ("RNN", "") => onnx_runtime_ep_api::rnn::DTYPES,
         ("Unique", "") => CUDA_UNIQUE_DTYPES,
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
         ("Einsum", "") => CUDA_EINSUM_DTYPES,
@@ -919,6 +922,16 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
+    for since in [14, 22] {
+        reg.register(
+            OpKey::new("RNN", "", since),
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+            Box::new(rnn::Factory {
+                runtime: runtime.clone(),
+                since,
+            }),
+        );
+    }
     reg.register(
         OpKey::new("CumProd", "", 26),
         onnx_runtime_ep_api::WorkspacePlanning::None,
