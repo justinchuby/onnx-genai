@@ -275,9 +275,12 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
 /// Keep it independent of model resolution and do not pretend to change defaults.
 pub(crate) async fn post_props(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     if !state.config.endpoint_props {
-        return Err(ApiError::forbidden(
-            "POST /props is disabled; start nxrt serve with --props to enable the upstream acknowledgement (no properties are changed)",
-        ));
+        return Err(ApiError {
+            status: StatusCode::NOT_IMPLEMENTED,
+            kind: "not_supported_error",
+            message: "POST /props is disabled; start nxrt serve with --props to enable the upstream acknowledgement (no properties are changed)".into(),
+            retry_after_secs: None,
+        });
     }
     Ok(Json(json!({"success": true})))
 }

@@ -7922,7 +7922,9 @@ mod llama_router_compat {
                     assert_eq!(status, StatusCode::OK);
                     assert_eq!(value, json!({"success":true}));
                 } else {
-                    assert_eq!(status, StatusCode::FORBIDDEN);
+                    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+                    assert_eq!(value["error"]["type"], "not_supported_error");
+                    assert_eq!(value["error"]["code"], 501);
                     assert!(
                         value["error"]["message"]
                             .as_str()
@@ -7975,7 +7977,7 @@ mod llama_router_compat {
                 if enabled {
                     StatusCode::OK
                 } else {
-                    StatusCode::FORBIDDEN
+                    StatusCode::NOT_IMPLEMENTED
                 }
             );
             let response = router

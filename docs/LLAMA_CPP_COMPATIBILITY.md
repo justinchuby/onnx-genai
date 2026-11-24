@@ -428,7 +428,8 @@ parity. These upstream protocols are still unimplemented:
 Model download/delete remain disabled. `--props` enables `POST /props`, matching
 upstream's current acknowledgement-only contract: it returns `{"success":true}`
 and does not read or change generation settings. `GET /props` advertises the
-configured `endpoint_props` value in router and model modes. This is not an API
+configured `endpoint_props` value in router and model modes. When disabled, POST
+returns upstream-compatible `501 not_supported_error`. This is not an API
 for changing generation defaults.
 `GET/POST /tools` now supports the seven explicitly enabled host built-ins,
 including command SSE, file selection and editing. See [host tools](SERVER_TOOLS.md)
