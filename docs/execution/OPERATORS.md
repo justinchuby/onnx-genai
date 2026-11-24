@@ -52,7 +52,7 @@ plugin EPs (via C ABI bridge) handle them.
 | Less / Greater / LessOrEqual / GreaterOrEqual | 7–12 | Comparisons for masking. |
 | Expand | 8 | Broadcasting. |
 | Shape | 1 | Dynamic shape queries. |
-| ConstantOfShape | 9 | Mask/padding creation. |
+| ConstantOfShape | 9 | Mask/padding creation. Native CPU and CUDA support opset 25 INT2/UINT2 fills with packed storage and zeroed unused lanes in the last byte. |
 | ScatterND | 11 | Slice update; opset 29 adds Int32 indices and mean reduction on native CPU/CUDA. |
 | TensorScatter | 24 | KV cache update, standardized. Fixed-capacity buffer written at a per-sample `write_indices` offset; `linear` (append) and `circular` (ring) modes. Prefill omits `write_indices`; decode supplies it. |
 | GatherElements | 11 | Top-k/sampling. |

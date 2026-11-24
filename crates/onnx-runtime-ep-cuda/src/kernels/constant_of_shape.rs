@@ -15,14 +15,15 @@ const MODULE: &str = "constant_of_shape";
 const SOURCE: &str = r#"
 extern "C" __global__ void fill_pattern(
     unsigned char* output, unsigned long long bytes, int pattern_bytes,
-    unsigned long long pattern_lo, unsigned long long pattern_hi) {
+    unsigned long long pattern_lo, unsigned long long pattern_hi, int tail_mask) {
   for (unsigned long long offset = blockIdx.x * blockDim.x + threadIdx.x;
        offset < bytes;
        offset += (unsigned long long)gridDim.x * blockDim.x) {
     int pattern_offset = (int)(offset % (unsigned long long)pattern_bytes);
     unsigned long long word = pattern_offset < 8 ? pattern_lo : pattern_hi;
     int shift = (pattern_offset & 7) * 8;
-    output[offset] = (unsigned char)(word >> shift);
+    unsigned char value = (unsigned char)(word >> shift);
+    output[offset] = offset == bytes - 1 ? value & tail_mask : value;
   }
 }
 "#;
@@ -145,14 +146,10 @@ impl Kernel for ConstantOfShapeKernel {
             ));
         }
 
-        let bytes = output
-            .dtype
-            .checked_storage_bytes(output.numel())
-            .ok_or_else(|| {
-                EpError::KernelFailed(
-                    "cuda_ep ConstantOfShape: output storage size overflow".into(),
-                )
-            })?;
+        let numel = output.numel();
+        let bytes = output.dtype.checked_storage_bytes(numel).ok_or_else(|| {
+            EpError::KernelFailed("cuda_ep ConstantOfShape: output storage size overflow".into())
+        })?;
         if bytes != 0 {
             let entry = "fill_pattern";
             let function = self.runtime.nvrtc_function(MODULE, SOURCE, entry)?;
@@ -163,6 +160,17 @@ impl Kernel for ConstantOfShapeKernel {
             let pattern_bytes = i32::try_from(self.pattern_bytes).unwrap();
             let pattern_lo = u64::from_le_bytes(self.pattern[..8].try_into().unwrap());
             let pattern_hi = u64::from_le_bytes(self.pattern[8..].try_into().unwrap());
+            let tail_bits = if self.dtype.is_sub_byte() {
+                let bits = self.dtype.bit_size();
+                (numel % (8 / bits)) * bits
+            } else {
+                0
+            };
+            let tail_mask = if tail_bits == 0 {
+                0xff_i32
+            } else {
+                (1_i32 << tail_bits) - 1
+            };
             let config = LaunchConfig {
                 grid_dim: (bytes.div_ceil(BLOCK as u64).clamp(1, 65_535) as u32, 1, 1),
                 block_dim: (BLOCK, 1, 1),
@@ -174,7 +182,8 @@ impl Kernel for ConstantOfShapeKernel {
                 .arg(&bytes)
                 .arg(&pattern_bytes)
                 .arg(&pattern_lo)
-                .arg(&pattern_hi);
+                .arg(&pattern_hi)
+                .arg(&tail_mask);
             // SAFETY: the output allocation covers `bytes`, and all remaining
             // arguments are scalar launch metadata.
             unsafe { builder.launch(config) }

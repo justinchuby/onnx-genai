@@ -5,8 +5,8 @@
 //! rank equals that tensor's length (an empty length yields a scalar). The
 //! `value` attribute is a one-element tensor carrying both the fill value and
 //! the output dtype (default: a single `float32` `0`). The op is dtype-generic:
-//! the decoded fill bytes are simply tiled across the output, so every
-//! fixed-width element type is supported without special-casing.
+//! the decoded element bits repeat across the output, including packed
+//! sub-byte lanes.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{Attribute, DataType, Node};
@@ -36,7 +36,11 @@ impl KernelFactory for ConstantOfShapeFactory {
 fn decode_value(node: &Node) -> Result<(DataType, Vec<u8>)> {
     match node.attr("value") {
         Some(Attribute::Tensor(t)) => {
-            let esize = elem_size(t.dtype)?;
+            let esize = if t.dtype.is_sub_byte() {
+                t.dtype.storage_bytes(1)
+            } else {
+                elem_size(t.dtype)?
+            };
             if t.data.len() < esize {
                 return Err(EpError::KernelFailed(format!(
                     "ConstantOfShape: WHAT: `value` tensor holds {} bytes but dtype {:?} needs \
@@ -96,8 +100,37 @@ impl Kernel for ConstantOfShapeKernel {
             )));
         }
 
-        let esize = elem_size(self.dtype)?;
         let n = numel(&out_shape);
+        if self.dtype.is_sub_byte() {
+            out.validate()?;
+            if !out.is_contiguous() {
+                return Err(EpError::InvalidTensorView {
+                    reason: format!(
+                        "ConstantOfShape: packed {:?} output requires contiguous storage; \
+                         supply a contiguous output view for shape {out_shape:?}",
+                        self.dtype
+                    ),
+                });
+            }
+            if n == 0 {
+                return Ok(());
+            }
+            let bits = self.dtype.bit_size();
+            let lane_mask = u8::MAX >> (8 - bits);
+            let pattern = (self.fill[0] & lane_mask) * (u8::MAX / lane_mask);
+            let len = self.dtype.storage_bytes(n);
+            // SAFETY: the CPU executor bounds-checks the contiguous view's
+            // writable packed extent; TensorMut gives exclusive write access.
+            let dst = unsafe { std::slice::from_raw_parts_mut(out.data_ptr_mut::<u8>(), len) };
+            dst.fill(pattern);
+            let tail_bits = (n % (8 / bits)) * bits;
+            if tail_bits != 0 {
+                dst[len - 1] &= u8::MAX >> (8 - tail_bits);
+            }
+            return Ok(());
+        }
+
+        let esize = elem_size(self.dtype)?;
         let mut buf = vec![0u8; n * esize];
         for chunk in buf.chunks_exact_mut(esize) {
             chunk.copy_from_slice(&self.fill);
