@@ -880,21 +880,23 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
-    for opset in [11, 16] {
+    for opset in [11, 16, 18, 29] {
         reg.register(
             OpKey::new("ScatterElements", "", opset),
             onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(indexing::ScatterElementsFactory {
                 runtime: runtime.clone(),
+                opset,
             }),
         );
     }
-    for opset in [11, 16, 18] {
+    for opset in [11, 16, 18, 29] {
         reg.register(
             OpKey::new("ScatterND", "", opset),
             onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(indexing::ScatterNdFactory {
                 runtime: runtime.clone(),
+                opset,
             }),
         );
     }
@@ -941,13 +943,15 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
-    reg.register(
-        OpKey::new("GatherND", "", 11),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(structural::GatherNdFactory {
-            runtime: runtime.clone(),
-        }),
-    );
+    for opset in [11, 29] {
+        reg.register(
+            OpKey::new("GatherND", "", opset),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(structural::GatherNdFactory {
+                runtime: runtime.clone(),
+            }),
+        );
+    }
     reg.register(
         OpKey::new("SpaceToDepth", "", 13),
         onnx_runtime_ep_api::WorkspacePlanning::None,

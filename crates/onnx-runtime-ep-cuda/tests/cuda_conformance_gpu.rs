@@ -1992,7 +1992,7 @@ fn gather_nd_cases() -> Vec<Case> {
             label: "GatherND[i32-indices,batch-dims]".into(),
             op: "GatherND",
             domain: "",
-            opset: 13,
+            opset: 29,
             inputs: vec![
                 input(
                     DataType::Int64,
