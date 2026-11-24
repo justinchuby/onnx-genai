@@ -16,6 +16,7 @@ pub(crate) fn unsupported_reason_at_opset(
     let result = match node.op_type.as_str() {
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
         "GatherND" => gather_nd(node, opset, input_dtypes),
+        "ConvTranspose" => conv_transpose(node, opset, input_shapes, input_dtypes),
         _ => return unsupported_reason(node, input_shapes, input_dtypes),
     };
     result
@@ -69,7 +70,6 @@ pub(crate) fn unsupported_reason(
         "Col2Im" => col2im(node, input_dtypes),
         "QLinearMatMul" => qlinear_matmul(node, input_dtypes),
         "Resize" => resize(node, input_dtypes),
-        "ConvTranspose" => conv_transpose(node, input_shapes, input_dtypes),
         "GridSample" => grid_sample(node, input_shapes, input_dtypes),
         _ => return None,
     };
@@ -194,6 +194,7 @@ fn qlinear_matmul(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> 
 
 fn conv_transpose(
     node: &Node,
+    opset: u64,
     input_shapes: &[Shape],
     input_dtypes: &[DataType],
 ) -> Result<(), String> {
@@ -204,7 +205,7 @@ fn conv_transpose(
     if node.inputs.iter().any(Option::is_none) {
         return Err("all declared inputs must be present".into());
     }
-    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")?;
+    super::conv_transpose::storage(input_dtypes[0], opset)?;
     if input_dtypes[1] != input_dtypes[0]
         || input_dtypes
             .get(2)
@@ -212,15 +213,7 @@ fn conv_transpose(
     {
         return Err("W and optional B must match X dtype".into());
     }
-    match node.attr("auto_pad").and_then(Attribute::as_str) {
-        None | Some("" | "NOTSET" | "VALID") => {}
-        Some(value) => return Err(format!("auto_pad {value:?} is deferred")),
-    }
-    if node.attr("output_shape").is_some() {
-        return Err("output_shape-driven padding is deferred".into());
-    }
-    require_input_rank(input_shapes, 0, &[3, 4], "X")?;
-    Ok(())
+    super::conv_transpose::validate_claim(node, input_shapes).map_err(|error| error.to_string())
 }
 
 fn grid_sample(

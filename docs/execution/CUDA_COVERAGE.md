@@ -272,7 +272,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `QuantizeLinear`, `DequantizeLinear`, `QLinearMatMul`, `DynamicQuantizeLinear` | `` | ✅ | **NVRTC quantization** | Per-tensor/per-axis constraints and supported integer storage are enforced by each kernel's claim gate. |
 | `DequantizePacked` | `` | ✅ | **NVRTC block decode** | All 27 opset-29 GGUF profiles decode directly from device-resident UINT8 payloads into FLOAT, FLOAT16, BFLOAT16, or DOUBLE. |
 | `Dropout`, `NonZero` | `` | ✅ | **NVRTC-custom** | Inference Dropout and bounded dynamic-output coordinate extraction; dynamic metadata paths decline capture where host materialization is required. |
-| `Resize`, `GridSample`, `ConvTranspose` | `` | ✅ | **NVRTC-custom** | Implemented interpolation/sampling and transposed-convolution subsets; unsupported coordinate modes, cubic/volumetric cases, and output-shape policies fail closed. |
+| `Resize`, `GridSample` | `` | ✅ | **NVRTC-custom** | Implemented interpolation/sampling subsets; unsupported coordinate modes and sampling policies fail closed. |
+| `ConvTranspose` | `` | ✅ | **NVRTC-custom** | 1-D/2-D/3-D f16/f32/f64 and opset-22+ bf16; explicit pads, SAME_UPPER/SAME_LOWER, VALID, and explicit output shape. |
 | `DeformConv` | `` | ✅ | **NVRTC-custom** | Opsets 19 and 22; fused N-D interpolation and grouped accumulation, with a specialized 2-D kernel. Supports up to 32 spatial axes on contiguous tensors. |
 
 <!-- CUDA_COVERAGE_MATRIX_END -->
@@ -634,12 +635,13 @@ Historical snapshot after batch 13: **159** advertised CUDA op names, **164**
 CUDA `(domain, op_type)` pairs, and **141 / 145** CPU standard-domain op types.
 
 The issue #67 operator-coverage batch 14 adds `ConvTranspose` and `GridSample`.
-`ConvTranspose` covers 1-D/2-D f32/f16/bf16 overlap-add with strides, asymmetric
-pads, dilations, output padding, bias, groups, and depthwise geometry.
+Standalone `ConvTranspose` covers 1-D/2-D/3-D f16/f32/f64 and opset-22+ bf16
+overlap-add with strides, asymmetric pads, dilations, output padding, bias, groups,
+and depthwise geometry. SAME_UPPER and SAME_LOWER target `input * stride`;
+explicit `output_shape` overrides `pads`.
 `GridSample` covers 4-D bilinear/nearest sampling for zeros, border, and
-reflection padding with either `align_corners` setting. ConvTranspose
-`SAME_UPPER`/`SAME_LOWER` and output-shape-driven padding, plus cubic/bicubic and
-volumetric GridSample, remain explicitly fail-closed. GPU parity covers the
+reflection padding with either `align_corners` setting. Cubic/bicubic and
+volumetric GridSample remain explicitly fail-closed. GPU parity covers the
 supported narrow storage types and out-of-bounds sampling. Historical snapshot after batch 14: **163** advertised CUDA op names, **168**
 CUDA `(domain, op_type)` pairs, and **143 / 145** CPU standard-domain op types.
 

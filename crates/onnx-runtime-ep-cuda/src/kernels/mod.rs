@@ -1125,13 +1125,16 @@ pub fn build_cuda_registry_with_metrics(
             since_version: 11,
         }),
     );
-    reg.register(
-        OpKey::new("ConvTranspose", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(conv_transpose::ConvTransposeFactory {
-            runtime: runtime.clone(),
-        }),
-    );
+    for since_version in [1, conv_transpose::BFLOAT16_SINCE] {
+        reg.register(
+            OpKey::new("ConvTranspose", "", since_version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(conv_transpose::ConvTransposeFactory {
+                runtime: runtime.clone(),
+                since_version,
+            }),
+        );
+    }
     for version in [19, 22] {
         reg.register(
             OpKey::new("DeformConv", "", version),

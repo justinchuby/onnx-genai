@@ -1,4 +1,4 @@
-//! Common 1-D/2-D ONNX `ConvTranspose` using deterministic output-owned NVRTC work.
+//! ONNX `ConvTranspose` using deterministic output-owned NVRTC work.
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -12,37 +12,44 @@ use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
 const SOURCE: &str = r#"
+#ifdef CONV_TRANSPOSE_HALF
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#endif
 
-__device__ __forceinline__ float load_value(
-    const void* values, int dtype, unsigned long long index) {
-  if (dtype == 0) return ((const float*)values)[index];
-  if (dtype == 1) return __half2float(((const __half*)values)[index]);
-  return __bfloat162float(((const __nv_bfloat16*)values)[index]);
-}
+using U = unsigned long long;
+using I = long long;
 
-__device__ __forceinline__ void store_value(
-    void* values, int dtype, unsigned long long index, float value) {
-  if (dtype == 0) ((float*)values)[index] = value;
-  else if (dtype == 1) ((__half*)values)[index] = __float2half_rn(value);
-  else ((__nv_bfloat16*)values)[index] = __float2bfloat16_rn(value);
-}
+template <typename T, typename Acc>
+struct Storage {
+  __device__ static Acc load(const T* values, U index) { return values[index]; }
+  __device__ static void store(T* values, U index, Acc value) { values[index] = value; }
+};
+#ifdef CONV_TRANSPOSE_HALF
+template <> struct Storage<__half, float> {
+  __device__ static float load(const __half* values, U i) { return __half2float(values[i]); }
+  __device__ static void store(__half* values, U i, float v) { values[i] = __float2half_rn(v); }
+};
+template <> struct Storage<__nv_bfloat16, float> {
+  __device__ static float load(const __nv_bfloat16* values, U i) { return __bfloat162float(values[i]); }
+  __device__ static void store(__nv_bfloat16* values, U i, float v) { values[i] = __float2bfloat16_rn(v); }
+};
+#endif
 
-extern "C" __global__ void conv_transpose(
-    const void* x, const void* weights, const void* bias, void* output,
-    unsigned long long output_elements, unsigned long long input_channels,
-    unsigned long long input_height, unsigned long long input_width,
-    unsigned long long output_channels, unsigned long long output_height,
-    unsigned long long output_width, unsigned long long output_channels_per_group,
-    unsigned long long input_channels_per_group, unsigned long long kernel_height,
-    unsigned long long kernel_width, unsigned long long stride_height,
-    unsigned long long stride_width, unsigned long long dilation_height,
-    unsigned long long dilation_width, long long pad_height, long long pad_width,
-    int dtype, int has_bias) {
-  const unsigned long long output_spatial = output_height * output_width;
-  const unsigned long long input_spatial = input_height * input_width;
-  const unsigned long long kernel_spatial = kernel_height * kernel_width;
+#define CT_ARGS(T) \
+    const T* x, const T* weights, const T* bias, T* output, \
+    U output_elements, U input_channels, U output_channels, \
+    U input_channels_per_group, U output_channels_per_group, \
+    U id, U ih, U iw, U od, U oh, U ow, U kd, U kh, U kw, \
+    U sd, U sh, U sw, U dd, U dh, U dw, I pd, I ph, I pw
+
+template <typename T, typename Acc, bool Volumetric>
+__device__ void conv_transpose(CT_ARGS(T)) {
+  using S = Storage<T, Acc>;
+  const U output_plane = oh * ow, input_plane = ih * iw, kernel_plane = kh * kw;
+  const U output_spatial = Volumetric ? od * output_plane : output_plane;
+  const U input_spatial = Volumetric ? id * input_plane : input_plane;
+  const U kernel_spatial = Volumetric ? kd * kernel_plane : kernel_plane;
   for (unsigned long long output_index =
            blockIdx.x * blockDim.x + threadIdx.x;
        output_index < output_elements;
@@ -51,221 +58,325 @@ extern "C" __global__ void conv_transpose(
     const unsigned long long within_batch = output_index % (output_channels * output_spatial);
     const unsigned long long output_channel = within_batch / output_spatial;
     const unsigned long long output_flat = within_batch % output_spatial;
-    const unsigned long long output_y = output_flat / output_width;
-    const unsigned long long output_x = output_flat % output_width;
+    const U output_z = Volumetric ? output_flat / output_plane : 0;
+    const U output_y = (Volumetric ? output_flat % output_plane : output_flat) / ow;
+    const U output_x = output_flat % ow;
     const unsigned long long group = output_channel / output_channels_per_group;
     const unsigned long long output_in_group = output_channel % output_channels_per_group;
     const unsigned long long input_begin = group * input_channels_per_group;
     const unsigned long long input_end = input_begin + input_channels_per_group;
-    float accumulated = has_bias ? load_value(bias, dtype, output_channel) : 0.0f;
+    Acc accumulated = bias ? S::load(bias, output_channel) : Acc(0);
 
     // Keep the CPU reference's input-channel/input-position/kernel-position order.
     for (unsigned long long input_channel = input_begin;
          input_channel < input_end; ++input_channel) {
       for (unsigned long long input_flat = 0; input_flat < input_spatial; ++input_flat) {
-        const unsigned long long input_y = input_flat / input_width;
-        const unsigned long long input_x = input_flat % input_width;
-        const float input_value = load_value(
-            x, dtype, (batch * input_channels + input_channel) * input_spatial + input_flat);
+        const U input_z = Volumetric ? input_flat / input_plane : 0;
+        const U input_y = (Volumetric ? input_flat % input_plane : input_flat) / iw;
+        const U input_x = input_flat % iw;
+        const Acc input_value = S::load(
+            x, (batch * input_channels + input_channel) * input_spatial + input_flat);
         for (unsigned long long kernel_flat = 0; kernel_flat < kernel_spatial; ++kernel_flat) {
-          const unsigned long long kernel_y = kernel_flat / kernel_width;
-          const unsigned long long kernel_x = kernel_flat % kernel_width;
-          const long long candidate_y =
-              (long long)(input_y * stride_height + kernel_y * dilation_height) - pad_height;
-          const long long candidate_x =
-              (long long)(input_x * stride_width + kernel_x * dilation_width) - pad_width;
-          if (candidate_y != (long long)output_y || candidate_x != (long long)output_x) continue;
+          if (Volumetric && I(input_z * sd + (kernel_flat / kernel_plane) * dd) - pd != I(output_z))
+            continue;
+          const U kernel_y = (Volumetric ? kernel_flat % kernel_plane : kernel_flat) / kw;
+          const U kernel_x = kernel_flat % kw;
+          if (I(input_y * sh + kernel_y * dh) - ph != I(output_y) ||
+              I(input_x * sw + kernel_x * dw) - pw != I(output_x)) continue;
           const unsigned long long weight_index =
               (input_channel * output_channels_per_group + output_in_group) * kernel_spatial
               + kernel_flat;
-          accumulated += input_value * load_value(weights, dtype, weight_index);
+          accumulated += input_value * S::load(weights, weight_index);
         }
       }
     }
-    store_value(output, dtype, output_index, accumulated);
+    S::store(output, output_index, accumulated);
   }
 }
+
+#define CT_ENTRY(name, T, Acc, volumetric) \
+  extern "C" __global__ void name(CT_ARGS(T)) { \
+    conv_transpose<T, Acc, volumetric>(x, weights, bias, output, output_elements, \
+        input_channels, output_channels, input_channels_per_group, output_channels_per_group, \
+        id, ih, iw, od, oh, ow, kd, kh, kw, sd, sh, sw, dd, dh, dw, pd, ph, pw); \
+  }
+#define CT_ENTRIES(name, T, Acc) \
+  CT_ENTRY(name##_2d, T, Acc, false) \
+  CT_ENTRY(name##_3d, T, Acc, true)
+
+#ifdef CONV_TRANSPOSE_HALF
+CT_ENTRIES(conv_transpose_f16, __half, float)
+CT_ENTRIES(conv_transpose_bf16, __nv_bfloat16, float)
+#else
+CT_ENTRIES(conv_transpose_f32, float, float)
+CT_ENTRIES(conv_transpose_f64, double, double)
+#endif
 "#;
 
 pub struct ConvTransposeFactory {
     pub runtime: Arc<CudaRuntime>,
+    pub since_version: u64,
 }
 
-#[derive(Clone)]
+pub(super) const BFLOAT16_SINCE: u64 = 22;
+
+enum Padding {
+    Explicit(Vec<i64>),
+    Inferred {
+        shape: Option<Vec<i64>>,
+        upper: bool,
+    },
+}
+
 struct Parameters {
-    dilations: Vec<usize>,
+    dilations: Vec<i64>,
     group: usize,
-    output_padding: Vec<usize>,
-    pads: Vec<usize>,
-    strides: Vec<usize>,
+    kernel_shape: Option<Vec<i64>>,
+    output_padding: Vec<i64>,
+    padding: Padding,
+    strides: Vec<i64>,
 }
 
 impl KernelFactory for ConvTransposeFactory {
     fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        reject_deferred(node)?;
-        let rank = input_shapes
-            .first()
-            .map(|shape| shape.len())
-            .filter(|rank| matches!(rank, 3 | 4))
-            .ok_or_else(|| not_implemented("ConvTranspose supports only 1-D/2-D inputs"))?
-            - 2;
-        if input_shapes
-            .get(1)
-            .is_none_or(|shape| shape.len() != rank + 2)
-        {
-            return Err(EpError::KernelFailed(
-                "cuda_ep ConvTranspose: X and W ranks must match".into(),
-            ));
-        }
-        let weight_shape = &input_shapes[1];
-        if let Some(kernel_shape) = node.attr("kernel_shape").and_then(Attribute::as_ints)
-            && (kernel_shape.len() != rank
-                || kernel_shape.iter().any(|&value| value <= 0)
-                || kernel_shape
-                    .iter()
-                    .zip(&weight_shape[2..])
-                    .any(|(&attribute, &weight)| attribute as usize != weight))
-        {
-            return Err(EpError::KernelFailed(
-                "cuda_ep ConvTranspose: kernel_shape must match W spatial dimensions".into(),
-            ));
-        }
-        let strides = positive_attribute(node, "strides", rank)?;
-        let dilations = positive_attribute(node, "dilations", rank)?;
-        let output_padding = nonnegative_attribute(node, "output_padding", rank, rank)?;
+        let parameters = Parameters::parse(node, metadata_rank(input_shapes)?)?;
+        parameters.validate_kernel(&input_shapes[1][2..])?;
+        Ok(Box::new(ConvTransposeKernel {
+            runtime: self.runtime.clone(),
+            parameters,
+            since_version: self.since_version,
+        }))
+    }
+}
+
+fn invalid(message: impl std::fmt::Display) -> EpError {
+    EpError::KernelFailed(format!("cuda_ep ConvTranspose: {message}"))
+}
+
+fn metadata_rank<T>(shapes: &[Vec<T>]) -> Result<usize> {
+    let [x, w, ..] = shapes else {
+        return Err(invalid("requires shape metadata for both X and W"));
+    };
+    spatial_rank(x.len(), w.len())
+}
+
+fn spatial_rank(x: usize, w: usize) -> Result<usize> {
+    if !(3..=5).contains(&x) || w != x {
+        return Err(invalid(format!(
+            "X and W must have matching ranks in 3..=5 (1-D to 3-D spatial input); got {x} and {w}"
+        )));
+    }
+    Ok(x - 2)
+}
+
+impl Parameters {
+    fn parse(node: &Node, rank: usize) -> Result<Self> {
+        let strides = int_list(node, "strides", rank, 1)?.unwrap_or_else(|| vec![1; rank]);
+        let dilations = int_list(node, "dilations", rank, 1)?.unwrap_or_else(|| vec![1; rank]);
+        let output_padding =
+            int_list(node, "output_padding", rank, 0)?.unwrap_or_else(|| vec![0; rank]);
         if output_padding
             .iter()
             .enumerate()
             .any(|(axis, &value)| value >= strides[axis] && value >= dilations[axis])
         {
-            return Err(EpError::KernelFailed(
-                "cuda_ep ConvTranspose: output_padding must be smaller than stride or dilation"
-                    .into(),
+            return Err(invalid(
+                "output_padding must be smaller than stride or dilation on each spatial axis",
             ));
         }
-        let group = node.attr("group").and_then(Attribute::as_int).unwrap_or(1);
-        let group = usize::try_from(group)
-            .ok()
-            .filter(|&value| value > 0)
-            .ok_or_else(|| {
-                EpError::KernelFailed("cuda_ep ConvTranspose: group must be positive".into())
-            })?;
-        let pads = if node
-            .attr("auto_pad")
-            .and_then(Attribute::as_str)
-            .is_some_and(|value| value == "VALID")
-        {
-            vec![0; rank * 2]
-        } else {
-            nonnegative_attribute(node, "pads", rank, rank * 2)?
+        let group = match node.attr("group") {
+            None => 1,
+            Some(attr) => attr
+                .as_int()
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|&value| value != 0)
+                .ok_or_else(|| invalid("group must be a positive integer"))?,
         };
-        Ok(Box::new(ConvTransposeKernel {
-            runtime: self.runtime.clone(),
-            parameters: Parameters {
-                dilations,
-                group,
-                output_padding,
-                pads,
-                strides,
-            },
-        }))
+        let auto_pad = match node.attr("auto_pad") {
+            None => "NOTSET",
+            Some(attr) => attr
+                .as_str()
+                .ok_or_else(|| invalid("auto_pad must be a string"))?,
+        };
+        let output_shape = int_list(node, "output_shape", rank, 0)?;
+        let pads = int_list(node, "pads", 2 * rank, 0)?;
+        if !matches!(
+            auto_pad,
+            "" | "NOTSET" | "VALID" | "SAME_UPPER" | "SAME_LOWER"
+        ) {
+            return Err(invalid(format!(
+                "auto_pad {auto_pad:?} must be NOTSET, VALID, SAME_UPPER or SAME_LOWER"
+            )));
+        }
+        let padding = if output_shape.is_some() || matches!(auto_pad, "SAME_UPPER" | "SAME_LOWER") {
+            if output_shape.is_none() && pads.is_some() {
+                return Err(invalid("omit pads when using SAME_UPPER or SAME_LOWER"));
+            }
+            Padding::Inferred {
+                shape: output_shape,
+                upper: auto_pad == "SAME_UPPER",
+            }
+        } else if auto_pad == "VALID" {
+            Padding::Explicit(vec![0; 2 * rank])
+        } else {
+            Padding::Explicit(pads.unwrap_or_else(|| vec![0; 2 * rank]))
+        };
+        Ok(Self {
+            dilations,
+            group,
+            kernel_shape: int_list(node, "kernel_shape", rank, 1)?,
+            output_padding,
+            padding,
+            strides,
+        })
+    }
+
+    fn validate_kernel(&self, shape: &[usize]) -> Result<()> {
+        if shape.len() != self.strides.len()
+            || shape.contains(&0)
+            || self.kernel_shape.as_ref().is_some_and(|kernel| {
+                kernel
+                    .iter()
+                    .zip(shape)
+                    .any(|(&attr, &weight)| usize::try_from(attr) != Ok(weight))
+            })
+        {
+            return Err(invalid(format!(
+                "W spatial dimensions {shape:?} must be positive and match kernel_shape {:?}",
+                self.kernel_shape
+            )));
+        }
+        Ok(())
     }
 }
 
-pub(crate) fn reject_deferred(node: &Node) -> Result<()> {
-    match node.attr("auto_pad").and_then(Attribute::as_str) {
-        None | Some("" | "NOTSET" | "VALID") => {}
-        Some(value) => {
-            return Err(not_implemented(format!(
-                "ConvTranspose auto_pad {value:?}; SAME_UPPER/SAME_LOWER are deferred"
-            )));
-        }
-    }
-    if node.attr("output_shape").is_some() {
-        return Err(not_implemented(
-            "ConvTranspose output_shape-driven padding is deferred",
-        ));
-    }
+fn int_list(node: &Node, name: &str, count: usize, minimum: i64) -> Result<Option<Vec<i64>>> {
+    node.attr(name)
+        .map(|attr| {
+            attr.as_ints()
+                .filter(|values| {
+                    values.len() == count && values.iter().all(|&value| value >= minimum)
+                })
+                .map(<[i64]>::to_vec)
+                .ok_or_else(|| {
+                    invalid(format!("{name} must contain {count} integers >= {minimum}"))
+                })
+        })
+        .transpose()
+}
+
+pub(super) fn validate_claim(node: &Node, shapes: &[onnx_runtime_ir::Shape]) -> Result<()> {
+    Parameters::parse(node, metadata_rank(shapes)?)?;
     Ok(())
 }
 
-fn positive_attribute(node: &Node, name: &str, rank: usize) -> Result<Vec<usize>> {
-    let values = node
-        .attr(name)
-        .and_then(Attribute::as_ints)
-        .map(<[i64]>::to_vec)
-        .unwrap_or_else(|| vec![1; rank]);
-    if values.len() != rank || values.iter().any(|&value| value <= 0) {
-        return Err(EpError::KernelFailed(format!(
-            "cuda_ep ConvTranspose: {name} must contain {rank} positive values"
-        )));
-    }
-    Ok(values.into_iter().map(|value| value as usize).collect())
-}
-
-fn nonnegative_attribute(node: &Node, name: &str, rank: usize, count: usize) -> Result<Vec<usize>> {
-    let values = node
-        .attr(name)
-        .and_then(Attribute::as_ints)
-        .map(<[i64]>::to_vec)
-        .unwrap_or_else(|| vec![0; count]);
-    if values.len() != count || values.iter().any(|&value| value < 0) {
-        return Err(EpError::KernelFailed(format!(
-            "cuda_ep ConvTranspose: {name} must contain {count} non-negative values for rank {rank}"
-        )));
-    }
-    Ok(values.into_iter().map(|value| value as usize).collect())
-}
-
-fn dtype_code(dtype: DataType) -> Result<i32> {
+pub(super) fn storage(dtype: DataType, opset: u64) -> std::result::Result<Storage, String> {
     match dtype {
-        DataType::Float32 => Ok(0),
-        DataType::Float16 => Ok(1),
-        DataType::BFloat16 => Ok(2),
-        other => Err(not_implemented(format!(
-            "ConvTranspose dtype {other:?} (supported: Float32, Float16, BFloat16)"
-        ))),
+        DataType::Float32 => Ok(Storage::Float32),
+        DataType::Float16 => Ok(Storage::Float16),
+        DataType::BFloat16 if opset >= BFLOAT16_SINCE => Ok(Storage::BFloat16),
+        DataType::Float64 => Ok(Storage::Float64),
+        DataType::BFloat16 => Err(format!(
+            "BF16 requires opset {BFLOAT16_SINCE} or later; got {opset}"
+        )),
+        other => Err(format!(
+            "X dtype {other:?} is unsupported; use Float32, Float16, Float64 or opset-{BFLOAT16_SINCE}+ BFloat16"
+        )),
+    }
+}
+
+pub(super) enum Storage {
+    Float32,
+    Float16,
+    BFloat16,
+    Float64,
+}
+
+impl Storage {
+    fn function(
+        &self,
+        runtime: &CudaRuntime,
+        volumetric: bool,
+    ) -> Result<cudarc::driver::CudaFunction> {
+        let entry = match (self, volumetric) {
+            (Self::Float32, false) => "conv_transpose_f32_2d",
+            (Self::Float32, true) => "conv_transpose_f32_3d",
+            (Self::Float16, false) => "conv_transpose_f16_2d",
+            (Self::Float16, true) => "conv_transpose_f16_3d",
+            (Self::BFloat16, false) => "conv_transpose_bf16_2d",
+            (Self::BFloat16, true) => "conv_transpose_bf16_3d",
+            (Self::Float64, false) => "conv_transpose_f64_2d",
+            (Self::Float64, true) => "conv_transpose_f64_3d",
+        };
+        if matches!(self, Self::Float16 | Self::BFloat16) {
+            runtime.require_nvrtc_half_headers("ConvTranspose")?;
+            runtime.nvrtc_function(
+                "conv_transpose_half_v2",
+                &format!("#define CONV_TRANSPOSE_HALF\n{SOURCE}"),
+                entry,
+            )
+        } else {
+            runtime.nvrtc_function("conv_transpose_float_v2", SOURCE, entry)
+        }
     }
 }
 
 struct ConvTransposeKernel {
     runtime: Arc<CudaRuntime>,
     parameters: Parameters,
+    since_version: u64,
 }
 
-impl ConvTransposeKernel {
-    fn output_spatial(&self, input: &[usize], kernel: &[usize]) -> Result<Vec<usize>> {
+impl Parameters {
+    fn output_geometry(&self, input: &[usize], kernel: &[usize]) -> Result<(Vec<usize>, Vec<i64>)> {
+        self.validate_kernel(kernel)?;
         let rank = input.len();
-        input
-            .iter()
-            .zip(kernel)
-            .enumerate()
-            .map(|(axis, (&input, &kernel))| {
-                let effective = self.parameters.dilations[axis]
-                    .checked_mul(kernel.saturating_sub(1))
-                    .and_then(|value| value.checked_add(1))
-                    .ok_or_else(|| {
-                        EpError::KernelFailed(
-                            "cuda_ep ConvTranspose: effective kernel overflow".into(),
-                        )
-                    })?;
-                let base = self.parameters.strides[axis]
-                    .checked_mul(input.saturating_sub(1))
-                    .and_then(|value| value.checked_add(effective))
-                    .and_then(|value| value.checked_add(self.parameters.output_padding[axis]))
-                    .ok_or_else(|| {
-                        EpError::KernelFailed(
-                            "cuda_ep ConvTranspose: output dimension overflow".into(),
-                        )
-                    })?;
-                base.checked_sub(self.parameters.pads[axis] + self.parameters.pads[axis + rank])
-                    .ok_or_else(|| {
-                        EpError::KernelFailed(
-                            "cuda_ep ConvTranspose: pads exceed generated output".into(),
-                        )
-                    })
-            })
-            .collect()
+        let mut output = Vec::with_capacity(rank);
+        let mut pad_begin = Vec::with_capacity(rank);
+        for axis in 0..rank {
+            let overflow = || {
+                invalid(format!(
+                    "spatial axis {axis} exceeds signed 64-bit geometry; reduce shape, stride or dilation"
+                ))
+            };
+            let x = i64::try_from(input[axis]).map_err(|_| overflow())?;
+            let k = i64::try_from(kernel[axis]).map_err(|_| overflow())?;
+            let stride = i128::from(self.strides[axis]);
+            let last =
+                stride * i128::from(x - 1) + i128::from(self.dilations[axis]) * i128::from(k - 1);
+            let base = last + 1 + i128::from(self.output_padding[axis]);
+            let (size, begin) = match &self.padding {
+                Padding::Explicit(pads) => {
+                    let begin = i128::from(pads[axis]);
+                    (base - begin - i128::from(pads[axis + rank]), begin)
+                }
+                Padding::Inferred { shape, upper } => {
+                    let desired = shape
+                        .as_ref()
+                        .map_or(i128::from(x) * stride, |s| i128::from(s[axis]));
+                    let total = base - desired;
+                    // floor corrects the odd split even when a stride leaves a hole
+                    // (negative generated padding).
+                    let small = total.div_euclid(2);
+                    (desired, if *upper { small } else { total - small })
+                }
+            };
+            if size < 0 {
+                return Err(invalid(format!(
+                    "pads produce negative output extent {size} on spatial axis {axis}; reduce pads or specify output_shape"
+                )));
+            }
+            // The device translates signed coordinates only for existing X cells.
+            if x > 0 && (i64::try_from(last).is_err() || i64::try_from(last - begin).is_err()) {
+                return Err(overflow());
+            }
+            output.push(
+                usize::try_from(i64::try_from(size).map_err(|_| overflow())?)
+                    .map_err(|_| overflow())?,
+            );
+            pad_begin.push(i64::try_from(begin).map_err(|_| overflow())?);
+        }
+        Ok((output, pad_begin))
     }
 }
 
@@ -281,21 +392,13 @@ impl Kernel for ConvTransposeKernel {
         }
         let x = &inputs[0];
         let weights = &inputs[1];
-        let rank = x.shape.len();
-        if !matches!(rank, 3 | 4) || weights.shape.len() != rank {
-            return Err(not_implemented(
-                "ConvTranspose supports only 1-D/2-D inputs",
-            ));
-        }
+        let rank = spatial_rank(x.shape.len(), weights.shape.len())?;
         if x.dtype != weights.dtype || outputs[0].dtype != x.dtype {
             return Err(EpError::KernelFailed(
                 "cuda_ep ConvTranspose: X, W, and Y dtypes must match".into(),
             ));
         }
-        let dtype = dtype_code(x.dtype)?;
-        if dtype != 0 {
-            self.runtime.require_nvrtc_half_headers("ConvTranspose")?;
-        }
+        let storage = storage(x.dtype, self.since_version).map_err(invalid)?;
         let group = self.parameters.group;
         if weights.shape[0] != x.shape[1]
             || !x.shape[1].is_multiple_of(group)
@@ -308,7 +411,9 @@ impl Kernel for ConvTransposeKernel {
         let output_channels = weights.shape[1]
             .checked_mul(group)
             .ok_or_else(|| EpError::KernelFailed("output channel overflow".into()))?;
-        let output_spatial = self.output_spatial(&x.shape[2..], &weights.shape[2..])?;
+        let (output_spatial, pad_begin) = self
+            .parameters
+            .output_geometry(&x.shape[2..], &weights.shape[2..])?;
         let expected = [x.shape[0], output_channels]
             .into_iter()
             .chain(output_spatial.iter().copied())
@@ -328,32 +433,7 @@ impl Kernel for ConvTransposeKernel {
         if outputs[0].numel() == 0 {
             return Ok(());
         }
-        let (input_height, input_width, output_height, output_width, kernel_height, kernel_width) =
-            if rank == 3 {
-                (1, x.shape[2], 1, output_spatial[0], 1, weights.shape[2])
-            } else {
-                (
-                    x.shape[2],
-                    x.shape[3],
-                    output_spatial[0],
-                    output_spatial[1],
-                    weights.shape[2],
-                    weights.shape[3],
-                )
-            };
-        let axis = |values: &[usize], height_default: usize| {
-            if rank == 3 {
-                (height_default, values[0])
-            } else {
-                (values[0], values[1])
-            }
-        };
-        let (stride_height, stride_width) = axis(&self.parameters.strides, 1);
-        let (dilation_height, dilation_width) = axis(&self.parameters.dilations, 1);
-        let (pad_height, pad_width) = axis(&self.parameters.pads, 0);
-        let function =
-            self.runtime
-                .nvrtc_function("conv_transpose_common_v1", SOURCE, "conv_transpose")?;
+        let function = storage.function(&self.runtime, rank == 3)?;
         let x_pointer = cuptr(x.data_ptr::<u8>() as *const c_void);
         let weights_pointer = cuptr(weights.data_ptr::<u8>() as *const c_void);
         let bias_pointer = bias
@@ -361,26 +441,36 @@ impl Kernel for ConvTransposeKernel {
             .unwrap_or(0);
         let output_pointer = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
         let output_elements = outputs[0].numel() as u64;
-        let dimensions = [
+        let with_leading_ones = |values: &[usize]| {
+            let mut axes = [1; 3];
+            for (dst, &src) in axes[3 - rank..].iter_mut().zip(values) {
+                *dst = src as u64;
+            }
+            axes
+        };
+        let unsigned_axes = |values: &[i64]| {
+            let mut axes = [1; 3];
+            for (dst, &src) in axes[3 - rank..].iter_mut().zip(values) {
+                *dst = src as u64;
+            }
+            axes
+        };
+        let channels = [
             x.shape[1],
-            input_height,
-            input_width,
             output_channels,
-            output_height,
-            output_width,
-            weights.shape[1],
             x.shape[1] / group,
-            kernel_height,
-            kernel_width,
-            stride_height,
-            stride_width,
-            dilation_height,
-            dilation_width,
+            weights.shape[1],
         ]
         .map(|value| value as u64);
-        let pad_height = pad_height as i64;
-        let pad_width = pad_width as i64;
-        let has_bias = i32::from(bias.is_some());
+        let dimensions = [
+            with_leading_ones(&x.shape[2..]),
+            with_leading_ones(&output_spatial),
+            with_leading_ones(&weights.shape[2..]),
+            unsigned_axes(&self.parameters.strides),
+            unsigned_axes(&self.parameters.dilations),
+        ];
+        let mut pads = [0; 3];
+        pads[3 - rank..].copy_from_slice(&pad_begin);
         let mut builder = self.runtime.stream().launch_builder(&function);
         builder
             .arg(&x_pointer)
@@ -388,14 +478,12 @@ impl Kernel for ConvTransposeKernel {
             .arg(&bias_pointer)
             .arg(&output_pointer)
             .arg(&output_elements);
-        for dimension in &dimensions {
+        for dimension in channels.iter().chain(dimensions.iter().flatten()) {
             builder.arg(dimension);
         }
-        builder
-            .arg(&pad_height)
-            .arg(&pad_width)
-            .arg(&dtype)
-            .arg(&has_bias);
+        for pad in &pads {
+            builder.arg(pad);
+        }
         unsafe {
             builder.launch(LaunchConfig {
                 grid_dim: (
@@ -418,55 +506,87 @@ impl Kernel for ConvTransposeKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onnx_runtime_ir::{NodeId, ValueId};
+    use crate::kernels::standard_claims::unsupported_reason_at_opset;
+    use onnx_runtime_ir::{NodeId, ValueId, static_shape};
 
-    fn node(name: &str, attribute: Attribute) -> Node {
+    fn node(attributes: &[(&str, Attribute)]) -> Node {
         let mut node = Node::new(
             NodeId(0),
             "ConvTranspose",
             vec![Some(ValueId(0)), Some(ValueId(1))],
             vec![ValueId(2)],
         );
-        node.attributes.insert(name.into(), attribute);
+        node.attributes.extend(
+            attributes
+                .iter()
+                .map(|(name, attr)| ((*name).into(), attr.clone())),
+        );
         node
     }
 
     #[test]
-    fn deferred_geometry_is_rejected_by_claim_and_factory_contract() {
-        for deferred in [
-            node("auto_pad", Attribute::String(b"SAME_UPPER".to_vec())),
-            node("auto_pad", Attribute::String(b"SAME_LOWER".to_vec())),
-            node("output_shape", Attribute::Ints(vec![4, 4])),
+    fn conv_transpose_claim_observes_dtype_and_rank_boundaries() {
+        let op = node(&[]);
+        let shapes = [static_shape([1, 1, 2, 2, 2]), static_shape([1, 1, 3, 2, 1])];
+        let claim = |opset, dtype| unsupported_reason_at_opset(&op, opset, &shapes, &[dtype; 2]);
+        assert!(
+            claim(21, DataType::BFloat16)
+                .unwrap()
+                .contains("requires opset 22")
+        );
+        assert_eq!(claim(22, DataType::BFloat16), None);
+        assert_eq!(claim(11, DataType::Float64), None);
+        assert_eq!(claim(22, DataType::Float64), None);
+
+        for invalid_shapes in [
+            [static_shape([1; 6]), static_shape([1; 6])],
+            [static_shape([1; 5]), static_shape([1; 4])],
         ] {
-            assert!(
-                crate::kernels::standard_claims::unsupported_reason(
-                    &deferred,
-                    &[vec![1.into(), 1.into(), 2.into(), 2.into()]],
-                    &[DataType::Float32, DataType::Float32],
-                )
-                .is_some()
-            );
-            assert!(reject_deferred(&deferred).is_err());
+            let reason =
+                unsupported_reason_at_opset(&op, 22, &invalid_shapes, &[DataType::Float32; 2])
+                    .expect("CUDA must not claim unsupported or mismatched ranks");
+            assert!(reason.contains("matching ranks in 3..=5"), "{reason}");
         }
     }
 
     #[test]
-    fn three_dimensional_input_is_rejected_by_claim_gate() {
-        let node = Node::new(
-            NodeId(0),
-            "ConvTranspose",
-            vec![Some(ValueId(0)), Some(ValueId(1))],
-            vec![ValueId(2)],
+    fn conv_transpose_rejects_malformed_padding_at_claim() {
+        let shapes = [static_shape([1, 1, 2]), static_shape([1, 1, 3])];
+        for (attr, value) in [
+            ("output_shape", Attribute::Ints(vec![3, 4])),
+            ("output_shape", Attribute::Ints(vec![-1])),
+            ("output_padding", Attribute::Ints(vec![1])),
+            ("auto_pad", Attribute::String(b"SAME".to_vec())),
+        ] {
+            let reason = unsupported_reason_at_opset(
+                &node(&[(attr, value)]),
+                22,
+                &shapes,
+                &[DataType::Float32; 2],
+            )
+            .expect("malformed ConvTranspose attributes must not be claimed");
+            assert!(reason.contains(attr), "{reason}");
+        }
+    }
+
+    #[test]
+    fn conv_transpose_geometry_checks_empty_input_and_coordinate_overflow() {
+        let op = node(&[("strides", Attribute::Ints(vec![2]))]);
+        let parameters = Parameters::parse(&op, 1).unwrap();
+        assert_eq!(
+            parameters.output_geometry(&[0], &[3]).unwrap(),
+            (vec![1], vec![0])
         );
-        let reason = crate::kernels::standard_claims::unsupported_reason(
-            &node,
-            &[
-                vec![1.into(), 1.into(), 2.into(), 2.into(), 2.into()],
-                vec![1.into(), 1.into(), 2.into(), 2.into(), 2.into()],
-            ],
-            &[DataType::Float32, DataType::Float32],
-        )
-        .expect("rank-5 ConvTranspose must be declined before CUDA placement");
-        assert!(reason.contains("rank 5 unsupported"), "{reason}");
+
+        let op = node(&[("dilations", Attribute::Ints(vec![i64::MAX]))]);
+        let reason = Parameters::parse(&op, 1)
+            .unwrap()
+            .output_geometry(&[2], &[2])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            reason.contains("exceeds signed 64-bit geometry"),
+            "{reason}"
+        );
     }
 }
