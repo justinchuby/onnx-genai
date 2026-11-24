@@ -2468,7 +2468,10 @@ fn binary_metadata_and_signature_publish_together_and_preserve_old_graph() {
     let mut kernel = ep
         .get_kernel(&Node::new(NodeId(0), "Add", vec![], vec![]), &[], 13)
         .unwrap();
-    kernel.set_capture_seq_independent(true);
+    kernel.configure_shape_facts(onnx_runtime_ep_api::KernelShapeFacts {
+        capture_eligible: true,
+        ..Default::default()
+    });
     let execute = |a_shape: &[usize], b_shape: &[usize], out_shape: &[usize]| {
         let a_strides = compute_contiguous_strides(a_shape);
         let b_strides = compute_contiguous_strides(b_shape);
@@ -2583,6 +2586,35 @@ fn binary_metadata_and_signature_publish_together_and_preserve_old_graph() {
     runtime
         .end_graph_capture_in(onnx_runtime_ep_api::DeviceGraphSlot::Verify)
         .unwrap();
+    // Cold policy changes revoke warm capture readiness even if the concrete
+    // shape is unchanged. Already captured graphs retain their immutable owner.
+    let before_reconfigure = (
+        runtime.allocation_counts(),
+        runtime.transfer_counts(),
+        runtime.forced_synchronization_count(),
+    );
+    kernel.configure_shape_facts(onnx_runtime_ep_api::KernelShapeFacts {
+        evolution: onnx_runtime_ep_api::ShapeEvolution::Growing,
+        capture_eligible: false,
+    });
+    assert!(!kernel.cuda_graph_compatible());
+    kernel.configure_shape_facts(onnx_runtime_ep_api::KernelShapeFacts {
+        evolution: onnx_runtime_ep_api::ShapeEvolution::Stable,
+        capture_eligible: true,
+    });
+    assert!(
+        !kernel.cuda_graph_compatible(),
+        "enabling capture requires a new successful warm execution"
+    );
+    assert_eq!(
+        (
+            runtime.allocation_counts(),
+            runtime.transfer_counts(),
+            runtime.forced_synchronization_count(),
+        ),
+        before_reconfigure,
+        "cold shape facts must not allocate, transfer or synchronize"
+    );
     drop(kernel);
     let mut actual = [0u8; 24];
     runtime.replay_graph().unwrap();

@@ -127,9 +127,10 @@ impl Executor {
                 })
             })
             .collect::<Result<smallvec::SmallVec<[_; 2]>>>()?;
+        let shape_facts = self.kernel_shape_facts[pi];
         let kernel = if let Some(kernel) = self.kernel_bindings[pi]
             .as_ref()
-            .and_then(|binding| self.cache.get_prebound(binding, input_shapes))
+            .and_then(|binding| self.cache.get_prebound(binding, input_shapes, shape_facts))
         {
             kernel
         } else {
@@ -144,7 +145,7 @@ impl Executor {
                 &constant_inputs,
                 &constant_values,
                 effective_opset(&self.graph, node),
-                false,
+                shape_facts,
                 self.artifact_config,
                 &mut self.provider_artifact_readiness,
                 self.ep.as_ref(),

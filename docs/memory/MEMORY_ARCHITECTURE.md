@@ -79,6 +79,25 @@ and host tests do not validate CUDA mapping, stream ordering, capture/replay or
 throughput. Adoption, pooling, lending and release behavior remain unchanged in
 this cleanup.
 
+### Shape evidence and metadata ownership
+
+`KernelShapeFacts` separates positive graph evidence (`Stable`, `Growing`,
+`Unknown`) from capture eligibility. A capture denylist can permit an unproven
+symbol; that permission does not prove stability. Conversely, `Growing` means
+an input or output depends on a growing symbol, not that every call changes its
+concrete shape. Session computes these facts during construction and capacity
+pinning, and includes them in kernel specialization and prebinding identity.
+Changing facts cannot reuse a kernel prepared under the old configuration even
+when concrete input shapes match.
+
+Binary broadcast descriptors keep immutable native ownership. Repeated shapes
+reuse the published descriptor without a new upload or quota admission; captured
+graphs pin the actual owner. A shared workspace lane has unspecified contents
+between dispatches, so using it for these descriptors would require uploading on
+every call, including repeated growing shapes. Positive growth evidence alone
+therefore does not select mutable metadata storage. Such a policy needs device
+measurements of both changing and repeated shapes before changing the default.
+
 ### Resource allocation granularity
 
 Admission follows physical ownership and independent reclamation, not each
