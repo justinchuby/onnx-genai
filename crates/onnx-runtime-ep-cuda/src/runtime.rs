@@ -3786,7 +3786,6 @@ impl Drop for CudaRuntime {
         // source weight's device address, and that address stops meaning
         // anything once this runtime's allocator is gone. Freeing here is what
         // bounds an entry's life by the life of the address that names it.
-        crate::kernels::marlin_gemm::release_scratch_for_runtime(self.runtime_id);
         self.interleave.release_all(&*self);
         if self.capture_error != 0 {
             // SAFETY: `capture_error` was allocated by this runtime's `alloc_raw`
