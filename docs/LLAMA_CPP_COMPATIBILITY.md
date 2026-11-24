@@ -425,7 +425,10 @@ parity. These upstream protocols are still unimplemented:
 - Device-state/multi-sequence slot persistence; arbitrary GGUF/PEFT LoRA imports and device-fused LoRA.
 - GGUF/Hugging Face model downloads and deletion.
 
-`/tools`, model download/delete and mutable `/props` remain disabled. The MCP
+Model download/delete and mutable `/props` remain disabled.
+`GET/POST /tools` now supports the seven explicitly enabled host built-ins,
+including command SSE, file selection and editing. See [host tools](SERVER_TOOLS.md)
+for limits, trusted-origin policy and remaining MCP/container/SSH integrations. The MCP
 HTTP proxy is separately opt-in with `--ui-mcp-proxy`; `/props` reports
 `cors_proxy_enabled` from that setting. `GET` and `POST /cors-proxy?url=...`
 forward only headers explicitly prefixed with `x-llama-server-proxy-header-`.
