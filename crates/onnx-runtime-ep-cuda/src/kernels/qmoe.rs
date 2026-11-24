@@ -9,11 +9,13 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::sys::CUdeviceptr;
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
     DeviceGraphResource, EpError, ExecutorArtifactGeneration, ExecutorInstanceId,
     ExecutorRouteResidencyConfig, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata,
@@ -1663,7 +1665,6 @@ pub struct QMoERouteTelemetry {
     runtime: Arc<CudaRuntime>,
     routes_per_row: usize,
     state: Mutex<Option<ArmedTelemetry>>,
-    last_call_used: AtomicBool,
 }
 
 impl QMoERouteTelemetry {
@@ -1672,7 +1673,6 @@ impl QMoERouteTelemetry {
             runtime,
             routes_per_row,
             state: Mutex::new(None),
-            last_call_used: AtomicBool::new(false),
         }
     }
 
@@ -1693,38 +1693,26 @@ impl QMoERouteTelemetry {
             });
         }
         let armed = ArmedTelemetry::arm(&self.runtime, config)?;
-        let mut telemetry = self.state.lock().expect("cuda_ep QMoE telemetry poisoned");
-        if let Some(previous) = telemetry.take() {
-            let _ = self.runtime.drain_for_unmap();
-            drop(previous);
-        }
-        *telemetry = Some(armed);
+        // Return the replaced owner before dropping it: native retirement may
+        // run provider actions which acquire this same telemetry mutex.
+        drop(replace_route_telemetry(&self.state, armed)?);
         Ok(())
     }
 
     #[doc(hidden)]
     pub fn disarm_route_telemetry(&self) {
-        let mut telemetry = self.state.lock().expect("cuda_ep QMoE telemetry poisoned");
-        if let Some(previous) = telemetry.take() {
-            let _ = self.runtime.drain_for_unmap();
-            drop(previous);
-        }
-    }
-
-    pub(crate) fn disarm_route_telemetry_after_stream_fences(&self) {
-        let mut telemetry = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(previous) = telemetry.take() {
-            drop(previous);
-        }
+        drop(take_route_telemetry(&self.state));
     }
 
     #[doc(hidden)]
     pub fn reset_route_telemetry_boundary(&self) -> Result<()> {
-        let mut telemetry = self.state.lock().expect("cuda_ep QMoE telemetry poisoned");
-        match telemetry.as_mut() {
+        // Global capture exclusion precedes state: queue retirement callbacks
+        // can hold the capture/execution gates while acquiring this mutex.
+        let _section = onnx_runtime_cuda_memory::capture_gate::synchronizing_section();
+        let telemetry = self.state.lock().map_err(|_| error(
+            "QMoE route telemetry state is poisoned during boundary reset; stop inference and rebuild the provider",
+        ))?;
+        match telemetry.as_ref() {
             Some(armed) => armed.reset_boundary(&self.runtime),
             None => Ok(()),
         }
@@ -1732,7 +1720,10 @@ impl QMoERouteTelemetry {
 
     #[doc(hidden)]
     pub fn route_telemetry_snapshot(&self) -> Result<Option<TelemetrySnapshot>> {
-        let telemetry = self.state.lock().expect("cuda_ep QMoE telemetry poisoned");
+        let _section = onnx_runtime_cuda_memory::capture_gate::synchronizing_section();
+        let telemetry = self.state.lock().map_err(|_| error(
+            "QMoE route telemetry state is poisoned during snapshot; stop inference and rebuild the provider",
+        ))?;
         match telemetry.as_ref() {
             Some(armed) => Ok(Some(armed.snapshot(&self.runtime)?)),
             None => Ok(None),
@@ -1743,7 +1734,7 @@ impl QMoERouteTelemetry {
     pub fn route_telemetry_footprint_bytes(&self) -> usize {
         self.state
             .lock()
-            .expect("cuda_ep QMoE telemetry poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .map_or(0, ArmedTelemetry::footprint_bytes)
     }
@@ -1752,71 +1743,99 @@ impl QMoERouteTelemetry {
     pub fn route_telemetry_bitmap_addr(&self) -> Option<u64> {
         self.state
             .lock()
-            .expect("cuda_ep QMoE telemetry poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .map(ArmedTelemetry::bitmap_addr)
     }
 
-    fn launch_ptrs(&self, experts: usize) -> Result<(CUdeviceptr, CUdeviceptr)> {
-        let telemetry = self
-            .state
-            .lock()
-            .map_err(|_| error("cuda_ep QMoE telemetry poisoned"))?;
-        match telemetry.as_ref() {
-            Some(armed) if armed.matches_experts(experts) => {
-                if self.runtime.is_capturing()? {
-                    self.runtime.require_captured_address_owner(
-                        armed.device_graph_resource().identity(),
-                        "QMoE route telemetry allocation",
-                    )?;
-                }
-                self.last_call_used.store(true, Ordering::Relaxed);
-                Ok((armed.bitmap_ptr(), armed.header_ptr()))
-            }
-            _ => {
-                self.last_call_used.store(false, Ordering::Relaxed);
-                Ok((0, 0))
-            }
-        }
+    fn capture_resource(&self, experts: usize) -> Result<Option<DeviceGraphResource>> {
+        let telemetry = self.state.lock().map_err(|_| error(
+            "QMoE route telemetry state is poisoned while preparing capture ownership; rebuild the provider",
+        ))?;
+        Ok(telemetry
+            .as_ref()
+            .filter(|armed| armed.matches_experts(experts))
+            .map(ArmedTelemetry::device_graph_resource))
     }
 
-    fn capture_resource_ids(&self, experts: usize) -> Vec<usize> {
+    /// Keep the window mutex until route submission, so a reset cannot clear
+    /// the same record between pointer selection and the producer launch.
+    fn launch_read(&self, experts: usize, expected: &[usize]) -> Result<TelemetryLaunchRead<'_>> {
+        let state = self.state.lock().map_err(|_| error(
+            "QMoE route telemetry state is poisoned before route submission; rebuild the provider",
+        ))?;
+        let read = TelemetryLaunchRead { state, experts };
+        let actual = read.armed().map(ArmedTelemetry::identity);
+        validate_telemetry_owner(expected, actual)?;
+        if let Some(identity) = actual
+            && self.runtime.is_capturing()?
+        {
+            self.runtime
+                .require_captured_address_owner(identity, "QMoE route telemetry allocation")?;
+        }
+        Ok(read)
+    }
+}
+
+/// Administrative ownership handoff. No device operation or owner destruction
+/// occurs under state; the caller receives the old value to retire afterwards.
+fn replace_route_telemetry<T>(
+    state: &Mutex<Option<T>>,
+    armed: T,
+) -> std::result::Result<Option<T>, TelemetryUnsupported> {
+    let mut current = state
+        .lock()
+        .map_err(|_| TelemetryUnsupported::StatePoisoned)?;
+    Ok(current.replace(armed))
+}
+
+fn take_route_telemetry<T>(state: &Mutex<Option<T>>) -> Option<T> {
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
+
+fn validate_telemetry_owner(expected: &[usize], actual: Option<usize>) -> Result<()> {
+    if match (expected, actual) {
+        ([], None) => true,
+        ([expected], Some(actual)) => *expected == actual,
+        _ => false,
+    } {
+        return Ok(());
+    }
+    Err(error(format!(
+        "QMoE route telemetry changed during execution preparation: expected owners {expected:?}, actual {actual:?}; reconfigure telemetry only at a coarse idle boundary and repeat warmup"
+    )))
+}
+
+struct TelemetryLaunchRead<'a> {
+    state: std::sync::MutexGuard<'a, Option<ArmedTelemetry>>,
+    experts: usize,
+}
+
+impl TelemetryLaunchRead<'_> {
+    fn armed(&self) -> Option<&ArmedTelemetry> {
         self.state
-            .lock()
-            .ok()
-            .and_then(|telemetry| {
-                telemetry
-                    .as_ref()
-                    .filter(|armed| armed.matches_experts(experts))
-                    .map(|armed| vec![armed.device_graph_resource().identity()])
-            })
-            .unwrap_or_default()
+            .as_ref()
+            .filter(|armed| armed.matches_experts(self.experts))
     }
 
-    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        if !self.last_call_used.load(Ordering::Relaxed) {
-            return Vec::new();
-        }
-        self.state
-            .lock()
-            .ok()
-            .and_then(|telemetry| {
-                telemetry
-                    .as_ref()
-                    .map(|armed| vec![armed.device_graph_resource()])
-            })
-            .unwrap_or_default()
+    fn pointers(&self) -> (CUdeviceptr, CUdeviceptr) {
+        self.armed()
+            .map_or((0, 0), |armed| (armed.bitmap_ptr(), armed.header_ptr()))
     }
 }
 
 impl Drop for QMoERouteTelemetry {
     fn drop(&mut self) {
-        if let Ok(telemetry) = self.state.get_mut()
-            && let Some(armed) = telemetry.take()
-        {
-            let _ = self.runtime.drain_for_unmap();
-            drop(armed);
-        }
+        // No mutex is held during final native retirement, including poison.
+        let previous = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drop(previous);
     }
 }
 
@@ -2093,9 +2112,6 @@ impl QMoEKernel {
             .lock()
             .map_err(|_| error("QMoE warm-state lock poisoned"))?;
         let previous = warm_state.capture_ready.take();
-        if let Some(telemetry) = &self.telemetry {
-            telemetry.last_call_used.store(false, Ordering::Relaxed);
-        }
         if !(7..=21).contains(&inputs.len()) || outputs.len() != 1 {
             return Err(error(format!(
                 "expected 7 to 21 inputs and exactly 1 output, got {} inputs and {} outputs",
@@ -2162,9 +2178,18 @@ impl QMoEKernel {
             )
         });
         let capturing = self.runtime.is_capturing()?;
-        let telemetry_resource_ids = self.telemetry.as_ref().map_or_else(Vec::new, |telemetry| {
-            telemetry.capture_resource_ids(experts)
-        });
+        // Retain the early source identity through preparation, preventing an
+        // ABA identity reuse if an administrative reconfiguration races it.
+        let telemetry_resource = self
+            .telemetry
+            .as_ref()
+            .map(|telemetry| telemetry.capture_resource(experts))
+            .transpose()?
+            .flatten();
+        let telemetry_resource_ids = telemetry_resource
+            .iter()
+            .map(DeviceGraphResource::identity)
+            .collect();
         let capture_signature = Self::capture_signature(inputs, outputs, telemetry_resource_ids);
         if capturing {
             Self::validate_capture_signature(previous.as_deref(), &capture_signature)?;
@@ -2309,21 +2334,34 @@ impl QMoEKernel {
         // capacity — the pointers are null and the route kernel is
         // byte-identical; a capacity mismatch leaves telemetry inert for this
         // call and never fails inference.
-        let (telemetry_bitmap, telemetry_header) = match &self.telemetry {
-            Some(telemetry) => telemetry.launch_ptrs(experts)?,
-            None => (0, 0),
-        };
-
-        self.launch_route(
-            router_probs_ptr,
-            router_weights_ptr,
-            route_indices,
-            route_weights,
-            rows,
-            experts,
-            telemetry_bitmap,
-            telemetry_header,
-        )?;
+        // Module loading may synchronize; resolve it before the state mutex.
+        let route_function = self
+            .runtime
+            .nvrtc_function(MODULE, qmoe_module_src(), ROUTE_ENTRY)?;
+        {
+            let read = self
+                .telemetry
+                .as_ref()
+                .map(|telemetry| {
+                    telemetry.launch_read(experts, &capture_signature.telemetry_resource_ids)
+                })
+                .transpose()?;
+            let (bitmap, header) = read.as_ref().map_or((0, 0), TelemetryLaunchRead::pointers);
+            self.launch_route(
+                &route_function,
+                router_probs_ptr,
+                router_weights_ptr,
+                route_indices,
+                route_weights,
+                rows,
+                experts,
+                bitmap,
+                header,
+            )?;
+            // Release window submission serialization before subsequent work
+            // can allocate, synchronize or execute deferred retirement actions.
+            drop(read);
+        }
         // Investigation probe (default-OFF): dump the top-k expert SELECTION and
         // the router-logit margin per QMoE call so a CPU-vs-CUDA run can be
         // diffed to distinguish a benign borderline-argmax reassociation from a
@@ -2456,11 +2494,11 @@ impl QMoEKernel {
         if !capturing {
             self.runtime.synchronize()?;
         }
-        let mut resources = Vec::new();
-        if let Some(telemetry) = &self.telemetry {
-            resources.extend(telemetry.device_graph_resources());
-        }
-        Self::publish_capture_ready(&mut warm_state, capture_signature, resources);
+        Self::publish_capture_ready(
+            &mut warm_state,
+            capture_signature,
+            telemetry_resource.into_iter().collect(),
+        );
         Ok(())
     }
 
@@ -2570,6 +2608,7 @@ impl QMoEKernel {
     #[allow(clippy::too_many_arguments)]
     fn launch_route(
         &self,
+        function: &CudaFunction,
         router_probs: CUdeviceptr,
         router_weights: CUdeviceptr,
         route_indices: CUdeviceptr,
@@ -2579,15 +2618,12 @@ impl QMoEKernel {
         route_telemetry_bitmap: CUdeviceptr,
         route_telemetry_header: CUdeviceptr,
     ) -> Result<()> {
-        let function = self
-            .runtime
-            .nvrtc_function(MODULE, qmoe_module_src(), ROUTE_ENTRY)?;
         let rows = as_u64("row count", rows)?;
         let experts = as_i32("expert count", experts)?;
         let top_k = as_i32("top-k", self.attributes.k)?;
         let normalize = i32::from(self.attributes.normalize_routing_weights);
         let config = self.route_launch_config(rows, experts)?;
-        let mut builder = self.runtime.stream().launch_builder(&function);
+        let mut builder = self.runtime.stream().launch_builder(function);
         builder
             .arg(&router_probs)
             .arg(&router_weights)
@@ -3385,6 +3421,160 @@ mod tests {
             node.attributes.insert((*name).into(), value.clone());
         }
         node
+    }
+
+    #[test]
+    fn telemetry_owner_identity_is_exact_across_preparation_and_submission() {
+        for (expected, actual) in [(&[][..], None), (&[17][..], Some(17))] {
+            validate_telemetry_owner(expected, actual).unwrap();
+        }
+        for (expected, actual) in [
+            (&[][..], Some(17)),
+            (&[17][..], None),
+            (&[17][..], Some(23)),
+            (&[17, 23][..], Some(17)),
+        ] {
+            let error = validate_telemetry_owner(expected, actual)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("changed during execution preparation"),
+                "{error}"
+            );
+            assert!(error.contains("coarse idle boundary"), "{error}");
+        }
+    }
+
+    #[test]
+    fn telemetry_handoffs_retire_reentrant_owners_after_unlocking_including_poison() {
+        struct ReentrantOwner {
+            state: std::sync::Weak<Mutex<Option<ReentrantOwner>>>,
+            drops: Arc<AtomicU64>,
+        }
+        impl Drop for ReentrantOwner {
+            fn drop(&mut self) {
+                if let Some(state) = self.state.upgrade() {
+                    assert!(
+                        !matches!(state.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+                        "native retirement must be able to reenter the telemetry state"
+                    );
+                }
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let state = Arc::new(Mutex::new(None));
+        let drops = Arc::new(AtomicU64::new(0));
+        let owner = || ReentrantOwner {
+            state: Arc::downgrade(&state),
+            drops: Arc::clone(&drops),
+        };
+        drop(replace_route_telemetry(&state, owner()).unwrap());
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        drop(replace_route_telemetry(&state, owner()).unwrap());
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        drop(take_route_telemetry(&state));
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        drop(replace_route_telemetry(&state, owner()).unwrap());
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = state.lock().unwrap();
+            panic!("injected administrative panic");
+        });
+        let failure = replace_route_telemetry(&state, owner()).err().unwrap();
+        assert_eq!(failure, TelemetryUnsupported::StatePoisoned);
+        assert!(failure.to_string().contains("rebuild the provider"));
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            3,
+            "unpublished candidate retired outside poisoned lock"
+        );
+        drop(take_route_telemetry(&state));
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            4,
+            "cleanup must recover the retained owner after poison"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable gpu-tests"
+    )]
+    fn telemetry_read_serializes_submission_and_retirement_uses_native_owner() {
+        use onnx_runtime_ep_api::ExecutionProvider;
+        let (provider, runtime) =
+            crate::test_support::maybe_native_runtime().expect("native CUDA provider required");
+        let telemetry = QMoERouteTelemetry::new(Arc::clone(&runtime), 1);
+        let config = RouteTelemetryConfig {
+            request_id: 7,
+            device_id: runtime.ordinal(),
+            num_experts: 4,
+            routes_per_row: 1,
+        };
+        let counts_before = runtime.allocation_counts();
+        telemetry.arm_route_telemetry(config).unwrap();
+        let resource = telemetry.capture_resource(4).unwrap().unwrap();
+        let old = telemetry.route_telemetry_bitmap_addr().unwrap();
+        let syncs = runtime.forced_synchronization_count();
+        {
+            let read = telemetry.launch_read(4, &[resource.identity()]).unwrap();
+            assert_eq!(read.pointers().0, old);
+            assert!(
+                matches!(
+                    telemetry.state.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                "window reset cannot pass selection before route submission"
+            );
+        }
+        telemetry.disarm_route_telemetry();
+        assert_eq!(
+            runtime.forced_synchronization_count(),
+            syncs,
+            "disarm must not globally drain readers"
+        );
+        assert!(telemetry.capture_resource(4).unwrap().is_none());
+        let read = telemetry.launch_read(4, &[]).unwrap();
+        assert_eq!(read.pointers(), (0, 0));
+        drop(read);
+        let owner = (resource.identity(), old);
+        let before_rearm = runtime.forced_synchronization_count();
+        telemetry.arm_route_telemetry(config).unwrap();
+        assert_eq!(
+            runtime.forced_synchronization_count(),
+            before_rearm + 1,
+            "arming keeps its required H2D completion, without an old-owner retirement drain"
+        );
+        let replacement = telemetry.capture_resource(4).unwrap().unwrap();
+        assert_ne!(
+            replacement.identity(),
+            owner.0,
+            "old resource pin must retain the real owner identity"
+        );
+        assert_ne!(telemetry.route_telemetry_bitmap_addr(), Some(owner.1));
+        let refusal = telemetry
+            .launch_read(4, &[owner.0])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(refusal.contains("changed during execution preparation"));
+        let before = runtime.forced_synchronization_count();
+        drop(telemetry);
+        assert_eq!(
+            runtime.forced_synchronization_count(),
+            before,
+            "final native retirement must not drain"
+        );
+        drop(resource);
+        drop(replacement);
+        provider.wait_for_deferred_releases().unwrap();
+        let settled = runtime.allocation_counts();
+        assert_eq!(settled.allocations, counts_before.allocations + 2);
+        assert_eq!(
+            settled.frees,
+            counts_before.frees + 2,
+            "both native owners must settle exactly once"
+        );
     }
 
     #[test]

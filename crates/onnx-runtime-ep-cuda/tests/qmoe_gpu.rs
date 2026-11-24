@@ -4525,7 +4525,13 @@ mod route_telemetry {
         assert_eq!(snap_b.header[H_DEVICE], ep.runtime().ordinal());
 
         // Teardown/accounting: disarm frees the record and zeroes the footprint.
+        let before_disarm = ep.runtime().forced_synchronization_count();
         kernel_a.disarm_route_telemetry();
+        assert_eq!(
+            ep.runtime().forced_synchronization_count(),
+            before_disarm,
+            "native owner retirement must not add a global inference drain"
+        );
         assert_eq!(kernel_a.route_telemetry_footprint_bytes(), 0);
         assert!(kernel_a.route_telemetry_snapshot().unwrap().is_none());
         // Inference still works after disarm.

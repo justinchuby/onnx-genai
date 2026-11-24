@@ -1571,6 +1571,41 @@ BlockQuantizedMoE route/capture suites are compiled for integration coverage.
 Device execution, atomic-contention impact and throughput remain unmeasured;
 512B separation is a conservative layout choice, not proof of equal performance.
 
+QMoE retains one window-state mutex because reset writes the same record in
+place. Route submission now borrows that locked state from pointer selection
+through the route launch, so reset cannot pass between those steps. NVRTC
+function resolution occurs before taking the mutex; the borrowed state is
+released before subsequent allocations, synchronization or release-queue work.
+Snapshot/reset enter global capture exclusion before locking state, preserving
+the capture/queue-to-state lock order. Reset still drains completed compute and
+copy work before zeroing the record; snapshot remains a coarse ordered read.
+
+Arm publishes a complete candidate with a short ownership handoff, then drops
+the prior record outside the mutex. Disarm and poisoned-state cleanup use that
+same retirement handoff after unlocking. Native queue completion and graph pins own
+retirement, so arm/disarm/final destruction no longer perform an ignored global
+drain. Provider cleanup after its existing stream fences invokes this same
+disarm path; there is no second retirement API or new quota protocol. Failed
+state publication returns an actionable typed poison error and preserves the
+previous record.
+
+The early capture signature retains the exact selected native owner pin until
+successful publication. Submission compares the currently selected owner with
+that signature while holding the window mutex, refusing administrative
+reconfiguration instead of recording a different pointer. This also prevents
+host owner-address reuse during preparation. Successful capture readiness stores
+the exact same pin, without re-reading mutable telemetry state. The shared
+last-call-used flag is removed; warm execution adds no grant, refund, reset,
+extra resource allocation or owner clone compared with the prior path.
+
+Host tests exercise exact owner matching and reentrant retirement outside the
+state lock, including candidate refusal and cleanup after poison. CUDA fixtures
+compile/list assertions for submission serialization, no retirement drain,
+retained old ownership and exact native settlement. Existing QMoE graph/window
+integration tests retain reset, accumulation and request-isolation coverage.
+These source/Host checks do not prove device ordering or throughput; the longer
+route-submission mutex interval still needs device validation.
+
 ### Variable-length attention borrows one exact caller composite
 
 `pkg.nxrt::VarlenAttention` and `PackedVarlenAttention` register
