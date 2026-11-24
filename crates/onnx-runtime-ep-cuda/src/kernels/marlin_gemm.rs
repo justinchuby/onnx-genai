@@ -293,7 +293,11 @@ impl RepackCache {
             ));
         }
         let bytes = repacked_bytes(n, k);
-        let allocation = GraphDeviceAllocation::allocate(&self.runtime, bytes)?;
+        let allocation = GraphDeviceAllocation::allocate(
+            &self.runtime,
+            bytes,
+            onnx_runtime_memory_api::MemoryRole::Weights,
+        )?;
         let out = allocation.ptr();
         launch_marlin_repack(&self.runtime, packed, out, n, k, group_size)?;
         let mut cache = self.map.lock().expect("marlin repack cache poisoned");
@@ -1103,8 +1107,8 @@ mod tests {
 
     use crate::runtime::CudaRuntime;
 
-    fn runtime() -> Option<Arc<CudaRuntime>> {
-        crate::test_support::maybe_runtime()
+    fn runtime() -> Option<crate::test_support::NativeRuntimeFixture> {
+        crate::test_support::maybe_native_runtime()
     }
 
     fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
@@ -1349,7 +1353,7 @@ mod tests {
     #[test]
     #[ignore = "requires a live CUDA device (SM80+)"]
     fn marlin_parity_vs_f64_oracle() {
-        let Some(rt) = runtime() else {
+        let Some((_provider, rt)) = runtime() else {
             eprintln!("skipping: CUDA runtime unavailable");
             return;
         };
@@ -1409,7 +1413,7 @@ mod tests {
     #[test]
     #[ignore = "requires a live CUDA device (SM80+)"]
     fn marlin_splitk_parity_vs_f64_oracle() {
-        let Some(rt) = runtime() else {
+        let Some((_provider, rt)) = runtime() else {
             eprintln!("skipping: CUDA runtime unavailable");
             return;
         };
@@ -1460,7 +1464,7 @@ mod tests {
     #[test]
     #[ignore = "requires a live CUDA device (SM80+)"]
     fn marlin_splitk_is_deterministic() {
-        let Some(rt) = runtime() else {
+        let Some((_provider, rt)) = runtime() else {
             eprintln!("skipping: CUDA runtime unavailable");
             return;
         };
@@ -1483,7 +1487,7 @@ mod tests {
     fn marlin_bandwidth_microbench() {
         use half::f16;
 
-        let Some(rt) = runtime() else {
+        let Some((_provider, rt)) = runtime() else {
             eprintln!("skipping: CUDA runtime unavailable");
             return;
         };
@@ -1633,7 +1637,7 @@ mod tests {
     #[test]
     #[ignore = "requires a live CUDA device"]
     fn device_repack_matches_host() {
-        let Some(rt) = runtime() else {
+        let Some((_provider, rt)) = runtime() else {
             eprintln!("skipping: CUDA runtime unavailable");
             return;
         };
@@ -1681,7 +1685,7 @@ mod tests {
     #[test]
     #[ignore = "requires a live CUDA device"]
     fn repack_cache_address_reuse_is_scoped_to_kernel_owner() {
-        let Some(rt) = runtime() else {
+        let Some((_provider, rt)) = runtime() else {
             eprintln!("skipping: CUDA runtime unavailable");
             return;
         };

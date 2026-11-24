@@ -1324,7 +1324,7 @@ mod tests {
 
     #[test]
     fn silu_mul_f16_matches_reference_with_half2_tail() {
-        let Some(runtime) = crate::test_support::maybe_runtime() else {
+        let Some((_provider_runtime, runtime)) = crate::test_support::maybe_native_runtime() else {
             eprintln!("skipping fused SiluMul fp16 parity test: CUDA runtime unavailable");
             return;
         };
@@ -1418,7 +1418,7 @@ mod tests {
 
     #[test]
     fn decomposed_silu_mul_bf16_is_byte_exact_vs_two_op_bf16_reference() {
-        let Some(runtime) = crate::test_support::maybe_runtime() else {
+        let Some((_provider_runtime, runtime)) = crate::test_support::maybe_native_runtime() else {
             eprintln!("skipping decomposed SiluMul bf16 parity test: CUDA runtime unavailable");
             return;
         };
@@ -1628,8 +1628,8 @@ mod claim_probes {
     use super::{BinaryKernel, BinaryOp, BroadcastMetadataCache, broadcast_metadata, u64_bytes};
     use crate::CudaRuntime;
 
-    fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
-        crate::test_support::maybe_runtime()
+    fn maybe_runtime() -> Option<crate::test_support::NativeRuntimeFixture> {
+        crate::test_support::maybe_native_runtime()
     }
 
     fn run_i32_binary(runtime: &Arc<CudaRuntime>, op: BinaryOp, a: &[i32], b: &[i32]) -> Vec<i32> {
@@ -1693,7 +1693,7 @@ mod claim_probes {
 
     #[test]
     fn i32_binary_add_sub_mul_div_min_max_match_reference_on_gpu() {
-        let Some(runtime) = maybe_runtime() else {
+        let Some((_provider, runtime)) = maybe_runtime() else {
             eprintln!("skipping i32 binary GPU probe: CUDA runtime unavailable");
             return;
         };
@@ -1727,7 +1727,7 @@ mod claim_probes {
 
     #[test]
     fn broadcast_metadata_shape_churn_waits_before_recycling_old_storage() {
-        let Some(runtime) = maybe_runtime() else {
+        let Some((_provider, runtime)) = maybe_runtime() else {
             eprintln!("skipping broadcast metadata lifetime probe: CUDA runtime unavailable");
             return;
         };

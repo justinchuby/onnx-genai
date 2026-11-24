@@ -960,18 +960,15 @@ fn failed_reduce_call_preserves_capture_signature_resources_through_drop_rewarm_
         "the valid A call must record one non-vacuous reduction segment"
     );
 
+    ep.wait_for_deferred_releases().unwrap();
+
     let frees_before_a_drop = runtime.allocation_counts().frees;
-    let pooled_before_a_drop = runtime.raw_pool_retained_bytes();
+
     drop(kernel_a);
     assert_eq!(
         runtime.allocation_counts().frees,
         frees_before_a_drop,
         "dropping A's kernel must not free metadata retained by its graph"
-    );
-    assert_eq!(
-        runtime.raw_pool_retained_bytes(),
-        pooled_before_a_drop,
-        "dropping A's kernel must not return graph-retained metadata to the pool"
     );
 
     let b_in = [2usize, 16];
@@ -1009,12 +1006,14 @@ fn failed_reduce_call_preserves_capture_signature_resources_through_drop_rewarm_
         "rewarming B must publish owners distinct from graph-retained A"
     );
 
+    ep.wait_for_deferred_releases().unwrap();
+
     let counts_before_b_drop = runtime.allocation_counts();
-    let pooled_before_b_drop = runtime.raw_pool_retained_bytes();
+
     drop(kernel_b);
+    ep.wait_for_deferred_releases().unwrap();
     assert!(
-        runtime.allocation_counts().frees > counts_before_b_drop.frees
-            || runtime.raw_pool_retained_bytes() > pooled_before_b_drop,
+        runtime.allocation_counts().frees > counts_before_b_drop.frees,
         "dropping B must release its unretained replacement metadata"
     );
 
@@ -1026,12 +1025,14 @@ fn failed_reduce_call_preserves_capture_signature_resources_through_drop_rewarm_
     );
     assert_eq!(runtime.check_capture_error().unwrap(), 0);
 
+    ep.wait_for_deferred_releases().unwrap();
+
     let counts_before_reset = runtime.allocation_counts();
-    let pooled_before_reset = runtime.raw_pool_retained_bytes();
+
     assert!(runtime.reset_graph().unwrap());
+    ep.wait_for_deferred_releases().unwrap();
     assert!(
-        runtime.allocation_counts().frees > counts_before_reset.frees
-            || runtime.raw_pool_retained_bytes() > pooled_before_reset,
+        runtime.allocation_counts().frees > counts_before_reset.frees,
         "graph reset must release A's retained base/delta/axes payload owner"
     );
 

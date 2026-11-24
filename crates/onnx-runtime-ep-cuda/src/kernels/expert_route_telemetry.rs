@@ -347,8 +347,12 @@ impl ArmedTelemetry {
         let record_bytes = record_layout(config.num_experts)
             .map_err(|error| TelemetryUnsupported::Alloc(error.to_string()))?
             .size();
-        let record = GraphDeviceAllocation::allocate(runtime, record_bytes)
-            .map_err(|error| TelemetryUnsupported::Alloc(error.to_string()))?;
+        let record = GraphDeviceAllocation::allocate(
+            runtime,
+            record_bytes,
+            onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
+        )
+        .map_err(|error| TelemetryUnsupported::Alloc(error.to_string()))?;
 
         let armed = Self {
             request_id: config.request_id,
@@ -775,7 +779,8 @@ mod tests {
     #[cfg(feature = "gpu-tests")]
     #[test]
     fn one_record_upload_snapshot_and_graph_retained_owner() {
-        let runtime = Arc::new(CudaRuntime::new(0).expect("CUDA device required with gpu-tests"));
+        let (_provider, runtime) = crate::test_support::maybe_native_runtime()
+            .expect("retained artifact test requires native CUDA provider backing");
         runtime.test_drain_raw_pool();
         let allocations = runtime.allocation_counts();
         let transfers = runtime.transfer_counts();
