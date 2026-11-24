@@ -1795,10 +1795,26 @@ mod tests {
 
     #[test]
     fn gated_row_bias_states_preserve_layouts_and_signed_zero() {
-        let gate = [-0.0, -2.0, 3.0];
-        let linear = [1.0, 2.0, -3.0];
-        let gate_bias = [0.0, 0.25, -0.5];
-        let linear_bias = [0.0, -0.5, 0.75];
+        let gate = black_box([-0.0, -2.0, 3.0]);
+        let linear = black_box([1.0, 2.0, -3.0]);
+        let gate_bias = black_box([0.0, 0.25, -0.5]);
+        let linear_bias = black_box([0.0, -0.5, 0.75]);
+        // Observe rounding at the bias boundary itself. Once inlined through
+        // min/clamp, optimized activation code can fold zero expressions
+        // differently from a compile-time-constant scalar oracle.
+        let zero = black_box(-0.0_f32);
+        assert_eq!(
+            AppliedActivationBias.value(false, 0, zero).to_bits(),
+            (-0.0_f32).to_bits()
+        );
+        for fc1 in [None, Some(&gate_bias[..])] {
+            assert_eq!(
+                PendingActivationBias { fc1, linear: None }
+                    .value(false, 0, zero)
+                    .to_bits(),
+                0.0_f32.to_bits()
+            );
+        }
         for fusion in 0..=2 {
             let attributes = MoeAttributes {
                 k: 1,
@@ -1825,8 +1841,9 @@ mod tests {
                 &attributes,
                 AppliedActivationBias,
             );
-            let expected =
-                std::array::from_fn::<_, 3, _>(|i| attributes.swiglu(gate[i], linear[i]));
+            let expected = std::array::from_fn::<_, 3, _>(|i| {
+                attributes.swiglu(black_box(gate[i]), black_box(linear[i]))
+            });
             assert_eq!(applied.map(f32::to_bits), expected.map(f32::to_bits));
             assert_eq!(applied[0].to_bits(), (-0.0f32).to_bits());
             for biased in [false, true] {
@@ -1849,12 +1866,17 @@ mod tests {
                 );
                 let expected = std::array::from_fn::<_, 3, _>(|i| {
                     attributes.swiglu(
-                        gate[i] + if biased { gate_bias[i] } else { 0.0 },
-                        linear[i] + if biased { linear_bias[i] } else { 0.0 },
+                        black_box(gate[i]) + if biased { black_box(gate_bias[i]) } else { 0.0 },
+                        black_box(linear[i])
+                            + if biased {
+                                black_box(linear_bias[i])
+                            } else {
+                                0.0
+                            },
                     )
                 });
                 assert_eq!(pending.map(f32::to_bits), expected.map(f32::to_bits));
-                assert_eq!(pending[0].to_bits(), 0.0f32.to_bits());
+                assert_eq!(pending[0], 0.0);
             }
         }
     }
