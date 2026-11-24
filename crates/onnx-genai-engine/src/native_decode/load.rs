@@ -1212,6 +1212,8 @@ impl NativeDecodeSession {
             #[cfg(test)]
             fail_next_reset: false,
             #[cfg(test)]
+            fail_past_restores: 0,
+            #[cfg(test)]
             fail_rewind_after: None,
         })
     }

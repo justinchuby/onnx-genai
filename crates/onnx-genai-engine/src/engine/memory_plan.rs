@@ -154,6 +154,8 @@ holder_registry! {
     DecoderTurnSnapshot = 13,
     /// Byte-exact, portable ORT runner prefix snapshots and their staging copies.
     OrtPrefixSnapshot = 14,
+    /// Complete engine-local Native session captures and restore undo copies.
+    NativeSessionSnapshot = 15,
 }
 
 impl Holder {
@@ -168,9 +170,10 @@ impl Holder {
             // demotion candidate and not step-scoped `Workspace` either. It
             // lives and dies with its sequence, like KV.
             Holder::RecurrentState | Holder::RecurrentPrefixSnapshot => MemoryRole::KvCache,
-            Holder::NativeKvCache | Holder::DecoderTurnSnapshot | Holder::OrtPrefixSnapshot => {
-                MemoryRole::KvCache
-            }
+            Holder::NativeKvCache
+            | Holder::DecoderTurnSnapshot
+            | Holder::OrtPrefixSnapshot
+            | Holder::NativeSessionSnapshot => MemoryRole::KvCache,
             Holder::Activations => MemoryRole::Activation,
             Holder::FixedDeviceReservation => MemoryRole::Weights,
             // A standing pool the component keeps for as long as the session
@@ -194,6 +197,7 @@ impl Holder {
             Holder::NativeKvCache => "native decode KV tensors",
             Holder::DecoderTurnSnapshot => "decoder transaction snapshots",
             Holder::OrtPrefixSnapshot => "portable ORT prefix snapshots",
+            Holder::NativeSessionSnapshot => "complete native session snapshots",
             Holder::Activations => "activations",
             Holder::FixedDeviceReservation => "fixed device reservation",
             Holder::PipelineComponentPool => "pipeline component device pool",
@@ -213,7 +217,7 @@ impl Holder {
             // Charging it to `Device` would let it exhaust host RAM while the
             // device ledger still reported headroom.
             Holder::KvPool | Holder::PipelineKvPool | Holder::DraftKvPool => Tier::Host,
-            Holder::CpuDerivedWeights | Holder::DecoderTurnSnapshot | Holder::OrtPrefixSnapshot => Tier::Host,
+            Holder::CpuDerivedWeights | Holder::DecoderTurnSnapshot | Holder::OrtPrefixSnapshot | Holder::NativeSessionSnapshot => Tier::Host,
             Holder::WeightResidency
             | Holder::RecurrentState
             | Holder::RecurrentPrefixSnapshot

@@ -32,6 +32,22 @@ The supported surface and explicit limitations are documented in
 - [ ] Full compatibility matrix and executable conformance tests.
 - [ ] Fresh full checks, adversarial self-review, PR description update, CI and merge.
 
+## Native slot-state foundation
+
+The engine now exposes owned `NativeSessionSnapshot` captures and transactional
+restore into existing sessions. These preserve executable state (live in-place
+CPU KV rows, host past tensors including declared recurrent/compressed state,
+hidden conditioning and physical cursor) together with authoritative logical
+tokens. Capture and restore undo allocations reserve host memory first. Captures
+are bound to the original engine instance/generation and remain valid after the
+source conversation advances, resets or closes. Restore failures undo physical
+writes; failed undo poisons the affected conversations until reset.
+
+This is a prerequisite for slot persistence, not an implemented `/slots` API.
+Inactive histories and device state are explicitly refused. Persistent format,
+model identity validation, worker-owned slot identities, file admission and
+HTTP save/restore/erase remain required. Capability advertisement stays false.
+
 ## Design constraints
 
 Every wire protocol lowers into the existing admitted model/driver transaction.

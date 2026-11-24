@@ -44,6 +44,9 @@ pub mod speculative;
 mod text_projection;
 pub mod tokenization;
 
+#[cfg(feature = "native-backend")]
+pub use engine::NativeSessionSnapshot;
+
 pub use onnx_genai_scheduler::SchedulerAdmissionError;
 
 pub use batched::{
