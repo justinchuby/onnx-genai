@@ -369,11 +369,13 @@ fn reshape_uses_constant_shape_initializer() {
 
 // ── unknown / unmodeled protobuf enum handling ──────────────────────────────
 
+const UNKNOWN_ONNX_DTYPES: [i32; 2] = [-1, i32::MAX];
+
 /// An initializer whose `data_type` is an unknown/unsupported ONNX integer
 /// must produce a clean `LoaderError`, never a panic or a silent Float32.
 #[test]
 fn unknown_initializer_dtype_is_load_error() {
-    for bad in [27i32, 99] {
+    for bad in UNKNOWN_ONNX_DTYPES {
         let mut init = f32_initializer("W", &[2, 2]);
         init.data_type = bad;
         let g = onnx::GraphProto {
@@ -396,8 +398,12 @@ fn unknown_initializer_dtype_is_load_error() {
             .expect_err("unknown initializer data_type must be a load error");
         let msg = err.to_string();
         assert!(
-            msg.contains("data_type") || msg.contains(&bad.to_string()),
-            "error should mention the bad data_type, got: {msg}"
+            msg.contains("initializer 'W'") && msg.contains("data_type"),
+            "error should flag the initializer dtype, got: {msg}"
+        );
+        assert!(
+            msg.contains(&bad.to_string()),
+            "error should mention the raw dtype {bad}, got: {msg}"
         );
     }
 }
@@ -406,7 +412,7 @@ fn unknown_initializer_dtype_is_load_error() {
 /// dtype must fail closed with a clean `LoaderError`, never a silent Float32.
 #[test]
 fn unknown_value_info_dtype_is_load_error() {
-    for bad in [27i32, 99] {
+    for bad in UNKNOWN_ONNX_DTYPES {
         let g = onnx::GraphProto {
             input: vec![value_info("X", bad, &[Dimlike::Static(2)])],
             output: vec![value_info("Y", 1, &[Dimlike::Static(2)])],
@@ -432,7 +438,7 @@ fn unknown_value_info_dtype_is_load_error() {
 /// unmodeled ONNX dtype must fail closed, never be silently mislabeled Float32.
 #[test]
 fn unknown_attribute_tensor_dtype_is_load_error() {
-    for bad in [27i32, 99] {
+    for bad in UNKNOWN_ONNX_DTYPES {
         let t = onnx::TensorProto {
             name: "k".to_string(),
             data_type: bad,
