@@ -713,7 +713,11 @@ impl CudaEinsumProgram {
         let metadata = if metadata_bytes == 0 {
             None
         } else {
-            let allocation = GraphDeviceAllocation::allocate(runtime, metadata_bytes)?;
+            let allocation = GraphDeviceAllocation::allocate(
+                runtime,
+                metadata_bytes,
+                onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
+            )?;
             let bytes = metadata_words
                 .iter()
                 .flat_map(|word| word.to_ne_bytes())

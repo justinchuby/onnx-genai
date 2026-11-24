@@ -529,7 +529,7 @@ mod l2_faithful_tests {
 
     #[test]
     fn faithful_l2_normalize_matches_reduce_sqrt_div_chain_bit_exactly() {
-        let Some(runtime) = crate::test_support::maybe_runtime() else {
+        let Some((_provider_runtime, runtime)) = crate::test_support::maybe_native_runtime() else {
             eprintln!("skipping faithful L2-normalize parity test: CUDA runtime unavailable");
             return;
         };
@@ -562,7 +562,7 @@ mod l2_faithful_tests {
 
     #[test]
     fn faithful_kernel_differs_from_fp32_lp_normalization() {
-        let Some(runtime) = crate::test_support::maybe_runtime() else {
+        let Some((_provider_runtime, runtime)) = crate::test_support::maybe_native_runtime() else {
             eprintln!("skipping faithful-vs-fp32 divergence test: CUDA runtime unavailable");
             return;
         };

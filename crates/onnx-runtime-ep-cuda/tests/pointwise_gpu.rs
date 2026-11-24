@@ -896,6 +896,7 @@ fn binary_static_shape_metadata_captures_replays_and_tracks_signatures() {
         &prefill_strides,
         device,
     );
+    ep.wait_for_deferred_releases().unwrap();
     let before_shape_change = runtime.allocation_counts();
     kernel
         .execute(&prefill_inputs, &mut [prefill_output])
@@ -1245,19 +1246,15 @@ fn exercise_broadcast_capture_owner(ep: &CudaExecutionProvider, case: BroadcastC
         case.op
     );
 
+    ep.wait_for_deferred_releases().unwrap();
+
     let frees_before_drop = runtime.allocation_counts().frees;
-    let pooled_before_drop = runtime.raw_pool_retained_bytes();
+
     drop(kernel);
     assert_eq!(
         runtime.allocation_counts().frees,
         frees_before_drop,
         "{} kernel drop freed metadata still retained by the graph",
-        case.op
-    );
-    assert_eq!(
-        runtime.raw_pool_retained_bytes(),
-        pooled_before_drop,
-        "{} kernel drop returned graph-retained metadata to the raw pool",
         case.op
     );
 
@@ -1300,12 +1297,14 @@ fn exercise_broadcast_capture_owner(ep: &CudaExecutionProvider, case: BroadcastC
     );
     drop(rewarm_resources);
 
+    ep.wait_for_deferred_releases().unwrap();
+
     let counts_before_rewarm_drop = runtime.allocation_counts();
-    let pooled_before_rewarm_drop = runtime.raw_pool_retained_bytes();
+
     drop(rewarm_kernel);
+    ep.wait_for_deferred_releases().unwrap();
     assert!(
-        runtime.allocation_counts().frees > counts_before_rewarm_drop.frees
-            || runtime.raw_pool_retained_bytes() > pooled_before_rewarm_drop,
+        runtime.allocation_counts().frees > counts_before_rewarm_drop.frees,
         "{} dropping the uncaptured rewarm kernel must release its metadata owner",
         case.op
     );
@@ -1330,12 +1329,14 @@ fn exercise_broadcast_capture_owner(ep: &CudaExecutionProvider, case: BroadcastC
         case.op
     );
 
+    ep.wait_for_deferred_releases().unwrap();
+
     let counts_before_reset = runtime.allocation_counts();
-    let pooled_before_reset = runtime.raw_pool_retained_bytes();
+
     assert!(runtime.reset_graph().unwrap());
+    ep.wait_for_deferred_releases().unwrap();
     assert!(
-        runtime.allocation_counts().frees > counts_before_reset.frees
-            || runtime.raw_pool_retained_bytes() > pooled_before_reset,
+        runtime.allocation_counts().frees > counts_before_reset.frees,
         "{} graph reset must release its retained metadata owner",
         case.op
     );
