@@ -137,6 +137,7 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         E::UnsupportedOp { .. } | E::UnsupportedModel { .. } => OrtErrorCode::NotImplemented,
         E::Ep(_)
         | E::ExecutionProviderUnavailable(_)
+        | E::OrderedProviderDeclined { .. }
         | E::ExecutionProviderArtifactsPending { .. }
         | E::ExecutionProviderArtifactFinalizationFailed { .. }
         | E::ExecutionProviderArtifactRollbackFailed { .. } => OrtErrorCode::EpFail,
@@ -909,6 +910,17 @@ mod tests {
         assert!(!msg.is_null());
         // Releasing null is a no-op (idempotent guard against double-free).
         unsafe { nxrt_release_status(ptr::null_mut()) };
+    }
+
+    #[test]
+    fn ordered_provider_decline_preserves_reason() {
+        let reason = "test provider cannot execute node encoder";
+        let (code, message) = session_err(SessionError::OrderedProviderDeclined {
+            reason: reason.into(),
+        });
+
+        assert_eq!(code, OrtErrorCode::EpFail);
+        assert!(message.contains(reason), "{message}");
     }
 
     #[test]
