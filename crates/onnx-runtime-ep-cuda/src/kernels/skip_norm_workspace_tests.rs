@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::GraphDeviceAllocation;
 use onnx_runtime_ep_api::{DeviceId, DevicePtrMut};
 
 fn inputs() -> [TensorMetadata<'static>; 4] {

@@ -52,6 +52,176 @@ fn require_cuda() -> CudaExecutionProvider {
     }
 }
 
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable gpu-tests"
+)]
+fn skip_metadata_replacement_and_capture_keep_one_immutable_owner() {
+    let _serial = GPU_SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    runtime.set_defer_eager_sync(true);
+    let data_values = [1.0f32, -2.0, 3.0, 4.0, -1.0, 2.0, 0.5, -3.0];
+    let skip_values = [0.5f32, -0.75, 0.25, 1.25];
+    let gamma_values = [1.0f32; 4];
+    let data = ep.allocate(32, 256).unwrap();
+    let skip = ep.allocate(16, 256).unwrap();
+    let gamma = ep.allocate(16, 256).unwrap();
+    let output = ep.allocate(32, 256).unwrap();
+    // SAFETY: each complete upload fits its live allocation.
+    unsafe {
+        runtime
+            .htod(f32_bytes(&data_values), cuptr(data.as_ptr()))
+            .unwrap();
+        runtime
+            .htod(f32_bytes(&skip_values), cuptr(skip.as_ptr()))
+            .unwrap();
+        runtime
+            .htod(f32_bytes(&gamma_values), cuptr(gamma.as_ptr()))
+            .unwrap();
+    }
+    let mut node = Node::new(
+        NodeId(0),
+        "SkipSimplifiedLayerNormalization",
+        vec![],
+        vec![],
+    );
+    node.domain = "com.microsoft".into();
+    let kernel = ep.get_kernel(&node, &[], 1).unwrap();
+    let execute = |shape: &[usize], skip_shape: &[usize]| {
+        let strides = compute_contiguous_strides(shape);
+        let skip_strides = compute_contiguous_strides(skip_shape);
+        kernel.execute(
+            &[
+                TensorView::new(
+                    DevicePtr(data.as_ptr()),
+                    DataType::Float32,
+                    shape,
+                    &strides,
+                    ep.device_id(),
+                ),
+                TensorView::new(
+                    DevicePtr(skip.as_ptr()),
+                    DataType::Float32,
+                    skip_shape,
+                    &skip_strides,
+                    ep.device_id(),
+                ),
+                TensorView::new(
+                    DevicePtr(gamma.as_ptr()),
+                    DataType::Float32,
+                    &[4],
+                    &[1],
+                    ep.device_id(),
+                ),
+            ],
+            &mut [TensorMut::new(
+                DevicePtrMut(output.as_ptr() as *mut _),
+                DataType::Float32,
+                shape,
+                &strides,
+                ep.device_id(),
+            )],
+        )
+    };
+    let shape_a = [1usize, 2, 4];
+    let skip_a = [2usize, 1];
+    let shape_b = [2usize, 1, 4];
+    let skip_b = [1usize, 4];
+    execute(&shape_a, &skip_a).unwrap();
+    let identity_a = kernel.device_graph_resources()[0].identity();
+    let mut expected = [0u8; 32];
+    // SAFETY: read back the complete live A result as the replay oracle.
+    unsafe { runtime.dtoh(&mut expected, cuptr(output.as_ptr())).unwrap() };
+    let allocations = runtime.allocation_counts();
+    let transfers = runtime.transfer_counts();
+    let syncs = runtime.forced_synchronization_count();
+    for _ in 0..8 {
+        execute(&shape_a, &skip_a).unwrap();
+    }
+    assert_eq!(runtime.allocation_counts(), allocations);
+    assert_eq!(runtime.transfer_counts(), transfers);
+    assert_eq!(runtime.forced_synchronization_count(), syncs);
+
+    runtime.test_begin_unregistered_graph_capture().unwrap();
+    let error = execute(&shape_a, &skip_a).unwrap_err().to_string();
+    assert!(error.contains("no registered ownership token"), "{error}");
+    runtime.test_end_unregistered_graph_capture().unwrap();
+    assert!(!kernel.cuda_graph_compatible());
+    execute(&shape_a, &skip_a).unwrap();
+
+    // Bypass runtime capture flags entirely: driver-confirmed capture must
+    // still require an actual ownership sink.
+    runtime
+        .stream()
+        .begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )
+        .unwrap();
+    let error = execute(&shape_a, &skip_a).unwrap_err().to_string();
+    assert!(error.contains("no registered ownership token"), "{error}");
+    runtime.test_end_unregistered_graph_capture().unwrap();
+    assert!(!kernel.cuda_graph_compatible());
+    execute(&shape_a, &skip_a).unwrap();
+
+    runtime.begin_graph_capture(&[]).unwrap();
+    let error = execute(&shape_a, &skip_a).unwrap_err().to_string();
+    assert!(
+        error.contains("did not retain the ownership token"),
+        "{error}"
+    );
+    runtime.abort_graph_capture().unwrap();
+    assert!(!kernel.cuda_graph_compatible());
+    execute(&shape_a, &skip_a).unwrap();
+
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    let allocations = runtime.allocation_counts();
+    let transfers = runtime.transfer_counts();
+    let syncs = runtime.forced_synchronization_count();
+    let error = execute(&shape_b, &skip_b).unwrap_err().to_string();
+    assert!(error.contains("metadata signature changed"), "{error}");
+    assert_eq!(runtime.allocation_counts(), allocations);
+    assert_eq!(runtime.transfer_counts(), transfers);
+    assert_eq!(runtime.forced_synchronization_count(), syncs);
+    assert_eq!(kernel.device_graph_resources()[0].identity(), identity_a);
+    runtime.abort_graph_capture().unwrap();
+    assert!(!kernel.cuda_graph_compatible());
+    execute(&shape_a, &skip_a).unwrap();
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute(&shape_a, &skip_a).unwrap();
+    runtime.end_graph_capture().unwrap();
+
+    #[cfg(feature = "gpu-tests")]
+    {
+        runtime.fail_warm_transaction_at_for_test(1);
+        assert!(
+            execute(&shape_b, &skip_b)
+                .unwrap_err()
+                .to_string()
+                .contains("injected staged warm-cache failure")
+        );
+        assert_eq!(kernel.device_graph_resources()[0].identity(), identity_a);
+        assert!(
+            !kernel.cuda_graph_compatible(),
+            "failed rewarm must revoke readiness even while graph A remains pinned"
+        );
+    }
+    execute(&shape_b, &skip_b).unwrap();
+    assert_ne!(kernel.device_graph_resources()[0].identity(), identity_a);
+    assert!(kernel.cuda_graph_compatible());
+    drop(kernel);
+    runtime.replay_graph().unwrap();
+    let mut actual = [0u8; 32];
+    // SAFETY: A and B use the same complete live output allocation.
+    unsafe { runtime.dtoh(&mut actual, cuptr(output.as_ptr())).unwrap() };
+    assert_eq!(actual, expected);
+    assert!(runtime.reset_graph().unwrap());
+    for buffer in [data, skip, gamma, output] {
+        ep.deallocate(buffer).unwrap();
+    }
+}
+
 fn run(
     ep: &CudaExecutionProvider,
     input_shape: &[usize],

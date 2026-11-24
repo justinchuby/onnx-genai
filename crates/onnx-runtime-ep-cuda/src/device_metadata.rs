@@ -74,7 +74,7 @@ impl<K> DeviceMetadataCache<K> {
             && matches(&current.key)
         {
             if self.runtime.is_capturing()? {
-                self.runtime.require_registered_address_capture(
+                self.runtime.require_captured_address_owner(
                     GraphDeviceAllocation::device_graph_resource(&current.allocation).identity(),
                     label,
                 )?;

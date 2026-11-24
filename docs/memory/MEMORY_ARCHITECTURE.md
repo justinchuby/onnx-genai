@@ -1273,6 +1273,37 @@ one 512-byte artifact class through driver release or the existing pool for
 the rank-two fixture. These are compiled device assertions; CUDA execution,
 actual driver memory use and latency/throughput remain unmeasured here.
 
+### Skip normalization metadata uses the same owner contract
+
+`SkipSimplifiedLayerNormalization` now delegates its two-table broadcast cache
+to `DeviceMetadataCache`, with input/skip shapes in one non-Clone typed key and
+the owner in the same immutable record. The outer warm rollback snapshot shares
+the Arc instead of copying shape vectors. Table encoding, allocation/upload
+checkpoint and BF16 caller-workspace pins remain separate kernel contracts.
+Preparation failures restore the old owner and revoke capture readiness; a
+successful launch keeps the replacement. Cold content replacement uses the
+common mandatory drain in place of the old trailing optional synchronization.
+
+The shared metadata hit path already queries the driver's capture status. It
+now uses a strict captured-owner check: an actual capture must have a registered
+ownership sink retaining the exact metadata identity, even if capture was begun
+directly on the stream without runtime flags. A single validator handles owner
+classification and diagnostics. Existing unconditional bank launch checks keep
+their tracked-capture atomic fast path and delegate to that validator only when
+tracked capture is active. Direct external capture for those other bank/planar
+routes remains a separate audit; this is a metadata-path correction.
+
+Skip's old cache hit did not perform this capture-status query. Adopting the
+shared helper therefore adds that Host-side check and its existing graph
+lifecycle mutex acquisition to Skip metadata hits; no zero-query, zero-lock or
+end-to-end speedup is claimed. It adds no pool, budget, metadata mutex, quota
+callback, H2D upload or retirement drain to fitting metadata hits. GPU
+fixtures cover stable warm counters, flagged and truly external raw-capture
+refusal, registered capture without a metadata pin, capture-time key mismatch,
+post-upload failure/ready revocation, and replay of A after B rewarm/kernel drop.
+Host checks pin broadcast-table ABI and owner-registration classification.
+These device fixtures require CUDA hardware to execute.
+
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
 The dated audit and measurements below preserve historical evidence. The current
