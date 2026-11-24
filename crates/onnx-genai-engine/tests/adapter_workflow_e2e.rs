@@ -181,17 +181,18 @@ pipeline:
         ports:
           inputs:
             input: { dtype: float32, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
+            base: { dtype: float32, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
             output: { dtype: float32, shape: [batch, 2], batch_layout: { kind: request_aligned, axis: 0 } }
         contract:
           id: onnx-genai.parameter-overlay
           version: "1"
-          bindings: { input: input, output: output }
+          bindings: { input: input, base: base, output: output }
           parameters: { action: apply, component: decoder, parameter: projection }
     steps:
       - kind: invoke
         component: overlay
-        inputs: { input: activations }
+        inputs: { input: activations, base: activations }
         outputs: { output: adapted }
       - kind: emit
         value: adapted

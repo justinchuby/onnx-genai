@@ -203,6 +203,15 @@ pub(crate) async fn completions(
     for request in requests {
         prepared.push(prepare(&state, request, Arc::clone(&handle))?);
     }
+    let adapter_selection = match &prepared[0].operation {
+        NativeOperation::Generate { options, .. } => options.adapter_selection.clone(),
+        NativeOperation::Prefill(_) => None,
+    };
+    for input in prepared.iter_mut().skip(1) {
+        if let NativeOperation::Generate { options, .. } = &mut input.operation {
+            options.adapter_selection = adapter_selection.clone();
+        }
+    }
     let mut inputs = prepared.into_iter().enumerate();
     let (index, first) = inputs
         .next()
@@ -351,12 +360,13 @@ fn prepare(
         ));
     }
     if request.prefill_only {
-        super::completions::build_generate_options_with_tokenizer(
+        let mut prefill_options = super::completions::build_generate_options_with_tokenizer(
             &request.sampling,
             &handle.tokenizer,
             1,
         )
         .map_err(|error| ApiError::invalid_request(error.to_string()))?;
+        crate::lora::apply_request(&request.sampling, &handle, &mut prefill_options, false)?;
         if handle
             .model_max_context
             .is_some_and(|limit| prompt_tokens > limit)
@@ -396,6 +406,7 @@ fn prepare(
         output_budget,
     )
     .map_err(|err| ApiError::invalid_request(format!("{err:#}")))?;
+    crate::lora::apply_request(&request.sampling, &handle, &mut options, false)?;
     if request.probabilities.top > 0 {
         options.top_logprobs = Some(
             request

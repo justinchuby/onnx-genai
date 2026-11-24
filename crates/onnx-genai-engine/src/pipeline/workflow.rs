@@ -912,6 +912,21 @@ impl WorkflowRuntime {
 }
 
 impl WorkflowRuntime {
+    /// Adapter changes are safe when the only retained state is replayed token
+    /// history. Every adapter-dependent tensor is then rebuilt for this turn.
+    pub(crate) fn supports_adapter_sessions(&self) -> bool {
+        let history = workflow_prompt_continuation(
+            &self.plan.compiled_workflow.state_plan,
+            &self.plan.workflow,
+        )
+        .map(|(name, _, _, _)| name);
+        self.plan
+            .compiled_workflow
+            .state_plan
+            .session_cells()
+            .all(|(name, _)| Some(name) == history)
+    }
+
     /// Rejoin a session's conversation to this turn's prompt.
     ///
     /// Returns the request the pass actually runs and, when a continuation
@@ -1048,6 +1063,12 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 .copied()
                 .unwrap_or_default()
         });
+        anyhow::ensure!(
+            session_id.is_none()
+                || engine.plan.adapter_service.is_none()
+                || engine.supports_adapter_sessions(),
+            "adapter requests cannot reuse session-scoped tensors beyond replayed token history; send the full conversation as a stateless request or declare invocation-scoped adapter-dependent state"
+        );
         validate_component_overrides(workflow, &component_overrides)?;
         // A conversation the package declares as a prompt prefix rejoins here,
         // before anything is bound: every input derived from the prompt — the
@@ -3742,6 +3763,7 @@ impl WorkflowRuntime {
             .filter(|contract| contract.id == "onnx-genai.parameter-overlay")
             .context("parameter overlay adapter is missing its versioned contract")?;
         let input_port = workflow_contract_binding(contract, "input")?;
+        let base_port = workflow_contract_binding(contract, "base")?;
         let output_port = workflow_contract_binding(contract, "output")?;
         let target_component = workflow_contract_parameter(contract, "component")?;
         let target_parameter = workflow_contract_parameter(contract, "parameter")?;
@@ -3763,13 +3785,53 @@ impl WorkflowRuntime {
         let batch = usize::try_from(shape[0]).context("adapter batch is negative")?;
         let input_features =
             usize::try_from(shape[1]).context("adapter feature dimension is negative")?;
-        let source = input
-            .to_vec_f32()
-            .context("portable parameter overlay requires host float32 input")?;
+        let base_name = inputs.get(base_port).with_context(|| {
+            format!("parameter overlay '{component}' has no base projection binding '{base_port}'")
+        })?;
+        let base = values
+            .get(base_name)
+            .with_context(|| format!("base projection '{base_name}' is unavailable"))?;
+        let base_shape = base.shape();
+        anyhow::ensure!(
+            base_shape.len() == 2 && base_shape[0] == shape[0],
+            "parameter overlay base '{base_name}' must have shape [batch, output_features], got {base_shape:?}"
+        );
+        let output_features = usize::try_from(base_shape[1])
+            .context("base projection feature dimension is negative")?;
         let context = self.worker.active_adapter_context.borrow();
         let context = context
             .as_ref()
             .context("parameter overlay executed without a request adapter context")?;
+        let cache = self.worker.adapter_cache.borrow();
+        let rank = cache.projection_rank(context, target_component, target_parameter)?;
+        let source_elements = batch
+            .checked_mul(input_features)
+            .context("adapter activation shape overflow")?;
+        let output_elements = batch
+            .checked_mul(output_features)
+            .context("adapter base shape overflow")?;
+        let staging_bytes = source_elements
+            .checked_add(output_elements)
+            .and_then(|n| n.checked_add(rank))
+            .and_then(|n| n.checked_mul(4))
+            .context("adapter projection staging size overflow")?;
+        let _staging = cache.reserve(
+            u64::try_from(staging_bytes)?,
+            crate::engine::memory_plan::Holder::Activations,
+        )?;
+        let output_bytes = output_elements
+            .checked_mul(4)
+            .context("adapter projection output size overflow")?;
+        let output_lease = std::sync::Arc::new(cache.reserve(
+            u64::try_from(output_bytes)?,
+            crate::engine::memory_plan::Holder::Activations,
+        )?);
+        let base_data = base
+            .to_vec_f32()
+            .context("portable parameter overlay requires host float32 base projection output")?;
+        let source = input
+            .to_vec_f32()
+            .context("portable parameter overlay requires host float32 input")?;
         // The adapter context is already in physical batch-row order, so the
         // overlay indexes it positionally. A scheduler that compacts the batch
         // moves it through the mandatory RowScopedState ABI instead.
@@ -3778,21 +3840,27 @@ impl WorkflowRuntime {
             "adapter context holds {} rows but the overlay input has batch {batch}",
             context.rows()
         );
-        let cache = self.worker.adapter_cache.borrow();
         let (result, output_features) = super::adapters::apply_parameter_overlay(
             &cache,
             context,
             target_component,
             target_parameter,
-            &source,
-            batch,
-            input_features,
+            super::adapters::ProjectionInputs {
+                source: &source,
+                base: &base_data,
+                batch,
+                input_features,
+                output_features,
+            },
         )?;
         values.insert(
             output_name.clone(),
-            Value::from_slice_f32(
-                &result,
-                &[i64::try_from(batch)?, i64::try_from(output_features)?],
+            super::adapters::governed_value(
+                Value::from_vec_f32(
+                    result,
+                    &[i64::try_from(batch)?, i64::try_from(output_features)?],
+                )?,
+                output_lease,
             )?,
         );
         Ok(())
@@ -4316,6 +4384,45 @@ impl WorkflowRuntime {
         PipelineTensors,
         std::collections::BTreeMap<String, onnx_genai_metadata::LiteralValue>,
     )> {
+        if let Some(service) = self.plan.adapter_service.as_ref() {
+            let selection_names = [
+                Some(service.selection.segments.as_str()),
+                Some(service.selection.adapter_counts.as_str()),
+                Some(service.selection.scales.as_str()),
+                service.selection.active.as_deref(),
+            ];
+            let supplied = selection_names
+                .into_iter()
+                .flatten()
+                .any(|name| provided.contains_key(name));
+            anyhow::ensure!(
+                request.options.adapter_selection.is_none() || !supplied,
+                "adapter selection has two sources: GenerateOptions.adapter_selection and explicit workflow selection tensors; provide exactly one"
+            );
+            if !supplied {
+                let rows = match &request.prompt {
+                    GeneratePrompt::TokenRows(rows) => rows.len(),
+                    _ => 1,
+                };
+                let base;
+                let selection = if let Some(selection) = request.options.adapter_selection.as_ref()
+                {
+                    selection
+                } else {
+                    base = super::AdapterSelection {
+                        rows: vec![Vec::new(); rows],
+                    };
+                    &base
+                };
+                provided
+                    .extend(selection.bind_inputs(service, &self.worker.adapter_cache.borrow())?);
+            }
+        } else if let Some(selection) = &request.options.adapter_selection {
+            anyhow::ensure!(
+                selection.rows.iter().all(Vec::is_empty),
+                "this workflow has no admitted adapter service; select a package declaring adapters and a compatible executor"
+            );
+        }
         let mut values = HashMap::new();
         // The literal each materialized value was built from, not merely that
         // one was: a literal whose contract has symbolic axes is first

@@ -1332,6 +1332,8 @@ impl From<SamplerSequence> for Vec<SamplerStage> {
 /// User-controllable decoding options for Phase 1 generation.
 #[derive(Debug, Clone)]
 pub struct GenerateOptions {
+    /// Declared adapter composition per request row. Absence selects the base model.
+    pub adapter_selection: Option<crate::pipeline::AdapterSelection>,
     /// Maximum tokens to produce after the prompt.
     pub max_new_tokens: usize,
     /// Maximum retained raw and logical content bytes during constrained decoding.
@@ -1432,6 +1434,7 @@ pub struct GenerateOptions {
 impl Default for GenerateOptions {
     fn default() -> Self {
         Self {
+            adapter_selection: None,
             max_new_tokens: 128,
             max_constraint_bytes: 4 * 1024 * 1024,
             response_projection: None,

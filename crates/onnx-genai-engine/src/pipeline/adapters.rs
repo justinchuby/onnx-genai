@@ -1,13 +1,17 @@
 use super::row_state::{RowScopedState, gather_rows};
+use crate::engine::memory_plan::Holder;
 use anyhow::Context;
 use onnx_genai_metadata::{
     AdapterArtifact, AdapterScaleEncoding, AdapterServiceContract, AdapterWeightFormat,
 };
 use onnx_genai_ort::Value;
+use onnx_runtime_memory_governor::{MemoryGovernor, MemoryLease};
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
+use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdapterActivation {
@@ -40,6 +44,97 @@ impl AdapterSelection {
     pub fn with_row(mut self, adapters: impl IntoIterator<Item = AdapterActivation>) -> Self {
         self.rows.push(adapters.into_iter().collect());
         self
+    }
+
+    pub(super) fn bind_inputs(
+        &self,
+        service: &AdapterServiceContract,
+        cache: &AdapterCache,
+    ) -> anyhow::Result<HashMap<String, Value>> {
+        anyhow::ensure!(
+            !self.rows.is_empty(),
+            "adapter selection needs at least one request row"
+        );
+        let width = service.selection.max_adapters;
+        let slots = self
+            .rows
+            .len()
+            .checked_mul(width)
+            .context("adapter selection dimensions overflow; reduce batch size")?;
+        let bytes = slots
+            .checked_mul(12)
+            .and_then(|n| {
+                self.rows
+                    .len()
+                    .checked_mul(9)
+                    .and_then(|rows| n.checked_add(rows))
+            })
+            .context("adapter selection byte count overflow")?;
+        let lease = Arc::new(cache.reserve(u64::try_from(bytes)?, Holder::Activations)?);
+        let mut ids = vec![-1_i64; slots];
+        let mut scales = vec![0_f32; slots];
+        let mut counts = Vec::with_capacity(self.rows.len());
+        for (row, activations) in self.rows.iter().enumerate() {
+            anyhow::ensure!(
+                activations.len() <= width,
+                "adapter row {row} selects {} adapters, exceeding adapters.selection.max_adapters={width}",
+                activations.len()
+            );
+            let mut seen = std::collections::HashSet::new();
+            for (slot, activation) in activations.iter().enumerate() {
+                anyhow::ensure!(
+                    activation.scale.is_finite(),
+                    "adapter '{}' scale must be finite",
+                    activation.adapter
+                );
+                anyhow::ensure!(
+                    seen.insert(&activation.adapter),
+                    "adapter row {row} contains duplicate adapter '{}'",
+                    activation.adapter
+                );
+                let artifact = service.artifacts.get(&activation.adapter).with_context(||format!("adapter row {row} selects undeclared adapter '{}'; use the package's declared adapter aliases",activation.adapter))?;
+                ids[row * width + slot] =
+                    i64::try_from(artifact.index).context("declared adapter ID exceeds int64")?;
+                scales[row * width + slot] = activation.scale;
+            }
+            counts.push(i64::try_from(activations.len())?);
+        }
+        let batch = i64::try_from(self.rows.len())?;
+        let width = i64::try_from(width)?;
+        let mut result = HashMap::from([
+            (
+                service.selection.segments.clone(),
+                governed_value(
+                    Value::from_vec_i64(ids, &[batch, width])?,
+                    Arc::clone(&lease),
+                )?,
+            ),
+            (
+                service.selection.adapter_counts.clone(),
+                governed_value(Value::from_vec_i64(counts, &[batch])?, Arc::clone(&lease))?,
+            ),
+            (
+                service.selection.scales.clone(),
+                governed_value(
+                    Value::from_vec_f32(scales, &[batch, width])?,
+                    Arc::clone(&lease),
+                )?,
+            ),
+        ]);
+        if let Some(active) = &service.selection.active {
+            result.insert(
+                active.clone(),
+                governed_value(
+                    Value::from_raw_bytes(
+                        vec![1; self.rows.len()],
+                        &[batch],
+                        onnx_genai_ort::DataType::Bool,
+                    )?,
+                    Arc::clone(&lease),
+                )?,
+            );
+        }
+        Ok(result)
     }
 }
 
@@ -151,15 +246,17 @@ pub struct AdapterLifecycleDiagnostic {
 pub(super) struct AdapterTargetWeights {
     pub input_features: usize,
     pub output_features: usize,
+    pub output_offset: usize,
+    pub output_width: usize,
     pub rank: usize,
     pub factor: f32,
     pub a: Vec<f32>,
     pub b: Vec<f32>,
 }
 
-#[derive(Debug, Clone)]
 struct LoadedAdapter {
-    targets: HashMap<(String, String), AdapterTargetWeights>,
+    targets: HashMap<(String, String), Vec<AdapterTargetWeights>>,
+    _lease: MemoryLease,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,9 +273,10 @@ struct JsonTarget {
 #[derive(Default)]
 pub(super) struct AdapterCache {
     entries: HashMap<String, LoadedAdapter>,
+    authority: Option<Rc<dyn MemoryGovernor>>,
     lru: VecDeque<String>,
     previously_loaded: std::collections::HashSet<String>,
-    plans: std::collections::HashSet<String>,
+    plans: VecDeque<String>,
     diagnostic: AdapterLifecycleDiagnostic,
 }
 
@@ -214,6 +312,32 @@ impl RowScopedState for AdapterRunContext {
 }
 
 impl AdapterCache {
+    pub(super) fn new(authority: Rc<dyn MemoryGovernor>) -> Self {
+        Self {
+            authority: Some(authority),
+            ..Self::default()
+        }
+    }
+    pub(super) fn reserve(&self, bytes: u64, holder: Holder) -> anyhow::Result<MemoryLease> {
+        self.authority.as_deref().context("adapter execution has no host-memory authority; reload the package with its model governor")?
+            .reserve(onnx_runtime_memory_api::Tier::Host,bytes,holder.role(),holder.id()).map_err(Into::into)
+    }
+    pub(super) fn projection_rank(
+        &self,
+        context: &AdapterRunContext,
+        component: &str,
+        parameter: &str,
+    ) -> anyhow::Result<usize> {
+        let mut rank = 0;
+        for row in &context.rows {
+            for (alias, _) in row {
+                for target in self.targets(alias, component, parameter)? {
+                    rank = rank.max(target.rank);
+                }
+            }
+        }
+        Ok(rank)
+    }
     pub fn diagnostic(&self) -> AdapterLifecycleDiagnostic {
         let mut diagnostic = self.diagnostic.clone();
         diagnostic.cached = self.lru.iter().cloned().collect();
@@ -240,6 +364,7 @@ impl AdapterCache {
             .zip(active_rows)
             .filter(|(_, active)| **active)
             .flat_map(|(activations, _)| activations)
+            .filter(|activation| activation.scale != 0.0)
             .map(|activation| activation.adapter.as_str())
             .collect::<std::collections::HashSet<_>>();
         if requested.len() > service.cache.max_entries {
@@ -268,13 +393,9 @@ impl AdapterCache {
                         activation.adapter
                     );
                 }
-                if !activation.scale.is_finite()
-                    || activation.scale < -16.0
-                    || activation.scale > 16.0
-                {
+                if !activation.scale.is_finite() {
                     anyhow::bail!(
-                        "adapter '{}' scale {} for batch row {physical_row} must be finite and \
-                         within [-16, 16]",
+                        "adapter '{}' scale {} for batch row {physical_row} must be finite",
                         activation.adapter,
                         activation.scale
                     );
@@ -289,29 +410,31 @@ impl AdapterCache {
                             activation.adapter
                         )
                     })?;
+                if activation.scale == 0.0 {
+                    continue;
+                }
                 self.ensure_loaded(root, service, &activation.adapter, artifact)?;
                 let scale = activation.scale;
-                if !scale.is_finite() || !(-16.0..=16.0).contains(&scale) {
+                if !scale.is_finite() {
                     anyhow::bail!(
-                        "adapter '{}' effective scale {scale} for batch row {physical_row} must \
-                         be finite and within [-16, 16]",
+                        "adapter '{}' effective scale {scale} for batch row {physical_row} must be finite",
                         activation.adapter
                     );
                 }
-                row_key.push(format!("{}:{scale:.8}", activation.adapter));
+                row_key.push((activation.adapter.clone(), scale.to_bits()));
                 resolved.push((activation.adapter, scale));
             }
-            plan_parts.push(format!("[{}]", row_key.join(",")));
+            plan_parts.push(row_key);
             rows.push(resolved);
         }
-        let plan_key = format!(
-            "{}|{}",
-            service.application_capability,
-            plan_parts.join(";")
-        );
-        if !self.plans.insert(plan_key.clone()) {
+        let plan_key = serde_json::to_string(&(&service.application_capability, plan_parts))?;
+        if let Some(index) = self.plans.iter().position(|key| key == &plan_key) {
             self.diagnostic.replayed_plans += 1;
+            self.plans.remove(index);
+        } else if self.plans.len() >= service.cache.max_entries {
+            self.plans.pop_front();
         }
+        self.plans.push_back(plan_key.clone());
         self.diagnostic.plan_variants = self.plans.len();
         self.diagnostic.active_plan_key = Some(plan_key.clone());
         self.diagnostic.capability = Some(service.application_capability.clone());
@@ -341,7 +464,8 @@ impl AdapterCache {
                 self.plans.clear();
             }
         }
-        let loaded = load_adapter(root, service, artifact)?;
+        let authority=self.authority.as_deref().context("adapter weight cache has no host-memory authority; construct the runtime with its model governor")?;
+        let loaded = load_adapter(root, service, artifact, authority)?;
         if !self.previously_loaded.insert(name.to_string()) {
             self.diagnostic.reloads += 1;
         }
@@ -358,21 +482,37 @@ impl AdapterCache {
         self.lru.push_back(name.to_string());
     }
 
-    pub fn target(
+    pub fn targets(
         &self,
         adapter: &str,
         component: &str,
         parameter: &str,
-    ) -> anyhow::Result<&AdapterTargetWeights> {
-        self.entries
+    ) -> anyhow::Result<&[AdapterTargetWeights]> {
+        let loaded = self
+            .entries
             .get(adapter)
-            .with_context(|| format!("adapter '{adapter}' is not loaded"))?
+            .with_context(|| format!("adapter '{adapter}' is not loaded"))?;
+        // An adapter may target only some declared projections. Missing patches
+        // preserve the actual base output rather than inventing a zero result.
+        Ok(loaded
             .targets
             .get(&(component.to_string(), parameter.to_string()))
-            .with_context(|| {
-                format!("adapter '{adapter}' does not target parameter '{component}.{parameter}'")
-            })
+            .map(Vec::as_slice)
+            .unwrap_or(&[]))
     }
+}
+
+/// The tensor owns its host buffer and its credit together, including through aliases.
+pub(super) fn governed_value(value: Value, lease: Arc<MemoryLease>) -> anyhow::Result<Value> {
+    value.with_owner(lease).map_err(Into::into)
+}
+
+pub(super) struct ProjectionInputs<'a> {
+    pub source: &'a [f32],
+    pub base: &'a [f32],
+    pub batch: usize,
+    pub input_features: usize,
+    pub output_features: usize,
 }
 
 pub(super) fn apply_parameter_overlay(
@@ -380,61 +520,58 @@ pub(super) fn apply_parameter_overlay(
     context: &AdapterRunContext,
     component: &str,
     parameter: &str,
-    source: &[f32],
-    batch: usize,
-    input_features: usize,
+    inputs: ProjectionInputs<'_>,
 ) -> anyhow::Result<(Vec<f32>, usize)> {
-    if context.rows.len() != batch {
-        anyhow::bail!(
-            "adapter selection has {} rows but overlay input has batch {batch}",
-            context.rows.len()
-        );
-    }
-    let mut output_features = input_features;
-    for activations in &context.rows {
-        for (adapter, _) in activations {
-            output_features = cache.target(adapter, component, parameter)?.output_features;
-        }
-    }
-    let mut result = vec![0.0_f32; batch * output_features];
+    let ProjectionInputs {
+        source,
+        base,
+        batch,
+        input_features,
+        output_features,
+    } = inputs;
+    anyhow::ensure!(
+        context.rows.len() == batch,
+        "adapter selection has {} rows but projection has batch {batch}",
+        context.rows.len()
+    );
+    anyhow::ensure!(
+        batch.checked_mul(input_features) == Some(source.len()),
+        "adapter activation shape does not match batch and input features"
+    );
+    anyhow::ensure!(
+        batch.checked_mul(output_features) == Some(base.len()),
+        "adapter base projection shape does not match batch and output features"
+    );
+    let mut result = base.to_vec();
     for (row, activations) in context.rows.iter().enumerate() {
-        if activations.is_empty() {
-            if output_features != input_features {
-                anyhow::bail!(
-                    "base row without adapters requires matching input/output features, got {input_features} and {output_features}"
-                );
-            }
-            result[row * output_features..(row + 1) * output_features]
-                .copy_from_slice(&source[row * input_features..(row + 1) * input_features]);
-            continue;
-        }
-        if output_features == input_features {
-            result[row * output_features..(row + 1) * output_features]
-                .copy_from_slice(&source[row * input_features..(row + 1) * input_features]);
-        }
         for (adapter, scale) in activations {
-            let target = cache.target(adapter, component, parameter)?;
-            if target.input_features != input_features || target.output_features != output_features
-            {
-                anyhow::bail!(
+            for target in cache.targets(adapter, component, parameter)? {
+                anyhow::ensure!(
+                    target.input_features == input_features
+                        && target.output_features == output_features,
                     "adapter '{adapter}' target '{component}.{parameter}' expects [{}, {}], got [{input_features}, {output_features}]",
                     target.input_features,
                     target.output_features
                 );
-            }
-            let x = &source[row * input_features..(row + 1) * input_features];
-            let mut low_rank = vec![0.0_f32; target.rank];
-            for (rank, value) in low_rank.iter_mut().enumerate() {
-                for (feature, input) in x.iter().enumerate() {
-                    *value += input * target.a[rank * input_features + feature];
+                let factor = *scale * target.factor;
+                anyhow::ensure!(
+                    factor.is_finite(),
+                    "adapter '{adapter}' scale times alpha/rank exceeds finite float32; reduce the requested scale"
+                );
+                let x = &source[row * input_features..(row + 1) * input_features];
+                let mut low_rank = vec![0.0_f32; target.rank];
+                for (rank, value) in low_rank.iter_mut().enumerate() {
+                    for (feature, input) in x.iter().enumerate() {
+                        *value += input * target.a[rank * input_features + feature];
+                    }
                 }
-            }
-            for output in 0..output_features {
-                let mut delta = 0.0_f32;
-                for (rank, value) in low_rank.iter().enumerate() {
-                    delta += target.b[output * target.rank + rank] * value;
+                for output in 0..target.output_width {
+                    let mut delta = 0.0_f32;
+                    for (rank, value) in low_rank.iter().enumerate() {
+                        delta += target.b[output * target.rank + rank] * value;
+                    }
+                    result[row * output_features + target.output_offset + output] += factor * delta;
                 }
-                result[row * output_features + output] += *scale * target.factor * delta;
             }
         }
     }
@@ -445,6 +582,7 @@ fn load_adapter(
     root: &Path,
     service: &AdapterServiceContract,
     artifact: &AdapterArtifact,
+    authority: &dyn MemoryGovernor,
 ) -> anyhow::Result<LoadedAdapter> {
     anyhow::ensure!(
         matches!(artifact.dtype.as_str(), "float32" | "fp32"),
@@ -482,8 +620,100 @@ fn load_adapter(
             package_root.display()
         );
     }
-    let bytes = fs::read(&path)
-        .with_context(|| format!("failed to load adapter artifact '{}'", path.display()))?;
+    let file = fs::File::open(&path)
+        .with_context(|| format!("open adapter artifact '{}'", path.display()))?;
+    let metadata = file
+        .metadata()
+        .context("inspect adapter artifact before bounded loading")?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "adapter artifact '{}' must be a regular file",
+        path.display()
+    );
+    let length = metadata.len();
+    let transient = length
+        .checked_mul(16)
+        .context("adapter JSON staging size overflow; reduce the artifact")?;
+    let _staging = authority
+        .reserve(
+            onnx_runtime_memory_api::Tier::Host,
+            transient,
+            Holder::CpuDerivedWeights.role(),
+            Holder::CpuDerivedWeights.id(),
+        )
+        .with_context(|| {
+            format!(
+                "reserve adapter JSON parsing memory for '{}'",
+                path.display()
+            )
+        })?;
+    let mut live_bytes = 0_u64;
+    for binding in &artifact.bindings {
+        let target = service
+            .target_manifest
+            .targets
+            .iter()
+            .find(|target| target.id == binding.target)
+            .with_context(|| {
+                format!(
+                    "adapter binding targets undeclared projection '{}'",
+                    binding.target
+                )
+            })?;
+        let rank = u64::try_from(binding.rank.unwrap_or(artifact.rank))?;
+        let weights = u64::try_from(target.input_features)?
+            .checked_add(u64::try_from(
+                target
+                    .output_slice
+                    .as_ref()
+                    .map_or(target.output_features, |slice| slice.width),
+            )?)
+            .and_then(|n| n.checked_mul(rank))
+            .and_then(|n| n.checked_mul(4))
+            .context("adapter target tensor byte count overflow")?;
+        let names = u64::try_from(target.component.len())?
+            .checked_add(u64::try_from(target.initializer.len())?)
+            .and_then(|n| n.checked_add(512))
+            .context("adapter target descriptor size overflow")?;
+        live_bytes = live_bytes
+            .checked_add(weights)
+            .and_then(|n| n.checked_add(names))
+            .context("adapter weight cache size overflow")?;
+    }
+    let lease = authority
+        .reserve(
+            onnx_runtime_memory_api::Tier::Host,
+            live_bytes,
+            Holder::CpuDerivedWeights.role(),
+            Holder::CpuDerivedWeights.id(),
+        )
+        .with_context(|| {
+            format!(
+                "reserve normalized adapter weights for {}@{}",
+                artifact.identity, artifact.version
+            )
+        })?;
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(
+            usize::try_from(length)?
+                .checked_add(1)
+                .context("adapter file length overflow")?,
+        )
+        .context("allocate bounded adapter JSON input; free host memory and retry")?;
+    file.take(
+        length
+            .checked_add(1)
+            .context("adapter file length overflow")?,
+    )
+    .read_to_end(&mut bytes)
+    .with_context(|| format!("read bounded adapter artifact '{}'", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() as u64 == length,
+        "adapter artifact '{}' changed size while loading; replace model artifacts atomically between loads",
+        path.display()
+    );
     let bundle: JsonBundle = serde_json::from_slice(&bytes)
         .with_context(|| format!("adapter artifact '{}' is invalid JSON", path.display()))?;
     let bundles = bundle.targets;
@@ -508,8 +738,23 @@ fn load_adapter(
         })?;
         let rank = binding.rank.unwrap_or(artifact.rank);
         let alpha = binding.alpha.unwrap_or(artifact.alpha);
-        let expected_a = rank * target.input_features;
-        let expected_b = target.output_features * rank;
+        let expected_a = rank
+            .checked_mul(target.input_features)
+            .context("adapter A tensor size overflow")?;
+        let output_offset = target.output_slice.as_ref().map_or(0, |slice| slice.offset);
+        let output_width = target
+            .output_slice
+            .as_ref()
+            .map_or(target.output_features, |slice| slice.width);
+        anyhow::ensure!(
+            output_offset
+                .checked_add(output_width)
+                .is_some_and(|end| end <= target.output_features),
+            "adapter target output slice exceeds its declared projection width"
+        );
+        let expected_b = output_width
+            .checked_mul(rank)
+            .context("adapter B tensor size overflow")?;
         if tensors.a.len() != expected_a || tensors.b.len() != expected_b {
             anyhow::bail!(
                 "adapter target '{}.{}' shape mismatch: A has {} values (expected {expected_a}), B has {} values (expected {expected_b})",
@@ -523,19 +768,30 @@ fn load_adapter(
             AdapterScaleEncoding::AlphaOverRank => (alpha / rank as f64) as f32,
             AdapterScaleEncoding::Baked => 1.0,
         };
-        targets.insert(
-            (target.component.clone(), target.initializer.clone()),
-            AdapterTargetWeights {
+        anyhow::ensure!(
+            factor.is_finite() && tensors.a.iter().chain(&tensors.b).all(|n| n.is_finite()),
+            "adapter target '{}.{}' contains non-finite weights or alpha/rank factor; normalize finite tensors and scaling before loading",
+            target.component,
+            target.initializer
+        );
+        targets
+            .entry((target.component.clone(), target.initializer.clone()))
+            .or_insert_with(Vec::new)
+            .push(AdapterTargetWeights {
                 input_features: target.input_features,
                 output_features: target.output_features,
+                output_offset,
+                output_width,
                 rank,
                 factor,
                 a: tensors.a.clone(),
                 b: tensors.b.clone(),
-            },
-        );
+            });
     }
-    Ok(LoadedAdapter { targets })
+    Ok(LoadedAdapter {
+        targets,
+        _lease: lease,
+    })
 }
 
 #[cfg(test)]
@@ -547,6 +803,11 @@ mod tests {
         AdapterTargetBinding, AdapterWeightArtifact, LoraTargetDescriptor, LoraTargetManifest,
     };
 
+    fn test_cache() -> AdapterCache {
+        AdapterCache::new(Rc::new(onnx_runtime_memory_governor::LedgerGovernor::new(
+            onnx_runtime_memory_governor::LeaseLedger::new(0, 1024 * 1024 * 1024, 0),
+        )))
+    }
     fn artifact(name: &str, location: &str, _bytes: &[u8]) -> AdapterArtifact {
         AdapterArtifact {
             index: usize::from(name == "blue"),
@@ -624,6 +885,211 @@ mod tests {
     }
 
     #[test]
+    fn sparse_bindings_and_multiple_fused_slices_preserve_other_outputs() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        for alias in ["red", "blue"] {
+            fs::create_dir_all(root.path().join("adapters").join(alias))?;
+        }
+        let red =
+            br#"{"targets":{"head":{"a":[1.0,0.0],"b":[2.0]},"tail":{"a":[1.0,0.0],"b":[3.0]}}}"#;
+        let blue = br#"{"targets":{"other":{"a":[0.0,1.0],"b":[1.0,2.0,3.0]}}}"#;
+        fs::write(root.path().join("adapters/red/adapter.json"), red)?;
+        fs::write(root.path().join("adapters/blue/adapter.json"), blue)?;
+        let mut service = service_contract(red, blue, 2);
+        let target = &mut service.target_manifest.targets[0];
+        target.output_features = 3;
+        target.output_slice = Some(onnx_genai_metadata::LoraTargetSlice {
+            role: "first".into(),
+            offset: 0,
+            width: 1,
+            rank: None,
+            alpha: None,
+        });
+        let mut tail = target.clone();
+        tail.id = "tail".into();
+        tail.output_slice.as_mut().unwrap().role = "last".into();
+        tail.output_slice.as_mut().unwrap().offset = 2;
+        let mut other = target.clone();
+        other.id = "other".into();
+        other.initializer = "other".into();
+        other.node_name = "other".into();
+        other.output_name = "other.output".into();
+        other.output_slice = None;
+        service.target_manifest.targets.extend([tail, other]);
+        let artifact = service.artifacts.get_mut("red").unwrap();
+        artifact.bindings[0].weight_key = "head".into();
+        artifact.bindings.push(AdapterTargetBinding {
+            target: "tail".into(),
+            weight_key: "tail".into(),
+            rank: None,
+            alpha: None,
+        });
+        let artifact = service.artifacts.get_mut("blue").unwrap();
+        artifact.bindings[0].target = "other".into();
+        artifact.bindings[0].weight_key = "other".into();
+        let mut cache = test_cache();
+        let context = cache.prepare(
+            root.path(),
+            &service,
+            &AdapterSelection::default().with_row([
+                AdapterActivation::new("red", 1.0),
+                AdapterActivation::new("blue", 1.0),
+            ]),
+            &[true],
+        )?;
+        let inputs = || ProjectionInputs {
+            source: &[1.0, 2.0],
+            base: &[12.0, 15.0, 18.0],
+            batch: 1,
+            input_features: 2,
+            output_features: 3,
+        };
+        assert_eq!(
+            apply_parameter_overlay(&cache, &context, "decoder", "projection", inputs())?.0,
+            vec![14.0, 15.0, 21.0]
+        );
+        assert_eq!(
+            apply_parameter_overlay(&cache, &context, "decoder", "other", inputs())?.0,
+            vec![14.0, 19.0, 24.0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn composition_history_is_bounded_and_preserves_exact_float_scale_bits() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        fs::create_dir_all(root.path().join("adapters/red"))?;
+        let data = br#"{"targets":{"projection":{"a":[1.0,0.0],"b":[1.0,2.0]}}}"#;
+        fs::write(root.path().join("adapters/red/adapter.json"), data)?;
+        let service = service_contract(data, data, 2);
+        let mut cache = test_cache();
+        let small = 1e-9_f32;
+        for scale in [small, f32::from_bits(small.to_bits() + 1)] {
+            cache.prepare(
+                root.path(),
+                &service,
+                &AdapterSelection::default().with_row([AdapterActivation::new("red", scale)]),
+                &[true],
+            )?;
+        }
+        assert_eq!(cache.diagnostic().replayed_plans, 0);
+        for step in 1..32 {
+            cache.prepare(
+                root.path(),
+                &service,
+                &AdapterSelection::default().with_row([AdapterActivation::new("red", step as f32)]),
+                &[true],
+            )?;
+        }
+        assert_eq!(cache.diagnostic().plan_variants, 2);
+        let mut cold = test_cache();
+        fs::remove_file(root.path().join("adapters/red/adapter.json"))?;
+        let disabled = cold.prepare(
+            root.path(),
+            &service,
+            &AdapterSelection::default().with_row([AdapterActivation::new("red", 0.0)]),
+            &[true],
+        )?;
+        assert!(disabled.rows[0].is_empty());
+        assert_eq!(cold.diagnostic().loads, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn governed_tensor_aliases_keep_host_credit_until_last_view() -> anyhow::Result<()> {
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor};
+        let ledger = LeaseLedger::new(0, 64, 0);
+        let governor = LedgerGovernor::new(ledger);
+        let lease = Arc::new(governor.reserve(
+            Tier::Host,
+            8,
+            Holder::Activations.role(),
+            Holder::Activations.id(),
+        )?);
+        let value = governed_value(Value::from_vec_f32(vec![2.0, 3.0], &[2])?, lease)?;
+        let alias = value
+            .try_alias_clone()
+            .expect("governed tensors are shared views")?;
+        drop(value);
+        assert_eq!(governor.used(Tier::Host), 8);
+        assert_eq!(alias.to_vec_f32()?, vec![2.0, 3.0]);
+        drop(alias);
+        assert_eq!(governor.used(Tier::Host), 0);
+        Ok(())
+    }
+    #[test]
+    fn adapter_weight_cache_reserves_and_releases_host_memory() -> anyhow::Result<()> {
+        use onnx_runtime_memory_api::{MemoryError, Tier};
+        use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor};
+        let root = tempfile::tempdir()?;
+        fs::create_dir_all(root.path().join("adapters/red"))?;
+        let data = br#"{"targets":{"projection":{"a":[1.0,0.0],"b":[1.0,2.0]}}}"#;
+        fs::write(root.path().join("adapters/red/adapter.json"), data)?;
+        let service = service_contract(data, data, 2);
+        let selection = AdapterSelection::default().with_row([AdapterActivation::new("red", 1.0)]);
+        let governor = Rc::new(LedgerGovernor::new(LeaseLedger::new(0, 64, 0)));
+        let mut cache = AdapterCache::new(governor.clone());
+        let error = cache
+            .prepare(root.path(), &service, &selection, &[true])
+            .unwrap_err();
+        assert!(error.downcast_ref::<MemoryError>().is_some(), "{error:#}");
+        assert_eq!(governor.used(Tier::Host), 0);
+        assert_eq!(cache.diagnostic().loads, 0);
+        let governor = Rc::new(LedgerGovernor::new(LeaseLedger::new(0, 1024 * 1024, 0)));
+        let mut cache = AdapterCache::new(governor.clone());
+        cache.prepare(root.path(), &service, &selection, &[true])?;
+        assert!(governor.used(Tier::Host) >= 16);
+        drop(cache);
+        assert_eq!(governor.used(Tier::Host), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_uses_actual_non_identity_non_square_base_projection() -> anyhow::Result<()> {
+        let red = br#"{"targets":{"projection":{"a":[1.0,0.0],"b":[1.0,2.0,3.0]}}}"#;
+        let mut service = service_contract(red, red, 2);
+        service.target_manifest.targets[0].output_features = 3;
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().to_path_buf();
+        fs::create_dir_all(root.join("adapters/red"))?;
+        fs::write(root.join("adapters/red/adapter.json"), red)?;
+        let mut cache = test_cache();
+        let context = cache.prepare(
+            &root,
+            &service,
+            &AdapterSelection::default().with_row([AdapterActivation::new("red", 0.5)]),
+            &[true],
+        )?;
+        // [1,2] * [[2,3,4],[5,6,7]] = [12,15,18], independently of LoRA.
+        let input = ProjectionInputs {
+            source: &[1.0, 2.0],
+            base: &[12.0, 15.0, 18.0],
+            batch: 1,
+            input_features: 2,
+            output_features: 3,
+        };
+        assert_eq!(
+            apply_parameter_overlay(&cache, &context, "decoder", "projection", input)?.0,
+            vec![12.5, 16.0, 19.5]
+        );
+        let empty = AdapterRunContext { rows: vec![vec![]] };
+        let input = ProjectionInputs {
+            source: &[1.0, 2.0],
+            base: &[12.0, 15.0, 18.0],
+            batch: 1,
+            input_features: 2,
+            output_features: 3,
+        };
+        assert_eq!(
+            apply_parameter_overlay(&cache, &empty, "decoder", "projection", input)?.0,
+            vec![12.0, 15.0, 18.0]
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn one_artifact_supports_heterogeneous_target_rank_and_alpha() {
         let root = std::env::current_dir()
             .expect("current directory")
@@ -661,21 +1127,36 @@ mod tests {
         });
 
         let selection = AdapterSelection::default().with_row([AdapterActivation::new("red", 1.0)]);
-        let mut cache = AdapterCache::default();
+        let mut cache = test_cache();
         let context = cache
             .prepare(&root, &service, &selection, &[true])
             .expect("load heterogeneous-rank artifact under one alias");
-        let (rank_one, _) =
-            apply_parameter_overlay(&cache, &context, "decoder", "projection", &[1.0, 2.0], 1, 2)
-                .expect("apply rank-one target");
+        let (rank_one, _) = apply_parameter_overlay(
+            &cache,
+            &context,
+            "decoder",
+            "projection",
+            ProjectionInputs {
+                source: &[1.0, 2.0],
+                base: &[1.0, 2.0],
+                batch: 1,
+                input_features: 2,
+                output_features: 2,
+            },
+        )
+        .expect("apply rank-one target");
         let (rank_two, _) = apply_parameter_overlay(
             &cache,
             &context,
             "decoder",
             "projection_2",
-            &[1.0, 2.0],
-            1,
-            2,
+            ProjectionInputs {
+                source: &[1.0, 2.0],
+                base: &[1.0, 2.0],
+                batch: 1,
+                input_features: 2,
+                output_features: 2,
+            },
         )
         .expect("apply rank-two target");
         assert_eq!(rank_one, vec![3.0, 6.0]);
@@ -707,7 +1188,7 @@ mod tests {
                 AdapterActivation::new("red", 0.5),
                 AdapterActivation::new("blue", 1.0),
             ]);
-        let mut cache = AdapterCache::default();
+        let mut cache = test_cache();
         let context = cache
             .prepare(&root, &service, &selection, &[true, true, true])
             .expect("prepare heterogeneous adapters");
@@ -716,9 +1197,13 @@ mod tests {
             &context,
             "decoder",
             "projection",
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            3,
-            2,
+            ProjectionInputs {
+                source: &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                base: &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                batch: 3,
+                input_features: 2,
+                output_features: 2,
+            },
         )
         .expect("apply heterogeneous adapters");
         assert_eq!(width, 2);
@@ -733,9 +1218,20 @@ mod tests {
             let single = cache
                 .prepare(&root, &service, &isolated, &[true])
                 .expect("prepare independent row");
-            let (single_output, _) =
-                apply_parameter_overlay(&cache, &single, "decoder", "projection", &row_input, 1, 2)
-                    .expect("apply independent row");
+            let (single_output, _) = apply_parameter_overlay(
+                &cache,
+                &single,
+                "decoder",
+                "projection",
+                ProjectionInputs {
+                    source: &row_input,
+                    base: &row_input,
+                    batch: 1,
+                    input_features: 2,
+                    output_features: 2,
+                },
+            )
+            .expect("apply independent row");
             assert_eq!(single_output, expected);
         }
 
@@ -748,9 +1244,13 @@ mod tests {
             &dynamic_context,
             "decoder",
             "projection",
-            &[1.0, 2.0],
-            1,
-            2,
+            ProjectionInputs {
+                source: &[1.0, 2.0],
+                base: &[1.0, 2.0],
+                batch: 1,
+                input_features: 2,
+                output_features: 2,
+            },
         )
         .expect("apply dynamic scale");
         assert_eq!(dynamic_output, vec![1.5, 3.0]);
@@ -767,9 +1267,13 @@ mod tests {
             &compacted,
             "decoder",
             "projection",
-            &[5.0, 6.0, 1.0, 2.0],
-            2,
-            2,
+            ProjectionInputs {
+                source: &[5.0, 6.0, 1.0, 2.0],
+                base: &[5.0, 6.0, 1.0, 2.0],
+                batch: 2,
+                input_features: 2,
+                output_features: 2,
+            },
         )
         .expect("apply compacted adapters");
         assert_eq!(compacted_output, vec![25.5, 35.0, 2.0, 4.0]);
@@ -783,14 +1287,18 @@ mod tests {
             &released,
             "decoder",
             "projection",
-            &[1.0, 2.0, 5.0, 6.0],
-            2,
-            2,
+            ProjectionInputs {
+                source: &[1.0, 2.0, 5.0, 6.0],
+                base: &[1.0, 2.0, 5.0, 6.0],
+                batch: 2,
+                input_features: 2,
+                output_features: 2,
+            },
         )
         .expect("apply after release");
         assert_eq!(released_output, vec![2.0, 4.0, 25.5, 35.0]);
 
-        let mut inactive_cache = AdapterCache::default();
+        let mut inactive_cache = test_cache();
         let inactive_selection =
             AdapterSelection::default().with_row([AdapterActivation::new("red", 1.0)]);
         let inactive = inactive_cache
@@ -801,9 +1309,13 @@ mod tests {
             &inactive,
             "decoder",
             "projection",
-            &[1.0, 2.0],
-            1,
-            2,
+            ProjectionInputs {
+                source: &[1.0, 2.0],
+                base: &[1.0, 2.0],
+                batch: 1,
+                input_features: 2,
+                output_features: 2,
+            },
         )
         .expect("inactive row uses immutable base");
         assert_eq!(inactive_output, vec![1.0, 2.0]);
@@ -820,7 +1332,7 @@ mod tests {
 
         // A one-entry cache evicts, reloads, and invalidates captured plan variants.
         let service = service_contract(red, blue, 1);
-        let mut cache = AdapterCache::default();
+        let mut cache = test_cache();
         for adapter in ["red", "blue", "red"] {
             let selection =
                 AdapterSelection::default().with_row([AdapterActivation::new(adapter, 1.0)]);
@@ -901,7 +1413,7 @@ mod tests {
         fs::write(root.join("adapters/blue/adapter.json"), valid).expect("write blue adapter");
         let service = service_contract(valid, valid, 2);
         let selection = AdapterSelection::default().with_row([AdapterActivation::new("red", 1.0)]);
-        AdapterCache::default()
+        test_cache()
             .prepare(&root, &service, &selection, &[true])
             .expect("semantically compatible replacement bytes must load");
 
@@ -909,7 +1421,7 @@ mod tests {
         fs::write(root.join("adapters/red/adapter.json"), malformed)
             .expect("write malformed adapter");
         let service = service_contract(malformed, valid, 2);
-        let error = AdapterCache::default()
+        let error = test_cache()
             .prepare(&root, &service, &selection, &[true])
             .expect_err("shape mismatch must fail");
         assert!(error.to_string().contains("shape mismatch"));

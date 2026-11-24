@@ -144,6 +144,9 @@ pub struct ServeArgs {
     #[arg(long, env = "ONNX_GENAI_ADMIN_ENDPOINTS")]
     pub enable_admin_endpoints: bool,
 
+    /// Load declared adapters without applying them until selected by API.
+    #[arg(long, env = "NXRT_LORA_INIT_WITHOUT_APPLY")]
+    pub lora_init_without_apply: bool,
     /// Directory for llama.cpp slot save/restore/erase actions.
     #[arg(long, env = "NXRT_SLOT_SAVE_PATH")]
     pub slot_save_path: Option<std::path::PathBuf>,
@@ -227,6 +230,7 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
         enable_debug_endpoints: args.enable_debug_endpoints,
         enable_admin_endpoints: args.enable_admin_endpoints,
         slot_save_path: args.slot_save_path.clone(),
+        lora_init_without_apply: args.lora_init_without_apply,
         slot_save_max_file_bytes: args.slot_save_max_file_bytes,
         slot_save_max_total_bytes: args.slot_save_max_total_bytes,
         slot_save_max_files: args.slot_save_max_files,
@@ -291,6 +295,14 @@ mod tests {
     struct TestCli {
         #[command(flatten)]
         serve: ServeArgs,
+    }
+
+    #[test]
+    fn lora_init_without_apply_flag_preserves_explicit_operator_choice() {
+        let disabled = TestCli::parse_from(["test", "model-dir", "--lora-init-without-apply"]);
+        assert!(server_config_from_args(&disabled.serve).lora_init_without_apply);
+        let defaults = TestCli::parse_from(["test", "model-dir"]);
+        assert!(!server_config_from_args(&defaults.serve).lora_init_without_apply);
     }
 
     #[test]

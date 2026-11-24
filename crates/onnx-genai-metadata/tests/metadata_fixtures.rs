@@ -80,12 +80,13 @@ pipeline:
         ports:
           inputs:
             input: { dtype: float32, shape: [batch, 2] }
+            base: { dtype: float32, shape: [batch, 2] }
           outputs:
             output: { dtype: float32, shape: [batch, 2] }
         contract:
           id: onnx-genai.parameter-overlay
           version: "1"
-          bindings: { input: input, output: output }
+          bindings: { input: input, base: base, output: output }
           parameters:
             action: apply
             component: decoder
@@ -1046,6 +1047,27 @@ pipeline:
         errors
             .iter()
             .any(|error| error.contains("unsupported action")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn parameter_overlay_requires_an_explicit_base_projection_port() {
+    let mut metadata: InferenceMetadata = serde_yaml::from_str(ADAPTER_WORKFLOW).unwrap();
+    let component = metadata
+        .pipeline
+        .as_mut()
+        .unwrap()
+        .workflow
+        .components
+        .get_mut("overlay")
+        .unwrap();
+    component.contract.as_mut().unwrap().bindings.remove("base");
+    let errors = validate_metadata(&metadata).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("must bind 'base'")),
         "{errors:?}"
     );
 }

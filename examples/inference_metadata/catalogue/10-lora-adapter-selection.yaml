@@ -111,6 +111,14 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+            base:
+              dtype: float32
+              shape:
+              - batch
+              - 2
+              batch_layout:
+                kind: request_aligned
+                axis: 0
           outputs:
             output:
               dtype: float32
@@ -125,6 +133,7 @@ pipeline:
           version: '1'
           bindings:
             input: input
+            base: base
             output: output
           parameters:
             action: apply
@@ -140,6 +149,7 @@ pipeline:
       component: overlay
       inputs:
         input: activations
+        base: activations
       outputs:
         output: adapted
     - kind: emit

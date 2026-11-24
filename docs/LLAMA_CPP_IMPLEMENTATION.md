@@ -136,7 +136,7 @@ non-padding token usage and positive document/token budgets are covered by real
 ONNX HTTP tests. An actual raw-logit workflow is rejected with repair guidance;
 no embedding similarity is substituted for cross-encoder scores. Metadata guards
 cover ambiguous/unsupported profiles, vector scores and mismatched fixed inputs.
-Adapter and device/multi-sequence slot persistence work in the shared delivery row remains outstanding.
+Declared host LoRA selection and its HTTP catalog/default controls now execute actual weights; alternative artifact loaders, device-fused application and device/multi-sequence slot persistence remain outstanding.
 
 Reranking checkpoint: full server library 379 passed / 2 inherited ignores;
 metadata library 76 passed; both real engine ranking tests passed, including
@@ -1820,3 +1820,21 @@ capacity and completion cleanup checks use the canonical path. All 38 HTTP
 integration tests, Native-CUDA-feature all-target strict Clippy, formatting and
 diff checks passed locally. CUDA execution remains unmeasured. This corrects a
 frontend-blocking endpoint gap; remaining acceptance rows stay open.
+
+
+### Model-bound LoRA serving
+
+`GET/POST /lora-adapters` and per-generation `lora` now lower into the
+admitted workflow service. Defaults initialize at scale 1 (or disabled with
+`--lora-init-without-apply`), snapshot per request, and remain isolated between
+models. The wire parser preserves upstream ID ordering, last duplicate wins,
+and missing/null/non-numeric scale defaults. Invalid updates leave defaults
+untouched; unavailable owners return an actionable 503.
+
+Real base-plus-low-rank execution supports non-square projections, sparse
+bindings and multiple fused slices. Model-governed host leases cover parsed
+weights, bounded staging and generated tensors, surviving no-copy aliases.
+Token-history replay supports named adapter sessions; other retained state is
+refused before mutation. Native generated-token tests run with ORT unavailable.
+See [LoRA serving](LORA_SERVING.md) for the executed contract and remaining
+source-format, device and embedding gaps. The overall acceptance rows stay open.
