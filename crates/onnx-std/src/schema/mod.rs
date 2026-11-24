@@ -796,7 +796,6 @@ type_constraints:
             ("Hardmax", 13),
             ("IsInf", 10),
             ("IsNaN", 9),
-            ("LpNormalization", 1),
             ("PRelu", 16),
             ("Selu", 6),
             ("ThresholdedRelu", 10),
@@ -830,6 +829,41 @@ type_constraints:
         assert_eq!(
             registry.lookup("EyeLike", "", 22).unwrap().since_version,
             22
+        );
+        assert_eq!(
+            registry
+                .lookup("LpNormalization", "", 21)
+                .unwrap()
+                .since_version,
+            1
+        );
+        assert_eq!(
+            registry
+                .lookup("LpNormalization", "", 22)
+                .unwrap()
+                .since_version,
+            22
+        );
+        assert_eq!(
+            registry
+                .lookup("LpNormalization", "", 21)
+                .unwrap()
+                .type_constraints[0]
+                .allowed,
+            [DataType::Float16, DataType::Float32, DataType::Float64]
+        );
+        assert_eq!(
+            registry
+                .lookup("LpNormalization", "", 22)
+                .unwrap()
+                .type_constraints[0]
+                .allowed,
+            [
+                DataType::BFloat16,
+                DataType::Float16,
+                DataType::Float32,
+                DataType::Float64
+            ]
         );
         assert_eq!(
             registry
