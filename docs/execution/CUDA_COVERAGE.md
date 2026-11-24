@@ -464,13 +464,15 @@ complete frames and applies the optional window before one batched cuFFT call.
 |---------|------------------------------|-----------|
 | **CUTLASS / cuDNN SDPA** | `FusedAttention` | Flash/SDPA implementation avoids materialising the O(S²) score tensor. |
 
-`Unique` now has an honest bounded NVRTC slice: flattened, contiguous Float32
-inputs with at most 1024 elements (further clamped to the device's
+`Unique` supports flattened, contiguous Float32 inputs since opset 11 and
+BFloat16 inputs since opset 28, with at most 1024 elements (further clamped to the device's
 threads-per-block limit). One device bitonic-sort/grouping phase leaves reusable
-state in governed workspace, copies only the 8-byte count to host for ORT output
-allocation, then launches one device materialization phase. Axis mode, dynamic
-input extents, other dtypes, larger inputs, strided layouts, and CUDA graph
-capture decline at placement with an explicit reason.
+state in governed workspace, copies only the 8-byte count to host for output
+allocation, then gathers `Y` in the input dtype and produces int64 metadata
+on-device. BF16 NaNs compare unequal (as in ONNX's NumPy BF16 reference);
+sorted CUDA output places them after numeric values. Axis mode, dynamic input
+extents, other dtypes, larger inputs, strided
+layouts, and CUDA graph capture remain outside this slice.
 
 ### Historical coverage-wave snapshots — not current totals
 

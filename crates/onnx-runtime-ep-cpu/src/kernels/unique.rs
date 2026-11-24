@@ -19,6 +19,7 @@ std::thread_local! {
 pub struct UniqueKernel {
     axis: Option<i64>,
     sorted: bool,
+    opset: u64,
 }
 
 pub struct UniqueFactory;
@@ -35,8 +36,18 @@ impl KernelFactory for UniqueFactory {
                 )));
             }
         };
-        Ok(Box::new(UniqueKernel { axis, sorted }))
+        Ok(Box::new(UniqueKernel {
+            axis,
+            sorted,
+            opset: node.local_opset().unwrap_or(11),
+        }))
     }
+}
+
+pub(crate) fn unsupported_dtype_for_opset(dtype: DataType, opset: u64) -> Option<String> {
+    (dtype == DataType::BFloat16 && opset < 28).then(|| {
+        format!("Unique: BFloat16 input requires opset 28 or later, got {opset}; export at opset 28 or use Float32")
+    })
 }
 
 impl Kernel for UniqueKernel {
@@ -112,6 +123,9 @@ impl UniqueKernel {
                  place Unique on a host EP instead of copying device payloads implicitly",
                 input.device
             )));
+        }
+        if let Some(reason) = unsupported_dtype_for_opset(input.dtype, self.opset) {
+            return Err(EpError::KernelFailed(reason));
         }
         ensure_supported_dtype(input.dtype)?;
 
@@ -467,6 +481,47 @@ fn optional_int_attr(node: &Node, name: &str) -> Result<Option<i64>> {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+    use onnx_runtime_ep_api::ExecutionProvider;
+
+    #[test]
+    fn bfloat16_admission_starts_at_opset_28() {
+        let provider = crate::provider::CpuExecutionProvider::new();
+        let node = Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "Unique",
+            vec![Some(onnx_runtime_ir::ValueId(0))],
+            vec![onnx_runtime_ir::ValueId(1)],
+        );
+        let input = Owned::zeros(DataType::BFloat16, &[2]);
+        for opset in [27, 28] {
+            let claim = provider.supports_op(
+                &node,
+                opset,
+                &[onnx_runtime_ir::static_shape([2])],
+                &[DataType::BFloat16],
+                &[onnx_runtime_ir::TensorLayout::contiguous()],
+            );
+            let output = provider
+                .get_kernel(&node, &[vec![2]], opset)
+                .unwrap()
+                .execute_kernel_sized(&[input.view()], &[true], None);
+            if opset == 27 {
+                assert!(claim.reason().unwrap().contains("requires opset 28"));
+                assert!(
+                    output
+                        .unwrap_err()
+                        .to_string()
+                        .contains("requires opset 28")
+                );
+            } else {
+                assert!(claim.is_supported(), "{claim:?}");
+                let output = output.unwrap();
+                let y = output[0].as_ref().unwrap();
+                assert_eq!(y.dtype, DataType::BFloat16);
+                assert_eq!(y.shape, [1]);
+            }
+        }
+    }
 
     fn output_f32(output: &KernelSizedOutput) -> Vec<f32> {
         output
@@ -500,6 +555,7 @@ mod tests {
         UniqueKernel {
             axis: Some(1),
             sorted: true,
+            opset: 11,
         }
         .execute(
             &[input.view()],
@@ -532,6 +588,7 @@ mod tests {
         UniqueKernel {
             axis: None,
             sorted: false,
+            opset: 11,
         }
         .execute(
             &[input.view()],
@@ -563,6 +620,7 @@ mod tests {
         UniqueKernel {
             axis: None,
             sorted: true,
+            opset: 11,
         }
         .execute(
             &[input.view()],
@@ -606,6 +664,7 @@ mod tests {
         let outputs = UniqueKernel {
             axis: None,
             sorted: false,
+            opset: 11,
         }
         .execute_kernel_sized(&[input.view()], &[true, true, true, true], None)
         .unwrap();
@@ -635,6 +694,7 @@ mod tests {
         let outputs = UniqueKernel {
             axis: None,
             sorted: true,
+            opset: 11,
         }
         .execute_kernel_sized(&[input.view()], &[true, false, true, false], None)
         .unwrap();
@@ -656,6 +716,7 @@ mod tests {
             let outputs = UniqueKernel {
                 axis: None,
                 sorted: true,
+                opset: 11,
             }
             .execute_kernel_sized(&[input.view()], &[true], None)
             .unwrap();
@@ -669,6 +730,7 @@ mod tests {
         let outputs = UniqueKernel {
             axis: None,
             sorted: false,
+            opset: 11,
         }
         .execute_kernel_sized(&[input.view()], &[true], None)
         .unwrap();
@@ -695,6 +757,7 @@ mod tests {
         let error = UniqueKernel {
             axis: None,
             sorted: true,
+            opset: 11,
         }
         .execute_kernel_sized(&[view], &[true], None)
         .unwrap_err();

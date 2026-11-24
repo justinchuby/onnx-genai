@@ -18,8 +18,9 @@ use crate::runtime::{CudaDeviceCapabilities, CudaRuntime, cuptr};
 pub const MAX_UNIQUE_ELEMENTS: usize = 1024;
 
 const SOURCE: &str = r#"
-__device__ __forceinline__ bool unique_equal(float a, float b) {
-  return (isnan(a) && isnan(b)) || a == b;
+__device__ __forceinline__ bool unique_equal(float a, float b, int bf16) {
+  // NumPy's native FP32 path groups NaNs; ml_dtypes BF16 uses IEEE equality.
+  return a == b || (!bf16 && isnan(a) && isnan(b));
 }
 
 __device__ __forceinline__ bool unique_before(
@@ -34,8 +35,8 @@ __device__ __forceinline__ bool unique_before(
   return ia < ib;
 }
 
-extern "C" __global__ void unique_plan_f32(
-    const float* input, unsigned int n, int sorted,
+extern "C" __global__ void unique_plan(
+    const void* input, unsigned int n, int sorted, int bf16,
     unsigned int* first, unsigned int* counts, unsigned int* inverse,
     unsigned long long* unique_count) {
   extern __shared__ unsigned char raw[];
@@ -44,7 +45,10 @@ extern "C" __global__ void unique_plan_f32(
       reinterpret_cast<unsigned int*>(keys + blockDim.x);
   const unsigned int tid = threadIdx.x;
   if (tid < n) {
-    keys[tid] = input[tid];
+    // BF16 widens exactly, including subnormals, with no BF16 ISA dependency.
+    keys[tid] = bf16
+        ? __uint_as_float((unsigned int)static_cast<const unsigned short*>(input)[tid] << 16)
+        : static_cast<const float*>(input)[tid];
     indices[tid] = tid;
   } else {
     keys[tid] = 0.0f;
@@ -78,7 +82,7 @@ extern "C" __global__ void unique_plan_f32(
   unsigned int groups = 0;
   for (unsigned int position = 0; position < n; ++position) {
     const unsigned int original = indices[position];
-    if (position == 0 || !unique_equal(keys[position - 1], keys[position])) {
+    if (position == 0 || !unique_equal(keys[position - 1], keys[position], bf16)) {
       first[groups] = original;
       counts[groups] = 0;
       ++groups;
@@ -115,16 +119,21 @@ extern "C" __global__ void unique_plan_f32(
   *unique_count = groups;
 }
 
-extern "C" __global__ void unique_materialize_f32(
-    const float* input, unsigned int n,
+extern "C" __global__ void unique_materialize(
+    const void* input, unsigned int n, int bf16,
     const unsigned int* first, const unsigned int* counts,
     const unsigned int* inverse, const unsigned long long* unique_count_ptr,
-    float* y, long long* indices,
+    void* y, long long* indices,
     long long* inverse_indices, long long* output_counts) {
   const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
   const unsigned int unique_count = (unsigned int)*unique_count_ptr;
   if (i < unique_count) {
-    if (y) y[i] = input[first[i]];
+    if (y) {
+      if (bf16)
+        static_cast<unsigned short*>(y)[i] = static_cast<const unsigned short*>(input)[first[i]];
+      else
+        static_cast<float*>(y)[i] = static_cast<const float*>(input)[first[i]];
+    }
     if (indices) indices[i] = (long long)first[i];
     if (output_counts) output_counts[i] = (long long)counts[i];
   }
@@ -187,6 +196,7 @@ impl KernelFactory for UniqueFactory {
         };
         Ok(Box::new(UniqueKernel {
             runtime: self.runtime.clone(),
+            opset: node.local_opset().unwrap_or(11),
             sorted,
             max_elements: MAX_UNIQUE_ELEMENTS.min(
                 usize::try_from(self.runtime.capabilities().max_threads_per_block())
@@ -198,6 +208,7 @@ impl KernelFactory for UniqueFactory {
 
 struct UniqueKernel {
     runtime: Arc<CudaRuntime>,
+    opset: u64,
     sorted: bool,
     max_elements: usize,
 }
@@ -271,12 +282,8 @@ impl UniqueKernel {
             )));
         }
         let input = &inputs[0];
-        if input.dtype != DataType::Float32 {
-            return Err(not_implemented(format!(
-                "Unique dtype {:?}; the bounded CUDA slice supports Float32 only",
-                input.dtype
-            )));
-        }
+        validate_dtype(input.dtype, self.opset)
+            .map_err(|reason| not_implemented(format!("Unique: {reason}")))?;
         if !input.is_contiguous() {
             return Err(not_implemented(
                 "Unique with strided input; the bounded CUDA slice requires contiguous input",
@@ -327,8 +334,9 @@ impl UniqueKernel {
             ));
         }
         let elements = self.validate_input(inputs)?;
+        let dtype = inputs[0].dtype;
         if elements == 0 {
-            return Ok(unique_metadata(elements, 0, requested_outputs));
+            return Ok(unique_metadata(dtype, elements, 0, requested_outputs));
         }
         let (workspace, layout) = self.workspace(workspace, elements)?;
         let base = cuptr(workspace.ptr().as_ptr::<u8>().cast::<c_void>());
@@ -339,7 +347,7 @@ impl UniqueKernel {
         let capacity = elements.next_power_of_two();
         let function = self
             .runtime
-            .nvrtc_function("unique_f32_v1", SOURCE, "unique_plan_f32")?;
+            .nvrtc_function("unique_v2", SOURCE, "unique_plan")?;
         if capacity > self.max_elements {
             return Err(not_implemented(format!(
                 "Unique launch needs {capacity} threads, device limit is {}",
@@ -350,11 +358,13 @@ impl UniqueKernel {
         let n = u32::try_from(elements)
             .map_err(|_| EpError::KernelFailed("cuda_ep Unique: input is too large".into()))?;
         let sorted = i32::from(self.sorted);
+        let bf16 = i32::from(dtype == DataType::BFloat16);
         let mut builder = self.runtime.stream().launch_builder(&function);
         builder
             .arg(&input)
             .arg(&n)
             .arg(&sorted)
+            .arg(&bf16)
             .arg(&first)
             .arg(&counts)
             .arg(&inverse)
@@ -382,7 +392,12 @@ impl UniqueKernel {
                 "cuda_ep Unique: device returned invalid count {unique_count} for {elements} inputs"
             )));
         }
-        Ok(unique_metadata(elements, unique_count, requested_outputs))
+        Ok(unique_metadata(
+            dtype,
+            elements,
+            unique_count,
+            requested_outputs,
+        ))
     }
 
     fn materialize(
@@ -425,13 +440,15 @@ impl UniqueKernel {
         let inverse_indices = ptr(2);
         let output_counts = ptr(3);
         let n = elements as u32;
-        let function =
-            self.runtime
-                .nvrtc_function("unique_f32_v1", SOURCE, "unique_materialize_f32")?;
+        let bf16 = i32::from(inputs[0].dtype == DataType::BFloat16);
+        let function = self
+            .runtime
+            .nvrtc_function("unique_v2", SOURCE, "unique_materialize")?;
         let mut builder = self.runtime.stream().launch_builder(&function);
         builder
             .arg(&input)
             .arg(&n)
+            .arg(&bf16)
             .arg(&first)
             .arg(&counts)
             .arg(&inverse)
@@ -454,6 +471,7 @@ impl UniqueKernel {
 }
 
 fn unique_metadata(
+    dtype: DataType,
     elements: usize,
     unique_count: usize,
     requested_outputs: &[bool],
@@ -468,11 +486,7 @@ fn unique_metadata(
                 } else {
                     vec![unique_count]
                 },
-                dtype: if slot == 0 {
-                    DataType::Float32
-                } else {
-                    DataType::Int64
-                },
+                dtype: if slot == 0 { dtype } else { DataType::Int64 },
             })
         })
         .collect()
@@ -593,8 +607,22 @@ impl Kernel for UniqueKernel {
     }
 }
 
+fn validate_dtype(dtype: DataType, opset: u64) -> std::result::Result<(), String> {
+    match dtype {
+        DataType::Float32 => Ok(()),
+        DataType::BFloat16 if opset >= 28 => Ok(()),
+        DataType::BFloat16 => Err(format!(
+            "BFloat16 input requires opset 28 or later, got {opset}; export at opset 28 or use Float32"
+        )),
+        _ => Err(format!(
+            "bounded CUDA input must be Float32 or BFloat16 (opset 28+), got {dtype:?}"
+        )),
+    }
+}
+
 pub(crate) fn unsupported_reason(
     node: &Node,
+    opset: u64,
     input_shapes: &[Shape],
     input_dtypes: &[DataType],
     input_layouts: &[TensorLayout],
@@ -611,12 +639,10 @@ pub(crate) fn unsupported_reason(
             None | Some(0 | 1) => {}
             Some(value) => return Err(format!("attribute 'sorted' must be 0 or 1, got {value}")),
         }
-        if input_dtypes.first() != Some(&DataType::Float32) {
-            return Err(format!(
-                "input dtype must be Float32, got {:?}",
-                input_dtypes.first().copied().unwrap_or(DataType::Undefined)
-            ));
-        }
+        validate_dtype(
+            input_dtypes.first().copied().unwrap_or(DataType::Undefined),
+            opset,
+        )?;
         let shape = input_shapes
             .first()
             .ok_or_else(|| "missing input shape metadata".to_string())?;
@@ -677,6 +703,7 @@ mod tests {
         assert!(
             unsupported_reason(
                 &node,
+                11,
                 std::slice::from_ref(&shape),
                 &[DataType::Float32],
                 &[TensorLayout::contiguous()],
@@ -688,6 +715,7 @@ mod tests {
         assert!(
             unsupported_reason(
                 &node,
+                11,
                 std::slice::from_ref(&shape),
                 &[DataType::Float32],
                 &[TensorLayout::contiguous()],
@@ -701,6 +729,7 @@ mod tests {
         assert!(
             unsupported_reason(
                 &node,
+                11,
                 std::slice::from_ref(&shape),
                 &[DataType::Float16],
                 &[TensorLayout::contiguous()],
@@ -713,6 +742,7 @@ mod tests {
         assert!(
             unsupported_reason(
                 &node,
+                11,
                 &[dynamic],
                 &[DataType::Float32],
                 &[TensorLayout::contiguous()],
@@ -725,6 +755,7 @@ mod tests {
         assert!(
             unsupported_reason(
                 &node,
+                11,
                 &[too_large],
                 &[DataType::Float32],
                 &[TensorLayout::contiguous()],
@@ -736,6 +767,7 @@ mod tests {
         assert!(
             unsupported_reason(
                 &node,
+                11,
                 std::slice::from_ref(&shape),
                 &[DataType::Float32],
                 &[TensorLayout::strided(vec![2])],
@@ -744,6 +776,29 @@ mod tests {
             .unwrap()
             .contains("contiguous")
         );
+    }
+
+    #[test]
+    fn claim_admits_bfloat16_at_opset_28_and_later() {
+        let node = Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "Unique",
+            vec![Some(onnx_runtime_ir::ValueId(0))],
+            vec![onnx_runtime_ir::ValueId(1)],
+        );
+        let reason = |opset| {
+            unsupported_reason(
+                &node,
+                opset,
+                &[onnx_runtime_ir::static_shape([2, 3])],
+                &[DataType::BFloat16],
+                &[TensorLayout::contiguous()],
+                CudaDeviceCapabilities::for_test((8, 9), 24, 24 * 1024 * 1024),
+            )
+        };
+        assert!(reason(27).unwrap().contains("requires opset 28"));
+        assert!(reason(28).is_none());
+        assert!(reason(29).is_none());
     }
 
     struct DeviceOutput {
@@ -804,28 +859,57 @@ mod tests {
         sorted: bool,
         requested: &[bool],
     ) -> GpuCaseResult {
+        run_gpu_bytes(
+            runtime,
+            &bytes_f32(values),
+            DataType::Float32,
+            11,
+            sorted,
+            requested,
+        )
+    }
+
+    fn run_gpu_bytes(
+        runtime: Arc<CudaRuntime>,
+        input_bytes: &[u8],
+        dtype: DataType,
+        opset: i64,
+        sorted: bool,
+        requested: &[bool],
+    ) -> GpuCaseResult {
         reset_unique_execution_stats();
-        let input_bytes = bytes_f32(values);
         let input_ptr = runtime.alloc_raw(input_bytes.len().max(1)).unwrap();
         if !input_bytes.is_empty() {
-            unsafe { runtime.htod(&input_bytes, input_ptr).unwrap() };
+            unsafe { runtime.htod(input_bytes, input_ptr).unwrap() };
         }
-        let input_shape = vec![values.len()];
+        let elements = input_bytes.len() / dtype.byte_size();
+        let input_shape = vec![elements];
         let input_strides = vec![1];
         let input = TensorView::new(
             DevicePtr(input_ptr as usize as *const c_void),
-            DataType::Float32,
+            dtype,
             &input_shape,
             &input_strides,
             DeviceId::cuda(0),
         );
-        let kernel = UniqueKernel {
-            runtime: runtime.clone(),
-            sorted,
-            max_elements: MAX_UNIQUE_ELEMENTS
-                .min(usize::try_from(runtime.capabilities().max_threads_per_block()).unwrap()),
-        };
-        let layout = workspace_layout(values.len()).unwrap();
+        let registry = crate::kernels::build_cuda_registry(runtime.clone());
+        let mut node = Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "Unique",
+            vec![Some(onnx_runtime_ir::ValueId(0))],
+            (0..requested.len())
+                .map(|index| onnx_runtime_ir::ValueId(index as u32 + 1))
+                .collect(),
+        );
+        node.version = Some(opset);
+        node.attributes
+            .insert("sorted".into(), Attribute::Int(i64::from(sorted)));
+        let kernel = registry
+            .lookup("Unique", "", opset as u64)
+            .unwrap()
+            .create(&node, std::slice::from_ref(&input_shape))
+            .unwrap();
+        let layout = workspace_layout(elements).unwrap();
         let workspace_ptr = if layout.bytes == 0 {
             0
         } else {
@@ -876,18 +960,22 @@ mod tests {
         let transfers_after_algorithm = runtime.transfer_counts();
         assert_eq!(
             transfers_after_algorithm.device_to_host - transfers_before.device_to_host,
-            if values.is_empty() { 0 } else { 1 },
+            if elements == 0 { 0 } else { 1 },
             "CUDA Unique may copy only the compact count during its algorithm"
         );
 
         let mut host_outputs = Vec::with_capacity(device_outputs.len());
         let mut shapes = Vec::with_capacity(device_outputs.len());
-        for output in &device_outputs {
+        for (slot, output) in device_outputs.iter().enumerate() {
             if !output.present {
                 host_outputs.push(None);
                 shapes.push(None);
                 continue;
             }
+            assert_eq!(
+                output.dtype,
+                if slot == 0 { dtype } else { DataType::Int64 }
+            );
             let mut bytes =
                 vec![0u8; output.shape.iter().product::<usize>() * output.dtype.byte_size()];
             if !bytes.is_empty() {
@@ -919,10 +1007,8 @@ mod tests {
     )]
     #[test]
     fn gpu_flattened_unique_matches_cpu_semantics_and_transfer_contract() {
-        let Some(runtime) = crate::test_support::maybe_runtime() else {
-            eprintln!("skipping CUDA Unique test: CUDA runtime unavailable");
-            return;
-        };
+        let runtime = crate::test_support::maybe_runtime()
+            .expect("CUDA Unique requires a usable CUDA runtime; there is no CPU fallback");
         let registry = crate::kernels::build_cuda_registry(runtime.clone());
         let factory = registry
             .lookup("Unique", "", 11)
@@ -952,7 +1038,7 @@ mod tests {
         assert!(crate::kernels::CUDA_COVERED_OPS.contains(&"Unique"));
         assert_eq!(
             crate::kernels::cuda_supported_dtypes_for_op("Unique", ""),
-            &[DataType::Float32, DataType::Int64]
+            &[DataType::Float32, DataType::BFloat16, DataType::Int64]
         );
 
         let GpuCaseResult {
@@ -1013,7 +1099,7 @@ mod tests {
         let first_nan = f32::from_bits(0x7fc0_0001);
         let second_nan = f32::from_bits(0x7fc0_1234);
         let GpuCaseResult { outputs, .. } = run_gpu_case(
-            runtime,
+            runtime.clone(),
             &[first_nan, second_nan, -0.0, 0.0],
             true,
             &[true, true, true, true],
@@ -1024,6 +1110,91 @@ mod tests {
         assert_eq!(read_i64(outputs[1].as_ref().unwrap()), [2, 0]);
         assert_eq!(read_i64(outputs[2].as_ref().unwrap()), [1, 1, 0, 0]);
         assert_eq!(read_i64(outputs[3].as_ref().unwrap()), [2, 2]);
+
+        assert_bfloat16_cases(runtime);
+    }
+
+    fn assert_bfloat16_cases(runtime: Arc<CudaRuntime>) {
+        let bytes =
+            |bits: &[u16]| -> Vec<u8> { bits.iter().flat_map(|bits| bits.to_ne_bytes()).collect() };
+        let run = |bits: &[u16], sorted| {
+            run_gpu_bytes(
+                runtime.clone(),
+                &bytes(bits),
+                DataType::BFloat16,
+                28,
+                sorted,
+                &[true; 4],
+            )
+        };
+        // ONNX 622adf94d4e720142950aa8178f7357d52e63db0:
+        // onnx/backend/test/case/node/unique.py, test_unique_bfloat16_sorted_without_axis.
+        let input = [0x4000, 0x3f80, 0x3f80, 0x4040, 0x4080, 0x4040];
+        let case = run(&input, true);
+        assert_eq!(
+            case.shapes,
+            [Some(vec![4]), Some(vec![4]), Some(vec![6]), Some(vec![4])]
+        );
+        assert_eq!(
+            case.outputs[0],
+            Some(bytes(&[0x3f80, 0x4000, 0x4040, 0x4080]))
+        );
+        assert_eq!(read_i64(case.outputs[1].as_ref().unwrap()), [1, 0, 3, 4]);
+        assert_eq!(
+            read_i64(case.outputs[2].as_ref().unwrap()),
+            [1, 0, 0, 2, 3, 2]
+        );
+        assert_eq!(read_i64(case.outputs[3].as_ref().unwrap()), [2, 1, 2, 1]);
+        assert_eq!(case.stats.metadata_launches, 1);
+        assert_eq!(case.stats.materialize_launches, 1);
+        assert_eq!(case.stats.d2h_bytes, 8);
+
+        // Equal signed zeros keep the original representative; distinct
+        // subnormals do not flush to zero. BF16 NaNs compare unequal.
+        let edge = [0x8000, 0x0000, 0x0001, 0x8001, 0x7fc1, 0x7fc1];
+        for (sorted, first, inverse, counts) in [
+            (false, [0, 2, 3, 4, 5], [0, 0, 1, 2, 3, 4], [2, 1, 1, 1, 1]),
+            (true, [3, 0, 2, 4, 5], [1, 1, 2, 0, 3, 4], [1, 2, 1, 1, 1]),
+        ] {
+            let case = run(&edge, sorted);
+            assert_eq!(
+                case.outputs[0],
+                Some(bytes(&first.map(|index| edge[index as usize])))
+            );
+            assert_eq!(read_i64(case.outputs[1].as_ref().unwrap()), first);
+            assert_eq!(read_i64(case.outputs[2].as_ref().unwrap()), inverse);
+            assert_eq!(read_i64(case.outputs[3].as_ref().unwrap()), counts);
+        }
+
+        let empty = run(&[], false);
+        assert_eq!(
+            empty.shapes,
+            std::array::from_fn::<_, 4, _>(|_| Some(vec![0]))
+        );
+        assert_eq!(empty.stats, UniqueExecutionStats::default());
+
+        let legacy = UniqueFactory { runtime }
+            .create(
+                &Node::new(
+                    onnx_runtime_ir::NodeId(0),
+                    "Unique",
+                    vec![Some(onnx_runtime_ir::ValueId(0))],
+                    vec![onnx_runtime_ir::ValueId(1)],
+                ),
+                &[vec![0]],
+            )
+            .unwrap();
+        let input = TensorView::new(
+            DevicePtr(std::ptr::null()),
+            DataType::BFloat16,
+            &[0],
+            &[1],
+            DeviceId::cuda(0),
+        );
+        let error = legacy
+            .prepare_kernel_sized_device(&[input], &[true], None)
+            .unwrap_err();
+        assert!(error.to_string().contains("requires opset 28"));
     }
 
     #[test]

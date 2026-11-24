@@ -532,8 +532,8 @@ static CUDA_ATTENTION_DTYPES: &[DataType] = &[
     DataType::Int64,
 ];
 
-/// Bounded CUDA Unique consumes f32 and returns f32 Y plus i64 metadata.
-static CUDA_UNIQUE_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
+/// Bounded CUDA Unique preserves the input dtype and produces i64 metadata.
+static CUDA_UNIQUE_DTYPES: &[DataType] = &[DataType::Float32, DataType::BFloat16, DataType::Int64];
 static CUDA_NMS_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
 static CUDA_EINSUM_DTYPES: &[DataType] = &[
     DataType::Float16,

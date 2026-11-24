@@ -560,6 +560,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "Unique"
+            && op.is_default_domain()
+            && let Some(&dtype) = input_dtypes.first()
+            && let Some(reason) = crate::kernels::unique::unsupported_dtype_for_opset(dtype, opset)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         // The numeric extrema kernel predates BOOL, which entered both schemas in opset 20.
         if opset < 20
             && onnx_runtime_ir::is_default_domain(&op.domain)
