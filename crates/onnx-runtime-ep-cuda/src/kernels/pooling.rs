@@ -37,7 +37,41 @@ __device__ __forceinline__ void store_pool_value(
   else ((__nv_bfloat16*)values)[index] = __float2bfloat16_rn(value);
 }
 
-template <bool Average>
+template <typename Scalar>
+__device__ __forceinline__ Scalar load_window_value(
+    const void* values, int dtype, unsigned long long index);
+
+template <>
+__device__ __forceinline__ float load_window_value<float>(
+    const void* values, int dtype, unsigned long long index) {
+  return load_pool_value(values, dtype, index);
+}
+
+template <>
+__device__ __forceinline__ double load_window_value<double>(
+    const void* values, int, unsigned long long index) {
+  return ((const double*)values)[index];
+}
+
+__device__ __forceinline__ void store_window_value(
+    void* values, int dtype, unsigned long long index, float value) {
+  store_pool_value(values, dtype, index, value);
+}
+
+__device__ __forceinline__ void store_window_value(
+    void* values, int, unsigned long long index, double value) {
+  ((double*)values)[index] = value;
+}
+
+__device__ __forceinline__ float lp_pow(float value, float exponent) {
+  return powf(value, exponent);
+}
+
+__device__ __forceinline__ double lp_pow(double value, double exponent) {
+  return pow(value, exponent);
+}
+
+template <bool Average, typename Scalar>
 __device__ void window_pool(
     const void* input, void* output, const unsigned long long* metadata,
     int spatial_rank, int dtype, int p, unsigned long long output_elements,
@@ -55,7 +89,7 @@ __device__ void window_pool(
        output_index += (unsigned long long)gridDim.x * blockDim.x) {
     const unsigned long long group = output_index / output_spatial;
     const unsigned long long spatial_index = output_index % output_spatial;
-    float sum = 0.0f;
+    Scalar sum = 0;
     unsigned long long valid_count = 0;
     // Decode flat tap indices in reverse axis order to avoid recomputing
     // the kernel's suffix products inside each window.
@@ -84,14 +118,14 @@ __device__ void window_pool(
         input_stride *= input_dimensions[axis];
       }
       if (valid) {
-        const float value =
-            load_pool_value(input, dtype, group * input_spatial + input_index);
+        const Scalar value =
+            load_window_value<Scalar>(input, dtype, group * input_spatial + input_index);
         if (Average) {
           sum += value;
           ++valid_count;
         } else {
-          const float magnitude = fabsf(value);
-          sum += p == 1 ? magnitude : powf(magnitude, (float)p);
+          const Scalar magnitude = value == 0 ? Scalar(0) : (value < 0 ? -value : value);
+          sum += p == 1 ? magnitude : lp_pow(magnitude, Scalar(p));
         }
       }
     }
@@ -101,8 +135,8 @@ __device__ void window_pool(
       const unsigned long long divisor = p != 0 ? kernel_elements : valid_count;
       store_pool_value(output, dtype, output_index, divisor > 0 ? sum / (float)divisor : 0.0f);
     } else {
-      store_pool_value(output, dtype, output_index,
-                       p == 1 ? sum : powf(sum, 1.0f / (float)p));
+      store_window_value(output, dtype, output_index,
+                         p == 1 ? sum : lp_pow(sum, Scalar(1) / Scalar(p)));
     }
   }
 }
@@ -112,8 +146,13 @@ extern "C" __global__ void lp_pool(
     int spatial_rank, int dtype, int p, unsigned long long output_elements,
     unsigned long long input_spatial, unsigned long long output_spatial,
     unsigned long long kernel_elements) {
-  window_pool<false>(input, output, metadata, spatial_rank, dtype, p,
-                     output_elements, input_spatial, output_spatial, kernel_elements);
+  if (dtype == 3) {
+    window_pool<false, double>(input, output, metadata, spatial_rank, dtype, p,
+                              output_elements, input_spatial, output_spatial, kernel_elements);
+  } else {
+    window_pool<false, float>(input, output, metadata, spatial_rank, dtype, p,
+                             output_elements, input_spatial, output_spatial, kernel_elements);
+  }
 }
 
 extern "C" __global__ void dilated_average_pool(
@@ -121,8 +160,8 @@ extern "C" __global__ void dilated_average_pool(
     int spatial_rank, int dtype, int include_pad, unsigned long long output_elements,
     unsigned long long input_spatial, unsigned long long output_spatial,
     unsigned long long kernel_elements) {
-  window_pool<true>(input, output, metadata, spatial_rank, dtype, include_pad,
-                    output_elements, input_spatial, output_spatial, kernel_elements);
+  window_pool<true, float>(input, output, metadata, spatial_rank, dtype, include_pad,
+                          output_elements, input_spatial, output_spatial, kernel_elements);
 }
 "#;
 
@@ -726,6 +765,7 @@ fn window_dtype(op: &str, dtype: DataType) -> Result<i32> {
         DataType::Float32 => Ok(0),
         DataType::Float16 => Ok(1),
         DataType::BFloat16 => Ok(2),
+        DataType::Float64 if op == "LpPool" => Ok(3),
         other => Err(not_implemented(format!(
             "{op} dtype {other:?} (supported: Float32, Float16, BFloat16)"
         ))),
@@ -765,7 +805,7 @@ impl WindowPoolKernel {
         let dtype = window_dtype(op, input.dtype)?;
         checked_tensor_bytes(op, "input", input.dtype, input.shape)?;
         checked_tensor_bytes(op, "output", output.dtype, output.shape)?;
-        if dtype != 0 {
+        if matches!(input.dtype, DataType::Float16 | DataType::BFloat16) {
             self.runtime.require_nvrtc_half_headers(op)?;
         }
         let spatial = &input.shape[2..];
@@ -902,22 +942,16 @@ impl WindowParams {
                     extent
                 }
                 auto @ ("" | "NOTSET" | "VALID") => {
-                    // Executable ONNX AveragePool shape inference applies
-                    // ceil_mode after resolving VALID to zero pads.
-                    let ceil = self.ceil_mode && (auto != "VALID" || op == "AveragePool");
+                    // Resolve VALID to zero pads before applying floor/ceil.
+                    let ceil = self.ceil_mode;
                     if auto == "VALID" {
                         pads[axis] = 0;
                         pads[axis + rank] = 0;
                     }
                     let begin = i128::from(pads[axis]);
                     let numerator = input + begin + i128::from(pads[axis + rank]) - effective;
-                    let quotient = if op == "LpPool" {
-                        // Preserve the existing LpPool signed-division behavior.
-                        (numerator + if ceil { stride - 1 } else { 0 }) / stride
-                    } else {
-                        numerator.div_euclid(stride)
-                            + i128::from(ceil && numerator.rem_euclid(stride) != 0)
-                    };
+                    let quotient = numerator.div_euclid(stride)
+                        + i128::from(ceil && numerator.rem_euclid(stride) != 0);
                     let mut extent = (quotient + 1).max(0);
                     if ceil && extent > 0 && (extent - 1) * stride >= input + begin {
                         extent -= 1;
