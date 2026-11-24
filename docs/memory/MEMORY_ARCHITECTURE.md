@@ -103,6 +103,35 @@ does not refund those bytes. Idle capacity can be reclaimed under pressure.
 Pending asynchronous work, active readers and capture pins prevent reuse, and
 quarantined backing retains its charge until physical release is settled.
 
+Cold replacement borrows the caller's `Option<WorkspaceAllocation>`. The option
+retains the original owner until the provider actually takes it for retirement.
+CUDA rejects real stream capture before release-barrier waiting, growth grants,
+synchronization or that ownership move; allocation has the same early guard.
+A published kernel plan alone does not prove the caller still has backing:
+pressure may have retired an idle lane or a different caller may be cold. Thus
+capture admission belongs at this physical allocation boundary, including
+captures started directly on the stream without runtime flags.
+
+Provider replacement now owns the explicit synchronization boundary previously
+performed by Session dispatch. A sync error or panic before `take()` leaves the
+owner funded and available for restoration. Session preparation and dispatch
+share one reservation helper with an ownership-only restore guard; its Drop
+restores only the owner still present, without callbacks or synchronization.
+Once consumed, a failed release/allocation leaves the caller slot empty and must
+not resurrect or retry the owner. Existing settlement/quarantine keeps physical
+charges until verified retirement. ORT borrows its backing slot directly and
+retains its existing failed-Compute retirement policy. Fitting and zero demands
+do not enter this cold boundary, so its driver capture query and synchronization
+add no warm quota callback, provider call or query.
+
+Host regressions cover pre-consumption sync error/unwind with unchanged address,
+capacity and authority callbacks, successful retry, and consuming release failure
+with retained quarantine charge and no second release. Existing allocation-failure,
+child-loan and ORT lifecycle tests retain their coverage. Device fixtures check
+raw stream capture rejects both allocation and replacement without manager-state
+or forced-sync changes and without consuming the old owner. Those device checks
+still require CUDA hardware to execute.
+
 The canonical `workspace_requirement(inputs, outputs)` hook describes the views
 that the kernel will actually receive after graph lowering. Output facts retain
 present/absent positions and distinguish unresolved geometry from a known scalar.
@@ -213,7 +242,7 @@ serializes host calls from different states sharing those kernels. The lock orde
 is compiled info then state; kernel panic poisons the shared info for all states.
 These host locks do not establish device completion. Fitting
 requests make no provider or issuer calls. Growth preserves both capacity and
-alignment high-water marks using the existing consuming `replace_workspace`;
+alignment high-water marks using the provider's borrowed-slot `replace_workspace`;
 teardown releases through the original provider. Failed replacement cannot
 resurrect a consumed owner or refund unsettled storage. Any failed Compute
 retires its lane, and a panic poisons its host lock, preventing later submissions.

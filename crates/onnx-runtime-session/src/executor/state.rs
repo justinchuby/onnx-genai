@@ -859,6 +859,16 @@ pub(super) struct PreparedWorkspace {
     pub(super) alignment: usize,
 }
 
+impl PreparedWorkspace {
+    pub(super) fn from_buffer(buffer: WorkspaceAllocation) -> Self {
+        Self {
+            bytes: buffer.len(),
+            alignment: buffer.alignment(),
+            buffer,
+        }
+    }
+}
+
 /// After this many consecutive buffer-identity signature mismatches, F5 Stage 2
 /// view reuse is latched off for the session (Chew defense-in-depth).
 pub(super) const STAGE2_SIG_MISMATCH_LIMIT: u32 = 2;

@@ -1561,15 +1561,26 @@ pub trait ExecutionProvider: Send + Sync {
     ///
     /// Synchronous providers use this default. Deferred providers override it
     /// to await a structured release outcome with a finite deadline.
+    ///
+    /// `old` remains Some until the provider consumes the previous owner.
+    /// Refusal or synchronization failure before `take()` preserves it. Once
+    /// taken, release/allocation failures leave None: callers must not recreate
+    /// or retry a consumed owner. On success the previous slot is None.
+    /// Providers must reject unsupported recording before synchronization,
+    /// accounting, waiting for release, or taking the owner. Fitting and zero
+    /// workspace demands never call this cold replacement boundary.
     fn replace_workspace(
         &self,
-        old: Option<WorkspaceAllocation>,
+        old: &mut Option<WorkspaceAllocation>,
         size: usize,
         alignment: usize,
         role: MemoryRole,
     ) -> Result<WorkspaceAllocation> {
-        if let Some(old) = old {
-            self.deallocate_workspace(old)?;
+        if old.is_some() {
+            self.sync()?;
+        }
+        if let Some(previous) = old.take() {
+            self.deallocate_workspace(previous)?;
         }
         self.allocate_workspace(size, alignment, role)
     }

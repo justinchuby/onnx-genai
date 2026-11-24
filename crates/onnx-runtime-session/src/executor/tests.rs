@@ -175,6 +175,8 @@ struct DeferredValidationEp {
     completion_observation_enabled: AtomicBool,
     completion_observations: AtomicUsize,
     fail_workspace_release: AtomicBool,
+    fail_workspace_sync: AtomicBool,
+    panic_workspace_sync: AtomicBool,
     cpu: CpuExecutionProvider,
     fail_next: Arc<AtomicBool>,
     validation_latch: Arc<AtomicU32>,
@@ -278,6 +280,8 @@ impl DeferredValidationEp {
             completion_observation_enabled: AtomicBool::new(false),
             completion_observations: AtomicUsize::new(0),
             fail_workspace_release: AtomicBool::new(false),
+            fail_workspace_sync: AtomicBool::new(false),
+            panic_workspace_sync: AtomicBool::new(false),
             fail_next: Arc::new(AtomicBool::new(true)),
             validation_latch: Arc::new(AtomicU32::new(0)),
             executions: Arc::new(AtomicUsize::new(0)),
@@ -512,6 +516,12 @@ impl ExecutionProvider for DeferredValidationEp {
 
     fn sync(&self) -> onnx_runtime_ep_api::Result<()> {
         self.sync_calls.fetch_add(1, Ordering::Relaxed);
+        if self.panic_workspace_sync.swap(false, Ordering::Relaxed) {
+            panic!("forced workspace preflight sync panic");
+        }
+        if self.fail_workspace_sync.swap(false, Ordering::Relaxed) {
+            return Err(EpError::KernelFailed("forced workspace preflight sync failure; restore completion before replacing workspace".into()));
+        }
         self.synchronized_executions
             .store(self.executions.load(Ordering::Relaxed), Ordering::Relaxed);
         self.route_lifecycle_events.lock().unwrap().push("sync");

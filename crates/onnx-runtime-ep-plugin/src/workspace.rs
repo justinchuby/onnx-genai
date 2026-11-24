@@ -90,7 +90,8 @@ impl WorkspaceLane {
             .as_ref()
             .is_some_and(|backing| backing.len() >= bytes && backing.alignment() >= alignment);
         if !fits {
-            // Take once: replace consumes old ownership even when it fails.
+            // The provider borrows the slot for preflight and consumes its
+            // owner only when retirement actually begins.
             let capacity = self
                 .backing
                 .as_ref()
@@ -99,9 +100,8 @@ impl WorkspaceLane {
                 .backing
                 .as_ref()
                 .map_or(alignment, |old| old.alignment().max(alignment));
-            let old = self.backing.take();
             let result = provider.with(|ep| {
-                let backing = ep.replace_workspace(old, capacity, alignment, MemoryRole::Workspace { step_scoped: false })?;
+                let backing = ep.replace_workspace(&mut self.backing, capacity, alignment, MemoryRole::Workspace { step_scoped: false })?;
                 if backing.len() < capacity || backing.alignment() < alignment || !backing.alignment().is_power_of_two()
                     || !(backing.as_ptr() as usize).is_multiple_of(alignment)
                     || backing.device() != ep.device_id()

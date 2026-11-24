@@ -218,7 +218,7 @@ impl ExecutionProvider for PluginExecutionProvider {
 
     fn replace_workspace(
         &self,
-        old: Option<onnx_runtime_ep_api::WorkspaceAllocation>,
+        old: &mut Option<onnx_runtime_ep_api::WorkspaceAllocation>,
         size: usize,
         alignment: usize,
         role: onnx_runtime_memory_api::MemoryRole,

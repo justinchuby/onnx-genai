@@ -74,9 +74,13 @@ pub fn prepare_workspace(
         .as_ref()
         .is_none_or(|buffer| buffer.len() < required || buffer.alignment() < requirement.alignment);
     if needs_replacement {
-        let old = workspace.take();
-        *workspace =
-            Some(ep.replace_workspace(old, required, requirement.alignment, requirement.role())?);
+        let fresh = ep.replace_workspace(
+            workspace,
+            required,
+            requirement.alignment,
+            requirement.role(),
+        )?;
+        *workspace = Some(fresh);
     }
     let workspace = workspace
         .as_mut()
