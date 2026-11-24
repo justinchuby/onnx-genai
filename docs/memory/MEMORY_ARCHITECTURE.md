@@ -241,28 +241,48 @@ caller owner, including pending work and capture pins. Existing SessionPersisten
 capacity policy remains, with no new pool, quota interface or per-step issuer call.
 Ordinary empty half outputs now return before the single-row decode launch.
 
-The separate BF16 arena/constant conversion backing, Marlin caches and generic
-f32 dequantized weights are not migrated by this change. Portable prefill capture
+The separate immutable BF16 conversion backing, Marlin caches and generic
+f32 dequantized weights remain distinct ownership domains. Dynamic BF16 staging
+now joins this same composite as described below. Portable prefill capture
 eligibility remains conservative. Host layout checks and GPU-target compilation
 do not validate device arithmetic, asynchronous failure ordering or throughput.
 
 ### CUDA quantized MatMul BF16 staging
 
-Persistent BF16-to-FP16 scale conversions require the existing positional
-`constant_inputs` proof. A scale role, stable pointer or shape alone cannot prove
-immutability. Ordinary input 2 and fused gate/up inputs 2/4 are checked
-independently; unproven scales join invocation-local activation/output staging
-and are converted each call. The session supplies constant facts once after
-kernel construction. Immutable scale reuse retains its existing fast path.
+Dynamic BF16-to-FP16 inputs and the intermediate FP16 result now use the same
+prepared workspace as normalization, gate output and BLAS. The fixed composite
+keeps each present dynamic input in a disjoint aligned region, with one result
+region; all may coexist with the prefill regions. Checked element counts and
+layouts replace the private per-kernel arena, capacity counter, mutex and used
+flag. Runtime metadata, converted-input views and scale-cache lookup results use
+fixed arrays rather than per-call heap vectors. Capacity retains the existing
+SessionPersistent policy, so fitting warm calls do not negotiate another grant.
 
-Staged BF16 execution enters the common FP16 dispatcher directly. It must not
-re-enter top-level call initialization while holding the staging arena lock:
-that would relock the same mutex and clear the arena/constant resource-use facts.
-Capture ownership enumeration must retain both owners actually used by the call.
-This corrects conversion eligibility and resource marking; the private staging
-arena and persistent conversion backing still need separate migration to
-governed ownership; portable prefill temporary views now use the composite above. No new cache, issuer or EP interface
-is introduced. Device numerical, capture and throughput validation remain pending.
+Presence precedes dtype and shape: an absent BF16 optional keeps its null slot
+and never becomes a conversion target, while a present scalar still has one
+element. Persistent scale conversions require the existing per-input constant
+proof. Ordinary input 2 and fused gate/up inputs 2/4 are checked independently;
+unproven scales are converted each invocation. Immutable scale backing remains
+a separate cache owner, and its existing layout now uses checked aligned bounds.
+
+Staged execution enters the shared FP16 dispatcher with the already-bound
+prefill parts, without restarting call initialization or reinterpreting the whole
+workspace. The kernel retains no dynamic staging owner or pointer. Capture
+requires an actual registered caller-owner span covering the entire used
+composite before the first cache fill or cast; immutable-cache pins cannot
+substitute for dynamic staging coverage. Graph retirement precedes caller
+workspace retirement, and partial submission errors retain the original
+provider's deferred-release/settlement contract. BF16_DIRECT_OUT restoration
+remains before error propagation.
+
+The immutable conversion cache, Marlin caches and generic f32 dequantized weights
+still require separate governed-ownership work. This migration adds no pool,
+quota protocol or public EP hook. The generic ORT adapter still declines
+nonzero SessionPersistent requirements; serving this migrated path there needs
+caller-owned persistent workspace integration. Native sessions and explicit
+workspace callers provide that ownership today. Device numerical, capture and
+throughput validation remain pending; Host contracts and target compilation
+cannot prove them.
 
 ### CUDA variadic Sum/Mean temporary storage
 
@@ -383,9 +403,10 @@ when in fact it is 1955 lines.
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
 The dated audit and measurements below preserve historical evidence. The current
-GQA contract above supersedes the old slot allocator, compatibility fallback,
-and score-only composite descriptions; GQA now requires prepared backing for
-sequence metadata as well as its other temporary regions.
+GQA, quantized MatMul prefill/BF16 staging, and variadic Sum/Mean contracts above
+supersede their old private-scratch and fallback descriptions. GQA now requires
+prepared backing for sequence metadata as well as its other temporary regions;
+MatMul dynamic BF16 staging and portable half-prefill no longer own raw scratch.
 
 
 Updated through #736 (default-domain `Attention` staged K/V) on 2026-08-12.

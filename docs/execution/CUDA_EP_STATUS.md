@@ -19,6 +19,15 @@ Batty (Engine — PR #830 revision 4), Gaff (Review — evidence harness, revisi
 > returns `CUDA_ERROR_NO_DEVICE`), so nothing in §4–§7 is evidence about real
 > CUDA hardware.
 
+> **Current source contract:** the historical measurements and decline audit
+> below describe their pinned revisions. Native dynamic BF16 MatMul staging now
+> borrows governed workspace; the private `Bf16Scratch` arena has been removed.
+> See [the current memory contract](../memory/MEMORY_ARCHITECTURE.md#cuda-quantized-matmul-bf16-staging).
+> The generic ORT adapter still declines nonzero `SessionPersistent` requirements.
+> It does not yet serve the migrated BF16 path; caller-owned persistent workspace
+> support remains adapter integration work, with no raw fallback. This source
+> migration has not been validated on CUDA hardware.
+
 ---
 
 ## 0. Evidence Ledger
@@ -326,12 +335,11 @@ not an amount anyone requires. No claim is made here about which fraction of
 real models lands on which branch, because that has not been measured on
 hardware.
 
-**Correction to the previous table:** it listed `MatMulNBits`' **bf16 staging**
-as a self-owned decline fallback. That is wrong. `uses_dequant_cublas_workspace`
-requires `DataType::Float32`, so `MatMulNBits` returns `NONE` for BFloat16 and
-never requests a governed workspace on that path at all. Its `Bf16Scratch` arena
-is *always* self-owned, in every revision, and the decline neither helps nor
-harms it.
+**Historical correction to the previous table:** at the audited revision,
+BF16 MatMulNBits staging did not request governed workspace. Its private
+`Bf16Scratch` arena was self-owned, so declining a persistent requirement could
+neither fund nor repair that path. This describes that revision; the later native
+migration and current ORT adapter limitation are in the source-contract note above.
 
 **(c) Unconditional hard error — every geometry.**
 
