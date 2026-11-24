@@ -25,7 +25,9 @@
 
 mod common;
 
+use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
@@ -34,12 +36,15 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::prefill_double_buffer::{
-    LayerTicket, PrefillDoubleBuffer, PrefillLayerRequest, PrefillReject, PrefillSlotStatus,
+    CudaPrefillTransfer, LayerTicket, PrefillDoubleBuffer, PrefillLayerRequest, PrefillReject,
+    PrefillSlotStatus, PrefillTransfer, SlotFillPlan,
 };
 use onnx_runtime_ep_cuda::weight_paging::{
     PrefillRoute, PrefillWireDecline, prefill_double_buffer_enabled,
 };
 use onnx_runtime_ir::DataType;
+use onnx_runtime_memory_api::{DeviceAllocator, DeviceKey, MemoryError, Tier};
+use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor};
 
 fn require_cuda() -> CudaExecutionProvider {
     match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
@@ -180,9 +185,16 @@ fn whole_layer_prefill_is_byte_identical_across_wraparound() {
     let (host, lazies) = whole_layer_weights(region_bytes, regions_per_layer, layers);
     let residency = ep.weight_residency(layer_bytes * layers as u64);
 
+    let before = runtime.allocation_counts();
     let mut db = residency
         .build_prefill_double_buffer(layer_bytes)
         .expect("capacity-sufficient synthetic layer must build the pipeline");
+    let reserved = runtime.allocation_counts();
+    assert_eq!(
+        reserved.allocations,
+        before.allocations + 2,
+        "one cold native admission per stable slot"
+    );
 
     // Prime the pipeline one layer ahead, then for each layer prefetch N+1
     // *before* consuming N — the double-buffer overlap ordering.
@@ -234,7 +246,14 @@ fn whole_layer_prefill_is_byte_identical_across_wraparound() {
         "no slot may be quarantined on the clean path"
     );
 
-    drop(db); // teardown drains in-flight + frees both stable buffers.
+    assert_eq!(
+        runtime.allocation_counts(),
+        reserved,
+        "multi-layer reuse cannot allocate or retire slot backing"
+    );
+    drop(db);
+    common::drain_releases(&ep, "normal prefill slot settlement");
+    assert_eq!(runtime.allocation_counts().frees, before.frees + 2);
 }
 
 /// A single-layer prefill never reaches slot reuse, and dropping the pipeline
@@ -1190,4 +1209,186 @@ fn one_slot_vs_two_slot_overlap_probe() {
     );
 
     proxy.teardown(&ep);
+}
+
+#[derive(Debug)]
+struct DenySecondSlotAllocator {
+    inner: common::ExternalEagerAllocator,
+    attempts: AtomicUsize,
+    deny_second: bool,
+}
+impl DeviceAllocator for DenySecondSlotAllocator {
+    fn device(&self) -> DeviceKey {
+        self.inner.device()
+    }
+    fn allocate(&self, bytes: usize, align: usize) -> Result<NonNull<u8>, MemoryError> {
+        let index = self.attempts.fetch_add(1, Ordering::Relaxed);
+        if self.deny_second && index == 1 {
+            return Err(MemoryError::AllocationFailed {
+                tier: Tier::Device.name(),
+                requested: bytes as u64,
+                reason: "injected second prefill slot capacity failure".into(),
+            });
+        }
+        self.inner.allocate(bytes, align)
+    }
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, align: usize) {
+        // SAFETY: forwarding the exact allocation/layout originally issued here.
+        unsafe { self.inner.deallocate(ptr, bytes, align) };
+    }
+}
+
+fn native_prefill_provider(
+    deny_second: bool,
+) -> (CudaExecutionProvider, Arc<DenySecondSlotAllocator>) {
+    let allocator = Arc::new(DenySecondSlotAllocator {
+        inner: common::ExternalEagerAllocator::new(common::require_context(
+            "native prefill slot ownership",
+        )),
+        attempts: AtomicUsize::new(0),
+        deny_second,
+    });
+    let provider = CudaExecutionProvider::from_config(
+        0,
+        onnx_runtime_ep_cuda::CudaProviderConfig {
+            memory: Some(allocator.clone()),
+            governor: Some(Arc::new(LedgerGovernor::new(LeaseLedger::new(
+                16 * 1024 * 1024,
+                0,
+                0,
+            )))),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    (provider, allocator)
+}
+
+fn native_prefill_transfer(ep: &CudaExecutionProvider) -> CudaPrefillTransfer {
+    let runtime = ep.runtime().clone();
+    let staging =
+        onnx_runtime_ep_cuda::PinnedStagingPool::with_bounds(runtime.clone(), 2, 1024 * 1024);
+    CudaPrefillTransfer::new(runtime, staging)
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable gpu-tests"
+)]
+fn second_native_slot_failure_publishes_neither_slot_and_settles_the_first() {
+    let (ep, allocator) = native_prefill_provider(true);
+    let mut transfer = native_prefill_transfer(&ep);
+    let before = ep.runtime().allocation_counts();
+    let failure = transfer
+        .reserve(4096)
+        .expect_err("second native admission is denied");
+    assert!(
+        failure
+            .to_string()
+            .contains("second prefill slot capacity failure"),
+        "{failure}"
+    );
+    let mut cause: &dyn std::error::Error = &failure;
+    let mut found_native = false;
+    loop {
+        found_native |= cause
+            .downcast_ref::<onnx_runtime_ep_api::EpError>()
+            .is_some();
+        let Some(source) = cause.source() else {
+            break;
+        };
+        cause = source;
+    }
+    assert!(
+        found_native,
+        "native allocation error must remain a typed source"
+    );
+    assert_eq!(allocator.attempts.load(Ordering::Relaxed), 2);
+    for slot in 0..2 {
+        assert_eq!(
+            transfer.payload(slot).device_ptr,
+            0,
+            "partial reservation cannot escape"
+        );
+    }
+    drop(transfer);
+    common::drain_releases(&ep, "failed second prefill admission rollback");
+    let after = ep.runtime().allocation_counts();
+    assert_eq!(after.allocations, before.allocations + 1);
+    assert_eq!(after.frees, before.frees + 1);
+    assert_eq!(allocator.inner.cumemalloc_calls(), 1);
+    assert_eq!(allocator.inner.frees(), 1);
+    assert!(
+        ep.process_memory_manager()
+            .snapshot()
+            .unwrap()
+            .allocations
+            .is_empty()
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable gpu-tests"
+)]
+fn direct_transfer_drop_without_teardown_orders_live_native_slots() {
+    let (ep, allocator) = native_prefill_provider(false);
+    let mut transfer = native_prefill_transfer(&ep);
+    let before = ep.runtime().allocation_counts();
+    transfer.reserve(4096).unwrap();
+    let (source, layers) = whole_layer_weights(2048, 2, 1);
+    transfer
+        .fill_slot(
+            0,
+            &PrefillLayerRequest::new(&layers[0], &*source),
+            SlotFillPlan::default(),
+        )
+        .unwrap();
+    let view = transfer.payload(0);
+    assert_eq!(view.len, 4096);
+    // No pipeline object or teardown descriptor is involved. The private copy
+    // proof plus native dual-stream queue must still order final ownership.
+    drop(transfer);
+    common::drain_releases(&ep, "direct transfer defensive Drop");
+    let after = ep.runtime().allocation_counts();
+    assert_eq!(after.allocations, before.allocations + 2);
+    assert_eq!(after.frees, before.frees + 2);
+    assert_eq!(allocator.inner.frees(), 2);
+    assert!(
+        ep.process_memory_manager()
+            .snapshot()
+            .unwrap()
+            .allocations
+            .is_empty()
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable gpu-tests"
+)]
+fn quarantining_one_native_slot_keeps_its_charge_while_the_other_settles() {
+    let (ep, allocator) = native_prefill_provider(false);
+    let mut transfer = native_prefill_transfer(&ep);
+    transfer.reserve(4096).unwrap();
+    transfer.quarantine_slot(0);
+    assert_eq!(transfer.quarantined_len(), 1);
+    assert_eq!(transfer.payload(0).device_ptr, 0);
+    drop(transfer);
+    common::drain_releases(&ep, "healthy sibling of quarantined prefill slot");
+    assert_eq!(allocator.inner.cumemalloc_calls(), 2);
+    assert_eq!(
+        allocator.inner.frees(),
+        1,
+        "quarantined native storage must not be freed"
+    );
+    let retained = ep.process_memory_manager().snapshot().unwrap().allocations;
+    assert_eq!(retained.len(), 1);
+    assert_eq!(
+        retained[0].charged_bytes, 4096,
+        "unknown completion cannot refund its charge"
+    );
 }

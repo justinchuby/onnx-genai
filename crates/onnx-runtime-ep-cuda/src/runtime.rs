@@ -90,39 +90,48 @@ fn require_workspace_capture_pin(
     )))
 }
 
-/// One retained native owner; final graph pins keep its allocation domain alive.
+/// One native owner; shared graph pins or an exclusive pipeline slot keep its
+/// allocation domain alive.
 /// No strong runtime back-edge or pointer-only/synchronous fallback is permitted.
-pub(crate) struct GraphDeviceAllocation {
+pub(crate) struct NativeDeviceAllocation {
     allocation: Option<onnx_runtime_ep_api::DeviceBuffer>,
     domain: Arc<crate::provider::CudaAllocationDomain>,
     runtime: Weak<CudaRuntime>,
     bytes: usize,
 }
 
-impl std::fmt::Debug for GraphDeviceAllocation {
+impl std::fmt::Debug for NativeDeviceAllocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GraphDeviceAllocation")
+        f.debug_struct("NativeDeviceAllocation")
             .field("ptr", &self.ptr())
             .field("bytes", &self.bytes)
             .finish_non_exhaustive()
     }
 }
 
-impl GraphDeviceAllocation {
-    pub(crate) fn allocate(
+impl NativeDeviceAllocation {
+    pub(crate) fn allocate_shared(
         runtime: &Arc<CudaRuntime>,
         bytes: usize,
         role: onnx_runtime_memory_api::MemoryRole,
     ) -> Result<Arc<Self>> {
+        Self::allocate(runtime, bytes, role).map(Arc::new)
+    }
+
+    pub(crate) fn allocate(
+        runtime: &Arc<CudaRuntime>,
+        bytes: usize,
+        role: onnx_runtime_memory_api::MemoryRole,
+    ) -> Result<Self> {
         let backing_bytes = native_artifact_backing_bytes(bytes)?;
         let domain = runtime.allocation_domain()?;
         let allocation = domain.allocate_governed(runtime, backing_bytes, 256, role)?;
-        Ok(Arc::new(Self::from_owned(
+        Ok(Self::from_owned(
             allocation,
             domain,
             Arc::downgrade(runtime),
             bytes,
-        )))
+        ))
     }
 
     pub(crate) fn from_owned(
@@ -154,21 +163,35 @@ impl GraphDeviceAllocation {
     }
 
     pub(crate) fn release(&mut self) -> Result<()> {
-        let Some(buffer) = self.allocation.take() else {
+        let Some(buffer) = self.take_buffer() else {
             return Ok(());
         };
+        self.domain.retire_owned(buffer)
+    }
+
+    pub(crate) fn quarantine(
+        &mut self,
+        reason: onnx_runtime_memory_api::QuarantineReason,
+    ) -> Result<Option<onnx_runtime_memory_api::AllocationReleaseOutcome>> {
+        self.take_buffer()
+            .map(|buffer| self.domain.quarantine_owned(buffer, reason))
+            .transpose()
+    }
+
+    fn take_buffer(&mut self) -> Option<onnx_runtime_ep_api::DeviceBuffer> {
+        let buffer = self.allocation.take()?;
         if let Some(runtime) = self.runtime.upgrade() {
             runtime.invalidate_interleaved_for(cuptr(buffer.as_ptr()), buffer.len());
         }
-        self.domain.retire_owned(buffer)
+        Some(buffer)
     }
 }
 
-impl Drop for GraphDeviceAllocation {
+impl Drop for NativeDeviceAllocation {
     fn drop(&mut self) {
         if let Err(error) = self.release() {
             eprintln!(
-                "cuda_ep: retained graph artifact retirement failed; ownership remains retained/quarantined, inspect release diagnostics: {error}"
+                "cuda_ep: native device allocation retirement failed; ownership remains retained/quarantined, inspect release diagnostics: {error}"
             );
         }
     }
@@ -1106,7 +1129,7 @@ impl CudaRuntime {
     fn allocation_domain(&self) -> Result<Arc<crate::provider::CudaAllocationDomain>> {
         self.native_allocation_domain.get().and_then(|installed| installed.domain.upgrade())
             .ok_or_else(|| EpError::KernelFailed(format!(
-                "cuda_ep: retained artifact admission on CUDA runtime {} requires its live provider allocation domain; construct through CudaExecutionProvider and retain it during preparation",
+                "cuda_ep: native device allocation admission on CUDA runtime {} requires its live provider allocation domain; construct through CudaExecutionProvider and retain it during preparation",
                 self.ordinal,
             )))
     }
@@ -4393,13 +4416,13 @@ mod tests {
             return;
         };
         let strong_before = Arc::strong_count(&runtime);
-        let allocation = GraphDeviceAllocation::allocate(
+        let allocation = NativeDeviceAllocation::allocate_shared(
             &runtime,
             8,
             onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
         )
         .unwrap();
-        let resource = GraphDeviceAllocation::device_graph_resource(&allocation);
+        let resource = NativeDeviceAllocation::device_graph_resource(&allocation);
         assert_eq!(
             Arc::strong_count(&runtime),
             strong_before,
@@ -4419,7 +4442,8 @@ mod tests {
         use onnx_runtime_memory_api::MemoryRole;
         let raw = Arc::new(CudaRuntime::new(0).expect("CUDA runtime required"));
         let before = raw.allocation_counts();
-        let error = GraphDeviceAllocation::allocate(&raw, 8, MemoryRole::Weights).unwrap_err();
+        let error =
+            NativeDeviceAllocation::allocate_shared(&raw, 8, MemoryRole::Weights).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -4433,7 +4457,8 @@ mod tests {
         let runtime = Arc::clone(provider.runtime());
         let before = runtime.allocation_counts();
         let strong_before = Arc::strong_count(&runtime);
-        let artifact = GraphDeviceAllocation::allocate(&runtime, 0, MemoryRole::Weights).unwrap();
+        let artifact =
+            NativeDeviceAllocation::allocate_shared(&runtime, 0, MemoryRole::Weights).unwrap();
         assert_eq!(artifact.bytes(), 0);
         assert_eq!(
             artifact.allocation.as_ref().unwrap().len(),

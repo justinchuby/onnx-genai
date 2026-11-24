@@ -66,7 +66,7 @@ use crate::cudnn::{
     governed_workspace_requirement,
 };
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
+use crate::runtime::{CudaRuntime, NativeDeviceAllocation, cuptr};
 
 /// NVRTC source: one block per output element, reducing over its group of
 /// `reduce_count` elements addressed by `base_off[o] + delta_off[r]`.
@@ -863,7 +863,7 @@ struct ReductionMetadataCache {
 #[derive(Clone, Debug)]
 struct PreparedReductionMetadata {
     key: ReductionMetadataKey,
-    payload: Arc<GraphDeviceAllocation>,
+    payload: Arc<NativeDeviceAllocation>,
     base: CUdeviceptr,
     delta: CUdeviceptr,
     axes: CUdeviceptr,
@@ -874,7 +874,7 @@ impl PreparedReductionMetadata {
         (self.base, self.delta, self.axes)
     }
     fn resources(&self) -> Vec<DeviceGraphResource> {
-        vec![GraphDeviceAllocation::device_graph_resource(&self.payload)]
+        vec![NativeDeviceAllocation::device_graph_resource(&self.payload)]
     }
 }
 
@@ -1029,7 +1029,7 @@ impl ReductionMetadataCache {
         // base/delta vectors; cold plans retain all checked geometry guards.
         let plan = build_plan(op, input_shape, reduce, keepdims, geometry)?;
         let payload = ReductionMetadataPayload::new(&plan.base, &plan.delta, axes)?;
-        let allocation = GraphDeviceAllocation::allocate(
+        let allocation = NativeDeviceAllocation::allocate_shared(
             &self.runtime,
             payload.bytes.len(),
             onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
