@@ -4,7 +4,7 @@ mod common;
 #[path = "fixtures/deform_conv.rs"]
 mod fixtures;
 
-use common::{require_cuda, run_cuda};
+use common::{assert_close, require_cuda, run_cuda};
 use fixtures::{cases, compare};
 use onnx_runtime_ir::{Attribute, DataType};
 

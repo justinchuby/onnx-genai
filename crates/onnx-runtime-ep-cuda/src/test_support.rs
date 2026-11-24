@@ -155,16 +155,15 @@ fn cuda_available() -> bool {
     })
 }
 
-/// A freshly constructed runtime, or `None` when this host has no usable CUDA
-/// device.
-///
-/// Each caller gets its own [`CudaRuntime`] — tests assert on per-runtime state
-/// such as pool occupancy and capture status, so they must not share one. Only
-/// the availability *probe* is memoized; once it has succeeded, construction
-/// needs no `catch_unwind` because the panicking path has been ruled out.
-pub(crate) fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
+/// Keep the native provider alive for every artifact admission in a test scope.
+pub(crate) type NativeRuntimeFixture = (crate::CudaExecutionProvider, Arc<CudaRuntime>);
+
+pub(crate) fn maybe_native_runtime() -> Option<NativeRuntimeFixture> {
     if !cuda_available() {
         return None;
     }
-    CudaRuntime::new(0).ok().map(Arc::new)
+    let provider = crate::CudaExecutionProvider::new(0)
+        .expect("native CUDA artifact tests require a provider allocation domain");
+    let runtime = Arc::clone(provider.runtime());
+    Some((provider, runtime))
 }

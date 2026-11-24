@@ -667,8 +667,8 @@ regions, source address overflow and int32 conversion limits. A GPU fixture
 covers warm no-work counters, failed replacement, same-size replacement after
 capture, old graph replay and raw-capture refusal. It is compiled/listed on this
 Host, not executed; device arithmetic, lifetime behavior and performance remain
-unmeasured. The underlying retained-artifact owner still uses the runtime raw
-allocation path; this change does not claim native quota coverage for artifacts.
+unmeasured. Its retained-artifact owner now uses the provider's native domain
+for admission, ownership and structured deferred settlement.
 
 ### CUDA quantized MatMul accuracy-4 decode activation scratch
 
@@ -1226,18 +1226,13 @@ adding grants, a pool or a new EP lifecycle. Warm calls retain the existing zero
 metadata-upload/device-allocation behavior. One cold upload replaces three
 synchronous uploads, but GPU latency/throughput effects are unmeasured.
 
-Retained `GraphDeviceAllocation` owners use checked 512-byte capacity classes in
-the existing raw pool; ordinary transient `alloc_raw` keeps its wider reuse
-classes. The same allocation core, capacity tracking, retention cap and retirement
-path serve both. This prevents a combined payload just beyond a power-of-two or
-MiB boundary from nearly doubling its live requested capacity: 32,784 bytes now
-requests 33,280 rather than 65,536 (the original three blocks requested 33,792).
-It introduces more possible classes and may reduce cold reuse across different
-sizes. Empty pool buckets retain Host metadata until the existing drain path;
-the device-byte cap does not bound that metadata under repeated shape changes.
-Fitting warm owners perform no class lookup or allocation. This policy
-does not add managed-workspace quota accounting to raw artifacts, and driver
-memory use and cold-path performance still need device measurements.
+Retained `GraphDeviceAllocation` owners now use the provider's native domain
+with exact requested bytes (logical zero retains one real backing byte). The
+selected allocator determines mapping/physical granularity; artifacts no longer
+use the raw pool's size classes or a synchronous free fallback. Coalesced tables
+still own one payload per shared lifetime. The existing raw pool remains for
+explicit runtime raw callers, with its existing retention policy. No reduction
+in physical GPU footprint or cold latency is claimed without device measurements.
 
 Host tests verify table order and signed/native-endian contents, aligned region
 origins, initialized empty slots, complete-span refusal and overflow before
@@ -1651,8 +1646,7 @@ retry that owner or refund retained bytes.
 
 No runtime, new registry, quota authority, pool or per-region lease is stored in
 this core. It introduces no hot execution path. This is the shared retirement
-boundary used by the native allocation domain; runtime-private raw artifacts
-have not yet migrated.
+boundary used by the native allocation domain and its retained graph artifacts.
 
 Host regressions drive this production function with real binding/managed Host
 owners and independently controlled compute/copy fences. They verify pending
@@ -1692,11 +1686,13 @@ without claiming CUDA execution on a Host-only machine.
 
 The private `CudaAllocationDomain` owns the selected allocator, process-manager
 binding, governor, mapped attribution, allocation/free counters, admission-closed
-state and deferred-release queue. These are moved out of the provider into one
-inline value; the provider does not retain a parallel copy. Native admission,
-mapped-growth transactions and release accounting read that same state. The
-runtime is borrowed only to query capture during cold admission; the domain does
-not retain it. No additional Arc, lock, quota ticket or allocation tier is added.
+state and deferred-release queue. Provider and retained artifacts share one Arc
+domain; there is no parallel mutable configuration. Native admission, mapped
+growth and release accounting read that same state. The runtime installs one
+Weak domain after complete construction and is borrowed for capture checks;
+the domain never retains it. Runtime also retains the existing two counter Arcs,
+which contain only atomics, so cumulative native counts survive domain teardown.
+No configuration lock, per-region ticket or allocation tier is added.
 
 Allocator selection is construction-only through `CudaProviderConfig::memory`.
 The selected mechanism is registered once before the provider/runtime can escape;
@@ -1709,13 +1705,52 @@ with the domain queue last. No second cleanup owner or Domain Drop is introduced
 The EP continues to coordinate workspace release barriers, executor/graph state,
 shutdown and the terminal runtime keepalive. Existing provider trait methods
 forward allocation work to the domain; retained warm workspace paths do not gain
-quota calls. This extraction does not install the domain into the runtime or
-migrate runtime-private raw artifacts. Those callers still require an explicit
-ownership migration with capture and retirement guarantees.
+quota calls. A retained graph artifact consumes a real binding/managed owner
+through this domain. Missing or expired runtime installation refuses admission
+explicitly, including standalone runtimes; there is no silent raw fallback.
+Existing raw runtime APIs and their transient consumers remain a separate scope.
 
 Host allocator/retirement regressions pass; GPU admission and deferred-release
 fixtures compile and are listed, and default/GPU-feature all-target Clippy covers
 the EP, plugin and session callers. No CUDA execution or performance was measured.
+
+### Retained graph artifacts use native ownership and settlement
+
+`GraphDeviceAllocation` admits one whole artifact or metadata composite through
+`allocate_governed`, using Weights for converted/repacked constants and persistent
+Workspace for metadata/telemetry. Its buffer retains the real owner and its
+allocation domain. Graph resources pin the same artifact Arc, never duplicate
+its allocation or charge. Final retirement validates the selected binding and
+uses the common consuming release core after both stream tails. Keeping an
+artifact beyond provider shutdown keeps its retirement domain/queue available;
+it cannot reopen admission. The domain has no strong runtime back-edge.
+
+Runtime allocation counts now combine raw driver calls with native logical
+admissions and settled releases; they are not all driver malloc/free counts.
+The provider forwards these totals without adding the same domain twice.
+Native frees increase only on complete settlement, not enqueue. GPU lifecycle
+fixtures wait for settlement before asserting release; raw-pool growth and the
+old 512-byte retained class are no longer evidence of native retirement.
+
+LinearAttention's large runtime head-size state was a per-execution temporary,
+so it does not become a graph-artifact admission. Both registry entries declare
+metadata workspace planning. One checked geometry helper determines an FP32
+state span (`batch * kv_heads * d_k * d_v * sizeof(f32)`) independent of storage
+dtype, optional past and sequence length. Sizes within local-column capacity
+need no scratch; larger sizes borrow a persistent caller lane, including zero
+sequence with nonempty state. Warm fitting execution performs no internal
+allocation or quota request. Missing/misaligned/short backing is refused, and
+capture requires a real registered pin covering the used state span.
+
+Host regressions exercise the real graph owner, manager/domain and native
+retirement with controlled fences: last-pin lifetime, retained domain, pending
+charges, settlement and no retry/refund on refusal. Geometry/layout checks cover
+thresholds, zero extents/sequence, overflow and malformed backing. GPU fixtures
+compile numerical parity across state sizes/dtypes, pinned recurrent capture,
+missing-domain refusal and monotonic/nonduplicated counters; CUDA execution and
+throughput remain unmeasured. Migrating raw pool allocation to selected native
+backing changes physical granularity and cold behavior, so no memory/performance
+improvement is inferred from Host tests.
 
 ### Sealed weights and workspace share cold native admission
 
@@ -1753,8 +1788,8 @@ raw-capture entry points, role/charge-mode/process-reservation records, copied
 bytes, allocation failure, post-upload rejection and deferred release. CUDA
 execution and performance were unavailable. No new warm inference allocation or
 quota callback was added; this does not establish a universal zero-callback
-contract for arbitrary existing StepScoped callers. Runtime-private raw artifacts
-still require the subsequent native-domain migration.
+contract for arbitrary existing StepScoped callers. Retained graph artifacts now
+use the same domain; other explicit raw runtime consumers remain separate.
 
 ### Physical release pins are independent of the runtime graph registry
 
@@ -1892,7 +1927,7 @@ call; it owns the governed workspace preparation path
 | `kernels/einsum/plan.rs` | immutable final-address launch metadata | exact encoded generic-step program | complete I/O identity and final used-span binding | independently pinned immutable device artifact | fresh candidate published only after successful execution; installed graphs retain older metadata |
 | `kernels/index_transform.rs` | CenterCropPad/Col2Im descriptors | respectively `4 * rank * 8` and `6 * control_elements * 8` | input rank / checked image-shape control length | SessionPersistent caller peak | complete bind before existing D2H; exact borrowed upload |
 | `kernels/indexing.rs` | ScatterElements/ScatterND mean accumulator state | `data_numel * (16 or 24)` | output shape/dtype dependent | session-persistent shared caller peak | governed metadata requirement; real used-span capture pin; no private scratch owner |
-| `kernels/indexing.rs` metadata caches | shape/indexing descriptors | `bytes.len().max(1)` | op/rank/shape dependent | shape-keyed persistent metadata artifact | existing raw artifact owner and capture pin; separate from disposable mean state |
+| `kernels/indexing.rs` metadata caches | shape/indexing descriptors | `bytes.len().max(1)` | op/rank/shape dependent | shape-keyed persistent metadata artifact | native allocation-domain owner and capture pin; separate from disposable mean state |
 | `kernels/matmul.rs` | dense MatMul cuBLASLt workspace, including F32/F16 single-row paths | exact cached ActualAddress plan `workspaceSize` | shape/dtype/alignment/algorithm dependent | session-persistent caller lane peak | metadata Deferred, execution refiner fixes the plan before admission; no private device scratch |
 | `kernels/matmul.rs` | batched/broadcast MatMul cuBLASLt workspace | metadata planner heuristic `workspaceSize` | shape/dtype/algorithm dependent | session-persistent shared peak | existing governed metadata bound; non-capturable |
 | `kernels/matmul_nbits.rs:3599` | `MatMulNBits` accuracy-4 decode activation quantization | `padded_k + (padded_k / block_size) * sizeof(f32)` | model config (`K`, `block_size`) | model-lifetime fixed scratch | raw bypass |
