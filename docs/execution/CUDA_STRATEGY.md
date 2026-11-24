@@ -18,9 +18,9 @@ traffic:
 |------|-----------------|--------|
 | Dense and batched GEMM, fused GEMM epilogues | cuBLASLt | Vendor library. |
 | DFT / STFT | cuFFT plus NVRTC packing | Vendor transform with custom layout glue. |
-| 2-D Conv, MaxPool, AveragePool | cuDNN | Vendor library; **landed**, not future work. |
+| 2-D Conv, MaxPool, unit-dilation AveragePool | cuDNN | Vendor library. |
 | Softmax, ReduceSum, ReduceMean | cuDNN with bounded fallback where documented | Vendor library. |
-| ConvTranspose, extended/global pooling and normalization subsets | NVRTC | Current implemented subsets; move only when a library route preserves ONNX semantics and wins. |
+| ConvTranspose, dilated AveragePool, extended/global pooling and normalization subsets | NVRTC | Current implemented subsets; move only when a library route preserves ONNX semantics and wins. |
 | Pointwise, comparison, logical, cast, indexing, movement | NVRTC / D2D copy | No useful dlopen-able library primitive; JIT targets the running device. |
 | Fused norm/residual, RoPE, recurrent attention/state | NVRTC | Retained fusion or no-library case. |
 | Attention | tiled NVRTC/cuBLASLt cores | Current implementation; further SDPA tuning remains. |
@@ -35,7 +35,7 @@ pooling, softmax, and reduction surfaces.
 ### Landed
 
 - cuBLASLt `MatMul`, `Gemm`, `FusedMatMulBias`, and `FusedGemm`.
-- cuDNN 2-D `Conv`, `MaxPool`, `AveragePool`, standalone `Softmax`,
+- cuDNN 2-D `Conv`, `MaxPool`, unit-dilation `AveragePool`, standalone `Softmax`,
   `ReduceSum`, and `ReduceMean`.
 - cuFFT `DFT` and `STFT`.
 - Fused CUDA attention cores for `Attention`, plus implemented
@@ -113,7 +113,7 @@ Missing-library errors must name the component, attempted paths, and the exact
 CUDA 13 package that supplies it. Optional compatibility probes may fail
 quietly; executing an advertised kernel may not.
 
-Today, supported `Conv`, `MaxPool`, and `AveragePool` nodes are registered and
+Today, supported `Conv`, `MaxPool`, and unit-dilation `AveragePool` nodes are registered and
 claimed without probing cuDNN availability. Their execution paths then enter
 the lazy `cudnn().with_handle(...)` backend and return the actionable
 missing-library error if cuDNN is absent. Including cuDNN in the CUDA package
