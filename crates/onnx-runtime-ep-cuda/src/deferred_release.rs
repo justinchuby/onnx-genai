@@ -179,6 +179,13 @@ impl DeferredActionOutcome {
 pub trait DeferredReleaseAction: Send + Debug + 'static {
     fn execute(self: Box<Self>) -> DeferredActionOutcome;
 
+    /// Execution-handle destructors can synchronize. Such an action is first
+    /// moved outside the execution gate and scheduled under capture exclusion,
+    /// then rechecks device loss under the gate before touching CUDA handles.
+    fn requires_capture_exclusion(&self) -> bool {
+        false
+    }
+
     /// Settle this action after the device or provider context was lost.
     ///
     /// This is a *terminal* path, not a deferral: it consumes the action
@@ -653,6 +660,25 @@ impl CudaDeferredReleaseQueue {
                 carry.push_back(entry);
                 continue;
             }
+            if entry.action.requires_capture_exclusion() {
+                // Never wait for capture while holding the queue execution
+                // gate: a capturing thread may enqueue unrelated retirement.
+                drop(execution);
+                let queue = self
+                    .me
+                    .upgrade()
+                    .expect("a live queue pins its own weak identity");
+                let completed = Arc::new(AtomicBool::new(false));
+                let observed = Arc::clone(&completed);
+                onnx_runtime_cuda_memory::capture_gate::run_or_defer_synchronizing(move || {
+                    observed.store(
+                        queue.execute_capture_excluded_entry(entry),
+                        Ordering::Release,
+                    );
+                });
+                executed += usize::from(completed.load(Ordering::Acquire));
+                continue;
+            }
             let PendingRelease { fences, action } = entry;
             let label = action.label();
             // Fences are dropped (destroying their events) before the action
@@ -689,6 +715,34 @@ impl CudaDeferredReleaseQueue {
         }
         self.run_drain_callback_if_ready();
         executed
+    }
+
+    /// Called only under process capture exclusion, before taking the execution
+    /// gate. Outstanding ownership remains charged/pending while deferred.
+    fn execute_capture_excluded_entry(&self, entry: PendingRelease) -> bool {
+        let execution = self.execution_gate.lock();
+        if self.is_device_lost() {
+            drop(execution);
+            let retained =
+                self.settle_lost_entry(entry, "device lost before execution-handle retirement");
+            self.lock().retained.push(retained);
+            self.wake.notify_all();
+            return false;
+        }
+        let PendingRelease { fences, action } = entry;
+        let label = action.label();
+        drop(fences);
+        let outcome = action.execute();
+        drop(execution);
+        let mut retained = Vec::new();
+        self.record_outcome(label, outcome, &mut retained);
+        if !retained.is_empty() {
+            self.lock().retained.append(&mut retained);
+        }
+        self.outstanding.fetch_sub(1, Ordering::AcqRel);
+        self.wake.notify_all();
+        self.run_drain_callback_if_ready();
+        true
     }
 
     fn record_outcome(
@@ -1192,6 +1246,51 @@ impl Drop for PreparedReleaseAction {
     }
 }
 
+/// Keep execution handles alive until the queue's stream fences complete.
+/// Unlike a permanent context pin this creates no idle graph/runtime cycle.
+/// If normal execution is impossible, even dropping the queue must not destroy
+/// handles on an unordered or lost device: the final Arc is deliberately retained.
+#[derive(Debug)]
+pub(crate) struct StreamOrderedKeepAlive<T: Send + Sync + Debug + 'static> {
+    resource: Option<Arc<T>>,
+    label: &'static str,
+}
+
+impl<T: Send + Sync + Debug + 'static> StreamOrderedKeepAlive<T> {
+    pub(crate) fn new(resource: Arc<T>, label: &'static str) -> Self {
+        Self {
+            resource: Some(resource),
+            label,
+        }
+    }
+}
+
+impl<T: Send + Sync + Debug + 'static> DeferredReleaseAction for StreamOrderedKeepAlive<T> {
+    fn requires_capture_exclusion(&self) -> bool {
+        true
+    }
+    fn execute(mut self: Box<Self>) -> DeferredActionOutcome {
+        // Only the queue's completed-fence path may relinquish this resource.
+        drop(self.resource.take());
+        DeferredActionOutcome::released(0)
+    }
+    fn label(&self) -> &'static str {
+        self.label
+    }
+}
+
+impl<T: Send + Sync + Debug + 'static> Drop for StreamOrderedKeepAlive<T> {
+    fn drop(&mut self) {
+        if let Some(resource) = self.resource.take() {
+            eprintln!(
+                "cuda_ep: {} did not reach ordered retirement; keeping execution handles alive instead of running an unordered destructor",
+                self.label
+            );
+            std::mem::forget(resource);
+        }
+    }
+}
+
 /// Ordering fences recorded on this provider's CUDA streams.
 ///
 /// One event is recorded at the tail of the compute stream and one at the tail
@@ -1200,14 +1299,39 @@ impl Drop for PreparedReleaseAction {
 /// an event is asynchronous: this never waits for either stream. If a legacy
 /// synchronous upload failed without a completion proof, subsequent releases
 /// additionally fence the legacy default stream. Ordinary releases keep two fences.
-#[derive(Debug)]
 pub struct CudaStreamFences {
-    runtime: Arc<crate::runtime::CudaRuntime>,
+    context: Arc<cudarc::driver::CudaContext>,
+    compute: Arc<cudarc::driver::CudaStream>,
+    copy: Arc<cudarc::driver::CudaStream>,
+    legacy_upload_unsettled: Arc<AtomicBool>,
+    // Last: CUDA stream/context field destruction may synchronize.
+    teardown_section: Option<onnx_runtime_cuda_memory::capture_gate::SynchronizingSection>,
+}
+
+impl Debug for CudaStreamFences {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CudaStreamFences")
+            .field("context", &self.context)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for CudaStreamFences {
+    fn drop(&mut self) {
+        self.teardown_section = onnx_runtime_cuda_memory::capture_gate::synchronizing_section();
+    }
 }
 
 impl CudaStreamFences {
-    pub fn new(runtime: Arc<crate::runtime::CudaRuntime>) -> Self {
-        Self { runtime }
+    /// Pin only physical fence resources, never the runtime's graph registry.
+    pub fn new(runtime: &crate::runtime::CudaRuntime) -> Self {
+        Self {
+            context: runtime.cuda_context(),
+            compute: Arc::clone(runtime.stream()),
+            copy: Arc::clone(runtime.copy_stream()),
+            legacy_upload_unsettled: runtime.legacy_upload_release_latch(),
+            teardown_section: None,
+        }
     }
 }
 
@@ -1223,21 +1347,17 @@ fn release_streams<'a, S>(
 
 impl ReleaseFenceSource for CudaStreamFences {
     fn record(&self) -> Result<Vec<Box<dyn ReleaseFence>>, String> {
-        self.runtime
-            .bind()
+        self.context
+            .bind_to_thread()
             .map_err(|error| format!("could not bind the CUDA context: {error}"))?;
-        let context = self.runtime.cuda_context();
+        let context = &self.context;
         let legacy_default = self
-            .runtime
-            .legacy_upload_needs_release_fence()
+            .legacy_upload_unsettled
+            .load(Ordering::Acquire)
             .then(|| context.default_stream());
         let mut fences: Vec<Box<dyn ReleaseFence>> =
             Vec::with_capacity(if legacy_default.is_some() { 3 } else { 2 });
-        for (stream, name) in release_streams(
-            self.runtime.stream(),
-            self.runtime.copy_stream(),
-            legacy_default.as_ref(),
-        ) {
+        for (stream, name) in release_streams(&self.compute, &self.copy, legacy_default.as_ref()) {
             let event = context
                 .new_event(None)
                 .map_err(|error| format!("cuEventCreate for the {name} stream failed: {error}"))?;
@@ -1440,6 +1560,194 @@ mod tests {
             capacity,
         );
         (queue, compute, copy)
+    }
+
+    #[derive(Debug)]
+    struct HandleDropProbe(Arc<AtomicUsize>);
+    impl Drop for HandleDropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn execution_keepalive_waits_for_both_streams_before_last_handle_drop() {
+        let _section = onnx_runtime_cuda_memory::capture_gate::synchronizing_section();
+        let (queue, compute, copy) = manual_queue(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let handles = Arc::new(HandleDropProbe(drops.clone()));
+        let weak = Arc::downgrade(&handles);
+        queue
+            .enqueue(StreamOrderedKeepAlive::new(
+                handles,
+                "test execution handles",
+            ))
+            .unwrap();
+        assert_eq!(queue.poll(), 0);
+        compute.store(true, Ordering::Release);
+        assert_eq!(queue.poll(), 0);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        copy.store(true, Ordering::Release);
+        assert_eq!(queue.poll(), 1);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        assert_eq!(queue.poll(), 0);
+    }
+
+    #[test]
+    fn execution_keepalive_defers_capture_and_can_enqueue_late_child_retirement() {
+        #[derive(Debug)]
+        struct Handles {
+            queue: Arc<CudaDeferredReleaseQueue>,
+            drops: Arc<AtomicUsize>,
+            children: Arc<AtomicUsize>,
+        }
+        impl Drop for Handles {
+            fn drop(&mut self) {
+                let _section = onnx_runtime_cuda_memory::capture_gate::synchronizing_section();
+                self.drops.fetch_add(1, Ordering::AcqRel);
+                self.queue
+                    .enqueue(CountingAction {
+                        executed: self.children.clone(),
+                    })
+                    .unwrap();
+            }
+        }
+        let (queue, compute, copy) = manual_queue(4);
+        compute.store(true, Ordering::Release);
+        copy.store(true, Ordering::Release);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let children = Arc::new(AtomicUsize::new(0));
+        let handles = Arc::new(Handles {
+            queue: queue.clone(),
+            drops: drops.clone(),
+            children: children.clone(),
+        });
+        let capture = onnx_runtime_cuda_memory::capture_gate::CaptureExclusion::acquire();
+        queue
+            .enqueue(StreamOrderedKeepAlive::new(
+                handles,
+                "test capture-sensitive handles",
+            ))
+            .unwrap();
+        queue.close_after_drain();
+        assert_eq!(
+            queue.poll(),
+            0,
+            "capture defers terminal destruction without holding the execution gate"
+        );
+        assert_eq!(queue.pending(), 1);
+        queue
+            .enqueue(CountingAction {
+                executed: children.clone(),
+            })
+            .unwrap();
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        drop(capture);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        assert_eq!(
+            queue.pending(),
+            2,
+            "the destructor's child is accepted during close-after-drain"
+        );
+        assert_eq!(queue.poll(), 2);
+        assert_eq!(children.load(Ordering::Acquire), 2);
+        assert_eq!(queue.pending(), 0);
+        assert_eq!(queue.stats().completed, 3);
+    }
+
+    #[test]
+    fn execution_keepalive_deferred_by_capture_rechecks_device_loss() {
+        let (queue, compute, copy) = manual_queue(1);
+        compute.store(true, Ordering::Release);
+        copy.store(true, Ordering::Release);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let handles = Arc::new(HandleDropProbe(drops.clone()));
+        let capture = onnx_runtime_cuda_memory::capture_gate::CaptureExclusion::acquire();
+        queue
+            .enqueue(StreamOrderedKeepAlive::new(
+                handles,
+                "test deferred lost handles",
+            ))
+            .unwrap();
+        assert_eq!(queue.poll(), 0);
+        queue.mark_device_lost("test loss while retirement waits for capture");
+        assert_eq!(queue.pending(), 1);
+        drop(capture);
+        assert_eq!(queue.pending(), 0);
+        assert_eq!(queue.stats().retained, 1);
+        drop(queue);
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn execution_keepalive_never_destroys_unordered_handles_on_queue_drop() {
+        for lost in [false, true] {
+            let (queue, _, _) = manual_queue(1);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let handles = Arc::new(HandleDropProbe(drops.clone()));
+            let weak = Arc::downgrade(&handles);
+            if lost {
+                queue
+                    .enqueue(StreamOrderedKeepAlive::new(
+                        handles,
+                        "lost execution handles",
+                    ))
+                    .unwrap();
+                queue.mark_device_lost("test device loss");
+                assert_eq!(queue.stats().retained, 1);
+            } else {
+                queue.close();
+                let refused = queue
+                    .enqueue(StreamOrderedKeepAlive::new(
+                        handles,
+                        "refused execution handles",
+                    ))
+                    .unwrap_err();
+                queue.retain_refused(refused, "test closed queue".into());
+                assert_eq!(queue.stats().retained, 1);
+            }
+            drop(queue);
+            assert!(
+                weak.upgrade().is_some(),
+                "unordered handles stay retained after queue teardown"
+            );
+            assert_eq!(drops.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    #[test]
+    fn physical_stream_fences_outlive_runtime_without_retaining_its_graph_registry() {
+        let runtime = Arc::new(
+            crate::runtime::CudaRuntime::new(0)
+                .expect("CUDA fence lifetime regression requires a device"),
+        );
+        let weak = Arc::downgrade(&runtime);
+        let fences = CudaStreamFences::new(&runtime);
+        assert_eq!(Arc::strong_count(&runtime), 1);
+        assert_eq!(fences.record().unwrap().len(), 2);
+        // This is the actual shared failure latch used by runtime uploads.
+        runtime
+            .legacy_upload_release_latch()
+            .store(true, Ordering::Release);
+        assert_eq!(fences.record().unwrap().len(), 3);
+        drop(runtime);
+        assert!(
+            weak.upgrade().is_none(),
+            "physical fence pins cannot root the runtime graph registry"
+        );
+        let recorded = fences.record().unwrap();
+        assert_eq!(
+            recorded.len(),
+            3,
+            "the legacy failure latch survives runtime teardown"
+        );
+        fences.compute.synchronize().unwrap();
+        fences.copy.synchronize().unwrap();
+        fences.context.default_stream().synchronize().unwrap();
+        assert!(recorded.iter().all(|fence| fence.is_complete()));
     }
 
     #[test]

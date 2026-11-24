@@ -334,6 +334,10 @@ fn provider_teardown_is_non_blocking_and_lets_accepted_releases_finish() {
     provider.deallocate(buffer).expect("accepted");
     provider.deallocate(marker).expect("accepted");
 
+    let weak_runtime = Arc::downgrade(&runtime);
+    drop(launch);
+    drop(spin);
+    drop(runtime);
     let started = Instant::now();
     drop(provider);
     let teardown = started.elapsed();
@@ -357,6 +361,15 @@ fn provider_teardown_is_non_blocking_and_lets_accepted_releases_finish() {
     assert!(stats.completed >= 2, "{stats:?}");
     assert_eq!(stats.quarantined, 0, "{stats:?}");
     assert_eq!(stats.retained, 0, "{stats:?}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while weak_runtime.upgrade().is_some() && Instant::now() < deadline {
+        queue.poll();
+        std::thread::yield_now();
+    }
+    assert!(
+        weak_runtime.upgrade().is_none(),
+        "the terminal keepalive must release the final runtime after completion"
+    );
 }
 
 #[cfg_attr(

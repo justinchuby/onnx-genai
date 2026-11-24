@@ -67,7 +67,7 @@ use onnx_runtime_memory_governor::{
 
 use crate::deferred_release::{
     CudaDeferredReleaseQueue, CudaStreamFences, DEFAULT_DEFERRED_RELEASE_CAPACITY,
-    DeferredActionOutcome, DeferredReleaseAction, ReleaseObserver,
+    DeferredActionOutcome, DeferredReleaseAction, ReleaseObserver, StreamOrderedKeepAlive,
 };
 use crate::kernels::build_cuda_registry_with_metrics;
 use crate::kernels::csa_checkpoint::CsaMetrics;
@@ -379,14 +379,12 @@ impl CudaMappedAttribution {
 
 /// The provider-context resource a binding pins.
 ///
-/// Holding the runtime **and** the deferred queue is what makes a queued
-/// release safe: while any allocation of this mechanism is live or queued, the
-/// CUDA context, both streams, and the queue that will perform the release all
-/// outlive it.
+/// The queue pins the physical CUDA context and streams, not the runtime graph
+/// registry. A managed allocation retained by a graph must not indirectly keep
+/// that entire runtime alive. Execution handles retire through a terminal,
+/// stream-ordered keepalive rather than through this permanent context pin.
 #[derive(Debug)]
 struct CudaProviderContextPin {
-    #[allow(dead_code)]
-    runtime: Arc<CudaRuntime>,
     #[allow(dead_code)]
     queue: Arc<CudaDeferredReleaseQueue>,
 }
@@ -1512,7 +1510,7 @@ impl CudaExecutionProvider {
         // reservations hand their teardown to it, so no reservation `Drop`
         // anywhere below can reach a stream synchronizer.
         let release_queue = CudaDeferredReleaseQueue::new(
-            Box::new(CudaStreamFences::new(Arc::clone(&runtime))),
+            Box::new(CudaStreamFences::new(&runtime)),
             DEFAULT_DEFERRED_RELEASE_CAPACITY,
         );
         // Declared before every allocator/reservation owner below so failure
@@ -1724,8 +1722,8 @@ impl CudaExecutionProvider {
     /// Every allocation this provider hands out is issued (or adopted) through
     /// the returned binding, so its identity, generation, authority, and
     /// provider context travel with it to the deferred release. The provider
-    /// context resource pins the runtime *and* the deferred queue: a queued
-    /// release therefore cannot outlive the CUDA context it needs.
+    /// context resource pins the physical streams through the deferred queue:
+    /// a queued release cannot outlive its CUDA context or retain graph state.
     fn register_memory_binding(
         manager: ProcessMemoryManager,
         ordinal: u32,
@@ -1765,7 +1763,6 @@ impl CudaExecutionProvider {
                 device,
                 format!("cuda:{ordinal} provider context"),
                 Arc::new(CudaProviderContextPin {
-                    runtime: Arc::clone(runtime),
                     queue: Arc::clone(release_queue),
                 }),
             )
@@ -3634,6 +3631,17 @@ impl CudaExecutionProvider {
     fn arm_memory_cleanup(&self) {
         if self.memory_cleanup_armed.swap(true, Ordering::AcqRel) {
             return;
+        }
+        // Pin modules, BLAS/cuDNN handles and runtime-private storage through
+        // the final stream tails without permanently rooting its graph state.
+        // Refusal must never fall back to an unordered destructor on this thread.
+        let action = StreamOrderedKeepAlive::new(Arc::clone(&self.runtime), "CUDA runtime handles");
+        if let Err(refused) = self.release_queue.enqueue(action) {
+            let detail = format!(
+                "runtime handle retirement refused as {}; retaining execution handles without synchronization or quota refund",
+                refused.rejection.name()
+            );
+            self.release_queue.retain_refused(refused, detail);
         }
         if let Err(error) = self
             .memory_binding
