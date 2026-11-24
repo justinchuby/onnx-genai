@@ -1451,3 +1451,36 @@ all-target engine/server/CLI Clippy passed on the final source. The Native
 benchmark API consumer compiled, without running a benchmark. Formatting and
 diff checks passed. Active lazy activation and triggers remain required
 follow-ups; the broader goal is open.
+
+### Deferred reference-memory descriptions
+
+`MemoryInfo` now holds an immutable placement description. Construction,
+inspection, cloning and dropping an unresolved description do not load ORT.
+Only explicit reference-adapter resolution creates a handle, and successful
+resolution is cached. The ready owner retains both the handle and description
+independently of the original description's lifetime. Resolution errors retain
+the original typed cause and name the requested device and memory contract.
+
+ORT allocator callbacks hold the resolved type, so their `Info` callback neither
+loads a library nor performs fallible initialization. CPU arena/device kinds,
+GPU descriptions and host-access checks retain their declared semantics.
+Placement fields and an allocator's description cannot be replaced separately
+from its actual resource. All Rust callers use the new immutable accessors.
+
+The Native workflow tensor container and optional hybrid MTP executor still use
+ORT APIs. This increment removes eager metadata creation as a prerequisite for
+porting those owners; it does not claim ORT-free Native model execution or
+remove the Python runtime dependency.
+
+Validation passed: ORT library 190; engine 952 / 1 inherited ignore; server
+450 / 2 inherited ignores; HTTP 37; CLI 71 and both profiling subprocesses.
+The final CUDA-feature descriptor run selected and passed both tests; its nested
+missing-library subprocess also proves exactly one test was selected. These
+checks exercise descriptions and CPU reference handles, not GPU execution.
+Strict ORT/engine/server/CLI all-target Clippy with the ORT CUDA feature passed;
+the final test changes also passed CUDA-feature ORT all-target Clippy. Both
+packed-gather IR tests passed. Formatting and diff checks passed. The feature
+restacked unchanged onto current main and the full functional graph passed
+again. A private versioned-inference-row name addresses an inherited strict
+lint without changing registration behavior. Per owner instruction this work
+does not wait for blocked remote CI.

@@ -165,7 +165,7 @@ struct GovernedAllocatorState {
 pub struct GovernedAllocator {
     /// Must be first: ORT treats `&self` as an `OrtAllocator`.
     base: onnx_genai_ort_sys::OrtAllocator,
-    memory_info: MemoryInfo,
+    memory_info: crate::allocator::ResolvedMemoryInfo,
     state: Arc<GovernedAllocatorState>,
 }
 
@@ -228,7 +228,7 @@ impl GovernedAllocator {
                  serves {tier:?}; use GovernedAllocator::new for host memory"
             )));
         }
-        if memory_info.device_name == "Cpu" {
+        if memory_info.is_host_accessible() {
             return Err(crate::error::OrtError::InvalidArgument(String::from(
                 "this allocator owns device memory but its memory info names 'Cpu'; ONNX \
                  Runtime would let the host dereference pointers that are not host-readable. \
@@ -245,7 +245,7 @@ impl GovernedAllocator {
         // Replace what `new` assumed: host memory info and a host allocator,
         // neither of which is right here. Both are swapped together so no
         // state exists where they disagree.
-        allocator.memory_info = memory_info;
+        allocator.memory_info = memory_info.resolve()?;
         allocator.state = Arc::new(GovernedAllocatorState {
             governor,
             memory,
@@ -275,13 +275,14 @@ impl GovernedAllocator {
                  pass Tier::Host, or use an allocator implementation that owns memory on that tier"
             )));
         }
-        if memory_info.device_name != "Cpu" {
+        if !memory_info.is_host_accessible() {
             return Err(crate::error::OrtError::InvalidArgument(format!(
                 "GovernedAllocator allocates host memory, but its memory info names device \
                  '{}'; ONNX Runtime would treat the host pointers it returns as memory on \
                  that device. Pass MemoryInfo::cpu_device(), or use an allocator \
                  implementation that owns memory on '{}'",
-                memory_info.device_name, memory_info.device_name
+                memory_info.device_name(),
+                memory_info.device_name()
             )));
         }
         let mut allocator = Box::new(Self {
@@ -298,7 +299,7 @@ impl GovernedAllocator {
                 AllocOnStream: None,
                 Shrink: Some(governed_shrink),
             },
-            memory_info,
+            memory_info: memory_info.resolve()?,
             state: Arc::new(GovernedAllocatorState {
                 governor,
                 memory: Arc::new(HostAllocator),
@@ -742,7 +743,7 @@ pub fn register_governed_allocator(
     let register = api
         .RegisterAllocator
         .ok_or(crate::error::OrtError::ApiUnavailable("RegisterAllocator"))?;
-    if allocator.memory_info.is_arena()? {
+    if allocator.memory_info.is_arena() {
         // ORT's own message for this names an enum the caller never wrote down.
         return Err(crate::error::OrtError::InvalidArgument(
             "a governed allocator's memory info describes an arena allocator, but \
@@ -1089,7 +1090,7 @@ mod tests {
         let status = unsafe {
             (api.UnregisterAllocator.expect("UnregisterAllocator"))(
                 env.as_ptr().cast_mut(),
-                info.as_ptr(),
+                info.resolve().unwrap().as_ptr(),
             )
         };
         assert!(
