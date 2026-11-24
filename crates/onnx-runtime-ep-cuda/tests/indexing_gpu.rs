@@ -117,7 +117,7 @@ fn run(
     let input_buffers = inputs
         .iter()
         .map(|input| {
-            let buffer = ep.allocate(input.bytes.len(), 256).unwrap();
+            let buffer = ep.allocate(input.bytes.len().max(1), 256).unwrap();
             if !input.bytes.is_empty() {
                 unsafe {
                     ep.runtime()
@@ -149,7 +149,7 @@ fn run(
     let mut output_buffers = outputs
         .iter()
         .map(|(dtype, shape)| {
-            ep.allocate(dtype.storage_bytes(shape.iter().product()), 256)
+            ep.allocate(dtype.storage_bytes(shape.iter().product()).max(1), 256)
                 .unwrap()
         })
         .collect::<Vec<DeviceBuffer>>();
@@ -229,7 +229,7 @@ fn with_warmed_capture(
     let mut input_buffers = inputs
         .iter()
         .map(|input| {
-            let mut buffer = ep.allocate(input.bytes.len(), 256).unwrap();
+            let mut buffer = ep.allocate(input.bytes.len().max(1), 256).unwrap();
             if !input.bytes.is_empty() {
                 unsafe {
                     ep.runtime()
@@ -261,7 +261,7 @@ fn with_warmed_capture(
     let mut output_buffers = outputs
         .iter()
         .map(|(dtype, shape)| {
-            ep.allocate(dtype.storage_bytes(shape.iter().product()), 256)
+            ep.allocate(dtype.storage_bytes(shape.iter().product()).max(1), 256)
                 .unwrap()
         })
         .collect::<Vec<_>>();
