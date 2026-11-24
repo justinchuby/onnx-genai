@@ -7,10 +7,10 @@ pub fn validate_dtype(opset: u64, dtype: DataType) -> Result<(), String> {
         DataType::Float16 | DataType::Float32 | DataType::Float64 => Ok(()),
         DataType::BFloat16 if opset >= 22 => Ok(()),
         DataType::BFloat16 => Err(format!(
-            "LpPool: BF16 input X is not allowed at opset {opset}; export at opset 22 or later or use a legacy float type"
+            "BF16 input X is not allowed at opset {opset}; export at opset 22 or later or use a legacy float type"
         )),
         _ => Err(format!(
-            "LpPool: input X has type {dtype:?} at opset {opset}; use Float16, Float32, Float64, or BF16 at opset 22 or later"
+            "input X has type {dtype:?} at opset {opset}; use Float16, Float32, Float64, or BF16 at opset 22 or later"
         )),
     }
 }

@@ -776,11 +776,16 @@ type_constraints:
         assert_eq!(v18.attributes, v22.attributes);
         assert_eq!(
             v18.type_constraints[0].allowed,
-            ["float16", "float32", "float64"]
+            [DataType::Float16, DataType::Float32, DataType::Float64]
         );
         assert_eq!(
             v22.type_constraints[0].allowed,
-            ["bfloat16", "float16", "float32", "float64"]
+            [
+                DataType::BFloat16,
+                DataType::Float16,
+                DataType::Float32,
+                DataType::Float64
+            ]
         );
     }
 
