@@ -13,11 +13,12 @@ use std::sync::LazyLock;
 static GATE_UP: LazyLock<RecognitionRule> = LazyLock::new(|| {
     RecognitionRule::parse(
         "CPU gate/up",
-        "(x,gs:slots[0:*],us:slots[0:*]) => {
-            gate=com.microsoft.MatMulNBits(x,...gs);
-            up=com.microsoft.MatMulNBits(x,...us);
-            activation=Swish(gate)|com.microsoft.Silu(gate);
-            out=Mul(activation,up)|Mul(up,activation); return out
+        "(x, gs:slots[0:*], us:slots[0:*]) => {
+            gate = com.microsoft.MatMulNBits(x, ...gs)
+            up = com.microsoft.MatMulNBits(x, ...us)
+            activation = Swish(gate) | com.microsoft.Silu(gate)
+            out = Mul(activation, up) | Mul(up, activation)
+            return out
         }",
         "activation",
     )
@@ -27,10 +28,11 @@ static GATE_UP: LazyLock<RecognitionRule> = LazyLock::new(|| {
 static CONV_BN: LazyLock<RecognitionRule> = LazyLock::new(|| {
     RecognitionRule::parse(
         "CPU Conv/BatchNormalization",
-        "(args:slots[0:*],scale,bias,mean,var) => {
-            conv=Conv(...args);
-            bn=BatchNormalization(conv,scale,bias,mean,var);
-            out=Relu(bn)|bn; return out
+        "(args:slots[0:*], scale, bias, mean, var) => {
+            conv = Conv(...args)
+            bn = BatchNormalization(conv, scale, bias, mean, var)
+            out = Relu(bn) | bn
+            return out
         }",
         "bn",
     )
@@ -40,8 +42,8 @@ static CONV_BN: LazyLock<RecognitionRule> = LazyLock::new(|| {
 static SIBLING_PROJECTION: LazyLock<RecognitionRule> = LazyLock::new(|| {
     RecognitionRule::parse(
         "CPU sibling projection",
-        "(activation,args:slots[1:*])=>{
-            out=MatMul(activation,...args)|com.microsoft.FusedMatMulBias(activation,...args);
+        "(activation, args:slots[1:*]) => {
+            out = MatMul(activation, ...args) | com.microsoft.FusedMatMulBias(activation, ...args)
             return out
         }",
         "out",
@@ -80,14 +82,12 @@ impl Default for ProjectionFusion {
 
 /// The ordered CPU EP optimization registry.
 pub fn cpu_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
-    let mut passes: Vec<Box<dyn OptimizationPass>> = Vec::new();
-    passes.push(Box::new(
-        onnx_runtime_optimizer::quantized_grouped::QuantizedGroupedFusion,
-    ));
-    passes.push(Box::new(
-        onnx_runtime_optimizer::affine_gather::AffineGatherFusion,
-    ));
-    passes.push(Box::new(CpuSiluFusion));
+    let mut passes: Vec<Box<dyn OptimizationPass>> = vec![
+        Box::new(onnx_runtime_optimizer::quantized_grouped::QuantizedGroupedFusion),
+        Box::new(onnx_runtime_optimizer::affine_gather::AffineGatherFusion),
+        Box::new(onnx_runtime_optimizer::dequantize_packed_gather::DequantizePackedGatherFusion),
+        Box::new(CpuSiluFusion),
+    ];
     let projection_fusion = ProjectionFusion::new();
     if projection_fusion.enabled() {
         passes.push(Box::new(projection_fusion));

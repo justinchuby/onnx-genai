@@ -4234,7 +4234,7 @@ impl ExecutionProvider for CudaExecutionProvider {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "CausalConvWithState"
-            && op.domain == "com.microsoft"
+            && (op.is_default_domain() || op.domain == "com.microsoft")
             && let Some(reason) =
                 crate::kernels::causal_conv_with_state::unsupported_reason(op, input_dtypes)
         {
@@ -4249,8 +4249,12 @@ impl ExecutionProvider for CudaExecutionProvider {
         }
         if op.op_type == "Attention"
             && (op.domain.is_empty() || op.domain == "ai.onnx")
-            && let Some(reason) =
-                crate::kernels::standard_attention::unsupported_reason(opset, input_dtypes)
+            && let Some(reason) = crate::kernels::standard_attention::unsupported_reason(
+                op,
+                opset,
+                input_dtypes,
+                shapes.first().map(|shape| shape.len()),
+            )
         {
             return KernelMatch::unsupported(reason);
         }
@@ -4429,6 +4433,16 @@ impl ExecutionProvider for CudaExecutionProvider {
             grant,
             MemoryRole::Workspace { step_scoped: false },
         )
+    }
+
+    fn workspace_pressure_registry(
+        &self,
+    ) -> Result<Option<onnx_runtime_memory_governor::PressureRegistry>> {
+        self.memory_binding.authority.pressure_registry().map_err(|error| {
+            EpError::KernelFailed(format!(
+                "cuda_ep: workspace authority pressure registry is invalid: {error}; bind workspace backing and its pressure registry to the same physical authority"
+            ))
+        })
     }
 
     fn allocate_workspace(
@@ -5253,9 +5267,16 @@ impl ExecutionProvider for CudaExecutionProvider {
         slot: DeviceGraphSlot,
         continuation: Option<DeviceGraphToken>,
         kernels: &[&dyn Kernel],
+        resources: Vec<onnx_runtime_ep_api::DeviceGraphResource>,
     ) -> Result<DeviceGraphToken> {
-        self.runtime
-            .begin_owned_graph_capture_in(owner, slot, continuation, kernels)
+        self.runtime.begin_owned_graph_capture_in(
+            owner,
+            slot,
+            continuation,
+            kernels,
+            resources,
+            self.provider_context_identity(),
+        )
     }
 
     fn end_owned_device_graph_capture(&self, token: DeviceGraphToken) -> Result<()> {

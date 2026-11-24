@@ -196,6 +196,29 @@ pub fn affine_gather(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> 
     gather_impl(ctx, true)
 }
 
+pub fn dequantize_packed_gather(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let metadata =
+        onnx_runtime_ir::dequantize_packed::Metadata::from_node(ctx.node).map_err(|detail| {
+            ShapeInferError::Invalid {
+                op: ctx.node.op_type.clone(),
+                detail,
+            }
+        })?;
+    let Some(indices) = ctx.input_shape(1) else {
+        return Ok(());
+    };
+    let mut shape = indices.to_vec();
+    shape.extend(
+        metadata
+            .shape()
+            .iter()
+            .skip(1)
+            .map(|&n| DimExpr::constant(n as i64)),
+    );
+    ctx.set_output(0, metadata.dtype(), shape);
+    Ok(())
+}
+
 fn gather_impl(ctx: &mut InferenceContext, dequantize: bool) -> Result<(), ShapeInferError> {
     let Some(data) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) else {
         return Ok(());

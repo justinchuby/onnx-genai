@@ -314,10 +314,8 @@ pub(super) fn validate_control_flow_signatures(graph: &Graph) -> Result<()> {
     Ok(())
 }
 
-/// Whether opt-in per-op heterogeneous placement is enabled on the default
-/// session build path (`ONNX_GENAI_HETERO`). Default OFF: unset/empty and the
-/// explicit `0`/`false`/`off` values (case-insensitive) all disable it, so the
-/// whole-session fallback stays byte-identical unless a caller opts in.
+/// Whether to opt into heterogeneous placement beyond CUDA graphs with
+/// managed string operations (`ONNX_GENAI_HETERO`).
 pub(super) fn hetero_placement_env_enabled() -> bool {
     match std::env::var("ONNX_GENAI_HETERO") {
         Ok(value) => matches!(
@@ -343,6 +341,7 @@ pub(super) fn hetero_placement_env_enabled() -> bool {
 pub(super) fn reject_unsupported_operators(
     graph: &Graph,
     ep: &dyn ExecutionProvider,
+    probe_symbolic: bool,
 ) -> Result<()> {
     if ep.device_type() == DeviceType::Cuda {
         return Ok(());
@@ -368,7 +367,7 @@ pub(super) fn reject_unsupported_operators(
             .collect::<Vec<_>>();
         // Defer nodes with any non-static declared input shape to the run-time
         // kernel gate, which sees concrete shapes.
-        if !shapes.iter().all(|shape| as_static_shape(shape).is_some()) {
+        if !probe_symbolic && !shapes.iter().all(|shape| as_static_shape(shape).is_some()) {
             continue;
         }
         let input_dtypes = node
@@ -401,13 +400,35 @@ pub(super) fn cuda_fallback_report(
     graph: &Graph,
     ep: &dyn ExecutionProvider,
     artifact_config: ExecutorArtifactConfig,
+    ordered_probe: bool,
 ) -> Result<Option<ExecutionProviderFallbackReport>> {
     if ep.device_type() != DeviceType::Cuda {
         return Ok(None);
     }
 
     let mut issues = Vec::new();
-    collect_cuda_coverage_issues(graph, graph, ep, artifact_config, "graph", &mut issues)?;
+    collect_cuda_coverage_issues(
+        graph,
+        graph,
+        ep,
+        artifact_config,
+        "graph",
+        &mut issues,
+        ordered_probe,
+    )?;
+    for value_id in super::host_strings::producerless_string_outputs(graph) {
+        let value = graph.value(value_id);
+        issues.push(ExecutionProviderDecline {
+            node: format!(
+                "graph output '{}' (value#{})",
+                value.name.as_deref().unwrap_or("<unnamed>"),
+                value_id.0
+            ),
+            domain: "ai.onnx".into(),
+            op_type: "<graph output>".into(),
+            reason: super::host_strings::MANAGED_STRING_DEVICE_DECLINE.into(),
+        });
+    }
     if issues.is_empty() {
         return Ok(None);
     }
@@ -474,9 +495,19 @@ pub(super) fn collect_cuda_coverage_issues(
     artifact_config: ExecutorArtifactConfig,
     scope: &str,
     issues: &mut Vec<ExecutionProviderDecline>,
+    ordered_probe: bool,
 ) -> Result<()> {
     let graph_claims = onnx_runtime_ep_api::GraphKernelClaims::query(ep, graph)?;
     for (node_id, node) in graph.nodes.iter() {
+        if super::host_strings::uses_managed_strings(graph, node) {
+            issues.push(ExecutionProviderDecline {
+                node: format_node_identity(scope, node_id, node),
+                domain: canonical_domain(node),
+                op_type: node.op_type.clone(),
+                reason: super::host_strings::MANAGED_STRING_DEVICE_DECLINE.into(),
+            });
+            continue;
+        }
         if graph_claims.contains(node_id)
             || onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
             || is_control_flow_op(&node.op_type, &node.domain)
@@ -541,6 +572,15 @@ pub(super) fn collect_cuda_coverage_issues(
             &concrete_shapes,
             opset,
         ) {
+            if ordered_probe && !matches!(error, onnx_runtime_ep_api::EpError::NoEpForOp { .. }) {
+                return Err(SessionError::unsupported_op(
+                    node,
+                    node_id,
+                    opset,
+                    ep.name(),
+                    format!("capability was accepted but kernel creation failed: {error}"),
+                ));
+            }
             issues.push(ExecutionProviderDecline {
                 node: format_node_identity(scope, node_id, node),
                 domain: canonical_domain(node),
@@ -562,6 +602,7 @@ pub(super) fn collect_cuda_coverage_issues(
             artifact_config,
             &sub_scope,
             issues,
+            ordered_probe,
         )?;
     }
     Ok(())
@@ -873,6 +914,13 @@ fn qmoe_int_attr(node: &Node, name: &'static str, default: i64) -> std::result::
     }
 }
 
+#[derive(Clone, Copy)]
+struct BuildPlacement {
+    require_cuda: bool,
+    hetero_enabled: bool,
+    ordered_probe: bool,
+}
+
 impl Executor {
     /// Per-expert region candidates recorded for `com.microsoft::QMoE` lazy
     /// weights, keyed by initializer [`ValueId`]. See
@@ -911,6 +959,148 @@ impl Executor {
         )
     }
 
+    pub(crate) fn build_ordered(
+        graph: Graph,
+        weights: Arc<WeightStore>,
+        providers: crate::ExecutionProviderOrder,
+        fallback_ep: Option<Arc<dyn ExecutionProvider>>,
+    ) -> Result<Self> {
+        Self::build_ordered_with_mode(
+            graph,
+            weights,
+            providers,
+            onnx_genai_runtime_config::runtime_config().require_cuda,
+            hetero_placement_env_enabled(),
+            fallback_ep,
+        )
+    }
+
+    pub(crate) fn build_ordered_with_mode(
+        graph: Graph,
+        weights: Arc<WeightStore>,
+        providers: crate::ExecutionProviderOrder,
+        require_cuda: bool,
+        hetero_enabled: bool,
+        fallback_ep: Option<Arc<dyn ExecutionProvider>>,
+    ) -> Result<Self> {
+        use crate::hetero::{PlacementDecision, ProviderPlacement};
+        use onnx_runtime_ep_api::EpId;
+
+        let crate::ExecutionProviderOrder {
+            primary,
+            additional,
+        } = providers;
+        if !additional.is_empty() && require_cuda && primary.device_type() != DeviceType::Cuda {
+            return Err(SessionError::ExecutionProviderUnavailable(format!(
+                "ONNX_GENAI_REQUIRE_CUDA=1 requires a CUDA primary in the ordered provider list; '{}' is bound to {:?}. Configure CUDA first or unset ONNX_GENAI_REQUIRE_CUDA",
+                primary.name(),
+                primary.device_id(),
+            )));
+        }
+        if additional.is_empty() || require_cuda {
+            return Self::build_with_mode(
+                graph,
+                weights,
+                primary,
+                require_cuda,
+                hetero_enabled,
+                fallback_ep,
+            );
+        }
+        if let Some(fallback) = &fallback_ep {
+            validate_cpu_fallback(fallback.as_ref())?;
+        }
+        // Keep the existing managed-string path (including producerless outputs).
+        if graph
+            .values
+            .iter()
+            .any(|(_, v)| v.tensor_dtype() == Some(DataType::String))
+        {
+            return Self::build_with_mode(
+                graph,
+                weights,
+                primary,
+                false,
+                hetero_enabled,
+                fallback_ep,
+            );
+        }
+        match crate::hetero::validate_top_level_tensor_graph(&graph) {
+            Ok(()) => {}
+            Err(SessionError::HeterogeneousExecutionUnsupported { .. }) => {
+                return Self::build_with_mode(graph, weights, primary, false, false, fallback_ep);
+            }
+            Err(error) => return Err(error),
+        }
+        graph.topological_order()?;
+        let mut primary_decline = None;
+        for (index, ep) in std::iter::once(&primary).chain(&additional).enumerate() {
+            match Self::build_single(
+                graph.clone(),
+                Arc::clone(&weights),
+                Arc::clone(ep),
+                BuildPlacement {
+                    require_cuda: false,
+                    hetero_enabled: false,
+                    ordered_probe: true,
+                },
+                fallback_ep.clone(),
+            ) {
+                Ok(exec) => return Ok(exec),
+                Err(error @ SessionError::OrderedProviderDeclined { .. }) => {
+                    if index == 0 {
+                        primary_decline = Some(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if hetero_enabled {
+            let cpu = resolve_cpu_fallback(fallback_ep.as_ref())?;
+            let slots = std::iter::once(Arc::clone(&primary))
+                .chain(additional)
+                .chain(std::iter::once(Arc::clone(&cpu)))
+                .zip(0_u32..)
+                .map(|(provider, id)| ProviderPlacement {
+                    ep: EpId(id),
+                    provider,
+                })
+                .collect::<Vec<_>>();
+            let mixed = match crate::hetero::classify_ordered_mixed_placement(&graph, &slots) {
+                Ok(PlacementDecision::Heterogeneous(plan))
+                    if plan.transfers.iter().all(|transfer| {
+                        (transfer.from.is_host_accessible() && transfer.to.is_host_accessible())
+                            || transfer.from.device_type == DeviceType::Cpu
+                            || transfer.to.device_type == DeviceType::Cpu
+                    }) =>
+                {
+                    Self::build_mixed(*plan, &graph, &weights, &slots, &cpu).map(Some)
+                }
+                Ok(_) => Ok(None),
+                Err(error) => Err(error),
+            };
+            match mixed {
+                Ok(Some(exec)) => return Ok(exec),
+                Ok(None) | Err(SessionError::HeterogeneousExecutionUnsupported { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        if primary.device_type() == DeviceType::Cuda {
+            // Preserve the legacy CUDA placement report on whole-session fallback.
+            Self::build_with_mode(graph, weights, primary, false, false, fallback_ep)
+        } else if let Some(cpu) = fallback_ep {
+            Self::build_with_mode(graph, weights, cpu, false, false, None)
+        } else {
+            Err(primary_decline.ok_or_else(|| {
+                SessionError::Internal(
+                    "ordered placement did not record the primary decline".into(),
+                )
+            })?)
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn build_with_cuda_requirement(
         graph: Graph,
@@ -937,7 +1127,7 @@ impl Executor {
         Self::build_with_mode(graph, weights, ep, false, true, None)
     }
 
-    pub(super) fn build_with_mode(
+    pub(crate) fn build_with_mode(
         mut graph: Graph,
         weights: Arc<WeightStore>,
         ep: Arc<dyn ExecutionProvider>,
@@ -949,7 +1139,18 @@ impl Executor {
             validate_cpu_fallback(fallback.as_ref())?;
         }
         prepare_execution(&mut graph)?;
-        if hetero_enabled && !require_cuda && ep.device_type() != DeviceType::Cpu {
+        let needs_host_strings = ep.device_type() == DeviceType::Cuda
+            && (graph
+                .nodes
+                .iter()
+                .any(|(_, node)| super::host_strings::uses_managed_strings(&graph, node))
+                || super::host_strings::producerless_string_outputs(&graph)
+                    .next()
+                    .is_some());
+        if (hetero_enabled || needs_host_strings)
+            && !require_cuda
+            && ep.device_type() != DeviceType::Cpu
+        {
             let cpu = resolve_cpu_fallback(fallback_ep.as_ref())?;
             let providers = vec![
                 crate::hetero::ProviderPlacement {
@@ -964,35 +1165,30 @@ impl Executor {
             if let crate::hetero::PlacementDecision::Heterogeneous(plan) =
                 crate::hetero::classify_placement(&graph, &providers)?
             {
-                let planned_graph = plan
-                    .legalized_graph
-                    .as_deref()
-                    .cloned()
-                    .unwrap_or_else(|| graph.clone());
-                let heterogeneous = crate::hetero::HeterogeneousExecutor::build(
-                    *plan, &graph, &weights, &providers,
-                )?;
-                let report = heterogeneous.placement_report().to_string();
-
-                // The outer Executor is only an API coordinator. Build its
-                // legacy fields from an empty graph so no whole-model CPU
-                // kernels, weights, or activation buffers are materialized.
-                let mut coordinator = Self::build_with_mode(
-                    Graph::new(),
-                    weights,
-                    cpu,
-                    false,
-                    false,
-                    fallback_ep.clone(),
-                )?;
-                coordinator.graph = planned_graph;
-                coordinator.heterogeneous = Some(Box::new(heterogeneous));
-                coordinator.execution_provider_fallback_report = None;
-                eprintln!("[onnx-genai-info] heterogeneous placement: {report}");
-                return Ok(coordinator);
+                return Self::build_mixed(*plan, &graph, &weights, &providers, &cpu);
             }
         }
 
+        Self::build_single(
+            graph,
+            weights,
+            ep,
+            BuildPlacement {
+                require_cuda,
+                hetero_enabled,
+                ordered_probe: false,
+            },
+            fallback_ep,
+        )
+    }
+
+    fn build_single(
+        graph: Graph,
+        weights: Arc<WeightStore>,
+        ep: Arc<dyn ExecutionProvider>,
+        placement: BuildPlacement,
+        fallback_ep: Option<Arc<dyn ExecutionProvider>>,
+    ) -> Result<Self> {
         let instance_id = issue_executor_instance_id()?;
         let artifact_config = Self::resolve_artifact_config(ep.as_ref(), instance_id)?;
         let mut artifact_transaction =
@@ -1003,7 +1199,7 @@ impl Executor {
             ep,
             instance_id,
             &mut artifact_transaction,
-            require_cuda,
+            placement,
             fallback_ep,
         );
         match build {
@@ -1022,13 +1218,41 @@ impl Executor {
         }
     }
 
+    fn build_mixed(
+        plan: crate::hetero::HeterogeneousPlan,
+        graph: &Graph,
+        weights: &Arc<WeightStore>,
+        providers: &[crate::hetero::ProviderPlacement],
+        cpu: &Arc<dyn ExecutionProvider>,
+    ) -> Result<Self> {
+        let planned_graph = plan.legalized_graph.as_deref().unwrap_or(graph).clone();
+        let heterogeneous =
+            crate::hetero::HeterogeneousExecutor::build(plan, graph, weights, providers)?;
+        // No whole-model CPU kernels, weights or activations in the coordinator.
+        let mut coordinator = Self::build_with_mode(
+            Graph::new(),
+            Arc::clone(weights),
+            Arc::clone(cpu),
+            false,
+            false,
+            None,
+        )?;
+        eprintln!(
+            "[onnx-genai-info] heterogeneous placement: {}",
+            heterogeneous.placement_report()
+        );
+        coordinator.graph = planned_graph;
+        coordinator.heterogeneous = Some(Box::new(heterogeneous));
+        Ok(coordinator)
+    }
+
     fn build_with_artifact_transaction(
         mut graph: Graph,
         weights: Arc<WeightStore>,
         mut ep: Arc<dyn ExecutionProvider>,
         instance_id: ExecutorInstanceId,
         artifact_transaction: &mut ExecutorArtifactBuildTransaction,
-        require_cuda: bool,
+        placement_mode: BuildPlacement,
         fallback_ep: Option<Arc<dyn ExecutionProvider>>,
     ) -> Result<Self> {
         let execution_provider_fallback_report = Self::place_graph(
@@ -1037,7 +1261,7 @@ impl Executor {
             &mut ep,
             instance_id,
             artifact_transaction,
-            require_cuda,
+            placement_mode,
             fallback_ep.as_ref(),
         )?;
         // Topological order up front: also validates the selected graph is a DAG.
@@ -1080,6 +1304,7 @@ impl Executor {
             Vec::new()
         };
 
+        let string_initializers = Self::load_string_initializers(&graph, ep.as_ref())?;
         let (mut value_shapes, mut value_dtypes, buffers, buffer_shapes) =
             Self::materialize_initializers(&graph, &weights, ep.as_ref(), &weight_handles)?;
 
@@ -1131,6 +1356,8 @@ impl Executor {
             prefetch_issue_nodes: std::sync::Mutex::new(HashMap::new()),
             prefetch_lookahead_nodes: dense_weight_prefetch_lookahead_nodes(),
             buffers,
+            string_initializers,
+            string_values: HashMap::new(),
             buffer_shapes,
             has_unknown_rank: value_shapes.values().any(Option::is_none),
             value_shapes,
@@ -1192,6 +1419,8 @@ impl Executor {
             provider_artifact_readiness: ProviderArtifactReadiness::default(),
             persistent_workspace: None,
             step_workspace: None,
+            workspace_reuse: WorkspaceReuse::default(),
+            workspace_completion: WorkspaceCompletion::Pending,
             pin_step_workspace: false,
             inherited_workspace: InheritedWorkspaces::default(),
             workspace_preparation_required: false,
@@ -1408,7 +1637,11 @@ impl Executor {
         ep: &mut Arc<dyn ExecutionProvider>,
         instance_id: ExecutorInstanceId,
         artifact_transaction: &mut ExecutorArtifactBuildTransaction,
-        require_cuda: bool,
+        BuildPlacement {
+            require_cuda,
+            hetero_enabled,
+            ordered_probe,
+        }: BuildPlacement,
         fallback_ep: Option<&Arc<dyn ExecutionProvider>>,
     ) -> Result<Option<ExecutionProviderFallbackReport>> {
         let mut placement_span = trace_span("session.node_placement", "session");
@@ -1429,18 +1662,37 @@ impl Executor {
         // unsupported-operator error) with a structural error. Mirrors the
         // control-flow signature check above.
         graph.topological_order()?;
-        reject_unsupported_operators(graph, ep.as_ref())?;
+        if let Err(error) = reject_unsupported_operators(graph, ep.as_ref(), ordered_probe) {
+            return Err(
+                if ordered_probe && matches!(error, SessionError::UnsupportedOp { .. }) {
+                    SessionError::OrderedProviderDeclined {
+                        reason: error.to_string(),
+                    }
+                } else {
+                    error
+                },
+            );
+        }
         let graph_before_ep_passes = graph.clone();
         let ep_pass_nodes_before = graph.num_nodes();
         run_ep_scoped_passes(graph, weights, ep.as_ref())?;
         let ep_pass_nodes_after = graph.num_nodes();
         rewrite_kv_capacity_appends(graph, ep.as_ref());
-        let mut execution_provider_fallback_report =
-            cuda_fallback_report(graph, ep.as_ref(), artifact_transaction.config())?;
+        let mut execution_provider_fallback_report = cuda_fallback_report(
+            graph,
+            ep.as_ref(),
+            artifact_transaction.config(),
+            ordered_probe,
+        )?;
         let fallback_declines = execution_provider_fallback_report
             .as_ref()
             .map_or(0, |report| report.declines.len());
         if let Some(report) = &mut execution_provider_fallback_report {
+            if ordered_probe {
+                return Err(SessionError::OrderedProviderDeclined {
+                    reason: report.to_string(),
+                });
+            }
             if require_cuda {
                 return Err(SessionError::HeterogeneousPlacementRequired {
                     unsupported_nodes: report.to_string(),
@@ -1465,7 +1717,7 @@ impl Executor {
             crate::hetero::guard_heterogeneous_fallback(
                 &graph_before_ep_passes,
                 &hetero_providers,
-                hetero_placement_env_enabled(),
+                hetero_enabled,
             )?;
             let cpu_artifact_config = Self::resolve_artifact_config(cpu.as_ref(), instance_id)?;
             artifact_transaction.rebind(Arc::clone(&cpu), cpu_artifact_config)?;
@@ -1542,6 +1794,9 @@ impl Executor {
             let dims = weight.dims().to_vec();
             value_dtypes.insert(vid, dtype);
             value_shapes.insert(vid, Some(dims.iter().map(|&d| Dim::Static(d)).collect()));
+            if dtype == DataType::String {
+                continue;
+            }
             let value = graph.value(vid);
             let prepared_only = !value.is_graph_output
                 && !value.consumers.is_empty()
@@ -1724,22 +1979,15 @@ impl Executor {
                 }
                 continue;
             }
-            // Preserve positional input arity: keep interior `None` (omitted
-            // optional) slots so a later present input is not misread as the
-            // omitted one, but trim trailing `None`s (a trailing omitted
-            // optional just lowers the arity, matching ONNX semantics).
-            let mut slots: Vec<Option<ValueId>> = node.inputs.clone();
+            // Claim, compilation and execution must describe the same source
+            // positions, including omitted trailing optional inputs. Only graph
+            // kernels append captures to that unchanged positional prefix.
             let graph_kernel = graph_claims.contains(nid);
-            if graph_kernel {
-                slots = node.inputs_with_captures(
-                    captures_by_node.get(&nid).into_iter().flatten().copied(),
-                );
+            let inputs = if graph_kernel {
+                node.inputs_with_captures(captures_by_node.get(&nid).into_iter().flatten().copied())
             } else {
-                while matches!(slots.last(), Some(None)) {
-                    slots.pop();
-                }
-            }
-            let inputs = slots;
+                node.inputs.clone()
+            };
             let outputs: Vec<ValueId> = node.output_values().collect();
             let dtype = |vid: ValueId| -> Result<DataType> {
                 let dtype = value_dtypes.get(&vid).copied().ok_or_else(|| SessionError::Ep(EpError::KernelFailed(format!("graph node #{} ('{}') references value #{} without dtype metadata; declare its tensor type before claiming the graph", nid.0, node.op_type, vid.0))))?;
@@ -1786,6 +2034,7 @@ impl Executor {
             }
             plan.push(NodePlan {
                 node_id: nid,
+                managed_strings: super::host_strings::uses_managed_strings(graph, node),
                 graph_kernel,
                 workspace_planning: super::bindings::workspace_planning_for_node(
                     ep,
@@ -2414,6 +2663,9 @@ impl Executor {
                 continue;
             }
             let dtype = self.value_dtypes[&vid];
+            if dtype == DataType::String {
+                continue;
+            }
             let Some(dims) = resolved.get(&vid) else {
                 continue;
             };

@@ -25,6 +25,7 @@ use std::borrow::Cow;
 
 use onnx_runtime_ep_api::{EpError, OpKey, OpRegistry, Result, TensorMut, TensorView};
 use onnx_runtime_ir::DataType;
+use onnx_runtime_ir::opset26::{BIT_CAST_TYPES, CUM_PROD_TYPES};
 
 use crate::strided::{elem_offset, next_index, numel};
 
@@ -37,9 +38,16 @@ pub struct CpuOpDescriptor {
     pub op_type: String,
     pub domain: String,
     pub since_version: u64,
+    pub end_version: u64,
     /// Supported element types for the "T" type-constraint. Derived from the
     /// kernel's actual dtype dispatch — fail closed (f32-only) when unknown.
     pub supported_dtypes: &'static [DataType],
+    /// Whether this kernel can execute through the fixed-width raw tensor ABI.
+    ///
+    /// Managed host-string kernels remain in the native registry but must not
+    /// become ORT plugin `KernelRegistryEntry`s: that ABI has no string payload
+    /// representation.
+    pub supports_raw_tensor_abi: bool,
 }
 
 // ── Dtype categories ─────────────────────────────────────────────────────────
@@ -160,6 +168,9 @@ static STFT_DTYPES: &[DataType] = &[
 
 /// NonMaxSuppression mixes f32 geometry/thresholds with i64 limits/output.
 static NMS_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
+static STRING_ONLY: &[DataType] = &[DataType::String];
+static STRING_BOOL_DTYPES: &[DataType] = &[DataType::String, DataType::Bool];
+static STRING_I64_DTYPES: &[DataType] = &[DataType::String, DataType::Int64];
 /// Exact dtype union for `pkg.nxrt::DsaIndexSelect` edges.
 ///
 /// Inputs 0..=2 accept the three compute floats, input 3 is f32, and the sole
@@ -279,6 +290,8 @@ pub fn input_dtype_constraints_for_op(
         (2, FLOAT_COMPUTE_DTYPES),
         (3, F32_ONLY),
     ];
+    static TEXT_STRING_INPUT: &[(usize, &[DataType])] = &[(0, STRING_ONLY)];
+    static STRING_CONCAT_INPUTS: &[(usize, &[DataType])] = &[(0, STRING_ONLY), (1, STRING_ONLY)];
     match (op_type, domain) {
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::INPUT_DTYPES,
         ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_SLOTS,
@@ -291,8 +304,11 @@ pub fn input_dtype_constraints_for_op(
         ("PackedMultiHeadAttention", "com.microsoft") => PACKED_MHA_SLOTS,
         ("QMoE", "com.microsoft") => QMOE_SLOTS,
         ("STFT", "") => STFT_SLOTS,
+        ("CumProd", "") => onnx_runtime_ir::opset26::CUM_PROD_INPUT_TYPES,
         ("NonMaxSuppression", "") => NMS_SLOTS,
         ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_SLOTS,
+        ("RegexFullMatch", "") | ("StringSplit", "") => TEXT_STRING_INPUT,
+        ("StringConcat", "") => STRING_CONCAT_INPUTS,
         _ => &[],
     }
 }
@@ -306,9 +322,13 @@ pub fn output_dtype_constraints_for_op(
     domain: &str,
 ) -> &'static [(usize, &'static [DataType])] {
     static DSA_INDEX_SELECT_OUTPUTS: &[(usize, &[DataType])] = &[(0, I64_ONLY)];
+    static REGEX_OUTPUTS: &[(usize, &[DataType])] = &[(0, &[DataType::Bool])];
+    static STRING_SPLIT_OUTPUTS: &[(usize, &[DataType])] = &[(0, STRING_ONLY), (1, I64_ONLY)];
     match (op_type, domain) {
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::OUTPUT_DTYPES,
         ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_OUTPUTS,
+        ("RegexFullMatch", "") => REGEX_OUTPUTS,
+        ("StringSplit", "") => STRING_SPLIT_OUTPUTS,
         _ => &[],
     }
 }
@@ -344,6 +364,10 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("OneHot", "")
         | ("Dropout", "")
         | ("Unique", "") => ALL_DTYPES,
+
+        ("StringConcat", "") => STRING_ONLY,
+        ("RegexFullMatch", "") => STRING_BOOL_DTYPES,
+        ("StringSplit", "") => STRING_I64_DTYPES,
 
         // Arithmetic ops (dispatch_arith!): f32, f16, bf16, f64, int types.
         ("Add", "")
@@ -497,7 +521,18 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         }
 
         // Sequence/range ops.
-        ("Range", "") | ("CumSum", "") | ("CumProd", "") => ARITH_DTYPES,
+        ("Range", "") => &[
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+        ],
+        ("CumSum", "") => ARITH_DTYPES,
+        ("CumProd", "") => CUM_PROD_TYPES,
+        ("BitCast", "") => BIT_CAST_TYPES,
 
         // Window functions.
         ("HannWindow", "") | ("HammingWindow", "") | ("BlackmanWindow", "") | ("DFT", "") => {
@@ -526,9 +561,8 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("LinearAttention", "com.microsoft")
         | ("GatherBlockQuantized", "com.microsoft") => FLOAT_DTYPES,
 
-        ("SimplifiedLayerNormalization", "")
-        | ("LinearAttention", "")
-        | ("CausalConvWithState", "") => FLOAT_DTYPES,
+        ("SimplifiedLayerNormalization", "") => FLOAT_DTYPES,
+        ("LinearAttention", "") | ("CausalConvWithState", "") => FLOAT_COMPUTE_DTYPES,
 
         ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_DTYPES,
         // `moe.rs` widens f16/bf16 to f32, computes, and narrows on the way
@@ -579,6 +613,8 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
 pub mod activations;
 pub mod add;
 pub mod attention;
+pub mod bit_cast;
+mod bit_packing;
 pub mod bitshift;
 pub mod bitwise;
 pub mod block_dequant;
@@ -614,7 +650,9 @@ mod half_gemm;
 // path is unchanged, so the module is not compiled at all rather than left as
 // dead code.
 mod dequantize_packed;
+mod dequantize_packed_gather;
 pub mod governed_weight_cache;
+mod grouped_matmul;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod half_gemv;
 pub mod hardmax;
@@ -637,7 +675,6 @@ pub mod msft_attention;
 pub mod multi_head_attention;
 pub mod onehot;
 pub mod packed_multi_head_attention;
-mod packed_routed;
 pub mod packed_varlen_attention;
 pub mod pad;
 pub mod planar_block_quant;
@@ -664,9 +701,9 @@ pub mod slice;
 pub mod softmax;
 pub mod sparse_kv_gather;
 pub mod split;
-mod standard_math;
 pub mod stft;
 pub mod tensor_scatter;
+pub mod text;
 pub mod transpose;
 pub mod unary_math;
 pub mod unique;
@@ -1034,11 +1071,23 @@ pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor
 fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
     let mut descriptors: Vec<CpuOpDescriptor> = reg
         .keys()
-        .map(|key| CpuOpDescriptor {
-            op_type: key.op_type.clone(),
-            domain: key.domain.clone(),
-            since_version: key.since_version,
-            supported_dtypes: supported_dtypes_for_op(&key.op_type, &key.domain),
+        .map(|key| {
+            let supports_raw_tensor_abi = input_dtype_constraints_for_op(&key.op_type, &key.domain)
+                .iter()
+                .chain(output_dtype_constraints_for_op(&key.op_type, &key.domain))
+                .all(|(_, dtypes)| {
+                    dtypes
+                        .iter()
+                        .any(|dtype| !matches!(dtype, DataType::String | DataType::Undefined))
+                });
+            CpuOpDescriptor {
+                op_type: key.op_type.clone(),
+                domain: key.domain.clone(),
+                since_version: key.since_version,
+                end_version: reg.explicit_end_version(key),
+                supported_dtypes: supported_dtypes_for_op(&key.op_type, &key.domain),
+                supports_raw_tensor_abi,
+            }
         })
         .collect();
     // `OpRegistry` iterates a hash map, so fix an order: callers leak these
@@ -1066,7 +1115,16 @@ pub(crate) fn build_cpu_registry_with_resources(
             1,
         ),
         onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(packed_routed::AffineFactory),
+        Box::new(grouped_matmul::AffineFactory),
+    );
+    rec.register(
+        OpKey::new(
+            onnx_runtime_ir::quantized_grouped::PACKED_OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(grouped_matmul::PackedFactory),
     );
     rec.register(
         OpKey::new(
@@ -1077,18 +1135,29 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(gather::AffineGatherFactory),
     );
-    for name in onnx_runtime_ir::packed_routed::OPS {
+    for name in ["Pack", "Unpack"] {
         rec.register(
             OpKey::new(name, "", 29),
             onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(packed_routed::Factory),
+            Box::new(bit_packing::Factory),
         );
     }
+    rec.register(
+        OpKey::new("GroupedMatMul", "", 29),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(grouped_matmul::Factory),
+    );
     for (name, since) in onnx_runtime_ir::standard_math::OPS {
+        let factory: Box<dyn onnx_runtime_ep_api::KernelFactory> = match name {
+            "Expm1" | "Log1p" => Box::new(unary_math::StableUnaryFactory),
+            "SwiGLU" | "GeGLU" => Box::new(activations::GatedActivationFactory),
+            "LogCumSumExp" => Box::new(sequence::LogCumSumExpFactory),
+            _ => unreachable!("unregistered standard math family for {name}"),
+        };
         rec.register(
             OpKey::new(name, "", since),
             onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(standard_math::Factory),
+            factory,
         );
     }
     register_cnn_ops(&mut rec);
@@ -1261,12 +1330,10 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(causal_conv::CausalConvWithStateFactory),
     );
-    // Standard ONNX-domain spelling, opset 27. Same contract as the contrib op
-    // (rank-3 `[B, C, L]`, depthwise `[C, 1, k]` weight, `k-1` carry state,
-    // `none`/`silu`/`swish` activation), so it reuses the same kernel rather
-    // than growing a second implementation to keep in step.
-    rec.register(
+    // Reuse the depthwise kernel; the standard schema changes at opset 29.
+    rec.register_through(
         OpKey::new("CausalConvWithState", "", 27),
+        28,
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(causal_conv::CausalConvWithStateFactory),
     );
@@ -1275,10 +1342,9 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(linear_attention::LinearAttentionFactory),
     );
-    // Standard ONNX-domain spelling (onnx/onnx#7689), semantically identical to
-    // the com.microsoft op — served by the same fused kernel.
-    rec.register(
-        OpKey::new("LinearAttention", "", 1),
+    rec.register_through(
+        OpKey::new("LinearAttention", "", 27),
+        28,
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(linear_attention::LinearAttentionFactory),
     );
@@ -1293,22 +1359,15 @@ pub(crate) fn build_cpu_registry_with_resources(
     // Standard `ai.onnx::Attention`: the richer SDPA op with 3D/4D inputs,
     // GQA/MQA head sharing, a KV cache (`past_*`/`present_*`), causal masking,
     // softcap, and up to four outputs. Distinct from the contrib
-    // `FusedAttention` above. Added at opset 23 and revised at opset 24; since
-    // no newer version exists, the opset-24 kernel serves model opsets 24, 25
-    // and 26 (the registry resolves the highest `since_version <= opset`). Both
-    // versions are registered so opset-23 models keep the original
-    // `qk_matmul_output_mode` 1↔2 ordering while opset-24+ models get the
-    // swapped ordering and `nonpad_kv_seqlen` support.
-    rec.register(
-        OpKey::new("Attention", "", 23),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(attention::AttentionFactory { since_version: 23 }),
-    );
-    rec.register(
-        OpKey::new("Attention", "", 24),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(attention::AttentionFactory { since_version: 24 }),
-    );
+    // `FusedAttention` above. The registry selects the newest revision at or
+    // below the model opset; external KV lengths start at 24, windows at 25.
+    for since_version in [23, 24, 25] {
+        rec.register(
+            OpKey::new("Attention", "", u64::from(since_version)),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(attention::AttentionFactory { since_version }),
+        );
+    }
     // The optimizer's exact-GELU fusion emits `com.microsoft::Gelu`; bind its
     // CPU kernel in the same contrib domain (there is no standard-domain `Gelu`
     // op, so it is registered only under `com.microsoft`).
@@ -1496,6 +1555,11 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(cast::CastLikeFactory),
     );
+    rec.register(
+        OpKey::new("BitCast", "", 26),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(bit_cast::BitCastFactory),
+    );
     // Identity: dtype-agnostic passthrough (raw byte copy).
     rec.register(
         OpKey::new("Identity", "", 1),
@@ -1546,6 +1610,21 @@ pub(crate) fn build_cpu_registry_with_resources(
         OpKey::new("Expand", "", 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(expand::ExpandFactory),
+    );
+    rec.register(
+        OpKey::new("RegexFullMatch", "", 20),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(text::RegexFullMatchFactory),
+    );
+    rec.register(
+        OpKey::new("StringConcat", "", 20),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(text::StringConcatFactory),
+    );
+    rec.register(
+        OpKey::new("StringSplit", "", 20),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(text::StringSplitFactory),
     );
     rec.register(
         OpKey::new("Slice", "", 1),
@@ -1616,6 +1695,15 @@ pub(crate) fn build_cpu_registry_with_resources(
         OpKey::new("DequantizePacked", "", 29),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(dequantize_packed::Factory),
+    );
+    rec.register(
+        OpKey::new(
+            onnx_runtime_ir::dequantize_packed_gather::OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(dequantize_packed_gather::Factory),
     );
     rec.register(
         OpKey::new("DynamicQuantizeLinear", "", 11),
@@ -1973,10 +2061,16 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(sequence::TileFactory),
     );
-    rec.register(
+    rec.register_through(
         OpKey::new("Range", "", 11),
+        26,
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(sequence::RangeFactory),
+    );
+    rec.register(
+        OpKey::new("Range", "", 27),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(sequence::Range27Factory),
     );
     rec.register(
         OpKey::new("CumSum", "", 14),
@@ -2486,7 +2580,12 @@ pub(crate) mod testutil {
                     )
                 })
                 .collect::<Vec<_>>();
-            let requirement = self.workspace_requirement_for_execution(inputs, &metadata)?;
+            let output_metadata = outputs
+                .iter()
+                .map(onnx_runtime_ep_api::OutputMetadata::from_view)
+                .collect::<Vec<_>>();
+            let requirement =
+                self.workspace_requirement_for_execution(inputs, &metadata, &output_metadata)?;
             assert!(requirement.alignment <= std::mem::align_of::<u128>());
             let mut backing = vec![0u128; (requirement.bytes as usize).div_ceil(16)];
             let workspace = (!backing.is_empty()).then(|| {
@@ -3354,7 +3453,7 @@ mod tests {
         // v13), and `LayerNormalization`, `FusedMatMulBias`, `FusedGemm`,
         // `FusedAttention` and the fused exact-GELU `Gelu` add contrib
         // (`com.microsoft`) entries. Standard `ai.onnx::Attention` is registered
-        // at both opset 23 and 24 (two default-domain entries not in
+        // at opsets 23, 24 and 25 (three default-domain entries not in
         // `PHASE1_OPS`). The standard LLM primitives `Gelu` (opset 20),
         // `RMSNormalization` (23), `RotaryEmbedding` (23) and `Swish` (24) add
         // four more default-domain entries not in `PHASE1_OPS`; `Softmax` and
@@ -3405,9 +3504,9 @@ mod tests {
         // standard-domain `CausalConvWithState` (opset 27) adds one alongside
         // its `com.microsoft` spelling.
         // `STFT` and `DequantizePacked` each add a standard-domain registration.
-        // The EP-owned affine Gather and grouped-projection fusions each add one.
+        // The EP-owned affine and GGUF Gather and grouped-projection fusions each add one.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 109 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 117 + mlas_registrations);
         for op in PHASE1_OPS {
             let since = reg
                 .earliest_since_version(op, "")
@@ -3427,6 +3526,8 @@ mod tests {
         assert!(reg.lookup("ReduceLogSumExp", "", 18).is_some());
         assert!(reg.lookup("CumSum", "", 14).is_some());
         assert!(reg.lookup("CumProd", "", 26).is_some());
+        assert!(reg.lookup("BitCast", "", 25).is_none());
+        assert!(reg.lookup("BitCast", "", 26).is_some());
         assert!(reg.lookup("HannWindow", "", 17).is_some());
         assert!(reg.lookup("HammingWindow", "", 17).is_some());
         assert!(reg.lookup("BlackmanWindow", "", 17).is_some());
@@ -3477,6 +3578,12 @@ mod tests {
                 .is_some()
         );
         assert!(reg.lookup("LinearAttention", "com.microsoft", 1).is_some());
+        for op in ["LinearAttention", "CausalConvWithState"] {
+            assert!(!reg.supports(op, "", 26));
+            assert!(reg.supports(op, "ai.onnx", 28));
+            assert!(!reg.supports(op, "", 29));
+            assert!(reg.lookup(op, "", 29).is_none());
+        }
         assert!(
             reg.lookup("GatherBlockQuantized", "com.microsoft", 1)
                 .is_some()
@@ -3542,7 +3649,7 @@ mod tests {
         assert!(reg.lookup("Swish", "", 23).is_none());
         // Standard ai.onnx::Attention resolves at opsets 23–26 (default domain
         // and the `ai.onnx` alias), but not below its since-version. Opset 23
-        // resolves to the v23 kernel; 24/25/26 resolve to the v24 kernel.
+        // resolves to the v23 kernel; 24 to v24; 25/26 to v25.
         assert!(reg.lookup("Attention", "", 23).is_some());
         assert!(reg.lookup("Attention", "", 24).is_some());
         assert!(reg.lookup("Attention", "", 25).is_some());

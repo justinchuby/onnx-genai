@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use std::collections::BTreeMap;
 
 use onnx_genai::StopSequence;
@@ -175,6 +176,16 @@ pub struct ChatCompletionRequest {
     pub stop: Option<StopInput>,
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
+    /// llama.cpp GBNF over the raw newly generated stream.
+    #[serde(default)]
+    pub grammar: Option<String>,
+    /// Lazy grammar activation is not implemented; false is accepted explicitly.
+    #[serde(default)]
+    pub grammar_lazy: bool,
+    #[serde(default)]
+    pub grammar_triggers: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub preserved_tokens: Vec<String>,
     #[serde(default)]
     pub tools: Option<Vec<ChatTool>>,
     #[serde(default)]
@@ -364,6 +375,54 @@ impl ReasoningEffort {
 }
 
 impl ChatCompletionRequest {
+    pub(crate) fn validate_grammar(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.grammar_lazy,
+            "grammar_lazy=true is not supported yet; use false or omit lazy grammar activation"
+        );
+        anyhow::ensure!(
+            self.grammar_triggers.is_empty(),
+            "grammar_triggers are not supported yet; send [] or omit grammar triggers"
+        );
+        let Some(grammar) = self
+            .grammar
+            .as_deref()
+            .filter(|grammar| !grammar.is_empty())
+        else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            self.response_format
+                .as_ref()
+                .is_none_or(|format| matches!(format, ResponseFormat::Text)),
+            "grammar conflicts with response_format; supply only a grammar or a JSON response format"
+        );
+        anyhow::ensure!(
+            !matches!(
+                self.tool_choice,
+                Some(ToolChoice::Mode(ToolChoiceMode::Required) | ToolChoice::Specific(_))
+            ),
+            "grammar conflicts with forced tool_choice; use grammar with tool_choice auto/none or omit grammar"
+        );
+        anyhow::ensure!(
+            self.extensions.get("ignore_eos") != Some(&serde_json::Value::Bool(true)),
+            "grammar cannot be combined with ignore_eos=true; allow grammar completion to terminate the generation"
+        );
+        if grammar.starts_with("%llguidance") {
+            let max_bytes = onnx_genai_engine::GenerateOptions::default().max_constraint_bytes;
+            anyhow::ensure!(
+                grammar.len() <= max_bytes,
+                "raw Lark grammar exceeds its {max_bytes}-byte budget; shorten grammar"
+            );
+            // Vocabulary-aware parsing runs during request preparation, before SSE.
+            return Ok(());
+        }
+        onnx_genai_engine::gbnf::validate_gbnf(
+            grammar,
+            onnx_genai_engine::GenerateOptions::default().max_constraint_bytes,
+        )
+    }
+
     pub(crate) fn continuation_mode(&self) -> ChatContinuation {
         match self.continue_final_message {
             ChatContinuation::Auto => {
@@ -423,9 +482,8 @@ impl ChatCompletionRequest {
                         .as_ref()
                         .map(|content| content.text())
                         .unwrap_or_default();
-                    onnx_genai_engine::JsonConstraint::new(prefix).map_err(|error| {
-                        anyhow::anyhow!("continue_final_message JSON prefix rejected: {error}")
-                    })?;
+                    onnx_genai_engine::validate_json_prefix(&prefix)
+                        .context("continue_final_message JSON prefix rejected")?;
                 }
             }
         }

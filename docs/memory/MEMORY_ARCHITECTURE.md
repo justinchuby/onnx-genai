@@ -103,6 +103,15 @@ does not refund those bytes. Idle capacity can be reclaimed under pressure.
 Pending asynchronous work, active readers and capture pins prevent reuse, and
 quarantined backing retains its charge until physical release is settled.
 
+The canonical `workspace_requirement(inputs, outputs)` hook describes the views
+that the kernel will actually receive after graph lowering. Output facts retain
+present/absent positions and distinguish unresolved geometry from a known scalar.
+Planning uses the same physical-versus-logical shape rule as dispatch. Output
+capacity, dtype and presence participate in workspace plan caches; external
+binding geometry and strides also invalidate session preparation. A known backing
+capacity alone must not invent an unresolved logical output extent. Output facts
+contain no storage pointer or new owner and require no separate quota protocol.
+
 The EP contract remains metadata planning plus an exclusive workspace borrow;
 common runtime ownership handles admission and pooling. Internal bank partitioning
 is an EP implementation detail, not a collection of separately charged resources.
@@ -111,9 +120,259 @@ the provider supplies backing and completion evidence. Providers do not need
 per-kernel budgets, private scratch pools, or a second quota ledger. Context
 retirement guards, asynchronous settlement and capture pins remain separate
 contracts rather than one retention flag.
-Keep release/replacement settlement contracts for asynchronous providers. Further
-run-boundary pooling optimization requires evidence of overhead; request lifetime
-must not implicitly pin a prefill-sized lane throughout decode.
+A successful request that actually synchronizes and validates its device work
+can return its step workspace to one reclaimable idle cell per executor lane.
+The next fitting run takes back the same owner and original charge. The provider
+opts in by exposing its existing workspace authority's pressure registry through
+`workspace_pressure_registry`; registration is cold and does not create a holder,
+budget or provider-private pool. Without that capability, the executor preserves
+its normal provider retirement path. Zero requirements do not enroll or allocate.
+
+Pressure removes only idle owners and invokes the original provider release path
+outside the cell lock. It may wait for allocation-specific settlement on that cold
+path; only verified release reports the retired authority charge. Active and
+capture-referenced owners never enter the idle cell. Pending device-binding runs
+continue through provider deferred retirement, so zero warm issuer calls are not
+claimed for that path. No per-token completion synchronization is added.
+
+Pending reuse needs a completion proof, not another allocation API. CUDA's
+`begin_device_validation` rejects an outstanding coordinator generation, but a
+successful begin overwrites the old owner slot: it cannot serve as a receipt for
+the previous generation's validation flags. The generic provider default also
+has no such completion guarantee. Consuming a still-pending validation token can
+perform device work, so polling through the consuming operation would introduce
+a new completion boundary. Binding reads consume validation after the existing
+host-transfer boundary, but do not currently publish a generation-specific
+completion receipt back to the executor.
+
+A future reuse change must expose the same generation's completed-and-clean
+receipt before replacing it, preserve failed outcomes, and leave unresolved work
+outside pressure-reclaimable idle storage. It must cover cross-binding and
+cross-executor isolation, stale generations, partial and zero-byte reads, errors,
+and teardown without adding synchronization to the fitting warm path. Until
+then, keep deferred retirement and retain GQA's persistent capacity; do not infer
+completion from DeviceId, a default fence, successful begin, or a prior binding
+read alone.
+
+Installed capture addresses also prevent workspace replacement: preparation or
+runtime refinement that needs larger capacity or alignment must first retire all
+referencing graph slots. This preserves the old owner on refusal. Host contracts
+cover the ownership, pressure and failure paths; CUDA execution and throughput
+still require a device runner.
+
+### ORT persistent workspace adapter
+
+The ORT adapter serves `StepScoped` workspace from ORT scratch and nonzero
+`SessionPersistent` workspace from the original provider only after explicit
+execution-domain registration. Unknown ordering is an actionable error, never
+`None` or a downgrade to ORT scratch. Compiled info and each compute state retain
+the provider independently. Facade release cannot shut down an owned provider
+before those references end; kernel resources drop before the final reference.
+Shared factory owners retain their existing teardown policy.
+
+One exclusive workspace lane belongs to each `ComputeState`. Sequential nodes
+borrow the same retained peak; coexisting states own independent backing.
+Because `Kernel` requires `Send`, not `Sync`, a compiled-info execution lock also
+serializes host calls from different states sharing those kernels. The lock order
+is compiled info then state; kernel panic poisons the shared info for all states.
+These host locks do not establish device completion. Fitting
+requests make no provider or issuer calls. Growth preserves both capacity and
+alignment high-water marks using the existing consuming `replace_workspace`;
+teardown releases through the original provider. Failed replacement cannot
+resurrect a consumed owner or refund unsettled storage. Any failed Compute
+retires its lane, and a panic poisons its host lock, preventing later submissions.
+No per-node pool, quota ledger or new kernel resource protocol is added.
+
+Host exclusivity does not prove device ordering. The unsafe factory registration
+contract requires synchronous completion or a fixed ordered execution domain
+covering all workspace uses, including dependencies from helper streams and error
+paths. Built-in CPU and CUDA plugins register explicitly. CUDA binds the proof
+and its preflight closure to the same constructed runtime and compute stream.
+Before uploads or execution, once per Compute, the closure queries the actual
+stream capture state and rejects active/unknown capture: ORT external graphs do
+not yet carry caller-workspace pins. This is a driver status query, not a device
+synchronization or provider/issuer call; its GPU performance cost is unmeasured.
+CPU requires no preflight callback. Provider settlement remains mandatory for
+growth and release even when device submissions are ordered.
+
+The adapter does not enroll retained state lanes in a new pressure responder.
+Shared-provider locking stays confined to backing creation/replacement/release,
+outside ORT callbacks. A responder that reentered that mutex during allocation
+would deadlock; idle-state pressure reclamation needs a release capability that
+does not reenter the outer mutex. State teardown returns backing to the existing
+provider path, whose retained physical pool stays charged until actual release.
+Host C ABI tests use real governed backing, zero-byte issuer positive controls,
+serial peak reuse, failure retirement and preflight refusal. They do not prove
+CUDA execution, asynchronous ordering, capture behavior or throughput.
+
+### Workspace capture ownership
+
+The canonical owned-capture hook accepts caller resources alongside kernels.
+At each capture segment, the executor obtains real `OwnedView` pins from its
+binding-owned workspace lanes; it does not create a pin during normal inference.
+The installed graph retains those pins, and premature owner release remains
+refused while any segment references the allocation. Growth and pressure
+retirement still require graph retirement first; refusal or quarantine is not
+used as a normal release sequence.
+
+A workspace resource carries a private span derived through binding validation,
+including the provider-context identity. Arbitrary tokens cannot grant workspace
+coverage. CUDA combines caller and kernel resources once and validates all their
+workspace contexts before beginning capture. One active resource registry retains
+the same real resource Arcs as the graph lifecycle. Providers that do not retain
+caller resources explicitly refuse the capture rather than dropping pins.
+
+Raw workspace has no transferable binding ownership and is refused at this
+capture boundary. Inherited child views cannot manufacture a parent owner;
+independent capture must be driven by the executor that owns the backing. Current
+child execution remains scoped execution through the parent's live workspace.
+This bridge adds no allocator, pool, quota ledger, or warm inference callback.
+GQA below now consumes this ownership bridge for its complete borrowed composite.
+
+### CUDA MHA and shared Phase-2a temporary storage
+
+MultiHeadAttention borrows one SessionPersistent composite for query/output BNSH
+staging, temporary hidden K/V, additive mask, padding upload, and Phase-2a
+scores/BLAS. Regions are offsets in one allocation. Declared optional output
+positions and supplied output metadata must agree before present K/V replace
+temporary buffers; known output shapes/dtypes are validated identically during
+planning and execution. Unresolved output shape does not change the bound, which
+comes from input geometry and compiled output presence.
+
+Retention keeps the same funded peak available for fitting device-binding runs,
+including when the existing synchronization policy defers completion. The policy
+is not a completion receipt. Provider fences and settlement still govern growth
+and release; uncertain backing remains charged. Capture stays unsupported, and
+the host padding mask remains an owned Vec outside device workspace accounting.
+
+All three shared Phase-2a callers now pass checked, borrowed scratch. The engine
+validates score capacity against actual invocation geometry before its first
+launch; no raw allocation/free fallback or runtime-private shared BLAS allocation
+remains. A failed synchronous legacy upload latches an additional legacy-stream
+release fence; normal releases retain their existing compute/copy pair. Host
+contracts and Rust GPU-target compilation do not establish CUDA numerical parity,
+actual asynchronous failure behavior or performance.
+
+### CUDA GQA temporary storage
+
+GQA uses one prepared composite for packed staging, Q/output transposes,
+reference/general-half attention scratch, and omitted KV destinations. These
+large temporary regions have no private raw-allocation fallback. Hidden K/V
+share the physical capacity of any visible sibling; if neither is visible,
+the input-derived length bound funds both. Every region is checked against the
+complete admitted backing before metadata preparation starts. This introduces
+no additional authority, pool, or issuer callback in dispatch.
+
+The three sequence metadata arrays occupy the composite's final checked group:
+`align256(previous_regions) + max(3 * batch * sizeof(i32), 1)` bytes in total.
+There is no GQA private allocation or graph-resource factory. The kernel retains
+only capture-signature facts. Capture requires one registered actual owner span
+to cover the entire used invocation view, rather than just the metadata start
+or the unused larger lane capacity. Empty windows retain their funded backing.
+Readback tests borrow the caller's owner and exact invocation requirement; no
+raw workspace pointer is cached in the kernel.
+
+Capacity remains SessionPersistent while deferred device-binding requests can
+return Pending. Switching to per-step retirement there could force allocation
+and admission on each token even when the shape fits. Scratch contents are
+call-local, but retaining physical capacity is a separate policy. This migration
+does not add per-token synchronization, issuer calls, or a new pool. CUDA capture,
+allocation and throughput validation still require a device runner.
+
+Dedicated split-K f32/f16/bf16 partial states now occupy a route-selected region
+of this same composite, with the shared checked bound
+`min(batch * heads * query_seq, row_cap) * max_splits * (head_dim + 2) * 4` bytes.
+The old fixed module-global declarations are removed. Row-cap fallback remains
+per-row: early rows use partials and later rows write direct output. The budget
+therefore does not become zero merely because total rows exceed the cap. It
+reserves all split columns, including a one-split invocation when direct output
+is disabled. Host and NVRTC limits are emitted from one definition, and the
+partial/merge arguments share the same borrowed backing. No extra pool, quota
+transaction, or per-launch allocation is introduced.
+
+### CUDA quantized MatMul prefill temporary storage
+
+The portable FP16 RMSNorm, gate/up, and combined prefill paths borrow three
+checked regions from the existing prepared workspace: normalized activation,
+gate output, and the maximum reachable BLAS plan. Normalization uses `M*K*2`
+bytes when its fallback is reachable; gate output uses `M*N*2`. All region starts
+use the existing BLAS alignment. Combined RMSNorm/gate-up lifetimes overlap, so
+these sizes add rather than replace one another. Serial projections share only
+the BLAS region. BF16 staging enters the same half dispatch and uses this layout.
+
+Planning funds the portable fallback even when a Marlin/dequant fast path may
+succeed. The row-loop classifier is shared with execution; single-token, empty,
+and guaranteed looped decode do not gain prefill scratch or runtime BLAS-plan
+queries. No private allocation/free fallback remains in the three portable
+prefill helpers. A full composite borrow is validated before submitted work, and
+BLAS receives only its region. Launch-error retirement belongs to the original
+caller owner, including pending work and capture pins. Existing SessionPersistent
+capacity policy remains, with no new pool, quota interface or per-step issuer call.
+Ordinary empty half outputs now return before the single-row decode launch.
+
+The separate immutable BF16 conversion backing, Marlin caches and generic
+f32 dequantized weights remain distinct ownership domains. Dynamic BF16 staging
+now joins this same composite as described below. Portable prefill capture
+eligibility remains conservative. Host layout checks and GPU-target compilation
+do not validate device arithmetic, asynchronous failure ordering or throughput.
+
+### CUDA quantized MatMul BF16 staging
+
+Dynamic BF16-to-FP16 inputs and the intermediate FP16 result now use the same
+prepared workspace as normalization, gate output and BLAS. The fixed composite
+keeps each present dynamic input in a disjoint aligned region, with one result
+region; all may coexist with the prefill regions. Checked element counts and
+layouts replace the private per-kernel arena, capacity counter, mutex and used
+flag. Runtime metadata, converted-input views and scale-cache lookup results use
+fixed arrays rather than per-call heap vectors. Capacity retains the existing
+SessionPersistent policy, so fitting warm calls do not negotiate another grant.
+
+Presence precedes dtype and shape: an absent BF16 optional keeps its null slot
+and never becomes a conversion target, while a present scalar still has one
+element. Persistent scale conversions require the existing per-input constant
+proof. Ordinary input 2 and fused gate/up inputs 2/4 are checked independently;
+unproven scales are converted each invocation. Immutable scale backing remains
+a separate cache owner, and its existing layout now uses checked aligned bounds.
+
+Staged execution enters the shared FP16 dispatcher with the already-bound
+prefill parts, without restarting call initialization or reinterpreting the whole
+workspace. The kernel retains no dynamic staging owner or pointer. Capture
+requires an actual registered caller-owner span covering the entire used
+composite before the first cache fill or cast; immutable-cache pins cannot
+substitute for dynamic staging coverage. Graph retirement precedes caller
+workspace retirement, and partial submission errors retain the original
+provider's deferred-release/settlement contract. BF16_DIRECT_OUT restoration
+remains before error propagation.
+
+The immutable conversion cache, Marlin caches and generic f32 dequantized weights
+still require separate governed-ownership work. This migration adds no pool,
+quota protocol or public EP trait hook. The generic ORT adapter now serves
+nonzero SessionPersistent requests through its registered state-owned lane;
+see the [adapter contract](#ort-persistent-workspace-adapter). Native sessions
+and explicit workspace callers retain their existing ownership paths. Device numerical, capture and
+throughput validation remain pending; Host contracts and target compilation
+cannot prove them.
+
+### CUDA variadic Sum/Mean temporary storage
+
+Sum/Mean use one prepared workspace with two checked regions: an f32 accumulator
+for the broadcast output and all inputs' shape/stride metadata. Metadata slices
+are offsets into that owner, not separately admitted allocations. The bound is
+`output_numel * sizeof(f32)`, aligned for the following
+`inputs * output_rank * 2 * sizeof(u64)` bytes. Empty outputs need no workspace;
+scalar metadata has zero words. Layout overflow and incomplete backing fail before
+upload or launch.
+
+A single host pack/upload precedes every accumulation launch. This preserves
+input summation order and f32 accumulation for half inputs while removing the
+per-input allocation/upload loop. The kernel no longer synchronizes merely to
+free temporary buffers; normal executor ownership and deferred retirement cover
+successful and failed launches. Capacity is SessionPersistent to avoid admission
+churn on deferred device-binding requests. Contents remain invocation-local.
+Synchronous metadata upload still drains prior compute once, and capture remains
+explicitly unsupported until metadata preparation has a capture-safe contract.
+No new pool, quota interface or issuer callback is introduced in execution.
+CUDA numerical, asynchronous-failure and throughput validation require a device.
 
 ### CPU compressed-projection scratch
 
@@ -211,6 +470,13 @@ when in fact it is 1955 lines.
 | Paged attention (vLLM-style) | — | **not built, and not the plan** | Verified against the tree: `block_table` does not appear in any CUDA attention kernel. `GroupQueryAttention` takes `past_key`/`past_value` as ordinary contiguous tensors and `CompressedSparseAttention` reads a flat pointer with a computed stride, so there is no input through which a page index could be passed. Making every kernel walk a block table cannot be made uniform across backends — we do not own ORT's kernels — so vAttention-style commit-on-demand under a contiguous virtual range is the chosen route instead (#656) |
 
 ### CUDA raw allocation audit (#736, 2026-08-10)
+
+The dated audit and measurements below preserve historical evidence. The current
+GQA, quantized MatMul prefill/BF16 staging, and variadic Sum/Mean contracts above
+supersede their old private-scratch and fallback descriptions. GQA now requires
+prepared backing for sequence metadata as well as its other temporary regions;
+MatMul dynamic BF16 staging and portable half-prefill no longer own raw scratch.
+
 
 Updated through #736 (default-domain `Attention` staged K/V) on 2026-08-12.
 

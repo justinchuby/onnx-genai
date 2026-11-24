@@ -238,7 +238,7 @@ impl Engine {
         self.require_workflow_execution_admitted()?;
         // Fail closed on the exact declared protocol before scheduler
         // admission, workflow session binding, or specialized driver state.
-        let _ = self.tool_call_observer(&request.tool_call_policy)?;
+        let _ = self.tool_call_observer(&request.tool_call_policy, &request.request.options)?;
         // A request that binds no tensors is a prompt, and a prompt is served
         // by the ordinary entry point — which admits through the scheduler,
         // reuses a cached prefix, and routes the declared decode step to the
@@ -360,7 +360,15 @@ impl Engine {
         }
         let options = request.request.options.clone();
         let tokenizer = runtime.package_tokenizer();
-        let mut observer = self.tool_call_observer(&request.tool_call_policy)?;
+        if !options.effective_preserved_tokens().is_empty() || options.response_projection.is_some()
+        {
+            options.validate_preserved_tokens(
+                tokenizer.context("preserved_tokens requires a declared package tokenizer")?,
+            )?;
+        }
+
+        let mut observer =
+            self.tool_call_observer(&request.tool_call_policy, &request.request.options)?;
         if runtime.candidate_tree_diagnostic().is_some() {
             return runtime.run_candidate_tree_generation(
                 &options,

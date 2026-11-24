@@ -76,7 +76,10 @@ extern "C" __global__ void NAME(                                               \
         }                                                                       \
         acc += LOAD(weight[w_base + k]) * val;                                  \
       }                                                                         \
-      if (activation == 1) acc = ccws_silu(acc);                                \
+      if (activation != 0) {                                                   \
+        if (activation == 2) acc = LOAD(STORE(acc));                            \
+        acc = ccws_silu(acc);                                                   \
+      }                                                                        \
       y[x_base + t] = STORE(acc);                                               \
     }                                                                           \
     if (has_present) {                                                          \
@@ -142,8 +145,8 @@ pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Opti
             ));
         }
     }
-    for index in 2..input_dtypes.len() {
-        if input_dtypes[index] != input_dtypes[0] {
+    for (index, dtype) in input_dtypes.iter().enumerate().skip(1) {
+        if !(index >= 2 && *dtype == DataType::Undefined) && *dtype != input_dtypes[0] {
             return Some(format!(
                 "CausalConvWithState input {index} dtype {:?} must match x dtype {:?}",
                 input_dtypes[index], input_dtypes[0]
@@ -177,6 +180,7 @@ impl KernelFactory for CausalConvWithStateFactory {
         Ok(Box::new(CausalConvWithStateKernel {
             runtime: self.runtime.clone(),
             activation,
+            standard: node.is_default_domain(),
         }))
     }
 }
@@ -185,6 +189,7 @@ impl KernelFactory for CausalConvWithStateFactory {
 pub struct CausalConvWithStateKernel {
     runtime: Arc<CudaRuntime>,
     activation: ConvActivation,
+    standard: bool,
 }
 
 impl std::fmt::Debug for ConvActivation {
@@ -312,7 +317,7 @@ impl Kernel for CausalConvWithStateKernel {
         }
 
         let rows = batch * channels;
-        if rows == 0 || length == 0 {
+        if rows == 0 || (length == 0 && (!has_present || pad == 0)) {
             return Ok(());
         }
 
@@ -353,7 +358,15 @@ impl Kernel for CausalConvWithStateKernel {
         let has_bias = i32::from(bias.is_some());
         let has_state = i32::from(state.is_some());
         let has_present_flag = i32::from(has_present);
-        let activation = i32::from(self.activation == ConvActivation::Silu);
+        let activation = if self.activation == ConvActivation::Silu {
+            if self.standard && dtype != DataType::Float32 {
+                2
+            } else {
+                1
+            }
+        } else {
+            0
+        };
 
         let grid = u32::try_from(rows.div_ceil(BLOCK as usize))
             .unwrap_or(u32::MAX)

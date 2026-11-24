@@ -83,6 +83,12 @@ pub fn register(reg: &mut InferenceRegistry) {
         1,
         split_gather::affine_gather,
     );
+    reg.register(
+        onnx_runtime_ir::RUNTIME_DOMAIN,
+        onnx_runtime_ir::dequantize_packed_gather::OP,
+        1,
+        split_gather::dequantize_packed_gather,
+    );
     reg.register("", "Transpose", 1, transpose);
     reg.register("", "Reshape", 1, reshape);
     reg.register("", "Flatten", 1, flatten);

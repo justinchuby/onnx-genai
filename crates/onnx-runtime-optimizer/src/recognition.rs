@@ -13,7 +13,11 @@ use crate::{OptimizerError, Result};
 pub static SILU_DECOMPOSITION: LazyLock<RecognitionRule> = LazyLock::new(|| {
     RecognitionRule::parse(
         "SiLU decomposition",
-        "(x) => { sigmoid=Sigmoid(x); out=Mul(x,sigmoid)|Mul(sigmoid,x); return out }",
+        "(x) => {
+            sigmoid = Sigmoid(x)
+            out = Mul(x, sigmoid) | Mul(sigmoid, x)
+            return out
+        }",
         "sigmoid",
     )
     .expect("built-in SiLU pattern must compile; fix its textual definition")
@@ -23,9 +27,9 @@ pub static SILU_DECOMPOSITION: LazyLock<RecognitionRule> = LazyLock::new(|| {
 pub static MATMUL_NBITS_BIAS: LazyLock<RecognitionRule> = LazyLock::new(|| {
     RecognitionRule::parse(
         "MatMulNBits bias",
-        "(args:slots[0:*],bias) => {
-            projection=com.microsoft.MatMulNBits(...args);
-            out=Add(projection,bias)|Add(bias,projection);
+        "(args:slots[0:*], bias) => {
+            projection = com.microsoft.MatMulNBits(...args)
+            out = Add(projection, bias) | Add(bias, projection)
             return out
         }",
         "out",
@@ -53,10 +57,12 @@ pub fn capture_node(matched: &Match<'_>, name: &str) -> std::result::Result<Node
     })
 }
 
-/// A compile-once native textual rule with an explicit traversal anchor.
+/// A compile-once rule with an explicit traversal anchor.
 ///
 /// The anchor need not be the pattern's last operator. This preserves a
 /// provider's existing rewrite order while the IR engine recognizes the DAG.
+/// Prefer readable text in a `LazyLock` for fixed built-ins; use
+/// [`Self::from_pattern`] for generated/composed typed definitions.
 #[derive(Clone, Debug)]
 pub struct RecognitionRule {
     name: String,
@@ -65,11 +71,14 @@ pub struct RecognitionRule {
 }
 
 impl RecognitionRule {
+    /// Compile fixed declarative native text and resolve its traversal anchor.
+    /// Cache built-ins once rather than parsing during graph traversal.
     pub fn parse(name: &str, text: &str, anchor: &str) -> Result<Self> {
         let pattern = Pattern::parse_native(text)?;
         Self::from_pattern(name, pattern, anchor)
     }
 
+    /// Wrap an already compiled pattern, including a generated typed definition.
     pub fn from_pattern(name: &str, pattern: Pattern, anchor: &str) -> Result<Self> {
         let anchor = pattern.value_capture(anchor)?;
         Ok(Self {
@@ -81,6 +90,16 @@ impl RecognitionRule {
 
     pub fn is_anchor_candidate(&self, node: &onnx_runtime_ir::Node) -> bool {
         self.anchor.is_producer_candidate(node)
+    }
+
+    /// Match a component structurally; the caller checks the assembled rewrite
+    /// boundary once all components and retained outputs are known.
+    pub(crate) fn match_component_at<'g>(
+        &self,
+        session: &MatchSession<'g>,
+        root: NodeId,
+    ) -> std::result::Result<Option<Match<'g>>, PatternError> {
+        session.match_at(&self.pattern, root, MatchOptions::default())
     }
 
     /// Visit deterministic closed-region matches using a prepared graph index.

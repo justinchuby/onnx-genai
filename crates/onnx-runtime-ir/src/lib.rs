@@ -49,6 +49,7 @@
 pub mod affine_gather;
 mod arena;
 pub mod dequantize_packed;
+pub mod dequantize_packed_gather;
 mod device;
 mod domain;
 mod dtype;
@@ -57,8 +58,10 @@ mod error;
 mod graph;
 mod graph_view;
 mod layout;
+pub mod linear_attention;
 mod node;
 pub mod onnx;
+pub mod opset26;
 pub mod packed_matmul;
 pub mod packed_routed;
 pub mod pattern;

@@ -526,68 +526,14 @@ impl LogitProcessor for ConstraintProcessor {
     }
 }
 
-/// Character-level JSON grammar constraint.
-///
-/// This validates the generated prefix plus each candidate token and only allows
-/// tokens that keep the prefix valid and completable. EOS is allowed only after
-/// a complete, balanced JSON value. JSON Schema uses the llguidance recognizer.
-#[derive(Debug, Clone, Default)]
-pub struct JsonConstraint {
-    prefix: String,
-}
-
-impl JsonConstraint {
-    /// Seed the recognizer with existing output, leaving new-token history separate.
-    pub fn new(prefix: String) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            Self::prefix_is_valid(&prefix),
-            "JSON constraint prefix is not a valid partial JSON value; continue a syntactically valid JSON prefix or omit constrained JSON output"
-        );
-        Ok(Self { prefix })
-    }
-
-    pub fn prefix_is_valid(text: &str) -> bool {
-        JsonPrefixParser::parse(text).is_ok()
-    }
-
-    pub fn is_complete(text: &str) -> bool {
-        JsonPrefixParser::parse(text).is_ok_and(|parser| parser.is_complete())
-    }
-}
-
-impl Constraint for JsonConstraint {
-    fn allowed_next_tokens(
-        &self,
-        context: &ProcessorContext,
-        candidates: &[TokenCandidate],
-    ) -> anyhow::Result<Vec<bool>> {
-        let generated = if self.prefix.is_empty() {
-            std::borrow::Cow::Borrowed(context.generated_text.as_str())
-        } else {
-            std::borrow::Cow::Owned(format!("{}{}", self.prefix, context.generated_text))
-        };
-        let complete = Self::is_complete(&generated);
-        Ok(candidates
-            .iter()
-            .map(|candidate| {
-                if candidate.is_eos {
-                    return complete;
-                }
-
-                if candidate.text.is_empty() {
-                    return false;
-                }
-                let mut next = String::with_capacity(generated.len() + candidate.text.len());
-                next.push_str(&generated);
-                next.push_str(&candidate.text);
-                Self::prefix_is_valid(&next)
-            })
-            .collect())
-    }
-
-    fn name(&self) -> &str {
-        "json_constraint"
-    }
+/// Validate an existing prefix as JSON syntax before model-aware admission.
+/// Schema recognition and token masks use the shared byte-oriented constraint.
+pub fn validate_json_prefix(text: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        JsonPrefixParser::parse(text).is_ok(),
+        "JSON constraint prefix is not a valid partial JSON value; continue a syntactically valid JSON prefix or omit constrained JSON output"
+    );
+    Ok(())
 }
 
 /// Existing output could not be admitted into a requested grammar.
@@ -597,7 +543,7 @@ impl Constraint for JsonConstraint {
 )]
 pub struct ConstraintPrefixError {
     #[source]
-    source: anyhow::Error,
+    pub(crate) source: anyhow::Error,
 }
 
 /// llguidance-backed grammar constraint for JSON Schema, regex, and Lark grammars.
@@ -607,6 +553,7 @@ pub struct ConstraintPrefixError {
 /// unchanged while still using llguidance's compute-mask/commit-token loop.
 pub struct LlguidanceConstraint {
     kind: GrammarConstraintKind,
+    completion_only_eos: Option<Vec<TokenId>>,
     sampled_vocab_size: usize,
     inner: Mutex<LlguidanceState>,
 }
@@ -618,6 +565,13 @@ struct LlguidanceState {
 }
 
 impl LlguidanceConstraint {
+    /// GBNF endings terminate only at a completed root, even when a token
+    /// wildcard's lexeme mask also contains the EOS token ID.
+    pub(crate) fn with_completion_only_eos(mut self, endings: Vec<TokenId>) -> Self {
+        self.completion_only_eos = Some(endings);
+        self
+    }
+
     pub fn from_hf_tokenizer(
         kind: GrammarConstraintKind,
         grammar: &str,
@@ -680,7 +634,7 @@ impl LlguidanceConstraint {
         Self::from_token_bytes(kind, grammar, token_bytes, endings, &value_prefix)
     }
 
-    fn from_token_bytes(
+    pub(crate) fn from_token_bytes(
         kind: GrammarConstraintKind,
         grammar: &str,
         mut token_bytes: Vec<Vec<u8>>,
@@ -776,6 +730,7 @@ impl LlguidanceConstraint {
         }
         Ok(Self {
             kind,
+            completion_only_eos: None,
             sampled_vocab_size,
             inner: Mutex::new(LlguidanceState {
                 initial: constraint.deep_clone(),
@@ -837,6 +792,16 @@ impl Constraint for LlguidanceConstraint {
                     "{} history token {token} at offset {offset} continues after the grammar completed; truncate the stale suffix or start a new generation",
                     self.name()
                 );
+                if self
+                    .completion_only_eos
+                    .as_ref()
+                    .is_some_and(|endings| endings.contains(&token))
+                {
+                    anyhow::ensure!(
+                        inner.constraint.parser.is_accepting(),
+                        "GBNF history ending token {token} at offset {offset} precedes root completion; discard the invalid history suffix or start a new generation"
+                    );
+                }
                 let commit = inner
                     .constraint
                     .commit_token(Some(token))
@@ -872,12 +837,19 @@ impl Constraint for LlguidanceConstraint {
                     })
                     .collect());
             }
+            let eos_allowed =
+                self.completion_only_eos.is_none() || inner.constraint.parser.is_accepting();
             let mask=step.sample_mask.as_ref().with_context(||format!("{} returned neither a stop nor a sampling mask; use a grammar compatible with ordinary token sampling",self.name()))?;
             Ok(candidates
                 .iter()
                 .map(|candidate| {
                     let idx = candidate.token_id as usize;
-                    idx < self.sampled_vocab_size && idx < mask.len() && mask.get(idx)
+                    idx < self.sampled_vocab_size
+                        && if self.completion_only_eos.is_some() && candidate.is_eos {
+                            eos_allowed
+                        } else {
+                            idx < mask.len() && mask.get(idx)
+                        }
                 })
                 .collect())
         })();
@@ -1029,21 +1001,6 @@ impl JsonPrefixParser {
             parser.consume(ch)?;
         }
         Ok(parser)
-    }
-
-    fn is_complete(&self) -> bool {
-        let mut parser = self.clone();
-        match parser.mode {
-            Mode::Normal => {}
-            Mode::Number(state) if state.is_complete() => {
-                parser.mode = Mode::Normal;
-                if parser.finish_value().is_err() {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
-        parser.stack.is_empty() && parser.root_complete
     }
 
     fn consume(&mut self, ch: char) -> Result<(), ()> {
@@ -4726,12 +4683,46 @@ mod tests {
         ]
     }
 
+    fn json_processor(
+        texts: Vec<Option<String>>,
+        eos: TokenId,
+        prefix: &str,
+    ) -> ConstraintProcessor {
+        let vocab = texts
+            .iter()
+            .enumerate()
+            .map(|(id, text)| {
+                (
+                    if id == eos as usize {
+                        "<eos>".to_string()
+                    } else {
+                        text.clone().unwrap()
+                    },
+                    serde_json::json!(id),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let config = serde_json::json!({"version":"1.0", "added_tokens":[{"id":eos,"content":"<eos>","special":true,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false}],
+            "decoder":{"type":"ByteFallback"}, "model":{"type":"BPE","vocab":vocab,"merges":[],"byte_fallback":true,"unk_token":null}});
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("tokenizer.json");
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let tokenizer = onnx_genai_ort::Tokenizer::from_file(path).unwrap();
+        let constraint = crate::response_constraint::ContentConstraint::json_schema(
+            &tokenizer,
+            &serde_json::Value::Bool(true),
+            crate::text_projection::ProjectionKind::Plain,
+            prefix,
+            4096,
+            vec![eos],
+            &Default::default(),
+        )
+        .unwrap();
+        ConstraintProcessor::new(Box::new(constraint), texts, vec![eos])
+    }
+
     fn generate_scripted_json(script: &[TokenId], eos_token_id: TokenId) -> String {
-        let processor = ConstraintProcessor::new(
-            Box::new(JsonConstraint::default()),
-            json_token_texts(),
-            vec![eos_token_id],
-        );
+        let processor = json_processor(json_token_texts(), eos_token_id, "");
         let mut generated_text = String::new();
         let mut generated_tokens = Vec::new();
 
@@ -5414,16 +5405,12 @@ payload: %json {"type":"object","properties":{"n":{"const":1}},"required":["n"],
     #[test]
     fn json_continuation_prefix_controls_initial_and_complete_masks() {
         assert!(
-            JsonConstraint::new("not JSON".into())
+            validate_json_prefix("not JSON")
                 .unwrap_err()
                 .to_string()
                 .contains("valid partial JSON")
         );
-        let processor = ConstraintProcessor::new(
-            Box::new(JsonConstraint::new("{\"a\":".into()).unwrap()),
-            json_token_texts(),
-            vec![14],
-        );
+        let processor = json_processor(json_token_texts(), 14, "{\"a\":");
         let mut logits = vec![0.0; json_token_texts().len()];
         processor
             .process(&mut logits, &ProcessorContext::default())
@@ -5437,6 +5424,7 @@ payload: %json {"type":"object","properties":{"n":{"const":1}},"required":["n"],
                 &mut logits,
                 &ProcessorContext {
                     generated_text: "1}".into(),
+                    generated_tokens: vec![5, 6],
                     ..Default::default()
                 },
             )
@@ -5447,11 +5435,7 @@ payload: %json {"type":"object","properties":{"n":{"const":1}},"required":["n"],
 
     #[test]
     fn grammar_has_no_finite_candidate_returns_an_actionable_error_before_selection() {
-        let processor = ConstraintProcessor::new(
-            Box::new(JsonConstraint::default()),
-            vec![Some("word".into()), Some("<eos>".into())],
-            vec![1],
-        );
+        let processor = json_processor(vec![Some("word".into()), Some("<eos>".into())], 1, "");
         let error = processor
             .process(&mut [1.0, 2.0], &ProcessorContext::default())
             .unwrap_err()
@@ -5467,11 +5451,7 @@ payload: %json {"type":"object","properties":{"n":{"const":1}},"required":["n"],
 
     #[test]
     fn json_constraint_masks_invalid_tokens_and_allows_eos_only_when_complete() {
-        let processor = ConstraintProcessor::new(
-            Box::new(JsonConstraint::default()),
-            json_token_texts(),
-            vec![14],
-        );
+        let processor = json_processor(json_token_texts(), 14, "");
 
         let mut logits = vec![0.0; json_token_texts().len()];
         logits[6] = 10.0;
@@ -5485,6 +5465,7 @@ payload: %json {"type":"object","properties":{"n":{"const":1}},"required":["n"],
 
         let complete_context = ProcessorContext {
             generated_text: "{\"a\":1}".to_string(),
+            generated_tokens: vec![1, 2, 3, 4, 5, 6],
             ..Default::default()
         };
         let mut complete_logits = vec![0.0; json_token_texts().len()];
@@ -5504,7 +5485,6 @@ payload: %json {"type":"object","properties":{"n":{"const":1}},"required":["n"],
             vec![13, 14],
         ] {
             let text = generate_scripted_json(&script, 14);
-            assert!(JsonConstraint::is_complete(&text), "{text}");
             assert!(
                 serde_json::from_str::<serde_json::Value>(&text).is_ok(),
                 "{text}"

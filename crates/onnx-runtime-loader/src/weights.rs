@@ -632,6 +632,10 @@ impl WeightStore {
         self.mmap_file(path.as_ref())
     }
 
+    pub(crate) fn mapped_file_bytes(&self, path: &Path) -> Option<&[u8]> {
+        Some(&self.mmaps.get(path)?.mmap)
+    }
+
     /// Resolve a weight descriptor to its raw little-endian bytes.
     ///
     /// For inline weights this borrows the stored bytes; for external weights
@@ -798,7 +802,17 @@ pub fn load_weights(
     model_dir: &Path,
     name_map: &HashMap<String, ValueId>,
 ) -> Result<WeightStore, LoaderError> {
+    load_weights_with_keyed_files(model, model_dir, name_map, &[])
+}
+
+pub(crate) fn load_weights_with_keyed_files(
+    model: &ModelProto,
+    model_dir: &Path,
+    name_map: &HashMap<String, ValueId>,
+    files: &[crate::KeyedWeightFile],
+) -> Result<WeightStore, LoaderError> {
     let mut store = WeightStore::new();
+    let mut keyed = crate::keyed_weights::KeyedWeights::load(files, &mut store)?;
     let Some(graph) = model.graph.as_ref() else {
         return Ok(store);
     };
@@ -810,10 +824,16 @@ pub fn load_weights(
             // happens for malformed models.
             continue;
         };
-        let weight = resolve_initializer(&mut store, init, model_dir)?;
+        let weight = resolve_initializer(
+            &mut store,
+            init,
+            model_dir,
+            (!files.is_empty()).then_some(&mut keyed),
+        )?;
         store.weights.insert(vid, weight);
     }
 
+    keyed.finish()?;
     Ok(store)
 }
 
@@ -821,6 +841,7 @@ fn resolve_initializer(
     store: &mut WeightStore,
     init: &TensorProto,
     model_dir: &Path,
+    keyed: Option<&mut crate::keyed_weights::KeyedWeights>,
 ) -> Result<WeightRef, LoaderError> {
     let dtype =
         DataType::from_onnx(init.data_type).ok_or_else(|| LoaderError::UnsupportedDataType {
@@ -834,7 +855,35 @@ fn resolve_initializer(
     })).collect::<Result<_, _>>()?;
 
     if init.data_location == tensor_proto::DataLocation::External as i32 {
-        let weight = external_initializer_reference(init, dtype, dims, model_dir)?;
+        let fields = external_fields(init)?;
+        if let Some(keyed) = keyed
+            && fields.get("location").is_none_or(|value| value.is_empty())
+        {
+            for (&key, &value) in &fields {
+                if match key {
+                    "location" | "length" => false,
+                    "offset" => !value.is_empty() && value != "0",
+                    _ => true,
+                } {
+                    return Err(LoaderError::GraphBuild(format!(
+                        "keyed external initializer {:?}: unsupported external_data {key}={value:?}; omit the byte location and offset and let the container supply them",
+                        init.name
+                    )));
+                }
+            }
+            let weight = keyed.resolve(&init.name, dtype, dims)?;
+            if let Some(length) = external_number(init, &fields, "length")?
+                && let WeightRef::External { length: actual, .. } = weight
+                && length != actual
+            {
+                return Err(LoaderError::GraphBuild(format!(
+                    "keyed external initializer {:?}: declared length {length} differs from container length {actual}; omit or correct external_data length",
+                    init.name
+                )));
+            }
+            return Ok(weight);
+        }
+        let weight = ordinary_external_reference(init, dtype, dims, model_dir, &fields)?;
         let WeightRef::External {
             ref path,
             offset,
@@ -872,6 +921,11 @@ pub(crate) fn external_initializer_reference(
     dims: Vec<usize>,
     model_dir: &Path,
 ) -> Result<WeightRef, LoaderError> {
+    let fields = external_fields(init)?;
+    ordinary_external_reference(init, dtype, dims, model_dir, &fields)
+}
+
+fn external_fields(init: &TensorProto) -> Result<HashMap<&str, &str>, LoaderError> {
     let mut fields = HashMap::new();
     for field in &init.external_data {
         if fields
@@ -884,24 +938,39 @@ pub(crate) fn external_initializer_reference(
             )));
         }
     }
+    Ok(fields)
+}
+
+fn external_number(
+    init: &TensorProto,
+    fields: &HashMap<&str, &str>,
+    key: &str,
+) -> Result<Option<usize>, LoaderError> {
+    fields.get(key).map(|value| value.parse::<usize>().map_err(|_| {
+        LoaderError::GraphBuild(format!(
+            "external initializer {:?}: {key} {value:?} is not a nonnegative host-sized integer; repair external_data", init.name
+        ))
+    })).transpose()
+}
+
+fn ordinary_external_reference(
+    init: &TensorProto,
+    dtype: DataType,
+    dims: Vec<usize>,
+    model_dir: &Path,
+    fields: &HashMap<&str, &str>,
+) -> Result<WeightRef, LoaderError> {
     let location = fields.get("location").filter(|location| !location.is_empty()).ok_or_else(|| {
         LoaderError::GraphBuild(format!(
             "external initializer {:?} missing 'location'; supply a model-relative external_data location", init.name
         ))
     })?;
-    let parse = |key| {
-        fields.get(key).map(|value| value.parse::<usize>().map_err(|_| {
-        LoaderError::GraphBuild(format!(
-            "external initializer {:?}: {key} {value:?} is not a nonnegative host-sized integer; repair external_data", init.name
-        ))
-    })).transpose()
-    };
-    let offset = parse("offset")?.unwrap_or(0);
+    let offset = external_number(init, fields, "offset")?.unwrap_or(0);
     let expected = TensorData::from_raw(dtype, dims.clone(), Vec::new())
         .checked_expected_bytes().ok_or_else(|| LoaderError::GraphBuild(format!(
             "external initializer {:?}: tensor geometry overflows for shape {dims:?} or dtype {dtype:?} has no bounded dense byte size; repair the descriptor", init.name
         )))?;
-    let length = parse("length")?.unwrap_or(expected);
+    let length = external_number(init, fields, "length")?.unwrap_or(expected);
     if matches!(dtype, DataType::String | DataType::Undefined)
         || length != expected
         || offset.checked_add(length).is_none()
@@ -1162,7 +1231,7 @@ mod tests {
             ..Default::default()
         };
         let mut store = WeightStore::new();
-        let error = resolve_initializer(&mut store, &initializer, &model_dir)
+        let error = resolve_initializer(&mut store, &initializer, &model_dir, None)
             .expect_err("overflowing external tensor geometry must be rejected");
         assert!(
             matches!(error, LoaderError::GraphBuild(message) if message.contains("geometry overflows"))
@@ -1222,7 +1291,8 @@ mod tests {
         };
 
         let mut store = WeightStore::new();
-        resolve_initializer(&mut store, &initializer, &model_dir).expect("resolve live tensor");
+        resolve_initializer(&mut store, &initializer, &model_dir, None)
+            .expect("resolve live tensor");
 
         let model = ModelProto {
             graph: Some(crate::proto::onnx::GraphProto {
@@ -1282,7 +1352,8 @@ mod tests {
         };
 
         let mut store = WeightStore::new();
-        resolve_initializer(&mut store, &initializer, &model_dir).expect("resolve live tensor");
+        resolve_initializer(&mut store, &initializer, &model_dir, None)
+            .expect("resolve live tensor");
 
         let model = ModelProto {
             graph: Some(crate::proto::onnx::GraphProto {

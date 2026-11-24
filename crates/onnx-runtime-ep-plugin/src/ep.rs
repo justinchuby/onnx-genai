@@ -12,27 +12,53 @@ use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::provider::ExecutionProvider;
 use onnx_runtime_ir::{DataType, DeviceType, NodeIndex};
 
-/// How an [`ExportedEp`] holds its backing Rust [`ExecutionProvider`].
-///
-/// Device EPs (CUDA) advertise a *shared* EP: the same instance backs the
-/// factory's allocator, stream, and data-transfer, so `CreateEp` must reuse it
-/// (rather than constructing a fresh EP whose stream/allocator would not match
-/// the memory ORT allocated through the factory). CPU EPs own their instance.
+/// Shared lifetime of a facade-owned provider. Final release, rather than any
+/// particular ORT callback, owns shutdown. Compiled info/state can outlive a facade.
+pub struct OwnedEp {
+    provider: Box<dyn ExecutionProvider>,
+    name: String,
+}
+
+impl OwnedEp {
+    fn new(provider: Box<dyn ExecutionProvider>) -> Self {
+        Self {
+            name: provider.name().to_owned(),
+            provider,
+        }
+    }
+}
+
+impl Drop for OwnedEp {
+    fn drop(&mut self) {
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| self.provider.shutdown()));
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!(
+                "nxrt ep plugin: provider '{}' final shutdown failed: {error}; resources will be dropped; inspect provider shutdown and deferred-release diagnostics",
+                self.name
+            ),
+            Err(_) => eprintln!(
+                "nxrt ep plugin: provider '{}' panicked during final shutdown; resources will be dropped; inspect its shutdown implementation",
+                self.name
+            ),
+        }
+    }
+}
+
+/// A real provider keepalive shared by ORT facades, compiled info and states.
+/// Device providers retain their existing factory-owned shared teardown policy.
+#[derive(Clone)]
 pub enum EpHandle {
-    /// The EP is owned exclusively by this `ExportedEp` (CPU plugin path).
-    Owned(Box<dyn ExecutionProvider>),
-    /// The EP is shared with the factory's allocator/stream/data-transfer
-    /// (CUDA plugin path). `ExportedEp` must not shut it down on release.
+    Owned(Arc<OwnedEp>),
     Shared(Arc<Mutex<Box<dyn ExecutionProvider + Send>>>),
 }
 
 impl EpHandle {
-    /// Runs `f` with a shared reference to the backing EP. For the shared
-    /// variant the mutex is locked only for the duration of `f`; callers must
-    /// not re-enter ORT (allocator/stream) while inside `f`.
+    /// Shared-provider locking is confined to this call; never re-enter ORT
+    /// allocator/stream callbacks while holding it.
     pub fn with<R>(&self, f: impl FnOnce(&dyn ExecutionProvider) -> R) -> R {
         match self {
-            EpHandle::Owned(ep) => f(ep.as_ref()),
+            EpHandle::Owned(owner) => f(owner.provider.as_ref()),
             EpHandle::Shared(shared) => {
                 let guard = shared.lock().unwrap_or_else(|p| p.into_inner());
                 f(guard.as_ref())
@@ -40,17 +66,8 @@ impl EpHandle {
         }
     }
 
-    /// Returns the EP name.
     pub fn name(&self) -> String {
         self.with(|ep| ep.name().to_string())
-    }
-
-    /// Shuts down the EP only if it is exclusively owned. Shared EPs are owned
-    /// by the factory and are shut down when the factory is released.
-    pub fn shutdown_if_owned(&mut self) {
-        if let EpHandle::Owned(ep) = self {
-            let _ = ep.shutdown();
-        }
     }
 }
 
@@ -174,6 +191,7 @@ pub struct ExportedEp {
     /// Defaults to `false` ("assume device"), the conservative direction: an EP
     /// built by a path that does not set it keeps the full memory-info scan.
     pub host_accessible: bool,
+    pub(crate) workspace_execution: Option<crate::workspace::OrderedWorkspace>,
 }
 
 /// Owns an `OrtKernelRegistry*` allocated via ORT's EP API.
@@ -213,6 +231,19 @@ impl Drop for OrtKernelRegistryHolder {
 }
 
 impl ExportedEp {
+    /// Wrap compiled kernel entries with this provider's lifetime, registered
+    /// execution ordering and tensor placement. The compiler attaches optional
+    /// routing and boundary-input staging before publishing the compute info.
+    pub fn wrap_compiled_kernels(
+        &self,
+        entries: Vec<crate::compute::CompiledKernelEntry>,
+    ) -> ExportedComputeInfo {
+        let mut info = ExportedComputeInfo::new(entries, Some(self.ep.clone()));
+        info.workspace_execution = self.workspace_execution.clone();
+        info.set_host_accessible(self.host_accessible);
+        info
+    }
+
     pub fn new(ep: Box<dyn ExecutionProvider>) -> Self {
         Self::new_with_registry(ep, None)
     }
@@ -242,7 +273,12 @@ impl ExportedEp {
         entries: Vec<KernelRegistryEntry>,
     ) -> Self {
         let name = ep.name().to_string();
-        Self::from_handle(EpHandle::Owned(ep), &name, registry, entries)
+        Self::from_handle(
+            EpHandle::Owned(Arc::new(OwnedEp::new(ep))),
+            &name,
+            registry,
+            entries,
+        )
     }
 
     /// Construct an `ExportedEp` that reuses a *shared* EP (device/CUDA path).
@@ -295,6 +331,7 @@ impl ExportedEp {
             kernel_registry: registry,
             registry_entries: entries,
             host_accessible: false,
+            workspace_execution: None,
         }
     }
 }
@@ -663,6 +700,27 @@ pub(crate) fn node_passes_dtype_filter(
     let Some(entry) = entry else {
         return false;
     };
+    if node.is_default_domain() && node.op_type == "BitCast" {
+        use onnx_runtime_ir::opset26::{bit_cast_target, validate_bit_cast};
+        let input = node
+            .inputs
+            .first()
+            .copied()
+            .flatten()
+            .and_then(|id| ir_graph.values.get(id));
+        let output = node
+            .outputs
+            .first()
+            .copied()
+            .flatten()
+            .and_then(|id| ir_graph.values.get(id));
+        if !matches!(
+            (input, output, bit_cast_target(node)),
+            (Some(x), Some(y), Ok(to)) if y.dtype == to && validate_bit_cast(x.dtype, to).is_ok()
+        ) {
+            return false;
+        }
+    }
     // The slot sets describe which types the op can use; the attribute selects
     // the one dtype this particular node produces.
     if node.is_default_domain() && node.op_type == "DequantizePacked" {
@@ -1090,13 +1148,7 @@ fn ep_compile_inner(
             continue;
         }
 
-        // Wrap kernels in OrtNodeComputeInfo.
-        let mut info = ExportedComputeInfo::new(entries);
-
-        // Placement is a property of the EP, decided by the factory when it
-        // registered the allocator; pass it down so `Compute` never has to ask
-        // ORT where a routed subgraph's intermediates belong.
-        info.set_host_accessible(exported.host_accessible);
+        let mut info = exported.wrap_compiled_kernels(entries);
 
         // Attach device staging so an interspersed CPU→device partition can
         // upload host-resident boundary inputs before launching (#982).
@@ -1792,22 +1844,8 @@ unsafe extern "C" fn noop_kernel_create(
 
 /// Map `DataType` to `ONNXTensorElementDataType` enum value.
 fn dtype_to_onnx_tensor_elem(dtype: DataType) -> ort::ONNXTensorElementDataType {
-    match dtype {
-        DataType::Float32 => 1,   // ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
-        DataType::Uint8 => 2,     // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8
-        DataType::Int8 => 3,      // ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8
-        DataType::Uint16 => 4,    // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16
-        DataType::Int16 => 5,     // ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16
-        DataType::Int32 => 6,     // ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32
-        DataType::Int64 => 7,     // ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
-        DataType::Bool => 9,      // ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL
-        DataType::Float16 => 10,  // ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16
-        DataType::Float64 => 11,  // ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE
-        DataType::Uint32 => 12,   // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32
-        DataType::Uint64 => 13,   // ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64
-        DataType::BFloat16 => 16, // ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16
-        _ => 0,                   // ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED
-    }
+    // Both enums follow TensorProto.DataType, including packed and float8 types.
+    dtype.to_onnx() as ort::ONNXTensorElementDataType
 }
 
 #[cfg(test)]
@@ -2056,8 +2094,8 @@ mod tests {
         // Allocate an array of 3 pointers, writing non-null "sentinels" for 2.
         let mut infos: [*mut ort::OrtNodeComputeInfo; 3] = [ptr::null_mut(); 3];
         // Create real ExportedComputeInfo that cleanup_partial_infos will drop.
-        let info0 = Box::into_raw(Box::new(ExportedComputeInfo::new(Vec::new())));
-        let info1 = Box::into_raw(Box::new(ExportedComputeInfo::new(Vec::new())));
+        let info0 = Box::into_raw(Box::new(ExportedComputeInfo::new(Vec::new(), None)));
+        let info1 = Box::into_raw(Box::new(ExportedComputeInfo::new(Vec::new(), None)));
         infos[0] = info0.cast();
         infos[1] = info1.cast();
         // Simulate failure at index 2 — cleanup [0..2].
@@ -2078,6 +2116,22 @@ mod tests {
         assert_eq!(dtype_to_onnx_tensor_elem(DataType::Float16), 10);
         assert_eq!(dtype_to_onnx_tensor_elem(DataType::BFloat16), 16);
         assert_eq!(dtype_to_onnx_tensor_elem(DataType::Float32), 1);
+        for (dtype, expected) in [
+            (DataType::Complex64, 14),
+            (DataType::Complex128, 15),
+            (DataType::Float8E4M3FN, 17),
+            (DataType::Float8E4M3FNUZ, 18),
+            (DataType::Float8E5M2, 19),
+            (DataType::Float8E5M2FNUZ, 20),
+            (DataType::Uint4, 21),
+            (DataType::Int4, 22),
+            (DataType::Float4E2M1, 23),
+            (DataType::Float8E8M0, 24),
+            (DataType::Uint2, 25),
+            (DataType::Int2, 26),
+        ] {
+            assert_eq!(dtype_to_onnx_tensor_elem(dtype), expected);
+        }
     }
 
     /// KernelRegistryEntry can be constructed with static data.

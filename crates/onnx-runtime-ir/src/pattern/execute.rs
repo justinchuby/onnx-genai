@@ -15,6 +15,14 @@ pub enum BoundaryPolicy {
     OrtBoundary,
 }
 
+/// An observation of a region value which a rewrite must preserve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EscapingUse {
+    GraphOutput,
+    Consumer { node: NodeId, input: u32 },
+    LexicalCapture { owner: NodeId },
+}
+
 /// Bounds shared by alternatives, nested bodies and predicates within the
 /// budget scope selected by [`MatchOptions::budget_scope`].
 #[derive(Clone, Copy, Debug)]
@@ -417,6 +425,22 @@ impl<'g> MatchSession<'g> {
         options: MatchOptions,
     ) -> Result<Option<Match<'g>>> {
         self.match_at_where(pattern, root, options, |_| Ok(true))
+    }
+
+    /// Check the exact region of a proposed rewrite in this session's root
+    /// graph. Use this when one rewrite combines multiple structural matches.
+    /// `retained` lists outputs still produced by the replacement.
+    pub fn first_escaping_use(
+        &self,
+        region: &[NodeId],
+        retained: &[ValueId],
+    ) -> Option<(ValueId, EscapingUse)> {
+        first_escaping_use(
+            &self.scopes[0],
+            region.iter().copied(),
+            |node| region.contains(&node),
+            |value| retained.contains(&value),
+        )
     }
 
     /// Find the first matching producer on a bounded, positional input path.
@@ -1349,30 +1373,50 @@ impl<'g> MatchSession<'g> {
                 .iter()
                 .filter_map(|slot| state.values[*slot].flatten())
                 .collect();
-            for &node in &nodes {
-                for output in graph.node(node).output_values() {
-                    if exposed.contains(&output) {
-                        continue;
-                    }
-                    if graph.outputs.contains(&output)
-                        || graph
-                            .value(output)
-                            .consumers
-                            .uses()
-                            .iter()
-                            .any(|(user, _)| !nodes.contains(user))
-                        || prepared
-                            .capture_owners
-                            .get(&output)
-                            .is_some_and(|owners| owners.iter().any(|owner| !nodes.contains(owner)))
-                    {
-                        return Ok(false);
-                    }
-                }
+            if first_escaping_use(
+                prepared,
+                nodes.iter().copied(),
+                |node| nodes.contains(&node),
+                |value| exposed.contains(&value),
+            )
+            .is_some()
+            {
+                return Ok(false);
             }
         }
         Ok(true)
     }
+}
+
+fn first_escaping_use(
+    scope: &Scope<'_>,
+    nodes: impl Iterator<Item = NodeId>,
+    in_region: impl Fn(NodeId) -> bool,
+    retained: impl Fn(ValueId) -> bool,
+) -> Option<(ValueId, EscapingUse)> {
+    let graph = scope.graph;
+    for node in nodes {
+        for output in graph.node(node).output_values().filter(|&v| !retained(v)) {
+            let value = graph.value(output);
+            if value.is_graph_output {
+                return Some((output, EscapingUse::GraphOutput));
+            }
+            if let Some((node, input)) = value
+                .consumers
+                .first_use_where(|(user, _)| !in_region(user))
+            {
+                return Some((output, EscapingUse::Consumer { node, input }));
+            }
+            if let Some(&owner) = scope
+                .capture_owners
+                .get(&output)
+                .and_then(|owners| owners.iter().find(|&&owner| !in_region(owner)))
+            {
+                return Some((output, EscapingUse::LexicalCapture { owner }));
+            }
+        }
+    }
+    None
 }
 
 #[derive(Clone)]

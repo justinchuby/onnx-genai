@@ -65,8 +65,8 @@ use std::sync::Arc;
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
-    CaptureSupport, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
-    WorkspaceLayout, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    CaptureSupport, EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata,
+    TensorMut, TensorView, WorkspaceLayout, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node, Shape};
 
@@ -453,6 +453,16 @@ impl MhaWorkspace {
         Ok(Self { regions, phase2a })
     }
 
+    fn requirement(&self) -> Result<WorkspaceRequirement> {
+        Ok(WorkspaceRequirement {
+            bytes: u64::try_from(self.regions.bytes())
+                .map_err(|_| mha_error("workspace bytes exceed u64; reduce the input shape"))?,
+            alignment: self.regions.alignment(),
+            // Deferred device-binding runs retain the funded peak between steps.
+            lifetime: WorkspaceLifetime::SessionPersistent,
+        })
+    }
+
     fn bind(&self, workspace: Option<WorkspaceView>) -> Result<[WorkspaceView; 7]> {
         self.regions.bind(workspace).map_err(|error| mha_error(format!(
             "cannot bind prepared workspace: {error}; query workspace_requirement and pass executor-owned backing to execute_with_workspace"
@@ -478,6 +488,57 @@ fn check_present_slots(compiled: [bool; 2], actual: [bool; 2]) -> Result<()> {
         return Err(mha_error(format!(
             "runtime present KV output slots {actual:?} differ from compiled slots {compiled:?}; execute the kernel with its declared positional outputs"
         )));
+    }
+    Ok(())
+}
+
+/// Output facts do not size MHA's exact-shape caches, but they must agree with
+/// the declared slots before those buffers can replace temporary KV regions.
+fn validate_output_metadata(
+    g: MhaGeometry,
+    compiled: [bool; 2],
+    outputs: &[OutputMetadata<'_>],
+) -> Result<()> {
+    if outputs.is_empty() {
+        return Ok(());
+    }
+    if outputs.len() > 3 || matches!(outputs[0], OutputMetadata::Absent) {
+        return Err(mha_error(
+            "output metadata must include the required output and at most two positional present KV slots",
+        ));
+    }
+    let actual = std::array::from_fn(|index| {
+        outputs
+            .get(index + 1)
+            .is_some_and(|fact| !matches!(fact, OutputMetadata::Absent))
+    });
+    check_present_slots(compiled, actual)?;
+    for (index, output) in outputs.iter().enumerate() {
+        let (dtype, shape) = match output {
+            OutputMetadata::Absent => continue,
+            OutputMetadata::Unresolved { dtype } => (*dtype, None),
+            OutputMetadata::Tensor { dtype, shape } => (*dtype, Some(shape.as_ref())),
+        };
+        let expected_dtype = match g.dtype {
+            AttentionDtype::F32 => DataType::Float32,
+            AttentionDtype::F16 => DataType::Float16,
+            AttentionDtype::Bf16 => DataType::BFloat16,
+        };
+        if dtype != expected_dtype {
+            return Err(mha_error(format!(
+                "output slot {index} dtype {dtype:?} must match query dtype {expected_dtype:?}"
+            )));
+        }
+        if let Some(shape) = shape {
+            let cache = [g.batch, g.heads, g.total_seq, g.head_size];
+            let output = [g.batch, g.q_seq, g.q_hidden];
+            let expected: &[usize] = if index == 0 { &output } else { &cache };
+            if shape != expected {
+                return Err(mha_error(format!(
+                    "output slot {index} shape {shape:?} must be {expected:?}; provide the exact logical MHA output geometry"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -1301,47 +1362,26 @@ impl MultiHeadAttentionKernel {
         // build them directly into the output allocations when requested.
         let want_present_k = outputs.len() >= 2 && !outputs[1].is_absent();
         let want_present_v = outputs.len() >= 3 && !outputs[2].is_absent();
-        check_present_slots(self.present_outputs, [want_present_k, want_present_v])?;
+        if outputs.len() > 3 {
+            return Err(mha_error("expected at most three positional outputs"));
+        }
+        let output_facts: [_; 3] = std::array::from_fn(|index| {
+            outputs
+                .get(index)
+                .map_or(OutputMetadata::Absent, OutputMetadata::from_view)
+        });
+        validate_output_metadata(
+            geometry,
+            self.present_outputs,
+            &output_facts[..outputs.len()],
+        )?;
         for (index, name) in [(0usize, "output"), (1, "present_key"), (2, "present_value")] {
             if let Some(output) = outputs.get(index)
                 && !output.is_absent()
+                && !output.is_contiguous()
             {
-                if output.dtype != dtype {
-                    return Err(mha_error(format!(
-                        "{name} dtype {:?} must match query dtype {dtype:?}",
-                        output.dtype
-                    )));
-                }
-                if !output.is_contiguous() {
-                    return Err(mha_error(format!("{name} must be contiguous")));
-                }
+                return Err(mha_error(format!("{name} must be contiguous")));
             }
-        }
-        if want_present_k {
-            check_present(
-                &outputs[1],
-                batch,
-                num_heads,
-                total_seq,
-                head_size,
-                "present_key",
-            )?;
-        }
-        if want_present_v {
-            check_present(
-                &outputs[2],
-                batch,
-                num_heads,
-                total_seq,
-                v_head_size,
-                "present_value",
-            )?;
-        }
-        if outputs[0].shape != [batch, q_seq, v_hidden] {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep MultiHeadAttention: output shape {:?} must be [B={batch}, S={q_seq}, v_hidden={v_hidden}]",
-                outputs[0].shape
-            )));
         }
         let output_elements = q_elements;
         checked_bytes(
@@ -1588,7 +1628,7 @@ impl MultiHeadAttentionKernel {
                 0,
                 0,
                 0.0,
-                Some(phase2a_scratch),
+                phase2a_scratch,
             )?;
 
             let (batch_i, heads_i, sq_i, dim_i) = (
@@ -1617,16 +1657,15 @@ impl Kernel for MultiHeadAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         self.run(inputs, outputs, None)
     }
-    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
         let geometry = MhaGeometry::from_inputs(self.num_heads, inputs)?;
+        validate_output_metadata(geometry, self.present_outputs, outputs)?;
         let present = |index: usize| inputs.get(index).is_some_and(|input| input.present);
-        let layout = MhaWorkspace::new(geometry, self.present_outputs, present(4), present(5))?;
-        Ok(WorkspaceRequirement {
-            bytes: u64::try_from(layout.regions.bytes())
-                .map_err(|_| mha_error("workspace bytes exceed u64; reduce the input shape"))?,
-            alignment: layout.regions.alignment(),
-            lifetime: WorkspaceLifetime::StepScoped,
-        })
+        MhaWorkspace::new(geometry, self.present_outputs, present(4), present(5))?.requirement()
     }
     fn execute_with_workspace(
         &self,
@@ -1791,24 +1830,6 @@ impl MultiHeadAttentionKernel {
 /// Reinterpret an `f32` slice as its little-endian bytes for an H2D upload.
 fn bytemuck_f32_bytes(values: &[f32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_ne_bytes()).collect()
-}
-
-/// Validate a `present_key`/`present_value` output shape.
-fn check_present(
-    out: &TensorMut,
-    batch: usize,
-    num_heads: usize,
-    total_seq: usize,
-    dim: usize,
-    name: &str,
-) -> Result<()> {
-    if out.shape != [batch, num_heads, total_seq, dim] {
-        return Err(EpError::KernelFailed(format!(
-            "cuda_ep MultiHeadAttention: {name} shape {:?} must be [B={batch}, N={num_heads}, total={total_seq}, H={dim}]",
-            out.shape
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2020,6 +2041,99 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn prepared_composite_retains_one_funded_peak_for_deferred_runs() {
+        let geometry = planned_geometry(DataType::Float32, false, true);
+        let layout = MhaWorkspace::new(geometry, [false, true], true, true).unwrap();
+        let requirement = layout.requirement().unwrap();
+        assert_eq!(requirement.bytes, layout.regions.bytes() as u64);
+        assert_eq!(requirement.alignment, layout.regions.alignment());
+        assert_eq!(requirement.lifetime, WorkspaceLifetime::SessionPersistent);
+        assert_eq!(
+            requirement.role(),
+            onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false }
+        );
+    }
+
+    #[test]
+    fn prepared_output_metadata_checks_declared_slots_dtype_and_exact_geometry() {
+        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            let g = planned_geometry(dtype, true, true);
+            let y = [g.batch, g.q_seq, g.q_hidden];
+            let cache = [g.batch, g.heads, g.total_seq, g.head_size];
+            for present in [[false, false], [true, false], [false, true], [true, true]] {
+                let outputs = [
+                    OutputMetadata::tensor(dtype, &y),
+                    if present[0] {
+                        OutputMetadata::tensor(dtype, &cache)
+                    } else {
+                        OutputMetadata::Absent
+                    },
+                    if present[1] {
+                        OutputMetadata::tensor(dtype, &cache)
+                    } else {
+                        OutputMetadata::Absent
+                    },
+                ];
+                validate_output_metadata(g, present, &outputs).unwrap();
+                let unresolved = [
+                    OutputMetadata::Unresolved { dtype },
+                    if present[0] {
+                        OutputMetadata::Unresolved { dtype }
+                    } else {
+                        OutputMetadata::Absent
+                    },
+                    if present[1] {
+                        OutputMetadata::Unresolved { dtype }
+                    } else {
+                        OutputMetadata::Absent
+                    },
+                ];
+                validate_output_metadata(g, present, &unresolved).unwrap();
+            }
+            let wrong_cache = [g.batch, g.heads, g.total_seq + 1, g.head_size];
+            let error = validate_output_metadata(
+                g,
+                [false, true],
+                &[
+                    OutputMetadata::tensor(dtype, &y),
+                    OutputMetadata::Absent,
+                    OutputMetadata::tensor(dtype, &wrong_cache),
+                ],
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("slot 2 shape") && error.contains("exact logical MHA"),
+                "{error}"
+            );
+            let error =
+                validate_output_metadata(g, [true, false], &[OutputMetadata::tensor(dtype, &y)])
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains("compiled slots"), "{error}");
+        }
+        let g = planned_geometry(DataType::Float32, false, false);
+        let y = [g.batch, g.q_seq, g.q_hidden];
+        let error = validate_output_metadata(
+            g,
+            [false, false],
+            &[OutputMetadata::tensor(DataType::Float16, &y)],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("slot 0 dtype") && error.contains("Float32"),
+            "{error}"
+        );
+        assert!(
+            validate_output_metadata(g, [false, false], &[OutputMetadata::Absent])
+                .unwrap_err()
+                .to_string()
+                .contains("required output")
+        );
     }
 
     #[test]

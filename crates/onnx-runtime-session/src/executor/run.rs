@@ -21,6 +21,7 @@ impl Executor {
     pub(super) fn begin_device_validation_submission(
         &mut self,
     ) -> Result<DeviceValidationSubmission> {
+        self.workspace_completion = WorkspaceCompletion::Pending;
         let registration = self
             .validation_registration
             .as_ref()
@@ -35,6 +36,7 @@ impl Executor {
         &mut self,
         bindings: &mut [DeviceIoBinding],
     ) -> Result<DeviceValidationSubmission> {
+        self.workspace_completion = WorkspaceCompletion::Pending;
         let registration = self
             .validation_registration
             .as_ref()
@@ -74,6 +76,7 @@ impl Executor {
         validation_submission: Option<DeviceValidationSubmission>,
         artifact_requirement: Option<CapturedProviderArtifactRequirement>,
     ) -> Result<ScopedRunResult> {
+        self.workspace_completion = WorkspaceCompletion::Pending;
         // Distinguish the outermost (top-level graph) run from nested
         // control-flow subgraph runs so the phase profiler can attribute
         // overhead to the right layer.
@@ -195,8 +198,12 @@ impl Executor {
             submission.disarm();
         }
         let unbound = self.unbind_borrowed_inputs();
+        self.string_values.clear();
         if !decode_memo_eligible {
             self.scratch_resolved_shapes = resolved;
+        }
+        if outcome.is_err() || validation.is_err() || unbound.is_err() {
+            self.workspace_completion = WorkspaceCompletion::Pending;
         }
         match (outcome, validation, unbound) {
             (_, Err(e), _) => Err(e),
@@ -276,6 +283,7 @@ impl Executor {
                     self.ep
                         .consume_route_residency_at_boundary_for_executor(owner)?;
                 }
+                self.workspace_completion = WorkspaceCompletion::Completed;
                 Ok(())
             }
             flags => Err(EpError::KernelFailed(format!(
@@ -345,7 +353,10 @@ impl Executor {
             let numel = dims
                 .iter()
                 .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))?;
-            self.value_dtypes.get(&vid)?.checked_storage_bytes(numel)
+            let dtype = *self.value_dtypes.get(&vid)?;
+            (dtype != DataType::String)
+                .then(|| dtype.checked_storage_bytes(numel))
+                .flatten()
         };
         let stats = match plan_activations(&self.graph, &view_map, oracle, &options) {
             Ok(PlanStatus::Complete(plan)) => ActivationMemoryPlanStats {
@@ -394,6 +405,7 @@ impl Executor {
     }
 
     fn reset_run_state(&mut self) -> Result<()> {
+        self.restore_completed_step_workspace();
         // A previous run must never leave a handle aliasing its caller's
         // tensors installed (it cannot, but re-establishing the invariant here
         // makes the guarantee independent of every early-return path above).
@@ -406,6 +418,7 @@ impl Executor {
         // run-scoped (element Arcs from a prior run must not leak in).
         self.sequences.clear();
         self.seq_elem_values.clear();
+        self.string_values.clear();
         self.restore_shared_buffers()?;
         Ok(())
     }
@@ -655,6 +668,10 @@ impl Executor {
         let mut borrowed_bytes = 0usize;
         for (name, tensor) in inputs {
             let vid = self.input_index[*name];
+            if tensor.dtype == DataType::String {
+                self.string_values.insert(vid, tensor.try_clone()?);
+                continue;
+            }
             let bytes = tensor.as_bytes();
             let buf = self
                 .buffers
@@ -1014,6 +1031,17 @@ impl Executor {
         let mut host_output_bytes = 0usize;
         for output_index in 0..self.graph.outputs.len() {
             let vid = self.graph.outputs[output_index];
+            if self.value_dtypes.get(&vid) == Some(&DataType::String) {
+                let tensor = self.string_values.remove(&vid).map(Ok).unwrap_or_else(|| {
+                    self.string_initializers
+                        .get(&vid)
+                        .ok_or_else(|| self.missing_host_string(vid))?
+                        .try_clone()
+                        .map_err(SessionError::from)
+                })?;
+                results.push(Some(SessionOutput::Tensor(tensor)));
+                continue;
+            }
             if let Some(ext) = external.outputs.get(&vid) {
                 // A graph output with no producing node (e.g. a bare
                 // initializer, or a value `ConstantFolding` collapsed to one

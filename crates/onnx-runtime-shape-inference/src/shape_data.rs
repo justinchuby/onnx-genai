@@ -159,6 +159,23 @@ impl ShapeData {
 
 fn read_floats(dtype: DataType, numel: usize, data: &[u8]) -> Option<Vec<f64>> {
     match dtype {
+        DataType::Float16 | DataType::BFloat16 => {
+            let (words, _) = data.as_chunks::<2>();
+            Some(
+                words
+                    .get(..numel)?
+                    .iter()
+                    .map(|bytes| {
+                        let bits = u16::from_le_bytes(*bytes);
+                        if dtype == DataType::Float16 {
+                            half::f16::from_bits(bits).to_f64()
+                        } else {
+                            half::bf16::from_bits(bits).to_f64()
+                        }
+                    })
+                    .collect(),
+            )
+        }
         DataType::Float32 => {
             if data.len() < numel.checked_mul(4)? {
                 return None;

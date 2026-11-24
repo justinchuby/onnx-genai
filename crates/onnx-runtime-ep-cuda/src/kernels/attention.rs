@@ -34,7 +34,8 @@
 //!    `k = Sk` (`transa = N`, `transb = N`).
 //!
 //! All three steps submit onto the EP's single stream, so their ordering is
-//! implicit — no host sync between stages, one sync at the end.
+//! implicit. The runtime synchronization policy is applied at the end; when
+//! deferred, its success is not a device-completion witness.
 //!
 //! ## GQA / MQA
 //!
@@ -388,11 +389,30 @@ fn phase2a_scores_layout(
 #[derive(Clone, Copy)]
 pub(super) struct Phase2aScratch {
     scores: CUdeviceptr,
+    scores_bytes: usize,
     workspace: CUdeviceptr,
     workspace_bytes: usize,
 }
 
 impl Phase2aScratch {
+    fn validate_geometry(
+        &self,
+        dtype: AttentionDtype,
+        batch: usize,
+        heads: usize,
+        sq: usize,
+        sk: usize,
+    ) -> Result<()> {
+        let required = phase2a_scores_layout(dtype, batch, heads, sq, sk)?.size();
+        if self.scores_bytes < required {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Attention: borrowed score capacity {} bytes is smaller than {required} bytes for batch={batch}, heads={heads}, seq_q={sq}, seq_k={sk}, dtype={dtype:?}; reprepare caller workspace for this invocation",
+                self.scores_bytes
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) fn bind(
         layout: &WorkspaceLayout<2>,
         workspace: Option<WorkspaceView>,
@@ -404,6 +424,7 @@ impl Phase2aScratch {
         })?;
         Ok(Self {
             scores: cuptr(scores.ptr().0.cast_const()),
+            scores_bytes: scores.bytes(),
             workspace: cuptr(blas.ptr().0.cast_const()),
             workspace_bytes: blas.bytes(),
         })
@@ -780,7 +801,7 @@ impl AttentionKernel {
                 0,
                 0,
                 0.0,
-                Some(scratch),
+                scratch,
             )
         }
     }
@@ -813,160 +834,123 @@ pub(super) fn run_attention_phase2a(
     past_lengths: CUdeviceptr,
     local_window: i32,
     softcap: f32,
-    scratch: Option<Phase2aScratch>,
+    scratch: Phase2aScratch,
 ) -> Result<()> {
     let elem_size = dtype.element_size();
-    let scores_bytes = phase2a_scores_layout(dtype, batch, num_heads, sq, sk)?.size();
-    // The governed path hands us pre-reserved scratch carved from the executor's
-    // workspace. The MHA/GQA callers still request disposable scratch, which
-    // must be freed here. `owned` records which contract applies.
-    //
-    // The cuBLASLt workspace is *not* part of that ownership: it carries no
-    // state between calls and this runtime's stream is serial, so one buffer
-    // per stream is exactly as correct as one per call. Allocating it per call
-    // cost WORKSPACE_BYTES for every attention op — hundreds of MiB of raw
-    // device memory across a 32-layer prefill that needs 32 MiB at a time.
-    let owned = scratch.is_none();
-    let (scores_buf, workspace, workspace_bytes) = match scratch {
-        Some(scratch) => (scratch.scores, scratch.workspace, scratch.workspace_bytes),
-        None => {
-            let scores_buf = runtime.alloc_raw(scores_bytes)?;
-            let workspace = match runtime.shared_blas_workspace(WORKSPACE_BYTES) {
-                Ok(workspace) => workspace,
-                Err(error) => {
-                    // SAFETY: `scores_buf` was allocated immediately above and
-                    // has not escaped or been freed.
-                    let _ = unsafe { runtime.free_raw(scores_buf) };
-                    return Err(error);
-                }
+    scratch.validate_geometry(dtype, batch, num_heads, sq, sk)?;
+    let Phase2aScratch {
+        scores: scores_buf,
+        workspace,
+        workspace_bytes,
+        ..
+    } = scratch;
+    let blas = runtime.blas();
+    let stream = runtime.stream_ptr();
+
+    // Stage 1: per-head S = scale · Q·Kᵀ.  Column-major C[Sk,Sq] = Kᵀ·Q.
+    for b in 0..batch {
+        for h in 0..num_heads {
+            let kv = h / group;
+            let q_head = q_base + ((b * num_heads + h) * sq * d) as u64 * elem_size;
+            let k_head = k_base + ((b * num_kv_heads + kv) * kv_capacity * d) as u64 * elem_size;
+            let s_head = scores_buf + ((b * num_heads + h) * sq * sk) as u64 * elem_size;
+
+            let p = GemmEx {
+                dtype: dtype.gemm(),
+                transa: true,  // op(A=K) = Kᵀ  -> [Sk, D]
+                transb: false, // op(B=Q) = Q   -> [D, Sq] (col-major view)
+                m: sk,
+                n: sq,
+                k: d,
+                alpha: scale,
+                beta: 0.0,
+                a: k_head,
+                lda: d,
+                b: q_head,
+                ldb: d,
+                c: s_head,
+                ldc: sk,
+                epilogue: None,
             };
-            (scores_buf, workspace, WORKSPACE_BYTES)
+            // SAFETY: per-head pointers lie inside the validated dense Q/K
+            // and checked borrowed scores buffers; `workspace` is live;
+            // `s_head` (output) aliases neither operand.
+            unsafe { gemm_ex(blas, stream, &p, workspace, workspace_bytes) }?;
         }
-    };
-    let result = (|| {
-        let blas = runtime.blas();
-        let stream = runtime.stream_ptr();
-
-        // Stage 1: per-head S = scale · Q·Kᵀ.  Column-major C[Sk,Sq] = Kᵀ·Q.
-        for b in 0..batch {
-            for h in 0..num_heads {
-                let kv = h / group;
-                let q_head = q_base + ((b * num_heads + h) * sq * d) as u64 * elem_size;
-                let k_head =
-                    k_base + ((b * num_kv_heads + kv) * kv_capacity * d) as u64 * elem_size;
-                let s_head = scores_buf + ((b * num_heads + h) * sq * sk) as u64 * elem_size;
-
-                let p = GemmEx {
-                    dtype: dtype.gemm(),
-                    transa: true,  // op(A=K) = Kᵀ  -> [Sk, D]
-                    transb: false, // op(B=Q) = Q   -> [D, Sq] (col-major view)
-                    m: sk,
-                    n: sq,
-                    k: d,
-                    alpha: scale,
-                    beta: 0.0,
-                    a: k_head,
-                    lda: d,
-                    b: q_head,
-                    ldb: d,
-                    c: s_head,
-                    ldc: sk,
-                    epilogue: None,
-                };
-                // SAFETY: per-head pointers lie inside the validated dense Q/K
-                // and freshly-allocated scores buffers; `workspace` is live;
-                // `s_head` (output) aliases neither operand.
-                unsafe { gemm_ex(blas, stream, &p, workspace, workspace_bytes) }?;
-            }
-        }
-
-        // Stage 2: fused softmax over the keys axis (scale already applied).
-        let nrows = batch * num_heads * sq;
-        let (softmax_module, softmax_source, softmax_entry) = dtype.softmax();
-        let func = runtime.nvrtc_function(softmax_module, softmax_source, softmax_entry)?;
-        let cfg = runtime.reduction_launch_config(
-            &func,
-            nrows as u32,
-            SOFTMAX_BLOCK,
-            std::mem::size_of::<f32>() as u32,
-        )?;
-        let nrows_i = i32::try_from(nrows).map_err(|_| {
-            EpError::KernelFailed(format!("cuda_ep Attention: {nrows} score rows exceed i32"))
-        })?;
-        let (sk_i, sq_i, heads_i, batch_i) = (sk as i32, sq as i32, num_heads as i32, batch as i32);
-        let causal_i: i32 = causal.into();
-        let stream_ref = runtime.stream();
-        // Device pointers are passed by value (as u64) — a CUDA pointer kernel
-        // parameter is ABI-identical to a 64-bit scalar argument.
-        let mut builder = stream_ref.launch_builder(&func);
-        builder
-            .arg(&scores_buf)
-            .arg(&mask_ptr)
-            .arg(&total_lengths)
-            .arg(&past_lengths)
-            .arg(&nrows_i)
-            .arg(&sk_i)
-            .arg(&sq_i)
-            .arg(&heads_i)
-            .arg(&causal_i)
-            .arg(&mask_planes)
-            .arg(&batch_i)
-            .arg(&local_window)
-            .arg(&softcap);
-        // SAFETY: `func` is the compiled softmax entry; the argument list and
-        // its ABI match the kernel signature; `scores_buf`/`mask_ptr` are live
-        // device allocations sized for [nrows, sk] / the mask planes.
-        unsafe { builder.launch(cfg) }
-            .map_err(|e| driver_err(&format!("launch {softmax_entry}"), e))?;
-
-        // Stage 3: per-head O = P·V.  Column-major C[D,Sq] = Vᵀ·Pᵀ.
-        for b in 0..batch {
-            for h in 0..num_heads {
-                let kv = h / group;
-                let s_head = scores_buf + ((b * num_heads + h) * sq * sk) as u64 * elem_size;
-                let v_head =
-                    v_base + ((b * num_kv_heads + kv) * kv_capacity * d) as u64 * elem_size;
-                let o_head = o_base + ((b * num_heads + h) * sq * d) as u64 * elem_size;
-
-                let p = GemmEx {
-                    dtype: dtype.gemm(),
-                    transa: false, // op(A=V) = V  -> [D, Sk] (col-major view)
-                    transb: false, // op(B=P) = P  -> [Sk, Sq] (col-major view)
-                    m: d,
-                    n: sq,
-                    k: sk,
-                    alpha: 1.0,
-                    beta: 0.0,
-                    a: v_head,
-                    lda: d,
-                    b: s_head,
-                    ldb: sk,
-                    c: o_head,
-                    ldc: d,
-                    epilogue: None,
-                };
-                // SAFETY: per-head pointers lie inside the validated dense V and
-                // the softmaxed scores buffer and the dense output; `workspace`
-                // is live; `o_head` aliases neither operand.
-                unsafe { gemm_ex(blas, stream, &p, workspace, workspace_bytes) }?;
-            }
-        }
-
-        runtime.synchronize()
-    })();
-    if owned {
-        // SAFETY: `scores_buf` came from this runtime and is freed exactly
-        // once; the governed path never enters this branch and leaves scratch
-        // lifetime to the executor-owned workspace.
-        //
-        // The cuBLASLt workspace is deliberately NOT freed here: it is the
-        // runtime's shared buffer, kept alive for the next call. Freeing it
-        // would hand the following GEMM a dangling pointer.
-        let free_scores = unsafe { runtime.free_raw(scores_buf) };
-        result.and(free_scores)
-    } else {
-        result
     }
+
+    // Stage 2: fused softmax over the keys axis (scale already applied).
+    let nrows = batch * num_heads * sq;
+    let (softmax_module, softmax_source, softmax_entry) = dtype.softmax();
+    let func = runtime.nvrtc_function(softmax_module, softmax_source, softmax_entry)?;
+    let cfg = runtime.reduction_launch_config(
+        &func,
+        nrows as u32,
+        SOFTMAX_BLOCK,
+        std::mem::size_of::<f32>() as u32,
+    )?;
+    let nrows_i = i32::try_from(nrows).map_err(|_| {
+        EpError::KernelFailed(format!("cuda_ep Attention: {nrows} score rows exceed i32"))
+    })?;
+    let (sk_i, sq_i, heads_i, batch_i) = (sk as i32, sq as i32, num_heads as i32, batch as i32);
+    let causal_i: i32 = causal.into();
+    let stream_ref = runtime.stream();
+    // Device pointers are passed by value (as u64) — a CUDA pointer kernel
+    // parameter is ABI-identical to a 64-bit scalar argument.
+    let mut builder = stream_ref.launch_builder(&func);
+    builder
+        .arg(&scores_buf)
+        .arg(&mask_ptr)
+        .arg(&total_lengths)
+        .arg(&past_lengths)
+        .arg(&nrows_i)
+        .arg(&sk_i)
+        .arg(&sq_i)
+        .arg(&heads_i)
+        .arg(&causal_i)
+        .arg(&mask_planes)
+        .arg(&batch_i)
+        .arg(&local_window)
+        .arg(&softcap);
+    // SAFETY: `func` is the compiled softmax entry; the argument list and
+    // its ABI match the kernel signature; `scores_buf`/`mask_ptr` are live
+    // device allocations sized for [nrows, sk] / the mask planes.
+    unsafe { builder.launch(cfg) }
+        .map_err(|e| driver_err(&format!("launch {softmax_entry}"), e))?;
+
+    // Stage 3: per-head O = P·V.  Column-major C[D,Sq] = Vᵀ·Pᵀ.
+    for b in 0..batch {
+        for h in 0..num_heads {
+            let kv = h / group;
+            let s_head = scores_buf + ((b * num_heads + h) * sq * sk) as u64 * elem_size;
+            let v_head = v_base + ((b * num_kv_heads + kv) * kv_capacity * d) as u64 * elem_size;
+            let o_head = o_base + ((b * num_heads + h) * sq * d) as u64 * elem_size;
+
+            let p = GemmEx {
+                dtype: dtype.gemm(),
+                transa: false, // op(A=V) = V  -> [D, Sk] (col-major view)
+                transb: false, // op(B=P) = P  -> [Sk, Sq] (col-major view)
+                m: d,
+                n: sq,
+                k: sk,
+                alpha: 1.0,
+                beta: 0.0,
+                a: v_head,
+                lda: d,
+                b: s_head,
+                ldb: sk,
+                c: o_head,
+                ldc: d,
+                epilogue: None,
+            };
+            // SAFETY: per-head pointers lie inside the validated dense V and
+            // the softmaxed scores buffer and the dense output; `workspace`
+            // is live; `o_head` aliases neither operand.
+            unsafe { gemm_ex(blas, stream, &p, workspace, workspace_bytes) }?;
+        }
+    }
+
+    runtime.synchronize()
 }
 
 impl Kernel for AttentionKernel {
@@ -977,7 +961,11 @@ impl Kernel for AttentionKernel {
         self.run(inputs, outputs, None)
     }
 
-    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
         // Prepare-only planning (#747): report the exact governed scratch for the
         // Phase-2a path so the executor reserves it against the device authority
         // before request admission. The fused path uses only shared memory and
@@ -1164,6 +1152,40 @@ mod tests {
     }
 
     #[test]
+    fn phase2a_borrowed_scores_reject_larger_actual_geometry_without_device_access() {
+        let layout = phase2a_scratch_layout(AttentionDtype::F32, 2, 3, 5, 7).unwrap();
+        let backing = WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(0x10000usize as *mut _),
+            layout.bytes(),
+        );
+        let scratch = Phase2aScratch::bind(&layout, Some(backing)).unwrap();
+        scratch
+            .validate_geometry(AttentionDtype::F32, 2, 3, 5, 7)
+            .unwrap();
+        scratch
+            .validate_geometry(AttentionDtype::F32, 2, 3, 5, 6)
+            .unwrap();
+        let error = scratch
+            .validate_geometry(AttentionDtype::F32, 2, 3, 5, 8)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("borrowed score capacity")
+                && error.contains("reprepare caller workspace"),
+            "{error}"
+        );
+        assert!(
+            scratch
+                .validate_geometry(AttentionDtype::F32, usize::MAX, 3, 5, 7)
+                .is_err()
+        );
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable gpu-tests on a CUDA runner"
+    )]
+    #[test]
     fn workspace_requirement_matches_layout_for_phase2a_and_is_none_for_fused() {
         let Some(runtime) = rt() else {
             eprintln!("skip: no CUDA GPU");
@@ -1181,7 +1203,7 @@ mod tests {
         let k = TensorMetadata::new(DataType::Float16, &kv_shape, true);
         let v = TensorMetadata::new(DataType::Float16, &kv_shape, true);
         let req = phase2a
-            .workspace_requirement(&[q, k, v])
+            .workspace_requirement(&[q, k, v], &[])
             .expect("workspace requirement");
         let layout = phase2a_scratch_layout(AttentionDtype::F16, batch, heads, sq, sk).unwrap();
         assert_eq!(req.bytes, layout.bytes() as u64);
@@ -1200,7 +1222,7 @@ mod tests {
         let k = TensorMetadata::new(DataType::Float16, &kv_shape, true);
         let v = TensorMetadata::new(DataType::Float16, &kv_shape, true);
         let fused_req = fused
-            .workspace_requirement(&[q, k, v])
+            .workspace_requirement(&[q, k, v], &[])
             .expect("fused workspace requirement");
         assert_eq!(fused_req.bytes, 0, "fused path needs no governed scratch");
     }

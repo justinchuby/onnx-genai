@@ -2054,6 +2054,7 @@ struct SealedPackedExperts<'a> {
 
 fn block_format_name(format: BlockFormat) -> &'static str {
     match format {
+        BlockFormat::Onnx(format) => format.name(),
         BlockFormat::Mxfp4 => "mxfp4",
         BlockFormat::Iq4Nl => "iq4_nl",
         BlockFormat::Iq4Xs => "iq4_xs",
@@ -2270,7 +2271,11 @@ impl Kernel for BlockQuantizedMoEKernel {
         ))
     }
 
-    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
         if inputs.len() != self.geometry.input_shapes.len() {
             return Err(error(format!(
                 "expected {} input metadata entries, got {}",

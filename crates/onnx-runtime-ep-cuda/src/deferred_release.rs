@@ -92,9 +92,9 @@ pub trait ReleaseFence: Send + Sync + Debug {
 /// Where a release request's ordering fences come from.
 ///
 /// The production implementation records one event on the compute stream and
-/// one on the dedicated copy stream, which is the whole ordering claim this
-/// queue makes: a release runs after every kernel and every transfer that could
-/// still touch the memory.
+/// one on the dedicated copy stream. An unsettled legacy upload adds that
+/// stream's tail too: release waits for every recorded point that could still
+/// touch the memory.
 pub trait ReleaseFenceSource: Send + Sync + Debug {
     /// Record completion fences at the current tail of every relevant stream.
     ///

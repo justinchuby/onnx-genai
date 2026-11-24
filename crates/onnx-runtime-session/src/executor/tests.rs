@@ -7,7 +7,8 @@ use onnx_runtime_ep_api::{
     ExecutorArtifactReport, ExecutorArtifactState, ExecutorRouteResidencyConfig, Fence, Kernel,
     NegotiatedWeight,
 };
-use onnx_runtime_memory_api::MemoryRole;
+use onnx_runtime_memory_api::{MemoryRole, Tier};
+use onnx_runtime_memory_governor::MemoryGovernor;
 
 use super::*;
 
@@ -75,6 +76,7 @@ fn count_host_allocations<T>(operation: impl FnOnce() -> T) -> (T, u64) {
 }
 
 struct DeferredValidationKernel {
+    workspace_bytes: Arc<AtomicUsize>,
     fail_next: Arc<AtomicBool>,
     panic_next: Arc<AtomicBool>,
     validation_latch: Arc<AtomicU32>,
@@ -82,6 +84,42 @@ struct DeferredValidationKernel {
 }
 
 impl Kernel for DeferredValidationKernel {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+        Ok(WorkspaceRequirement {
+            bytes: (self.workspace_bytes.load(Ordering::Relaxed)
+                * inputs
+                    .first()
+                    .map_or(0, |input| input.shape.iter().product::<usize>()))
+                as u64,
+            alignment: 64,
+            lifetime: WorkspaceLifetime::StepScoped,
+        })
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        let required = self.workspace_bytes.load(Ordering::Relaxed)
+            * inputs
+                .first()
+                .map_or(0, |input| input.shape.iter().product::<usize>());
+        if required != 0 {
+            let scratch =
+                workspace.ok_or_else(|| EpError::KernelFailed("test workspace missing".into()))?;
+            assert!(scratch.bytes() >= required);
+            // SAFETY: this Host fixture exclusively borrows the checked scratch extent.
+            unsafe { std::ptr::write_bytes(scratch.ptr().0.cast::<u8>(), 0xA5, required) };
+        }
+        self.execute(inputs, outputs)
+    }
+
     fn execute(
         &self,
         inputs: &[TensorView],
@@ -114,6 +152,12 @@ impl Kernel for DeferredValidationKernel {
 }
 
 struct DeferredValidationEp {
+    workspace_bytes: Arc<AtomicUsize>,
+    workspace_registry: Option<onnx_runtime_memory_governor::PressureRegistry>,
+    workspace_allocations: AtomicUsize,
+    workspace_releases: AtomicUsize,
+    workspace_registry_calls: AtomicUsize,
+    fail_workspace_release: AtomicBool,
     cpu: CpuExecutionProvider,
     fail_next: Arc<AtomicBool>,
     validation_latch: Arc<AtomicU32>,
@@ -206,6 +250,12 @@ impl DeferredValidationEp {
         cpu.initialize(&EpConfig::default()).unwrap();
         Self {
             cpu,
+            workspace_bytes: Arc::new(AtomicUsize::new(0)),
+            workspace_registry: None,
+            workspace_allocations: AtomicUsize::new(0),
+            workspace_releases: AtomicUsize::new(0),
+            workspace_registry_calls: AtomicUsize::new(0),
+            fail_workspace_release: AtomicBool::new(false),
             fail_next: Arc::new(AtomicBool::new(true)),
             validation_latch: Arc::new(AtomicU32::new(0)),
             executions: Arc::new(AtomicUsize::new(0)),
@@ -330,11 +380,58 @@ impl ExecutionProvider for DeferredValidationEp {
         _opset: u64,
     ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
         Ok(Box::new(DeferredValidationKernel {
+            workspace_bytes: Arc::clone(&self.workspace_bytes),
             fail_next: Arc::clone(&self.fail_next),
             panic_next: Arc::clone(&self.panic_next),
             validation_latch: Arc::clone(&self.validation_latch),
             executions: Arc::clone(&self.executions),
         }))
+    }
+
+    fn workspace_pressure_registry(
+        &self,
+    ) -> onnx_runtime_ep_api::Result<Option<onnx_runtime_memory_governor::PressureRegistry>> {
+        self.workspace_registry_calls
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(self.workspace_registry.clone())
+    }
+
+    fn allocate_workspace(
+        &self,
+        size: usize,
+        alignment: usize,
+        role: MemoryRole,
+    ) -> onnx_runtime_ep_api::Result<WorkspaceAllocation> {
+        self.workspace_allocations.fetch_add(1, Ordering::Relaxed);
+        self.cpu.allocate_workspace(size, alignment, role)
+    }
+
+    fn deallocate_workspace(
+        &self,
+        workspace: WorkspaceAllocation,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.workspace_releases.fetch_add(1, Ordering::Relaxed);
+        if self.fail_workspace_release.swap(false, Ordering::Relaxed) {
+            return Err(EpError::KernelFailed(
+                "forced workspace release failure; ownership remains quarantined".into(),
+            ));
+        }
+
+        if self.workspace_registry.is_none() {
+            return self.cpu.deallocate_workspace(workspace);
+        }
+        let onnx_runtime_ep_api::BoundBufferOwnership::Managed(owner) = workspace
+            .into_buffer()
+            .into_bound_ownership()
+            .expect("managed test workspace")
+        else {
+            panic!("managed test workspace");
+        };
+        let outcome = (*owner)
+            .release_now()
+            .map_err(|error| EpError::KernelFailed(error.to_string()))?;
+        assert!(outcome.is_complete());
+        Ok(())
     }
 
     fn allocate(&self, size: usize, alignment: usize) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
@@ -3649,6 +3746,15 @@ fn capacity_form_attention_mask_input_classifier() {
         "a frozen causal additive mask carries the valid length at its last-row frontier, \
          so the causal capacity-form Attention is a valid frozen-mask leaf"
     );
+    causal
+        .attributes
+        .insert("left_window_size".into(), Attribute::Int(-1));
+    assert!(is_capacity_form_attention_mask_input(&causal, 3));
+    causal
+        .attributes
+        .insert("right_window_size".into(), Attribute::Int(0));
+    assert!(!kernel_input_uses_physical_capacity(&causal, 4));
+    assert!(!is_capacity_form_attention_mask_input(&causal, 3));
 
     // A masked `Attention` with no past KV bindings (inputs 4/5 absent) is not a
     // capacity-form leaf regardless of causality.
@@ -5209,6 +5315,7 @@ impl Kernel for WeightDeliveryKernel {
     fn workspace_requirement(
         &self,
         inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
     ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
         let rows = inputs
             .first()
@@ -5300,6 +5407,7 @@ impl Kernel for WorkspaceOnlyKernel {
     fn workspace_requirement(
         &self,
         _inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
     ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
         Ok(WorkspaceRequirement {
             bytes: self.bytes,
@@ -5466,7 +5574,23 @@ impl ExecutionProvider for WeightDeliveryEp {
         _layouts: &[TensorLayout],
     ) -> KernelMatch {
         if self.optional_input_contract && op.op_type == "OptionalContract" {
-            if input_dtypes == [DataType::Float32, DataType::Undefined, DataType::Bool] {
+            let expected: Vec<_> = op
+                .inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    if input.is_none() {
+                        DataType::Undefined
+                    } else if index == 0 {
+                        DataType::Float32
+                    } else {
+                        assert_eq!(index, 2);
+                        DataType::Bool
+                    }
+                })
+                .collect();
+            if input_dtypes == expected && _shapes.len() == op.inputs.len() {
+                self.deliveries.lock().unwrap().push("optional.claim");
                 return KernelMatch::Supported {
                     workspace_planning: onnx_runtime_ep_api::WorkspacePlanning::Metadata,
                     cost: Cost::ZERO,
@@ -5475,7 +5599,7 @@ impl ExecutionProvider for WeightDeliveryEp {
                 };
             }
             return KernelMatch::unsupported(format!(
-                "OptionalContract requires [Float32, Undefined, Bool] input dtypes, got {input_dtypes:?}"
+                "OptionalContract requires {expected:?} positional dtypes and matching shapes, got {input_dtypes:?} and {_shapes:?}"
             ));
         }
         if self.support_index_share_workspace
@@ -5515,6 +5639,20 @@ impl ExecutionProvider for WeightDeliveryEp {
         _shapes: &[Vec<usize>],
         _opset: u64,
     ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
+        if self.optional_input_contract && op.op_type == "OptionalContract" {
+            assert_eq!(
+                _shapes.len(),
+                op.inputs.len(),
+                "compilation must preserve every optional slot"
+            );
+            assert_eq!(_shapes[0], [1]);
+            assert!(_shapes[1..].iter().all(Vec::is_empty));
+            self.deliveries.lock().unwrap().push("optional.compile");
+            return Ok(Box::new(OptionalSlotContractKernel {
+                arity: op.inputs.len(),
+                deliveries: Arc::clone(&self.deliveries),
+            }));
+        }
         if self.support_index_share_workspace
             && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && op.op_type == "IndexShare"
@@ -6355,6 +6493,219 @@ fn claim_time_optional_input_dtype_is_undefined_not_silently_float32() {
         executor.is_ok(),
         "an omitted optional input must reach supports_op as DataType::Undefined"
     );
+}
+
+struct OptionalSlotContractKernel {
+    arity: usize,
+    deliveries: Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+impl Kernel for OptionalSlotContractKernel {
+    fn execute(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+    ) -> onnx_runtime_ep_api::Result<()> {
+        assert_eq!(
+            inputs.len(),
+            self.arity,
+            "execution must preserve every optional slot"
+        );
+        assert_eq!(inputs[0].dtype, DataType::Float32);
+        assert!(!inputs[0].is_absent());
+        assert!(inputs[1].is_absent());
+        assert_eq!(inputs[1].dtype, DataType::Undefined);
+        assert_eq!(inputs[2].dtype, DataType::Bool);
+        assert!(
+            !inputs[2].is_absent(),
+            "a present scalar with an empty shape is not an omitted input"
+        );
+        for input in &inputs[3..] {
+            assert!(input.is_absent());
+            assert_eq!(input.dtype, DataType::Undefined);
+        }
+        self.deliveries.lock().unwrap().push("optional.execute");
+        // SAFETY: live input/output tensor views are bounded by the executor;
+        // the fixture declares a single f32 result with the same byte extent.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(inputs[0].data_ptr::<u8>(), inputs[0].byte_size())
+        };
+        WeightDeliveryKernel::copy_bytes(bytes, &mut outputs[0])
+    }
+}
+
+#[test]
+fn optional_input_slots_agree_through_claim_compile_and_public_execution() {
+    for encoded in [false, true] {
+        for prepared in [false, true] {
+            for trailing in [false, true] {
+                let mut graph = Graph::new();
+                graph.opset_imports.insert("test.optional".into(), 1);
+                let data = graph.create_named_value("data", DataType::Float32, static_shape([1]));
+                let training =
+                    graph.create_named_value("training", DataType::Bool, static_shape([]));
+                let output =
+                    graph.create_named_value("output", DataType::Float32, static_shape([1]));
+                graph.add_input(data);
+                graph.add_input(training);
+                graph.add_output(output);
+                let mut inputs = vec![Some(data), None, Some(training)];
+                if trailing {
+                    inputs.extend([None, None]);
+                }
+                let mut node = Node::new(NodeId(0), "OptionalContract", inputs, vec![output]);
+                node.domain = "test.optional".into();
+                graph.insert_node(node);
+                let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let mut provider = WeightDeliveryEp::new(false, Arc::clone(&deliveries));
+                provider.optional_input_contract = true;
+                let provider: Arc<dyn ExecutionProvider> = Arc::new(provider);
+                let mut session = if encoded {
+                    let bytes =
+                        onnx_runtime_loader::encode_model(&onnx_runtime_loader::Model::new(&graph))
+                            .unwrap();
+                    crate::InferenceSession::builder()
+                        .model_bytes(&bytes)
+                        .option("optimization", "none")
+                        .execution_provider(provider)
+                        .build()
+                        .unwrap()
+                } else {
+                    crate::InferenceSession::from_graph_with_provider(
+                        graph,
+                        Arc::new(WeightStore::new()),
+                        std::path::Path::new("."),
+                        provider,
+                        None,
+                    )
+                    .unwrap()
+                };
+                let data = Tensor::from_f32(&[1], &[7.25]).unwrap();
+                let training = Tensor::from_raw(DataType::Bool, vec![], &[1]).unwrap();
+                let bindings = [("data", &data), ("training", &training)];
+                if prepared {
+                    session
+                        .prepare_with_device_bindings(&bindings, &mut [])
+                        .unwrap();
+                }
+                let output = session.run(&bindings).unwrap();
+                assert_eq!(output[0].to_vec_f32(), [7.25]);
+                let seen = deliveries.lock().unwrap();
+                for phase in ["optional.claim", "optional.compile", "optional.execute"] {
+                    assert!(
+                        seen.contains(&phase),
+                        "missing {phase}; encoded={encoded}, prepared={prepared}, trailing={trailing}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn public_block_moe_accepts_preserved_trailing_optional_inputs() {
+    const H: usize = 32;
+    let mut expected = None;
+    for prepared in [false, true] {
+        for trailing in [0, 2, 4, 5] {
+            let mut graph = Graph::new();
+            graph
+                .opset_imports
+                .insert(onnx_runtime_ir::RUNTIME_DOMAIN.into(), 1);
+            let data = graph.create_named_value("data", DataType::Float32, static_shape([1, H]));
+            let router =
+                graph.create_named_value("router", DataType::Float32, static_shape([1, 2]));
+            let output =
+                graph.create_named_value("output", DataType::Float32, static_shape([1, H]));
+            let mut weight = |name: &str| {
+                let shape = vec![2, H, 1, 17];
+                let value = graph.create_named_value(
+                    name,
+                    DataType::Uint8,
+                    static_shape(shape.iter().copied()),
+                );
+                let mut packed = vec![0x22; 2 * H * 17];
+                for block in packed.chunks_exact_mut(17) {
+                    block[0] = 121;
+                }
+                graph.set_initializer(
+                    value,
+                    WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                        DataType::Uint8,
+                        shape,
+                        packed,
+                    )),
+                );
+                value
+            };
+            let fc1 = weight("fc1");
+            let fc2 = weight("fc2");
+            let mut inputs = vec![Some(data), Some(router), Some(fc1), None, Some(fc2)];
+            inputs.extend(std::iter::repeat_n(None, trailing));
+            let mut node = Node::new(NodeId(0), "BlockQuantizedMoE", inputs, vec![output]);
+            node.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+            for (name, attr) in [
+                (
+                    "fc1_format",
+                    onnx_runtime_ir::Attribute::String(b"mxfp4".to_vec()),
+                ),
+                (
+                    "fc2_format",
+                    onnx_runtime_ir::Attribute::String(b"mxfp4".to_vec()),
+                ),
+                ("block_layout_version", onnx_runtime_ir::Attribute::Int(1)),
+                (
+                    "activation_type",
+                    onnx_runtime_ir::Attribute::String(b"identity".to_vec()),
+                ),
+                ("k", onnx_runtime_ir::Attribute::Int(1)),
+                (
+                    "normalize_routing_weights",
+                    onnx_runtime_ir::Attribute::Int(1),
+                ),
+            ] {
+                node.attributes.insert(name.into(), attr);
+            }
+            graph.add_input(data);
+            graph.add_input(router);
+            graph.add_output(output);
+            graph.insert_node(node);
+            let bytes = onnx_runtime_loader::encode_model(&onnx_runtime_loader::Model::new(&graph))
+                .unwrap();
+            let built = crate::InferenceSession::builder()
+                .model_bytes(&bytes)
+                .option("optimization", "none")
+                .execution_provider(Arc::new(CpuExecutionProvider::new()))
+                .build();
+            if trailing == 5 {
+                let Err(error) = built else {
+                    panic!("ten positional slots must not be accepted by a nine-input operator");
+                };
+                let message = error.to_string();
+                assert!(
+                    message.contains("expected 5 to 9 positional inputs, got 10"),
+                    "{message}"
+                );
+                continue;
+            }
+            let mut session = built.unwrap();
+            let data = Tensor::from_f32(&[1, H], &[0.125; H]).unwrap();
+            let router = Tensor::from_f32(&[1, 2], &[4., -4.]).unwrap();
+            let bindings = [("data", &data), ("router", &router)];
+            if prepared {
+                session
+                    .prepare_with_device_bindings(&bindings, &mut [])
+                    .unwrap();
+            }
+            let output = session.run(&bindings).unwrap();
+            let values = output[0].to_vec_f32();
+            assert!(values.iter().all(|x| x.is_finite() && *x != 0.));
+            assert_eq!(
+                *expected.get_or_insert_with(|| output[0].as_bytes().to_vec()),
+                output[0].as_bytes()
+            );
+        }
+    }
 }
 
 #[test]
@@ -8546,8 +8897,16 @@ fn coverage_collector_surfaces_ep_decline_reason() {
     )
     .unwrap();
     let mut issues = Vec::new();
-    collect_cuda_coverage_issues(&graph, &graph, &ep, artifact_config, "graph", &mut issues)
-        .unwrap();
+    collect_cuda_coverage_issues(
+        &graph,
+        &graph,
+        &ep,
+        artifact_config,
+        "graph",
+        &mut issues,
+        false,
+    )
+    .unwrap();
 
     assert_eq!(issues.len(), 1);
     assert_eq!(issues[0].op_type, "NotRegistered");
@@ -8614,7 +8973,7 @@ fn cuda_coverage_report_groups_all_distinct_failure_classes_deterministically() 
     )
     .unwrap();
     let report = || {
-        cuda_fallback_report(&graph, &ep, artifact_config)
+        cuda_fallback_report(&graph, &ep, artifact_config, false)
             .unwrap()
             .expect("CUDA declines must produce a fallback report")
             .to_string()
@@ -16452,4 +16811,930 @@ fn a_false_no_workspace_declaration_is_rejected_before_late_allocation() {
         "{error}"
     );
     assert!(executor.step_workspace.is_none());
+}
+
+#[derive(Debug)]
+struct WorkspaceAccounting {
+    inner: onnx_runtime_memory_governor::LedgerGovernor,
+    claims: AtomicUsize,
+    returns: AtomicUsize,
+}
+
+#[derive(Debug)]
+struct WorkspaceCountingAuthority(Arc<WorkspaceAccounting>);
+
+impl WorkspaceCountingAuthority {
+    fn callbacks(&self) -> (usize, usize) {
+        (
+            self.0.claims.load(Ordering::Relaxed),
+            self.0.returns.load(Ordering::Relaxed),
+        )
+    }
+}
+
+impl onnx_runtime_memory_governor::LeaseAccounting for WorkspaceAccounting {
+    fn authority_id(&self) -> Option<onnx_runtime_memory_governor::MemoryAuthorityId> {
+        Some(self.inner.authority_id(Tier::Host))
+    }
+    fn try_claim(
+        &self,
+        tier: Tier,
+        bytes: u64,
+        role: MemoryRole,
+    ) -> std::result::Result<(), onnx_runtime_memory_api::MemoryError> {
+        self.claims.fetch_add(1, Ordering::Relaxed);
+        onnx_runtime_memory_governor::LeaseAccounting::try_claim(
+            self.inner.ledger().as_ref(),
+            tier,
+            bytes,
+            role,
+        )
+    }
+    fn release(&self, tier: Tier, bytes: u64) {
+        self.returns.fetch_add(1, Ordering::Relaxed);
+        onnx_runtime_memory_governor::LeaseAccounting::release(
+            self.inner.ledger().as_ref(),
+            tier,
+            bytes,
+        );
+    }
+}
+
+impl MemoryGovernor for WorkspaceCountingAuthority {
+    fn authority_id(&self, tier: Tier) -> onnx_runtime_memory_governor::MemoryAuthorityId {
+        self.0.inner.authority_id(tier)
+    }
+    fn pressure_registry(
+        &self,
+        tier: Tier,
+    ) -> Option<onnx_runtime_memory_governor::PressureRegistry> {
+        self.0.inner.pressure_registry(tier)
+    }
+    fn reserve(
+        &self,
+        tier: Tier,
+        bytes: u64,
+        role: MemoryRole,
+        holder: onnx_runtime_memory_governor::HolderId,
+    ) -> std::result::Result<
+        onnx_runtime_memory_governor::MemoryLease,
+        onnx_runtime_memory_api::MemoryError,
+    > {
+        onnx_runtime_memory_governor::LeaseAccounting::try_claim(
+            self.0.as_ref(),
+            tier,
+            bytes,
+            role,
+        )?;
+        Ok(onnx_runtime_memory_governor::MemoryLease::new(
+            tier,
+            bytes,
+            role,
+            holder,
+            self.0.clone(),
+        ))
+    }
+    fn available(&self, tier: Tier) -> u64 {
+        self.0.inner.available(tier)
+    }
+    fn used(&self, tier: Tier) -> u64 {
+        self.0.inner.used(tier)
+    }
+}
+
+fn completed_workspace_fixture(
+    expose_registry: bool,
+) -> (
+    Executor,
+    Arc<DeferredValidationEp>,
+    Arc<WorkspaceCountingAuthority>,
+    onnx_runtime_memory_governor::ProcessMemoryManager,
+) {
+    use onnx_runtime_memory_api::DeviceKey;
+    use onnx_runtime_memory_governor::{
+        HolderId, HostWorkspacePool, LeaseLedger, LedgerGovernor, MemoryGovernor,
+        ProcessMemoryManager,
+    };
+    let books = Arc::new(WorkspaceCountingAuthority(Arc::new(WorkspaceAccounting {
+        inner: LedgerGovernor::new(LeaseLedger::new_for_device(DeviceKey::HOST, 0, 4096, 0)),
+        claims: AtomicUsize::new(0),
+        returns: AtomicUsize::new(0),
+    })));
+    let manager = ProcessMemoryManager::new().unwrap();
+    let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+    let resources = onnx_runtime_ep_cpu::CpuMemoryResources::new(
+        onnx_runtime_ep_cpu::DerivedWeightMemory::governed(books.as_ref(), HolderId::new(19))
+            .unwrap(),
+        Default::default(),
+    )
+    .unwrap()
+    .with_workspace_pool(pool)
+    .unwrap();
+    let mut ep = DeferredValidationEp::new();
+    ep.cpu = CpuExecutionProvider::initialized_with_resources(resources).unwrap();
+    ep.workspace_bytes.store(32, Ordering::Relaxed);
+    ep.workspace_registry = expose_registry.then(|| books.pressure_registry(Tier::Host).unwrap());
+    ep.fail_next.store(false, Ordering::Relaxed);
+    let ep = Arc::new(ep);
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let elements = graph.create_symbol(None);
+    let input = graph.create_named_value("input", DataType::Float32, vec![Dim::Symbolic(elements)]);
+    let output =
+        graph.create_named_value("output", DataType::Float32, vec![Dim::Symbolic(elements)]);
+    graph.add_input(input);
+    graph.add_output(output);
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "DeferredValidation",
+        vec![Some(input)],
+        vec![output],
+    ));
+    let executor = Executor::build(graph, Arc::new(WeightStore::new()), ep.clone(), None).unwrap();
+    (executor, ep, books, manager)
+}
+
+fn completed_workspace_input(elements: usize) -> Tensor {
+    Tensor::from_raw(
+        DataType::Float32,
+        vec![elements],
+        &vec![3.0f32; elements]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn completed_workspace_warm_runs_retain_original_owner_and_charge() {
+    let (mut executor, ep, books, manager) = completed_workspace_fixture(true);
+    let input = completed_workspace_input(2);
+    let mut identity = None;
+    let before = books.callbacks();
+    for iteration in 0..8 {
+        let before_sync = ep.sync_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            executor.run(&[("input", &input)]).unwrap()[0].as_bytes(),
+            input.as_bytes()
+        );
+        let used_syncs = ep.sync_calls.load(Ordering::Relaxed) - before_sync;
+        if iteration > 0 {
+            assert_eq!(
+                used_syncs, 1,
+                "only the existing request completion boundary"
+            );
+        }
+        let allocations = manager.snapshot().unwrap().allocations;
+        assert_eq!(allocations.len(), 1);
+        assert_eq!(
+            *identity.get_or_insert(allocations[0].identity),
+            allocations[0].identity
+        );
+        assert_eq!(books.used(Tier::Host), 64);
+        assert_eq!(manager.process_used(Tier::Host), 64);
+        assert_eq!(
+            ep.workspace_allocations.load(Ordering::Relaxed),
+            1,
+            "iteration {iteration}"
+        );
+        assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 0);
+        assert_eq!(ep.workspace_registry_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            books.callbacks(),
+            (before.0 + 1, before.1),
+            "warm fitting runs must make zero issuer callbacks, including zero-byte calls"
+        );
+    }
+    drop(executor);
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 1);
+    assert_eq!(books.used(Tier::Host), 0);
+    assert_eq!(manager.process_used(Tier::Host), 0);
+}
+
+#[test]
+fn completed_workspace_pressure_releases_idle_but_cannot_take_active_owner() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(true);
+    let input = completed_workspace_input(2);
+    executor.run(&[("input", &input)]).unwrap();
+    let registry = ep.workspace_registry.as_ref().unwrap();
+    assert_eq!(registry.reclaim(0).unwrap(), 0);
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 0);
+    executor.restore_completed_step_workspace();
+    assert_eq!(registry.reclaim(1).unwrap(), 0);
+    assert_eq!(books.used(Tier::Host), 64);
+    executor.release_step_workspace().unwrap();
+    assert_eq!(registry.reclaim(1).unwrap(), 64);
+    assert_eq!(books.used(Tier::Host), 0);
+    executor.run(&[("input", &input)]).unwrap();
+    assert_eq!(ep.workspace_allocations.load(Ordering::Relaxed), 2);
+    assert_eq!(books.used(Tier::Host), 64);
+    drop(executor);
+    assert_eq!(registry.reclaim(1).unwrap(), 0);
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn completed_workspace_growth_replaces_only_the_lane_capacity() {
+    let (mut executor, ep, books, manager) = completed_workspace_fixture(true);
+    for (elements, expected_capacity, allocations) in [(2, 64, 1), (4, 128, 2), (1, 128, 2)] {
+        let input = completed_workspace_input(elements);
+        executor.run(&[("input", &input)]).unwrap();
+        assert_eq!(books.used(Tier::Host), expected_capacity);
+        assert_eq!(manager.snapshot().unwrap().allocations.len(), 1);
+        assert_eq!(
+            ep.workspace_allocations.load(Ordering::Relaxed),
+            allocations
+        );
+    }
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 1);
+    drop(executor);
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn completed_workspace_deferred_binding_run_retires_without_new_sync() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(true);
+    let mut bindings = vec![
+        executor
+            .allocate_device_binding("input".into(), None, DataType::Float32, vec![2], vec![2])
+            .unwrap(),
+        executor
+            .allocate_device_output_binding("output".into(), DataType::Float32, vec![2], vec![2])
+            .unwrap(),
+    ];
+    bindings[0]
+        .write_bytes(0, completed_workspace_input(2).as_bytes())
+        .unwrap();
+    executor
+        .prepare_with_device_bindings(&[], &mut bindings)
+        .unwrap();
+    let syncs = ep.sync_calls.load(Ordering::Relaxed);
+    executor
+        .run_with_device_bindings(&[], &mut bindings)
+        .unwrap();
+    assert_eq!(ep.sync_calls.load(Ordering::Relaxed), syncs);
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 1);
+    assert_eq!(books.used(Tier::Host), 0);
+    assert!(matches!(
+        executor.workspace_reuse,
+        WorkspaceReuse::Uninitialized
+    ));
+}
+
+#[test]
+fn completed_workspace_failed_validation_cannot_publish_idle_owner() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(true);
+    ep.fail_next.store(true, Ordering::Relaxed);
+    let error = executor
+        .run(&[("input", &completed_workspace_input(2))])
+        .unwrap_err();
+    assert!(error.to_string().contains("0x40"), "{error}");
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 1);
+    assert_eq!(books.used(Tier::Host), 0);
+    assert!(executor.workspace_reuse.take().is_none());
+}
+
+#[test]
+fn completed_workspace_installed_capture_is_never_pressure_idle() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(true);
+    executor
+        .run(&[("input", &completed_workspace_input(2))])
+        .unwrap();
+    executor.restore_completed_step_workspace();
+    executor.slot_capture[0].device_graph_token = Some(DeviceGraphToken::new(
+        executor.graph_owner,
+        DeviceGraphSlot::Primary,
+        1,
+    ));
+    executor.release_step_workspace().unwrap();
+    assert!(executor.step_workspace.is_some());
+    assert_eq!(
+        ep.workspace_registry.as_ref().unwrap().reclaim(1).unwrap(),
+        0
+    );
+    assert_eq!(books.used(Tier::Host), 64);
+    executor.slot_capture[0].device_graph_token = None;
+    executor.release_step_workspace().unwrap();
+    assert_eq!(
+        ep.workspace_registry.as_ref().unwrap().reclaim(1).unwrap(),
+        64
+    );
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn completed_workspace_restore_and_pressure_have_one_owner() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(true);
+    let input = completed_workspace_input(2);
+    for _ in 0..16 {
+        executor.run(&[("input", &input)]).unwrap();
+        let reuse = &executor.workspace_reuse;
+        let registry = ep.workspace_registry.as_ref().unwrap();
+        let (owner, reclaimed) = std::thread::scope(|scope| {
+            let take = scope.spawn(|| reuse.take());
+            let pressure = scope.spawn(|| registry.reclaim(1).unwrap());
+            (take.join().unwrap(), pressure.join().unwrap())
+        });
+        if let Some(owner) = owner {
+            assert_eq!(reclaimed, 0);
+            assert_eq!(books.used(Tier::Host), 64);
+            ep.deallocate_workspace(owner.buffer).unwrap();
+        } else {
+            assert_eq!(reclaimed, 64);
+        }
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+}
+
+#[test]
+fn completed_workspace_no_pressure_capability_keeps_original_retirement() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(false);
+    let input = completed_workspace_input(2);
+    for _ in 0..3 {
+        executor.run(&[("input", &input)]).unwrap();
+    }
+    assert_eq!(ep.workspace_registry_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(ep.workspace_allocations.load(Ordering::Relaxed), 3);
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 3);
+    assert!(matches!(executor.workspace_reuse, WorkspaceReuse::Disabled));
+    // The underlying CPU pool, rather than the executor, still retains charge.
+    assert_eq!(books.used(Tier::Host), 64);
+}
+
+#[test]
+fn completed_workspace_zero_requirement_never_enrolls_or_allocates() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(true);
+    ep.workspace_bytes.store(0, Ordering::Relaxed);
+    let before = books.callbacks();
+    executor
+        .run(&[("input", &completed_workspace_input(2))])
+        .unwrap();
+    assert_eq!(ep.workspace_registry_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(books.callbacks(), before);
+    assert_eq!(ep.workspace_allocations.load(Ordering::Relaxed), 0);
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 0);
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn completed_workspace_failed_release_is_not_retried_or_refunded() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(true);
+    executor
+        .run(&[("input", &completed_workspace_input(2))])
+        .unwrap();
+    ep.fail_workspace_release.store(true, Ordering::Relaxed);
+    let registry = ep.workspace_registry.as_ref().unwrap();
+    let error = registry.reclaim(1).unwrap_err();
+    assert!(
+        error.to_string().contains("workspace release failure"),
+        "{error}"
+    );
+    assert_eq!(books.used(Tier::Host), 64);
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 1);
+    assert_eq!(registry.reclaim(1).unwrap(), 0);
+    drop(executor);
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 1);
+    assert_eq!(books.used(Tier::Host), 64);
+}
+
+#[test]
+fn completed_workspace_preparation_without_execution_stays_active_until_drop() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(true);
+    executor
+        .prepare_with_device_bindings(&[("input", &completed_workspace_input(2))], &mut [])
+        .unwrap();
+    assert!(executor.step_workspace.is_some());
+    assert_eq!(
+        ep.workspace_registry.as_ref().unwrap().reclaim(1).unwrap(),
+        0
+    );
+    assert_eq!(books.used(Tier::Host), 64);
+    drop(executor);
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 1);
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn completed_workspace_capture_refuses_prepare_growth_until_all_slots_retire() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(true);
+    executor
+        .run(&[("input", &completed_workspace_input(2))])
+        .unwrap();
+    executor.restore_completed_step_workspace();
+    let original = executor.step_workspace.as_ref().unwrap().buffer.as_ptr();
+    executor.slot_capture[1].device_graph_token = Some(DeviceGraphToken::new(
+        executor.graph_owner,
+        DeviceGraphSlot::Verify,
+        1,
+    ));
+    let bigger = completed_workspace_input(4);
+    let error = executor
+        .prepare_with_device_bindings(&[("input", &bigger)], &mut [])
+        .unwrap_err();
+    assert!(error.to_string().contains("reset_device_graph"), "{error}");
+    assert_eq!(
+        executor.step_workspace.as_ref().unwrap().buffer.as_ptr(),
+        original
+    );
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 0);
+    assert_eq!(books.used(Tier::Host), 64);
+    executor.slot_capture[1].device_graph_token = None;
+    assert_eq!(
+        executor
+            .prepare_with_device_bindings(&[("input", &bigger)], &mut [])
+            .unwrap()
+            .bytes,
+        128
+    );
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 1);
+    assert_eq!(books.used(Tier::Host), 128);
+}
+
+#[test]
+fn completed_workspace_capture_refuses_eager_growth_and_alignment_changes() {
+    let (mut executor, ep, books, _) = completed_workspace_fixture(true);
+    executor
+        .run(&[("input", &completed_workspace_input(2))])
+        .unwrap();
+    executor.restore_completed_step_workspace();
+    let original = executor.step_workspace.as_ref().unwrap().buffer.as_ptr();
+    executor.slot_capture[0].device_graph_token = Some(DeviceGraphToken::new(
+        executor.graph_owner,
+        DeviceGraphSlot::Primary,
+        1,
+    ));
+    let error = executor
+        .run(&[("input", &completed_workspace_input(4))])
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("installed device graph"),
+        "{error}"
+    );
+    assert_eq!(
+        executor.step_workspace.as_ref().unwrap().buffer.as_ptr(),
+        original
+    );
+    let alignment = executor.step_workspace.as_ref().unwrap().alignment * 2;
+    let error = WorkspaceReplacement::for_captures(&executor.slot_capture)
+        .check(
+            executor.step_workspace.as_ref(),
+            WorkspaceRequirement {
+                bytes: 64,
+                alignment,
+                lifetime: WorkspaceLifetime::StepScoped,
+            },
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("aligned to"), "{error}");
+    assert_eq!(ep.workspace_releases.load(Ordering::Relaxed), 0);
+    assert_eq!(books.used(Tier::Host), 64);
+    executor.slot_capture[0].device_graph_token = None;
+    executor
+        .run(&[("input", &completed_workspace_input(4))])
+        .unwrap();
+    assert_eq!(books.used(Tier::Host), 128);
+}
+
+struct OutputWorkspaceProbeEp {
+    cpu: CpuExecutionProvider,
+    plans: Arc<std::sync::Mutex<Vec<Vec<OutputMetadata<'static>>>>>,
+}
+struct OutputWorkspaceProbeKernel {
+    slots: Vec<bool>,
+    plans: Arc<std::sync::Mutex<Vec<Vec<OutputMetadata<'static>>>>>,
+}
+impl OutputWorkspaceProbeKernel {
+    fn bytes(&self, outputs: &[OutputMetadata<'_>]) -> onnx_runtime_ep_api::Result<u64> {
+        if outputs.len() != self.slots.len() {
+            return Err(EpError::KernelFailed(
+                "workspace output positions were compressed".into(),
+            ));
+        }
+        let mut bytes = 0;
+        for (index, (present, output)) in self.slots.iter().zip(outputs).enumerate() {
+            match (present, output) {
+                (false, OutputMetadata::Absent) => {}
+                (true, OutputMetadata::Tensor { shape, .. }) => {
+                    bytes += shape.iter().product::<usize>() as u64 * 8
+                }
+                _ => {
+                    return Err(EpError::KernelFailed(format!(
+                        "workspace output #{index}: expected presence {present}, received {output:?}; slots={:?}; bind an exact output extent before preparation",
+                        self.slots
+                    )));
+                }
+            }
+        }
+        Ok(bytes)
+    }
+}
+impl Kernel for OutputWorkspaceProbeKernel {
+    fn workspace_requirement(
+        &self,
+        _: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+        let bytes = self.bytes(outputs)?;
+        self.plans.lock().unwrap().push(
+            outputs
+                .iter()
+                .cloned()
+                .map(OutputMetadata::into_owned)
+                .collect(),
+        );
+        Ok(WorkspaceRequirement {
+            bytes,
+            alignment: 8,
+            ..WorkspaceRequirement::NONE
+        })
+    }
+    fn execute(&self, _: &[TensorView], _: &mut [TensorMut]) -> onnx_runtime_ep_api::Result<()> {
+        Err(EpError::KernelFailed(
+            "output-bound probe requires prepared workspace".into(),
+        ))
+    }
+    fn execute_with_workspace(
+        &self,
+        _: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        let facts = outputs
+            .iter()
+            .map(OutputMetadata::from_view)
+            .collect::<Vec<_>>();
+        let bytes = self.bytes(&facts)?;
+        assert!(workspace.is_some_and(|workspace| workspace.bytes() as u64 >= bytes));
+        for output in outputs.iter_mut().filter(|output| !output.is_absent()) {
+            let bytes = output.byte_size();
+            // SAFETY: this fixture receives exclusive, contiguous Host outputs.
+            unsafe { std::ptr::write_bytes(output.data_ptr_mut::<u8>(), 0x5A, bytes) };
+        }
+        Ok(())
+    }
+}
+impl ExecutionProvider for OutputWorkspaceProbeEp {
+    fn name(&self) -> &str {
+        "output_workspace_probe"
+    }
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Cpu
+    }
+    fn device_id(&self) -> onnx_runtime_ir::DeviceId {
+        onnx_runtime_ir::DeviceId::cpu()
+    }
+    fn initialize(&mut self, config: &EpConfig) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.initialize(config)
+    }
+    fn shutdown(&mut self) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.shutdown()
+    }
+    fn supports_op(
+        &self,
+        node: &Node,
+        opset: u64,
+        shapes: &[Shape],
+        dtypes: &[DataType],
+        layouts: &[TensorLayout],
+    ) -> KernelMatch {
+        if matches!(node.op_type.as_str(), "Attention" | "OutputWorkspaceProbe") {
+            KernelMatch::Supported {
+                workspace_planning: onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+                cost: Cost::ZERO,
+                required_input_layouts: None,
+                output_layouts: vec![TensorLayout::contiguous(); node.output_values().count()],
+            }
+        } else {
+            self.cpu.supports_op(node, opset, shapes, dtypes, layouts)
+        }
+    }
+    fn get_kernel(
+        &self,
+        node: &Node,
+        shapes: &[Vec<usize>],
+        opset: u64,
+    ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
+        if matches!(node.op_type.as_str(), "Attention" | "OutputWorkspaceProbe") {
+            Ok(Box::new(OutputWorkspaceProbeKernel {
+                slots: node.outputs.iter().map(Option::is_some).collect(),
+                plans: self.plans.clone(),
+            }))
+        } else {
+            self.cpu.get_kernel(node, shapes, opset)
+        }
+    }
+    fn allocate(
+        &self,
+        bytes: usize,
+        alignment: usize,
+    ) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
+        self.cpu.allocate(bytes, alignment)
+    }
+    fn deallocate(&self, buffer: DeviceBuffer) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.deallocate(buffer)
+    }
+    fn allocate_workspace(
+        &self,
+        bytes: usize,
+        alignment: usize,
+        role: MemoryRole,
+    ) -> onnx_runtime_ep_api::Result<WorkspaceAllocation> {
+        self.cpu.allocate_workspace(bytes, alignment, role)
+    }
+    fn deallocate_workspace(&self, owner: WorkspaceAllocation) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.deallocate_workspace(owner)
+    }
+    fn copy(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        bytes: usize,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.copy(src, dst, bytes)
+    }
+    fn copy_async(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        bytes: usize,
+    ) -> onnx_runtime_ep_api::Result<Fence> {
+        self.cpu.copy_async(src, dst, bytes)
+    }
+    fn sync(&self) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.sync()
+    }
+}
+
+#[test]
+fn output_workspace_metadata_tracks_physical_bindings_and_memo() {
+    let ep = Arc::new(OutputWorkspaceProbeEp {
+        cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
+        plans: Default::default(),
+    });
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 24);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([2]));
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([1]));
+    let cache = graph.create_named_value("cache", DataType::Float32, static_shape([1, 1, 2, 4]));
+    graph.add_input(input);
+    graph.add_output(y);
+    graph.add_output(cache);
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Attention",
+        vec![Some(input)],
+        vec![y, cache],
+    ));
+    let mut executor =
+        Executor::build(graph, Arc::new(WeightStore::new()), ep.clone(), None).unwrap();
+    assert_eq!(
+        executor.graph.node(NodeId(0)).outputs,
+        vec![Some(y), Some(cache)]
+    );
+    let input = Tensor::from_f32(&[2], &[1., 2.]).unwrap();
+    for capacity in [4, 8, 4] {
+        let mut bindings = vec![
+            executor
+                .allocate_device_output_binding(
+                    "cache".into(),
+                    DataType::Float32,
+                    vec![1, 1, capacity, 4],
+                    vec![1, 1, 2, 4],
+                )
+                .unwrap(),
+        ];
+        let requirement = executor
+            .prepare_with_device_bindings(&[("input", &input)], &mut bindings)
+            .unwrap();
+        assert_eq!(requirement.bytes, 8 + capacity as u64 * 32);
+        let plans = ep.plans.lock().unwrap().len();
+        assert_eq!(
+            executor
+                .prepare_with_device_bindings(&[("input", &input)], &mut bindings)
+                .unwrap()
+                .bytes,
+            requirement.bytes
+        );
+        assert_eq!(
+            ep.plans.lock().unwrap().len(),
+            plans,
+            "unchanged output facts must hit the preparation memo"
+        );
+        executor
+            .run_with_device_bindings(&[("input", &input)], &mut bindings)
+            .unwrap();
+        assert!(
+            bindings[0]
+                .read_bytes()
+                .unwrap()
+                .iter()
+                .all(|byte| *byte == 0x5A)
+        );
+        let expected = vec![
+            OutputMetadata::tensor(DataType::Float32, &[1]).into_owned(),
+            OutputMetadata::tensor(DataType::Float32, &[1, 1, capacity, 4]).into_owned(),
+        ];
+        assert_eq!(ep.plans.lock().unwrap().last(), Some(&expected));
+    }
+}
+
+#[test]
+fn output_workspace_metadata_matches_lowered_trailing_outputs() {
+    let ep = Arc::new(OutputWorkspaceProbeEp {
+        cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
+        plans: Default::default(),
+    });
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([3]));
+    graph.add_output(y);
+    let mut node = Node::new(NodeId(0), "OutputWorkspaceProbe", vec![], vec![y]);
+    node.outputs = vec![Some(y), None, None];
+    graph.insert_node(node);
+    let mut executor =
+        Executor::build(graph, Arc::new(WeightStore::new()), ep.clone(), None).unwrap();
+    assert_eq!(
+        executor
+            .prepare_with_device_bindings(&[], &mut [])
+            .unwrap()
+            .bytes,
+        24
+    );
+    assert_eq!(executor.run(&[]).unwrap()[0].as_bytes(), &[0x5A; 12]);
+    assert_eq!(
+        ep.plans.lock().unwrap().last().unwrap().as_slice(),
+        &[OutputMetadata::tensor(DataType::Float32, &[3])]
+    );
+}
+
+#[test]
+fn output_workspace_metadata_reaches_nested_control_flow_preparation() {
+    let ep = Arc::new(OutputWorkspaceProbeEp {
+        cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
+        plans: Default::default(),
+    });
+    let mut child = Graph::new();
+    let value = child.create_named_value("child_output", DataType::Float32, static_shape([3]));
+    child.add_output(value);
+    let mut node = Node::new(NodeId(0), "OutputWorkspaceProbe", vec![], vec![value]);
+    node.outputs = vec![Some(value), None];
+    child.insert_node(node);
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let condition = graph.create_named_value("condition", DataType::Bool, static_shape([]));
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([3]));
+    graph.add_input(condition);
+    graph.add_output(output);
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "If",
+        vec![Some(condition)],
+        vec![output],
+    ));
+    graph
+        .subgraphs
+        .insert((NodeId(0), "then_branch".into()), child.clone());
+    graph
+        .subgraphs
+        .insert((NodeId(0), "else_branch".into()), child);
+    let mut executor =
+        Executor::build(graph, Arc::new(WeightStore::new()), ep.clone(), None).unwrap();
+    for condition in [0, 1] {
+        let condition = Tensor::from_raw(DataType::Bool, vec![], &[condition]).unwrap();
+        assert_eq!(
+            executor
+                .prepare_with_device_bindings(&[("condition", &condition)], &mut [])
+                .unwrap()
+                .bytes,
+            24
+        );
+        assert_eq!(
+            executor.run(&[("condition", &condition)]).unwrap()[0].as_bytes(),
+            &[0x5A; 12]
+        );
+    }
+    assert!(
+        ep.plans
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|facts| facts == &[OutputMetadata::tensor(DataType::Float32, &[3])])
+    );
+}
+
+#[test]
+fn workspace_capture_pins_use_existing_lane_without_issuer_callbacks() {
+    let (mut executor, _ep, books, _manager) = completed_workspace_fixture(true);
+    let input = completed_workspace_input(2);
+    executor
+        .prepare_with_device_bindings(&[("input", &input)], &mut [])
+        .unwrap();
+    let callbacks = books.callbacks();
+    let first = executor.workspace_capture_resources().unwrap();
+    assert_eq!(first.len(), 1);
+    let prepared = executor.step_workspace.as_ref().unwrap();
+    assert!(
+        first[0]
+            .workspace_span()
+            .unwrap()
+            .covers(prepared.buffer.as_ptr() as usize, prepared.bytes)
+    );
+    let installed = first.clone();
+    let provisional = executor.workspace_capture_resources().unwrap();
+    assert_eq!(
+        prepared.buffer.bound_owner().unwrap().outstanding_views(),
+        2
+    );
+    drop(first);
+    drop(provisional);
+    assert_eq!(
+        prepared.buffer.bound_owner().unwrap().outstanding_views(),
+        1
+    );
+    drop(installed);
+    assert_eq!(
+        prepared.buffer.bound_owner().unwrap().outstanding_views(),
+        0
+    );
+    assert_eq!(books.callbacks(), callbacks);
+    assert_eq!(books.used(Tier::Host), 64);
+    drop(executor);
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn workspace_capture_default_cannot_silently_discard_real_pins() {
+    let (mut executor, ep, _books, _manager) = completed_workspace_fixture(true);
+    executor
+        .prepare_with_device_bindings(&[("input", &completed_workspace_input(2))], &mut [])
+        .unwrap();
+    let resources = executor.workspace_capture_resources().unwrap();
+    let error = ep
+        .begin_owned_device_graph_capture(
+            executor.graph_owner,
+            DeviceGraphSlot::Primary,
+            None,
+            &[],
+            resources,
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("implement begin_owned_device_graph_capture"),
+        "{error}"
+    );
+    assert_eq!(
+        executor
+            .step_workspace
+            .as_ref()
+            .unwrap()
+            .buffer
+            .bound_owner()
+            .unwrap()
+            .outstanding_views(),
+        0
+    );
+}
+
+#[test]
+fn workspace_capture_inherited_addresses_cannot_manufacture_ownership() {
+    let (mut executor, _ep, _books, _manager) = completed_workspace_fixture(true);
+    executor.inherited_workspace = InheritedWorkspaces {
+        persistent: Some((0x1000, 64)),
+        step: None,
+    };
+    let error = executor.workspace_capture_resources().err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("parent executor that owns their backing")
+    );
+    executor.inherited_workspace = InheritedWorkspaces::default();
+}
+
+#[test]
+fn workspace_capture_cannot_silently_skip_unpinned_raw_backing() {
+    let (mut executor, _ep, _books, _manager) = completed_workspace_fixture(true);
+    let mut backing = [0u8; 64];
+    // SAFETY: this scoped backing remains live and exclusive until the test
+    // removes the borrowed lane; it is never handed to provider deallocation.
+    let buffer = unsafe {
+        DeviceBuffer::from_borrowed_mut_parts(
+            backing.as_mut_ptr().cast(),
+            onnx_runtime_ir::DeviceId::cpu(),
+            backing.len(),
+            1,
+        )
+    }
+    .unwrap();
+    executor.step_workspace = Some(PreparedWorkspace {
+        buffer: WorkspaceAllocation::new(buffer),
+        bytes: 64,
+        alignment: 1,
+    });
+    let error = executor.workspace_capture_resources().err().unwrap();
+    assert!(error.to_string().contains("binding-owned workspace"));
+    drop(executor.step_workspace.take());
 }

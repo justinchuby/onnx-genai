@@ -596,7 +596,15 @@ fn matmul_private_and_executor_workspace_authorities_are_disjoint_gpu() {
         .unwrap();
 
     let external_after_tensors = injected.cumemalloc_calls();
-    let requirement = common::runtime_workspace_requirement(kernel.as_ref(), &inputs).unwrap();
+    let requirement = common::runtime_workspace_requirement(
+        kernel.as_ref(),
+        &inputs,
+        &[onnx_runtime_ep_api::OutputMetadata::tensor(
+            DataType::Float32,
+            &output_shape,
+        )],
+    )
+    .unwrap();
     assert_eq!(
         requirement.bytes, 0,
         "the single-matrix private-plan route must not reserve executor workspace"
@@ -713,8 +721,15 @@ fn matmul_private_and_executor_workspace_authorities_are_disjoint_gpu() {
             device,
         ),
     ];
-    let batched_requirement =
-        common::runtime_workspace_requirement(kernel.as_ref(), &batched_inputs).unwrap();
+    let batched_requirement = common::runtime_workspace_requirement(
+        kernel.as_ref(),
+        &batched_inputs,
+        &[onnx_runtime_ep_api::OutputMetadata::tensor(
+            DataType::Float32,
+            &batched_output_shape,
+        )],
+    )
+    .unwrap();
     assert!(
         batched_requirement.bytes > 0,
         "the constrained batched shape must request executor workspace"

@@ -55,9 +55,9 @@ use onnx_runtime_ep_api::{
     ExecutorArtifactReadinessEpoch, ExecutorArtifactState, ExecutorInstanceId,
     ExecutorRouteResidencyConfig, ExternalMmapRegion, FinalizedExpertBank, FinalizedExpertWeight,
     Kernel, KernelConstantInput, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
-    ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView,
-    WeightHandle, WorkspaceAllocation, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
-    expert_weight_groups, lazy_weight_candidates,
+    OutputMetadata, ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata,
+    TensorMut, TensorView, WeightHandle, WorkspaceAllocation, WorkspaceLifetime,
+    WorkspaceRequirement, WorkspaceView, expert_weight_groups, lazy_weight_candidates,
 };
 use smallvec::SmallVec;
 
@@ -765,14 +765,17 @@ fn record_dense_prefetch_gap(nodes_between: u64) {
 #[derive(Debug)]
 pub(crate) struct NodePlan {
     pub node_id: NodeId,
+    /// String values have managed host storage and cannot use raw dispatch.
+    pub managed_strings: bool,
     /// Accepted whole-graph claim; compile and dispatch through the provider.
     pub graph_kernel: bool,
     pub workspace_planning: onnx_runtime_ep_api::WorkspacePlanning,
     /// Positional input value ids in ONNX signature order. An omitted optional
     /// input (ONNX empty-string input name → `None` slot) is preserved as
     /// `None` so a later present input is never misread as the omitted one
-    /// (e.g. `Slice(data, starts, ends, "", steps)`). Trailing `None`s are
-    /// trimmed — a truly absent trailing optional simply lowers the arity.
+    /// (e.g. `Slice(data, starts, ends, "", steps)`). Trailing `None`s also
+    /// remain: the source node, claim metadata and execution share one arity.
+    /// Whole-graph kernels append lexical captures after this source prefix.
     pub inputs: Vec<Option<ValueId>>,
     /// Output value ids, in positional order.
     pub outputs: Vec<ValueId>,
@@ -1048,6 +1051,8 @@ impl Drop for Executor {
                 drop(buf);
             }
         }
+        self.workspace_reuse
+            .retire(self.ep.as_ref(), safe_to_release);
         if let Some(workspace) = self.persistent_workspace.take() {
             if safe_to_release {
                 let _ = self.ep.deallocate_workspace(workspace.buffer);
@@ -1098,6 +1103,8 @@ mod dynamic_shapes;
 mod geometry;
 use dynamic_shapes::*;
 use geometry::*;
+mod workspace_reuse;
+use workspace_reuse::{WorkspaceCompletion, WorkspaceReplacement, WorkspaceReuse};
 mod bindings;
 #[cfg(test)]
 use bindings::{AxisBound, PlannedInputShape};
@@ -1105,6 +1112,7 @@ mod build;
 mod capture;
 mod control_flow;
 mod dispatch;
+pub(crate) mod host_strings;
 mod platform;
 mod prefetch;
 mod run;

@@ -25,10 +25,9 @@
 //! * [`Coverage::Sweep`] — inline `(op, dtype, shapes, attrs)` parity cases that
 //!   the generic sweep here runs against the CPU EP; or
 //! * [`Coverage::Dedicated`] — covered by a named dedicated GPU parity suite
-//!   (another `tests/*.rs` file that runs the op), recorded so the claim is
-//!   auditable.
+//!   (a test source file that runs the op), recorded so the claim is auditable.
 //!
-//! The three highest-value tests need **no GPU** and run everywhere (incl. CI):
+//! The three profile guards run when `gpu-tests` is enabled on a CUDA runner:
 //!
 //! * [`every_covered_op_has_a_conformance_entry`] — the *coverage-of-coverage*
 //!   check: it fails if any [`CUDA_COVERED_OPS`] op is missing a profile entry
@@ -44,7 +43,7 @@
 //! `gpu-tests` is enabled. Run it on a GPU box with:
 //!
 //! ```bash
-//! CUDA_VISIBLE_DEVICES=0 cargo test -p onnx-runtime-ep-cuda --features cuda \
+//! CUDA_VISIBLE_DEVICES=0 cargo test -p onnx-runtime-ep-cuda --features cuda,gpu-tests \
 //!     --test cuda_conformance_gpu
 //! ```
 //!
@@ -90,8 +89,8 @@ struct Case {
 enum Coverage {
     /// Inline parity cases executed by [`conformance_sweep_matches_cpu`].
     Sweep(Vec<Case>),
-    /// Covered by a dedicated GPU parity suite (`tests/<suite>`). The
-    /// coverage-of-coverage audit verifies the file exists and names the op.
+    /// Covered by a dedicated GPU parity suite (path relative to this crate's
+    /// `tests` directory). The audit verifies the file exists and names the op.
     Dedicated {
         suite: &'static str,
         note: &'static str,
@@ -317,7 +316,7 @@ fn qlinear_matmul_cases() -> Vec<Case> {
 
 fn resize_cases() -> Vec<Case> {
     let image = [1.0, 2.0, 4.0, 8.0, 3.0, 5.0];
-    vec![
+    let mut cases = vec![
         Case {
             label: "Resize[nearest,asymmetric,scales,upsample]".into(),
             op: "Resize",
@@ -461,6 +460,95 @@ fn resize_cases() -> Vec<Case> {
             ],
             compare: Compare::Float { tol: 3e-3 },
         },
+    ];
+    cases.extend(resize_symmetric_cases());
+    cases
+}
+
+fn resize_symmetric_cases() -> Vec<Case> {
+    let case = |label: &str,
+                data: Tensor,
+                control,
+                output_shape,
+                mode: &str,
+                axes: Option<Vec<i64>>,
+                sizes| {
+        let mut inputs = vec![data, input(DataType::Float32, &[0], &[] as &[f32])];
+        if sizes {
+            inputs.push(input(DataType::Float32, &[0], &[] as &[f32]));
+        }
+        inputs.push(control);
+        let mut attrs = vec![
+            ("mode", Attribute::String(mode.as_bytes().to_vec())),
+            (
+                "coordinate_transformation_mode",
+                Attribute::String(b"half_pixel_symmetric".to_vec()),
+            ),
+        ];
+        let nearest = mode == "nearest";
+        if nearest {
+            attrs.push(("nearest_mode", Attribute::String(b"floor".to_vec())));
+        }
+        if let Some(axes) = axes {
+            attrs.push(("axes", Attribute::Ints(axes)));
+        }
+        Case {
+            label: label.into(),
+            op: "Resize",
+            domain: "",
+            opset: 19,
+            inputs,
+            outputs: vec![(DataType::Float32, output_shape)],
+            attrs,
+            compare: if nearest {
+                Compare::ExactBytes
+            } else {
+                Compare::Float { tol: 1e-5 }
+            },
+        }
+    };
+    // ONNX backend test vectors from commit 622adf94d4e720142950aa8178f7357d52e63db0.
+    vec![
+        case(
+            "Resize[linear,half-pixel-symmetric,scales,downsample]",
+            float_input(DataType::Float32, &[1, 1, 1, 4], &[1., 2., 3., 4.]),
+            input(DataType::Float32, &[4], &[1.0f32, 1., 1., 0.6]),
+            vec![1, 1, 1, 2],
+            "linear",
+            None,
+            false,
+        ),
+        case(
+            "Resize[linear,half-pixel-symmetric,scales,upsample]",
+            float_input(DataType::Float32, &[1, 1, 2, 2], &[1., 2., 3., 4.]),
+            input(DataType::Float32, &[4], &[1.0f32, 1., 2.3, 2.94]),
+            vec![1, 1, 4, 5],
+            "linear",
+            None,
+            false,
+        ),
+        case(
+            "Resize[nearest,half-pixel-symmetric,scales,negative-axis]",
+            float_input(
+                DataType::Float32,
+                &[2, 4],
+                &[1., 2., 3., 4., 5., 6., 7., 8.],
+            ),
+            input(DataType::Float32, &[1], &[0.6f32]),
+            vec![2, 2],
+            "nearest",
+            Some(vec![-1]),
+            false,
+        ),
+        case(
+            "Resize[linear,half-pixel-symmetric,sizes,reordered-axes]",
+            float_input(DataType::Float32, &[2, 1, 3], &[1., 2., 3., 4., 5., 6.]),
+            input(DataType::Int64, &[2], &[5i64, 1]),
+            vec![1, 1, 5],
+            "linear",
+            Some(vec![-1, 0]),
+            true,
+        ),
     ]
 }
 
@@ -1689,8 +1777,36 @@ fn quick_gelu_cases() -> Vec<Case> {
     cases
 }
 
-/// `CumProd` parity vs the CPU scan: f32 (exclusive/reverse/axis variants,
-/// float-close) and i64 (byte-exact) over multi-dimensional inputs.
+fn bitcast_cases() -> Vec<Case> {
+    use DataType::*;
+    [
+        (Int32, Float32, vec![2], vec![1, 0, 192, 127, 0, 0, 0, 128]),
+        (Uint8, Bool, vec![3], vec![0, 1, 255]),
+        (Uint4, Float4E2M1, vec![3], vec![0x21, 0x03]),
+        (Uint2, Int2, vec![5], vec![0xe4, 0x03]),
+        (Complex128, Complex128, vec![], (0..16).collect()),
+        (Uint64, Float64, vec![0, 4], vec![]),
+    ]
+    .into_iter()
+    .map(|(from, to, shape, bytes)| Case {
+        label: format!("BitCast[{from:?}->{to:?}]"),
+        op: "BitCast",
+        domain: "",
+        opset: 26,
+        inputs: vec![Tensor {
+            dtype: from,
+            shape: shape.clone(),
+            bytes,
+            absent: false,
+        }],
+        outputs: vec![(to, shape)],
+        attrs: vec![("to", Attribute::Int(i64::from(to.to_onnx())))],
+        compare: Compare::ExactBytes,
+    })
+    .collect()
+}
+
+/// `CumProd` parity across numeric dtypes, directions, axes, and scan modes.
 fn cumprod_cases() -> Vec<Case> {
     let f = |label: &str,
              shape: &[usize],
@@ -1752,6 +1868,39 @@ fn cumprod_cases() -> Vec<Case> {
         attrs: vec![("reverse", Attribute::Int(1))],
         compare: Compare::ExactBytes,
     });
+    for dtype in [
+        DataType::Float16,
+        DataType::BFloat16,
+        DataType::Float64,
+        DataType::Int32,
+        DataType::Uint32,
+        DataType::Uint64,
+    ] {
+        let shape = vec![2, 5];
+        let values = match dtype {
+            DataType::Float16 | DataType::BFloat16 => float_input(dtype, &shape, &[1.13; 10]),
+            DataType::Float64 => input(dtype, &shape, &[1.13_f64; 10]),
+            DataType::Int32 => input(dtype, &shape, &[i32::MAX, 2, -3, 5, 0, -5, 4, 3, 2, 1]),
+            DataType::Uint32 => input(dtype, &shape, &[u32::MAX, 2, 3, 5, 0, 5, 4, 3, 2, 1]),
+            DataType::Uint64 => input(dtype, &shape, &[u64::MAX, 2, 3, 5, 0, 5, 4, 3, 2, 1]),
+            _ => unreachable!(),
+        };
+        for (exclusive, reverse) in [(0, 0), (1, 1)] {
+            cases.push(Case {
+                label: format!("CumProd[{dtype:?},axis-1,exclusive={exclusive},reverse={reverse}]"),
+                op: "CumProd",
+                domain: "",
+                opset: 26,
+                inputs: vec![values.clone(), input(DataType::Int32, &[], &[-1_i32])],
+                outputs: vec![(dtype, shape.clone())],
+                attrs: vec![
+                    ("exclusive", Attribute::Int(exclusive)),
+                    ("reverse", Attribute::Int(reverse)),
+                ],
+                compare: Compare::ExactBytes,
+            });
+        }
+    }
     cases
 }
 
@@ -2132,6 +2281,31 @@ fn scatter_nd_cases() -> Vec<Case> {
     ]
 }
 
+fn tensor_scatter_cases() -> Vec<Case> {
+    // Distinct batch values and offsets catch cross-batch writes; the
+    // circular case wraps only the first batch.
+    [("linear", [0_i64, 2]), ("circular", [3, 1])]
+        .into_iter()
+        .map(|(mode, offsets)| Case {
+            label: format!("TensorScatter_{mode}_batch_offsets"),
+            op: "TensorScatter",
+            domain: "",
+            opset: 24,
+            inputs: vec![
+                input(DataType::Float32, &[2, 4], &[-1.0_f32; 8]),
+                input(DataType::Float32, &[2, 2], &[1.0_f32, 2.0, 3.0, 4.0]),
+                input(DataType::Int64, &[2], &offsets),
+            ],
+            outputs: vec![(DataType::Float32, vec![2, 4])],
+            attrs: vec![
+                ("axis", Attribute::Int(-1)),
+                ("mode", Attribute::String(mode.as_bytes().to_vec())),
+            ],
+            compare: Compare::ExactBytes,
+        })
+        .collect()
+}
+
 fn window_cases(op: &'static str) -> Vec<Case> {
     [
         (DataType::Float32, true, 1e-6),
@@ -2334,6 +2508,7 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     }));
     p.push(sweep("QuickGelu", quick_gelu_cases()));
     p.push(sweep("CumProd", cumprod_cases()));
+    p.push(sweep("BitCast", bitcast_cases()));
     p.push(sweep("ArgMax", arg_reduce_cases("ArgMax")));
     p.push(sweep("ArgMin", arg_reduce_cases("ArgMin")));
 
@@ -2425,11 +2600,34 @@ fn conformance_profile() -> Vec<ProfileEntry> {
             "independent CPU and native CUDA math expectations",
         ));
     }
-    for op in ["Pack", "Unpack", "GroupedMatMul"] {
+    for op in ["Pack", "Unpack"] {
         p.push(dedicated(
             op,
-            "packed_routed_gpu.rs",
+            "bit_packing_gpu.rs",
             "pinned opset-29 vectors and input validation on native CPU and CUDA",
+        ));
+    }
+    p.push(dedicated(
+        "GroupedMatMul",
+        "grouped_matmul_gpu.rs",
+        "native CPU and CUDA routing, dtype, bias and input validation vectors",
+    ));
+    for (op, suite) in [
+        ("AffineQuantizedGather", "session:affine_gather.rs"),
+        (
+            "AffineQuantizedGroupedMatMul",
+            "session:quantized_grouped.rs",
+        ),
+        (
+            "DequantizePackedGather",
+            "session:dequantize_packed_gather.rs",
+        ),
+        ("PackedGroupedMatMul", "session:packed_grouped.rs"),
+    ] {
+        p.push(dedicated(
+            op,
+            suite,
+            "native session graph selection and numerical parity",
         ));
     }
     p.push(dedicated(
@@ -2478,6 +2676,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(dedicated("AveragePool", "pooling_gpu.rs", "cuDNN pooling"));
 
     // Attention / KV / sparse family.
+    p.push(dedicated(
+        "PagedAttention",
+        "paged_attention_latent_gpu.rs",
+        "latent prefill and decode against the CPU oracle",
+    ));
     p.push(dedicated(
         "Attention",
         "standard_attention_gpu.rs",
@@ -2571,6 +2774,16 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(dedicated("Silu", "activations_gpu.rs", "SiLU activation"));
     p.push(dedicated("LeakyRelu", "activations_gpu.rs", "alpha-driven"));
     p.push(dedicated("Elu", "activations_gpu.rs", "alpha-driven"));
+    p.push(dedicated(
+        "Celu",
+        "activations_gpu.rs",
+        "scalar oracle parity across alpha values and NaN inputs",
+    ));
+    p.push(dedicated(
+        "Mish",
+        "activations_gpu.rs",
+        "scalar oracle parity including the saturating tail",
+    ));
     p.push(dedicated(
         "HardSigmoid",
         "activations_gpu.rs",
@@ -2698,8 +2911,13 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     ));
     p.push(dedicated(
         "NonMaxSuppression",
-        "nms_gpu.rs + cuda_unique_ort_e2e.rs",
-        "bounded device-workspace NMS and dynamic plugin materialization",
+        "nms_gpu.rs",
+        "CPU parity and bounded device workspace",
+    ));
+    p.push(dedicated(
+        "Unique",
+        "../src/kernels/unique.rs",
+        "flattened CUDA Unique CPU parity and dynamic output transfer contract",
     ));
     p.push(dedicated(
         "STFT",
@@ -2749,6 +2967,7 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "indexing_gpu.rs",
         "scatter along axis",
     ));
+    p.push(sweep("TensorScatter", tensor_scatter_cases()));
 
     p
 }
@@ -2843,7 +3062,15 @@ fn dedicated_suites_exist_and_name_their_op() {
     let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     for entry in conformance_profile() {
         if let Coverage::Dedicated { suite, note } = entry.coverage {
-            let path = tests_dir.join(suite);
+            let path = match suite.strip_prefix("session:") {
+                Some(file) => tests_dir
+                    .join("..")
+                    .join("..")
+                    .join("onnx-runtime-session")
+                    .join("tests")
+                    .join(file),
+                None => tests_dir.join(suite),
+            };
             let src = std::fs::read_to_string(&path).unwrap_or_else(|error| {
                 panic!(
                     "dedicated suite {suite} for op {:?} could not be read at {}: {error}",
@@ -2868,7 +3095,7 @@ fn dedicated_suites_exist_and_name_their_op() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Run one inline case on CUDA and compare to the CPU oracle.
-fn run_case(ep: &CudaExecutionProvider, case: &Case) {
+fn run_case(ep: &CudaExecutionProvider, case: &Case) -> Vec<Vec<u8>> {
     let cuda = run_cuda(
         ep,
         case.op,
@@ -2920,6 +3147,48 @@ fn run_case(ep: &CudaExecutionProvider, case: &Case) {
             }
         }
     }
+    cuda
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn resize_19_symmetric_matches_onnx_and_cpu() {
+    let ep = require_cuda();
+    let cases = resize_symmetric_cases();
+    let expected: [&[f32]; 4] = [
+        &[1.6666667, 3.3333333],
+        &[
+            1., 1.159864, 1.5, 1.840136, 2., 1.5652174, 1.7250813, 2.0652174, 2.4053535, 2.5652175,
+            2.4347825, 2.5946467, 2.9347825, 3.2749186, 3.4347825, 3., 3.159864, 3.5, 3.840136, 4.,
+        ],
+        &[1., 3., 5., 7.],
+        &[2.5, 2.9, 3.5, 4.1, 4.5],
+    ];
+    assert_eq!(cases.len(), expected.len());
+    for (case, expected) in cases.iter().zip(expected) {
+        let output = run_case(&ep, case);
+        assert_close(
+            &case.label,
+            DataType::Float32,
+            &decode_floats(&output[0], DataType::Float32),
+            expected,
+            1e-5,
+        );
+    }
+}
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn tensor_scatter_batch_offsets_match_cpu() {
+    let ep = require_cuda();
+    for case in tensor_scatter_cases() {
+        run_case(&ep, &case);
+    }
 }
 
 /// Execute every inline `Sweep` case against the CPU oracle on the real GPU.
@@ -2942,4 +3211,13 @@ fn conformance_sweep_matches_cpu() {
     }
     assert!(ran > 0, "expected at least one inline conformance case");
     eprintln!("conformance sweep: {ran} inline CUDA-vs-CPU parity cases passed");
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
+fn opset26_native_cuda_conformance() {
+    let ep = require_cuda();
+    for case in bitcast_cases().into_iter().chain(cumprod_cases()) {
+        run_case(&ep, &case);
+    }
 }

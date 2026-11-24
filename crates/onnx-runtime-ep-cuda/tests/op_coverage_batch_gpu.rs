@@ -22,6 +22,8 @@
 //! concrete values. The suite skips cleanly when no CUDA runtime is present so a
 //! host without a GPU still passes.
 
+mod common;
+
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
     DeviceBuffer, DeviceId, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
@@ -170,6 +172,18 @@ fn run_cuda(
         "{op} (opset {opset}) must be claimed by the CUDA EP, got: {:?}",
         claim.reason()
     );
+    if matches!(op, "Sum" | "Mean") {
+        assert!(
+            matches!(
+                claim,
+                onnx_runtime_ep_api::KernelMatch::Supported {
+                    workspace_planning: onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+                    ..
+                }
+            ),
+            "variadic CUDA claim must enable prepared workspace"
+        );
+    }
     let kernel = ep
         .get_kernel(model.graph.node(node_id), &concrete_shapes, opset)
         .unwrap();
@@ -231,7 +245,19 @@ fn run_cuda(
             )
         })
         .collect::<Vec<_>>();
-    kernel.execute(&input_views, &mut output_views).unwrap();
+    let mut workspace = None;
+    common::execute_kernel(
+        ep,
+        kernel.as_ref(),
+        &input_views,
+        &mut output_views,
+        &mut workspace,
+    )
+    .unwrap();
+    ep.sync().unwrap();
+    if let Some(workspace) = workspace {
+        ep.deallocate_workspace(workspace).unwrap();
+    }
 
     let result = outputs
         .iter()
@@ -1017,4 +1043,45 @@ fn prelu_matches_cpu() {
         assert_close("PRelu(scalar)", dtype, &cuda_f, &cpu_f, tolerance);
     }
     eprintln!("PRelu: CUDA matches CPU EP across f32/f16/bf16 and scalar/per-channel/full slopes");
+}
+
+/// Scalar metadata has zero words; empty output needs no workspace or upload.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn variadic_sum_mean_scalar_and_empty_match_cpu() {
+    let ep = require_cuda();
+    for op in ["Sum", "Mean"] {
+        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            let scalars = [1.0, 2.0, 3.0].map(|value| Tensor {
+                dtype,
+                shape: vec![],
+                bytes: encode_floats(&[value], dtype),
+            });
+            let output = [(dtype, vec![])];
+            assert_eq!(
+                run_cuda(&ep, op, 13, &scalars, &output, &[]),
+                run_cpu(op, 13, &scalars, &output, &[])
+            );
+            let empty = [
+                Tensor {
+                    dtype,
+                    shape: vec![2, 0, 3],
+                    bytes: vec![],
+                },
+                Tensor {
+                    dtype,
+                    shape: vec![3],
+                    bytes: encode_floats(&[1.0, 2.0, 3.0], dtype),
+                },
+            ];
+            let output = [(dtype, vec![2, 0, 3])];
+            assert_eq!(
+                run_cuda(&ep, op, 13, &empty, &output, &[]),
+                run_cpu(op, 13, &empty, &output, &[])
+            );
+        }
+    }
 }

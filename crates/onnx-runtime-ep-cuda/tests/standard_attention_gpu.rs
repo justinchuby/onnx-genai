@@ -412,6 +412,17 @@ fn run_result_core(
     outputs: &[(DataType, Vec<usize>)],
     attrs: &[(&str, Attribute)],
 ) -> Result<Vec<Vec<u8>>> {
+    run_result_core_inner(op, opset, inputs, outputs, attrs, None)
+}
+
+fn run_result_core_inner(
+    op: &str,
+    opset: u64,
+    inputs: &[Option<&Tensor>],
+    outputs: &[(DataType, Vec<usize>)],
+    attrs: &[(&str, Attribute)],
+    timing_label: Option<&str>,
+) -> Result<Vec<Vec<u8>>> {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), opset);
@@ -537,6 +548,25 @@ fn run_result_core(
             kernel.cuda_graph_compatible(),
             "warmed RotaryEmbedding signature must be capture-supported"
         );
+    }
+
+    if let Some(label) = timing_label {
+        let warm = std::time::Instant::now();
+        while warm.elapsed().as_secs_f32() < 3.0 {
+            kernel.execute(&input_views, &mut output_views)?;
+        }
+        let mut per_call_us = Vec::new();
+        for _ in 0..5 {
+            ep.runtime().synchronize()?;
+            let start = std::time::Instant::now();
+            for _ in 0..30 {
+                kernel.execute(&input_views, &mut output_views)?;
+            }
+            ep.runtime().synchronize()?;
+            per_call_us.push(start.elapsed().as_secs_f64() * 1e6 / 30.0);
+        }
+        per_call_us.sort_by(f64::total_cmp);
+        eprintln!("{label}: synchronized execute µs/call (sorted): {per_call_us:.1?}");
     }
 
     let result = outputs
@@ -1991,6 +2021,168 @@ fn standard_attention_opset24_nonpad_kv_seqlen_masks_padding_and_offsets_causal(
         error.to_string().contains("added in opset 24"),
         "unexpected v23 error: {error}"
     );
+}
+
+// Zero Q/K makes every allowed key equally weighted, so these oracles are
+// independent of either kernel's score calculations and mask implementation.
+fn assert_attention25_window_cases(
+    run: impl Fn(
+        &str,
+        u64,
+        &[Option<Tensor>],
+        &[(DataType, Vec<usize>)],
+        &[(&str, Attribute)],
+    ) -> Vec<Vec<u8>>,
+) {
+    let f = DataType::Float32;
+    let t = |b, s, values: &[f32]| Some(tensor(f, &[b, 1, s, 1], values));
+    let attrs = |left, right, causal| {
+        [
+            ("left_window_size", Attribute::Int(left)),
+            ("right_window_size", Attribute::Int(right)),
+            ("is_causal", Attribute::Int(causal)),
+        ]
+    };
+    let no_cache = [
+        t(1, 3, &[0.; 3]),
+        t(1, 4, &[0.; 4]),
+        t(1, 4, &[2., 4., 8., 16.]),
+    ];
+    let shape = [(f, vec![1, 1, 3, 1])];
+    for (left, right, expected) in [
+        (0, 1, [3., 6., 12.]),
+        (1, 0, [2., 3., 6.]),
+        (-1, 0, [2., 3., 14. / 3.]),
+        (0, i64::MAX, [7.5, 28. / 3., 12.]),
+    ] {
+        let out = run("Attention", 25, &no_cache, &shape, &attrs(left, right, 0));
+        assert_close(&f32s(&out[0]), &expected);
+    }
+
+    // Internal cache shifts the center by two past keys. A boolean mask
+    // removes the current key of query 0; causal removes its future key.
+    let internal = [
+        t(1, 2, &[1., 2.]),
+        t(1, 2, &[3., 4.]),
+        t(1, 2, &[8., 16.]),
+        Some(tensor(DataType::Bool, &[4], &[1u8, 1, 0, 1])),
+        t(1, 2, &[1., 2.]),
+        t(1, 2, &[2., 4.]),
+    ];
+    let output_shapes = [
+        (f, vec![1, 1, 2, 1]),
+        (f, vec![1, 1, 4, 1]),
+        (f, vec![1, 1, 4, 1]),
+        (f, vec![1, 1, 2, 4]),
+    ];
+    for mode in 0..=3 {
+        let mut a = attrs(1, 2, 1).to_vec();
+        a.push(("qk_matmul_output_mode", Attribute::Int(mode)));
+        let result = run("Attention", 25, &internal, &output_shapes, &a);
+        assert_close(&f32s(&result[0]), &[4., 16.]);
+        assert_eq!(f32s(&result[1]), [1., 2., 3., 4.]);
+        assert_eq!(f32s(&result[2]), [2., 4., 8., 16.]);
+        let n = f32::NEG_INFINITY;
+        let expected = match mode {
+            0 | 1 => [1., 2., 3., 4., 2., 4., 6., 8.],
+            2 => [n, 2., n, n, n, n, n, 8.],
+            3 => [0., 1., 0., 0., 0., 0., 0., 1.],
+            _ => unreachable!(),
+        };
+        assert_eq!(f32s(&result[3]), expected);
+    }
+    // External offsets differ per batch (+2, -1), including an empty row.
+    // Additive rank-1 mask excludes key 1; out-of-padding V has large values.
+    let external = [
+        t(2, 2, &[0.; 4]),
+        t(2, 5, &[0.; 10]),
+        t(2, 5, &[2., 4., 8., 16., 256., 32., 64., 128., 256., 512.]),
+        Some(tensor(f, &[5], &[0., f32::NEG_INFINITY, 0., 0., 0.])),
+        None,
+        None,
+        Some(tensor(DataType::Int64, &[2], &[4i64, 1])),
+    ];
+    let result = run(
+        "Attention",
+        25,
+        &external,
+        &[(f, vec![2, 1, 2, 1])],
+        &attrs(1, 0, 0),
+    );
+    assert_close(&f32s(&result[0]), &[8., 12., 0., 32.]);
+}
+
+// This CPU oracle belongs to the cross-EP CUDA conformance target. Run it
+// explicitly with gpu-tests even on Host; ordinary Host runs skip this target.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "cross-EP conformance oracle; enable gpu-tests to run the CPU reference"
+)]
+#[test]
+fn standard_attention_opset25_windows_cpu() {
+    assert_attention25_window_cases(run_cpu_opt);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn standard_attention_opset25_windows_cuda() {
+    assert_attention25_window_cases(run_opt);
+}
+
+#[test]
+#[ignore = "release microbenchmark; run on an idle GPU under the host benchmark lock"]
+fn standard_attention_opset25_window_timing() {
+    for (q_len, kv_len) in [(1, 8192), (128, 4096)] {
+        let h = 16;
+        let kv_h = 4;
+        let d = 64;
+        let f = DataType::Float32;
+        let q = tensor(f, &[1, h, q_len, d], &conformance_values(h * q_len * d, 1));
+        let k = tensor(
+            f,
+            &[1, kv_h, kv_len, d],
+            &conformance_values(kv_h * kv_len * d, 2),
+        );
+        let v = tensor(
+            f,
+            &[1, kv_h, kv_len, d],
+            &conformance_values(kv_h * kv_len * d, 3),
+        );
+        let length = tensor(DataType::Int64, &[1], &[kv_len as i64]);
+        let inputs = [
+            Some(&q),
+            Some(&k),
+            Some(&v),
+            None,
+            None,
+            None,
+            Some(&length),
+        ];
+        for (variant, attrs) in [
+            ("dense A", vec![]),
+            (
+                "window",
+                vec![
+                    ("left_window_size", Attribute::Int(127)),
+                    ("right_window_size", Attribute::Int(0)),
+                ],
+            ),
+            ("dense A repeat", vec![]),
+        ] {
+            run_result_core_inner(
+                "Attention",
+                25,
+                &inputs,
+                &[(f, vec![1, h, q_len, d])],
+                &attrs,
+                Some(&format!("Q={q_len} KV={kv_len} {variant}")),
+            )
+            .unwrap();
+        }
+    }
 }
 
 #[cfg_attr(

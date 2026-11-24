@@ -12,41 +12,45 @@ use onnx_runtime_optimizer::{
 use std::sync::LazyLock;
 
 static QUANTIZED_PROJECTION: LazyLock<Pattern> = LazyLock::new(|| {
-    Pattern::parse_native("(args:slots[0:*])=>return com.microsoft.MatMulNBits(...args)")
+    Pattern::parse_native("(args:slots[0:*]) => return com.microsoft.MatMulNBits(...args)")
         .expect("built-in quantized projection pattern must compile; fix its textual definition")
 });
 
 static CAST: LazyLock<Pattern> = LazyLock::new(|| {
-    Pattern::parse_ort("(x)=>{out=Cast(x);return out}")
+    Pattern::parse_ort("(x) => { out = Cast(x); return out }")
         .expect("built-in Cast pattern must compile; fix its textual definition")
 });
 
 static CONSTANT: LazyLock<Pattern> = LazyLock::new(|| {
-    Pattern::parse_ort("()=>{out=Constant();return out}")
+    Pattern::parse_ort("() => { out = Constant(); return out }")
         .expect("built-in Constant pattern must compile; fix its textual definition")
 });
 
 static THRESHOLD: LazyLock<Pattern> = LazyLock::new(|| {
     Pattern::parse_ort(
-        "(x,threshold)=>{out=Greater(x,threshold)|GreaterOrEqual(x,threshold);return out}",
+        "(x, threshold) => {
+            out = Greater(x, threshold) | GreaterOrEqual(x, threshold)
+            return out
+        }",
     )
     .expect("built-in threshold pattern must compile; fix its textual definition")
 });
 
 static BETA_GATE: LazyLock<Pattern> = LazyLock::new(|| {
-    Pattern::parse_ort("(raw)=>{out=Sigmoid(raw);return out}")
+    Pattern::parse_ort("(raw) => { out = Sigmoid(raw); return out }")
         .expect("built-in beta gate pattern must compile; fix its textual definition")
 });
 
 static DECAY_GATES: LazyLock<[Pattern; 2]> = LazyLock::new(|| {
-    ["coefficient=c", "exp=Exp(c);coefficient=Neg(exp)"].map(|coefficient| {
+    ["coefficient = c", "exp = Exp(c); coefficient = Neg(exp)"].map(|coefficient| {
         Pattern::parse_ort(&format!(
-            "(a,bias,c)=>{{
-                {coefficient};
-                sum=Add(a,bias)|Add(bias,a);
-                soft=Softplus(sum);
-                product=Mul(coefficient,soft)|Mul(soft,coefficient);
-                out=Cast(product)|product;return out
+            "(a, bias, c) => {{
+                {coefficient}
+                sum = Add(a, bias) | Add(bias, a)
+                soft = Softplus(sum)
+                product = Mul(coefficient, soft) | Mul(soft, coefficient)
+                out = Cast(product) | product
+                return out
             }}"
         ))
         .expect("built-in decay gate pattern must compile; fix its textual definition")
@@ -80,7 +84,11 @@ fn cast_index(session: &MatchSession<'_>) -> OptimizerResult<CastIndex> {
 static RSQRT: LazyLock<RecognitionRule> = LazyLock::new(|| {
     RecognitionRule::parse(
         "CUDA rsqrt",
-        "(x)=>{sqrt=Sqrt(x);out=Reciprocal(sqrt);return out}",
+        "(x) => {
+            sqrt = Sqrt(x)
+            out = Reciprocal(sqrt)
+            return out
+        }",
         "sqrt",
     )
     .expect("built-in rsqrt pattern must compile; fix its textual definition")
@@ -89,8 +97,11 @@ static RSQRT: LazyLock<RecognitionRule> = LazyLock::new(|| {
 static L2_NORMALIZE: LazyLock<RecognitionRule> = LazyLock::new(|| {
     RecognitionRule::parse(
         "CUDA L2 normalization",
-        "(x,axes:slots[0:*])=>{
-            sq=ReduceSumSquare(x,...axes);nrm=Sqrt(sq);out=Div(x,nrm);return out
+        "(x, axes:slots[0:*]) => {
+            sq = ReduceSumSquare(x, ...axes)
+            nrm = Sqrt(sq)
+            out = Div(x, nrm)
+            return out
         }",
         "out",
     )
@@ -100,9 +111,10 @@ static L2_NORMALIZE: LazyLock<RecognitionRule> = LazyLock::new(|| {
 static SWIGLU: LazyLock<RecognitionRule> = LazyLock::new(|| {
     RecognitionRule::parse(
         "CUDA SwiGLU",
-        "(gate,up)=>{
-            silu=com.microsoft.Silu(gate)|Swish(gate);
-            out=Mul(silu,up)|Mul(up,silu);return out
+        "(gate, up) => {
+            silu = com.microsoft.Silu(gate) | Swish(gate)
+            out = Mul(silu, up) | Mul(up, silu)
+            return out
         }",
         "silu",
     )
@@ -112,10 +124,11 @@ static SWIGLU: LazyLock<RecognitionRule> = LazyLock::new(|| {
 static GATE_UP_SWIGLU: LazyLock<RecognitionRule> = LazyLock::new(|| {
     RecognitionRule::parse(
         "CUDA gate/up SwiGLU",
-        "(x,gs:slots[0:*],us:slots[0:*])=>{
-            gate=com.microsoft.MatMulNBits(x,...gs);
-            up=com.microsoft.MatMulNBits(x,...us);
-            out=Mul(gate,up);return out
+        "(x, gs:slots[0:*], us:slots[0:*]) => {
+            gate = com.microsoft.MatMulNBits(x, ...gs)
+            up = com.microsoft.MatMulNBits(x, ...us)
+            out = Mul(gate, up)
+            return out
         }",
         "out",
     )
@@ -125,8 +138,10 @@ static GATE_UP_SWIGLU: LazyLock<RecognitionRule> = LazyLock::new(|| {
 static SKIP_RMSNORM: LazyLock<RecognitionRule> = LazyLock::new(|| {
     RecognitionRule::parse(
         "CUDA residual RMS normalization",
-        "(a,b,gamma,rest:slots[0:*])=>{
-            sum=Add(a,b);out=SimplifiedLayerNormalization(sum,gamma,...rest);return out,sum
+        "(a, b, gamma, rest:slots[0:*]) => {
+            sum = Add(a, b)
+            out = SimplifiedLayerNormalization(sum, gamma, ...rest)
+            return out, sum
         }",
         "out",
     )
@@ -237,6 +252,7 @@ pub(crate) fn cuda_optimization_passes(
     vec![
         Box::new(onnx_runtime_optimizer::quantized_grouped::QuantizedGroupedFusion),
         Box::new(onnx_runtime_optimizer::affine_gather::AffineGatherFusion),
+        Box::new(onnx_runtime_optimizer::dequantize_packed_gather::DequantizePackedGatherFusion),
         Box::new(CudaSiluFusion),
         // Collapse the SSM/linear-attention `Reciprocal(Sqrt(x))` normalize-scale
         // glue into a single byte-identical `rsqrt` kernel (drops the standalone

@@ -371,101 +371,6 @@ unsafe fn run_1x4(
     result
 }
 
-/// Run a `[1,4]` f32 model and return the failure message instead of panicking.
-///
-/// Used by the fail-closed falsifiers, where a *successful* `Run()` is the bug.
-///
-/// # Safety
-/// `api`/`session` must be valid.
-unsafe fn try_run_1x4(
-    api: *const ort::OrtApi,
-    session: *mut ort::OrtSession,
-    input_names: &[&CStr],
-    input_data: &[[f32; 4]],
-    output_name: &CStr,
-) -> Result<[f32; 4], String> {
-    let mut mem_info: *mut ort::OrtMemoryInfo = ptr::null_mut();
-    let status = unsafe {
-        ((*api).CreateCpuMemoryInfo.unwrap())(
-            ort::OrtDeviceAllocator,
-            ort::OrtMemTypeDefault,
-            &mut mem_info,
-        )
-    };
-    unsafe { check_status(api, status, "CreateCpuMemoryInfo") };
-
-    let shape: [i64; 2] = [1, 4];
-    let mut owned: Vec<[f32; 4]> = input_data.to_vec();
-    let mut values: Vec<*mut ort::OrtValue> = Vec::with_capacity(owned.len());
-    for buf in owned.iter_mut() {
-        let mut v: *mut ort::OrtValue = ptr::null_mut();
-        let status = unsafe {
-            ((*api).CreateTensorWithDataAsOrtValue.unwrap())(
-                mem_info,
-                buf.as_mut_ptr().cast(),
-                4 * std::mem::size_of::<f32>(),
-                shape.as_ptr(),
-                2,
-                ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
-                &mut v,
-            )
-        };
-        unsafe { check_status(api, status, "CreateTensorWithDataAsOrtValue") };
-        values.push(v);
-    }
-
-    let name_ptrs: Vec<*const std::os::raw::c_char> =
-        input_names.iter().map(|n| n.as_ptr()).collect();
-    let const_values: Vec<*const ort::OrtValue> = values.iter().map(|v| *v as *const _).collect();
-    let out_names = [output_name.as_ptr()];
-    let mut output: *mut ort::OrtValue = ptr::null_mut();
-
-    let status = unsafe {
-        ((*api).Run.unwrap())(
-            session,
-            ptr::null(),
-            name_ptrs.as_ptr(),
-            const_values.as_ptr(),
-            const_values.len(),
-            out_names.as_ptr(),
-            1,
-            &mut output,
-        )
-    };
-
-    let result = if status.is_null() {
-        assert!(!output.is_null(), "Run produced a null output value");
-        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
-        let s2 = unsafe { ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr) };
-        unsafe { check_status(api, s2, "GetTensorMutableData") };
-        let slice = unsafe { std::slice::from_raw_parts(data_ptr as *const f32, 4) };
-        Ok([slice[0], slice[1], slice[2], slice[3]])
-    } else {
-        let get_msg = unsafe { (*api).GetErrorMessage }.expect("GetErrorMessage");
-        let msg_ptr = unsafe { get_msg(status) };
-        let msg = if msg_ptr.is_null() {
-            "(no message)".to_owned()
-        } else {
-            unsafe { std::ffi::CStr::from_ptr(msg_ptr) }
-                .to_string_lossy()
-                .into_owned()
-        };
-        if let Some(release) = unsafe { (*api).ReleaseStatus } {
-            unsafe { release(status) };
-        }
-        Err(msg)
-    };
-
-    if !output.is_null() {
-        unsafe { ((*api).ReleaseValue.unwrap())(output) };
-    }
-    for v in values {
-        unsafe { ((*api).ReleaseValue.unwrap())(v) };
-    }
-    unsafe { ((*api).ReleaseMemoryInfo.unwrap())(mem_info) };
-    result
-}
-
 fn assert_close(got: [f32; 4], want: [f32; 4], label: &str) {
     for i in 0..4 {
         assert!(
@@ -774,29 +679,12 @@ fn shared_ep_shutdown_runs_once_at_library_unregister() {
     }
 }
 
-/// `WorkspaceLifetime::SessionPersistent` must be **declined** (`None`), never
-/// served from the step-scoped ORT scratch this executor can actually provide.
-///
-/// ORT reclaims `KernelContext_GetScratchBuffer` memory when `Compute` returns,
-/// so handing that block to a kernel that asked for session-persistent scratch
-/// gives it memory recycled behind its back on the next `Run` — a silent
-/// correctness bug on the second decode step, not a loud one.
-///
-/// Declining is also the behaviour `main` (#832, H200-validated) has today: the
-/// executor called bare `Kernel::execute`, which for a persistent declarer such
-/// as `GroupQueryAttention` is exactly `execute_with_workspace(.., None)` and
-/// routes it to its own pooled scratch. Hard-failing instead would turn every
-/// GQA-bearing model into a plugin-path error on hardware that runs it today,
-/// so the contract is: decline, never downgrade, and let a kernel that truly
-/// cannot cope fail closed itself.
-///
-/// Falsifier: `persistent_downgraded` must be `0` (nobody handed over recycled
-/// memory) while `persistent_declined` must be `> 0` (the path was actually
-/// exercised, so the test cannot pass vacuously).
+/// A real ORT session retains provider-owned Persistent backing across Run and
+/// releases it with compute state; the kernel rejects non-provider spans.
 #[test]
-fn session_persistent_workspace_is_declined_not_downgraded() {
+fn session_persistent_workspace_reuses_provider_backing_until_session_release() {
     let _lock = lock_ort_ep();
-    let Some(fx) = Fixture::acquire("session_persistent_workspace_is_declined") else {
+    let Some(fx) = Fixture::acquire("session_persistent_workspace_reuses_provider_backing") else {
         return;
     };
     fx.reset_counters();
@@ -804,55 +692,57 @@ fn session_persistent_workspace_is_declined_not_downgraded() {
     let api = fx.api;
     let model = fixture_model("add_1x4");
     let reg_name = CString::new("shared_mock_persistent").unwrap();
-
     unsafe {
         let env = register_plugin(api, &reg_name, &fx.plugin_path);
         let device = find_our_ep_device(api, env);
         let (session, options) = create_session_on_our_ep(api, env, device, &model);
-
-        let outcome = try_run_1x4(
-            api,
-            session,
-            &[c"X", c"Y"],
-            &[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
-            c"Z",
-        );
-
-        match outcome {
-            Ok(values) => assert_close(values, [6.0, 8.0, 10.0, 12.0], "add_1x4 (persistent)"),
-            Err(msg) => panic!(
-                "Run() failed for a SessionPersistent request ({msg}). Declining must route the \
-                 kernel to its own self-owned scratch, not break a model that runs on main"
-            ),
+        let mut address = 0;
+        for run in 0..8 {
+            let got = run_1x4(
+                api,
+                session,
+                &[c"X", c"Y"],
+                &[[1.0 + run as f32, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
+                c"Z",
+            );
+            assert_close(
+                got,
+                [6.0 + run as f32, 8.0, 10.0, 12.0],
+                "provider persistent Add",
+            );
+            let current = fx.counter("nxrt_mock_shared_ep_persistent_address");
+            assert_ne!(current, 0);
+            if run == 0 {
+                address = current;
+            } else {
+                assert_eq!(current, address, "warm persistent pointer must stay stable");
+            }
+            assert_eq!(
+                fx.counter("nxrt_mock_shared_ep_alloc_calls"),
+                1,
+                "no per-Run backing allocation"
+            );
+            assert_eq!(
+                fx.counter("nxrt_mock_shared_ep_dealloc_calls"),
+                0,
+                "owner must survive Compute return"
+            );
+            assert_eq!(fx.counter("nxrt_mock_shared_ep_alloc_live"), 1);
         }
-
-        assert_eq!(
-            fx.counter("nxrt_mock_shared_ep_persistent_downgraded"),
-            0,
-            "the executor served a SessionPersistent request from step-scoped ORT scratch — that \
-             block is recycled when Compute returns"
-        );
-        assert!(
-            fx.counter("nxrt_mock_shared_ep_persistent_declined") >= 1,
-            "the persistent path was never exercised, so this test proves nothing"
-        );
+        assert_eq!(fx.counter("nxrt_mock_shared_ep_persistent_unowned"), 0);
+        assert_eq!(fx.counter("nxrt_mock_shared_ep_persistent_served"), 8);
+        assert_eq!(fx.counter("nxrt_mock_shared_ep_workspace_ok"), 8);
         assert_eq!(
             fx.counter("nxrt_mock_shared_ep_execute_without_workspace"),
-            0,
-            "declining a workspace must still go through execute_with_workspace()"
+            0
         );
-        assert_eq!(
-            fx.counter("nxrt_mock_shared_ep_workspace_ok"),
-            0,
-            "no workspace may have been served while the persistent request was in force"
-        );
-        assert_eq!(
-            fx.counter("nxrt_mock_shared_ep_alloc_calls"),
-            0,
-            "declining must not fall back to per-dispatch EP allocate/free"
-        );
-
         ((*api).ReleaseSession.unwrap())(session);
+        assert_eq!(
+            fx.counter("nxrt_mock_shared_ep_dealloc_calls"),
+            1,
+            "ReleaseState must return the original owner once"
+        );
+        assert_eq!(fx.counter("nxrt_mock_shared_ep_alloc_live"), 0);
         ((*api).ReleaseSessionOptions.unwrap())(options);
         let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name.as_ptr());
         check_status(api, status, "UnregisterExecutionProviderLibrary");
@@ -1092,27 +982,19 @@ fn a_changed_shape_gets_its_own_workspace_plan() {
     }
 }
 
-/// A declined `SessionPersistent` request must not resolve operand placement.
-///
-/// Resolving where a node's operands live costs up to `2n` ORT FFI calls plus
-/// `n-1` `CompareMemoryInfo` calls, and the answer is only ever used to place a
-/// workspace. If the executor derives it before deciding whether it will serve
-/// one, every declining node on every dispatch pays for an answer that is
-/// thrown away — which is what revision 3 did.
-///
-/// Falsifier: move the `operand_mem_info` call in `prepare_workspace` back
-/// above the `lifetime != StepScoped` gate and this test goes red.
+/// Provider-owned Persistent backing does not use ORT scratch placement.
+/// Its original provider already establishes the allocation domain.
 #[test]
-fn a_declined_workspace_never_asks_ort_where_the_operands_live() {
+fn a_provider_workspace_never_asks_ort_where_the_operands_live() {
     let _lock = lock_ort_ep();
-    let Some(fx) = Fixture::acquire("a_declined_workspace_never_asks_ort") else {
+    let Some(fx) = Fixture::acquire("a_provider_workspace_never_asks_ort") else {
         return;
     };
     fx.reset_counters();
     fx.set_persistent_workspace(true);
     let api = fx.api;
     let model = fixture_model("add_1x4");
-    let reg_name = CString::new("shared_mock_lazy_declined").unwrap();
+    let reg_name = CString::new("shared_mock_lazy_persistent").unwrap();
     const RUNS: usize = 4;
 
     unsafe {
@@ -1131,25 +1013,19 @@ fn a_declined_workspace_never_asks_ort_where_the_operands_live() {
             assert_close(
                 got,
                 [6.0, 8.0, 10.0, 12.0],
-                &format!("add_1x4 declined run {run}"),
+                &format!("add_1x4 persistent run {run}"),
             );
         }
 
-        // Guard against a vacuous pass: the declining path must actually have
-        // been exercised.
         assert!(
-            fx.counter("nxrt_mock_shared_ep_persistent_declined") >= RUNS,
-            "the SessionPersistent path never ran ({} declines for {RUNS} runs), so this test \
-             would pass even if placement were still derived eagerly",
-            fx.counter("nxrt_mock_shared_ep_persistent_declined")
+            fx.counter("nxrt_mock_shared_ep_persistent_served") >= RUNS,
+            "persistent path must actually execute"
         );
+        assert_eq!(fx.counter("nxrt_mock_shared_ep_persistent_unowned"), 0);
         assert_eq!(
             fx.counter("nxrt_mock_shared_ep_placement_queries"),
             0,
-            "the executor resolved where the operands live for a node whose workspace request \
-             it then declined. That is {} wasted placement resolutions per dispatch, on every \
-             node of every decode step.",
-            fx.counter("nxrt_mock_shared_ep_placement_queries")
+            "provider-owned workspace must not resolve ORT scratch placement"
         );
 
         ((*api).ReleaseSession.unwrap())(session);

@@ -637,6 +637,7 @@ impl Executor {
         // specializations conservatively invalidate the metadata-only plan.
         if let Some(memo) = &self.workspace_preparation_memo
             && memo.symbols == symbols
+            && memo.output_bindings.matches(&external)
             && memo.growing_symbols == self.capture_growing_symbols
             && memo.artifacts == self.artifact_config
             && memo.kernel_misses == stats.misses
@@ -766,7 +767,12 @@ impl Executor {
                 .zip(&self.plan[pi].inputs)
                 .map(|((shape, dtype), input)| TensorMetadata::new(*dtype, shape, input.is_some()))
                 .collect::<Vec<_>>();
-            let requirement = kernel.workspace_requirement(&metadata)?;
+            let output_metadata = if kernel.has_kernel_sized_outputs() {
+                super::dispatch::unresolved_output_metadata(node, &self.graph)
+            } else {
+                workspace_output_metadata(&self.graph, node, &symbols, Some(&external))
+            };
+            let requirement = kernel.workspace_requirement(&metadata, &output_metadata)?;
             if requirement.bytes == 0 {
                 continue;
             }
@@ -803,6 +809,7 @@ impl Executor {
         let result = self.reserve_prepared_workspaces(peak_persistent, peak_step)?;
         let stats = self.cache.stats();
         self.workspace_preparation_memo = Some(WorkspacePreparationMemo {
+            output_bindings: WorkspaceOutputBindings::from_external(&external),
             symbols,
             growing_symbols: self.capture_growing_symbols.clone(),
             artifacts: self.artifact_config,
@@ -819,6 +826,12 @@ impl Executor {
         peak_persistent: WorkspaceRequirement,
         peak_step: WorkspaceRequirement,
     ) -> Result<WorkspaceRequirement> {
+        if peak_step.bytes != 0 {
+            self.restore_completed_step_workspace();
+        }
+        let replacement = WorkspaceReplacement::for_captures(&self.slot_capture);
+        replacement.check(self.persistent_workspace.as_ref(), peak_persistent)?;
+        replacement.check(self.step_workspace.as_ref(), peak_step)?;
         Self::reserve_prepared_workspace(
             self.ep.as_ref(),
             &mut self.persistent_workspace,
@@ -959,7 +972,12 @@ impl Executor {
                     TensorMetadata::new(dtype, shape, input.is_some())
                 })
                 .collect::<Vec<_>>();
-            let requirement = kernel.workspace_requirement(&metadata)?;
+            let output_metadata = if kernel.has_kernel_sized_outputs() {
+                super::dispatch::unresolved_output_metadata(node, graph)
+            } else {
+                workspace_output_metadata(graph, node, symbols, None)
+            };
+            let requirement = kernel.workspace_requirement(&metadata, &output_metadata)?;
             if requirement.bytes == 0 {
                 continue;
             }
@@ -989,11 +1007,20 @@ impl Executor {
         // address), keep the StepScoped scratch alive so a later replay reads a
         // valid pointer. `reserve_prepared_workspace` reuses it whenever the next
         // requirement fits, so the pointer stays stable across replays.
-        if self.pin_step_workspace {
+        if self.pin_step_workspace
+            || matches!(
+                WorkspaceReplacement::for_captures(&self.slot_capture),
+                WorkspaceReplacement::CapturePinned
+            )
+        {
             return Ok(());
         }
         if let Some(workspace) = self.step_workspace.take() {
-            self.ep.deallocate_workspace(workspace.buffer)?;
+            if self.workspace_completion == WorkspaceCompletion::Completed {
+                self.workspace_reuse.recycle(&self.ep, workspace)?;
+            } else {
+                self.ep.deallocate_workspace(workspace.buffer)?;
+            }
         }
         Ok(())
     }
@@ -1909,5 +1936,110 @@ mod planned_workspace_node_tests {
             merge_workspace_peak(&mut peak, requirement);
         }
         assert_eq!(peak.bytes, requirement.bytes);
+    }
+}
+
+fn workspace_output_metadata(
+    graph: &Graph,
+    node: &Node,
+    symbols: &HashMap<SymbolId, usize>,
+    external: Option<&ExternalBindings>,
+) -> SmallVec<[OutputMetadata<'static>; 8]> {
+    node.outputs
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| {
+            let Some(value) = slot else {
+                return OutputMetadata::Absent;
+            };
+            let spec = graph.value(*value);
+            match spec
+                .tensor_shape()
+                .and_then(|shape| substitute(shape, symbols))
+            {
+                None => match external.and_then(|external| external.outputs.get(value)) {
+                    // An exact binding fixes every valid output view. A logical
+                    // prefix binding only fixes storage, so it cannot invent the
+                    // still-unknown extent that the kernel will actually receive.
+                    Some(bound) if !bound.accepts_subshape => OutputMetadata::Tensor {
+                        dtype: bound.dtype,
+                        shape: std::borrow::Cow::Owned(bound.shape.clone()),
+                    },
+                    _ => OutputMetadata::Unresolved { dtype: spec.dtype },
+                },
+                Some(shape) => {
+                    let shape = external
+                        .and_then(|external| {
+                            super::dispatch::bound_kernel_output_shape(
+                                node, index, *value, &shape, external,
+                            )
+                        })
+                        .map_or(shape, <[usize]>::to_vec);
+                    OutputMetadata::Tensor {
+                        dtype: spec.dtype,
+                        shape: std::borrow::Cow::Owned(shape),
+                    }
+                }
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod output_workspace_metadata_tests {
+    use super::*;
+    use onnx_runtime_ir::static_shape;
+
+    #[test]
+    fn unknown_rank_exact_binding_and_logical_prefix_are_distinct() {
+        let mut graph = Graph::new();
+        let scalar = graph.create_value(DataType::Float32, static_shape([]));
+        let unknown = graph.create_value(DataType::Float32, static_shape([]));
+        graph.mark_value_shape_unknown(unknown);
+        let mut node = Node::new(NodeId(0), "Probe", vec![], vec![scalar, unknown]);
+        node.outputs = vec![Some(scalar), None, Some(unknown)];
+        let mut external = ExternalBindings::default();
+        let facts = workspace_output_metadata(&graph, &node, &HashMap::new(), Some(&external));
+        assert_eq!(
+            facts.as_slice(),
+            &[
+                OutputMetadata::tensor(DataType::Float32, &[]),
+                OutputMetadata::Absent,
+                OutputMetadata::Unresolved {
+                    dtype: DataType::Float32
+                }
+            ]
+        );
+        external.outputs.insert(
+            unknown,
+            ExternalValue {
+                dtype: DataType::Float32,
+                shape: vec![3],
+                accepts_subshape: false,
+                strides: None,
+                fixed_stride_shape: None,
+                ptr: 0x1000,
+                len: 12,
+                alignment: 8,
+                device: onnx_runtime_ir::DeviceId::cpu(),
+            },
+        );
+        assert_eq!(
+            workspace_output_metadata(&graph, &node, &HashMap::new(), Some(&external))[2],
+            OutputMetadata::tensor(DataType::Float32, &[3])
+        );
+        external.outputs.get_mut(&unknown).unwrap().accepts_subshape = true;
+        external
+            .outputs
+            .get_mut(&unknown)
+            .unwrap()
+            .fixed_stride_shape = Some(vec![3]);
+        assert!(
+            matches!(
+                workspace_output_metadata(&graph, &node, &HashMap::new(), Some(&external))[2],
+                OutputMetadata::Unresolved { .. }
+            ),
+            "storage bounds cannot invent the unknown logical view"
+        );
     }
 }

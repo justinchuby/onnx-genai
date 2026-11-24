@@ -652,6 +652,48 @@ impl<'a> TensorMetadata<'a> {
     }
 }
 
+/// Kernel-visible output facts available for workspace planning. An unresolved
+/// shape is distinct from both an omitted output and a known scalar shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutputMetadata<'a> {
+    Absent,
+    Unresolved {
+        dtype: DataType,
+    },
+    Tensor {
+        dtype: DataType,
+        shape: std::borrow::Cow<'a, [usize]>,
+    },
+}
+
+impl<'a> OutputMetadata<'a> {
+    pub fn tensor(dtype: DataType, shape: &'a [usize]) -> Self {
+        Self::Tensor {
+            dtype,
+            shape: std::borrow::Cow::Borrowed(shape),
+        }
+    }
+
+    pub fn from_view(view: &TensorMut<'a>) -> Self {
+        if view.is_absent() {
+            Self::Absent
+        } else {
+            Self::tensor(view.dtype, view.shape)
+        }
+    }
+
+    pub fn into_owned(self) -> OutputMetadata<'static> {
+        match self {
+            Self::Absent => OutputMetadata::Absent,
+            Self::Unresolved { dtype } => OutputMetadata::Unresolved { dtype },
+            Self::Tensor { dtype, shape } => OutputMetadata::Tensor {
+                dtype,
+                shape: std::borrow::Cow::Owned(shape.into_owned()),
+            },
+        }
+    }
+}
+
 /// How long prepared kernel workspace remains live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceLifetime {
@@ -726,14 +768,52 @@ impl<T: Any> KernelType for T {
     }
 }
 
+/// A workspace extent derived from a validated, pinned binding allocation.
+/// Bare graph tokens cannot construct one or grant address-coverage permission.
+#[derive(Clone, Copy, Debug)]
+pub struct WorkspaceCaptureSpan {
+    binding: onnx_runtime_memory_api::BindingIdentity,
+    start: usize,
+    bytes: usize,
+}
+
+impl WorkspaceCaptureSpan {
+    pub fn binding(self) -> onnx_runtime_memory_api::BindingIdentity {
+        self.binding
+    }
+
+    pub fn require_context(
+        self,
+        expected: onnx_runtime_memory_api::ProviderContextIdentity,
+    ) -> Result<()> {
+        let actual = self.binding.provider_context();
+        if actual != expected {
+            return Err(crate::EpError::KernelFailed(format!(
+                "workspace capture pin belongs to provider context {actual:?}, expected {expected:?}; allocate capture workspace through this provider"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether one pinned owner covers the entire requested byte range.
+    pub fn covers(self, address: usize, bytes: usize) -> bool {
+        self.start
+            .checked_add(self.bytes)
+            .zip(address.checked_add(bytes))
+            .is_some_and(|(limit, end)| address >= self.start && end <= limit)
+    }
+}
+
 /// Immutable owner retained by an installed device graph.
 ///
-/// Kernels return these owners before capture begins so address-bearing
-/// resources are pinned before any CUDA node can embed their pointers.
+/// Kernels and executors return these owners before capture begins so address-
+/// bearing resources are pinned before any device node can embed their pointers.
+/// Workspace coverage is granted only by a validated binding-issued view.
 #[derive(Clone)]
 pub struct DeviceGraphResource {
     identity: usize,
     owner: Arc<dyn Any + Send + Sync>,
+    workspace_span: Option<WorkspaceCaptureSpan>,
 }
 
 impl DeviceGraphResource {
@@ -741,7 +821,42 @@ impl DeviceGraphResource {
     where
         T: Any + Send + Sync,
     {
-        Self { identity, owner }
+        Self {
+            identity,
+            owner,
+            workspace_span: None,
+        }
+    }
+
+    /// Pin a complete workspace through its binding-issued owner. Creation is
+    /// capture preparation work; it does not reserve or refund memory quota.
+    pub fn for_workspace(owner: &onnx_runtime_memory_api::OwningAllocation) -> Result<Self> {
+        let pin = owner.view(0, owner.len()).map_err(|error| crate::EpError::KernelFailed(format!(
+            "cannot pin workspace for device graph capture: {error}; retain its live binding-issued owner until graph retirement"
+        )))?;
+        let span = pin.binding().with_view(pin.view(), |validated| WorkspaceCaptureSpan {
+            binding: pin.allocation_identity().binding(),
+            start: validated.as_ptr().as_ptr() as usize,
+            bytes: validated.len(),
+        }).map_err(|error| crate::EpError::KernelFailed(format!(
+            "cannot validate workspace for device graph capture: {error}; allocate it through the active provider binding"
+        )))?;
+        if span.start.checked_add(span.bytes).is_none() {
+            return Err(crate::EpError::KernelFailed(
+                "workspace capture extent wraps the address space; use a valid binding allocation"
+                    .into(),
+            ));
+        }
+        let pin = Arc::new(pin);
+        Ok(Self {
+            identity: Arc::as_ptr(&pin) as usize,
+            owner: pin,
+            workspace_span: Some(span),
+        })
+    }
+
+    pub fn workspace_span(&self) -> Option<WorkspaceCaptureSpan> {
+        self.workspace_span
     }
 
     pub fn identity(&self) -> usize {
@@ -772,8 +887,37 @@ pub struct BlockQuantizedMoeTraffic {
     pub byte_hit_rate: Option<f64>,
 }
 
+/// A borrowed, dense host string tensor. It has no byte or device representation.
+pub struct HostStringInput<'a> {
+    pub shape: &'a [usize],
+    pub values: &'a [String],
+}
+
+/// An owned output whose shape may be determined by the string kernel.
+pub struct HostKernelOutput {
+    pub shape: Vec<usize>,
+    pub data: HostKernelData,
+}
+
+/// Managed strings or ordinary little-endian tensor bytes.
+pub enum HostKernelData {
+    Strings(Vec<String>),
+    Raw { dtype: DataType, bytes: Vec<u8> },
+}
+
 /// A kernel ready to execute a specific op with specific shapes (§4.2).
 pub trait Kernel: Send + KernelType {
+    /// Execute on borrowed host strings without a raw-byte tensor ABI.
+    fn execute_host_strings(
+        &self,
+        _inputs: &[HostStringInput<'_>],
+    ) -> Result<Vec<HostKernelOutput>> {
+        Err(crate::EpError::KernelFailed(
+            "kernel does not support native host string tensors; use a string-aware host kernel"
+                .into(),
+        ))
+    }
+
     /// Tell the kernel which positional inputs are immutable graph constants.
     ///
     /// The session calls this exactly once, immediately after construction.
@@ -959,12 +1103,19 @@ pub trait Kernel: Send + KernelType {
         ))
     }
 
-    /// Report a safe owned-scratch bound for these concrete metadata inputs.
+    /// Report a safe owned-scratch bound for the input and output geometry.
+    /// Output slots describe the views this kernel receives, after any graph
+    /// lowering, and preserve positions marked absent by that caller. Unknown geometry must
+    /// remain Unresolved; output-dependent planners must refuse it clearly.
     /// Runtime layout facts may refine this bound before dispatch. For a fixed
-    /// compiled kernel and metadata this is a stable upper bound: executors may
+    /// compiled kernel and both input/output metadata this is a stable upper bound: executors may
     /// memoize it. It must cover both cold and warm cache residency; values or
     /// layouts that refine the bound belong in the execution-time hook below.
-    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[crate::OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
         let _ = inputs;
         Ok(WorkspaceRequirement::NONE)
     }
@@ -983,9 +1134,10 @@ pub trait Kernel: Send + KernelType {
         &self,
         inputs: &[TensorView],
         metadata: &[TensorMetadata<'_>],
+        outputs: &[crate::OutputMetadata<'_>],
     ) -> Result<WorkspaceRequirement> {
         let _ = inputs;
-        self.workspace_requirement(metadata)
+        self.workspace_requirement(metadata, outputs)
     }
 
     /// Execute using workspace prepared before request admission.
@@ -1407,5 +1559,82 @@ mod trace_standard_tests {
         assert_eq!(events[0].name, "probe");
 
         set_global_context(None);
+    }
+}
+
+#[cfg(test)]
+mod output_workspace_metadata_tests {
+    use super::*;
+    use crate::EpError;
+
+    #[test]
+    fn output_workspace_metadata_distinguishes_scalar_unknown_and_absent() {
+        let scalar = OutputMetadata::tensor(DataType::Float32, &[]);
+        assert_ne!(scalar, OutputMetadata::Absent);
+        assert_ne!(
+            scalar,
+            OutputMetadata::Unresolved {
+                dtype: DataType::Float32
+            }
+        );
+        let owned = {
+            let shape = vec![2, 7];
+            OutputMetadata::tensor(DataType::Float16, &shape).into_owned()
+        };
+        assert_eq!(owned, OutputMetadata::tensor(DataType::Float16, &[2, 7]));
+    }
+
+    #[test]
+    fn execution_refinement_forwards_output_facts_to_canonical_planner() {
+        struct OutputBound;
+        impl Kernel for OutputBound {
+            fn execute(&self, _: &[TensorView], _: &mut [TensorMut]) -> Result<()> {
+                Ok(())
+            }
+            fn workspace_requirement(
+                &self,
+                _: &[TensorMetadata<'_>],
+                outputs: &[OutputMetadata<'_>],
+            ) -> Result<WorkspaceRequirement> {
+                let [
+                    OutputMetadata::Absent,
+                    OutputMetadata::Tensor {
+                        dtype: DataType::Float32,
+                        shape,
+                    },
+                ] = outputs
+                else {
+                    return Err(EpError::KernelFailed(
+                        "output #1 must have resolved Float32 geometry before preparation".into(),
+                    ));
+                };
+                Ok(WorkspaceRequirement {
+                    bytes: shape.iter().product::<usize>() as u64 * 4,
+                    ..WorkspaceRequirement::NONE
+                })
+            }
+        }
+        let outputs = [
+            OutputMetadata::Absent,
+            OutputMetadata::tensor(DataType::Float32, &[3, 5]),
+        ];
+        assert_eq!(
+            OutputBound
+                .workspace_requirement_for_execution(&[], &[], &outputs)
+                .unwrap()
+                .bytes,
+            60
+        );
+        let unknown = [
+            OutputMetadata::Absent,
+            OutputMetadata::Unresolved {
+                dtype: DataType::Float32,
+            },
+        ];
+        assert!(
+            OutputBound
+                .workspace_requirement_for_execution(&[], &[], &unknown)
+                .is_err()
+        );
     }
 }

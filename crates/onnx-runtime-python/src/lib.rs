@@ -50,7 +50,7 @@ mod thread_owned;
 use std::sync::Mutex;
 
 use onnx_runtime_ir::{DataType, DeviceId, Dim, Shape};
-use onnx_runtime_session::{InferenceSession as RtSession, IoMeta, Tensor};
+use onnx_runtime_session::{InferenceSession as RtSession, IoMeta, KeyedWeightFile, Tensor};
 use pyo3::exceptions::{
     PyAttributeError, PyFileNotFoundError, PyIndexError, PyKeyError, PyRuntimeError, PyTypeError,
     PyValueError,
@@ -377,6 +377,12 @@ struct InferenceSession {
     providers: Vec<String>,
 }
 
+type KeyedWeightSpec = (
+    String,
+    std::path::PathBuf,
+    Option<std::collections::BTreeMap<String, String>>,
+);
+
 #[pymethods]
 impl InferenceSession {
     /// Load a model from a filesystem path or raw ONNX model bytes.
@@ -387,12 +393,16 @@ impl InferenceSession {
     ///   requested provider at runtime and executes with the first one. Defaults
     ///   to `["CPUExecutionProvider"]`; unavailable providers raise an error
     ///   rather than being silently dropped.
+    /// * `keyed_weights` — optional list of `(format, path, mapping)` tuples.
+    ///   `format` is `"gguf"` or `"safetensors"`; `mapping` is a dictionary
+    ///   from file keys to ONNX initializer names, or `None`.
     #[new]
-    #[pyo3(signature = (path_or_bytes, providers=None))]
+    #[pyo3(signature = (path_or_bytes, providers=None, *, keyed_weights=None))]
     fn new(
         py: Python<'_>,
         path_or_bytes: &Bound<'_, PyAny>,
         providers: Option<Vec<String>>,
+        keyed_weights: Option<Vec<KeyedWeightSpec>>,
     ) -> PyResult<Self> {
         let providers = providers.unwrap_or_else(|| vec!["CPUExecutionProvider".to_string()]);
         let selected =
@@ -405,17 +415,35 @@ impl InferenceSession {
             SelectedProvider::Cpu => vec!["CPUExecutionProvider".to_string()],
             SelectedProvider::Cuda => vec!["CUDAExecutionProvider".to_string()],
         };
+        let mut builder = RtSession::builder();
+        if let Some(provider) = execution_provider {
+            builder = builder.execution_provider(provider);
+        }
+        for (format, path, mapping) in keyed_weights.unwrap_or_default() {
+            let mut file = match format.as_str() {
+                "gguf" => KeyedWeightFile::gguf(path),
+                "safetensors" => KeyedWeightFile::safetensors(path),
+                _ => {
+                    return Err(PyValueError::new_err(format!(
+                        "keyed_weights file {}: unknown format {format:?}; use 'gguf' or 'safetensors'",
+                        path.display()
+                    )));
+                }
+            };
+            for (key, name) in mapping.unwrap_or_default() {
+                file = file.rename(key, name);
+            }
+            builder = builder.keyed_weight_file(file);
+        }
 
         // Accept raw model bytes directly; otherwise treat the argument as a
         // path (covering str and os.PathLike via Python's str()).
         let session = if let Ok(pybytes) = path_or_bytes.cast::<PyBytes>() {
             let bytes = pybytes.as_bytes();
-            let builder = RtSession::builder().model_bytes(bytes);
-            let result = match execution_provider {
-                Some(provider) => builder.execution_provider(provider).build(),
-                None => builder.build(),
-            };
-            result.map_err(|e| load_error(&format!("<{} bytes>", bytes.len()), e))?
+            builder
+                .model_bytes(bytes)
+                .build()
+                .map_err(|e| load_error(&format!("<{} bytes>", bytes.len()), e))?
         } else {
             let path: String = path_or_bytes
                 .str()
@@ -433,12 +461,10 @@ impl InferenceSession {
                      .onnx file, or pass the serialized model as bytes."
                 )));
             }
-            let builder = RtSession::builder().model(&path);
-            let result = match execution_provider {
-                Some(provider) => builder.execution_provider(provider).build(),
-                None => builder.build(),
-            };
-            result.map_err(|e| load_error(&path, e))?
+            builder
+                .model(&path)
+                .build()
+                .map_err(|e| load_error(&path, e))?
         };
 
         let inputs = session.inputs().to_vec();
@@ -794,20 +820,24 @@ impl InferenceSession {
             let name: String = key.extract().map_err(|_| {
                 PyTypeError::new_err("input_feed keys must be strings (input names)")
             })?;
-            if !self.inputs.iter().any(|m| m.name == name) {
+            let Some(meta) = self.inputs.iter().find(|m| m.name == name) else {
                 let known: Vec<&str> = self.inputs.iter().map(|m| m.name.as_str()).collect();
                 return Err(PyValueError::new_err(format!(
                     "unknown input {name:?} in input_feed. Model inputs are: {known:?}"
                 )));
-            }
+            };
             // Prefer a zero-copy DLPack borrow when the value exposes the
             // producer protocol (torch.Tensor, numpy ≥ 1.23, …) and lives on a
             // CPU, contiguous buffer; otherwise fall back to the numpy copy
             // path. This keeps `run()`/`run_with_values()` transparently
             // zero-copy for supported inputs without changing their contract.
-            let tensor = match dlpack::tensor_from_dlpack(py, &value)? {
-                Some(t) => t,
-                None => numpy_to_tensor(py, np, &name, &value)?,
+            let tensor = if meta.dtype == DataType::String {
+                numpy_to_string_tensor(np, &name, &value)?
+            } else {
+                match dlpack::tensor_from_dlpack(py, &value)? {
+                    Some(t) => t,
+                    None => numpy_to_tensor(py, np, &name, &value)?,
+                }
             };
             // FIX 3: honest CPU-session boundary — refuse device-resident inputs
             // before execution rather than panicking in the CPU executor. Full
@@ -1158,7 +1188,7 @@ fn load(
         Some(p) => p,
         None => device_to_providers(device.as_deref())?,
     };
-    InferenceSession::new(py, path, Some(providers))
+    InferenceSession::new(py, path, Some(providers), None)
 }
 
 /// The numpy dtype *name* for a [`DataType`] (e.g. `"float32"`), falling back to
@@ -1260,6 +1290,46 @@ fn numpy_to_tensor(
     })
 }
 
+fn numpy_to_string_tensor(
+    np: &Bound<'_, PyModule>,
+    name: &str,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<Tensor> {
+    let array = np.call_method1("asarray", (value,))?;
+    let kind: String = array.getattr("dtype")?.getattr("kind")?.extract()?;
+    if !matches!(kind.as_str(), "O" | "U" | "S" | "T") {
+        return Err(PyTypeError::new_err(format!(
+            "input {name:?}: expected a NumPy string or object array"
+        )));
+    }
+    let shape: Vec<usize> = array.getattr("shape")?.extract()?;
+    let flattened = array
+        .call_method1("reshape", (-1,))?
+        .call_method0("tolist")?;
+    let values = flattened.cast::<PyList>()?;
+    let mut strings = Vec::with_capacity(values.len());
+    for (index, item) in values.iter().enumerate() {
+        let text = if let Ok(bytes) = item.cast::<PyBytes>() {
+            std::str::from_utf8(bytes.as_bytes())
+                .map(str::to_owned)
+                .map_err(|error| {
+                    PyValueError::new_err(format!(
+                        "input {name:?}: string tensor element {index} is not valid UTF-8: {error}"
+                    ))
+                })?
+        } else {
+            item.extract::<String>().map_err(|_| {
+                PyTypeError::new_err(format!(
+                    "input {name:?}: string tensor element {index} must be str or UTF-8 bytes"
+                ))
+            })?
+        };
+        strings.push(text);
+    }
+    Tensor::from_strings(shape, strings)
+        .map_err(|error| PyValueError::new_err(format!("input {name:?}: {error}")))
+}
+
 /// Convert an nxrt output [`Tensor`] back into a numpy array via
 /// `numpy.frombuffer(...).reshape(...)`.
 ///
@@ -1270,6 +1340,14 @@ pub(crate) fn tensor_to_numpy(
     name: &str,
     tensor: &Tensor,
 ) -> PyResult<Py<PyAny>> {
+    if let Some(strings) = tensor.as_strings() {
+        let values = PyList::new(py, strings.iter().map(String::as_str))?;
+        let shape = PyTuple::new(py, &tensor.shape)?;
+        return Ok(np
+            .call_method1("asarray", (values, "object"))?
+            .call_method1("reshape", (shape,))?
+            .unbind());
+    }
     if let Some(msg) = non_host_read_error(name, tensor.device()) {
         return Err(PyRuntimeError::new_err(msg));
     }

@@ -56,6 +56,17 @@ pub(crate) async fn completions(
             &state.config,
             handle.model_max_context,
         )?;
+        if prepared.generation.options_mut().constraint.is_some()
+            || prepared.generation.options_mut().reasoning_budget.is_some()
+        {
+            prepared
+                .generation
+                .options_mut()
+                .validate_processors(&handle.tokenizer)
+                .map_err(|error| {
+                    ApiError::invalid_request(format!("invalid completion constraint: {error:#}"))
+                })?;
+        }
         Ok(prepared)
     };
     let first_prepared = prepare(&first)?;
@@ -229,6 +240,7 @@ fn index_completion_publications(
         .collect()
 }
 struct StartedCompletion {
+    _registration: crate::completion_control::Registration,
     events: mpsc::Receiver<DriverEvent>,
     prompt_tokens: usize,
 }
@@ -239,6 +251,7 @@ fn admit_completion_output(
     config: &ServerConfig,
     max_context: Option<usize>,
 ) -> Result<(), ApiError> {
+    prepared.generation.options_mut().max_constraint_bytes = config.replay_buffer_bytes;
     prepared.generation.options_mut().max_new_tokens = admit_output_budget(
         &request.sampling,
         prompt_tokens,
@@ -269,6 +282,7 @@ fn add_completion_usage(total: &mut Usage, next: &Usage) -> Result<(), ApiError>
 }
 async fn start_completion(
     state: &AppState,
+    id: &str,
     handle: &ModelHandle,
     request: &CompletionRequest,
     mut prepared: PreparedCompletion,
@@ -285,11 +299,17 @@ async fn start_completion(
         &state.config,
         handle.model_max_context,
     )?;
+    let registration = state.completion_controls.register_request(
+        id,
+        &request.sampling,
+        prepared.generation.options_mut(),
+    )?;
     let session = open_session_after_admission(state, handle, conversational, lease).await?;
     let generation = submit_completion(handle, prepared.generation, session).await?;
     await_driver_admission(generation.admission).await?;
     crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
     Ok(StartedCompletion {
+        _registration: registration,
         events: generation.events,
         prompt_tokens,
     })
@@ -301,9 +321,10 @@ async fn run_completion(
     prepared: PreparedCompletion,
     client_session_id: Option<&str>,
 ) -> Result<CompletionResponse, ApiError> {
-    let id = text_completion_id();
+    let id = text_completion_id()?;
     let created = now_unix();
-    let started = start_completion(state, handle, &request, prepared, client_session_id).await?;
+    let started =
+        start_completion(state, &id, handle, &request, prepared, client_session_id).await?;
     let collected = collect_generation_with_publications(started.events)
         .await
         .map_err(generation_failure)?;
@@ -447,8 +468,10 @@ async fn stream_completions(
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
     let is_batch = !rest.is_empty();
     let (request, prepared) = first;
+    let id = text_completion_id()?;
     let started = start_completion(
         &state,
+        &id,
         &handle,
         &request,
         prepared,
@@ -463,7 +486,6 @@ async fn stream_completions(
         .clone()
         .map(StopInput::into_texts)
         .unwrap_or_default();
-    let id = text_completion_id();
     let created = now_unix();
     let model = handle.id.clone();
     let (tx, rx) = mpsc::channel(16);
@@ -517,7 +539,7 @@ async fn stream_completions(
                 break;
             };
             index += 1;
-            let started = tokio::select! { biased; _=tx.closed()=>return Ok(()),started=start_completion(&state,&handle,&request,prepared,None)=>started };
+            let started = tokio::select! { biased; _=tx.closed()=>return Ok(()),started=start_completion(&state,&id,&handle,&request,prepared,None)=>started };
             match started {
                 Ok(started) => current = started,
                 Err(error) => {
@@ -619,10 +641,11 @@ async fn prepare_chat_input(
         output_budget,
         config.replay_buffer_bytes,
     )
-    .map_err(|err| ApiError::invalid_request(format!("prompt preparation failed: {err}")))?;
+    .map_err(|err| ApiError::invalid_request(format!("prompt preparation failed: {err:#}")))?;
     if !input_audio.is_empty() {
         prepared = prepare_audio_generate_request(request, &handle.tokenizer, output_budget)?;
     }
+    prepared.request.options.max_constraint_bytes = config.replay_buffer_bytes;
     let pipeline_input = if !image_urls.is_empty() {
         Some(
             preprocess_chat_images(
@@ -671,7 +694,7 @@ async fn run_chat_completion(
     request: ChatCompletionRequest,
     client_session_id: Option<String>,
 ) -> Result<ChatCompletionResponse, ApiError> {
-    let id = completion_id();
+    let id = completion_id()?;
     let created = now_unix();
     let model = request.model.clone();
     let requested_top_logprobs = request
@@ -716,6 +739,10 @@ async fn run_chat_completion(
     projection.start().map_err(|error| {
         ApiError::invalid_request(format!("response prefix is invalid: {error:#}"))
     })?;
+    let registration =
+        state
+            .completion_controls
+            .register_request(&id, &request, &prepared.request.options)?;
     let mut generation_request = prepared.request;
     generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
@@ -742,6 +769,7 @@ async fn run_chat_completion(
     let result = collect_generation_with_publications(generation.events)
         .await
         .map_err(generation_failure);
+    drop(registration);
     crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
 
     let session_token_count = if let Some(session) = session_for_count {
@@ -772,7 +800,7 @@ async fn run_chat_completion(
     let logprobs = chat_logprobs(&result, &tokenizer, requested_top_logprobs)
         .map_err(|error| ApiError::internal(format!("logprobs conversion failed: {error}")))?;
     let output = projection
-        .buffered(&result, &tokenizer)
+        .buffered(&result)
         .map_err(|error| ApiError::internal(format!("response parsing failed: {error:#}")))?;
     let tool_calls = committed_chat_tool_calls(&result);
     let content = if tool_calls.is_some() {
@@ -780,10 +808,7 @@ async fn run_chat_completion(
     } else {
         Some(output.content)
     };
-    let reasoning = tool_calls
-        .is_none()
-        .then_some(output.reasoning)
-        .filter(|thought| !thought.is_empty());
+    let reasoning = Some(output.reasoning).filter(|thought| !thought.is_empty());
     let total_tokens = prompt_tokens + completion_tokens;
     Ok(ChatCompletionResponse {
         id,
@@ -821,7 +846,7 @@ async fn stream_chat_completion(
     request: ChatCompletionRequest,
     client_session_id: Option<String>,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
-    let id = completion_id();
+    let id = completion_id()?;
     let created = now_unix();
     let model = request.model.clone();
     let requested_top_logprobs = request
@@ -867,6 +892,10 @@ async fn stream_chat_completion(
     let initial_gate = projection.start().map_err(|error| {
         ApiError::invalid_request(format!("response prefix is invalid: {error:#}"))
     })?;
+    let registration =
+        state
+            .completion_controls
+            .register_request(&id, &request, &prepared.request.options)?;
     let mut generation_request = prepared.request;
     generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
@@ -891,6 +920,7 @@ async fn stream_chat_completion(
     crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
 
     tokio::spawn(async move {
+        let _registration = registration;
         send_stream_chunk(&tx, role_chunk(&id, created, &model, prompt_tokens)).await?;
 
         if request.has_tool_context() {
@@ -916,11 +946,10 @@ async fn stream_chat_completion(
                 event = driver_rx.recv() => event,
             } {
                 Some(DriverEvent::Token(token)) => {
-                    let revealed =
-                        match channel_gate.push_token(&tokenizer, token.token_id, &token.text) {
-                            Ok(delta) => delta,
-                            Err(error) => break Err(StreamOutputFailure::Projection(error)),
-                        };
+                    let revealed = match channel_gate.push_text(&token.text) {
+                        Ok(delta) => delta,
+                        Err(error) => break Err(StreamOutputFailure::Projection(error)),
+                    };
                     if !revealed.reasoning.is_empty() {
                         send_stream_chunk(
                             &tx,
@@ -977,7 +1006,7 @@ async fn stream_chat_completion(
                     )
                     .await?;
                 } else {
-                    let remaining = match channel_gate.finish(&tokenizer) {
+                    let remaining = match channel_gate.finish(&result.text) {
                         Ok(delta) => delta,
                         Err(error) => {
                             send_projection_error(&tx, error).await?;
@@ -1069,8 +1098,7 @@ async fn stream_declared_tool_chat_completion(
             event = driver_rx.recv() => event,
         } {
             Some(DriverEvent::Token(token)) => {
-                let revealed = match channel_gate.push_token(tokenizer, token.token_id, &token.text)
-                {
+                let revealed = match channel_gate.push_text(&token.text) {
                     Ok(delta) => delta,
                     Err(error) => break Err(StreamOutputFailure::Projection(error)),
                 };
@@ -1097,7 +1125,7 @@ async fn stream_declared_tool_chat_completion(
 
     match result {
         Ok(result) => {
-            let remaining = match channel_gate.finish(tokenizer) {
+            let remaining = match channel_gate.finish(&result.text) {
                 Ok(delta) => delta,
                 Err(error) => {
                     send_projection_error(tx, error).await?;
@@ -1376,14 +1404,33 @@ fn prepare_audio_generate_request(
     tokenizer: &Tokenizer,
     output_budget: usize,
 ) -> Result<PreparedGenerateRequest, ApiError> {
+    let mut options = build_generate_options_with_tokenizer(request, tokenizer, output_budget)
+        .map_err(|error| {
+            ApiError::invalid_request(format!("invalid audio generation controls: {error:#}"))
+        })?;
+    crate::reasoning_request::ReasoningRequest::extract(request)
+        .and_then(|controls| {
+            controls.apply(
+                &mut options,
+                tokenizer,
+                crate::reasoning_request::BudgetContext::Raw,
+            )
+        })
+        .map_err(|error| {
+            ApiError::invalid_request(format!("invalid audio reasoning controls: {error:#}"))
+        })?;
+    if options.reasoning_budget.is_some() {
+        options.validate_processors(tokenizer).map_err(|error| {
+            ApiError::invalid_request(format!("invalid audio reasoning protocol: {error:#}"))
+        })?;
+    }
     let token_ids = audio_decoder_prompt(tokenizer, None)?;
     let prompt_tokens = token_ids.len();
     Ok(PreparedGenerateRequest {
         response_prefix: None,
         request: GenerateRequest {
             prompt: GeneratePrompt::TokenIds(token_ids),
-            options: build_generate_options_with_tokenizer(request, tokenizer, output_budget)
-                .map_err(|err| ApiError::invalid_request(err.to_string()))?,
+            options,
         },
         prompt_tokens,
     })
@@ -1903,6 +1950,17 @@ pub(crate) fn prepare_completion(
         handle.generation_defaults.as_ref(),
         &chat_sampling_overrides(&request.sampling),
     );
+    crate::reasoning_request::ReasoningRequest::extract(&request.sampling)
+        .and_then(|controls| {
+            controls.apply(
+                &mut options,
+                &handle.tokenizer,
+                crate::reasoning_request::BudgetContext::Raw,
+            )
+        })
+        .map_err(|error| {
+            ApiError::invalid_request(format!("invalid completion reasoning controls: {error:#}"))
+        })?;
     if let Some(suffix) = request.suffix.as_ref() {
         let fim_config = handle
             .fim_config
@@ -2073,6 +2131,7 @@ fn prepare_generate_request(
         .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))?;
     let prompt_tokens = token_ids.len();
     let mut options = build_generate_options_with_tokenizer(request, tokenizer, output_budget)?;
+    options.max_constraint_bytes = response_buffer_bytes;
     // Honor the model's declared sampling regime (e.g. a reasoning model that
     // ships do_sample=true); explicit request fields still win.
     options.resolve_sampling_defaults(
@@ -2084,33 +2143,44 @@ fn prepare_generate_request(
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
     if let Some(template) = context.response_template {
-        let schema = match options.constraint.as_ref() {
-            Some(GenerateConstraint::Json { .. }) => Some(serde_json::Value::Bool(true)),
-            Some(GenerateConstraint::JsonSchema { schema, .. }) => {
-                Some(serde_json::from_str(schema)?)
-            }
-            _ => None,
-        };
-        if let Some(schema) = schema {
-            options.constraint = Some(GenerateConstraint::ResponseJson {
-                schema,
-                template: template.clone(),
-                prefix: prompt.clone(),
-                max_bytes: response_buffer_bytes,
-            });
-            options.validate_processors(tokenizer)
-                .map_err(|error| anyhow::anyhow!("resolve response_format against the declared response_template and tokenizer: {error:#}"))?;
+        if let Some(
+            GenerateConstraint::Json { prefix }
+            | GenerateConstraint::JsonSchema { prefix, .. }
+            | GenerateConstraint::Regex { prefix, .. }
+            | GenerateConstraint::Lark { prefix, .. },
+        ) = options.constraint.as_mut()
+        {
+            prefix.clear();
         }
+        options.response_projection = Some(
+            onnx_genai_engine::response_template::ResponseProjection::resolve(
+                template.clone(),
+                prompt.clone(),
+                response_buffer_bytes,
+                Some(tokenizer),
+            )?,
+        );
     }
     anyhow::ensure!(
         request.continuation_mode() != crate::types::ChatContinuation::Reasoning
             || options.constraint.is_none()
-            || matches!(
-                options.constraint,
-                Some(GenerateConstraint::ResponseJson { .. })
-            ),
-        "reasoning continuation with this constrained output policy requires a channel-aware generation grammar; use response_format with a compatible declared response_template"
+            || options.response_projection.is_some(),
+        "reasoning continuation with constrained output requires declared response framing; provide a compatible response_template"
     );
+    if request.input_audio().is_empty() {
+        crate::reasoning_request::ReasoningRequest::extract(request)?.apply(
+            &mut options,
+            tokenizer,
+            crate::reasoning_request::BudgetContext::Chat {
+                template: context.response_template,
+                prompt: &prompt,
+            },
+        )?;
+    }
+    if options.constraint.is_some() || options.reasoning_budget.is_some() {
+        options.validate_processors(tokenizer)
+            .context("resolve requested output constraint against the model tokenizer and declared response template")?;
+    }
     Ok(PreparedGenerateRequest {
         response_prefix: Some(prompt),
         request: GenerateRequest {
@@ -2218,6 +2288,21 @@ fn build_generate_options(
     if let Some(constraint) = response_format_constraint(request) {
         options.constraint = Some(constraint);
     }
+    if let Some(grammar) = request
+        .grammar
+        .as_ref()
+        .filter(|grammar| !grammar.is_empty())
+    {
+        options.constraint = Some(if grammar.starts_with("%llguidance") {
+            GenerateConstraint::RawLark {
+                grammar: grammar.clone(),
+            }
+        } else {
+            GenerateConstraint::Gbnf {
+                grammar: grammar.clone(),
+            }
+        });
+    }
     options
 }
 
@@ -2321,6 +2406,7 @@ pub(super) fn build_generate_options_with_tokenizer(
     tokenizer: &Tokenizer,
     output_budget: usize,
 ) -> anyhow::Result<GenerateOptions> {
+    request.validate_grammar()?;
     let mut options = build_generate_options(request, output_budget);
     if let Some(biases) = request.extensions.get("logit_bias") {
         use onnx_genai_engine::logits::LogitBias;
@@ -2384,6 +2470,23 @@ pub(super) fn build_generate_options_with_tokenizer(
             }
         }
     }
+    for spelling in &request.preserved_tokens {
+        let ids = tokenizer
+            .encode_with_options(
+                spelling,
+                onnx_genai_ort::TokenizationOptions {
+                    add_special: false,
+                    parse_special: true,
+                },
+            )
+            .with_context(|| {
+                format!("preserved_tokens spelling {spelling:?} could not be tokenized")
+            })?;
+        if let [id] = ids.as_slice() {
+            options.preserved_tokens.insert(*id);
+        }
+    }
+    options.validate_preserved_tokens(tokenizer)?;
     options.validate_logit_bias(tokenizer)?;
     if let Some(dry) = &mut options.dry {
         for (index, breaker) in request.dry_sequence_breakers.iter().enumerate() {
@@ -2750,28 +2853,15 @@ impl ChatProjection {
                 })
                 .transpose()?,
             stop_buffer: StopBoundaryBuffer::new(self.stop_sequences.clone()),
-            decoder: onnx_genai_engine::tokenization::TokenTextDecoder::new(
-                onnx_genai_engine::tokenization::SpecialTokenHandling::Preserve,
-            ),
+            generated: String::new(),
         })
     }
-    fn buffered(
-        &self,
-        result: &GenerateResult,
-        tokenizer: &Tokenizer,
-    ) -> anyhow::Result<ChannelDelta> {
+    fn buffered(&self, result: &GenerateResult) -> anyhow::Result<ChannelDelta> {
         let Some(template) = &self.template else {
             return Ok(ChannelDelta {
                 content: text_before_stop(&result.text, &self.stop_sequences).to_owned(),
                 reasoning: String::new(),
             });
-        };
-        let raw = if result.token_ids.is_empty() {
-            result.text.clone()
-        } else {
-            tokenizer
-                .decode_with_special_tokens(&result.token_ids)
-                .context("decode generated response with declared protocol markers")?
         };
         let mut parser = response_template::ResponseParser::new(
             template.clone(),
@@ -2779,7 +2869,7 @@ impl ChatProjection {
             self.prefix_output,
             self.max_bytes,
         )?;
-        let output = parser.preview(text_before_stop(&raw, &self.stop_sequences), true)?;
+        let output = parser.preview(text_before_stop(&result.text, &self.stop_sequences), true)?;
         Ok(ChannelDelta {
             content: output.content,
             reasoning: output.reasoning,
@@ -2790,7 +2880,7 @@ impl ChatProjection {
 struct ChannelGate {
     stop_buffer: StopBoundaryBuffer,
     parser: Option<response_template::ResponseParser>,
-    decoder: onnx_genai_engine::tokenization::TokenTextDecoder,
+    generated: String,
 }
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ChannelDelta {
@@ -2798,39 +2888,35 @@ struct ChannelDelta {
     reasoning: String,
 }
 impl ChannelGate {
-    fn push_token(
-        &mut self,
-        tokenizer: &Tokenizer,
-        id: u32,
-        plain: &str,
-    ) -> anyhow::Result<ChannelDelta> {
+    fn push_text(&mut self, text: &str) -> anyhow::Result<ChannelDelta> {
+        self.generated.push_str(text);
+        let safe = self.stop_buffer.push(text);
         let Some(parser) = &mut self.parser else {
             return Ok(ChannelDelta {
-                content: self.stop_buffer.push(plain),
+                content: safe,
                 reasoning: String::new(),
             });
         };
-        let raw = self.decoder.step(tokenizer, id)?;
-        let delta = parser.feed(&self.stop_buffer.push(&raw))?;
+        let delta = parser.feed(&safe)?;
         Ok(ChannelDelta {
             content: delta.content,
             reasoning: delta.reasoning,
         })
     }
-    fn finish(mut self, tokenizer: &Tokenizer) -> anyhow::Result<ChannelDelta> {
+    fn finish(mut self, final_text: &str) -> anyhow::Result<ChannelDelta> {
+        let tail=final_text.strip_prefix(&self.generated).context("committed response text does not extend its published token text; repair the tokenizer's incremental output contract")?;
+        let mut safe = self.stop_buffer.push(tail);
+        safe.push_str(&self.stop_buffer.flush());
         let Some(mut parser) = self.parser.take() else {
             return Ok(ChannelDelta {
-                content: self.stop_buffer.flush(),
+                content: safe,
                 reasoning: String::new(),
             });
         };
-        let raw = self.decoder.finish(tokenizer)?;
-        let mut safe = self.stop_buffer.push(&raw);
-        safe.push_str(&self.stop_buffer.flush());
         let mut output = parser.feed(&safe)?;
-        let tail = parser.finish()?;
-        output.content.push_str(&tail.content);
-        output.reasoning.push_str(&tail.reasoning);
+        let end = parser.finish()?;
+        output.content.push_str(&end.content);
+        output.reasoning.push_str(&end.reasoning);
         Ok(ChannelDelta {
             content: output.content,
             reasoning: output.reasoning,
@@ -2965,8 +3051,11 @@ async fn send_completion_logprob_chunks(
     let (id, created, model, choice_index) = response;
     let logprobs = completion_logprobs(result, tokenizer, Some(requested_top_logprobs))?
         .context("requested completion logprobs were not built")?;
-    let stream_text =
-        onnx_genai_engine::tokenization::token_texts(Some(tokenizer), &result.token_ids)?;
+    let stream_text = onnx_genai_engine::tokenization::token_texts(
+        Some(tokenizer),
+        &result.token_ids,
+        &result.preserved_tokens,
+    )?;
     let visible_text = truncate_tokens_at_stop(&stream_text, stop_sequences);
     for (index, text) in visible_text.into_iter().enumerate() {
         if text.is_empty() {
@@ -3009,15 +3098,18 @@ async fn send_chat_logprob_chunks(
     // logprob entry aligned by index, rather than being dropped here.
     let prepare = || -> anyhow::Result<(Vec<String>, String)> {
         let mut gate = projection.start()?;
-        let plain =
-            onnx_genai_engine::tokenization::token_texts(Some(tokenizer), &result.token_ids)?;
+        let plain = onnx_genai_engine::tokenization::token_texts(
+            Some(tokenizer),
+            &result.token_ids,
+            &result.preserved_tokens,
+        )?;
         let mut reasoning = String::new();
         let mut text = Vec::with_capacity(result.token_ids.len());
-        for (&token_id, plain) in result.token_ids.iter().zip(&plain) {
-            let delta = gate.push_token(tokenizer, token_id, plain)?;
+        for plain in &plain {
+            let delta = gate.push_text(plain)?;
             text.push(delta.content);
         }
-        let tail = gate.finish(tokenizer)?;
+        let tail = gate.finish(&result.text)?;
         if let Some(last) = text.last_mut() {
             last.push_str(&tail.content);
         }
@@ -3105,12 +3197,12 @@ async fn send_tool_call_deltas(
     send_stream_chunk(tx, done_chunk(id, created, model, "tool_calls")).await
 }
 
-fn completion_id() -> String {
-    format!("chatcmpl-{}", now_unix())
+fn completion_id() -> Result<String, ApiError> {
+    crate::completion_control::new_id("chatcmpl-")
 }
 
-fn text_completion_id() -> String {
-    format!("cmpl-{}", now_unix())
+fn text_completion_id() -> Result<String, ApiError> {
+    crate::completion_control::new_id("cmpl-")
 }
 
 #[cfg(test)]
@@ -3798,12 +3890,8 @@ mod channel_gate_tests {
             max_bytes: 4096,
             stop_sequences: Vec::new(),
         };
-        let tokenizer = Tokenizer::from_file(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tests/fixtures/tiny-llm/tokenizer.json"),
-        )
-        .unwrap();
         let result = GenerateResult {
+            preserved_tokens: Default::default(),
             text: "</c><c>".into(),
             token_ids: Vec::new(),
             finish_reason: onnx_genai_engine::FinishReason::MaxTokens,
@@ -3813,7 +3901,7 @@ mod channel_gate_tests {
             budget_cap: None,
         };
         assert_eq!(
-            projection.buffered(&result, &tokenizer).unwrap(),
+            projection.buffered(&result).unwrap(),
             ChannelDelta::default()
         );
     }
@@ -3828,14 +3916,9 @@ mod channel_gate_tests {
             stop_sequences: Vec::new(),
         };
         let mut gate = projection.start().unwrap();
-        let tokenizer = Tokenizer::from_file(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tests/fixtures/tiny-llm/tokenizer.json"),
-        )
-        .unwrap();
         let text = "to=self<|message|>ordinary text";
-        assert_eq!(gate.push_token(&tokenizer, 0, text).unwrap().content, text);
-        assert_eq!(gate.finish(&tokenizer).unwrap(), ChannelDelta::default());
+        assert_eq!(gate.push_text(text).unwrap().content, text);
+        assert_eq!(gate.finish(text).unwrap(), ChannelDelta::default());
     }
 }
 
@@ -3896,6 +3979,7 @@ mod completion_delivery_tests {
     #[tokio::test]
     async fn failed_or_truncated_completion_delivery_never_claims_finished_usage() {
         let tokenizer = tokenizer();
+        let controls = crate::completion_control::CompletionControls::new(1);
         for explicit_error in [false, true] {
             let (source, events) = mpsc::channel(2);
             if explicit_error {
@@ -3912,6 +3996,7 @@ mod completion_delivery_tests {
                 &tx,
                 ("id", 1, "model", 3),
                 StartedCompletion {
+                    _registration: controls.register("id", None).unwrap(),
                     events,
                     prompt_tokens: 3,
                 },
@@ -3922,6 +4007,8 @@ mod completion_delivery_tests {
             )
             .await
             .unwrap();
+            let released = controls.register("id", None).unwrap();
+            drop(released);
             let CompletionDelivery::Failed(error) = delivery else {
                 panic!("unfinished source must fail instead of claiming completed usage");
             };
@@ -3939,6 +4026,7 @@ mod completion_delivery_tests {
     #[tokio::test]
     async fn disconnected_completion_delivery_releases_its_source_without_finishing() {
         let tokenizer = tokenizer();
+        let controls = crate::completion_control::CompletionControls::new(1);
         let (source, events) = mpsc::channel(2);
         let (tx, rx) = mpsc::channel(2);
         drop(rx);
@@ -3946,6 +4034,7 @@ mod completion_delivery_tests {
             &tx,
             ("id", 1, "model", 0),
             StartedCompletion {
+                _registration: controls.register("id", None).unwrap(),
                 events,
                 prompt_tokens: 3,
             },
@@ -3957,6 +4046,8 @@ mod completion_delivery_tests {
         .await
         .unwrap();
         assert!(matches!(delivery, CompletionDelivery::Disconnected));
+        let released = controls.register("id", None).unwrap();
+        drop(released);
         assert!(source.is_closed());
     }
 }

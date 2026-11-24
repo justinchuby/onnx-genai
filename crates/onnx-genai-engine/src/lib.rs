@@ -8,6 +8,8 @@
 //! - Speculative decoding (acceleration)
 
 pub(crate) mod batched;
+pub mod byte_grammar;
+mod byte_stream;
 pub mod config;
 pub(crate) mod connector_bridge;
 pub(crate) mod decode;
@@ -15,7 +17,7 @@ pub(crate) mod decode_loop;
 pub mod embedding;
 pub mod engine;
 pub mod fim;
-pub mod json_cursor;
+pub mod gbnf;
 mod json_prefix;
 pub(crate) mod kv_bridge;
 pub(crate) mod kv_sizing;
@@ -31,6 +33,7 @@ pub mod pipeline_cache;
 pub(crate) mod platform_capacity;
 pub(crate) mod processors;
 pub mod ranking;
+pub mod reasoning;
 mod response_constraint;
 pub mod response_template;
 #[cfg(feature = "native-backend")]
@@ -38,6 +41,7 @@ pub mod runtime_trace;
 pub mod sampling;
 pub(crate) mod session;
 pub mod speculative;
+mod text_projection;
 pub mod tokenization;
 
 pub use onnx_genai_scheduler::SchedulerAdmissionError;
@@ -56,22 +60,22 @@ pub use engine::{
     EngineDecodeBackend, EngineGovernorError, EngineResourceGovernor, FinishReason,
     GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
     GenerateToken, GenerateTokenCallback, GenerationBudgetCap, KvConnectorBackend,
-    KvConnectorConfig, LayerWeightBytes, LimitParseError, MemoryPolicyApplication, MemoryStrategy,
-    MemoryStrategyDecision, MemoryStrategyPlan, MirostatConfig, MirostatVersion, MtpCacheScope,
-    MtpConfig, MtpHiddenLayout, MtpWeightSource, OrtEngineWorkerFactory, OrtSessionWorkerLoadError,
-    PackageExecutionError, PrefillRequest, PrefillResult, PrioritizedGenerateRequest,
-    PrioritizedGenerateResult, RewindTokenCount, SamplerSequence, SamplerStage, SamplingOverrides,
-    ScheduledGenerateArrival, SessionCheckpoint, SessionForkError, SessionForkParticipant,
-    SessionForkParticipantKind, SessionForkPlan, SessionId, SessionPosition, SessionPrefillCarry,
-    SpeculativeMode, TokenLogprob, ToolCallPolicy, WeightAccessPattern, WeightPlacementReport,
-    XtcConfig, package_execution_error, parse_device_policy, parse_resource_limit,
-    resolve_device_vram_limit_bytes,
+    KvConnectorConfig, LayerWeightBytes, LimitParseError, LogprobSource, MemoryPolicyApplication,
+    MemoryStrategy, MemoryStrategyDecision, MemoryStrategyPlan, MirostatConfig, MirostatVersion,
+    MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource, OrtEngineWorkerFactory,
+    OrtSessionWorkerLoadError, PackageExecutionError, PrefillRequest, PrefillResult,
+    PrioritizedGenerateRequest, PrioritizedGenerateResult, RewindTokenCount, SamplerSequence,
+    SamplerStage, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint, SessionForkError,
+    SessionForkParticipant, SessionForkParticipantKind, SessionForkPlan, SessionId,
+    SessionPosition, SessionPrefillCarry, SpeculativeMode, TokenLogprob, ToolCallPolicy,
+    WeightAccessPattern, WeightPlacementReport, XtcConfig, package_execution_error,
+    parse_device_policy, parse_resource_limit, resolve_device_vram_limit_bytes,
 };
 pub use fim::{FimConfig, FimFormat};
 pub use logits::{
-    Constraint, ConstraintPrefixError, ConstraintProcessor, JsonConstraint, LogitProcessor,
-    ProcessorChain, ProcessorChainBuilder, ProcessorContext, ProcessorSignal, StopSequence,
-    TokenId,
+    Constraint, ConstraintPrefixError, ConstraintProcessor, LogitProcessor, ProcessorChain,
+    ProcessorChainBuilder, ProcessorContext, ProcessorSignal, StopSequence, TokenId,
+    validate_json_prefix,
 };
 pub use memory_authority::{
     DeviceCompatibilityDomain, DeviceMemoryAuthority, EngineMemoryAccounting,

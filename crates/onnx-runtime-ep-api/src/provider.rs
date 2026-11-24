@@ -984,6 +984,15 @@ impl WorkspaceAllocation {
         &mut self.buffer
     }
 
+    /// Produce a real allocation pin for a capture boundary. Raw or borrowed
+    /// backing has no binding-issued ownership proof and returns `None`.
+    pub fn device_graph_resource(&self) -> Result<Option<crate::DeviceGraphResource>> {
+        self.buffer
+            .bound_owner()
+            .map(crate::DeviceGraphResource::for_workspace)
+            .transpose()
+    }
+
     pub fn into_buffer(self) -> DeviceBuffer {
         self.buffer
     }
@@ -1935,14 +1944,24 @@ pub trait ExecutionProvider: Send + Sync {
 
     /// Begin capture in an executor-owned namespace and return the exact
     /// installation token. `continuation` is supplied for later segments of the
-    /// same capture and must identify the already-installed generation.
+    /// same capture and must identify the already-installed generation. Caller
+    /// resources must remain owned by their installed segment until retirement;
+    /// aborting a continuation must not discard resources of prior segments.
+    /// The default refuses nonempty resources rather than dropping their pins.
     fn begin_owned_device_graph_capture(
         &self,
         owner: DeviceGraphOwner,
         slot: DeviceGraphSlot,
         continuation: Option<DeviceGraphToken>,
         kernels: &[&dyn Kernel],
+        resources: Vec<crate::DeviceGraphResource>,
     ) -> Result<DeviceGraphToken> {
+        if !resources.is_empty() {
+            return Err(EpError::KernelFailed(format!(
+                "EP {} does not retain caller-owned workspace resources during capture; implement begin_owned_device_graph_capture before capturing address-bearing workspace",
+                self.name()
+            )));
+        }
         self.begin_device_graph_capture_in(slot, kernels)?;
         Ok(continuation.unwrap_or_else(|| DeviceGraphToken::new(owner, slot, 1)))
     }
@@ -2347,6 +2366,21 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(())
     }
 
+    /// Existing pressure registry for the authority funding workspace backing.
+    ///
+    /// Executors may retain completed workspace only when this returns a
+    /// registry, so idle capacity remains reclaimable. This cold capability
+    /// lookup must use the workspace allocator's actual authority/tier, without
+    /// creating another budget or holder. The provider's `deallocate_workspace`
+    /// must retire backing and settle its charge rather than move the owner to
+    /// another retained cache. Pending/captured owners remain with the executor
+    /// and never enter reclaimable idle storage.
+    fn workspace_pressure_registry(
+        &self,
+    ) -> Result<Option<onnx_runtime_memory_governor::PressureRegistry>> {
+        Ok(None)
+    }
+
     /// Block until all pending work on this EP completes.
     fn sync(&self) -> Result<()>;
 
@@ -2592,6 +2626,80 @@ mod tests {
             .expect("allocator");
         registry.select(mechanism).expect("selection");
         registry.bind(DeviceKey::HOST).expect("binding")
+    }
+
+    #[test]
+    fn workspace_capture_pin_retains_real_owner_until_every_segment_retires() {
+        let binding = host_binding();
+        let owner = binding.allocate_owning(128, 16).unwrap();
+        let workspace =
+            WorkspaceAllocation::new(DeviceBuffer::from_owning_allocation(owner, DeviceId::cpu()));
+        let base = workspace.as_ptr() as usize;
+        let first = workspace.device_graph_resource().unwrap().unwrap();
+        let span = first.workspace_span().unwrap();
+        assert_eq!(span.binding(), binding.identity());
+        assert!(span.covers(base, 128));
+        assert!(span.covers(base + 16, 32));
+        assert!(!span.covers(base - 1, 1));
+        assert!(!span.covers(base + 127, 2));
+        assert!(!span.covers(usize::MAX, 2));
+        let installed_segment = first.clone();
+        let continuation = workspace.device_graph_resource().unwrap().unwrap();
+        assert_eq!(workspace.bound_owner().unwrap().outstanding_views(), 2);
+        drop(first);
+        let BoundBufferOwnership::Binding(owner) =
+            workspace.into_buffer().into_bound_ownership().unwrap()
+        else {
+            panic!("binding owner")
+        };
+        let refused = owner.release_now().unwrap_err();
+        assert_eq!(refused.allocation().outstanding_views(), 2);
+        let (_, owner) = refused.into_parts();
+        // Aborting the new segment drops only its pin, not the installed one.
+        drop(continuation);
+        let refused = owner.release_now().unwrap_err();
+        assert_eq!(refused.allocation().outstanding_views(), 1);
+        let (_, owner) = refused.into_parts();
+        drop(installed_segment);
+        assert!(owner.release_now().unwrap().is_complete());
+    }
+
+    #[test]
+    fn workspace_capture_pin_requires_bound_ownership_not_arbitrary_tokens() {
+        let raw = WorkspaceAllocation::new(host_alloc(64, 16));
+        assert!(raw.device_graph_resource().unwrap().is_none());
+        let token = crate::DeviceGraphResource::new(raw.as_ptr() as usize, std::sync::Arc::new(()));
+        assert!(token.workspace_span().is_none());
+        host_free(raw.into_buffer());
+    }
+
+    #[test]
+    fn workspace_capture_pin_preserves_provider_context_identity() {
+        let first = host_binding();
+        let second = host_binding();
+        let owner = first.allocate_owning(32, 16).unwrap();
+        let pin = crate::DeviceGraphResource::for_workspace(&owner).unwrap();
+        let span = pin.workspace_span().unwrap();
+        assert_eq!(
+            span.binding().provider_context(),
+            first.identity().provider_context()
+        );
+        assert_ne!(
+            span.binding().provider_context(),
+            second.identity().provider_context()
+        );
+        span.require_context(first.identity().provider_context())
+            .unwrap();
+        let error = span
+            .require_context(second.identity().provider_context())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("allocate capture workspace through this provider")
+        );
+        drop(pin);
+        owner.release_now().unwrap();
     }
 
     /// Give back the host bytes a test deliberately left quarantined.

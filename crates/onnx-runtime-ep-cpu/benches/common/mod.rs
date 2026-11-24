@@ -16,7 +16,11 @@ pub struct PreparedKernel {
     scratch: Vec<u128>,
 }
 impl PreparedKernel {
-    pub fn new(kernel: Box<dyn Kernel>, inputs: &[TensorView]) -> Self {
+    pub fn new(
+        kernel: Box<dyn Kernel>,
+        inputs: &[TensorView],
+        outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Self {
         let metadata: Vec<_> = inputs
             .iter()
             .map(|input| {
@@ -28,7 +32,7 @@ impl PreparedKernel {
             })
             .collect();
         let req = kernel
-            .workspace_requirement_for_execution(inputs, &metadata)
+            .workspace_requirement_for_execution(inputs, &metadata, outputs)
             .expect("benchmark workspace planning must succeed");
         assert!(req.alignment <= std::mem::align_of::<u128>());
         let bytes = usize::try_from(req.bytes).expect("benchmark workspace must be addressable");

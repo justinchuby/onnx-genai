@@ -48,7 +48,14 @@ pub enum StagedOutputObservationError {
         identity: &'static str,
         version: &'static str,
         #[source]
-        source: onnx_genai_ort::OrtError,
+        source: anyhow::Error,
+    },
+    #[error("project declared response content for tool protocol {identity}@{version}: {source:#}")]
+    Projection {
+        identity: &'static str,
+        version: &'static str,
+        #[source]
+        source: anyhow::Error,
     },
     #[error(
         "declared tool protocol {identity}@{version} produced malformed staged output: {reason}"
@@ -78,6 +85,35 @@ pub enum StagedOutputObservationError {
     },
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+enum ProjectedInput {
+    #[default]
+    Unset,
+    Text,
+    Tokens,
+}
+#[derive(Clone)]
+enum ProjectionTokenCodec {
+    Bytes(std::sync::Arc<crate::byte_stream::ByteStreamContract>),
+    Canonical(std::sync::Arc<Tokenizer>),
+    Deferred {
+        tokenizer: std::sync::Arc<Tokenizer>,
+        reason: std::sync::Arc<anyhow::Error>,
+    },
+}
+impl std::fmt::Debug for ProjectionTokenCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bytes(_) => f.write_str("ByteTokens"),
+            Self::Canonical(_) => f.write_str("CanonicalTokens"),
+            Self::Deferred { reason, .. } => f
+                .debug_struct("DeferredCanonicalTokens")
+                .field("reason", reason)
+                .finish(),
+        }
+    }
+}
+
 /// Replayable decoder and parser state captured at a transaction boundary.
 ///
 /// It contains canonical token decoding state as well as the parser's
@@ -87,6 +123,8 @@ pub enum StagedOutputObservationError {
 pub struct StagedOutputCheckpoint {
     tokens: Vec<TokenId>,
     text: String,
+    raw: Vec<u8>,
+    input: ProjectedInput,
     stream: ToolCallStream,
     terminal: Option<Vec<ToolCall>>,
 }
@@ -99,22 +137,145 @@ pub struct ToolCallStagedOutputObserver {
     policy: ToolCallPolicy,
     tokens: Vec<TokenId>,
     text: String,
+    raw: Vec<u8>,
+    input: ProjectedInput,
     stream: ToolCallStream,
     terminal: Option<Vec<ToolCall>>,
     baseline: Option<StagedOutputCheckpoint>,
+    projection: Option<crate::response_template::ResponseProjection>,
+    codec: Option<ProjectionTokenCodec>,
+    preserved_tokens: std::collections::BTreeSet<u32>,
 }
 
 impl ToolCallStagedOutputObserver {
-    pub fn new(protocol: ToolProtocol, policy: ToolCallPolicy) -> Self {
+    pub fn new(
+        protocol: ToolProtocol,
+        policy: ToolCallPolicy,
+        preserved_tokens: std::collections::BTreeSet<u32>,
+    ) -> Self {
         debug_assert!(policy.observes_output());
         Self {
             protocol,
             policy,
             tokens: Vec::new(),
             text: String::new(),
+            raw: Vec::new(),
+            input: ProjectedInput::Unset,
             stream: ToolCallStream::default(),
             terminal: None,
             baseline: None,
+            projection: None,
+            codec: None,
+            preserved_tokens,
+        }
+    }
+
+    /// Apply an already validated response channel definition before observation
+    /// starts. Tools are parsed only from its content, including assistant prefill.
+    /// Bind the model tokenizer for token observation; None is for text hosts.
+    /// Unsupported contextual byte decoders defer tool parsing until terminal
+    /// cumulative decode, retaining the reason in this observer's Debug state.
+    pub fn with_projection(
+        mut self,
+        projection: crate::response_template::ResponseProjection,
+        tokenizer: Option<&Tokenizer>,
+    ) -> Result<Self, StagedOutputObservationError> {
+        if !self.raw.is_empty()
+            || !self.tokens.is_empty()
+            || self.baseline.is_some()
+            || self.projection.is_some()
+        {
+            return Err(self.projection_error(anyhow::anyhow!("response projection must be configured before tool observation starts; create a fresh observer")));
+        }
+        if let Some(ids) = projection.preserved_tokens() {
+            self.preserved_tokens.extend(ids);
+        }
+        if let Some(tokenizer) = tokenizer {
+            projection
+                .validate_tokenizer(tokenizer)
+                .map_err(|source| self.projection_error(source))?;
+        }
+        let content = projection
+            .project(b"", false)
+            .map_err(|source| self.projection_error(source))?;
+        self.codec =
+            tokenizer.map(
+                |tokenizer| match crate::byte_stream::ByteStreamContract::resolve_output(
+                    tokenizer,
+                    &self.preserved_tokens,
+                ) {
+                    Ok(Some(contract)) => {
+                        ProjectionTokenCodec::Bytes(std::sync::Arc::new(contract))
+                    }
+                    Ok(None) => {
+                        ProjectionTokenCodec::Canonical(std::sync::Arc::new(tokenizer.clone()))
+                    }
+                    Err(reason) => ProjectionTokenCodec::Deferred {
+                        tokenizer: std::sync::Arc::new(tokenizer.clone()),
+                        reason: std::sync::Arc::new(reason),
+                    },
+                },
+            );
+        self.projection = Some(projection);
+        self.replace_content(content)?;
+        Ok(self)
+    }
+
+    fn projected_token_bytes(
+        &self,
+        terminal: bool,
+    ) -> Result<Option<Vec<u8>>, StagedOutputObservationError> {
+        let decoded = match &self.codec {
+            Some(ProjectionTokenCodec::Bytes(contract)) => {
+                let mut decoder = contract.new_state();
+                let mut bytes = Vec::new();
+                let limit = self.projection.as_ref().expect("projected token codec owns a projection").max_bytes();
+                for &id in &self.tokens {
+                    let piece = contract.pieces.get(id as usize).ok_or_else(|| self.projection_error(anyhow::anyhow!("tool observation token {id} is absent from the bound tokenizer vocabulary; use IDs from that model")))?;
+                    let delta = decoder.step(piece);
+                    if bytes.len().checked_add(delta.len()).is_none_or(|size| size > limit) {
+                        return Err(self.projection_error(anyhow::anyhow!("projected tool output exceeds its {limit}-byte response buffer; reduce max_tokens or increase the response buffer")));
+                    }
+                    bytes.extend_from_slice(&delta);
+                }
+                if terminal {
+                    let tail = decoder.finish();
+                    if bytes.len().checked_add(tail.len()).is_none_or(|size| size > limit) {
+                        return Err(self.projection_error(anyhow::anyhow!("terminal projected tool output exceeds its {limit}-byte response buffer; reduce max_tokens or increase the response buffer")));
+                    }
+                    bytes.extend(tail);
+                }
+                bytes
+            }
+            Some(ProjectionTokenCodec::Canonical(tokenizer)) => self.decode_tokens(tokenizer)?.into_bytes(),
+            Some(ProjectionTokenCodec::Deferred { tokenizer, .. }) if terminal => self.decode_tokens(tokenizer)?.into_bytes(),
+            Some(ProjectionTokenCodec::Deferred { .. }) => return Ok(None),
+            None => return Err(self.projection_error(anyhow::anyhow!("token observation requires a tokenizer bound by with_projection; provide the model tokenizer before observing token IDs"))),
+        };
+        Ok(Some(decoded))
+    }
+
+    fn projection_error(&self, source: anyhow::Error) -> StagedOutputObservationError {
+        let (identity, version) = self.protocol.declaration();
+        StagedOutputObservationError::Projection {
+            identity,
+            version,
+            source,
+        }
+    }
+
+    fn replace_content(
+        &mut self,
+        content: String,
+    ) -> Result<StagedOutputObservation, StagedOutputObservationError> {
+        if let Some(chunk) = content.strip_prefix(&self.text) {
+            let chunk = chunk.to_owned();
+            self.text = content;
+            self.observe_stream(&chunk)
+        } else {
+            self.text = content;
+            self.stream = ToolCallStream::default();
+            self.observe_stream(&self.text.clone())
         }
     }
 
@@ -146,8 +307,20 @@ impl ToolCallStagedOutputObserver {
         &mut self,
         chunk: &str,
     ) -> Result<StagedOutputObservation, StagedOutputObservationError> {
-        self.text.push_str(chunk);
-        self.observe_stream(chunk)
+        if self.projection.is_some() && matches!(self.input, ProjectedInput::Tokens) {
+            return Err(self.projection_error(anyhow::anyhow!("cannot mix text and token observation in one projected turn; use one input representation")));
+        }
+        self.input = ProjectedInput::Text;
+        self.raw.extend_from_slice(chunk.as_bytes());
+        if let Some(projection) = &self.projection {
+            let content = projection
+                .project(&self.raw, false)
+                .map_err(|source| self.projection_error(source))?;
+            self.replace_content(content)
+        } else {
+            self.text.push_str(chunk);
+            self.observe_stream(chunk)
+        }
     }
 
     /// Decode and observe generated tokens before output publication.
@@ -161,18 +334,27 @@ impl ToolCallStagedOutputObserver {
         tokenizer: &Tokenizer,
         tokens: &[TokenId],
     ) -> Result<StagedOutputObservation, StagedOutputObservationError> {
+        if self.projection.is_some() && matches!(self.input, ProjectedInput::Text) {
+            return Err(self.projection_error(anyhow::anyhow!("cannot mix text and token observation in one projected turn; use one input representation")));
+        }
+        self.input = ProjectedInput::Tokens;
         self.tokens.extend_from_slice(tokens);
-        let decoded = tokenizer
-            .decode(&self.tokens)
-            .map_err(|source| self.decode_error(source))?;
-        if let Some(chunk) = decoded.strip_prefix(&self.text) {
-            let chunk = chunk.to_string();
-            self.text = decoded;
-            self.observe_stream(&chunk)
+        if let Some(projection) = &self.projection {
+            let Some(bytes) = self.projected_token_bytes(false)? else {
+                // Contextual byte decoders are authoritative at terminal
+                // cumulative decode; provisional replacement glyphs stay out
+                // of tool syntax and response framing.
+                return Ok(StagedOutputObservation::Continue);
+            };
+            let content = projection
+                .project(&bytes, false)
+                .map_err(|source| self.projection_error(source))?;
+            self.raw = bytes;
+            self.replace_content(content)
         } else {
-            self.text = decoded;
-            self.stream = ToolCallStream::default();
-            self.observe_stream(&self.text.clone())
+            let decoded = self.decode_tokens(tokenizer)?;
+            self.raw = decoded.as_bytes().to_vec();
+            self.replace_content(decoded)
         }
     }
 
@@ -182,6 +364,17 @@ impl ToolCallStagedOutputObserver {
         &mut self,
         boundary: &'static str,
     ) -> Result<StagedOutputObservation, StagedOutputObservationError> {
+        if matches!(self.input, ProjectedInput::Tokens) && self.projection.is_some() {
+            self.raw = self
+                .projected_token_bytes(true)?
+                .expect("terminal token decoding returns bytes");
+        }
+        if let Some(projection) = &self.projection {
+            let content = projection
+                .project(&self.raw, true)
+                .map_err(|source| self.projection_error(source))?;
+            self.replace_content(content)?;
+        }
         let outcome = self.stream.clone().finish(self.protocol);
         match &outcome {
             ToolParseOutcome::NoCall => {
@@ -225,6 +418,8 @@ impl ToolCallStagedOutputObserver {
         StagedOutputCheckpoint {
             tokens: self.tokens.clone(),
             text: self.text.clone(),
+            raw: self.raw.clone(),
+            input: self.input,
             stream: self.stream.clone(),
             terminal: self.terminal.clone(),
         }
@@ -233,6 +428,8 @@ impl ToolCallStagedOutputObserver {
     pub fn restore(&mut self, checkpoint: StagedOutputCheckpoint) {
         self.tokens = checkpoint.tokens;
         self.text = checkpoint.text;
+        self.raw = checkpoint.raw;
+        self.input = checkpoint.input;
         self.stream = checkpoint.stream;
         self.terminal = checkpoint.terminal;
     }
@@ -272,7 +469,15 @@ impl ToolCallStagedOutputObserver {
         }
     }
 
-    fn decode_error(&self, source: onnx_genai_ort::OrtError) -> StagedOutputObservationError {
+    fn decode_tokens(&self, tokenizer: &Tokenizer) -> Result<String, StagedOutputObservationError> {
+        crate::tokenization::decode_output(tokenizer, &self.tokens, &self.preserved_tokens)
+        .map_err(|source| self.decode_error(source.context(format!(
+            "decode staged tool token {:?} through tokenizer.decoder ({} generated tokens); repair the decoder or vocabulary",
+            self.tokens.last(), self.tokens.len()
+        ))))
+    }
+
+    fn decode_error(&self, source: anyhow::Error) -> StagedOutputObservationError {
         let (identity, version) = self.protocol.declaration();
         StagedOutputObservationError::Decode {
             identity,
@@ -336,10 +541,308 @@ mod tests {
         .unwrap()
     }
 
+    fn projected_observer(prefix: &str) -> ToolCallStagedOutputObserver {
+        let template = crate::response_template::ResponseTemplate::compile(&serde_json::json!({
+            "start_anchor":"A", "fields":{
+                "reasoning_content":{"open":"[r]","close":"[/r]"},
+                "content":{"optional":false}
+            }
+        }))
+        .unwrap();
+        let projection = crate::response_template::ResponseProjection::resolve(
+            template,
+            prefix.to_owned(),
+            4096,
+            None,
+        )
+        .unwrap();
+        ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        )
+        .with_projection(projection, None)
+        .unwrap()
+    }
+
+    #[test]
+    fn projected_tool_observer_ignores_reasoning_and_restores_both_text_histories() {
+        let mut observer = projected_observer("A[r]prefill");
+        observer.begin_turn();
+        let fake = r#"<tool_call>{"name":"example","arguments":{}}</tool_call>"#;
+        assert_eq!(
+            observer.observe_text(fake).unwrap(),
+            StagedOutputObservation::Continue
+        );
+        let checkpoint = observer.checkpoint();
+        observer
+            .observe_text(r#"[/r]<tool_call>{"name":"read","arguments":{}}</tool_call>"#)
+            .unwrap();
+        assert!(
+            matches!(observer.finish("EOS").unwrap(), StagedOutputObservation::TerminalComplete(ref calls) if calls.len()==1 && calls[0].name=="read")
+        );
+        observer.restore(checkpoint);
+        observer
+            .observe_text(r#"[/r]<tool_call>{"name":"write","arguments":{}}</tool_call>"#)
+            .unwrap();
+        assert!(
+            matches!(observer.finish("EOS").unwrap(), StagedOutputObservation::TerminalComplete(ref calls) if calls.len()==1 && calls[0].name=="write")
+        );
+        observer.abort_turn();
+        assert!(observer.committed_calls().is_empty());
+        observer
+            .observe_text(
+                r#"different thought[/r]<tool_call>{"name":"retry","arguments":{}}</tool_call>"#,
+            )
+            .unwrap();
+        assert!(
+            matches!(observer.finish("retry EOS").unwrap(), StagedOutputObservation::TerminalComplete(ref calls) if calls.len()==1 && calls[0].name=="retry")
+        );
+    }
+
+    #[test]
+    fn projected_tool_observer_consumes_assistant_tool_prefill_and_special_closers() {
+        let mut observer =
+            projected_observer(r#"A[r]thought[/r]<tool_call>{"name":"read","arguments":{"#);
+        observer.observe_text("}}</tool_call>").unwrap();
+        assert!(
+            matches!(observer.finish("EOS").unwrap(), StagedOutputObservation::TerminalComplete(ref calls) if calls.len()==1 && calls[0].name=="read")
+        );
+        let tokenizer = Tokenizer::from_file(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/tiny-tool-call/tokenizer.json"),
+        )
+        .unwrap();
+        let template = crate::response_template::ResponseTemplate::compile(&serde_json::json!({
+            "start_anchor":"A","fields":{"reasoning_content":{"open":"[r]","close":"<eos>"},"content":{}}
+        })).unwrap();
+        let projection = crate::response_template::ResponseProjection::resolve(
+            template,
+            "A[r]thought".to_owned(),
+            4096,
+            Some(&tokenizer),
+        )
+        .unwrap();
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        )
+        .with_projection(projection, Some(&tokenizer))
+        .unwrap();
+        assert_eq!(
+            observer.observe_tokens(&tokenizer, &[3]).unwrap(),
+            StagedOutputObservation::Continue
+        );
+        observer.observe_tokens(&tokenizer, &[22]).unwrap();
+        assert!(
+            matches!(observer.finish("EOS").unwrap(), StagedOutputObservation::TerminalComplete(ref calls) if calls.len()==1 && calls[0].name=="weather")
+        );
+    }
+
+    #[test]
+    fn projected_tool_observer_preserves_required_field_and_buffer_error_causes() {
+        let mut observer = projected_observer("A[r]thought");
+        observer.observe_text("x").unwrap();
+        let error = observer.finish("EOS").unwrap_err();
+        assert!(format!("{error:#}").contains("required field"), "{error:#}");
+        let mut observer = projected_observer("A[r]thought");
+        observer.begin_turn();
+        let error = observer.observe_text(&"x".repeat(4096)).unwrap_err();
+        assert!(format!("{error:#}").contains("4096"), "{error:#}");
+        assert!(std::error::Error::source(&error).is_some());
+        observer.abort_turn();
+        observer
+            .observe_text(r#"retry[/r]<tool_call>{"name":"retry","arguments":{}}</tool_call>"#)
+            .unwrap();
+        assert!(
+            matches!(observer.finish("retry EOS").unwrap(), StagedOutputObservation::TerminalComplete(ref calls) if calls[0].name=="retry")
+        );
+    }
+
+    #[test]
+    fn projected_tool_observer_retains_split_unicode_boundaries_and_deferred_decoders() {
+        use serde_json::json;
+        for byte_level in [false, true] {
+            for deferred in [false, true] {
+                let mut tokenizer: serde_json::Value = serde_json::from_str(include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/tiny-llm/tokenizer.json"
+                )))
+                .unwrap();
+                let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+                for (id, text) in [
+                    (4, if byte_level { "Ã" } else { "<0xC3>" }),
+                    (5, if byte_level { "©" } else { "<0xA9>" }),
+                    (
+                        7,
+                        if deferred {
+                            "<tool_call>{\"name\":\"weather\",\"arguments\":{}}</tool_call>x"
+                        } else {
+                            "<tool_call>{\"name\":\"weather\",\"arguments\":{}}</tool_call>"
+                        },
+                    ),
+                ] {
+                    let old = vocab
+                        .iter()
+                        .find(|(_, value)| **value == json!(id))
+                        .unwrap()
+                        .0
+                        .clone();
+                    vocab.remove(&old);
+                    vocab.insert(text.to_owned(), json!(id));
+                }
+                tokenizer["model"] = json!({"type":"BPE","unk_token":"<unk>","vocab":tokenizer["model"]["vocab"],"merges":[],"byte_fallback":!byte_level});
+                let decoder = if byte_level {
+                    json!({"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false})
+                } else {
+                    json!({"type":"ByteFallback"})
+                };
+                tokenizer["decoder"] = if deferred {
+                    json!({"type":"Sequence","decoders":[decoder,{"type":"Strip","content":"x","start":0,"stop":1}]})
+                } else {
+                    decoder
+                };
+                let scratch = tempfile::tempdir().unwrap();
+                let path = scratch.path().join("tokenizer.json");
+                std::fs::write(&path, tokenizer.to_string()).unwrap();
+                let tokenizer = Tokenizer::from_file(path).unwrap();
+                let template = crate::response_template::ResponseTemplate::compile(
+                    &json!({"start_anchor":"A","fields":{"content":{"close":"é"}}}),
+                )
+                .unwrap();
+                let projection = crate::response_template::ResponseProjection::resolve(
+                    template,
+                    "A".to_owned(),
+                    4096,
+                    Some(&tokenizer),
+                )
+                .unwrap();
+                let mut observer = ToolCallStagedOutputObserver::new(
+                    protocol("tagged-json"),
+                    ToolCallPolicy::Auto,
+                    Default::default(),
+                )
+                .with_projection(projection, Some(&tokenizer))
+                .unwrap();
+                let observed = observer.observe_tokens(&tokenizer, &[7]).unwrap();
+                if deferred {
+                    assert_eq!(observed, StagedOutputObservation::Continue);
+                    assert!(format!("{observer:?}").contains("DeferredCanonicalTokens"));
+                } else {
+                    assert!(
+                        matches!(observed, StagedOutputObservation::CompleteSoFar(ref calls) if calls[0].name=="weather")
+                    );
+                    observer.observe_tokens(&tokenizer, &[4]).unwrap();
+                    let checkpoint = observer.checkpoint();
+                    observer.observe_tokens(&tokenizer, &[5]).unwrap();
+                    assert!(
+                        matches!(observer.finish("EOS").unwrap(), StagedOutputObservation::TerminalComplete(ref calls) if calls[0].name=="weather")
+                    );
+                    observer.restore(checkpoint);
+                    observer.observe_tokens(&tokenizer, &[5]).unwrap();
+                }
+                assert!(
+                    matches!(observer.finish("EOS").unwrap(), StagedOutputObservation::TerminalComplete(ref calls) if calls.len()==1 && calls[0].name=="weather")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn projected_tool_observer_rejects_mixed_inputs_and_fences_decoder_panics() {
+        let tokenizer = Tokenizer::from_file(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/tiny-llm/tokenizer.json"),
+        )
+        .unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&tokenizer.inner().to_string(false).unwrap()).unwrap();
+        value["model"]["vocab"]
+            .as_object_mut()
+            .unwrap()
+            .remove("hello");
+        value["model"]["vocab"]["x"] = serde_json::json!(4);
+        value["decoder"] = serde_json::json!({"type":"Strip","content":"x","start":0,"stop":100});
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("tokenizer.json");
+        std::fs::write(&path, value.to_string()).unwrap();
+        let tokenizer = Tokenizer::from_file(path).unwrap();
+        let broken_frame = crate::response_template::ResponseTemplate::compile(
+            &serde_json::json!({"start_anchor":"A","fields":{"content":{"open":"x"}}}),
+        )
+        .unwrap();
+        let error = crate::response_template::ResponseProjection::resolve(
+            broken_frame,
+            "A".to_owned(),
+            4096,
+            Some(&tokenizer),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("tokenizer.decoder"),
+            "{error:#}"
+        );
+        let template = crate::response_template::ResponseTemplate::compile(
+            &serde_json::json!({"start_anchor":"A","fields":{"content":{}}}),
+        )
+        .unwrap();
+        assert!(
+            crate::response_template::ResponseProjection::resolve(
+                template.clone(),
+                "A".to_owned(),
+                0,
+                Some(&tokenizer)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("positive")
+        );
+        let projection = crate::response_template::ResponseProjection::resolve(
+            template,
+            "A".to_owned(),
+            4096,
+            Some(&tokenizer),
+        )
+        .unwrap();
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        )
+        .with_projection(projection.clone(), Some(&tokenizer))
+        .unwrap();
+        let error = observer.observe_tokens(&tokenizer, &[4]).unwrap_err();
+        assert!(matches!(error, StagedOutputObservationError::Decode { .. }));
+        assert!(
+            format!("{error:#}").contains("tokenizer.decoder"),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("Some(4)"), "{error:#}");
+        assert!(
+            observer
+                .observe_text("text")
+                .unwrap_err()
+                .to_string()
+                .contains("cannot mix")
+        );
+        let observer = projected_observer("A[r]thought");
+        assert!(
+            observer
+                .with_projection(projection, None)
+                .unwrap_err()
+                .to_string()
+                .contains("fresh observer")
+        );
+    }
+
     #[test]
     fn incomplete_staged_text_keeps_the_loop_running() {
-        let mut observer =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        );
         assert_eq!(
             observer
                 .observe_text(r#"<tool_call>{"name":"read","arguments":{"path":"src/"#)
@@ -354,8 +857,11 @@ mod tests {
 
     #[test]
     fn complete_calls_are_pending_until_an_independent_terminal_boundary() {
-        let mut observer =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        );
         let StagedOutputObservation::CompleteSoFar(calls) = observer
             .observe_text(r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#)
             .unwrap()
@@ -374,8 +880,11 @@ mod tests {
             FinishReason::ToolCalls
         );
 
-        let mut observer =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        );
         let StagedOutputObservation::CompleteSoFar(calls) = observer
             .observe_text(concat!(
                 r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#,
@@ -395,8 +904,11 @@ mod tests {
 
     #[test]
     fn malformed_text_is_a_typed_precommit_failure() {
-        let mut observer =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        );
         assert!(matches!(
             observer.observe_text("<tool_call>{bad}</tool_call>"),
             Err(StagedOutputObservationError::Malformed { .. })
@@ -405,8 +917,11 @@ mod tests {
 
     #[test]
     fn text_after_a_complete_envelope_remains_malformed() {
-        let mut observer =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        );
         assert!(matches!(
             observer.observe_text(r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#),
             Ok(StagedOutputObservation::CompleteSoFar(_))
@@ -419,8 +934,11 @@ mod tests {
 
     #[test]
     fn abort_restores_incremental_decoder_and_parser_state_for_retry() {
-        let mut observer =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        );
         observer.begin_turn();
         assert_eq!(
             observer
@@ -440,8 +958,11 @@ mod tests {
 
     #[test]
     fn abort_after_complete_call_does_not_duplicate_the_retry() {
-        let mut observer =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        );
         observer.begin_turn();
         assert!(matches!(
             observer.observe_text(r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#),
@@ -461,8 +982,11 @@ mod tests {
 
     #[test]
     fn request_policy_is_enforced_only_at_the_terminal_boundary() {
-        let mut required =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Required);
+        let mut required = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Required,
+            Default::default(),
+        );
         assert_eq!(
             required.observe_text("ordinary assistant text").unwrap(),
             StagedOutputObservation::Continue
@@ -478,6 +1002,7 @@ mod tests {
             ToolCallPolicy::Specific {
                 function: "weather".to_string(),
             },
+            Default::default(),
         );
         specific
             .observe_text(r#"<tool_call>{"name":"calendar","arguments":{}}</tool_call>"#)
@@ -488,16 +1013,22 @@ mod tests {
                 if reason.contains("weather") && reason.contains("calendar")
         ));
 
-        let mut auto =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        let mut auto = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        );
         auto.observe_text("ordinary assistant text").unwrap();
         assert!(auto.finish("semantic commit").is_ok());
     }
 
     #[test]
     fn oversized_staged_output_fails_before_commit() {
-        let mut observer =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        );
         let oversized = "x".repeat(onnx_genai_metadata::MAX_TOOL_PAYLOAD_BYTES + 1);
         assert!(matches!(
             observer.observe_text(&oversized),
@@ -515,13 +1046,19 @@ mod tests {
         let text = r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#;
         let tokens = tokenizer.encode(text)?;
         let expected = {
-            let mut observer =
-                ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+            let mut observer = ToolCallStagedOutputObserver::new(
+                protocol("tagged-json"),
+                ToolCallPolicy::Auto,
+                Default::default(),
+            );
             observer.observe_tokens(&tokenizer, &tokens)?
         };
         for split in 0..=tokens.len() {
-            let mut observer =
-                ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+            let mut observer = ToolCallStagedOutputObserver::new(
+                protocol("tagged-json"),
+                ToolCallPolicy::Auto,
+                Default::default(),
+            );
             observer.observe_tokens(&tokenizer, &tokens[..split])?;
             assert_eq!(
                 observer.observe_tokens(&tokenizer, &tokens[split..])?,
@@ -533,8 +1070,11 @@ mod tests {
 
     #[test]
     fn complete_so_far_never_requests_host_stop_before_finish() -> anyhow::Result<()> {
-        let mut observer =
-            ToolCallStagedOutputObserver::new(protocol("tagged-json"), ToolCallPolicy::Auto);
+        let mut observer = ToolCallStagedOutputObserver::new(
+            protocol("tagged-json"),
+            ToolCallPolicy::Auto,
+            Default::default(),
+        );
         for chunk in [
             r#"<tool_call>{"name":"read","arguments":{}}</tool_call>"#,
             "\n<tool_call>",

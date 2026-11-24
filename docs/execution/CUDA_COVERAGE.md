@@ -133,7 +133,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Relu`, `Sqrt`, `Erf`, `Tanh`, `Sigmoid` | `` | ✅ | **NVRTC-custom** | f32/f16/bf16; half storage widens to f32 compute and narrows once on store (`elementwise.rs`). |
 | `Gelu` | `` | ✅ | **NVRTC-custom** | Standard-domain opset-20 exact or tanh-approximate GELU (`elementwise.rs`). |
 | `SwiGLU`, `GeGLU` | `` | ✅ | **NVRTC-custom** | Opsets 28/29 respectively; identical input shapes, no broadcasting. f16/bf16/f32/f64. |
-| `Expm1`, `Log1p`, `LogCumSumExp` | `` | ✅ | **NVRTC-custom** | Opset 29; f16/bf16/f32/f64. Stable small-value math and log-domain prefix accumulation. |
+| `Expm1`, `Log1p` | `` | ✅ | **NVRTC-custom** | Opset 29; f16/bf16/f32/f64. Stable small-value math in the elementwise kernel family. |
+| `LogCumSumExp` | `` | ✅ | **NVRTC-custom** | Opset 29; f16/bf16/f32/f64. Log-domain prefix accumulation in the cumulative-sum kernel family. |
 | `Pack`, `Unpack` | `` | ✅ | **NVRTC-custom** | Opset 29; fixed-bit and grouped-radix encoding along arbitrary axes, with UINT8/UINT32 words. Eager CUDA only. |
 | `GroupedMatMul` | `` | ✅ | **NVRTC-custom** | Opset 29; f16/bf16/f32/f64, INT32/INT64 routes, either weight layout, optional bias. Eager CUDA only. |
 | `Gelu`, `Silu` | `com.microsoft` | ✅ | **NVRTC-custom** | Contrib activation forms (`elementwise.rs`). |
@@ -200,7 +201,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | Op | Domain | Status | Backend | Notes |
 |----|--------|--------|---------|-------|
 | `Attention` | `com.microsoft` | ✅ | **NVRTC tiled online-softmax + Phase-2a fallback** | Phase-2b fused f32/f16/bf16 prefill, including GQA and additive masks; measured auto-gate retains the cuBLAS baseline where faster. See `CUDA_FLASH_ATTENTION.md`. |
-| `Attention` (opset 23/24) | `` | ✅ | **deterministic CUDA EP fallback** | Standard ONNX SDPA with 3D/4D layouts, GQA, bool/additive masks, and in-op KV cache. f32. |
+| `Attention` (opset 23/24/25) | `` | ✅ | **CUDA row kernel; split-KV on eligible unwindowed decode** | Standard ONNX SDPA with 3D/4D layouts, GQA, bool/additive masks, and KV cache. Opset 25 windows bound the score and value loops; windowed calls retain logical KV extents rather than using mask-derived frozen capacity. f32/f16/bf16. |
 | `RotaryEmbedding` (opset 23) | `` | ✅ | **deterministic CUDA EP fallback** | f32 interleaved/non-interleaved RoPE, partial rotary dimensions, and optional position-id gathering. |
 | `RotaryEmbedding` | `com.microsoft` | ✅ | **NVRTC-custom** | Contrib-domain RoPE registration with shape/dtype/attribute validation in `rotary_embedding.rs`. |
 | `MultiHeadAttention` | `com.microsoft` | ✅ | **cuBLASLt Phase-2a SDPA + NVRTC layout adapters** | Contiguous f32/f16/bf16 separate Q/K/V. Query is BSH; K/V may be BSH or BNSH. Supports optional same-dtype projection bias, broadcast additive attention bias, Int32/Int64 key-padding mask, causal mode, and paired BNSH past/present KV. Q/K/V head sizes must match. Packed QKV/KV, DecoderMaskedMHA inputs, unequal V head size, and mixed float dtypes fail closed. Per-call scratch, a host-resolved padding mask, and a trailing synchronization make graph capture unsupported (`multi_head_attention.rs`). |
@@ -217,6 +218,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 |----|--------|--------|---------|-------|
 | `Cast` | `` | ✅ | **NVRTC-custom** | Element-wise dtype conversion; f32/f64/f16/bf16/int8-64/uint8-64/bool, ONNX saturating float→int. Two NVRTC modules keep f16/bf16 (which need NVRTC's built-in `cuda_fp16.h`/`cuda_bf16.h`) out of the common integer/f32 path (`cast.rs`). |
 | `CastLike` | `` | ✅ | **NVRTC-custom** | Same kernel as `Cast`; target dtype taken from the output tensor. |
+| `BitCast` (v26) | `` | ✅ | **Device copy** | Preserves exact bytes for equal-width dtypes, including dense packed 2- and 4-bit tensors. Uses an asynchronous stream copy when storage cannot be reused. |
 | `Identity` | `` | ✅ | **memcpy** (D2D) | Straight dtype-agnostic device copy into the pre-shaped output (`movement.rs`). |
 | `Flatten` | `` | ✅ | **memcpy** (D2D) | Dtype-agnostic D2D copy; the 2-D output shape is metadata-only, so the bytes are copied unchanged (`movement.rs`). |
 | `Concat` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic byte copy, arbitrary/negative axis, multiple inputs. |
@@ -225,6 +227,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Gather` | `` | ✅ | **NVRTC-custom** | Axis-parametric contiguous indexed copy; Int32/Int64 indices, negative index wrap, arbitrary index rank. |
 | `AffineQuantizedGather` | `pkg.nxrt` | ✅ | **NVRTC-custom** | EP fusion for single-use per-tensor FLOAT `DequantizeLinear` on INT8/UINT8 data feeding `Gather`; decodes only selected elements. |
 | `AffineQuantizedGroupedMatMul` | `pkg.nxrt` | ✅ | **NVRTC-custom** | Eager fusion of row-packed unsigned 4-bit affine weights into `GroupedMatMul`; only selected experts are decoded. Routing and intervening MoE operations stay separate. |
+| `PackedGroupedMatMul` | `pkg.nxrt` | ✅ | **NVRTC-custom** | Eager fusion of row-aligned GGUF weights into unbiased FLOAT `GroupedMatMul`; only selected experts are decoded. |
+| `DequantizePackedGather` | `pkg.nxrt` | ✅ | **NVRTC-custom** | Fusion of GGUF `DequantizePacked` into axis-0 Gather with block-aligned slices; only selected slices are decoded. |
 | `GatherElements` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic contiguous element gather with Int64 indices, negative axes/indices, and CPU-matched rank/dimension validation. |
 | `ScatterElements` (v11 & v16) | `` | ✅ | **NVRTC-custom** | Deterministic f32/Int64 updates in row-major input order. Opset 16 supports `none`, `add`, `mul`, `min`, and `max`; duplicate indices therefore preserve CPU last-write/sequential-reduction semantics. |
 | `TopK` (v10) | `` | ✅ | **NVRTC-custom** | Deterministic f32 per-slice selection with input `K`, arbitrary/negative axis, largest/smallest modes, and CPU tie-breaking by lower source index. |
@@ -241,7 +245,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `BiasGelu` | `com.microsoft` | ✅ | **NVRTC-custom** | Exact (erf) GELU of `X + bias` with the bias broadcast over the last dimension; f32/f16/bf16, GELU evaluated in `double` and the `-inf → 0` guard matched to the CPU EP (`fused_gelu.rs`). |
 | `FastGelu` | `com.microsoft` | ✅ | **NVRTC-custom** | Tanh-approximation GELU of `X` plus an optional last-dim bias (1- or 2-input arity); f32/f16/bf16, matched to the CPU EP. |
 | `QuickGelu` | `com.microsoft` | ✅ | **NVRTC-custom** | `X · sigmoid(alpha · X)` with the `com.microsoft` default `alpha=1.702`; f32/f16/bf16, numerically stable sigmoid matched to the CPU EP. |
-| `CumProd` (v26) | `` | ✅ | **NVRTC-custom** | Deterministic per-lane cumulative product (f32/i64) honouring `exclusive`/`reverse`, mirroring the `CumSum` scan (`cumprod.rs`). |
+| `CumProd` (v26) | `` | ✅ | **NVRTC-custom** | Deterministic per-lane product for all eight schema dtypes, with an int32/int64 scalar axis. An immutable initializer axis needs no host read and supports graph capture; a runtime axis is validated on the host. |
 | `ArgMax` | `` | ✅ | **NVRTC-custom** | Per-lane axis reduction to Int64 indices (f32/f16/bf16 widened to f32), honouring `keepdims` and `select_last_index`; first-index tie-break matched to the CPU EP (`argreduce.rs`). |
 | `ArgMin` | `` | ✅ | **NVRTC-custom** | Per-lane axis reduction to Int64 indices (f32/f16/bf16 widened to f32), honouring `keepdims` and `select_last_index`; first-index tie-break matched to the CPU EP (`argreduce.rs`). |
 | `GatherND` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic indexed copy with Int32/Int64 indices, negative index wrapping, arbitrary tuple depth, and `batch_dims`; eager execution validates indices before launch and graph capture uses the device error latch (`structural.rs`). |
@@ -251,7 +255,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Compress` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic fixed-width selection with omitted-axis flattening, positive/negative axes, and short conditions (`data_transform.rs`). |
 | `DynamicQuantizeLinear` | `` | ✅ | **NVRTC-custom** | Float32 per-tensor dynamic uint8 quantization; one block derives min/max, scale, and ties-to-even zero point before quantizing (`quantization.rs`). |
 | `Pad` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic constant/reflect/edge/wrap padding, negative-pad cropping, and opset-18 subset/negative axes (`pad.rs`). |
-| `Range` | `` | ✅ | **NVRTC-custom** | Scalar-driven f32/f16/bf16/Int64 sequence construction with positive/negative steps and CPU-matched output-count validation (`range.rs`). |
+| `Range` | `` | ✅ | **NVRTC-custom** | FP32/FP64, FP16/BF16, and Int16/32/64; opset 27 supports FLOAT and DOUBLE stash precision. CUDA graph capture cannot resolve a scalar-dependent output length. The ORT CUDA plugin declines runtime-valued shape reads rather than claiming them. |
 | `ScatterND` (v11/v16/v18) | `` | ✅ | **NVRTC-custom** | Deterministic slice updates in row-major tuple order for f32/f16/bf16/Int64 data and Int64 indices; negative indices and `none`/`add`/`mul`/`min`/`max` reductions match the CPU EP (`indexing.rs`). |
 | `HannWindow`, `HammingWindow`, `BlackmanWindow` (v17) | `` | ✅ | **NVRTC-custom** | Periodic or symmetric signal windows generated directly on device in f16/bf16/f32/f64, with the scalar size and `output_datatype` contract matched to the CPU EP (`window.rs`). |
 | `DFT` (v17/v20) | `` | ✅ | **cuFFT + NVRTC pack/unpack** | f32 real/complex input, forward/inverse, full/onesided output, arbitrary signal axis, and truncating/zero-padding `dft_length`. A bounded 16-entry plan cache reuses stream-bound C2C plans; execution scratch and packed data use governed EP workspace. Plan selection and scalar staging deliberately decline CUDA-graph capture (`dft.rs`, `cufft.rs`). |
@@ -282,12 +286,12 @@ codes match. `Unpack` yields `UINT8`; use matching zero-point types or cast
 both operands consistently. An omitted ONNX zero point means zero, not the
 Mobius QMoE default of eight.
 
-The native packed projection fusion covers transposed, unbiased FLOAT
+The native affine projection fusion covers transposed, unbiased FLOAT
 `GroupedMatMul` with last-axis blocked affine weights, accepting either
 `Unpack` or the unsigned nibble expansion used by Mobius. It does not claim
-direct sub-byte initializers, GGUF `DequantizePacked`, or whole-MoE routing,
-activation, and reduction. The original graph remains unchanged when a
-decoded intermediate is shared or the layout cannot be proved.
+direct sub-byte initializers or whole-MoE routing, activation, and reduction.
+The GGUF `DequantizePacked` path is described below. The original graph remains
+unchanged when a decoded intermediate is shared or the layout cannot be proved.
 
 ## Source-derived coverage audit
 
@@ -337,7 +341,8 @@ record what each wave landed and are not a statement about today.
 
 <!-- CUDA_CPU_ONLY_GAPS_START -->
 
-- `ai.onnx`: none.
+- Deliberately CPU-only: `ai.onnx::RegexFullMatch`, `ai.onnx::StringConcat`,
+  and `ai.onnx::StringSplit`.
 - Open implementation gap: `com.microsoft::FusedAttention`.
 - Deliberate non-gaps: `com.microsoft::MoE` and
   `com.microsoft::PackedMultiHeadAttention`.
@@ -369,8 +374,13 @@ batch.
 For `com.microsoft`, `FusedAttention` is the only open CPU-only implementation
 gap. `MoE` and `PackedMultiHeadAttention` are deliberate non-gaps explained
 below. `BiasGelu`, `FastGelu`, and `QuickGelu` are covered by `fused_gelu.rs`.
-CUDA additionally exposes `com.microsoft::Attention`. There are no
-standard-domain CPU-only gaps.
+CUDA additionally exposes `com.microsoft::Attention`.
+
+The three standard-domain text operators listed above consume managed string
+tensors, which stay on the host. There are no CUDA kernels for these operators.
+Standalone nxrt can still place eligible numeric subgraphs on CUDA when CPU
+fallback is allowed; strict CUDA placement rejects graphs that require these
+text operators.
 
 `com.microsoft::MoE` (the float/unquantized form, with dense f32/f16/bf16 FC
 weight tensors) is present in the CPU EP but is **not a real CUDA gap**: no
@@ -613,9 +623,9 @@ The issue #67 operator-coverage batch 13 adds `QLinearMatMul` and `Resize`.
 `QLinearMatMul` preserves the CPU reference's wrapping i32 accumulation,
 ties-to-even requantization, and per-tensor/per-row/per-column quantization for
 Int8 and Uint8. `Resize` supports nearest and N-D linear interpolation with
-`half_pixel`, `align_corners`, and `asymmetric` coordinates, scales or sizes,
-selected axes, and all four standard nearest rounding modes. Cubic,
-`pytorch_half_pixel`, `tf_crop_and_resize`, `half_pixel_symmetric`, antialiasing,
+`half_pixel`, `align_corners`, `asymmetric`, and Resize-19 `half_pixel_symmetric`
+coordinates, scales or sizes, selected axes, and all four standard nearest
+rounding modes. Cubic, `pytorch_half_pixel`, `tf_crop_and_resize`, antialiasing,
 and non-stretch aspect policies remain fail-closed at the claim gate. GPU parity
 covers quantized signed/unsigned and batched per-axis cases plus nearest/linear
 upsampling and downsampling across the supported coordinate and control modes.
@@ -779,11 +789,9 @@ must specify an immutable scalar count equal to K.
 
 For GGUF, emit a flat UINT8 initializer, opset-29 `DequantizePacked` with
 logical shape `[N,K]`, and a swap transpose. Blocks must fit within each
-row without padding. A redundant FLOAT-to-FLOAT Cast before the transpose
-is allowed. The fused formats are `iq1_s`, `iq1_m`, `iq2_xxs`, `iq2_xs`,
-`iq2_s`, `iq3_xxs`, `iq3_s`, `iq4_nl`, `iq4_xs`, `q2_k`, `q3_k`, `q5_k`,
-`q6_k`, and `q8_0`. The other profiles, including `q4_k` and `mxfp4`,
-retain standalone decoding. Precision-changing casts, shared decoded
+row without padding. A redundant FLOAT-to-FLOAT Cast before or after the
+transpose is allowed. All 27 standard GGUF profiles use the same block
+decoder as standalone `DequantizePacked`. Precision-changing casts, shared decoded
 values, shared inline GGUF bytes, or other layouts also retain the original
 graph.
 
@@ -791,3 +799,9 @@ CUDA uses these fusions only when the activation is statically known to
 contain one row and launch geometry permits it. CPU can stream decoded
 rows for multiple activation rows. Neither fused path materializes the
 full decoded weight matrix.
+
+Packed Gather fuses when axis 0 selects whole block-aligned slices, preserving
+the decoded dtype. Packed `GroupedMatMul` fuses unbiassed FLOAT projections
+with integer routes and `transB=1` when the `[experts, outputs, depth]`
+weight bank is row-aligned. These paths decode only selected slices or expert
+projection blocks. Shared decoded tensors retain the original graph.

@@ -980,9 +980,13 @@ fn attention_rejects_unsupported_dtype_and_rank() {
     );
     let phase2a = AttentionKernel::new_phase2a(runtime, false, 4, 4, None).unwrap();
     assert!(
-        common::runtime_workspace_requirement(&phase2a, &inputs4)
-            .unwrap()
-            .bytes
+        common::runtime_workspace_requirement(
+            &phase2a,
+            &inputs4,
+            &[onnx_runtime_ep_api::OutputMetadata::from_view(&output4)]
+        )
+        .unwrap()
+        .bytes
             > 0
     );
     let error = phase2a.execute(&inputs4, &mut [output4]).unwrap_err();

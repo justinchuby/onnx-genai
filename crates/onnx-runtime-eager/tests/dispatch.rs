@@ -249,5 +249,22 @@ fn dispatch_rejects_invalid_or_unsupported_output_counts_cleanly() {
     let too_few = ctx
         .dispatch_with_outputs("TopK", "", &[&x, &k], &HashMap::new(), 1, None)
         .unwrap_err();
-    assert!(matches!(too_few, EagerError::Kernel(_)));
+    let EagerError::Execution {
+        op_type,
+        domain,
+        device,
+        source,
+    } = too_few
+    else {
+        panic!("TopK output-count failure must retain execution context");
+    };
+    assert_eq!(op_type, "TopK");
+    assert!(domain.is_empty());
+    assert_eq!(device, onnx_runtime_ir::DeviceId::cpu());
+    assert!(matches!(*source, EagerError::Kernel(_)));
+    let reason = source.to_string();
+    assert!(
+        reason.contains("TopK") && reason.contains("output"),
+        "{reason}"
+    );
 }

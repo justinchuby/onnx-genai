@@ -1,0 +1,14 @@
+domain: ""
+name: Range
+since_version: 27
+doc: Generate a one-dimensional arithmetic progression with configurable intermediate precision for FP16 and BF16.
+attributes:
+  - { name: stash_type, type: int, default: 1 }
+inputs:
+  - { name: start, type_str: T }
+  - { name: limit, type_str: T }
+  - { name: delta, type_str: T }
+outputs:
+  - { name: output, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [float32, float64, int16, int32, int64, float16, bfloat16] }

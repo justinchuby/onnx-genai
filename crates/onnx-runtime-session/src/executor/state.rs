@@ -482,6 +482,8 @@ pub(crate) struct Executor {
     /// build; dynamic (symbol-shaped) values are allocated per run and cached
     /// here so a run whose resolved shape is unchanged reuses the allocation.
     pub(super) buffers: HashMap<ValueId, DeviceBuffer>,
+    pub(super) string_initializers: HashMap<ValueId, Tensor>,
+    pub(super) string_values: HashMap<ValueId, Tensor>,
     /// The concrete shape each live buffer in [`Self::buffers`] is currently
     /// sized for — the reuse key for run-scoped buffers.
     pub(super) buffer_shapes: HashMap<ValueId, Vec<usize>>,
@@ -758,6 +760,8 @@ pub(crate) struct Executor {
     pub(super) provider_artifact_readiness: ProviderArtifactReadiness,
     pub(super) persistent_workspace: Option<PreparedWorkspace>,
     pub(super) step_workspace: Option<PreparedWorkspace>,
+    pub(super) workspace_reuse: WorkspaceReuse,
+    pub(super) workspace_completion: WorkspaceCompletion,
     /// When set, [`Executor::release_step_workspace`] is a no-op: the StepScoped
     /// `step_workspace` buffer is kept alive between runs instead of being freed
     /// after each one. A captured device graph bakes the physical address of the
@@ -766,8 +770,8 @@ pub(crate) struct Executor {
     /// speculative verify forward reserves a bigger scratch than the M=1 decode),
     /// the replay reads a stale pointer and produces non-finite logits (#1647).
     /// Pinning the workspace at the M=K peak keeps the pointer stable across
-    /// replays. Inert by default (`false`) so every non-verify executor frees its
-    /// StepScoped scratch exactly as before.
+    /// replays. Ordinary completed scratch instead enters reclaimable idle
+    /// storage when the provider exposes its physical pressure registry.
     pub(super) pin_step_workspace: bool,
     /// Non-owning view of an enclosing executor's prepared workspace. Nested
     /// control-flow executors run sequentially, so they may reuse the parent's
@@ -783,6 +787,7 @@ pub(crate) struct Executor {
 /// growing-symbol classification supplies the remaining capacity-bound input.
 /// Store peaks, never borrowed addresses or admission/ownership proofs.
 pub(super) struct WorkspacePreparationMemo {
+    pub(super) output_bindings: WorkspaceOutputBindings,
     pub(super) symbols: HashMap<SymbolId, usize>,
     pub(super) growing_symbols: HashSet<SymbolId>,
     pub(super) artifacts: ExecutorArtifactConfig,
@@ -790,6 +795,50 @@ pub(super) struct WorkspacePreparationMemo {
     pub(super) kernel_evictions: u64,
     pub(super) persistent: WorkspaceRequirement,
     pub(super) step: WorkspaceRequirement,
+}
+
+#[derive(Default)]
+pub(super) struct WorkspaceOutputBindings(Vec<WorkspaceOutputBinding>);
+
+struct WorkspaceOutputBinding {
+    value: ValueId,
+    dtype: DataType,
+    shape: Vec<usize>,
+    accepts_subshape: bool,
+    strides: Option<Vec<i64>>,
+    fixed_stride_shape: Option<Vec<usize>>,
+}
+
+impl WorkspaceOutputBindings {
+    pub(super) fn from_external(external: &ExternalBindings) -> Self {
+        let mut outputs = external
+            .outputs
+            .iter()
+            .map(|(&value, bound)| WorkspaceOutputBinding {
+                value,
+                dtype: bound.dtype,
+                shape: bound.shape.clone(),
+                accepts_subshape: bound.accepts_subshape,
+                strides: bound.strides.clone(),
+                fixed_stride_shape: bound.fixed_stride_shape.clone(),
+            })
+            .collect::<Vec<_>>();
+        outputs.sort_unstable_by_key(|output| output.value.0);
+        Self(outputs)
+    }
+
+    pub(super) fn matches(&self, external: &ExternalBindings) -> bool {
+        self.0.len() == external.outputs.len()
+            && self.0.iter().all(|output| {
+                external.outputs.get(&output.value).is_some_and(|bound| {
+                    output.dtype == bound.dtype
+                        && output.shape == bound.shape
+                        && output.accepts_subshape == bound.accepts_subshape
+                        && output.strides == bound.strides
+                        && output.fixed_stride_shape == bound.fixed_stride_shape
+                })
+            })
+    }
 }
 
 /// Parent scratch remains separated by lifetime; a step must never borrow and

@@ -10,6 +10,7 @@
 //! shape the design sanctions for CPU testing. A real CUDA end-to-end check is
 //! gated separately (GPU-only) and is not part of CI.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -38,6 +39,7 @@ struct AcceleratorEp {
     allowed: Vec<&'static str>,
     claim_only: Vec<&'static str>,
     device_sized: Vec<&'static str>,
+    unavailable_kernel: bool,
     device: DeviceId,
 }
 
@@ -50,6 +52,7 @@ impl AcceleratorEp {
             allowed,
             claim_only: Vec::new(),
             device_sized: Vec::new(),
+            unavailable_kernel: false,
             // Mlx is host-accessible, so the CPU execution path stays valid while
             // the device id differs from CPU:0 for transfer planning.
             device: DeviceId::new(DeviceType::Mlx, 0),
@@ -74,7 +77,7 @@ impl ExecutionProvider for AcceleratorEp {
         "accel_ep"
     }
     fn device_type(&self) -> DeviceType {
-        DeviceType::Mlx
+        self.device.device_type
     }
     fn device_id(&self) -> DeviceId {
         self.device
@@ -116,6 +119,9 @@ impl ExecutionProvider for AcceleratorEp {
         shapes: &[Vec<usize>],
         opset: u64,
     ) -> EpResult<Box<dyn Kernel>> {
+        if self.unavailable_kernel {
+            return Err(onnx_runtime_ep_api::EpError::NotInitialized);
+        }
         if self.device_sized.contains(&op.op_type.as_str()) {
             return Ok(Box::new(DeviceSizedKernel));
         }
@@ -1180,6 +1186,171 @@ fn classify_mixed_graph_is_heterogeneous() {
 }
 
 #[test]
+fn ordered_session_prefers_first_whole_graph_provider() {
+    use crate::{ExecutionProviderOrder, InferenceSession};
+
+    let graph = build_chain(&["Relu", "Abs"]);
+    let order = || {
+        let mut whole = AcceleratorEp::new(vec!["Relu", "Abs"]);
+        whole.device.index = 1;
+        ExecutionProviderOrder::new(accel_slot(0, vec!["Relu"]).provider)
+            .then(Arc::new(whole))
+            .then(cpu_slot(2).provider)
+    };
+    let ir_session = InferenceSession::from_graph_with_providers(
+        graph.clone(),
+        weights(),
+        Path::new("."),
+        order(),
+        None,
+    )
+    .unwrap();
+    let bytes =
+        onnx_runtime_loader::encode_model(&onnx_runtime_loader::Model::new(&graph)).unwrap();
+    let bytes_session = InferenceSession::builder()
+        .model_bytes(&bytes)
+        .execution_providers(order())
+        .build()
+        .unwrap();
+    let tensor = Tensor::from_f32(&[4], &[-2.0, 1.0, -3.0, 4.0]).unwrap();
+    let inputs = [("x", &tensor)];
+    let expected = reference(&graph, &inputs);
+    for mut session in [ir_session, bytes_session] {
+        assert_eq!(session.device_id(), DeviceId::new(DeviceType::Mlx, 1));
+        assert!(session.heterogeneous_placement_report().is_none());
+        assert_eq!(
+            session.run(&inputs).unwrap()[0].as_bytes(),
+            expected[0].as_bytes()
+        );
+    }
+}
+
+#[test]
+fn ordered_session_can_select_a_whole_provider_for_symbolic_shapes() {
+    let mut graph = build_chain(&["Relu", "Abs"]);
+    let n = graph.create_symbol(Some("n".into()));
+    let values = graph.values.iter().map(|(id, _)| id).collect::<Vec<_>>();
+    for id in values {
+        graph.value_mut(id).shape = vec![onnx_runtime_ir::Dim::Symbolic(n)];
+    }
+    let order = crate::ExecutionProviderOrder::new(accel_slot(0, vec!["Relu"]).provider)
+        .then(cpu_slot(1).provider);
+    let mut session = crate::InferenceSession::from_graph_with_providers(
+        graph,
+        weights(),
+        Path::new("."),
+        order,
+        None,
+    )
+    .unwrap();
+    assert_eq!(session.device_id(), DeviceId::cpu());
+    assert!(session.heterogeneous_placement_report().is_none());
+    let input = Tensor::from_f32(&[3], &[-1.0, 3.0, 2.0]).unwrap();
+    assert_eq!(
+        session.run(&[("x", &input)]).unwrap()[0].to_vec_f32(),
+        &[0.0, 3.0, 2.0]
+    );
+}
+
+#[test]
+fn ordered_executor_splits_across_explicit_providers_and_cpu_only_when_enabled() {
+    use crate::ExecutionProviderOrder;
+
+    let graph = build_chain(&["Relu", "Abs", "Neg"]);
+    let waits = Arc::new(AtomicUsize::new(0));
+    let order = || {
+        ExecutionProviderOrder::new(accel_slot(0, vec!["Relu"]).provider)
+            .then(async_accel_slot(1, vec!["Relu", "Abs"], Arc::clone(&waits)).provider)
+    };
+    let tensor = Tensor::from_f32(&[4], &[-2.0, 1.0, -3.0, 4.0]).unwrap();
+    let inputs = [("x", &tensor)];
+    let expected = reference(&graph, &inputs);
+    let mut mixed =
+        Executor::build_ordered_with_mode(graph.clone(), weights(), order(), false, true, None)
+            .unwrap();
+    let report = mixed.heterogeneous_placement_report().unwrap();
+    assert!(report.contains("1 node(s) on accel_ep"));
+    assert!(report.contains("1 node(s) on async_accel_ep"));
+    assert!(report.contains("1 node(s) on cpu_ep"));
+    assert!(report.contains("2 cross-provider transfer(s)"));
+    assert_eq!(
+        mixed.run(&inputs).unwrap()[0].as_bytes(),
+        expected[0].as_bytes()
+    );
+    assert_eq!(waits.load(Ordering::Relaxed), 1);
+
+    let mut single = Executor::build_ordered_with_mode(
+        graph,
+        weights(),
+        order(),
+        false,
+        false,
+        Some(cpu_slot(2).provider),
+    )
+    .unwrap();
+    assert!(single.heterogeneous_placement_report().is_none());
+    assert_eq!(single.device_id(), DeviceId::cpu());
+    assert_eq!(
+        single.run(&inputs).unwrap()[0].as_bytes(),
+        expected[0].as_bytes()
+    );
+}
+
+#[test]
+fn ordered_executor_uses_single_fallback_for_ineligible_split_and_preserves_strict_cuda() {
+    use crate::ExecutionProviderOrder;
+
+    let graph = build_chain(&["Relu", "Abs", "Neg"]);
+    let order = || {
+        ExecutionProviderOrder::new(Arc::new(AcceleratorEp::device_sized(vec!["Relu"])))
+            .then(accel_slot(1, vec![]).provider)
+    };
+    let mut single = Executor::build_ordered_with_mode(
+        graph.clone(),
+        weights(),
+        order(),
+        false,
+        true,
+        Some(cpu_slot(2).provider),
+    )
+    .unwrap();
+    assert!(single.heterogeneous_placement_report().is_none());
+    let tensor = Tensor::from_f32(&[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    let inputs = [("x", &tensor)];
+    assert_eq!(
+        single.run(&inputs).unwrap()[0].as_bytes(),
+        reference(&graph, &inputs)[0].as_bytes()
+    );
+    let error = Executor::build_ordered_with_mode(graph, weights(), order(), true, true, None)
+        .err()
+        .expect("strict CUDA must reject this non-CUDA primary");
+    assert!(error.to_string().contains("ONNX_GENAI_REQUIRE_CUDA=1"));
+}
+
+#[test]
+fn ordered_executor_keeps_mixed_kernel_errors_visible() {
+    let mut failing = AcceleratorEp::new(vec!["Relu"]);
+    failing.unavailable_kernel = true;
+    let order = crate::ExecutionProviderOrder::new(Arc::new(failing))
+        .then(accel_slot(1, vec!["Abs"]).provider);
+    let error = Executor::build_ordered_with_mode(
+        build_chain(&["Relu", "Abs", "Neg"]),
+        weights(),
+        order,
+        false,
+        true,
+        None,
+    )
+    .err()
+    .expect("an accepted claim that cannot compile is not mixed ineligibility");
+    let message = error.to_string();
+    assert!(
+        message.contains("Relu") && message.contains("not initialized"),
+        "{message}"
+    );
+}
+
+#[test]
 fn classified_heterogeneous_plan_still_executes_byte_identically() {
     // De-latenting proof: a classified mixed plan, executed per-op via the
     // standalone host-staged executor, is byte-identical to the single-EP
@@ -1277,6 +1448,182 @@ fn default_executor_opt_in_uses_mixed_plan_instead_of_whole_cpu_fallback() {
         Ok(_) => panic!("mixed-provider capture must fail closed"),
     };
     assert!(capture_error.contains("device-graph capture"));
+}
+
+#[test]
+fn strict_cuda_declines_text_before_partition_execution() {
+    let graph = string_then_numeric_graph();
+    let mut cuda = AcceleratorEp::new(vec!["Neg"]);
+    cuda.device = DeviceId::new(DeviceType::Cuda, 0);
+    let error = Executor::build_with_mode(graph, weights(), Arc::new(cuda), true, false, None)
+        .err()
+        .expect("strict CUDA must reject a graph with managed string nodes");
+    let crate::SessionError::HeterogeneousPlacementRequired { unsupported_nodes } = error else {
+        panic!("unexpected strict CUDA failure: {error}");
+    };
+    assert!(
+        unsupported_nodes.contains("StringConcat"),
+        "{unsupported_nodes}"
+    );
+    assert!(
+        unsupported_nodes.contains("no device representation"),
+        "{unsupported_nodes}"
+    );
+}
+
+#[test]
+fn producerless_string_output_keeps_cuda_nodes_and_declines_strict_cuda() {
+    let mut graph = build_chain(&["Neg"]);
+    let text = graph.create_named_value("passthrough", DataType::String, static_shape([4]));
+    graph.add_input(text);
+    graph.add_output(text);
+    let mut cuda = AcceleratorEp::new(vec!["Neg"]);
+    cuda.device = DeviceId::new(DeviceType::Cuda, 0);
+    let cuda: Arc<dyn ExecutionProvider> = Arc::new(cuda);
+    let providers = [
+        ProviderPlacement {
+            ep: EpId(0),
+            provider: Arc::clone(&cuda),
+        },
+        ProviderPlacement {
+            ep: EpId(1),
+            provider: Arc::new(AcceleratorEp::new(vec!["Neg"])),
+        },
+    ];
+    let PlacementDecision::Heterogeneous(placement) =
+        classify_placement(&graph, &providers).unwrap()
+    else {
+        panic!("a CUDA node and a host string output need separate storage");
+    };
+    assert_eq!(placement.partitions.len(), 1);
+    assert_eq!(placement.partitions[0].ep, EpId(0));
+    assert!(placement.transfers.is_empty());
+    assert!(
+        placement_summary(&placement, &graph, &providers)
+            .contains("1 producerless string output(s) kept on host")
+    );
+    let error = Executor::build_with_mode(graph, weights(), cuda, true, false, None)
+        .err()
+        .expect("strict CUDA must reject a host string output")
+        .to_string();
+    assert!(error.contains("graph output 'passthrough'"), "{error}");
+    assert!(error.contains("no device representation"), "{error}");
+}
+
+fn string_then_numeric_graph() -> Graph {
+    let mut graph = build_chain(&["Neg"]);
+    graph.opset_imports.insert(String::new(), 20);
+    let input = graph.create_named_value("text", DataType::String, static_shape([4]));
+    graph.add_input(input);
+    let joined = graph.create_named_value("joined", DataType::String, static_shape([4]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "StringConcat",
+        vec![Some(input), Some(input)],
+        vec![joined],
+    ));
+    graph.add_output(joined);
+    graph
+}
+
+#[test]
+fn planner_declines_device_string_claims_and_rejects_cross_provider_string_transfer() {
+    let mut graph = string_then_numeric_graph();
+    let joined = *graph.outputs.last().unwrap();
+    let matches = graph.create_named_value("matches", DataType::Bool, static_shape([4]));
+    let mut regex = Node::new(
+        NodeId(0),
+        "RegexFullMatch",
+        vec![Some(joined)],
+        vec![matches],
+    );
+    regex
+        .attributes
+        .insert("pattern".into(), Attribute::String(b"aa".to_vec()));
+    let regex = graph.insert_node(regex);
+    graph.add_output(matches);
+
+    // Even an EP whose declared kernel capability accepts a string op cannot
+    // claim it on a device with no representation for the operand.
+    let mut device = AcceleratorEp::new(vec!["RegexFullMatch", "Neg"]);
+    device.device = DeviceId::new(DeviceType::Cuda, 0);
+    let providers = [
+        ProviderPlacement {
+            ep: EpId(0),
+            provider: Arc::new(device),
+        },
+        ProviderPlacement {
+            ep: EpId(1),
+            provider: Arc::new(AcceleratorEp::new(vec!["StringConcat", "RegexFullMatch"])),
+        },
+    ];
+    let placed = plan(&graph, &providers).unwrap();
+    assert_eq!(placed.node_placement[&regex], EpId(1));
+    assert!(placed.transfers.is_empty());
+
+    let providers = [
+        ProviderPlacement {
+            ep: EpId(0),
+            provider: Arc::new(AcceleratorEp::new(vec!["RegexFullMatch", "Neg"])),
+        },
+        ProviderPlacement {
+            ep: EpId(1),
+            provider: Arc::new(AcceleratorEp::new(vec!["StringConcat"])),
+        },
+    ];
+    let error = plan(&graph, &providers).unwrap_err().to_string();
+    assert!(error.contains("tensor(string) 'joined'"), "{error}");
+    assert!(error.contains("crosses EpId(1) -> EpId(0)"), "{error}");
+}
+
+#[test]
+fn mixed_string_outputs_stay_host_owned_and_keep_graph_order() {
+    let mut graph = string_then_numeric_graph();
+    let joined = graph.outputs.pop().unwrap();
+    let matches = graph.create_named_value("matches", DataType::Bool, static_shape([4]));
+    let mut regex = Node::new(
+        NodeId(0),
+        "RegexFullMatch",
+        vec![Some(joined)],
+        vec![matches],
+    );
+    regex
+        .attributes
+        .insert("pattern".into(), Attribute::String(b"aa".to_vec()));
+    graph.insert_node(regex);
+    let mask = graph.create_named_value("mask", DataType::Float32, static_shape([4]));
+    let mut cast = Node::new(NodeId(0), "Cast", vec![Some(matches)], vec![mask]);
+    cast.attributes
+        .insert("to".into(), Attribute::Int(DataType::Float32 as i64));
+    graph.insert_node(cast);
+    graph.add_output(mask);
+    graph.add_output(joined);
+
+    let providers = [
+        ProviderPlacement {
+            ep: EpId(0),
+            provider: Arc::new(AcceleratorEp::new(vec!["Neg", "Cast"])),
+        },
+        ProviderPlacement {
+            ep: EpId(1),
+            provider: Arc::new(AcceleratorEp::new(vec!["StringConcat", "RegexFullMatch"])),
+        },
+    ];
+    let plan = plan(&graph, &providers).unwrap();
+    let mut executor = HeterogeneousExecutor::build(plan, &graph, &weights(), &providers).unwrap();
+    let x = Tensor::from_f32(&[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    let text = Tensor::from_strings(
+        vec![4],
+        ["a", "b", "a", ""].into_iter().map(String::from).collect(),
+    )
+    .unwrap();
+    let outputs = executor.run(&[("x", &x), ("text", &text)]).unwrap();
+    assert_eq!(executor.last_transfer_count(), 1);
+    assert_eq!(outputs[0].to_vec_f32(), vec![-1.0, -2.0, -3.0, -4.0]);
+    assert_eq!(outputs[1].to_vec_f32(), vec![1.0, 0.0, 1.0, 0.0]);
+    assert_eq!(outputs[2].as_strings().unwrap(), &["aa", "bb", "aa", ""]);
+    assert!(outputs[2].device().is_host_accessible());
+    assert!(outputs[2].device_ptr().is_null());
 }
 
 #[test]

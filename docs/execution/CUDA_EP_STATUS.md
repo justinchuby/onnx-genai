@@ -19,6 +19,20 @@ Batty (Engine — PR #830 revision 4), Gaff (Review — evidence harness, revisi
 > returns `CUDA_ERROR_NO_DEVICE`), so nothing in §4–§7 is evidence about real
 > CUDA hardware.
 
+> **Current source contract:** the historical measurements and decline audit
+> below describe their pinned revisions. Native dynamic BF16 MatMul staging now
+> borrows governed workspace; the private `Bf16Scratch` arena has been removed.
+> See [the current memory contract](../memory/MEMORY_ARCHITECTURE.md#cuda-quantized-matmul-bf16-staging).
+> The generic ORT adapter now serves nonzero `SessionPersistent` requests through
+> one provider-owned lane per ComputeState after explicit ordering registration.
+> Warm fitting requests make zero provider/issuer calls. CUDA performs one actual
+> stream-capture status query per Compute and rejects external capture without
+> caller-owned pins; no device synchronization is added. Host C ABI tests use
+> real governed backing, but this adapter change has not run on CUDA hardware,
+> and the status-query performance cost remains unmeasured. See the
+> [adapter contract](../memory/MEMORY_ARCHITECTURE.md#ort-persistent-workspace-adapter).
+> The decline ledger below remains historical evidence for its pinned revisions.
+
 ---
 
 ## 0. Evidence Ledger
@@ -326,12 +340,11 @@ not an amount anyone requires. No claim is made here about which fraction of
 real models lands on which branch, because that has not been measured on
 hardware.
 
-**Correction to the previous table:** it listed `MatMulNBits`' **bf16 staging**
-as a self-owned decline fallback. That is wrong. `uses_dequant_cublas_workspace`
-requires `DataType::Float32`, so `MatMulNBits` returns `NONE` for BFloat16 and
-never requests a governed workspace on that path at all. Its `Bf16Scratch` arena
-is *always* self-owned, in every revision, and the decline neither helps nor
-harms it.
+**Historical correction to the previous table:** at the audited revision,
+BF16 MatMulNBits staging did not request governed workspace. Its private
+`Bf16Scratch` arena was self-owned, so declining a persistent requirement could
+neither fund nor repair that path. This describes that revision; the later native
+migration and current ORT adapter limitation are in the source-contract note above.
 
 **(c) Unconditional hard error — every geometry.**
 
@@ -348,7 +361,7 @@ Both declare `SessionPersistent` for all shapes, and both `execute()` and
 | Kernel | Site |
 |---|---|
 | `com.microsoft` `Attention` Phase-2a scratch | `attention.rs:973`, registered at `kernels/mod.rs:946` |
-| default-domain `Attention` (opset 23/24) = `StandardAttention`, prefill / batched | `standard_attention.rs:864`, registered at `kernels/mod.rs:952` |
+| default-domain `Attention` (opset 23/24/25) = `StandardAttention`, prefill / batched | `standard_attention.rs`, registered in `kernels/mod.rs` |
 
 These are the only paths where this change does something observable on
 hardware, and they are what H200 validation must exercise. **GQA decode is not
@@ -357,7 +370,7 @@ one of them** — it declines, so measuring it would validate nothing.
 > Earlier revisions of this document and of #830 called `attention.rs:973` the
 > **default-domain** `Attention` kernel. It is not: `AttentionFactory` is
 > registered only under `("Attention", "com.microsoft", 1)`, and default-domain
-> `Attention` at opsets 23 and 24 resolves to `StandardAttentionFactory`. Both
+> `Attention` at opsets 23 and later resolves to `StandardAttentionFactory`. Both
 > are `StepScoped` at prefill geometry, so the validation plan is unchanged, but
 > a model built with a default-domain `Attention` node exercises the second row,
 > not the first.

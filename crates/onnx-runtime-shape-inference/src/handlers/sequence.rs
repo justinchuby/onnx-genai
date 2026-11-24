@@ -140,11 +140,38 @@ fn range_len_f64(start: f64, limit: f64, delta: f64) -> RangeLength {
 /// all scalar operands are statically known. Supports both integer and
 /// floating-point (`Float32`/`Float64`) constant operands.
 fn range(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    infer_range(ctx, None)
+}
+
+fn range_v27(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let stash = ctx
+        .node
+        .attr("stash_type")
+        .and_then(|a| a.as_int())
+        .unwrap_or(1);
+    if ctx.input_type(0).is_some_and(|ty| {
+        matches!(
+            ty.dtype,
+            onnx_runtime_ir::DataType::Float16 | onnx_runtime_ir::DataType::BFloat16
+        )
+    }) && !matches!(stash, 1 | 11)
+    {
+        return Err(ShapeInferError::Invalid {
+            op: "Range".into(),
+            detail: format!(
+                "stash_type={stash} is invalid for FP16/BF16; use FLOAT (1) or DOUBLE (11)"
+            ),
+        });
+    }
+    infer_range(ctx, Some(stash))
+}
+
+fn infer_range(ctx: &mut InferenceContext, stash: Option<i64>) -> Result<(), ShapeInferError> {
     let Some(dtype) = ctx.input_dtype(0) else {
         return Ok(());
     };
     let length = range_int_len(ctx)
-        .or_else(|| range_float_len(ctx, dtype))
+        .or_else(|| range_float_len(ctx, dtype, stash))
         .unwrap_or(RangeLength::Unknown);
     let dim = match length {
         RangeLength::Known(length) => DimExpr::constant(length),
@@ -177,6 +204,7 @@ fn range_int_len(ctx: &InferenceContext) -> Option<RangeLength> {
 fn range_float_len(
     ctx: &InferenceContext,
     dtype: onnx_runtime_ir::DataType,
+    stash: Option<i64>,
 ) -> Option<RangeLength> {
     let start = const_float_scalar(ctx, 0)?;
     let limit = const_float_scalar(ctx, 1)?;
@@ -184,6 +212,15 @@ fn range_float_len(
     match dtype {
         onnx_runtime_ir::DataType::Float32 => Some(range_len_f32(start, limit, delta)),
         onnx_runtime_ir::DataType::Float64 => Some(range_len_f64(start, limit, delta)),
+        onnx_runtime_ir::DataType::Float16 | onnx_runtime_ir::DataType::BFloat16 => {
+            stash.map(|stash| {
+                if stash == 11 {
+                    range_len_f64(start, limit, delta)
+                } else {
+                    range_len_f32(start, limit, delta)
+                }
+            })
+        }
         _ => None,
     }
 }
@@ -196,12 +233,61 @@ fn cum_sum(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+fn cum_prod(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    use onnx_runtime_ir::{
+        DataType,
+        opset26::{CUM_PROD_TYPES, cum_prod_axis, cum_prod_flags},
+    };
+    let invalid = |detail| ShapeInferError::Invalid {
+        op: "CumProd".into(),
+        detail,
+    };
+    cum_prod_flags(ctx.node).map_err(invalid)?;
+    if let Some(dtype) = ctx.input_dtype(1)
+        && !matches!(dtype, DataType::Int32 | DataType::Int64)
+    {
+        return Err(invalid(format!(
+            "axis must be Int32 or Int64, got {dtype:?}"
+        )));
+    }
+    if let Some(rank) = ctx.input_rank(1)
+        && rank != 0
+    {
+        return Err(ShapeInferError::InvalidRank {
+            op: "CumProd".into(),
+            index: 1,
+            rank,
+            detail: "axis must be a rank-0 tensor".into(),
+        });
+    }
+    if let Some(input) = ctx.input_type(0).cloned() {
+        if !CUM_PROD_TYPES.contains(&input.dtype) {
+            return Err(invalid(format!(
+                "unsupported CumProd-26 input dtype {:?}",
+                input.dtype
+            )));
+        }
+        if input.rank() == 0 {
+            return Err(invalid(
+                "data must have rank at least one to select an axis".into(),
+            ));
+        }
+        if let Some([axis]) = const_ints(ctx, 1).as_deref() {
+            cum_prod_axis(*axis, input.rank()).map_err(invalid)?;
+        }
+        ctx.set_output_type(0, input);
+    }
+    Ok(())
+}
+
 /// Register sequence-construction and scan rules.
 pub fn register(reg: &mut InferenceRegistry) {
     // The CPU kernel implements only the modern two-input `(input, repeats)`
     // form, registered at opset 6; there is no attribute-based opset-1 path.
     reg.register("", "Tile", 6, tile);
     reg.register("", "Range", 11, range);
+    reg.register("", "Range", 27, range_v27);
     reg.register("", "CumSum", 11, cum_sum);
     reg.register("", "CumSum", 14, cum_sum);
+    reg.register("", "CumProd", 26, cum_prod);
 }

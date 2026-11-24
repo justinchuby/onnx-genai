@@ -375,13 +375,11 @@ fn allowlisted_unconditional_syncs() -> BTreeSet<String> {
         "attention.rs::run_attention_phase2a".to_string(),
         "fused_gemm.rs::run".to_string(),
         "gemm.rs::run".to_string(),
-        "matmul_nbits.rs::run".to_string(),
         "mod_op.rs::run".to_string(),
-        // Declares CaptureSupport::unsupported: MHA drains the Phase-2a core
-        // and trailing output transpose before returning borrowed workspace.
-        // Prepared backing does not make these host waits capturable.
+        // MHA declares CaptureSupport::unsupported for the existing Phase-2a,
+        // padding and output-transpose sync policy. A deferred policy success
+        // is not a completion witness; prepared backing is not capture proof.
         "multi_head_attention.rs::synchronize_runtime".to_string(),
-        "nary.rs::run".to_string(),
         // DeviceWorkspace prepare must copy the scalar count D2H so ORT can
         // allocate the dynamic output before materialize. The per-kernel audit
         // below binds this entry to that explicit capture refusal.

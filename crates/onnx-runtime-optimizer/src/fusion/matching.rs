@@ -6,13 +6,18 @@ use std::sync::LazyLock;
 pub(super) static LAYERNORM: LazyLock<RecognitionRule> = LazyLock::new(|| {
     RecognitionRule::parse(
         "LayerNorm",
-        "(x,power,eps,scale,bias,axes:slots[0:*],vaxes:slots[0:*])=>{
-            mean=ReduceMean(x,...axes);diff=Sub(x,mean);
-            square=Pow(diff,power);variance=ReduceMean(square,...vaxes);
-            variance_eps=Add(variance,eps)|Add(eps,variance);
-            std=Sqrt(variance_eps);numerator=diff|Sub(x,mean);
-            norm=Div(numerator,std);scaled=Mul(norm,scale)|Mul(scale,norm);
-            out=Add(scaled,bias)|Add(bias,scaled);return out
+        "(x, power, eps, scale, bias, axes:slots[0:*], vaxes:slots[0:*]) => {
+            mean = ReduceMean(x, ...axes)
+            diff = Sub(x, mean)
+            square = Pow(diff, power)
+            variance = ReduceMean(square, ...vaxes)
+            variance_eps = Add(variance, eps) | Add(eps, variance)
+            std = Sqrt(variance_eps)
+            numerator = diff | Sub(x, mean)
+            norm = Div(numerator, std)
+            scaled = Mul(norm, scale) | Mul(scale, norm)
+            out = Add(scaled, bias) | Add(bias, scaled)
+            return out
         }",
         "mean",
     )
@@ -22,26 +27,31 @@ pub(super) static LAYERNORM: LazyLock<RecognitionRule> = LazyLock::new(|| {
 pub(super) static GELU: LazyLock<RecognitionRule> = LazyLock::new(|| {
     RecognitionRule::parse(
         "GELU",
-        "(x,inner_constant,half_constant,one)=>{
-            inner=Div(x,inner_constant)|Mul(x,inner_constant)|Mul(inner_constant,x);
-            erf=Erf(inner);plus_one=Add(erf,one)|Add(one,erf);
-            half=Mul(x,half_constant)|Mul(half_constant,x)|Div(x,half_constant);
-            out=Mul(half,plus_one)|Mul(plus_one,half);return out
+        "(x, inner_constant, half_constant, one) => {
+            inner = Div(x, inner_constant) | Mul(x, inner_constant) | Mul(inner_constant, x)
+            erf = Erf(inner)
+            plus_one = Add(erf, one) | Add(one, erf)
+            half = Mul(x, half_constant) | Mul(half_constant, x) | Div(x, half_constant)
+            out = Mul(half, plus_one) | Mul(plus_one, half)
+            return out
         }",
         "erf",
     )
     .expect("built-in GELU recognition must compile; fix its textual rule")
 });
 
-const SCALE_BODY: &str = "scores=MatMul(q,key);scaled=Mul(scores,c)|Mul(c,scores)|Div(scores,c);";
+const SCALE_BODY: &str = "
+    scores = MatMul(q, key)
+    scaled = Mul(scores, c) | Mul(c, scores) | Div(scores, c)
+";
 
 static SCORE_SCALE: LazyLock<Pattern> = LazyLock::new(|| {
-    Pattern::parse_ort(&format!("(q,key,c)=>{{{SCALE_BODY}return scaled}}"))
+    Pattern::parse_ort(&format!("(q, key, c) => {{ {SCALE_BODY} return scaled }}"))
         .expect("built-in score scaling must compile; fix its textual rule")
 });
 
 static TRANSPOSE: LazyLock<Pattern> = LazyLock::new(|| {
-    Pattern::parse_ort("(x)=>{out=Transpose(x);return out}")
+    Pattern::parse_ort("(x) => { out = Transpose(x); return out }")
         .expect("built-in Transpose recognition must compile; fix its textual rule")
 });
 
@@ -49,11 +59,14 @@ pub(super) static ATTENTION: LazyLock<RecognitionRule> = LazyLock::new(|| {
     RecognitionRule::parse(
         "SDPA",
         &format!(
-            "(q,k,v,c,mask:value|None)=>{{
-            key=Transpose(k)|k;{SCALE_BODY}
-            masked=Add(scaled,mask)|Add(mask,scaled)|scaled;
-            softmax=Softmax(masked);out=MatMul(softmax,v);return out
-        }}"
+            "(q, k, v, c, mask:value | None) => {{
+                key = Transpose(k) | k
+                {SCALE_BODY}
+                masked = Add(scaled, mask) | Add(mask, scaled) | scaled
+                softmax = Softmax(masked)
+                out = MatMul(softmax, v)
+                return out
+            }}"
         ),
         "softmax",
     )

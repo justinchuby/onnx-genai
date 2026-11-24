@@ -40,6 +40,8 @@ pub mod activations;
 pub mod argreduce;
 pub mod attention;
 pub mod batch_normalization;
+pub mod bit_cast;
+mod bit_packing;
 pub mod bitwise;
 pub mod block_quant;
 pub mod block_quantized_matmul;
@@ -58,6 +60,7 @@ pub mod cumprod;
 pub mod cumsum;
 pub mod data_transform;
 mod dequantize_packed;
+mod dequantize_packed_gather;
 pub(crate) mod device_argmax;
 pub(crate) mod device_token_writer;
 pub mod dft;
@@ -79,6 +82,7 @@ mod gqa_decode_fp16;
 pub mod grid_sample;
 pub mod group_normalization;
 pub mod group_query_attention;
+mod grouped_matmul;
 pub mod hardmax;
 pub mod index_share;
 pub mod index_transform;
@@ -98,7 +102,6 @@ pub mod non_max_suppression;
 pub mod nonzero;
 pub mod normalization;
 pub mod onehot;
-mod packed_routed;
 pub mod packed_varlen_attention;
 pub mod pad;
 pub mod paged_attention;
@@ -122,7 +125,6 @@ pub mod softmax;
 pub mod sparse_kv_gather;
 pub mod standard_attention;
 pub(crate) mod standard_claims;
-mod standard_math;
 pub mod stft;
 pub mod structural;
 pub mod tensor_scatter;
@@ -194,7 +196,7 @@ use pointwise::{
 ///   `FastGelu` (tanh GELU of `X`+ optional bias), and `QuickGelu`
 ///   (`X·sigmoid(alpha·X)`), f32/f16/bf16, matched to the CPU EP
 ///   `contrib_fused.rs` (GELU evaluated in `double`).
-/// * **CumProd** — deterministic per-lane cumulative product (f32/i64) with the
+/// * **CumProd** — deterministic per-lane cumulative product with the
 ///   `exclusive`/`reverse` attributes, mirroring the `CumSum` scan.
 /// * **ArgMax / ArgMin** — axis reduction to `Int64` indices (f32/f16/bf16)
 ///   honouring `keepdims` and `select_last_index`, matched to the CPU EP
@@ -213,6 +215,10 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Pack",
     "Unpack",
     "GroupedMatMul",
+    "AffineQuantizedGroupedMatMul",
+    "PackedGroupedMatMul",
+    "AffineQuantizedGather",
+    "DequantizePackedGather",
     "MatMulNBits",
     "QMoE",
     "BlockQuantizedMatMul",
@@ -260,6 +266,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "RMSNormalization",
     "Cast",
     "CastLike",
+    "BitCast",
     "ReduceSum",
     "ReduceMean",
     "ReduceMax",
@@ -402,6 +409,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
 // `build_cpu_registry_with_descriptors` pattern.
 
 use onnx_runtime_ir::DataType;
+use onnx_runtime_ir::opset26::{BIT_CAST_TYPES, CUM_PROD_TYPES};
 
 /// Descriptor of one registered CUDA op for plugin kernel-registry
 /// advertisement. Derived from the real [`OpRegistry`] registration keys — not
@@ -411,6 +419,7 @@ pub struct CudaOpDescriptor {
     pub op_type: String,
     pub domain: String,
     pub since_version: u64,
+    pub end_version: u64,
     /// Element types advertised for the op's type constraints. The plugin's
     /// claim filter checks *every* input and output dtype against this set, so
     /// it must be the union of all element types the kernel legitimately
@@ -548,12 +557,34 @@ static CUDA_EINSUM_DTYPES: &[DataType] = &[
 /// kernels. Fail closed to the float compute set for unrecognised ops.
 pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataType] {
     match (op_type, domain) {
+        ("BitCast", "") => BIT_CAST_TYPES,
+        ("CumProd", "") => CUM_PROD_TYPES,
         ("DFT", "") => CUDA_DFT_DTYPES,
         ("STFT", "") => CUDA_STFT_DTYPES,
         ("Unique", "") => CUDA_UNIQUE_DTYPES,
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
         ("Einsum", "") => CUDA_EINSUM_DTYPES,
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
+        ("DequantizePackedGather", onnx_runtime_ir::RUNTIME_DOMAIN) => &[
+            DataType::Uint8,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float32,
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Float64,
+        ],
+        (
+            "PackedGroupedMatMul" | "AffineQuantizedGroupedMatMul",
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+        ) => &[DataType::Float32, DataType::Uint8, DataType::Int32, DataType::Int64],
+        ("AffineQuantizedGather", onnx_runtime_ir::RUNTIME_DOMAIN) => &[
+            DataType::Float32,
+            DataType::Int8,
+            DataType::Uint8,
+            DataType::Int32,
+            DataType::Int64,
+        ],
         ("Pack", "") => &[DataType::Uint8],
         ("Unpack", "") => onnx_runtime_ir::packed_routed::WORD_DTYPES,
         ("GroupedMatMul", "") => onnx_runtime_ir::standard_math::DTYPES,
@@ -629,8 +660,11 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("Cast", _)
         | ("CastLike", _)
         | ("TopK", _)
-        | ("Range", _)
         | ("EyeLike", _) => CUDA_ALL_DTYPES,
+        ("Range", "") => &[
+            DataType::Float32, DataType::Float64, DataType::Float16, DataType::BFloat16,
+            DataType::Int16, DataType::Int32, DataType::Int64,
+        ],
 
         // Logical ops: boolean.
         ("And", _) | ("Or", _) | ("Xor", _) | ("Not", _) => CUDA_BOOL_DTYPES,
@@ -663,7 +697,6 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("ArgMax", _)
         | ("ArgMin", _)
         | ("CumSum", _)
-        | ("CumProd", _)
         | ("ReduceSum", _)
         | ("ReduceMean", _)
         | ("ReduceMax", _)
@@ -698,6 +731,7 @@ pub fn build_cuda_registry_descriptors(runtime: Arc<CudaRuntime>) -> Vec<CudaOpD
             op_type: key.op_type.clone(),
             domain: key.domain.clone(),
             since_version: key.since_version,
+            end_version: registry.explicit_end_version(key),
             supported_dtypes: cuda_supported_dtypes_for_op(&key.op_type, &key.domain),
         })
         .collect();
@@ -745,7 +779,16 @@ pub fn build_cuda_registry_with_metrics(
             1,
         ),
         onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(packed_routed::AffineFactory(runtime.clone())),
+        Box::new(grouped_matmul::AffineFactory(runtime.clone())),
+    );
+    reg.register(
+        OpKey::new(
+            onnx_runtime_ir::quantized_grouped::PACKED_OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(grouped_matmul::PackedFactory(runtime.clone())),
     );
     reg.register(
         OpKey::new(
@@ -758,19 +801,30 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
-    for name in onnx_runtime_ir::packed_routed::OPS {
+    for name in ["Pack", "Unpack"] {
         reg.register(
             OpKey::new(name, "", 29),
             onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(packed_routed::Factory(runtime.clone())),
+            Box::new(bit_packing::Factory(runtime.clone())),
         );
     }
 
+    reg.register(
+        OpKey::new("GroupedMatMul", "", 29),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(grouped_matmul::Factory(runtime.clone())),
+    );
     for (name, since) in onnx_runtime_ir::standard_math::OPS {
+        let factory: Box<dyn onnx_runtime_ep_api::KernelFactory> = match name {
+            "Expm1" | "Log1p" => Box::new(elementwise::StableUnaryFactory(runtime.clone())),
+            "SwiGLU" | "GeGLU" => Box::new(activations::GatedActivationFactory(runtime.clone())),
+            "LogCumSumExp" => Box::new(cumsum::LogCumSumExpFactory(runtime.clone())),
+            _ => unreachable!("unregistered standard math family for {name}"),
+        };
         reg.register(
             OpKey::new(name, "", since),
             onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(standard_math::Factory(runtime.clone())),
+            factory,
         );
     }
 
@@ -862,6 +916,11 @@ pub fn build_cuda_registry_with_metrics(
         Box::new(cumprod::CumProdFactory {
             runtime: runtime.clone(),
         }),
+    );
+    reg.register(
+        OpKey::new("BitCast", "", 26),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(bit_cast::BitCastFactory(runtime.clone())),
     );
     reg.register(
         OpKey::new("ArgMax", "", 1),
@@ -976,11 +1035,21 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
-    reg.register(
+    reg.register_through(
         OpKey::new("Range", "", 11),
+        26,
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(range::RangeFactory {
             runtime: runtime.clone(),
+            v27: false,
+        }),
+    );
+    reg.register(
+        OpKey::new("Range", "", 27),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(range::RangeFactory {
+            runtime: runtime.clone(),
+            v27: true,
         }),
     );
     for version in [10, 13, 19, 21, 23, 25] {
@@ -1005,6 +1074,15 @@ pub fn build_cuda_registry_with_metrics(
         OpKey::new("DequantizePacked", "", 29),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(dequantize_packed::Factory(runtime.clone())),
+    );
+    reg.register(
+        OpKey::new(
+            onnx_runtime_ir::dequantize_packed_gather::OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(dequantize_packed_gather::Factory(runtime.clone())),
     );
     reg.register(
         OpKey::new("DynamicQuantizeLinear", "", 11),
@@ -1251,14 +1329,10 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
-    // Standard ONNX-domain spelling, opset 27. Same contract as the contrib op
-    // (rank-3 `[B, C, L]`, depthwise `[C, 1, k]` weight, `k-1` carry state,
-    // `none`/`silu`/`swish` activation), so it reuses the same kernel rather
-    // than growing a second implementation to keep in step — matching what the
-    // CPU EP does for this op and what both EPs already do for
-    // `LinearAttention`.
-    reg.register(
+    // Reuse the depthwise kernel; the standard schema changes at opset 29.
+    reg.register_through(
         OpKey::new("CausalConvWithState", "", 27),
+        28,
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(causal_conv_with_state::CausalConvWithStateFactory {
             runtime: runtime.clone(),
@@ -1271,10 +1345,9 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
-    // Standard ONNX-domain spelling (onnx/onnx#7689), semantically identical to
-    // the com.microsoft op — served by the same fused kernel.
-    reg.register(
-        OpKey::new("LinearAttention", "", 1),
+    reg.register_through(
+        OpKey::new("LinearAttention", "", 27),
+        28,
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(linear_attention::LinearAttentionFactory {
             runtime: runtime.clone(),
@@ -1532,7 +1605,7 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
-    for opset in [23, 24] {
+    for opset in [23, 24, 25] {
         reg.register(
             OpKey::new("Attention", "", opset),
             onnx_runtime_ep_api::WorkspacePlanning::Metadata,
@@ -1731,7 +1804,7 @@ pub fn build_cuda_registry_with_metrics(
     // Variadic elementwise (nary.rs) — Sum/Mean, f32/f16/bf16 broadcasting.
     reg.register(
         OpKey::new("Sum", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(nary::NaryFactory {
             is_mean: false,
             runtime: runtime.clone(),
@@ -1739,7 +1812,7 @@ pub fn build_cuda_registry_with_metrics(
     );
     reg.register(
         OpKey::new("Mean", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(nary::NaryFactory {
             is_mean: true,
             runtime: runtime.clone(),

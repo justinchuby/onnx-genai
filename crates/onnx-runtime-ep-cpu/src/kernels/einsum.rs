@@ -642,7 +642,11 @@ impl Kernel for EinsumKernel {
         self.execute_with_route(inputs, outputs, None).map(|_| ())
     }
 
-    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
         let dtype = self.validate_workspace_metadata(inputs)?;
         let bytes_per_element = match self.mode {
             EinsumExecutionMode::GenericNative => accumulator_element_size(dtype),
@@ -3081,7 +3085,7 @@ mod tests {
             (DataType::Float64, 8),
         ] {
             let request = reduction
-                .workspace_requirement(&[TensorMetadata::new(dtype, &[2, 3], true)])
+                .workspace_requirement(&[TensorMetadata::new(dtype, &[2, 3], true)], &[])
                 .unwrap();
             assert_eq!(
                 (request.bytes, request.alignment),
@@ -3090,8 +3094,11 @@ mod tests {
         }
         let view = kernel("ij->ji", &[vec![2, 3]], ExecutionMode::Optimized);
         assert_eq!(
-            view.workspace_requirement(&[TensorMetadata::new(DataType::Float32, &[2, 3], true)])
-                .unwrap(),
+            view.workspace_requirement(
+                &[TensorMetadata::new(DataType::Float32, &[2, 3], true)],
+                &[]
+            )
+            .unwrap(),
             WorkspaceRequirement::NONE
         );
         let gemm = kernel(
@@ -3105,10 +3112,13 @@ mod tests {
             (DataType::Int64, 0),
         ] {
             let request = gemm
-                .workspace_requirement(&[
-                    TensorMetadata::new(dtype, &[2, 3], true),
-                    TensorMetadata::new(dtype, &[3, 4], true),
-                ])
+                .workspace_requirement(
+                    &[
+                        TensorMetadata::new(dtype, &[2, 3], true),
+                        TensorMetadata::new(dtype, &[3, 4], true),
+                    ],
+                    &[],
+                )
                 .unwrap();
             assert_eq!(request.bytes, bytes);
         }
@@ -3124,11 +3134,14 @@ mod tests {
             DataType::Float64,
         ] {
             assert_eq!(
-                tree.workspace_requirement(&[
-                    TensorMetadata::new(dtype, &[2, 3], true),
-                    TensorMetadata::new(dtype, &[3, 4], true),
-                    TensorMetadata::new(dtype, &[4, 5], true)
-                ])
+                tree.workspace_requirement(
+                    &[
+                        TensorMetadata::new(dtype, &[2, 3], true),
+                        TensorMetadata::new(dtype, &[3, 4], true),
+                        TensorMetadata::new(dtype, &[4, 5], true)
+                    ],
+                    &[]
+                )
                 .unwrap(),
                 WorkspaceRequirement::NONE,
                 "a compiled tree must not reserve unused generic publication scratch"
@@ -3139,7 +3152,7 @@ mod tests {
             TensorMetadata::new(DataType::Float32, &[3, 3], true),
         ] {
             let error = reduction
-                .workspace_requirement(&[metadata])
+                .workspace_requirement(&[metadata], &[])
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -3153,11 +3166,14 @@ mod tests {
             ExecutionMode::GenericNative,
         );
         let error = large
-            .workspace_requirement(&[TensorMetadata::new(
-                DataType::Float64,
-                &[isize::MAX as usize / 8 + 1],
-                true,
-            )])
+            .workspace_requirement(
+                &[TensorMetadata::new(
+                    DataType::Float64,
+                    &[isize::MAX as usize / 8 + 1],
+                    true,
+                )],
+                &[],
+            )
             .unwrap_err()
             .to_string();
         assert!(
@@ -3197,7 +3213,10 @@ mod tests {
         let empty = kernel("ij->i", &[vec![0, 3]], ExecutionMode::GenericNative);
         assert_eq!(
             empty
-                .workspace_requirement(&[TensorMetadata::new(DataType::Float64, &[0, 3], true)])
+                .workspace_requirement(
+                    &[TensorMetadata::new(DataType::Float64, &[0, 3], true)],
+                    &[]
+                )
                 .unwrap(),
             WorkspaceRequirement::NONE
         );
@@ -3238,7 +3257,10 @@ mod tests {
             .each_ref()
             .map(|provider| provider.get_kernel(&node, &[vec![2, 3]], 12).unwrap());
         let first = kernels[0]
-            .workspace_requirement(&[TensorMetadata::new(DataType::Float64, &[2, 3], true)])
+            .workspace_requirement(
+                &[TensorMetadata::new(DataType::Float64, &[2, 3], true)],
+                &[],
+            )
             .unwrap();
         let mut allocation = providers[0]
             .allocate_workspace(16, first.alignment, first.role())
@@ -3269,7 +3291,7 @@ mod tests {
                 (&input32, &mut output32)
             };
             let request = kernel
-                .workspace_requirement(&[TensorMetadata::new(input.dtype, &input.shape, true)])
+                .workspace_requirement(&[TensorMetadata::new(input.dtype, &input.shape, true)], &[])
                 .unwrap();
             let mut allocation = provider
                 .allocate_workspace(request.bytes as usize, request.alignment, request.role())
@@ -4227,7 +4249,8 @@ mod tests {
                         input.dtype,
                         input.shape,
                         true
-                    ))
+                    )),
+                    &[]
                 )
                 .unwrap(),
             WorkspaceRequirement::NONE,

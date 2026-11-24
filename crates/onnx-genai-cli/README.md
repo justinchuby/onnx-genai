@@ -1,16 +1,18 @@
 # onnx-genai-server
 
-The `onnx-genai` command-line tool and OpenAI-compatible server, backed by
-[ONNX Runtime](https://onnxruntime.ai/).
+The `onnx-genai` command-line tool and OpenAI-compatible server use Native
+execution by default. Select `--backend ort` only for reference runs.
 
 ```bash
-pip install onnx-genai-server            # CPU (all platforms; MLX on macOS)
-pip install onnx-genai-server[cuda]      # + CUDA 13 / cuDNN 9 (Windows/Linux)
+pip install onnx-genai-server            # Native CPU default (all platforms)
+pip install 'onnx-genai-server[cuda]'    # ORT CUDA reference runtime (Windows/Linux)
 ```
 
-ONNX Runtime is **not** bundled. The command loads `libonnxruntime` from the
-installed `onnxruntime` (CPU) or `onnxruntime-gpu` (CUDA) wheel at startup, so it
-uses whichever execution providers you installed.
+The current workflow tensor bridge still requires the ONNX Runtime library,
+including when model computation runs on Native. The launcher loads it from
+the installed `onnxruntime` wheel; removing this bridge dependency is ongoing.
+The `cuda` extra supplies the ORT reference runtime. Native CUDA execution uses
+a build with `--features native-cuda`.
 
 ## Commands
 
@@ -69,6 +71,8 @@ environment variable > automatic sizing. With neither setting, the
 peak-throughput automatic default is unchanged. This controls native decode
 workers; use an OS cpuset/taskset as well when the entire process, including
 prefill or ONNX Runtime work, must be hard-confined.
+
+Native is compiled and selected by default. ONNX Runtime is an explicit reference backend for testing; select it with `--backend ort`.
 
 For the ONNX Runtime CPU backend, use `ONNX_GENAI_INTRA_OP_THREADS=N` to
 override ORT intra-op parallelism. On Windows ARM64, the automatic ORT CPU
