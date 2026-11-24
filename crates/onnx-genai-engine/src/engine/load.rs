@@ -591,7 +591,6 @@ impl Engine {
                     Self::from_native_model_directory(
                         model_directory,
                         config,
-                        &session_options,
                         metadata_hints,
                         native_device,
                         authority_provider.as_ref(),
@@ -603,12 +602,7 @@ impl Engine {
             #[cfg(not(feature = "native-backend"))]
             {
                 return augment_backend_error(
-                    Self::from_native_model_directory(
-                        model_directory,
-                        config,
-                        &session_options,
-                        metadata_hints,
-                    ),
+                    Self::from_native_model_directory(model_directory, config, metadata_hints),
                     EngineDecodeBackend::Native,
                 );
             }
@@ -879,20 +873,21 @@ impl Engine {
     fn from_native_model_directory(
         model_directory: ModelDirectory,
         config: EngineConfig,
-        session_options: &SessionOptions,
         metadata_hints: MetadataHints,
         native_device: crate::native_decode::NativeDecodeDevice,
         authority_provider: Option<&SharedMemoryAuthorityProvider>,
         authority_domain: &DeviceCompatibilityDomain,
     ) -> anyhow::Result<Self> {
-        if config.draft_model.is_some() || !matches!(config.speculative_mode, SpeculativeMode::None)
+        if config.draft_model.is_some()
+            || !matches!(
+                config.speculative_mode,
+                SpeculativeMode::None | SpeculativeMode::Mtp(_)
+            )
         {
-            // User-configured speculation (draft model / explicit mode) is still
-            // unsupported on the native backend. Metadata-advertised proposers
-            // (shared-KV, MTP) are resolved below and do NOT set
-            // `config.speculative_mode`, so they never trip this guard.
+            // The MTP flag controls enablement/width; its head and weight
+            // bindings must still pass the canonical metadata validation below.
             anyhow::bail!(
-                "native decoder backend does not yet support user-configured speculative, MTP, EAGLE-3, or shared-KV generation; declare the proposer in inference metadata instead"
+                "native decoder backend does not support this user-configured draft/EAGLE/shared-KV proposer; declare a supported proposer in inference metadata or disable speculation"
             );
         }
         if !matches!(&config.kv_connector.backend, KvConnectorBackend::Null) {
@@ -1464,14 +1459,13 @@ impl Engine {
                  speculative.proposal_execution.kind: mtp."
             );
         }
-        // Workflow-native MTP self-speculation: the pure-attention MTP head
-        // loads on the ORT `environment` (ORT CUDA EP), seeded from the native
-        // hybrid target's declared hidden output. Yields `None` for every
-        // non-MTP model, preserving the plain native load path exactly.
-        let mtp_resources = load_native_mtp_proposer(
+        // The declared MTP head executes through the same selected Native
+        // component backend as ordinary workflow graphs.
+        let mtp = load_native_mtp_proposer(
             &metadata,
             &model_directory,
-            session_options,
+            &native_device,
+            governor.cpu_memory_resources(cache_retention.clone()),
             match native_device.cuda_index() {
                 Some(index) => crate::speculative::DraftProjectionDevice::Cuda {
                     index,
@@ -1489,13 +1483,9 @@ impl Engine {
                         .as_ref()
                         .is_some_and(|contract| contract.distribution_preserving)),
         )?;
-        let (mtp, mtp_mode, environment) = match mtp_resources {
-            Some(resources) => {
-                let mode = SpeculativeMode::Mtp(resources.model.config.clone());
-                (Some(resources.model), mode, Some(resources.environment))
-            }
-            None => (None, SpeculativeMode::None, None),
-        };
+        let mtp_mode = mtp.as_ref().map_or(SpeculativeMode::None, |model| {
+            SpeculativeMode::Mtp(model.config.clone())
+        });
         // A model runs at most one proposer kind; shared-KV drafting and MTP are
         // mutually exclusive, so at most one of these may be anything but
         // `None`.
@@ -1555,7 +1545,7 @@ impl Engine {
             last_speculative_stats: SpeculativeStats::default(),
             connector,
             _shared_memory_plan: None,
-            _environment: environment,
+            _environment: None,
         })
     }
 
@@ -1563,7 +1553,6 @@ impl Engine {
     fn from_native_model_directory(
         _model_directory: ModelDirectory,
         _config: EngineConfig,
-        _session_options: &SessionOptions,
         _metadata_hints: MetadataHints,
     ) -> anyhow::Result<Self> {
         anyhow::bail!(
@@ -2741,10 +2730,17 @@ fn load_mtp_model(
                 mtp_config.public_config.hidden_size
             ),
         }
+        let head = MtpHeadModel::Ort(Arc::new(
+            Session::new(
+                environment,
+                &mtp_config.public_config.head_model,
+                session_options.clone(),
+            )
+            .context("load the selected ORT reference MTP head")?,
+        ));
         Some(build_mtp_model_from_resolved(
             mtp_config,
-            environment,
-            session_options,
+            head,
             model_directory,
             // The ORT target path has no native projection device; a quantised
             // shared LM-head therefore still fails fast in the adapter loader,
@@ -2757,20 +2753,11 @@ fn load_mtp_model(
     Ok(mtp)
 }
 
-/// Build an [`MtpModel`] (ORT MTP-head session + shared target embedding / LM
-/// head) from an already-resolved and validated [`ResolvedMtpConfig`].
-///
-/// The target hidden-state output existence/shape/dtype validation is the
-/// caller's responsibility because it depends on the target backend: the ORT
-/// path validates against the target [`Session`] outputs, the native path
-/// validates against the target ONNX graph. Everything downstream of that
-/// validation — loading the pure-attention MTP head on the ORT environment and
-/// resolving the target-initializer or file-based embedding/LM-head adapters —
-/// is backend-agnostic and shared here.
+/// Build shared embedding/projection and validate the resolved head executor.
+/// Target hidden metadata is validated by the caller for its selected backend.
 fn build_mtp_model_from_resolved(
     mtp_config: ResolvedMtpConfig,
-    environment: &Environment,
-    session_options: &SessionOptions,
+    head_session: MtpHeadModel,
     model_directory: &ModelDirectory,
     draft_projection: Option<crate::speculative::DraftProjectionDevice>,
 ) -> anyhow::Result<MtpModel> {
@@ -2779,14 +2766,6 @@ fn build_mtp_model_from_resolved(
             "MTP kv_mode accepted_prefix is declared but not executable: the frozen Mobius contract does not define correction-token/cache alignment"
         );
     }
-    let head_session = Arc::new(
-        Session::new(
-            environment,
-            &mtp_config.public_config.head_model,
-            session_options.clone(),
-        )
-        .map_err(|error| anyhow::anyhow!("Failed to load MTP head: {error}"))?,
-    );
     let decode_options = onnx_genai_ort::MtpDecodeOptions {
         kv_mode: mtp_config.public_config.kv_mode,
         batch_size: 1,
@@ -2795,8 +2774,9 @@ fn build_mtp_model_from_resolved(
         hidden_output: mtp_config.mtp_hidden_output.clone(),
         state_output: mtp_config.mtp_state_output.clone(),
     };
-    let head_signature = MtpDecodeSession::new(&head_session, decode_options)
-        .map_err(|error| anyhow::anyhow!("Failed to inspect MTP head: {error}"))?
+    let head_signature = head_session
+        .decode(decode_options)
+        .context("inspect the selected MTP head metadata")?
         .signature()
         .clone();
     if head_signature.hidden_size != mtp_config.public_config.hidden_size {
@@ -2860,25 +2840,18 @@ fn build_mtp_model_from_resolved(
     })
 }
 
-/// The legacy MTP head and the environment that must outlive its session.
-#[cfg(feature = "native-backend")]
-struct NativeMtpResources {
-    model: MtpModel,
-    environment: Arc<Environment>,
-}
-
-/// Resolve an enabled metadata-declared MTP head and its owned ORT environment.
-/// The caller derives [`SpeculativeMode::Mtp`] from the loaded model. Yields
-/// `None` before initializing ORT for other proposal forms or disabled speculation.
+/// Resolve an enabled declared head on the selected Native executor, without
+/// creating an ORT environment or reference session.
 #[cfg(feature = "native-backend")]
 fn load_native_mtp_proposer(
     metadata: &InferenceMetadata,
     model_directory: &ModelDirectory,
-    session_options: &SessionOptions,
+    device: &crate::native_decode::NativeDecodeDevice,
+    resources: onnx_runtime_ep_cpu::CpuMemoryResources,
     draft_projection: crate::speculative::DraftProjectionDevice,
     requested_drafts: usize,
     enabled: bool,
-) -> anyhow::Result<Option<NativeMtpResources>> {
+) -> anyhow::Result<Option<MtpModel>> {
     if !enabled {
         return Ok(None);
     }
@@ -2913,41 +2886,16 @@ fn load_native_mtp_proposer(
     )?;
     validate_resolved_mtp_config(&resolved)?;
     validate_native_mtp_hidden_output(&model_directory.model_path, &resolved)?;
-    // The pure-attention MTP head runs as an ORT session; when the native target
-    // is on CUDA the head must load on the CUDA EP too (its mixed-precision graph
-    // relies on CUDA kernels — the CPU EP rejects the bf16/f32 mix). Build head
-    // session options that match the native decode device rather than inheriting
-    // the native path's default (CPU) options. Allow CPU fallback so the handful
-    // of mixed-precision norm nodes ORT cannot assign to CUDA still get a home
-    // (the bulk of the head — attention and matmuls — stays on CUDA).
-    let head_session_options = match draft_projection {
-        crate::speculative::DraftProjectionDevice::Cuda { index, .. } => {
-            let mut selection = onnx_genai_ort::ep_selection("cuda");
-            selection
-                .options
-                .insert("device_id".to_string(), index.to_string());
-            SessionOptions::with_execution_provider(selection).with_cpu_fallback(true)
-        }
-        crate::speculative::DraftProjectionDevice::Cpu { .. } => session_options.clone(),
-    };
-    // The int4 shared LM-head is projected on the same device as the native
-    // target: CUDA when the target is on CUDA, otherwise the CPU int4 kernel.
-    // This projection runs during proposal, outside the captured decode step.
-    // Ordinary Native loading must never initialize an ORT environment just
-    // because this optional legacy proposer is compiled into the engine.
-    let environment = Arc::new(Environment::new("onnx-genai-native-mtp-head")
-        .context("load the legacy ORT MTP head for this package; install an ORT reference runtime or use a package without an ORT-backed MTP head")?);
-    let mtp = build_mtp_model_from_resolved(
+    let head = MtpHeadModel::Native(
+        crate::pipeline::NativeMtpHead::load(&resolved.public_config.head_model, device, resources)
+            .context("load the metadata-declared Native MTP head")?,
+    );
+    Ok(Some(build_mtp_model_from_resolved(
         resolved,
-        &environment,
-        &head_session_options,
+        head,
         model_directory,
         Some(draft_projection),
-    )?;
-    Ok(Some(NativeMtpResources {
-        model: mtp,
-        environment,
-    }))
+    )?))
 }
 
 /// Validate the target decoder's hidden-state seed output against the target

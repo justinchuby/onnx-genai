@@ -5,7 +5,7 @@
 //! longest-prefix acceptance, correction-token, and KV rewind path.
 
 use crate::TokenId;
-use crate::config::{MtpCacheScope, MtpHiddenLayout};
+use crate::config::MtpCacheScope;
 use crate::decode::{
     DraftProposalRequest, apply_paged_sliding_window, extract_logits_sequence_with_io,
     next_session_token_logits, next_session_token_logits_and_hidden,
@@ -1008,7 +1008,7 @@ impl SpeculativeProposer for NgramProposer {
     }
 }
 
-/// Multi-token-prediction proposer backed by an ORT MTP-head session.
+/// Multi-token-prediction proposer over the selected head executor.
 pub struct MtpProposer<'a, E = LinearEmbedder, L = LinearLmHead> {
     session: MtpDecodeSession<'a>,
     embedder: E,
@@ -1043,8 +1043,17 @@ where
         lm_head: L,
         cache_scope: MtpCacheScope,
     ) -> anyhow::Result<Self> {
-        let session = MtpDecodeSession::new(head, options)
-            .map_err(|error| anyhow::anyhow!("Failed to create MTP decode session: {error}"))?;
+        let session =
+            MtpDecodeSession::new(head, options).context("Failed to create MTP decode session")?;
+        Self::from_decode_session(session, embedder, lm_head, cache_scope)
+    }
+
+    pub fn from_decode_session(
+        session: MtpDecodeSession<'a>,
+        embedder: E,
+        lm_head: L,
+        cache_scope: MtpCacheScope,
+    ) -> anyhow::Result<Self> {
         if session.signature().hidden_size != embedder.hidden_size() {
             anyhow::bail!(
                 "MTP head hidden size {} does not match target embedding hidden size {}",
@@ -1074,20 +1083,8 @@ where
         cache_scope: MtpCacheScope,
     ) -> anyhow::Result<Self> {
         let session = MtpDecodeSession::new_owned(head, options)
-            .map_err(|error| anyhow::anyhow!("Failed to create MTP decode session: {error}"))?;
-        if session.signature().hidden_size != embedder.hidden_size() {
-            anyhow::bail!(
-                "MTP head hidden size {} does not match target embedding hidden size {}",
-                session.signature().hidden_size,
-                embedder.hidden_size()
-            );
-        }
-        Ok(Self {
-            session,
-            embedder,
-            lm_head,
-            cache_scope,
-        })
+            .context("Failed to create MTP decode session")?;
+        Self::from_decode_session(session, embedder, lm_head, cache_scope)
     }
 }
 
@@ -1147,7 +1144,7 @@ where
             let output = self
                 .session
                 .step_with_state(&embedding, &running_state, position)
-                .map_err(|error| anyhow::anyhow!("MTP proposal step failed: {error}"))?;
+                .context("MTP proposal step failed")?;
             self.lm_head.logits(&output.hidden, &mut logits)?;
             let token = argmax(&logits).context("lm-head produced empty logits")? as TokenId;
             tokens.push(token);
@@ -1170,7 +1167,7 @@ where
         }
         self.session
             .rewind(context.accepted_prefix_len.saturating_sub(1))
-            .map_err(|error| anyhow::anyhow!("Failed to rewind MTP proposal: {error}"))
+            .context("Failed to rewind MTP proposal")
     }
 
     fn rewind(&mut self, _target_tokens: &[TokenId]) -> anyhow::Result<()> {
@@ -1724,21 +1721,7 @@ impl Engine {
                 .mtp
                 .as_ref()
                 .context("MTP speculation requested without a loaded MTP head")?;
-            Some(MtpProposer::new_owned(
-                Arc::clone(&mtp.session),
-                MtpDecodeOptions {
-                    kv_mode: mtp.kv_mode,
-                    batch_size: 1,
-                    hc_mult: mtp.runtime_config.hc_mult,
-                    hidden_state_rank4: mtp.runtime_config.target_hidden_layout
-                        == MtpHiddenLayout::Bshc,
-                    hidden_output: mtp.runtime_config.mtp_hidden_output.clone(),
-                    state_output: mtp.runtime_config.mtp_state_output.clone(),
-                },
-                mtp.embedder.clone(),
-                mtp.lm_head.clone(),
-                mtp.runtime_config.cache_scope,
-            )?)
+            Some(mtp.proposer()?)
         } else {
             None
         };

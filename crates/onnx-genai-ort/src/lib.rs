@@ -83,7 +83,8 @@ pub use loader::{
 #[cfg(feature = "cuda")]
 pub use managed_cuda_allocator::{ManagedCudaAllocatorConfig, ManagedCudaAllocatorStats};
 pub use mtp::{
-    MtpDecodeOptions, MtpDecodeSession, MtpDraftKvMode, MtpHeadSignature, MtpStepOutput,
+    MtpDecodeOptions, MtpDecodeSession, MtpDraftKvMode, MtpHeadExecution, MtpHeadSignature,
+    MtpStepOutput,
 };
 pub use onnx_genai_runtime_config::EpSelection;
 pub use onnx_model_package::SelectionRequest as ModelPackageSelection;

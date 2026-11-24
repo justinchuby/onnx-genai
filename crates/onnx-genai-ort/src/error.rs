@@ -4,6 +4,13 @@ use std::ffi::CStr;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OrtError {
+    #[error("{backend} {operation}: {source}")]
+    BackendExecution {
+        backend: &'static str,
+        operation: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("{operation}: {source}")]
     Context {
         operation: String,

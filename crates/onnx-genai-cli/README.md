@@ -10,9 +10,10 @@ pip install 'onnx-genai-server[cuda]'    # ORT CUDA reference runtime (Windows/L
 
 Workflow tensors retain their storage without constructing ORT handles. Native
 CPU binary generation is tested with an unavailable ORT library; explicit ORT
-bindings materialize reference views over the same storage. The optional MTP
-head still uses ORT, and the Python launcher still preloads the installed
-`onnxruntime` wheel. Removing those remaining dependencies is ongoing.
+bindings materialize reference views over the same storage. Metadata-declared
+MTP heads also execute on Native without an ORT environment. The Python launcher
+still preloads the installed `onnxruntime` wheel; removing that remaining
+dependency is ongoing.
 The `cuda` extra supplies the ORT reference runtime. Native CUDA execution uses
 a build with `--features native-cuda`.
 

@@ -265,3 +265,22 @@ invariants are observable through a per-backend run counter.
 
 Each boundary is independently landable and independently testable; none require
 re-opening the interpreter.
+
+### Native MTP head execution
+
+A metadata-declared MTP head uses the selected Native component executor and
+its admitted graph I/O. `MtpDecodeSession` shares signature validation, draft KV
+ownership, reset/rewind, and HC state threading across explicit Native and ORT
+reference adapters. Native MTP does not construct an ORT environment or session.
+Each proposer owns its cache; head runners serialize access to their shared
+native workspace. Hidden/state projection is an explicit host materialization
+boundary; device KV outputs retain their original owners.
+
+Local CPU coverage compares three successive head steps against ORT for the
+attention, rank-4 HC, and growing-KV fixtures. Subprocesses with a nonexistent
+ORT library exercise all three Native heads and Native MTP generation, including
+actual proposal/verification statistics. Growing-KV coverage includes rewind,
+replay, and reset; malformed hidden output must leave the prior cache committed.
+CUDA compilation does not establish CUDA execution parity. Accepted-prefix cache
+alignment remains rejected until its metadata contract defines correction-token
+semantics.
