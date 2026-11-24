@@ -68,7 +68,7 @@ use output::{build_turn_prompt, load_chat_template};
 #[command(
     name = "onnx-genai",
     version,
-    about = "Run generative AI models with ONNX Runtime"
+    about = "Run generative AI models from ONNX packages"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -569,6 +569,23 @@ impl Drop for FlushGuard {
 /// the requested subcommand. Clap prints `--help`/`--version` and exits the
 /// process on a usage error, matching a normal binary.
 pub fn run(args: Vec<String>) -> anyhow::Result<()> {
+    // Windows' process entry thread has a smaller stack than Rust workers.
+    // Use the same standard worker stack as the server and engine tests for
+    // native execution, including when a Python host calls this entry point.
+    // Leaving stack_size unset also honors Rust's RUST_MIN_STACK setting.
+    let worker = std::thread::Builder::new()
+        .name("nxrt-cli".into())
+        .spawn(move || run_command(args))
+        .map_err(|error| anyhow::anyhow!(
+            "Could not start the CLI execution thread: {error}. Check available process/thread resources and retry."
+        ))?;
+    match worker.join() {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+fn run_command(args: Vec<String>) -> anyhow::Result<()> {
     init_tracing();
     let cli = Cli::parse_from(args);
     cli.profiling.install();

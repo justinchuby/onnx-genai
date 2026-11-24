@@ -1340,3 +1340,30 @@ engine/server all-target Clippy passed. Explicit Native CPU and ORT tests cover
 all three completion endpoints, buffered/logprob SSE, reasoning-budget interaction,
 neutral grammar controls, conflicting fields and malformed input before SSE.
 This increment does not close the goal.
+
+
+### Native-default CLI portability
+
+The profiling subprocess test now selects ORT explicitly for its CPU reference
+run and independently checks that an ordinary command records Native as its
+actual backend. CI previously exposed a Windows process-main stack overflow
+once Native became the default. The shared CLI entry point now executes on a
+named standard Rust worker, including calls from Python. It honors Rust's
+standard worker-stack configuration, preserves panic payloads, and reports
+thread startup failures with recovery advice.
+
+Native is the default computation backend. The workflow tensor bridge and the
+optional hybrid MTP head still use ORT APIs; eliminating those runtime library
+dependencies is separate unfinished work, tracked by a local missing-ORT
+subprocess regression. The Python package must retain its runtime dependency
+until that regression passes. This change does not claim ORT-free deployment.
+
+Final portability validation: 71 CLI unit tests and both real profiling
+subprocesses passed. A separate command with a 1 MiB process-main stack completed
+Native generation and recorded `decode_backend=native` and
+`execution_provider=native`. Strict all-target engine/server/CLI Clippy passed
+with `-D warnings`; formatting and diff checks passed. The integrated parent
+runtime had already passed engine 948 / 1 inherited ignore, server 449 / 2
+inherited ignores, and HTTP 37. The incidental host-string lint repairs passed
+11 CPU text-kernel tests and 6 session text integration tests / 1 inherited
+benchmark ignore. Windows CI remains the platform-specific confirmation.
