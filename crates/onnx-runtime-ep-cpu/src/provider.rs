@@ -477,7 +477,7 @@ impl ExecutionProvider for CpuExecutionProvider {
             opset,
             shapes,
             input_dtypes,
-            crate::kernels::gemm::strict_dtypes(opset >= onnx_runtime_ir::gemm::ND_GEMM_OPSET),
+            crate::kernels::gemm::DTYPES,
         ) {
             return KernelMatch::unsupported(reason);
         }
@@ -1288,6 +1288,7 @@ mod tests {
         let shapes = [static_shape([2, 3]), static_shape([3, 4])];
         let mixed = [DataType::Float64, DataType::Float32];
         let homogeneous = [DataType::Float64, DataType::Float64];
+        let unsupported = [DataType::Float32, DataType::Int32];
         assert!(
             ep.supports_op(&node, 28, &shapes, &mixed, &[])
                 .is_supported()
@@ -1298,6 +1299,10 @@ mod tests {
         );
         assert!(
             ep.supports_op(&node, 29, &shapes, &homogeneous, &[])
+                .is_supported()
+        );
+        assert!(
+            !ep.supports_op(&node, 28, &shapes, &unsupported, &[])
                 .is_supported()
         );
     }

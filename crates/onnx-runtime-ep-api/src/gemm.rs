@@ -7,17 +7,20 @@ use onnx_runtime_ir::{
 
 pub fn validate_dtypes(
     allowed: &[DataType],
-    mut dtypes: impl Iterator<Item = DataType>,
+    require_same: bool,
+    dtypes: impl Iterator<Item = DataType>,
 ) -> Result<(), String> {
-    if let Some(dtype) = dtypes.next() {
+    let mut first = None;
+    for dtype in dtypes {
         if !allowed.contains(&dtype) {
             return Err(format!(
                 "Gemm dtype {dtype:?} is unsupported on this provider; use one of {allowed:?} or select a different provider"
             ));
         }
-        if let Some(other) = dtypes.find(|&other| other != dtype) {
+        let first = *first.get_or_insert(dtype);
+        if require_same && first != dtype {
             return Err(format!(
-                "Gemm requires A, B, optional C, and Y to share one dtype, got {dtype:?} and {other:?}; cast all operands to the same supported dtype"
+                "Gemm requires A, B, optional C, and Y to share one dtype, got {first:?} and {dtype:?}; cast all operands to the same supported dtype"
             ));
         }
     }
@@ -29,24 +32,23 @@ pub fn unsupported_reason(
     opset: u64,
     shapes: &[Shape],
     dtypes: &[DataType],
-    allowed: Option<&[DataType]>,
+    allowed: &[DataType],
 ) -> Option<String> {
     if !node.is_default_domain() || node.op_type != "Gemm" {
         return None;
     }
-    if let Some(allowed) = allowed
-        && let Err(reason) = validate_dtypes(
-            allowed,
-            dtypes
-                .iter()
-                .copied()
-                .filter(|&dtype| dtype != DataType::Undefined),
-        )
-    {
+    let nd = opset >= ND_GEMM_OPSET;
+    if let Err(reason) = validate_dtypes(
+        allowed,
+        nd,
+        dtypes
+            .iter()
+            .copied()
+            .filter(|&dtype| dtype != DataType::Undefined),
+    ) {
         return Some(reason);
     }
     let [a, b, ..] = shapes else { return None };
-    let nd = opset >= ND_GEMM_OPSET;
     let axes = match GemmAxes::new(
         a.len(),
         b.len(),
@@ -89,7 +91,7 @@ mod tests {
         let cpu = &[Float16, Float32];
         let cuda = &[Float32];
         let claim = |dtypes: &[DataType], allowed: &[DataType]| {
-            unsupported_reason(&node, 29, &shapes, dtypes, Some(allowed))
+            unsupported_reason(&node, 29, &shapes, dtypes, allowed)
         };
         assert_eq!(claim(&[Float32, Float32, Undefined], cuda), None);
         assert_eq!(claim(&[Float16, Float16, Float16], cpu), None);

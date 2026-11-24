@@ -276,6 +276,7 @@ impl GemmKernel {
 
         onnx_runtime_ep_api::gemm::validate_dtypes(
             DTYPES,
+            self.nd,
             [a.dtype, b.dtype, outputs[0].dtype]
                 .into_iter()
                 .chain(bias.map(|c| c.dtype)),
