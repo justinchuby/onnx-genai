@@ -65,17 +65,17 @@ impl Attributes {
                     "{OP}: axes contains {axis}, out of range for X rank {rank}; use axes in [-{rank}, {rank})"
                 )));
             }
-            Ok(reduce)
-        }
-
-        pub fn layout(&self, shape: &[usize]) -> Result<Layout> {
-            let reduce = self.reduction_mask(shape.len())?;
             if std::mem::replace(&mut reduce[normalized as usize], true) {
                 return Err(EpError::KernelFailed(format!(
                     "{OP}: axes contains duplicate axis {axis} for rank {rank}; specify each axis once"
                 )));
             }
         }
+        Ok(reduce)
+    }
+
+    pub fn layout(&self, shape: &[usize]) -> Result<Layout> {
+        let reduce = self.reduction_mask(shape.len())?;
         if shape.contains(&0) {
             return Ok(Layout {
                 kept: vec![],

@@ -1030,6 +1030,7 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
     );
     registry.register(
         OpKey::new("MeanVarianceNormalization", "", 29),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(norm_ops::MeanVarianceNormalizationFactory),
     );
     registry.register(

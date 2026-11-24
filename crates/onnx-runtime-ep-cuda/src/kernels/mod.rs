@@ -1008,8 +1008,9 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
-    registry.register(
+    reg.register(
         OpKey::new("MeanVarianceNormalization", "", 29),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(
             mean_variance_normalization::MeanVarianceNormalizationFactory {
                 runtime: runtime.clone(),

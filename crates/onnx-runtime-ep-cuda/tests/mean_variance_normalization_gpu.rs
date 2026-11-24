@@ -252,6 +252,7 @@ fn mean_variance_normalization_cuda_release_probe() {
     };
     let first = profile(&[512, 1024], vec![-1], Duration::from_secs(8));
     profile(&[8, 64, 32, 32], vec![0, 2, 3], Duration::from_secs(1));
+    profile(&[512, 1024], vec![], Duration::from_secs(1));
     let last = profile(&[512, 1024], vec![-1], Duration::from_secs(1));
     eprintln!("Anchor repeat drift: {:.2}%", (last / first - 1.) * 100.);
 }
