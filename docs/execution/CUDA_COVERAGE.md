@@ -216,7 +216,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 
 | Op | Domain | Status | Backend | Notes |
 |----|--------|--------|---------|-------|
-| `Cast` | `` | ✅ | **NVRTC-custom** | Element-wise dtype conversion; f32/f64/f16/bf16/int8-64/uint8-64/bool, ONNX saturating float→int. Two NVRTC modules keep f16/bf16 (which need NVRTC's built-in `cuda_fp16.h`/`cuda_bf16.h`) out of the common integer/f32 path (`cast.rs`). |
+| `Cast` | `` | ✅ | **NVRTC-custom** | Element-wise conversion for f32/f64/f16/bf16/int8–64/uint8–64/bool and byte-aligned FP8. Signed FP8 Cast supports `saturate` from opset 19; E8M0 adds `round_mode` from opset 24. FP8 tables and NVRTC half headers are kept out of the common integer/f32 path. Packed FLOAT6 supports widening only, from opset 28. |
 | `CastLike` | `` | ✅ | **NVRTC-custom** | Same kernel as `Cast`; target dtype taken from the output tensor. |
 | `BitCast` (v26) | `` | ✅ | **Device copy** | Preserves exact bytes for equal-width dtypes, including dense packed 2- and 4-bit tensors. Uses an asynchronous stream copy when storage cannot be reused. |
 | `Identity` | `` | ✅ | **memcpy** (D2D) | Straight dtype-agnostic device copy into the pre-shaped output (`movement.rs`). |

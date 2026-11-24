@@ -1554,21 +1554,20 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(elementwise::TanhFactory),
     );
-    rec.register(
-        OpKey::new("Cast", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(cast::CastFactory { float6: false }),
-    );
-    rec.register(
-        OpKey::new("Cast", "", 28),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(cast::CastFactory { float6: true }),
-    );
-    rec.register(
-        OpKey::new("CastLike", "", 15),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(cast::CastLikeFactory),
-    );
+    for opset in [1, 19, 24, 28] {
+        rec.register(
+            OpKey::new("Cast", "", opset),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(cast::CastFactory { opset }),
+        );
+    }
+    for opset in [15, 19, 24] {
+        rec.register(
+            OpKey::new("CastLike", "", opset),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(cast::CastLikeFactory { opset }),
+        );
+    }
     rec.register(
         OpKey::new("BitCast", "", 26),
         onnx_runtime_ep_api::WorkspacePlanning::None,
