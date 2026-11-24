@@ -1324,6 +1324,36 @@ failure retention, capture miss rejection and replay after owner replacement
 and kernel drop. Host/type checks and GPU-feature compilation can verify the
 interfaces here; device execution and performance need CUDA hardware.
 
+Binary elementwise and `Where` now keep metadata and their most recent
+successful dtype/shape signature in one `WarmMetadata` record under one mutex.
+Execution briefly clones the complete record, releases the lock, and performs
+validation, lazy preparation, NVRTC resolution and device launches against that
+local candidate. A successful call publishes the metadata/signature pair through
+one short replace; old owners retire after unlocking. Poisoned publication
+refuses the candidate without changing the published pair. Failed execution
+preserves the previous successful A signature and owner, matching the existing
+broadcast capture contract rather than SkipNorm's last-call readiness policy.
+
+Capture validates the signature from that same snapshot and the real native
+owner consumed by the candidate. It does not combine independently re-read
+metadata/signature states or perform a separate post-launch capture query just
+to publish. Empty `Where` keeps its no-allocation path, updates the empty
+signature and may retain one previously prepared owner without consuming it;
+a later nonempty capture still must match the new exact signature. Resource
+collection and capture eligibility inspect the same published record. This does
+not authorize concurrent warm/configuration/capture on one kernel: existing
+exclusive execution contracts remain required.
+
+The one-record clone retains the existing Host signature-vector work. No new
+physical allocation, per-region ticket, grant or refund is added on warm reuse.
+Host publication tests exercise metadata/proof pairing and reentrant retirement
+after unlocking, including poison refusal. Device fixtures cover A success,
+B post-upload failure preserving A, successful B publication, independent A/B
+graph replay after kernel destruction, and empty/nonempty signature transitions.
+They are compiled/listed on this CPU-only host; device lifetime and performance
+are unmeasured. SiluMul and other paths without broadcast metadata retain their
+existing state handling.
+
 The same cache now backs `ScatterElements`, `GatherElements` and the shared
 `PersistentMetadata` adapter used by movement, Einsum views, ScatterND,
 GatherND and TensorScatter. Scatter and Gather keep distinct typed keys and
