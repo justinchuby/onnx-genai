@@ -3527,8 +3527,9 @@ mod tests {
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
         // Opset 29 adds the three indexing revisions; ScatterElements also
         // gets a distinct opset 18 registration for max/min.
-        // Opset-28 Cast adds one registration.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 124 + mlas_registrations);
+        // Opset-28 Cast adds one registration; Cast and CastLike each add
+        // FP8 registrations at opsets 19 and 24.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 128 + mlas_registrations);
         for op in PHASE1_OPS {
             let since = reg
                 .earliest_since_version(op, "")

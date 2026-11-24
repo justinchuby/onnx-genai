@@ -266,7 +266,7 @@ static THRESHOLDS: LazyLock<[[u64; 255]; 7]> = LazyLock::new(|| {
             } else if row == Float8::E8M0.row(RoundMode::Down) as usize {
                 hi.to_bits()
             } else {
-                let ties_to_lower = spec.signed && code % 2 == 0;
+                let ties_to_lower = spec.signed && code.is_multiple_of(2);
                 ((lo + hi) * 0.5).to_bits() + u64::from(ties_to_lower)
             }
         })
