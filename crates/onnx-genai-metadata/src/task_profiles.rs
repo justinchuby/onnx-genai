@@ -7,7 +7,10 @@ use crate::{
 /// Unsupported versions of an ignorable task contract have no semantic effect.
 pub(crate) fn skip_unsupported_version(profile: &crate::TaskProfile) -> bool {
     profile.requirement == ProfileRequirement::Ignorable
-        && matches!(profile.kind.as_str(), "embedding" | "reranking")
+        && matches!(
+            profile.kind.as_str(),
+            "embedding" | "reranking" | "decision"
+        )
         && profile.version != "1"
 }
 

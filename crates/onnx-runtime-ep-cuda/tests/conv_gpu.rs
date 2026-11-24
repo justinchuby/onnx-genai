@@ -525,8 +525,16 @@ fn cudnn_conv_prepared_workspace_reuses_the_injected_allocator_and_captures() {
     let injected = Arc::new(common::ExternalEagerAllocator::new(
         common::require_context("cuDNN Conv prepared-workspace allocator substitution"),
     ));
-    let ep = common::require_cuda()
-        .with_memory(Arc::clone(&injected) as Arc<dyn onnx_runtime_memory_api::DeviceAllocator>)
+    let ep =
+        CudaExecutionProvider::from_config(
+            0,
+            onnx_runtime_ep_cuda::CudaProviderConfig {
+                memory: Some(
+                    Arc::clone(&injected) as Arc<dyn onnx_runtime_memory_api::DeviceAllocator>
+                ),
+                ..Default::default()
+            },
+        )
         .expect("the injected allocator must be accepted for the visible CUDA device");
     let runtime = ep.runtime();
     let dtype = DataType::Float32;

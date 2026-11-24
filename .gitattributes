@@ -45,3 +45,8 @@ scripts/hooks/* text eol=lf
 
 # Serialized ONNX protobufs must remain byte-identical across checkouts.
 *.onnx binary
+
+# Unified-diff context prefixes intentionally precede upstream tabs/blank lines.
+# Keep this reproducible source patch byte-exact; its TypeScript is formatted
+# and tested in the pinned upstream checkout before assets are regenerated.
+scripts/llama_chat/capabilities.patch text eol=lf whitespace=-blank-at-eol,-space-before-tab

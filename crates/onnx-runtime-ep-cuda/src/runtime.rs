@@ -40,7 +40,7 @@ fn warm_transaction_faults() -> &'static Mutex<HashMap<u64, usize>> {
     FAULTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Counts explicit device allocation/free calls made through a runtime.
+/// Counts raw driver calls plus native logical admissions/settled releases.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CudaAllocationCounts {
     pub allocations: u64,
@@ -90,64 +90,130 @@ fn require_workspace_capture_pin(
     )))
 }
 
-/// Immutable owner for a kernel-private allocation whose address may be
-/// embedded in a CUDA graph.
-///
-/// The weak runtime reference avoids a `CudaRuntime -> graph -> resource ->
-/// CudaRuntime` cycle. While the runtime is alive, final release updates its
-/// allocation accounting. During runtime teardown the context fallback still
-/// frees the allocation after graph handles are destroyed.
-#[derive(Debug)]
-pub(crate) struct GraphDeviceAllocation {
+/// One native owner; shared graph pins or an exclusive pipeline slot keep its
+/// allocation domain alive.
+/// No strong runtime back-edge or pointer-only/synchronous fallback is permitted.
+pub(crate) struct NativeDeviceAllocation {
+    allocation: Option<onnx_runtime_ep_api::DeviceBuffer>,
+    domain: Arc<crate::provider::CudaAllocationDomain>,
     runtime: Weak<CudaRuntime>,
-    context: Arc<CudaContext>,
-    ptr: CUdeviceptr,
     bytes: usize,
 }
 
-impl GraphDeviceAllocation {
-    pub(crate) fn allocate(runtime: &Arc<CudaRuntime>, bytes: usize) -> Result<Arc<Self>> {
-        // Retained owners do not benefit from doubling their live footprint
-        // merely to accommodate a future, differently sized allocation.
-        let class = retained_pool_size_class(bytes)?;
-        let ptr = runtime.alloc_raw_in_class(bytes.max(1), class)?;
-        Ok(Arc::new(Self {
-            runtime: Arc::downgrade(runtime),
-            context: Arc::clone(&runtime.context),
-            ptr,
+impl std::fmt::Debug for NativeDeviceAllocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeDeviceAllocation")
+            .field("ptr", &self.ptr())
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativeDeviceAllocation {
+    pub(crate) fn allocate_shared(
+        runtime: &Arc<CudaRuntime>,
+        bytes: usize,
+        role: onnx_runtime_memory_api::MemoryRole,
+    ) -> Result<Arc<Self>> {
+        Self::allocate(runtime, bytes, role).map(Arc::new)
+    }
+
+    pub(crate) fn allocate(
+        runtime: &Arc<CudaRuntime>,
+        bytes: usize,
+        role: onnx_runtime_memory_api::MemoryRole,
+    ) -> Result<Self> {
+        let backing_bytes = native_artifact_backing_bytes(bytes)?;
+        let domain = runtime.allocation_domain()?;
+        let allocation = domain.allocate_governed(runtime, backing_bytes, 256, role)?;
+        Ok(Self::from_owned(
+            allocation,
+            domain,
+            Arc::downgrade(runtime),
             bytes,
-        }))
+        ))
+    }
+
+    pub(crate) fn from_owned(
+        allocation: onnx_runtime_ep_api::DeviceBuffer,
+        domain: Arc<crate::provider::CudaAllocationDomain>,
+        runtime: Weak<CudaRuntime>,
+        bytes: usize,
+    ) -> Self {
+        Self {
+            allocation: Some(allocation),
+            domain,
+            runtime,
+            bytes,
+        }
     }
 
     pub(crate) fn ptr(&self) -> CUdeviceptr {
-        self.ptr
+        self.allocation
+            .as_ref()
+            .map_or(0, |buffer| cuptr(buffer.as_ptr()))
     }
 
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
 
+    pub(crate) fn identity(owner: &Arc<Self>) -> usize {
+        Arc::as_ptr(owner) as usize
+    }
+
     pub(crate) fn device_graph_resource(owner: &Arc<Self>) -> DeviceGraphResource {
-        DeviceGraphResource::new(Arc::as_ptr(owner) as usize, Arc::clone(owner))
+        DeviceGraphResource::new(Self::identity(owner), Arc::clone(owner))
+    }
+
+    pub(crate) fn release(&mut self) -> Result<()> {
+        let Some(buffer) = self.take_buffer() else {
+            return Ok(());
+        };
+        self.domain.retire_owned(buffer)
+    }
+
+    pub(crate) fn quarantine(
+        &mut self,
+        reason: onnx_runtime_memory_api::QuarantineReason,
+    ) -> Result<Option<onnx_runtime_memory_api::AllocationReleaseOutcome>> {
+        self.take_buffer()
+            .map(|buffer| self.domain.quarantine_owned(buffer, reason))
+            .transpose()
+    }
+
+    fn take_buffer(&mut self) -> Option<onnx_runtime_ep_api::DeviceBuffer> {
+        let buffer = self.allocation.take()?;
+        if let Some(runtime) = self.runtime.upgrade() {
+            runtime.invalidate_interleaved_for(cuptr(buffer.as_ptr()), buffer.len());
+        }
+        Some(buffer)
     }
 }
 
-impl Drop for GraphDeviceAllocation {
+impl Drop for NativeDeviceAllocation {
     fn drop(&mut self) {
-        if self.ptr == 0 {
-            return;
+        if let Err(error) = self.release() {
+            eprintln!(
+                "cuda_ep: native device allocation retirement failed; ownership remains retained/quarantined, inspect release diagnostics: {error}"
+            );
         }
-        if let Some(runtime) = self.runtime.upgrade() {
-            // SAFETY: this immutable owner is the final owner of the pointer.
-            let _ = unsafe { runtime.free_raw(self.ptr) };
-        } else {
-            let _ = self.context.bind_to_thread();
-            let _section = capture_gate::synchronizing_section();
-            // SAFETY: runtime teardown is dropping the graph before the context;
-            // this owner still exclusively owns the allocation.
-            let _ = unsafe { cudarc::driver::result::free_sync(self.ptr) };
+    }
+}
+
+/// One immutable installation, with counter handles that survive domain teardown.
+struct NativeAllocationDomain {
+    domain: Weak<crate::provider::CudaAllocationDomain>,
+    allocations: Arc<AtomicU64>,
+    frees: Arc<AtomicU64>,
+}
+
+impl NativeAllocationDomain {
+    fn counts(&self) -> CudaAllocationCounts {
+        CudaAllocationCounts {
+            allocations: self.allocations.load(Ordering::Relaxed),
+            frees: self.frees.load(Ordering::Relaxed),
         }
-        self.ptr = 0;
     }
 }
 
@@ -741,18 +807,13 @@ fn raw_pool_size_class(bytes: usize) -> usize {
     }
 }
 
-/// Retained graph owners use the same pool and retirement path, with bounded
-/// rounding waste rather than transient scratch's wider reuse classes. This is
-/// computed only when creating the owner, never on a fitting warm invocation.
-fn retained_pool_size_class(bytes: usize) -> Result<usize> {
-    const GRANULARITY: usize = 512;
-    bytes
-        .max(1)
-        .checked_next_multiple_of(GRANULARITY)
-        .filter(|class| *class <= isize::MAX as usize)
-        .ok_or_else(|| EpError::KernelFailed(format!(
-            "cuda_ep: retained allocation request of {bytes} bytes exceeds addressable capacity after {GRANULARITY}-byte rounding; reduce the retained artifact size"
-        )))
+/// Logical zero-byte artifacts still retain one real backing byte for an address.
+fn native_artifact_backing_bytes(bytes: usize) -> Result<usize> {
+    (bytes <= isize::MAX as usize).then_some(bytes.max(1)).ok_or_else(|| {
+        EpError::KernelFailed(format!(
+            "cuda_ep: retained artifact request of {bytes} bytes exceeds addressable capacity; reduce the retained artifact size"
+        ))
+    })
 }
 
 /// Source of [`CudaRuntime::runtime_id`]. Monotonic and never reset, so an id
@@ -870,6 +931,7 @@ fn production_cannot_reset_capture_error(runtime: &CudaRuntime) {
 "#
 )]
 pub struct CudaRuntime {
+    native_allocation_domain: OnceLock<NativeAllocationDomain>,
     context: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     /// Dedicated non-blocking transfer stream, distinct from the compute
@@ -1048,6 +1110,34 @@ impl std::fmt::Debug for CudaRuntime {
 }
 
 impl CudaRuntime {
+    pub(crate) fn install_allocation_domain(
+        &self,
+        domain: &Arc<crate::provider::CudaAllocationDomain>,
+    ) -> Result<()> {
+        if domain.device() != onnx_runtime_ir::DeviceId::cuda(self.ordinal) {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep: cannot install allocation domain for {:?} into CUDA runtime {}; construct both for the same device",
+                domain.device(),
+                self.ordinal,
+            )));
+        }
+        let (allocations, frees) = domain.counter_handles();
+        self.native_allocation_domain.set(NativeAllocationDomain {
+            domain: Arc::downgrade(domain), allocations, frees,
+        }).map_err(|_| EpError::KernelFailed(format!(
+            "cuda_ep: CUDA runtime {} already has an allocation domain; select allocator backing before constructing the provider instead of replacing its domain",
+            self.ordinal,
+        )))
+    }
+
+    fn allocation_domain(&self) -> Result<Arc<crate::provider::CudaAllocationDomain>> {
+        self.native_allocation_domain.get().and_then(|installed| installed.domain.upgrade())
+            .ok_or_else(|| EpError::KernelFailed(format!(
+                "cuda_ep: native device allocation admission on CUDA runtime {} requires its live provider allocation domain; construct through CudaExecutionProvider and retain it during preparation",
+                self.ordinal,
+            )))
+    }
+
     /// Fail the `checkpoint`th staged warm-cache mutation for this runtime.
     ///
     /// The seam is runtime-wide because all capture-capable kernels share the
@@ -1217,6 +1307,7 @@ impl CudaRuntime {
             DeviceGraphSlot::Verify,
         );
         Self {
+            native_allocation_domain: OnceLock::new(),
             context,
             stream,
             copy_stream,
@@ -2388,11 +2479,16 @@ impl CudaRuntime {
         }
     }
 
-    /// Snapshot explicit device allocation/free calls made through this runtime.
+    /// Raw driver allocation/free calls plus native logical admissions/settled
+    /// releases. Native counter handles remain valid after the domain retires.
     pub fn allocation_counts(&self) -> CudaAllocationCounts {
+        let native = self.native_allocation_domain.get().map_or(
+            CudaAllocationCounts::default(),
+            NativeAllocationDomain::counts,
+        );
         CudaAllocationCounts {
-            allocations: self.allocations.load(Ordering::Relaxed),
-            frees: self.frees.load(Ordering::Relaxed),
+            allocations: self.allocations.load(Ordering::Relaxed) + native.allocations,
+            frees: self.frees.load(Ordering::Relaxed) + native.frees,
         }
     }
 
@@ -3066,15 +3162,12 @@ impl CudaRuntime {
         self.runtime_id
     }
 
-    /// The interleaved copy of the `bytes`-byte int4 packed weight at `packed`,
-    /// built once per weight and released when this runtime drops. Returns
-    /// `(pointer, warm)`; see [`crate::interleave_cache::InterleaveCache::ensure`].
-    pub(crate) fn ensure_interleaved_int4(
-        &self,
-        packed: CUdeviceptr,
-        bytes: usize,
-    ) -> Result<(CUdeviceptr, bool)> {
-        self.interleave.ensure(self, packed, bytes)
+    /// Prepare a shared owning conversion for an explicitly immutable source.
+    pub(crate) fn prepare_interleaved_int4(
+        self: &Arc<Self>,
+        source: crate::interleave_cache::ImmutablePackedWeight,
+    ) -> Result<(Arc<crate::interleave_cache::InterleaveEntry>, bool)> {
+        self.interleave.prepare(self, source)
     }
 
     /// Release every interleaved weight copy this runtime holds.
@@ -3084,7 +3177,7 @@ impl CudaRuntime {
     /// which runs per buffer as the provider frees it.
     #[cfg(test)]
     pub(crate) fn release_interleaved_weights(&self) {
-        self.interleave.release_all(self);
+        self.interleave.release_all();
     }
 
     /// Drop any interleaved copy derived from the buffer at `base`.
@@ -3099,7 +3192,7 @@ impl CudaRuntime {
     /// and frees their initializers back into the same arena — so runtime
     /// scoping alone leaves that window open and this is what closes it.
     pub(crate) fn invalidate_interleaved_for(&self, base: CUdeviceptr, len: usize) {
-        self.interleave.invalidate(self, base, len);
+        self.interleave.invalidate(base, len);
     }
 
     /// Record that device weight offload is on, so weight buffers may be paged.
@@ -3837,11 +3930,10 @@ impl Drop for CudaRuntime {
         // released when this body returns, which is *before* the fields drop.
         // See `teardown_section`.
         self.teardown_section = capture_gate::synchronizing_section();
-        // Before the context goes: an interleaved weight copy is keyed by the
-        // source weight's device address, and that address stops meaning
-        // anything once this runtime's allocator is gone. Freeing here is what
-        // bounds an entry's life by the life of the address that names it.
-        self.interleave.release_all(&*self);
+        // Revoke source names and release the cache's native owners before
+        // field teardown. Graph pins may retain independent domain ownership;
+        // native retirement does not need to upgrade this dying runtime.
+        self.interleave.release_all();
         if self.capture_error != 0 {
             // SAFETY: `capture_error` was allocated by this runtime's `alloc_raw`
             // in `with_capture_error_word` and is freed exactly once here.
@@ -4086,39 +4178,28 @@ mod tests {
     }
 
     #[test]
-    fn retained_pool_rounding_bounds_live_waste_and_rejects_overflow() {
-        for bytes in [0, 1, 511, 512, 513, 32_784, (1 << 20) + 16] {
-            let class = retained_pool_size_class(bytes).unwrap();
-            assert!(class >= bytes.max(1));
-            assert!(class - bytes.max(1) < 512);
-            assert_eq!(class % 512, 0);
-            assert!(class <= raw_pool_size_class(bytes.max(1)));
+    fn native_artifact_backing_keeps_exact_bytes_and_checks_addressability() {
+        assert_eq!(native_artifact_backing_bytes(0).unwrap(), 1);
+        for bytes in [
+            1,
+            511,
+            512,
+            513,
+            32_784,
+            (1 << 20) + 16,
+            isize::MAX as usize,
+        ] {
+            assert_eq!(native_artifact_backing_bytes(bytes).unwrap(), bytes);
         }
-        assert_eq!(retained_pool_size_class(32_784).unwrap(), 33_280);
-        for bytes in [isize::MAX as usize, usize::MAX - 1, usize::MAX] {
-            let message = retained_pool_size_class(bytes).unwrap_err().to_string();
+        for bytes in [isize::MAX as usize + 1, usize::MAX] {
+            let message = native_artifact_backing_bytes(bytes)
+                .unwrap_err()
+                .to_string();
             assert!(message.contains(&bytes.to_string()));
             assert!(message.contains("reduce the retained artifact size"));
         }
     }
 
-    #[test]
-    fn coalesced_metadata_does_not_increase_physical_capacity_at_class_boundaries() {
-        for middle in [8usize, 512, 32_768, 1 << 20, (1 << 20) + 8] {
-            let tables = [8, middle, 8];
-            let separate: usize = tables.into_iter().map(raw_pool_size_class).sum();
-            let combined = retained_pool_size_class(tables.into_iter().sum()).unwrap();
-            assert!(
-                combined <= separate,
-                "coalescing {tables:?} retained {combined} bytes, previously {separate}"
-            );
-        }
-    }
-
-    /// Pooling only pays if the second request for a shape skips the driver
-    /// entirely, and it is only safe if the pointer it hands back is the one it
-    /// retained. Both are asserted here rather than inferred from a wall-clock
-    /// improvement.
     #[test]
     #[ignore = "requires a CUDA device"]
     fn raw_pool_recycles_freed_blocks_without_reentering_the_driver() {
@@ -4330,13 +4411,18 @@ mod tests {
 
     #[test]
     fn graph_device_allocation_does_not_retain_runtime() {
-        let Some(runtime) = maybe_runtime() else {
+        let Some((_provider, runtime)) = crate::test_support::maybe_native_runtime() else {
             eprintln!("skipping graph allocation ownership test: CUDA runtime unavailable");
             return;
         };
         let strong_before = Arc::strong_count(&runtime);
-        let allocation = GraphDeviceAllocation::allocate(&runtime, 8).unwrap();
-        let resource = GraphDeviceAllocation::device_graph_resource(&allocation);
+        let allocation = NativeDeviceAllocation::allocate_shared(
+            &runtime,
+            8,
+            onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
+        )
+        .unwrap();
+        let resource = NativeDeviceAllocation::device_graph_resource(&allocation);
         assert_eq!(
             Arc::strong_count(&runtime),
             strong_before,
@@ -4344,6 +4430,81 @@ mod tests {
         );
         drop(resource);
         drop(allocation);
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable gpu-tests"
+    )]
+    fn native_artifact_admission_requires_domain_and_counts_survive_provider_retirement() {
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_memory_api::MemoryRole;
+        let raw = Arc::new(CudaRuntime::new(0).expect("CUDA runtime required"));
+        let before = raw.allocation_counts();
+        let error =
+            NativeDeviceAllocation::allocate_shared(&raw, 8, MemoryRole::Weights).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("live provider allocation domain"),
+            "{error}"
+        );
+        assert_eq!(raw.allocation_counts(), before);
+        drop(raw);
+
+        let provider = crate::CudaExecutionProvider::new(0).expect("native provider required");
+        let runtime = Arc::clone(provider.runtime());
+        let before = runtime.allocation_counts();
+        let strong_before = Arc::strong_count(&runtime);
+        let artifact =
+            NativeDeviceAllocation::allocate_shared(&runtime, 0, MemoryRole::Weights).unwrap();
+        assert_eq!(artifact.bytes(), 0);
+        assert_eq!(
+            artifact.allocation.as_ref().unwrap().len(),
+            1,
+            "logical zero still admits real backing"
+        );
+        let after = runtime.allocation_counts();
+        assert_eq!(after.allocations, before.allocations + 1);
+        assert_eq!(after.frees, before.frees);
+        assert_eq!(
+            provider.device_allocation_counts(),
+            Some((after.allocations, after.frees)),
+            "provider/runtime must not double-count"
+        );
+        assert_eq!(
+            Arc::strong_count(&runtime),
+            strong_before,
+            "artifact must not root runtime"
+        );
+        let weak_domain = runtime
+            .native_allocation_domain
+            .get()
+            .unwrap()
+            .domain
+            .clone();
+        let queue = Arc::clone(provider.release_queue());
+        drop(provider);
+        assert!(
+            weak_domain.upgrade().is_some(),
+            "artifact owns its retirement domain"
+        );
+        drop(artifact);
+        assert!(
+            queue.wait_until_idle(std::time::Duration::from_secs(30)),
+            "{:?}",
+            queue.stats()
+        );
+        assert!(weak_domain.upgrade().is_none());
+        let settled = runtime.allocation_counts();
+        assert_eq!(settled.allocations, after.allocations);
+        assert_eq!(settled.frees, after.frees + 1);
+        assert_eq!(
+            runtime.allocation_counts(),
+            settled,
+            "cumulative native counters cannot disappear with domain"
+        );
     }
 
     /// The on-disk kernel cache stores PTX *text* and restores it through a

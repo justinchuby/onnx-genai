@@ -919,7 +919,7 @@ mod tests {
     )]
     #[test]
     fn gpu_flattened_unique_matches_cpu_semantics_and_transfer_contract() {
-        let Some(runtime) = crate::test_support::maybe_runtime() else {
+        let Some((_provider_runtime, runtime)) = crate::test_support::maybe_native_runtime() else {
             eprintln!("skipping CUDA Unique test: CUDA runtime unavailable");
             return;
         };
@@ -1029,7 +1029,7 @@ mod tests {
     #[test]
     #[ignore = "CUDA phase accounting probe; run explicitly on an idle GPU"]
     fn gpu_unique_phase_accounting() {
-        let Some(runtime) = crate::test_support::maybe_runtime() else {
+        let Some((_provider_runtime, runtime)) = crate::test_support::maybe_native_runtime() else {
             eprintln!("skipping CUDA Unique accounting: CUDA runtime unavailable");
             return;
         };

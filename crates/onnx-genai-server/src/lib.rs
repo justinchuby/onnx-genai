@@ -33,6 +33,9 @@ mod image_input;
 mod lease;
 mod lora;
 mod metrics;
+mod model_cache;
+mod model_hub;
+mod model_management;
 mod models_config;
 pub mod multimodal;
 mod reasoning_request;
@@ -47,8 +50,6 @@ mod speech;
 mod sse;
 mod state;
 mod tool_protocol;
-mod tools;
-pub use tools::{BuiltinTool, ToolsConfig};
 mod types;
 mod webui;
 mod worker;
@@ -65,8 +66,7 @@ pub use runtime_args::{
 #[cfg(feature = "native-backend")]
 pub use state::parse_native_device;
 pub use state::{
-    AppState, McpProxyPolicy, OrtSessionWorkerCount, ServerConfig, default_node_id,
-    parse_kv_cache_dtype,
+    AppState, OrtSessionWorkerCount, ServerConfig, default_node_id, parse_kv_cache_dtype,
 };
 pub use tool_protocol::{ToolProtocol, ToolProtocolError};
 pub use types::{
@@ -81,26 +81,6 @@ pub use types::{
 };
 
 pub fn app(state: AppState) -> Router {
-    let tools_origin = state.tools.clone();
-    let tools_cors = tower_http::cors::CorsLayer::new()
-        .allow_origin(tower_http::cors::AllowOrigin::predicate(
-            move |origin, _| {
-                origin.to_str().is_ok_and(|origin| {
-                    tools_origin
-                        .as_ref()
-                        .is_some_and(|tools| tools.origin_allowed(origin))
-                })
-            },
-        ))
-        .allow_credentials(true)
-        .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
-        .allow_headers([
-            axum::http::header::CONTENT_TYPE,
-            axum::http::header::AUTHORIZATION,
-            axum::http::HeaderName::from_static("x-tool-cwd"),
-            axum::http::HeaderName::from_static("x-tool-runtime"),
-            axum::http::HeaderName::from_static("x-resp-type"),
-        ]);
     let mut router = Router::new()
         .route("/health", get(routes::health))
         .route("/v1/health", get(routes::health))
@@ -131,8 +111,8 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/models",
             get(routes::models)
-                .post(routes::llama::disabled_feature)
-                .delete(routes::llama::disabled_feature),
+                .post(routes::model_management::download)
+                .delete(routes::model_management::delete),
         )
         .route("/models/sse", get(routes::llama::model_events))
         .route(
@@ -143,7 +123,7 @@ pub fn app(state: AppState) -> Router {
         .route("/audio/speech", post(routes::audio_speech))
         .route(
             "/props",
-            get(routes::llama::props).post(routes::llama::disabled_feature),
+            get(routes::llama::props).post(routes::llama::post_props),
         )
         .route(
             "/v1/chat/completions/input_tokens",
@@ -163,6 +143,7 @@ pub fn app(state: AppState) -> Router {
         .route("/tts", post(routes::native::tts))
         .route("/reranking", post(routes::ranking::rerank))
         .route("/rerank", post(routes::ranking::rerank))
+        .route("/v1/systemone", post(routes::decision::decide))
         .route("/v1/rerank", post(routes::ranking::rerank))
         .route("/v1/reranking", post(routes::ranking::rerank))
         .route("/embedding", post(routes::native::embeddings))
@@ -176,16 +157,6 @@ pub fn app(state: AppState) -> Router {
         .route("/tokenize", post(routes::llama::tokenize))
         .route("/detokenize", post(routes::llama::detokenize))
         .route("/apply-template", post(routes::llama::apply_template))
-        .route(
-            "/tools",
-            get(routes::tools::list)
-                .post(routes::tools::invoke)
-                .layer(tools_cors),
-        )
-        .route(
-            "/cors-proxy",
-            get(routes::proxy::forward).post(routes::proxy::forward),
-        )
         .route("/chat/completions", post(routes::chat_completions))
         .route("/v1/models", get(routes::models))
         .route("/v1/status", get(routes::status))
@@ -229,10 +200,13 @@ pub fn app(state: AppState) -> Router {
                 get(routes::debug_trace_perfetto),
             );
     }
-    if state.config.enable_admin_endpoints {
+    if state.config.enable_admin_endpoints || state.model_manager.is_some() {
         router = router
             .route("/models/load", post(routes::llama::load_model))
-            .route("/models/unload", post(routes::llama::unload_model))
+            .route("/models/unload", post(routes::llama::unload_model));
+    }
+    if state.config.enable_admin_endpoints {
+        router = router
             .route("/v1/admin/models", get(routes::admin_list_models))
             .route("/v1/admin/models/{id}/load", post(routes::admin_load_model))
             .route(

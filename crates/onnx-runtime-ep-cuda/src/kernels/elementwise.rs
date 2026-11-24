@@ -30,7 +30,7 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::standard_math::Math;
 use onnx_runtime_ir::{Attribute, DataType, Node};
 
-use crate::device_metadata::DeviceMetadataCache;
+use crate::device_metadata::{DeviceMetadataCache, WarmMetadata, publish_metadata_candidate};
 use crate::error::{driver_err, not_implemented};
 use crate::optimizer::SILU_MUL_FUSION_ATTR;
 use crate::runtime::{CudaRuntime, cuptr};
@@ -670,8 +670,14 @@ impl Kernel for UnaryKernel {
         }
     }
 
-    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
-        self.capture_seq_independent = seq_independent;
+    fn configure_shape_facts(&mut self, facts: onnx_runtime_ep_api::KernelShapeFacts) {
+        if self.capture_seq_independent != facts.capture_eligible {
+            *self
+                .last_capture_safe_signature
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+        self.capture_seq_independent = facts.capture_eligible;
     }
 }
 
@@ -699,8 +705,9 @@ impl KernelFactory for BinaryFactory {
         Ok(Box::new(BinaryKernel {
             op: self.op,
             runtime: self.runtime.clone(),
-            metadata: Mutex::new(BroadcastMetadataCache::new(self.runtime.clone())),
-            last_capture_safe_signature: Mutex::new(None),
+            warm: Mutex::new(WarmMetadata::new(BroadcastMetadataCache::new(
+                self.runtime.clone(),
+            ))),
             capture_seq_independent: false,
         }))
     }
@@ -711,8 +718,7 @@ impl KernelFactory for BinaryFactory {
 pub struct BinaryKernel {
     op: BinaryOp,
     runtime: Arc<CudaRuntime>,
-    metadata: Mutex<BroadcastMetadataCache>,
-    last_capture_safe_signature: Mutex<Option<BinaryCaptureSignature>>,
+    warm: Mutex<WarmMetadata<BroadcastMetadataCache, BinaryCaptureSignature>>,
     capture_seq_independent: bool,
 }
 
@@ -776,12 +782,9 @@ impl BroadcastMetadataCache {
 
 impl BinaryKernel {
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        let mut last_signature = self.last_capture_safe_signature.lock().map_err(|_| {
-            EpError::KernelFailed(
-                "cuda_ep binary elementwise capture signature lock was poisoned".into(),
-            )
-        })?;
-        let warmed_signature = last_signature.clone();
+        let mut candidate = self.warm.lock().map_err(|_| EpError::KernelFailed(
+            "cuda_ep binary broadcast metadata/signature state is poisoned; rebuild the provider before warming again".into(),
+        ))?.clone();
         let op = self.op.op_name();
         if inputs.len() != 2 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
@@ -866,17 +869,13 @@ impl BinaryKernel {
         require_matching_capture_signature(
             &self.runtime,
             op,
-            warmed_signature.as_ref(),
+            candidate.signature.as_ref(),
             current_signature.as_ref(),
         )?;
         let func = self
             .runtime
             .nvrtc_function(POINTWISE_MODULE, POINTWISE_SRC, &entry)?;
-        let mut metadata = self.metadata.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep binary elementwise metadata lock was poisoned".into())
-        })?;
-        let mut metadata_candidate = metadata.clone();
-        let metadata_ptr = metadata_candidate.prepare(a.shape, b.shape, &out_shape)?;
+        let metadata_ptr = candidate.metadata.prepare(a.shape, b.shape, &out_shape)?;
         let a_ptr = cuptr(a.data_ptr::<u8>() as *const c_void);
         let b_ptr = cuptr(b.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
@@ -905,11 +904,8 @@ impl BinaryKernel {
         // SAFETY: pointer types match the dtype; metadata contains three
         // rank-length u64 arrays; broadcast strides keep all reads in bounds.
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
-        if !self.runtime.is_capturing()? {
-            *metadata = metadata_candidate;
-        }
-        *last_signature = current_signature;
-        Ok(())
+        candidate.signature = current_signature;
+        publish_metadata_candidate(&self.warm, candidate, self.op.op_name())
     }
 }
 
@@ -923,10 +919,10 @@ impl Kernel for BinaryKernel {
     }
 
     fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        self.metadata
+        self.warm
             .lock()
             .ok()
-            .and_then(|metadata| metadata.device_graph_resource())
+            .and_then(|state| state.metadata.device_graph_resource())
             .into_iter()
             .collect()
     }
@@ -934,8 +930,10 @@ impl Kernel for BinaryKernel {
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         // Only the exact fixed-row signature recorded by the most recent
         // successful call may enter capture, including integer metadata ops.
-        match self.last_capture_safe_signature.lock() {
-            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+        match self.warm.lock() {
+            Ok(state) if state.signature.is_some() => {
+                onnx_runtime_ep_api::CaptureSupport::Supported
+            }
             Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(format!(
                 "{} broadcast shape/dtype signature does not match the warmed capture signature",
                 self.op.op_name()
@@ -947,8 +945,14 @@ impl Kernel for BinaryKernel {
         }
     }
 
-    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
-        self.capture_seq_independent = seq_independent;
+    fn configure_shape_facts(&mut self, facts: onnx_runtime_ep_api::KernelShapeFacts) {
+        if self.capture_seq_independent != facts.capture_eligible {
+            self.warm
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .signature = None;
+        }
+        self.capture_seq_independent = facts.capture_eligible;
     }
 }
 
@@ -1074,8 +1078,14 @@ impl Kernel for SiluMulKernel {
         }
     }
 
-    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
-        self.capture_seq_independent = seq_independent;
+    fn configure_shape_facts(&mut self, facts: onnx_runtime_ep_api::KernelShapeFacts) {
+        if self.capture_seq_independent != facts.capture_eligible {
+            *self
+                .last_capture_safe_signature
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+        self.capture_seq_independent = facts.capture_eligible;
     }
 }
 
@@ -1097,7 +1107,7 @@ pub(crate) fn require_matching_capture_signature<T: PartialEq>(
 ///
 /// The build-time growing-symbol classifier
 /// (`compute_capture_disqualifying_symbols` →
-/// `node_capture_seq_independent` → `set_capture_seq_independent`) is the sole,
+/// `node_capture_seq_independent` → `configure_shape_facts`) is the sole,
 /// authoritative authority here: `seq_independent == true` means every symbol on
 /// this node's output shape is *provably* pinned (fail-safe classifier) / not
 /// proven growing (denylist classifier), so the captured launch geometry stays
@@ -1324,7 +1334,7 @@ mod tests {
 
     #[test]
     fn silu_mul_f16_matches_reference_with_half2_tail() {
-        let Some(runtime) = crate::test_support::maybe_runtime() else {
+        let Some((_provider_runtime, runtime)) = crate::test_support::maybe_native_runtime() else {
             eprintln!("skipping fused SiluMul fp16 parity test: CUDA runtime unavailable");
             return;
         };
@@ -1418,7 +1428,7 @@ mod tests {
 
     #[test]
     fn decomposed_silu_mul_bf16_is_byte_exact_vs_two_op_bf16_reference() {
-        let Some(runtime) = crate::test_support::maybe_runtime() else {
+        let Some((_provider_runtime, runtime)) = crate::test_support::maybe_native_runtime() else {
             eprintln!("skipping decomposed SiluMul bf16 parity test: CUDA runtime unavailable");
             return;
         };
@@ -1627,9 +1637,10 @@ mod claim_probes {
 
     use super::{BinaryKernel, BinaryOp, BroadcastMetadataCache, broadcast_metadata, u64_bytes};
     use crate::CudaRuntime;
+    use crate::device_metadata::WarmMetadata;
 
-    fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
-        crate::test_support::maybe_runtime()
+    fn maybe_runtime() -> Option<crate::test_support::NativeRuntimeFixture> {
+        crate::test_support::maybe_native_runtime()
     }
 
     fn run_i32_binary(runtime: &Arc<CudaRuntime>, op: BinaryOp, a: &[i32], b: &[i32]) -> Vec<i32> {
@@ -1673,8 +1684,9 @@ mod claim_probes {
         let kernel = BinaryKernel {
             op,
             runtime: runtime.clone(),
-            metadata: Mutex::new(BroadcastMetadataCache::new(runtime.clone())),
-            last_capture_safe_signature: Mutex::new(None),
+            warm: Mutex::new(WarmMetadata::new(BroadcastMetadataCache::new(
+                runtime.clone(),
+            ))),
             capture_seq_independent: false,
         };
         kernel.execute(&inputs, &mut outputs).unwrap();
@@ -1693,7 +1705,7 @@ mod claim_probes {
 
     #[test]
     fn i32_binary_add_sub_mul_div_min_max_match_reference_on_gpu() {
-        let Some(runtime) = maybe_runtime() else {
+        let Some((_provider, runtime)) = maybe_runtime() else {
             eprintln!("skipping i32 binary GPU probe: CUDA runtime unavailable");
             return;
         };
@@ -1727,7 +1739,7 @@ mod claim_probes {
 
     #[test]
     fn broadcast_metadata_shape_churn_waits_before_recycling_old_storage() {
-        let Some(runtime) = maybe_runtime() else {
+        let Some((_provider, runtime)) = maybe_runtime() else {
             eprintln!("skipping broadcast metadata lifetime probe: CUDA runtime unavailable");
             return;
         };

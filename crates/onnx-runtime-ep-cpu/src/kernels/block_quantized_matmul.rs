@@ -1109,17 +1109,27 @@ fn linear_packed_tiled<const FEATURE_TILE: usize>(
         PackedProjectionRows::new(format, packed, input, rows, in_features, out_features, bias)?;
     let make_decoder = || packed_rows.decoder();
     let project = project_packed_tile::<FEATURE_TILE>;
-    super::decoded_projection::linear_decoded_grouped::<FEATURE_TILE, _>(
+    let elements = rows.checked_mul(out_features).ok_or_else(|| {
+        error("owned projection output element count overflows; reduce batch or output features")
+    })?;
+    let mut output = super::decoded_projection::zeroed_f32(
+        "block-quantized projection",
+        "owned output staging",
+        elements,
+    )?;
+    super::decoded_projection::linear_decoded_grouped_into::<FEATURE_TILE, _>(
         "block-quantized projection",
         input,
         rows,
         in_features,
         out_features,
         bias,
+        &mut output,
         make_decoder,
         project,
         super::decoded_projection::rayon_decoded_columns,
-    )
+    )?;
+    Ok(output)
 }
 
 fn decode_mxfp4_block(block: &[u8], output: &mut [f32]) {

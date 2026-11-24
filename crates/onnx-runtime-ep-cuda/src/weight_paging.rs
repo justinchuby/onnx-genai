@@ -6690,7 +6690,8 @@ impl CudaWeightResidency {
     /// (deliberately caller-less, primitive-only) opt-in entry: it reserves two
     /// stable staging slots so layer `N` computes while layer `N+1`'s transfer
     /// overlaps, without becoming a second residency/cache authority — the
-    /// existing paging lifecycle stays the sole mapping/accounting authority.
+    /// native provider domain owns allocation and settlement. The pipeline does
+    /// not reserve a separate residency budget or create another quota ledger.
     ///
     /// `layer_bytes` is the largest layer's transfer size the pipeline is sized
     /// for; every layer submitted must fit it. The layer region bytes for each

@@ -19,7 +19,7 @@ use crate::blas::{
     self, CaptureStridedBatchedGemmPlan, GemmDtype, StridedBatchedGemmParams, WORKSPACE_BYTES,
 };
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, RawCudaFunction};
+use crate::runtime::{CudaRuntime, NativeDeviceAllocation, RawCudaFunction};
 
 const BLOCK: u32 = 256;
 const WORKSPACE_ALIGNMENT: usize = blas::WORKSPACE_ALIGNMENT;
@@ -370,7 +370,7 @@ struct BoundExecution {
     key: BindingKey,
     function: Option<RawCudaFunction>,
     launches: Vec<PreparedLaunch>,
-    metadata: Option<Arc<GraphDeviceAllocation>>,
+    metadata: Option<Arc<NativeDeviceAllocation>>,
     metadata_bytes: usize,
 }
 
@@ -713,7 +713,11 @@ impl CudaEinsumProgram {
         let metadata = if metadata_bytes == 0 {
             None
         } else {
-            let allocation = GraphDeviceAllocation::allocate(runtime, metadata_bytes)?;
+            let allocation = NativeDeviceAllocation::allocate_shared(
+                runtime,
+                metadata_bytes,
+                onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
+            )?;
             let bytes = metadata_words
                 .iter()
                 .flat_map(|word| word.to_ne_bytes())
@@ -815,7 +819,7 @@ impl CudaEinsumPlan {
             }
             if let Some(metadata) = &binding.metadata {
                 runtime.require_captured_address_owner(
-                    GraphDeviceAllocation::device_graph_resource(metadata).identity(),
+                    NativeDeviceAllocation::device_graph_resource(metadata).identity(),
                     "immutable CUDA Einsum metadata",
                 )?;
             }
@@ -859,7 +863,7 @@ impl CudaEinsumPlan {
         self.binding
             .as_ref()
             .and_then(|binding| binding.metadata.as_ref())
-            .map(GraphDeviceAllocation::device_graph_resource)
+            .map(NativeDeviceAllocation::device_graph_resource)
             .into_iter()
             .collect()
     }
