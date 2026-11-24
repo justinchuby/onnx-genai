@@ -645,7 +645,7 @@ do not validate device arithmetic, asynchronous failure ordering or throughput.
 ### BF16 converted constants are immutable per signature
 
 MatMulNBits keeps one prepared record containing the source signature, checked
-composite layout and actual optional `GraphDeviceAllocation` owner. Capacity is
+composite layout and actual optional `NativeDeviceAllocation` owner. Capacity is
 derived from that owner. Warm hits perform signature comparison, layout binding
 and capture ownership validation; they do not allocate, convert or synchronize.
 Zero-element constants require no device backing.
@@ -1226,7 +1226,7 @@ adding grants, a pool or a new EP lifecycle. Warm calls retain the existing zero
 metadata-upload/device-allocation behavior. One cold upload replaces three
 synchronous uploads, but GPU latency/throughput effects are unmeasured.
 
-Retained `GraphDeviceAllocation` owners now use the provider's native domain
+Retained `NativeDeviceAllocation` owners now use the provider's native domain
 with exact requested bytes (logical zero retains one real backing byte). The
 selected allocator determines mapping/physical granularity; artifacts no longer
 use the raw pool's size classes or a synchronous free fallback. Coalesced tables
@@ -1492,7 +1492,7 @@ allowlist and transitive synchronization checks remain enforced.
 
 The immutable allocation scope of an armed route record now covers its six-word
 header and expert bitmap together. `ArmedTelemetry` keeps one
-`GraphDeviceAllocation`; QMoE publishes/validates one capture resource, while
+`NativeDeviceAllocation`; QMoE publishes/validates one capture resource, while
 BlockQuantizedMoE continues to pin its existing outer telemetry owner. Header
 injection remains bounded to its six words. Kernel sources and two-pointer ABI
 are unchanged: header is at the owner base and bitmap at byte offset 512.
@@ -1716,7 +1716,7 @@ the EP, plugin and session callers. No CUDA execution or performance was measure
 
 ### Retained graph artifacts use native ownership and settlement
 
-`GraphDeviceAllocation` admits one whole artifact or metadata composite through
+`NativeDeviceAllocation` admits one whole artifact or metadata composite through
 `allocate_governed`, using Weights for converted/repacked constants and persistent
 Workspace for metadata/telemetry. Its buffer retains the real owner and its
 allocation domain. Graph resources pin the same artifact Arc, never duplicate
@@ -1751,6 +1751,51 @@ missing-domain refusal and monotonic/nonduplicated counters; CUDA execution and
 throughput remain unmeasured. Migrating raw pool allocation to selected native
 backing changes physical granularity and cold behavior, so no memory/performance
 improvement is inferred from Host tests.
+
+### Prefill staging keeps two exclusive native slot owners
+
+The whole-layer prefill double buffer reserves two independent
+`NativeDeviceAllocation` owners through its runtime's existing provider domain.
+The former graph-specific owner name is removed; graph pins use its shared
+constructor, while prefill holds exclusive values. One cold admission per stable
+slot keeps failure isolation without per-layer, per-row or per-tile tickets.
+There is no second residency budget or accounting ledger. Content is Weights;
+selected allocator, capture checks and native mapped accounting remain canonical.
+
+Reservation validates the per-slot layout and two-slot peak before casts, then
+prepares both native owners and both pinned sources before publishing either
+slot. A second-slot refusal retires the unpublished first owner through the same
+queue, so its charge is released only after settlement. Slot pointers and
+capacities come from the owner, instead of separately maintained raw fields.
+Repeated fill/wait/release changes data and existing fences, never slot backing
+or quota. Replacing an already reserved transfer is explicitly refused.
+
+Pinned source reads have three states: Idle, Unproven and Fenced. The transfer
+sets Unproven before attempting H2D submission and publishes a reuse fence only
+after recording succeeds. An enqueue or fence failure cannot later use fence
+zero as a fake completion proof. Actual completion (including an authoritative
+fallback sync witness) permits pinned reuse; absence of submission is safe to
+drop but does not forge a pool-return witness. Unknown completion retains the
+source and explicitly quarantines its native destination with
+`QuarantineReason::CompletionUnknown`. The healthy sibling can still retire.
+
+Normal teardown and defensive Drop share this path. Device ownership goes to
+the existing two-stream deferred queue; it no longer ignores a failed global
+compute drain and raw-frees the destination. Final per-slot fences are handled
+without claiming enqueue is refund. Pinned retention remains a separate safety
+condition: only a real copy-completion witness returns pages to the pool.
+Quarantined native charges stay visible in the manager rather than disappearing
+inside a forgotten raw-pointer bundle. Typed binding/transaction errors remain
+in the source chain through native, prefill transfer and rejection boundaries.
+Capture admission remains unchanged; this does not enable pipeline capture.
+
+Host checks cover the actual native quarantine/charge path, typed capacity
+refusal, failed read proofs, address/peak overflow and typed prefill causes,
+alongside the existing generic pipeline state machine. GPU fixtures compile
+second-slot refusal, direct Drop, single-slot quarantine and normal multi-layer
+reuse/settlement. They are not CUDA execution or performance measurements. The
+native allocator can change physical granularity and cold reservation behavior;
+no footprint or throughput improvement is inferred from these Host checks.
 
 ### Sealed weights and workspace share cold native admission
 
