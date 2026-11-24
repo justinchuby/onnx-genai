@@ -877,9 +877,9 @@ fn topk_block_decode_path_is_byte_identical_to_cpu_oracle() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn cuda_ep_topk_admission_tracks_opset() {
+fn native_topk_admission_and_cuda_claims() {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
-    let claims = |opset, dtype: DataType| {
+    let admit = |opset, dtype: DataType| {
         let (graph, node_id) = graph(
             "TopK",
             opset,
@@ -894,31 +894,33 @@ fn cuda_ep_topk_admission_tracks_opset() {
             &[(dtype, vec![1, 8]), (DataType::Int64, vec![1, 8])],
             &[("axis", Attribute::Int(-1))],
         );
-        let model = Model::new(&graph);
+        onnx_runtime_loader::validate_model(&graph)?;
         let shapes = [static_shape([1_usize, 256]), static_shape([1_usize])];
-        ep.supports_op(
-            model.graph.node(node_id),
+        let claim = ep.supports_op(
+            graph.node(node_id),
             opset,
             &shapes,
             &[dtype, DataType::Int64],
             &[],
-        )
+        );
+        assert!(
+            claim.is_supported(),
+            "opset={opset}, {dtype:?}: {:?}",
+            claim.reason()
+        );
+        Ok::<(), onnx_runtime_loader::LoaderError>(())
     };
     for opset in [10, 23] {
-        let bf16 = claims(opset, DataType::BFloat16);
-        let reason = bf16.reason().expect("pre-24 BF16 must be rejected");
+        let reason = admit(opset, DataType::BFloat16).unwrap_err().to_string();
         assert!(
             reason.contains("BFloat16") && reason.contains("opset 24"),
             "{reason}"
         );
         for dtype in [DataType::Float16, DataType::Float32] {
-            assert!(
-                claims(opset, dtype).is_supported(),
-                "opset={opset}, {dtype:?}"
-            );
+            admit(opset, dtype).unwrap();
         }
     }
-    assert!(claims(24, DataType::BFloat16).is_supported());
+    admit(24, DataType::BFloat16).unwrap();
 }
 
 #[cfg_attr(

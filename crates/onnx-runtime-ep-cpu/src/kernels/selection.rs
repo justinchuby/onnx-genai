@@ -1209,7 +1209,7 @@ mod tests {
     }
 
     #[test]
-    fn topk_24_bfloat16_admission_and_execution() {
+    fn topk_24_bfloat16_values_and_indices() {
         let ep = CpuExecutionProvider::new();
         let mut node = Node::new(
             NodeId(0),
@@ -1221,16 +1221,6 @@ mod tests {
         let claim = |node: &Node, opset, dtype| {
             ep.supports_op(node, opset, &shapes, &[dtype, DataType::Int64], &[])
         };
-        for opset in [10, 23] {
-            let rejected = claim(&node, opset, DataType::BFloat16);
-            let reason = rejected.reason().expect("pre-24 BF16 must be rejected");
-            assert!(
-                reason.contains("BFloat16") && reason.contains("opset 24"),
-                "{reason}"
-            );
-            assert!(claim(&node, opset, DataType::Float16).is_supported());
-        }
-
         let input = Owned::bf16(&[6], &[4.5, 4.5, 0.25, -2.5, -2.5, -2.5]);
         let count = Owned::i64(&[1], &[2]);
         for (largest, expected_values, expected_indices) in

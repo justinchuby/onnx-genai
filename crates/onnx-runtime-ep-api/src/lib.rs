@@ -46,7 +46,6 @@ pub mod provider;
 pub mod registry;
 pub mod standard_math;
 pub mod tensor;
-pub mod topk;
 pub mod weight;
 pub mod workspace;
 pub use workspace::WorkspaceLayout;
