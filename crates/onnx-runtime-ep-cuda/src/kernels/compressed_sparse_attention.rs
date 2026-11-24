@@ -18,9 +18,9 @@
 //!
 //! ## Capture support
 //!
-//! Both fully device-resident FP8 paths reserve stable scratch at construction,
+//! Both fully device-resident FP8 paths borrow caller-owned computational scratch,
 //! read logical cursors on device, and are CUDA-graph capture compatible after
-//! eager NVRTC warmup.
+//! eager NVRTC warmup with a real caller workspace pin.
 //!
 //! ## Claim-time gating
 //!
@@ -37,7 +37,9 @@ use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
-    DeviceGraphResource, Kernel, KernelFactory, Result, TensorMut, TensorView,
+    EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceExecutionPreparation, WorkspaceLayout, WorkspaceLifetime, WorkspacePreparation,
+    WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ep_cpu::kernels::compressed_sparse_attention::CompressedSparseAttentionFactory as CpuCsaFactory;
 use onnx_runtime_ir::{
@@ -47,7 +49,7 @@ use onnx_runtime_ir::{
 use crate::error::{driver_err, not_implemented};
 use crate::kernels::block_quant;
 use crate::kernels::csa_checkpoint::{CsaAttentionMode, CsaCursors, CsaLayerMetrics, CsaMetrics};
-use crate::kernels::csa_device_state::{CsaBufferLayout, CsaDeviceBufferManager};
+use crate::kernels::csa_layout::CsaBufferLayout;
 use crate::kernels::csa_state_group::CsaStateGroupDescriptor;
 use crate::runtime::{CudaRuntime, cuptr};
 
@@ -64,60 +66,77 @@ const WS_RATIO128_ATTN: usize = 0;
 /// per-row attention score scratch stride.
 const RATIO4_DENSE_WINDOW: usize = 128;
 
-/// Fixed-capacity (D3) byte sizes for pooled workspaces, computed
-/// from the reserved [`CsaBufferLayout`] so the device-only capture path never
-/// allocates per call.
-fn csa_workspace_bytes(
-    node: &Node,
-    input_shapes: &[Vec<usize>],
-    layout: &CsaBufferLayout,
-) -> Vec<usize> {
-    let ratio = node
-        .attr("compression_ratio")
-        .and_then(|attribute| attribute.as_int())
-        .unwrap_or(0);
-    let query = match input_shapes.first() {
-        Some(shape) if shape.len() >= 4 => shape,
-        _ => return Vec::new(),
+/// One checked, non-owning composite. All four ratio-4 stages keep their
+/// original simultaneous capacity; this does not compress live ranges.
+#[derive(Clone, Copy)]
+struct CsaScratchGeometry {
+    rows: usize,
+    heads: usize,
+    index_heads: usize,
+    index_dim: usize,
+    records: usize,
+    topk: usize,
+    ratio: u64,
+}
+
+fn csa_scratch_layout(geometry: CsaScratchGeometry) -> Result<WorkspaceLayout<4>> {
+    let CsaScratchGeometry {
+        rows,
+        heads,
+        index_heads,
+        index_dim,
+        records,
+        topk,
+        ratio,
+    } = geometry;
+    let product = |dims: &[usize], label: &str| -> Result<usize> {
+        if dims.contains(&0) {
+            return Ok(0);
+        }
+        dims.iter().try_fold(1usize, |n, &d| n.checked_mul(d)).ok_or_else(|| not_implemented(format!("{OP}: {label} scratch geometry {dims:?} exceeds addressable capacity; reduce batch, query rows, heads or record capacity")))
     };
-    let attr_usize = |name: &str| -> usize {
-        node.attr(name)
-            .and_then(|attribute| attribute.as_int())
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(0)
+    let stride = RATIO4_DENSE_WINDOW
+        .checked_add(if ratio == 128 { records } else { topk })
+        .ok_or_else(|| {
+            not_implemented(format!(
+                "{OP}: attention scratch stride overflow; reduce record or selection capacity"
+            ))
+        })?;
+    let sizes = if ratio == 128 {
+        [
+            product(&[rows, heads, stride, 4], "ratio-128 attention")?,
+            0,
+            0,
+            0,
+        ]
+    } else {
+        [
+            product(&[rows, index_heads, index_dim, 4], "index transform")?,
+            product(&[rows, records, 4], "index scores")?,
+            product(&[rows, topk, 4], "index selection")?,
+            product(&[rows, heads, stride, 4], "ratio-4 attention")?,
+        ]
     };
-    let batch = query[0];
-    let sequence = query[1];
-    let heads = query[2];
-    let rows = batch.saturating_mul(sequence);
-    let f32 = std::mem::size_of::<f32>();
-    if ratio == 128 {
-        let max_records = layout.max_seq_len.div_ceil(128);
-        return vec![
-            rows.saturating_mul(heads)
-                .saturating_mul(RATIO4_DENSE_WINDOW.saturating_add(max_records))
-                .saturating_mul(f32),
-        ];
+    let mut regions = [std::alloc::Layout::new::<()>(); 4];
+    for (index, size) in sizes.into_iter().enumerate() {
+        if size != 0 {
+            regions[index] = std::alloc::Layout::from_size_align(size, 256).map_err(|source| EpError::Backend {
+                operation: "plan CSA caller scratch region; reduce batch, query or record capacity",
+                source: Box::new(source),
+            })?;
+        }
     }
-    if ratio != 4 {
-        return Vec::new();
-    }
-    let index_heads = attr_usize("index_num_heads");
-    let index_dim = attr_usize("index_head_dim");
-    let max_records = layout.max_seq_len.div_ceil(4);
-    let max_topk = max_records.min(512);
-    let rows_attn = rows.saturating_mul(heads);
-    let i32 = std::mem::size_of::<i32>();
-    vec![
-        rows.saturating_mul(index_heads)
-            .saturating_mul(index_dim)
-            .saturating_mul(f32),
-        rows.saturating_mul(max_records).saturating_mul(f32),
-        rows.saturating_mul(max_topk).saturating_mul(i32),
-        rows_attn
-            .saturating_mul(RATIO4_DENSE_WINDOW.saturating_add(max_topk))
-            .saturating_mul(f32),
-    ]
+    WorkspaceLayout::new(regions)
+}
+
+fn csa_scratch_requirement(layout: &WorkspaceLayout<4>) -> Result<WorkspaceRequirement> {
+    Ok(WorkspaceRequirement {
+        bytes: u64::try_from(layout.bytes()).map_err(|_| {
+            not_implemented("CSA caller workspace exceeds u64; reduce scratch geometry")
+        })?,
+        alignment: 256,
+        lifetime: WorkspaceLifetime::SessionPersistent,
+    })
 }
 
 /// Device stage-7 (sparse sink-softmax attention) + stage-6 (candidate read)
@@ -1018,33 +1037,10 @@ impl KernelFactory for CompressedSparseAttentionFactory {
                 .expect("CPU factory accepted compression_ratio"),
         )
         .expect("CPU factory accepted positive compression_ratio");
-        // This is runner initialization, never capability claiming: reserve every
-        // fixed-address stream now so an OOM fails before any execution.
-        let layout = CsaBufferLayout::from_runner(node, input_shapes, ratio)?;
-        // B6 pooled scratch: the device-only capture path never allocates per
-        // call, so size every workspace to the fixed-capacity (D3) bound now and
-        // reserve stable addresses.
-        let workspace_bytes = csa_workspace_bytes(node, input_shapes, &layout);
-        // B6 accounting authority: reserve a per-(request, device) charge on the
-        // shared CSA state-group ledger BEFORE any device allocation, so the
-        // ledger is the single accountant for every CSA device buffer and an
-        // over-limit group fails closed with a typed refusal instead of leaking.
-        // `validate` carries the property gate (ratio/cache_format/head geometry
-        // /device/state-edge) so an unsupported config is refused with its
-        // reason rather than reaching CUDA. When the ledger is unlimited (the
-        // default) the reservation is byte-identical to the pre-accounting path.
-        let ledger = self.metrics.state_group_ledger();
-        let request_id = ledger.next_request_id();
-        let descriptor =
-            CsaStateGroupDescriptor::from_node(node, self.runtime.ordinal(), 1, request_id)?;
-        descriptor.validate()?;
-        let device_state = CsaDeviceBufferManager::reserve(
-            self.runtime.clone(),
-            layout,
-            &workspace_bytes,
-            ledger,
-            descriptor.charge_key(),
-        )?;
+        // Compile semantic capacity facts only. Scratch admission belongs to
+        // the caller's common owner, never to a runner-private lease ledger.
+        let capacity_layout = CsaBufferLayout::from_runner(node, input_shapes, ratio)?;
+        CsaStateGroupDescriptor::from_node(node, 1)?.validate()?;
 
         // Ratio-128 compression and attention both consume graph-threaded device
         // state. Hybrid FP8 is fully resident/capturable; f32 retains the
@@ -1073,7 +1069,7 @@ impl KernelFactory for CompressedSparseAttentionFactory {
         // flag keys strictly on ratio; the output-count gate lives at dispatch.
         let device_ratio4_attention = ratio == 4;
         // Capture eligibility requires every output to be produced by kernels
-        // reading device-resident cursors with stable pooled scratch.
+        // reading device-resident cursors with pinned caller scratch.
         let capturable = device_resident_ratio128
             || (device_main_compression
                 && device_index_compression
@@ -1110,7 +1106,7 @@ impl KernelFactory for CompressedSparseAttentionFactory {
         Ok(Box::new(CompressedSparseAttentionKernel {
             runtime: self.runtime.clone(),
             inner,
-            device_state,
+            capacity_layout,
             dispatch,
             device_compression,
             device_resident_ratio128,
@@ -1156,8 +1152,8 @@ impl KernelFactory for CompressedSparseAttentionFactory {
 struct CompressedSparseAttentionKernel {
     runtime: Arc<CudaRuntime>,
     inner: Box<dyn Kernel>,
-    // Kept alive for stable device addresses; B0 still uses graph-threaded state.
-    device_state: CsaDeviceBufferManager,
+    // Pure graph-declared bounds; graph-threaded state has native session owners.
+    capacity_layout: CsaBufferLayout,
     dispatch: CsaStageDispatch,
     /// Ratio-128 stage-1 device kernel.
     device_compression: bool,
@@ -1399,7 +1395,88 @@ fn dense_host_to_device_view(
 
 #[cfg(test)]
 mod host_staging_layout_tests {
-    use super::dense_copy_chunks;
+    use super::{CsaScratchGeometry, csa_scratch_layout, dense_copy_chunks};
+    use onnx_runtime_ep_api::WorkspaceView;
+
+    #[test]
+    fn caller_scratch_keeps_the_full_peak_and_checked_regions() {
+        let geometry = CsaScratchGeometry {
+            rows: 4,
+            heads: 2,
+            index_heads: 2,
+            index_dim: 3,
+            records: 8,
+            topk: 5,
+            ratio: 4,
+        };
+        let layout = csa_scratch_layout(geometry).unwrap();
+        assert_eq!(layout.bytes(), 768 + 4 * 2 * (128 + 5) * 4);
+        let ptr = onnx_runtime_ep_api::DevicePtrMut(0x1000usize as *mut _);
+        let regions = layout
+            .bind(Some(WorkspaceView::new(ptr, layout.bytes())))
+            .unwrap();
+        assert_eq!(
+            regions.map(|r| r.ptr().0 as usize),
+            [0x1000, 0x1100, 0x1200, 0x1300]
+        );
+        assert!(layout.bind(None).is_err());
+        assert!(
+            layout
+                .bind(Some(WorkspaceView::new(ptr, layout.bytes() - 1)))
+                .is_err()
+        );
+        let ratio128 = csa_scratch_layout(CsaScratchGeometry {
+            index_heads: 0,
+            index_dim: 0,
+            topk: 0,
+            ratio: 128,
+            ..geometry
+        })
+        .unwrap();
+        assert_eq!(ratio128.bytes(), 4 * 2 * (128 + 8) * 4);
+        assert_eq!(
+            csa_scratch_layout(CsaScratchGeometry {
+                rows: 0,
+                ..geometry
+            })
+            .unwrap()
+            .bytes(),
+            0
+        );
+        assert!(
+            csa_scratch_layout(CsaScratchGeometry {
+                rows: usize::MAX,
+                ..geometry
+            })
+            .is_err()
+        );
+        assert!(
+            csa_scratch_layout(CsaScratchGeometry {
+                rows: 1,
+                heads: 1,
+                index_heads: 0,
+                index_dim: 0,
+                records: usize::MAX,
+                topk: 0,
+                ratio: 128
+            })
+            .is_err()
+        );
+        assert!(
+            csa_scratch_layout(CsaScratchGeometry {
+                index_heads: 0,
+                index_dim: 0,
+                records: 64,
+                topk: 0,
+                ratio: 128,
+                ..geometry
+            })
+            .unwrap()
+            .bytes()
+                > ratio128.bytes(),
+            "live physical record capacity must enlarge the bound"
+        );
+    }
 
     #[test]
     fn fixed_batch_row_stride_copies_one_dense_chunk_per_row() {
@@ -1528,12 +1605,72 @@ impl CsaGoldenCapture {
 }
 
 impl CompressedSparseAttentionKernel {
+    fn scratch_layout(
+        &self,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+    ) -> Result<WorkspaceLayout<4>> {
+        let empty = || WorkspaceLayout::new([std::alloc::Layout::new::<()>(); 4]);
+        let ratio128 = self.device_attention && self.ratio == 128;
+        let ratio4 = self.ratio == 4 && outputs.len() == 6;
+        if self.force_host || (!ratio128 && !ratio4) {
+            return empty();
+        }
+        let query = inputs
+            .first()
+            .ok_or_else(|| not_implemented("CSA missing query input for workspace planning"))?;
+        let [batch, sequence, heads, _] = <[usize; 4]>::try_from(query.shape).map_err(|_| {
+            not_implemented(format!(
+                "{OP}: caller scratch requires rank-4 query, got {:?}",
+                query.shape
+            ))
+        })?;
+        let rows = batch.checked_mul(sequence).ok_or_else(|| {
+            not_implemented("CSA query row count overflow; reduce batch or query sequence")
+        })?;
+        let output = outputs.get(if ratio128 { 1 } else { 3 }).ok_or_else(|| {
+            not_implemented("CSA missing present record output for workspace planning")
+        })?;
+        let physical_records = record_row_capacity(
+            output.shape,
+            output.strides,
+            "present records for caller scratch",
+        )?;
+        let records = self
+            .capacity_layout
+            .max_seq_len
+            .div_ceil(self.ratio as usize)
+            .max(physical_records);
+        let topk = self.capacity_layout.max_seq_len.div_ceil(4).min(512);
+        if ratio4 {
+            let actual_topk = outputs[5].shape.get(3).copied().ok_or_else(|| {
+                not_implemented(
+                    "CSA selected_indices output must have rank 4 for workspace planning",
+                )
+            })?;
+            if actual_topk > topk {
+                return Err(not_implemented(format!(
+                    "{OP}: topk_width {actual_topk} exceeds declared selection capacity {topk}; increase max_seq_len or reduce top-k"
+                )));
+            }
+        }
+        csa_scratch_layout(CsaScratchGeometry {
+            rows,
+            heads,
+            index_heads: self.index_num_heads,
+            index_dim: self.index_head_dim,
+            records,
+            topk,
+            ratio: self.ratio,
+        })
+    }
+
     fn run_host_staged_pipeline(
         &self,
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
     ) -> Result<()> {
-        let _stable_capacity = self.device_state.layout.max_seq_len;
+        let _stable_capacity = self.capacity_layout.max_seq_len;
         for stage in CsaPipelineStage::ALL {
             self.golden_capture
                 .record(stage, self.dispatch.mode(stage), inputs);
@@ -1548,6 +1685,7 @@ impl CompressedSparseAttentionKernel {
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
         sync: bool,
+        scratch: &[WorkspaceView; 4],
     ) -> Result<()> {
         let [batch, sequence, heads, dim] = inputs[0].shape.try_into().map_err(|_| {
             not_implemented(format!(
@@ -1601,7 +1739,7 @@ impl CompressedSparseAttentionKernel {
         };
         let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
         let total_ptr = cuptr(inputs[9].data_ptr::<u8>() as *const c_void);
-        let scratch = self.device_state.workspace(WS_RATIO128_ATTN);
+        let scratch = cuptr(scratch[WS_RATIO128_ATTN].ptr().0.cast_const());
         let source = format!("{}\n{}", block_quant::source(), ATTENTION_SOURCE);
         let func = self
             .runtime
@@ -1650,7 +1788,7 @@ impl CompressedSparseAttentionKernel {
             .arg(&scale);
         // SAFETY: argument types and order match `csa_ratio128_sink_attention`;
         // all pointers refer to live contiguous device allocations sized by the
-        // validated tensor shapes and fixed-capacity pooled scratch.
+        // validated tensor shapes and fixed-capacity caller scratch.
         unsafe {
             builder.launch(LaunchConfig {
                 grid_dim: (grid, 1, 1),
@@ -1675,6 +1813,7 @@ impl CompressedSparseAttentionKernel {
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
         sync: bool,
+        scratch: &[WorkspaceView; 4],
     ) -> Result<()> {
         let [batch, sequence, heads, dim] = inputs[0].shape.try_into().map_err(|_| {
             not_implemented(format!(
@@ -1688,7 +1827,7 @@ impl CompressedSparseAttentionKernel {
             "present_compressed_kv",
         )?;
         let topk_width = outputs[5].shape[3];
-        // B6: the per-row attention scratch is the pooled workspace with a fixed
+        // B6: the per-row attention scratch is the borrowed caller region with a fixed
         // stride bound (`RATIO4_DENSE_WINDOW + topk_width`). The kernel derives
         // the actual `dense_candidates`/`candidate_count` on device from the
         // `total_sequence_length` cursor, always <= this stride.
@@ -1722,7 +1861,7 @@ impl CompressedSparseAttentionKernel {
         } else {
             self.configured_scale
         };
-        let scratch = self.device_state.workspace(WS_ATTN);
+        let scratch = cuptr(scratch[WS_ATTN].ptr().0.cast_const());
         let source = format!("{}\n{}", block_quant::source(), RATIO4_ATTENTION_SOURCE);
         let func = self.runtime.nvrtc_function(
             RATIO4_ATTENTION_MODULE,
@@ -1938,10 +2077,16 @@ impl CompressedSparseAttentionKernel {
     /// Device-only ratio-128 hybrid-FP8 pipeline. Compression writes packed
     /// cache/carry outputs, then attention consumes the packed cache on the same
     /// non-default stream. The logical cursor stays device-resident throughout.
-    fn run_device_ratio128(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+    fn run_device_ratio128(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        scratch: &[WorkspaceView; 4],
+        capturing: bool,
+    ) -> Result<()> {
         self.run_device_compression(inputs, outputs, false)?;
-        self.run_device_attention(inputs, outputs, false)?;
-        if !self.runtime.is_capturing()? {
+        self.run_device_attention(inputs, outputs, false, scratch)?;
+        if !capturing {
             self.runtime.synchronize()?;
         }
         Ok(())
@@ -1950,7 +2095,7 @@ impl CompressedSparseAttentionKernel {
     /// B6 device-only, capture-clean pipeline for the ratio-4 fp8 6-output
     /// config. Every stage runs on device reading the `total_sequence_length`
     /// cursor, writing directly into the graph-threaded outputs using the
-    /// pre-reserved stable-address scratch. No host staging, no per-call
+    /// prepared, pinned caller scratch. No host staging, no per-call
     /// alloc/free. The four kernels are serialized on the single compute stream:
     /// main compression (outputs 1/2) → index compression (outputs 3/4) → index
     /// scoring + replicate (output 5) → fused sparse attention (output 0). The
@@ -1965,15 +2110,17 @@ impl CompressedSparseAttentionKernel {
         &self,
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
+        scratch: &[WorkspaceView; 4],
+        capturing: bool,
     ) -> Result<()> {
         self.run_device_main_compression(inputs, outputs, false)?;
         self.run_device_index_compression(inputs, outputs, false)?;
-        self.run_device_index_scoring(inputs, outputs, false)?;
-        self.run_device_ratio4_attention(inputs, outputs, false)?;
+        self.run_device_index_scoring(inputs, outputs, false, scratch)?;
+        self.run_device_ratio4_attention(inputs, outputs, false, scratch)?;
         // §8 metrics: record off the captured hot path only. `is_capturing` is a
         // cheap host query (no sync), so it is capture-safe; during capture we
         // skip recording entirely and the eager warmup pass supplies the sample.
-        if !self.runtime.is_capturing()? {
+        if !capturing {
             self.record_device_metrics(inputs, outputs);
             self.runtime.synchronize()?;
         }
@@ -2139,7 +2286,7 @@ impl CompressedSparseAttentionKernel {
     /// weighted-head-sum` scoring + deterministic top-k selection, then a device
     /// head-broadcast into `selected_indices` (output 5). Runs entirely on device
     /// — the logical cursor is read from `total_sequence_length` (input 9), the
-    /// scratch is the pre-reserved pooled workspaces (stable addresses, D3), and
+    /// scratch borrows the prepared caller parts (pinned during capture), and
     /// the selection is replicated by `csa_ratio4_index_replicate`. No host
     /// readback of indices (removes the B4/D5 host round trip), no per-call
     /// alloc/free. `sync` is `false` inside a captured region.
@@ -2148,6 +2295,7 @@ impl CompressedSparseAttentionKernel {
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
         sync: bool,
+        scratch: &[WorkspaceView; 4],
     ) -> Result<()> {
         let (batch, sequence) = (inputs[0].shape[0], inputs[0].shape[1]);
         let index_heads = self.index_num_heads;
@@ -2156,29 +2304,15 @@ impl CompressedSparseAttentionKernel {
             record_row_capacity(outputs[3].shape, outputs[3].strides, "present_index_key")?;
         // selected_indices is [batch, index_heads, sequence, topk_width].
         let topk_width = outputs[5].shape[3];
-        // N1 (B6): the pooled `WS_SELECTED` scratch is sized to `max_topk`
-        // (`max_seq_len/4`, capped at 512). A `topk_width` above that bound would
-        // overrun the fixed-capacity selection scratch, so gate it here.
-        let max_topk = self.device_state.layout.max_seq_len.div_ceil(4).min(512);
-        debug_assert!(
-            topk_width <= max_topk,
-            "CSA topk_width {topk_width} exceeds pooled WS_SELECTED bound {max_topk}"
-        );
-        if topk_width > max_topk {
-            return Err(not_implemented(format!(
-                "{OP}: topk_width {topk_width} exceeds pooled selection capacity {max_topk}"
-            )));
-        }
         if batch == 0 || sequence == 0 || index_heads == 0 || topk_width == 0 {
             return Ok(());
         }
 
-        // Pooled, stable-address scratch reserved at runner init (D3). The pooled
-        // buffers are sized to the fixed-capacity bound, so the actual per-call
-        // `records`/`topk_width` strides always fit.
-        let transformed = self.device_state.workspace(WS_TRANSFORMED);
-        let scores = self.device_state.workspace(WS_SCORES);
-        let selected = self.device_state.workspace(WS_SELECTED);
+        // The entry bound the complete caller peak for these fixed-capacity
+        // parts, including the live physical record-row strides.
+        let transformed = cuptr(scratch[WS_TRANSFORMED].ptr().0.cast_const());
+        let scores = cuptr(scratch[WS_SCORES].ptr().0.cast_const());
+        let selected = cuptr(scratch[WS_SELECTED].ptr().0.cast_const());
 
         let total = cuptr(inputs[9].data_ptr::<u8>() as *const c_void);
         let index_query = cuptr(inputs[11].data_ptr::<u8>() as *const c_void);
@@ -2224,7 +2358,7 @@ impl CompressedSparseAttentionKernel {
             .arg(&topk_i);
         // SAFETY: argument order/types match `csa_ratio4_index_select`; every
         // pointer is a live contiguous allocation sized by the shapes above (the
-        // pooled scratch is fixed-capacity), and one block per `(batch, query)`
+        // caller scratch retains the fixed-capacity peak), and one block per `(batch, query)`
         // row owns its scratch slices.
         unsafe {
             builder.launch(LaunchConfig {
@@ -2278,22 +2412,45 @@ impl CompressedSparseAttentionKernel {
     }
 }
 
-impl Kernel for CompressedSparseAttentionKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+impl CompressedSparseAttentionKernel {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        let layout = self.scratch_layout(inputs, outputs)?;
+        let scratch = layout.bind(workspace).map_err(|source| EpError::Backend {
+            operation: "bind CompressedSparseAttention complete caller workspace",
+            source: Box::new(source),
+        })?;
+        let capturing = self.runtime.is_capturing()?;
+        if capturing && layout.bytes() != 0 {
+            let used = WorkspaceView::new(
+                workspace
+                    .expect("nonempty layout bound a caller span")
+                    .ptr(),
+                layout.bytes(),
+            );
+            self.runtime.require_registered_workspace_capture(
+                used,
+                "CompressedSparseAttention computational scratch",
+            )?;
+        }
         if self.device_resident_ratio128 && !self.force_host {
-            return self.run_device_ratio128(inputs, outputs);
+            return self.run_device_ratio128(inputs, outputs, &scratch, capturing);
         }
         // B6/B7: the fully device-resident ratio-4 fp8 6-output config runs a
         // device-only pipeline — every stage reads the `total_sequence_length`
-        // cursor on device, uses pre-reserved stable-address scratch, and skips
+        // cursor on device, uses prepared, pinned caller scratch, and skips
         // the final stream sync while a CUDA graph is capturing. No host staging,
         // no per-call alloc/free, so the decode is capture-clean. This is the
         // **default** path after the B7 switchover (D7); the host-staged oracle
         // below stays reachable only when `ONNX_GENAI_CSA_FORCE_HOST` is set.
         if self.capturable && !self.force_host {
-            return self.run_capturable_ratio4(inputs, outputs);
+            return self.run_capturable_ratio4(inputs, outputs, &scratch, capturing);
         }
-        if self.runtime.is_capturing()? {
+        if capturing {
             return Err(onnx_runtime_ep_api::EpError::KernelFailed(
                 "CompressedSparseAttention reached its host-staged path during CUDA graph capture"
                     .into(),
@@ -2456,7 +2613,7 @@ impl Kernel for CompressedSparseAttentionKernel {
             && outputs.len() == 6
             && self.dispatch.mode(CsaPipelineStage::Selection) == CsaStageMode::Device
         {
-            self.run_device_index_scoring(inputs, outputs, true)?;
+            self.run_device_index_scoring(inputs, outputs, true, &scratch)?;
         }
 
         // B1 device stage-7: ratio-128 f32-cache consumes the f32 candidate
@@ -2469,7 +2626,7 @@ impl Kernel for CompressedSparseAttentionKernel {
                 .mode(CsaPipelineStage::SparseSinkSoftmaxAttention)
                 == CsaStageMode::Device
         {
-            self.run_device_attention(inputs, outputs, true)?;
+            self.run_device_attention(inputs, outputs, true, &scratch)?;
         }
 
         // B5 device stage-6/7: ratio-4 fused selection→attention. Gated on the
@@ -2488,7 +2645,7 @@ impl Kernel for CompressedSparseAttentionKernel {
                 .mode(CsaPipelineStage::SparseSinkSoftmaxAttention)
                 == CsaStageMode::Device
         {
-            self.run_device_ratio4_attention(inputs, outputs, true)?;
+            self.run_device_ratio4_attention(inputs, outputs, true, &scratch)?;
         }
 
         // §8 metrics for the host-staged (diagnostic / non-capturable) path.
@@ -2520,19 +2677,48 @@ impl Kernel for CompressedSparseAttentionKernel {
 
         self.runtime.synchronize()
     }
+}
+
+impl Kernel for CompressedSparseAttentionKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+    fn workspace_requirement(
+        &self,
+        _inputs: &[TensorMetadata<'_>],
+        _outputs: &[OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        // Record rows may have physical capacity in their live strides.
+        Ok(WorkspacePreparation::Deferred)
+    }
+    fn workspace_requirement_for_execution(
+        &self,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+        _metadata: &[TensorMetadata<'_>],
+        _output_metadata: &[OutputMetadata<'_>],
+        _cached: Option<WorkspacePreparation>,
+    ) -> Result<WorkspaceExecutionPreparation> {
+        csa_scratch_requirement(&self.scratch_layout(inputs, outputs)?)
+            .map(WorkspaceExecutionPreparation::Ready)
+    }
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
+    }
 
     fn supports_strided_input(&self, input_idx: usize) -> bool {
         let device_path = !self.force_host && (self.device_resident_ratio128 || self.capturable);
         !device_path || matches!(input_idx, 6 | 17)
     }
 
-    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        self.device_state.device_graph_resources()
-    }
-
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         // Ratio-4 fp8 six-output and ratio-128 fp8 three-output configurations
-        // run cursor-driven pipelines with pre-reserved stable-address scratch
+        // run cursor-driven pipelines with prepared, pinned caller scratch
         // and no per-call alloc/free/sync while capture is active.
         // `ONNX_GENAI_CSA_FORCE_HOST` (D7) forces the host-staged oracle, which
         // host-stages (D2H inputs, H2D outputs, per-copy syncs) — illegal during

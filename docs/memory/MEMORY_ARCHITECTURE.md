@@ -1546,6 +1546,63 @@ zero demand. Original numerical parity suites also use the public preparation
 seam. No CUDA device was available to execute these tests; Host plan/lock/query
 cost and end-to-end throughput remain unmeasured.
 
+### CSA computational scratch belongs to the native caller peak
+
+The former `CsaDeviceBufferManager` pinned raw buffers into a graph while its
+separate `CsaStateGroupCharge` lived only as long as the manager. That could
+refund a charge while graph references still held the addresses; wrapping the
+two in an Arc would still leave a second raw-pool/eager-retirement protocol.
+The computational buffers now borrow the same caller-owned SessionPersistent
+peak as other kernels. No CSA-specific lease, quota ticket, private allocation
+or per-region release remains. Graph-threaded `past_* → present_*` tensors keep
+their existing native state owners; the speculative checkpoint journal is a
+separate resource and is not changed here.
+
+`CompressedSparseAttention` registers Metadata planning. Metadata-only planning
+is Deferred because output record rows may expose physical capacity through
+live strides. Execution refinement is Host-only and returns a complete Ready
+layout. Ratio-4 retains its four simultaneous regions (index transform, scores,
+selection, attention scores); ratio-128 uses the first region for attention
+scores. The plan preserves the previous declared sequence-capacity bounds and
+enlarges record capacity when live physical row strides exceed them. Query rows
+use the current views. Byte products, stride addition and 256B region alignment
+are checked. Pure force-host and five-output ratio-4 paths need no compute
+scratch. Host-staged paths that append device stages borrow the same parts.
+
+Execution binds the complete span before submitting any stage. One real stream
+capture observation is reused by pipeline tails; capture requires a genuine
+registered caller pin covering the used span. The kernel no longer publishes
+private scratch resources or stores borrowed addresses. Sources and floating
+math remain unchanged. Eager warmup still prepares NVRTC modules, and captured
+addresses stay fixed until graph retirement.
+
+The old CSA workspace ledger, its RAII charge, request identities and public
+ledger getters on `CsaMetrics` are removed, with no compatibility facade.
+Capability validation remains property-driven in `csa_state_group`; pure
+capacity facts live in `csa_layout`. Metrics report execution observations, not
+an independent allocator. Budget refusal moves from kernel construction to
+public caller admission. Fitting serial invocations can share a root peak with
+no new quota callback. Native loan, pressure-idle, completion, failed-release and
+quarantine behavior is reused rather than reimplemented in CSA.
+
+A real graph pin is a borrowed OwnedView, not permission to discard the unique
+owner. The caller keeps that owner through replay, resets graph views, explicitly
+releases through the provider and waits for structured settlement. Dropping or
+releasing it while views remain is an ownership error that retains/quarantines
+charges; it must never be treated as successful refund. GPU regressions follow
+this order and check kernel drop cannot change caller accounting, then observe
+Released/zero allocation charge only after native settlement.
+
+Host checks cover complete four-region/one-region peaks, zero/overflow,
+physical-row capacity and unchanged property rejection. Existing native workspace
+Host tests retain the proof for exact warm grants, distinct concurrent runs,
+idle-only yielding, delegation and incomplete-release charge retention. GPU
+fixtures compile actual Metadata claims, allocation-free factory construction,
+warm root reuse without private allocation/transfer, malformed backing, raw or
+unregistered caller capture refusal, numerical parity and replay after kernel
+drop. CUDA execution and throughput remain unmeasured. The new Host layout/bind
+and capture-owner checks are not claimed to have zero cost.
+
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
 The dated audit and measurements below preserve historical evidence. The current
@@ -1578,8 +1635,7 @@ call; it owns the governed workspace preparation path
 | `kernels/attention.rs:830-831` | legacy `Attention` Phase-2a scores + cuBLASLt workspace | `align256(batch * num_heads * sq * sk * elem_size) + WORKSPACE_BYTES` | prompt/cache dependent score matrix + static cuBLASLt ceiling | step-scoped | **governed by #753** inside one composite workspace; direct-execute compatibility/opt-out fallback remains raw |
 | `kernels/csa_checkpoint.rs:126` | CSA checkpoint main carry snapshot | `main_carry_bytes.max(1)` | config/state shape | session-persistent | raw bypass |
 | `kernels/csa_checkpoint.rs:127` | CSA checkpoint index carry snapshot | `index_carry_bytes.max(1)` | config/state shape | session-persistent | raw bypass |
-| `kernels/csa_device_state.rs:160` | CSA device-state allocation/growth | `size` | config/state shape | session-persistent | raw bypass |
-| `kernels/csa_device_state.rs:169` | CSA device-state replacement | `size.max(1)` | config/state shape | session-persistent | raw bypass |
+| `kernels/compressed_sparse_attention.rs` | CSA computational scratch | checked caller composite | live query rows / declared and physical record capacity | SessionPersistent caller peak | private manager and charge removed; native owner settlement |
 | `kernels/elementwise.rs:699` | elementwise scalar/shape metadata upload | `metadata_bytes.len()` | op arity/rank | step-scoped | raw bypass |
 | `kernels/fused_gemm.rs` | fused GEMM cuBLASLt workspace | selected heuristic `workspaceSize` (ceiling `WORKSPACE_BYTES`) | shape/dtype/algorithm dependent | session-persistent shared peak | **governed by #799** via the shared exact plan/execute helper + prepared workspace |
 | `kernels/gemm.rs` | GEMM cuBLASLt workspace | selected heuristic `workspaceSize` (ceiling `WORKSPACE_BYTES`) | shape/dtype/algorithm dependent | session-persistent shared peak | **governed by #799** via the shared exact plan/execute helper + prepared workspace |

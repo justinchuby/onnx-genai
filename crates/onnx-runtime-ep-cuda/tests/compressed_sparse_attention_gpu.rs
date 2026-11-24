@@ -30,6 +30,8 @@
 //!
 //! CPU-only CI reports these tests as ignored unless `gpu-tests` is enabled.
 
+mod common;
+
 use onnx_runtime_ep_api::{
     CaptureSupport, DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch,
     TensorMut, TensorView,
@@ -672,8 +674,30 @@ fn run_gpu_observed(
 ) -> onnx_runtime_ep_api::Result<(Vec<Vec<u8>>, GpuExecutionObservation)> {
     let model = Model::new(graph);
     let concrete: Vec<Vec<usize>> = inputs.iter().map(|input| input.shape.clone()).collect();
-    let kernel = ep.get_kernel(model.graph.node(node), &concrete, 1)?;
+    let shapes = concrete
+        .iter()
+        .map(|shape| static_shape(shape.iter().copied()))
+        .collect::<Vec<_>>();
+    let dtypes = inputs.iter().map(|input| input.dtype).collect::<Vec<_>>();
+    let claim = ep.supports_op(model.graph.node(node), 1, &shapes, &dtypes, &[]);
+    assert!(
+        matches!(
+            claim,
+            KernelMatch::Supported {
+                workspace_planning: onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+                ..
+            }
+        ),
+        "{claim:?}"
+    );
     let runtime = ep.runtime();
+    let allocations = runtime.allocation_counts();
+    let kernel = ep.get_kernel(model.graph.node(node), &concrete, 1)?;
+    assert_eq!(
+        runtime.allocation_counts(),
+        allocations,
+        "factory may not allocate private CSA scratch"
+    );
 
     let mut buffers = Vec::<DeviceBuffer>::new();
     for input in inputs {
@@ -729,7 +753,14 @@ fn run_gpu_observed(
         .collect();
     let capture_supported = matches!(kernel.capture_support(), CaptureSupport::Supported);
     let before_transfers = runtime.transfer_counts();
-    let result = kernel.execute(&input_views, &mut out_views);
+    let mut workspace = None;
+    let mut result = common::execute_kernel(
+        ep,
+        kernel.as_ref(),
+        &input_views,
+        &mut out_views,
+        &mut workspace,
+    );
     let after_transfers = runtime.transfer_counts();
     let transfers = CudaTransferCounts {
         host_to_device: after_transfers
@@ -742,6 +773,47 @@ fn run_gpu_observed(
             .async_host_to_device
             .saturating_sub(before_transfers.async_host_to_device),
     };
+    if result.is_ok() && capture_supported && workspace.is_some() {
+        let allocations = runtime.allocation_counts();
+        let transfers = runtime.transfer_counts();
+        let pointer = workspace.as_ref().unwrap().as_ptr();
+        let prepared = kernel
+            .workspace_requirement_for_execution(&input_views, &out_views, &[], &[], None)?
+            .require_ready()?;
+        let view = common::prepare_workspace(ep, prepared, &mut workspace)?;
+        let request_bytes = prepared.bytes as usize;
+        for offered in [
+            None,
+            Some(onnx_runtime_ep_api::WorkspaceView::new(
+                view.unwrap().ptr(),
+                request_bytes - 1,
+            )),
+        ] {
+            let message = kernel
+                .execute_with_workspace(&input_views, &mut out_views, offered)
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains("complete caller workspace"), "{message}");
+        }
+        result = common::execute_kernel(
+            ep,
+            kernel.as_ref(),
+            &input_views,
+            &mut out_views,
+            &mut workspace,
+        );
+        assert_eq!(workspace.as_ref().unwrap().as_ptr(), pointer);
+        assert_eq!(
+            runtime.allocation_counts(),
+            allocations,
+            "fitting warm root adds no private allocation/free"
+        );
+        assert_eq!(
+            runtime.transfer_counts(),
+            transfers,
+            "device-only warm CSA adds no transfer"
+        );
+    }
     drop(out_views);
     drop(input_views);
 
@@ -755,6 +827,9 @@ fn run_gpu_observed(
             }
             outputs.push(host);
         }
+    }
+    if let Some(owner) = workspace {
+        ep.deallocate_workspace(owner)?;
     }
     for buffer in buffers {
         ep.deallocate(buffer)?;
@@ -2172,7 +2247,7 @@ fn ratio4_decode_step(
 
 /// Execute the node on the CUDA EP by capturing a single `execute` into a CUDA
 /// graph and replaying it via `cuGraphLaunch`. Uses one kernel instance so the
-/// pooled workspace addresses are stable across warmup/capture/replay. The
+/// caller workspace addresses are pinned across capture/replay. The
 /// output buffers are zeroed after warmup and before capture, so the returned
 /// bytes are produced solely by the graph replay (never the warmup pass).
 fn run_gpu_capture_replay(
@@ -2182,11 +2257,6 @@ fn run_gpu_capture_replay(
     inputs: &[HostTensor],
     output_specs: &[OutputSpec],
 ) -> onnx_runtime_ep_api::Result<Vec<Vec<u8>>> {
-    use cudarc::driver::sys::{
-        CUgraph, CUgraphExec, CUstreamCaptureMode, cuGraphDestroy, cuGraphExecDestroy,
-        cuGraphInstantiateWithFlags, cuGraphLaunch, cuStreamBeginCapture_v2, cuStreamEndCapture,
-    };
-
     let model = Model::new(graph);
     let concrete: Vec<Vec<usize>> = inputs.iter().map(|input| input.shape.clone()).collect();
     let kernel = ep.get_kernel(model.graph.node(node), &concrete, 1)?;
@@ -2252,12 +2322,19 @@ fn run_gpu_capture_replay(
             .collect()
     };
 
+    let mut workspace = None;
     // Warmup: an eager execute compiles/caches every NVRTC kernel and primes the
-    // fixed-address device state before capture (module loads during capture are
+    // caller workspace and NVRTC cache before capture (module loads during capture are
     // avoided by the cache hit).
     {
         let mut out_views = make_out_views(&mut out_buffers);
-        kernel.execute(&input_views, &mut out_views)?;
+        common::execute_kernel(
+            ep,
+            kernel.as_ref(),
+            &input_views,
+            &mut out_views,
+            &mut workspace,
+        )?;
     }
     runtime.synchronize()?;
 
@@ -2271,50 +2348,107 @@ fn run_gpu_capture_replay(
     }
     runtime.synchronize()?;
 
-    let stream = runtime.stream_ptr();
-    let mut graph_handle: CUgraph = std::ptr::null_mut();
-    let mut graph_exec: CUgraphExec = std::ptr::null_mut();
-
-    // Capture the device-only pipeline into a CUDA graph, then instantiate and
-    // launch it. The captured `execute` performs no host staging, no per-call
-    // alloc/free, and skips the trailing sync while capturing.
-    let captured = (|| -> onnx_runtime_ep_api::Result<()> {
-        // SAFETY: `stream` is the EP's live compute stream.
-        unsafe {
-            cuStreamBeginCapture_v2(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)
-                .result()
-                .map_err(|error| {
-                    onnx_runtime_ep_api::EpError::KernelFailed(format!(
-                        "cuStreamBeginCapture_v2: {error:?}"
-                    ))
-                })?;
-        }
+    let view = {
+        let out_views = make_out_views(&mut out_buffers);
+        common::prepare_kernel_workspace(
+            ep,
+            kernel.as_ref(),
+            &input_views,
+            &out_views,
+            &mut workspace,
+        )?
+    };
+    let resource = workspace
+        .as_ref()
+        .expect("CSA device path uses a caller peak")
+        .device_graph_resource()?
+        .expect("caller owner must have a real graph pin");
+    let identity = workspace
+        .as_ref()
+        .unwrap()
+        .bound_owner()
+        .unwrap()
+        .identity();
+    let settlement = workspace
+        .as_ref()
+        .unwrap()
+        .managed_settlement_wait()
+        .unwrap();
+    let manager = ep.process_memory_manager();
+    let charged = || {
+        manager
+            .snapshot()
+            .unwrap()
+            .allocations
+            .into_iter()
+            .find(|a| a.identity == identity)
+            .map_or(0, |a| a.charged_bytes)
+    };
+    assert!(charged() > 0);
+    #[cfg(feature = "gpu-tests")]
+    {
+        runtime
+            .stream()
+            .begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )
+            .unwrap();
+        let allocations = runtime.allocation_counts();
+        let transfers = runtime.transfer_counts();
         let mut out_views = make_out_views(&mut out_buffers);
-        let record = kernel.execute(&input_views, &mut out_views);
+        assert!(
+            kernel
+                .execute_with_workspace(&input_views, &mut out_views, view)
+                .unwrap_err()
+                .to_string()
+                .contains("real workspace owner")
+        );
+        assert_eq!(runtime.allocation_counts(), allocations);
+        assert_eq!(runtime.transfer_counts(), transfers);
+        assert_eq!(
+            runtime.stream_capture_status()?,
+            cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
+        );
+        runtime.test_end_unregistered_graph_capture().unwrap();
+    }
+    runtime.begin_graph_capture(&[kernel.as_ref()])?;
+    {
+        let allocations = runtime.allocation_counts();
+        let transfers = runtime.transfer_counts();
+        let mut out_views = make_out_views(&mut out_buffers);
+        let message = kernel
+            .execute_with_workspace(&input_views, &mut out_views, view)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("real workspace owner"), "{message}");
+        assert_eq!(
+            runtime.stream_capture_status()?,
+            cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
+        );
+        assert_eq!(runtime.allocation_counts(), allocations);
+        assert_eq!(runtime.transfer_counts(), transfers);
+    }
+    runtime.abort_graph_capture()?;
+    let captured = (|| -> onnx_runtime_ep_api::Result<()> {
+        runtime.begin_graph_capture_with_resources(&[kernel.as_ref()], vec![resource])?;
+        let mut out_views = make_out_views(&mut out_buffers);
+        if let Err(error) = kernel.execute_with_workspace(&input_views, &mut out_views, view) {
+            runtime.abort_graph_capture()?;
+            return Err(error);
+        }
         drop(out_views);
-        // Always end capture to leave the stream in a clean state, even on error.
-        // SAFETY: `stream` is capturing; `graph_handle` is a valid out-pointer.
-        let end = unsafe { cuStreamEndCapture(stream, &mut graph_handle) }
-            .result()
-            .map_err(|error| {
-                onnx_runtime_ep_api::EpError::KernelFailed(format!("cuStreamEndCapture: {error:?}"))
-            });
-        record?;
-        end?;
-        // SAFETY: `graph_handle` is a freshly captured non-null graph.
-        unsafe { cuGraphInstantiateWithFlags(&mut graph_exec, graph_handle, 0) }
-            .result()
-            .map_err(|error| {
-                onnx_runtime_ep_api::EpError::KernelFailed(format!(
-                    "cuGraphInstantiateWithFlags: {error:?}"
-                ))
-            })?;
-        // SAFETY: `graph_exec` is instantiated; `stream` is the EP stream.
-        unsafe { cuGraphLaunch(graph_exec, stream) }
-            .result()
-            .map_err(|error| {
-                onnx_runtime_ep_api::EpError::KernelFailed(format!("cuGraphLaunch: {error:?}"))
-            })?;
+        runtime.end_graph_capture()?;
+        // Kernel lifetime no longer owns scratch accounting. Keep the unique
+        // caller owner until graph views retire; early drop/release would be
+        // an ownership error that correctly retains/quarantines quota.
+        let before = charged();
+        drop(kernel);
+        assert_eq!(
+            charged(),
+            before,
+            "installed graph must retain real caller accounting"
+        );
+        runtime.replay_graph()?;
         runtime.synchronize()
     })();
 
@@ -2330,14 +2464,20 @@ fn run_gpu_capture_replay(
         }
     }
 
-    if !graph_exec.is_null() {
-        // SAFETY: `graph_exec` was instantiated above and is destroyed once.
-        let _ = unsafe { cuGraphExecDestroy(graph_exec) }.result();
+    runtime.reset_graph()?;
+    if let Some(owner) = workspace.take() {
+        ep.deallocate_workspace(owner)?;
     }
-    if !graph_handle.is_null() {
-        // SAFETY: `graph_handle` was captured above and is destroyed once.
-        let _ = unsafe { cuGraphDestroy(graph_handle) }.result();
-    }
+    common::drain_releases(ep, "CSA graph caller workspace retirement");
+    assert_eq!(
+        settlement.wait(std::time::Duration::from_secs(30)),
+        onnx_runtime_memory_governor::AllocationSettlementStatus::Released
+    );
+    assert_eq!(
+        charged(),
+        0,
+        "only completed native settlement may return caller quota"
+    );
     for buffer in buffers {
         ep.deallocate(buffer)?;
     }

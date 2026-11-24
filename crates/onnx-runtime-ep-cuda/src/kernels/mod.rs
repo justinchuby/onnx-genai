@@ -54,7 +54,7 @@ pub mod constant_of_shape;
 pub mod conv;
 pub mod conv_transpose;
 pub mod csa_checkpoint;
-pub mod csa_device_state;
+mod csa_layout;
 pub mod csa_state_group;
 pub mod cumprod;
 pub mod cumsum;
@@ -1405,7 +1405,7 @@ pub fn build_cuda_registry_with_metrics(
     );
     reg.register(
         OpKey::new("CompressedSparseAttention", "pkg.nxrt", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(
             compressed_sparse_attention::CompressedSparseAttentionFactory {
                 runtime: runtime.clone(),
