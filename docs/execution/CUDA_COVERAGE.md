@@ -122,7 +122,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | Op | Domain | Status | Backend | Notes / justification |
 |----|--------|--------|---------|-----------------------|
 | `MaxPool` | `` | ✅ | **cuDNN** `cudnnPoolingForward` | 2-D NCHW f32/f16/bf16; kernel, strides, symmetric explicit padding, `VALID`, and symmetric `SAME_UPPER`/`SAME_LOWER`. `ceil_mode=1`, dilated pooling, `storage_order`, asymmetric padding, and the optional ONNX Indices output are rejected explicitly. |
-| `AveragePool` | `` | ✅ | **cuDNN** `cudnnPoolingForward` | Same geometry/dtypes; `count_include_pad` maps to cuDNN include/exclude-padding modes. `ceil_mode=1`, dilation, `storage_order`, and asymmetric padding are rejected explicitly. |
+| `AveragePool` | `` | ✅ | **cuDNN** / **NVRTC** | Unit dilation keeps the 2-D NCHW cuDNN path (symmetric padding and floor mode only). Non-unit dilation uses a native N-D CUDA kernel (opset ≥19), with explicit or automatic padding, ceil mode, and both divisors. Contiguous f32/f16, plus bf16 in opset ≥22; f64 is not supported. |
 | `LpPool` | `` | ✅ | **NVRTC-custom** | Arbitrary-rank NCHW-style f32/f16/bf16 Lp window reduction with positive integer `p`, strides, dilation, explicit/automatic padding, and `ceil_mode`; accumulation widens to f32 (`pooling.rs`). |
 | `GlobalAveragePool`, `GlobalMaxPool`, `GlobalLpPool` | `` | ✅ | **NVRTC block reduction** | Arbitrary-rank NCHW-style f32/f16/bf16 global spatial reduction. Average, max, and integer-`p` Lp semantics match the CPU EP (`global_reduction.rs`). |
 

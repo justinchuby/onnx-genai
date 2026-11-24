@@ -192,8 +192,33 @@ fn skip_metadata_replacement_and_capture_keep_one_immutable_owner() {
     execute(&shape_a, &skip_a).unwrap();
     runtime.end_graph_capture().unwrap();
 
+    let before_invalid = (
+        runtime.allocation_counts(),
+        runtime.transfer_counts(),
+        runtime.forced_synchronization_count(),
+    );
+    assert!(
+        kernel
+            .execute(&[], &mut [])
+            .unwrap_err()
+            .to_string()
+            .contains("expected 3-4 inputs")
+    );
+    assert_eq!(
+        (
+            runtime.allocation_counts(),
+            runtime.transfer_counts(),
+            runtime.forced_synchronization_count()
+        ),
+        before_invalid,
+        "invalid input must not prepare, publish or drain metadata"
+    );
+    assert_eq!(kernel.device_graph_resources()[0].identity(), identity_a);
+    assert!(!kernel.cuda_graph_compatible());
     #[cfg(feature = "gpu-tests")]
     {
+        let before_failure = runtime.forced_synchronization_count();
+        let uploads = runtime.transfer_counts().host_to_device;
         runtime.fail_warm_transaction_at_for_test(1);
         assert!(
             execute(&shape_b, &skip_b)
@@ -202,12 +227,26 @@ fn skip_metadata_replacement_and_capture_keep_one_immutable_owner() {
                 .contains("injected staged warm-cache failure")
         );
         assert_eq!(kernel.device_graph_resources()[0].identity(), identity_a);
+        assert_eq!(
+            runtime.forced_synchronization_count(),
+            before_failure,
+            "failed candidate must retire without a rollback drain"
+        );
+        assert_eq!(
+            runtime.transfer_counts().host_to_device,
+            uploads + 1,
+            "the submitted candidate's synchronous H2D remains tracked separately"
+        );
         assert!(
             !kernel.cuda_graph_compatible(),
             "failed rewarm must revoke readiness even while graph A remains pinned"
         );
     }
+    let before_rewarm = runtime.forced_synchronization_count();
+    let uploads = runtime.transfer_counts().host_to_device;
     execute(&shape_b, &skip_b).unwrap();
+    assert_eq!(runtime.forced_synchronization_count(), before_rewarm);
+    assert_eq!(runtime.transfer_counts().host_to_device, uploads + 1);
     assert_ne!(kernel.device_graph_resources()[0].identity(), identity_a);
     assert!(kernel.cuda_graph_compatible());
     drop(kernel);

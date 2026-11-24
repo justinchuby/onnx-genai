@@ -645,30 +645,80 @@ do not validate device arithmetic, asynchronous failure ordering or throughput.
 ### BF16 converted constants are immutable per signature
 
 MatMulNBits keeps one prepared record containing the source signature, checked
-composite layout and actual optional `GraphDeviceAllocation` owner. Capacity is
-derived from that owner. Warm hits perform signature comparison, layout binding
-and capture ownership validation; they do not allocate, convert or synchronize.
-Zero-element constants require no device backing.
+composite layout and actual optional `NativeDeviceAllocation` owner. Capacity is
+derived from that owner. Warm BF16 hits borrow an ArcSwap guard and bind the
+existing immutable composite, without a signature Vec, owner clone, cache mutex,
+conversion, allocation or quota request/return. Zero-element constants require
+no device backing. Non-BF16 execution does not touch this cache: no per-call
+`used` flag or `begin_call` initialization is needed. Resource collection may
+conservatively pin the one retained record even if the most recent route did
+not consume it, rather than maintaining a second last-call ownership state.
 
 A changed signature validates every source extent and cast limit, refuses real
 stream capture, and prepares a new complete composite. It never overwrites the
-previous allocation merely because its capacity fits. Prior compute readers are
-drained at this cold boundary even with eager synchronization deferred. Only
-successful conversion submissions and the preparation checkpoint publish the
-replacement. Errors leave the previous record intact; outer execution still
-clears capture readiness on failure. An already captured graph retains its old
-owner and converted contents until graph retirement. This is resource reuse by
-signature and lifetime, without per-operand quota tickets or a new EP protocol.
+previous allocation merely because its capacity fits. Successful conversion
+submissions and the preparation checkpoint publish the replacement; errors leave
+the previous record intact and outer execution clears capture readiness. The
+caller keeps its exact borrowed record through every GEMV/GEMM and output cast,
+including partial submission failure. Cold publication returns the candidate
+it prepared rather than reloading a potentially different signature.
 
-Registered capture hits must pin the real artifact owner. Raw/unregistered
-capture cannot embed a warm private pointer, and a capture miss rejects before
-allocation or conversion. Host tests exercise operand count, empty layouts,
-regions, source address overflow and int32 conversion limits. A GPU fixture
-covers warm no-work counters, failed replacement, same-size replacement after
-capture, old graph replay and raw-capture refusal. It is compiled/listed on this
-Host, not executed; device arithmetic, lifetime behavior and performance remain
-unmeasured. Its retained-artifact owner now uses the provider's native domain
-for admission, ownership and structured deferred settlement.
+Old readers and captured graphs keep their independent native owners. Final
+retirement uses the existing stream-ordered queue instead of globally draining
+compute/copy before replacing immutable data. This removes an explicit cold
+synchronization, without adding a pool, ledger or per-operand ticket. Kernel
+execution, resource enumeration and capture retain their existing exclusive
+execution contract; guard lifetime alone does not authorize concurrent capture.
+
+BF16 staging shares one actual stream-capture observation between workspace
+and constant ownership validation. Registered capture hits must pin the real
+artifact owner; raw/unregistered capture cannot embed a warm private pointer.
+A capture miss rejects before allocation or conversion. Native owner identity
+is derived directly without temporarily constructing another resource pin.
+
+Host tests exercise empty-layout real publication/read guards, warm preparation
+counts, cache replacement/destruction with outstanding reads, failed candidate
+preservation and capture refusal/validation ordering, alongside existing operand
+and layout checks. The GPU fixture additionally covers no-drain replacement,
+submitted failure, old graph replay, missing pins and a borrowed nonempty record
+surviving cache replacement and destruction. It is compiled/listed on this host,
+not executed. Device arithmetic, asynchronous lifetime and throughput remain
+unmeasured; fewer locks and explicit drains do not establish a speedup.
+
+### Immutable int4 interleave ownership
+
+Interleave conversion requires explicit constant-input metadata for packed B.
+Dynamic packed weights use the ordinary GEMV, including in-place updates at an
+address already present in the conversion cache. Paged weights also bypass the
+optimization because their source retirement does not invalidate this cache.
+
+Each runtime cache entry owns a native allocation with role Weights, admitted
+through the provider's selected domain. Removing a source key marks its entry
+invalid before unlocking, then drops the cache's owner outside the lock. This
+also handles offset views and multiple lengths of one source allocation.
+Last-owner retirement uses the existing compute/copy completion queue; there
+is no cache-specific raw free, global drain, or retired-pointer collection.
+Failed conversions and racing duplicate conversions follow that same path.
+
+A kernel retains one prepared entry. Warm execution borrows its ArcSwap guard
+and checks source signature, runtime identity and validity, without a shared
+cache lookup or quota request/return. A changed entry publishes only after
+successful GEMV submission. Graph resources pin the owning entry, so source
+invalidation and a later kernel binding cannot overwrite an old graph's bytes.
+A kernel can retain an invalid entry until rebinding or destruction; graphs can
+retain it until retirement. Source invalidation therefore revokes cache reuse,
+not necessarily physical residency immediately. No cross-kernel invalidation
+registry or second accounting ledger is introduced.
+
+Actual stream-capture observation requires the precise registered entry owner;
+a missing pin, capture-time preparation or failed submission propagates an
+error and clears capture readiness. The new capture-status query and ArcSwap
+read cost have not been measured. Deterministic Host tests cover recycled
+addresses, old graph pins, recursive retirement outside cache locks and failed
+submitted conversion. The GPU fixture covers native wiring, dynamic in-place
+updates, warm allocation counters, missing pins and independent graph replay;
+it is compiled/listed here, not executed on this CPU-only host. CUDA arithmetic,
+asynchronous execution and throughput still require a device runner.
 
 ### CUDA quantized MatMul accuracy-4 decode activation scratch
 
@@ -749,8 +799,8 @@ workspace retirement, and partial submission errors retain the original
 provider's deferred-release/settlement contract. BF16_DIRECT_OUT restoration
 remains before error propagation.
 
-The immutable conversion cache and Marlin caches still require separate
-governed-ownership work. This migration adds no pool,
+Immutable conversion and Marlin artifacts use the native allocation domain;
+interleave ownership is described above. Workspace migration adds no pool,
 quota protocol or public EP trait hook. The generic ORT adapter now serves
 nonzero SessionPersistent requests through its registered state-owned lane;
 see the [adapter contract](#ort-persistent-workspace-adapter). Native sessions
@@ -1226,7 +1276,7 @@ adding grants, a pool or a new EP lifecycle. Warm calls retain the existing zero
 metadata-upload/device-allocation behavior. One cold upload replaces three
 synchronous uploads, but GPU latency/throughput effects are unmeasured.
 
-Retained `GraphDeviceAllocation` owners now use the provider's native domain
+Retained `NativeDeviceAllocation` owners now use the provider's native domain
 with exact requested bytes (logical zero retains one real backing byte). The
 selected allocator determines mapping/physical granularity; artifacts no longer
 use the raw pool's size classes or a synchronous free fallback. Coalesced tables
@@ -1253,10 +1303,12 @@ encodes a new key and payload. Kernels still define their table ABI and scalar
 sentinels; the helper owns allocation/upload, capture-registration checks and
 the existing staged-mutation checkpoint.
 
-A capture miss refuses before encoding, draining or uploading. On an eager
-miss with a previous entry, the common path uses `drain_for_unmap`, including
-`Where` when optional per-op synchronization is deferred. Only successful
-allocation/upload/checkpoint installs the candidate record, and each kernel
+A capture miss refuses before encoding or uploading. Eager misses prepare a
+new immutable native owner; they do not explicitly drain old readers before
+encoding or replacing metadata. Encoding refusal performs no admission, copy
+or drain. Synchronous H2D upload still waits for stream completion; this change
+does not make uploads asynchronous. Only successful allocation/upload/checkpoint
+installs the candidate record, and each kernel
 still publishes that candidate and its capture signature after successful
 launch. Installed graphs independently pin old allocation owners across rewarm
 and kernel drop. No new lock, pool, budget, quota callback or device owner is
@@ -1267,7 +1319,7 @@ key construction on `Where` hits, and both caches' candidate key deep copies.
 Capture-signature and broadcast-output shape handling still allocate Host
 vectors, so this is not an allocation-free whole-call claim. Cold preparation
 materializes a byte payload for the shared upload interface. Device fixtures
-cover lazy hits, mandatory replacement drains under eager deferral, staged
+cover lazy hits, no explicit drain on replacement under eager deferral, staged
 failure retention, capture miss rejection and replay after owner replacement
 and kernel drop. Host/type checks and GPU-feature compilation can verify the
 interfaces here; device execution and performance need CUDA hardware.
@@ -1283,15 +1335,14 @@ extent and graph resource derive from that record through a borrowed allocation
 accessor. Empty metadata retains the initialized u64 sentinel, including exact
 signed-stride bit patterns in nonempty payloads.
 
-For this adapter, a content miss now adds the common explicit
-`drain_for_unmap` before replacement, independent of deferred per-op eager sync;
-its fitting warm path adds no drain or upload. Cold preparation materializes
-an owned byte payload. Existing kernel-specific signature checks, dynamic
+For this adapter, content misses use native retirement for the prior owner;
+fitting warm reuse adds no drain or upload. Cold preparation materializes an
+owned byte payload and retains its synchronous H2D completion. Existing kernel-specific signature checks, dynamic
 control readbacks, identity/empty paths and launch-success publication remain
 in their callers. The artifact labels passed to staging are borrowed, avoiding
 new warm formatting. Host regressions pin table ABI and sentinel/signed-bit
 encoding; the Transpose device fixture additionally checks warm allocation/
-transfer/drain stability and mandatory drains for failed and successful rewarm,
+transfer/drain stability and no explicit drain for failed or successful rewarm,
 while retaining its old-graph replay after rewarm and kernel drop.
 
 ### Slice metadata shares one physical lifetime
@@ -1312,8 +1363,10 @@ Eager calls still read dynamic starts/ends/axes/steps; capture reuses the warmed
 fixed plan. Empty-output and scalar-copy paths remain unchanged. Warm eager
 calls therefore still incur control D2H and Host shape/plan construction; the
 metadata hit introduces no additional upload or retirement drain. A content
-miss uses one mandatory retirement drain rather than independently replacing
-two tables. This adds no quota protocol or new allocator.
+miss prepares one complete immutable replacement and retires prior ownership
+through the existing native queue. Its four dynamic control D2H completion
+barriers remain; there is no added metadata retirement drain, quota protocol or
+new allocator.
 
 Host regressions cover table order, signed encoding, aligned origins,
 initialized sentinels, complete-span refusal, rank mismatch and layout overflow.
@@ -1329,12 +1382,27 @@ actual driver memory use and latency/throughput remain unmeasured here.
 
 `SkipSimplifiedLayerNormalization` now delegates its two-table broadcast cache
 to `DeviceMetadataCache`, with input/skip shapes in one non-Clone typed key and
-the owner in the same immutable record. The outer warm rollback snapshot shares
-the Arc instead of copying shape vectors. Table encoding, allocation/upload
-checkpoint and BF16 caller-workspace pins remain separate kernel contracts.
-Preparation failures restore the old owner and revoke capture readiness; a
-successful launch keeps the replacement. Cold content replacement uses the
-common mandatory drain in place of the old trailing optional synchronization.
+the owner in the same immutable record. Each invocation briefly locks shared
+state to clone a candidate, sharing the Arc rather than copying shape vectors.
+Direct, native BF16 and BF16-through-F32 paths all consume that local candidate
+through the final output conversion. No shared metadata lock is held over
+encoding, upload, NVRTC resolution or kernel launches. Only successful complete
+consumption publishes the candidate with a short replace; the old value retires
+after unlocking. Failed calls never mutate published metadata and retain the
+old graph's owner, with readiness false from entry. The Drop rollback object,
+ignored failure drain and restore-under-lock path are removed.
+
+Branches return their capture eligibility as an ordinary result. The outer call
+publishes that eligibility only after metadata commit succeeds, so failed casts
+and poisoned publication cannot advertise ready state. Table encoding,
+allocation/upload checkpoint and actual BF16 workspace pins remain enforced.
+Host tests exercise reentrant candidate retirement outside the publication lock,
+including refusal with poisoned state. Device fixtures distinguish required
+H2D upload counters from explicit force/drain counters, and check no work on
+invalid input, failed replacement preservation, successful rewarm and old graph
+replay after kernel destruction. These fixtures are compiled/listed, not run on
+this CPU-only host. Synchronous H2D behavior is unchanged, and no latency or
+throughput improvement is claimed.
 
 The shared metadata hit path already queries the driver's capture status. It
 now uses a strict captured-owner check: an actual capture must have a registered
@@ -1492,7 +1560,7 @@ allowlist and transitive synchronization checks remain enforced.
 
 The immutable allocation scope of an armed route record now covers its six-word
 header and expert bitmap together. `ArmedTelemetry` keeps one
-`GraphDeviceAllocation`; QMoE publishes/validates one capture resource, while
+`NativeDeviceAllocation`; QMoE publishes/validates one capture resource, while
 BlockQuantizedMoE continues to pin its existing outer telemetry owner. Header
 injection remains bounded to its six words. Kernel sources and two-pointer ABI
 are unchanged: header is at the owner base and bitmap at byte offset 512.
@@ -1520,6 +1588,43 @@ owner surviving handle drop until graph reset. Existing QMoE and
 BlockQuantizedMoE route/capture suites are compiled for integration coverage.
 Device execution, atomic-contention impact and throughput remain unmeasured;
 512B separation is a conservative layout choice, not proof of equal performance.
+
+QMoE retains one window-state mutex because reset writes the same record in
+place. Route submission now borrows that locked state from pointer selection
+through the route launch, so reset cannot pass between those steps. NVRTC
+function resolution occurs before taking the mutex; the borrowed state is
+released before subsequent allocations, synchronization or release-queue work.
+Snapshot/reset enter global capture exclusion before locking state, preserving
+the capture/queue-to-state lock order. Reset still drains completed compute and
+copy work before zeroing the record; snapshot remains a coarse ordered read.
+
+Arm publishes a complete candidate with a short ownership handoff, then drops
+the prior record outside the mutex. Disarm and poisoned-state cleanup use that
+same retirement handoff after unlocking. Native queue completion and graph pins own
+retirement, so arm/disarm/final destruction no longer perform an ignored global
+drain. Provider cleanup after its existing stream fences invokes this same
+disarm path; there is no second retirement API or new quota protocol. Failed
+state publication returns an actionable typed poison error and preserves the
+previous record.
+
+The early capture signature retains the exact selected native owner pin until
+successful publication. Submission compares the currently selected owner with
+that signature while holding the window mutex, refusing administrative
+reconfiguration instead of recording a different pointer. This also prevents
+host owner-address reuse during preparation. Successful capture readiness stores
+the exact same pin, without re-reading mutable telemetry state. The shared
+last-call-used flag is removed; warm execution adds no grant, refund, reset,
+extra resource allocation or owner clone compared with the prior path.
+
+Host tests exercise exact owner matching and reentrant retirement outside the
+state lock, including candidate refusal and cleanup after poison. CUDA fixtures
+compile/list assertions for submission serialization, no retirement drain,
+retained old ownership and exact native settlement. Their counter assertions
+track required synchronous H2D through `host_to_device` separately from
+`forced_synchronization_count`, which records explicit force/drain calls. Existing QMoE graph/window
+integration tests retain reset, accumulation and request-isolation coverage.
+These source/Host checks do not prove device ordering or throughput; the longer
+route-submission mutex interval still needs device validation.
 
 ### Variable-length attention borrows one exact caller composite
 
@@ -1716,7 +1821,7 @@ the EP, plugin and session callers. No CUDA execution or performance was measure
 
 ### Retained graph artifacts use native ownership and settlement
 
-`GraphDeviceAllocation` admits one whole artifact or metadata composite through
+`NativeDeviceAllocation` admits one whole artifact or metadata composite through
 `allocate_governed`, using Weights for converted/repacked constants and persistent
 Workspace for metadata/telemetry. Its buffer retains the real owner and its
 allocation domain. Graph resources pin the same artifact Arc, never duplicate
@@ -1751,6 +1856,51 @@ missing-domain refusal and monotonic/nonduplicated counters; CUDA execution and
 throughput remain unmeasured. Migrating raw pool allocation to selected native
 backing changes physical granularity and cold behavior, so no memory/performance
 improvement is inferred from Host tests.
+
+### Prefill staging keeps two exclusive native slot owners
+
+The whole-layer prefill double buffer reserves two independent
+`NativeDeviceAllocation` owners through its runtime's existing provider domain.
+The former graph-specific owner name is removed; graph pins use its shared
+constructor, while prefill holds exclusive values. One cold admission per stable
+slot keeps failure isolation without per-layer, per-row or per-tile tickets.
+There is no second residency budget or accounting ledger. Content is Weights;
+selected allocator, capture checks and native mapped accounting remain canonical.
+
+Reservation validates the per-slot layout and two-slot peak before casts, then
+prepares both native owners and both pinned sources before publishing either
+slot. A second-slot refusal retires the unpublished first owner through the same
+queue, so its charge is released only after settlement. Slot pointers and
+capacities come from the owner, instead of separately maintained raw fields.
+Repeated fill/wait/release changes data and existing fences, never slot backing
+or quota. Replacing an already reserved transfer is explicitly refused.
+
+Pinned source reads have three states: Idle, Unproven and Fenced. The transfer
+sets Unproven before attempting H2D submission and publishes a reuse fence only
+after recording succeeds. An enqueue or fence failure cannot later use fence
+zero as a fake completion proof. Actual completion (including an authoritative
+fallback sync witness) permits pinned reuse; absence of submission is safe to
+drop but does not forge a pool-return witness. Unknown completion retains the
+source and explicitly quarantines its native destination with
+`QuarantineReason::CompletionUnknown`. The healthy sibling can still retire.
+
+Normal teardown and defensive Drop share this path. Device ownership goes to
+the existing two-stream deferred queue; it no longer ignores a failed global
+compute drain and raw-frees the destination. Final per-slot fences are handled
+without claiming enqueue is refund. Pinned retention remains a separate safety
+condition: only a real copy-completion witness returns pages to the pool.
+Quarantined native charges stay visible in the manager rather than disappearing
+inside a forgotten raw-pointer bundle. Typed binding/transaction errors remain
+in the source chain through native, prefill transfer and rejection boundaries.
+Capture admission remains unchanged; this does not enable pipeline capture.
+
+Host checks cover the actual native quarantine/charge path, typed capacity
+refusal, failed read proofs, address/peak overflow and typed prefill causes,
+alongside the existing generic pipeline state machine. GPU fixtures compile
+second-slot refusal, direct Drop, single-slot quarantine and normal multi-layer
+reuse/settlement. They are not CUDA execution or performance measurements. The
+native allocator can change physical granularity and cold reservation behavior;
+no footprint or throughput improvement is inferred from these Host checks.
 
 ### Sealed weights and workspace share cold native admission
 

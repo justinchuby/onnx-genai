@@ -422,6 +422,7 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/scatter_elements_v29.yaml"),
     include_str!("../../schemas/standard/constant_of_shape.yaml"),
     include_str!("../../schemas/standard/max_pool.yaml"),
+    include_str!("../../schemas/standard/average_pool_19.yaml"),
     include_str!("../../schemas/standard/average_pool.yaml"),
     include_str!("../../schemas/standard/global_average_pool.yaml"),
     include_str!("../../schemas/standard/global_max_pool.yaml"),
@@ -1067,6 +1068,18 @@ type_constraints:
                 .required
         );
 
+        let average_pool_19 = registry.lookup("AveragePool", "", 19).unwrap();
+        assert_eq!(average_pool_19.since_version, 19);
+        assert_eq!(
+            average_pool_19.type_constraints[0].allowed,
+            [DataType::Float16, DataType::Float32, DataType::Float64]
+        );
+        assert!(
+            average_pool_19
+                .attributes
+                .iter()
+                .any(|a| a.name == "dilations")
+        );
         let average_pool = registry.lookup("AveragePool", "", 25).unwrap();
         assert_eq!(average_pool.type_constraints[0].allowed.len(), 4);
         assert_eq!(

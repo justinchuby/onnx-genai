@@ -5,7 +5,7 @@ Run the same command with `--check` to detect stale registrations.
 
 Reference: llama.cpp `8d60873dfb8619f2b5ed31adfbab07cccb40db5c`, `tools/server/server.cpp`;
 59 registrations / 55 distinct method-path contracts.
-Local registrations: 51 present, 2 disabled placeholders, 2 missing.
+Local registrations: 47 present, 2 disabled placeholders, 2 missing, 4 delegated to the external harness.
 
 **Registration presence is not behavioral conformance.** This source audit does not
 execute handlers, enable feature gates, compare schemas/results, or prove frontend
@@ -65,24 +65,29 @@ See [compatibility behavior and remaining gaps](LLAMA_CPP_COMPATIBILITY.md) and
 | GET | `/v1/stream` | present | `replay::get` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L232) |
 | POST | `/v1/streams/lookup` | present | `replay::lookup` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L233) |
 | DELETE | `/v1/stream` | present | `replay::delete` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L234) |
-| GET | `/cors-proxy` | present | `routes::proxy::forward` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L284) |
-| POST | `/cors-proxy` | present | `routes::proxy::forward` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L285) |
-| GET | `/tools` | present | `routes::tools::list` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L308) |
-| POST | `/tools` | present | `routes::tools::invoke` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L309) |
+| GET | `/cors-proxy` | external harness | `—` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L284) |
+| POST | `/cors-proxy` | external harness | `—` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L285) |
+| GET | `/tools` | external harness | `—` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L308) |
+| POST | `/tools` | external harness | `—` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L309) |
 | POST | `/models` | disabled | `routes::llama::disabled_feature` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L557) |
 | POST | `/models/load` | present | `routes::llama::load_model` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L558) |
 | POST | `/models/unload` | present | `routes::llama::unload_model` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L559) |
 | GET | `/models/sse` | present | `routes::llama::model_events` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L560) |
 | DELETE | `/models` | disabled | `routes::llama::disabled_feature` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L561) |
 
+Tool execution and MCP transport (`/tools`, `/cors-proxy`, stdio MCP and
+container/SSH runtimes) are outside the inference server's scope by design.
+Chat tool definitions, calls, streamed deltas and tool-result messages remain
+in scope; the external harness owns execution and network/process access.
+
 ## Acceptance work still required
 
-For each contract, validate enabled and disabled gates, malformed and valid input,
-schema/defaults, actual model or tool execution, status/error bodies, aliases, and
+For each in-scope contract, validate enabled and disabled gates, malformed and valid input,
+schema/defaults, actual model execution, status/error bodies, aliases, and
 stream framing/cancellation where applicable. Test source presence alone does not
 satisfy these cases. Cross-model and backend-specific behavior must use declared
 capabilities; a passing narrow fixture does not establish general parity.
 
 The missing realtime/SystemOne protocols and disabled model download/deletion
 remain implementation work. Existing handlers also retain the explicit source,
-device-state, multimodal and MCP/runtime gaps documented in the compatibility ledger.
+device-state and multimodal gaps documented in the compatibility ledger.

@@ -589,8 +589,8 @@ fn where_metadata_rewarm_is_transactional_and_preserves_captured_payload() {
     execute(&[1, 2], &[3, 1], &[3, 2]).unwrap();
     assert_eq!(
         runtime.forced_synchronization_count(),
-        syncs + 1,
-        "Where shape churn must drain old readers despite eager-sync deferral"
+        syncs,
+        "Where immutable owner replacement must not add an explicit reader drain"
     );
     let identity_b = kernel.device_graph_resources()[0].identity();
     assert_ne!(identity_b, identity_a);
@@ -1713,8 +1713,8 @@ fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop_gpu() {
     );
     assert_eq!(
         runtime.forced_synchronization_count(),
-        syncs_before_failure + 1,
-        "persistent metadata replacement must drain old readers even when the staged upload fails and eager sync is deferred"
+        syncs_before_failure,
+        "failed immutable metadata replacement must use native retirement without an explicit reader drain"
     );
     ep.wait_for_deferred_releases().unwrap();
     let counts_after_failure = runtime.allocation_counts();
@@ -1743,8 +1743,8 @@ fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop_gpu() {
         .unwrap();
     assert_eq!(
         runtime.forced_synchronization_count(),
-        syncs_before_rewarm + 1,
-        "successful persistent metadata replacement must use the same mandatory drain"
+        syncs_before_rewarm,
+        "successful immutable replacement must use native retirement without an explicit reader drain"
     );
     let b_resource = kernel.device_graph_resources();
     assert_eq!(b_resource.len(), 1);
@@ -2025,8 +2025,8 @@ fn slice_captured_metadata_outlives_rewarm_and_kernel_drop() {
     );
     assert_eq!(
         runtime.forced_synchronization_count(),
-        syncs_before_rewarm + 5,
-        "rewarm has four unchanged control-read barriers plus one payload retirement drain"
+        syncs_before_rewarm + 4,
+        "rewarm keeps four control-read barriers; immutable native payload retirement adds no explicit drain"
     );
     let mut b_resource_ids = kernel
         .device_graph_resources()

@@ -64,7 +64,7 @@ use onnx_runtime_ep_api::{DeviceGraphResource, EpError, Result};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation};
+use crate::runtime::{CudaRuntime, NativeDeviceAllocation};
 
 // ---------------------------------------------------------------------------
 // Header layout (design §2.3). Six u32 words, device-resident, one per armed
@@ -232,8 +232,8 @@ pub struct RouteTelemetryConfig {
     pub routes_per_row: usize,
 }
 
-/// Typed reason telemetry could not be armed. Arming returns this instead of
-/// failing; ordinary inference proceeds with telemetry left disabled.
+/// Typed reason an arming request was refused. A failed replacement preserves
+/// the existing arming; an initially disarmed source remains disarmed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TelemetryUnsupported {
     /// The config's device ordinal does not match the runtime's device.
@@ -250,6 +250,8 @@ pub enum TelemetryUnsupported {
     RouteWidthMismatch { config: usize, execution: usize },
     /// The device buffer could not be allocated (message carried for the log).
     Alloc(String),
+    /// An earlier panic invalidated the shared window's state authority.
+    StatePoisoned,
     /// Reconfiguration would invalidate pointers embedded in an installed graph.
     GraphInstalled,
 }
@@ -276,6 +278,10 @@ impl std::fmt::Display for TelemetryUnsupported {
                  contract {execution}; re-arm with the kernel's actual selected-expert width"
             ),
             Self::Alloc(message) => write!(f, "route telemetry buffer alloc failed: {message}"),
+            Self::StatePoisoned => write!(
+                f,
+                "QMoE route telemetry state is poisoned; stop inference and rebuild the provider before arming another window"
+            ),
             Self::GraphInstalled => write!(
                 f,
                 "route telemetry must be configured before device-graph capture"
@@ -293,8 +299,9 @@ impl std::fmt::Display for TelemetryUnsupported {
 // at an explicit host-ordered `reset_boundary`.
 // ---------------------------------------------------------------------------
 
-/// Live telemetry buffers + identity for an armed kernel. Owned by the kernel;
-/// freed on disarm/drop. Pointers are fixed for the armed lifetime.
+/// Live telemetry buffers and identity published by an armed source. Disarm
+/// releases that source's owner; graph/read pins and native queue completion
+/// govern physical retirement. Pointers are fixed for the armed lifetime.
 #[derive(Debug)]
 pub(crate) struct ArmedTelemetry {
     request_id: u32,
@@ -302,7 +309,7 @@ pub(crate) struct ArmedTelemetry {
     num_experts: usize,
     routes_per_row: u32,
     // Header and bitmap share an armed lifetime and one physical owner.
-    record: Arc<GraphDeviceAllocation>,
+    record: Arc<NativeDeviceAllocation>,
     /// Host-side window/epoch counter. Stamped into `header[H_EPOCH]` at arm
     /// (window 1) and at every `reset_boundary`; held fixed for the whole
     /// window. There is no device epoch counter and no reset kernel.
@@ -347,7 +354,7 @@ impl ArmedTelemetry {
         let record_bytes = record_layout(config.num_experts)
             .map_err(|error| TelemetryUnsupported::Alloc(error.to_string()))?
             .size();
-        let record = GraphDeviceAllocation::allocate(
+        let record = NativeDeviceAllocation::allocate_shared(
             runtime,
             record_bytes,
             onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
@@ -546,8 +553,12 @@ impl ArmedTelemetry {
         unsafe { runtime.htod(&value.to_ne_bytes(), destination) }
     }
 
+    pub(crate) fn identity(&self) -> usize {
+        NativeDeviceAllocation::identity(&self.record)
+    }
+
     pub(crate) fn device_graph_resource(&self) -> DeviceGraphResource {
-        GraphDeviceAllocation::device_graph_resource(&self.record)
+        NativeDeviceAllocation::device_graph_resource(&self.record)
     }
 }
 

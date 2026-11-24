@@ -616,7 +616,7 @@ pub(super) fn run(
 /// admitted workspace. The actual owner is retained across recorded graphs.
 #[cfg(test)]
 pub(super) struct TestScratch {
-    owner: std::sync::Arc<crate::runtime::GraphDeviceAllocation>,
+    owner: std::sync::Arc<crate::runtime::NativeDeviceAllocation>,
 }
 #[cfg(test)]
 impl TestScratch {
@@ -632,7 +632,7 @@ impl TestScratch {
             .bytes()
             .max(1);
         Self {
-            owner: crate::runtime::GraphDeviceAllocation::allocate(
+            owner: crate::runtime::NativeDeviceAllocation::allocate_shared(
                 runtime,
                 bytes,
                 onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
@@ -647,7 +647,7 @@ impl TestScratch {
         )
     }
     pub(super) fn resource(&self) -> onnx_runtime_ep_api::DeviceGraphResource {
-        crate::runtime::GraphDeviceAllocation::device_graph_resource(&self.owner)
+        crate::runtime::NativeDeviceAllocation::device_graph_resource(&self.owner)
     }
 }
 

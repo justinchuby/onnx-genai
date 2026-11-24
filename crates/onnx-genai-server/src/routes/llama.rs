@@ -47,8 +47,8 @@ pub(crate) async fn props(
     if query.model.is_empty() && state.registry.is_router().map_err(map_registry_error)? {
         return Ok(Json(json!({
             "role": "router", "ui": true, "ui_settings": {},
-            "nxrt_capabilities": {"tool_protocol_per_model": true, "reasoning_control": true, "resumable_streams": true, "server_tools": state.tools.is_some()},
-            "cors_proxy_enabled": state.config.mcp_proxy_policy.is_enabled(), "endpoint_slots": true,
+            "nxrt_capabilities": {"tool_protocol_per_model": true, "reasoning_control": true, "resumable_streams": true, "server_tools": false},
+            "cors_proxy_enabled": false, "endpoint_slots": true,
             "endpoint_props": state.config.endpoint_props, "endpoint_metrics": cfg!(feature = "metrics"),
             "build_info": concat!("nxrt ", env!("CARGO_PKG_VERSION"))
         })));
@@ -93,10 +93,10 @@ pub(crate) async fn props(
         "endpoint_slots": handle.engine.native_slot.is_some(), "endpoint_props": state.config.endpoint_props,
         "endpoint_metrics": cfg!(feature = "metrics"),
         "ui": true, "ui_settings": {}, "is_sleeping": false,
-        "cors_proxy_enabled": state.config.mcp_proxy_policy.is_enabled(),
+        "cors_proxy_enabled": false,
         "build_info": concat!("nxrt ", env!("CARGO_PKG_VERSION")),
         "nxrt_capabilities": {
-            "server_tools": state.tools.is_some(),
+            "server_tools": false,
             "resumable_streams": true, "reasoning_control": true,
             "tools": handle.tool_protocol.is_some(), "custom_sampler_order": handle.engine.runtime_sampling,
             "lora": handle.engine.adapters.is_some(),
