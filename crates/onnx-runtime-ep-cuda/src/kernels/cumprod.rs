@@ -240,8 +240,6 @@ mod tests {
                                 rt.replay_graph().unwrap();
                             }
                             rt.synchronize().unwrap();
-                            // The runtime otherwise appends the next arm to this capture.
-                            assert!(rt.reset_graph().unwrap());
                         }
                     }
                     let start = context
@@ -257,6 +255,8 @@ mod tests {
                         f64::from(start.elapsed_ms(&end).unwrap()) * 1_000.0 / LAUNCHES as f64,
                     );
                     rt.synchronize().unwrap();
+                    // The runtime otherwise appends the next arm to this capture.
+                    assert!(rt.reset_graph().unwrap());
                 }
             }
             for (arm, times) in ["baseline", "opset-26"].into_iter().zip(&mut samples) {
