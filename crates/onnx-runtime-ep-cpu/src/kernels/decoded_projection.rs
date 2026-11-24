@@ -200,18 +200,22 @@ impl<'a> ProjectionScratch<'a> {
 /// FEATURE_TILE is a compute tile, not a model dimension. Each worker owns at
 /// most FEATURE_TILE decoded rows and one decoder state, reused across tiles.
 /// The serial projection callback overwrites a complete column-major tile.
+/// The initialized destination is caller-owned staging: geometry failures leave
+/// it untouched, while a later decoder/dispatch failure may modify it. Callers
+/// publish actual tensor outputs only after successful computation.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn linear_decoded_grouped<const FEATURE_TILE: usize, D>(
+pub(super) fn linear_decoded_grouped_into<const FEATURE_TILE: usize, D>(
     context: &str,
     input: &[f32],
     rows: usize,
     in_features: usize,
     out_features: usize,
     bias: Option<&[f32]>,
+    output: &mut [f32],
     make_decoder: impl Fn() -> D + Sync,
     project: impl Fn(&[f32], &[f32], &mut [f32], usize, usize, usize) -> Result<()> + Sync,
     dispatch: impl FnOnce(&mut [f32], usize, &DecodedShard<'_>) -> Result<()>,
-) -> Result<Vec<f32>>
+) -> Result<()>
 where
     D: FnMut(usize, &mut [f32]) -> Result<()>,
 {
@@ -223,7 +227,7 @@ where
     }
     let invalid = |reason: &str| {
         EpError::KernelFailed(format!(
-            "{context} row-decoded projection [{rows},{in_features}] -> [{rows},{out_features}]: {reason}; supply addressable dimensions and matching input/bias storage"
+            "{context} row-decoded projection [{rows},{in_features}] -> [{rows},{out_features}]: {reason}; supply addressable dimensions and matching input/output/bias storage"
         ))
     };
     if rows.checked_mul(in_features) != Some(input.len())
@@ -236,10 +240,15 @@ where
     let elements = rows
         .checked_mul(out_features)
         .ok_or_else(|| invalid("output element count overflow"))?;
-    if elements == 0 {
-        return Ok(Vec::new());
+    if output.len() != elements {
+        return Err(invalid(&format!(
+            "destination has {} elements, expected {elements}",
+            output.len()
+        )));
     }
-    let mut column_major = zeroed_f32(context, "column-major output", elements)?;
+    if elements == 0 {
+        return Ok(());
+    }
     let compute = |column_start: usize, columns: &mut [f32]| -> Result<()> {
         if !columns.len().is_multiple_of(rows) {
             return Err(invalid(
@@ -267,18 +276,19 @@ where
         )?;
         Ok(())
     };
-    dispatch(&mut column_major, rows, &compute)?;
     // A unit axis makes column-major and row-major storage identical.
+    // The caller's staging is already initialized and receives complete writes.
     if rows == 1 || out_features == 1 {
-        return Ok(column_major);
+        return dispatch(output, rows, &compute);
     }
-    let mut output = zeroed_f32(context, "row-major output", elements)?;
+    let mut column_major = zeroed_f32(context, "column-major output", elements)?;
+    dispatch(&mut column_major, rows, &compute)?;
     for (row, target) in output.chunks_exact_mut(out_features).enumerate() {
         for (column, value) in target.iter_mut().enumerate() {
             *value = column_major[column * rows + row];
         }
     }
-    Ok(output)
+    Ok(())
 }
 
 /// A contiguous set of complete decoded output columns. `start` counts
