@@ -2304,6 +2304,12 @@ callback and CUDA host-side barrier tests remain applicable.
 
 ### QMoE input groups reuse one execution lane
 
+This entry describes the engine grouped-input migration. The CUDA integer-affine
+`com.microsoft::QMoE` kernel now also places all routing, expert intermediates,
+grouping and floating-operand conversion in one SessionPersistent caller
+composite; see [the current ownership contract](MEMORY_ARCHITECTURE.md#integer-affine-qmoe-shares-one-prepared-composite).
+Its regions do not introduce separate grants or slot owners.
+
 Integer QMoE now declares metadata-planned StepScoped grouped-input scratch.
 The checked bound is rows*hidden*f32, reused across serial experts, without an
 expert-count/top-k multiplier. A singleton group borrows its already contiguous

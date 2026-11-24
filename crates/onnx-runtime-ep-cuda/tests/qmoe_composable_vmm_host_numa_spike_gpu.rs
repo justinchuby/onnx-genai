@@ -73,6 +73,8 @@
     clippy::type_complexity
 )]
 
+mod common;
+
 use std::ffi::c_void;
 use std::sync::Mutex;
 
@@ -1016,8 +1018,20 @@ fn execute_over_arenas(
     let output_bytes = output_shape[0] * hidden * 4;
     let mut output_buf = ep.allocate(output_bytes, 256).unwrap();
     let output_strides = compute_contiguous_strides(&output_shape);
+    let mut workspace = None;
+    let caller_view = {
+        let output = TensorMut::new(
+            DevicePtrMut(output_buf.as_mut_ptr()),
+            DataType::Float32,
+            &output_shape,
+            &output_strides,
+            device_id,
+        );
+        common::prepare_kernel_workspace(ep, kernel.as_ref(), &views, &[output], &mut workspace)
+            .unwrap()
+    };
     kernel
-        .execute(
+        .execute_with_workspace(
             &views,
             &mut [TensorMut::new(
                 DevicePtrMut(output_buf.as_mut_ptr()),
@@ -1026,6 +1040,7 @@ fn execute_over_arenas(
                 &output_strides,
                 device_id,
             )],
+            caller_view,
         )
         .expect("QMoE execute over a composable device/host-NUMA arena must succeed");
     runtime.synchronize().unwrap();
@@ -1047,6 +1062,9 @@ fn execute_over_arenas(
     ep.deallocate(router_buf).unwrap();
     ep.deallocate(agg_buf).unwrap();
     ep.deallocate(output_buf).unwrap();
+    if let Some(workspace) = workspace {
+        ep.deallocate_workspace(workspace).unwrap();
+    }
     output
 }
 
@@ -1844,9 +1862,27 @@ fn run_performance_sweep(shape: QmoeShape) {
         let output_bytes = output_shape[0] * hidden * 4;
         let mut output_buf = ep.allocate(output_bytes, 256).unwrap();
         let output_strides = compute_contiguous_strides(&output_shape);
+        let mut workspace = None;
+        let caller_view = {
+            let output = TensorMut::new(
+                DevicePtrMut(output_buf.as_mut_ptr()),
+                DataType::Float32,
+                &output_shape,
+                &output_strides,
+                device_id,
+            );
+            common::prepare_kernel_workspace(
+                &ep,
+                kernel.as_ref(),
+                &views,
+                &[output],
+                &mut workspace,
+            )
+            .unwrap()
+        };
         let mut execute_once = || {
             kernel
-                .execute(
+                .execute_with_workspace(
                     &views,
                     &mut [TensorMut::new(
                         DevicePtrMut(output_buf.as_mut_ptr()),
@@ -1855,6 +1891,7 @@ fn run_performance_sweep(shape: QmoeShape) {
                         &output_strides,
                         device_id,
                     )],
+                    caller_view,
                 )
                 .unwrap();
         };
@@ -1897,6 +1934,9 @@ fn run_performance_sweep(shape: QmoeShape) {
         ep.deallocate(router_buf).unwrap();
         ep.deallocate(agg_buf).unwrap();
         ep.deallocate(output_buf).unwrap();
+        if let Some(workspace) = workspace {
+            ep.deallocate_workspace(workspace).unwrap();
+        }
     };
 
     println!(

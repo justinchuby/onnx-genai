@@ -16,7 +16,8 @@ use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
     DeviceGraphResource, EpError, ExecutorArtifactGeneration, ExecutorInstanceId,
-    ExecutorRouteResidencyConfig, Kernel, KernelFactory, Result, TensorMut, TensorView,
+    ExecutorRouteResidencyConfig, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata,
+    TensorMut, TensorView, WorkspacePreparation, WorkspaceView,
 };
 use onnx_runtime_ep_cpu::kernels::moe::{
     Activation, DEFAULT_SWIGLU_LIMIT, validate_moe_activation_attributes,
@@ -29,7 +30,9 @@ use crate::kernels::expert_route_telemetry::{
 };
 use crate::kernels::{qmoe_gemm, qmoe_grouping};
 use crate::route_residency::RouteTelemetrySource;
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
+use crate::runtime::{CudaRuntime, cuptr};
+mod workspace;
+use workspace::{ExpertGeometry, geometry};
 
 const MODULE: &str = "qmoe_affine_v1";
 const ROUTE_ENTRY: &str = "qmoe_route";
@@ -1464,6 +1467,39 @@ impl Kernel for SharedQMoEKernel {
         self.0.execute(inputs, outputs)
     }
 
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.0.execute_with_workspace(inputs, outputs, workspace)
+    }
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        self.0.workspace_requirement(inputs, outputs)
+    }
+
+    fn workspace_requirement_for_execution(
+        &self,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+        metadata: &[TensorMetadata<'_>],
+        output_metadata: &[OutputMetadata<'_>],
+        cached: Option<WorkspacePreparation>,
+    ) -> Result<onnx_runtime_ep_api::WorkspaceRequirement> {
+        self.0.workspace_requirement_for_execution(
+            inputs,
+            outputs,
+            metadata,
+            output_metadata,
+            cached,
+        )
+    }
+
     fn supports_strided_input(&self, input_idx: usize) -> bool {
         self.0.supports_strided_input(input_idx)
     }
@@ -1555,7 +1591,6 @@ impl QMoEFactory {
             bits: bits as usize,
             block_size: block_size as usize,
             warm_state: Mutex::new(QMoEWarmState {
-                scratch: ScratchPool::default(),
                 capture_ready: None,
             }),
             telemetry,
@@ -1803,7 +1838,6 @@ pub struct QMoEKernel {
 }
 
 struct QMoEWarmState {
-    scratch: ScratchPool,
     capture_ready: Option<Arc<QMoECaptureReady>>,
 }
 
@@ -1840,10 +1874,10 @@ impl QMoEKernel {
     }
 
     fn validate_capture_signature(
-        state: &QMoEWarmState,
+        previous: Option<&QMoECaptureReady>,
         signature: &QMoECaptureSignature,
     ) -> Result<()> {
-        let ready = state.capture_ready.as_ref().ok_or_else(|| {
+        let ready = previous.ok_or_else(|| {
             error(
                 "QMoE capture began without a successful warmed call. HOW: run the exact \
                  fixed-shape QMoE call eagerly before capture.",
@@ -1952,101 +1986,26 @@ struct ExpertGrouping {
 }
 
 impl<'a> QuantizedExperts<'a> {
-    #[allow(clippy::too_many_arguments)]
-    fn validate(
-        name: &str,
+    fn bind(
         packed: &'a TensorView<'a>,
         scales: &'a TensorView<'a>,
         zero_points: Option<&'a TensorView<'a>>,
         bias: Option<&'a TensorView<'a>>,
-        experts: usize,
-        out_features: usize,
-        in_features: usize,
-        bits: usize,
-        block_size: usize,
-    ) -> Result<Self> {
-        require_dtype(
-            &format!("{name}_experts_weights"),
-            packed.dtype,
-            DataType::Uint8,
-        )?;
-        float_widen_entry(&format!("{name}_scales"), scales.dtype)?;
-        let pack_size = 8 / bits;
-        if !in_features.is_multiple_of(pack_size) {
-            return Err(error(format!(
-                "{name} input features {in_features} must be divisible by pack_size {pack_size}"
-            )));
-        }
-        if !in_features.is_multiple_of(block_size) {
-            return Err(error(format!(
-                "{name} input features {in_features} must be divisible by block_size {block_size}"
-            )));
-        }
-        let packed_in = in_features / pack_size;
-        let blocks = in_features / block_size;
-        let zero_point_bytes = checked_div_ceil(
-            blocks,
-            pack_size,
-            &format!("{name} zero-point row byte count"),
-        )?;
-        require_shape(
-            &format!("{name}_experts_weights"),
-            packed.shape,
-            &[experts, out_features, packed_in],
-        )?;
-        require_shape(
-            &format!("{name}_scales"),
-            scales.shape,
-            &[experts, out_features, blocks],
-        )?;
-        if let Some(zero_points) = zero_points {
-            require_dtype(
-                &format!("{name}_zero_points"),
-                zero_points.dtype,
-                DataType::Uint8,
-            )?;
-            require_shape(
-                &format!("{name}_zero_points"),
-                zero_points.shape,
-                &[experts, out_features, zero_point_bytes],
-            )?;
-        }
-        if let Some(bias) = bias {
-            float_widen_entry(&format!("{name}_experts_bias"), bias.dtype)?;
-            require_shape(
-                &format!("{name}_experts_bias"),
-                bias.shape,
-                &[experts, out_features],
-            )?;
-        }
-        for (tensor_name, tensor) in [
-            (format!("{name}_experts_weights"), Some(packed)),
-            (format!("{name}_scales"), Some(scales)),
-            (format!("{name}_zero_points"), zero_points),
-            (format!("{name}_experts_bias"), bias),
-        ] {
-            if let Some(tensor) = tensor {
-                checked_tensor_layout(&tensor_name, tensor.shape, tensor.dtype)?;
-                if !tensor.is_contiguous() {
-                    return Err(error(format!(
-                        "{tensor_name} must be contiguous on the CUDA execution provider"
-                    )));
-                }
-            }
-        }
-        Ok(Self {
+        geometry: ExpertGeometry,
+    ) -> Self {
+        Self {
             packed,
             scales,
             zero_points,
             bias,
             scales_override: None,
             bias_override: None,
-            out_features,
-            in_features,
-            packed_in,
-            blocks,
-            zero_point_bytes,
-        })
+            out_features: geometry.out_features,
+            in_features: geometry.in_features,
+            packed_in: geometry.packed_in,
+            blocks: geometry.blocks,
+            zero_point_bytes: geometry.zero_point_bytes,
+        }
     }
 
     /// Device pointer to f32 scales: the widened buffer for fp16/bf16 graphs,
@@ -2067,33 +2026,81 @@ impl<'a> QuantizedExperts<'a> {
 }
 
 impl Kernel for QMoEKernel {
-    /// Returning `Ok(())` does not, by itself, imply the launched kernels have
-    /// completed on the device: like the rest of the CUDA EP's single-in-order-
-    /// stream eager path, the trailing `self.runtime.synchronize()` call below
-    /// is a no-op by default (see `CudaRuntime::synchronize`'s doc comment on
-    /// `defer_eager_sync`). Kernel-to-kernel ordering is guaranteed by the
-    /// stream; any host-visible read (`dtoh`/`dtod`) self-synchronizes before
-    /// its copy. This call used to be relied on (accidentally, since it was
-    /// already inert under the default configuration) to protect two things
-    /// that are now handled explicitly instead:
-    ///
-    /// - scratch-growth-free safety: `ScratchPool::ensure` now drains the
-    ///   stream itself with `drain_for_unmap` (an unconditional barrier,
-    ///   unlike `synchronize`), only when a slot actually grows (see its doc
-    ///   comment) — the case this really guards against.
-    /// - teardown safety: graph-retained immutable scratch owners keep every
-    ///   captured address alive through graph reset/destruction.
-    ///
-    /// The trailing `synchronize()` call itself is kept, not removed: it
-    /// establishes no correctness guarantee of its own in the default
-    /// configuration (that is now entirely the job of the two `drain_for_unmap`
-    /// call sites above), but keeping it means `ONNX_GENAI_DEFER_EAGER_SYNC=0`'s
-    /// debug escape hatch still forces this kernel to become fully synchronous
-    /// too, exactly like every other kernel in this EP (e.g.
-    /// `MatMulNBitsKernel::run`'s main GEMV path) — so a device-side error from
-    /// this call's kernels still surfaces synchronously from `execute` itself
-    /// under that debug flag, matching prior behavior.
+    /// Enqueue into the caller's exclusive lane. Completion belongs to the
+    /// stream/request boundary; the explicit eager-sync debug policy remains.
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
+    }
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        Ok(WorkspacePreparation::Ready(
+            geometry(
+                &self.attributes,
+                self.bits,
+                self.block_size,
+                inputs,
+                outputs,
+            )?
+            .requirement(),
+        ))
+    }
+
+    fn supports_strided_input(&self, _input_idx: usize) -> bool {
+        false
+    }
+
+    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
+        self.warm_state
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state
+                    .capture_ready
+                    .as_ref()
+                    .map(|ready| ready.resources.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        match self.warm_state.lock() {
+            Ok(state) if state.capture_ready.is_some() => {
+                onnx_runtime_ep_api::CaptureSupport::Supported
+            }
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "requires a warmed fixed-shape eager QMoE pass with prepared caller workspace to \
+                 compile every routed expert kernel",
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "QMoE capture readiness is unavailable because its state lock was poisoned",
+            ),
+        }
+    }
+}
+
+impl QMoEKernel {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        let mut warm_state = self
+            .warm_state
+            .lock()
+            .map_err(|_| error("QMoE warm-state lock poisoned"))?;
+        let previous = warm_state.capture_ready.take();
         if let Some(telemetry) = &self.telemetry {
             telemetry.last_call_used.store(false, Ordering::Relaxed);
         }
@@ -2104,185 +2111,71 @@ impl Kernel for QMoEKernel {
                 outputs.len()
             )));
         }
-        for (index, name) in [
-            (0, "input"),
-            (1, "router_probs"),
-            (2, "fc1_experts_weights"),
-            (3, "fc1_scales"),
-            (5, "fc2_experts_weights"),
-            (6, "fc2_scales"),
-        ] {
-            if inputs[index].is_absent() {
-                return Err(error(format!(
-                    "required input {index} ('{name}') is absent"
-                )));
-            }
-        }
-        if let Some((index, _)) = inputs
-            .iter()
-            .enumerate()
-            .skip(15)
-            .find(|(_, input)| !input.is_absent())
-        {
-            return Err(error(format!(
-                "input {index} is only used by FP4/FP8 QMoE modes, which are deferred"
-            )));
-        }
-
+        let metadata: [_; 21] = std::array::from_fn(|index| {
+            inputs.get(index).map_or(
+                TensorMetadata::new(DataType::Undefined, &[], false),
+                |input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()),
+            )
+        });
+        let output_metadata = [OutputMetadata::from_view(&outputs[0])];
+        let plan = geometry(
+            &self.attributes,
+            self.bits,
+            self.block_size,
+            &metadata[..inputs.len()],
+            &output_metadata,
+        )?;
+        let (rows, hidden, experts, inter) = (plan.rows, plan.hidden, plan.experts, plan.inter);
         let dtype = FloatDtype::from_input(inputs[0].dtype)?;
-        if outputs[0].dtype != inputs[0].dtype {
-            return Err(error(format!(
-                "output dtype {:?} must equal input dtype {:?}",
-                outputs[0].dtype, inputs[0].dtype
-            )));
-        }
-        float_widen_entry("router_probs", inputs[1].dtype)?;
         if dtype.needs_half_headers() {
             self.runtime.require_nvrtc_half_headers("QMoE")?;
         }
-
-        let input_shape = inputs[0].shape;
-        if !matches!(input_shape.len(), 2 | 3) {
-            return Err(error(format!(
-                "input must be 2-D [rows, hidden] or 3-D [batch, sequence, hidden], got {input_shape:?}"
-            )));
-        }
-        require_shape("output", outputs[0].shape, input_shape)?;
-        let hidden = *input_shape
-            .last()
-            .ok_or_else(|| error("input rank unexpectedly empty"))?;
-        let rows = checked_product(
-            &input_shape[..input_shape.len() - 1],
-            "flattened input row count",
-        )?;
-        let experts = router_probs_experts(inputs[1].shape, rows)?;
-        if self.attributes.k > experts {
-            return Err(error(format!(
-                "requires 0 < k <= num_experts, got k={} and num_experts={experts}",
-                self.attributes.k
-            )));
-        }
-        if !hidden.is_multiple_of(self.block_size) {
-            return Err(error(format!(
-                "hidden_size {hidden} must be divisible by block_size {}",
-                self.block_size
-            )));
-        }
-
-        require_rank("fc2_experts_weights", inputs[5].shape, 3)?;
-        if inputs[5].shape[0] != experts || inputs[5].shape[1] != hidden {
-            return Err(error(format!(
-                "fc2_experts_weights must start with [experts={experts}, hidden={hidden}], got {:?}",
-                inputs[5].shape
-            )));
-        }
-        let pack_size = 8 / self.bits;
-        let inter = inputs[5].shape[2]
-            .checked_mul(pack_size)
-            .ok_or_else(|| error("fc2 inter_size exceeds usize limits"))?;
-        if inter == 0 || !inter.is_multiple_of(self.block_size) {
-            return Err(error(format!(
-                "inferred inter_size {inter} must be non-zero and divisible by block_size {}",
-                self.block_size
-            )));
-        }
-        let fc1_size = self.attributes.fc1_size(inter)?;
-
-        let mut fc1 = QuantizedExperts::validate(
-            "fc1",
-            &inputs[2],
-            &inputs[3],
-            optional_input(inputs, 11),
-            optional_input(inputs, 4),
-            experts,
-            fc1_size,
-            hidden,
-            self.bits,
-            self.block_size,
-        )?;
-        let mut fc2 = QuantizedExperts::validate(
-            "fc2",
-            &inputs[5],
-            &inputs[6],
-            optional_input(inputs, 12),
-            optional_input(inputs, 7),
-            experts,
-            hidden,
-            inter,
-            self.bits,
-            self.block_size,
-        )?;
-
-        let has_fc3 = optional_input(inputs, 8).is_some();
-        let uses_separate_gate = self.attributes.uses_separate_gate(has_fc3);
-        let mut fc3 = if uses_separate_gate {
-            Some(QuantizedExperts::validate(
-                "fc3",
-                optional_input(inputs, 8)
-                    .ok_or_else(|| error("unfused swiglu requires input 8 fc3_experts_weights"))?,
-                optional_input(inputs, 9)
-                    .ok_or_else(|| error("fc3_experts_weights requires input 9 fc3_scales"))?,
-                optional_input(inputs, 13),
-                optional_input(inputs, 10),
-                experts,
-                inter,
-                hidden,
-                self.bits,
-                self.block_size,
-            )?)
-        } else {
-            for (index, name) in [
-                (8, "fc3_experts_weights"),
-                (9, "fc3_scales"),
-                (10, "fc3_experts_bias"),
-                (13, "fc3_zero_points"),
-            ] {
-                if optional_input(inputs, index).is_some() {
-                    return Err(error(format!(
-                        "{name} is only valid for unfused swiglu or silu gated-GLU"
-                    )));
-                }
-            }
-            None
-        };
-
-        if let Some(router_weights) = optional_input(inputs, 14) {
-            float_widen_entry("router_weights", router_weights.dtype)?;
-            require_shape("router_weights", router_weights.shape, &[rows, experts])?;
-        }
-        for (name, tensor) in [("input", &inputs[0]), ("router_probs", &inputs[1])] {
-            checked_tensor_layout(name, tensor.shape, tensor.dtype)?;
-            if !tensor.is_contiguous() {
+        for (index, input) in inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, input)| !input.is_absent())
+        {
+            if !input.is_contiguous() {
                 return Err(error(format!(
-                    "{name} must be contiguous on the CUDA execution provider"
+                    "input {index} must be contiguous on the CUDA execution provider"
                 )));
             }
         }
-        if let Some(router_weights) = optional_input(inputs, 14) {
-            checked_tensor_layout("router_weights", router_weights.shape, router_weights.dtype)?;
-            if !router_weights.is_contiguous() {
-                return Err(error(
-                    "router_weights must be contiguous on the CUDA execution provider",
-                ));
-            }
-        }
-        checked_tensor_layout("output", outputs[0].shape, outputs[0].dtype)?;
         if !outputs[0].is_contiguous() {
             return Err(error(
                 "output must be contiguous on the CUDA execution provider",
             ));
         }
+        let mut fc1 = QuantizedExperts::bind(
+            &inputs[2],
+            &inputs[3],
+            optional_input(inputs, 11),
+            optional_input(inputs, 4),
+            plan.fc1,
+        );
+        let mut fc2 = QuantizedExperts::bind(
+            &inputs[5],
+            &inputs[6],
+            optional_input(inputs, 12),
+            optional_input(inputs, 7),
+            plan.fc2,
+        );
+        let mut fc3 = plan.fc3.map(|proof| {
+            QuantizedExperts::bind(
+                &inputs[8],
+                &inputs[9],
+                optional_input(inputs, 13),
+                optional_input(inputs, 10),
+                proof,
+            )
+        });
         let capturing = self.runtime.is_capturing()?;
         let telemetry_resource_ids = self.telemetry.as_ref().map_or_else(Vec::new, |telemetry| {
             telemetry.capture_resource_ids(experts)
         });
         let capture_signature = Self::capture_signature(inputs, outputs, telemetry_resource_ids);
-        let mut warm_state = self
-            .warm_state
-            .lock()
-            .map_err(|_| error("QMoE warm-state lock poisoned"))?;
         if capturing {
-            Self::validate_capture_signature(&warm_state, &capture_signature)?;
+            Self::validate_capture_signature(previous.as_deref(), &capture_signature)?;
         }
         if rows == 0 || hidden == 0 {
             if capturing {
@@ -2296,87 +2189,38 @@ impl Kernel for QMoEKernel {
         }
 
         let routes = checked_product(&[rows, self.attributes.k], "route count")?;
-        let route_index_bytes = checked_bytes(routes, std::mem::size_of::<i32>(), "route indices")?;
-        let route_weight_bytes =
-            checked_bytes(routes, std::mem::size_of::<f32>(), "route weights")?;
-        let fc1_elements = checked_product(&[routes, fc1_size], "FC1 scratch element count")?;
-        let fc1_bytes = checked_bytes(fc1_elements, 4, "FC1 scratch")?;
-        let activated_elements =
-            checked_product(&[routes, inter], "activation scratch element count")?;
-        let activated_bytes = checked_bytes(activated_elements, 4, "activation scratch")?;
-        let route_output_elements =
-            checked_product(&[routes, hidden], "route output element count")?;
-        let route_output_bytes = checked_bytes(route_output_elements, 4, "route output scratch")?;
-        let fused_gate_up_decode = rows == 1
-            && routes <= LINEAR_ONE_TASK_PER_BLOCK_MAX_ROUTES
-            && ((fc3.is_some()
-                && matches!(
-                    self.attributes.activation,
-                    Activation::Silu | Activation::Swiglu
-                ))
-                || (fc3.is_none()
-                    && self.attributes.activation == Activation::Swiglu
-                    && self.attributes.swiglu_fusion != 0));
-        let grouping_sizes = (rows > 1)
-            .then(|| {
-                let expert_entries = experts
-                    .checked_add(1)
-                    .ok_or_else(|| error("expert offset entry count exceeds usize limits"))?;
-                let counts =
-                    checked_bytes(experts, std::mem::size_of::<u64>(), "expert token counts")?;
-                let offsets = checked_bytes(
-                    expert_entries,
-                    std::mem::size_of::<u64>(),
-                    "expert token offsets",
-                )?;
-                let grouped_routes =
-                    checked_bytes(routes, std::mem::size_of::<u64>(), "grouped route indices")?;
-                let grouped_features = hidden.max(inter);
-                let grouped_elements = checked_product(
-                    &[routes, grouped_features],
-                    "grouped activation element count",
-                )?;
-                let grouped_input =
-                    checked_bytes(grouped_elements, 4, "grouped activation scratch")?;
-                Ok::<_, EpError>((counts, offsets, grouped_routes, grouped_input))
-            })
-            .transpose()?;
-
-        let mut scratch = warm_state.scratch.clone();
-        scratch.begin_call();
-        let route_indices = scratch.ensure(&self.runtime, 0, route_index_bytes, capturing)?;
-        let route_weights = scratch.ensure(&self.runtime, 1, route_weight_bytes, capturing)?;
-        let fc1_output = (!fused_gate_up_decode)
-            .then(|| scratch.ensure(&self.runtime, 2, fc1_bytes, capturing))
-            .transpose()?;
-        let fc3_output = (fc3.is_some() && !fused_gate_up_decode)
-            .then(|| scratch.ensure(&self.runtime, 3, activated_bytes, capturing))
-            .transpose()?;
-        let activated = scratch.ensure(&self.runtime, 4, activated_bytes, capturing)?;
-        let route_output = scratch.ensure(&self.runtime, 5, route_output_bytes, capturing)?;
-        let grouping = grouping_sizes
-            .map(
-                |(counts_bytes, offsets_bytes, grouped_routes_bytes, grouped_input_bytes)| {
-                    Ok::<_, EpError>(ExpertGrouping {
-                        counts: scratch.ensure(&self.runtime, 6, counts_bytes, capturing)?,
-                        offsets: scratch.ensure(&self.runtime, 7, offsets_bytes, capturing)?,
-                        cursors: scratch.ensure(&self.runtime, 8, counts_bytes, capturing)?,
-                        grouped_routes: scratch.ensure(
-                            &self.runtime,
-                            9,
-                            grouped_routes_bytes,
-                            capturing,
-                        )?,
-                        grouped_input: scratch.ensure(
-                            &self.runtime,
-                            10,
-                            grouped_input_bytes,
-                            capturing,
-                        )?,
-                    })
-                },
-            )
-            .transpose()?;
+        let scratch = plan
+            .layout
+            .bind(workspace)
+            .map_err(|source| EpError::Backend {
+                operation: "bind complete caller QMoE composite workspace",
+                source: Box::new(source),
+            })?;
+        if capturing && plan.layout.bytes() != 0 {
+            let used = WorkspaceView::new(
+                workspace
+                    .expect("bound nonempty QMoE layout requires backing")
+                    .ptr(),
+                plan.layout.bytes(),
+            );
+            self.runtime
+                .require_registered_workspace_capture(used, "QMoE composite workspace")?;
+        }
+        let ptr = |index: usize| cuptr(scratch[index].ptr().0);
+        let route_indices = ptr(0);
+        let route_weights = ptr(1);
+        let fused_gate_up_decode = plan.fused_gate_up_decode;
+        let fc1_output = (!fused_gate_up_decode).then(|| ptr(2));
+        let fc3_output = (fc3.is_some() && !fused_gate_up_decode).then(|| ptr(3));
+        let activated = ptr(4);
+        let route_output = ptr(5);
+        let grouping = (rows > 1).then(|| ExpertGrouping {
+            counts: ptr(6),
+            offsets: ptr(7),
+            cursors: ptr(8),
+            grouped_routes: ptr(9),
+            grouped_input: ptr(10),
+        });
 
         // ORT binds input, router_probs, scales, biases and the optional
         // aggregation weights to one type parameter T, so a valid fp16/bf16
@@ -2390,34 +2234,22 @@ impl Kernel for QMoEKernel {
         let router_elems = checked_product(&[rows, experts], "router element count")?;
         let router_probs_ptr = match float_widen_entry("router_probs", inputs[1].dtype)? {
             None => tensor_ptr(&inputs[1]),
-            Some(entry) => self.widen_to_f32(
-                &mut scratch,
-                11,
-                capturing,
-                entry,
-                tensor_ptr(&inputs[1]),
-                router_elems,
-            )?,
+            Some(entry) => {
+                self.widen_to_f32(scratch[11], entry, tensor_ptr(&inputs[1]), router_elems)?
+            }
         };
         let router_weights_ptr = match optional_input(inputs, 14) {
             None => 0,
             Some(rw) => match float_widen_entry("router_weights", rw.dtype)? {
                 None => tensor_ptr(rw),
-                Some(entry) => self.widen_to_f32(
-                    &mut scratch,
-                    12,
-                    capturing,
-                    entry,
-                    tensor_ptr(rw),
-                    router_elems,
-                )?,
+                Some(entry) => {
+                    self.widen_to_f32(scratch[12], entry, tensor_ptr(rw), router_elems)?
+                }
             },
         };
         if let Some(entry) = float_widen_entry("fc1_scales", fc1.scales.dtype)? {
             fc1.scales_override = Some(self.widen_to_f32(
-                &mut scratch,
-                13,
-                capturing,
+                scratch[13],
                 entry,
                 tensor_ptr(fc1.scales),
                 checked_product(fc1.scales.shape, "fc1 scales element count")?,
@@ -2425,9 +2257,7 @@ impl Kernel for QMoEKernel {
         }
         if let Some(entry) = float_widen_entry("fc2_scales", fc2.scales.dtype)? {
             fc2.scales_override = Some(self.widen_to_f32(
-                &mut scratch,
-                14,
-                capturing,
+                scratch[14],
                 entry,
                 tensor_ptr(fc2.scales),
                 checked_product(fc2.scales.shape, "fc2 scales element count")?,
@@ -2437,9 +2267,7 @@ impl Kernel for QMoEKernel {
             && let Some(entry) = float_widen_entry("fc3_scales", fc3.scales.dtype)?
         {
             fc3.scales_override = Some(self.widen_to_f32(
-                &mut scratch,
-                15,
-                capturing,
+                scratch[15],
                 entry,
                 tensor_ptr(fc3.scales),
                 checked_product(fc3.scales.shape, "fc3 scales element count")?,
@@ -2449,9 +2277,7 @@ impl Kernel for QMoEKernel {
             && let Some(entry) = float_widen_entry("fc1_experts_bias", bias.dtype)?
         {
             fc1.bias_override = Some(self.widen_to_f32(
-                &mut scratch,
-                16,
-                capturing,
+                scratch[16],
                 entry,
                 tensor_ptr(bias),
                 checked_product(bias.shape, "fc1 bias element count")?,
@@ -2461,9 +2287,7 @@ impl Kernel for QMoEKernel {
             && let Some(entry) = float_widen_entry("fc2_experts_bias", bias.dtype)?
         {
             fc2.bias_override = Some(self.widen_to_f32(
-                &mut scratch,
-                17,
-                capturing,
+                scratch[17],
                 entry,
                 tensor_ptr(bias),
                 checked_product(bias.shape, "fc2 bias element count")?,
@@ -2474,9 +2298,7 @@ impl Kernel for QMoEKernel {
             && let Some(entry) = float_widen_entry("fc3_experts_bias", bias.dtype)?
         {
             fc3.bias_override = Some(self.widen_to_f32(
-                &mut scratch,
-                18,
-                capturing,
+                scratch[18],
                 entry,
                 tensor_ptr(bias),
                 checked_product(bias.shape, "fc3 bias element count")?,
@@ -2637,60 +2459,19 @@ impl Kernel for QMoEKernel {
             rows,
             hidden,
         )?;
-        // All kernels above are enqueued on the single in-order EP stream, so
-        // kernel-to-kernel ordering is already guaranteed without waiting here,
-        // and no host-visible read of their output happens in this function
-        // (see the doc comment on this impl). The `synchronize()` call below is
-        // a no-op by default (`defer_eager_sync`); it exists only so the
-        // `ONNX_GENAI_DEFER_EAGER_SYNC=0` debug escape hatch still applies to
-        // this kernel like every other one in the EP — see the doc comment on
-        // this impl.
+        // Stream ordering owns kernel-to-kernel dependencies. Preserve the
+        // explicit eager-sync debug policy; synchronize is deferred by default.
         if !capturing {
             self.runtime.synchronize()?;
-            let mut resources = scratch.device_graph_resources();
-            if let Some(telemetry) = &self.telemetry {
-                resources.extend(telemetry.device_graph_resources());
-            }
-            warm_state.scratch = scratch;
-            Self::publish_capture_ready(&mut warm_state, capture_signature, resources);
         }
+        let mut resources = Vec::new();
+        if let Some(telemetry) = &self.telemetry {
+            resources.extend(telemetry.device_graph_resources());
+        }
+        Self::publish_capture_ready(&mut warm_state, capture_signature, resources);
         Ok(())
     }
 
-    fn supports_strided_input(&self, _input_idx: usize) -> bool {
-        false
-    }
-
-    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        self.warm_state
-            .lock()
-            .ok()
-            .and_then(|state| {
-                state
-                    .capture_ready
-                    .as_ref()
-                    .map(|ready| ready.resources.clone())
-            })
-            .unwrap_or_default()
-    }
-
-    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        match self.warm_state.lock() {
-            Ok(state) if state.capture_ready.is_some() => {
-                onnx_runtime_ep_api::CaptureSupport::Supported
-            }
-            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "requires a warmed fixed-shape eager QMoE pass to size the pooled scratch and \
-                 compile every routed expert kernel",
-            ),
-            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "QMoE capture readiness is unavailable because its state lock was poisoned",
-            ),
-        }
-    }
-}
-
-impl QMoEKernel {
     /// Investigation-only: copy the top-k expert indices and the router logits
     /// back to the host and print, per decode row, the selected expert SET plus
     /// the logit margin between the last-selected expert and the best rejected
@@ -2757,21 +2538,25 @@ impl QMoEKernel {
     }
 
     /// Widen a contiguous fp16/bf16 device buffer (`entry` selects the kernel)
-    /// into f32 scratch slot `index`, returning the f32 pointer. Conversion is
+    /// into a pre-bound caller region, returning the f32 pointer. Conversion is
     /// exact, so the reused f32 routing/dequant kernels are numerically
     /// unaffected. Only invoked for fp16/bf16 graphs; f32 never widens.
     #[allow(clippy::too_many_arguments)]
     fn widen_to_f32(
         &self,
-        scratch: &mut ScratchPool,
-        index: usize,
-        capturing: bool,
+        destination: WorkspaceView,
         entry: &str,
         src: CUdeviceptr,
         elements: usize,
     ) -> Result<CUdeviceptr> {
         let bytes = checked_bytes(elements, std::mem::size_of::<f32>(), "widened f32 scratch")?;
-        let dst = scratch.ensure(&self.runtime, index, bytes, capturing)?;
+        if destination.bytes() < bytes {
+            return Err(error(format!(
+                "widened QMoE operand requires {bytes} bytes, caller region contains {}; prepare the complete composite",
+                destination.bytes()
+            )));
+        }
+        let dst = cuptr(destination.ptr().0);
         // The widen kernels use __half/__nv_bfloat16, so ensure NVRTC compiles
         // the module with the fp16/bf16 headers available before it is resolved.
         self.runtime.require_nvrtc_half_headers("QMoE widen")?;
@@ -3415,8 +3200,6 @@ impl QMoEKernel {
     }
 }
 
-const SCRATCH_SLOTS: usize = 19;
-
 /// Classifies a QMoE T-typed float operand (router_probs, scales, biases,
 /// aggregation weights) and returns the widen kernel that upcasts it to f32, or
 /// `None` when it is already f32 (used directly to keep the f32 path
@@ -3436,119 +3219,6 @@ fn float_widen_entry(name: &str, dtype: DataType) -> Result<Option<&'static str>
         other => Err(error(format!(
             "{name} requires Float32, Float16, or BFloat16, got {other:?}"
         ))),
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct ScratchSlot {
-    allocation: Option<Arc<GraphDeviceAllocation>>,
-    capacity: usize,
-}
-
-#[derive(Clone, Debug)]
-struct ScratchPool {
-    slots: [ScratchSlot; SCRATCH_SLOTS],
-    used: [bool; SCRATCH_SLOTS],
-}
-
-impl Default for ScratchPool {
-    fn default() -> Self {
-        Self {
-            slots: std::array::from_fn(|_| ScratchSlot::default()),
-            used: [false; SCRATCH_SLOTS],
-        }
-    }
-}
-
-impl ScratchPool {
-    /// Returns a device pointer with capacity for at least `bytes`, growing
-    /// the slot (freeing any smaller previous allocation) on demand.
-    ///
-    /// Growth is the one place in `QMoEKernel::execute` that still needs an
-    /// unconditional device drain (see the call to `drain_for_unmap` below):
-    /// `execute` itself is otherwise fully asynchronous, so a launch from the
-    /// *previous* call may still be reading the old, undersized pointer when
-    /// this call wants to free it.
-    fn ensure(
-        &mut self,
-        runtime: &Arc<CudaRuntime>,
-        index: usize,
-        bytes: usize,
-        capturing: bool,
-    ) -> Result<CUdeviceptr> {
-        let slot = &mut self.slots[index];
-        let bytes = bytes.max(1);
-        self.used[index] = true;
-        if slot.capacity >= bytes
-            && let Some(allocation) = slot.allocation.as_ref()
-        {
-            if capturing {
-                runtime.require_registered_address_capture(
-                    GraphDeviceAllocation::device_graph_resource(allocation).identity(),
-                    "QMoE scratch allocation",
-                )?;
-            }
-            return Ok(allocation.ptr());
-        }
-        if capturing {
-            return Err(error(format!(
-                "QMoE scratch slot {index} needs {bytes} bytes but the warmed capacity is {} bytes",
-                slot.capacity
-            )));
-        }
-        if slot.allocation.is_some() {
-            // `free_raw` returns to a shared, size-classed pool rather than the
-            // driver in the common case, so a stale pointer can be handed to an
-            // unrelated caller almost immediately — there is no synchronization
-            // inside `alloc_raw`/`free_raw` to rely on. A prior `execute()` call
-            // may still have in-flight kernels reading this slot (the trailing
-            // per-op sync that used to force this ordering was removed; see
-            // `QMoEKernel::execute`), so this growth path is now the only place
-            // that needs an unconditional barrier before freeing the old
-            // pointer. Drain *before* allocating the replacement (mirroring
-            // `BroadcastMetadataCache::prepare` in `elementwise.rs`): if the
-            // drain fails, nothing new has been allocated yet, so there is
-            // nothing to leak on this error path. Growth is rare (first time a
-            // kernel instance sees a shape larger than any previous call), so
-            // this cost is not paid on the steady-state path.
-            runtime.drain_for_unmap()?;
-        }
-        let fresh = GraphDeviceAllocation::allocate(runtime, bytes)?;
-        runtime.staged_warm_cache_mutation(&format!("QMoE scratch slot {index} allocation"))?;
-        let ptr = fresh.ptr();
-        slot.allocation = Some(fresh);
-        slot.capacity = bytes;
-        Ok(ptr)
-    }
-
-    fn begin_call(&mut self) {
-        self.used.fill(false);
-    }
-
-    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        self.slots
-            .iter()
-            .zip(self.used)
-            .filter_map(|(slot, used)| used.then_some(slot.allocation.as_ref()).flatten())
-            .map(GraphDeviceAllocation::device_graph_resource)
-            .collect()
-    }
-}
-
-impl Drop for QMoEKernel {
-    fn drop(&mut self) {
-        let state = self
-            .warm_state
-            .get_mut()
-            .expect("cuda_ep QMoE warm state poisoned");
-        if state
-            .scratch
-            .slots
-            .iter()
-            .any(|slot| slot.allocation.is_some())
-        {
-            let _ = self.runtime.drain_for_unmap();
-        }
     }
 }
 

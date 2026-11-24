@@ -85,6 +85,22 @@ pub fn prepare_workspace(
     )))
 }
 
+/// Prepare a caller owner without launching the kernel or changing telemetry.
+pub fn prepare_kernel_workspace(
+    ep: &CudaExecutionProvider,
+    kernel: &dyn Kernel,
+    inputs: &[TensorView],
+    outputs: &[TensorMut],
+    workspace: &mut Option<WorkspaceAllocation>,
+) -> onnx_runtime_ep_api::Result<Option<WorkspaceView>> {
+    let output_metadata = outputs
+        .iter()
+        .map(onnx_runtime_ep_api::OutputMetadata::from_view)
+        .collect::<Vec<_>>();
+    let requirement = runtime_workspace_requirement(kernel, inputs, &output_metadata, outputs)?;
+    prepare_workspace(ep, requirement, workspace)
+}
+
 /// Execute one kernel through the same prepared-workspace path the session
 /// executor uses.
 pub fn execute_kernel(
@@ -94,12 +110,7 @@ pub fn execute_kernel(
     outputs: &mut [TensorMut],
     workspace: &mut Option<WorkspaceAllocation>,
 ) -> onnx_runtime_ep_api::Result<()> {
-    let output_metadata = outputs
-        .iter()
-        .map(onnx_runtime_ep_api::OutputMetadata::from_view)
-        .collect::<Vec<_>>();
-    let requirement = runtime_workspace_requirement(kernel, inputs, &output_metadata, outputs)?;
-    let workspace_view = prepare_workspace(ep, requirement, workspace)?;
+    let workspace_view = prepare_kernel_workspace(ep, kernel, inputs, outputs, workspace)?;
     kernel.execute_with_workspace(inputs, outputs, workspace_view)
 }
 

@@ -1374,7 +1374,7 @@ pub fn build_cuda_registry_with_metrics(
     );
     reg.register(
         OpKey::new("QMoE", "com.microsoft", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(qmoe::QMoEFactory {
             runtime: runtime.clone(),
             telemetry_registry: Arc::clone(&telemetry_registry),

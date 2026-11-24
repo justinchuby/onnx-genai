@@ -48,21 +48,18 @@ before the kernel that consumes them launches.
 
 ### 1.2 Buffer shape and lifetime (prefill vs decode)
 
-`route_indices` is scratch slot 0 of `QMoEKernel`'s persistent `ScratchPool`:
+`route_indices` is region 0 of the caller-funded QMoE composite workspace
+(`kernels/qmoe/workspace.rs`):
 
-- Allocated at `qmoe.rs:1723`, `route_index_bytes = routes * sizeof(i32)` where
-  `routes = rows * k` (`qmoe.rs:1671`).
-- **Prefill:** `rows = prompt length`, so `routes = prompt_len * top_k`.
-- **Decode:** `rows = 1`, so `routes = top_k` (6 for DeepSeek-V4-Flash, 8 for
-  GLM-5.2, 2 for the tiny DeepSeek-V4 fixture).
-- The slot is **persistent and size-classed** with a **stable device pointer**
-  reused across calls (`ScratchPool::ensure`, `qmoe.rs:2793`). It is overwritten
-  every call; nothing accumulates.
-- **Capture safety is already load-bearing here:** under capture,
-  `ScratchPool::ensure` **refuses to grow** and returns `Err` if the warmed
-  capacity is too small (`qmoe.rs:2810-2814`). Warm-up fixes every scratch
-  pointer before capture; capture records launches against those fixed pointers;
-  replay re-runs them. This is exactly the contract a telemetry buffer must obey.
+- Its checked size is `rows * k * sizeof(i32)`.
+- Prefill uses the flattened token count; decode uses one row.
+- The region is overwritten each call. It is a borrowed view into one
+  SessionPersistent root lane, with no private slot allocation or capacity.
+- Preparation funds the complete composite before dispatch. Capture checks the
+  warmed signature and requires a real caller-owner pin for the complete used
+  span before the first widening or routing launch. Capture cannot grow it.
+- Cumulative telemetry has a separate owner and graph pins. Its contents survive
+  scratch reuse and reset only at the explicit telemetry boundary.
 
 ### 1.3 The contiguous expert-bank pointer ABI (must be preserved)
 
@@ -437,10 +434,11 @@ real routing corpus and remain open (§8).
 
 ## 8. Exact next implementation slice (not in scope here)
 
-Slice 7 (production wiring, gated on §6 GO): add telemetry as **scratch slot(s)**
-of `QMoEKernel`/`BlockQuantizedMoEKernel` (new slots in `ScratchPool`,
-`qmoe.rs`), write it from `qmoe_route`/`bqmoe_route` (or one appended
-telemetry kernel on the same stream), expose a boundary-time consumer that
+The original Slice 7 proposal below is historical: telemetry is now a separately
+owned cumulative artifact, never an extra caller scratch region. The remaining
+production residency wiring must preserve its existing owner and graph pins.
+Write observations from `qmoe_route`/`bqmoe_route` (or one appended telemetry
+kernel on the same stream), expose a boundary-time consumer that
 produces a per-expert desired-set, and feed that set to the **existing** Slice
 4/5 coarse-boundary plan application (`coarse_residency.rs`) as its policy input —
 with **no** new allocator, **no** id→slot rewrite, and every mapping change still
