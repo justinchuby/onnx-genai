@@ -16,9 +16,33 @@ use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
 const ENTRY: &str = "dequantize_packed_gather";
+const VALIDATE_ENTRY: &str = "dequantize_packed_gather_validate_indices";
 const THREADS: u32 = 256;
 
 const GATHER_SOURCE: &str = r#"
+__device__ __forceinline__ long long packed_gather_row(
+    const void* indices, unsigned long long selected, long long rows, int index_is_i64)
+{
+    const long long row = index_is_i64
+        ? ((const long long*)indices)[selected]
+        : (long long)((const int*)indices)[selected];
+    return row < 0 ? row + rows : row;
+}
+
+extern "C" __global__ void dequantize_packed_gather_validate_indices(
+    const void* indices, unsigned long long count, long long rows,
+    int index_is_i64, unsigned int* capture_error)
+{
+    unsigned long long selected =
+        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long stride =
+        (unsigned long long)blockDim.x * gridDim.x;
+    for (; selected < count; selected += stride) {
+        const long long row = packed_gather_row(indices, selected, rows, index_is_i64);
+        if (row < 0 || row >= rows) atomicOr(capture_error, 64u);
+    }
+}
+
 extern "C" __global__ void dequantize_packed_gather(
     const unsigned char* packed, const void* indices, unsigned char* output,
     unsigned long long lanes, unsigned long long row_elements,
@@ -31,10 +55,7 @@ extern "C" __global__ void dequantize_packed_gather(
         (unsigned long long)blockDim.x * gridDim.x;
     for (; lane < lanes; lane += stride) {
         const unsigned long long selected = lane / row_elements;
-        long long row = index_is_i64
-            ? ((const long long*)indices)[selected]
-            : (long long)((const int*)indices)[selected];
-        if (row < 0) row += rows;
+        const long long row = packed_gather_row(indices, selected, rows, index_is_i64);
         if (row < 0 || row >= rows) {
             if (capture_error) atomicOr(capture_error, 64u);
             continue;
@@ -92,6 +113,47 @@ impl KernelFactory for Factory {
 }
 
 impl PackedGatherKernel {
+    fn validate_empty_rows(
+        &self,
+        indices: &TensorView,
+        count: usize,
+        rows: usize,
+        device_validation: bool,
+    ) -> Result<()> {
+        // Even after host validation, prepare the entry for a later capture;
+        // a validation-only launch still needs a warm NVRTC module.
+        let function = self
+            .runtime
+            .nvrtc_function(ENTRY, source(), VALIDATE_ENTRY)?;
+        if !device_validation {
+            return Ok(());
+        }
+        let rows = i64::try_from(rows).map_err(|_| invalid("row count exceeds i64"))?;
+        let count = u64::try_from(count).map_err(|_| invalid("index count exceeds u64"))?;
+        let index_is_i64 = i32::from(indices.dtype == DataType::Int64);
+        let indices = cuptr(indices.data_ptr::<u8>().cast::<c_void>());
+        let capture_error = self.runtime.capture_error_ptr();
+        let grid = count.div_ceil(u64::from(THREADS)).clamp(1, 65_535) as u32;
+        let stream = self.runtime.stream();
+        let mut args = stream.launch_builder(&function);
+        args.arg(&indices)
+            .arg(&count)
+            .arg(&rows)
+            .arg(&index_is_i64)
+            .arg(&capture_error);
+        // SAFETY: the contiguous index buffer covers `count` elements, and
+        // the runtime owns the live latch. Packed input and output aren't read.
+        unsafe {
+            args.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|error| driver_err("launch DequantizePackedGather index validation", error))?;
+        Ok(())
+    }
+
     fn validate_indices_host(&self, indices: &TensorView, rows: usize) -> Result<()> {
         let mut bytes = vec![0; indices.dtype.storage_bytes(indices.numel())];
         if !bytes.is_empty() {
@@ -162,11 +224,17 @@ impl Kernel for PackedGatherKernel {
                 "indices cannot select from an empty decoded axis 0",
             ));
         }
+        if layout.indices == 0 {
+            self.last_call_capture_safe.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
         let capturing = self.runtime.is_capturing()?;
-        if !capturing && !self.runtime.eager_sync_deferred() {
+        let device_validation = capturing || self.runtime.eager_sync_deferred();
+        if !device_validation {
             self.validate_indices_host(indices, layout.rows)?;
         }
         if layout.lanes == 0 {
+            self.validate_empty_rows(indices, layout.indices, layout.rows, device_validation)?;
             self.last_call_capture_safe.store(true, Ordering::Relaxed);
             return Ok(());
         }
@@ -182,7 +250,7 @@ impl Kernel for PackedGatherKernel {
         let index_is_i64 = i32::from(indices.dtype == DataType::Int64);
         let kind = decoder_kind(self.metadata.format());
         let dtype = self.metadata.dtype().to_onnx();
-        let capture_error = if capturing || self.runtime.eager_sync_deferred() {
+        let capture_error = if device_validation {
             self.runtime.capture_error_ptr()
         } else {
             0
