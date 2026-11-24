@@ -7195,23 +7195,77 @@ impl Accuracy4Geometry {
 /// result across steps. Converting BFloat16→Float16 in one staging pass is
 /// byte-identical whether done once or per step, so decode output is unchanged.
 #[derive(Debug)]
+struct PreparedBf16Constants {
+    signature: Vec<(CUdeviceptr, usize)>,
+    layout: WorkspaceLayout<BF16_MAX_CACHED_SCALES>,
+    allocation: Option<Arc<GraphDeviceAllocation>>,
+}
+
+fn bf16_constant_layout(
+    consts: &[(CUdeviceptr, usize)],
+) -> Result<WorkspaceLayout<BF16_MAX_CACHED_SCALES>> {
+    if consts.len() > BF16_MAX_CACHED_SCALES {
+        return Err(error(format!(
+            "BF16 constant cache received {} operands, capacity is {BF16_MAX_CACHED_SCALES}; use the declared gate/up signature",
+            consts.len()
+        )));
+    }
+    let mut regions = [std::alloc::Layout::new::<()>(); BF16_MAX_CACHED_SCALES];
+    for (index, &(src, numel)) in consts.iter().enumerate() {
+        if numel > i32::MAX as usize {
+            return Err(error(format!(
+                "BF16 constant cache operand {index} has {numel} elements, exceeding the cast kernel's int32 extent; reduce the constant shape"
+            )));
+        }
+        if numel == 0 {
+            continue;
+        }
+        let bytes = numel.checked_mul(2).ok_or_else(|| error(format!(
+            "BF16 constant cache operand {index} byte extent overflows; reduce the constant shape"
+        )))?;
+        if src == 0 || src.checked_add(bytes as u64).is_none() {
+            return Err(error(format!(
+                "BF16 constant cache operand {index} at {src:#x} with {bytes} bytes is null or wraps device address space; pass a live BF16 constant span"
+            )));
+        }
+        regions[index] = std::alloc::Layout::from_size_align(bytes, blas::WORKSPACE_ALIGNMENT)
+            .map_err(|source| EpError::Backend {
+                operation: "plan BF16 constant cache region; reduce the constant shape",
+                source: Box::new(source),
+            })?;
+    }
+    WorkspaceLayout::new(regions)
+}
+
+impl PreparedBf16Constants {
+    fn pointers(&self) -> Result<[CUdeviceptr; BF16_MAX_CACHED_SCALES]> {
+        let views =
+            self.layout.bind(self.allocation.as_ref().map(|owner| {
+                WorkspaceView::new(DevicePtrMut(raw_ptr(owner.ptr())), owner.bytes())
+            }))?;
+        Ok(std::array::from_fn(|index| {
+            if index < self.signature.len() && views[index].bytes() != 0 {
+                cuptr(views[index].ptr().0.cast_const())
+            } else {
+                0
+            }
+        }))
+    }
+}
+
+#[derive(Debug)]
 struct Bf16ConstCache {
     runtime: Arc<CudaRuntime>,
-    allocation: Option<Arc<GraphDeviceAllocation>>,
-    cap: usize,
+    current: Option<PreparedBf16Constants>,
     used: bool,
-    /// One entry per cached constant: `(src_ptr, numel, byte_offset)`.
-    slots: Vec<(CUdeviceptr, usize, usize)>,
 }
 
 impl Bf16ConstCache {
     fn new(runtime: Arc<CudaRuntime>) -> Self {
         Self {
             runtime,
-            allocation: None,
-            cap: 0,
+            current: None,
             used: false,
-            slots: Vec::new(),
         }
     }
 
@@ -7219,96 +7273,87 @@ impl Bf16ConstCache {
         self.used = false;
     }
 
-    /// Return the Float16 device pointers holding the staged copies of the
-    /// BFloat16 constants described by `consts` (`(src_ptr, numel)` each),
-    /// casting them on first use and reusing them thereafter. The staged buffer
-    /// is allocated once (before CUDA-graph capture, during warmup) and never
-    /// grows again for a given node, so replays hit only cache lookups.
+    /// Warm hits only bind the existing immutable composite. Changed signatures
+    /// always get a new owner: an old graph retains both its address and data.
     fn staged(
         &mut self,
         consts: &[(CUdeviceptr, usize)],
     ) -> Result<[CUdeviceptr; BF16_MAX_CACHED_SCALES]> {
-        self.used = true;
-        let matches =
-            self.slots.len() == consts.len()
-                && self.slots.iter().zip(consts).all(
-                    |((src, numel, _), (want_src, want_numel))| {
-                        *src == *want_src && *numel == *want_numel
-                    },
-                );
-        if !matches {
-            self.rebuild(consts)?;
-        }
-        Ok(std::array::from_fn(|index| {
-            self.slots.get(index).map_or(0, |(_, _, offset)| {
-                self.allocation
-                    .as_ref()
-                    .map_or(0, |allocation| allocation.ptr())
-                    + *offset as CUdeviceptr
-            })
-        }))
-    }
-
-    fn rebuild(&mut self, consts: &[(CUdeviceptr, usize)]) -> Result<()> {
-        if consts.len() > BF16_MAX_CACHED_SCALES {
-            return Err(error(
-                "too many BF16 scale-cache operands; use the declared gate/up signature",
-            ));
-        }
-        let empty = std::alloc::Layout::from_size_align(0, blas::WORKSPACE_ALIGNMENT)
-            .map_err(|_| error("invalid BF16 scale-cache alignment"))?;
-        let mut regions = [empty; BF16_MAX_CACHED_SCALES];
-        for (index, (_, numel)) in consts.iter().enumerate() {
-            regions[index] = std::alloc::Layout::array::<half::f16>(*numel)
-                .and_then(|layout| layout.align_to(blas::WORKSPACE_ALIGNMENT))
-                .map(|layout| layout.pad_to_align())
-                .map_err(|_| error("BF16 scale-cache layout exceeds addressable capacity; reduce the scale tensor shapes"))?;
-        }
-        let layout = WorkspaceLayout::new(regions)?;
-        let total = layout.bytes();
-        // Once backing or contents may change, no previous descriptor may hit
-        // until every conversion has been submitted successfully.
-        self.slots.clear();
-        if total > self.cap {
-            if self.allocation.is_some() {
-                self.runtime.drain_for_unmap()?;
-            }
-            self.allocation = Some(GraphDeviceAllocation::allocate(
-                &self.runtime,
-                total.max(1),
-            )?);
-            self.cap = total;
-        }
-        let base = self
-            .allocation
+        let matches = self
+            .current
             .as_ref()
-            .map_or(0, |allocation| allocation.ptr());
-        let views = layout.bind(Some(WorkspaceView::new(
-            DevicePtrMut(raw_ptr(base)),
-            self.cap,
-        )))?;
-        let mut slots = Vec::with_capacity(consts.len());
-        for ((src, numel), region) in consts.iter().zip(views) {
-            let ptr = cuptr(region.ptr().0.cast_const());
-            super::cast::launch_cast_raw(
-                &self.runtime,
-                *src,
-                DataType::BFloat16,
-                ptr,
-                DataType::Float16,
-                *numel,
-            )?;
-            slots.push((*src, *numel, (ptr - base) as usize));
+            .is_some_and(|entry| entry.signature == consts);
+        let contextual = |operation, source| EpError::Backend {
+            operation,
+            source: Box::new(source),
+        };
+        let capturing = self.runtime.is_capturing().map_err(|source| contextual(
+            "query capture before staging MatMulNBits BF16 constants; restore a healthy CUDA stream before retrying", source,
+        ))?;
+        if matches {
+            let entry = self.current.as_ref().unwrap();
+            if capturing && let Some(owner) = &entry.allocation {
+                self.runtime.require_captured_address_owner(
+                    GraphDeviceAllocation::device_graph_resource(owner).identity(),
+                    "MatMulNBits BF16 constants",
+                )?;
+            }
+        } else {
+            let layout = bf16_constant_layout(consts)?;
+            if capturing {
+                return Err(error(
+                    "BF16 constant signature changed during CUDA graph capture; abort recording and eagerly warm the exact constant signature before capture",
+                ));
+            }
+            if self.current.is_some() {
+                self.runtime.drain_for_unmap().map_err(|source| contextual(
+                    "retire previous MatMulNBits BF16 constant readers; stop inference on device failure before preparing again", source,
+                ))?;
+            }
+            let allocation = if layout.bytes() == 0 {
+                None
+            } else {
+                Some(GraphDeviceAllocation::allocate(
+                    &self.runtime,
+                    layout.bytes(),
+                ).map_err(|source| contextual(
+                    "allocate immutable MatMulNBits BF16 constant composite; free device capacity or reduce constant shapes", source,
+                ))?)
+            };
+            let candidate = PreparedBf16Constants {
+                signature: consts.to_vec(),
+                layout,
+                allocation,
+            };
+            let pointers = candidate.pointers()?;
+            for (&(src, numel), dst) in consts.iter().zip(pointers) {
+                super::cast::launch_cast_raw(
+                    &self.runtime,
+                    src,
+                    DataType::BFloat16,
+                    dst,
+                    DataType::Float16,
+                    numel,
+                ).map_err(|source| contextual(
+                    "convert MatMulNBits BF16 constant candidate; verify live BF16 inputs and CUDA kernel support before warming again", source,
+                ))?;
+            }
+            self.runtime
+                .staged_warm_cache_mutation("MatMulNBits BF16 constants")?;
+            self.current = Some(candidate);
         }
-        self.slots = slots;
-        Ok(())
+        let pointers = self.current.as_ref().unwrap().pointers()?;
+        self.used = true;
+        Ok(pointers)
     }
 
     fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
         if !self.used {
             return None;
         }
-        self.allocation
+        self.current
+            .as_ref()?
+            .allocation
             .as_ref()
             .map(GraphDeviceAllocation::device_graph_resource)
     }
@@ -11876,6 +11921,213 @@ mod tests {
     use onnx_runtime_ir::{DataType, DeviceId};
 
     use super::*;
+
+    #[test]
+    fn bf16_constant_layout_checks_all_operands_before_device_work() {
+        let empty = bf16_constant_layout(&[(0, 0)]).unwrap();
+        assert_eq!(empty.bytes(), 0);
+        assert!(
+            empty
+                .bind(None)
+                .unwrap()
+                .iter()
+                .all(|view| view.bytes() == 0)
+        );
+        let layout = bf16_constant_layout(&[(0x1000, 3), (0x2000, 5)]).unwrap();
+        let views = layout
+            .bind(Some(WorkspaceView::new(
+                DevicePtrMut(raw_ptr(0x1000)),
+                layout.bytes(),
+            )))
+            .unwrap();
+        assert_eq!(views[0].bytes(), 6);
+        assert_eq!(views[1].bytes(), 10);
+        assert_eq!(
+            cuptr(views[1].ptr().0.cast_const()) % blas::WORKSPACE_ALIGNMENT as u64,
+            0
+        );
+        for (consts, detail) in [
+            (vec![(0, 1)], "operand 0"),
+            (vec![(u64::MAX - 1, 2)], "wraps"),
+            (vec![(0x1000, i32::MAX as usize + 1)], "int32"),
+            (vec![(0x1000, 1); BF16_MAX_CACHED_SCALES + 1], "capacity"),
+        ] {
+            let message = bf16_constant_layout(&consts).unwrap_err().to_string();
+            assert!(message.contains(detail), "{message}");
+        }
+    }
+
+    #[cfg(feature = "gpu-tests")]
+    #[test]
+    fn bf16_constant_replacements_preserve_old_graph_contents_and_reject_unpinned_capture() {
+        use half::bf16;
+        let runtime =
+            Arc::new(CudaRuntime::new(0).expect("BF16 immutable cache test requires CUDA"));
+        runtime.set_defer_eager_sync(true);
+        let source_a = GraphDeviceAllocation::allocate(&runtime, 4).unwrap();
+        let source_b = GraphDeviceAllocation::allocate(&runtime, 4).unwrap();
+        let output = GraphDeviceAllocation::allocate(&runtime, 8).unwrap();
+        unsafe {
+            runtime
+                .htod(
+                    as_bytes(&[bf16::from_f32(1.5), bf16::from_f32(-2.0)]),
+                    source_a.ptr(),
+                )
+                .unwrap();
+            runtime
+                .htod(
+                    as_bytes(&[bf16::from_f32(7.0), bf16::from_f32(8.0)]),
+                    source_b.ptr(),
+                )
+                .unwrap();
+        }
+        let a = [(source_a.ptr(), 2)];
+        let b = [(source_b.ptr(), 2)];
+        let mut cache = Bf16ConstCache::new(runtime.clone());
+        let first = cache.staged(&a).unwrap();
+        let first_resource = cache.device_graph_resource().unwrap();
+        let counts = runtime.allocation_counts();
+        let transfers = runtime.transfer_counts();
+        let syncs = runtime.forced_synchronization_count();
+        for _ in 0..4 {
+            assert_eq!(cache.staged(&a).unwrap(), first);
+        }
+        assert_eq!(runtime.allocation_counts(), counts);
+        assert_eq!(runtime.transfer_counts(), transfers);
+        assert_eq!(runtime.forced_synchronization_count(), syncs);
+        super::super::cast::launch_cast_raw(
+            &runtime,
+            first[0],
+            DataType::Float16,
+            output.ptr(),
+            DataType::Float32,
+            2,
+        )
+        .unwrap();
+        runtime
+            .begin_graph_capture_with_resources(
+                &[],
+                vec![
+                    first_resource,
+                    GraphDeviceAllocation::device_graph_resource(&output),
+                ],
+            )
+            .unwrap();
+        assert_eq!(cache.staged(&a).unwrap(), first);
+        let counts = runtime.allocation_counts();
+        let transfers = runtime.transfer_counts();
+        let syncs = runtime.forced_synchronization_count();
+        assert!(
+            cache
+                .staged(&b)
+                .unwrap_err()
+                .to_string()
+                .contains("eagerly warm")
+        );
+        assert_eq!(runtime.allocation_counts(), counts);
+        assert_eq!(runtime.transfer_counts(), transfers);
+        assert_eq!(runtime.forced_synchronization_count(), syncs);
+        assert_eq!(
+            runtime.stream_capture_status().unwrap(),
+            cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
+        );
+        super::super::cast::launch_cast_raw(
+            &runtime,
+            first[0],
+            DataType::Float16,
+            output.ptr(),
+            DataType::Float32,
+            2,
+        )
+        .unwrap();
+        runtime.end_graph_capture().unwrap();
+
+        runtime.fail_warm_transaction_at_for_test(1);
+        assert!(
+            cache
+                .staged(&b)
+                .unwrap_err()
+                .to_string()
+                .contains("injected staged warm-cache failure")
+        );
+        assert_eq!(
+            cache.staged(&a).unwrap(),
+            first,
+            "failed replacement preserves the previous signature and owner"
+        );
+        let mut original = [f16::ZERO; 2];
+        unsafe {
+            runtime.dtoh(as_bytes_mut(&mut original), first[0]).unwrap();
+        }
+        assert_eq!(original, [f16::from_f32(1.5), f16::from_f32(-2.0)]);
+        let second = cache.staged(&b).unwrap();
+        assert_ne!(
+            first[0], second[0],
+            "equal-size replacement cannot rewrite a graph-retained artifact"
+        );
+        let mut replacement = [f16::ZERO; 2];
+        unsafe {
+            runtime
+                .dtoh(as_bytes_mut(&mut replacement), second[0])
+                .unwrap();
+        }
+        assert_eq!(replacement, [f16::from_f32(7.0), f16::from_f32(8.0)]);
+        runtime.replay_graph().unwrap();
+        let mut actual = [0f32; 2];
+        unsafe {
+            runtime
+                .dtoh(as_bytes_mut(&mut actual), output.ptr())
+                .unwrap();
+        }
+        assert_eq!(
+            actual,
+            [1.5, -2.0],
+            "old graph must keep reading its original immutable constants"
+        );
+
+        let exclusion = onnx_runtime_cuda_memory::capture_gate::CaptureExclusion::acquire();
+        runtime
+            .stream()
+            .begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )
+            .unwrap();
+        let counts = runtime.allocation_counts();
+        let transfers = runtime.transfer_counts();
+        assert!(
+            cache
+                .staged(&b)
+                .unwrap_err()
+                .to_string()
+                .contains("capture"),
+            "raw capture cannot use an unregistered warm owner"
+        );
+        assert!(
+            cache
+                .staged(&a)
+                .unwrap_err()
+                .to_string()
+                .contains("eagerly warm")
+        );
+        assert_eq!(runtime.allocation_counts(), counts);
+        assert_eq!(runtime.transfer_counts(), transfers);
+        assert_eq!(
+            runtime.stream_capture_status().unwrap(),
+            cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
+        );
+        runtime.test_end_unregistered_graph_capture().unwrap();
+        drop(exclusion);
+        runtime.reset_graph().unwrap();
+        drop(cache);
+        let mut empty = Bf16ConstCache::new(runtime.clone());
+        let counts = runtime.allocation_counts();
+        assert_eq!(
+            empty.staged(&[(0, 0)]).unwrap(),
+            [0; BF16_MAX_CACHED_SCALES]
+        );
+        assert!(empty.device_graph_resource().is_none());
+        assert_eq!(runtime.allocation_counts(), counts);
+    }
 
     /// These ignored Marlin probes mutate process-wide dispatch settings and
     /// must be invoked serially (--test-threads=1), like their Marlin flag arms.
@@ -22137,7 +22389,13 @@ extern "C" __global__ void ref_silu_mul_f16(
                     );
                 }
                 assert_eq!(
-                    kernel.bf16_const_cache.lock().unwrap().slots.len(),
+                    kernel
+                        .bf16_const_cache
+                        .lock()
+                        .unwrap()
+                        .current
+                        .as_ref()
+                        .map_or(0, |entry| entry.signature.len()),
                     usize::from(fused)
                 );
                 assert_eq!(
