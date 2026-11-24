@@ -58,6 +58,13 @@ pub enum LoaderError {
     InvalidEinsum { node: String, detail: String },
 
     #[error(
+        "illegal ONNX SplitToSequence at node {node}: {detail}. RULES #1: the input tensor dtype \
+         must match the schema selected by the imported ai.onnx opset. Expected: use opset 24+ \
+         for bfloat16, or cast the input to a dtype admitted by the selected SplitToSequence schema"
+    )]
+    InvalidSplitToSequence { node: String, detail: String },
+
+    #[error(
         "unsupported ONNX model: operator {domain}::{op_type} at node {node} carries a \
          subgraph attribute '{attr}' (control-flow / nested-graph op) that this runtime cannot \
          execute. RULES #1: ep-cpu recursively executes the standard control-flow ops \
