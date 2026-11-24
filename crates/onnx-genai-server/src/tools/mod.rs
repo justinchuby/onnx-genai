@@ -1,6 +1,8 @@
 //! Explicitly enabled host tools used by the official llama.cpp frontend.
 const REQUEST_EXPANSION: usize = 16;
 mod files;
+pub(crate) mod mcp;
+pub use mcp::McpSources;
 mod process;
 #[cfg(test)]
 mod tests;
@@ -69,9 +71,6 @@ impl BuiltinTool {
     pub(crate) fn parse(name: &str) -> Option<Self> {
         Self::TOOLS.into_iter().find(|t| t.name() == name)
     }
-    pub(crate) fn streaming(self) -> bool {
-        self == Self::ExecShellCommand
-    }
 }
 
 /// These limits bound this node's host-tool I/O, independently of model execution.
@@ -81,6 +80,7 @@ pub struct ToolsConfig {
     pub max_concurrent: std::num::NonZeroUsize,
     pub max_host_bytes: std::num::NonZeroU64,
     pub allow_origins: Vec<String>,
+    pub mcp: McpSources,
 }
 impl Default for ToolsConfig {
     fn default() -> Self {
@@ -89,13 +89,15 @@ impl Default for ToolsConfig {
             max_concurrent: std::num::NonZeroUsize::new(8).unwrap(),
             max_host_bytes: std::num::NonZeroU64::new(256 * 1024 * 1024).unwrap(),
             allow_origins: Vec::new(),
+            mcp: McpSources::default(),
         }
     }
 }
 impl ToolsConfig {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         ensure!(
-            self.enabled.is_empty() || self.max_host_bytes.get() >= 256 * 1024,
+            (self.enabled.is_empty() && !self.mcp.configured())
+                || self.max_host_bytes.get() >= 256 * 1024,
             "--tools-max-host-bytes must be at least 262144 bytes for tool control/response overhead; increase the budget"
         );
         ensure!(
@@ -131,6 +133,8 @@ pub(crate) struct Tools {
     home: Option<PathBuf>,
     origins: Vec<String>,
     writes: std::sync::Mutex<()>,
+    mcp: Option<mcp::Client>,
+    catalog: tokio::sync::OnceCell<mcp::Catalog>,
 }
 impl std::fmt::Debug for Tools {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -142,15 +146,43 @@ impl std::fmt::Debug for Tools {
 impl Tools {
     pub(crate) fn new(config: &ToolsConfig) -> anyhow::Result<Option<Arc<Self>>> {
         config.validate()?;
-        if config.enabled.is_empty() {
+        if config.enabled.is_empty() && !config.mcp.configured() {
             return Ok(None);
         }
-        let enabled = if config.enabled.contains(&BuiltinTool::All) {
+        let enabled: BTreeSet<BuiltinTool> = if config.enabled.contains(&BuiltinTool::All) {
             BuiltinTool::TOOLS.into_iter().collect()
         } else {
             config.enabled.iter().copied().collect()
         };
-        Ok(Some(Arc::new(Self {enabled,slots:Arc::new(Semaphore::new(config.max_concurrent.get())),memory:LedgerGovernor::new(LeaseLedger::new(0,config.max_host_bytes.get(),0)),cwd:std::env::current_dir().context("resolve host-tools working directory; start the server from an accessible directory")?,home:std::env::var_os(if cfg!(windows){"USERPROFILE"}else{"HOME"}).map(PathBuf::from),origins:config.allow_origins.clone(),writes:std::sync::Mutex::new(())})))
+        let memory = LedgerGovernor::new(LeaseLedger::new(0, config.max_host_bytes.get(), 0));
+        let cwd = std::env::current_dir().context(
+            "resolve host-tools working directory; start the server from an accessible directory",
+        )?;
+        let mcp = if config.mcp.configured() {
+            Some(mcp::Client::new(
+                &config.mcp,
+                memory.clone(),
+                &cwd,
+                config.max_concurrent.get(),
+            )?)
+        } else {
+            None
+        };
+        if enabled.is_empty() && mcp.as_ref().is_none_or(|client| client.is_empty()) {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(Self {
+            enabled,
+            slots: Arc::new(Semaphore::new(config.max_concurrent.get())),
+            memory,
+            cwd,
+            home: std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                .map(PathBuf::from),
+            origins: config.allow_origins.clone(),
+            writes: std::sync::Mutex::new(()),
+            mcp,
+            catalog: tokio::sync::OnceCell::new(),
+        })))
     }
     pub(crate) fn origin_allowed(&self, origin: &str) -> bool {
         if self.origins.iter().any(|o| o == origin) {
@@ -189,6 +221,7 @@ impl Tools {
             .memory
             .ledger()
             .limit(Tier::Host)
+            .saturating_sub(self.memory.ledger().used(Tier::Host))
             .saturating_sub(256 * 1024)
             / REQUEST_EXPANSION as u64;
         maximum.min(usize::try_from(bytes).unwrap_or(usize::MAX))
@@ -208,11 +241,10 @@ impl Tools {
             _permit: permit,
             _lease: lease,
             cancelled: AtomicBool::new(false),
-            created: Instant::now(),
-            deadline: Instant::now() + TIMEOUT,
+            deadline: std::sync::Mutex::new(Instant::now() + TIMEOUT),
         })
     }
-    fn reserve(&self, bytes: usize) -> anyhow::Result<MemoryLease> {
+    pub(crate) fn reserve(&self, bytes: usize) -> anyhow::Result<MemoryLease> {
         self.memory.reserve(Tier::Host,u64::try_from(bytes)?,MemoryRole::Activation,HolderId::new(0)).context("reserve host-tool I/O memory; retry after another call completes, reduce its size, or increase --tools-max-host-bytes")
     }
     pub(crate) fn cwd(&self, header: Option<&str>) -> PathBuf {
@@ -245,25 +277,6 @@ impl Tools {
             }
         }
         result
-    }
-    pub(crate) async fn invoke(
-        self: Arc<Self>,
-        tool: BuiltinTool,
-        params: &str,
-        cwd: PathBuf,
-        base64: bool,
-        job: Arc<Job>,
-        events: Option<tokio::sync::mpsc::Sender<Value>>,
-    ) -> anyhow::Result<ToolValue> {
-        let deadline = job.deadline;
-        tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            self.execute(tool, params, cwd, base64, job, events),
-        )
-        .await
-        .context(
-            "host-tool operation deadline exceeded; narrow the operation or reduce its output",
-        )?
     }
     async fn execute(
         self: Arc<Self>,
@@ -351,8 +364,7 @@ pub(crate) struct Job {
     _permit: OwnedSemaphorePermit,
     _lease: MemoryLease,
     cancelled: AtomicBool,
-    created: Instant,
-    deadline: Instant,
+    deadline: std::sync::Mutex<Instant>,
 }
 impl Job {
     pub(crate) fn retain_body_credit(&mut self, actual: usize) -> anyhow::Result<()> {
@@ -369,8 +381,21 @@ impl Job {
         Ok(())
     }
 
-    pub(crate) fn limit_time(&mut self, limit: Duration) {
-        self.deadline = self.deadline.min(self.created + limit);
+    fn deadline(&self) -> Instant {
+        *self
+            .deadline
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+    pub(crate) fn begin_operation(&self, limit: Duration) -> anyhow::Result<()> {
+        let deadline = Instant::now()
+            .checked_add(limit)
+            .context("tool timeout exceeds this host's monotonic clock range; reduce timeout_ms")?;
+        *self
+            .deadline
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = deadline;
+        Ok(())
     }
     fn check(&self) -> anyhow::Result<()> {
         ensure!(
@@ -378,7 +403,7 @@ impl Job {
             "tool call cancelled by client disconnect"
         );
         ensure!(
-            Instant::now() < self.deadline,
+            Instant::now() < self.deadline(),
             "tool call exceeded its operation deadline; narrow the operation and retry"
         );
         Ok(())

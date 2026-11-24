@@ -15,9 +15,9 @@ async fn invoke(
     cwd: &Path,
 ) -> anyhow::Result<ToolValue> {
     tools
-        .clone()
+        .select_builtin(tool)
+        .context("requested builtin is disabled")?
         .invoke(
-            tool,
             &params.to_string(),
             cwd.to_path_buf(),
             false,
@@ -80,9 +80,9 @@ async fn filesystem_calls_write_read_base64_and_transactional_edits() {
     std::fs::write(root.path().join("b.bin"), [0, 255, 7]).unwrap();
     let job = Arc::new(tools.admit(1024).unwrap());
     let result = tools
-        .clone()
+        .select_builtin(BuiltinTool::ReadFile)
+        .unwrap()
         .invoke(
-            BuiltinTool::ReadFile,
             r#"{"path":"b.bin"}"#,
             root.path().to_owned(),
             true,
@@ -204,9 +204,9 @@ async fn shell_stream_preserves_split_utf8_and_reports_exit_and_timeout() {
     let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
     let job = Arc::new(tools.admit(1024).unwrap());
     let result = tools
-        .clone()
+        .select_builtin(BuiltinTool::ExecShellCommand)
+        .unwrap()
         .invoke(
-            BuiltinTool::ExecShellCommand,
             r#"{"command":"printf '\\342'; sleep 0.05; printf '\\202\\254'"}"#,
             root.path().to_owned(),
             false,
@@ -492,18 +492,18 @@ async fn disconnect_cancels_the_process_group_even_after_the_shell_exits() {
     let state = app_state(true);
     let tools = state.tools.clone().unwrap();
     let response=http(state,"POST",json!({"tool":"exec_shell_command","params":{"command":"sleep 30 & echo $! > child.pid"},"stream":true}),&[("x-tool-cwd",root.path().to_str().unwrap())]).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !root.path().join("child.pid").exists() {
+    let pid: i32 = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(root.path().join("child.pid"))
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                break pid;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .unwrap();
-    let pid: i32 = std::fs::read_to_string(root.path().join("child.pid"))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     drop(response);
     tokio::time::timeout(Duration::from_secs(5), async {

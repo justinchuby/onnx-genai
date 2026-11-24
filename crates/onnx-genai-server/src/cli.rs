@@ -99,6 +99,17 @@ pub struct ServeArgs {
     #[arg(long)]
     pub tools_allow_origin: Vec<String>,
 
+    /// Cursor-compatible stdio MCP configuration file (executes configured commands).
+    #[arg(long, env = "NXRT_MCP_SERVERS_CONFIG")]
+    pub mcp_servers_config: Option<PathBuf>,
+    /// Inline Cursor-compatible stdio MCP configuration JSON.
+    #[arg(long, env = "NXRT_MCP_SERVERS_JSON")]
+    pub mcp_servers_json: Option<String>,
+
+    /// Maximum bytes per MCP stdio message (up to upstream's 8 MiB limit).
+    #[arg(long, default_value = "262144")]
+    pub mcp_max_message_bytes: std::num::NonZeroUsize,
+
     /// Enable the official chat frontend's HTTP(S) MCP proxy (off by default).
     #[arg(long)]
     pub ui_mcp_proxy: bool,
@@ -227,6 +238,11 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
         endpoint_props: args.props,
         tools: crate::ToolsConfig {
             enabled: args.tools.clone(),
+            mcp: crate::McpSources {
+                file: args.mcp_servers_config.clone(),
+                json: args.mcp_servers_json.as_deref().map(std::sync::Arc::from),
+                max_message_bytes: args.mcp_max_message_bytes,
+            },
             max_concurrent: args.tools_max_concurrent,
             max_host_bytes: args.tools_max_host_bytes,
             allow_origins: args.tools_allow_origin.clone(),
@@ -359,6 +375,38 @@ mod tests {
         ] {
             assert!(TestCli::try_parse_from(["test", "model-dir", flag, "0"]).is_err());
         }
+    }
+
+    #[test]
+    fn mcp_configuration_is_explicit_and_message_bounds_are_positive() {
+        let disabled = TestCli::parse_from(["test", "model-dir"]);
+        assert!(
+            !server_config_from_args(&disabled.serve)
+                .tools
+                .mcp
+                .configured()
+        );
+        let enabled = TestCli::parse_from([
+            "test",
+            "model-dir",
+            "--mcp-servers-config",
+            "mcp.json",
+            "--mcp-servers-json",
+            r#"{"mcpServers":{}}"#,
+            "--mcp-max-message-bytes",
+            "524288",
+        ]);
+        let config = server_config_from_args(&enabled.serve);
+        assert!(config.tools.enabled.is_empty());
+        assert_eq!(config.tools.mcp.file, Some(PathBuf::from("mcp.json")));
+        assert_eq!(
+            config.tools.mcp.json.as_deref(),
+            Some(r#"{"mcpServers":{}}"#)
+        );
+        assert_eq!(config.tools.mcp.max_message_bytes.get(), 524288);
+        assert!(
+            TestCli::try_parse_from(["test", "model-dir", "--mcp-max-message-bytes", "0"]).is_err()
+        );
     }
 
     #[test]
