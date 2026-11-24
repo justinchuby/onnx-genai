@@ -2122,7 +2122,7 @@ async fn native_http_generation_does_not_load_ort() {
     }
     let config = ServerConfig::default();
     assert_eq!(
-        config.decode_backend,
+        config.engine_config.decode_backend,
         onnx_genai_engine::EngineDecodeBackend::Native
     );
     let router = test_app_with_config(config).await;
@@ -2142,4 +2142,17 @@ async fn native_http_generation_does_not_load_ort() {
     let stream = String::from_utf8(bytes.to_vec()).unwrap();
     assert!(stream.contains("chat.completion.chunk"), "{stream}");
     assert!(stream.contains("data: [DONE]"), "{stream}");
+    let mut finished = false;
+    for data in stream
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+    {
+        if data == "[DONE]" {
+            continue;
+        }
+        let chunk: Value = serde_json::from_str(data).unwrap();
+        assert!(chunk.get("error").is_none(), "{chunk}");
+        finished |= chunk["choices"][0]["finish_reason"].is_string();
+    }
+    assert!(finished, "{stream}");
 }

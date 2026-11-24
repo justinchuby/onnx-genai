@@ -281,15 +281,18 @@ impl Value {
     /// Owns zero-initialized CPU storage without opening a runtime. Use
     /// [`Value::empty_in`] to allocate on a specific (device) allocator.
     pub fn empty(shape: &[i64], dtype: DataType) -> Result<Self> {
-        validate_shape(shape, None)?;
-        let numel = shape.iter().fold(1usize, |n, &d| n * d as usize);
+        let numel = validate_shape(shape, None)?;
         let bytes = numel.checked_mul(dtype.size_of()).ok_or_else(|| OrtError::InvalidArgument(format!("tensor byte size overflows for shape {shape:?} at {dtype:?}; use a smaller allocation")))?;
         match dtype {
-            DataType::Float32 => Self::from_vec_f32(vec![0.; numel], shape),
-            DataType::Float16 => Self::from_vec_f16_bits(vec![0; numel], shape),
-            DataType::BFloat16 => Self::from_vec_bf16_bits(vec![0; numel], shape),
-            DataType::Int64 => Self::from_vec_i64(vec![0; numel], shape),
-            _ => Self::from_raw_bytes(vec![0; bytes], shape, dtype),
+            DataType::Float32 => Self::from_vec_f32(host_zeros(numel, 0., shape, dtype)?, shape),
+            DataType::Float16 => {
+                Self::from_vec_f16_bits(host_zeros(numel, 0, shape, dtype)?, shape)
+            }
+            DataType::BFloat16 => {
+                Self::from_vec_bf16_bits(host_zeros(numel, 0, shape, dtype)?, shape)
+            }
+            DataType::Int64 => Self::from_vec_i64(host_zeros(numel, 0, shape, dtype)?, shape),
+            _ => Self::from_raw_bytes(host_zeros(bytes, 0, shape, dtype)?, shape, dtype),
         }
     }
 
@@ -586,8 +589,7 @@ impl Value {
     /// dtype round-trips without a per-dtype host representation. `shape` must be
     /// fully static and `data.len()` must equal `numel * dtype.size_of()`.
     pub fn from_raw_bytes(data: Vec<u8>, shape: &[i64], dtype: DataType) -> Result<Self> {
-        validate_shape(shape, None)?;
-        let numel = shape.iter().fold(1usize, |acc, &dim| acc * dim as usize);
+        let numel = validate_shape(shape, None)?;
         let expected = numel.checked_mul(dtype.size_of()).ok_or_else(|| OrtError::InvalidArgument(format!("tensor byte size overflows for shape {shape:?} at {dtype:?}; use a smaller allocation")))?;
         if data.len() != expected {
             return Err(OrtError::InvalidArgument(format!(
@@ -1866,6 +1868,7 @@ impl Value {
     pub(crate) unsafe fn from_raw(ptr: *mut onnx_genai_ort_sys::OrtValue) -> Result<Self> {
         let handle = OrtValueHandle::new(NonNull::new(ptr).ok_or(OrtError::NullPointer)?)?;
         let (shape, dtype) = tensor_shape_and_type(handle.ptr.as_ptr())?;
+        validate_shape(&shape, None)?;
         Ok(Self {
             ort_view: Mutex::new(None),
             shape,
@@ -1875,7 +1878,16 @@ impl Value {
     }
 }
 
-fn validate_shape(shape: &[i64], actual_len: Option<usize>) -> Result<()> {
+fn host_zeros<T: Clone>(len: usize, zero: T, shape: &[i64], dtype: DataType) -> Result<Vec<T>> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(len).map_err(|error| OrtError::InvalidArgument(format!(
+        "cannot allocate {len} host elements for {dtype:?} tensor with shape {shape:?}: {error}; reduce tensor dimensions or the requested memory footprint"
+    )))?;
+    data.resize(len, zero);
+    Ok(data)
+}
+
+fn validate_shape(shape: &[i64], actual_len: Option<usize>) -> Result<usize> {
     let mut expected_len = 1usize;
     for &dim in shape {
         if dim < 0 {
@@ -1883,7 +1895,8 @@ fn validate_shape(shape: &[i64], actual_len: Option<usize>) -> Result<()> {
                 "tensor shape contains negative dimension: {shape:?}"
             )));
         }
-        expected_len = expected_len.checked_mul(dim as usize).ok_or_else(|| {
+        let dim = usize::try_from(dim).map_err(|_| OrtError::InvalidArgument(format!("tensor dimension {dim} does not fit this platform's address width for shape {shape:?}; use smaller dimensions")))?;
+        expected_len = expected_len.checked_mul(dim).ok_or_else(|| {
             OrtError::InvalidArgument(format!("tensor shape too large: {shape:?}"))
         })?;
     }
@@ -1894,7 +1907,7 @@ fn validate_shape(shape: &[i64], actual_len: Option<usize>) -> Result<()> {
             "data length {actual_len} doesn't match shape {shape:?} (expected {expected_len})"
         )));
     }
-    Ok(())
+    Ok(expected_len)
 }
 
 fn create_tensor_with_data(
@@ -3242,6 +3255,9 @@ mod alias_offset_tests {
 mod neutral_storage_tests {
     use super::*;
     #[test]
+    // The production alias API shares allocation owners through Arc; these
+    // handles stay on this process's test thread, including cached ORT views.
+    #[allow(clippy::arc_with_non_send_sync)]
     fn host_values_and_aliases_work_without_ort() -> Result<()> {
         const CHILD: &str = "NXRT_NEUTRAL_VALUE_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -3267,6 +3283,16 @@ mod neutral_storage_tests {
             assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
             return Ok(());
         }
+        let oversized = Value::empty(&[i64::MAX, 2], DataType::Uint8)
+            .err()
+            .expect("capacity must be rejected without panicking");
+        assert!(!oversized.to_string().is_empty());
+        #[cfg(target_pointer_width = "64")]
+        assert!(
+            oversized.to_string().contains("cannot allocate"),
+            "{oversized}"
+        );
+        assert!(Value::empty(&[i64::MAX, 2], DataType::Float32).is_err());
         let value = Arc::new(Value::from_vec_i64(vec![10, 20, 30, 40], &[4])?);
         let alias = Value::alias_with_offset(Arc::clone(&value), 1, &[2])?;
         let cloned = alias.try_alias_clone().unwrap()?;
