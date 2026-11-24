@@ -175,7 +175,7 @@ fn run<T: Number>(
     // group. Retain all taps for that one offset group if scratch stays bounded.
     let reuse_stencils = g.axes.len() == 2
         && output_channels > m
-        && g.input_per_group % g.input_per_offset_group != 0
+        && !g.input_per_group.is_multiple_of(g.input_per_offset_group)
         && g.kernel_spatial.saturating_mul(tile)
             <= 65536 / std::mem::size_of::<Option<Bilinear<T>>>();
     let mut bilinear = if g.axes.len() == 2 {
