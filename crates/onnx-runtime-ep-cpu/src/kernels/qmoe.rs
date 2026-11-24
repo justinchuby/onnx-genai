@@ -187,19 +187,28 @@ impl QMoEKernel {
     }
 
     /// Each token selects an expert at most once. Serial experts reuse one
-    /// pair of banks, without multiplying capacity by top-k or expert count.
+    /// pair of FC banks. Contributions retain original route slots until all
+    /// experts finish; then the dead input bank becomes the accumulator.
     fn execution_workspace_layout(
         &self,
         dims: &Dimensions,
         has_fc3: bool,
-    ) -> Result<WorkspaceLayout<2>> {
-        WorkspaceLayout::new(MoeWorkspace::bank_layouts(
+    ) -> Result<WorkspaceLayout<3>> {
+        let [a, b] = MoeWorkspace::bank_layouts(
             dims.rows,
             dims.hidden,
             dims.inter,
             &self.attributes,
             has_fc3,
-        )?)
+        )?;
+        let elements = checked_product(
+            &[dims.rows, self.attributes.k, dims.hidden],
+            "routed contribution element count",
+        )?;
+        let contributions = std::alloc::Layout::array::<f32>(elements).map_err(|_| {
+            error("routed contribution bytes exceed addressable workspace; reduce batch, top-k or hidden width")
+        })?;
+        WorkspaceLayout::new([a, b, contributions])
     }
 }
 
@@ -444,7 +453,7 @@ impl Kernel for QMoEKernel {
         // SAFETY: the executor lends Host-accessible scratch exclusively for
         // this dispatch. Only the main compute thread borrows it; the prefetch
         // worker owns weights independently and never receives this lane.
-        let [bank_a, bank_b] = unsafe {
+        let [bank_a, bank_b, mut contribution_scratch] = unsafe {
             ProjectionScratch::bind_layout(
                 "QMoE expert workspace",
                 self.execution_workspace_layout(&dims, has_fc3)?,
@@ -455,7 +464,6 @@ impl Kernel for QMoEKernel {
             input: bank_a,
             projection: bank_b,
         };
-        let mut output = vec![0.0f32; output_elements];
         let mut routes = Vec::with_capacity(rows);
         let mut token_counts = BTreeMap::new();
         let mut tasks = BTreeMap::<usize, Vec<(usize, usize, f32)>>::new();
@@ -514,7 +522,7 @@ impl Kernel for QMoEKernel {
             std::mem::size_of::<f32>(),
             "routed contribution byte count",
         )?;
-        let mut contributions = vec![0.0f32; contribution_elements];
+        let contributions = contribution_scratch.zeroed_prefix(contribution_elements)?;
         let route_first = self.weight_offload.enabled
             && fc1.is_pageable()
             && fc2.is_pageable()
@@ -631,7 +639,7 @@ impl Kernel for QMoEKernel {
                                 .map_err(|_| error("route-first prefetch worker unavailable"))?;
                         }
                         let (expert, expert_tasks) = &ordered_ref[index];
-                        compute(*expert, expert_tasks, &weights, &mut contributions)?;
+                        compute(*expert, expert_tasks, &weights, contributions)?;
                     }
                     Ok(())
                 })?;
@@ -645,7 +653,7 @@ impl Kernel for QMoEKernel {
                         fc3.as_ref(),
                         &ExpertMemoryScope::OnDemand(self.host_cache.memory()),
                     )?;
-                    compute(*expert, expert_tasks, &weights, &mut contributions)?;
+                    compute(*expert, expert_tasks, &weights, contributions)?;
                 }
             }
         } else {
@@ -659,7 +667,7 @@ impl Kernel for QMoEKernel {
                     false,
                 )?;
                 write_grouped_contributions(
-                    &mut contributions,
+                    contributions,
                     &mut expert_workspace,
                     &x,
                     &expert_tasks,
@@ -678,6 +686,10 @@ impl Kernel for QMoEKernel {
                 )?;
             }
         }
+        // All expert reads and the prefetch scope have ended. Bank A is at
+        // least rows*hidden and is dead until it becomes the zero accumulator.
+        // Keep the original +0 start and route-slot += order, including -0/NaN.
+        let output = expert_workspace.input.zeroed_prefix(output_elements)?;
         let mut slot = 0usize;
         for (row, route) in routes.into_iter().enumerate() {
             let output_range = checked_range(row, hidden, "output row")?;
@@ -696,7 +708,7 @@ impl Kernel for QMoEKernel {
             }
         }
         debug_assert_eq!(slot, route_slots);
-        write_dense_f32(&mut outputs[0], &output)
+        write_dense_f32(&mut outputs[0], output)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -2254,7 +2266,7 @@ mod tests {
         for rows in [1, 3] {
             const H: usize = 16;
             const E: usize = 4;
-            let bytes = rows * (H + H) * 4;
+            let bytes = rows * (H + H + 2 * H) * 4;
             let books = RecordingGovernor::new_host(bytes as u64);
             let manager = ProcessMemoryManager::new().unwrap();
             let pool = HostWorkspacePool::governed(&manager, Arc::new(books.clone())).unwrap();
@@ -2348,6 +2360,11 @@ mod tests {
                     let mut backing = cpu
                         .allocate_workspace(req.bytes as usize, req.alignment, req.role())
                         .unwrap();
+                    // SAFETY: this is the exclusively borrowed, Host-accessible
+                    // allocation returned by the CPU workspace bridge.
+                    unsafe {
+                        std::ptr::write_bytes(backing.as_mut_ptr(), 0xff, backing.len());
+                    }
                     let view =
                         WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr()), backing.len());
                     kernel
@@ -2412,7 +2429,7 @@ mod tests {
                 prepare(TensorMetadata::new(DataType::Float32, shape, true), fc2)
                     .unwrap()
                     .bytes,
-                (rows * (16 + 32) * 4) as u64
+                (rows * (16 + 32 + 16) * 4) as u64
             );
         }
         for input in [
@@ -2446,6 +2463,235 @@ mod tests {
             .bytes,
             32 * 4
         );
+    }
+
+    #[test]
+    fn routed_output_preserves_strides_and_input_output_aliases() {
+        use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
+        use onnx_runtime_ir::DeviceId;
+        const ROWS: usize = 3;
+        const H: usize = 16;
+        const E: usize = 4;
+        let shapes = [
+            Some((DataType::Float32, &[ROWS, H][..])),
+            Some((DataType::Float32, &[ROWS, E])),
+            Some((DataType::Uint8, &[E, H, H])),
+            Some((DataType::Float32, &[E, H, 1])),
+            None,
+            Some((DataType::Uint8, &[E, H, H])),
+            Some((DataType::Float32, &[E, H, 1])),
+        ];
+        let (graph, node) = model_node("QMoE", &shapes, &[ROWS, H], &attributes(8, 16, 2, true));
+        let kernel = kernel(&graph, node).unwrap();
+        let values = pseudo_random_values(ROWS * H, 71);
+        let input = Owned::f32(&[ROWS, H], &values);
+        let router = Owned::f32(
+            &[ROWS, E],
+            &[4., 3., 0., -1., 0., -1., 4., 3., 4., 0., -1., 3.],
+        );
+        let w1 = quantize(E, H, H, 8, 16, false);
+        let w2 = quantize(E, H, H, 8, 16, false);
+        let p1 = Owned::u8(&[E, H, H], &w1.packed);
+        let p2 = Owned::u8(&[E, H, H], &w2.packed);
+        let sc1 = Owned::f32(&[E, H, 1], &w1.scales);
+        let sc2 = Owned::f32(&[E, H, 1], &w2.scales);
+        let inputs = [
+            input.view(),
+            router.view(),
+            p1.view(),
+            sc1.view(),
+            TensorView::absent(DataType::Float32),
+            p2.view(),
+            sc2.view(),
+        ];
+        let mut expected = Owned::zeros_f32(&[ROWS, H]);
+        kernel
+            .execute_prepared(&inputs, &mut [expected.view_mut()])
+            .unwrap();
+        let expected = expected.to_f32();
+        let shape = [ROWS, H];
+        let strides = [(2 * H + 1) as i64, 2];
+        let mut padded = vec![-123f32; ROWS * (2 * H + 1)];
+        let out = TensorMut::new(
+            DevicePtrMut(padded.as_mut_ptr().cast()),
+            DataType::Float32,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        )
+        .with_byte_offset(4);
+        kernel.execute_prepared(&inputs, &mut [out]).unwrap();
+        for (i, value) in padded.iter().enumerate() {
+            let row = i / (2 * H + 1);
+            let col = i % (2 * H + 1);
+            let target = if col % 2 == 1 {
+                expected[row * H + col / 2]
+            } else {
+                -123.
+            };
+            assert_eq!(
+                value.to_bits(),
+                target.to_bits(),
+                "physical output element {i}"
+            );
+        }
+        let mut aliased = values;
+        let pointer = aliased.as_mut_ptr();
+        let strides = [H as i64, 1];
+        let mut alias_inputs = inputs;
+        alias_inputs[0] = TensorView::new(
+            DevicePtr(pointer.cast()),
+            DataType::Float32,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        );
+        let out = TensorMut::new(
+            DevicePtrMut(pointer.cast()),
+            DataType::Float32,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        );
+        kernel.execute_prepared(&alias_inputs, &mut [out]).unwrap();
+        assert_eq!(
+            aliased.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn contribution_and_composite_bounds_reject_overflow_without_allocating() {
+        let (graph, node) = model_node("QMoE", &[], &[1, 16], &attributes(4, 16, 1, false));
+        let mut kernel = QMoEKernel {
+            layer_id: 0,
+            attributes: quantized_moe_attributes(graph.node(node)).unwrap().0,
+            bits: 4,
+            block_size: 16,
+            weight_offload: WeightOffloadMode { enabled: false },
+            host_cache: crate::CpuMemoryResources::default().expert_cache().clone(),
+            prefetch_experts: false,
+        };
+        let dims = Dimensions {
+            rows: 1,
+            hidden: 16,
+            inter: 16,
+            fc1_size: 16,
+        };
+        kernel.attributes.k = usize::MAX;
+        let err = kernel
+            .execution_workspace_layout(&dims, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("routed contribution element count"), "{err}");
+        kernel.attributes.k = 1;
+        let width = (isize::MAX as usize / 8 / 16) * 16;
+        let dims = Dimensions {
+            rows: 1,
+            hidden: width,
+            inter: width,
+            fc1_size: width,
+        };
+        let err = kernel
+            .execution_workspace_layout(&dims, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("workspace region") && err.contains("addressable"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn routed_accumulator_starts_at_positive_zero_and_keeps_ieee_route_order() {
+        const R: usize = 4;
+        const H: usize = 16;
+        const E: usize = 4;
+        let x = Owned::f32(&[R, H], &[1.; R * H]);
+        let logits = [1f32, 3., 2., 0.]; // order 1,2,0 differs from expert order
+        let router = Owned::f32(&[R, E], &logits.repeat(R));
+        let packed = Owned::u8(&[E, H, H / 2], &[0x99; E * H * H / 2]);
+        let scales = Owned::f32(&[E, H, 1], &[1.; E * H]);
+        let weights = [
+            -0.0,
+            -0.0,
+            -0.0,
+            -0.0,
+            1.,
+            16777216.,
+            -16777216.,
+            0.,
+            f32::from_bits(0x7fc12345),
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            1.,
+            f32::INFINITY,
+            0.,
+            0.,
+            0.,
+        ];
+        let aggregation = Owned::f32(&[R, E], &weights);
+        for k in [1, 3] {
+            let shapes = [
+                Some((DataType::Float32, &[R, H][..])),
+                Some((DataType::Float32, &[R, E])),
+                Some((DataType::Uint8, &[E, H, H / 2])),
+                Some((DataType::Float32, &[E, H, 1])),
+                None,
+                Some((DataType::Uint8, &[E, H, H / 2])),
+                Some((DataType::Float32, &[E, H, 1])),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some((DataType::Float32, &[R, E])),
+            ];
+            let (graph, node) = model_node("QMoE", &shapes, &[R, H], &attributes(4, 16, k, false));
+            let kernel = kernel(&graph, node).unwrap();
+            let mut inputs = vec![TensorView::absent(DataType::Float32); 15];
+            for (i, v) in [
+                (0, x.view()),
+                (1, router.view()),
+                (2, packed.view()),
+                (3, scales.view()),
+                (5, packed.view()),
+                (6, scales.view()),
+                (14, aggregation.view()),
+            ] {
+                inputs[i] = v;
+            }
+            let mut output = Owned::f32(&[R, H], &[91.; R * H]);
+            kernel
+                .execute_prepared(&inputs, &mut [output.view_mut()])
+                .unwrap();
+            for (row, values) in output.to_f32().chunks_exact(H).enumerate() {
+                let mut expected = 0f32;
+                for (_, weight) in
+                    routing_weights(&logits, Some(&weights[row * E..(row + 1) * E]), k, false)
+                {
+                    expected += weight * (H * H) as f32;
+                }
+                for &actual in values {
+                    if expected.is_nan() {
+                        assert!(actual.is_nan());
+                    } else {
+                        assert_eq!(actual.to_bits(), expected.to_bits(), "row {row}, k={k}");
+                    }
+                }
+            }
+            // A rejected dispatch must not publish scratch or overwrite output.
+            inputs[6] = TensorView::absent(DataType::Float32);
+            let previous = output.bytes.clone();
+            assert!(
+                kernel
+                    .execute_prepared(&inputs, &mut [output.view_mut()])
+                    .is_err()
+            );
+            assert_eq!(output.bytes, previous);
+        }
     }
 
     fn quantize(
