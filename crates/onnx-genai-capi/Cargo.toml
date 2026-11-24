@@ -15,10 +15,8 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [features]
 default = []
-# ONNX Runtime's CUDA EP. The C ABI has no native-backend path, and no code in
-# this crate references `onnx-runtime-ep-cuda`, so forwarding the engine's
-# `native-cuda` here would compile a whole CUDA EP that nothing can call and
-# impose a CUDA toolkit on the build for nothing.
+# ONNX Runtime CUDA support for explicit reference execution. The engine's
+# default features compile the Native CPU backend, which is selected by default.
 ort-cuda = ["onnx-genai-engine/ort-cuda"]
 
 [dependencies]

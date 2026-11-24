@@ -56,7 +56,9 @@ pub(crate) async fn completions(
             &state.config,
             handle.model_max_context,
         )?;
-        if prepared.generation.options_mut().constraint.is_some() {
+        if prepared.generation.options_mut().constraint.is_some()
+            || prepared.generation.options_mut().reasoning_budget.is_some()
+        {
             prepared
                 .generation
                 .options_mut()
@@ -238,6 +240,7 @@ fn index_completion_publications(
         .collect()
 }
 struct StartedCompletion {
+    _registration: crate::completion_control::Registration,
     events: mpsc::Receiver<DriverEvent>,
     prompt_tokens: usize,
 }
@@ -248,7 +251,7 @@ fn admit_completion_output(
     config: &ServerConfig,
     max_context: Option<usize>,
 ) -> Result<(), ApiError> {
-    prepared.generation.options_mut().max_json_bytes = config.replay_buffer_bytes;
+    prepared.generation.options_mut().max_constraint_bytes = config.replay_buffer_bytes;
     prepared.generation.options_mut().max_new_tokens = admit_output_budget(
         &request.sampling,
         prompt_tokens,
@@ -279,6 +282,7 @@ fn add_completion_usage(total: &mut Usage, next: &Usage) -> Result<(), ApiError>
 }
 async fn start_completion(
     state: &AppState,
+    id: &str,
     handle: &ModelHandle,
     request: &CompletionRequest,
     mut prepared: PreparedCompletion,
@@ -295,11 +299,17 @@ async fn start_completion(
         &state.config,
         handle.model_max_context,
     )?;
+    let registration = state.completion_controls.register_request(
+        id,
+        &request.sampling,
+        prepared.generation.options_mut(),
+    )?;
     let session = open_session_after_admission(state, handle, conversational, lease).await?;
     let generation = submit_completion(handle, prepared.generation, session).await?;
     await_driver_admission(generation.admission).await?;
     crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
     Ok(StartedCompletion {
+        _registration: registration,
         events: generation.events,
         prompt_tokens,
     })
@@ -311,9 +321,10 @@ async fn run_completion(
     prepared: PreparedCompletion,
     client_session_id: Option<&str>,
 ) -> Result<CompletionResponse, ApiError> {
-    let id = text_completion_id();
+    let id = text_completion_id()?;
     let created = now_unix();
-    let started = start_completion(state, handle, &request, prepared, client_session_id).await?;
+    let started =
+        start_completion(state, &id, handle, &request, prepared, client_session_id).await?;
     let collected = collect_generation_with_publications(started.events)
         .await
         .map_err(generation_failure)?;
@@ -457,8 +468,10 @@ async fn stream_completions(
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
     let is_batch = !rest.is_empty();
     let (request, prepared) = first;
+    let id = text_completion_id()?;
     let started = start_completion(
         &state,
+        &id,
         &handle,
         &request,
         prepared,
@@ -473,7 +486,6 @@ async fn stream_completions(
         .clone()
         .map(StopInput::into_texts)
         .unwrap_or_default();
-    let id = text_completion_id();
     let created = now_unix();
     let model = handle.id.clone();
     let (tx, rx) = mpsc::channel(16);
@@ -527,7 +539,7 @@ async fn stream_completions(
                 break;
             };
             index += 1;
-            let started = tokio::select! { biased; _=tx.closed()=>return Ok(()),started=start_completion(&state,&handle,&request,prepared,None)=>started };
+            let started = tokio::select! { biased; _=tx.closed()=>return Ok(()),started=start_completion(&state,&id,&handle,&request,prepared,None)=>started };
             match started {
                 Ok(started) => current = started,
                 Err(error) => {
@@ -633,7 +645,7 @@ async fn prepare_chat_input(
     if !input_audio.is_empty() {
         prepared = prepare_audio_generate_request(request, &handle.tokenizer, output_budget)?;
     }
-    prepared.request.options.max_json_bytes = config.replay_buffer_bytes;
+    prepared.request.options.max_constraint_bytes = config.replay_buffer_bytes;
     let pipeline_input = if !image_urls.is_empty() {
         Some(
             preprocess_chat_images(
@@ -682,7 +694,7 @@ async fn run_chat_completion(
     request: ChatCompletionRequest,
     client_session_id: Option<String>,
 ) -> Result<ChatCompletionResponse, ApiError> {
-    let id = completion_id();
+    let id = completion_id()?;
     let created = now_unix();
     let model = request.model.clone();
     let requested_top_logprobs = request
@@ -727,6 +739,10 @@ async fn run_chat_completion(
     projection.start().map_err(|error| {
         ApiError::invalid_request(format!("response prefix is invalid: {error:#}"))
     })?;
+    let registration =
+        state
+            .completion_controls
+            .register_request(&id, &request, &prepared.request.options)?;
     let mut generation_request = prepared.request;
     generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
@@ -753,6 +769,7 @@ async fn run_chat_completion(
     let result = collect_generation_with_publications(generation.events)
         .await
         .map_err(generation_failure);
+    drop(registration);
     crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
 
     let session_token_count = if let Some(session) = session_for_count {
@@ -791,10 +808,7 @@ async fn run_chat_completion(
     } else {
         Some(output.content)
     };
-    let reasoning = tool_calls
-        .is_none()
-        .then_some(output.reasoning)
-        .filter(|thought| !thought.is_empty());
+    let reasoning = Some(output.reasoning).filter(|thought| !thought.is_empty());
     let total_tokens = prompt_tokens + completion_tokens;
     Ok(ChatCompletionResponse {
         id,
@@ -832,7 +846,7 @@ async fn stream_chat_completion(
     request: ChatCompletionRequest,
     client_session_id: Option<String>,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
-    let id = completion_id();
+    let id = completion_id()?;
     let created = now_unix();
     let model = request.model.clone();
     let requested_top_logprobs = request
@@ -878,6 +892,10 @@ async fn stream_chat_completion(
     let initial_gate = projection.start().map_err(|error| {
         ApiError::invalid_request(format!("response prefix is invalid: {error:#}"))
     })?;
+    let registration =
+        state
+            .completion_controls
+            .register_request(&id, &request, &prepared.request.options)?;
     let mut generation_request = prepared.request;
     generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
@@ -902,6 +920,7 @@ async fn stream_chat_completion(
     crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
 
     tokio::spawn(async move {
+        let _registration = registration;
         send_stream_chunk(&tx, role_chunk(&id, created, &model, prompt_tokens)).await?;
 
         if request.has_tool_context() {
@@ -1387,14 +1406,33 @@ fn prepare_audio_generate_request(
     tokenizer: &Tokenizer,
     output_budget: usize,
 ) -> Result<PreparedGenerateRequest, ApiError> {
+    let mut options = build_generate_options_with_tokenizer(request, tokenizer, output_budget)
+        .map_err(|error| {
+            ApiError::invalid_request(format!("invalid audio generation controls: {error:#}"))
+        })?;
+    crate::reasoning_request::ReasoningRequest::extract(request)
+        .and_then(|controls| {
+            controls.apply(
+                &mut options,
+                tokenizer,
+                crate::reasoning_request::BudgetContext::Raw,
+            )
+        })
+        .map_err(|error| {
+            ApiError::invalid_request(format!("invalid audio reasoning controls: {error:#}"))
+        })?;
+    if options.reasoning_budget.is_some() {
+        options.validate_processors(tokenizer).map_err(|error| {
+            ApiError::invalid_request(format!("invalid audio reasoning protocol: {error:#}"))
+        })?;
+    }
     let token_ids = audio_decoder_prompt(tokenizer, None)?;
     let prompt_tokens = token_ids.len();
     Ok(PreparedGenerateRequest {
         response_prefix: None,
         request: GenerateRequest {
             prompt: GeneratePrompt::TokenIds(token_ids),
-            options: build_generate_options_with_tokenizer(request, tokenizer, output_budget)
-                .map_err(|err| ApiError::invalid_request(err.to_string()))?,
+            options,
         },
         prompt_tokens,
     })
@@ -1914,6 +1952,17 @@ pub(crate) fn prepare_completion(
         handle.generation_defaults.as_ref(),
         &chat_sampling_overrides(&request.sampling),
     );
+    crate::reasoning_request::ReasoningRequest::extract(&request.sampling)
+        .and_then(|controls| {
+            controls.apply(
+                &mut options,
+                &handle.tokenizer,
+                crate::reasoning_request::BudgetContext::Raw,
+            )
+        })
+        .map_err(|error| {
+            ApiError::invalid_request(format!("invalid completion reasoning controls: {error:#}"))
+        })?;
     if let Some(suffix) = request.suffix.as_ref() {
         let fim_config = handle
             .fim_config
@@ -2084,7 +2133,7 @@ fn prepare_generate_request(
         .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))?;
     let prompt_tokens = token_ids.len();
     let mut options = build_generate_options_with_tokenizer(request, tokenizer, output_budget)?;
-    options.max_json_bytes = response_buffer_bytes;
+    options.max_constraint_bytes = response_buffer_bytes;
     // Honor the model's declared sampling regime (e.g. a reasoning model that
     // ships do_sample=true); explicit request fields still win.
     options.resolve_sampling_defaults(
@@ -2096,31 +2145,40 @@ fn prepare_generate_request(
             .map_err(|error| anyhow::anyhow!("{error}"))?;
     }
     if let Some(template) = context.response_template {
-        let schema = match options.constraint.as_ref() {
-            Some(GenerateConstraint::Json { .. }) => Some(serde_json::Value::Bool(true)),
-            Some(GenerateConstraint::JsonSchema { schema, .. }) => {
-                Some(serde_json::from_str(schema)?)
-            }
-            _ => None,
-        };
-        if let Some(schema) = schema {
-            options.constraint = Some(GenerateConstraint::ResponseJson {
-                schema,
-                template: template.clone(),
-                prefix: prompt.clone(),
-            });
+        if let Some(
+            GenerateConstraint::Json { prefix }
+            | GenerateConstraint::JsonSchema { prefix, .. }
+            | GenerateConstraint::Regex { prefix, .. }
+            | GenerateConstraint::Lark { prefix, .. },
+        ) = options.constraint.as_mut()
+        {
+            prefix.clear();
         }
+        options.response_projection = Some(
+            onnx_genai_engine::response_template::ResponseProjection::resolve(
+                template.clone(),
+                prompt.clone(),
+                response_buffer_bytes,
+            )?,
+        );
     }
     anyhow::ensure!(
         request.continuation_mode() != crate::types::ChatContinuation::Reasoning
             || options.constraint.is_none()
-            || matches!(
-                options.constraint,
-                Some(GenerateConstraint::ResponseJson { .. })
-            ),
-        "reasoning continuation with this constrained output policy requires a channel-aware generation grammar; use response_format with a compatible declared response_template"
+            || options.response_projection.is_some(),
+        "reasoning continuation with constrained output requires declared response framing; provide a compatible response_template"
     );
-    if options.constraint.is_some() {
+    if request.input_audio().is_empty() {
+        crate::reasoning_request::ReasoningRequest::extract(request)?.apply(
+            &mut options,
+            tokenizer,
+            crate::reasoning_request::BudgetContext::Chat {
+                template: context.response_template,
+                prompt: &prompt,
+            },
+        )?;
+    }
+    if options.constraint.is_some() || options.reasoning_budget.is_some() {
         options.validate_processors(tokenizer)
             .context("resolve requested output constraint against the model tokenizer and declared response template")?;
     }
@@ -2231,6 +2289,15 @@ fn build_generate_options(
     if let Some(constraint) = response_format_constraint(request) {
         options.constraint = Some(constraint);
     }
+    if let Some(grammar) = request
+        .grammar
+        .as_ref()
+        .filter(|grammar| !grammar.is_empty())
+    {
+        options.constraint = Some(GenerateConstraint::Gbnf {
+            grammar: grammar.clone(),
+        });
+    }
     options
 }
 
@@ -2334,6 +2401,7 @@ pub(super) fn build_generate_options_with_tokenizer(
     tokenizer: &Tokenizer,
     output_budget: usize,
 ) -> anyhow::Result<GenerateOptions> {
+    request.validate_grammar()?;
     let mut options = build_generate_options(request, output_budget);
     if let Some(biases) = request.extensions.get("logit_bias") {
         use onnx_genai_engine::logits::LogitBias;
@@ -3118,12 +3186,12 @@ async fn send_tool_call_deltas(
     send_stream_chunk(tx, done_chunk(id, created, model, "tool_calls")).await
 }
 
-fn completion_id() -> String {
-    format!("chatcmpl-{}", now_unix())
+fn completion_id() -> Result<String, ApiError> {
+    crate::completion_control::new_id("chatcmpl-")
 }
 
-fn text_completion_id() -> String {
-    format!("cmpl-{}", now_unix())
+fn text_completion_id() -> Result<String, ApiError> {
+    crate::completion_control::new_id("cmpl-")
 }
 
 #[cfg(test)]
@@ -3909,6 +3977,7 @@ mod completion_delivery_tests {
     #[tokio::test]
     async fn failed_or_truncated_completion_delivery_never_claims_finished_usage() {
         let tokenizer = tokenizer();
+        let controls = crate::completion_control::CompletionControls::new(1);
         for explicit_error in [false, true] {
             let (source, events) = mpsc::channel(2);
             if explicit_error {
@@ -3925,6 +3994,7 @@ mod completion_delivery_tests {
                 &tx,
                 ("id", 1, "model", 3),
                 StartedCompletion {
+                    _registration: controls.register("id", None).unwrap(),
                     events,
                     prompt_tokens: 3,
                 },
@@ -3935,6 +4005,8 @@ mod completion_delivery_tests {
             )
             .await
             .unwrap();
+            let released = controls.register("id", None).unwrap();
+            drop(released);
             let CompletionDelivery::Failed(error) = delivery else {
                 panic!("unfinished source must fail instead of claiming completed usage");
             };
@@ -3952,6 +4024,7 @@ mod completion_delivery_tests {
     #[tokio::test]
     async fn disconnected_completion_delivery_releases_its_source_without_finishing() {
         let tokenizer = tokenizer();
+        let controls = crate::completion_control::CompletionControls::new(1);
         let (source, events) = mpsc::channel(2);
         let (tx, rx) = mpsc::channel(2);
         drop(rx);
@@ -3959,6 +4032,7 @@ mod completion_delivery_tests {
             &tx,
             ("id", 1, "model", 0),
             StartedCompletion {
+                _registration: controls.register("id", None).unwrap(),
                 events,
                 prompt_tokens: 3,
             },
@@ -3970,6 +4044,8 @@ mod completion_delivery_tests {
         .await
         .unwrap();
         assert!(matches!(delivery, CompletionDelivery::Disconnected));
+        let released = controls.register("id", None).unwrap();
+        drop(released);
         assert!(source.is_closed());
     }
 }

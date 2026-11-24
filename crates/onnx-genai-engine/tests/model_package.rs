@@ -8,6 +8,12 @@ fn fixture() -> PathBuf {
 
 #[test]
 fn engine_loads_ort_model_package_directory() -> anyhow::Result<()> {
-    let _engine = Engine::from_dir(&fixture(), EngineConfig::default())?;
+    let _engine = Engine::from_dir(
+        &fixture(),
+        EngineConfig {
+            decode_backend: onnx_genai_engine::EngineDecodeBackend::Ort,
+            ..Default::default()
+        },
+    )?;
     Ok(())
 }

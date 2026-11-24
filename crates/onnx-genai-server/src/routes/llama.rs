@@ -51,8 +51,8 @@ pub(crate) async fn props(
     {
         return Ok(Json(json!({
             "role": "router", "ui": true, "ui_settings": {},
-            "nxrt_capabilities": {"tool_protocol_per_model": true, "reasoning_control": false, "resumable_streams": true},
-            "cors_proxy_enabled": false, "endpoint_slots": false,
+            "nxrt_capabilities": {"tool_protocol_per_model": true, "reasoning_control": true, "resumable_streams": true},
+            "cors_proxy_enabled": state.config.mcp_proxy_policy.is_enabled(), "endpoint_slots": false,
             "endpoint_props": false, "endpoint_metrics": cfg!(feature = "metrics"),
             "build_info": concat!("nxrt ", env!("CARGO_PKG_VERSION"))
         })));
@@ -97,10 +97,10 @@ pub(crate) async fn props(
         "endpoint_slots": false, "endpoint_props": false,
         "endpoint_metrics": cfg!(feature = "metrics"),
         "ui": true, "ui_settings": {}, "is_sleeping": false,
-        "cors_proxy_enabled": false,
+        "cors_proxy_enabled": state.config.mcp_proxy_policy.is_enabled(),
         "build_info": concat!("nxrt ", env!("CARGO_PKG_VERSION")),
         "nxrt_capabilities": {
-            "resumable_streams": true, "reasoning_control": false,
+            "resumable_streams": true, "reasoning_control": true,
             "tools": handle.tool_protocol.is_some(), "custom_sampler_order": handle.engine.runtime_sampling,
             "reranking": handle.engine.reranking.is_some()
         }
@@ -213,6 +213,9 @@ pub(crate) async fn apply_template(
 /// Controls that do not change inference may be safely accepted. Every other
 /// unknown field is rejected, rather than reporting success with ignored settings.
 pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(), ApiError> {
+    request
+        .validate_grammar()
+        .map_err(|error| ApiError::invalid_request(format!("{error:#}")))?;
     if request.repeat_last_n != -1 && usize::try_from(request.repeat_last_n).is_err() {
         return Err(ApiError::invalid_request(
             "repeat_last_n must be -1 for full history, 0 to disable all penalties, or a non-negative token count supported by this host",
@@ -220,11 +223,17 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
     }
     ChatTemplate::validate_kwargs(&request.chat_template_kwargs)
         .map_err(|err| ApiError::invalid_request(err.to_string()))?;
+    crate::reasoning_request::ReasoningRequest::extract(request).map_err(|error| {
+        ApiError::invalid_request(format!("invalid reasoning controls: {error:#}"))
+    })?;
     for (key, value) in &request.extensions {
+        if crate::reasoning_request::ReasoningRequest::is_field(key) {
+            continue;
+        }
         let accepted = match key.as_str() {
             "reasoning_format" => value == "auto" || value == "deepseek",
             // These opt into optional progress/control facilities, not a different decoding algorithm.
-            "reasoning_control" | "return_progress" | "timings_per_token" => value.is_boolean(),
+            "return_progress" | "timings_per_token" => value.is_boolean(),
             "sse_ping_interval" => value.as_f64().is_some_and(|n| n >= 0.0),
             "cache_prompt" | "ignore_eos" => value.is_boolean(),
             "logit_bias" => value.is_object() || value.is_array(),

@@ -35,7 +35,7 @@ name = "onnx-genai"
 path = "src/main.rs"
 
 [features]
-default = ["cuda-13000", "onnx-genai-server/metrics"]
+default = ["cuda-13000", "onnx-genai-server/metrics", "native-backend"]
 # Build the PyO3 extension module for the `onnx-genai-server` wheel. maturin adds
 # `pyo3/extension-module` on top of this at wheel-build time.
 python = ["dep:pyo3"]

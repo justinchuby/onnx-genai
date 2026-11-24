@@ -1679,7 +1679,7 @@ impl Engine {
         mode_available
             // Grammar processors carry per-request parser state; draft/verify
             // would need separate parser branches for speculative candidates.
-            && options.constraint.is_none()
+            && options.constraint.is_none() && options.reasoning_budget.is_none()
             && options.selects_greedily()
             && self.kv_model.is_some()
     }
