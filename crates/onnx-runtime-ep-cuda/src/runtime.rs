@@ -759,6 +759,29 @@ fn retained_pool_size_class(bytes: usize) -> Result<usize> {
 /// is never handed to a second runtime.
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
+fn validate_captured_address_owner(
+    registered: bool,
+    resources: Option<&[DeviceGraphResource]>,
+    identity: usize,
+    label: &str,
+) -> Result<()> {
+    if !registered {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep: active CUDA graph capture has no registered ownership token for sealed {label}; abort capture and use the runtime capture API with the warmed kernel's real resources"
+        )));
+    }
+    if !resources.is_some_and(|resources| {
+        resources
+            .iter()
+            .any(|resource| resource.identity() == identity)
+    }) {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep: active CUDA graph capture did not retain the ownership token for sealed {label}; abort capture and register the warmed kernel's real resources before recording"
+        )));
+    }
+    Ok(())
+}
+
 struct RawCudaModule {
     module: CUmodule,
     context: Arc<CudaContext>,
@@ -2966,36 +2989,35 @@ impl CudaRuntime {
             || self.unregistered_capture_active.load(Ordering::Acquire)
     }
 
+    /// Fast check for launch paths using the runtime's tracked capture modes.
+    /// A caller that already confirmed capture with the driver must use
+    /// `require_captured_address_owner`, including captures started externally.
     pub(crate) fn require_registered_address_capture(
         &self,
         identity: usize,
         label: &str,
     ) -> Result<()> {
-        if self.unregistered_capture_active.load(Ordering::Acquire)
-            && !self.registered_capture_active.load(Ordering::Acquire)
-        {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep: active CUDA graph capture has no registered ownership token for \
-                 sealed {label}; refusing to embed its device addresses"
-            )));
-        }
-        if self.registered_capture_active.load(Ordering::Acquire)
-            && !self
-                .active_capture_resources
-                .load()
-                .as_ref()
-                .is_some_and(|resources| {
-                    resources
-                        .iter()
-                        .any(|resource| resource.identity() == identity)
-                })
-        {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep: active CUDA graph capture did not retain the ownership token for \
-                  sealed {label}; refusing to embed its device addresses"
-            )));
+        if self.capture_active() {
+            self.require_captured_address_owner(identity, label)?;
         }
         Ok(())
+    }
+
+    /// Require the real owner on a path already confirmed to be capturing.
+    /// An external stream capture has no tracked flags, but still cannot embed
+    /// private addresses without a registered ownership sink.
+    pub(crate) fn require_captured_address_owner(
+        &self,
+        identity: usize,
+        label: &str,
+    ) -> Result<()> {
+        let resources = self.active_capture_resources.load();
+        validate_captured_address_owner(
+            self.registered_capture_active.load(Ordering::Acquire),
+            resources.as_ref().map(|resources| resources.as_slice()),
+            identity,
+            label,
+        )
     }
 
     /// Require a registered owner for a borrowed workspace before embedding it
@@ -3845,6 +3867,29 @@ mod tests {
     use super::*;
     use cudarc::driver::PushKernelArg;
 
+    #[test]
+    fn captured_address_owner_requires_registration_and_exact_resource() {
+        let resource = DeviceGraphResource::new(17, Arc::new(()));
+        let resources = [resource];
+        let error = validate_captured_address_owner(false, Some(&resources), 17, "test metadata")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("no registered ownership token")
+                && error.contains("test metadata")
+                && error.contains("abort capture")
+        );
+        for missing in [None, Some(&[][..]), Some(&resources[..])] {
+            let error = validate_captured_address_owner(true, missing, 18, "test metadata")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("did not retain the ownership token")
+                    && error.contains("register the warmed kernel's real resources")
+            );
+        }
+        validate_captured_address_owner(true, Some(&resources), 17, "test metadata").unwrap();
+    }
     #[test]
     fn failed_legacy_upload_latches_release_fence_until_context_retirement() {
         let unsettled = AtomicBool::new(false);

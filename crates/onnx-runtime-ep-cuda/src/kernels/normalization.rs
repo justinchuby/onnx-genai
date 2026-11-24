@@ -45,8 +45,9 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ir::{DataType, Node};
 
+use crate::device_metadata::DeviceMetadataCache;
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr, raw_ptr};
+use crate::runtime::{CudaRuntime, cuptr, raw_ptr};
 
 use super::softmax::resolve_axis;
 
@@ -2314,65 +2315,43 @@ impl Drop for SkipNormWarmRollback<'_> {
     }
 }
 
-#[derive(Clone, Debug)]
-struct SkipBroadcastMetadataCache {
-    runtime: Arc<CudaRuntime>,
-    allocation: Option<Arc<GraphDeviceAllocation>>,
+#[derive(Debug)]
+struct SkipBroadcastMetadataKey {
     input_shape: Vec<usize>,
     skip_shape: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct SkipBroadcastMetadataCache {
+    storage: DeviceMetadataCache<SkipBroadcastMetadataKey>,
 }
 
 impl SkipBroadcastMetadataCache {
     fn new(runtime: Arc<CudaRuntime>) -> Self {
         Self {
-            runtime,
-            allocation: None,
-            input_shape: Vec::new(),
-            skip_shape: Vec::new(),
+            storage: DeviceMetadataCache::new(runtime),
         }
     }
 
     fn reserve(&mut self, input_shape: &[usize], skip_shape: &[usize]) -> Result<CUdeviceptr> {
-        if self.input_shape == input_shape
-            && self.skip_shape == skip_shape
-            && let Some(allocation) = self.allocation.as_ref()
-        {
-            return Ok(allocation.ptr());
-        }
-        if self.runtime.is_capturing()? {
-            return Err(EpError::KernelFailed(
-                "cuda_ep SkipSimplifiedLayerNormalization: broadcast metadata shape changed \
-                 during CUDA graph capture; warm the fixed decode shape before capture"
-                    .into(),
-            ));
-        }
-
-        let metadata = skip_broadcast_metadata(input_shape, skip_shape);
-        let metadata_bytes = u64_bytes(&metadata);
-        let allocation = GraphDeviceAllocation::allocate(&self.runtime, metadata_bytes.len())?;
-        // SAFETY: `ptr` exactly covers the metadata byte slice.
-        unsafe { self.runtime.htod(metadata_bytes, allocation.ptr()) }?;
-        self.runtime.staged_warm_cache_mutation(
-            "SkipSimplifiedLayerNorm broadcast metadata allocation/upload",
-        )?;
-        if self.allocation.is_some() {
-            // A dynamic shape change may replace metadata still referenced by
-            // queued work. Fixed-shape decode always takes the cache-hit path.
-            self.runtime.synchronize()?;
-        }
-        let ptr = allocation.ptr();
-        self.allocation = Some(allocation);
-        self.input_shape.clear();
-        self.input_shape.extend_from_slice(input_shape);
-        self.skip_shape.clear();
-        self.skip_shape.extend_from_slice(skip_shape);
-        Ok(ptr)
+        self.storage.get_or_prepare(
+            "SkipSimplifiedLayerNorm broadcast metadata",
+            |key| key.input_shape == input_shape && key.skip_shape == skip_shape,
+            || {
+                let metadata = skip_broadcast_metadata(input_shape, skip_shape);
+                Ok((
+                    SkipBroadcastMetadataKey {
+                        input_shape: input_shape.to_vec(),
+                        skip_shape: skip_shape.to_vec(),
+                    },
+                    u64_bytes(&metadata).to_vec(),
+                ))
+            },
+        )
     }
 
     fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
-        self.allocation
-            .as_ref()
-            .map(GraphDeviceAllocation::device_graph_resource)
+        self.storage.device_graph_resource()
     }
 }
 
@@ -3482,6 +3461,18 @@ mod tests {
     use super::*;
     use crate::CudaExecutionProvider;
 
+    #[test]
+    fn skip_metadata_preserves_dimensions_and_right_aligned_broadcast_strides() {
+        assert_eq!(
+            skip_broadcast_metadata(&[1, 2, 4], &[2, 1]),
+            [1, 2, 4, 0, 1, 0]
+        );
+        assert_eq!(
+            skip_broadcast_metadata(&[2, 1, 4], &[1, 4]),
+            [2, 1, 4, 0, 0, 1]
+        );
+        assert_eq!(skip_broadcast_metadata(&[2, 3], &[]), [2, 3, 0, 0]);
+    }
     #[test]
     fn sources_expose_their_entry_points() {
         assert!(LAYERNORM_SRC.contains("layernorm_f32"));
