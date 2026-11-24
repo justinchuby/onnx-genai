@@ -3,6 +3,8 @@
 //! This grammar describes the raw generated stream, independently of response
 //! channel projection. Token references are resolved against the actual model.
 
+pub mod replay;
+
 use anyhow::{Context, Result, ensure};
 use std::collections::{BTreeMap, HashSet};
 

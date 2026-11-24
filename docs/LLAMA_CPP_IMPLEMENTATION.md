@@ -1517,3 +1517,35 @@ validation. The full engine library regression passed: 956 tests and one
 inherited ignore. Strict engine all-target Clippy and formatting passed.
 Word/pattern activation, partial-token replay, reasoning
 suppression, server mapping and real HTTP conformance remain required.
+
+### Token-aware GBNF replay prerequisite
+
+A raw replay cursor now compiles the existing bounded GBNF syntax tree into
+explicit scalar/token states. Token-reference branches inspect the original
+model token ID even when a trigger truncates its piece, including a truncation
+inside UTF-8. Character branches instead consume the supplied bytes. Ambiguous
+text and token branches survive independently, and cursor clones provide
+independent rollback checkpoints. Character classes, finite/unbounded repetition
+and consuming recursion use the existing parser's validation. Pending Unicode
+prefixes are checked against the next scalar ranges before being admitted.
+
+Expansion checks bound queued and visited stack cells before queue insertion;
+accepted replay has a separate explicit byte budget. A rejected piece or budget
+error leaves the previous cursor unchanged. This provides the missing replay
+capability without mutating llguidance's private token history or replacing a
+model-token reference with synthetic text. It is still a prerequisite: the
+server's active lazy admission remains closed until trigger matching, vocabulary
+resolution and request/runtime integration are complete.
+
+Nine selected tests passed. Besides the truncated-token and Unicode cases, they
+cover ambiguity, independent clones, rejection recovery, finite repetition, byte
+budget failures and bounded ambiguous recursive expansion. A cross-check walks
+accepted histories and compares each next-token decision with the current
+llguidance backend for five grammars covering character classes, recursion,
+repetition, positive token references and negated token references. This is
+regression evidence for those complete-token cases, not a claim of full upstream
+or HTTP conformance.
+
+The final engine regression passed 965 tests / one inherited ignore. Strict
+engine all-target Clippy, formatting and diff checks passed on this replay
+implementation. No active server lazy behavior is claimed by those checks.
