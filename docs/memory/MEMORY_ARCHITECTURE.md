@@ -899,6 +899,39 @@ These device fixtures are compiled locally without CUDA execution or throughput
 claims. Historical raw-pool and timing descriptions below are superseded for
 this kernel's ownership only; the device algorithm sources are unchanged.
 
+### Half-prefill accelerator scratch uses the MatMulNBits caller peak
+
+Marlin and the FP16 dequant/cuBLASLt route use the existing MatMulNBits
+SessionPersistent caller composite. Its normalization, gate and BLAS regions
+now accompany two checked accelerator regions: split-K partials and one
+`K * N * sizeof(f16)` dequantized-weight region. BF16 conversion regions remain
+in the same composite and can be live concurrently. Eligible routes contribute
+only their needed capacity; empty work, single-row half decode and the existing
+small-row decode loop keep their zero-prefill-scratch fast path.
+
+The gate/up dequant loop submits `dequant(gate) -> GEMM(gate) -> dequant(up)
+-> GEMM(up)` on one compute stream. The first GEMM finishes reading the shared
+weight region before it is overwritten; gate output stays in its separate
+region through SiluMul. Gate/up split-K reductions similarly reuse one partials
+region serially. These regions remain disjoint from normalization, gate, BLAS
+and BF16 staging; the migration does not assume inter-route overlap.
+
+The module-global `(runtime, slot, bytes)` scratch cache, its retained-byte cap,
+usage locks, resource list and runtime-destruction cleanup are removed. Capacity
+belongs to the root lane; kernel dispatch has no scratch allocation, return or
+per-region grant. Immutable Marlin repacked weights remain a separate
+kernel-owned artifact cache with real graph pins. A cold repack still prevents
+capture readiness; prepared scratch alone does not prove readiness.
+
+FP16 prefill, like BF16 staging, binds the whole composite and checks the real
+used-span caller pin before dispatch during recording. This refusal happens
+outside optional algorithm fallbacks. Host tests cover overflow, disabled
+regions, disjoint binding and missing/short/misaligned capacity. Compiled device
+probes cover direct/split-K gate/up capture, failed preparation, missing pins,
+warm allocation/transfer/sync counts, replay after retiring the original caller
+handle and clearing the repack cache, and final physical settlement. Device
+numerical/capture/performance checks still require CUDA hardware.
+
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
 The dated audit and measurements below preserve historical evidence. The current
