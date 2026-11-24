@@ -1685,6 +1685,10 @@ and use supported encodings.
   the byte length but does not transform or describe producer-specific
   blocking or swizzling; nxrt cannot infer a different order from the header.
   The total logical element count, not each row, must be divisible by four.
+  For example, [compressed-tensors' E2M3 packer](https://docs.vllm.ai/projects/compressed-tensors/en/latest/api/compressed_tensors/compressors/mxfp6/helpers/)
+  emits least-significant bits first, while [pt2-bfp's E3M2 packer](https://github.com/d-matrix-ai/pt2-bfp/blob/main/src/pt2bfp/torchao/dtypes/float6_e3m2.py)
+  puts the first code in the high six bits of the first byte. The latter
+  payload must be repacked before using it as an nxrt FLOAT6 initializer.
   ONNX inline and ordinary external data can use a
   zero-padded final byte; ONNX `int32_data` uses one unsigned code per
   element. On native CPU and CUDA, opset 28 `Cast` widens contiguous
