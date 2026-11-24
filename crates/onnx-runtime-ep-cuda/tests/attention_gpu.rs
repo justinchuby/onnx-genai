@@ -12,7 +12,7 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
-//! On-GPU integration test for the Phase-2a SDPA/GQA attention kernel
+//! On-GPU integration test for the cuBLASLt/softmax SDPA/GQA attention kernel
 //! (`docs/architecture/ORT2.md` §13 + §15.5).
 //!
 //! Gated on a real device: CPU-only CI reports these as ignored unless
@@ -174,7 +174,7 @@ struct Buf(onnx_runtime_ep_api::DeviceBuffer);
 enum AttentionTestBackend {
     Auto,
     Fused,
-    Phase2a,
+    BlasSoftmax,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -298,9 +298,13 @@ fn run_gpu_attention_with_backend(
         AttentionTestBackend::Fused => {
             AttentionKernel::new_fused(runtime.clone(), causal, num_heads, num_kv_heads, scale)
         }
-        AttentionTestBackend::Phase2a => {
-            AttentionKernel::new_phase2a(runtime.clone(), causal, num_heads, num_kv_heads, scale)
-        }
+        AttentionTestBackend::BlasSoftmax => AttentionKernel::new_blas_softmax(
+            runtime.clone(),
+            causal,
+            num_heads,
+            num_kv_heads,
+            scale,
+        ),
     }
     .unwrap();
     let mut workspace = None;
@@ -612,7 +616,7 @@ fn attention_bf16_on_gpu_matches_f32_reference() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn fused_attention_matches_phase2a_baseline() {
+fn fused_attention_matches_blas_softmax_baseline() {
     let ep = match CudaExecutionProvider::new_default() {
         Ok(ep) => ep,
         Err(e) => {
@@ -671,7 +675,7 @@ fn fused_attention_matches_phase2a_baseline() {
             false,
             Some(scale),
             dtype,
-            AttentionTestBackend::Phase2a,
+            AttentionTestBackend::BlasSoftmax,
         );
         assert_close(&fused, &baseline, atol, rtol);
 
@@ -723,7 +727,7 @@ fn fused_attention_matches_phase2a_baseline() {
             true,
             Some(scale),
             dtype,
-            AttentionTestBackend::Phase2a,
+            AttentionTestBackend::BlasSoftmax,
         );
         println!(
             "fused parity dtype={dtype:?} GQA causal+mask S={s} D={d}: max_abs_err={:e}",
@@ -780,7 +784,7 @@ fn fused_attention_matches_phase2a_baseline() {
         false,
         Some(1.0),
         DataType::Float32,
-        AttentionTestBackend::Phase2a,
+        AttentionTestBackend::BlasSoftmax,
     );
     assert!(fused.iter().all(|value| value.is_finite()));
     assert_close(&fused, &baseline, 2e-4, 1e-5);
@@ -813,7 +817,7 @@ fn attention_prefill_h200_benchmark() {
         let mut baseline_out = ep.allocate(b * h * s * d * 2, 256).unwrap();
         let fused = AttentionKernel::new_fused(runtime.clone(), true, h, h, Some(scale)).unwrap();
         let baseline =
-            AttentionKernel::new_phase2a(runtime.clone(), true, h, h, Some(scale)).unwrap();
+            AttentionKernel::new_blas_softmax(runtime.clone(), true, h, h, Some(scale)).unwrap();
 
         let mut workspace = None;
         let mut run = |kernel: &AttentionKernel, output: &mut onnx_runtime_ep_api::DeviceBuffer| {
@@ -911,7 +915,7 @@ fn attention_rejects_unsupported_dtype_and_rank() {
     let runtime = ep.runtime().clone();
     let dev = ep.device_id();
 
-    // A rank-3 Q is out of Phase-2a scope: expect an actionable error, not a panic.
+    // Both routes require 4-D Q: rank-3 must fail with reshape guidance.
     let data = [1.0f32; 64];
     let buf = ep.allocate(256, 256).unwrap();
     // SAFETY: 64 f32 = 256 bytes.
@@ -952,15 +956,17 @@ fn attention_rejects_unsupported_dtype_and_rank() {
     let kernel = AttentionKernel::new(runtime.clone(), false, 4, 4, None).unwrap();
     let err = kernel
         .execute(&[qv, kv, vv], &mut [ov])
-        .expect_err("rank-3 attention must be rejected in Phase 2a");
+        .expect_err("CUDA Attention must reject rank-3 Q");
     let msg = format!("{err}");
     println!("rank error: {msg}");
     assert!(
-        msg.contains("Phase 2a") || msg.contains("Phase-2a"),
+        msg.contains("Attention with Q rank 3")
+            && msg.contains("expects 4-D")
+            && msg.contains("reshape/transpose upstream"),
         "{msg}"
     );
 
-    // The explicit Phase-2a route must reject a missing prepared owner even
+    // The explicit cuBLASLt/softmax route must reject a missing prepared owner even
     // with valid geometry. It must not silently allocate scores/cuBLASLt scratch.
     let shape4 = [1usize, 4, 4, 4];
     let strides4 = compute_contiguous_strides(&shape4);
@@ -978,10 +984,10 @@ fn attention_rejects_unsupported_dtype_and_rank() {
         &strides4,
         dev,
     );
-    let phase2a = AttentionKernel::new_phase2a(runtime, false, 4, 4, None).unwrap();
+    let blas_softmax = AttentionKernel::new_blas_softmax(runtime, false, 4, 4, None).unwrap();
     assert!(
         common::runtime_workspace_requirement(
-            &phase2a,
+            &blas_softmax,
             &inputs4,
             &[onnx_runtime_ep_api::OutputMetadata::from_view(&output4)],
             &[]
@@ -990,7 +996,7 @@ fn attention_rejects_unsupported_dtype_and_rank() {
         .bytes
             > 0
     );
-    let error = phase2a.execute(&inputs4, &mut [output4]).unwrap_err();
+    let error = blas_softmax.execute(&inputs4, &mut [output4]).unwrap_err();
     let message = error.to_string();
     assert!(
         message.contains("cuda_ep Attention") && message.contains("execute_with_workspace"),

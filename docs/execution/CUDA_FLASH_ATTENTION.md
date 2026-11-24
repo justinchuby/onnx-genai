@@ -1,4 +1,4 @@
-# CUDA Phase-2b fused attention
+# CUDA fused attention
 
 ## Backend decision
 
@@ -49,12 +49,12 @@ tiles. The general f32/f16/bf16 kernel widens storage to f32 and uses an
 | MHA / GQA / MQA | yes | as above |
 | causal / non-causal | yes | as above |
 | additive mask | shared, per-batch, or per-`(batch,head)` planes | as above |
-| decode (`Sq == 1`) | Phase-2a fallback | always |
-| `D > 128`, unsupported dtype/layout/mask | Phase-2a fallback | always |
-| longer prefill | fused can be forced for memory-bounded use | Phase-2a is faster today |
+| decode (`Sq == 1`) | cuBLASLt/softmax fallback | always |
+| `D > 128`, unsupported dtype/layout/mask | cuBLASLt/softmax fallback | always |
+| longer prefill | fused can be forced for memory-bounded use | cuBLASLt/softmax is faster today |
 
 `AttentionKernel::new` applies the measured heuristic.
-`AttentionKernel::new_fused` and `new_phase2a` are parity/benchmark controls.
+`AttentionKernel::new_fused` and `new_blas_softmax` are parity/benchmark controls.
 The registered operator uses `new`, so unsupported or slower shapes retain the
 existing implementation without changing callers.
 
@@ -85,11 +85,11 @@ cached prefill but deliberately differ when `Sq != Sk`.
 
 The public `GroupQueryAttentionBackend` control mirrors `AttentionKernel`'s test
 controls: production factory-created kernels use `Auto`; parity and benchmark
-tests select `Fused` or `Phase2a` directly.
+tests select `Fused` or `BlasSoftmax` directly.
 
 ## Numeric validation
 
-H200 parity tests execute forced fused and forced Phase-2a on identical inputs:
+H200 parity tests execute forced fused and forced cuBLASLt/softmax on identical inputs:
 
 - f32: `atol=3e-6`, `rtol=2e-6`;
 - f16: `atol=rtol=7e-4`;
@@ -108,9 +108,9 @@ fresh and cached-ragged batches in all three dtypes; it verifies causal origin i
 `total-Sq`, while present-cache append remains `total-Sk`. Present K/V buffers
 match exactly in every case.
 
-Separate Auto tests assert and execute Phase-2a fallback for decode (`Sq=1`) and
+Separate Auto tests assert and execute cuBLASLt/softmax fallback for decode (`Sq=1`) and
 the measured-slower cached shape `Sq=512,total=1024`; both outputs and caches
-match forced Phase-2a exactly.
+match forced cuBLASLt/softmax exactly.
 
 ## H200 benchmark
 
@@ -119,14 +119,14 @@ Device: NVIDIA H200, driver 580.105.08. Shape: causal f16
 Timing includes the kernel's production allocation/synchronization behavior but
 not input upload or output download.
 
-| Sequence | Fused | Phase-2a | Result | Temporary global scratch |
+| Sequence | Fused | cuBLASLt/softmax | Result | Temporary global scratch |
 |---:|---:|---:|---:|---:|
 | 512 | 0.572 ms | 0.878 ms | **1.53x faster** | 0 vs 48 MiB |
 | 2048 | 8.329 ms | 2.159 ms | 0.26x | 0 vs 288 MiB |
 
-Phase-2a scratch is the f16 `[B,H,S,S]` score tensor plus the 32 MiB cuBLASLt
+cuBLASLt/softmax scratch is the f16 `[B,H,S,S]` score tensor plus the 32 MiB cuBLASLt
 workspace. The fused kernel allocates neither. Automatic dispatch therefore
-uses fused f16 through S=512 and retains Phase-2a at S=2048; callers prioritizing
+uses fused f16 through S=512 and retains cuBLASLt/softmax at S=2048; callers prioritizing
 memory over latency can explicitly select the fused path.
 
 ### GroupQueryAttention prefill
@@ -153,7 +153,7 @@ pipeline, or a maintained cuDNN frontend SDPA wrapper.
 
 ### Prepared fallback workspace
 
-`com.microsoft::Attention` obtains its Phase-2a scores and cuBLASLt scratch
+`com.microsoft::Attention` obtains its cuBLASLt/softmax scores and cuBLASLt scratch
 through the executor workspace contract. Session/plugin and direct callers
 obtain the requirement from input metadata and pass an exclusive prepared view
 to `execute_with_workspace`. Planning and binding share `WorkspaceLayout`, with
@@ -161,12 +161,12 @@ checked shape multiplication and alignment. Short, null, misaligned, wrapping,
 or unaddressable prepared workspace is rejected with preparation guidance.
 
 A direct `execute` call is valid when the selected fused route needs no global
-scratch. Phase-2a rejects a missing workspace rather than allocating outside
+scratch. cuBLASLt/softmax rejects a missing workspace rather than allocating outside
 preparation. Eager registration currently exposes only CPU execution; future
 asynchronous registration needs an explicit completion/retirement contract.
 
 GroupQueryAttention's general half/bf16 fallback also borrows the complete
-Phase-2a score/32 MiB BLAS region from its existing composite workspace. One
+cuBLASLt/softmax score/32 MiB BLAS region from its existing composite workspace. One
 route classifier drives KV-read support, execution and scratch planning. The
 input-derived `past_capacity + current_key_length` bound covers every legal
 valid length without inspecting device length values during preparation. Auto
@@ -209,7 +209,7 @@ runner and are not established by Rust compilation.
 
 `com.microsoft::MultiHeadAttention` also borrows one SessionPersistent composite:
 Q/output BNSH staging, optional temporary K/V, additive mask, padding upload,
-and the complete Phase-2a scores/cuBLASLt region. Compile-time optional slots
+and the complete cuBLASLt/softmax scores/cuBLASLt region. Compile-time optional slots
 and supplied output metadata are checked before omitting K/V regions. Planning
 and execution share geometry and output validation; regions receive no separate
 grants. Retained capacity permits fitting device-binding runs to avoid repeated
@@ -223,7 +223,7 @@ latches that stream into subsequent release fences, so compute/copy completion
 alone cannot release an unsettled destination. The host padding mask remains an
 owned Vec; this is not a complete process-memory bound. Capture stays refused.
 
-All Phase-2a callers now pass typed, checked caller scratch. Its raw-allocation
+All cuBLASLt/softmax callers now pass typed, checked caller scratch. Its raw-allocation
 fallback and runtime-private shared BLAS allocation are removed. Borrowed score
 capacity is validated against the actual invocation before launches. This is a
 source/Host-tested contract, with CUDA execution and performance still pending.

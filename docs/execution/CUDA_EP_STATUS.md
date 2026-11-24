@@ -360,7 +360,7 @@ Both declare `SessionPersistent` for all shapes, and both `execute()` and
 
 | Kernel | Site |
 |---|---|
-| `com.microsoft` `Attention` Phase-2a scratch | `attention.rs:973`, registered at `kernels/mod.rs:946` |
+| `com.microsoft` `Attention` cuBLASLt/softmax scratch | `attention.rs:973`, registered at `kernels/mod.rs:946` |
 | default-domain `Attention` (opset 23/24/25) = `StandardAttention`, prefill / batched | `standard_attention.rs`, registered in `kernels/mod.rs` |
 
 These are the only paths where this change does something observable on
@@ -650,7 +650,7 @@ The default model is a default-domain `Attention` (opset 23), i.e. per §4.1(d)
 the `StandardAttention` row, at `batch=2 q_seq=8` — a **prefill / batched**
 geometry (`batch > 1` or `q_seq > 1`), which is what makes it `StepScoped`.
 `--batch 1 --q-seq 1` is refused as UNVALIDATED rather than measured. To
-exercise the `com.microsoft` `Attention` Phase-2a row instead, point `--lib` at
+exercise the `com.microsoft` `Attention` cuBLASLt/softmax row instead, point `--lib` at
 the same plugin and supply a model with a `com.microsoft` `Attention` node.
 
 The harness self-tests on a host with no GPU, against the CPU shared-mock

@@ -76,10 +76,9 @@ crate feature selecting the CUDA binding version:
   `cuda-12090` by disabling default features and enabling exactly one selector.
   Do **not** switch to `cuda-version-from-build-system`, which would reintroduce
   a build-time CUDA dependency.
-- There is **no `build.rs` and no `nvcc` step** in this crate — the Phase-2a
-  slice is cuBLASLt GEMM only. When Phase-2b custom `.cu`/CuTe kernels land they
-  will introduce a compile step and a real build-host CUDA requirement; that
-  will change the publish story and must be revisited here.
+- There is **no `build.rs` and no `nvcc` step** in this crate. Custom CUDA
+  kernels are compiled at runtime with NVRTC, so the build host does not need
+  a CUDA toolkit.
 
 ## `onnx-runtime-ep-cpu` — publish considerations
 

@@ -1266,7 +1266,7 @@ fn run_forced_parity_case(ep: &CudaExecutionProvider, case: &ParityCase) {
         &attrs,
         &inputs,
         &output_shapes,
-        Some(GroupQueryAttentionBackend::Phase2a),
+        Some(GroupQueryAttentionBackend::NoFlashPrefill),
     ))
     .unwrap();
     let (atol, rtol) = parity_tolerances(case.dtype);
@@ -1484,7 +1484,7 @@ fn gqa_gpu_fp16_decode_split_k_long_context_is_deterministic_and_matches_baselin
         &attrs,
         &inputs,
         &output_shapes,
-        Some(GroupQueryAttentionBackend::Phase2a),
+        Some(GroupQueryAttentionBackend::NoFlashPrefill),
     ))
     .unwrap();
     assert_eq!(first, second, "fp16 split-K decode must be deterministic");
@@ -1558,7 +1558,7 @@ fn gqa_gpu_auto_fallback_matches_baseline_and_reports_selected_backend() {
                 *case.totals.iter().max().unwrap(),
                 case.dim,
             ),
-            GroupQueryAttentionBackend::Phase2a,
+            GroupQueryAttentionBackend::NoFlashPrefill,
             "{} must select the baseline",
             case.name
         );
@@ -1575,7 +1575,7 @@ fn gqa_gpu_auto_fallback_matches_baseline_and_reports_selected_backend() {
             &attrs,
             &inputs,
             &output_shapes,
-            Some(GroupQueryAttentionBackend::Phase2a),
+            Some(GroupQueryAttentionBackend::NoFlashPrefill),
         ))
         .unwrap();
         let (atol, rtol) = parity_tolerances(case.dtype);
@@ -1777,7 +1777,7 @@ fn gqa_prefill_h200_benchmark() {
                 &ep,
                 q_seq,
                 past_len,
-                GroupQueryAttentionBackend::Phase2a,
+                GroupQueryAttentionBackend::NoFlashPrefill,
                 iterations,
             );
             let total = q_seq + past_len;
@@ -3784,7 +3784,7 @@ fn gqa_gpu_prepared_reference_scores_ignore_present_cache_padding() {
                     vec![1, 2, capacity, 2],
                     vec![1, 2, capacity, 2],
                 ],
-                Some(GroupQueryAttentionBackend::Phase2a),
+                Some(GroupQueryAttentionBackend::NoFlashPrefill),
             )
             .unwrap();
             close(&outputs[0], &expected_row.repeat(2));
@@ -3838,7 +3838,7 @@ fn gqa_gpu_prepared_general_half_uses_arbitrary_head_dim_and_padded_cache() {
                 vec![1, kv_heads, capacity, dim],
                 vec![1, kv_heads, capacity, dim],
             ],
-            Some(GroupQueryAttentionBackend::Phase2a),
+            Some(GroupQueryAttentionBackend::NoFlashPrefill),
         )
         .unwrap();
         assert_close(&outputs[0], &expected, 0.002, 0.002);
@@ -3882,7 +3882,7 @@ fn gqa_gpu_hidden_present_scratch_matches_visible_padded_cache_outputs() {
         &attrs(&[]),
         &inputs,
         &output_shapes,
-        Some(GroupQueryAttentionBackend::Phase2a),
+        Some(GroupQueryAttentionBackend::NoFlashPrefill),
     )
     .unwrap();
     for outputs in [1, 2] {
@@ -3891,7 +3891,7 @@ fn gqa_gpu_hidden_present_scratch_matches_visible_padded_cache_outputs() {
             &attrs(&[]),
             &inputs,
             &output_shapes[..outputs],
-            Some(GroupQueryAttentionBackend::Phase2a),
+            Some(GroupQueryAttentionBackend::NoFlashPrefill),
         )
         .unwrap();
         close(&hidden[0], &all[0]);
