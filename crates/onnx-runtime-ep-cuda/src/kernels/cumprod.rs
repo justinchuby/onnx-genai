@@ -113,6 +113,136 @@ fn decode_axis(dtype: DataType, shape: &[usize], bytes: &[u8]) -> Result<i64> {
     }
 }
 
+impl Kernel for CumProdKernel {
+    fn prepare_constant_inputs(
+        &mut self,
+        constants: &[Option<KernelConstantInput<'_>>],
+        _: &dyn ExecutionProvider,
+    ) -> Result<()> {
+        if let Some(Some(axis)) = constants.get(1) {
+            self.fixed_axis = Some(decode_axis(axis.dtype, axis.shape, axis.bytes)?);
+        }
+        Ok(())
+    }
+
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let ([input, axis_input], [output]) = (inputs, outputs) else {
+            return Err(EpError::KernelFailed(
+                "CumProd: expected data, scalar axis and one output".into(),
+            ));
+        };
+        if !input.is_contiguous() || !axis_input.is_contiguous() || !output.is_contiguous() {
+            return Err(not_implemented(
+                "CumProd requires contiguous input and output on CUDA",
+            ));
+        }
+        if output.dtype != input.dtype || output.shape != input.shape {
+            return Err(EpError::KernelFailed(format!(
+                "CumProd: expected output {:?} {:?} matching the input, got {:?} {:?}",
+                input.dtype, input.shape, output.dtype, output.shape
+            )));
+        }
+        let (entry, narrow) = match input.dtype {
+            DataType::Int32 | DataType::Uint32 => ("cumprod_u32", false),
+            DataType::Int64 | DataType::Uint64 => ("cumprod_u64", false),
+            DataType::Float32 => ("cumprod_f32", false),
+            DataType::Float64 => ("cumprod_f64", false),
+            DataType::Float16 => ("cumprod_f16", true),
+            DataType::BFloat16 => ("cumprod_bf16", true),
+            dtype => {
+                return Err(not_implemented(format!(
+                    "CumProd-26 does not accept {dtype:?} data"
+                )));
+            }
+        };
+        if !axis_input.shape.is_empty()
+            || !matches!(axis_input.dtype, DataType::Int32 | DataType::Int64)
+        {
+            return Err(EpError::KernelFailed(format!(
+                "CumProd: axis must be an Int32 or Int64 rank-0 tensor, got {:?} {:?}",
+                axis_input.dtype, axis_input.shape
+            )));
+        }
+        input.validate()?;
+        axis_input.validate()?;
+        output.validate()?;
+        let raw = if let Some(axis) = self.fixed_axis {
+            axis
+        } else {
+            if self.runtime.is_capturing()? {
+                return Err(not_implemented(
+                    "CumProd must read and validate its runtime axis outside CUDA graph capture",
+                ));
+            }
+            let mut bytes = [0_u8; 8];
+            let len = axis_input.dtype.byte_size();
+            unsafe {
+                self.runtime
+                    .dtoh(&mut bytes[..len], cuptr(axis_input.data_ptr::<c_void>()))?;
+            }
+            decode_axis(axis_input.dtype, axis_input.shape, &bytes[..len])?
+        };
+        let axis = cum_prod_axis(raw, input.shape.len()).map_err(EpError::KernelFailed)?;
+        if input.shape.contains(&0) {
+            return Ok(());
+        }
+        let inner = input.shape[axis + 1..].iter().product::<usize>() as u64;
+        let width = input.shape[axis] as u64;
+        let lanes = input.shape[..axis].iter().product::<usize>() as u64 * inner;
+        static NARROW_SOURCE: std::sync::LazyLock<String> =
+            std::sync::LazyLock::new(|| format!("{SCAN}{NARROW}"));
+        static WIDE_SOURCE: std::sync::LazyLock<String> =
+            std::sync::LazyLock::new(|| format!("{SCAN}{WIDE}"));
+        let (module, source) = if narrow {
+            ("cumprod_narrow", NARROW_SOURCE.as_str())
+        } else {
+            ("cumprod_wide", WIDE_SOURCE.as_str())
+        };
+        let func = self.runtime.nvrtc_function(module, source, entry)?;
+        let input_ptr = cuptr(input.data_ptr::<c_void>());
+        let output_ptr = cuptr(output.data_ptr_mut::<c_void>());
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        builder
+            .arg(&input_ptr)
+            .arg(&output_ptr)
+            .arg(&lanes)
+            .arg(&width)
+            .arg(&inner)
+            .arg(&self.flags);
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (
+                    lanes.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32,
+                    1,
+                    1,
+                ),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| driver_err("launch CumProd", e))?;
+        Ok(())
+    }
+
+    fn supports_strided_input(&self, _: usize) -> bool {
+        false
+    }
+
+    fn can_run_in_place(&self, input_index: usize) -> bool {
+        input_index == 0
+    }
+
+    fn capture_support(&self) -> CaptureSupport {
+        if self.fixed_axis.is_some() {
+            CaptureSupport::Supported
+        } else {
+            CaptureSupport::unsupported(
+                "CumProd has a runtime axis that must be read and validated on the host",
+            )
+        }
+    }
+}
+
 #[cfg(feature = "gpu-tests")]
 #[cfg(test)]
 mod tests {
@@ -281,134 +411,5 @@ mod tests {
             }
         }
         unsafe { rt.free_raw(axis_dev).unwrap() };
-    }
-}
-impl Kernel for CumProdKernel {
-    fn prepare_constant_inputs(
-        &mut self,
-        constants: &[Option<KernelConstantInput<'_>>],
-        _: &dyn ExecutionProvider,
-    ) -> Result<()> {
-        if let Some(Some(axis)) = constants.get(1) {
-            self.fixed_axis = Some(decode_axis(axis.dtype, axis.shape, axis.bytes)?);
-        }
-        Ok(())
-    }
-
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        let ([input, axis_input], [output]) = (inputs, outputs) else {
-            return Err(EpError::KernelFailed(
-                "CumProd: expected data, scalar axis and one output".into(),
-            ));
-        };
-        if !input.is_contiguous() || !axis_input.is_contiguous() || !output.is_contiguous() {
-            return Err(not_implemented(
-                "CumProd requires contiguous input and output on CUDA",
-            ));
-        }
-        if output.dtype != input.dtype || output.shape != input.shape {
-            return Err(EpError::KernelFailed(format!(
-                "CumProd: expected output {:?} {:?} matching the input, got {:?} {:?}",
-                input.dtype, input.shape, output.dtype, output.shape
-            )));
-        }
-        let (entry, narrow) = match input.dtype {
-            DataType::Int32 | DataType::Uint32 => ("cumprod_u32", false),
-            DataType::Int64 | DataType::Uint64 => ("cumprod_u64", false),
-            DataType::Float32 => ("cumprod_f32", false),
-            DataType::Float64 => ("cumprod_f64", false),
-            DataType::Float16 => ("cumprod_f16", true),
-            DataType::BFloat16 => ("cumprod_bf16", true),
-            dtype => {
-                return Err(not_implemented(format!(
-                    "CumProd-26 does not accept {dtype:?} data"
-                )));
-            }
-        };
-        if !axis_input.shape.is_empty()
-            || !matches!(axis_input.dtype, DataType::Int32 | DataType::Int64)
-        {
-            return Err(EpError::KernelFailed(format!(
-                "CumProd: axis must be an Int32 or Int64 rank-0 tensor, got {:?} {:?}",
-                axis_input.dtype, axis_input.shape
-            )));
-        }
-        input.validate()?;
-        axis_input.validate()?;
-        output.validate()?;
-        let raw = if let Some(axis) = self.fixed_axis {
-            axis
-        } else {
-            if self.runtime.is_capturing()? {
-                return Err(not_implemented(
-                    "CumProd must read and validate its runtime axis outside CUDA graph capture",
-                ));
-            }
-            let mut bytes = [0_u8; 8];
-            let len = axis_input.dtype.byte_size();
-            unsafe {
-                self.runtime
-                    .dtoh(&mut bytes[..len], cuptr(axis_input.data_ptr::<c_void>()))?;
-            }
-            decode_axis(axis_input.dtype, axis_input.shape, &bytes[..len])?
-        };
-        let axis = cum_prod_axis(raw, input.shape.len()).map_err(EpError::KernelFailed)?;
-        if input.shape.contains(&0) {
-            return Ok(());
-        }
-        let inner = input.shape[axis + 1..].iter().product::<usize>() as u64;
-        let width = input.shape[axis] as u64;
-        let lanes = input.shape[..axis].iter().product::<usize>() as u64 * inner;
-        static NARROW_SOURCE: std::sync::LazyLock<String> =
-            std::sync::LazyLock::new(|| format!("{SCAN}{NARROW}"));
-        static WIDE_SOURCE: std::sync::LazyLock<String> =
-            std::sync::LazyLock::new(|| format!("{SCAN}{WIDE}"));
-        let (module, source) = if narrow {
-            ("cumprod_narrow", NARROW_SOURCE.as_str())
-        } else {
-            ("cumprod_wide", WIDE_SOURCE.as_str())
-        };
-        let func = self.runtime.nvrtc_function(module, source, entry)?;
-        let input_ptr = cuptr(input.data_ptr::<c_void>());
-        let output_ptr = cuptr(output.data_ptr_mut::<c_void>());
-        let mut builder = self.runtime.stream().launch_builder(&func);
-        builder
-            .arg(&input_ptr)
-            .arg(&output_ptr)
-            .arg(&lanes)
-            .arg(&width)
-            .arg(&inner)
-            .arg(&self.flags);
-        unsafe {
-            builder.launch(LaunchConfig {
-                grid_dim: (
-                    lanes.div_ceil(u64::from(BLOCK)).clamp(1, 65_535) as u32,
-                    1,
-                    1,
-                ),
-                block_dim: (BLOCK, 1, 1),
-                shared_mem_bytes: 0,
-            })
-        }
-        .map_err(|e| driver_err("launch CumProd", e))?;
-        Ok(())
-    }
-
-    fn supports_strided_input(&self, _: usize) -> bool {
-        false
-    }
-
-    fn can_run_in_place(&self, input_index: usize) -> bool {
-        input_index == 0
-    }
-
-    fn capture_support(&self) -> CaptureSupport {
-        if self.fixed_axis.is_some() {
-            CaptureSupport::Supported
-        } else {
-            CaptureSupport::unsupported(
-                "CumProd has a runtime axis that must be read and validated on the host",
-            )
-        }
     }
 }

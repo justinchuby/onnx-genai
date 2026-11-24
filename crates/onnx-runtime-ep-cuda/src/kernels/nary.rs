@@ -394,8 +394,9 @@ impl Kernel for NaryKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         _outputs: &[OutputMetadata<'_>],
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
         workspace_requirement(self.op_name(), inputs)
+            .map(onnx_runtime_ep_api::WorkspacePreparation::Ready)
     }
 
     fn execute_with_workspace(

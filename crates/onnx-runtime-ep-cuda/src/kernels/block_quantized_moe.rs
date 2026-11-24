@@ -2275,7 +2275,7 @@ impl Kernel for BlockQuantizedMoEKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
         if inputs.len() != self.geometry.input_shapes.len() {
             return Err(error(format!(
                 "expected {} input metadata entries, got {}",
@@ -2297,12 +2297,14 @@ impl Kernel for BlockQuantizedMoEKernel {
                 )));
             }
         }
-        Ok(WorkspaceRequirement {
-            bytes: u64::try_from(self.geometry.layout.bytes)
-                .map_err(|_| error("BlockQuantizedMoE workspace does not fit u64"))?,
-            alignment: WORKSPACE_ALIGNMENT,
-            lifetime: WorkspaceLifetime::SessionPersistent,
-        })
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            WorkspaceRequirement {
+                bytes: u64::try_from(self.geometry.layout.bytes)
+                    .map_err(|_| error("BlockQuantizedMoE workspace does not fit u64"))?,
+                alignment: WORKSPACE_ALIGNMENT,
+                lifetime: WorkspaceLifetime::SessionPersistent,
+            },
+        ))
     }
 
     fn execute_with_workspace(

@@ -965,38 +965,50 @@ impl Kernel for AttentionKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
         // Prepare-only planning (#747): report the exact governed scratch for the
         // Phase-2a path so the executor reserves it against the device authority
         // before request admission. The fused path uses only shared memory and
         // needs no device scratch. On any shape/dtype that `run` would reject we
         // report NONE and let execution raise the precise validation error.
         let (Some(q), Some(k)) = (inputs.first(), inputs.get(1)) else {
-            return Ok(WorkspaceRequirement::NONE);
+            return Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+                WorkspaceRequirement::NONE,
+            ));
         };
         if q.shape.len() != 4 || k.shape.len() != 4 {
-            return Ok(WorkspaceRequirement::NONE);
+            return Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+                WorkspaceRequirement::NONE,
+            ));
         }
         let Ok(dtype) = AttentionDtype::from_onnx(q.dtype) else {
-            return Ok(WorkspaceRequirement::NONE);
+            return Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+                WorkspaceRequirement::NONE,
+            ));
         };
         let (batch, hq, sq, d) = (q.shape[0], q.shape[1], q.shape[2], q.shape[3]);
         let sk = k.shape[2];
         if hq != self.num_heads {
-            return Ok(WorkspaceRequirement::NONE);
+            return Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+                WorkspaceRequirement::NONE,
+            ));
         }
         if self.use_fused(q.dtype, sq, sk, d) {
-            return Ok(WorkspaceRequirement::NONE);
+            return Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+                WorkspaceRequirement::NONE,
+            ));
         }
         let layout = phase2a_scratch_layout(dtype, batch, self.num_heads, sq, sk)?;
         let bytes = u64::try_from(layout.bytes()).map_err(|_| {
             EpError::KernelFailed("cuda_ep Attention: workspace does not fit u64".into())
         })?;
-        Ok(WorkspaceRequirement {
-            bytes,
-            alignment: PHASE2A_SCRATCH_ALIGN,
-            lifetime: WorkspaceLifetime::StepScoped,
-        })
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            WorkspaceRequirement {
+                bytes,
+                alignment: PHASE2A_SCRATCH_ALIGN,
+                lifetime: WorkspaceLifetime::StepScoped,
+            },
+        ))
     }
 
     fn execute_with_workspace(
@@ -1204,6 +1216,7 @@ mod tests {
         let v = TensorMetadata::new(DataType::Float16, &kv_shape, true);
         let req = phase2a
             .workspace_requirement(&[q, k, v], &[])
+            .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)
             .expect("workspace requirement");
         let layout = phase2a_scratch_layout(AttentionDtype::F16, batch, heads, sq, sk).unwrap();
         assert_eq!(req.bytes, layout.bytes() as u64);
@@ -1223,6 +1236,7 @@ mod tests {
         let v = TensorMetadata::new(DataType::Float16, &kv_shape, true);
         let fused_req = fused
             .workspace_requirement(&[q, k, v], &[])
+            .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)
             .expect("fused workspace requirement");
         assert_eq!(fused_req.bytes, 0, "fused path needs no governed scratch");
     }

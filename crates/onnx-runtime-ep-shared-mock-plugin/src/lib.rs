@@ -494,7 +494,7 @@ impl Kernel for WorkspaceAddKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> EpResult<WorkspaceRequirement> {
+    ) -> EpResult<onnx_runtime_ep_api::WorkspacePreparation> {
         // Stands in for the cuBLASLt heuristic search a real CUDA GEMM kernel
         // runs here. The executor must not repeat it for a shape it has already
         // planned; `workspace_plans_do_not_repeat_for_an_unchanged_shape`
@@ -505,15 +505,50 @@ impl Kernel for WorkspaceAddKernel {
             .map(|m| m.shape.iter().product())
             .unwrap_or(0usize);
         let persistent = PERSISTENT_WORKSPACE.load(Ordering::SeqCst);
-        Ok(WorkspaceRequirement {
-            bytes: (numel * std::mem::size_of::<f32>()) as u64,
-            alignment: MOCK_WORKSPACE_ALIGNMENT,
-            lifetime: if persistent {
-                WorkspaceLifetime::SessionPersistent
-            } else {
-                WorkspaceLifetime::StepScoped
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            WorkspaceRequirement {
+                bytes: (numel * std::mem::size_of::<f32>()) as u64,
+                alignment: MOCK_WORKSPACE_ALIGNMENT,
+                lifetime: if persistent {
+                    WorkspaceLifetime::SessionPersistent
+                } else {
+                    WorkspaceLifetime::StepScoped
+                },
             },
-        })
+        ))
+    }
+
+    fn workspace_requirement_for_execution(
+        &self,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+        metadata: &[TensorMetadata<'_>],
+        output_metadata: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+        cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
+    ) -> EpResult<WorkspaceRequirement> {
+        let output = outputs.first().ok_or_else(|| {
+            EpError::KernelFailed(
+                "WorkspaceAddKernel: execution-time workspace planning needs the real output binding before admission".into(),
+            )
+        })?;
+        let (input, _, _) = f32_operands(inputs, "Add workspace planning")?;
+        if output.dtype != input.dtype
+            || output.shape != input.shape
+            || output_metadata.first()
+                != Some(&onnx_runtime_ep_api::OutputMetadata::tensor(
+                    output.dtype,
+                    output.shape,
+                ))
+        {
+            return Err(EpError::KernelFailed(
+                "WorkspaceAddKernel: real output dtype/shape differs from the canonical planning metadata; bind the allocated Add output before admission".into(),
+            ));
+        }
+        match cached {
+            Some(preparation) => preparation,
+            None => self.workspace_requirement(metadata, output_metadata)?,
+        }
+        .require_ready()
     }
 
     fn execute_with_workspace(
@@ -792,7 +827,11 @@ mod tests {
         let k = WorkspaceAddKernel;
         let shape = [2usize, 4];
         let meta = TensorMetadata::new(DataType::Float32, &shape, true);
-        let req = k.workspace_requirement(&[meta, meta], &[]).unwrap();
+        let req = k
+            .workspace_requirement(&[meta, meta], &[])
+            .unwrap()
+            .require_ready()
+            .unwrap();
         assert_eq!(req.bytes, 8 * 4);
         assert_eq!(req.alignment, MOCK_WORKSPACE_ALIGNMENT);
     }

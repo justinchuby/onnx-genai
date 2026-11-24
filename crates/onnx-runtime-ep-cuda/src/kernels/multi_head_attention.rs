@@ -1666,11 +1666,13 @@ impl Kernel for MultiHeadAttentionKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         outputs: &[OutputMetadata<'_>],
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
         let geometry = MhaGeometry::from_inputs(self.num_heads, inputs)?;
         validate_output_metadata(geometry, self.present_outputs, outputs)?;
         let present = |index: usize| inputs.get(index).is_some_and(|input| input.present);
-        MhaWorkspace::new(geometry, self.present_outputs, present(4), present(5))?.requirement()
+        MhaWorkspace::new(geometry, self.present_outputs, present(4), present(5))?
+            .requirement()
+            .map(onnx_runtime_ep_api::WorkspacePreparation::Ready)
     }
     fn execute_with_workspace(
         &self,

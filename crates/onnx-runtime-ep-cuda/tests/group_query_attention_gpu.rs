@@ -435,7 +435,11 @@ fn prepare_in_place_workspace(
             OutputMetadata::tensor(DataType::Float32, &cache),
             OutputMetadata::tensor(DataType::Float32, &cache),
         ];
-        let candidate = kernel.workspace_requirement(&inputs, &outputs).unwrap();
+        let candidate = kernel
+            .workspace_requirement(&inputs, &outputs)
+            .unwrap()
+            .require_ready()
+            .unwrap();
         if candidate.bytes > requirement.bytes {
             requirement = candidate;
         }
@@ -601,7 +605,7 @@ fn execute_in_place_packed_f32_gqa_with_seqlens_shape(
         .iter()
         .map(onnx_runtime_ep_api::OutputMetadata::from_view)
         .collect::<Vec<_>>();
-    let requirement = common::runtime_workspace_requirement(kernel, &inputs, &facts)?;
+    let requirement = common::runtime_workspace_requirement(kernel, &inputs, &facts, &[])?;
     let view = common::prepare_workspace(ep, requirement, workspace)?;
     kernel.execute_with_workspace(&inputs, &mut outputs, view)?;
     Ok(requirement)
@@ -1685,6 +1689,7 @@ fn benchmark_gqa_case(
             onnx_runtime_ep_api::OutputMetadata::tensor(dtype, &cache_shape),
             onnx_runtime_ep_api::OutputMetadata::tensor(dtype, &cache_shape),
         ],
+        &[],
     )
     .unwrap();
     let mut workspace = None;

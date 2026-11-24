@@ -76,7 +76,7 @@ impl Kernel for IfPatternKernel {
         &self,
         _inputs: &[TensorMetadata<'_>],
         outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspacePreparation> {
         assert_eq!(outputs.len(), 1);
         assert!(
             matches!(
@@ -85,11 +85,13 @@ impl Kernel for IfPatternKernel {
             ),
             "kernel-sized output metadata must not pretend a final view already exists"
         );
-        Ok(WorkspaceRequirement {
-            bytes: self.scratch_bytes as u64,
-            alignment: 16,
-            ..WorkspaceRequirement::NONE
-        })
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            WorkspaceRequirement {
+                bytes: self.scratch_bytes as u64,
+                alignment: 16,
+                ..WorkspaceRequirement::NONE
+            },
+        ))
     }
     fn execute_kernel_sized(
         &self,

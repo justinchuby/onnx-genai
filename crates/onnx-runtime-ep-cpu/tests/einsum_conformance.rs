@@ -186,6 +186,7 @@ impl BackendAdapter for CpuAdapter {
                     &output.view_mut(),
                 )],
             )
+            .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)
             .map_err(|error| AdapterError(error.to_string()))?;
         assert!(workspace_request.alignment <= std::mem::align_of::<u64>());
         let bytes = usize::try_from(workspace_request.bytes)

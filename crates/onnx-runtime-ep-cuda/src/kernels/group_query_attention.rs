@@ -3532,7 +3532,7 @@ impl Kernel for GroupQueryAttentionKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         outputs: &[OutputMetadata<'_>],
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
         Self::composite_workspace_requirement(
             inputs,
             outputs,
@@ -3542,6 +3542,7 @@ impl Kernel for GroupQueryAttentionKernel {
             self.backend,
             self.runtime.capabilities().compute_capability().0,
         )
+        .map(onnx_runtime_ep_api::WorkspacePreparation::Ready)
     }
 
     fn execute_with_workspace(

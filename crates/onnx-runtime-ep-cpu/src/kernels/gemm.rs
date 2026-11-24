@@ -289,20 +289,24 @@ impl Kernel for GemmKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
         let plan = self.layout_plan(inputs, None)?;
-        Ok(WorkspaceRequirement {
-            bytes: plan.bytes() as u64,
-            alignment: plan.alignment(),
-            ..WorkspaceRequirement::NONE
-        })
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            WorkspaceRequirement {
+                bytes: plan.bytes() as u64,
+                alignment: plan.alignment(),
+                ..WorkspaceRequirement::NONE
+            },
+        ))
     }
 
     fn workspace_requirement_for_execution(
         &self,
         inputs: &[TensorView],
+        _output_views: &[TensorMut],
         metadata: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+        _cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
     ) -> Result<WorkspaceRequirement> {
         let plan = self.layout_plan(metadata, Some(inputs))?;
         Ok(WorkspaceRequirement {
@@ -781,7 +785,7 @@ mod tests {
             TensorMetadata::new(b.dtype, &b.shape, true),
         ];
         let request = kernel
-            .workspace_requirement_for_execution(&[a.view(), b.view()], &metadata, &[])
+            .workspace_requirement_for_execution(&[a.view(), b.view()], &[], &metadata, &[], None)
             .unwrap();
         let first = provider
             .allocate_workspace(request.bytes as usize, request.alignment, request.role())
@@ -896,7 +900,11 @@ mod tests {
             TensorMetadata::new(a.dtype, &a.shape, true),
             TensorMetadata::new(b.dtype, &b.shape, true),
         ];
-        let bound = kernel.workspace_requirement(&metadata, &[]).unwrap();
+        let bound = kernel
+            .workspace_requirement(&metadata, &[])
+            .unwrap()
+            .require_ready()
+            .unwrap();
         assert_eq!(bound.bytes, (6 + 12) * 4);
         let mut backing = vec![0f32; 18];
         let workspace = WorkspaceView::new(
@@ -951,11 +959,21 @@ mod tests {
                 TensorMetadata::new(a.dtype, &a.shape, true),
                 TensorMetadata::new(b.dtype, &b.shape, true),
             ];
-            let bound = kernel.workspace_requirement(&metadata, &[]).unwrap();
+            let bound = kernel
+                .workspace_requirement(&metadata, &[])
+                .unwrap()
+                .require_ready()
+                .unwrap();
             assert_eq!(bound.bytes, 24);
             assert_eq!(
                 kernel
-                    .workspace_requirement_for_execution(&[a.view(), b.view()], &metadata, &[])
+                    .workspace_requirement_for_execution(
+                        &[a.view(), b.view()],
+                        &[],
+                        &metadata,
+                        &[],
+                        None
+                    )
                     .unwrap()
                     .bytes,
                 0
@@ -967,7 +985,13 @@ mod tests {
             ];
             assert_eq!(
                 kernel
-                    .workspace_requirement_for_execution(&[a.view(), b.view()], &metadata, &[])
+                    .workspace_requirement_for_execution(
+                        &[a.view(), b.view()],
+                        &[],
+                        &metadata,
+                        &[],
+                        None
+                    )
                     .unwrap(),
                 bound
             );
@@ -1029,14 +1053,18 @@ mod tests {
             TensorMetadata::new(a.dtype, &a.shape, true),
             TensorMetadata::new(b.dtype, &b.shape, true),
         ];
-        let bound = kernel.workspace_requirement(&metadata, &[]).unwrap();
+        let bound = kernel
+            .workspace_requirement(&metadata, &[])
+            .unwrap()
+            .require_ready()
+            .unwrap();
         assert!(bound.bytes >= 12);
         let mut out = Owned::zeros_f32(&[1, 2]);
         for (stride, offset, expected) in [(2, 0, [4., 5.]), (-2, 16, [4., 3.])] {
             a.strides = vec![stride, 1];
             let view = a.view().with_byte_offset(offset);
             let requirement = kernel
-                .workspace_requirement_for_execution(&[view, b.view()], &metadata, &[])
+                .workspace_requirement_for_execution(&[view, b.view()], &[], &metadata, &[], None)
                 .unwrap();
             assert_eq!(requirement.bytes, 12);
             assert!(requirement.bytes <= bound.bytes);

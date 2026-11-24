@@ -132,7 +132,11 @@ fn run_nms(ep: &CudaExecutionProvider, inputs: &[Tensor], attrs: &[(&str, Attrib
         .iter()
         .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
         .collect::<Vec<_>>();
-    let requirement = kernel.workspace_requirement(&metadata, &[]).unwrap();
+    let requirement = kernel
+        .workspace_requirement(&metadata, &[])
+        .unwrap()
+        .require_ready()
+        .unwrap();
     let mut workspace = None;
     let workspace_view = prepare_workspace(ep, requirement, &mut workspace).unwrap();
     let output_metadata = kernel

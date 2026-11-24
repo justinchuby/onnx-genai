@@ -407,7 +407,7 @@ fn fp16_zero_append_shared_cache_matches_cpu_and_replays() {
                 .iter()
                 .map(onnx_runtime_ep_api::OutputMetadata::from_view)
                 .collect::<Vec<_>>();
-            let requirement = common::runtime_workspace_requirement(&kernel, &inputs, &facts)?;
+            let requirement = common::runtime_workspace_requirement(&kernel, &inputs, &facts, &[])?;
             let view = common::prepare_workspace(&ep, requirement, workspace)?;
             kernel.execute_with_workspace(&inputs, &mut outputs, view)?;
             Ok::<_, onnx_runtime_ep_api::EpError>(requirement)

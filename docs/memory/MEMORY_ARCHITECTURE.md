@@ -333,22 +333,41 @@ MRU retain their original policies, actual-pointer algorithm selection and
 capture resources; this consolidation does not yet govern their private device
 scratch. Plan reuse still checks the selected alignment contract before launch.
 
-A complete scratch migration must first provide actual output layout facts
-before admission. The metadata helper selects with TypedMinimum alignment, while
-capture plans select with ActualAddress alignment; their selected workspace sizes
-need not order monotonically. The current execution-refinement hook has input
-views and canonical output metadata, but no output origin/alignment. Treating its
-metadata-only answer as an upper bound for the cached algorithm is unsound.
+Metadata preparation now returns `WorkspacePreparation::Ready(requirement)` or
+`Deferred`. `Ready(NONE)` means an actual zero demand; `Deferred` requires live
+storage or runtime values and never grants zero-capacity admission. Strict
+metadata-only preparation refuses it with node context and publishes its memo
+and strict-preparation flag only after a complete successful reservation.
 
-Do not resolve this by claiming unknown capacity is zero, choosing a different
-algorithm, or reserving the fixed 32-MiB performance ceiling. Exhaustively planning
-all finite pointer-alignment classes is a possible true bound but introduces
-hundreds of cold heuristic queries per shape. The intended next boundary is an
-explicit deferred preparation result followed by exact planning from actual
-output storage, with the same selected host plan used by the borrowed-workspace
-launch. Native, eager and ORT dispatch must all preserve that ordering; ORT's
-metadata-plan cache must not memoize address-dependent refinements as geometry.
-No performance or CUDA numerical claim follows from this representation cleanup.
+Native, eager and ORT execution pass real input and output views to the execution
+refiner before admission. Output storage is uninitialized: only layout and
+pointer origins may be inspected. Kernel-sized output paths explicitly have no
+final output storage yet. The caller retains exclusive execution ownership from
+refinement through admission and launch. Most kernels implement only the metadata
+hook; only address/value-dependent kernels need an execution refiner. ORT caches
+metadata preparations, including `Deferred`, and refines on each Compute; exact
+address/value-dependent bytes never enter that geometry cache. Cached ready
+preparations avoid repeating the metadata query.
+
+This is the prerequisite for moving dense MatMul's remaining private scratch,
+not the migration itself. The metadata BLAS helper selects with TypedMinimum
+alignment, while capture plans select with ActualAddress alignment; workspace
+sizes need not order monotonically. The migration must retain the same selected
+host plan for exact admission and the borrowed-workspace launch. Unknown demand,
+a substitute algorithm, and a fixed 32-MiB reservation are not valid bounds.
+Exhaustively querying all pointer-alignment classes would add hundreds of cold
+heuristic calls and is not required by this contract.
+
+Resource accounting stays coarse: each concurrent workspace lane owns its
+physical peak, serial kernels share the maximum, and simultaneously live regions
+are laid out within that owner. Regions carry no individual quota tickets.
+Kernels borrow the workspace rather than maintain pools or issuer callbacks.
+Zero demand and warm fitting capacity bypass allocation/quota callbacks; retained
+physical capacity remains charged until actual release. Pending work, capture
+pins and quarantine still govern retirement. Host and ORT regressions verify
+these callback properties; CUDA Pending StepScoped retirement and private MatMul
+scratch do not yet provide a universal warm-zero-callback guarantee. No CUDA
+numerical or performance claim follows from this API change.
 
 ### CUDA quantized MatMul prefill temporary storage
 

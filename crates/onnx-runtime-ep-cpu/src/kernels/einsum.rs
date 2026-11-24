@@ -646,7 +646,7 @@ impl Kernel for EinsumKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
         let dtype = self.validate_workspace_metadata(inputs)?;
         let bytes_per_element = match self.mode {
             EinsumExecutionMode::GenericNative => accumulator_element_size(dtype),
@@ -659,7 +659,9 @@ impl Kernel for EinsumKernel {
             EinsumExecutionMode::Optimized => match self.plan.planning_classification() {
                 EinsumPlanningClassification::ViewOnlyPermutation(_)
                 | EinsumPlanningClassification::DiagonalView(_) => {
-                    return Ok(WorkspaceRequirement::NONE);
+                    return Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+                        WorkspaceRequirement::NONE,
+                    ));
                 }
                 EinsumPlanningClassification::Gemm(_)
                     if matches!(
@@ -669,11 +671,17 @@ impl Kernel for EinsumKernel {
                 {
                     4
                 }
-                EinsumPlanningClassification::Gemm(_) => return Ok(WorkspaceRequirement::NONE),
+                EinsumPlanningClassification::Gemm(_) => {
+                    return Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+                        WorkspaceRequirement::NONE,
+                    ));
+                }
                 EinsumPlanningClassification::ContractionTree(_)
                     if self.tree_choice(dtype)?.is_some() =>
                 {
-                    return Ok(WorkspaceRequirement::NONE);
+                    return Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+                        WorkspaceRequirement::NONE,
+                    ));
                 }
                 _ => accumulator_element_size(dtype),
             },
@@ -686,13 +694,17 @@ impl Kernel for EinsumKernel {
             geometry_overflow(self.plan.equation(), "addressable accumulator workspace")
         })?;
         if bytes == 0 {
-            return Ok(WorkspaceRequirement::NONE);
+            return Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+                WorkspaceRequirement::NONE,
+            ));
         }
-        Ok(WorkspaceRequirement {
-            bytes: layout.size() as u64,
-            alignment: layout.align(),
-            ..WorkspaceRequirement::NONE
-        })
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            WorkspaceRequirement {
+                bytes: layout.size() as u64,
+                alignment: layout.align(),
+                ..WorkspaceRequirement::NONE
+            },
+        ))
     }
 
     fn execute_with_workspace(
@@ -3086,6 +3098,8 @@ mod tests {
         ] {
             let request = reduction
                 .workspace_requirement(&[TensorMetadata::new(dtype, &[2, 3], true)], &[])
+                .unwrap()
+                .require_ready()
                 .unwrap();
             assert_eq!(
                 (request.bytes, request.alignment),
@@ -3098,6 +3112,8 @@ mod tests {
                 &[TensorMetadata::new(DataType::Float32, &[2, 3], true)],
                 &[]
             )
+            .unwrap()
+            .require_ready()
             .unwrap(),
             WorkspaceRequirement::NONE
         );
@@ -3119,6 +3135,8 @@ mod tests {
                     ],
                     &[],
                 )
+                .unwrap()
+                .require_ready()
                 .unwrap();
             assert_eq!(request.bytes, bytes);
         }
@@ -3142,6 +3160,8 @@ mod tests {
                     ],
                     &[]
                 )
+                .unwrap()
+                .require_ready()
                 .unwrap(),
                 WorkspaceRequirement::NONE,
                 "a compiled tree must not reserve unused generic publication scratch"
@@ -3153,6 +3173,7 @@ mod tests {
         ] {
             let error = reduction
                 .workspace_requirement(&[metadata], &[])
+                .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -3174,6 +3195,7 @@ mod tests {
                 )],
                 &[],
             )
+            .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)
             .unwrap_err()
             .to_string();
         assert!(
@@ -3217,6 +3239,8 @@ mod tests {
                     &[TensorMetadata::new(DataType::Float64, &[0, 3], true)],
                     &[]
                 )
+                .unwrap()
+                .require_ready()
                 .unwrap(),
             WorkspaceRequirement::NONE
         );
@@ -3261,6 +3285,8 @@ mod tests {
                 &[TensorMetadata::new(DataType::Float64, &[2, 3], true)],
                 &[],
             )
+            .unwrap()
+            .require_ready()
             .unwrap();
         let mut allocation = providers[0]
             .allocate_workspace(16, first.alignment, first.role())
@@ -3292,6 +3318,8 @@ mod tests {
             };
             let request = kernel
                 .workspace_requirement(&[TensorMetadata::new(input.dtype, &input.shape, true)], &[])
+                .unwrap()
+                .require_ready()
                 .unwrap();
             let mut allocation = provider
                 .allocate_workspace(request.bytes as usize, request.alignment, request.role())
@@ -4252,6 +4280,8 @@ mod tests {
                     )),
                     &[]
                 )
+                .unwrap()
+                .require_ready()
                 .unwrap(),
             WorkspaceRequirement::NONE,
             "successful trees need no second publication accumulator"

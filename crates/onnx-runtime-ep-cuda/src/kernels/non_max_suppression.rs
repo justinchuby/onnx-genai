@@ -513,7 +513,7 @@ impl Kernel for NonMaxSuppressionKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
         let boxes = inputs
             .first()
             .filter(|input| input.present)
@@ -535,11 +535,13 @@ impl Kernel for NonMaxSuppressionKernel {
                 .ok_or_else(|| EpError::KernelFailed("cuda_ep NMS: group count overflow".into()))?,
         };
         let layout = workspace_layout(geometry)?;
-        Ok(WorkspaceRequirement {
-            bytes: layout.bytes as u64,
-            alignment: 8,
-            lifetime: WorkspaceLifetime::StepScoped,
-        })
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            WorkspaceRequirement {
+                bytes: layout.bytes as u64,
+                alignment: 8,
+                lifetime: WorkspaceLifetime::StepScoped,
+            },
+        ))
     }
 
     fn execute_with_workspace(

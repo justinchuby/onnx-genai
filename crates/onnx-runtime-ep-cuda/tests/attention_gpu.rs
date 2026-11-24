@@ -983,7 +983,8 @@ fn attention_rejects_unsupported_dtype_and_rank() {
         common::runtime_workspace_requirement(
             &phase2a,
             &inputs4,
-            &[onnx_runtime_ep_api::OutputMetadata::from_view(&output4)]
+            &[onnx_runtime_ep_api::OutputMetadata::from_view(&output4)],
+            &[]
         )
         .unwrap()
         .bytes

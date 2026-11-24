@@ -88,6 +88,10 @@ unsafe extern "C" fn api(_: u32) -> *const ort::OrtApi {
 }
 
 struct ScratchKernel {
+    deferred: Arc<AtomicBool>,
+    requested: Arc<AtomicUsize>,
+    metadata_calls: Arc<AtomicUsize>,
+    refinements: Arc<AtomicUsize>,
     bytes: usize,
     seen: Arc<Mutex<Vec<usize>>>,
     fail: Arc<AtomicBool>,
@@ -100,12 +104,37 @@ impl Kernel for ScratchKernel {
         &self,
         _: &[TensorMetadata<'_>],
         _: &[OutputMetadata<'_>],
+    ) -> EpResult<onnx_runtime_ep_api::WorkspacePreparation> {
+        self.metadata_calls.fetch_add(1, Ordering::SeqCst);
+        if self.deferred.load(Ordering::SeqCst) {
+            return Ok(onnx_runtime_ep_api::WorkspacePreparation::Deferred);
+        }
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            WorkspaceRequirement {
+                bytes: self.requested.load(Ordering::SeqCst) as u64,
+                alignment: 16,
+                lifetime: WorkspaceLifetime::SessionPersistent,
+            },
+        ))
+    }
+    fn workspace_requirement_for_execution(
+        &self,
+        _: &[TensorView],
+        outputs: &[TensorMut],
+        _: &[TensorMetadata<'_>],
+        facts: &[OutputMetadata<'_>],
+        cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
     ) -> EpResult<WorkspaceRequirement> {
-        Ok(WorkspaceRequirement {
-            bytes: self.bytes as u64,
-            alignment: 16,
-            lifetime: WorkspaceLifetime::SessionPersistent,
-        })
+        self.refinements.fetch_add(1, Ordering::SeqCst);
+        assert!(outputs.is_empty() && facts.is_empty());
+        match cached.expect("ORT must carry its cached metadata preparation") {
+            onnx_runtime_ep_api::WorkspacePreparation::Ready(requirement) => Ok(requirement),
+            onnx_runtime_ep_api::WorkspacePreparation::Deferred => Ok(WorkspaceRequirement {
+                bytes: self.requested.load(Ordering::SeqCst) as u64,
+                alignment: 16,
+                lifetime: WorkspaceLifetime::SessionPersistent,
+            }),
+        }
     }
     fn execute(&self, _: &[TensorView<'_>], _: &mut [TensorMut<'_>]) -> EpResult<()> {
         Err(EpError::KernelFailed(
@@ -118,9 +147,15 @@ impl Kernel for ScratchKernel {
         _: &mut [TensorMut<'_>],
         workspace: Option<WorkspaceView>,
     ) -> EpResult<()> {
+        if self.requested.load(Ordering::SeqCst) == 0 {
+            assert!(workspace.is_none());
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            return Ok(());
+        }
         let workspace = workspace
             .ok_or_else(|| EpError::KernelFailed("fixture did not receive workspace".into()))?;
         assert!(workspace.bytes() >= self.bytes);
+        assert!(workspace.bytes() >= self.requested.load(Ordering::SeqCst));
         let scratch = unsafe { std::slice::from_raw_parts_mut(workspace.ptr().0.cast::<u64>(), 8) };
         let generation = self.calls.fetch_add(1, Ordering::SeqCst) as u64;
         assert!(
@@ -150,6 +185,10 @@ impl Kernel for ScratchKernel {
     }
 }
 struct Fixture {
+    deferred: Arc<AtomicBool>,
+    requested: Arc<AtomicUsize>,
+    metadata_calls: Arc<AtomicUsize>,
+    refinements: Arc<AtomicUsize>,
     factory: *mut ort::OrtEpFactory,
     facade: *mut ort::OrtEp,
     info: Box<ExportedComputeInfo>,
@@ -203,6 +242,10 @@ impl Fixture {
             .is_null()
         );
         assert!(!facade.is_null());
+        let deferred = Arc::new(AtomicBool::new(false));
+        let requested = Arc::new(AtomicUsize::new(64));
+        let metadata_calls = Arc::new(AtomicUsize::new(0));
+        let refinements = Arc::new(AtomicUsize::new(0));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let fail = Arc::new(AtomicBool::new(false));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -210,6 +253,10 @@ impl Fixture {
         let panic_next = Arc::new(AtomicBool::new(false));
         let entry = CompiledKernelEntry {
             kernel: Box::new(ScratchKernel {
+                deferred: deferred.clone(),
+                requested: requested.clone(),
+                metadata_calls: metadata_calls.clone(),
+                refinements: refinements.clone(),
                 bytes: 64,
                 seen: seen.clone(),
                 fail: fail.clone(),
@@ -227,6 +274,10 @@ impl Fixture {
         let info =
             Box::new(unsafe { &*facade.cast::<ExportedEp>() }.wrap_compiled_kernels(vec![entry]));
         Self {
+            deferred,
+            requested,
+            metadata_calls,
+            refinements,
             factory,
             facade,
             info,
@@ -325,6 +376,62 @@ fn persistent_workspace_registered_factory_reuses_governed_backing_without_warm_
         64,
         "pool-retained physical backing stays charged"
     );
+    drop(fixture);
+    drop(pool);
+    assert_eq!(manager.process_used(Tier::Host), 0);
+    assert_eq!(books.used(Tier::Host), 0);
+}
+
+#[test]
+fn deferred_workspace_ort_refines_cached_geometry_before_admission_and_skips_warm_quota_calls() {
+    let books = Arc::new(RecordingGovernor::new_host(512));
+    let manager = ProcessMemoryManager::new().unwrap();
+    let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+    let resources = CpuMemoryResources::new(
+        DerivedWeightMemory::governed(books.as_ref(), HolderId::new(13)).unwrap(),
+        Default::default(),
+    )
+    .unwrap()
+    .with_workspace_pool(pool.clone())
+    .unwrap();
+    let mut fixture = Fixture::new(resources, true, None);
+    fixture.deferred.store(true, Ordering::SeqCst);
+    fixture.requested.store(0, Ordering::SeqCst);
+    let state = fixture.state();
+    let before = (books.claims(), books.releases());
+    assert!(fixture.compute(state).is_null());
+    assert_eq!(
+        (books.claims(), books.releases()),
+        before,
+        "deferred zero is resolved without an issuer callback"
+    );
+    fixture.requested.store(64, Ordering::SeqCst);
+    assert!(fixture.compute(state).is_null());
+    let warm = (books.claims(), books.releases());
+    for _ in 0..8 {
+        assert!(fixture.compute(state).is_null());
+    }
+    assert_eq!((books.claims(), books.releases()), warm);
+    fixture.requested.store(128, Ordering::SeqCst);
+    assert!(fixture.compute(state).is_null());
+    assert!(
+        books.claims() > warm.0,
+        "runtime growth must acquire actual capacity"
+    );
+    let grown = (books.claims(), books.releases());
+    fixture.requested.store(64, Ordering::SeqCst);
+    assert!(fixture.compute(state).is_null());
+    fixture.requested.store(0, Ordering::SeqCst);
+    assert!(fixture.compute(state).is_null());
+    assert_eq!((books.claims(), books.releases()), grown);
+    assert_eq!(
+        fixture.metadata_calls.load(Ordering::SeqCst),
+        1,
+        "only Deferred, never its runtime byte count, enters the geometry cache"
+    );
+    assert_eq!(fixture.refinements.load(Ordering::SeqCst), 13);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 13);
+    fixture.release(state);
     drop(fixture);
     drop(pool);
     assert_eq!(manager.process_used(Tier::Host), 0);
@@ -531,6 +638,10 @@ fn persistent_workspace_serial_nodes_share_peak_capacity_and_one_preflight_per_c
     let mut entries = std::mem::take(&mut fixture.info.entries);
     entries.push(CompiledKernelEntry {
         kernel: Box::new(ScratchKernel {
+            deferred: fixture.deferred.clone(),
+            requested: Arc::new(AtomicUsize::new(128)),
+            metadata_calls: Arc::new(AtomicUsize::new(0)),
+            refinements: Arc::new(AtomicUsize::new(0)),
             bytes: 128,
             seen: fixture.seen.clone(),
             fail: fixture.fail.clone(),

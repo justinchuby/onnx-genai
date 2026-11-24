@@ -708,7 +708,7 @@ impl Kernel for IndexShareKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
         let dims = self.validate_metadata(inputs)?;
         let dtype = inputs
             .first()
@@ -716,12 +716,14 @@ impl Kernel for IndexShareKernel {
             .ok_or_else(|| error("IndexShare requires input metadata"))?;
         let has_bias = inputs.get(6).is_some_and(|input| input.present);
         let layout = index_share_workspace_layout(dims, dtype, has_bias, self.present_outputs)?;
-        Ok(WorkspaceRequirement {
-            bytes: u64::try_from(layout.bytes)
-                .map_err(|_| error("IndexShare workspace does not fit u64"))?,
-            alignment: WORKSPACE_ALIGNMENT,
-            lifetime: WorkspaceLifetime::SessionPersistent,
-        })
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            WorkspaceRequirement {
+                bytes: u64::try_from(layout.bytes)
+                    .map_err(|_| error("IndexShare workspace does not fit u64"))?,
+                alignment: WORKSPACE_ALIGNMENT,
+                lifetime: WorkspaceLifetime::SessionPersistent,
+            },
+        ))
     }
 
     fn execute_with_workspace(

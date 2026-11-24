@@ -13,6 +13,9 @@
 //! the shared native registry adapter or a plugin-only rule. There is
 //! deliberately no attribute-blind op-name entry point.
 
+#[cfg(test)]
+use onnx_runtime_ep_api::WorkspaceRequirement;
+
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,7 +26,7 @@ use onnx_runtime_ep_api::HostToDeviceCopier;
 use onnx_runtime_ep_api::kernel::validate_kernel_sized_outputs;
 use onnx_runtime_ep_api::kernel::{
     Kernel, KernelSizedOutput, KernelSizedOutputMetadata, KernelSizedOutputPolicy, OutputMetadata,
-    TensorMetadata, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    TensorMetadata, WorkspaceLifetime, WorkspacePreparation, WorkspaceView,
 };
 use onnx_runtime_ep_api::tensor::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, DeviceId, Node};
@@ -1181,7 +1184,7 @@ const WORKSPACE_PLAN_CACHE_CAPACITY: usize = 8;
 struct HotPlan {
     operands: Box<[OperandKey]>,
     outputs: Box<[OutputMetadata<'static>]>,
-    requirement: WorkspaceRequirement,
+    requirement: WorkspacePreparation,
 }
 
 /// Memoizes workspace requirements per kernel using exact operand/output facts.
@@ -1217,7 +1220,7 @@ struct WorkspacePlanCache {
     /// [`WorkspacePlanCache::locked_only`].
     #[cfg(test)]
     suppress_hot: bool,
-    plans: Mutex<Vec<(WorkspaceSignature, WorkspaceRequirement)>>,
+    plans: Mutex<Vec<(WorkspaceSignature, WorkspacePreparation)>>,
 }
 
 impl WorkspacePlanCache {
@@ -1245,7 +1248,7 @@ impl WorkspacePlanCache {
         &self,
         metadata: &[TensorMetadata<'_>],
         outputs: &[OutputMetadata<'_>],
-    ) -> Option<WorkspaceRequirement> {
+    ) -> Option<WorkspacePreparation> {
         let hot = self.hot.get()?;
         (hot.outputs.as_ref() == outputs
             && hot.operands.len() == metadata.len()
@@ -1265,7 +1268,7 @@ impl WorkspacePlanCache {
         &self,
         inputs: &[TensorView<'_>],
         outputs: &[OutputMetadata<'_>],
-    ) -> Option<WorkspaceRequirement> {
+    ) -> Option<WorkspacePreparation> {
         let hot = self.hot.get()?;
         (hot.outputs.as_ref() == outputs
             && hot.operands.len() == inputs.len()
@@ -1284,7 +1287,7 @@ impl WorkspacePlanCache {
         &self,
         metadata: &[TensorMetadata<'_>],
         outputs: &[OutputMetadata<'_>],
-        requirement: WorkspaceRequirement,
+        requirement: WorkspacePreparation,
     ) {
         #[cfg(test)]
         if self.suppress_hot {
@@ -1311,8 +1314,8 @@ impl WorkspacePlanCache {
         &self,
         inputs: &[TensorView<'_>],
         outputs: &[OutputMetadata<'_>],
-        plan: impl FnOnce(&[TensorMetadata<'_>]) -> Result<WorkspaceRequirement, String>,
-    ) -> Result<WorkspaceRequirement, String> {
+        plan: impl FnOnce(&[TensorMetadata<'_>]) -> Result<WorkspacePreparation, String>,
+    ) -> Result<WorkspacePreparation, String> {
         if let Some(hit) = self.hot_hit_views(inputs, outputs) {
             return Ok(hit);
         }
@@ -1328,8 +1331,8 @@ impl WorkspacePlanCache {
         &self,
         metadata: &[TensorMetadata<'_>],
         outputs: &[OutputMetadata<'_>],
-        plan: impl FnOnce() -> Result<WorkspaceRequirement, String>,
-    ) -> Result<WorkspaceRequirement, String> {
+        plan: impl FnOnce() -> Result<WorkspacePreparation, String>,
+    ) -> Result<WorkspacePreparation, String> {
         if let Some(hit) = self.hot_hit(metadata, outputs) {
             return Ok(hit);
         }
@@ -1348,7 +1351,7 @@ impl WorkspacePlanCache {
         &self,
         metadata: &[TensorMetadata<'_>],
         outputs: &[OutputMetadata<'_>],
-    ) -> Option<WorkspaceRequirement> {
+    ) -> Option<WorkspacePreparation> {
         let mut plans = self.plans.lock().unwrap_or_else(PoisonError::into_inner);
         let idx = plans
             .iter()
@@ -1370,7 +1373,7 @@ impl WorkspacePlanCache {
         Some(requirement)
     }
 
-    fn remember(&self, signature: WorkspaceSignature, requirement: WorkspaceRequirement) {
+    fn remember(&self, signature: WorkspaceSignature, requirement: WorkspacePreparation) {
         let mut plans = self.plans.lock().unwrap_or_else(PoisonError::into_inner);
         // A concurrent dispatch may have inserted the same signature while this
         // one was planning. Overwrite rather than duplicate: both computed the
@@ -2359,16 +2362,31 @@ unsafe fn prepare_workspace(
     placement: PlacementSources<'_>,
     kernel: &dyn Kernel,
     workspace: (&WorkspacePlanCache, &mut crate::workspace::WorkspaceLane),
-    operands: (&[TensorView<'_>], &[OutputMetadata<'_>]),
+    operands: (&[TensorView<'_>], &[OutputMetadata<'_>], &[TensorMut<'_>]),
     node_label: impl std::fmt::Display + Copy,
 ) -> Result<Option<WorkspaceView>, String> {
     let (plans, lane) = workspace;
-    let (inputs, outputs) = operands;
-    let requirement: WorkspaceRequirement =
+    let (inputs, outputs, output_views) = operands;
+    let preparation: WorkspacePreparation =
         plans.get_or_plan_views(inputs, outputs, |metadata| {
             kernel
                 .workspace_requirement(metadata, outputs)
                 .map_err(|e| format!("{node_label}: workspace_requirement failed: {e}"))
+        })?;
+    let metadata: smallvec::SmallVec<[TensorMetadata<'_>; 16]> = inputs
+        .iter()
+        .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
+        .collect();
+    let requirement = kernel
+        .workspace_requirement_for_execution(
+            inputs,
+            output_views,
+            &metadata,
+            outputs,
+            Some(preparation),
+        )
+        .map_err(|cause| {
+            format!("{node_label}: execution-time workspace planning failed: {cause}")
         })?;
     if requirement.bytes == 0 {
         return Ok(None);
@@ -2884,6 +2902,7 @@ unsafe extern "C" fn compute_execute(
                                             &requested_outputs,
                                             &entry.output_dtypes,
                                         ),
+                                        &[],
                                     ),
                                     format_args!(
                                         "Compute: node {node_idx} kernel-sized device workspace"
@@ -3120,6 +3139,7 @@ unsafe extern "C" fn compute_execute(
                                         &requested_outputs,
                                         &entry.output_dtypes,
                                     ),
+                                    &[],
                                 ),
                                 format_args!(
                                     "Compute: node {node_idx} host-owned dynamic-output workspace"
@@ -3540,7 +3560,11 @@ unsafe extern "C" fn compute_execute(
                             },
                             &*entry.kernel,
                             (plans, &mut workspace_lane),
-                            (&kernel_inputs, &workspace_outputs(all_output_views)),
+                            (
+                                &kernel_inputs,
+                                &workspace_outputs(all_output_views),
+                                all_output_views,
+                            ),
                             format_args!("Compute: node {node_idx}"),
                         )
                     } {
@@ -3691,6 +3715,7 @@ unsafe extern "C" fn compute_execute(
                                         &requested_outputs,
                                         &entry.output_dtypes,
                                     ),
+                                    &[],
                                 ),
                                 "Compute: node 0 kernel-sized device workspace",
                             )
@@ -3789,6 +3814,7 @@ unsafe extern "C" fn compute_execute(
                                     &requested_outputs,
                                     &entry.output_dtypes,
                                 ),
+                                &[],
                             ),
                             "Compute: node 0 host-owned dynamic-output workspace",
                         )
@@ -4021,7 +4047,11 @@ unsafe extern "C" fn compute_execute(
                         },
                         &*entry.kernel,
                         (plans, &mut workspace_lane),
-                        (kernel_inputs, &workspace_outputs(output_views)),
+                        (
+                            kernel_inputs,
+                            &workspace_outputs(output_views),
+                            output_views,
+                        ),
                         "Compute: node 0",
                     )
                 } {
@@ -10114,18 +10144,18 @@ mod workspace_plan_cache_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use onnx_runtime_ep_api::kernel::{TensorMetadata, WorkspaceRequirement};
+    use onnx_runtime_ep_api::kernel::{TensorMetadata, WorkspacePreparation, WorkspaceRequirement};
     use onnx_runtime_ep_api::tensor::{DevicePtr, TensorView};
     use onnx_runtime_ir::DataType;
 
     use super::{OperandKey, WORKSPACE_PLAN_CACHE_CAPACITY, WorkspacePlanCache};
 
-    fn requirement(bytes: u64) -> WorkspaceRequirement {
-        WorkspaceRequirement {
+    fn requirement(bytes: u64) -> WorkspacePreparation {
+        WorkspacePreparation::Ready(WorkspaceRequirement {
             bytes,
             alignment: 256,
             ..WorkspaceRequirement::NONE
-        }
+        })
     }
 
     /// Stands in for a kernel whose `workspace_requirement` is expensive: it
@@ -10148,7 +10178,7 @@ mod workspace_plan_cache_tests {
 
         /// Derive a distinct answer for every distinguishable metadata list, so
         /// serving one signature's plan for another is detectable by value.
-        fn plan(&self, metadata: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement, String> {
+        fn plan(&self, metadata: &[TensorMetadata<'_>]) -> Result<WorkspacePreparation, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut bytes = 0u64;
             for meta in metadata {
@@ -10190,11 +10220,13 @@ mod workspace_plan_cache_tests {
                 cache
                     .get_or_plan(&inputs, outputs, || {
                         calls.fetch_add(1, Ordering::Relaxed);
-                        Ok(WorkspaceRequirement {
+                        Ok(WorkspacePreparation::Ready(WorkspaceRequirement {
                             bytes,
                             ..WorkspaceRequirement::NONE
-                        })
+                        }))
                     })
+                    .unwrap()
+                    .require_ready()
                     .unwrap()
                     .bytes
             };
@@ -10267,7 +10299,11 @@ mod workspace_plan_cache_tests {
             before,
             "the signature every dispatch uses was evicted -- move-to-front is not promoting it"
         );
-        assert_eq!(got.bytes, 4, "wrong plan served for the hot signature");
+        assert_eq!(
+            got.require_ready().unwrap().bytes,
+            4,
+            "wrong plan served for the hot signature"
+        );
     }
 
     /// The point of the cache: the second dispatch of an unchanged shape must
@@ -10318,9 +10354,9 @@ mod workspace_plan_cache_tests {
             .get_or_plan(&large_meta, &[], || planner.plan(&large_meta))
             .expect("plan");
 
-        assert_eq!(small_req.bytes, 4 * 8 * 4);
+        assert_eq!(small_req.require_ready().unwrap().bytes, 4 * 8 * 4);
         assert_eq!(
-            large_req.bytes,
+            large_req.require_ready().unwrap().bytes,
             4 * 16 * 4,
             "the larger geometry must get its own plan, not the smaller one's"
         );
@@ -10360,9 +10396,9 @@ mod workspace_plan_cache_tests {
             .get_or_plan(&f16_meta, &[], || planner.plan(&f16_meta))
             .expect("plan");
 
-        assert_eq!(f32_req.bytes, 64 * 4);
+        assert_eq!(f32_req.require_ready().unwrap().bytes, 64 * 4);
         assert_eq!(
-            f16_req.bytes,
+            f16_req.require_ready().unwrap().bytes,
             64 * 2,
             "an f16 dispatch must not be served the f32 plan"
         );
@@ -10396,9 +10432,9 @@ mod workspace_plan_cache_tests {
             .get_or_plan(&without_bias, &[], || planner.plan(&without_bias))
             .expect("plan");
 
-        assert_eq!(with.bytes, 16 * 4 * 2);
+        assert_eq!(with.require_ready().unwrap().bytes, 16 * 4 * 2);
         assert_eq!(
-            without.bytes,
+            without.require_ready().unwrap().bytes,
             16 * 4,
             "an absent optional operand must not be served the plan that charged for it"
         );
@@ -10425,8 +10461,8 @@ mod workspace_plan_cache_tests {
             .get_or_plan(&two, &[], || planner.plan(&two))
             .expect("plan");
 
-        assert_eq!(one_req.bytes, 8 * 4);
-        assert_eq!(two_req.bytes, 8 * 4 * 2);
+        assert_eq!(one_req.require_ready().unwrap().bytes, 8 * 4);
+        assert_eq!(two_req.require_ready().unwrap().bytes, 8 * 4 * 2);
         assert_eq!(planner.calls(), 2);
     }
 
@@ -10449,7 +10485,7 @@ mod workspace_plan_cache_tests {
                     .get_or_plan(&metadata, &[], || planner.plan(&metadata))
                     .expect("plan");
                 assert_eq!(
-                    got.bytes,
+                    got.require_ready().unwrap().bytes,
                     (shape[0] * 4) as u64,
                     "signature {shape:?} was served another signature's plan"
                 );
@@ -10548,7 +10584,7 @@ mod workspace_plan_cache_tests {
                             .get_or_plan(&metadata, &[], || planner.plan(&metadata))
                             .expect("plan");
                         assert_eq!(
-                            got.bytes,
+                            got.require_ready().unwrap().bytes,
                             (id * 32 * 4) as u64,
                             "thread {id} was served another thread's plan"
                         );
@@ -10597,7 +10633,7 @@ mod workspace_plan_cache_tests {
         let got = cache
             .get_or_plan(&metadata, &[], || planner.plan(&metadata))
             .expect("a poisoned lock must not fail the dispatch");
-        assert_eq!(got.bytes, 12 * 4);
+        assert_eq!(got.require_ready().unwrap().bytes, 12 * 4);
         assert_eq!(
             planner.calls(),
             1,
@@ -10708,7 +10744,7 @@ mod workspace_plan_cache_tests {
                 panic!("the published plan must not be re-planned")
             })
             .expect("served from the lock-free slot");
-        assert_eq!(got.bytes, 8 * 4);
+        assert_eq!(got.require_ready().unwrap().bytes, 8 * 4);
         assert_eq!(planner.calls(), before);
     }
 
@@ -10742,7 +10778,7 @@ mod workspace_plan_cache_tests {
                 let got = cache
                     .get_or_plan_views(&inputs, &[], |_| panic!("must not re-plan"))
                     .expect("served");
-                let _ = tx.send(got.bytes);
+                let _ = tx.send(got.require_ready().unwrap().bytes);
             })
         };
         let bytes = rx
@@ -10781,7 +10817,7 @@ mod workspace_plan_cache_tests {
             &decode[..],
             "the one-off prefill shape was pinned instead of the recurring decode shape"
         );
-        assert_eq!(published.requirement.bytes, 4);
+        assert_eq!(published.requirement.require_ready().unwrap().bytes, 4);
     }
 
     /// Falsification of fast-path bypass: once a signature is published, every
@@ -10817,7 +10853,7 @@ mod workspace_plan_cache_tests {
                 .get_or_plan_views(&other, &[], |m| planner.plan(m))
                 .expect("plan");
             assert_eq!(
-                got.bytes,
+                got.require_ready().unwrap().bytes,
                 4 * 4,
                 "a changed shape was served the published plan"
             );
@@ -10832,7 +10868,7 @@ mod workspace_plan_cache_tests {
                 .get_or_plan_views(&other, &[], |m| planner.plan(m))
                 .expect("plan");
             assert_eq!(
-                got.bytes,
+                got.require_ready().unwrap().bytes,
                 8 * 2,
                 "a changed dtype was served the published plan"
             );
@@ -10847,7 +10883,8 @@ mod workspace_plan_cache_tests {
                 .get_or_plan_views(&other, &[], |m| planner.plan(m))
                 .expect("plan");
             assert_eq!(
-                got.bytes, 1,
+                got.require_ready().unwrap().bytes,
+                1,
                 "an absent optional slot was served the present operand's plan"
             );
         }
@@ -10864,7 +10901,7 @@ mod workspace_plan_cache_tests {
                 .get_or_plan_views(&other, &[], |m| planner.plan(m))
                 .expect("plan");
             assert_eq!(
-                got.bytes,
+                got.require_ready().unwrap().bytes,
                 8 * 4 * 2,
                 "a longer operand list was served the shorter signature's plan"
             );
@@ -10892,7 +10929,7 @@ mod workspace_plan_cache_tests {
                         .get_or_plan_views(&inputs, &[], |m| planner.plan(m))
                         .expect("plan");
                     assert_eq!(
-                        got.bytes as usize,
+                        got.require_ready().unwrap().bytes as usize,
                         n * 2 * 4,
                         "a concurrent dispatch received another signature's plan"
                     );

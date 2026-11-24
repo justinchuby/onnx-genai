@@ -794,7 +794,7 @@ impl Executor {
                 kernel,
                 inputs,
                 &views,
-                &output_metadata,
+                (&output_metadata, &[]),
                 node,
                 workspace_planning,
             )?;
@@ -1990,10 +1990,11 @@ impl KernelDispatchContext<'_> {
         kernel: &dyn Kernel,
         inputs: &[Option<ValueId>],
         views: &[TensorView],
-        output_metadata: &[OutputMetadata<'_>],
+        outputs: (&[OutputMetadata<'_>], &[TensorMut]),
         node: &Node,
         workspace_planning: onnx_runtime_ep_api::WorkspacePlanning,
     ) -> Result<(WorkspaceRequirement, Option<WorkspaceView>)> {
+        let (output_metadata, output_views) = outputs;
         let metadata: SmallVec<[TensorMetadata<'_>; 16]> = views
             .iter()
             .enumerate()
@@ -2017,8 +2018,13 @@ impl KernelDispatchContext<'_> {
                 TensorMetadata::new(view.dtype, view.shape, !view.is_absent())
             })
             .collect();
-        let requirement =
-            kernel.workspace_requirement_for_execution(views, &metadata, output_metadata)?;
+        let requirement = kernel.workspace_requirement_for_execution(
+            views,
+            output_views,
+            &metadata,
+            output_metadata,
+            None,
+        )?;
         if requirement.bytes != 0
             && workspace_planning == onnx_runtime_ep_api::WorkspacePlanning::None
         {
@@ -2228,7 +2234,7 @@ impl KernelDispatchContext<'_> {
                 kernel,
                 inputs,
                 views,
-                &output_metadata,
+                (&output_metadata, outs),
                 node,
                 workspace_planning,
             )?;

@@ -162,7 +162,7 @@ impl Kernel for QMoEKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
         let input = inputs
             .first()
             .filter(|input| input.present)
@@ -175,11 +175,13 @@ impl Kernel for QMoEKernel {
                 input.dtype
             )));
         }
-        Ok(WorkspaceRequirement {
-            bytes: grouped_input_workspace_bytes(input.shape)? as u64,
-            alignment: std::mem::align_of::<f32>(),
-            ..WorkspaceRequirement::NONE
-        })
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            WorkspaceRequirement {
+                bytes: grouped_input_workspace_bytes(input.shape)? as u64,
+                alignment: std::mem::align_of::<f32>(),
+                ..WorkspaceRequirement::NONE
+            },
+        ))
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
@@ -2252,7 +2254,11 @@ mod tests {
                 .iter()
                 .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
                 .collect::<Vec<_>>();
-            let req = kernel.workspace_requirement(&metadata, &[]).unwrap();
+            let req = kernel
+                .workspace_requirement(&metadata, &[])
+                .unwrap()
+                .require_ready()
+                .unwrap();
             assert_eq!(
                 req.bytes, BYTES as u64,
                 "serial expert groups reuse input size, without k or E multiplication"
@@ -2316,6 +2322,7 @@ mod tests {
         assert!(
             kernel
                 .workspace_requirement(&[], &[])
+                .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)
                 .unwrap_err()
                 .to_string()
                 .contains("input 0")
@@ -2323,6 +2330,8 @@ mod tests {
         for shape in [&[2, 3][..], &[1, 2, 3][..]] {
             let req = kernel
                 .workspace_requirement(&[TensorMetadata::new(DataType::Float32, shape, true)], &[])
+                .unwrap()
+                .require_ready()
                 .unwrap();
             assert_eq!(req.bytes, 24);
         }
@@ -2332,6 +2341,8 @@ mod tests {
                     &[TensorMetadata::new(DataType::Float32, &[0, 16], true)],
                     &[]
                 )
+                .unwrap()
+                .require_ready()
                 .unwrap()
                 .bytes,
             0
@@ -2344,6 +2355,8 @@ mod tests {
                         &[]
                     )
                     .unwrap()
+                    .require_ready()
+                    .unwrap()
                     .bytes,
                 0
             );
@@ -2355,7 +2368,12 @@ mod tests {
             TensorMetadata::new(DataType::Float32, &[usize::MAX, 2], true),
             TensorMetadata::new(DataType::Float32, &[isize::MAX as usize, 1], true),
         ] {
-            assert!(kernel.workspace_requirement(&[input], &[]).is_err());
+            assert!(
+                kernel
+                    .workspace_requirement(&[input], &[])
+                    .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)
+                    .is_err()
+            );
         }
     }
 

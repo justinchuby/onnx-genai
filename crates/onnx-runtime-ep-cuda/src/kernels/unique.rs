@@ -543,20 +543,22 @@ impl Kernel for UniqueKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> Result<WorkspaceRequirement> {
+    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
         let elements = inputs
             .first()
             .filter(|input| input.present)
             .ok_or_else(|| EpError::KernelFailed("cuda_ep Unique: missing input metadata".into()))
             .and_then(|input| checked_numel(input.shape))?;
         let layout = workspace_layout(elements)?;
-        Ok(WorkspaceRequirement {
-            bytes: u64::try_from(layout.bytes).map_err(|_| {
-                EpError::KernelFailed("cuda_ep Unique: workspace exceeds u64".into())
-            })?,
-            alignment: std::mem::align_of::<u64>(),
-            lifetime: WorkspaceLifetime::StepScoped,
-        })
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            WorkspaceRequirement {
+                bytes: u64::try_from(layout.bytes).map_err(|_| {
+                    EpError::KernelFailed("cuda_ep Unique: workspace exceeds u64".into())
+                })?,
+                alignment: std::mem::align_of::<u64>(),
+                lifetime: WorkspaceLifetime::StepScoped,
+            },
+        ))
     }
 
     fn execute_with_workspace(
