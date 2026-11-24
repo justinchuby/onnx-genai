@@ -1862,6 +1862,24 @@ converted probabilities through engine-result ownership. A native ONNX fixture
 changes its decisions with the input; it does not simulate a chat answer.
 
 This increment does not establish all upstream decision-model conformance.
-Multimodal inputs, per-model request defaults, joint/packed heads and shared
-workflow entry points remain required; [SystemOne](SYSTEMONE.md) records the
+Multimodal inputs, joint/packed heads and shared workflow entry points remain
+required; [SystemOne](SYSTEMONE.md) records the
 current executable contract and explicit gaps. Server tools remain out of scope.
+
+
+### Declared SystemOne input contracts
+
+Core schema v1.11 requires explicit `decision.input_policy`. A single engine
+question factory admits defaults, required/optional/forbidden instructions,
+payload types, enabled question kinds, dynamic/fixed choices, request/lexical
+order, declared score ranges, boolean alias/order rules and legend formatting.
+The HTTP transport supplies its operator limits; it does not duplicate question
+interpretation. Immutable questions/results retain their admitted contract, with
+fixed options and default instructions borrowed from that owner. No model-name
+branch selects request semantics. Schema v1.10 keeps its published contract.
+
+Native inference tests exercise missing/null/non-string default types, changed
+choice ordering, true-first boolean heads, canonical-null alias precedence,
+fixed tasks and one-/eleven-level dynamic score heads. HTTP tests cover authored
+limits, payload rejection and wire legends. These tests establish text decision
+behavior for the authored fixtures; they do not establish media or GGUF support.
