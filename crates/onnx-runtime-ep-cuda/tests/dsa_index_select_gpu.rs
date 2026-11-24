@@ -36,6 +36,7 @@ use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::kernels::dsa_index_select::DsaIndexSelectFactory;
 use onnx_runtime_ep_cuda::runtime::cuptr;
+#[cfg(feature = "gpu-tests")]
 use onnx_runtime_ep_cuda::{dsa_launch_stats, reset_dsa_launch_stats};
 use onnx_runtime_ir::{
     Attribute, DataType, DeviceId, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
@@ -1489,6 +1490,7 @@ fn supports_op_declines_malformed_nodes_at_capability_time() {
 // mask in the executor-owned SessionPersistent workspace.
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "gpu-tests")]
 struct BenchResult {
     kernel_us_median: f32,
     kernel_us_min: f32,
@@ -1506,12 +1508,14 @@ struct BenchResult {
     selection_grid_x: u64,
 }
 
+#[cfg(feature = "gpu-tests")]
 fn median_min_max(samples: &mut [f32]) -> (f32, f32, f32) {
     samples.sort_by(|a, b| a.total_cmp(b));
     let median = samples[samples.len() / 2];
     (median, samples[0], samples[samples.len() - 1])
 }
 
+#[cfg(feature = "gpu-tests")]
 fn gpu_clock_witness(phase: &str) {
     let physical_gpu = std::env::var("ONNX_GENAI_DSA_PHYSICAL_GPU").unwrap_or_else(|_| "0".into());
     let out = std::process::Command::new("nvidia-smi")
@@ -1635,6 +1639,7 @@ fn real_glm_perf_case(key_seq: usize, top_k: usize) -> Case {
     }
 }
 
+#[cfg(feature = "gpu-tests")]
 fn real_glm_perf_inputs(key_seq: usize) -> [Option<HostTensor>; 4] {
     let shape = PerfInputShape::from(real_glm_perf_case(key_seq, 2048));
     perf_inputs(shape, 0x2076_5eba ^ key_seq as u64, DataType::Float16)
@@ -1670,6 +1675,7 @@ fn real_glm_perf_controls_are_byte_identical_across_top_k() {
 
 /// Capture the single-node DsaIndexSelect graph, ramp the device for
 /// `ramp_secs`, then time `repeats` batches of `batch` captured-graph launches.
+#[cfg(feature = "gpu-tests")]
 fn bench_config(
     ep: &CudaExecutionProvider,
     label: &str,
@@ -1905,6 +1911,14 @@ fn bench_config(
 #[ignore = "perf probe; run explicitly: cargo test -p onnx-runtime-ep-cuda --features gpu-tests --test dsa_index_select_gpu -- --ignored --nocapture measure_dsa_index_select"]
 #[test]
 fn measure_dsa_index_select_kernel_and_host_enqueue() {
+    #[cfg(feature = "gpu-tests")]
+    probe_kernel_and_host_enqueue();
+    #[cfg(not(feature = "gpu-tests"))]
+    panic!("enable gpu-tests on a CUDA runner to measure DSA kernel and host enqueue timing");
+}
+
+#[cfg(feature = "gpu-tests")]
+fn probe_kernel_and_host_enqueue() {
     let ep = require_cuda();
     gpu_clock_witness("start");
 
@@ -2007,6 +2021,14 @@ fn measure_dsa_index_select_kernel_and_host_enqueue() {
 #[ignore = "real GLM paired perf probe; set T=2048/8192 and order=real-first/control-first"]
 #[test]
 fn measure_dsa_index_select_real_glm_decode() {
+    #[cfg(feature = "gpu-tests")]
+    probe_real_glm_decode();
+    #[cfg(not(feature = "gpu-tests"))]
+    panic!("enable gpu-tests on a CUDA runner to measure the DSA decode probe");
+}
+
+#[cfg(feature = "gpu-tests")]
+fn probe_real_glm_decode() {
     let key_seq = std::env::var("ONNX_GENAI_DSA_PERF_T")
         .expect("set ONNX_GENAI_DSA_PERF_T to 2048 or 8192")
         .parse::<usize>()
