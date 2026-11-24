@@ -13,10 +13,16 @@ use std::sync::Arc;
 use crate::error::{driver_err, not_implemented};
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspacePreparation, WorkspaceView,
+};
 use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use crate::runtime::{CudaRuntime, cuptr};
+
+use super::metadata_workspace::MetadataWorkspace;
+const METADATA_WORDS_PER_AXIS: usize = 3;
 
 const BLOCK: u32 = 256;
 const MODULE: &str = "mod_op_v1";
@@ -99,14 +105,6 @@ fn broadcast_metadata(a_shape: &[usize], b_shape: &[usize], out_shape: &[usize])
     metadata
 }
 
-fn u64_bytes(values: &[u64]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(values.len() * 8);
-    for &value in values {
-        out.extend_from_slice(&value.to_ne_bytes());
-    }
-    out
-}
-
 fn grid_for(n: usize) -> u32 {
     const MAX_BLOCKS: usize = 65_535;
     n.div_ceil(BLOCK as usize).clamp(1, MAX_BLOCKS) as u32
@@ -158,13 +156,23 @@ pub struct ModKernel {
 }
 
 impl ModKernel {
-    fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         if inputs.len() != 2 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep Mod: expected 2 inputs and 1 output, got {} and {}",
                 inputs.len(),
                 outputs.len()
             )));
+        }
+        if self.runtime.is_capturing()? {
+            return Err(not_implemented(
+                "Mod during CUDA graph capture: borrowed broadcast metadata requires an eager host upload",
+            ));
         }
         let a = &inputs[0];
         let b = &inputs[1];
@@ -218,8 +226,13 @@ impl ModKernel {
         let fmod: i32 = i32::from(self.fmod);
 
         let metadata = broadcast_metadata(a.shape, b.shape, &out_shape);
-        let metadata_bytes = u64_bytes(&metadata);
-        let metadata_ptr = self.runtime.alloc_raw(metadata_bytes.len().max(1))?;
+        let metadata_ptr = MetadataWorkspace::for_rank(
+            "Mod",
+            out_shape.len(),
+            METADATA_WORDS_PER_AXIS,
+            &OutputMetadata::from_view(&outputs[0]),
+        )?
+        .upload(&self.runtime, workspace, &metadata)?;
 
         let func = self.runtime.nvrtc_function(MODULE, SRC, entry)?;
         let cfg = LaunchConfig {
@@ -231,35 +244,52 @@ impl ModKernel {
         let b_ptr = cuptr(b.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
-        let result = (|| {
-            // SAFETY: the fresh allocation exactly covers the metadata slice.
-            unsafe { self.runtime.htod(&metadata_bytes, metadata_ptr) }?;
-            let mut builder = self.runtime.stream().launch_builder(&func);
-            builder
-                .arg(&a_ptr)
-                .arg(&b_ptr)
-                .arg(&y_ptr)
-                .arg(&metadata_ptr)
-                .arg(&rank)
-                .arg(&n_u64)
-                .arg(&fmod);
-            // SAFETY: `a_ptr`/`b_ptr`/`y_ptr` cover their validated contiguous
-            // elements and `metadata_ptr` holds `rank*3` u64 words per the ABI.
-            unsafe { builder.launch(cfg) }
-                .map_err(|error| driver_err(&format!("launch {entry}"), error))?;
-            self.runtime.synchronize()
-        })();
-
-        // SAFETY: the synchronize (or a failed launch) guarantees no kernel is
-        // still reading the metadata buffer; it is freed exactly once here.
-        let cleanup = unsafe { self.runtime.free_raw(metadata_ptr) };
-        result.and(cleanup)
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        builder
+            .arg(&a_ptr)
+            .arg(&b_ptr)
+            .arg(&y_ptr)
+            .arg(&metadata_ptr)
+            .arg(&rank)
+            .arg(&n_u64)
+            .arg(&fmod);
+        // SAFETY: `a_ptr`/`b_ptr`/`y_ptr` cover their validated contiguous
+        // elements and `metadata_ptr` holds `rank*3` u64 words per the ABI.
+        unsafe { builder.launch(cfg) }
+            .map_err(|error| driver_err(&format!("launch {entry}"), error))?;
+        self.runtime.synchronize()
     }
 }
 
 impl Kernel for ModKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.run(inputs, outputs)
+        self.run(inputs, outputs, None)
+    }
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
+    }
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        if inputs.len() != 2 || outputs.len() != 1 || inputs.iter().any(|input| !input.present) {
+            return Err(EpError::KernelFailed(
+                "cuda_ep Mod: workspace planning requires two present inputs and one output".into(),
+            ));
+        }
+        let shape = onnx_runtime_ir::broadcast_shapes(inputs[0].shape, inputs[1].shape)
+            .map_err(EpError::Ir)?;
+        let rank = if shape.contains(&0) { 0 } else { shape.len() };
+        Ok(WorkspacePreparation::Ready(
+            MetadataWorkspace::for_rank("Mod", rank, METADATA_WORDS_PER_AXIS, &outputs[0])?
+                .requirement(),
+        ))
     }
 
     fn supports_strided_input(&self, _idx: usize) -> bool {
@@ -268,7 +298,7 @@ impl Kernel for ModKernel {
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         onnx_runtime_ep_api::CaptureSupport::unsupported(
-            "Mod allocates and uploads broadcast metadata on every call",
+            "Mod uploads borrowed broadcast metadata from the host on each eager call",
         )
     }
 }

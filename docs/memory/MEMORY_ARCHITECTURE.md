@@ -932,6 +932,34 @@ warm allocation/transfer/sync counts, replay after retiring the original caller
 handle and clearing the repack cache, and final physical settlement. Device
 numerical/capture/performance checks still require CUDA hardware.
 
+### Eager rank metadata borrows the shared lane
+
+`Mod`, `LpPool` and `NonZero` declare metadata-planned SessionPersistent caller
+capacity for their per-call descriptors: respectively `3 * output_rank * 8`,
+`6 * spatial_rank * 8` and `input_rank * 8` bytes. One private checked-layout
+helper binds the complete u64 payload and uploads into borrowed backing. It owns
+no device allocation, pool, cache, graph resource or quota ticket. Different
+serial kernels can overwrite and reuse the same fitting root owner.
+
+Empty output has zero demand. Mod infers broadcast emptiness from input facts;
+NonZero also proves zero work for an empty input or scalar rank. An unresolved
+output fact remains distinct from an absent output or a known scalar. Scalar
+Mod has no descriptor words and skips the upload entirely. Nonempty payloads
+reject missing, short, unaligned or stale-layout backing before any H2D work.
+
+These kernels still use the existing synchronous H2D lifetime contract and eager
+synchronization policy. They explicitly reject recording before uploading;
+borrowed descriptors can be overwritten by another node, so removing their raw
+allocation does not make them capture-safe. There are no additional control
+readbacks or per-region admission/return callbacks.
+
+Host tests exercise checked sizes, scalar/empty/unresolved facts and refusal
+paths. Device fixtures compile real Metadata registrations, CPU parity after
+dirty-lane reuse, stable owner identity across all three kernels, no warm private
+allocations, capture refusal and physical settlement. No CUDA hardware was
+available to execute those fixtures; upload latency and throughput remain
+unmeasured.
+
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
 The dated audit and measurements below preserve historical evidence. The current
@@ -985,11 +1013,11 @@ call; it owns the governed workspace preparation path
 | `kernels/matmul_nbits.rs:4425` | `MatMulNBits` RMSNorm prefill activation scratch | `M * K * sizeof(f16)` | prompt-dependent (`M`) and model config (`K`) | request/prefill-dependent | raw bypass |
 | `kernels/matmul_nbits.rs:4942` | `MatMulNBits` decomposed SiLU scratch | `output.byte_size()` | output shape/prompt dependent | step-scoped | raw bypass |
 | `kernels/matmul_nbits.rs:5200` | `MatMulNBits` gate/up RMSNorm prefill scratch | `M * K * sizeof(f16)` | prompt-dependent (`M`) and model config (`K`) | request/prefill-dependent | raw bypass |
-| `kernels/mod_op.rs:222` | Mod metadata | `metadata_bytes.len().max(1)` | op/rank/config | step-scoped | raw bypass |
+| `kernels/mod_op.rs` | Mod broadcast metadata | `3 * output_rank * 8`, zero for scalar/empty | broadcast shape | SessionPersistent caller peak | checked borrowed upload; no private allocation |
 | `kernels/movement.rs:239` | movement op metadata | `bytes.len()` | op/rank/config | step-scoped | raw bypass |
 | `kernels/nary.rs:264` | N-ary fp32 scratch | `n * sizeof(f32)` | output element count | step-scoped | raw bypass |
 | `kernels/nary.rs:271` | N-ary metadata | `metadata_bytes.len().max(1)` | op arity/rank | step-scoped | raw bypass |
-| `kernels/nonzero.rs:99` | NonZero strides metadata | `bytes.len()` | input rank | step-scoped | raw bypass |
+| `kernels/nonzero.rs` | NonZero coordinate strides | `input_rank * 8`, zero for scalar/empty | input rank/output emptiness | SessionPersistent caller peak | checked borrowed upload; no private allocation |
 | `kernels/normalization.rs:1563` | normalization metadata | `metadata_bytes.len()` | op/rank/config | step-scoped | raw bypass |
 | `kernels/packed_varlen_attention.rs:581` | packed-varlen metadata | `bytes.max(1)` | batch/sequence metadata | step-scoped | raw bypass |
 | `kernels/pad.rs:292` | Pad metadata | `metadata.len()` | rank/pads config | step-scoped | raw bypass |

@@ -95,6 +95,7 @@ pub mod log_softmax;
 pub mod marlin_gemm;
 pub mod matmul;
 pub mod matmul_nbits;
+mod metadata_workspace;
 pub mod mod_op;
 pub mod movement;
 pub mod multi_head_attention;
@@ -1161,7 +1162,7 @@ pub fn build_cuda_registry_with_metrics(
     }
     reg.register(
         OpKey::new("NonZero", "", 9),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(nonzero::NonZeroFactory {
             runtime: runtime.clone(),
         }),
@@ -1489,7 +1490,7 @@ pub fn build_cuda_registry_with_metrics(
     }
     reg.register(
         OpKey::new("LpPool", "", 18),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(pooling::LpPoolFactory {
             runtime: runtime.clone(),
         }),
@@ -1842,7 +1843,7 @@ pub fn build_cuda_registry_with_metrics(
     // Mod (mod_op.rs) — f32 (fmod=1) plus i32/i64 truncated and floor modulo.
     reg.register(
         OpKey::new("Mod", "", 10),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(mod_op::ModFactory {
             runtime: runtime.clone(),
         }),
