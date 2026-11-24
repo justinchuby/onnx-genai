@@ -632,13 +632,14 @@ use crate::kernels::testutil::PreparedTestKernel;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernels::testutil::Owned;
+    use onnx_runtime_ir::{Attribute, Graph, NodeId, TensorData, WeightRef};
 
     #[test]
     fn gemm_29_vector_trans_a_with_explicitly_absent_bias() {
-        let mut node = Node::new(onnx_runtime_ir::NodeId(0), "Gemm", vec![], vec![]);
+        let mut node = Node::new(NodeId(0), "Gemm", vec![], vec![]);
         node.version = Some(29);
-        node.attributes
-            .insert("transA".into(), onnx_runtime_ir::Attribute::Int(1));
+        node.attributes.insert("transA".into(), Attribute::Int(1));
         let a = Owned::f32(&[3], &[1., 2., 3.]);
         let b = Owned::f32(&[3, 2], &[1., 2., 3., 4., 5., 6.]);
         let mut y = Owned::zeros_f32(&[2]);
@@ -659,8 +660,44 @@ mod tests {
                 .contains("rank 2 before opset 29")
         );
     }
-    use crate::kernels::testutil::Owned;
-    use onnx_runtime_ir::{Attribute, Graph, NodeId, TensorData, WeightRef};
+
+    #[test]
+    fn gemm_29_transposes_each_matrix_for_f32_and_half() {
+        let mut node = Node::new(NodeId(0), "Gemm", vec![], vec![]);
+        node.version = Some(29);
+        for attr in ["transA", "transB"] {
+            node.attributes.insert(attr.into(), Attribute::Int(1));
+        }
+        node.attributes
+            .insert("alpha".into(), Attribute::Float(0.25));
+        node.attributes.insert("beta".into(), Attribute::Float(0.5));
+        let kernel = GemmFactory::default().create(&node, &[]).unwrap();
+        for (dtype, tensor, read) in [
+            (
+                DataType::Float32,
+                Owned::f32 as fn(&[usize], &[f32]) -> Owned,
+                Owned::to_f32 as fn(&Owned) -> Vec<f32>,
+            ),
+            (DataType::Float16, Owned::f16, Owned::to_f16_as_f32),
+            (DataType::BFloat16, Owned::bf16, Owned::to_bf16_as_f32),
+        ] {
+            let a = tensor(
+                &[2, 1, 3, 2],
+                &[1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.],
+            );
+            let b = tensor(&[2, 3], &[1., 0., 1., 0., 1., 0.]);
+            let c = tensor(&[2, 1, 1, 2], &[10., 20., 30., 40.]);
+            let mut y = Owned::zeros(dtype, &[2, 1, 2, 2]);
+            kernel
+                .execute_prepared(&[a.view(), b.view(), c.view()], &mut [y.view_mut()])
+                .unwrap();
+            assert_eq!(
+                read(&y),
+                [6.5, 10.75, 7., 11., 19.5, 22.25, 20., 22.5],
+                "{dtype:?}"
+            );
+        }
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn gemm(

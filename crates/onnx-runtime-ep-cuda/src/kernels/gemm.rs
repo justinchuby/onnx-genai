@@ -54,9 +54,19 @@ extern "C" __global__ void gemm_bias_f32(
     const unsigned long long total = m * n;
     for (unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
          idx < total; idx += (unsigned long long)gridDim.x * blockDim.x) {
-        const auto offset = c_col_stride == 1 && c_row_stride == n ? idx
-                           : (c_row_stride ? (idx / n) * c_row_stride : 0)
-                             + (c_col_stride ? idx % n : 0);
+        unsigned long long offset;
+        if (c_col_stride == 1 && c_row_stride == n) {
+            offset = idx;
+        } else if (total <= 0xffffffffULL) {
+            // Keep the normal-sized broadcast epilogue off 64-bit division.
+            const auto i = (unsigned int)idx;
+            const auto width = (unsigned int)n;
+            offset = (c_row_stride ? (i / width) * (unsigned int)c_row_stride : 0)
+                   + (c_col_stride ? i % width : 0);
+        } else {
+            offset = (c_row_stride ? (idx / n) * c_row_stride : 0)
+                   + (c_col_stride ? idx % n : 0);
+        }
         const float cv = c[offset];
         y[idx] += beta * cv;
     }
