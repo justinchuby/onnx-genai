@@ -1,11 +1,9 @@
 # Heterogeneous CPU+CUDA Placement
 
-> **Status:** opt-in static execution slice, merged in #2095
-> (`f6d893fd7`, 2026-08-25). Enable with `ONNX_GENAI_HETERO=1`.
->
-> The default remains the existing single-EP executor and whole-session
-> fallback. Heterogeneous execution is not yet the default and is not broad
-> stateful-decode support.
+> Native CUDA requests with top-level managed string operations attempt mixed
+> placement when CPU fallback is allowed. Other graphs still opt in with
+> `ONNX_GENAI_HETERO=1`. This is a static execution slice, not broad
+> stateful-decode support. `ONNX_GENAI_REQUIRE_CUDA=1` rejects CPU placement.
 
 ## What exists today
 
@@ -31,6 +29,14 @@ The opt-in executor accepts:
 - independently owned kernel outputs rather than zero-copy views;
 - model-local functions already legalized by the bounded fixpoint from #602.
 
+Nodes that read or produce `tensor(string)` stay on a string-aware host
+provider. Managed strings can be returned as host outputs or shared with
+another partition on the same host provider; they are never raw buffers or
+cross-provider transfers. Fixed-size numeric results of text operations can
+cross to CUDA. Text-only graphs still use single-provider CPU fallback; mixed
+graphs with runtime-sized outputs (such as the token output of `StringSplit`)
+are outside this slice and fail at session creation.
+
 It fails closed **before execution** for:
 
 - symbolic or runtime-dynamic shapes and runtime-sized outputs;
@@ -47,7 +53,7 @@ partially executed request.
 
 ## Ownership and transfer semantics
 
-Each boundary value has one authoritative provider-owned `DeviceBuffer`.
+Each raw numeric boundary value has one authoritative provider-owned `DeviceBuffer`.
 Destination realizations are allocated through the destination EP and its
 existing governor, only for planned cross-provider edges, and released by that
 owner after the last consuming partition.
@@ -73,7 +79,7 @@ counts by EP and planned cross-provider transfer counts.
 4. Transfer fences complete before destination consumption.
 5. A buffer is released exactly once by the EP that allocated it.
 6. Mixed execution never masquerades as a single-EP capture key.
-7. The flag-off path remains unchanged.
+7. All-numeric sessions with the flag off retain the single-EP path.
 8. Unsupported state/control-flow/sequence/dynamic/view/capture cases fail
    closed with actionable diagnostics.
 
