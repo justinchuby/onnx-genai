@@ -1,5 +1,5 @@
-//! Complete, owned Native session captures. File codecs and transport admission
-//! belong above this engine boundary; an opaque capture cannot cross engines.
+//! Complete owned Native captures and model-bound state files. Transport path
+//! admission remains above the engine; opaque captures cannot cross engines.
 
 use super::*;
 use onnx_runtime_memory_api::Tier;
@@ -18,7 +18,15 @@ pub struct NativeSessionSnapshot {
     source: SessionId,
     tokens: Vec<TokenId>,
     state: crate::native_decode::NativePastSnapshot,
-    _lease: MemoryLease,
+    _leases: Vec<MemoryLease>,
+}
+
+/// Logical history and executable cursor are independent in a saved file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeStateFileSummary {
+    pub logical_tokens: usize,
+    pub materialized_tokens: usize,
+    pub bytes: u64,
 }
 
 impl std::fmt::Debug for NativeSessionSnapshot {
@@ -103,7 +111,7 @@ impl Engine {
             source: session,
             tokens: logical.tokens.clone(),
             state,
-            _lease: lease,
+            _leases: vec![lease],
         })
     }
 
@@ -186,6 +194,87 @@ impl Engine {
         // Host-only admission makes bind infallible: there is no device owner
         // registry to update. The public owner is committed only after writes.
         Ok(())
+    }
+
+    /// Write a bounded, checksummed Native state file. The writer must be
+    /// staged/atomically published by the transport; an I/O error can leave a
+    /// partial output. Load with `native_state_files=true` to enable identity.
+    pub fn write_native_session_state(
+        &mut self,
+        session: SessionId,
+        writer: &mut impl std::io::Write,
+        mut limits: crate::native_decode::NativeStateFileLimits,
+    ) -> anyhow::Result<NativeStateFileSummary> {
+        self.require_native_snapshot_backend()?;
+        let identity = self
+            .native_session
+            .as_ref()
+            .and_then(|s| s.state_identity)
+            .context(
+                "Native state files are disabled; reload with EngineConfig.native_state_files=true",
+            )?;
+        if let Some(context) = self.effective_max_context(&GenerateOptions::default()) {
+            limits.max_tokens = limits.max_tokens.min(context);
+        }
+        let capture = self.capture_native_session(session)?;
+        let bytes = capture.state.write_file(
+            &capture.tokens,
+            identity,
+            writer,
+            limits,
+            self.governor.memory(),
+        )?;
+        Ok(NativeStateFileSummary {
+            logical_tokens: capture.tokens.len(),
+            materialized_tokens: capture.state.len(),
+            bytes,
+        })
+    }
+
+    /// Verify and restore a complete state file from the same model package,
+    /// including across engine instances/restarts. Admission and checksum
+    /// validation complete before the transactional restore touches live state.
+    pub fn restore_native_session_state(
+        &mut self,
+        target: SessionId,
+        reader: &mut impl std::io::Read,
+        mut limits: crate::native_decode::NativeStateFileLimits,
+    ) -> anyhow::Result<NativeStateFileSummary> {
+        self.require_native_snapshot_backend()?;
+        let logical = self.native_sessions.get(&target)
+            .with_context(|| format!("cannot read state for native session {target}: destination not found; create it first"))?;
+        require_healthy(target, logical)?;
+        if let Some(context) = self.effective_max_context(&GenerateOptions::default()) {
+            limits.max_tokens = limits.max_tokens.min(context);
+        }
+        let native = self
+            .native_session
+            .as_ref()
+            .context("Native decoder is unavailable; reload the model")?;
+        let decoded = native.read_state_file(reader, limits, self.governor.memory())?;
+        let tokenizer = self.require_tokenizer()?;
+        for (index, token) in decoded.tokens.iter().enumerate() {
+            anyhow::ensure!(
+                tokenizer.inner().id_to_token(*token).is_some(),
+                "Native state token[{index}]={token} is absent from the package vocabulary; restore a file from the original tokenizer"
+            );
+        }
+        let report = NativeStateFileSummary {
+            logical_tokens: decoded.tokens.len(),
+            materialized_tokens: decoded.state.len(),
+            bytes: decoded.encoded_bytes,
+        };
+        self.restore_native_session(
+            target,
+            NativeSessionSnapshot {
+                origin: self.session_fork_origin,
+                source: target,
+                tokens: decoded.tokens,
+                state: decoded.state,
+                _leases: decoded.leases,
+            },
+        )?;
+        Ok(report)
     }
 
     fn require_native_snapshot_backend(&self) -> anyhow::Result<()> {

@@ -930,6 +930,16 @@ pub(super) struct RecordTensorFacts<'a> {
     contiguous: bool,
 }
 
+impl<'a> RecordTensorFacts<'a> {
+    pub(super) fn contiguous(dtype: DataType, shape: &'a [usize]) -> Self {
+        Self {
+            dtype,
+            shape,
+            contiguous: true,
+        }
+    }
+}
+
 impl<'a> From<&'a Tensor> for RecordTensorFacts<'a> {
     fn from(tensor: &'a Tensor) -> Self {
         Self {

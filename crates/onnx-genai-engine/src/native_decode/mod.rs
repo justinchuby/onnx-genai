@@ -29,6 +29,8 @@ mod io;
 mod kv_commit;
 mod load;
 mod paged_gqa;
+mod state_file;
+pub use state_file::NativeStateFileLimits;
 mod tensor;
 pub use csa::{
     CompressedStateLoadRefusal, CompressedStateTensorPhase, CompressedStateTransitionRefusal,
@@ -113,6 +115,7 @@ pub struct NativeDecodeCudaOptions {
 /// Stateful decoder-with-past adapter over the pure-Rust native runtime.
 pub struct NativeDecodeSession {
     session: InferenceSession,
+    pub(crate) state_identity: Option<[u8; 32]>,
     step_inputs: Vec<NativeStepInputBinding>,
     logits: String,
     hidden_output: Option<String>,
@@ -933,7 +936,11 @@ impl NativeDecodeSession {
         snapshot: Option<&cpu::CpuKvSnapshot>,
     ) -> anyhow::Result<()> {
         match (self.cpu_kv.as_mut(), snapshot) {
-            (Some(state), Some(snapshot)) => state.restore_snapshot(snapshot),
+            (Some(state), Some(snapshot)) => {
+                state.validate_snapshot_layout(snapshot)?;
+                state.grow_to(&self.session, snapshot.logical_len, self.current_len)?;
+                state.restore_snapshot(snapshot)
+            }
             (None, None) => Ok(()),
             _ => bail!(
                 "native state snapshot uses a different CPU KV storage mode; restore with the original decoder"

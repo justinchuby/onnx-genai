@@ -437,8 +437,10 @@ reason.
   sessions if rollback also fails. A selected but unmaterialized final token
   remains pending after restore. Inactive token histories and device-owned
   state are refused; neither is silently replayed or transferred as a snapshot.
-  This engine primitive does not yet provide Native fork plans, a persistent
-  file codec, or the llama.cpp `/slots` transport.
+  The separate [Native state file codec](../NATIVE_SESSION_STATE.md) admits
+  cross-engine/restart restores only after validating load-time model identity,
+  bounded layout metadata, token vocabulary, payload checksum and exact file
+  boundary. Neither primitive provides Native fork plans or `/slots` transport.
 - **Copy-on-write leases are refused at load.** The policy enum admits
   `copy_on_write` (`schema/inference_metadata.schema.json:3248-3254`) and the
   loader rejects it (`crates/onnx-genai-engine/tests/workflow_session_continuation.rs:695-702`).
