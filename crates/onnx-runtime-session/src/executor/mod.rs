@@ -804,6 +804,8 @@ fn record_dense_prefetch_gap(nodes_between: u64) {
 #[derive(Debug)]
 pub(crate) struct NodePlan {
     pub node_id: NodeId,
+    /// String values have managed host storage and cannot use raw dispatch.
+    pub managed_strings: bool,
     /// Accepted whole-graph claim; compile and dispatch through the provider.
     pub graph_kernel: bool,
     pub workspace_planning: onnx_runtime_ep_api::WorkspacePlanning,
@@ -1148,6 +1150,7 @@ mod build;
 mod capture;
 mod control_flow;
 mod dispatch;
+pub(crate) mod host_strings;
 mod platform;
 mod prefetch;
 mod run;

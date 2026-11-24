@@ -26,6 +26,7 @@ mod recurrent;
 mod selection;
 mod sequence;
 mod signal;
+mod text;
 
 /// Normalise an ONNX axis (which may be negative) into `0..rank`.
 ///
@@ -70,5 +71,6 @@ pub fn register_all(registry: &mut InferenceRegistry) {
     signal::register(registry);
     loss::register(registry);
     ml::register(registry);
+    text::register(registry);
     container::register(registry);
 }

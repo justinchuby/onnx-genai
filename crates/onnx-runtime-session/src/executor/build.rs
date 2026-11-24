@@ -314,10 +314,8 @@ pub(super) fn validate_control_flow_signatures(graph: &Graph) -> Result<()> {
     Ok(())
 }
 
-/// Whether opt-in per-op heterogeneous placement is enabled on the default
-/// session build path (`ONNX_GENAI_HETERO`). Default OFF: unset/empty and the
-/// explicit `0`/`false`/`off` values (case-insensitive) all disable it, so the
-/// whole-session fallback stays byte-identical unless a caller opts in.
+/// Whether to opt into heterogeneous placement beyond CUDA graphs with
+/// managed string operations (`ONNX_GENAI_HETERO`).
 pub(super) fn hetero_placement_env_enabled() -> bool {
     match std::env::var("ONNX_GENAI_HETERO") {
         Ok(value) => matches!(
@@ -409,6 +407,19 @@ pub(super) fn cuda_fallback_report(
 
     let mut issues = Vec::new();
     collect_cuda_coverage_issues(graph, graph, ep, artifact_config, "graph", &mut issues)?;
+    for value_id in super::host_strings::producerless_string_outputs(graph) {
+        let value = graph.value(value_id);
+        issues.push(ExecutionProviderDecline {
+            node: format!(
+                "graph output '{}' (value#{})",
+                value.name.as_deref().unwrap_or("<unnamed>"),
+                value_id.0
+            ),
+            domain: "ai.onnx".into(),
+            op_type: "<graph output>".into(),
+            reason: super::host_strings::MANAGED_STRING_DEVICE_DECLINE.into(),
+        });
+    }
     if issues.is_empty() {
         return Ok(None);
     }
@@ -478,6 +489,15 @@ pub(super) fn collect_cuda_coverage_issues(
 ) -> Result<()> {
     let graph_claims = onnx_runtime_ep_api::GraphKernelClaims::query(ep, graph)?;
     for (node_id, node) in graph.nodes.iter() {
+        if super::host_strings::uses_managed_strings(graph, node) {
+            issues.push(ExecutionProviderDecline {
+                node: format_node_identity(scope, node_id, node),
+                domain: canonical_domain(node),
+                op_type: node.op_type.clone(),
+                reason: super::host_strings::MANAGED_STRING_DEVICE_DECLINE.into(),
+            });
+            continue;
+        }
         if graph_claims.contains(node_id)
             || onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
             || is_control_flow_op(&node.op_type, &node.domain)
@@ -939,7 +959,7 @@ impl Executor {
         Self::build_with_mode(graph, weights, ep, false, true, None)
     }
 
-    pub(super) fn build_with_mode(
+    pub(crate) fn build_with_mode(
         mut graph: Graph,
         weights: Arc<WeightStore>,
         ep: Arc<dyn ExecutionProvider>,
@@ -951,7 +971,18 @@ impl Executor {
             validate_cpu_fallback(fallback.as_ref())?;
         }
         prepare_execution(&mut graph)?;
-        if hetero_enabled && !require_cuda && ep.device_type() != DeviceType::Cpu {
+        let needs_host_strings = ep.device_type() == DeviceType::Cuda
+            && (graph
+                .nodes
+                .iter()
+                .any(|(_, node)| super::host_strings::uses_managed_strings(&graph, node))
+                || super::host_strings::producerless_string_outputs(&graph)
+                    .next()
+                    .is_some());
+        if (hetero_enabled || needs_host_strings)
+            && !require_cuda
+            && ep.device_type() != DeviceType::Cpu
+        {
             let cpu = resolve_cpu_fallback(fallback_ep.as_ref())?;
             let providers = vec![
                 crate::hetero::ProviderPlacement {
@@ -1082,6 +1113,7 @@ impl Executor {
             Vec::new()
         };
 
+        let string_initializers = Self::load_string_initializers(&graph, ep.as_ref())?;
         let (mut value_shapes, mut value_dtypes, buffers, buffer_shapes) =
             Self::materialize_initializers(&graph, &weights, ep.as_ref(), &weight_handles)?;
 
@@ -1133,6 +1165,8 @@ impl Executor {
             prefetch_issue_nodes: std::sync::Mutex::new(HashMap::new()),
             prefetch_lookahead_nodes: dense_weight_prefetch_lookahead_nodes(),
             buffers,
+            string_initializers,
+            string_values: HashMap::new(),
             buffer_shapes,
             has_unknown_rank: value_shapes.values().any(Option::is_none),
             value_shapes,
@@ -1550,6 +1584,9 @@ impl Executor {
             let dims = weight.dims().to_vec();
             value_dtypes.insert(vid, dtype);
             value_shapes.insert(vid, Some(dims.iter().map(|&d| Dim::Static(d)).collect()));
+            if dtype == DataType::String {
+                continue;
+            }
             let value = graph.value(vid);
             let prepared_only = !value.is_graph_output
                 && !value.consumers.is_empty()
@@ -1813,6 +1850,7 @@ impl Executor {
             }
             plan.push(NodePlan {
                 node_id: nid,
+                managed_strings: super::host_strings::uses_managed_strings(graph, node),
                 graph_kernel,
                 workspace_planning: super::bindings::workspace_planning_for_node(
                     ep,
@@ -2441,6 +2479,9 @@ impl Executor {
                 continue;
             }
             let dtype = self.value_dtypes[&vid];
+            if dtype == DataType::String {
+                continue;
+            }
             let Some(dims) = resolved.get(&vid) else {
                 continue;
             };

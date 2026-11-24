@@ -1,0 +1,11 @@
+# ONNX 622adf94d4e720142950aa8178f7357d52e63db0, onnx/defs/text/defs.cc
+name: RegexFullMatch
+since_version: 20
+doc: Test whether each UTF-8 string fully matches a RE2 pattern.
+inputs: [{ name: X, type_str: T1 }]
+outputs: [{ name: Y, type_str: T2 }]
+attributes:
+  - { name: pattern, type: string }
+type_constraints:
+  - { type_param: T1, allowed: [string] }
+  - { type_param: T2, allowed: [bool] }

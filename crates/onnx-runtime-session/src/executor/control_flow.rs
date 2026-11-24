@@ -560,6 +560,11 @@ impl Executor {
         resolved: &mut HashMap<ValueId, Vec<usize>>,
         external: &ExternalBindings,
     ) -> Result<()> {
+        if tensor.dtype == DataType::String {
+            return Err(SessionError::Internal(
+                "control-flow outputs do not support tensor(string); move text operators outside the control-flow node".into(),
+            ));
+        }
         self.store_output_bytes(
             vid,
             tensor.dtype,
@@ -698,6 +703,12 @@ impl Executor {
         external: &ExternalBindings,
     ) -> Result<()> {
         let node = self.graph.node(self.plan[pi].node_id).clone();
+        if self.plan[pi].managed_strings {
+            return Err(SessionError::Internal(format!(
+                "{} does not support tensor(string) inputs or outputs; move text operators outside the control-flow node",
+                node.op_type
+            )));
+        }
         match node.op_type.as_str() {
             "If" => self.exec_if(&node, resolved, outer_scope, external),
             "Loop" => self.exec_loop(&node, resolved, outer_scope, external),

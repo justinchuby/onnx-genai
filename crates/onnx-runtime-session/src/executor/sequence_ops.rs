@@ -290,6 +290,15 @@ impl Executor {
             return Ok(elem.clone()); // zero-copy Arc share
         }
         let dtype = self.value_dtypes[&vid];
+        if dtype == DataType::String {
+            return Err(SessionError::SequenceOp {
+                op: "Sequence".into(),
+                reason: format!(
+                    "input value#{} is tensor(string); sequence storage only supports fixed-width tensor elements",
+                    vid.0
+                ),
+            });
+        }
         let shape = resolved
             .get(&vid)
             .cloned()

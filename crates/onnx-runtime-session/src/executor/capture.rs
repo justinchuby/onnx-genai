@@ -71,6 +71,8 @@ impl CapturePathKind {
 /// Structural reason a node forms an eager seam during device-graph capture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeamReason {
+    /// Managed STRING has no device representation.
+    HostManagedStrings,
     /// Host-driven control-flow or sequence semantics.
     HostControlFlowOrSequence,
     /// A data-dependent output shape was unresolved before capture.
@@ -101,7 +103,7 @@ impl SeamReason {
     /// Execution path implied by this structural seam cause.
     pub const fn path_kind(self) -> CapturePathKind {
         match self {
-            Self::HostControlFlowOrSequence => CapturePathKind::HostSeam,
+            Self::HostControlFlowOrSequence | Self::HostManagedStrings => CapturePathKind::HostSeam,
             Self::UnresolvedOutputShape
             | Self::UnresolvedInputShape
             | Self::KernelNotWarmed
@@ -640,6 +642,14 @@ impl Executor {
         resolved: &HashMap<ValueId, Vec<usize>>,
     ) -> Option<CaptureDecline> {
         let node = self.graph.node(plan.node_id);
+        if plan.managed_strings {
+            return Some(CaptureDecline::node(
+                plan.node_id,
+                node,
+                SeamReason::HostManagedStrings,
+                "managed tensor(string) values have no device representation",
+            ));
+        }
         // A kernel that aborted device-graph recording on a prior capture pass is
         // quarantined by op-type: force it (and every sibling of the same op-type)
         // to an eager seam so warm-decode shape seeding can still fold the rest of

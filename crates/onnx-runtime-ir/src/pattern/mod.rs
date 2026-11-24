@@ -3,6 +3,9 @@
 //! [`Pattern::parse_ort`] and [`PatternLibrary::parse_ort`] accept the documented
 //! subset of ORT's pattern dialect, **not** ONNX model/function text. See
 //! `docs/architecture/IR_PATTERNS.md` for the interoperability contract.
+//! Prefer compile-once text for fixed declarative graph patterns and
+//! [`Pattern::builder`] for generated/composed patterns. Both use the same
+//! compiler, capture semantics and match executor.
 //!
 //! ```
 //! use onnx_runtime_ir::{Graph, Node, NodeId, DataType};
@@ -30,7 +33,7 @@ pub use builder::{
     PatternSequence, PatternValue,
 };
 pub use execute::{
-    AttributeCapture, BindingView, BoundaryPolicy, DimensionValue, Match, MatchBudget,
+    AttributeCapture, BindingView, BoundaryPolicy, DimensionValue, EscapingUse, Match, MatchBudget,
     MatchBudgetScope, MatchOptions, MatchSession, ScopedValue, ValueCapture,
 };
 
@@ -97,13 +100,17 @@ pub struct Pattern {
 }
 
 impl Pattern {
-    /// Author a pattern with typed Rust handles and the same compiler as text.
+    /// Author a generated/composed pattern with typed handles and the text compiler.
+    /// Prefer compile-once [`Self::parse_ort`] / [`Self::parse_native`] for fixed
+    /// declarative graphs; builder handles avoid string generation for dynamic ones.
     pub fn builder() -> PatternBuilder {
         PatternBuilder::new()
     }
 
     /// Parse an anonymous ORT pattern `(inputs) => { ... return outputs }`.
     /// Unsupported syntax is rejected, never interpreted as an ONNX model.
+    /// Prefer this for fixed patterns within the portable subset. Cache the
+    /// result (for example with `LazyLock`) instead of parsing per match.
     pub fn parse_ort(source: &str) -> Result<Self> {
         let definition = syntax::parse_inline(source, false)?;
         compile::inline(definition)

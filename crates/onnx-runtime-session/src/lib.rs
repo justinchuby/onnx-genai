@@ -212,10 +212,10 @@ mod error {
         HeterogeneousPlacementRequired { unsupported_nodes: String },
 
         #[error(
-            "the opt-in heterogeneous executor cannot run this graph or API safely: \
+            "the heterogeneous executor cannot run this graph or API safely: \
              {placement_summary}. The first #603 execution slice supports fully-static, \
              tensor-only acyclic graphs through ordinary run/run_outputs; unset \
-             ONNX_GENAI_HETERO for legacy whole-session CPU fallback"
+             ONNX_GENAI_HETERO if you opted into mixed numeric placement"
         )]
         HeterogeneousExecutionUnsupported { placement_summary: String },
 
@@ -2007,7 +2007,7 @@ impl InferenceSession {
     }
 
     /// Per-provider node counts and cross-provider transfer count for an
-    /// opt-in heterogeneous session. `None` for the unchanged single-EP path.
+    /// heterogeneous session. `None` for the single-EP path.
     pub fn heterogeneous_placement_report(&self) -> Option<&str> {
         self.exec.heterogeneous_placement_report()
     }

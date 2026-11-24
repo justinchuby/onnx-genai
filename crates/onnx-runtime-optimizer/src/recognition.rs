@@ -11,42 +11,30 @@ use crate::{OptimizerError, Result};
 
 /// Exact shared-input SiLU decomposition, in either multiplication order.
 pub static SILU_DECOMPOSITION: LazyLock<RecognitionRule> = LazyLock::new(|| {
-    let mut p = Pattern::builder();
-    let x = p.input("x");
-    let sigmoid = p.op("Sigmoid", [x]);
-    let out = p
-        .node("Mul", [x, sigmoid])
-        .or_node("Mul", [sigmoid, x])
-        .output();
-    p.capture("sigmoid", sigmoid);
-    p.capture("out", out);
-    let pattern = p
-        .finish(out)
-        .expect("built-in SiLU pattern must compile; fix its Rust definition");
-    RecognitionRule::from_pattern("SiLU decomposition", pattern, "sigmoid")
-        .expect("built-in SiLU anchor must identify the sigmoid output")
+    RecognitionRule::parse(
+        "SiLU decomposition",
+        "(x) => {
+            sigmoid = Sigmoid(x)
+            out = Mul(x, sigmoid) | Mul(sigmoid, x)
+            return out
+        }",
+        "sigmoid",
+    )
+    .expect("built-in SiLU pattern must compile; fix its textual definition")
 });
 
 /// Quantized projection plus a separate bias; eligibility remains EP-owned.
 pub static MATMUL_NBITS_BIAS: LazyLock<RecognitionRule> = LazyLock::new(|| {
-    let mut p = Pattern::builder();
-    let args = p.slot_sequence("args", 0, None);
-    let bias = p.input("bias");
-    let projection = p
-        .node("MatMulNBits", [args])
-        .domain("com.microsoft")
-        .output();
-    let out = p
-        .node("Add", [projection, bias])
-        .or_node("Add", [bias, projection])
-        .output();
-    p.capture("projection", projection);
-    p.capture("out", out);
-    let pattern = p
-        .finish(out)
-        .expect("built-in MatMulNBits bias pattern must compile; fix its Rust definition");
-    RecognitionRule::from_pattern("MatMulNBits bias", pattern, "out")
-        .expect("built-in MatMulNBits bias anchor must identify the Add output")
+    RecognitionRule::parse(
+        "MatMulNBits bias",
+        "(args:slots[0:*], bias) => {
+            projection = com.microsoft.MatMulNBits(...args)
+            out = Add(projection, bias) | Add(bias, projection)
+            return out
+        }",
+        "out",
+    )
+    .expect("built-in MatMulNBits bias pattern must compile; fix its textual definition")
 });
 
 pub fn capture_value(
@@ -73,6 +61,8 @@ pub fn capture_node(matched: &Match<'_>, name: &str) -> std::result::Result<Node
 ///
 /// The anchor need not be the pattern's last operator. This preserves a
 /// provider's existing rewrite order while the IR engine recognizes the DAG.
+/// Prefer readable text in a `LazyLock` for fixed built-ins; use
+/// [`Self::from_pattern`] for generated/composed typed definitions.
 #[derive(Clone, Debug)]
 pub struct RecognitionRule {
     name: String,
@@ -81,11 +71,14 @@ pub struct RecognitionRule {
 }
 
 impl RecognitionRule {
+    /// Compile fixed declarative native text and resolve its traversal anchor.
+    /// Cache built-ins once rather than parsing during graph traversal.
     pub fn parse(name: &str, text: &str, anchor: &str) -> Result<Self> {
         let pattern = Pattern::parse_native(text)?;
         Self::from_pattern(name, pattern, anchor)
     }
 
+    /// Wrap an already compiled pattern, including a generated typed definition.
     pub fn from_pattern(name: &str, pattern: Pattern, anchor: &str) -> Result<Self> {
         let anchor = pattern.value_capture(anchor)?;
         Ok(Self {
@@ -97,6 +90,16 @@ impl RecognitionRule {
 
     pub fn is_anchor_candidate(&self, node: &onnx_runtime_ir::Node) -> bool {
         self.anchor.is_producer_candidate(node)
+    }
+
+    /// Match a component structurally; the caller checks the assembled rewrite
+    /// boundary once all components and retained outputs are known.
+    pub(crate) fn match_component_at<'g>(
+        &self,
+        session: &MatchSession<'g>,
+        root: NodeId,
+    ) -> std::result::Result<Option<Match<'g>>, PatternError> {
+        session.match_at(&self.pattern, root, MatchOptions::default())
     }
 
     /// Visit deterministic closed-region matches using a prepared graph index.

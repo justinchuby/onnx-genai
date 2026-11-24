@@ -23,15 +23,21 @@ pub struct SeqTensor {
 
 impl SeqTensor {
     /// Wrap an existing session tensor in an immutable shared handle.
-    pub fn new(tensor: Tensor) -> Self {
+    pub fn new(tensor: Tensor) -> SequenceResult<Self> {
+        if tensor.dtype == DataType::String {
+            return Err(SequenceError::UnsupportedDtype {
+                op: "SequenceTensor",
+                dtype: tensor.dtype,
+            });
+        }
         let (storage, dtype, shape, layout) = tensor.into_shared_parts();
-        Self {
+        Ok(Self {
             storage,
             dtype,
             shape,
             layout,
             byte_offset: 0,
-        }
+        })
     }
 
     /// Build a host tensor from raw element bytes and share it as a sequence item.
