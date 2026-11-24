@@ -229,6 +229,41 @@ child execution remains scoped execution through the parent's live workspace.
 This bridge adds no allocator, pool, quota ledger, or warm inference callback.
 GQA below now consumes this ownership bridge for its complete borrowed composite.
 
+### CUDA standard Attention temporary storage
+
+Default-domain Attention now requires one caller-owned SessionPersistent composite
+for scores, device length, per-batch external-cache controls, optional aliased KV
+staging, hidden present K/V and selected split-KV partials. A single checked
+`WorkspaceLayout` defines all nine regions. No private workspace slots, raw
+allocation/free fallback or separate per-region grant remains. Retaining the
+lane peak also avoids repeated admission on deferred device-binding calls.
+
+Canonical output metadata preserves positional holes, dtype and known physical
+capacity. Unresolved present outputs conservatively fund possible dense aliasing;
+a mask matching the past extent cannot prove a future output is frozen. When
+one present capacity is known, it bounds the unresolved peer. The current device
+kernel has one KV sequence stride, so incompatible known capacities fail clearly.
+
+Without `nonpad_kv_seqlen`, both attention kernels receive the uniform offset as
+a signed scalar argument and use padding limit -1. Device-derived length takes
+precedence. This removes host control vectors and uploads on these routes, adds
+no initialization launch, and prevents replay from relying on warmup bytes that
+another node sharing the lane may overwrite. External per-batch lengths retain
+their existing validation/upload path and are refused during capture.
+
+Capture requires the complete used span to be covered by a registered real
+caller-owner pin. Warm signatures include borrowed base, used size, selected
+split and control geometry; a changed signature requires eager warmup. Readiness
+is invalidated before any validation or submission and republished only after
+success. The kernel retains no scratch owner; graph retirement, growth refusal,
+provider deferred settlement and quarantine remain the ownership authority.
+
+Host contracts cover bounds, output facts, signature changes and overflow. The
+GPU regression shares one provider-backed workspace between two Attention nodes,
+checks missing-pin refusal and overwrites all warmup contents before replay.
+Compilation of that regression does not establish CUDA numerical, NVRTC, replay,
+asynchronous-release or throughput correctness; these still require a device.
+
 ### CUDA MHA and shared Phase-2a temporary storage
 
 MultiHeadAttention borrows one SessionPersistent composite for query/output BNSH
@@ -492,7 +527,7 @@ when in fact it is 1955 lines.
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
 The dated audit and measurements below preserve historical evidence. The current
-GQA, quantized MatMul prefill/BF16 staging, and variadic Sum/Mean contracts above
+GQA, standard Attention, quantized MatMul prefill/BF16 staging, and variadic Sum/Mean contracts above
 supersede their old private-scratch and fallback descriptions. GQA now requires
 prepared backing for sequence metadata as well as its other temporary regions;
 MatMul dynamic BF16 staging, portable half-prefill and generic f32 dequantization

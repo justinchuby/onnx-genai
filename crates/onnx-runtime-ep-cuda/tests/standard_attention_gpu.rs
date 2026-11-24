@@ -14,6 +14,8 @@
 )]
 //! CUDA conformance tests for router/mask indexing and scan operators.
 
+mod common;
+
 use half::f16;
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, EpError, ExecutionProvider, KernelMatch, Result,
@@ -529,7 +531,17 @@ fn run_result_core_inner(
         })
         .collect::<Vec<_>>();
     let allocations_before = ep.runtime().allocation_counts();
-    if let Err(error) = kernel.execute(&input_views, &mut output_views) {
+    let mut workspace = None;
+    if let Err(error) = common::execute_kernel(
+        &ep,
+        kernel.as_ref(),
+        &input_views,
+        &mut output_views,
+        &mut workspace,
+    ) {
+        if let Some(workspace) = workspace.take() {
+            ep.deallocate_workspace(workspace)?;
+        }
         for buffer in input_buffers.into_iter().flatten() {
             ep.deallocate(buffer)?;
         }
@@ -553,14 +565,26 @@ fn run_result_core_inner(
     if let Some(label) = timing_label {
         let warm = std::time::Instant::now();
         while warm.elapsed().as_secs_f32() < 3.0 {
-            kernel.execute(&input_views, &mut output_views)?;
+            common::execute_kernel(
+                &ep,
+                kernel.as_ref(),
+                &input_views,
+                &mut output_views,
+                &mut workspace,
+            )?;
         }
         let mut per_call_us = Vec::new();
         for _ in 0..5 {
             ep.runtime().synchronize()?;
             let start = std::time::Instant::now();
             for _ in 0..30 {
-                kernel.execute(&input_views, &mut output_views)?;
+                common::execute_kernel(
+                    &ep,
+                    kernel.as_ref(),
+                    &input_views,
+                    &mut output_views,
+                    &mut workspace,
+                )?;
             }
             ep.runtime().synchronize()?;
             per_call_us.push(start.elapsed().as_secs_f64() * 1e6 / 30.0);
@@ -580,6 +604,12 @@ fn run_result_core_inner(
             Ok(bytes)
         })
         .collect::<Result<Vec<_>>>()?;
+    ep.runtime().stream().synchronize().map_err(|cause| {
+        EpError::KernelFailed(format!("complete standard attention GPU fixture: {cause}"))
+    })?;
+    if let Some(workspace) = workspace {
+        ep.deallocate_workspace(workspace)?;
+    }
     let device_error = ep.runtime().check_capture_error()?;
     for buffer in input_buffers.into_iter().flatten() {
         ep.deallocate(buffer)?;

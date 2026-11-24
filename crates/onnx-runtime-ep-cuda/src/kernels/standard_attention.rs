@@ -79,15 +79,16 @@ use std::sync::{Arc, Mutex};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
+use onnx_runtime_ep_api::WorkspaceLayout;
 use onnx_runtime_ep_api::{
-    DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut,
-    TensorView, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
     attention_window::{AttentionWindow, validate_attention_head_attributes},
 };
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::driver_err;
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
+use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
 /// Threads per block for `attention_row` (one block services one score row).
@@ -253,13 +254,21 @@ fn attention_split_geometry(
 /// Floats of split-KV partial scratch for `num_splits` splits over `total_rows`
 /// decode rows: 2 metadata floats (running max + sum) plus `v_head_size`
 /// unnormalized P·V floats per (row, split) partial.
-fn attention_split_scratch_floats(num_splits: u64, total_rows: u64, v_head_size: u64) -> usize {
-    num_splits
-        .saturating_mul(total_rows)
-        .saturating_mul(v_head_size + 2)
-        .min(usize::MAX as u64) as usize
+fn attention_split_scratch_bytes(
+    num_splits: u64,
+    total_rows: u64,
+    v_head_size: u64,
+) -> Result<usize> {
+    let bytes = v_head_size.checked_add(2)
+        .and_then(|columns| columns.checked_mul(total_rows))
+        .and_then(|elements| elements.checked_mul(num_splits))
+        .and_then(|elements| elements.checked_mul(4))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .filter(|bytes| *bytes <= isize::MAX as usize)
+        .ok_or_else(|| EpError::KernelFailed("Attention: split-KV workspace exceeds addressable capacity; reduce the decode geometry".into()))?;
+    Ok(bytes)
 }
-const ATTENTION_MODULE: &str = "standard_attention_f32_f16_bf16_v3";
+const ATTENTION_MODULE: &str = "standard_attention_f32_f16_bf16_v4";
 const ATTENTION_SOURCE: &str = r#"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -451,7 +460,7 @@ __device__ __forceinline__ float mask_bias(
 extern "C" __global__ void attention_row(
     const void* q, const void* key, const void* value,
     const void* mask, float* scores, void* y, void* qk_out,
-    const long long* offsets, const long long* pad_limits,
+    const long long* offsets, const long long* pad_limits, long long default_offset,
     unsigned long long batch, unsigned long long q_heads, unsigned long long q_seq,
     unsigned long long kv_heads, unsigned long long total_seq_arg,
     unsigned long long cap,
@@ -491,8 +500,8 @@ extern "C" __global__ void attention_row(
       : ((b * q_heads + qh) * q_seq + i) * head_size;
 
   const long long offset =
-      (dev_len != nullptr) ? (long long)total_seq - (long long)q_seq : offsets[b];
-  const long long pad_limit = pad_limits[b];
+      (dev_len != nullptr) ? (long long)total_seq - (long long)q_seq : (offsets != nullptr ? offsets[b] : default_offset);
+  const long long pad_limit = pad_limits != nullptr ? pad_limits[b] : -1LL;
   const long long position = (long long)i + offset;
   unsigned long long begin = 0, end = total_seq;
   if (window_left >= 0 || window_right >= 0) {
@@ -644,7 +653,7 @@ extern "C" __global__ void attention_row(
 extern "C" __global__ void attention_split(
     const void* q, const void* key, const void* value,
     const void* mask, float* scores, float* split_out, float* split_meta,
-    const long long* offsets, const long long* pad_limits,
+    const long long* offsets, const long long* pad_limits, long long default_offset,
     unsigned long long batch, unsigned long long q_heads, unsigned long long q_seq,
     unsigned long long kv_heads, unsigned long long total_seq_arg,
     unsigned long long cap,
@@ -701,8 +710,8 @@ extern "C" __global__ void attention_split(
   // derived on-device (`total_seq - q_seq`) instead of the host `offsets[b]`,
   // which reports padded capacity under a frozen fixed-capacity binding.
   const long long offset =
-      (dev_len != nullptr) ? (long long)total_seq - (long long)q_seq : offsets[b];
-  const long long pad_limit = pad_limits[b];
+      (dev_len != nullptr) ? (long long)total_seq - (long long)q_seq : (offsets != nullptr ? offsets[b] : default_offset);
+  const long long pad_limit = pad_limits != nullptr ? pad_limits[b] : -1LL;
   const long long causal_limit = (long long)i + offset;
   const bool single = (total_seq <= chunk);
 
@@ -1014,18 +1023,14 @@ pub struct StandardAttentionKernel {
     qk_matmul_output_mode: i64,
     /// Softcap value; `0.0` disables it.
     softcap: f32,
-    /// Static node output arity. Present-key/value staging is reachable only
-    /// when output slots 1/2 exist, so prepare-only planning must not charge
-    /// their bytes for one-output attention nodes.
-    output_count: usize,
+    /// Compiled positional output presence; omitted outputs need temporary KV
+    /// backing and must not be confused with unresolved output shapes.
+    output_slots: [bool; 4],
     /// The registered schema revision this kernel serves (23, 24 or 25).
     /// Controls `nonpad_kv_seqlen` acceptance (opset 24+ only).
     since_version: u32,
-    /// Persistent device scratch for capture-eligible single-token decode paths
-    /// so the captured hot path performs no per-op allocation. Reserved lazily
-    /// during the eager warmup step and reused (never grown) during CUDA-graph
-    /// capture/replay.
-    warm_state: Mutex<StdAttnWarmState>,
+    /// Only capture readiness is retained; scratch belongs to the caller lane.
+    warm_state: Mutex<Option<StdAttnCaptureSignature>>,
 }
 
 /// Decode signature warmed as capture-safe. A subsequent capture pass reuses
@@ -1042,65 +1047,35 @@ struct StdAttnCaptureSignature {
     key_cap: usize,
     head_size: usize,
     v_head_size: usize,
+    workspace_base: usize,
+    workspace_bytes: usize,
+    split: Option<(u64, u64)>,
+    default_offset: i64,
 }
-
-#[derive(Clone)]
-struct StdAttnCaptureReady {
-    signature: StdAttnCaptureSignature,
-    resources: Vec<DeviceGraphResource>,
-}
-
-struct StdAttnWarmState {
-    workspace: StdAttnWorkspace,
-    capture_ready: Option<Arc<StdAttnCaptureReady>>,
-}
-
-const WS_SCORES: usize = 0;
-const WS_DEV_LEN: usize = 1;
-const WS_OFFSETS: usize = 2;
-const WS_PAD_LIMITS: usize = 3;
-const WS_STAGE_KEY: usize = 4;
-const WS_STAGE_VALUE: usize = 5;
-const WS_PRESENT_KEY: usize = 6;
-const WS_PRESENT_VALUE: usize = 7;
-const WS_SPLIT: usize = 8;
-const WS_COUNT: usize = 9;
 
 /// Alignment of the governed default-domain `Attention` score buffer (#736),
 /// matching the executor's 256-byte device-allocation granularity.
 const STD_SCORES_ALIGN: usize = 256;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct StdAttentionWorkspaceLayout {
-    scores_offset: usize,
-    scores_bytes: usize,
-    stage_key_offset: Option<usize>,
-    stage_key_bytes: usize,
-    stage_value_offset: Option<usize>,
-    stage_value_bytes: usize,
-    /// Present-K scratch served from the governed workspace when the present-key
-    /// output slot is unbound (the kernel still needs it as the attention K
-    /// source). `None` when a bound output slot supplies the storage.
-    present_key_offset: Option<usize>,
-    present_key_bytes: usize,
-    present_value_offset: Option<usize>,
-    present_value_bytes: usize,
-    /// Per-batch control arrays (`offsets`, `pad_limits`). Always served from the
-    /// governed workspace so the served-path dispatch performs no per-call device
-    /// allocation for them (requirement 3: allocation-free captured region).
-    offsets_offset: usize,
-    offsets_bytes: usize,
-    pad_limits_offset: usize,
-    pad_limits_bytes: usize,
-    total_bytes: usize,
-}
-
-fn std_attention_align_up(value: usize) -> Result<usize> {
-    value
-        .checked_add(STD_SCORES_ALIGN - 1)
-        .map(|value| value / STD_SCORES_ALIGN * STD_SCORES_ALIGN)
-        .ok_or_else(|| EpError::KernelFailed("Attention: workspace alignment overflow".into()))
-}
+#[cfg(test)]
+const SCORES: usize = 0;
+#[cfg(test)]
+const DEVICE_LENGTH: usize = 1;
+#[cfg(test)]
+const OFFSETS: usize = 2;
+#[cfg(test)]
+const PAD_LIMITS: usize = 3;
+#[cfg(test)]
+const STAGED_KEY: usize = 4;
+#[cfg(test)]
+const STAGED_VALUE: usize = 5;
+#[cfg(test)]
+const PRESENT_KEY: usize = 6;
+#[cfg(test)]
+const PRESENT_VALUE: usize = 7;
+#[cfg(test)]
+const SPLIT_PARTIALS: usize = 8;
+type StdAttentionWorkspaceLayout = WorkspaceLayout<9>;
 
 /// Byte size of the governed default-domain `Attention` f32 score matrix for one
 /// concrete geometry: `batch·q_heads·q_seq·total_seq` fp32 scores. Prepare-only
@@ -1125,6 +1100,16 @@ fn std_attention_scores_bytes(
         .max(1)
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or_else(|| EpError::KernelFailed("Attention: score scratch byte count overflow".into()))
+}
+
+fn std_attention_elements(factors: &[usize], region: &str) -> Result<usize> {
+    factors.iter().try_fold(1usize, |product, factor| {
+        product.checked_mul(*factor).ok_or_else(|| {
+            EpError::KernelFailed(format!(
+                "Attention: {region} element count overflows for {factors:?}; reduce the shape"
+            ))
+        })
+    })
 }
 
 fn std_attention_stage_bytes(elements: usize, element_bytes: usize) -> Result<usize> {
@@ -1155,192 +1140,40 @@ fn std_attention_workspace_layout(
     present_key_scratch: bool,
     present_value_scratch: bool,
     control_batch: usize,
+    device_length: bool,
+    split_bytes: usize,
 ) -> Result<StdAttentionWorkspaceLayout> {
-    let scores_bytes = std_attention_scores_bytes(batch, q_heads, q_seq, total_seq)?;
-    let mut total_bytes = scores_bytes;
-
-    let key_elements = batch
-        .checked_mul(kv_heads)
-        .and_then(|value| value.checked_mul(key_seq))
-        .and_then(|value| value.checked_mul(head_size))
-        .ok_or_else(|| EpError::KernelFailed("Attention: staged key size overflow".into()))?;
-    let stage_key_bytes = if stage_key {
-        std_attention_stage_bytes(key_elements, element_bytes)?
-    } else {
-        0
-    };
-    let stage_key_offset = if stage_key {
-        total_bytes = std_attention_align_up(total_bytes)?;
-        let offset = total_bytes;
-        total_bytes = total_bytes.checked_add(stage_key_bytes).ok_or_else(|| {
-            EpError::KernelFailed("Attention: staged key workspace overflow".into())
-        })?;
-        Some(offset)
-    } else {
-        None
-    };
-
-    let value_elements = batch
-        .checked_mul(kv_heads)
-        .and_then(|value| value.checked_mul(value_seq))
-        .and_then(|value| value.checked_mul(value_head_size))
-        .ok_or_else(|| EpError::KernelFailed("Attention: staged value size overflow".into()))?;
-    let stage_value_bytes = if stage_value {
-        std_attention_stage_bytes(value_elements, element_bytes)?
-    } else {
-        0
-    };
-    let stage_value_offset = if stage_value {
-        total_bytes = std_attention_align_up(total_bytes)?;
-        let offset = total_bytes;
-        total_bytes = total_bytes.checked_add(stage_value_bytes).ok_or_else(|| {
-            EpError::KernelFailed("Attention: staged value workspace overflow".into())
-        })?;
-        Some(offset)
-    } else {
-        None
-    };
-
-    // Present-K/V scratch: identical byte formula as the staged K/V regions
-    // (`batch·kv_heads·seq·head_size·element_bytes`), served when the present
-    // output slot is unbound so `run` never `alloc_raw`s it per dispatch.
-    let present_key_bytes = if present_key_scratch {
-        std_attention_stage_bytes(key_elements, element_bytes)?
-    } else {
-        0
-    };
-    let present_key_offset = if present_key_scratch {
-        total_bytes = std_attention_align_up(total_bytes)?;
-        let offset = total_bytes;
-        total_bytes = total_bytes.checked_add(present_key_bytes).ok_or_else(|| {
-            EpError::KernelFailed("Attention: present-key scratch workspace overflow".into())
-        })?;
-        Some(offset)
-    } else {
-        None
-    };
-
-    let present_value_bytes = if present_value_scratch {
-        std_attention_stage_bytes(value_elements, element_bytes)?
-    } else {
-        0
-    };
-    let present_value_offset = if present_value_scratch {
-        total_bytes = std_attention_align_up(total_bytes)?;
-        let offset = total_bytes;
-        total_bytes = total_bytes
-            .checked_add(present_value_bytes)
-            .ok_or_else(|| {
-                EpError::KernelFailed("Attention: present-value scratch workspace overflow".into())
-            })?;
-        Some(offset)
-    } else {
-        None
-    };
-
-    // Per-batch control arrays: `offsets` and `pad_limits`, one i64 per batch
-    // row each. Always governed so the served path uploads them into fixed
-    // workspace slots instead of allocating fresh device buffers per dispatch.
-    let control_elems = control_batch.max(1);
-    let control_bytes = control_elems
-        .checked_mul(std::mem::size_of::<i64>())
-        .ok_or_else(|| {
-            EpError::KernelFailed("Attention: control-array byte count overflow".into())
-        })?;
-    total_bytes = std_attention_align_up(total_bytes)?;
-    let offsets_offset = total_bytes;
-    total_bytes = total_bytes
-        .checked_add(control_bytes)
-        .ok_or_else(|| EpError::KernelFailed("Attention: offsets workspace overflow".into()))?;
-    total_bytes = std_attention_align_up(total_bytes)?;
-    let pad_limits_offset = total_bytes;
-    total_bytes = total_bytes
-        .checked_add(control_bytes)
-        .ok_or_else(|| EpError::KernelFailed("Attention: pad-limits workspace overflow".into()))?;
-
-    Ok(StdAttentionWorkspaceLayout {
-        scores_offset: 0,
-        scores_bytes,
-        stage_key_offset,
-        stage_key_bytes,
-        stage_value_offset,
-        stage_value_bytes,
-        present_key_offset,
-        present_key_bytes,
-        present_value_offset,
-        present_value_bytes,
-        offsets_offset,
-        offsets_bytes: control_bytes,
-        pad_limits_offset,
-        pad_limits_bytes: control_bytes,
-        total_bytes,
-    })
-}
-
-fn std_attention_carve(
-    workspace: WorkspaceView,
-    offset: usize,
-    bytes: usize,
-    region: &str,
-) -> Result<CUdeviceptr> {
-    let end = offset.checked_add(bytes).ok_or_else(|| {
-        EpError::KernelFailed(format!(
-            "Attention: prepared {region} workspace offset overflow"
-        ))
+    let scores = std_attention_scores_bytes(batch, q_heads, q_seq, total_seq)?;
+    let key = std_attention_elements(&[batch, kv_heads, key_seq, head_size], "key workspace")?;
+    let value = std_attention_elements(
+        &[batch, kv_heads, value_seq, value_head_size],
+        "value workspace",
+    )?;
+    let key_bytes = std_attention_stage_bytes(key, element_bytes)?;
+    let value_bytes = std_attention_stage_bytes(value, element_bytes)?;
+    let controls = control_batch.max(1).checked_mul(8).ok_or_else(|| {
+        EpError::KernelFailed("Attention: control workspace size overflow; reduce the batch".into())
     })?;
-    if end > workspace.bytes() {
-        return Err(EpError::KernelFailed(format!(
-            "Attention: prepared workspace {} bytes is smaller than the {end} bytes required for \
-             {region}",
-            workspace.bytes()
-        )));
+    let sizes = [
+        scores,
+        if device_length { 4 } else { 0 },
+        controls,
+        controls,
+        if stage_key { key_bytes } else { 0 },
+        if stage_value { value_bytes } else { 0 },
+        if present_key_scratch { key_bytes } else { 0 },
+        if present_value_scratch {
+            value_bytes
+        } else {
+            0
+        },
+        split_bytes,
+    ];
+    let mut regions = [std::alloc::Layout::new::<()>(); 9];
+    for (index, bytes) in sizes.into_iter().enumerate() {
+        regions[index] = std::alloc::Layout::from_size_align(bytes, STD_SCORES_ALIGN).map_err(|_| EpError::KernelFailed(format!("Attention: workspace region {index} exceeds addressable capacity ({bytes} bytes); reduce the geometry")))?;
     }
-    let base = cuptr(workspace.ptr().0.cast_const());
-    Ok(base + offset as u64)
-}
-
-/// Static route signal for staged dense KV growth. On the session's
-/// mask-driven fixed-capacity decode contract, the mask key width and past-cache
-/// sequence extent are the same physical capacity, so execution takes the
-/// fixed-stride append path (`stage_key/value == false`) in both the causal and
-/// non-causal form. Other in-op-cache routes may grow a dense aliased cache and
-/// reserve only the present outputs that actually exist. Actual pointer aliasing
-/// is checked by `run`; a non-aliased dispatch can safely consume less than this
-/// conservative dense-route reservation.
-fn std_attention_staging_route(
-    inputs: &[TensorMetadata<'_>],
-    mask_can_supply_length: bool,
-    output_count: usize,
-) -> (bool, bool) {
-    let has_past_key = inputs.get(4).is_some_and(|input| input.present);
-    let has_past_value = inputs.get(5).is_some_and(|input| input.present);
-    if !has_past_key || !has_past_value {
-        return (false, false);
-    }
-    let past_key_capacity = inputs
-        .get(4)
-        .and_then(|past| past.shape.len().checked_sub(2).map(|axis| past.shape[axis]));
-    let past_value_capacity = inputs
-        .get(5)
-        .and_then(|past| past.shape.len().checked_sub(2).map(|axis| past.shape[axis]));
-    let mask_key_capacity = inputs
-        .get(3)
-        .filter(|mask| mask.present)
-        .and_then(|mask| mask.shape.last().copied());
-    // Fixed-capacity append when the past caches and the mask all share one
-    // physical key width (the frozen decode contract). The `is_causal` attribute
-    // is irrelevant: for a growing eager cache the past extent (valid length) and
-    // the mask width (valid length + current) differ, so this stays false there
-    // regardless of causality; it only holds once the KV+mask are frozen to a
-    // common capacity, where execution appends in place without staging.
-    let fixed_capacity_append = mask_can_supply_length
-        && past_key_capacity.is_some()
-        && past_key_capacity == past_value_capacity
-        && past_key_capacity == mask_key_capacity;
-    if fixed_capacity_append {
-        return (false, false);
-    }
-    (output_count >= 2, output_count >= 3)
+    WorkspaceLayout::new(regions)
 }
 
 /// Report the exact governed composite scratch a default-domain `Attention`
@@ -1353,16 +1186,16 @@ fn std_attention_staging_route(
 /// unresolvable or non-float input metadata returns NONE, letting `run` raise the
 /// precise error.
 ///
-/// The composite lifetime is route-dependent, so this models both classes
-/// truthfully: single-token decode (`batch==1 && q_seq==1`) can take the
-/// capture-eligible retained route, charged `SessionPersistent`; multi-token
-/// prefill and batched dispatch take the per-call route, charged `StepScoped`.
+/// One SessionPersistent lane retains the peak across fitting calls, including
+/// deferred execution. Regions are disjoint byte ranges, not separate grants.
 fn std_attention_workspace_requirement(
     inputs: &[TensorMetadata<'_>],
     q_num_heads: Option<usize>,
     kv_num_heads: Option<usize>,
     mask_can_supply_length: bool,
-    output_count: usize,
+    is_causal: bool,
+    output_slots: [bool; 4],
+    outputs: &[OutputMetadata<'_>],
 ) -> Result<WorkspaceRequirement> {
     let (Some(q), Some(k), Some(v)) = (inputs.first(), inputs.get(1), inputs.get(2)) else {
         return Ok(WorkspaceRequirement::NONE);
@@ -1370,7 +1203,10 @@ fn std_attention_workspace_requirement(
     if !matches!(
         q.dtype,
         DataType::Float32 | DataType::Float16 | DataType::BFloat16
-    ) || k.dtype != q.dtype
+    ) || !q.present
+        || !k.present
+        || !v.present
+        || k.dtype != q.dtype
         || v.dtype != q.dtype
     {
         return Ok(WorkspaceRequirement::NONE);
@@ -1425,22 +1261,85 @@ fn std_attention_workspace_requirement(
     if total_seq != value_total_seq {
         return Ok(WorkspaceRequirement::NONE);
     }
-    let (stage_key, stage_value) =
-        std_attention_staging_route(inputs, mask_can_supply_length, output_count);
-    // Present-K/V scratch is served whenever the corresponding present output
-    // slot is unbound — `run` derives this from `present_*_out.is_none()`, which
-    // is exactly `output_count < 2` / `< 3`, so plan and execution agree.
-    let present_key_scratch = output_count < 2;
-    let present_value_scratch = output_count < 3;
+    validate_std_attention_outputs(output_slots, outputs, q.dtype)?;
+    let output_capacity = |index: usize| match outputs.get(index) {
+        Some(OutputMetadata::Tensor { shape, .. }) if shape.len() == 4 => Some(shape[2]),
+        _ => None,
+    };
+    let key_capacity = output_capacity(1);
+    let value_capacity = output_capacity(2);
+    let frozen = mask_can_supply_length
+        && past_key.is_some()
+        && past_value.is_some()
+        && key_capacity.is_some_and(|cap| cap > 0 && cap <= key_past_seq)
+        && value_capacity.is_some_and(|cap| cap > 0 && cap <= value_past_seq);
+    let key_cap = key_capacity
+        .or(value_capacity)
+        .unwrap_or(total_seq)
+        .max(if frozen { 0 } else { total_seq });
+    let value_cap = value_capacity
+        .or(key_capacity)
+        .unwrap_or(value_total_seq)
+        .max(if frozen { 0 } else { value_total_seq });
+    if key_cap != value_cap {
+        return Err(EpError::KernelFailed(format!(
+            "Attention: key/value physical capacities {key_cap}/{value_cap} differ; this kernel requires the same per-head sequence capacity for both caches"
+        )));
+    }
+    let attended = if frozen { key_cap } else { total_seq };
+    // A mask matching the past extent cannot prove an unresolved output is
+    // frozen. Each declared output may still alias a growing dense cache.
+    let stage_key = output_slots[1]
+        && past_key.is_some()
+        && !frozen
+        && key_capacity.is_none_or(|cap| cap <= total_seq);
+    let stage_value = output_slots[2]
+        && past_value.is_some()
+        && !frozen
+        && value_capacity.is_none_or(|cap| cap <= value_total_seq);
+    let mask_present = inputs.get(3).is_some_and(|mask| mask.present);
+    // Pointer aliasing is unavailable to planning. Fund the selected split
+    // whenever fixed-stride append could use it; execution may consume less.
+    let device_length = mask_can_supply_length
+        && past_key.is_some()
+        && past_value.is_some()
+        && mask_present
+        && output_slots[1]
+        && output_slots[2];
+    let rows = batch
+        .checked_mul(q_heads)
+        .and_then(|rows| rows.checked_mul(q_seq))
+        .ok_or_else(|| {
+            EpError::KernelFailed(
+                "Attention: planned row count overflow; reduce the geometry".into(),
+            )
+        })?;
+    let split = attention_split_config(
+        q_seq == 1,
+        device_length,
+        is_causal,
+        output_slots[3],
+        key_cap as u64,
+        rows as u64,
+        value_head_size as u64,
+    );
+    let split_bytes = split
+        .map(|(splits, _)| {
+            attention_split_scratch_bytes(splits, rows as u64, value_head_size as u64)
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let present_key_scratch = !output_slots[1];
+    let present_value_scratch = !output_slots[2];
     let layout = std_attention_workspace_layout(
         batch,
         q_heads,
         q_seq,
-        total_seq,
+        attended,
         kv_heads,
-        total_seq,
+        key_cap,
         head_size,
-        value_total_seq,
+        value_cap,
         value_head_size,
         q.dtype.byte_size(),
         stage_key,
@@ -1448,98 +1347,57 @@ fn std_attention_workspace_requirement(
         present_key_scratch,
         present_value_scratch,
         batch,
+        device_length,
+        split_bytes,
     )?;
-    let step_scoped = !(batch == 1 && q_seq == 1);
-    let lifetime = if step_scoped {
-        WorkspaceLifetime::StepScoped
-    } else {
-        WorkspaceLifetime::SessionPersistent
-    };
     Ok(WorkspaceRequirement {
-        bytes: u64::try_from(layout.total_bytes).map_err(|_| {
+        bytes: u64::try_from(layout.bytes()).map_err(|_| {
             EpError::KernelFailed("Attention: composite workspace does not fit u64".into())
         })?,
         alignment: STD_SCORES_ALIGN,
-        lifetime,
+        lifetime: WorkspaceLifetime::SessionPersistent,
     })
 }
 
-#[derive(Clone, Debug, Default)]
-struct StdWorkspaceSlot {
-    allocation: Option<Arc<GraphDeviceAllocation>>,
-    bytes: usize,
+fn std_attention_output_slots(node: &Node) -> Result<[bool; 4]> {
+    if !(1..=4).contains(&node.outputs.len()) || node.outputs[0].is_none() {
+        return Err(EpError::KernelFailed(
+            "Attention: declare required Y and at most three positional optional output slots"
+                .into(),
+        ));
+    }
+    Ok(std::array::from_fn(|index| {
+        node.outputs.get(index).is_some_and(Option::is_some)
+    }))
 }
 
-#[derive(Clone, Debug)]
-struct StdAttnWorkspace {
-    runtime: Arc<CudaRuntime>,
-    slots: [StdWorkspaceSlot; WS_COUNT],
-    used: [bool; WS_COUNT],
-}
-
-impl StdAttnWorkspace {
-    fn new(runtime: Arc<CudaRuntime>) -> Self {
-        Self {
-            runtime,
-            slots: std::array::from_fn(|_| StdWorkspaceSlot::default()),
-            used: [false; WS_COUNT],
-        }
+fn validate_std_attention_outputs(
+    slots: [bool; 4],
+    outputs: &[OutputMetadata<'_>],
+    dtype: DataType,
+) -> Result<()> {
+    let actual = std::array::from_fn(|index| {
+        outputs
+            .get(index)
+            .is_some_and(|output| !matches!(output, OutputMetadata::Absent))
+    });
+    if outputs.len() > 4 || actual != slots {
+        return Err(EpError::KernelFailed(format!(
+            "Attention: runtime output slots {actual:?} differ from declared {slots:?}; pass the declared positional Y/present-key/present-value/QK outputs"
+        )));
     }
-
-    fn begin_call(&mut self) {
-        self.used.fill(false);
-    }
-
-    /// Return a device pointer for slot `index` with at least `bytes` capacity.
-    /// Reuses the existing allocation when large enough; otherwise (re)allocates
-    /// — but never during graph capture, where a grow would record an illegal
-    /// allocation, so the caller must have warmed the exact decode shape first.
-    fn reserve(&mut self, index: usize, bytes: usize) -> Result<CUdeviceptr> {
-        self.used[index] = true;
-        let bytes = bytes.max(1);
-        let slot = &self.slots[index];
-        if slot.bytes >= bytes
-            && let Some(allocation) = slot.allocation.as_ref()
-        {
-            if self.runtime.is_capturing()? {
-                self.runtime.require_registered_address_capture(
-                    GraphDeviceAllocation::device_graph_resource(allocation).identity(),
-                    "Attention workspace allocation",
-                )?;
-            }
-            return Ok(allocation.ptr());
-        }
-        if self.runtime.is_capturing()? {
+    for (index, output) in outputs.iter().enumerate() {
+        let actual_dtype = match output {
+            OutputMetadata::Absent => continue,
+            OutputMetadata::Unresolved { dtype } | OutputMetadata::Tensor { dtype, .. } => *dtype,
+        };
+        if actual_dtype != dtype {
             return Err(EpError::KernelFailed(format!(
-                "Attention: workspace slot {index} requires {bytes} bytes during CUDA graph \
-                 capture; warm the fixed decode shape before capture"
+                "Attention: output slot {index} dtype {actual_dtype:?} differs from input {dtype:?}; use the attention input dtype"
             )));
         }
-        if slot.allocation.is_some() {
-            // A growing (prefill/eager) shape may outgrow a slot warmed for a
-            // smaller step. Wait for queued users of the old storage before
-            // freeing; the fixed-capacity decode path never reaches here.
-            self.runtime.drain_for_unmap()?;
-        }
-        let allocation = GraphDeviceAllocation::allocate(&self.runtime, bytes)?;
-        self.runtime
-            .staged_warm_cache_mutation(&format!("Attention workspace slot {index} allocation"))?;
-        let ptr = allocation.ptr();
-        self.slots[index] = StdWorkspaceSlot {
-            allocation: Some(allocation),
-            bytes,
-        };
-        Ok(ptr)
     }
-
-    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        self.slots
-            .iter()
-            .zip(self.used)
-            .filter_map(|(slot, used)| used.then_some(slot.allocation.as_ref()).flatten())
-            .map(GraphDeviceAllocation::device_graph_resource)
-            .collect()
-    }
+    Ok(())
 }
 
 /// Factory for [`StandardAttentionKernel`], reading the standard-`Attention`
@@ -1598,12 +1456,9 @@ impl KernelFactory for StandardAttentionFactory {
             kv_num_heads,
             qk_matmul_output_mode,
             softcap,
-            output_count: node.outputs.len(),
+            output_slots: std_attention_output_slots(node)?,
             since_version: self.since_version,
-            warm_state: Mutex::new(StdAttnWarmState {
-                workspace: StdAttnWorkspace::new(self.runtime.clone()),
-                capture_ready: None,
-            }),
+            warm_state: Mutex::new(None),
         }))
     }
 }
@@ -1795,7 +1650,8 @@ impl StandardAttentionKernel {
         } else {
             total_seq.saturating_sub(write_start)
         };
-        let elements = (batch * heads * span * dim) as u64;
+        let elements =
+            std_attention_elements(&[batch, heads, span, dim], "build-KV launch")? as u64;
         if elements == 0 {
             return Ok(());
         }
@@ -1885,10 +1741,10 @@ impl StandardAttentionKernel {
 
 impl StandardAttentionKernel {
     fn validate_capture_signature(
-        state: &StdAttnWarmState,
+        state: &Option<StdAttnCaptureSignature>,
         signature: &StdAttnCaptureSignature,
     ) -> Result<()> {
-        let ready = state.capture_ready.as_ref().ok_or_else(|| {
+        let ready = state.as_ref().ok_or_else(|| {
             EpError::KernelFailed(
                 "Attention: CUDA graph capture began without a successful warmed decode \
                  signature. HOW: run the exact fixed-capacity decode call eagerly before \
@@ -1896,29 +1752,13 @@ impl StandardAttentionKernel {
                     .into(),
             )
         })?;
-        if ready.signature != *signature {
+        if *ready != *signature {
             return Err(EpError::KernelFailed(format!(
-                "Attention: signature changed during CUDA graph capture: warmed={:?}, \
+                "Attention: signature changed during CUDA graph capture: warmed={ready:?}, \
                  current={signature:?}. HOW: abort capture and warm the exact replacement.",
-                ready.signature
             )));
         }
         Ok(())
-    }
-
-    fn publish_capture_ready(
-        state: &mut StdAttnWarmState,
-        signature: StdAttnCaptureSignature,
-        resources: Vec<DeviceGraphResource>,
-    ) {
-        state.capture_ready = Some(Arc::new(StdAttnCaptureReady {
-            signature,
-            resources,
-        }));
-    }
-
-    fn publish_capture_unsupported(state: &mut StdAttnWarmState) {
-        state.capture_ready = None;
     }
 
     fn run(
@@ -1927,12 +1767,34 @@ impl StandardAttentionKernel {
         outputs: &mut [TensorMut],
         prepared: Option<WorkspaceView>,
     ) -> Result<()> {
+        let mut warm_state = self.warm_state.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "Attention: warm-state lock poisoned; recreate the kernel before execution".into(),
+            )
+        })?;
+        // Invalidate before validation or submission. Only a successful exact
+        // invocation republishes readiness; errors cannot retain stale proof.
+        let prior_signature = warm_state.take();
+        let capturing = self.runtime.is_capturing()?;
         check_arity("Attention", inputs, outputs, 3, 7, 1)?;
+        if outputs.len() > 4 {
+            return Err(EpError::KernelFailed(format!(
+                "Attention: received {} output slots, expected at most four positional outputs; use the declared Y/present-key/present-value/QK slots",
+                outputs.len()
+            )));
+        }
+        let output_metadata: [_; 4] = std::array::from_fn(|index| {
+            outputs
+                .get(index)
+                .map(OutputMetadata::from_view)
+                .unwrap_or(OutputMetadata::Absent)
+        });
+        validate_std_attention_outputs(self.output_slots, &output_metadata, inputs[0].dtype)?;
         // Inputs may have been uploaded asynchronously on the EP stream. During
         // CUDA-graph capture the uploads are recorded into the graph, so no host
         // synchronize is issued (and none is legal); ordering is preserved by
         // the stream the capture records.
-        if !self.runtime.is_capturing()? {
+        if !capturing {
             self.runtime.synchronize()?;
         }
 
@@ -2030,6 +1892,9 @@ impl StandardAttentionKernel {
             ));
         }
         let nonpad_kv_seqlen: Option<Vec<i64>> = if has_nonpad {
+            if capturing {
+                return Err(EpError::KernelFailed("Attention: nonpad_kv_seqlen requires host validation; execute this route outside CUDA capture".into()));
+            }
             let seqlen = dense_i64(&self.runtime, &inputs[6])?;
             if seqlen.len() != q.batch {
                 return Err(EpError::KernelFailed(format!(
@@ -2048,8 +1913,16 @@ impl StandardAttentionKernel {
         let q_seq = q.seq;
         let head_size = q.dim;
         let kv_heads = k_cur.heads;
-        let total_seq = key_past_seq + k_cur.seq;
-        let value_total_seq = value_past_seq + v_cur.seq;
+        let total_seq = key_past_seq.checked_add(k_cur.seq).ok_or_else(|| {
+            EpError::KernelFailed(
+                "Attention: total key length overflow; reduce the cache shape".into(),
+            )
+        })?;
+        let value_total_seq = value_past_seq.checked_add(v_cur.seq).ok_or_else(|| {
+            EpError::KernelFailed(
+                "Attention: total value length overflow; reduce the cache shape".into(),
+            )
+        })?;
         let v_head_size = v_cur.dim;
 
         if k_cur.dim != head_size {
@@ -2136,15 +2009,12 @@ impl StandardAttentionKernel {
 
         // Validate output slots up front (before any device work) so shape
         // errors surface cleanly.
-        let y_expected = if q_rank == 3 {
-            batch * q_seq * q_heads * v_head_size
-        } else {
-            batch * q_heads * q_seq * v_head_size
-        };
+        let y_expected = std_attention_elements(&[batch, q_seq, q_heads, v_head_size], "Y")?;
+        std_attention_stage_bytes(y_expected, element_bytes)?;
         let y_ptr = output_ptr(&mut outputs[0], dtype, y_expected)?;
-        let want_present_key = outputs.len() >= 2;
-        let want_present_value = outputs.len() >= 3;
-        let want_qk = outputs.len() >= 4;
+        let want_present_key = self.output_slots[1];
+        let want_present_value = self.output_slots[2];
+        let want_qk = self.output_slots[3];
         // Physical per-head seq capacity of the bound present K/V slots (their
         // stride when exposed at fixed capacity). Zero for dense/unbound slots.
         let present_key_phys = if want_present_key && outputs[1].shape.len() == 4 {
@@ -2200,31 +2070,29 @@ impl StandardAttentionKernel {
             };
             (key_cap, value_cap, total_seq, value_total_seq)
         };
-        let present_key_expected = batch * kv_heads * key_cap * head_size;
-        let present_value_expected = batch * kv_heads * value_cap * v_head_size;
-        let qk_expected = batch * q_heads * q_seq * total_seq;
+        if key_cap != value_cap {
+            return Err(EpError::KernelFailed(format!(
+                "Attention: key/value physical capacities {key_cap}/{value_cap} differ; use the same per-head sequence capacity for both caches"
+            )));
+        }
+        let present_key_expected =
+            std_attention_elements(&[batch, kv_heads, key_cap, head_size], "present key")?;
+        let present_value_expected =
+            std_attention_elements(&[batch, kv_heads, value_cap, v_head_size], "present value")?;
+        let qk_expected = std_attention_elements(&[batch, q_heads, q_seq, total_seq], "QK output")?;
 
-        // Validate present/qk outputs and capture their device pointers. Split
-        // the mutable borrows so each slot is checked independently.
-        let (rest0, rest1) = outputs.split_at_mut(1);
-        let _ = rest0;
-        let (present_key_out, rest_after1) = if want_present_key {
-            let (a, b) = rest1.split_at_mut(1);
-            (Some(output_ptr(&mut a[0], dtype, present_key_expected)?), b)
+        let present_key_out = if want_present_key {
+            Some(output_ptr(&mut outputs[1], dtype, present_key_expected)?)
         } else {
-            (None, rest1)
+            None
         };
-        let (present_value_out, rest_after2) = if want_present_value {
-            let (a, b) = rest_after1.split_at_mut(1);
-            (
-                Some(output_ptr(&mut a[0], dtype, present_value_expected)?),
-                b,
-            )
+        let present_value_out = if want_present_value {
+            Some(output_ptr(&mut outputs[2], dtype, present_value_expected)?)
         } else {
-            (None, rest_after1)
+            None
         };
         let qk_ptr = if want_qk {
-            output_ptr(&mut rest_after2[0], dtype, qk_expected)?
+            output_ptr(&mut outputs[3], dtype, qk_expected)?
         } else {
             0
         };
@@ -2249,659 +2117,482 @@ impl StandardAttentionKernel {
         // `past_seq`; otherwise 0. A negative offset fully masks leading query
         // rows (→ zero output rows). The padding frontier masks keys at
         // `j >= nonpad_kv_seqlen[b]` regardless of causal mode; `-1` disables it.
-        let mut offsets = vec![0i64; batch.max(1)];
-        let mut pad_limits = vec![-1i64; batch.max(1)];
-        for b in 0..batch {
-            offsets[b] = match &nonpad_kv_seqlen {
-                Some(seqlen) => seqlen[b] - q_seq as i64,
-                None => key_past_seq as i64,
+        let (offsets, pad_limits) = if let Some(seqlen) = &nonpad_kv_seqlen {
+            let query = i64::try_from(q_seq).map_err(|_| EpError::KernelFailed("Attention: query length exceeds signed control capacity; reduce the query shape".into()))?;
+            let offsets = seqlen.iter().map(|length| length.checked_sub(query).ok_or_else(|| EpError::KernelFailed("Attention: nonpad length minus query length overflows; supply valid external cache lengths".into()))).collect::<Result<Vec<_>>>()?;
+            (offsets, seqlen.clone())
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let default_offset = i64::try_from(key_past_seq).map_err(|_| EpError::KernelFailed("Attention: past length exceeds CUDA signed offset capacity; reduce the cache shape".into()))?;
+
+        // In-place KV growth. The decode graph binds the present K/V output
+        // onto the same buffer as the past K/V input.
+        //
+        // Fixed-capacity present (key_cap/value_cap > valid length): the
+        // cache lives at a constant per-head stride, so `build_kv` appends
+        // only the new token's rows into their fixed slot and leaves the
+        // prior rows (already at that stride) untouched — no restride, no
+        // cross-head overlap, race-free and deterministic in place. No
+        // staging needed.
+        //
+        // Dense present (legacy): `build_kv` rewrites the whole cache with a
+        // *wider* per-head stride (total_seq > past_seq), so an aliased
+        // in-place write makes head h's current-token store overlap head
+        // h+1's past load across unordered threads — a data race that leaves
+        // every head beyond head 0 nondeterministic. Stage the rebuild in a
+        // disjoint scratch buffer (reads the pristine past), then copy the
+        // fully-formed dense cache back. General: any model whose
+        // default-domain Attention grows an aliased KV cache.
+        let alias_key = has_past_key && present_key_out == Some(past_key_ptr);
+        let alias_value = has_past_value && present_value_out == Some(past_value_ptr);
+        let capacity_key = kv_frozen || key_cap > total_seq;
+        let capacity_value = kv_frozen || value_cap > value_total_seq;
+        let stage_key = alias_key && !capacity_key;
+        let stage_value = alias_value && !capacity_value;
+        // On-device valid length ABI for default-domain Attention: derive
+        // the valid attended length from the attention-mask frontier so the
+        // kernel reads it from device memory instead of host shape metadata
+        // (whose extent is frozen when a CUDA graph is captured). Scanning
+        // the LAST query row makes it correct for BOTH phases — prefill
+        // returns prompt_len, decode returns total_seq (row 0 would report 1
+        // under a causal prefill mask). Eligible for the fixed-capacity,
+        // masked fixed-slot-append path in BOTH causal and non-causal form:
+        // the standard additive causal-mask builder (`Where(And(mask, causal),
+        // 0, -inf)`) is frozen to physical capacity alongside the KV, so its
+        // last-row frontier is the true valid length regardless of the op's
+        // `is_causal` attribute (the causal frontier and the padding frontier
+        // coincide at the last query row). When `dev_len` is set the causal
+        // offset and score-loop extent are both derived from it (see
+        // `attention_row`), so no host length leaks into a captured causal
+        // decode. Every other path passes a null pointer and keeps the
+        // host-derived length, so eager/dense/GQA are bit-for-bit unchanged.
+        let dev_length_eligible = !self.window.is_active()
+            && has_past_key
+            && has_past_value
+            && mask.kind != 0
+            && capacity_key
+            && capacity_value
+            && alias_key
+            && alias_value;
+
+        // Single-token fixed-capacity decode and the staged dense growth path
+        // can be captured once warmed. Both have host-static launch geometry
+        // for a given step; borrow all scratch from the caller lane so
+        // capture records only device work. The staged path needs
+        // dedicated K/V slots because its source must remain disjoint from the
+        // aliased present/past destination.
+        let staged_decode_eligible = (stage_key || stage_value) && batch == 1 && q_seq == 1;
+        let capture_workspace_eligible = dev_length_eligible || staged_decode_eligible;
+        let mut capture_signature = capture_workspace_eligible.then(|| StdAttnCaptureSignature {
+            dtype,
+            inputs: inputs
+                .iter()
+                .map(|input| (input.dtype, input.shape.to_vec(), input.is_absent()))
+                .collect(),
+            outputs: outputs
+                .iter()
+                .map(|output| (output.dtype, output.shape.to_vec()))
+                .collect(),
+            batch,
+            q_heads,
+            kv_heads,
+            q_seq,
+            key_cap,
+            head_size,
+            v_head_size,
+            workspace_base: 0,
+            workspace_bytes: 0,
+            split: None,
+            default_offset,
+        });
+        // FlashDecoding split-KV: engage on the capture-safe fixed-capacity
+        // decode route. `num_splits`/`chunk` derive only from the fixed cap
+        // and row count, so the choice is identical under eager and capture.
+        let total_rows_u =
+            std_attention_elements(&[batch, q_heads, q_seq], "attention rows")? as u64;
+        let split_cfg = attention_split_config(
+            q_seq == 1,
+            dev_length_eligible,
+            self.is_causal,
+            want_qk,
+            key_cap as u64,
+            total_rows_u,
+            v_head_size as u64,
+        );
+        let split_bytes = split_cfg
+            .map(|(splits, _)| {
+                attention_split_scratch_bytes(splits, total_rows_u, v_head_size as u64)
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let workspace_layout = std_attention_workspace_layout(
+            batch,
+            q_heads,
+            q_seq,
+            total_seq,
+            kv_heads,
+            key_cap,
+            head_size,
+            value_cap,
+            v_head_size,
+            element_bytes,
+            stage_key,
+            stage_value,
+            present_key_out.is_none(),
+            present_value_out.is_none(),
+            batch,
+            dev_length_eligible,
+            split_bytes,
+        )?;
+        let parts = workspace_layout.bind(prepared).map_err(|cause| {
+            EpError::KernelFailed(format!("Attention: cannot bind caller workspace: {cause}"))
+        })?;
+        let prepared = WorkspaceView::new(
+            prepared
+                .ok_or_else(|| {
+                    EpError::KernelFailed(
+                        "Attention: prepare and pass caller workspace before execution".into(),
+                    )
+                })?
+                .ptr(),
+            workspace_layout.bytes(),
+        );
+        let [
+            scores_region,
+            dev_len_region,
+            offsets_region,
+            pad_limits_region,
+            stage_key_region,
+            stage_value_region,
+            present_key_region,
+            present_value_region,
+            split_region,
+        ] = parts;
+        if let Some(signature) = capture_signature.as_mut() {
+            signature.workspace_base = prepared.ptr().0 as usize;
+            signature.workspace_bytes = prepared.bytes();
+            signature.split = split_cfg;
+        }
+        if capturing {
+            Self::validate_capture_signature(&prior_signature, capture_signature.as_ref().ok_or_else(|| EpError::KernelFailed("Attention: route is not capture eligible; warm an eligible decode before capture".into()))?)?;
+            self.runtime
+                .require_registered_workspace_capture(prepared, "Attention prepared workspace")?;
+        }
+        let pointer = |view: WorkspaceView| cuptr(view.ptr().0.cast_const());
+        let scores_ptr = pointer(scores_region);
+        let split_base_ptr = (split_region.bytes() != 0).then(|| pointer(split_region));
+        let present_key_ptr = present_key_out.unwrap_or_else(|| pointer(present_key_region));
+        let present_value_ptr = present_value_out.unwrap_or_else(|| pointer(present_value_region));
+        let key_kv_ptr = if stage_key {
+            pointer(stage_key_region)
+        } else {
+            present_key_ptr
+        };
+        let value_kv_ptr = if stage_value {
+            pointer(stage_value_region)
+        } else {
+            present_value_ptr
+        };
+        let dev_len_ptr = if dev_length_eligible {
+            pointer(dev_len_region)
+        } else {
+            0
+        };
+        // Without nonpad, controls are uniform launch arguments. No shared
+        // workspace contents survive from warmup, and capture adds no upload
+        // or initialization launch. Device-derived length takes precedence.
+        let (offsets_ptr, pad_limits_ptr) = if nonpad_kv_seqlen.is_some() {
+            let offsets_ptr = pointer(offsets_region);
+            let pad_limits_ptr = pointer(pad_limits_region);
+            if capturing {
+                return Err(EpError::KernelFailed("Attention: nonpad_kv_seqlen requires host validation; execute this route outside CUDA capture".into()));
+            }
+            let offsets_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    offsets.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(offsets.as_slice()),
+                )
             };
-            pad_limits[b] = match &nonpad_kv_seqlen {
-                Some(seqlen) => seqlen[b],
-                None => -1,
+            let pad_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    pad_limits.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(pad_limits.as_slice()),
+                )
             };
+            unsafe { self.runtime.htod(offsets_bytes, offsets_ptr)? };
+            unsafe { self.runtime.htod(pad_bytes, pad_limits_ptr)? };
+            (offsets_ptr, pad_limits_ptr)
+        } else {
+            (0, 0)
+        };
+        if dev_length_eligible {
+            let key_len = mask.dims[3];
+            let last_row = mask.dims[2].saturating_sub(1);
+            let row_base = last_row.checked_mul(key_len).ok_or_else(|| {
+                EpError::KernelFailed(
+                    "Attention: mask last-row offset overflow; reduce the mask shape".into(),
+                )
+            })?;
+            self.launch_derive_len(mask.ptr, mask.kind, key_len, row_base, dev_len_ptr)?;
+        }
+        // Build present_key / present_value on the device. In capacity mode
+        // the append writes only the new rows [past_seq, total_seq) into
+        // their fixed slot; the dense path rebuilds all rows.
+        let key_write_start = if capacity_key && alias_key {
+            key_past_seq
+        } else {
+            0
+        };
+        let key_past_cap = if capacity_key { key_cap } else { key_past_seq };
+        let value_write_start = if capacity_value && alias_value {
+            value_past_seq
+        } else {
+            0
+        };
+        let value_past_cap = if capacity_value {
+            value_cap
+        } else {
+            value_past_seq
+        };
+        self.launch_build_kv(
+            past_key_ptr,
+            k_cur_ptr,
+            key_kv_ptr,
+            has_past_key,
+            k_cur.is_3d,
+            past_key.as_ref().map(|p| p.is_3d).unwrap_or(false),
+            dtype_code,
+            batch,
+            kv_heads,
+            key_past_seq,
+            k_cur.seq,
+            total_seq,
+            head_size,
+            key_cap,
+            key_past_cap,
+            key_write_start,
+            dev_len_ptr,
+        )?;
+        self.launch_build_kv(
+            past_value_ptr,
+            v_cur_ptr,
+            value_kv_ptr,
+            has_past_value,
+            v_cur.is_3d,
+            past_value.as_ref().map(|p| p.is_3d).unwrap_or(false),
+            dtype_code,
+            batch,
+            kv_heads,
+            value_past_seq,
+            v_cur.seq,
+            value_total_seq,
+            v_head_size,
+            value_cap,
+            value_past_cap,
+            value_write_start,
+            dev_len_ptr,
+        )?;
+
+        // When staged, publish the freshly-built dense cache back into the
+        // aliased present/past buffer for the next step. Source and
+        // destination are disjoint, so this copy is race-free. Issue it
+        // stream-ordered on the EP compute stream: `build_kv` (the producer)
+        // and the next step's `build_kv` (the consumer) both run on that same
+        // stream, so the copy is implicitly ordered against them without a
+        // full device `synchronize()`. The execute-exit synchronize (below)
+        // still drains it, preserving blocking semantics for eager callers.
+        if stage_key {
+            unsafe {
+                self.runtime.dtod_async(
+                    key_kv_ptr,
+                    present_key_ptr,
+                    present_key_expected * element_bytes,
+                )?;
+            }
+        }
+        if stage_value {
+            unsafe {
+                self.runtime.dtod_async(
+                    value_kv_ptr,
+                    present_value_ptr,
+                    present_value_expected * element_bytes,
+                )?;
+            }
         }
 
-        // Allocate device scratch; track owned allocations for cleanup.
-        let mut owned: Vec<CUdeviceptr> = Vec::new();
-        let result = (|| -> Result<()> {
-            let alloc = |runtime: &CudaRuntime,
-                         owned: &mut Vec<CUdeviceptr>,
-                         bytes: usize|
-             -> Result<CUdeviceptr> {
-                let ptr = runtime.alloc_raw(bytes.max(1))?;
-                owned.push(ptr);
-                Ok(ptr)
-            };
-
-            // Present K/V pointers are resolved after the governed workspace
-            // layout is known (below): a bound output slot supplies the storage,
-            // otherwise the scratch is carved from the served workspace (or, on
-            // the pooled/eager paths, from the per-kernel pool / a per-call
-            // allocation) — never a per-dispatch allocation on the served path.
-
-            // In-place KV growth. The decode graph binds the present K/V output
-            // onto the same buffer as the past K/V input.
-            //
-            // Fixed-capacity present (key_cap/value_cap > valid length): the
-            // cache lives at a constant per-head stride, so `build_kv` appends
-            // only the new token's rows into their fixed slot and leaves the
-            // prior rows (already at that stride) untouched — no restride, no
-            // cross-head overlap, race-free and deterministic in place. No
-            // staging needed.
-            //
-            // Dense present (legacy): `build_kv` rewrites the whole cache with a
-            // *wider* per-head stride (total_seq > past_seq), so an aliased
-            // in-place write makes head h's current-token store overlap head
-            // h+1's past load across unordered threads — a data race that leaves
-            // every head beyond head 0 nondeterministic. Stage the rebuild in a
-            // disjoint scratch buffer (reads the pristine past), then copy the
-            // fully-formed dense cache back. General: any model whose
-            // default-domain Attention grows an aliased KV cache.
-            let alias_key = has_past_key && present_key_out == Some(past_key_ptr);
-            let alias_value = has_past_value && present_value_out == Some(past_value_ptr);
-            let capacity_key = kv_frozen || key_cap > total_seq;
-            let capacity_value = kv_frozen || value_cap > value_total_seq;
-            let stage_key = alias_key && !capacity_key;
-            let stage_value = alias_value && !capacity_value;
-            // On-device valid length ABI for default-domain Attention: derive
-            // the valid attended length from the attention-mask frontier so the
-            // kernel reads it from device memory instead of host shape metadata
-            // (whose extent is frozen when a CUDA graph is captured). Scanning
-            // the LAST query row makes it correct for BOTH phases — prefill
-            // returns prompt_len, decode returns total_seq (row 0 would report 1
-            // under a causal prefill mask). Eligible for the fixed-capacity,
-            // masked fixed-slot-append path in BOTH causal and non-causal form:
-            // the standard additive causal-mask builder (`Where(And(mask, causal),
-            // 0, -inf)`) is frozen to physical capacity alongside the KV, so its
-            // last-row frontier is the true valid length regardless of the op's
-            // `is_causal` attribute (the causal frontier and the padding frontier
-            // coincide at the last query row). When `dev_len` is set the causal
-            // offset and score-loop extent are both derived from it (see
-            // `attention_row`), so no host length leaks into a captured causal
-            // decode. Every other path passes a null pointer and keeps the
-            // host-derived length, so eager/dense/GQA are bit-for-bit unchanged.
-            let dev_length_eligible = !self.window.is_active()
-                && has_past_key
-                && has_past_value
-                && mask.kind != 0
-                && capacity_key
-                && capacity_value
-                && alias_key
-                && alias_value;
-
-            // Single-token fixed-capacity decode and the staged dense growth path
-            // can be captured once warmed. Both have host-static launch geometry
-            // for a given step; retain every scratch allocation in the per-kernel
-            // workspace so capture records only device work. The staged path needs
-            // dedicated K/V slots because its source must remain disjoint from the
-            // aliased present/past destination.
-            let capturing = self.runtime.is_capturing()?;
-            let staged_decode_eligible = (stage_key || stage_value) && batch == 1 && q_seq == 1;
-            let capture_workspace_eligible = dev_length_eligible || staged_decode_eligible;
-            let capture_signature = capture_workspace_eligible.then(|| StdAttnCaptureSignature {
-                dtype,
-                inputs: inputs
-                    .iter()
-                    .map(|input| (input.dtype, input.shape.to_vec(), input.is_absent()))
-                    .collect(),
-                outputs: outputs
-                    .iter()
-                    .map(|output| (output.dtype, output.shape.to_vec()))
-                    .collect(),
-                batch,
-                q_heads,
-                kv_heads,
-                q_seq,
-                key_cap,
-                head_size,
-                v_head_size,
-            });
-            let mut warm_state = self
-                .warm_state
-                .lock()
-                .map_err(|_| EpError::KernelFailed("Attention: warm-state lock poisoned".into()))?;
-            if capturing {
-                let signature = capture_signature.as_ref().ok_or_else(|| {
+        // Launch the attention kernel. Decode with a fixed-capacity cache
+        // takes the FlashDecoding split-KV path (fills the machine at wide
+        // context); every other shape takes the monolithic one-block-per-row
+        // `attention_row`.
+        let total_rows = total_rows_u;
+        if total_rows > 0 {
+            let batch_u = batch as u64;
+            let q_heads_u = q_heads as u64;
+            let q_seq_u = q_seq as u64;
+            let kv_heads_u = kv_heads as u64;
+            let total_seq_u = total_seq as u64;
+            let kv_cap_u = key_cap as u64;
+            let head_size_u = head_size as u64;
+            let v_head_size_u = v_head_size as u64;
+            let group_u = group as u64;
+            let q_is_3d = i32::from(q.is_3d);
+            let out_is_3d = i32::from(q_rank == 3);
+            let is_causal = i32::from(self.is_causal);
+            let window_left = self.window.left.unwrap_or(-1);
+            let window_right = self.window.right.unwrap_or(-1);
+            let mask_kind = mask.kind;
+            let mask_rank = mask.rank;
+            let (md0, md1, md2, md3) = (mask.dims[0], mask.dims[1], mask.dims[2], mask.dims[3]);
+            let qk_mode = self.qk_matmul_output_mode as i32;
+            let want_qk_i = i32::from(want_qk);
+            let softcap = self.softcap;
+            let grid_x = total_rows.min(u32::MAX as u64).max(1) as u32;
+            if let Some((num_splits, chunk)) = split_cfg {
+                let split_base = split_base_ptr.ok_or_else(|| {
                     EpError::KernelFailed(
-                        "Attention: the current call is not a capture-eligible fixed-capacity \
-                         decode signature. HOW: abort capture and warm this exact route eagerly."
-                            .into(),
+                        "Attention: split-KV engaged but partial scratch is unallocated".into(),
                     )
                 })?;
-                Self::validate_capture_signature(&warm_state, signature)?;
-            }
-            // FlashDecoding split-KV: engage on the capture-safe fixed-capacity
-            // decode route. `num_splits`/`chunk` derive only from the fixed cap
-            // and row count, so the choice is identical under eager and capture.
-            let total_rows_u = (batch as u64)
-                .saturating_mul(q_heads as u64)
-                .saturating_mul(q_seq as u64);
-            let split_cfg = attention_split_config(
-                q_seq == 1,
-                dev_length_eligible,
-                self.is_causal,
-                want_qk,
-                key_cap as u64,
-                total_rows_u,
-                v_head_size as u64,
-            );
-            let split_bytes = match split_cfg {
-                Some((num_splits, _)) => {
-                    attention_split_scratch_floats(num_splits, total_rows_u, v_head_size as u64)
-                        .saturating_mul(std::mem::size_of::<f32>())
-                }
-                None => 0,
-            };
-            let mut workspace_candidate = warm_state.workspace.clone();
-            workspace_candidate.begin_call();
-            let mut ws = if capture_workspace_eligible {
-                Some(&mut workspace_candidate)
-            } else {
-                None
-            };
-            let workspace_layout = std_attention_workspace_layout(
-                batch,
-                q_heads,
-                q_seq,
-                total_seq,
-                kv_heads,
-                key_cap,
-                head_size,
-                value_cap,
-                v_head_size,
-                element_bytes,
-                stage_key,
-                stage_value,
-                present_key_out.is_none(),
-                present_value_out.is_none(),
-                offsets.len(),
-            )?;
-            if let Some(view) = prepared
-                && view.bytes() < workspace_layout.total_bytes
-            {
-                return Err(EpError::KernelFailed(format!(
-                    "Attention: prepared workspace {} bytes is smaller than the {} bytes this \
-                     dispatch requires",
-                    view.bytes(),
-                    workspace_layout.total_bytes
-                )));
-            }
-            let scores_ptr = match prepared {
-                Some(view) => std_attention_carve(
-                    view,
-                    workspace_layout.scores_offset,
-                    workspace_layout.scores_bytes,
-                    "score matrix",
-                )?,
-                // Compatibility/opt-out path (direct `execute`, e.g. unit tests):
-                // no executor-prepared workspace, so the score scratch stays
-                // self-owned — pooled on the capture-eligible route, per-call
-                // otherwise.
-                None => match ws.as_mut() {
-                    Some(ws) => ws.reserve(WS_SCORES, workspace_layout.scores_bytes)?,
-                    None => alloc(&self.runtime, &mut owned, workspace_layout.scores_bytes)?,
-                },
-            };
-            // FlashDecoding split-KV partial scratch (`split_meta` then
-            // `split_out`). Served from the retained per-kernel workspace pool
-            // (warmed before capture like the score scratch) so the split route
-            // records no allocation under CUDA-graph capture.
-            let split_base_ptr = if split_bytes > 0 {
-                match ws.as_mut() {
-                    Some(ws) => Some(ws.reserve(WS_SPLIT, split_bytes)?),
-                    None => Some(alloc(&self.runtime, &mut owned, split_bytes)?),
-                }
-            } else {
-                None
-            };
-            // Present K/V source pointers. A bound output slot supplies the
-            // storage directly; otherwise the scratch is served from the
-            // governed workspace on the executor-prepared (StepScoped) path, the
-            // per-kernel pool on the capture-eligible path, or a per-call
-            // allocation on the eager/opt-out path. Serving from `prepared`
-            // removes the per-dispatch `alloc_raw`/`cuMemAlloc` that previously
-            // scaled with step count (requirement 3).
-            let present_key_ptr = match present_key_out {
-                Some(ptr) => ptr,
-                None => match prepared {
-                    Some(view) => std_attention_carve(
-                        view,
-                        workspace_layout.present_key_offset.ok_or_else(|| {
-                            EpError::KernelFailed(
-                                "Attention: present-key scratch workspace layout is missing its \
-                                 offset"
-                                    .into(),
-                            )
-                        })?,
-                        workspace_layout.present_key_bytes,
-                        "present key scratch",
-                    )?,
-                    None => match ws.as_mut() {
-                        Some(ws) => {
-                            ws.reserve(WS_PRESENT_KEY, present_key_expected * element_bytes)?
-                        }
-                        None => alloc(
-                            &self.runtime,
-                            &mut owned,
-                            present_key_expected * element_bytes,
-                        )?,
-                    },
-                },
-            };
-            let present_value_ptr = match present_value_out {
-                Some(ptr) => ptr,
-                None => match prepared {
-                    Some(view) => std_attention_carve(
-                        view,
-                        workspace_layout.present_value_offset.ok_or_else(|| {
-                            EpError::KernelFailed(
-                                "Attention: present-value scratch workspace layout is missing its \
-                                 offset"
-                                    .into(),
-                            )
-                        })?,
-                        workspace_layout.present_value_bytes,
-                        "present value scratch",
-                    )?,
-                    None => match ws.as_mut() {
-                        Some(ws) => {
-                            ws.reserve(WS_PRESENT_VALUE, present_value_expected * element_bytes)?
-                        }
-                        None => alloc(
-                            &self.runtime,
-                            &mut owned,
-                            present_value_expected * element_bytes,
-                        )?,
-                    },
-                },
-            };
-            let key_kv_ptr = if stage_key {
-                match prepared {
-                    Some(view) => std_attention_carve(
-                        view,
-                        workspace_layout.stage_key_offset.ok_or_else(|| {
-                            EpError::KernelFailed(
-                                "Attention: staged-key workspace layout is missing its offset"
-                                    .into(),
-                            )
-                        })?,
-                        workspace_layout.stage_key_bytes,
-                        "staged key",
-                    )?,
-                    None => match ws.as_mut() {
-                        Some(ws) => ws.reserve(WS_STAGE_KEY, workspace_layout.stage_key_bytes)?,
-                        None => alloc(&self.runtime, &mut owned, workspace_layout.stage_key_bytes)?,
-                    },
-                }
-            } else {
-                present_key_ptr
-            };
-            let value_kv_ptr = if stage_value {
-                match prepared {
-                    Some(view) => std_attention_carve(
-                        view,
-                        workspace_layout.stage_value_offset.ok_or_else(|| {
-                            EpError::KernelFailed(
-                                "Attention: staged-value workspace layout is missing its offset"
-                                    .into(),
-                            )
-                        })?,
-                        workspace_layout.stage_value_bytes,
-                        "staged value",
-                    )?,
-                    None => match ws.as_mut() {
-                        Some(ws) => {
-                            ws.reserve(WS_STAGE_VALUE, workspace_layout.stage_value_bytes)?
-                        }
-                        None => alloc(
-                            &self.runtime,
-                            &mut owned,
-                            workspace_layout.stage_value_bytes,
-                        )?,
-                    },
-                }
-            } else {
-                present_value_ptr
-            };
-            let dev_len_ptr = if dev_length_eligible {
-                let ptr = match ws.as_mut() {
-                    Some(ws) => ws.reserve(WS_DEV_LEN, std::mem::size_of::<i32>())?,
-                    None => unreachable!("dev_length_eligible implies a workspace"),
-                };
-                let key_len = mask.dims[3];
-                let mask_q = mask.dims[2];
-                let last_row = mask_q.saturating_sub(1);
-                let row_base = last_row * key_len;
-                self.launch_derive_len(mask.ptr, mask.kind, key_len, row_base, ptr)?;
-                ptr
-            } else {
-                0
-            };
+                let meta_floats = total_rows.saturating_mul(num_splits).saturating_mul(2);
+                let split_meta_ptr = split_base;
+                let split_out_ptr = split_base + meta_floats * std::mem::size_of::<f32>() as u64;
+                let num_splits_u = num_splits;
+                let chunk_u = chunk;
 
-            // Per-batch control arrays. On the served (StepScoped) path they are
-            // carved from the governed workspace and uploaded via a captured H2D
-            // copy — no per-dispatch device allocation (requirement 3). On the
-            // capture path they live in fixed pool slots and are (re)uploaded only
-            // outside capture — their values are host-constant for a frozen decode
-            // (offset unused with `is_causal=false`, pad `-1`), so the warmup
-            // upload is what a replay reuses. The eager path uploads fresh per
-            // call.
-            let offsets_ptr = match prepared {
-                Some(view) => std_attention_carve(
-                    view,
-                    workspace_layout.offsets_offset,
-                    workspace_layout.offsets_bytes,
-                    "offsets",
-                )?,
-                None => match ws.as_mut() {
-                    Some(ws) => ws.reserve(WS_OFFSETS, offsets.len() * 8)?,
-                    None => alloc(&self.runtime, &mut owned, offsets.len() * 8)?,
-                },
-            };
-            let pad_limits_ptr = match prepared {
-                Some(view) => std_attention_carve(
-                    view,
-                    workspace_layout.pad_limits_offset,
-                    workspace_layout.pad_limits_bytes,
-                    "pad limits",
-                )?,
-                None => match ws.as_mut() {
-                    Some(ws) => ws.reserve(WS_PAD_LIMITS, pad_limits.len() * 8)?,
-                    None => alloc(&self.runtime, &mut owned, pad_limits.len() * 8)?,
-                },
-            };
-            if !capturing {
-                let offsets_bytes = unsafe {
-                    std::slice::from_raw_parts(offsets.as_ptr().cast::<u8>(), offsets.len() * 8)
-                };
-                let pad_bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        pad_limits.as_ptr().cast::<u8>(),
-                        pad_limits.len() * 8,
-                    )
-                };
-                unsafe { self.runtime.htod(offsets_bytes, offsets_ptr)? };
-                unsafe { self.runtime.htod(pad_bytes, pad_limits_ptr)? };
-            }
-            // Build present_key / present_value on the device. In capacity mode
-            // the append writes only the new rows [past_seq, total_seq) into
-            // their fixed slot; the dense path rebuilds all rows.
-            let key_write_start = if capacity_key && alias_key {
-                key_past_seq
-            } else {
-                0
-            };
-            let key_past_cap = if capacity_key { key_cap } else { key_past_seq };
-            let value_write_start = if capacity_value && alias_value {
-                value_past_seq
-            } else {
-                0
-            };
-            let value_past_cap = if capacity_value {
-                value_cap
-            } else {
-                value_past_seq
-            };
-            self.launch_build_kv(
-                past_key_ptr,
-                k_cur_ptr,
-                key_kv_ptr,
-                has_past_key,
-                k_cur.is_3d,
-                past_key.as_ref().map(|p| p.is_3d).unwrap_or(false),
-                dtype_code,
-                batch,
-                kv_heads,
-                key_past_seq,
-                k_cur.seq,
-                total_seq,
-                head_size,
-                key_cap,
-                key_past_cap,
-                key_write_start,
-                dev_len_ptr,
-            )?;
-            self.launch_build_kv(
-                past_value_ptr,
-                v_cur_ptr,
-                value_kv_ptr,
-                has_past_value,
-                v_cur.is_3d,
-                past_value.as_ref().map(|p| p.is_3d).unwrap_or(false),
-                dtype_code,
-                batch,
-                kv_heads,
-                value_past_seq,
-                v_cur.seq,
-                value_total_seq,
-                v_head_size,
-                value_cap,
-                value_past_cap,
-                value_write_start,
-                dev_len_ptr,
-            )?;
-
-            // When staged, publish the freshly-built dense cache back into the
-            // aliased present/past buffer for the next step. Source and
-            // destination are disjoint, so this copy is race-free. Issue it
-            // stream-ordered on the EP compute stream: `build_kv` (the producer)
-            // and the next step's `build_kv` (the consumer) both run on that same
-            // stream, so the copy is implicitly ordered against them without a
-            // full device `synchronize()`. The execute-exit synchronize (below)
-            // still drains it, preserving blocking semantics for eager callers.
-            if stage_key {
+                let split_func = self.runtime.nvrtc_function(
+                    ATTENTION_MODULE,
+                    ATTENTION_SOURCE,
+                    "attention_split",
+                )?;
+                let mut builder = self.runtime.stream().launch_builder(&split_func);
+                builder
+                    .arg(&q_ptr)
+                    .arg(&key_kv_ptr)
+                    .arg(&value_kv_ptr)
+                    .arg(&mask.ptr)
+                    .arg(&scores_ptr)
+                    .arg(&split_out_ptr)
+                    .arg(&split_meta_ptr)
+                    .arg(&offsets_ptr)
+                    .arg(&pad_limits_ptr)
+                    .arg(&default_offset)
+                    .arg(&batch_u)
+                    .arg(&q_heads_u)
+                    .arg(&q_seq_u)
+                    .arg(&kv_heads_u)
+                    .arg(&total_seq_u)
+                    .arg(&kv_cap_u)
+                    .arg(&head_size_u)
+                    .arg(&v_head_size_u)
+                    .arg(&group_u)
+                    .arg(&dtype_code)
+                    .arg(&q_is_3d)
+                    .arg(&is_causal)
+                    .arg(&sqrt_scale)
+                    .arg(&softcap)
+                    .arg(&mask_kind)
+                    .arg(&mask_rank)
+                    .arg(&md0)
+                    .arg(&md1)
+                    .arg(&md2)
+                    .arg(&md3)
+                    .arg(&dev_len_ptr)
+                    .arg(&num_splits_u)
+                    .arg(&chunk_u);
                 unsafe {
-                    self.runtime.dtod_async(
-                        key_kv_ptr,
-                        present_key_ptr,
-                        present_key_expected * element_bytes,
-                    )?;
+                    builder.launch(LaunchConfig {
+                        grid_dim: (grid_x, num_splits.min(u32::MAX as u64).max(1) as u32, 1),
+                        block_dim: (ATTN_SPLIT_THREADS, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
                 }
-            }
-            if stage_value {
+                .map_err(|error| driver_err("launch attention_split", error))?;
+
+                let combine_func = self.runtime.nvrtc_function(
+                    ATTENTION_MODULE,
+                    ATTENTION_SOURCE,
+                    "attention_combine",
+                )?;
+                let mut cbuilder = self.runtime.stream().launch_builder(&combine_func);
+                cbuilder
+                    .arg(&split_out_ptr)
+                    .arg(&split_meta_ptr)
+                    .arg(&y_ptr)
+                    .arg(&batch_u)
+                    .arg(&q_heads_u)
+                    .arg(&q_seq_u)
+                    .arg(&v_head_size_u)
+                    .arg(&dtype_code)
+                    .arg(&out_is_3d)
+                    .arg(&num_splits_u);
                 unsafe {
-                    self.runtime.dtod_async(
-                        value_kv_ptr,
-                        present_value_ptr,
-                        present_value_expected * element_bytes,
-                    )?;
+                    cbuilder.launch(LaunchConfig {
+                        grid_dim: (grid_x, 1, 1),
+                        block_dim: (ATTN_SPLIT_THREADS, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
                 }
-            }
-
-            // Launch the attention kernel. Decode with a fixed-capacity cache
-            // takes the FlashDecoding split-KV path (fills the machine at wide
-            // context); every other shape takes the monolithic one-block-per-row
-            // `attention_row`.
-            let total_rows = (batch * q_heads * q_seq) as u64;
-            if total_rows > 0 {
-                let batch_u = batch as u64;
-                let q_heads_u = q_heads as u64;
-                let q_seq_u = q_seq as u64;
-                let kv_heads_u = kv_heads as u64;
-                let total_seq_u = total_seq as u64;
-                let kv_cap_u = key_cap as u64;
-                let head_size_u = head_size as u64;
-                let v_head_size_u = v_head_size as u64;
-                let group_u = group as u64;
-                let q_is_3d = i32::from(q.is_3d);
-                let out_is_3d = i32::from(q_rank == 3);
-                let is_causal = i32::from(self.is_causal);
-                let window_left = self.window.left.unwrap_or(-1);
-                let window_right = self.window.right.unwrap_or(-1);
-                let mask_kind = mask.kind;
-                let mask_rank = mask.rank;
-                let (md0, md1, md2, md3) = (mask.dims[0], mask.dims[1], mask.dims[2], mask.dims[3]);
-                let qk_mode = self.qk_matmul_output_mode as i32;
-                let want_qk_i = i32::from(want_qk);
-                let softcap = self.softcap;
-                let grid_x = total_rows.min(u32::MAX as u64).max(1) as u32;
-                if let Some((num_splits, chunk)) = split_cfg {
-                    let split_base = split_base_ptr.ok_or_else(|| {
-                        EpError::KernelFailed(
-                            "Attention: split-KV engaged but partial scratch is unallocated".into(),
-                        )
-                    })?;
-                    let meta_floats = total_rows.saturating_mul(num_splits).saturating_mul(2);
-                    let split_meta_ptr = split_base;
-                    let split_out_ptr =
-                        split_base + meta_floats * std::mem::size_of::<f32>() as u64;
-                    let num_splits_u = num_splits;
-                    let chunk_u = chunk;
-
-                    let split_func = self.runtime.nvrtc_function(
-                        ATTENTION_MODULE,
-                        ATTENTION_SOURCE,
-                        "attention_split",
-                    )?;
-                    let mut builder = self.runtime.stream().launch_builder(&split_func);
-                    builder
-                        .arg(&q_ptr)
-                        .arg(&key_kv_ptr)
-                        .arg(&value_kv_ptr)
-                        .arg(&mask.ptr)
-                        .arg(&scores_ptr)
-                        .arg(&split_out_ptr)
-                        .arg(&split_meta_ptr)
-                        .arg(&offsets_ptr)
-                        .arg(&pad_limits_ptr)
-                        .arg(&batch_u)
-                        .arg(&q_heads_u)
-                        .arg(&q_seq_u)
-                        .arg(&kv_heads_u)
-                        .arg(&total_seq_u)
-                        .arg(&kv_cap_u)
-                        .arg(&head_size_u)
-                        .arg(&v_head_size_u)
-                        .arg(&group_u)
-                        .arg(&dtype_code)
-                        .arg(&q_is_3d)
-                        .arg(&is_causal)
-                        .arg(&sqrt_scale)
-                        .arg(&softcap)
-                        .arg(&mask_kind)
-                        .arg(&mask_rank)
-                        .arg(&md0)
-                        .arg(&md1)
-                        .arg(&md2)
-                        .arg(&md3)
-                        .arg(&dev_len_ptr)
-                        .arg(&num_splits_u)
-                        .arg(&chunk_u);
-                    unsafe {
-                        builder.launch(LaunchConfig {
-                            grid_dim: (grid_x, num_splits.min(u32::MAX as u64).max(1) as u32, 1),
-                            block_dim: (ATTN_SPLIT_THREADS, 1, 1),
-                            shared_mem_bytes: 0,
-                        })
-                    }
-                    .map_err(|error| driver_err("launch attention_split", error))?;
-
-                    let combine_func = self.runtime.nvrtc_function(
-                        ATTENTION_MODULE,
-                        ATTENTION_SOURCE,
-                        "attention_combine",
-                    )?;
-                    let mut cbuilder = self.runtime.stream().launch_builder(&combine_func);
-                    cbuilder
-                        .arg(&split_out_ptr)
-                        .arg(&split_meta_ptr)
-                        .arg(&y_ptr)
-                        .arg(&batch_u)
-                        .arg(&q_heads_u)
-                        .arg(&q_seq_u)
-                        .arg(&v_head_size_u)
-                        .arg(&dtype_code)
-                        .arg(&out_is_3d)
-                        .arg(&num_splits_u);
-                    unsafe {
-                        cbuilder.launch(LaunchConfig {
-                            grid_dim: (grid_x, 1, 1),
-                            block_dim: (ATTN_SPLIT_THREADS, 1, 1),
-                            shared_mem_bytes: 0,
-                        })
-                    }
-                    .map_err(|error| driver_err("launch attention_combine", error))?;
-                } else {
-                    let func = self.runtime.nvrtc_function(
-                        ATTENTION_MODULE,
-                        ATTENTION_SOURCE,
-                        "attention_row",
-                    )?;
-                    let mut builder = self.runtime.stream().launch_builder(&func);
-                    builder
-                        .arg(&q_ptr)
-                        .arg(&key_kv_ptr)
-                        .arg(&value_kv_ptr)
-                        .arg(&mask.ptr)
-                        .arg(&scores_ptr)
-                        .arg(&y_ptr)
-                        .arg(&qk_ptr)
-                        .arg(&offsets_ptr)
-                        .arg(&pad_limits_ptr)
-                        .arg(&batch_u)
-                        .arg(&q_heads_u)
-                        .arg(&q_seq_u)
-                        .arg(&kv_heads_u)
-                        .arg(&total_seq_u)
-                        .arg(&kv_cap_u)
-                        .arg(&head_size_u)
-                        .arg(&v_head_size_u)
-                        .arg(&group_u)
-                        .arg(&dtype_code)
-                        .arg(&q_is_3d)
-                        .arg(&out_is_3d)
-                        .arg(&is_causal)
-                        .arg(&sqrt_scale)
-                        .arg(&softcap)
-                        .arg(&mask_kind)
-                        .arg(&mask_rank)
-                        .arg(&md0)
-                        .arg(&md1)
-                        .arg(&md2)
-                        .arg(&md3)
-                        .arg(&qk_mode)
-                        .arg(&want_qk_i)
-                        .arg(&dev_len_ptr)
-                        .arg(&window_left)
-                        .arg(&window_right);
-                    unsafe {
-                        builder.launch(LaunchConfig {
-                            grid_dim: (grid_x, 1, 1),
-                            block_dim: (attention_row_threads(q_seq == 1), 1, 1),
-                            shared_mem_bytes: 0,
-                        })
-                    }
-                    .map_err(|error| driver_err("launch attention_row", error))?;
+                .map_err(|error| driver_err("launch attention_combine", error))?;
+            } else {
+                let func = self.runtime.nvrtc_function(
+                    ATTENTION_MODULE,
+                    ATTENTION_SOURCE,
+                    "attention_row",
+                )?;
+                let mut builder = self.runtime.stream().launch_builder(&func);
+                builder
+                    .arg(&q_ptr)
+                    .arg(&key_kv_ptr)
+                    .arg(&value_kv_ptr)
+                    .arg(&mask.ptr)
+                    .arg(&scores_ptr)
+                    .arg(&y_ptr)
+                    .arg(&qk_ptr)
+                    .arg(&offsets_ptr)
+                    .arg(&pad_limits_ptr)
+                    .arg(&default_offset)
+                    .arg(&batch_u)
+                    .arg(&q_heads_u)
+                    .arg(&q_seq_u)
+                    .arg(&kv_heads_u)
+                    .arg(&total_seq_u)
+                    .arg(&kv_cap_u)
+                    .arg(&head_size_u)
+                    .arg(&v_head_size_u)
+                    .arg(&group_u)
+                    .arg(&dtype_code)
+                    .arg(&q_is_3d)
+                    .arg(&out_is_3d)
+                    .arg(&is_causal)
+                    .arg(&sqrt_scale)
+                    .arg(&softcap)
+                    .arg(&mask_kind)
+                    .arg(&mask_rank)
+                    .arg(&md0)
+                    .arg(&md1)
+                    .arg(&md2)
+                    .arg(&md3)
+                    .arg(&qk_mode)
+                    .arg(&want_qk_i)
+                    .arg(&dev_len_ptr)
+                    .arg(&window_left)
+                    .arg(&window_right);
+                unsafe {
+                    builder.launch(LaunchConfig {
+                        grid_dim: (grid_x, 1, 1),
+                        block_dim: (attention_row_threads(q_seq == 1), 1, 1),
+                        shared_mem_bytes: 0,
+                    })
                 }
-            }
-            if !self.runtime.is_capturing()? {
-                self.runtime.synchronize()?;
-            }
-            // Record the fixed-capacity decode signature as capture-safe once a
-            // single-token step has run through the device-length workspace path
-            // with no per-op allocation or synchronize. `capture_support` gates
-            // on this so the session only captures a warmed decode shape.
-            if !capturing {
-                if let Some(signature) = capture_signature {
-                    let resources = workspace_candidate.device_graph_resources();
-                    warm_state.workspace = workspace_candidate;
-                    Self::publish_capture_ready(&mut warm_state, signature, resources);
-                } else {
-                    Self::publish_capture_unsupported(&mut warm_state);
-                }
-            }
-            Ok(())
-        })();
-
-        let mut free_result = Ok(());
-        for ptr in owned {
-            let freed = unsafe { self.runtime.free_raw(ptr) };
-            if free_result.is_ok() {
-                free_result = freed;
+                .map_err(|error| driver_err("launch attention_row", error))?;
             }
         }
-        result.and(free_result)
+        if !capturing {
+            self.runtime.synchronize()?;
+        }
+        *warm_state = capture_signature;
+        Ok(())
     }
 
     /// Report the exact score + route-required staged-K/V composite this
@@ -2910,31 +2601,31 @@ impl StandardAttentionKernel {
     fn composite_workspace_requirement(
         &self,
         inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
     ) -> Result<WorkspaceRequirement> {
         std_attention_workspace_requirement(
             inputs,
             self.q_num_heads,
             self.kv_num_heads,
             !self.window.is_active(),
-            self.output_count,
+            self.is_causal,
+            self.output_slots,
+            outputs,
         )
     }
 }
 
 impl Kernel for StandardAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        // Compatibility/opt-out path: no executor-prepared workspace, so the
-        // score + staged-K/V scratch stays self-owned (pooled or per-call inside
-        // `run`).
         self.run(inputs, outputs, None)
     }
 
     fn workspace_requirement(
         &self,
         inputs: &[TensorMetadata<'_>],
-        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+        outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
     ) -> Result<WorkspaceRequirement> {
-        self.composite_workspace_requirement(inputs)
+        self.composite_workspace_requirement(inputs, outputs)
     }
 
     fn execute_with_workspace(
@@ -2950,27 +2641,12 @@ impl Kernel for StandardAttentionKernel {
         false
     }
 
-    fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        self.warm_state
-            .lock()
-            .ok()
-            .and_then(|state| {
-                state
-                    .capture_ready
-                    .as_ref()
-                    .map(|ready| ready.resources.clone())
-            })
-            .unwrap_or_default()
-    }
-
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         // Eligible once a single-token decode step has been warmed with all
-        // scratch reserved in the persistent workspace and its control uploads
-        // done outside capture.
+        // scratch borrowed from the persistent caller lane. Uniform controls
+        // are launch arguments; device length is regenerated on every replay.
         match self.warm_state.lock() {
-            Ok(state) if state.capture_ready.is_some() => {
-                onnx_runtime_ep_api::CaptureSupport::Supported
-            }
+            Ok(state) if state.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
             Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
                 "requires a warmed capture-eligible single-token decode step",
             ),
@@ -2979,6 +2655,38 @@ impl Kernel for StandardAttentionKernel {
             ),
         }
     }
+}
+
+#[cfg(test)]
+fn execute_prepared(
+    kernel: &StandardAttentionKernel,
+    inputs: &[TensorView],
+    outputs: &mut [TensorMut],
+) -> Result<()> {
+    let metadata = inputs
+        .iter()
+        .map(|input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()))
+        .collect::<Vec<_>>();
+    let out = outputs
+        .iter()
+        .map(OutputMetadata::from_view)
+        .collect::<Vec<_>>();
+    let requirement = kernel.workspace_requirement(&metadata, &out)?;
+    let owner = crate::runtime::GraphDeviceAllocation::allocate(
+        &kernel.runtime,
+        requirement.bytes as usize,
+    )?;
+    let view = WorkspaceView::new(
+        onnx_runtime_ep_api::DevicePtrMut(owner.ptr() as *mut c_void),
+        requirement.bytes as usize,
+    );
+    let result = kernel.execute_with_workspace(inputs, outputs, Some(view));
+    let complete = kernel
+        .runtime
+        .stream()
+        .synchronize()
+        .map_err(|cause| driver_err("complete Attention workspace fixture", cause));
+    result.and(complete)
 }
 
 #[cfg(test)]
@@ -3020,7 +2728,9 @@ mod alias_tests {
     use std::ffi::c_void;
 
     fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
-        CudaRuntime::new(0).ok().map(Arc::new)
+        Some(Arc::new(CudaRuntime::new(0).expect(
+            "Attention GPU regression requires a CUDA device/runtime",
+        )))
     }
 
     fn f32_bytes(v: &[f32]) -> Vec<u8> {
@@ -3049,6 +2759,10 @@ mod alias_tests {
     /// Reproduces the DeepSeek MLA decode step: multi-head KV cache grown by one
     /// token, with `present` optionally aliasing `past` in one device buffer.
     #[test]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable gpu-tests"
+    )]
     fn decode_kv_growth_alias_matches_reference_and_is_deterministic() {
         let Some(rt) = maybe_runtime() else {
             eprintln!("skipping: no CUDA device available");
@@ -3080,18 +2794,15 @@ mod alias_tests {
             kv_num_heads: Some(heads),
             qk_matmul_output_mode: 0,
             softcap: 0.0,
-            output_count: 3,
+            output_slots: [true, true, true, false],
             since_version: 24,
-            warm_state: Mutex::new(StdAttnWarmState {
-                workspace: StdAttnWorkspace::new(rt.clone()),
-                capture_ready: None,
-            }),
+            warm_state: Mutex::new(None),
         };
 
         // Runs one decode step; when `alias` the present KV outputs share the
         // past KV buffers. `governed` routes the score + staged K/V composite
         // through an executor-shaped prepared workspace.
-        let run = |alias: bool, governed: bool| -> Vec<f32> {
+        let run = |alias: bool| -> Vec<f32> {
             let q_sh = [1usize, heads, qlen, kdim];
             let kcur_sh = [1usize, heads, qlen, kdim];
             let vcur_sh = [1usize, heads, qlen, vdim];
@@ -3139,27 +2850,6 @@ mod alias_tests {
                     )
                 };
                 let y_buf = rt.alloc_raw(heads * qlen * vdim * 4).unwrap();
-                let workspace_layout = std_attention_workspace_layout(
-                    1,
-                    heads,
-                    qlen,
-                    total,
-                    heads,
-                    total,
-                    kdim,
-                    total,
-                    vdim,
-                    std::mem::size_of::<f32>(),
-                    alias,
-                    alias,
-                    false,
-                    false,
-                    1,
-                )
-                .unwrap();
-                let workspace_buf =
-                    governed.then(|| rt.alloc_raw(workspace_layout.total_bytes).unwrap());
-
                 let dp = |p: CUdeviceptr| DevicePtr(p as *const c_void);
                 let dpm = |p: CUdeviceptr| DevicePtrMut(p as *mut c_void);
 
@@ -3189,20 +2879,7 @@ mod alias_tests {
                     ),
                 ];
 
-                if let Some(workspace_buf) = workspace_buf {
-                    kernel
-                        .execute_with_workspace(
-                            &inputs,
-                            &mut outputs,
-                            Some(WorkspaceView::new(
-                                dpm(workspace_buf),
-                                workspace_layout.total_bytes,
-                            )),
-                        )
-                        .unwrap();
-                } else {
-                    kernel.execute(&inputs, &mut outputs).unwrap();
-                }
+                execute_prepared(&kernel, &inputs, &mut outputs).unwrap();
 
                 let mut y_bytes = vec![0u8; heads * qlen * vdim * 4];
                 rt.dtoh(&mut y_bytes, y_buf).unwrap();
@@ -3217,30 +2894,27 @@ mod alias_tests {
                     rt.free_raw(presk_buf).unwrap();
                     rt.free_raw(presv_buf).unwrap();
                 }
-                if let Some(workspace_buf) = workspace_buf {
-                    rt.free_raw(workspace_buf).unwrap();
-                }
                 bytes_f32(&y_bytes)
             }
         };
 
         // Non-aliased present/past buffers give the race-free ground truth.
-        let reference = run(false, false);
-        // Both the compatibility fallback and governed prepared composite must
-        // reproduce it exactly; the fallback remains stable across runs.
-        let aliased = run(true, false);
+        let reference = run(false);
+        // Prepared aliased execution must reproduce the disjoint reference and
+        // remain stable across repeated uses of the same kernel.
+        let aliased = run(true);
         assert_eq!(
             aliased, reference,
             "in-place KV-cache growth (present aliases past) must match the non-aliased reference"
         );
         assert_eq!(
-            run(true, true),
+            run(true),
             reference,
             "governed staged KV growth must match the non-aliased reference"
         );
         for i in 0..4 {
             assert_eq!(
-                run(true, false),
+                run(true),
                 aliased,
                 "aliased KV-cache growth must be deterministic across runs (iteration {i})"
             );
@@ -3258,6 +2932,10 @@ mod alias_tests {
     /// the loop bound it would fold the non-zero padding into the scores and
     /// diverge from the dense reference.
     #[test]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable gpu-tests"
+    )]
     fn decode_kv_capacity_append_matches_reference_and_ignores_padding() {
         let Some(rt) = maybe_runtime() else {
             eprintln!("skipping: no CUDA device available");
@@ -3287,12 +2965,9 @@ mod alias_tests {
             kv_num_heads: Some(heads),
             qk_matmul_output_mode: 0,
             softcap: 0.0,
-            output_count: 3,
+            output_slots: [true, true, true, false],
             since_version: 24,
-            warm_state: Mutex::new(StdAttnWarmState {
-                workspace: StdAttnWorkspace::new(rt.clone()),
-                capture_ready: None,
-            }),
+            warm_state: Mutex::new(None),
         };
 
         // Lay a `[heads, valid, dim]` contiguous tensor into a `[heads, cap, dim]`
@@ -3401,7 +3076,7 @@ mod alias_tests {
                     ),
                 ];
 
-                kernel.execute(&inputs, &mut outputs).unwrap();
+                execute_prepared(&kernel, &inputs, &mut outputs).unwrap();
 
                 let mut y_bytes = vec![0u8; heads * qlen * vdim * 4];
                 rt.dtoh(&mut y_bytes, y_buf).unwrap();
@@ -3446,6 +3121,10 @@ mod alias_tests {
     /// scan would wrongly report 1 for a causal prefill mask, so this test fails
     /// if the kernel reverts to scanning row 0 or to host shape metadata.
     #[test]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable gpu-tests"
+    )]
     fn derive_len_reads_valid_length_from_device_for_prefill_and_decode() {
         let Some(rt) = maybe_runtime() else {
             eprintln!("skipping: no CUDA device available");
@@ -3460,12 +3139,9 @@ mod alias_tests {
             kv_num_heads: Some(1),
             qk_matmul_output_mode: 0,
             softcap: 0.0,
-            output_count: 1,
+            output_slots: [true, false, false, false],
             since_version: 24,
-            warm_state: Mutex::new(StdAttnWarmState {
-                workspace: StdAttnWorkspace::new(rt.clone()),
-                capture_ready: None,
-            }),
+            warm_state: Mutex::new(None),
         };
         const NEG: f32 = -65504.0;
         let mask_kind = 1i32; // f32 additive bias
@@ -3548,6 +3224,10 @@ mod alias_tests {
     /// fails if `capture_support` reverts to unconditionally returning `Supported`
     /// or the device-valid-length signature requirement is dropped.
     #[test]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable gpu-tests"
+    )]
     fn capture_support_gated_on_warmed_device_valid_length_signature() {
         let Some(rt) = maybe_runtime() else {
             eprintln!("skipping: no CUDA device available");
@@ -3562,12 +3242,9 @@ mod alias_tests {
             kv_num_heads: Some(1),
             qk_matmul_output_mode: 0,
             softcap: 0.0,
-            output_count: 1,
+            output_slots: [true, false, false, false],
             since_version: 24,
-            warm_state: Mutex::new(StdAttnWarmState {
-                workspace: StdAttnWorkspace::new(rt.clone()),
-                capture_ready: None,
-            }),
+            warm_state: Mutex::new(None),
         };
         // No warmed decode step yet -> capture declined.
         assert!(
@@ -3578,21 +3255,22 @@ mod alias_tests {
             "fresh kernel must decline capture until a fixed-capacity device-valid-length decode step is warmed"
         );
         // Simulate a warmed single-token decode step recording its signature.
-        kernel.warm_state.lock().unwrap().capture_ready = Some(Arc::new(StdAttnCaptureReady {
-            signature: StdAttnCaptureSignature {
-                dtype: DataType::Float16,
-                inputs: Vec::new(),
-                outputs: Vec::new(),
-                batch: 1,
-                q_heads: 1,
-                kv_heads: 1,
-                q_seq: 1,
-                key_cap: 4096,
-                head_size: 192,
-                v_head_size: 128,
-            },
-            resources: Vec::new(),
-        }));
+        *kernel.warm_state.lock().unwrap() = Some(StdAttnCaptureSignature {
+            dtype: DataType::Float16,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            batch: 1,
+            q_heads: 1,
+            kv_heads: 1,
+            q_seq: 1,
+            key_cap: 4096,
+            head_size: 192,
+            v_head_size: 128,
+            workspace_base: 256,
+            workspace_bytes: 4096,
+            split: None,
+            default_offset: 0,
+        });
         assert!(
             matches!(
                 kernel.capture_support(),
@@ -3601,13 +3279,205 @@ mod alias_tests {
             "capture must be Supported once a device-valid-length single-token decode step is warmed"
         );
     }
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable gpu-tests"
+    )]
+    fn shared_workspace_capture_controls_survive_overwrite_and_require_real_pins() {
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_memory_api::MemoryRole;
+        let ep = crate::CudaExecutionProvider::new_default()
+            .expect("Attention capture regression requires CUDA");
+        let rt = ep.runtime();
+        let make_kernel = || StandardAttentionKernel {
+            runtime: rt.clone(),
+            scale: None,
+            is_causal: true,
+            window: AttentionWindow::default(),
+            q_num_heads: None,
+            kv_num_heads: None,
+            qk_matmul_output_mode: 0,
+            softcap: 0.0,
+            output_slots: [true, true, true, false],
+            since_version: 24,
+            warm_state: Mutex::new(None),
+        };
+        let first = make_kernel();
+        let second = make_kernel();
+        let q = rt.alloc_raw(8).unwrap();
+        let k = rt.alloc_raw(8).unwrap();
+        let v = rt.alloc_raw(8).unwrap();
+        let key_a = rt.alloc_raw(16).unwrap();
+        let value_a = rt.alloc_raw(16).unwrap();
+        let key_b = rt.alloc_raw(24).unwrap();
+        let value_b = rt.alloc_raw(24).unwrap();
+        let y_a = rt.alloc_raw(8).unwrap();
+        let y_b = rt.alloc_raw(8).unwrap();
+        // SAFETY: each allocation covers its exact typed source bytes.
+        unsafe {
+            rt.htod(&f32_bytes(&[1.0, 0.5]), q).unwrap();
+            rt.htod(&f32_bytes(&[0.25, 1.0]), k).unwrap();
+            rt.htod(&f32_bytes(&[1.0, -1.0]), v).unwrap();
+            rt.htod(&f32_bytes(&[0.5, 0.25, 0.0, 0.0]), key_a).unwrap();
+            rt.htod(&f32_bytes(&[0.2, 0.7, 0.0, 0.0]), value_a).unwrap();
+            rt.htod(&f32_bytes(&[0.5, 0.25, 0.75, 0.5, 0.0, 0.0]), key_b)
+                .unwrap();
+            rt.htod(&f32_bytes(&[0.2, 0.7, 0.8, 0.3, 0.0, 0.0]), value_b)
+                .unwrap();
+        }
+        let requirement = |kernel: &StandardAttentionKernel, past: usize| {
+            let current = [1, 1, 1, 2];
+            let old = [1, 1, past, 2];
+            let present = [1, 1, past + 1, 2];
+            let inputs = [
+                TensorMetadata::new(DataType::Float32, &current, true),
+                TensorMetadata::new(DataType::Float32, &current, true),
+                TensorMetadata::new(DataType::Float32, &current, true),
+                TensorMetadata::new(DataType::Float32, &[], false),
+                TensorMetadata::new(DataType::Float32, &old, true),
+                TensorMetadata::new(DataType::Float32, &old, true),
+            ];
+            let outputs = [
+                OutputMetadata::tensor(DataType::Float32, &current),
+                OutputMetadata::tensor(DataType::Float32, &present),
+                OutputMetadata::tensor(DataType::Float32, &present),
+            ];
+            kernel.workspace_requirement(&inputs, &outputs).unwrap()
+        };
+        let bytes = requirement(&first, 1)
+            .bytes
+            .max(requirement(&second, 2).bytes) as usize;
+        let mut workspace = ep
+            .allocate_workspace(
+                bytes,
+                STD_SCORES_ALIGN,
+                MemoryRole::Workspace { step_scoped: false },
+            )
+            .unwrap();
+        let view = WorkspaceView::new(DevicePtrMut(workspace.as_mut_ptr()), workspace.len());
+        let execute = |kernel: &StandardAttentionKernel,
+                       past: usize,
+                       key: CUdeviceptr,
+                       value: CUdeviceptr,
+                       y: CUdeviceptr,
+                       view: Option<WorkspaceView>| {
+            let current = [1, 1, 1, 2];
+            let old = [1, 1, past, 2];
+            let present = [1, 1, past + 1, 2];
+            let current_st = compute_contiguous_strides(&current);
+            let old_st = compute_contiguous_strides(&old);
+            let present_st = compute_contiguous_strides(&present);
+            let device = ep.device_id();
+            let dp = |ptr| DevicePtr(ptr as *const c_void);
+            let dpm = |ptr| DevicePtrMut(ptr as *mut c_void);
+            let inputs = [
+                TensorView::new(dp(q), DataType::Float32, &current, &current_st, device),
+                TensorView::new(dp(k), DataType::Float32, &current, &current_st, device),
+                TensorView::new(dp(v), DataType::Float32, &current, &current_st, device),
+                TensorView::absent(DataType::Float32),
+                TensorView::new(dp(key), DataType::Float32, &old, &old_st, device),
+                TensorView::new(dp(value), DataType::Float32, &old, &old_st, device),
+            ];
+            let mut outputs = [
+                TensorMut::new(dpm(y), DataType::Float32, &current, &current_st, device),
+                TensorMut::new(dpm(key), DataType::Float32, &present, &present_st, device),
+                TensorMut::new(dpm(value), DataType::Float32, &present, &present_st, device),
+            ];
+            kernel.execute_with_workspace(&inputs, &mut outputs, view)
+        };
+        assert!(
+            execute(&first, 1, key_a, value_a, y_a, None)
+                .unwrap_err()
+                .to_string()
+                .contains("workspace")
+        );
+        execute(&first, 1, key_a, value_a, y_a, Some(view)).unwrap();
+        execute(&second, 2, key_b, value_b, y_b, Some(view)).unwrap();
+        let read = |ptr| {
+            let mut bytes = vec![0u8; 8];
+            unsafe { rt.dtoh(&mut bytes, ptr).unwrap() };
+            bytes
+        };
+        let expected = [read(y_a), read(y_b)];
+        rt.begin_graph_capture(&[&first]).unwrap();
+        let missing_pin = execute(&first, 1, key_a, value_a, y_a, Some(view))
+            .unwrap_err()
+            .to_string();
+        rt.abort_graph_capture().unwrap();
+        assert!(
+            missing_pin.contains("real workspace owner"),
+            "{missing_pin}"
+        );
+        execute(&first, 1, key_a, value_a, y_a, Some(view)).unwrap();
+        let pin = workspace
+            .device_graph_resource()
+            .unwrap()
+            .expect("provider workspace needs a true owner pin");
+        let counts = rt.allocation_counts();
+        rt.begin_graph_capture_with_resources(&[&first, &second], vec![pin])
+            .unwrap();
+        execute(&first, 1, key_a, value_a, y_a, Some(view)).unwrap();
+        execute(&second, 2, key_b, value_b, y_b, Some(view)).unwrap();
+        rt.end_graph_capture().unwrap();
+        // Deliberately destroy all warmup contents between every replay. Each
+        // op must reconstruct scratch or take controls from its own arguments.
+        for _ in 0..3 {
+            unsafe {
+                rt.htod(&vec![0xff; view.bytes()], cuptr(view.ptr().0.cast_const()))
+                    .unwrap()
+            };
+            rt.replay_graph().unwrap();
+            assert_eq!([read(y_a), read(y_b)], expected);
+        }
+        assert_eq!(rt.allocation_counts(), counts);
+        rt.reset_graph().unwrap();
+        ep.deallocate_workspace(workspace).unwrap();
+        for ptr in [q, k, v, key_a, value_a, key_b, value_b, y_a, y_b] {
+            unsafe { rt.free_raw(ptr).unwrap() };
+        }
+    }
 }
 
 #[cfg(test)]
 mod workspace_governance_tests {
-    //! CPU-only unit tests (no GPU needed) for the governed default-domain
-    //! `Attention` score + staged-K/V composite (#736): shared sizing, route
-    //! split, and both lifetime classes.
+
+    fn region(layout: StdAttentionWorkspaceLayout, index: usize) -> WorkspaceView {
+        let backing = WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(256usize as *mut c_void),
+            layout.bytes(),
+        );
+        layout.bind(Some(backing)).unwrap()[index]
+    }
+    fn slots(count: usize) -> [bool; 4] {
+        std::array::from_fn(|index| index < count)
+    }
+    fn requirement(
+        inputs: &[TensorMetadata<'_>],
+        q: Option<usize>,
+        kv: Option<usize>,
+        mask: bool,
+        count: usize,
+    ) -> Result<WorkspaceRequirement> {
+        let dtype = inputs
+            .first()
+            .map_or(DataType::Undefined, |input| input.dtype);
+        let outputs = (0..count)
+            .map(|_| OutputMetadata::Unresolved { dtype })
+            .collect::<Vec<_>>();
+        super::std_attention_workspace_requirement(
+            inputs,
+            q,
+            kv,
+            mask,
+            false,
+            slots(count),
+            &outputs,
+        )
+    }
+    // CPU-only unit tests (no GPU needed) for the governed default-domain
+    // `Attention` score + staged-K/V composite (#736): shared sizing, route
+    // split, and retained capacity.
     use super::*;
     use onnx_runtime_ep_api::TensorMetadata;
     use onnx_runtime_memory_api::MemoryRole;
@@ -3637,6 +3507,220 @@ mod workspace_governance_tests {
     }
 
     #[test]
+    fn complete_layout_is_disjoint_and_requires_valid_caller_backing() {
+        let layout = std_attention_workspace_layout(
+            2, 4, 1, 8, 2, 8, 3, 8, 5, 2, true, true, true, true, 2, true, 320,
+        )
+        .unwrap();
+        #[repr(align(256))]
+        struct Backing([u8; 4096]);
+        let mut backing = Backing([0; 4096]);
+        let view = WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(backing.0.as_mut_ptr().cast()),
+            layout.bytes(),
+        );
+        let parts = layout.bind(Some(view)).unwrap();
+        assert_eq!(parts[SCORES].bytes(), 2 * 4 * 8 * 4);
+        assert_eq!(parts[DEVICE_LENGTH].bytes(), 4);
+        assert_eq!(parts[OFFSETS].bytes(), 16);
+        assert_eq!(parts[PAD_LIMITS].bytes(), 16);
+        assert_eq!(parts[STAGED_KEY].bytes(), 2 * 2 * 8 * 3 * 2);
+        assert_eq!(parts[STAGED_VALUE].bytes(), 2 * 2 * 8 * 5 * 2);
+        assert_eq!(parts[PRESENT_KEY].bytes(), parts[STAGED_KEY].bytes());
+        assert_eq!(parts[PRESENT_VALUE].bytes(), parts[STAGED_VALUE].bytes());
+        assert_eq!(parts[SPLIT_PARTIALS].bytes(), 320);
+        for pair in parts.windows(2) {
+            assert!(pair[0].ptr().0 as usize + pair[0].bytes() <= pair[1].ptr().0 as usize);
+        }
+        for bad in [
+            None,
+            Some(WorkspaceView::new(view.ptr(), layout.bytes() - 1)),
+            Some(WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut((view.ptr().0 as usize + 1) as *mut c_void),
+                layout.bytes(),
+            )),
+            Some(WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut((usize::MAX - 255) as *mut c_void),
+                layout.bytes(),
+            )),
+        ] {
+            assert!(
+                layout
+                    .bind(bad)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("prepare and pass")
+            );
+        }
+        assert!(attention_split_scratch_bytes(u64::MAX, 2, 8).is_err());
+        assert!(attention_split_scratch_bytes(2, 2, u64::MAX).is_err());
+        assert!(
+            std_attention_workspace_layout(
+                1,
+                1,
+                1,
+                1,
+                1,
+                usize::MAX,
+                2,
+                1,
+                2,
+                4,
+                true,
+                false,
+                false,
+                false,
+                1,
+                false,
+                0
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn output_holes_keep_their_positional_scratch_and_validate_dtypes() {
+        use onnx_runtime_ir::{NodeId, ValueId};
+        let node = Node::new_with_output_slots(
+            NodeId(0),
+            "Attention",
+            vec![],
+            vec![Some(ValueId(0)), None, Some(ValueId(2))],
+        );
+        let slots = std_attention_output_slots(&node).unwrap();
+        assert_eq!(slots, [true, false, true, false]);
+        let inputs = [
+            meta(DataType::Float32, &[1, 2, 1, 3]),
+            meta(DataType::Float32, &[1, 1, 2, 3]),
+            meta(DataType::Float32, &[1, 1, 2, 5]),
+        ];
+        let outputs = [
+            OutputMetadata::tensor(DataType::Float32, &[1, 2, 1, 5]),
+            OutputMetadata::Absent,
+            OutputMetadata::tensor(DataType::Float32, &[1, 1, 2, 5]),
+        ];
+        let req =
+            std_attention_workspace_requirement(&inputs, None, None, true, false, slots, &outputs)
+                .unwrap();
+        let expected = std_attention_workspace_layout(
+            1, 2, 1, 2, 1, 2, 3, 2, 5, 4, false, false, true, false, 1, false, 0,
+        )
+        .unwrap();
+        assert_eq!(req.bytes, expected.bytes() as u64);
+        assert!(region(expected, PRESENT_KEY).bytes() > 0);
+        assert_eq!(region(expected, PRESENT_VALUE).bytes(), 0);
+        assert!(
+            validate_std_attention_outputs(slots, &outputs[..1], DataType::Float32)
+                .unwrap_err()
+                .to_string()
+                .contains("output slots")
+        );
+        let mut wrong = outputs.clone();
+        wrong[2] = OutputMetadata::Unresolved {
+            dtype: DataType::Float16,
+        };
+        assert!(
+            validate_std_attention_outputs(slots, &wrong, DataType::Float32)
+                .unwrap_err()
+                .to_string()
+                .contains("output slot 2 dtype")
+        );
+    }
+
+    #[test]
+    fn output_capacity_funds_the_selected_decode_and_physical_span() {
+        let inputs = [
+            meta(DataType::Float16, &[1, 4, 1, 3]),
+            meta(DataType::Float16, &[1, 2, 1, 3]),
+            meta(DataType::Float16, &[1, 2, 1, 5]),
+            meta(DataType::Float32, &[1, 1, 1, 1024]),
+            meta(DataType::Float16, &[1, 2, 1024, 3]),
+            meta(DataType::Float16, &[1, 2, 1024, 5]),
+        ];
+        let outputs = [
+            OutputMetadata::tensor(DataType::Float16, &[1, 4, 1, 5]),
+            OutputMetadata::tensor(DataType::Float16, &[1, 2, 1024, 3]),
+            OutputMetadata::tensor(DataType::Float16, &[1, 2, 1024, 5]),
+        ];
+        let split = attention_split_config(true, true, false, false, 1024, 4, 5);
+        let bytes = split
+            .map(|(splits, _)| attention_split_scratch_bytes(splits, 4, 5).unwrap())
+            .unwrap_or(0);
+        let expected = std_attention_workspace_layout(
+            1, 4, 1, 1024, 2, 1024, 3, 1024, 5, 2, false, false, false, false, 1, true, bytes,
+        )
+        .unwrap();
+        let req = std_attention_workspace_requirement(
+            &inputs,
+            None,
+            None,
+            true,
+            false,
+            [true, true, true, false],
+            &outputs,
+        )
+        .unwrap();
+        assert_eq!(req.bytes, expected.bytes() as u64);
+        assert_eq!(region(expected, DEVICE_LENGTH).bytes(), 4);
+        assert_eq!(region(expected, SPLIT_PARTIALS).bytes(), bytes);
+    }
+
+    #[test]
+    fn capture_signature_requires_the_exact_borrowed_address_and_layout() {
+        let warmed = StdAttnCaptureSignature {
+            dtype: DataType::Float32,
+            inputs: vec![],
+            outputs: vec![],
+            batch: 1,
+            q_heads: 2,
+            kv_heads: 1,
+            q_seq: 1,
+            key_cap: 1024,
+            head_size: 3,
+            v_head_size: 5,
+            workspace_base: 256,
+            workspace_bytes: 2048,
+            split: Some((4, 256)),
+            default_offset: 7,
+        };
+        let mut state = Some(warmed.clone());
+        StandardAttentionKernel::validate_capture_signature(&state, &warmed).unwrap();
+        for changed in [
+            StdAttnCaptureSignature {
+                workspace_base: 512,
+                ..warmed.clone()
+            },
+            StdAttnCaptureSignature {
+                workspace_bytes: 4096,
+                ..warmed.clone()
+            },
+            StdAttnCaptureSignature {
+                split: None,
+                ..warmed.clone()
+            },
+            StdAttnCaptureSignature {
+                default_offset: 8,
+                ..warmed.clone()
+            },
+        ] {
+            assert!(
+                StandardAttentionKernel::validate_capture_signature(&state, &changed)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("signature changed")
+            );
+        }
+        let previous = state.take();
+        assert!(
+            StandardAttentionKernel::validate_capture_signature(&state, &warmed)
+                .unwrap_err()
+                .to_string()
+                .contains("without a successful warmed")
+        );
+        assert!(previous.is_some());
+    }
+
+    #[test]
     fn scores_bytes_matches_score_count_formula() {
         // Planning and execution size the governed score buffer through this
         // exact helper (#736), so pin its formula: `batch·heads·q_seq·total_seq`
@@ -3653,7 +3737,7 @@ mod workspace_governance_tests {
     }
 
     #[test]
-    fn prefill_without_past_charges_only_step_scoped_scores() {
+    fn prefill_without_past_retains_the_composite() {
         // Multi-token prefill (the 512-MiB-class worst case) is the per-call
         // route: StepScoped, sized to `batch·heads·q_seq·key` fp32. With no past
         // cache there is no aliased growth to stage.
@@ -3665,24 +3749,23 @@ mod workspace_governance_tests {
             meta(DataType::Float32, &kv),
             meta(DataType::Float32, &kv),
         ];
-        let req =
-            std_attention_workspace_requirement(&inputs, Some(32), Some(32), true, 3).unwrap();
+        let req = requirement(&inputs, Some(32), Some(32), true, 3).unwrap();
         // Bound present outputs (3-output node) need no served K/V scratch, so the
         // composite is the always-live scores plus the per-batch control arrays.
         let layout = std_attention_workspace_layout(
-            1, 32, 2048, 2048, 32, 2048, 128, 2048, 128, 4, false, false, false, false, 1,
+            1, 32, 2048, 2048, 32, 2048, 128, 2048, 128, 4, false, false, false, false, 1, false, 0,
         )
         .unwrap();
-        assert_eq!(req.bytes, layout.total_bytes as u64);
+        assert_eq!(req.bytes, layout.bytes() as u64);
         // batch(1) x heads x q_seq x kv_seq x f32, in the order
         // std_attention_workspace_layout multiplies them; the unit batch is
         // elided so the expression is not an identity op.
-        assert_eq!(layout.scores_bytes, 32 * 2048 * 2048 * 4);
-        assert!(layout.present_key_offset.is_none());
-        assert_eq!(req.lifetime, WorkspaceLifetime::StepScoped);
+        assert_eq!(region(layout, SCORES).bytes(), 32 * 2048 * 2048 * 4);
+        assert!(region(layout, PRESENT_KEY).bytes() == 0);
+        assert_eq!(req.lifetime, WorkspaceLifetime::SessionPersistent);
         assert!(matches!(
             req.role(),
-            MemoryRole::Workspace { step_scoped: true }
+            MemoryRole::Workspace { step_scoped: false }
         ));
         assert_eq!(req.alignment, STD_SCORES_ALIGN);
     }
@@ -3690,15 +3773,14 @@ mod workspace_governance_tests {
     #[test]
     fn dense_single_token_growth_stages_both_as_session_persistent() {
         let inputs = dense_inputs(DataType::Float16, 1, 1, 2048);
-        assert_eq!(std_attention_staging_route(&inputs, true, 3), (true, true));
         let layout = std_attention_workspace_layout(
-            1, 32, 1, 2049, 8, 2049, 128, 2049, 128, 2, true, true, false, false, 1,
+            1, 32, 1, 2049, 8, 2049, 128, 2049, 128, 2, true, true, false, false, 1, false, 0,
         )
         .unwrap();
-        let req = std_attention_workspace_requirement(&inputs, Some(32), Some(8), true, 3).unwrap();
-        assert_eq!(req.bytes, layout.total_bytes as u64);
-        assert_eq!(layout.stage_key_bytes, 8 * 2049 * 128 * 2);
-        assert_eq!(layout.stage_value_bytes, 8 * 2049 * 128 * 2);
+        let req = requirement(&inputs, Some(32), Some(8), true, 3).unwrap();
+        assert_eq!(req.bytes, layout.bytes() as u64);
+        assert_eq!(region(layout, STAGED_KEY).bytes(), 8 * 2049 * 128 * 2);
+        assert_eq!(region(layout, STAGED_VALUE).bytes(), 8 * 2049 * 128 * 2);
         assert_eq!(req.lifetime, WorkspaceLifetime::SessionPersistent);
         assert!(matches!(
             req.role(),
@@ -3707,79 +3789,119 @@ mod workspace_governance_tests {
     }
 
     #[test]
-    fn dense_prefill_growth_stages_both_as_step_scoped() {
+    fn dense_prefill_growth_retains_both_staging_regions() {
         let inputs = dense_inputs(DataType::Float32, 2, 8, 128);
         let layout = std_attention_workspace_layout(
-            2, 32, 8, 136, 8, 136, 128, 136, 128, 4, true, true, false, false, 2,
+            2, 32, 8, 136, 8, 136, 128, 136, 128, 4, true, true, false, false, 2, false, 0,
         )
         .unwrap();
-        let req = std_attention_workspace_requirement(&inputs, Some(32), Some(8), true, 3).unwrap();
-        assert_eq!(req.bytes, layout.total_bytes as u64);
-        assert!(layout.stage_key_offset.is_some());
-        assert!(layout.stage_value_offset.is_some());
-        assert_eq!(req.lifetime, WorkspaceLifetime::StepScoped);
+        let req = requirement(&inputs, Some(32), Some(8), true, 3).unwrap();
+        assert_eq!(req.bytes, layout.bytes() as u64);
+        assert!(region(layout, STAGED_KEY).bytes() != 0);
+        assert!(region(layout, STAGED_VALUE).bytes() != 0);
+        assert_eq!(req.lifetime, WorkspaceLifetime::SessionPersistent);
         assert!(matches!(
             req.role(),
-            MemoryRole::Workspace { step_scoped: true }
+            MemoryRole::Workspace { step_scoped: false }
         ));
     }
 
     #[test]
-    fn fixed_capacity_append_and_missing_present_outputs_charge_zero_staging() {
-        let mut fixed = dense_inputs(DataType::Float16, 1, 1, 2048);
-        fixed[3] = meta(DataType::Float32, Box::leak(Box::new([1, 1, 1, 2048])));
-        assert_eq!(
-            std_attention_staging_route(&fixed, true, 3),
-            (false, false),
-            "mask-driven non-causal fixed-capacity append must report no staging"
-        );
-        let fixed_req =
-            std_attention_workspace_requirement(&fixed, Some(32), Some(8), true, 3).unwrap();
-        assert_eq!(
-            std_attention_staging_route(&fixed, false, 3),
-            (true, true),
-            "windowed Attention must reserve for logical cache growth, not infer length from mask width"
-        );
-        // Bound present outputs charge zero staged-K/V bytes; the composite keeps
-        // its always-live scores plus the per-batch control arrays.
-        let fixed_layout = std_attention_workspace_layout(
-            1, 32, 1, 2049, 8, 2049, 128, 2049, 128, 2, false, false, false, false, 1,
-        )
-        .unwrap();
-        assert_eq!(fixed_req.bytes, fixed_layout.total_bytes as u64);
-        assert!(fixed_layout.stage_key_offset.is_none());
-        assert!(fixed_layout.present_key_offset.is_none());
-        assert_eq!(
-            fixed_layout.scores_bytes,
-            std_attention_scores_bytes(1, 32, 1, 2049).unwrap(),
-            "the composite keeps its always-live scores but charges zero staged-K/V bytes"
-        );
+    fn unresolved_outputs_cover_dense_aliasing_even_when_mask_matches_past() {
+        let inputs = [
+            meta(DataType::Float32, &[1, 2, 1, 3]),
+            meta(DataType::Float32, &[1, 1, 1, 3]),
+            meta(DataType::Float32, &[1, 1, 1, 5]),
+            meta(DataType::Float32, &[1, 1, 1, 4]),
+            meta(DataType::Float32, &[1, 1, 4, 3]),
+            meta(DataType::Float32, &[1, 1, 4, 5]),
+        ];
+        let unresolved = [
+            OutputMetadata::Unresolved {
+                dtype: DataType::Float32,
+            },
+            OutputMetadata::Unresolved {
+                dtype: DataType::Float32,
+            },
+            OutputMetadata::Unresolved {
+                dtype: DataType::Float32,
+            },
+        ];
+        let dense = [
+            OutputMetadata::tensor(DataType::Float32, &[1, 2, 1, 5]),
+            OutputMetadata::tensor(DataType::Float32, &[1, 1, 5, 3]),
+            OutputMetadata::tensor(DataType::Float32, &[1, 1, 5, 5]),
+        ];
+        let requirement = |outputs: &[OutputMetadata<'_>]| {
+            std_attention_workspace_requirement(
+                &inputs,
+                None,
+                None,
+                true,
+                false,
+                [true, true, true, false],
+                outputs,
+            )
+            .unwrap()
+        };
+        let known = requirement(&dense);
+        assert!(requirement(&unresolved).bytes >= known.bytes);
+        let mut one_unknown = dense.clone();
+        one_unknown[1] = unresolved[1].clone();
+        assert!(requirement(&one_unknown).bytes >= known.bytes);
+        one_unknown = dense.clone();
+        one_unknown[2] = unresolved[2].clone();
+        assert!(requirement(&one_unknown).bytes >= known.bytes);
+        let frozen = [
+            dense[0].clone(),
+            OutputMetadata::tensor(DataType::Float32, &[1, 1, 4, 3]),
+            OutputMetadata::tensor(DataType::Float32, &[1, 1, 4, 5]),
+        ];
+        assert!(requirement(&frozen).bytes < known.bytes);
+    }
 
-        let mut dense = dense_inputs(DataType::Float16, 1, 1, 2048);
-        dense[3] = meta(DataType::Float32, Box::leak(Box::new([1, 1, 1, 2049])));
-        assert_eq!(
-            std_attention_staging_route(&dense, false, 3),
-            (true, true),
-            "a logical-width mask is not evidence of fixed-capacity append"
+    #[test]
+    fn one_known_output_capacity_bounds_the_unresolved_peer() {
+        let inputs = [
+            meta(DataType::Float32, &[1, 2, 1, 3]),
+            meta(DataType::Float32, &[1, 1, 1, 3]),
+            meta(DataType::Float32, &[1, 1, 1, 5]),
+            meta(DataType::Float32, &[1, 1, 1, 4]),
+            meta(DataType::Float32, &[1, 1, 4, 3]),
+            meta(DataType::Float32, &[1, 1, 4, 5]),
+        ];
+        let outputs = [
+            OutputMetadata::tensor(DataType::Float32, &[1, 2, 1, 5]),
+            OutputMetadata::tensor(DataType::Float32, &[1, 1, 11, 3]),
+            OutputMetadata::tensor(DataType::Float32, &[1, 1, 11, 5]),
+        ];
+        let requirement = |outputs: &[OutputMetadata<'_>]| {
+            std_attention_workspace_requirement(
+                &inputs,
+                None,
+                None,
+                true,
+                false,
+                [true, true, true, false],
+                outputs,
+            )
+        };
+        let known = requirement(&outputs).unwrap();
+        for index in [1, 2] {
+            let mut mixed = outputs.clone();
+            mixed[index] = OutputMetadata::Unresolved {
+                dtype: DataType::Float32,
+            };
+            assert!(requirement(&mixed).unwrap().bytes >= known.bytes);
+        }
+        let mut mismatched = outputs.clone();
+        mismatched[2] = OutputMetadata::tensor(DataType::Float32, &[1, 1, 12, 5]);
+        assert!(
+            requirement(&mismatched)
+                .unwrap_err()
+                .to_string()
+                .contains("physical capacities")
         );
-        assert_eq!(
-            std_attention_staging_route(&dense, true, 1),
-            (false, false),
-            "a one-output Attention node has no present cache to stage"
-        );
-        let one_output_req =
-            std_attention_workspace_requirement(&dense, Some(32), Some(8), true, 1).unwrap();
-        // A one-output node binds no present slots, so the served composite now
-        // also carries the present-K/V scratch the kernel needs as its attention
-        // source — strictly more than the scores+control-only bound-output case.
-        assert!(one_output_req.bytes > fixed_req.bytes);
-        let one_layout = std_attention_workspace_layout(
-            1, 32, 1, 2049, 8, 2049, 128, 2049, 128, 2, false, false, true, true, 1,
-        )
-        .unwrap();
-        assert_eq!(one_output_req.bytes, one_layout.total_bytes as u64);
-        assert!(one_layout.present_key_offset.is_some());
-        assert!(one_layout.present_value_offset.is_some());
     }
 
     #[test]
@@ -3792,7 +3914,7 @@ mod workspace_governance_tests {
             meta(DataType::Int32, &q_i),
         ];
         assert_eq!(
-            std_attention_workspace_requirement(&int_inputs, Some(4), Some(4), true, 3).unwrap(),
+            requirement(&int_inputs, Some(4), Some(4), true, 3).unwrap(),
             WorkspaceRequirement::NONE
         );
         // Rank-2 shape is not a resolvable attention operand.
@@ -3803,7 +3925,7 @@ mod workspace_governance_tests {
             meta(DataType::Float32, &bad),
         ];
         assert_eq!(
-            std_attention_workspace_requirement(&bad_inputs, Some(4), Some(4), true, 3).unwrap(),
+            requirement(&bad_inputs, Some(4), Some(4), true, 3).unwrap(),
             WorkspaceRequirement::NONE
         );
     }
@@ -3861,45 +3983,22 @@ mod workspace_governance_tests {
 mod raw_allocation_guard {
     #[test]
     fn std_attention_composite_is_governed_not_raw_allocated() {
-        const SOURCE: &str = include_str!("standard_attention.rs");
-        assert!(
-            SOURCE.contains("fn execute_with_workspace"),
-            "default-domain Attention must stay wired into governed workspace preparation (#736)."
-        );
-        assert!(
-            SOURCE.contains("std_attention_workspace_layout"),
-            "scores and staged K/V must be sized through the shared layout helper (#736)."
-        );
-        assert!(
-            SOURCE.contains("\"staged key\"") && SOURCE.contains("\"staged value\""),
-            "execute_with_workspace must carve both staged K/V regions from prepared memory."
-        );
-        // The pre-#736 seam sized the score slot as `qk_expected * 4` directly
-        // in both the pooled and per-call branches. The needles are assembled at
-        // runtime so these literals do not themselves match under `include_str!`.
-        let pooled = ["ws.reserve(WS_SCORES, qk_expected", " * 4)"].concat();
-        let owned = ["owned, qk_expected", " * 4)"].concat();
-        assert!(
-            !SOURCE.contains(pooled.as_str()) && !SOURCE.contains(owned.as_str()),
-            "default-domain Attention must not reintroduce an unconditional raw allocation of the \
-             governed score slot (#736); size it through `std_attention_scores_bytes` and consume \
-             the executor-prepared workspace."
-        );
-        let raw_key = [
-            "ws.reserve(WS_STAGE_KEY, present_key_expected",
-            " * element_bytes)",
-        ]
-        .concat();
-        let raw_value = [
-            "ws.reserve(WS_STAGE_VALUE, present_value_expected",
-            " * element_bytes)",
-        ]
-        .concat();
-        assert!(
-            !SOURCE.contains(raw_key.as_str()) && !SOURCE.contains(raw_value.as_str()),
-            "default-domain Attention must not bypass the prepared composite with direct staged \
-             K/V slot sizing; use `std_attention_workspace_layout` for both planning and execution."
-        );
+        let source = include_str!("standard_attention.rs")
+            .split("#[cfg(test)]\nfn execute_prepared")
+            .next()
+            .unwrap();
+        for forbidden in [
+            ".alloc_raw(",
+            ".free_raw(",
+            "StdAttnWorkspace",
+            "StdWorkspaceSlot",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "production Attention must borrow one caller lane rather than {forbidden}"
+            );
+        }
+        assert!(source.contains("require_registered_workspace_capture"));
     }
 }
 
