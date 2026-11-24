@@ -13,7 +13,7 @@ use crate::decode::{
     run_decode_step,
 };
 use crate::decode_loop::{
-    DecodeLoopState, commit_selected_token, logprob_for_token, reached_context_limit,
+    DecodeLoopState, ProbabilitySnapshot, commit_selected_token, reached_context_limit,
 };
 use crate::engine::{Engine, MISSING_ORT_SESSION};
 use crate::kv_bridge::{
@@ -1679,7 +1679,7 @@ impl Engine {
         mode_available
             // Grammar processors carry per-request parser state; draft/verify
             // would need separate parser branches for speculative candidates.
-            && options.constraint.is_none()
+            && options.constraint.is_none() && options.reasoning_budget.is_none()
             && options.selects_greedily()
             && self.kv_model.is_some()
     }
@@ -1810,6 +1810,7 @@ impl Engine {
                     FinishReason::MaxTokens,
                     prefix_cache_hit_len,
                     logprobs.as_deref(),
+                    &options.effective_preserved_tokens(),
                 )
             }
         }
@@ -2058,6 +2059,7 @@ impl Engine {
                 FinishReason::MaxTokens,
                 prefix_cache_hit_len,
                 generated_logprobs.as_deref(),
+                &options.effective_preserved_tokens(),
             )?));
         }
         if reached_context_limit(token_count, max_context) {
@@ -2066,6 +2068,7 @@ impl Engine {
                 FinishReason::Length,
                 prefix_cache_hit_len,
                 generated_logprobs.as_deref(),
+                &options.effective_preserved_tokens(),
             )?));
         }
         Ok(None)
@@ -2357,26 +2360,25 @@ impl Engine {
                     .copied()
                     .chain(draft_tokens[..idx].iter().copied())
                     .collect(),
-                generated_text: self
-                    .require_tokenizer()?
-                    .decode(
-                        &generated_tokens
-                            .iter()
-                            .copied()
-                            .chain(draft_tokens[..idx].iter().copied())
-                            .collect::<Vec<_>>(),
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to detokenize speculative context: {e}")
-                    })?,
+                generated_text: crate::tokenization::decode_output(
+                    self.require_tokenizer()?,
+                    &generated_tokens
+                        .iter()
+                        .copied()
+                        .chain(draft_tokens[..idx].iter().copied())
+                        .collect::<Vec<_>>(),
+                    &options.effective_preserved_tokens(),
+                )
+                .context("decode speculative output history with preserved_tokens")?,
                 step: step + idx,
             };
+            let probabilities = ProbabilitySnapshot::capture(options, &target_logits[idx]);
             let target_token =
                 select_next_token_with_rng(&mut target_logits[idx], &context, options, chain, rng)?;
             if let (Some(top_logprobs), Some(logprobs)) =
                 (options.top_logprobs, candidate_logprobs.as_mut())
             {
-                logprobs.push(logprob_for_token(
+                logprobs.push(probabilities.for_token(
                     &target_logits[idx],
                     target_token,
                     top_logprobs,
@@ -2454,20 +2456,24 @@ impl Engine {
                     .copied()
                     .chain(draft_tokens.iter().copied())
                     .collect(),
-                generated_text: self
-                    .require_tokenizer()?
-                    .decode(
-                        &generated_tokens
-                            .iter()
-                            .copied()
-                            .chain(draft_tokens.iter().copied())
-                            .collect::<Vec<_>>(),
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to detokenize speculative context: {e}")
-                    })?,
+                generated_text: crate::tokenization::decode_output(
+                    self.require_tokenizer()?,
+                    &generated_tokens
+                        .iter()
+                        .copied()
+                        .chain(draft_tokens.iter().copied())
+                        .collect::<Vec<_>>(),
+                    &options.effective_preserved_tokens(),
+                )
+                .context("decode speculative output history with preserved_tokens")?,
                 step: step + draft_tokens.len(),
             };
+            let probabilities = ProbabilitySnapshot::capture(
+                options,
+                target_logits
+                    .last()
+                    .context("target verification did not produce next-token logits")?,
+            );
             let token = select_next_token_with_rng(
                 target_logits
                     .last_mut()
@@ -2480,13 +2486,15 @@ impl Engine {
             if let (Some(top_logprobs), Some(logprobs)) =
                 (options.top_logprobs, commit_logprobs.as_mut())
             {
-                logprobs.push(logprob_for_token(
-                    target_logits
-                        .last()
-                        .context("target verification did not produce next-token logits")?,
-                    token,
-                    top_logprobs,
-                ));
+                logprobs.push(
+                    probabilities.for_token(
+                        target_logits
+                            .last()
+                            .context("target verification did not produce next-token logits")?,
+                        token,
+                        top_logprobs,
+                    ),
+                );
             }
             context.generated_tokens.push(token);
             commit_tokens.push(token);
@@ -2579,6 +2587,7 @@ impl Engine {
                     finish_reason,
                     prefix_cache_hit_len,
                     generated_logprobs.as_deref(),
+                    &options.effective_preserved_tokens(),
                 )?));
             }
         }

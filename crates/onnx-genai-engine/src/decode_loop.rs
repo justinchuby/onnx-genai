@@ -195,6 +195,12 @@ pub(crate) fn select_and_commit_step<B: DecodeLoopBackend + ?Sized>(
     forward: ForwardOutcome,
     callback: Option<&mut GenerateTokenCallback<'_>>,
 ) -> anyhow::Result<(TokenId, Option<FinishReason>)> {
+    anyhow::ensure!(
+        state.custom_sampler.is_none()
+            || options.top_logprobs.is_none()
+            || options.logprob_source != crate::config::LogprobSource::Sampling,
+        "logprob_source=Sampling cannot inspect a caller-supplied sampler's distribution; request Model or Processed probabilities instead"
+    );
     let token_id = match forward.device_token {
         Some(token_id) => token_id,
         None => {
@@ -211,6 +217,7 @@ pub(crate) fn select_and_commit_step<B: DecodeLoopBackend + ?Sized>(
             let mut logits = forward
                 .logits
                 .context("a forward pass produced neither a device token nor host logits")?;
+            let probabilities = ProbabilitySnapshot::capture(options, &logits);
             let token_id = {
                 let _span = onnx_genai_ort::prof_span!("loop.sampling");
                 if let Some(sampler) = state.custom_sampler.as_deref_mut() {
@@ -230,7 +237,7 @@ pub(crate) fn select_and_commit_step<B: DecodeLoopBackend + ?Sized>(
             if let (Some(top_logprobs), Some(logprobs)) =
                 (options.top_logprobs, state.logprobs.as_mut())
             {
-                logprobs.push(logprob_for_token(&logits, token_id, top_logprobs));
+                logprobs.push(probabilities.for_token(&logits, token_id, top_logprobs));
             }
             token_id
         }
@@ -261,6 +268,11 @@ pub(crate) fn commit_selected_token(
     tokenizer: &Tokenizer,
     callback: Option<&mut GenerateTokenCallback<'_>>,
 ) -> anyhow::Result<Option<FinishReason>> {
+    if state.step == 0 {
+        state.text_decoder = crate::tokenization::TokenTextDecoder::with_preserved_tokens(
+            &options.effective_preserved_tokens(),
+        );
+    }
     state.generated_tokens.push(token_id);
     // Which token this step produced. Without it a timeline shows that a step
     // happened but not what came out of it, so a stall cannot be tied to the
@@ -269,7 +281,7 @@ pub(crate) fn commit_selected_token(
     // decodes exactly as often as an untraced one.
     let mut commit_span = onnx_genai_ort::prof_span!("loop.commit_selected_token");
     commit_span.set_arg("token_id", token_id);
-    let decode_text = callback.is_some() || !chain.is_empty();
+    let decode_text = callback.is_some() || !chain.is_empty() || state.custom_sampler.is_some();
     let mut token_text = if decode_text {
         let _span = onnx_genai_ort::prof_span!("loop.detokenize");
         state.text_decoder.step(tokenizer, token_id)?
@@ -302,6 +314,11 @@ pub(crate) fn commit_selected_token(
     }
     if let Some(callback) = callback {
         callback(GenerateToken {
+            logprob: state
+                .logprobs
+                .as_ref()
+                .and_then(|values| values.last())
+                .cloned(),
             token_id,
             text: token_text,
             finish_reason: finish_reason.clone(),
@@ -317,11 +334,11 @@ pub(crate) fn finish_result(
     finish_reason: FinishReason,
     prefix_cache_hit_len: usize,
     logprobs: Option<&[TokenLogprob]>,
+    preserved_tokens: &std::collections::BTreeSet<TokenId>,
 ) -> anyhow::Result<GenerateResult> {
     Ok(GenerateResult {
-        text: tokenizer
-            .decode(generated_tokens)
-            .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {e}"))?,
+        text: crate::tokenization::decode_output(tokenizer, generated_tokens, preserved_tokens)?,
+        preserved_tokens: preserved_tokens.clone(),
         token_ids: generated_tokens.to_vec(),
         finish_reason,
         tool_calls: Vec::new(),
@@ -329,6 +346,36 @@ pub(crate) fn finish_result(
         logprobs: logprobs.map(<[TokenLogprob]>::to_vec),
         budget_cap: None,
     })
+}
+
+/// Retain model logits only when probability reporting requests them. Sampling
+/// mutates its own logits; the selected token is scored against this snapshot.
+pub(crate) struct ProbabilitySnapshot {
+    model: Option<Vec<f32>>,
+    greedy: bool,
+}
+
+impl ProbabilitySnapshot {
+    pub(crate) fn capture(options: &GenerateOptions, logits: &[f32]) -> Self {
+        Self {
+            model: (options.top_logprobs.is_some()
+                && options.logprob_source == crate::config::LogprobSource::Model)
+                .then(|| logits.to_vec()),
+            greedy: options.logprob_source == crate::config::LogprobSource::Sampling
+                && options.selects_greedily(),
+        }
+    }
+
+    pub(crate) fn for_token(&self, processed: &[f32], token: TokenId, top: usize) -> TokenLogprob {
+        if self.greedy {
+            return TokenLogprob {
+                token_id: token,
+                logprob: 0.0,
+                top: vec![(token, 0.0)],
+            };
+        }
+        logprob_for_token(self.model.as_deref().unwrap_or(processed), token, top)
+    }
 }
 
 pub(crate) fn logprob_for_token(
@@ -359,8 +406,17 @@ pub(crate) fn logprob_for_token(
         .iter()
         .copied()
         .enumerate()
-        .filter(|(_, logit)| logit.is_finite())
-        .map(|(id, logit)| (id as TokenId, logit - logsumexp))
+        .filter(|(_, logit)| logit.is_finite() || *logit == f32::NEG_INFINITY)
+        .map(|(id, logit)| {
+            (
+                id as TokenId,
+                if logit.is_finite() {
+                    logit - logsumexp
+                } else {
+                    f32::NEG_INFINITY
+                },
+            )
+        })
         .collect::<Vec<_>>();
     top.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
     top.truncate(top_logprobs);
@@ -392,6 +448,39 @@ pub(crate) fn exceeded_context_limit(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_probability_snapshot_precedes_bias_and_preserves_selected_metadata() {
+        let model = vec![1.0, 2.0, 3.0];
+        let options = crate::GenerateOptions {
+            top_logprobs: Some(1),
+            logprob_source: crate::LogprobSource::Model,
+            ..Default::default()
+        };
+        let snapshot = super::ProbabilitySnapshot::capture(&options, &model);
+        let processed = vec![1000.0, f32::NEG_INFINITY, f32::NEG_INFINITY];
+        let actual = snapshot.for_token(&processed, 0, 1);
+        assert_eq!(actual, super::logprob_for_token(&model, 0, 1));
+        assert_eq!(actual.top.len(), 2); // selected token remains distinct from top-1
+        let zero = super::logprob_for_token(&[0.0, f32::NEG_INFINITY], 0, 2);
+        assert_eq!(zero.top, vec![(0, 0.0), (1, f32::NEG_INFINITY)]);
+        let processed_options = crate::GenerateOptions {
+            logprob_source: crate::LogprobSource::Processed,
+            ..options.clone()
+        };
+        let snapshot = super::ProbabilitySnapshot::capture(&processed_options, &model);
+        assert!(snapshot.model.is_none());
+        assert_eq!(snapshot.for_token(&processed, 0, 1).logprob, 0.0);
+        let disabled = crate::GenerateOptions {
+            top_logprobs: None,
+            ..options
+        };
+        assert!(
+            super::ProbabilitySnapshot::capture(&disabled, &model)
+                .model
+                .is_none()
+        );
+    }
+
     /// The interpreter these loop tests drive.
     ///
     /// The loop is the workflow's, so a unit test must supply one; using the
@@ -583,8 +672,14 @@ mod tests {
                 );
                 assert_eq!(projected, "<eos>");
                 if let Some(finish) = finish {
-                    let result =
-                        finish_result(&tokenizer, &state.generated_tokens, finish, 0, None)?;
+                    let result = finish_result(
+                        &tokenizer,
+                        &state.generated_tokens,
+                        finish,
+                        0,
+                        None,
+                        &options.effective_preserved_tokens(),
+                    )?;
                     assert_eq!(result.token_ids, [3]);
                     assert_eq!(result.text, text);
                 }
@@ -945,6 +1040,7 @@ mod tests {
             )
             .expect("supported protocol"),
             policy,
+            Default::default(),
         )
     }
 

@@ -530,6 +530,58 @@ impl NativeDecodeSession {
         Ok(result)
     }
 
+    pub(crate) fn embedding_hidden_sequence(
+        &mut self,
+        token_ids: &[TokenId],
+        requested: Option<&str>,
+    ) -> anyhow::Result<(Vec<usize>, Vec<f32>, String)> {
+        anyhow::ensure!(
+            self.cuda.is_none(),
+            "native embedding extraction requires host-accessible outputs; select the native CPU device for this operation"
+        );
+        let name = requested.or(self.hidden_output.as_deref()).with_context(|| format!(
+            "model does not expose a usable per-token hidden-state output; declare hidden_output or EmbeddingOptions::hidden_state_output (available outputs: {:?})",
+            self.session.outputs().iter().map(|output| &output.name).collect::<Vec<_>>()
+        ))?.to_owned();
+        let index = self
+            .session
+            .outputs()
+            .iter()
+            .position(|output| output.name == name)
+            .with_context(|| {
+                format!("model does not expose requested hidden-state output '{name}'")
+            })?;
+        let output = &self.session.outputs()[index];
+        anyhow::ensure!(
+            matches!(
+                output.dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            ),
+            "hidden-state output '{name}' must be floating point, got {:?}",
+            output.dtype
+        );
+        let mut owned = self.prepare_cpu_step_inputs(token_ids, 0, token_ids.len(), &[])?;
+        for past in &self.kv_inputs {
+            owned.push((past.clone(), self.make_empty_past(past)?));
+        }
+        let bindings = owned
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<Vec<_>>();
+        let outputs = self
+            .session
+            .run(&bindings)
+            .with_context(|| format!("native embedding forward pass for output '{name}'"))?;
+        let hidden = outputs
+            .get(index)
+            .with_context(|| format!("native embedding forward omitted output '{name}'"))?;
+        Ok((
+            hidden.shape.clone(),
+            super::tensor::tensor_to_f32(hidden)?,
+            name,
+        ))
+    }
+
     pub(crate) fn decode_cpu(
         &mut self,
         token_ids: &[TokenId],

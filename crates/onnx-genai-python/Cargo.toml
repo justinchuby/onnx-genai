@@ -1,15 +1,10 @@
-# PyO3 extension module exposing the ONNX Runtime-backed genai Engine to Python
-# as `onnx_genai`.
-#
-# `onnx_genai` mirrors the `nxrt.genai` API (Engine / GenerateResult) but runs on
-# ONNX Runtime (via `onnx-genai-engine`'s default ORT backend), so it is ONNX
-# Runtime compatible. `nxrt.genai` exposes the same surface backed by the native
-# nxrt runtime instead.
+# PyO3 extension module exposing the genai Engine as onnx_genai.
+# The shared engine compiles and selects Native by default. ORT remains linked
+# for explicit reference testing and supported runtime infrastructure.
 #
 # Wheels: stable-ABI (`abi3`, tag `cp310-abi3`, min Python 3.10) built from the
-# `abi3-py310` PyO3 feature. Because the ORT backend links `libonnxruntime`
-# dynamically, the wheel bundles that shared library at repair time
-# (auditwheel/delocate/delvewheel) — see pyproject.toml.
+# `abi3-py310` PyO3 feature. libonnxruntime is loaded dynamically from the
+# installed ORT wheel for runtime infrastructure — see pyproject.toml.
 [package]
 name = "onnx-genai-python"
 version.workspace = true
@@ -17,7 +12,7 @@ edition = "2024"
 license = "MIT"
 authors = ["Justin Chu"]
 repository = "https://github.com/justinchuby/onnx-genai"
-description = "Python (PyO3/abi3) binding for the ONNX Runtime-backed onnx-genai text generation engine"
+description = "Python (PyO3/abi3) binding for the onnx-genai text generation engine"
 publish = false
 
 [lib]
@@ -28,7 +23,7 @@ name = "_onnx_genai"
 crate-type = ["cdylib"]
 
 [dependencies]
-# Default features keep the engine on its ONNX Runtime backend (no native-backend).
+# Default engine features compile and select the Native backend.
 onnx-genai-engine = { workspace = true }
 
 [dependencies.pyo3]

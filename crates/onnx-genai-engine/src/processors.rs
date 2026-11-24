@@ -30,6 +30,9 @@ pub(crate) fn build_processor_chain(
     // A temperature-zero stage still runs at its requested position. Only an
     // explicit greedy policy bypasses stochastic warpers before terminal selection.
     let samples = !options.greedy || has_custom_sampler;
+    if !options.effective_preserved_tokens().is_empty() || options.response_projection.is_some() {
+        options.validate_preserved_tokens(tokenizer.context("preserved_tokens requires the model tokenizer; provide a tokenizer before requesting special-token output")?)?;
+    }
     if !options.logit_bias.is_empty() {
         if let Some(tokenizer) = tokenizer {
             options.validate_logit_bias(tokenizer)?;
@@ -47,100 +50,176 @@ pub(crate) fn build_processor_chain(
     if let Some(constraint) = &options.constraint {
         let tokenizer = tokenizer.context("constrained decoding requires a tokenizer")?;
         let token_texts = tokenizer_token_texts(tokenizer)?;
-        match constraint {
-            GenerateConstraint::Json { prefix } => {
-                chain.add(Box::new(ConstraintProcessor::new(
-                    Box::new(crate::response_constraint::JsonContentConstraint::new(
-                        tokenizer,
-                        &serde_json::Value::Bool(true),
-                        crate::json_projection::ProjectionKind::Plain,
-                        prefix,
-                        options.max_json_bytes,
-                        if options.stop_on_eos {
-                            terminal_token_ids(options)
-                        } else {
-                            Vec::new()
-                        },
-                    )?),
-                    token_texts,
-                    terminal_token_ids(options),
-                )));
+        let projection = &options.response_projection;
+        let plain_prefix = match constraint {
+            GenerateConstraint::Json { prefix }
+            | GenerateConstraint::JsonSchema { prefix, .. }
+            | GenerateConstraint::Regex { prefix, .. }
+            | GenerateConstraint::Lark { prefix, .. } => prefix.as_str(),
+            GenerateConstraint::Gbnf { .. } | GenerateConstraint::RawLark { .. } => "",
+        };
+        anyhow::ensure!(
+            projection.is_none() || plain_prefix.is_empty(),
+            "constraint prefix conflicts with response_projection ownership; leave the constraint prefix empty and put the complete assistant prefill in response_projection"
+        );
+        let max_bytes = projection
+            .as_ref()
+            .map_or(options.max_constraint_bytes, |projection| {
+                projection.max_bytes().min(options.max_constraint_bytes)
+            });
+        let prefix = |plain: &str| {
+            projection.as_ref().map_or_else(
+                || plain.to_owned(),
+                |projection| projection.prefix().to_owned(),
+            )
+        };
+        let kind = || {
+            projection.as_ref().map_or(
+                crate::text_projection::ProjectionKind::Plain,
+                |projection| {
+                    crate::text_projection::ProjectionKind::Declared(projection.template().clone())
+                },
+            )
+        };
+        let endings = || {
+            if options.stop_on_eos {
+                terminal_token_ids(options)
+            } else {
+                Vec::new()
             }
-            GenerateConstraint::JsonSchema { schema, prefix } => {
+        };
+        let grammar: Box<dyn crate::logits::Constraint> = match constraint {
+            GenerateConstraint::Gbnf { grammar } | GenerateConstraint::RawLark { grammar } => {
+                let lark = match constraint {
+                    GenerateConstraint::RawLark { .. } => {
+                        anyhow::ensure!(
+                            options.max_constraint_bytes > 0
+                                && grammar.len() <= options.max_constraint_bytes,
+                            "raw Lark grammar is {} bytes with max_constraint_bytes={}; shorten grammar or configure a positive sufficient budget",
+                            grammar.len(),
+                            options.max_constraint_bytes
+                        );
+                        grammar.clone()
+                    }
+                    _ => crate::gbnf::compile(grammar, options.max_constraint_bytes, tokenizer)?,
+                };
+                let contract = crate::byte_stream::ByteStreamContract::resolve(
+                    tokenizer, crate::tokenization::SpecialTokenHandling::Preserve,
+                ).context("resolve tokenizer.decoder byte contract for raw grammar")?.context("raw grammar requires a resolved lossless tokenizer.decoder byte contract; use a tokenizer with supported byte decoding instead of contextual decoded-token guesses")?;
+                anyhow::ensure!(
+                    contract.new_state().is_identity(),
+                    "raw grammar cannot yet interpret tokenizer.decoder stream-initial stripping with model-token references; use a context-free byte decoder or a content-only response_format constraint"
+                );
+                // GBNF inspects raw pieces, including declared special tokens.
+                // Only explicitly resolved ending roles receive an EOS frame.
+                // The shared byte contract proves density and exact decoder
+                // transforms without adapter guesses based on token spelling.
+                let endings = terminal_token_ids(options);
+                Box::new(llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    LlguidanceConstraint::from_token_bytes(
+                        GrammarConstraintKind::Lark, &lark, contract.pieces, &endings, "",
+                    )
+                })).map(|constraint| constraint.with_completion_only_eos(endings)).context("compile raw grammar against the resolved model byte vocabulary; repair the grammar or tokenizer.decoder")?)
+            }
+            GenerateConstraint::Json { prefix: plain } => {
+                Box::new(crate::response_constraint::ContentConstraint::json_schema(
+                    tokenizer,
+                    &serde_json::Value::Bool(true),
+                    kind(),
+                    &prefix(plain),
+                    max_bytes,
+                    endings(),
+                    &options.effective_preserved_tokens(),
+                )?)
+            }
+            GenerateConstraint::JsonSchema {
+                schema,
+                prefix: plain,
+            } => {
                 let schema = serde_json::from_str(schema)
                     .context("parse JSON Schema constraint; supply a valid JSON schema value")?;
-                chain.add(Box::new(ConstraintProcessor::new(
-                    Box::new(crate::response_constraint::JsonContentConstraint::new(
-                        tokenizer,
-                        &schema,
-                        crate::json_projection::ProjectionKind::Plain,
-                        prefix,
-                        options.max_json_bytes,
-                        if options.stop_on_eos {
-                            terminal_token_ids(options)
-                        } else {
-                            Vec::new()
-                        },
-                    )?),
-                    token_texts,
-                    terminal_token_ids(options),
-                )));
+                Box::new(crate::response_constraint::ContentConstraint::json_schema(
+                    tokenizer,
+                    &schema,
+                    kind(),
+                    &prefix(plain),
+                    max_bytes,
+                    endings(),
+                    &options.effective_preserved_tokens(),
+                )?)
             }
-            GenerateConstraint::ResponseJson {
-                schema,
-                template,
-                prefix,
+            GenerateConstraint::Regex {
+                pattern,
+                prefix: plain,
             } => {
-                chain.add(Box::new(ConstraintProcessor::new(
-                    Box::new(crate::response_constraint::JsonContentConstraint::new(
+                if let Some(projection) = projection {
+                    Box::new(crate::response_constraint::ContentConstraint::text(
                         tokenizer,
-                        schema,
-                        crate::json_projection::ProjectionKind::Declared(template.clone()),
-                        prefix,
-                        options.max_json_bytes,
-                        if options.stop_on_eos {
-                            terminal_token_ids(options)
-                        } else {
-                            Vec::new()
-                        },
-                    )?),
-                    token_texts,
-                    terminal_token_ids(options),
-                )));
-            }
-            GenerateConstraint::Regex(regex) => {
-                chain.add(Box::new(ConstraintProcessor::new(
+                        &crate::config::TextGrammar::Regex(pattern.clone()),
+                        projection.template().clone(),
+                        projection.prefix(),
+                        max_bytes,
+                        endings(),
+                        &options.effective_preserved_tokens(),
+                    )?)
+                } else {
                     build_llguidance_constraint(
                         GrammarConstraintKind::Regex,
-                        regex,
-                        "",
+                        pattern,
+                        plain,
                         tokenizer,
                         &token_texts,
                         options.eos_token_id,
                         &terminal_token_ids(options),
-                    )?,
-                    token_texts,
-                    terminal_token_ids(options),
-                )));
+                    )?
+                }
             }
-            GenerateConstraint::Lark { grammar, prefix } => {
-                chain.add(Box::new(ConstraintProcessor::new(
+            GenerateConstraint::Lark {
+                grammar,
+                prefix: plain,
+            } => {
+                if let Some(projection) = projection {
+                    Box::new(crate::response_constraint::ContentConstraint::text(
+                        tokenizer,
+                        &crate::config::TextGrammar::Lark(grammar.clone()),
+                        projection.template().clone(),
+                        projection.prefix(),
+                        max_bytes,
+                        endings(),
+                        &options.effective_preserved_tokens(),
+                    )?)
+                } else {
                     build_llguidance_constraint(
                         GrammarConstraintKind::Lark,
                         grammar,
-                        prefix,
+                        plain,
                         tokenizer,
                         &token_texts,
                         options.eos_token_id,
                         &terminal_token_ids(options),
-                    )?,
-                    token_texts,
-                    terminal_token_ids(options),
-                )));
+                    )?
+                }
             }
-        }
+        };
+        chain.add(Box::new(ConstraintProcessor::new(
+            grammar,
+            token_texts,
+            terminal_token_ids(options),
+        )));
     }
 
+    if let Some(budget) = &options.reasoning_budget {
+        for id in budget.forced_tokens() {
+            anyhow::ensure!(
+                !matches!(
+                    options.logit_bias.get(id),
+                    Some(crate::logits::LogitBias::Ban)
+                ),
+                "reasoning closer token {id} is banned by logit_bias; allow all declared forced closing tokens before enabling the budget or live control"
+            );
+        }
+        chain.add(Box::new(budget.processor()?));
+    }
     chain.begin_optional_stages();
     if let Some(mirostat) = options.mirostat.filter(|_| samples) {
         // Mirostat owns selection policy and, like upstream, replaces the
@@ -1539,6 +1618,254 @@ mod json_continuation_tests {
 #[cfg(test)]
 mod lark_prefill_tests {
     use super::*;
+
+    #[test]
+    fn raw_grammars_match_actual_unicode_bytes_and_tokenizations() {
+        let mut value: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/tiny-llm/tokenizer.json"
+        )))
+        .unwrap();
+        let vocab = value["model"]["vocab"].as_object_mut().unwrap();
+        for (id, text) in [
+            (22, "é"),
+            (23, "😀"),
+            (24, "é😀"),
+            (25, r"\u00E9"),
+            (26, "<0xC3>"),
+            (27, "<0xA9>"),
+        ] {
+            let old = vocab
+                .iter()
+                .find(|(_, value)| value.as_u64() == Some(id))
+                .unwrap()
+                .0
+                .clone();
+            vocab.remove(&old);
+            vocab.insert(text.into(), serde_json::json!(id));
+        }
+        value["decoder"] = serde_json::json!({"type":"ByteFallback"});
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("tokenizer.json");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let tokenizer = Tokenizer::from_file(path).unwrap();
+        for (grammar, history, expected) in [
+            (
+                "%llguidance {\"no_forcing\":true}\nstart: \"é😀\"",
+                vec![],
+                vec![22, 24, 26],
+            ),
+            (
+                "%llguidance {\"no_forcing\":true}\nstart: \"é😀\"",
+                vec![26],
+                vec![27],
+            ),
+            (
+                "%llguidance {\"no_forcing\":true}\nstart: <[22]> <[23]>",
+                vec![22],
+                vec![23],
+            ),
+            ("root ::=", vec![], vec![3]),
+            (r"root ::= [é😀]{1,2}", vec![26], vec![27]),
+            (r"root ::= [é😀]{1,2}", vec![26, 27], vec![3, 22, 23, 26]),
+            ("root ::= \"é\" |", vec![], vec![3, 22, 26]),
+            ("root ::= \"é\"{0}", vec![], vec![3]),
+            (r"root ::= [é😀]{1,2}", vec![], vec![22, 23, 24, 26]),
+            (r"root ::= [é😀]{1,2}", vec![22], vec![3, 22, 23, 26]),
+            (r"root ::= [é😀]{1,2}", vec![24], vec![3]),
+            ("root ::= \"é\" root | \"\"", vec![], vec![3, 22, 26]),
+            ("root ::= \"é\" root | \"\"", vec![22], vec![3, 22, 26]),
+            ("root ::= .", vec![], vec![14, 15, 22, 23, 26]),
+            (r#"root ::= "\u00E9\U0001F600""#, vec![], vec![22, 24, 26]),
+            (r#"root ::= "\u00E9\U0001F600""#, vec![22], vec![23]),
+            (r#"root ::= "\\u00E9""#, vec![], vec![25]),
+        ] {
+            let options = GenerateOptions {
+                constraint: Some(if grammar.starts_with("%llguidance") {
+                    GenerateConstraint::RawLark {
+                        grammar: grammar.into(),
+                    }
+                } else {
+                    GenerateConstraint::Gbnf {
+                        grammar: grammar.into(),
+                    }
+                }),
+                eos_token_id: Some(3),
+                greedy: true,
+                ..Default::default()
+            };
+            let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+            let mut logits = vec![0.0; 32];
+            chain
+                .process(
+                    &mut logits,
+                    &ProcessorContext {
+                        generated_tokens: history.clone(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let allowed = logits
+                .iter()
+                .enumerate()
+                .filter_map(|(id, score)| score.is_finite().then_some(id))
+                .collect::<Vec<_>>();
+            assert_eq!(allowed, expected, "{grammar} after {history:?}");
+        }
+        let options = GenerateOptions {
+            constraint: Some(GenerateConstraint::RawLark {
+                grammar: "%llguidance {}\nstart: \"é\"".into(),
+            }),
+            max_constraint_bytes: 2,
+            ..Default::default()
+        };
+        let error = match build_processor_chain(&options, Some(&tokenizer), false) {
+            Ok(_) => panic!("oversized raw Lark must be rejected"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("max_constraint_bytes=2"));
+    }
+
+    #[test]
+    fn gbnf_masks_actual_model_tokens_negation_and_history_rewinds() {
+        let mut value: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/tiny-llm/tokenizer.json"
+        )))
+        .unwrap();
+        value["model"]["vocab"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tok31");
+        value["model"]["vocab"]["<think>"] = serde_json::json!(31);
+        value["model"]["vocab"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tok29");
+        value["model"]["vocab"]["<ordinary>"] = serde_json::json!(29);
+        value["added_tokens"] = serde_json::json!([{
+            "id":31,"content":"<think>","single_word":false,"lstrip":false,
+            "rstrip":false,"normalized":false,"special":true
+        }, {"id":29,"content":"<ordinary>","single_word":false,"lstrip":false,
+            "rstrip":false,"normalized":false,"special":false}]);
+        value["decoder"] = serde_json::json!({"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false});
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("tokenizer.json");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let tokenizer = Tokenizer::from_file(path).unwrap();
+        let options = GenerateOptions {
+            constraint: Some(GenerateConstraint::Gbnf {
+                grammar: "root ::= <think> !<[31]> <[31]>".into(),
+            }),
+            eos_token_id: Some(3),
+            eos_token_ids: vec![30],
+            greedy: true,
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        for (history, expected) in [
+            (vec![], Some(31)),
+            (vec![31], None),
+            (vec![31, 4], Some(31)),
+            (vec![31, 4, 31], Some(3)),
+            (vec![], Some(31)),
+            (vec![31, 5], Some(31)),
+        ] {
+            let mut logits = vec![0.0; 32];
+            chain
+                .process(
+                    &mut logits,
+                    &ProcessorContext {
+                        generated_tokens: history,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let allowed = logits
+                .iter()
+                .enumerate()
+                .filter_map(|(id, score)| score.is_finite().then_some(id))
+                .collect::<Vec<_>>();
+            if let Some(expected) = expected {
+                assert_eq!(
+                    allowed,
+                    if expected == 3 {
+                        vec![3, 30]
+                    } else {
+                        vec![expected]
+                    }
+                );
+            } else {
+                assert!(!allowed.contains(&31));
+                assert!(allowed.contains(&4));
+                assert!(!allowed.contains(&3));
+                assert!(!allowed.contains(&30));
+            }
+        }
+        for (literal, expected) in [("<think>", 31), ("<ordinary>", 29)] {
+            let mut literal_options = options.clone();
+            literal_options.constraint = Some(GenerateConstraint::Gbnf {
+                grammar: format!("root ::= {literal:?}"),
+            });
+            let literal_chain =
+                build_processor_chain(&literal_options, Some(&tokenizer), false).unwrap();
+            let mut logits = [0.0; 32];
+            literal_chain
+                .process(&mut logits, &ProcessorContext::default())
+                .unwrap();
+            let allowed = logits
+                .iter()
+                .enumerate()
+                .filter_map(|(id, score)| score.is_finite().then_some(id))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                allowed,
+                [expected],
+                "literal {literal} must follow actual token bytes and special flags"
+            );
+        }
+        for (case, expected) in [("initial-strip", "initial stripping"), ("sparse", "dense")] {
+            let mut invalid_vocab = value.clone();
+            if case == "initial-strip" {
+                invalid_vocab["decoder"] = serde_json::json!({"type":"Sequence","decoders":[
+                    {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
+                    {"type":"Strip","content":" ","start":1,"stop":0}
+                ]});
+            } else {
+                invalid_vocab["model"]["vocab"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("tok28");
+            }
+            let invalid_path = scratch.path().join(format!("{case}.json"));
+            std::fs::write(&invalid_path, serde_json::to_vec(&invalid_vocab).unwrap()).unwrap();
+            let invalid_tokenizer = Tokenizer::from_file(invalid_path).unwrap();
+            let error = build_processor_chain(&options, Some(&invalid_tokenizer), false)
+                .err()
+                .expect("unsupported byte contract must be explicit");
+            assert!(format!("{error:#}").contains(expected), "{case}: {error:#}");
+        }
+        let invalid_history = ProcessorContext {
+            generated_tokens: vec![31, 3],
+            ..Default::default()
+        };
+        assert!(chain.process(&mut [0.0; 32], &invalid_history).is_err());
+        let mut reset_logits = vec![0.0; 32];
+        chain
+            .process(&mut reset_logits, &ProcessorContext::default())
+            .unwrap();
+        assert!(reset_logits[31].is_finite() && !reset_logits[3].is_finite());
+        for grammar in ["root ::= <[32]>", "root ::= <not-in-vocabulary>"] {
+            let mut invalid = options.clone();
+            invalid.constraint = Some(GenerateConstraint::Gbnf {
+                grammar: grammar.into(),
+            });
+            let error = build_processor_chain(&invalid, Some(&tokenizer), false)
+                .err()
+                .expect("invalid token reference");
+            assert!(format!("{error:#}").contains("grammar token"), "{error:#}");
+        }
+    }
 
     #[test]
     fn lark_prefill_keeps_explicit_special_token_transitions() {

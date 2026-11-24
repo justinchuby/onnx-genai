@@ -1,12 +1,10 @@
 # onnx-genai
 
-ONNX Runtime-backed text generation for Python.
+Native text generation for Python.
 
-`onnx-genai` exposes a small, high-level generation API implemented on
-[ONNX Runtime](https://onnxruntime.ai/). It is the ONNX Runtime-compatible
-counterpart of `nxrt.genai`: both packages present the **same** `Engine` /
-`GenerateResult` API, but `onnx_genai` runs on ONNX Runtime while `nxrt.genai`
-runs on the native nxrt runtime.
+`onnx-genai` exposes the high-level `Engine` / `GenerateResult` API also offered
+by `nxrt.genai`. The shared engine compiles and selects Native execution by
+default. ORT remains linked for runtime infrastructure and reference tests.
 
 ```python
 import onnx_genai
@@ -31,8 +29,9 @@ metadata (`inference_metadata.yaml` or `genai_config.json`).
 Distributed as stable-ABI (`abi3`) wheels tagged `cp310-abi3`, so a single wheel
 per platform loads on CPython 3.10 and newer. ONNX Runtime is **not** bundled:
 `onnx_genai` loads `libonnxruntime` from the installed `onnxruntime` (CPU) or
-`onnxruntime-gpu` (CUDA) wheel at import time, so it uses whichever execution
-providers you installed.
+`onnxruntime-gpu` (CUDA) wheel at import time for runtime infrastructure and
+reference execution. Installing an ORT provider does not change the Native
+decoder default.
 
 ## Related packages
 

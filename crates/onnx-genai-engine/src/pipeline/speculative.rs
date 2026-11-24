@@ -481,6 +481,7 @@ fn finish_candidate_tree_without_generation(
     mut staged_output_observer: Option<&mut super::ToolCallStagedOutputObserver>,
     boundary: &'static str,
     finish_reason: FinishReason,
+    preserved_tokens: &std::collections::BTreeSet<crate::TokenId>,
 ) -> anyhow::Result<GenerateResult> {
     if let Some(observer) = staged_output_observer.as_deref_mut() {
         observer.begin_turn();
@@ -499,6 +500,7 @@ fn finish_candidate_tree_without_generation(
         observer.commit_turn();
     }
     Ok(GenerateResult {
+        preserved_tokens: preserved_tokens.clone(),
         text: String::new(),
         token_ids: Vec::new(),
         finish_reason: stop
@@ -1012,13 +1014,22 @@ impl super::workflow::WorkflowNodeHost for CandidateTreeWorkflowHost<'_> {
         self.observe(super::GenerationBoundary::BeforeAcceptedPathCommit)?;
         self.text = self
             .tokenizer
-            .map(|tokenizer| tokenizer.decode(&self.authoritative_tokens))
+            .map(|tokenizer| {
+                crate::tokenization::decode_output(
+                    tokenizer,
+                    &self.authoritative_tokens,
+                    &self.options.effective_preserved_tokens(),
+                )
+            })
             .transpose()
             .context("decode committed candidate-tree output before semantic commit")?
             .unwrap_or_default();
-        self.token_text =
-            crate::tokenization::token_texts(self.tokenizer, &self.authoritative_tokens)
-                .context("decode candidate-tree token events before semantic commit")?;
+        self.token_text = crate::tokenization::token_texts(
+            self.tokenizer,
+            &self.authoritative_tokens,
+            &self.options.effective_preserved_tokens(),
+        )
+        .context("decode candidate-tree token events before semantic commit")?;
         self.finalize_staged_output("candidate-tree semantic commit")?;
         match self.control.begin_commit() {
             Ok(true) => {
@@ -1652,7 +1663,8 @@ impl WorkflowRuntime {
                     && options.dry.is_none()
                     && options.mirostat.is_none()
                     && options.xtc.is_none()
-                    && options.constraint.is_none(),
+                    && options.constraint.is_none()
+                    && options.reasoning_budget.is_none(),
                 "candidate-tree sampling currently preserves the exact declared target \
                  distribution only; temperature/logit processors/grammar require matching \
                  proposer-side transforms and are refused before transaction admission"
@@ -1673,6 +1685,7 @@ impl WorkflowRuntime {
                 staged_output_observer,
                 "candidate-tree initial context-limit boundary",
                 FinishReason::Length,
+                &options.effective_preserved_tokens(),
             );
         }
         let mut execution = super::WorkflowExecutionPlan::new_candidate_tree_driver(self, request)?;
@@ -1748,6 +1761,7 @@ impl WorkflowRuntime {
         if let Some(callback) = callback.as_mut() {
             for (index, token) in published_tokens.iter().copied().enumerate() {
                 if let Err(error) = callback(crate::config::GenerateToken {
+                    logprob: None,
                     token_id: token,
                     text: host.token_text[index].clone(),
                     finish_reason: (index + 1 == published_tokens.len())
@@ -1761,6 +1775,7 @@ impl WorkflowRuntime {
             }
         }
         Ok(GenerateResult {
+            preserved_tokens: options.effective_preserved_tokens(),
             text: host.text,
             token_ids: published_tokens,
             finish_reason: host.finish_reason,
@@ -2272,7 +2287,8 @@ impl WorkflowRuntime {
                     && options.dry.is_none()
                     && options.mirostat.is_none()
                     && options.xtc.is_none()
-                    && options.constraint.is_none(),
+                    && options.constraint.is_none()
+                    && options.reasoning_budget.is_none(),
                 "DFlash sampling currently supports the exact unwarped target distribution \
                  only; processors require matching proposal-side transforms and are refused \
                  before transaction admission"
@@ -2336,6 +2352,7 @@ impl WorkflowRuntime {
                 observer.commit_turn();
             }
             return Ok(GenerateResult {
+                preserved_tokens: options.effective_preserved_tokens(),
                 text: String::new(),
                 token_ids: Vec::new(),
                 finish_reason: FinishReason::Length,
@@ -2587,7 +2604,13 @@ impl WorkflowRuntime {
         }
 
         let text = tokenizer
-            .map(|tokenizer| tokenizer.decode(&generated))
+            .map(|tokenizer| {
+                crate::tokenization::decode_output(
+                    tokenizer,
+                    &generated,
+                    &options.effective_preserved_tokens(),
+                )
+            })
             .transpose()?
             .unwrap_or_default();
         if let Some(observer) = staged_output_observer.as_deref_mut()
@@ -2649,9 +2672,14 @@ impl WorkflowRuntime {
         // failure is therefore delivery-only: state is already committed and is
         // never semantically rolled back by an external receiver.
         if let Some(callback) = callback.as_mut() {
-            let pieces = crate::tokenization::token_texts(tokenizer, &generated)?;
+            let pieces = crate::tokenization::token_texts(
+                tokenizer,
+                &generated,
+                &options.effective_preserved_tokens(),
+            )?;
             for (index, (token, text)) in generated.iter().copied().zip(pieces).enumerate() {
                 callback(crate::config::GenerateToken {
+                    logprob: None,
                     token_id: token,
                     text,
                     finish_reason: (index + 1 == generated.len()).then(|| finish_reason.clone()),
@@ -2666,6 +2694,7 @@ impl WorkflowRuntime {
             }
         }
         Ok(GenerateResult {
+            preserved_tokens: options.effective_preserved_tokens(),
             text,
             token_ids: generated,
             finish_reason,

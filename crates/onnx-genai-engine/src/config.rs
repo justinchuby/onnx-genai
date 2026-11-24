@@ -7,6 +7,7 @@ use onnx_genai_metadata::{GenerationContract, GenerationDefaults};
 use onnx_genai_ort::{Eagle3DraftKvMode, MtpDraftKvMode};
 use onnx_genai_scheduler::{Priority, ResourceLimit, ResourceLimits, SchedulerConfig};
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Error returned when a user-facing resource limit cannot be parsed.
@@ -564,11 +565,11 @@ impl Default for KvConnectorConfig {
 pub enum EngineDecodeBackend {
     /// Use the native runtime for models containing native-only operators;
     /// otherwise use ONNX Runtime.
-    #[default]
     Auto,
-    /// Always use ONNX Runtime.
+    /// Explicit ONNX Runtime reference backend for tests and comparisons.
     Ort,
     /// Always use the native runtime.
+    #[default]
     Native,
 }
 
@@ -851,6 +852,8 @@ pub enum DecisionSource {
 /// Engine configuration.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
+    /// Native is the production default; ORT and Auto are explicit reference
+    /// modes for tests and comparisons.
     /// Decoder execution backend. [`EngineDecodeBackend::Auto`] preserves ORT
     /// for existing models and selects native execution only when required.
     ///
@@ -928,7 +931,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            decode_backend: EngineDecodeBackend::Auto,
+            decode_backend: EngineDecodeBackend::Native,
             native_device: None,
             native_decode_batch: None,
             #[cfg(feature = "native-backend")]
@@ -1071,7 +1074,7 @@ mod resource_limit_tests {
     #[test]
     fn engine_config_defaults_to_scheduler_resource_defaults() {
         let config = EngineConfig::default();
-        assert_eq!(config.decode_backend, EngineDecodeBackend::Auto);
+        assert_eq!(config.decode_backend, EngineDecodeBackend::Native);
         assert_eq!(config.limits, ResourceLimits::default());
         assert!(!config.allow_runtime_override);
     }
@@ -1317,8 +1320,10 @@ impl From<SamplerSequence> for Vec<SamplerStage> {
 pub struct GenerateOptions {
     /// Maximum tokens to produce after the prompt.
     pub max_new_tokens: usize,
-    /// Maximum retained raw and canonical JSON bytes during constrained decoding.
-    pub max_json_bytes: usize,
+    /// Maximum retained raw and logical content bytes during constrained decoding.
+    pub max_constraint_bytes: usize,
+    /// Declared response framing shared by grammar constraints and tool observation.
+    pub response_projection: Option<crate::response_template::ResponseProjection>,
     /// Temperature at its sampling stage. Zero creates a point mass there.
     pub temperature: f32,
     /// Optional entropy-driven temperature scaling; zero range disables it.
@@ -1378,6 +1383,8 @@ pub struct GenerateOptions {
     pub eos_token_ids: Vec<TokenId>,
     /// Whether an end token terminates generation.
     pub stop_on_eos: bool,
+    /// Special IDs retained in output text; stopping roles remain unchanged.
+    pub preserved_tokens: BTreeSet<TokenId>,
     /// Optional maximum total context length (prompt + generated tokens).
     /// Used when model metadata does not declare `model.max_sequence_length`.
     pub max_context: Option<usize>,
@@ -1387,12 +1394,16 @@ pub struct GenerateOptions {
     pub speculative_mode: Option<SpeculativeMode>,
     /// Optional constrained decoding grammar. None preserves unconstrained generation.
     pub constraint: Option<GenerateConstraint>,
+    /// Resolved reasoning protocol, finite budget and optional live end signal.
+    pub reasoning_budget: Option<crate::reasoning::ReasoningBudget>,
     /// Return per-token log probabilities and this many highest-probability alternatives.
     ///
-    /// Values are computed from the final post-processor distribution used for sampling.
+    /// Values use logprob_source, defaulting to the processed sampling distribution.
     /// The chosen token is always included in `TokenLogprob::top`, in addition to the
     /// requested alternatives when it is not already among them.
     pub top_logprobs: Option<usize>,
+    /// Select model-output or processed logits for probability reporting.
+    pub logprob_source: LogprobSource,
     /// Force a cold start (full KV reset) even when session-persistent KV reuse
     /// is available. Default is `false`, which allows the engine to reuse cached
     /// KV state for matching prompt prefixes. Set to `true` for A/B measurement
@@ -1408,7 +1419,8 @@ impl Default for GenerateOptions {
     fn default() -> Self {
         Self {
             max_new_tokens: 128,
-            max_json_bytes: 4 * 1024 * 1024,
+            max_constraint_bytes: 4 * 1024 * 1024,
+            response_projection: None,
             temperature: 1.0,
             dynamic_temperature: None,
             sampler_order: None,
@@ -1434,11 +1446,14 @@ impl Default for GenerateOptions {
             eot_token_id: None,
             eos_token_ids: Vec::new(),
             stop_on_eos: true,
+            preserved_tokens: BTreeSet::new(),
             max_context: None,
             num_speculative_tokens: None,
             speculative_mode: None,
             constraint: None,
+            reasoning_budget: None,
             top_logprobs: None,
+            logprob_source: LogprobSource::default(),
             cold_start: false,
             semantic_prefix_len: None,
         }
@@ -1688,9 +1703,24 @@ fn describe_supported(contract: &GenerationContract) -> String {
     )
 }
 
-/// Built-in constrained decoding grammars.
+/// Literal-text grammars over projected response content. Unlike JSON Schema
+/// policy, these preserve authored backslash/Unicode escape spellings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TextGrammar {
+    Regex(String),
+    Lark(String),
+}
+
+/// Built-in constrained decoding grammars. Prefix fields apply to raw text;
+/// leave them empty when response_projection owns the declared assistant prefill.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerateConstraint {
+    /// llama.cpp GBNF over the raw newly generated stream, including channel
+    /// markers and model-token references. Assistant prefill is not consumed.
+    Gbnf { grammar: String },
+    /// Raw llguidance Lark over new model output, without assistant-prefill
+    /// consumption or response-content projection. Keep the %llguidance header.
+    RawLark { grammar: String },
     /// Constrain the existing prefix plus new output to prefixes of one JSON value.
     /// EOS requires a complete value; explicit stops and length limits may truncate it.
     Json {
@@ -1704,18 +1734,15 @@ pub enum GenerateConstraint {
         /// Existing assistant text, excluded from newly generated output.
         prefix: String,
     },
-    /// Constrain declared response content while permitting separate reasoning.
-    ResponseJson {
-        schema: serde_json::Value,
-        template: std::sync::Arc<crate::response_template::ResponseTemplate>,
-        /// Actual rendered assistant prefill, including response framing.
+    /// Constrain output to text matching the provided Rust regular expression.
+    Regex {
+        pattern: String,
+        /// Existing assistant prefill consumed by the grammar, excluded from new output.
         prefix: String,
     },
-    /// Constrain output to text matching the provided Rust regular expression.
-    Regex(String),
     /// Constrain existing prefix plus output to the provided llguidance Lark grammar.
     Lark {
-        /// Complete grammar, including any declared response framing.
+        /// Grammar over projected content, or raw text without response_projection.
         grammar: String,
         /// Existing text consumed by the grammar, excluded from newly generated output.
         prefix: String,
@@ -1723,13 +1750,48 @@ pub enum GenerateConstraint {
 }
 
 impl GenerateOptions {
+    /// The request's selections plus the resolved model framing symbols.
+    pub fn effective_preserved_tokens(&self) -> BTreeSet<TokenId> {
+        let mut selected = self.preserved_tokens.clone();
+        if let Some(ids) = self
+            .response_projection
+            .as_ref()
+            .and_then(|projection| projection.preserved_tokens())
+        {
+            selected.extend(ids);
+        }
+        selected
+    }
+    /// Validate output token selection against the actual model vocabulary.
+    pub fn validate_preserved_tokens(
+        &self,
+        tokenizer: &onnx_genai_ort::Tokenizer,
+    ) -> anyhow::Result<()> {
+        if let Some(projection) = &self.response_projection {
+            projection.validate_tokenizer(tokenizer)?;
+        }
+        for id in self.effective_preserved_tokens() {
+            anyhow::ensure!(
+                tokenizer.inner().id_to_token(id).is_some(),
+                "preserved_tokens contains absent token ID {id}; choose IDs from the model tokenizer vocabulary"
+            );
+        }
+        Ok(())
+    }
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.max_new_tokens == 0 {
             anyhow::bail!("max_new_tokens must be greater than zero");
         }
         anyhow::ensure!(
-            self.max_json_bytes > 0,
-            "max_json_bytes must be greater than zero; configure a positive JSON constraint byte budget"
+            self.max_constraint_bytes > 0,
+            "max_constraint_bytes must be greater than zero; configure a positive constraint text byte budget"
+        );
+        anyhow::ensure!(
+            !matches!(
+                self.constraint,
+                Some(GenerateConstraint::Gbnf { .. } | GenerateConstraint::RawLark { .. })
+            ) || self.stop_on_eos,
+            "raw grammar requires stop_on_eos=true; allow root completion to terminate the generation"
         );
         self.adaptive_p.validate()?;
         if !self.temperature.is_finite() || self.temperature < 0.0 {
@@ -2109,6 +2171,8 @@ pub struct GenerationBudgetCap {
 pub struct GenerateResult {
     /// Detokenized generated text.
     pub text: String,
+    /// Resolved output policy used when reconstructing per-token publication.
+    pub preserved_tokens: BTreeSet<TokenId>,
     /// Generated token ids, excluding prompt tokens.
     pub token_ids: Vec<TokenId>,
     /// Termination reason.
@@ -2126,6 +2190,18 @@ pub struct GenerateResult {
     pub budget_cap: Option<GenerationBudgetCap>,
 }
 
+/// Distribution used for requested token log probabilities.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LogprobSource {
+    /// Original model output, before grammar, penalties, temperature or truncation.
+    Model,
+    /// Logits after the processor chain, before the final token selector.
+    #[default]
+    Processed,
+    /// Effective default sampler distribution, including a greedy point mass.
+    Sampling,
+}
+
 /// Log-probability metadata for one generated token.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TokenLogprob {
@@ -2138,8 +2214,10 @@ pub struct TokenLogprob {
 }
 
 /// Per-token streaming event shape for future callback/iterator APIs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GenerateToken {
+    /// Probability for this committed token, when requested.
+    pub logprob: Option<TokenLogprob>,
     pub token_id: TokenId,
     /// Incrementally decoded text, including required decoder lookbehind.
     /// May be empty while a UTF-8 sequence is incomplete; terminal delivery
