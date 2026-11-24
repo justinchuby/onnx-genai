@@ -906,18 +906,41 @@ tiles. The logical shard count is fixed when the kernel is created and is used
 by both planning and execution, even when a different Rayon pool runs it.
 Dense-cache admission may decline, so the bound always covers streamed fallback.
 
-One exclusive scratch lane is borrowed by sequential projection calls, which
-return owned results. A private dispatch-local owner lazily initializes the
-required f32 prefix at the first streamed apply; later applies receive short,
-exclusive initialized slices and partition their own prefixes safely. Dense
-resident hits leave the streamed-projection regions untouched, and unused
-capacity in a larger pool slot is not initialized. The initialization proof ends with the dispatch and
-is never cached across pool borrowers. FC1/FC3 results survive subsequent
-scratch overwrites for gating. BlockQuantizedMoE grouped inputs also borrow an
-input-sized region in that admitted layout; singleton groups can borrow their
-original row. Routing, activation/output staging and owned intermediate results
-remain separate allocations, so this is not a complete process-memory bound. Dense resident-set admission remains a
-separate existing weight-cache operation. No new public EP API is required.
+The decode region is borrowed by sequential projection calls. A private
+dispatch-local owner lazily initializes its required f32 span at the first
+streamed apply; later applies reuse initialized prefixes. Dense resident hits
+leave it untouched, and a larger pool slot's unused capacity is not initialized.
+The proof ends with the dispatch, never surviving across pool borrowers.
+
+BlockQuantizedMoE now composes four regions in that one admission: maximum
+decode scratch, two FC banks, and an input-sized accumulator. The FC banks share
+the float MoE's private expert driver and checked width rules. For rows R,
+hidden H and intermediate I, nongated banks are R*H and R*I f32 values; gated
+banks are R*max(H,I) and R*max(FC1+separate_FC3,H). Experts remain serial, so
+these banks have no expert-count or top-k multiplier. Singleton groups borrow
+the original input row; other groups gather into bank A. All FC1/optional FC3
+reads finish before A becomes activation storage; gated FC2 then overwrites B.
+Nongated FC1 activates in B before FC2 overwrites A. The accumulator remains
+disjoint across all experts. Destination prefixes are initialized before each
+projection, including zero-K bias results, and final tensor publication still
+occurs only after every expert succeeds.
+
+This deliberately charges retained FC capacity that the former owned Vec path
+allocated outside the lane. The conservative physical bound can be larger than
+the previous declared workspace; it is not an RSS-saving claim. Admission may
+refuse a cap that previously omitted those intermediates. Routing, tensor
+widening, strided compressed copies, final tensor storage and GEMM internals
+remain separate; this is not a process-memory cap. Standalone MatMul retains
+its caller-owned output staging. Dense weight residency keeps its existing
+weight-cache authority. No allocator, pool or public EP API is added.
+
+[Public-session evidence](../benchmarks/block-moe-projection-banks/README.md)
+retains the initial measured gated regression and the inline-hint refinement,
+with complete output identity, actual funding, setup/doubled-work and A/A
+controls. Host resource tests count zero warm issuer requests/returns, including
+zero-byte calls; physical backing remains charged through idle retention and
+returns to zero only after trim. CPU fixture results do not establish model
+throughput, CUDA correctness or universal zero overhead.
 
 
 ### CPU float MoE projection banks
