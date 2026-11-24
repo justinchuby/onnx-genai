@@ -369,6 +369,53 @@ impl Kernel for Float6Projection {
         let avx2 = std::arch::is_x86_feature_detected!("avx2");
         #[cfg(target_arch = "x86_64")]
         let e2m3 = inputs[1].dtype == DataType::Float6E2M3;
+        // Walk contiguous runs of rows rather than rereading their cache lines
+        // from separate tiles, provided the partial output can stay in L1.
+        #[cfg(target_arch = "x86_64")]
+        if avx2 && k * n >= 128 * 1024 && n > TILE && n * 4 <= 16 * 1024 && n.is_multiple_of(8) {
+            let shards = rayon::current_num_threads().min(k);
+            let rows = k.div_ceil(shards);
+            let partials: Vec<_> = (0..k.div_ceil(rows))
+                .into_par_iter()
+                .map(|shard| {
+                    let start = shard * rows;
+                    let end = start + rows.min(k - start);
+                    let mut sum = vec![0f32; n];
+                    // SAFETY: AVX2 was detected; each shard includes complete rows.
+                    unsafe {
+                        if e2m3 {
+                            accumulate_float6_avx2::<3, 126>(
+                                &w[start * row_bytes..end * row_bytes],
+                                row_bytes,
+                                0,
+                                &mut sum,
+                                &x[start * 4..end * 4],
+                            );
+                        } else {
+                            accumulate_float6_avx2::<2, 124>(
+                                &w[start * row_bytes..end * row_bytes],
+                                row_bytes,
+                                0,
+                                &mut sum,
+                                &x[start * 4..end * 4],
+                            );
+                        }
+                    }
+                    sum
+                })
+                .collect();
+            let mut partials = partials.into_iter();
+            let mut sums = partials.next().expect("nonempty projection");
+            for shard in partials {
+                for (sum, p) in sums.iter_mut().zip(shard) {
+                    *sum += p;
+                }
+            }
+            for (out, v) in y.as_chunks_mut::<4>().0.iter_mut().zip(sums) {
+                *out = v.to_le_bytes();
+            }
+            return Ok(());
+        }
         let tile = |(i, out): (usize, &mut [u8])| {
             let mut accum = [0f32; TILE];
             let offset = i * (TILE / 4 * 3);
