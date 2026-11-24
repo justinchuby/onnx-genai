@@ -23,7 +23,10 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceLayout, WorkspaceLifetime, WorkspacePreparation, WorkspaceRequirement, WorkspaceView,
+};
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::{driver_err, not_implemented};
@@ -35,9 +38,8 @@ const BLOCK: u32 = 256;
 /// in the CUDA source and divide [`BLOCK`]).
 const LA_WARP: u32 = 32;
 
-/// Largest `d_k` the per-thread f32 state column can hold. Real Qwen3.5 hybrid
-/// heads use `d_k = 128`; the claim gate rejects anything larger so we never
-/// claim an op this kernel cannot run.
+/// Largest per-thread local state column. Larger runtime head sizes use one
+/// caller-owned FP32 state workspace, rather than a kernel-owned allocation.
 const MAX_D_K: usize = 256;
 
 /// Private markers set by `CudaLinearAttentionGatingFusion` (see `optimizer.rs`)
@@ -740,8 +742,147 @@ impl std::fmt::Debug for UpdateRule {
     }
 }
 
-impl Kernel for LinearAttentionKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+#[derive(Debug)]
+struct LinearAttentionGeometry {
+    batch: usize,
+    seq: usize,
+    d_k: usize,
+    d_v: usize,
+    n_k_heads: usize,
+    heads_per_group: usize,
+    kv_per_k_head: usize,
+    output_hidden: usize,
+    columns: usize,
+    kv_key_width: usize,
+    scratch: WorkspaceLayout<1>,
+}
+
+fn linear_attention_geometry(
+    q: &[usize],
+    k: &[usize],
+    v: &[usize],
+    q_num_heads: usize,
+    kv_num_heads: usize,
+    standard: bool,
+) -> Result<LinearAttentionGeometry> {
+    if q.len() != 3 || k.len() != 3 || v.len() != 3 {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep LinearAttention: query/key/value must be rank 3 [B, T, H·D], got {q:?}, {k:?}, {v:?}"
+        )));
+    }
+    let (batch, seq, q_hidden) = (q[0], q[1], q[2]);
+    if k[0] != batch || v[0] != batch || k[1] != seq || v[1] != seq {
+        return Err(EpError::KernelFailed(
+            "cuda_ep LinearAttention: query/key/value batch and sequence dims must agree".into(),
+        ));
+    }
+
+    if q_num_heads == 0 || kv_num_heads == 0 || !q_hidden.is_multiple_of(q_num_heads) {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep LinearAttention: query hidden {q_hidden} not divisible by q_num_heads \
+                 {q_num_heads}"
+        )));
+    }
+    let d_k = q_hidden / q_num_heads;
+    if d_k == 0 || !k[2].is_multiple_of(d_k) {
+        return Err(not_implemented(format!(
+            "cuda_ep LinearAttention: d_k {d_k} invalid (must be positive and divide \
+                 key hidden {})",
+            k[2]
+        )));
+    }
+    let n_k_heads = k[2] / d_k;
+    if n_k_heads == 0 || !v[2].is_multiple_of(kv_num_heads) {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep LinearAttention: value hidden {} not divisible by kv_num_heads \
+                 {kv_num_heads}",
+            v[2]
+        )));
+    }
+    let d_v = v[2] / kv_num_heads;
+    if standard && (n_k_heads != kv_num_heads || !q_num_heads.is_multiple_of(kv_num_heads)) {
+        return Err(EpError::KernelFailed(format!(
+            "LinearAttention-27: key heads {n_k_heads} must equal kv_num_heads={kv_num_heads}, and q_num_heads={q_num_heads} must be a multiple of it"
+        )));
+    }
+
+    let heads_per_group = if q_num_heads >= kv_num_heads {
+        if !q_num_heads.is_multiple_of(kv_num_heads) {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep LinearAttention: q_num_heads {q_num_heads} must be a multiple of \
+                     kv_num_heads {kv_num_heads}"
+            )));
+        }
+        q_num_heads / kv_num_heads
+    } else {
+        if !kv_num_heads.is_multiple_of(q_num_heads) {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep LinearAttention: kv_num_heads {kv_num_heads} must be a multiple of \
+                     q_num_heads {q_num_heads} (inverse GQA)"
+            )));
+        }
+        0
+    };
+    if !kv_num_heads.is_multiple_of(n_k_heads) {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep LinearAttention: kv_num_heads {kv_num_heads} must be a multiple of \
+                 n_k_heads {n_k_heads}"
+        )));
+    }
+    let kv_per_k_head = kv_num_heads / n_k_heads;
+    let capacity_error = || {
+        EpError::KernelFailed(
+        "cuda_ep LinearAttention: state geometry exceeds addressable FP32 workspace capacity; reduce batch, heads or state dimensions".into()
+    )
+    };
+    let kv_key_width = kv_num_heads.checked_mul(d_k).ok_or_else(capacity_error)?;
+    let columns = batch
+        .checked_mul(kv_num_heads)
+        .and_then(|v| v.checked_mul(d_v))
+        .ok_or_else(capacity_error)?;
+    let elements = columns.checked_mul(d_k).ok_or_else(capacity_error)?;
+    let output_hidden = q_num_heads
+        .max(kv_num_heads)
+        .checked_mul(d_v)
+        .ok_or_else(capacity_error)?;
+    let scratch_elements = if d_k > MAX_D_K { elements } else { 0 };
+    let state = std::alloc::Layout::array::<f32>(scratch_elements).map_err(|_| capacity_error())?;
+    let scratch = WorkspaceLayout::new([state])?;
+    Ok(LinearAttentionGeometry {
+        batch,
+        seq,
+        d_k,
+        d_v,
+        n_k_heads,
+        heads_per_group,
+        kv_per_k_head,
+        output_hidden,
+        columns,
+        kv_key_width,
+        scratch,
+    })
+}
+
+impl LinearAttentionGeometry {
+    fn requirement(&self) -> WorkspaceRequirement {
+        if self.scratch.bytes() == 0 {
+            return WorkspaceRequirement::NONE;
+        }
+        WorkspaceRequirement {
+            bytes: self.scratch.bytes() as u64,
+            alignment: self.scratch.alignment(),
+            lifetime: WorkspaceLifetime::SessionPersistent,
+        }
+    }
+}
+
+impl LinearAttentionKernel {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         let max_inputs = if self.standard { 6 } else { 8 };
         if inputs.len() < 3 || inputs.len() > max_inputs {
             return Err(EpError::KernelFailed(format!(
@@ -769,77 +910,29 @@ impl Kernel for LinearAttentionKernel {
         let q = &inputs[0];
         let k = &inputs[1];
         let v = &inputs[2];
-        if q.shape.len() != 3 || k.shape.len() != 3 || v.shape.len() != 3 {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep LinearAttention: query/key/value must be rank 3 [B, T, H·D], got {:?}, \
-                 {:?}, {:?}",
-                q.shape, k.shape, v.shape
-            )));
-        }
-        let (batch, seq, q_hidden) = (q.shape[0], q.shape[1], q.shape[2]);
-        if k.shape[0] != batch || v.shape[0] != batch || k.shape[1] != seq || v.shape[1] != seq {
-            return Err(EpError::KernelFailed(
-                "cuda_ep LinearAttention: query/key/value batch and sequence dims must agree"
-                    .into(),
-            ));
-        }
-
         let q_num_heads = self.q_num_heads;
         let kv_num_heads = self.kv_num_heads;
-        if q_num_heads == 0 || kv_num_heads == 0 || !q_hidden.is_multiple_of(q_num_heads) {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep LinearAttention: query hidden {q_hidden} not divisible by q_num_heads \
-                 {q_num_heads}"
-            )));
-        }
-        let d_k = q_hidden / q_num_heads;
-        if d_k == 0 || !k.shape[2].is_multiple_of(d_k) {
-            return Err(not_implemented(format!(
-                "cuda_ep LinearAttention: d_k {d_k} invalid (must be positive and divide \
-                 key hidden {})",
-                k.shape[2]
-            )));
-        }
-        let n_k_heads = k.shape[2] / d_k;
-        if n_k_heads == 0 || !v.shape[2].is_multiple_of(kv_num_heads) {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep LinearAttention: value hidden {} not divisible by kv_num_heads \
-                 {kv_num_heads}",
-                v.shape[2]
-            )));
-        }
-        let d_v = v.shape[2] / kv_num_heads;
-        if self.standard && (n_k_heads != kv_num_heads || !q_num_heads.is_multiple_of(kv_num_heads))
-        {
-            return Err(EpError::KernelFailed(format!(
-                "LinearAttention-27: key heads {n_k_heads} must equal kv_num_heads={kv_num_heads}, and q_num_heads={q_num_heads} must be a multiple of it"
-            )));
-        }
-
-        let heads_per_group = if q_num_heads >= kv_num_heads {
-            if !q_num_heads.is_multiple_of(kv_num_heads) {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep LinearAttention: q_num_heads {q_num_heads} must be a multiple of \
-                     kv_num_heads {kv_num_heads}"
-                )));
-            }
-            q_num_heads / kv_num_heads
-        } else {
-            if !kv_num_heads.is_multiple_of(q_num_heads) {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep LinearAttention: kv_num_heads {kv_num_heads} must be a multiple of \
-                     q_num_heads {q_num_heads} (inverse GQA)"
-                )));
-            }
-            0
-        };
-        if !kv_num_heads.is_multiple_of(n_k_heads) {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep LinearAttention: kv_num_heads {kv_num_heads} must be a multiple of \
-                 n_k_heads {n_k_heads}"
-            )));
-        }
-        let kv_per_k_head = kv_num_heads / n_k_heads;
+        let geometry = linear_attention_geometry(
+            q.shape,
+            k.shape,
+            v.shape,
+            q_num_heads,
+            kv_num_heads,
+            self.standard,
+        )?;
+        let LinearAttentionGeometry {
+            batch,
+            seq,
+            d_k,
+            d_v,
+            n_k_heads,
+            heads_per_group,
+            kv_per_k_head,
+            output_hidden,
+            columns,
+            kv_key_width,
+            ..
+        } = geometry;
         let scale = self.scale.unwrap_or_else(|| 1.0 / (d_k as f32).sqrt());
 
         let needs_decay = self.update_rule.needs_decay();
@@ -897,7 +990,7 @@ impl Kernel for LinearAttentionKernel {
                     "cuda_ep LinearAttention: decay must be [B={batch}, T={seq}, ...], got {s:?}"
                 )));
             }
-            if s[2] == kv_num_heads * d_k {
+            if s[2] == kv_key_width {
                 true
             } else if s[2] == kv_num_heads {
                 false
@@ -905,8 +998,7 @@ impl Kernel for LinearAttentionKernel {
                 return Err(EpError::KernelFailed(format!(
                     "cuda_ep LinearAttention: decay last dim must be H_kv={kv_num_heads} or \
                      H_kv·d_k={}, got {}",
-                    kv_num_heads * d_k,
-                    s[2]
+                    kv_key_width, s[2]
                 )));
             }
         } else {
@@ -940,7 +1032,7 @@ impl Kernel for LinearAttentionKernel {
         // kernel never reads out of bounds regardless of head count / layout.
         if fuse_decay_softplus {
             let want = if decay_per_key_dim {
-                kv_num_heads * d_k
+                kv_key_width
             } else {
                 kv_num_heads
             };
@@ -969,7 +1061,6 @@ impl Kernel for LinearAttentionKernel {
             }
         }
 
-        let output_hidden = q_num_heads.max(kv_num_heads) * d_v;
         if outputs[0].shape != [batch, seq, output_hidden] {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep LinearAttention: output must be [B={batch}, T={seq}, {output_hidden}], \
@@ -1016,34 +1107,27 @@ impl Kernel for LinearAttentionKernel {
             ));
         }
 
-        let total = (batch * kv_num_heads * d_v) as u64;
+        let total = columns as u64;
         if total == 0 {
             return Ok(());
         }
 
         let warp_coop = self.warp_coop && d_k <= MAX_D_K;
-        if d_k > MAX_D_K && self.runtime.is_capturing()? {
-            return Err(not_implemented(
-                "LinearAttention with temporary state during CUDA graph capture",
-            ));
-        }
-        let scratch = if d_k > MAX_D_K {
-            let bytes = outputs[1]
-                .numel()
-                .checked_mul(size_of::<f32>())
-                .ok_or_else(|| {
-                    EpError::KernelFailed(
-                        "LinearAttention: FP32 state scratch size overflows".into(),
-                    )
-                })?;
-            Some(crate::runtime::GraphDeviceAllocation::allocate(
-                &self.runtime,
-                bytes,
-            )?)
+        let scratch_ptr = if geometry.scratch.bytes() == 0 {
+            0
         } else {
-            None
+            let [state] = geometry.scratch.bind(workspace).map_err(|source| EpError::Backend {
+                operation: "bind LinearAttention caller FP32 state workspace; prepare the declared workspace before execution",
+                source: Box::new(source),
+            })?;
+            if self.runtime.is_capturing()? {
+                self.runtime.require_registered_workspace_capture(
+                    state,
+                    "LinearAttention FP32 state workspace",
+                )?;
+            }
+            cuptr(state.ptr().0.cast_const())
         };
-        let scratch_ptr = scratch.as_ref().map_or(0, |allocation| allocation.ptr());
         let stem = match (dtype, warp_coop) {
             (DataType::Float32, false) => "linear_attention_f32",
             (DataType::Float16, false) => "linear_attention_f16",
@@ -1167,8 +1251,154 @@ impl Kernel for LinearAttentionKernel {
         }
         self.runtime.synchronize()
     }
+}
+
+impl Kernel for LinearAttentionKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        let (Some(q), Some(k), Some(v)) = (inputs.first(), inputs.get(1), inputs.get(2)) else {
+            return Err(EpError::KernelFailed("cuda_ep LinearAttention: workspace planning requires query, key and value metadata; provide all three inputs".into()));
+        };
+        if !q.present || !k.present || !v.present {
+            return Err(EpError::KernelFailed("cuda_ep LinearAttention: query, key and value cannot be absent during workspace planning".into()));
+        }
+        linear_attention_geometry(
+            q.shape,
+            k.shape,
+            v.shape,
+            self.q_num_heads,
+            self.kv_num_heads,
+            self.standard,
+        )
+        .map(|geometry| WorkspacePreparation::Ready(geometry.requirement()))
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
+    }
 
     fn supports_strided_input(&self, _idx: usize) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    #[test]
+    fn state_workspace_uses_runtime_geometry_and_retains_zero_sequence_state() {
+        for d_k in [1, MAX_D_K, MAX_D_K + 1, MAX_D_K + 65] {
+            for seq in [0, 3] {
+                let plan = linear_attention_geometry(
+                    &[2, seq, 3 * d_k],
+                    &[2, seq, d_k],
+                    &[2, seq, 2 * 7],
+                    3,
+                    2,
+                    false,
+                )
+                .unwrap_err();
+                assert!(plan.to_string().contains("multiple"));
+                let plan = linear_attention_geometry(
+                    &[2, seq, 4 * d_k],
+                    &[2, seq, d_k],
+                    &[2, seq, 2 * 7],
+                    4,
+                    2,
+                    false,
+                )
+                .unwrap();
+                let expected = if d_k > MAX_D_K {
+                    2 * 2 * d_k * 7 * 4
+                } else {
+                    0
+                };
+                assert_eq!(plan.requirement().bytes, expected as u64);
+                if expected != 0 {
+                    assert_eq!(
+                        plan.requirement().lifetime,
+                        WorkspaceLifetime::SessionPersistent
+                    );
+                }
+            }
+        }
+        for (batch, d_v) in [(0, 7), (2, 0)] {
+            let plan = linear_attention_geometry(
+                &[batch, 0, 4 * 257],
+                &[batch, 0, 257],
+                &[batch, 0, 2 * d_v],
+                4,
+                2,
+                false,
+            )
+            .unwrap();
+            assert_eq!(plan.requirement(), WorkspaceRequirement::NONE);
+        }
+    }
+
+    #[test]
+    fn state_workspace_refuses_overflow_and_malformed_caller_spans() {
+        assert!(
+            linear_attention_geometry(
+                &[usize::MAX, 1, 257],
+                &[usize::MAX, 1, 257],
+                &[usize::MAX, 1, 7],
+                1,
+                1,
+                false
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("capacity")
+        );
+        for batch in [0, 1] {
+            let error = linear_attention_geometry(
+                &[batch, 0, 257],
+                &[batch, 0, 257],
+                &[batch, 0, 0],
+                1,
+                usize::MAX,
+                false,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("capacity"));
+        }
+        let plan =
+            linear_attention_geometry(&[1, 0, 257], &[1, 0, 257], &[1, 0, 7], 1, 1, false).unwrap();
+        let bytes = plan.scratch.bytes();
+        for workspace in [
+            None,
+            Some(WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(0x1001usize as *mut c_void),
+                bytes,
+            )),
+            Some(WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(0x1000usize as *mut c_void),
+                bytes - 1,
+            )),
+        ] {
+            assert!(plan.scratch.bind(workspace).is_err());
+        }
+        let [state] = plan
+            .scratch
+            .bind(Some(WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(0x1000usize as *mut c_void),
+                bytes,
+            )))
+            .unwrap();
+        assert_eq!(state.bytes(), bytes);
     }
 }
