@@ -88,6 +88,7 @@ pub mod capture;
 pub mod cudnn;
 pub mod cufft;
 pub mod deferred_release;
+mod device_metadata;
 mod dynamic_library;
 pub mod error;
 mod graph;
