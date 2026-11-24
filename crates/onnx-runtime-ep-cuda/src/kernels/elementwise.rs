@@ -30,9 +30,10 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::standard_math::Math;
 use onnx_runtime_ir::{Attribute, DataType, Node};
 
+use crate::device_metadata::DeviceMetadataCache;
 use crate::error::{driver_err, not_implemented};
 use crate::optimizer::SILU_MUL_FUSION_ATTR;
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
+use crate::runtime::{CudaRuntime, cuptr};
 
 /// Threads per block for the 1-D pointwise grids (a full warp-multiple block).
 const BLOCK: u32 = 256;
@@ -735,17 +736,13 @@ struct BinaryCaptureSignature {
 /// to advertise [`CaptureSupport::Supported`].
 #[derive(Clone, Debug)]
 pub(crate) struct BroadcastMetadataCache {
-    runtime: Arc<CudaRuntime>,
-    key: Option<BroadcastMetadataKey>,
-    allocation: Option<Arc<GraphDeviceAllocation>>,
+    storage: DeviceMetadataCache<BroadcastMetadataKey>,
 }
 
 impl BroadcastMetadataCache {
     pub(crate) fn new(runtime: Arc<CudaRuntime>) -> Self {
         Self {
-            runtime,
-            key: None,
-            allocation: None,
+            storage: DeviceMetadataCache::new(runtime),
         }
     }
 
@@ -755,60 +752,25 @@ impl BroadcastMetadataCache {
         b_shape: &[usize],
         out_shape: &[usize],
     ) -> Result<CUdeviceptr> {
-        let key = BroadcastMetadataKey {
-            a_shape: a_shape.to_vec(),
-            b_shape: b_shape.to_vec(),
-            out_shape: out_shape.to_vec(),
-        };
-        if self.key.as_ref() == Some(&key) {
-            let ptr = self.allocation.as_ref().map_or_else(
-                || {
-                    Err(EpError::KernelFailed(
-                        "cuda_ep binary elementwise: cached broadcast metadata lost its device allocation"
-                            .into(),
-                    ))
-                },
-                |allocation| Ok(allocation.ptr()),
-            )?;
-            if self.runtime.is_capturing()? {
-                self.runtime.require_registered_address_capture(
-                    self.device_graph_resource()
-                        .expect("cached broadcast allocation is present")
-                        .identity(),
-                    "binary broadcast metadata",
-                )?;
-            }
-            return Ok(ptr);
-        }
-        if self.runtime.is_capturing()? {
-            return Err(EpError::KernelFailed(
-                "cuda_ep binary elementwise: broadcast metadata shape changed during CUDA graph capture; warm the fixed decode shape before capture".into(),
-            ));
-        }
-        if self.allocation.is_some() {
-            // Shape churn retires storage an earlier launch may still read.
-            // Unlike trailing per-op eager synchronization, this lifetime
-            // boundary cannot be deferred.
-            self.runtime.drain_for_unmap()?;
-        }
-
-        let metadata = broadcast_metadata(a_shape, b_shape, out_shape);
-        let metadata_bytes = u64_bytes(&metadata);
-        let allocation = GraphDeviceAllocation::allocate(&self.runtime, metadata_bytes.len())?;
-        // SAFETY: allocation exactly covers the metadata byte slice.
-        unsafe { self.runtime.htod(metadata_bytes, allocation.ptr()) }?;
-        self.runtime
-            .staged_warm_cache_mutation("binary broadcast metadata allocation/upload")?;
-        let ptr = allocation.ptr();
-        self.key = Some(key);
-        self.allocation = Some(allocation);
-        Ok(ptr)
+        self.storage.get_or_prepare(
+            "binary broadcast metadata",
+            |key| key.a_shape == a_shape && key.b_shape == b_shape && key.out_shape == out_shape,
+            || {
+                let metadata = broadcast_metadata(a_shape, b_shape, out_shape);
+                Ok((
+                    BroadcastMetadataKey {
+                        a_shape: a_shape.to_vec(),
+                        b_shape: b_shape.to_vec(),
+                        out_shape: out_shape.to_vec(),
+                    },
+                    u64_bytes(&metadata).to_vec(),
+                ))
+            },
+        )
     }
 
     pub(crate) fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
-        self.allocation
-            .as_ref()
-            .map(GraphDeviceAllocation::device_graph_resource)
+        self.storage.device_graph_resource()
     }
 }
 

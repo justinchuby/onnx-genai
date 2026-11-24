@@ -436,6 +436,114 @@ fn where_broadcasts_all_three_inputs() {
     assert_eq!(out[0], raw(&[1_i64, 2, 3, 9, 9, 9]));
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable gpu-tests"
+)]
+#[test]
+fn where_metadata_rewarm_is_transactional_and_preserves_captured_payload() {
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    runtime.set_defer_eager_sync(true);
+    let condition = ep.allocate(2, 256).unwrap();
+    let x = ep.allocate(24, 256).unwrap();
+    let y = ep.allocate(8, 256).unwrap();
+    let output = ep.allocate(48, 256).unwrap();
+    // SAFETY: each live buffer covers its complete synchronous upload.
+    unsafe {
+        runtime.htod(&[1u8, 0], cuptr(condition.as_ptr())).unwrap();
+        runtime
+            .htod(&raw(&[1i64, 2, 3]), cuptr(x.as_ptr()))
+            .unwrap();
+        runtime.htod(&raw(&[9i64]), cuptr(y.as_ptr())).unwrap();
+    }
+    let kernel = ep
+        .get_kernel(&Node::new(NodeId(0), "Where", vec![], vec![]), &[], 13)
+        .unwrap();
+    let execute = |condition_shape: &[usize], x_shape: &[usize], out_shape: &[usize]| {
+        let condition_strides = compute_contiguous_strides(condition_shape);
+        let x_strides = compute_contiguous_strides(x_shape);
+        let out_strides = compute_contiguous_strides(out_shape);
+        kernel.execute(
+            &[
+                TensorView::new(
+                    DevicePtr(condition.as_ptr()),
+                    DataType::Bool,
+                    condition_shape,
+                    &condition_strides,
+                    ep.device_id(),
+                ),
+                TensorView::new(
+                    DevicePtr(x.as_ptr()),
+                    DataType::Int64,
+                    x_shape,
+                    &x_strides,
+                    ep.device_id(),
+                ),
+                TensorView::new(
+                    DevicePtr(y.as_ptr()),
+                    DataType::Int64,
+                    &[],
+                    &[],
+                    ep.device_id(),
+                ),
+            ],
+            &mut [TensorMut::new(
+                DevicePtrMut(output.as_ptr() as *mut _),
+                DataType::Int64,
+                out_shape,
+                &out_strides,
+                ep.device_id(),
+            )],
+        )
+    };
+    execute(&[2, 1], &[1, 3], &[2, 3]).unwrap();
+    let identity_a = kernel.device_graph_resources()[0].identity();
+    let allocations = runtime.allocation_counts();
+    let transfers = runtime.transfer_counts();
+    let syncs = runtime.forced_synchronization_count();
+    for _ in 0..8 {
+        execute(&[2, 1], &[1, 3], &[2, 3]).unwrap();
+    }
+    assert_eq!(runtime.allocation_counts(), allocations);
+    assert_eq!(runtime.transfer_counts(), transfers);
+    assert_eq!(runtime.forced_synchronization_count(), syncs);
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute(&[2, 1], &[1, 3], &[2, 3]).unwrap();
+    runtime.end_graph_capture().unwrap();
+    let syncs = runtime.forced_synchronization_count();
+    execute(&[1, 2], &[3, 1], &[3, 2]).unwrap();
+    assert_eq!(
+        runtime.forced_synchronization_count(),
+        syncs + 1,
+        "Where shape churn must drain old readers despite eager-sync deferral"
+    );
+    let identity_b = kernel.device_graph_resources()[0].identity();
+    assert_ne!(identity_b, identity_a);
+    #[cfg(feature = "gpu-tests")]
+    {
+        runtime.fail_warm_transaction_at_for_test(1);
+        assert!(
+            execute(&[2, 1], &[1, 3], &[2, 3])
+                .unwrap_err()
+                .to_string()
+                .contains("injected staged warm-cache failure")
+        );
+        assert_eq!(kernel.device_graph_resources()[0].identity(), identity_b);
+        assert!(kernel.cuda_graph_compatible());
+    }
+    drop(kernel);
+    runtime.replay_graph().unwrap();
+    let mut observed = [0u8; 48];
+    // SAFETY: output is live and covers the complete captured result.
+    unsafe { runtime.dtoh(&mut observed, cuptr(output.as_ptr())).unwrap() };
+    assert_eq!(observed.as_slice(), raw(&[1i64, 2, 3, 9, 9, 9]));
+    assert!(runtime.reset_graph().unwrap());
+    for buffer in [condition, x, y, output] {
+        ep.deallocate(buffer).unwrap();
+    }
+}
+
 /// Build a `Split` kernel for a single data input of `data_shape` producing
 /// `output_shapes`, with an optional runtime split-sizes input. Returns the
 /// kernel so a test can inspect its device-graph capture eligibility. The

@@ -1,10 +1,10 @@
 //! Dtype-agnostic, three-way broadcasting CUDA implementation of ONNX `Where`.
 //!
 //! The kernel persists its right-aligned broadcast stride/shape metadata in a
-//! [`WhereMetadataCache`] (mirroring the elementwise binary kernel's
-//! `BroadcastMetadataCache`) so a repeated call with unchanged operand shapes
-//! performs **no** per-step host allocation, upload, free, or stream
-//! synchronize. That is the prerequisite for a `Where` to fold into a captured
+//! shared [`DeviceMetadataCache`] so a repeated call with unchanged operand shapes
+//! reuses one immutable payload without device allocation, metadata upload,
+//! retirement or stream synchronization. Capture-signature handling still
+//! constructs Host shape vectors. Payload reuse lets `Where` fold into a captured
 //! CUDA graph instead of forcing a seam.
 //!
 //! Capture is advertised after an exact dtype/shape signature has warmed. The
@@ -14,15 +14,16 @@
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
-use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
+use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
     DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
 };
 use onnx_runtime_ir::{DataType, Node};
 
 use super::elementwise::{broadcast_strides, require_matching_capture_signature, u64_bytes};
+use crate::device_metadata::DeviceMetadataCache;
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
+use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
 const WHERE_SOURCE: &str = r#"
@@ -58,7 +59,7 @@ impl KernelFactory for WhereFactory {
     fn create(&self, _: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(WhereKernel {
             runtime: self.runtime.clone(),
-            metadata: Mutex::new(WhereMetadataCache::new(self.runtime.clone())),
+            metadata: Mutex::new(DeviceMetadataCache::new(self.runtime.clone())),
             last_capture_safe_signature: Mutex::new(None),
         }))
     }
@@ -81,86 +82,10 @@ struct WhereCaptureSignature {
     shapes: WhereMetadataKey,
 }
 
-/// A persistent device buffer holding the right-aligned broadcast stride/shape
-/// metadata for a three-input `Where`. Reused across decode steps whenever the
-/// operand shapes are unchanged, so a captured launch performs **no** per-step
-/// host allocation, upload, free, or synchronize.
-#[derive(Clone, Debug)]
-struct WhereMetadataCache {
-    runtime: Arc<CudaRuntime>,
-    key: Option<WhereMetadataKey>,
-    allocation: Option<Arc<GraphDeviceAllocation>>,
-}
-
-impl WhereMetadataCache {
-    fn new(runtime: Arc<CudaRuntime>) -> Self {
-        Self {
-            runtime,
-            key: None,
-            allocation: None,
-        }
-    }
-
-    fn prepare(&mut self, key: &WhereMetadataKey) -> Result<CUdeviceptr> {
-        if self.key.as_ref() == Some(key) {
-            let ptr = self.allocation.as_ref().map_or_else(
-                || {
-                    Err(EpError::KernelFailed(
-                        "cuda_ep Where: cached broadcast metadata lost its device allocation"
-                            .into(),
-                    ))
-                },
-                |allocation| Ok(allocation.ptr()),
-            )?;
-            if self.runtime.is_capturing()? {
-                self.runtime.require_registered_address_capture(
-                    self.device_graph_resource()
-                        .expect("cached Where allocation is present")
-                        .identity(),
-                    "Where broadcast metadata",
-                )?;
-            }
-            return Ok(ptr);
-        }
-        if self.runtime.is_capturing()? {
-            return Err(EpError::KernelFailed(
-                "cuda_ep Where: broadcast metadata shape changed during CUDA graph capture; warm the fixed decode shape before capture".into(),
-            ));
-        }
-        if self.allocation.is_some() {
-            self.runtime.synchronize()?;
-        }
-
-        let mut metadata = key.out_shape.iter().map(|&d| d as u64).collect::<Vec<_>>();
-        metadata.extend(broadcast_strides(&key.condition_shape, &key.out_shape));
-        metadata.extend(broadcast_strides(&key.x_shape, &key.out_shape));
-        metadata.extend(broadcast_strides(&key.y_shape, &key.out_shape));
-        if metadata.is_empty() {
-            metadata.push(0);
-        }
-        let metadata_bytes = u64_bytes(&metadata);
-        let allocation = GraphDeviceAllocation::allocate(&self.runtime, metadata_bytes.len())?;
-        // SAFETY: allocation exactly covers the metadata byte slice.
-        unsafe { self.runtime.htod(metadata_bytes, allocation.ptr()) }?;
-        self.runtime
-            .staged_warm_cache_mutation("Where broadcast metadata allocation/upload")?;
-        let ptr = allocation.ptr();
-        self.key = Some(key.clone());
-        self.allocation = Some(allocation);
-        Ok(ptr)
-    }
-
-    fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
-        self.allocation
-            .as_ref()
-            .map(GraphDeviceAllocation::device_graph_resource)
-    }
-}
-
 #[derive(Debug)]
 struct WhereKernel {
     runtime: Arc<CudaRuntime>,
-    metadata: Mutex<WhereMetadataCache>,
+    metadata: Mutex<DeviceMetadataCache<WhereMetadataKey>>,
     last_capture_safe_signature: Mutex<Option<WhereCaptureSignature>>,
 }
 
@@ -229,12 +154,6 @@ impl Kernel for WhereKernel {
             return Ok(());
         }
 
-        let key = WhereMetadataKey {
-            condition_shape: condition.shape.to_vec(),
-            x_shape: x.shape.to_vec(),
-            y_shape: y.shape.to_vec(),
-            out_shape: expected.clone(),
-        };
         let func = self
             .runtime
             .nvrtc_function("where_op", WHERE_SOURCE, "where_bytes")?;
@@ -242,7 +161,33 @@ impl Kernel for WhereKernel {
             EpError::KernelFailed("cuda_ep Where metadata lock was poisoned".into())
         })?;
         let mut metadata_candidate = metadata.clone();
-        let metadata_ptr = metadata_candidate.prepare(&key)?;
+        let metadata_ptr = metadata_candidate.get_or_prepare(
+            "Where broadcast metadata",
+            |key| {
+                key.condition_shape == condition.shape
+                    && key.x_shape == x.shape
+                    && key.y_shape == y.shape
+                    && key.out_shape == output.shape
+            },
+            || {
+                let mut values = expected.iter().map(|&d| d as u64).collect::<Vec<_>>();
+                values.extend(broadcast_strides(condition.shape, &expected));
+                values.extend(broadcast_strides(x.shape, &expected));
+                values.extend(broadcast_strides(y.shape, &expected));
+                if values.is_empty() {
+                    values.push(0);
+                }
+                Ok((
+                    WhereMetadataKey {
+                        condition_shape: condition.shape.to_vec(),
+                        x_shape: x.shape.to_vec(),
+                        y_shape: y.shape.to_vec(),
+                        out_shape: expected.clone(),
+                    },
+                    u64_bytes(&values).to_vec(),
+                ))
+            },
+        )?;
         let condition_ptr = cuptr(condition.data_ptr::<u8>() as *const c_void);
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(y.data_ptr::<u8>() as *const c_void);

@@ -1189,6 +1189,37 @@ warm reuse, attribute/all-axis numerics and capture replay; the existing
 failed-call/rewarm/drop/replay fixture now pins the one complete owner. No CUDA
 hardware was available to execute these device fixtures.
 
+### Shared immutable CUDA metadata staging
+
+Binary broadcast metadata (also used by comparison/logical/bitwise, PRelu and
+Gemm bias paths) and `Where` now share a single-entry `DeviceMetadataCache<K>`.
+One immutable record contains both the signature key and its device owner;
+there is no representable key-without-allocation state. Staging a candidate
+shares that record through an Arc instead of deep-cloning shape vectors. A
+borrowed signature predicate checks the retained key before a lazy builder
+encodes a new key and payload. Kernels still define their table ABI and scalar
+sentinels; the helper owns allocation/upload, capture-registration checks and
+the existing staged-mutation checkpoint.
+
+A capture miss refuses before encoding, draining or uploading. On an eager
+miss with a previous entry, the common path uses `drain_for_unmap`, including
+`Where` when optional per-op synchronization is deferred. Only successful
+allocation/upload/checkpoint installs the candidate record, and each kernel
+still publishes that candidate and its capture signature after successful
+launch. Installed graphs independently pin old allocation owners across rewarm
+and kernel drop. No new lock, pool, budget, quota callback or device owner is
+introduced; records retain the existing artifact allocation policy.
+
+This removes metadata-key construction on binary cache hits, repeated metadata
+key construction on `Where` hits, and both caches' candidate key deep copies.
+Capture-signature and broadcast-output shape handling still allocate Host
+vectors, so this is not an allocation-free whole-call claim. Cold preparation
+materializes a byte payload for the shared upload interface. Device fixtures
+cover lazy hits, mandatory replacement drains under eager deferral, staged
+failure retention, capture miss rejection and replay after owner replacement
+and kernel drop. Host/type checks and GPU-feature compilation can verify the
+interfaces here; device execution and performance need CUDA hardware.
+
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
 The dated audit and measurements below preserve historical evidence. The current
