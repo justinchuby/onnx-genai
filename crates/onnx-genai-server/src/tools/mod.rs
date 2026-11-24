@@ -168,7 +168,8 @@ impl Tools {
         } else {
             None
         };
-        if enabled.is_empty() && mcp.as_ref().is_none_or(|client| client.is_empty()) {
+        let mcp = mcp.filter(|client| !client.is_empty());
+        if enabled.is_empty() && mcp.is_none() {
             return Ok(None);
         }
         Ok(Some(Arc::new(Self {

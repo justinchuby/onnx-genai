@@ -505,6 +505,23 @@ async fn empty_mcp_configuration_does_not_require_a_large_staging_budget() {
     })
     .unwrap();
     assert!(tools.is_none());
+    let tools = Tools::new(&ToolsConfig {
+        enabled: vec![BuiltinTool::GetInfo],
+        mcp: McpSources {
+            json: Some("{}".into()),
+            ..Default::default()
+        },
+        max_host_bytes: std::num::NonZeroU64::new(256 * 1024).unwrap(),
+        ..Default::default()
+    })
+    .unwrap()
+    .unwrap();
+    assert!(tools.mcp.is_none());
+    assert_eq!(tools.memory.ledger().used(Tier::Host), 0);
+    assert!(
+        tools.admit(0).is_ok(),
+        "empty MCP sources must not consume the minimum builtin admission budget"
+    );
 }
 #[tokio::test]
 async fn http_mcp_preflight_credit_refusal_has_503_and_retries_without_spawning() {
