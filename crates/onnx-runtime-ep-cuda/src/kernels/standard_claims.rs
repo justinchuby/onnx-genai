@@ -4,6 +4,7 @@
 //! matrices. Keep their placement checks in sync with those runtime limits so a
 //! node is never claimed only to fail while constructing or executing a kernel.
 
+use onnx_runtime_ir::modulo::ModMode;
 use onnx_runtime_ir::qlinear_matmul::{ScaleSupport, ScaleType};
 use onnx_runtime_ir::scatter::{ScatterReduction, validate_nd_index_type};
 use onnx_runtime_ir::{Attribute, DataType, Node, Shape};
@@ -18,6 +19,7 @@ pub(crate) fn unsupported_reason_at_opset(
     let result = match node.op_type.as_str() {
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
         "GatherND" => gather_nd(node, opset, input_dtypes),
+        "Mod" => mod_op(node, opset, input_dtypes),
         "QuantizeLinear" | "DequantizeLinear" => {
             if matches!(
                 conv_transpose_contract,
@@ -85,7 +87,6 @@ pub(crate) fn unsupported_reason(
         | "ReduceLogSumExp" => reduce_float(node, input_dtypes),
         "Swish" | "ThresholdedRelu" => float_activation(node, input_dtypes),
         "Sum" | "Mean" => variadic_float(node, input_dtypes),
-        "Mod" => mod_op(node, input_dtypes),
         "QuantizeLinear" => quantize_linear(node, input_dtypes),
         "DequantizeLinear" => dequantize_linear(node, input_dtypes),
         "DequantizePacked" => {
@@ -901,26 +902,10 @@ fn variadic_float(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> 
     Ok(())
 }
 
-/// `Mod`: two same-dtype operands over f32/i32/i64; f32 requires `fmod=1`.
-fn mod_op(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+fn mod_op(node: &Node, opset: u64, input_dtypes: &[DataType]) -> Result<(), String> {
     required_arity(node, input_dtypes, 2, 1, 1)?;
-    require_one_of(
-        input_dtypes,
-        0,
-        &[DataType::Float32, DataType::Int32, DataType::Int64],
-        "A",
-    )?;
     require_dtype(input_dtypes, 1, input_dtypes[0], "B")?;
-    let fmod = match node.attr("fmod") {
-        None => 0,
-        Some(attribute) => match attribute.as_int() {
-            Some(value @ (0 | 1)) => value,
-            _ => return Err("attribute 'fmod' must be 0 or 1".into()),
-        },
-    };
-    if input_dtypes[0] == DataType::Float32 && fmod != 1 {
-        return Err("Float32 Mod requires fmod=1".into());
-    }
+    super::mod_op::entry_for(input_dtypes[0], opset, ModMode::parse(node)?)?;
     Ok(())
 }
 

@@ -561,6 +561,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("CumProd", "") => CUM_PROD_TYPES,
         ("DFT", "") => CUDA_DFT_DTYPES,
         ("STFT", "") => CUDA_STFT_DTYPES,
+        ("Mod", "" | "ai.onnx") => onnx_runtime_ir::modulo::DTYPES,
         ("Unique", "") => CUDA_UNIQUE_DTYPES,
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
         ("Einsum", "") => CUDA_EINSUM_DTYPES,
@@ -686,7 +687,6 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("Sub", _)
         | ("Mul", _)
         | ("Div", _)
-        | ("Mod", _)
         | ("Pow", _)
         | ("Min", _)
         | ("Max", _)
@@ -738,6 +738,11 @@ pub fn build_cuda_registry_descriptors(registry: &OpRegistry) -> Vec<CudaOpDescr
             end_version: registry.explicit_end_version(key),
             supported_dtypes: if key.op_type == "BitShift" && key.domain.is_empty() {
                 onnx_runtime_ep_api::bitshift::ORT_DTYPES
+            } else if key.op_type == "Mod"
+                && onnx_runtime_ir::is_default_domain(&key.domain)
+                && key.since_version < onnx_runtime_ir::modulo::FLOAT_FLOOR_SINCE
+            {
+                mod_op::LEGACY_DTYPES
             } else {
                 cuda_supported_dtypes_for_op(&key.op_type, &key.domain)
             },
@@ -1915,14 +1920,18 @@ pub(crate) fn build_cuda_registry_for_contract(
         }),
     );
 
-    // Mod (mod_op.rs) — f32 (fmod=1) plus i32/i64 truncated and floor modulo.
-    reg.register(
-        OpKey::new("Mod", "", 10),
-        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
-        Box::new(mod_op::ModFactory {
-            runtime: runtime.clone(),
-        }),
-    );
+    let mod_28 = onnx_runtime_ir::modulo::FLOAT_FLOOR_SINCE;
+    for (since_version, end_version) in [(10, mod_28 - 1), (mod_28, u64::MAX)] {
+        reg.register_through(
+            OpKey::new("Mod", "", since_version),
+            end_version,
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+            Box::new(mod_op::ModFactory {
+                runtime: runtime.clone(),
+                since_version,
+            }),
+        );
+    }
 
     // ── CUDA Wave 3 — pointwise math / logical / comparison (pointwise.rs) ──
 

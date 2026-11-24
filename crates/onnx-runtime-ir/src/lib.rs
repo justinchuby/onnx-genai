@@ -64,6 +64,7 @@ mod graph_view;
 pub mod int16_quantization;
 mod layout;
 pub mod linear_attention;
+pub mod modulo;
 mod node;
 pub mod onnx;
 pub mod opset26;
