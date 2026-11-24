@@ -285,7 +285,7 @@ impl PadKernel {
                 output.dtype, output.shape
             )));
         }
-        let src = packed_tensor(data)?;
+        data.validate()?;
         output.validate()?;
         if !output.is_contiguous() {
             return Err(EpError::KernelFailed(
@@ -307,21 +307,17 @@ impl PadKernel {
                     "Pad: constant_value must be a scalar with the data dtype {dtype:?}"
                 )));
             }
-            packed_tensor(value)?[0] & mask
+            value.validate()?;
+            packed_lane(value, 0, lanes, bits, mask)?
         } else {
             0
         };
-        // Avoid forming source strides for a tensor that can only supply fill.
-        let strides = if src.is_empty() {
-            Vec::new()
-        } else {
-            compute_contiguous_strides(data.shape)
-        };
+        let has_source = axes.iter().all(|axis| axis.cropped != 0);
         let mut idx = vec![0; shape.len()];
         let mut dense = vec![0; bytes];
         for i in 0..elements {
-            let mut offset = 0;
-            let mut present = !src.is_empty();
+            let mut offset = 0i128;
+            let mut present = has_source;
             if present {
                 for (d, axis) in axes.iter().enumerate() {
                     let coord = idx[d] as i64 - axis.pad_begin;
@@ -337,11 +333,14 @@ impl PadKernel {
                         PadMode::Edge => coord.clamp(0, n - 1),
                         PadMode::Wrap => coord.rem_euclid(n),
                     };
-                    offset += (axis.crop_start + mapped as usize) * strides[d] as usize;
+                    let source = axis.crop_start as i128 + i128::from(mapped);
+                    offset = offset
+                        .checked_add(source * i128::from(data.strides[d]))
+                        .ok_or_else(packed_offset_error)?;
                 }
             }
             let code = if present {
-                src[offset / lanes] >> ((offset % lanes) * bits) & mask
+                packed_lane(data, offset, lanes, bits, mask)?
             } else {
                 fill
             };
@@ -371,20 +370,22 @@ fn packed_size(dtype: DataType, shape: &[usize]) -> Result<(usize, usize)> {
                 )))
 }
 
-fn packed_tensor<'a>(view: &'a TensorView) -> Result<&'a [u8]> {
-    view.validate()?;
-    if !view.is_contiguous() {
-        return Err(EpError::KernelFailed(
-            "Pad: packed data must be contiguous; materialize the input".into(),
-        ));
-    }
-    let (_, bytes) = packed_size(view.dtype, view.shape)?;
-    if bytes == 0 {
-        return Ok(&[]);
-    }
-    // SAFETY: the validated contiguous view provides `bytes` readable bytes
-    // at its byte origin for the lifetime of the view.
-    Ok(unsafe { std::slice::from_raw_parts(view.data_ptr::<u8>(), bytes) })
+fn packed_offset_error() -> EpError {
+    EpError::KernelFailed(
+        "Pad: packed source offset exceeds addressable storage; reduce the view strides or shape"
+            .into(),
+    )
+}
+
+fn packed_lane(view: &TensorView, offset: i128, lanes: usize, bits: usize, mask: u8) -> Result<u8> {
+    let byte =
+        isize::try_from(offset.div_euclid(lanes as i128)).map_err(|_| packed_offset_error())?;
+    let shift = offset.rem_euclid(lanes as i128) as usize * bits;
+    // SAFETY: offset selects an in-shape logical lane (or the scalar at zero).
+    // The owning EP guarantees backing bounds for the view, including negative
+    // strides; Euclidean division selects the containing byte relative to its origin.
+    let raw = unsafe { view.data_ptr::<u8>().offset(byte).read() };
+    Ok((raw >> shift) & mask)
 }
 
 #[cfg(test)]
@@ -485,6 +486,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out.bytes, [0xdd, 0x21, 0xd3, 0x4d, 0x65]);
+    }
+
+    #[test]
+    fn pad_packed_reads_transposed_and_reversed_strides_at_byte_origin() {
+        // Backing lanes [1,2,3,4,5,6]. Start at the low lane of byte 1 (3)
+        // and use strides [1,-2] to get rows [3,1], [4,2].
+        let dtype = DataType::Uint4;
+        let backing = Owned {
+            bytes: vec![0x21, 0x43, 0x65],
+            shape: vec![2, 2],
+            strides: vec![1, -2],
+            dtype,
+        };
+        let pads = Owned::i64(&[4], &[0, 1, 0, 0]);
+        let mut out = Owned {
+            bytes: vec![0xa5; 3],
+            shape: vec![2, 3],
+            strides: vec![3, 1],
+            dtype,
+        };
+        constant_kernel(None)
+            .execute(
+                &[backing.view().with_byte_offset(1), pads.view()],
+                &mut [out.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(out.bytes, [0x30, 0x01, 0x24]);
     }
 
     #[test]
