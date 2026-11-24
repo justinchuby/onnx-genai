@@ -192,13 +192,13 @@ impl fmt::Debug for ManagedCudaOrtAllocatorState {
 #[repr(C)]
 struct ManagedCudaOrtAllocator {
     base: onnx_genai_ort_sys::OrtAllocator,
-    memory_info: MemoryInfo,
+    memory_info: crate::allocator::ResolvedMemoryInfo,
     state: Arc<ManagedCudaOrtAllocatorState>,
 }
 
 impl ManagedCudaOrtAllocator {
     fn new(
-        memory_info: MemoryInfo,
+        memory_info: crate::allocator::ResolvedMemoryInfo,
         binding: ScopedMemoryBinding,
         authority: RegisteredMemoryAuthority,
         holder: RegisteredMemoryHolder,
@@ -468,7 +468,7 @@ impl ManagedCudaEnvironmentRegistration {
             .take()
             .expect("managed CUDA registration binding was recorded");
         let mut registered_allocator = ManagedCudaOrtAllocator::new(
-            MemoryInfo::cuda(device_id)?,
+            MemoryInfo::cuda(device_id)?.resolve()?,
             binding,
             registered_authority.clone(),
             holder.clone(),
