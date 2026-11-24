@@ -1850,3 +1850,27 @@ transports forward overrides rather than dropping them. Decoder-only extraction
 refuses nonempty adapter selections, and model properties expose embedding-specific
 adapter admission. The compatibility goal remains active for the remaining loader,
 device, model-management, tools and full-matrix acceptance items.
+
+### Explicit host tools for the official frontend
+
+The seven built-in tools behind `GET/POST /tools` now execute real host operations:
+read, glob/grep, command, write/edit and runtime info. Discovery is independent of
+model loading; model-generated tool calls retain their separate metadata admission.
+`--tools` enables this privilege explicitly. Loopback/explicit trusted origins,
+JSON content type, bounded admission and host-buffer leases precede execution.
+Command SSE uses upstream chunk/done objects, preserves split UTF-8 and cancels
+Unix process groups on disconnect, including after the parent shell exits.
+Writes stage atomically; fuzzy edits preserve untouched lines and validate all
+replacements against the original file. Read-only Git listing disables repository
+fsmonitor execution. Searches and regex matching have explicit resource bounds.
+See [host tools](SERVER_TOOLS.md). MCP stdio and remote/container tool runtimes
+remain open; this increment does not close the overall compatibility goal.
+
+
+### Upstream properties acknowledgement
+
+`--props` enables `POST /props` without loading a model, with the current
+upstream acknowledgement-only response. Request fields do not mutate settings;
+this matches the pinned server-context.cpp handler, which has no mutation schema.
+Both router and model properties report the configured endpoint flag. Router
+properties also expose the actual host-tool capability independently of loading.
