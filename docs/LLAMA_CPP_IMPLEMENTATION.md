@@ -3,6 +3,8 @@
 Goal: maximize protocol and official-frontend compatibility, implement missing
 server features with real runtime semantics and remove the terminal REPL.
 Self-review and merge tested increments until all acceptance items are complete.
+Tool execution and MCP transport are explicitly excluded by the user's revised
+scope; external harnesses own them. Chat tool-call protocols remain required.
 
 The upstream baseline is pinned in `vendor/llama-chat/UPSTREAM`. A matching route
 name or a successful empty response is not an implemented capability.
@@ -28,7 +30,7 @@ The supported surface and explicit limitations are documented in
 - [ ] Responses and Anthropic Messages, including tools and streamed event contracts.
 - [ ] Generation controls/sampling and reporting needed by the upstream frontend.
 - [ ] Capability-backed ranking, adapter and slot/state operations; audit the engine boundary before introducing transport support.
-- [ ] Optional tools/MCP proxy, model catalogue/download semantics and audio transports; preserve explicit configuration and resource bounds.
+- [ ] Model catalogue/download semantics and audio transports; preserve explicit configuration and resource bounds.
 - [ ] Full compatibility matrix and executable conformance tests.
 - [ ] Fresh full checks, adversarial self-review, PR description update and merge (CI is currently blocked; user authorized merging after local verification).
 
@@ -1222,30 +1224,6 @@ passed 734 engine tests (1 inherited ignore) and 405 server tests (2 inherited
 ignores). These are functional checks, with no performance claim.
 
 
-## Optional MCP HTTP transport
-
-The official frontend's GET/POST `/cors-proxy` transport is implemented behind
-an independent opt-in network policy. Target admission checks every resolved
-address and pins those addresses into a client that disables environment proxies
-and automatic redirects. Only explicitly prefixed browser headers are eligible
-for forwarding. Redirects return through admission and strip forwarding headers
-when target origins differ, while preserving representation negotiation.
-Remote headers cannot set inference-origin cookies, CORS grants, storage or
-transport policy; remote documents receive a sandbox CSP.
-
-Request and response bytes and idle wait durations have positive operator
-limits. A bounded response queue propagates backpressure, the response body owns
-the transfer task, and dropping the reader cancels it. Timeout after a stalled
-reader remains an error rather than a successful truncated response. Native
-server tools, local tool execution and the other unchecked compatibility work
-remain separate delivery items. Fourteen new proxy/CLI tests passed, including
-real local SSE delivery before EOF, request/response byte limits, disconnect,
-stalled-reader timeout, cross-origin credential isolation and connection quota
-release and active SSE continuing beyond the idle interval. The full server
-library suite passed 419 tests with 2 inherited ignores. Strict server all-target
-Clippy passed. This increment does not complete the remaining delivery items.
-
-
 ## Declared reasoning budgets and grammar prefill
 
 Reasoning budgets lower into a mandatory engine processor shared by host sampling
@@ -1849,23 +1827,7 @@ the generation parser and snapshot once per batch. Native and OpenAI embedding
 transports forward overrides rather than dropping them. Decoder-only extraction
 refuses nonempty adapter selections, and model properties expose embedding-specific
 adapter admission. The compatibility goal remains active for the remaining loader,
-device, model-management, tools and full-matrix acceptance items.
-
-### Explicit host tools for the official frontend
-
-The seven built-in tools behind `GET/POST /tools` now execute real host operations:
-read, glob/grep, command, write/edit and runtime info. Discovery is independent of
-model loading; model-generated tool calls retain their separate metadata admission.
-`--tools` enables this privilege explicitly. Loopback/explicit trusted origins,
-JSON content type, bounded admission and host-buffer leases precede execution.
-Command SSE uses upstream chunk/done objects, preserves split UTF-8 and cancels
-Unix process groups on disconnect, including after the parent shell exits.
-Writes stage atomically; fuzzy edits preserve untouched lines and validate all
-replacements against the original file. Read-only Git listing disables repository
-fsmonitor execution. Searches and regex matching have explicit resource bounds.
-See [host tools](SERVER_TOOLS.md). MCP stdio and remote/container tool runtimes
-remain open; this increment does not close the overall compatibility goal.
-
+device, model-management and full-matrix acceptance items.
 
 ### Upstream properties acknowledgement
 
@@ -1873,17 +1835,18 @@ remain open; this increment does not close the overall compatibility goal.
 upstream acknowledgement-only response. Request fields do not mutate settings;
 this matches the pinned server-context.cpp handler, which has no mutation schema.
 Both router and model properties report the configured endpoint flag. Router
-properties also expose the actual host-tool capability independently of loading.
+properties also report that server tools are unavailable independently of loading.
 
 
-### Stdio MCP server tools
+### Tool execution belongs to the external harness
 
-Cursor-compatible file/inline configuration supplies independent stdio MCP server
-lanes. The official client SDK handles initialization, IDs and peer messages;
-canonical leases cover configuration, SDK message tasks, catalogs and cloned HTTP
-response bytes. Discovery is bounded and independent of model loading. Calls use
-upstream names/result normalization, preserve trusted frontend controls, reuse
-healthy sessions after application errors, and cancel/reap process groups on
-disconnect or timeout. A node-owned runtime joins actors and the child reaper.
-See [stdio MCP serving](SERVER_MCP.md) for configuration and explicit I/O limits.
-Container/SSH runtimes and the rest of the compatibility ledger remain open.
+The user explicitly excluded server-provided tool execution from the compatibility
+objective. Built-in filesystem/shell tools, `/tools`, stdio MCP, `/cors-proxy`, and
+container/SSH runtimes are removed from the server and its remaining-work ledger.
+Their CLI/configuration types and dedicated dependencies are removed as well;
+there are no compatibility aliases for these prerelease options.
+
+`/props` advertises `server_tools: false` and `cors_proxy_enabled: false`. Unknown
+tool/proxy routes return JSON 404. OpenAI/Anthropic/Responses tool-call transport,
+model tool-protocol admission and tool-result messages remain in scope. External
+harnesses execute calls and supply results to the next inference request.
