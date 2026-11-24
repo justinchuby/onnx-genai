@@ -1145,6 +1145,50 @@ recording refusal, graph ownership after original caller retirement and final
 physical settlement. No CUDA hardware was available to execute these probes;
 GPU numerics, NVRTC, capture/lifetime behavior and performance remain unmeasured.
 
+### Reduction metadata is one immutable payload
+
+NVRTC reductions consume base offsets, delta offsets and expected axes as one
+plan. They now share a single checked i64 payload, device owner, synchronous
+upload and capture resource. Three layouts preserve natural alignment and each
+ABI pointer stays inside the owner; an empty table gets one initialized i64
+sentinel. Host encoding checks individual counts and aggregate capacity before
+allocating/uploading. The CUDA launch ABI and numerical source are unchanged.
+
+The cache key still includes input shape, reduced-axis mask, keepdims and the
+exact axes sequence. Only a cache miss builds the checked base/delta tables and
+new payload; warm hits no longer enumerate large Host offset vectors before
+discovering the existing entry. Each call still checks dtype, contiguity,
+output geometry and checked reduction counts. Matching committed keys reuse the
+existing validated offset proof. Cold candidates remain unpublished until a
+successful launch, while installed graphs independently pin old payloads across
+replacement or kernel drop. Capturing a different signature remains refused.
+
+This is an immutable artifact, separate from disposable caller workspace.
+Coalescing its actual shared lifetime removes region-level ownership rather than
+adding grants, a pool or a new EP lifecycle. Warm calls retain the existing zero
+metadata-upload/device-allocation behavior. One cold upload replaces three
+synchronous uploads, but GPU latency/throughput effects are unmeasured.
+
+Retained `GraphDeviceAllocation` owners use checked 512-byte capacity classes in
+the existing raw pool; ordinary transient `alloc_raw` keeps its wider reuse
+classes. The same allocation core, capacity tracking, retention cap and retirement
+path serve both. This prevents a combined payload just beyond a power-of-two or
+MiB boundary from nearly doubling its live requested capacity: 32,784 bytes now
+requests 33,280 rather than 65,536 (the original three blocks requested 33,792).
+It introduces more possible classes and may reduce cold reuse across different
+sizes. Empty pool buckets retain Host metadata until the existing drain path;
+the device-byte cap does not bound that metadata under repeated shape changes.
+Fitting warm owners perform no class lookup or allocation. This policy
+does not add managed-workspace quota accounting to raw artifacts, and driver
+memory use and cold-path performance still need device measurements.
+
+Host tests verify table order and signed/native-endian contents, aligned region
+origins, initialized empty slots, complete-span refusal and overflow before
+encoding. Device fixtures compile exact cold allocation/upload/resource counts,
+warm reuse, attribute/all-axis numerics and capture replay; the existing
+failed-call/rewarm/drop/replay fixture now pins the one complete owner. No CUDA
+hardware was available to execute these device fixtures.
+
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
 The dated audit and measurements below preserve historical evidence. The current
@@ -1211,9 +1255,7 @@ call; it owns the governed workspace preparation path
 | `kernels/pooling.rs:538` | pooling metadata | `bytes.len()` | rank/kernel config | step-scoped | raw bypass |
 | `kernels/qlinear_matmul.rs:299` | QLinearMatMul metadata | `bytes.len()` | rank/quantization params | step-scoped | raw bypass |
 | `kernels/qmoe.rs`, `qmoe/workspace.rs` | integer-affine QMoE routing, expert intermediates, grouping and float widening | one checked composite of the 19 reachable regions | rows/experts/hidden/intermediate, activation/gate route and each operand dtype | shared SessionPersistent caller peak | metadata planning and actual used-span capture pin; no private pool or slot owner |
-| `kernels/reduce.rs:711` | reduce base shape metadata | `base_bytes.len().max(1)` | rank/config | step-scoped | raw bypass |
-| `kernels/reduce.rs:712` | reduce delta shape metadata | `delta_bytes.len().max(1)` | rank/config | step-scoped | raw bypass |
-| `kernels/reduce.rs:720` | reduce axes metadata | `axes_bytes.len().max(1)` | rank/axes config | step-scoped | raw bypass |
+| `kernels/reduce.rs` | immutable reduction base/delta/axes metadata | `8 * (max(base_count,1) + max(delta_count,1) + max(axes_count,1))`, checked | shape/mask/keepdims/exact axes | one shape-keyed immutable artifact | one allocation/upload/pin; published only after successful execution; no warm table rebuilding |
 | `kernels/resize.rs` | Resize integer arrays, scales and optional symmetric offsets | `40 * rank` or `48 * rank`, zero for empty output | rank/selected source/coordinate mode | SessionPersistent caller peak | one combined borrowed upload; no private allocation |
 | `kernels/standard_attention.rs:633,777` (`std_attention_workspace_layout` / `workspace_requirement`), selected at `:1690-1766` | default-domain `Attention` f32 scores + staged dense K/V composite | scores `batch * q_heads * q_seq * total_seq * sizeof(f32)` on every route; staged key/value, when reachable, each `batch * kv_heads * present_seq * head_dim * element_bytes`, with 256-byte region alignment | prompt/cache/route dependent | step-scoped on per-call prefill/batched dense growth; session-persistent on capture-eligible single-token dense growth | **governed by #736** through one shared plan/execute layout; fixed-capacity append, no-past, and missing present-output routes add **zero** staged-K/V bytes (the always-live scores remain); direct-`execute` compatibility keeps self-owned scratch |
 | `kernels/standard_attention.rs:1780,1799-1803` | default-domain `Attention` capture/eager control metadata | device valid length `sizeof(i32)`; offsets + pad limits `2 * batch.max(1) * sizeof(i64)` | batch dependent, negligible | step-scoped on eager calls; retained for capture-eligible decode | raw bypass; staged K/V and scores are excluded and governed by #736 |

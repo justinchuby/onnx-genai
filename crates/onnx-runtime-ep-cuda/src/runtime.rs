@@ -107,7 +107,10 @@ pub(crate) struct GraphDeviceAllocation {
 
 impl GraphDeviceAllocation {
     pub(crate) fn allocate(runtime: &Arc<CudaRuntime>, bytes: usize) -> Result<Arc<Self>> {
-        let ptr = runtime.alloc_raw(bytes)?;
+        // Retained owners do not benefit from doubling their live footprint
+        // merely to accommodate a future, differently sized allocation.
+        let class = retained_pool_size_class(bytes)?;
+        let ptr = runtime.alloc_raw_in_class(bytes.max(1), class)?;
         Ok(Arc::new(Self {
             runtime: Arc::downgrade(runtime),
             context: Arc::clone(&runtime.context),
@@ -736,6 +739,20 @@ fn raw_pool_size_class(bytes: usize) -> usize {
     } else {
         bytes.div_ceil(SMALL) * SMALL
     }
+}
+
+/// Retained graph owners use the same pool and retirement path, with bounded
+/// rounding waste rather than transient scratch's wider reuse classes. This is
+/// computed only when creating the owner, never on a fitting warm invocation.
+fn retained_pool_size_class(bytes: usize) -> Result<usize> {
+    const GRANULARITY: usize = 512;
+    bytes
+        .max(1)
+        .checked_next_multiple_of(GRANULARITY)
+        .filter(|class| *class <= isize::MAX as usize)
+        .ok_or_else(|| EpError::KernelFailed(format!(
+            "cuda_ep: retained allocation request of {bytes} bytes exceeds addressable capacity after {GRANULARITY}-byte rounding; reduce the retained artifact size"
+        )))
 }
 
 /// Source of [`CudaRuntime::runtime_id`]. Monotonic and never reset, so an id
@@ -3080,10 +3097,14 @@ impl CudaRuntime {
     /// pointer. Binds the context first.
     #[track_caller]
     pub fn alloc_raw(&self, bytes: usize) -> Result<CUdeviceptr> {
+        let requested = bytes.max(1);
+        self.alloc_raw_in_class(requested, raw_pool_size_class(requested))
+    }
+
+    #[track_caller]
+    fn alloc_raw_in_class(&self, requested: usize, class: usize) -> Result<CUdeviceptr> {
         let location = std::panic::Location::caller();
         self.bind()?;
-        let requested = bytes.max(1);
-        let class = raw_pool_size_class(requested);
         if let Some(ptr) = self.take_pooled(class) {
             self.raw_pool_hits.fetch_add(1, Ordering::Relaxed);
             self.raw_allocation_profile
@@ -4004,6 +4025,36 @@ mod tests {
             let class = raw_pool_size_class(bytes);
             assert!(class >= previous, "class fell from {previous} to {class}");
             previous = class;
+        }
+    }
+
+    #[test]
+    fn retained_pool_rounding_bounds_live_waste_and_rejects_overflow() {
+        for bytes in [0, 1, 511, 512, 513, 32_784, (1 << 20) + 16] {
+            let class = retained_pool_size_class(bytes).unwrap();
+            assert!(class >= bytes.max(1));
+            assert!(class - bytes.max(1) < 512);
+            assert_eq!(class % 512, 0);
+            assert!(class <= raw_pool_size_class(bytes.max(1)));
+        }
+        assert_eq!(retained_pool_size_class(32_784).unwrap(), 33_280);
+        for bytes in [isize::MAX as usize, usize::MAX - 1, usize::MAX] {
+            let message = retained_pool_size_class(bytes).unwrap_err().to_string();
+            assert!(message.contains(&bytes.to_string()));
+            assert!(message.contains("reduce the retained artifact size"));
+        }
+    }
+
+    #[test]
+    fn coalesced_metadata_does_not_increase_physical_capacity_at_class_boundaries() {
+        for middle in [8usize, 512, 32_768, 1 << 20, (1 << 20) + 8] {
+            let tables = [8, middle, 8];
+            let separate: usize = tables.into_iter().map(raw_pool_size_class).sum();
+            let combined = retained_pool_size_class(tables.into_iter().sum()).unwrap();
+            assert!(
+                combined <= separate,
+                "coalescing {tables:?} retained {combined} bytes, previously {separate}"
+            );
         }
     }
 
