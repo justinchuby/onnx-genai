@@ -103,6 +103,7 @@ pub mod non_max_suppression;
 pub mod nonzero;
 pub mod normalization;
 pub mod onehot;
+mod packed_validation;
 pub mod packed_varlen_attention;
 pub mod pad;
 pub mod paged_attention;
@@ -782,7 +783,7 @@ pub fn build_cuda_registry_with_metrics(
             onnx_runtime_ir::RUNTIME_DOMAIN,
             1,
         ),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(grouped_matmul::AffineFactory(runtime.clone())),
     );
     reg.register(
@@ -791,7 +792,7 @@ pub fn build_cuda_registry_with_metrics(
             onnx_runtime_ir::RUNTIME_DOMAIN,
             1,
         ),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(grouped_matmul::PackedFactory(runtime.clone())),
     );
     reg.register(
@@ -808,14 +809,14 @@ pub fn build_cuda_registry_with_metrics(
     for name in ["Pack", "Unpack"] {
         reg.register(
             OpKey::new(name, "", 29),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
             Box::new(bit_packing::Factory(runtime.clone())),
         );
     }
 
     reg.register(
         OpKey::new("GroupedMatMul", "", 29),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(grouped_matmul::Factory(runtime.clone())),
     );
     for (name, since) in onnx_runtime_ir::standard_math::OPS {

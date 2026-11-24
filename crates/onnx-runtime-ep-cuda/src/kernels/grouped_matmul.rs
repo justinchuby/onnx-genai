@@ -8,12 +8,13 @@ use onnx_runtime_ep_api::packed_routed::{
     AffineGrouped, fail, group_layout, packed_group_layout, validate,
 };
 use onnx_runtime_ep_api::{
-    CaptureSupport, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+    CaptureSupport, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspacePreparation, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node, dequantize_packed::Metadata, packed_routed::Op};
 
 use crate::error::driver_err;
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
+use crate::runtime::{CudaRuntime, cuptr};
 
 const SOURCE: &str = concat!(
     include_str!("packed_kernel_prelude.cuh"),
@@ -113,7 +114,29 @@ impl Kernel for Affine {
         )
     }
 
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        Ok(WorkspacePreparation::Ready(
+            super::packed_validation::requirement(super::packed_validation::routing_needed(
+                inputs.get(2).map(|input| input.shape),
+                Some(inputs.get(3).map_or(&[][..], |input| input.shape)),
+            )),
+        ))
+    }
+
     fn execute(&self, x: &[TensorView], y: &mut [TensorMut]) -> Result<()> {
+        self.execute_with_workspace(x, y, None)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        x: &[TensorView],
+        y: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         let l = self.config.layout(x, y)?;
         let op = Op::GroupedMatMul { transposed: true };
         if x.iter().any(|t| !t.is_contiguous()) || !y[0].is_contiguous() {
@@ -122,13 +145,13 @@ impl Kernel for Affine {
                 "quantized CUDA projection requires contiguous tensors",
             ));
         }
-        let scale_count = l.groups * l.n * (l.k / self.config.block);
-        if l.routes == 0 && scale_count == 0 {
+        // layout() checked the decoded bank element count and its scale shape.
+        let scale_count = x[3].numel();
+        if !super::packed_validation::routing_needed(Some(x[2].shape), Some(x[3].shape)) {
             return Ok(());
         }
-        let flag = GraphDeviceAllocation::allocate(&self.runtime, 4)?;
-        let status = flag.ptr();
-        // SAFETY: fresh live four-byte result flag.
+        let status = super::packed_validation::status(workspace, "AffineQuantizedGroupedMatMul")?;
+        // SAFETY: the checked caller-owned status region covers four bytes.
         unsafe { self.runtime.htod(&[0; 4], status)? };
         let ptr = |t: &TensorView| cuptr(t.data_ptr::<u8>() as *const c_void);
         let (a, w, idx, scale, zero_points) = (
@@ -226,19 +249,40 @@ impl Kernel for Packed {
         )
     }
 
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        Ok(WorkspacePreparation::Ready(
+            super::packed_validation::requirement(super::packed_validation::routing_needed(
+                inputs.get(2).map(|input| input.shape),
+                None,
+            )),
+        ))
+    }
+
     fn execute(&self, x: &[TensorView], y: &mut [TensorMut]) -> Result<()> {
+        self.execute_with_workspace(x, y, None)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        x: &[TensorView],
+        y: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         let l = packed_group_layout(&self.metadata, x, y)?;
         if x.iter().any(|tensor| !tensor.is_contiguous()) || !y[0].is_contiguous() {
             return Err(EpError::KernelFailed(
                 "cuda_ep PackedGroupedMatMul: inputs and output must use contiguous storage".into(),
             ));
         }
-        if l.routes == 0 {
+        if !super::packed_validation::routing_needed(Some(x[2].shape), None) {
             return Ok(());
         }
-        let flag = GraphDeviceAllocation::allocate(&self.runtime, 4)?;
-        let status = flag.ptr();
-        // SAFETY: fresh live four-byte result flag.
+        let status = super::packed_validation::status(workspace, "PackedGroupedMatMul")?;
+        // SAFETY: the checked caller-owned status region covers four bytes.
         unsafe { self.runtime.htod(&[0; 4], status)? };
         let ptr = |tensor: &TensorView| cuptr(tensor.data_ptr::<u8>() as *const c_void);
         let activation = ptr(&x[0]);
@@ -323,7 +367,29 @@ impl Kernel for Native {
         )
     }
 
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        Ok(WorkspacePreparation::Ready(
+            super::packed_validation::requirement(super::packed_validation::routing_needed(
+                inputs.get(2).map(|input| input.shape),
+                None,
+            )),
+        ))
+    }
+
     fn execute(&self, x: &[TensorView], y: &mut [TensorMut]) -> Result<()> {
+        self.execute_with_workspace(x, y, None)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        x: &[TensorView],
+        y: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         let op = self.op;
         validate(op, x, y)?;
         if x.iter()
@@ -340,14 +406,13 @@ impl Kernel for Native {
         let output = cuptr(y[0].data_ptr_mut::<u8>() as *const c_void);
         let stream = self.runtime.stream();
         let l = group_layout(op, x, &y[0])?;
-        if l.routes == 0 {
+        if !super::packed_validation::routing_needed(Some(x[2].shape), None) {
             return Ok(());
         }
         // Keep tensor data on the device; only the four-byte validation result
         // is read back. This kernel is eager-only until it uses the capture latch.
-        let flag = GraphDeviceAllocation::allocate(&self.runtime, 4)?;
-        let status = flag.ptr();
-        // SAFETY: this is a fresh, live four-byte allocation for this invocation.
+        let status = super::packed_validation::status(workspace, op.name())?;
+        // SAFETY: the checked caller-owned status region covers four bytes.
         unsafe { self.runtime.htod(&[0; 4], status)? };
 
         let ty = match x[0].dtype {

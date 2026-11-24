@@ -3,12 +3,13 @@ use std::{ffi::c_void, sync::Arc};
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::packed_routed::{fail, pack_layout, validate};
 use onnx_runtime_ep_api::{
-    CaptureSupport, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+    CaptureSupport, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspacePreparation, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node, packed_routed::Op};
 
 use crate::error::driver_err;
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
+use crate::runtime::{CudaRuntime, cuptr};
 
 const SOURCE: &str = concat!(
     include_str!("packed_kernel_prelude.cuh"),
@@ -47,7 +48,34 @@ impl Kernel for Native {
         )
     }
 
+    fn workspace_requirement(
+        &self,
+        _inputs: &[TensorMetadata<'_>],
+        outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        Ok(WorkspacePreparation::Ready(
+            super::packed_validation::requirement(super::packed_validation::packing_needed(
+                self.op,
+                outputs.first().and_then(|output| match output {
+                    onnx_runtime_ep_api::OutputMetadata::Tensor { shape, .. } => {
+                        Some(shape.as_ref())
+                    }
+                    _ => None,
+                }),
+            )),
+        ))
+    }
+
     fn execute(&self, x: &[TensorView], y: &mut [TensorMut]) -> Result<()> {
+        self.execute_with_workspace(x, y, None)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        x: &[TensorView],
+        y: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         let op = self.op;
         validate(op, x, y)?;
         if x.iter()
@@ -64,14 +92,13 @@ impl Kernel for Native {
         let output = cuptr(y[0].data_ptr_mut::<u8>() as *const c_void);
         let stream = self.runtime.stream();
         let l = pack_layout(op, &x[0], &y[0], None)?;
-        if l.lanes == 0 && matches!(op, Op::Pack(..)) {
+        if !super::packed_validation::packing_needed(op, Some(y[0].shape)) {
             return Ok(());
         }
         // Keep tensor data on the device; only the four-byte validation result
         // is read back. This kernel is eager-only until it uses the capture latch.
-        let flag = GraphDeviceAllocation::allocate(&self.runtime, 4)?;
-        let status = flag.ptr();
-        // SAFETY: this is a fresh, live four-byte allocation for this invocation.
+        let status = super::packed_validation::status(workspace, op.name())?;
+        // SAFETY: the checked caller-owned status region covers four bytes.
         unsafe { self.runtime.htod(&[0; 4], status)? };
 
         let unpack = matches!(op, Op::Unpack(_));

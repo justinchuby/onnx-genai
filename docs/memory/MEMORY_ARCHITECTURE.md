@@ -325,6 +325,34 @@ is disabled. Host and NVRTC limits are emitted from one definition, and the
 partial/merge arguments share the same borrowed backing. No extra pool, quota
 transaction, or per-launch allocation is introduced.
 
+### CUDA packing and grouped-projection validation status
+
+Pack, Unpack, native GroupedMatMul, affine-quantized grouped projection and packed
+GGUF grouped projection borrow their four-byte validation result from the shared
+SessionPersistent lane. Serial nodes reuse the same physical owner; the flag is
+an internal region, not a separately funded allocation. Their registry entries
+now declare metadata workspace planning. Missing, short, misaligned or invalid
+backing is rejected before upload or launch, and no private allocation fallback
+remains. Each invocation resets the borrowed flag before use, so it does not
+rely on contents retained from warmup or another node.
+
+The same empty-demand predicates drive planning and execution. Empty Pack and
+zero-route projections need no flag, except that an affine projection must still
+validate a nonempty scale bank. Unpack must still validate its device count for an
+empty output, and nonempty routes must still be checked when output width is
+zero. Existing four-byte H2D/D2H validation and synchronization remain; capture
+is still unsupported. This migration removes allocation/free from these kernels,
+not their validation transfers. Completion, failure retirement and actual quota
+return stay with the original caller/provider owner.
+
+Host tests check the borrowed region, invalid backing and empty-demand rules.
+A device regression shares one governed flag across all five operator spellings,
+refuses a missing workspace, dirties the flag before each reuse, checks outputs,
+recovers after a real validation error and verifies runtime allocation/free
+counts do not change during execution.
+Compiling that regression does not establish CUDA numerical or performance
+correctness; a device is still required to run it.
+
 ### CUDA dense MatMul cached-plan preparation boundary
 
 F32 single-row decode and the other single-matrix cuBLASLt paths now share one
@@ -357,6 +385,18 @@ host plan for exact admission and the borrowed-workspace launch. Unknown demand,
 a substitute algorithm, and a fixed 32-MiB reservation are not valid bounds.
 Exhaustively querying all pointer-alignment classes would add hundreds of cold
 heuristic calls and is not required by this contract.
+
+The remaining native barrier is storage preparation, not another quota API.
+The engine currently plans from metadata with physical-capacity symbol bounds,
+whereas execution can use a smaller logical shape and resolve view aliases only
+at dispatch. Workspace sizes across these shapes are not monotonic. Exact
+ActualAddress planning must reuse real per-value backings, resolve the execution
+shape and aliases, then refine and reserve before publishing a storage/plan
+epoch. A changed shape or binding requires cold preparation before submission.
+The activation-memory plan is currently observational and does not establish
+actual origins. Statically preparable children must contribute their concrete
+requirements to the parent lane; runtime-created data-dependent child storage
+cannot be covered by an invented zero demand or an independent child budget.
 
 Resource accounting stays coarse: each concurrent workspace lane owns its
 physical peak, serial kernels share the maximum, and simultaneously live regions
