@@ -429,6 +429,7 @@ impl MatMulPrefillGeometry {
 enum F32MatMulRoute {
     Empty,
     Gemv,
+    QuantizedGemv,
     Accuracy4,
     Dequant,
 }
@@ -439,11 +440,16 @@ fn f32_matmul_route(
     accuracy: i64,
     block: usize,
     group_indices: bool,
+    round_affine_weights: bool,
 ) -> F32MatMulRoute {
     if m == 0 {
         F32MatMulRoute::Empty
     } else if m == 1 && !group_indices {
-        F32MatMulRoute::Gemv
+        if bits == 4 && accuracy == 4 && block == 32 && !round_affine_weights {
+            F32MatMulRoute::QuantizedGemv
+        } else {
+            F32MatMulRoute::Gemv
+        }
     } else if bits == 4 && accuracy == 4 && block == 32 && !group_indices {
         F32MatMulRoute::Accuracy4
     } else {
@@ -577,7 +583,7 @@ impl MatMulNBitsWorkspaceLayout {
         constants: &[bool],
         gate_up: bool,
         output_elements: usize,
-        dequantized_weight: std::alloc::Layout,
+        f32_scratch: std::alloc::Layout,
     ) -> Result<Self> {
         if inputs.len() > MATMUL_MAX_INPUTS {
             return Err(error(
@@ -587,7 +593,7 @@ impl MatMulNBitsWorkspaceLayout {
         let empty = std::alloc::Layout::from_size_align(0, blas::WORKSPACE_ALIGNMENT)
             .map_err(|_| error("invalid BF16 workspace alignment"))?;
         let mut regions = [empty; MATMUL_WORKSPACE_REGIONS];
-        regions[0] = dequantized_weight;
+        regions[0] = f32_scratch;
         regions[MATMUL_PREFILL_START..MATMUL_STAGING_START].copy_from_slice(&prefill);
         let mut staged = [false; MATMUL_MAX_INPUTS];
         let mut input_elements = [0; MATMUL_MAX_INPUTS];
@@ -7039,15 +7045,6 @@ impl KernelFactory for MatMulNBitsFactory {
             .and_then(|value| value.as_int())
             .unwrap_or(0);
 
-        let accuracy4_workspace = if bits == 4 && accuracy_level == 4 {
-            Some(Mutex::new(Accuracy4Workspace::new(
-                self.runtime.clone(),
-                k,
-                block_size,
-            )?))
-        } else {
-            None
-        };
         Ok(Box::new(MatMulNBitsKernel {
             runtime: self.runtime.clone(),
             k,
@@ -7055,7 +7052,6 @@ impl KernelFactory for MatMulNBitsFactory {
             bits: bits as usize,
             block_size,
             accuracy_level,
-            accuracy4_workspace,
             round_affine_weights: node
                 .attr(onnx_runtime_optimizer::quantized_matmul::ROUND_AFFINE_WEIGHTS)
                 .and_then(|attr| attr.as_int())
@@ -7088,34 +7084,60 @@ impl KernelFactory for MatMulNBitsFactory {
     }
 }
 
-#[derive(Debug)]
-struct Accuracy4Workspace {
-    allocation: Arc<GraphDeviceAllocation>,
+/// Per-invocation activation quantization, borrowed from one caller lane.
+struct Accuracy4Geometry {
+    layout: WorkspaceLayout<2>,
+    padded_k: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Accuracy4Scratch {
     quantized_activation: CUdeviceptr,
     activation_scale: CUdeviceptr,
     padded_k: usize,
 }
 
-impl Accuracy4Workspace {
-    fn new(runtime: Arc<CudaRuntime>, k: usize, block_size: usize) -> Result<Self> {
-        let padded_k = k.div_ceil(block_size) * block_size;
-        // Per-K-block int8 activation scales: one f32 per weight block.
-        let k_blocks = padded_k / block_size;
-        let scale_bytes = k_blocks * std::mem::size_of::<f32>();
-        let allocation = GraphDeviceAllocation::allocate(&runtime, padded_k + scale_bytes)?;
-        let quantized_activation = allocation.ptr();
+impl Accuracy4Geometry {
+    fn new(k: usize, block_size: usize) -> Result<Self> {
+        if k == 0 || block_size == 0 {
+            return Err(error(format!(
+                "accuracy-4 scratch requires positive K and block_size, got {k}/{block_size}; use valid quantized matrix geometry"
+            )));
+        }
+        let blocks = k.div_ceil(block_size);
+        let padded_k = blocks
+            .checked_mul(block_size)
+            .ok_or_else(|| error("accuracy-4 padded K overflows; reduce K or block_size"))?;
+        as_i32("accuracy-4 padded K", padded_k)?;
+        let scales = blocks
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| error("accuracy-4 scales byte count overflows; reduce K"))?;
+        let activation = std::alloc::Layout::from_size_align(padded_k, 1)
+            .map_err(|_| error("accuracy-4 activation exceeds addressable capacity; reduce K"))?;
+        let scales = std::alloc::Layout::from_size_align(scales, std::mem::align_of::<f32>())
+            .map_err(|_| error("accuracy-4 scales exceed addressable capacity; reduce K"))?;
         Ok(Self {
-            allocation,
-            quantized_activation,
-            activation_scale: quantized_activation + padded_k as CUdeviceptr,
+            layout: WorkspaceLayout::new([activation, scales])?,
             padded_k,
         })
     }
-}
 
-impl Accuracy4Workspace {
-    fn device_graph_resource(&self) -> DeviceGraphResource {
-        GraphDeviceAllocation::device_graph_resource(&self.allocation)
+    fn allocation_layout(&self) -> Result<std::alloc::Layout> {
+        std::alloc::Layout::from_size_align(self.layout.bytes(), self.layout.alignment())
+            .map_err(|_| error("accuracy-4 workspace exceeds addressable capacity; reduce K"))
+    }
+
+    fn bind(&self, workspace: Option<WorkspaceView>) -> Result<(Accuracy4Scratch, WorkspaceView)> {
+        let [activation,scales]=self.layout.bind(workspace).map_err(|cause|error(format!("cannot bind accuracy-4 quantized activation/scales: {cause}; prepare the complete MatMulNBits requirement")))?;
+        let used = WorkspaceView::new(activation.ptr(), self.layout.bytes());
+        Ok((
+            Accuracy4Scratch {
+                quantized_activation: cuptr(activation.ptr().0.cast_const()),
+                activation_scale: cuptr(scales.ptr().0.cast_const()),
+                padded_k: self.padded_k,
+            },
+            used,
+        ))
     }
 }
 
@@ -7256,7 +7278,6 @@ pub struct MatMulNBitsKernel {
     bits: usize,
     block_size: usize,
     accuracy_level: i64,
-    accuracy4_workspace: Option<Mutex<Accuracy4Workspace>>,
     round_affine_weights: bool,
     /// Repacked immutable weights owned by this kernel. Owner scoping prevents a
     /// later kernel from hitting stale contents when CUDA reuses an address.
@@ -7437,6 +7458,7 @@ impl MatMulNBitsKernel {
             self.accuracy_level,
             self.block_size,
             group_indices.is_some(),
+            self.round_affine_weights,
         );
         if route == F32MatMulRoute::Empty {
             return Ok(());
@@ -7451,9 +7473,10 @@ impl MatMulNBitsKernel {
             }
             flops
         });
-        self.last_call_capture_safe
-            .store(m == 1 && group_indices.is_none(), Ordering::Relaxed);
         if route == F32MatMulRoute::Gemv {
+            self.last_call_capture_safe.store(true, Ordering::Relaxed);
+        }
+        if matches!(route, F32MatMulRoute::Gemv | F32MatMulRoute::QuantizedGemv) {
             self.release_marlin_repack_for_decode();
             if self.round_affine_weights {
                 return self.launch_f32_gemv(
@@ -7560,30 +7583,35 @@ impl MatMulNBitsKernel {
                     zp_row_bytes,
                 );
             }
-            if self.accuracy_level == 4 && self.block_size == 32 && zero_points.is_none() {
-                onnx_runtime_ep_api::record_kernel_variant!(
-                    "gemv_accuracy4_int8",
-                    "M==1 decode: accuracy_level==4, block_size==32, symmetric (no zero_points) \
-                     → int8-quantized-activation capture-safe GEMV"
-                );
-                return self.launch_accuracy4_gemv(
-                    &inputs[0],
-                    &inputs[1],
-                    &inputs[2],
-                    bias,
-                    &mut outputs[0],
-                    k_blocks,
-                );
-            }
-            if self.bits == 4 && self.accuracy_level == 4 {
-                if self.block_size == 32 {
+            if route == F32MatMulRoute::QuantizedGemv {
+                let geometry = Accuracy4Geometry::new(self.k, self.block_size)?;
+                let (scratch, used) = geometry.bind(workspace)?;
+                if self.runtime.is_capturing()? {
+                    self.runtime.require_registered_workspace_capture(
+                        used,
+                        "MatMulNBits accuracy-4 activation workspace",
+                    )?;
+                }
+                let result = if zero_points.is_none() {
+                    onnx_runtime_ep_api::record_kernel_variant!(
+                        "gemv_accuracy4_int8",
+                        "M==1, int4, accuracy_level=4, block_size=32, symmetric: quantize activation once in caller workspace"
+                    );
+                    self.launch_accuracy4_gemv(
+                        &inputs[0],
+                        &inputs[1],
+                        &inputs[2],
+                        bias,
+                        &mut outputs[0],
+                        k_blocks,
+                        scratch,
+                    )
+                } else {
                     onnx_runtime_ep_api::record_kernel_variant!(
                         "gemv_accuracy4_blockwise_int8",
-                        "M==1 decode: bits=4, accuracy_level==4, block_size=32 → int8-quantized \
-                         activation quantized ONCE then parallelized blockwise GEMV (grid filled \
-                         from the device SM count; bit-identical to the tiled accuracy4 GEMM)"
+                        "M==1, int4, accuracy_level=4, block_size=32, asymmetric: quantize activation once in caller workspace"
                     );
-                    return self.launch_accuracy4_gemv_blockwise(
+                    self.launch_accuracy4_gemv_blockwise(
                         &inputs[0],
                         &inputs[1],
                         &inputs[2],
@@ -7593,8 +7621,15 @@ impl MatMulNBitsKernel {
                         k_blocks,
                         blob_size,
                         zp_row_bytes,
-                    );
+                        scratch,
+                    )
+                };
+                if result.is_ok() {
+                    self.last_call_capture_safe.store(true, Ordering::Relaxed);
                 }
+                return result;
+            }
+            if self.bits == 4 && self.accuracy_level == 4 {
                 // accuracy_level 4 requests int8-quantized activations, but the
                 // int8 activation quantum is only calibrated at block_size=32
                 // (the size the blockwise/tiled accuracy4 kernels bake in). At
@@ -7736,6 +7771,7 @@ impl MatMulNBitsKernel {
             self.accuracy_level,
             self.block_size,
             group_indices_present,
+            self.round_affine_weights,
         ) == F32MatMulRoute::Dequant
     }
 
@@ -7811,15 +7847,21 @@ impl MatMulNBitsKernel {
         } else {
             0
         };
-        let dequantized = if a.is_some_and(|a| {
-            a.present
-                && self.uses_dequant_cublas_workspace(
-                    a.dtype,
-                    a.shape,
-                    inputs.get(4).is_some_and(|input| input.present),
-                )
-        }) {
-            F32DequantGeometry::new(m, self.k, self.n)?.weight
+        let f32_scratch = if a.is_some_and(|a| a.dtype == DataType::Float32) {
+            match f32_matmul_route(
+                m,
+                self.bits,
+                self.accuracy_level,
+                self.block_size,
+                inputs.get(4).is_some_and(|input| input.present),
+                self.round_affine_weights,
+            ) {
+                F32MatMulRoute::QuantizedGemv => {
+                    Accuracy4Geometry::new(self.k, self.block_size)?.allocation_layout()?
+                }
+                F32MatMulRoute::Dequant => F32DequantGeometry::new(m, self.k, self.n)?.weight,
+                _ => std::alloc::Layout::new::<()>(),
+            }
         } else {
             std::alloc::Layout::new::<()>()
         };
@@ -7829,7 +7871,7 @@ impl MatMulNBitsKernel {
             &self.constant_inputs,
             self.gate_up_swiglu,
             output_elements,
-            dequantized,
+            f32_scratch,
         )
     }
 
@@ -11057,13 +11099,8 @@ impl MatMulNBitsKernel {
         bias: Option<&TensorView>,
         output: &mut TensorMut,
         k_blocks: usize,
+        workspace: Accuracy4Scratch,
     ) -> Result<()> {
-        let workspace = self
-            .accuracy4_workspace
-            .as_ref()
-            .ok_or_else(|| error("accuracy_level=4 GEMV workspace is unavailable"))?
-            .lock()
-            .map_err(|_| error("accuracy_level=4 GEMV workspace lock poisoned"))?;
         let quantize_function =
             self.runtime
                 .nvrtc_function(GEMV_MODULE, GEMV_SRC, QUANTIZE_ACCURACY4_ENTRY)?;
@@ -11101,7 +11138,7 @@ impl MatMulNBitsKernel {
             .arg(&workspace.activation_scale)
             .arg(&k)
             .arg(&padded_k);
-        // SAFETY: the persistent workspace covers padded_k int8 values plus one
+        // SAFETY: the borrowed workspace covers padded_k int8 values plus one
         // f32 scale per block-32, and the scalar ABI matches the quantization
         // entry point. One warp (CUDA block) quantizes one K-block.
         unsafe {
@@ -11147,7 +11184,7 @@ impl MatMulNBitsKernel {
     }
 
     /// General-block-size fp32-activation accuracy_level=4 decode GEMV. Quantizes
-    /// the fp32 activation to int8 ONCE per K-block into the persistent workspace
+    /// the fp32 activation to int8 ONCE per K-block into the caller workspace
     /// (matching the tiled reference's per-block quantization), then runs a
     /// warp-per-column blockwise GEMV whose grid width is chosen from the device
     /// multiprocessor count so it fills consumer and datacenter GPUs alike. This
@@ -11166,13 +11203,8 @@ impl MatMulNBitsKernel {
         k_blocks: usize,
         blob_size: usize,
         zp_row_bytes: usize,
+        workspace: Accuracy4Scratch,
     ) -> Result<()> {
-        let workspace = self
-            .accuracy4_workspace
-            .as_ref()
-            .ok_or_else(|| error("accuracy_level=4 GEMV workspace is unavailable"))?
-            .lock()
-            .map_err(|_| error("accuracy_level=4 GEMV workspace lock poisoned"))?;
         let quantize_function = self.runtime.nvrtc_function(
             GEMV_MODULE,
             GEMV_SRC,
@@ -11207,7 +11239,7 @@ impl MatMulNBitsKernel {
             .arg(&k)
             .arg(&block_size)
             .arg(&padded_k);
-        // SAFETY: the persistent workspace covers padded_k int8 values plus one
+        // SAFETY: the borrowed workspace covers padded_k int8 values plus one
         // f32 scale per K-block, and the scalar ABI matches the quantization
         // entry point. One warp (CUDA block) quantizes one K-block.
         unsafe {
@@ -11613,11 +11645,6 @@ impl Kernel for MatMulNBitsKernel {
 
     fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
         let mut resources = self.marlin_repack_cache.device_graph_resources();
-        if let Some(workspace) = &self.accuracy4_workspace
-            && let Ok(workspace) = workspace.lock()
-        {
-            resources.push(workspace.device_graph_resource());
-        }
         if let Ok(cache) = self.bf16_const_cache.lock()
             && let Some(resource) = cache.device_graph_resource()
         {
@@ -11628,7 +11655,7 @@ impl Kernel for MatMulNBitsKernel {
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
         // The m=1 no-g_idx GEMV uses only launch-time shared memory and a
-        // shape-fixed persistent accuracy-4 activation workspace; it performs no
+        // caller-owned accuracy-4 activation workspace; it performs no
         // per-call allocation, D2H, or synchronization. The direct fp16 GEMV is
         // likewise capture-safe: fixed grid/block geometry from the shape
         // signature and register/launch-time-shared scratch.
@@ -11816,25 +11843,157 @@ mod tests {
     }
 
     #[test]
+    fn accuracy4_workspace_prefix_contains_padded_activation_and_disjoint_scales() {
+        let geometry = Accuracy4Geometry::new(45, 32).unwrap();
+        assert_eq!(geometry.padded_k, 64);
+        assert_eq!(geometry.layout.bytes(), 72);
+        let inputs = [TensorMetadata::new(DataType::Float32, &[1, 45], true)];
+        let empty = std::alloc::Layout::from_size_align(0, blas::WORKSPACE_ALIGNMENT).unwrap();
+        let composite = MatMulNBitsWorkspaceLayout::new(
+            [empty; 3],
+            &inputs,
+            &[],
+            false,
+            0,
+            geometry.allocation_layout().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(composite.bytes(), 256);
+        #[repr(align(256))]
+        struct Backing([u8; 256]);
+        let mut backing = Backing([0; 256]);
+        let view = WorkspaceView::new(
+            DevicePtrMut(backing.0.as_mut_ptr().cast()),
+            composite.bytes(),
+        );
+        let (scratch, used) = geometry.bind(Some(view)).unwrap();
+        assert_eq!(scratch.padded_k, 64);
+        assert_eq!(scratch.activation_scale - scratch.quantized_activation, 64);
+        assert_eq!(used.bytes(), 72);
+        let [activation, scales] = geometry.layout.bind(Some(view)).unwrap();
+        assert_eq!((activation.bytes(), scales.bytes()), (64, 8));
+        assert_eq!(
+            scales.ptr().0 as usize + scales.bytes(),
+            used.ptr().0 as usize + used.bytes()
+        );
+        assert!(composite.bind(Some(view)).unwrap().prefill.blas.is_none());
+        assert_eq!(
+            blas::governed_workspace_requirement(composite.bytes()).lifetime,
+            onnx_runtime_ep_api::WorkspaceLifetime::SessionPersistent
+        );
+    }
+
+    #[test]
+    fn accuracy4_workspace_rejects_invalid_geometry_and_backing() {
+        for (k, block, context) in [
+            (0, 32, "positive"),
+            (32, 0, "positive"),
+            (usize::MAX, 32, "overflows"),
+            (i32::MAX as usize, 32, "exceeds i32"),
+        ] {
+            assert!(
+                Accuracy4Geometry::new(k, block)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains(context)
+            );
+        }
+        let geometry = Accuracy4Geometry::new(45, 32).unwrap();
+        for view in [
+            None,
+            Some(WorkspaceView::new(DevicePtrMut(256usize as *mut _), 71)),
+            Some(WorkspaceView::new(DevicePtrMut(257usize as *mut _), 72)),
+            Some(WorkspaceView::new(
+                DevicePtrMut((usize::MAX - 3) as *mut _),
+                72,
+            )),
+        ] {
+            let cause = geometry.bind(view).err().unwrap().to_string();
+            assert!(
+                cause.contains("prepare the complete MatMulNBits requirement"),
+                "{cause}"
+            );
+        }
+    }
+
+    #[test]
+    fn accuracy4_workspace_is_exclusive_to_the_quantized_decode_route() {
+        for m in [0, 1, 2] {
+            for bits in [4, 8] {
+                for accuracy in [0, 4] {
+                    for block in [16, 32, 128] {
+                        for grouped in [false, true] {
+                            for rounded in [false, true] {
+                                let route =
+                                    f32_matmul_route(m, bits, accuracy, block, grouped, rounded);
+                                assert_eq!(
+                                    route == F32MatMulRoute::QuantizedGemv,
+                                    m == 1
+                                        && bits == 4
+                                        && accuracy == 4
+                                        && block == 32
+                                        && !grouped
+                                        && !rounded
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            f32_matmul_route(2, 4, 4, 32, false, false),
+            F32MatMulRoute::Accuracy4,
+            "multi-row tiled GEMM quantizes internally"
+        );
+    }
+
+    #[test]
+    fn accuracy4_workspace_has_no_factory_owner_or_capture_resource_fallback() {
+        let source = include_str!("matmul_nbits.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        assert!(!source.contains("struct Accuracy4Workspace"));
+        assert!(!source.contains("accuracy4_workspace:"));
+        let begin = source.find("fn launch_accuracy4_gemv(").unwrap();
+        let end = source[begin..].find("fn launch_accuracy4(").unwrap() + begin;
+        for bypass in [
+            ".alloc_raw(",
+            ".free_raw(",
+            ".lock()",
+            "GraphDeviceAllocation",
+        ] {
+            assert!(
+                !source[begin..end].contains(bypass),
+                "quantized activation launch must consume borrowed scratch, not {bypass}"
+            );
+        }
+    }
+
+    #[test]
     fn f32_dequant_route_keeps_grouped_decode_and_empty_work_explicit() {
         for bits in [4, 8] {
             for accuracy in [0, 4] {
                 for block in [16, 32, 128] {
                     for grouped in [false, true] {
                         assert_eq!(
-                            f32_matmul_route(0, bits, accuracy, block, grouped),
+                            f32_matmul_route(0, bits, accuracy, block, grouped, false),
                             F32MatMulRoute::Empty
                         );
                         assert_eq!(
-                            f32_matmul_route(1, bits, accuracy, block, grouped),
+                            f32_matmul_route(1, bits, accuracy, block, grouped, false),
                             if grouped {
                                 F32MatMulRoute::Dequant
+                            } else if bits == 4 && accuracy == 4 && block == 32 {
+                                F32MatMulRoute::QuantizedGemv
                             } else {
                                 F32MatMulRoute::Gemv
                             }
                         );
                         assert_eq!(
-                            f32_matmul_route(2, bits, accuracy, block, grouped),
+                            f32_matmul_route(2, bits, accuracy, block, grouped, false),
                             if bits == 4 && accuracy == 4 && block == 32 && !grouped {
                                 F32MatMulRoute::Accuracy4
                             } else {
@@ -12350,7 +12509,7 @@ mod tests {
                         bits: 4,
                         block_size,
                         accuracy_level: 0,
-                        accuracy4_workspace: None,
+
                         round_affine_weights: false,
                         marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                         constant_inputs: [false; 8],
@@ -12794,7 +12953,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             bits: 4,
             block_size,
             accuracy_level: 4,
-            accuracy4_workspace: None,
+
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
@@ -13041,7 +13200,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             bits: 4,
             block_size,
             accuracy_level: 4,
-            accuracy4_workspace: None,
+
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
@@ -13291,7 +13450,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             bits: 4,
             block_size,
             accuracy_level: 4,
-            accuracy4_workspace: None,
+
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
@@ -13685,7 +13844,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             bits: 4,
             block_size,
             accuracy_level: 4,
-            accuracy4_workspace: None,
+
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
@@ -13890,7 +14049,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             bits: 4,
             block_size,
             accuracy_level: 4,
-            accuracy4_workspace: None,
+
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
@@ -14478,7 +14637,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             bits: 4,
             block_size,
             accuracy_level: 4,
-            accuracy4_workspace: None,
+
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
@@ -14918,7 +15077,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             bits: 4,
             block_size,
             accuracy_level: 4,
-            accuracy4_workspace: None,
+
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
@@ -15642,7 +15801,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             bits: 8,
             block_size,
             accuracy_level: 4,
-            accuracy4_workspace: None,
+
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
@@ -15797,7 +15956,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 bits: 4,
                 block_size,
                 accuracy_level: 4,
-                accuracy4_workspace: None,
+
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
@@ -16394,7 +16553,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 bits: 4,
                 block_size,
                 accuracy_level: 4,
-                accuracy4_workspace: None,
+
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
@@ -16670,7 +16829,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 bits: 4,
                 block_size,
                 accuracy_level: 4,
-                accuracy4_workspace: None,
+
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
@@ -17344,7 +17503,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             bits: 8,
             block_size,
             accuracy_level: 4,
-            accuracy4_workspace: None,
+
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
@@ -17606,7 +17765,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             bits,
             block_size,
             accuracy_level: 4,
-            accuracy4_workspace: None,
+
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
@@ -17879,7 +18038,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             bits: 4,
             block_size,
             accuracy_level: 4,
-            accuracy4_workspace: None,
+
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
@@ -17898,7 +18057,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             bits: 4,
             block_size,
             accuracy_level: 4,
-            accuracy4_workspace: None,
+
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
@@ -18160,7 +18319,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 bits: 4,
                 block_size,
                 accuracy_level: 4,
-                accuracy4_workspace: None,
+
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
@@ -18548,7 +18707,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             bits: 4,
             block_size,
             accuracy_level: 4,
-            accuracy4_workspace: None,
+
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
@@ -19035,7 +19194,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             bits: 4,
             block_size,
             accuracy_level: 4,
-            accuracy4_workspace: None,
+
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
@@ -19054,7 +19213,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             bits: 4,
             block_size,
             accuracy_level: 4,
-            accuracy4_workspace: None,
+
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
@@ -19611,7 +19770,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 bits: 4,
                 block_size,
                 accuracy_level: 4,
-                accuracy4_workspace: None,
+
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
@@ -19630,7 +19789,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 bits: 4,
                 block_size,
                 accuracy_level: 4,
-                accuracy4_workspace: None,
+
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
@@ -19995,7 +20154,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                             bits: 4,
                             block_size,
                             accuracy_level: 4,
-                            accuracy4_workspace: None,
+
                             round_affine_weights: false,
                             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                             constant_inputs: [true; 8],
@@ -20450,7 +20609,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 bits,
                 block_size,
                 accuracy_level: 4,
-                accuracy4_workspace: None,
+
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
@@ -20820,7 +20979,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             bits: 4,
             block_size,
             accuracy_level: 0,
-            accuracy4_workspace: None,
+
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
@@ -21068,7 +21227,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             bits: 4,
             block_size,
             accuracy_level: 0,
-            accuracy4_workspace: None,
+
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
@@ -21334,7 +21493,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             bits: 4,
             block_size,
             accuracy_level: 0,
-            accuracy4_workspace: None,
+
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
@@ -21530,7 +21689,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 bits: 4,
                 block_size,
                 accuracy_level: 0,
-                accuracy4_workspace: None,
+
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [false; 8],
@@ -22028,7 +22187,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                     bits: 4,
                     block_size: BLOCK,
                     accuracy_level: 4,
-                    accuracy4_workspace: None,
+
                     round_affine_weights: false,
                     marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                     constant_inputs: [true; 8],

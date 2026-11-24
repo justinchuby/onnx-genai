@@ -352,6 +352,38 @@ now joins this same composite as described below. Portable prefill capture
 eligibility remains conservative. Host layout checks and GPU-target compilation
 do not validate device arithmetic, asynchronous failure ordering or throughput.
 
+### CUDA quantized MatMul accuracy-4 decode activation scratch
+
+The F32 single-row int4 accuracy-4 block-32 route borrows padded int8 activation
+and per-block F32 scales from the existing caller composite. These values are
+rewritten by the quantizer every call, so they are scratch rather than immutable
+weight artifacts. A shared route classifier selects this prefix only without
+group indices and without affine-weight rounding. Ordinary F32 GEMV, half/BF16,
+int8 weights, other block widths, empty input and multi-row tiled accuracy-4 do
+not gain this requirement. Symmetric and asymmetric GEMV share the same layout.
+
+Accuracy-4 and full-weight dequantization are mutually exclusive and reuse the
+existing first F32 region; no composite slot or quota protocol is added. Checked
+padding, byte counts and addressable layout replace factory-time device
+allocation, the private mutex and the kernel-owned capture resource. Quantization
+and GEMV consume a typed borrowed binding on the original ordered stream. Fitting
+native/ORT lanes retain their existing SessionPersistent owner and issuer-free
+reuse path. Device errors settle through that owner, never a launch-local free.
+
+Before the first quantization launch, capture verifies the actual used span
+against a real registered caller pin. Failed binding, missing pin and launch
+errors do not publish capture readiness. This introduces a capture-status query
+on the quantized decode route; its cost is unmeasured, and no throughput claim is
+made. No new synchronization or device launch is added, and embedded CUDA source
+is unchanged.
+
+Host tests cover exact route selection, ragged padding, nonoverlap, missing or
+invalid backing, overflow and persistent role. The device regression covers both
+zero-point modes with ragged K, allocation-free factory creation, missing
+workspace/pin refusal and a full workspace overwrite before each replay. Rust
+target compilation does not validate those CUDA numerical, replay or performance
+outcomes; a device runner is still required.
+
 ### CUDA quantized MatMul f32 dequantization
 
 The generic f32 route borrows one SessionPersistent composite containing the
@@ -530,8 +562,8 @@ The dated audit and measurements below preserve historical evidence. The current
 GQA, standard Attention, quantized MatMul prefill/BF16 staging, and variadic Sum/Mean contracts above
 supersede their old private-scratch and fallback descriptions. GQA now requires
 prepared backing for sequence metadata as well as its other temporary regions;
-MatMul dynamic BF16 staging, portable half-prefill and generic f32 dequantization
-no longer own raw scratch.
+MatMul dynamic BF16 staging, portable half-prefill, accuracy-4 decode activation
+and generic f32 dequantization no longer own raw scratch.
 
 
 Updated through #736 (default-domain `Attention` staged K/V) on 2026-08-12.
