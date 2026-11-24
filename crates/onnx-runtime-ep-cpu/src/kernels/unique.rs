@@ -239,16 +239,14 @@ fn unique_groups(
     item_count: usize,
     sorted: bool,
 ) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
-    unique_groups_by(item_count, sorted, |a, b| {
-        compare_items(dtype, &items[a], &items[b])
-    })
-}
-
-fn unique_groups_by(
-    item_count: usize,
-    sorted: bool,
-    compare: impl Fn(usize, usize) -> Ordering,
-) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+    let compare = |a: usize, b: usize| compare_items(dtype, &items[a], &items[b]);
+    // Keep a total sort order, but do not merge BF16 NaNs (including in slices).
+    let contains_bfloat16_nan = |index: usize| {
+        dtype == DataType::BFloat16
+            && items[index]
+                .chunks_exact(2)
+                .any(|bytes| half::bf16::from_le_bytes(bytes.try_into().unwrap()).is_nan())
+    };
     let mut order: Vec<usize> = (0..item_count).collect();
     order.sort_unstable_by(|&a, &b| compare(a, b).then_with(|| a.cmp(&b)));
 
@@ -257,8 +255,9 @@ fn unique_groups_by(
     let mut counts = Vec::new();
     let mut previous_index: Option<usize> = None;
     for &index in &order {
-        let new_group =
-            previous_index.is_none_or(|previous| compare(previous, index) != Ordering::Equal);
+        let new_group = previous_index.is_none_or(|previous| {
+            compare(previous, index) != Ordering::Equal || contains_bfloat16_nan(index)
+        });
         if new_group {
             first_indices.push(index);
             counts.push(0);
@@ -537,6 +536,27 @@ mod tests {
             .chunks_exact(8)
             .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()))
             .collect()
+    }
+
+    #[test]
+    fn bfloat16_nans_have_distinct_indices_and_counts() {
+        let input = Owned::bf16_bits(&[4], &[0x7fc1, 0x8000, 0x0000, 0x7fc1]);
+        let outputs = UniqueKernel {
+            axis: None,
+            sorted: false,
+            opset: 28,
+        }
+        .execute_kernel_sized(&[input.view()], &[true; 4], None)
+        .unwrap();
+        let output = |index: usize| outputs[index].as_ref().unwrap();
+        let expected = [0x7fc1u16, 0x8000, 0x7fc1]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(output(0).bytes, expected);
+        assert_eq!(output_i64(output(1)), [0, 1, 3]);
+        assert_eq!(output_i64(output(2)), [0, 1, 1, 2]);
+        assert_eq!(output_i64(output(3)), [1, 2, 1]);
     }
 
     #[test]

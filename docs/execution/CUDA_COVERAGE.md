@@ -470,9 +470,11 @@ threads-per-block limit). One device bitonic-sort/grouping phase leaves reusable
 state in governed workspace, copies only the 8-byte count to host for output
 allocation, then gathers `Y` in the input dtype and produces int64 metadata
 on-device. BF16 NaNs compare unequal (as in ONNX's NumPy BF16 reference);
-sorted CUDA output places them after numeric values. Axis mode, dynamic input
-extents, other dtypes, larger inputs, strided
-layouts, and CUDA graph capture remain outside this slice.
+sorted CUDA output places them after numeric values. The standalone session
+executor still needs concrete output extents for this kernel; dynamic
+`DeviceWorkspace` allocation is available through the ORT plugin adapter.
+Axis mode, dynamic input extents, other dtypes, larger inputs, strided layouts,
+and CUDA graph capture remain outside this slice.
 
 ### Historical coverage-wave snapshots — not current totals
 
