@@ -481,6 +481,10 @@ pub const CORE_CONFORMANCE: &[(SchemaVersion, &str)] = &[
         crate::version::DECISION_SCHEMA_VERSION,
         "Non-generative decision profiles: explicit prompting, tokenizer inputs, calibrated probability heads and answer policies; no architecture inference.",
     ),
+    (
+        crate::version::DECISION_INPUT_SCHEMA_VERSION,
+        "Decision request policies declare defaults, payloads, supported question kinds, option/score bounds, ordering and legend semantics explicitly.",
+    ),
 ];
 
 /// Look up a built-in extension by its exact declared identity and version.
