@@ -240,6 +240,69 @@ impl Kernel for UnaryMathKernel {
     }
 }
 
+pub(super) struct StableUnaryFactory;
+
+impl KernelFactory for StableUnaryFactory {
+    fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(StableUnaryKernel(
+            Math::from_node(node).map_err(EpError::KernelFailed)?,
+        )))
+    }
+}
+
+struct StableUnaryKernel(Math);
+
+impl Kernel for StableUnaryKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        validate(self.0, inputs, outputs)?;
+        let op = self.0.name();
+        let x = &inputs[0];
+        let y = &mut outputs[0];
+        match self.0 {
+            Math::Expm1 => run_dense_unary(
+                op,
+                x,
+                y,
+                |a| a.iter_mut().for_each(|x| *x = x.exp_m1()),
+                |a| a.iter_mut().for_each(|x| *x = x.exp_m1()),
+            ),
+            Math::Log1p => run_dense_unary(
+                op,
+                x,
+                y,
+                |a| a.iter_mut().for_each(|x| *x = x.ln_1p()),
+                |a| a.iter_mut().for_each(|x| *x = x.ln_1p()),
+            ),
+            _ => unreachable!("registered stable unary op"),
+        }
+    }
+
+    fn supports_strided_input(&self, _: usize) -> bool {
+        true
+    }
+}
+
+pub(super) fn run_dense_unary(
+    op: &str,
+    x: &TensorView,
+    y: &mut TensorMut,
+    eval_f32: impl FnOnce(&mut [f32]),
+    eval_f64: impl FnOnce(&mut [f64]),
+) -> Result<()> {
+    if x.numel() == 0 {
+        return Ok(());
+    }
+    if x.dtype == DataType::Float64 {
+        let mut a = to_dense::<f64>(x)?;
+        eval_f64(&mut a);
+        write_dense(y, &a)
+    } else {
+        let mut a = to_dense_f32_widen(op, x)?.into_owned();
+        eval_f32(&mut a);
+        write_dense_f32_narrow(op, y, &a)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,68 +508,5 @@ mod tests {
                 }
             }
         }
-    }
-}
-
-pub(super) struct StableUnaryFactory;
-
-impl KernelFactory for StableUnaryFactory {
-    fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(StableUnaryKernel(
-            Math::from_node(node).map_err(EpError::KernelFailed)?,
-        )))
-    }
-}
-
-struct StableUnaryKernel(Math);
-
-impl Kernel for StableUnaryKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        validate(self.0, inputs, outputs)?;
-        let op = self.0.name();
-        let x = &inputs[0];
-        let y = &mut outputs[0];
-        match self.0 {
-            Math::Expm1 => run_dense_unary(
-                op,
-                x,
-                y,
-                |a| a.iter_mut().for_each(|x| *x = x.exp_m1()),
-                |a| a.iter_mut().for_each(|x| *x = x.exp_m1()),
-            ),
-            Math::Log1p => run_dense_unary(
-                op,
-                x,
-                y,
-                |a| a.iter_mut().for_each(|x| *x = x.ln_1p()),
-                |a| a.iter_mut().for_each(|x| *x = x.ln_1p()),
-            ),
-            _ => unreachable!("registered stable unary op"),
-        }
-    }
-
-    fn supports_strided_input(&self, _: usize) -> bool {
-        true
-    }
-}
-
-pub(super) fn run_dense_unary(
-    op: &str,
-    x: &TensorView,
-    y: &mut TensorMut,
-    eval_f32: impl FnOnce(&mut [f32]),
-    eval_f64: impl FnOnce(&mut [f64]),
-) -> Result<()> {
-    if x.numel() == 0 {
-        return Ok(());
-    }
-    if x.dtype == DataType::Float64 {
-        let mut a = to_dense::<f64>(x)?;
-        eval_f64(&mut a);
-        write_dense(y, &a)
-    } else {
-        let mut a = to_dense_f32_widen(op, x)?.into_owned();
-        eval_f32(&mut a);
-        write_dense_f32_narrow(op, y, &a)
     }
 }

@@ -60,6 +60,7 @@ pub mod cumprod;
 pub mod cumsum;
 pub mod data_transform;
 mod dequantize_packed;
+mod dequantize_packed_gather;
 pub(crate) mod device_argmax;
 pub(crate) mod device_token_writer;
 pub mod dft;
@@ -214,6 +215,10 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Pack",
     "Unpack",
     "GroupedMatMul",
+    "AffineQuantizedGroupedMatMul",
+    "PackedGroupedMatMul",
+    "AffineQuantizedGather",
+    "DequantizePackedGather",
     "MatMulNBits",
     "QMoE",
     "BlockQuantizedMatMul",
@@ -559,6 +564,26 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
         ("Einsum", "") => CUDA_EINSUM_DTYPES,
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
+        ("DequantizePackedGather", onnx_runtime_ir::RUNTIME_DOMAIN) => &[
+            DataType::Uint8,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float32,
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Float64,
+        ],
+        (
+            "PackedGroupedMatMul" | "AffineQuantizedGroupedMatMul",
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+        ) => &[DataType::Float32, DataType::Uint8, DataType::Int32, DataType::Int64],
+        ("AffineQuantizedGather", onnx_runtime_ir::RUNTIME_DOMAIN) => &[
+            DataType::Float32,
+            DataType::Int8,
+            DataType::Uint8,
+            DataType::Int32,
+            DataType::Int64,
+        ],
         ("Pack", "") => &[DataType::Uint8],
         ("Unpack", "") => onnx_runtime_ir::packed_routed::WORD_DTYPES,
         ("GroupedMatMul", "") => onnx_runtime_ir::standard_math::DTYPES,
@@ -750,6 +775,15 @@ pub fn build_cuda_registry_with_metrics(
         ),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(grouped_matmul::AffineFactory(runtime.clone())),
+    );
+    reg.register(
+        OpKey::new(
+            onnx_runtime_ir::quantized_grouped::PACKED_OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(grouped_matmul::PackedFactory(runtime.clone())),
     );
     reg.register(
         OpKey::new(
@@ -1025,6 +1059,15 @@ pub fn build_cuda_registry_with_metrics(
         OpKey::new("DequantizePacked", "", 29),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(dequantize_packed::Factory(runtime.clone())),
+    );
+    reg.register(
+        OpKey::new(
+            onnx_runtime_ir::dequantize_packed_gather::OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(dequantize_packed_gather::Factory(runtime.clone())),
     );
     reg.register(
         OpKey::new("DynamicQuantizeLinear", "", 11),

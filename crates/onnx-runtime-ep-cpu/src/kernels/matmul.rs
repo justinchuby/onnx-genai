@@ -12395,6 +12395,9 @@ mod weight_cache_accounting {
             "Expm1" | "GeGLU" | "Log1p" | "LogCumSumExp" | "SwiGLU" => {
                 NoWeightCache("elementwise and scan buffers are local to each execution")
             }
+            "RegexFullMatch" | "StringConcat" | "StringSplit" => {
+                NoWeightCache("processes managed strings without transposing tensor weights")
+            }
             "Pack" | "Unpack" => {
                 NoWeightCache("packing and unpacking write outputs without retaining packed data")
             }
@@ -12404,10 +12407,10 @@ mod weight_cache_accounting {
             "GroupedMatMul" => NoWeightCache(
                 "indexes weight layouts directly using execution-local dense views or copies",
             ),
-            "AffineQuantizedGather" => NoWeightCache(
+            "AffineQuantizedGather" | "DequantizePackedGather" => NoWeightCache(
                 "dequantizes selected codes per call without retaining decoded weights",
             ),
-            "AffineQuantizedGroupedMatMul" => NoWeightCache(
+            "AffineQuantizedGroupedMatMul" | "PackedGroupedMatMul" => NoWeightCache(
                 "decodes packed weights on demand in the dot product without prepacking",
             ),
 

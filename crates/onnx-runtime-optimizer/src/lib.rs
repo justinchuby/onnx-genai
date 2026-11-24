@@ -38,6 +38,7 @@
 pub mod affine_gather;
 mod constant_folding;
 mod dead_node;
+pub mod dequantize_packed_gather;
 mod error;
 mod fusion;
 mod pass;

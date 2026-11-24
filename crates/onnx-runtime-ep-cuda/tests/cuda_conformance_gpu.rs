@@ -25,10 +25,9 @@
 //! * [`Coverage::Sweep`] — inline `(op, dtype, shapes, attrs)` parity cases that
 //!   the generic sweep here runs against the CPU EP; or
 //! * [`Coverage::Dedicated`] — covered by a named dedicated GPU parity suite
-//!   (another `tests/*.rs` file that runs the op), recorded so the claim is
-//!   auditable.
+//!   (a test source file that runs the op), recorded so the claim is auditable.
 //!
-//! The three highest-value tests need **no GPU** and run everywhere (incl. CI):
+//! The three profile guards run when `gpu-tests` is enabled on a CUDA runner:
 //!
 //! * [`every_covered_op_has_a_conformance_entry`] — the *coverage-of-coverage*
 //!   check: it fails if any [`CUDA_COVERED_OPS`] op is missing a profile entry
@@ -44,7 +43,7 @@
 //! `gpu-tests` is enabled. Run it on a GPU box with:
 //!
 //! ```bash
-//! CUDA_VISIBLE_DEVICES=0 cargo test -p onnx-runtime-ep-cuda --features cuda \
+//! CUDA_VISIBLE_DEVICES=0 cargo test -p onnx-runtime-ep-cuda --features cuda,gpu-tests \
 //!     --test cuda_conformance_gpu
 //! ```
 //!
@@ -90,8 +89,8 @@ struct Case {
 enum Coverage {
     /// Inline parity cases executed by [`conformance_sweep_matches_cpu`].
     Sweep(Vec<Case>),
-    /// Covered by a dedicated GPU parity suite (`tests/<suite>`). The
-    /// coverage-of-coverage audit verifies the file exists and names the op.
+    /// Covered by a dedicated GPU parity suite (path relative to this crate's
+    /// `tests` directory). The audit verifies the file exists and names the op.
     Dedicated {
         suite: &'static str,
         note: &'static str,
@@ -2282,6 +2281,31 @@ fn scatter_nd_cases() -> Vec<Case> {
     ]
 }
 
+fn tensor_scatter_cases() -> Vec<Case> {
+    // Distinct batch values and offsets catch cross-batch writes; the
+    // circular case wraps only the first batch.
+    [("linear", [0_i64, 2]), ("circular", [3, 1])]
+        .into_iter()
+        .map(|(mode, offsets)| Case {
+            label: format!("TensorScatter_{mode}_batch_offsets"),
+            op: "TensorScatter",
+            domain: "",
+            opset: 24,
+            inputs: vec![
+                input(DataType::Float32, &[2, 4], &[-1.0_f32; 8]),
+                input(DataType::Float32, &[2, 2], &[1.0_f32, 2.0, 3.0, 4.0]),
+                input(DataType::Int64, &[2], &offsets),
+            ],
+            outputs: vec![(DataType::Float32, vec![2, 4])],
+            attrs: vec![
+                ("axis", Attribute::Int(-1)),
+                ("mode", Attribute::String(mode.as_bytes().to_vec())),
+            ],
+            compare: Compare::ExactBytes,
+        })
+        .collect()
+}
+
 fn window_cases(op: &'static str) -> Vec<Case> {
     [
         (DataType::Float32, true, 1e-6),
@@ -2588,6 +2612,24 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "grouped_matmul_gpu.rs",
         "native CPU and CUDA routing, dtype, bias and input validation vectors",
     ));
+    for (op, suite) in [
+        ("AffineQuantizedGather", "session:affine_gather.rs"),
+        (
+            "AffineQuantizedGroupedMatMul",
+            "session:quantized_grouped.rs",
+        ),
+        (
+            "DequantizePackedGather",
+            "session:dequantize_packed_gather.rs",
+        ),
+        ("PackedGroupedMatMul", "session:packed_grouped.rs"),
+    ] {
+        p.push(dedicated(
+            op,
+            suite,
+            "native session graph selection and numerical parity",
+        ));
+    }
     p.push(dedicated(
         "MatMulNBits",
         "matmul_nbits_gpu.rs",
@@ -2634,6 +2676,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(dedicated("AveragePool", "pooling_gpu.rs", "cuDNN pooling"));
 
     // Attention / KV / sparse family.
+    p.push(dedicated(
+        "PagedAttention",
+        "paged_attention_latent_gpu.rs",
+        "latent prefill and decode against the CPU oracle",
+    ));
     p.push(dedicated(
         "Attention",
         "standard_attention_gpu.rs",
@@ -2727,6 +2774,16 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(dedicated("Silu", "activations_gpu.rs", "SiLU activation"));
     p.push(dedicated("LeakyRelu", "activations_gpu.rs", "alpha-driven"));
     p.push(dedicated("Elu", "activations_gpu.rs", "alpha-driven"));
+    p.push(dedicated(
+        "Celu",
+        "activations_gpu.rs",
+        "scalar oracle parity across alpha values and NaN inputs",
+    ));
+    p.push(dedicated(
+        "Mish",
+        "activations_gpu.rs",
+        "scalar oracle parity including the saturating tail",
+    ));
     p.push(dedicated(
         "HardSigmoid",
         "activations_gpu.rs",
@@ -2854,8 +2911,13 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     ));
     p.push(dedicated(
         "NonMaxSuppression",
-        "nms_gpu.rs + cuda_unique_ort_e2e.rs",
-        "bounded device-workspace NMS and dynamic plugin materialization",
+        "nms_gpu.rs",
+        "CPU parity and bounded device workspace",
+    ));
+    p.push(dedicated(
+        "Unique",
+        "../src/kernels/unique.rs",
+        "flattened CUDA Unique CPU parity and dynamic output transfer contract",
     ));
     p.push(dedicated(
         "STFT",
@@ -2905,6 +2967,7 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "indexing_gpu.rs",
         "scatter along axis",
     ));
+    p.push(sweep("TensorScatter", tensor_scatter_cases()));
 
     p
 }
@@ -2999,7 +3062,15 @@ fn dedicated_suites_exist_and_name_their_op() {
     let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     for entry in conformance_profile() {
         if let Coverage::Dedicated { suite, note } = entry.coverage {
-            let path = tests_dir.join(suite);
+            let path = match suite.strip_prefix("session:") {
+                Some(file) => tests_dir
+                    .join("..")
+                    .join("..")
+                    .join("onnx-runtime-session")
+                    .join("tests")
+                    .join(file),
+                None => tests_dir.join(suite),
+            };
             let src = std::fs::read_to_string(&path).unwrap_or_else(|error| {
                 panic!(
                     "dedicated suite {suite} for op {:?} could not be read at {}: {error}",
@@ -3108,6 +3179,18 @@ fn resize_19_symmetric_matches_onnx_and_cpu() {
         );
     }
 }
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn tensor_scatter_batch_offsets_match_cpu() {
+    let ep = require_cuda();
+    for case in tensor_scatter_cases() {
+        run_case(&ep, &case);
+    }
+}
+
 /// Execute every inline `Sweep` case against the CPU oracle on the real GPU.
 /// Fails loudly on a host without a CUDA device when `gpu-tests` is enabled.
 #[cfg_attr(

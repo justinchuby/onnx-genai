@@ -6,42 +6,32 @@ use std::{
     sync::LazyLock,
 };
 
-use onnx_runtime_ir::pattern::{EscapingUse, Input, MatchSession, Pattern, PatternError};
+use onnx_runtime_ir::pattern::{EscapingUse, MatchSession, PatternError};
 use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, RUNTIME_DOMAIN, ValueId};
 
 use crate::{OptimizationPass, PassContext, Result, recognition::RecognitionRule};
 
-static UNPACK: LazyLock<RecognitionRule> = LazyLock::new(|| {
-    let mut p = Pattern::builder();
-    let packed = p.input("packed");
-    let decoded = p.op("Unpack", [Input::Value(packed), Input::Any]);
-    nibble_rule(p, decoded)
-});
+static UNPACK: LazyLock<RecognitionRule> =
+    LazyLock::new(|| nibble_rule("(packed) => { decoded = Unpack(packed, _); return decoded }"));
 
 static BITWISE_DECODE: LazyLock<RecognitionRule> = LazyLock::new(|| {
-    let mut p = Pattern::builder();
-    let packed = Input::Value(p.input("packed"));
-    let low = p.op("BitwiseAnd", [packed, Input::Any]);
-    let high = p.op("BitShift", [packed, Input::Any]);
-    let low = p.op("Unsqueeze", [Input::Value(low), Input::Any]);
-    let high = p.op("Unsqueeze", [Input::Value(high), Input::Any]);
-    let pairs = p.op("Concat", [low, high]);
-    let decoded = p.op("Reshape", [Input::Value(pairs), Input::Any]);
-    nibble_rule(p, decoded)
+    nibble_rule(
+        "(packed) => {
+            low_bits = BitwiseAnd(packed, _)
+            high_bits = BitShift(packed, _)
+            low = Unsqueeze(low_bits, _)
+            high = Unsqueeze(high_bits, _)
+            pairs = Concat(low, high)
+            decoded = Reshape(pairs, _)
+            return decoded
+        }",
+    )
 });
 
-fn nibble_rule(
-    mut p: onnx_runtime_ir::pattern::PatternBuilder,
-    decoded: onnx_runtime_ir::pattern::PatternValue,
-) -> RecognitionRule {
-    p.capture("decoded", decoded);
-    RecognitionRule::from_pattern(
-        "Affine nibble decode",
-        p.finish(decoded)
-            .expect("built-in nibble decode pattern must compile"),
-        "decoded",
+fn nibble_rule(text: &str) -> RecognitionRule {
+    RecognitionRule::parse("Affine nibble decode", text, "decoded").expect(
+        "built-in nibble decode pattern must compile; fix its textual definition or decoded anchor",
     )
-    .expect("nibble decoder must anchor on its output")
 }
 
 #[derive(Debug)]
@@ -106,7 +96,13 @@ fn candidate(
         match eligibility::replacement(g, root, &|v| literal(g, ctx, v), &decode, &mut region) {
             Ok(node) => node,
             Err(Rejection::Matcher(error)) => return Err(error.into()),
-            Err(reason) => return Ok(Err(reason)),
+            Err(reason) => match onnx_runtime_ir::quantized_grouped::recognize_packed(g, root) {
+                Ok((dead, node)) => {
+                    region = dead;
+                    node
+                }
+                Err(_) => return Ok(Err(reason)),
+            },
         };
     for v in replacement.inputs.iter().flatten().copied() {
         if g.value(v)
@@ -136,8 +132,7 @@ pub fn explain_at(graph: &Graph, ctx: &PassContext, anchor: NodeId) -> Result<St
     let Some(node) = graph.try_node(anchor) else {
         return Err(crate::OptimizerError::Fusion(format!(
             "affine GroupedMatMul anchor {anchor:?} is not live; select a node from this graph"
-        ))
-        .into());
+        )));
     };
     let outcome = if !is_anchor(node) {
         Err(Rejection::Structure {
@@ -161,7 +156,7 @@ pub fn explain_at(graph: &Graph, ctx: &PassContext, anchor: NodeId) -> Result<St
         }
     };
     let detail = match outcome {
-        Ok(_) => "eligible for affine fusion".into(),
+        Ok((_, replacement)) => format!("eligible for {} fusion", replacement.op_type),
         Err(Rejection::Structure { value, reason }) => match value {
             Some(value) => format!("structural nonmatch at {}: {reason}", describe(value)),
             None => format!("structural nonmatch: {reason}"),

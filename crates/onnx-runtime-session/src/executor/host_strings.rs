@@ -4,12 +4,22 @@ use super::*;
 use onnx_runtime_ep_api::{HostKernelData, HostStringInput};
 use onnx_runtime_ir::checked_expected_bytes;
 
-pub(super) fn uses_managed_strings(graph: &Graph, node: &Node) -> bool {
+pub(crate) const MANAGED_STRING_DEVICE_DECLINE: &str =
+    "managed tensor(string) values have no device representation; use a string-aware host provider";
+
+pub(crate) fn uses_managed_strings(graph: &Graph, node: &Node) -> bool {
     node.inputs
         .iter()
         .chain(&node.outputs)
         .flatten()
         .any(|&value| graph.value(value).tensor_dtype() == Some(DataType::String))
+}
+
+pub(crate) fn producerless_string_outputs(graph: &Graph) -> impl Iterator<Item = ValueId> + '_ {
+    graph.outputs.iter().copied().filter(|&value_id| {
+        let value = graph.value(value_id);
+        value.producer.is_none() && value.tensor_dtype() == Some(DataType::String)
+    })
 }
 
 fn missing_host_string(graph: &Graph, value: ValueId) -> SessionError {
@@ -18,6 +28,29 @@ fn missing_host_string(graph: &Graph, value: ValueId) -> SessionError {
         "tensor(string) '{name}' (value#{}) has no managed host storage; supply a host string tensor or a string-aware producer",
         value.0
     ))
+}
+
+pub(crate) fn decode_string_initializer(value: ValueId, weight: &WeightRef) -> Result<Tensor> {
+    let WeightRef::Inline(data) = weight else {
+        return Err(SessionError::Internal(format!(
+            "tensor(string) initializer value#{} must use inline ONNX string_data; external raw bytes cannot represent strings",
+            value.0
+        )));
+    };
+    let strings = data
+        .strings
+        .iter()
+        .enumerate()
+        .map(|(index, bytes)| {
+            std::str::from_utf8(bytes).map(str::to_owned).map_err(|error| {
+                SessionError::Internal(format!(
+                    "tensor(string) initializer value#{} element {index} is not valid UTF-8: {error}",
+                    value.0
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Tensor::from_strings(data.dims.clone(), strings)
 }
 
 impl Executor {
@@ -37,26 +70,7 @@ impl Executor {
                     ep.name()
                 )));
             }
-            let WeightRef::Inline(data) = weight else {
-                return Err(SessionError::Internal(format!(
-                    "tensor(string) initializer value#{} must use inline ONNX string_data; external raw bytes cannot represent strings",
-                    value.0
-                )));
-            };
-            let strings = data
-                .strings
-                .iter()
-                .enumerate()
-                .map(|(index, bytes)| {
-                    std::str::from_utf8(bytes).map(str::to_owned).map_err(|error| {
-                        SessionError::Internal(format!(
-                            "tensor(string) initializer value#{} element {index} is not valid UTF-8: {error}",
-                            value.0
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            initializers.insert(value, Tensor::from_strings(data.dims.clone(), strings)?);
+            initializers.insert(value, decode_string_initializer(value, weight)?);
         }
         Ok(initializers)
     }
