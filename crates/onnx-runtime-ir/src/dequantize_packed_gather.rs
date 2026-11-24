@@ -136,10 +136,10 @@ pub fn recognize(
     if packed_value.rank() != Some(1) {
         return Err("packed input must have rank one".into());
     }
-    if let Some(shape) = packed_value.tensor_shape() {
-        if let Some(bytes) = shape[0].as_static() {
-            metadata.validate_packed_bytes(bytes)?;
-        }
+    if let Some(shape) = packed_value.tensor_shape()
+        && let Some(bytes) = shape[0].as_static()
+    {
+        metadata.validate_packed_bytes(bytes)?;
     }
     let decoded_shape_matches = decoded_value.tensor_shape().is_some_and(|shape| {
         shape.len() == metadata.shape().len()

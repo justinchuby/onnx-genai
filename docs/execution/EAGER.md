@@ -633,41 +633,35 @@ impl KernelRegistry {
 
 ### 8.2 Kernel Cache (Compiled Kernel Reuse)
 
-```rust
-pub struct KernelCache {
-    /// Compiled kernel cache: (op_key, shapes, device) → ready kernel.
-    cache: LruCache<KernelCacheKey, Arc<dyn Kernel>>,
-}
+The compiled-kernel cache and its key are internal implementation details;
+`EagerContext::cache_stats()` exposes `CacheStats` for diagnostics. Keys include
+operator/domain/opset, concrete input shapes and dtypes, canonicalized attributes,
+requested output count, and device.
 
-#[derive(Hash, Eq, PartialEq)]
-pub struct KernelCacheKey {
-    pub op_type: String,
-    pub domain: String,
-    pub opset: u64,
-    pub input_shapes: Vec<Vec<usize>>,
-    pub input_dtypes: Vec<DataType>,
-    pub device: DeviceId,
-}
+Entries are `Arc<Mutex<PreparedKernel>>` because `Kernel` is `Send`, not `Sync`.
+The entry owns the compiled kernel and any session-persistent workspace. The
+kernel is destroyed before its workspace, and the workspace retains the exact
+provider that allocated it. Eviction removes only the cache index: active Arc
+borrowers keep the entry alive. Retired entries are dropped outside the global
+cache mutex so provider cleanup can safely reenter diagnostics.
 
-impl KernelCache {
-    pub fn new(capacity: usize) -> Self {
-        Self { cache: LruCache::new(capacity) }
-    }
+Step-scoped scratch is borrowed from the provider's existing workspace domain
+for each dispatch and returned after synchronous completion. A warm fitting CPU
+lane preserves its physical owner and charge without issuer callbacks, including
+zero-byte callbacks. Zero workspace skips allocation and return entirely. A
+smaller logical requirement does not refund retained backing; only confirmed
+physical release does. Persistent scratch remains with the kernel entry until
+growth or retirement. There is no eager-private pool or quota ledger.
 
-    pub fn get_or_create(
-        &mut self,
-        key: KernelCacheKey,
-        create: impl FnOnce() -> Result<Arc<dyn Kernel>>,
-    ) -> Result<Arc<dyn Kernel>> {
-        if let Some(kernel) = self.cache.get(&key) {
-            return Ok(kernel.clone());
-        }
-        let kernel = create()?;
-        self.cache.put(key, kernel.clone());
-        Ok(kernel)
-    }
-}
-```
+Registration currently constructs a private synchronous-completion witness from
+the built-in CPU provider. Execution never infers completion from a provider name,
+device type, host accessibility, or a default fence, and introduces no per-dispatch
+`sync()`. Asynchronous eager registration remains deferred until the execution
+lane and retirement contract can preserve pending ownership without mandatory
+per-operation synchronization.
+
+See [cache.rs](../../crates/onnx-runtime-eager/src/cache.rs) and
+[workspace.rs](../../crates/onnx-runtime-eager/src/workspace.rs) for the implementation.
 
 ---
 
@@ -735,128 +729,26 @@ pub trait KernelFactory: Send + Sync {
 
 ### 10.1 EagerContext
 
-```rust
-/// Global eager execution context.
-///
-/// Manages EP registry, kernel cache, device detection, and opset resolution.
-/// One per process, thread-safe via internal locking.
-///
-/// Note: EagerContext maintains its own EP instances independent of any InferenceSession
-/// in the same process. To share EP resources (e.g., avoid double CUDA initialization),
-/// use `EagerContext::from_session_eps()` (planned, not yet implemented). This is a known
-/// limitation in Phase 1.
-pub struct EagerContext {
-    /// Available EPs, auto-detected at initialization.
-    eps: Vec<Arc<dyn ExecutionProvider>>,
-    /// Kernel cache (compiled kernels, keyed by op+shape+device).
-    cache: Mutex<KernelCache>,
-    /// Domain registry (standard + custom).
-    domains: RwLock<DomainRegistry>,
-    /// Default device for new tensors.
-    default_device: DeviceId,
-}
+`EagerContext` owns registered provider completion witnesses, the domain registry,
+shape inference, and the compiled-kernel cache. The current registration is CPU
+only. GPU dispatch, Python bindings, and shared-session provider registration are
+still deferred; the implementation does not expose placeholder compatibility APIs.
 
-impl EagerContext {
-    /// Initialize with auto-detected devices.
-    pub fn new() -> Result<Self> {
-        let eps = detect_available_eps()?;
-        let default_device = eps.first()
-            .map(|ep| ep.device_id())
-            .unwrap_or(DeviceId::cpu());
+A dispatch resolves the opset/device, constructs an ephemeral ONNX node, looks up
+or compiles its kernel, infers concrete outputs, and allocates final tensors. It
+then builds tensor views and calls `workspace_requirement_for_execution` with
+both actual inputs and their metadata. The prepared entry validates the layout,
+obtains the provider-owned scratch, and invokes `execute_with_workspace` even
+when the requirement is zero. Step ownership is returned on success, error, or
+panic. Execution and consuming-release errors are both preserved; a consuming
+release is never retried. Persistent ownership survives ordinary dispatches.
 
-        let mut domains = DomainRegistry::new();
-        domains.register("", LATEST_ONNX_OPSET);        // standard ONNX (26)
-        domains.register("ai.onnx.ml", 3);               // ML domain
-        domains.register("ai.onnx.training", 1);          // training domain
+Failures at the execution boundary identify the operator, domain, and device and
+preserve the lower-layer cause. Destructor-only release failures report provider
+context; managed providers keep unsettled backing charged through quarantine.
 
-        Ok(Self {
-            eps,
-            cache: Mutex::new(KernelCache::new(4096)),
-            domains: RwLock::new(domains),
-            default_device,
-        })
-    }
-
-    /// Dispatch a single ONNX op.
-    pub fn dispatch(
-        &self,
-        op_type: &str,
-        domain: &str,
-        inputs: &[&Tensor],
-        attrs: &HashMap<String, Attribute>,
-        explicit_opset: Option<u64>,
-    ) -> Result<Vec<Tensor>> {
-        // 1. Resolve opset version
-        let opset = self.domains.read().unwrap()
-            .resolve_opset_with_context(domain, explicit_opset);
-
-        // 2. Resolve target device from inputs
-        let device = self.resolve_device(inputs)?;
-
-        // 3. Build cache key
-        let cache_key = KernelCacheKey {
-            op_type: op_type.into(),
-            domain: domain.into(),
-            opset,
-            input_shapes: inputs.iter().map(|t| t.shape().to_vec()).collect(),
-            input_dtypes: inputs.iter().map(|t| t.dtype()).collect(),
-            device,
-        };
-
-        // 4. Get or compile kernel
-        let kernel = self.cache.lock().unwrap().get_or_create(cache_key, || {
-            let ep = self.ep_for_device(device)?;
-            let registry = ep.kernel_registry();
-            let factory = registry.lookup(op_type, domain, opset)
-                .ok_or_else(|| Error::NoKernel {
-                    op_type: op_type.into(),
-                    domain: domain.into(),
-                    device,
-                })?;
-            Ok(Arc::from(factory.create(attrs)?))
-        })?;
-
-        // 5. Infer output shapes and dtypes
-        let input_meta: Vec<TensorMeta> = inputs.iter()
-            .map(|t| TensorMeta { shape: t.shape().to_vec(), dtype: t.dtype() })
-            .collect();
-        let output_meta = infer_output_meta(op_type, domain, opset, &input_meta, attrs)?;
-
-        // 6. Allocate output tensors
-        let mut outputs: Vec<Tensor> = output_meta.iter()
-            .map(|m| Tensor::zeros(&m.shape, m.dtype, device))
-            .collect();
-
-        // 7. Execute
-        let input_views: Vec<TensorView> = inputs.iter().map(|t| t.view()).collect();
-        let mut output_views: Vec<TensorMut> = outputs.iter_mut().map(|t| t.view_mut()).collect();
-        kernel.execute(&input_views, &mut output_views)?;
-
-        Ok(outputs)
-    }
-
-    /// Resolve device from inputs. Error on mixed devices.
-    fn resolve_device(&self, inputs: &[&Tensor]) -> Result<DeviceId> {
-        let devices: HashSet<DeviceId> = inputs.iter().map(|t| t.device()).collect();
-        match devices.len() {
-            0 => Ok(self.default_device),
-            1 => Ok(*devices.iter().next().unwrap()),
-            _ => Err(Error::MixedDeviceInputs {
-                devices: devices.into_iter().collect(),
-                hint: "Use .to(device) to move tensors to the same device".into(),
-            }),
-        }
-    }
-
-    /// Get EP for a device.
-    fn ep_for_device(&self, device: DeviceId) -> Result<&dyn ExecutionProvider> {
-        self.eps.iter()
-            .find(|ep| ep.device_id() == device)
-            .map(|ep| ep.as_ref())
-            .ok_or(Error::NoEpForDevice(device))
-    }
-}
-```
+See [dispatch.rs](../../crates/onnx-runtime-eager/src/dispatch.rs),
+[lib.rs](../../crates/onnx-runtime-eager/src/lib.rs), and §8.2 for cache/workspace lifetime.
 
 ### 10.2 Global Singleton
 

@@ -87,7 +87,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         TensorMetadata::new(DataType::Float32, &[], true),
         TensorMetadata::new(DataType::Uint8, &[], true),
     ];
-    let request = kernel.workspace_requirement(&metadata)?;
+    let request = kernel.workspace_requirement(
+        &metadata,
+        &[onnx_runtime_ep_api::OutputMetadata::tensor(
+            DataType::Uint8,
+            &[m, n],
+        )],
+    )?;
     let a = vec![130u8; m * k];
     let b = vec![120u8; k * n];
     let (a_scale, b_scale, y_scale) = (

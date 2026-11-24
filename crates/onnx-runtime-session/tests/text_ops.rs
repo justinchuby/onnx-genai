@@ -202,10 +202,12 @@ fn control_flow_declines_managed_string_outputs_without_panicking() {
         .insert((if_node, "else_branch".into()), branch);
     model.add_output(output);
     let condition = Tensor::from_raw(DataType::Bool, vec![], &[1]).unwrap();
-    let error = InferenceSession::from_graph(model)
-        .and_then(|mut session| session.run(&[("condition", &condition)]))
-        .err()
-        .expect("raw control-flow signatures must reject string tensors");
+    let error = match InferenceSession::from_graph(model) {
+        Ok(mut session) => session
+            .run(&[("condition", &condition)])
+            .expect_err("raw control-flow signatures must reject string tensors"),
+        Err(error) => error,
+    };
     assert!(
         error
             .to_string()
@@ -282,8 +284,7 @@ fn text_split_reads_onnx_string_initializer_and_declines_raw_binding() {
     assert_eq!(output[1].to_vec_i64(), [2, 2]);
     let error = session
         .allocate_device_output_binding("substrings", DataType::String, vec![2, 2], vec![2, 2])
-        .err()
-        .expect("raw ABI must decline a string output");
+        .expect_err("raw ABI must decline a string output");
     assert!(error.to_string().contains("tensor(string)"), "{error}");
 }
 

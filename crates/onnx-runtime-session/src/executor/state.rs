@@ -787,6 +787,7 @@ pub(crate) struct Executor {
 /// growing-symbol classification supplies the remaining capacity-bound input.
 /// Store peaks, never borrowed addresses or admission/ownership proofs.
 pub(super) struct WorkspacePreparationMemo {
+    pub(super) output_bindings: WorkspaceOutputBindings,
     pub(super) symbols: HashMap<SymbolId, usize>,
     pub(super) growing_symbols: HashSet<SymbolId>,
     pub(super) artifacts: ExecutorArtifactConfig,
@@ -794,6 +795,50 @@ pub(super) struct WorkspacePreparationMemo {
     pub(super) kernel_evictions: u64,
     pub(super) persistent: WorkspaceRequirement,
     pub(super) step: WorkspaceRequirement,
+}
+
+#[derive(Default)]
+pub(super) struct WorkspaceOutputBindings(Vec<WorkspaceOutputBinding>);
+
+struct WorkspaceOutputBinding {
+    value: ValueId,
+    dtype: DataType,
+    shape: Vec<usize>,
+    accepts_subshape: bool,
+    strides: Option<Vec<i64>>,
+    fixed_stride_shape: Option<Vec<usize>>,
+}
+
+impl WorkspaceOutputBindings {
+    pub(super) fn from_external(external: &ExternalBindings) -> Self {
+        let mut outputs = external
+            .outputs
+            .iter()
+            .map(|(&value, bound)| WorkspaceOutputBinding {
+                value,
+                dtype: bound.dtype,
+                shape: bound.shape.clone(),
+                accepts_subshape: bound.accepts_subshape,
+                strides: bound.strides.clone(),
+                fixed_stride_shape: bound.fixed_stride_shape.clone(),
+            })
+            .collect::<Vec<_>>();
+        outputs.sort_unstable_by_key(|output| output.value.0);
+        Self(outputs)
+    }
+
+    pub(super) fn matches(&self, external: &ExternalBindings) -> bool {
+        self.0.len() == external.outputs.len()
+            && self.0.iter().all(|output| {
+                external.outputs.get(&output.value).is_some_and(|bound| {
+                    output.dtype == bound.dtype
+                        && output.shape == bound.shape
+                        && output.accepts_subshape == bound.accepts_subshape
+                        && output.strides == bound.strides
+                        && output.fixed_stride_shape == bound.fixed_stride_shape
+                })
+            })
+    }
 }
 
 /// Parent scratch remains separated by lifetime; a step must never borrow and

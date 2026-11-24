@@ -1874,7 +1874,11 @@ impl Kernel for MatMulNBitsKernel {
         Ok(true)
     }
 
-    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
         if !(3..=6).contains(&inputs.len()) || !inputs[0].present {
             return Err(error(
                 "activation workspace needs 3..=6 input slots with present A (0); provide complete MatMulNBits metadata",
@@ -11463,11 +11467,14 @@ mod tests {
     fn activation_workspace_tracks_dtype_shape_and_rejects_unaddressable_metadata() {
         let kernel = test_kernel(16, 2, 16);
         let requirement = |dtype, shape: &[usize]| {
-            kernel.workspace_requirement(&[
-                TensorMetadata::new(dtype, shape, true),
-                TensorMetadata::new(DataType::Uint8, &[2, 1, 8], true),
-                TensorMetadata::new(DataType::Float32, &[2, 1], true),
-            ])
+            kernel.workspace_requirement(
+                &[
+                    TensorMetadata::new(dtype, shape, true),
+                    TensorMetadata::new(DataType::Uint8, &[2, 1, 8], true),
+                    TensorMetadata::new(DataType::Float32, &[2, 1], true),
+                ],
+                &[],
+            )
         };
         assert_eq!(
             requirement(DataType::Float32, &[2, 16]).unwrap(),
@@ -11488,7 +11495,7 @@ mod tests {
         }
         assert!(
             kernel
-                .workspace_requirement(&[])
+                .workspace_requirement(&[], &[])
                 .unwrap_err()
                 .to_string()
                 .contains("input slots")
@@ -11508,11 +11515,14 @@ mod tests {
         }
         assert!(
             kernel
-                .workspace_requirement(&[
-                    TensorMetadata::new(DataType::Float16, &[2, 16], false),
-                    TensorMetadata::new(DataType::Uint8, &[2, 1, 8], true),
-                    TensorMetadata::new(DataType::Float32, &[2, 1], true),
-                ])
+                .workspace_requirement(
+                    &[
+                        TensorMetadata::new(DataType::Float16, &[2, 16], false),
+                        TensorMetadata::new(DataType::Uint8, &[2, 1, 8], true),
+                        TensorMetadata::new(DataType::Float32, &[2, 1], true),
+                    ],
+                    &[]
+                )
                 .unwrap_err()
                 .to_string()
                 .contains("present A")
@@ -11622,11 +11632,14 @@ mod tests {
         let b = Owned::u8(&[2, 1, 8], &[0x99; 16]);
         let scales = Owned::f32(&[2, 1], &[1.; 2]);
         let request = kernels[0]
-            .workspace_requirement(&[
-                TensorMetadata::new(a[0].dtype, &a[0].shape, true),
-                TensorMetadata::new(b.dtype, &b.shape, true),
-                TensorMetadata::new(scales.dtype, &scales.shape, true),
-            ])
+            .workspace_requirement(
+                &[
+                    TensorMetadata::new(a[0].dtype, &a[0].shape, true),
+                    TensorMetadata::new(b.dtype, &b.shape, true),
+                    TensorMetadata::new(scales.dtype, &scales.shape, true),
+                ],
+                &[],
+            )
             .unwrap();
         let allocation = providers[0]
             .allocate_workspace(request.bytes as usize, request.alignment, request.role())

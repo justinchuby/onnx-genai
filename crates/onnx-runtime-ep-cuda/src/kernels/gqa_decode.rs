@@ -7,16 +7,16 @@
 //! handful of resident CTAs while every warp walks the complete context. This
 //! implementation mirrors the fp16 split-K kernel: up to sixteen CTAs divide
 //! each query row's KV range, then a second kernel merges their online-softmax
-//! states. That exposes enough parallelism to keep decode latency nearly flat
-//! over practical context lengths without changing the graph contract.
+//! states. Their fixed merge order is unchanged when partial storage is borrowed
+//! from the caller's prepared workspace.
 //!
 //! ## Capture-safety
 //!
 //! The launch path is legal to record inside a CUDA graph and to replay with
 //! only device-buffer contents changing:
 //!   * No `stream.synchronize()` or any device sync on the launch path.
-//!   * No per-call `cudaMalloc`/`cudaFree`; partial states use fixed module-global
-//!     scratch allocated when NVRTC loads the module.
+//!   * No per-call `cudaMalloc`/`cudaFree`; partial states borrow the admitted
+//!     workspace, retained by the caller through execution and captured graphs.
 //!   * Fixed maximum-split launch geometry. The device-resident valid length
 //!     chooses the active split count, so graph replay needs no update.
 
@@ -53,7 +53,58 @@ fn dims_per_lane(head_dim: usize) -> usize {
 /// across many SMs, large enough to amortize launch overhead.
 const WARPS_PER_BLOCK: u32 = 4;
 const WARP_SIZE: u32 = 32;
-pub(super) const MAX_SPLITS: usize = 16;
+macro_rules! split_k_limits {
+    ($rows:literal, $splits:literal) => {
+        pub(super) const MAX_SCRATCH_ROWS: usize = $rows;
+        pub(super) const MAX_SPLITS: usize = $splits;
+        pub(super) const SPLIT_K_HEADER: &str = concat!(
+            "#define GQA_MAX_SCRATCH_ROWS ",
+            stringify!($rows),
+            "\n",
+            "#define GQA_MAX_SPLITS ",
+            stringify!($splits),
+            "\n"
+        );
+    };
+}
+split_k_limits!(256, 16);
+
+/// Partial states are max, denominator and D accumulator floats. Rows above
+/// the cap execute direct; earlier rows still use splits in that same launch.
+/// Reserve all split columns so direct-output toggles and device lengths do
+/// not invalidate a prepared requirement.
+pub(super) fn scratch_layout(
+    batch: usize,
+    heads: usize,
+    query_seq: usize,
+    head_dim: usize,
+) -> Result<onnx_runtime_ep_api::WorkspaceLayout<1>> {
+    let overflow = || {
+        EpError::KernelFailed("cuda_ep GQA split-K: partial-state layout exceeds addressable capacity; reduce the batch/head geometry".into())
+    };
+    let rows = batch
+        .checked_mul(heads)
+        .and_then(|rows| rows.checked_mul(query_seq))
+        .ok_or_else(overflow)?;
+    let stride = head_dim.checked_add(2).ok_or_else(overflow)?;
+    let elements = rows
+        .min(MAX_SCRATCH_ROWS)
+        .checked_mul(MAX_SPLITS)
+        .and_then(|states| states.checked_mul(stride))
+        .ok_or_else(overflow)?;
+    let bytes = elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(overflow)?;
+    let region = std::alloc::Layout::from_size_align(bytes, 16).map_err(|_| overflow())?;
+    onnx_runtime_ep_api::WorkspaceLayout::new([region])
+}
+
+fn decode_source() -> &'static str {
+    static SOURCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SOURCE
+        .get_or_init(|| format!("{SPLIT_K_HEADER}{DECODE_SRC}"))
+        .as_str()
+}
 
 /// Whether the warp-parallel decode kernel handles this shape. Single query
 /// token (`Sq=1`) with `head_dim` within [`MAX_HEAD_DIM`].
@@ -122,12 +173,8 @@ const DECODE_SRC: &str = r#"
 // register regression on small heads, no head256/head512 fallback to the serial
 // reference kernel.
 #define GQA_MAX_HEAD_SIZE 512
-#define GQA_MAX_SPLITS 16
-#define GQA_MAX_SCRATCH_ROWS 256
-#define GQA_SCRATCH_STRIDE (GQA_MAX_HEAD_SIZE + 2)
 
-__device__ __align__(16) float gqa_split_scratch[
-    GQA_MAX_SCRATCH_ROWS * GQA_MAX_SPLITS * GQA_SCRATCH_STRIDE];
+
 
 __device__ __forceinline__ int gqa_active_splits(const int sequence_length) {
     if (sequence_length <= 64) return 1;
@@ -155,7 +202,7 @@ __device__ __forceinline__ void gqa_decode_f32_impl(
     const int local_window,
     const float softcap,
     const int single_split_direct,
-    const float* __restrict__ head_sink)
+    const float* __restrict__ head_sink, float* __restrict__ scratch)
 {
     extern __shared__ float smem[];
     const int warps_per_block = blockDim.x / GQA_WARP_SIZE;
@@ -288,8 +335,8 @@ __device__ __forceinline__ void gqa_decode_f32_impl(
     }
     float* split_state = direct_output
         ? nullptr
-        : gqa_split_scratch
-            + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+        : scratch
+            + ((long)row * GQA_MAX_SPLITS + split) * (head_size + 2);
     if (lane == 0 && !direct_output) {
         split_state[0] = global_max;
         split_state[1] = denom;
@@ -324,7 +371,7 @@ __device__ __forceinline__ void gqa_merge_f32_impl(
     const int head_size,
     const int local_window,
     const int single_split_direct,
-    const float* __restrict__ head_sink)
+    const float* __restrict__ head_sink, float* __restrict__ scratch)
 {
     const int row = blockIdx.x;
     const int rows = batch * query_heads * query_seq;
@@ -347,8 +394,8 @@ __device__ __forceinline__ void gqa_merge_f32_impl(
     const int query_head = (row / query_seq) % query_heads;
     float global_max = __int_as_float(0xff800000);
     for (int split = 0; split < active_splits; ++split) {
-        const float* state = gqa_split_scratch
-            + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+        const float* state = scratch
+            + ((long)row * GQA_MAX_SPLITS + split) * (head_size + 2);
         global_max = fmaxf(global_max, state[0]);
     }
     // Learned attention sink (see the decode kernel): folded into the softmax
@@ -359,8 +406,8 @@ __device__ __forceinline__ void gqa_merge_f32_impl(
     global_max = fmaxf(global_max, sink_val);
     float denom = 0.0f;
     for (int split = 0; split < active_splits; ++split) {
-        const float* state = gqa_split_scratch
-            + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+        const float* state = scratch
+            + ((long)row * GQA_MAX_SPLITS + split) * (head_size + 2);
         denom += state[1] * expf(state[0] - global_max);
     }
     denom += expf(sink_val - global_max);
@@ -372,8 +419,8 @@ __device__ __forceinline__ void gqa_merge_f32_impl(
         if (d < head_size) {
             float out = 0.0f;
             for (int split = 0; split < active_splits; ++split) {
-                const float* state = gqa_split_scratch
-                    + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+                const float* state = scratch
+                    + ((long)row * GQA_MAX_SPLITS + split) * (head_size + 2);
                 out += state[2 + d] * expf(state[0] - global_max);
             }
             output[q_base + d] = out * inverse_sum;
@@ -393,21 +440,21 @@ extern "C" __global__ void gqa_decode_attention_f32_dpl##DPL(                  \
     const int head_size, const int cache_capacity, const int group_size,      \
     const float scale, const int local_window, const float softcap,           \
     const int single_split_direct,                                            \
-    const float* __restrict__ head_sink) {                                    \
+    const float* __restrict__ head_sink, float* __restrict__ scratch) {                                    \
     gqa_decode_f32_impl<DPL>(query, key, value, output, total_lengths, batch, \
         query_heads, kv_heads, query_seq, head_size, cache_capacity,          \
         group_size, scale, local_window, softcap, single_split_direct,        \
-        head_sink);                                                           \
+        head_sink, scratch);                                                           \
 }                                                                             \
 extern "C" __global__ void gqa_decode_attention_f32_merge_dpl##DPL(           \
     float* __restrict__ output, const int* __restrict__ total_lengths,        \
     const int batch, const int query_heads, const int query_seq,              \
     const int head_size, const int local_window,                             \
     const int single_split_direct,                                            \
-    const float* __restrict__ head_sink) {                                    \
+    const float* __restrict__ head_sink, float* __restrict__ scratch) {                                    \
     gqa_merge_f32_impl<DPL>(output, total_lengths, batch, query_heads,        \
         query_seq, head_size, local_window, single_split_direct,             \
-        head_sink);                                                           \
+        head_sink, scratch);                                                           \
 }
 
 GQA_DECODE_ENTRIES(1)
@@ -453,7 +500,11 @@ pub(super) fn run(
     local_window: i32,
     softcap: f32,
     head_sink: CUdeviceptr,
+    workspace: Option<onnx_runtime_ep_api::WorkspaceView>,
 ) -> Result<()> {
+    let [scratch_view] = scratch_layout(batch, num_heads, query_seq, head_dim)?.bind(workspace)?;
+    let scratch = crate::runtime::cuptr(scratch_view.ptr().0.cast_const());
+
     let as_i32 = |name: &str, value: usize| {
         i32::try_from(value).map_err(|_| {
             EpError::KernelFailed(format!("cuda_ep GQA decode: {name} {value} exceeds i32"))
@@ -500,7 +551,8 @@ pub(super) fn run(
     let decode_entry = format!("{ENTRY_PREFIX}{dpl}");
     let merge_entry = format!("{MERGE_ENTRY_PREFIX}{dpl}");
 
-    let function = runtime.nvrtc_function(MODULE_KEY, DECODE_SRC, &decode_entry)?;
+    let source = decode_source();
+    let function = runtime.nvrtc_function(MODULE_KEY, source, &decode_entry)?;
     let single_split_direct = single_split_direct_flag();
     let mut builder = runtime.stream().launch_builder(&function);
     builder
@@ -520,9 +572,10 @@ pub(super) fn run(
         .arg(&local_window)
         .arg(&softcap)
         .arg(&single_split_direct)
-        .arg(&head_sink);
+        .arg(&head_sink)
+        .arg(&scratch);
     // SAFETY: the selected `dpl` entry matches this argument ABI; all buffers were sized by the
-    // caller. Fixed module-global and dynamic shared scratch make the launch
+    // caller. Caller-owned prepared and dynamic shared scratch make the launch
     // legal to record into and replay from a CUDA graph.
     unsafe {
         builder.launch(LaunchConfig {
@@ -533,7 +586,7 @@ pub(super) fn run(
     }
     .map_err(|error| driver_err("launch GQA f32 split-K attention", error))?;
 
-    let merge_function = runtime.nvrtc_function(MODULE_KEY, DECODE_SRC, &merge_entry)?;
+    let merge_function = runtime.nvrtc_function(MODULE_KEY, source, &merge_entry)?;
     let mut merge_builder = runtime.stream().launch_builder(&merge_function);
     merge_builder
         .arg(&output)
@@ -544,7 +597,8 @@ pub(super) fn run(
         .arg(&dim_i)
         .arg(&local_window)
         .arg(&single_split_direct)
-        .arg(&head_sink);
+        .arg(&head_sink)
+        .arg(&scratch);
     // SAFETY: the same-stream partial launch writes every active split state
     // consumed here; both launches are graph-recordable.
     unsafe {
@@ -556,6 +610,40 @@ pub(super) fn run(
     }
     .map_err(|error| driver_err("launch GQA f32 split-K merge", error))?;
     Ok(())
+}
+
+/// Raw device fixture ownership is test-only; production borrows the caller's
+/// admitted workspace. The actual owner is retained across recorded graphs.
+#[cfg(test)]
+pub(super) struct TestScratch {
+    owner: std::sync::Arc<crate::runtime::GraphDeviceAllocation>,
+}
+#[cfg(test)]
+impl TestScratch {
+    pub(super) fn new(
+        runtime: &std::sync::Arc<CudaRuntime>,
+        batch: usize,
+        heads: usize,
+        query_seq: usize,
+        dim: usize,
+    ) -> Self {
+        let bytes = scratch_layout(batch, heads, query_seq, dim)
+            .unwrap()
+            .bytes()
+            .max(1);
+        Self {
+            owner: crate::runtime::GraphDeviceAllocation::allocate(runtime, bytes).unwrap(),
+        }
+    }
+    pub(super) fn view(&self) -> onnx_runtime_ep_api::WorkspaceView {
+        onnx_runtime_ep_api::WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(self.owner.ptr() as *mut std::ffi::c_void),
+            self.owner.bytes(),
+        )
+    }
+    pub(super) fn resource(&self) -> onnx_runtime_ep_api::DeviceGraphResource {
+        crate::runtime::GraphDeviceAllocation::device_graph_resource(&self.owner)
+    }
 }
 
 #[cfg(test)]
@@ -670,6 +758,8 @@ mod tests {
         let value_dev = runtime.alloc_raw(value.len() * 4).unwrap();
         let output_dev = runtime.alloc_raw(num_heads * head_dim * 4).unwrap();
         let totals_dev = runtime.alloc_raw(batch * 4).unwrap();
+        let scratch =
+            super::super::gqa_decode::TestScratch::new(&runtime, batch, num_heads, 1, head_dim);
 
         // SAFETY: device buffers were sized to hold each source slice.
         unsafe {
@@ -705,6 +795,7 @@ mod tests {
                 0,
                 0.0,
                 0, // head_sink: null (no attention sink)
+                Some(scratch.view()),
             )
             .unwrap();
 
@@ -759,7 +850,7 @@ mod tests {
     /// error versus the f64 CPU reference. Shared by the per-head-dim parity
     /// tests below.
     fn parity_for_shape(
-        runtime: &CudaRuntime,
+        runtime: &Arc<CudaRuntime>,
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
@@ -791,6 +882,8 @@ mod tests {
         let value_dev = runtime.alloc_raw(value.len() * 4).unwrap();
         let output_dev = runtime.alloc_raw(num_heads * head_dim * 4).unwrap();
         let totals_dev = runtime.alloc_raw(batch * 4).unwrap();
+        let scratch =
+            super::super::gqa_decode::TestScratch::new(runtime, batch, num_heads, 1, head_dim);
 
         // SAFETY: device buffers were sized to hold each source slice.
         unsafe {
@@ -826,6 +919,7 @@ mod tests {
                 0,
                 0.0,
                 0, // head_sink: null (no attention sink)
+                Some(scratch.view()),
             )
             .unwrap();
 
@@ -931,6 +1025,17 @@ mod tests {
         }
     }
 
+    #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA runner")]
+    #[test]
+    fn decode_kernel_matches_reference_across_partial_row_cap() {
+        let runtime = runtime().expect("row-cap numerical parity requires a CUDA runtime/device");
+        for heads in [255, 256, 257] {
+            let (absolute, relative) = parity_for_shape(&runtime, heads, 1, 7, &[1, 65, 257]);
+            assert!(absolute < 1e-3, "rows={heads}: absolute error {absolute}");
+            assert!(relative < 5e-3, "rows={heads}: relative error {relative}");
+        }
+    }
+
     #[test]
     fn support_gate_targets_single_token_decode() {
         assert!(supported(1, 64));
@@ -993,6 +1098,8 @@ mod tests {
             let value_dev = runtime.alloc_raw(v.len() * 4).unwrap();
             let output_dev = runtime.alloc_raw(num_heads * head_dim * 4).unwrap();
             let totals_dev = runtime.alloc_raw(batch * 4).unwrap();
+            let scratch =
+                super::super::gqa_decode::TestScratch::new(&runtime, batch, num_heads, 1, head_dim);
             // SAFETY: device buffers were sized to hold each source slice.
             unsafe {
                 runtime.htod(as_bytes(&q), query_dev).unwrap();
@@ -1025,6 +1132,7 @@ mod tests {
                     0,
                     0.0,
                     0, // head_sink: null (no attention sink)
+                    Some(scratch.view()),
                 )
                 .unwrap();
                 let mut got = vec![0.0f32; num_heads * head_dim];
@@ -1055,5 +1163,76 @@ mod tests {
                 runtime.free_raw(totals_dev).unwrap();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod workspace_contract_tests {
+    use super::*;
+    use onnx_runtime_ep_api::{DevicePtrMut, WorkspaceView};
+
+    #[test]
+    fn split_k_workspace_scales_rows_and_dimensions_preserving_the_partial_row_cap() {
+        for rows in [0usize, 1, 255, 256, 257] {
+            for dim in [1usize, 7, 64, 512] {
+                let layout = scratch_layout(1, rows, 1, dim).unwrap();
+                assert_eq!(layout.bytes(), rows.min(256) * 16 * (dim + 2) * 4);
+                assert_eq!(layout.alignment(), 16);
+            }
+        }
+        assert_eq!(
+            scratch_layout(1, 257, 1, 64).unwrap().bytes(),
+            scratch_layout(1, 256, 1, 64).unwrap().bytes()
+        );
+        // Geometry-only upper bounds remain valid across direct-output flags
+        // and all device-valid lengths; a one-split two-step path still writes.
+        assert!(scratch_layout(1, 1, 1, 64).unwrap().bytes() > 0);
+    }
+
+    #[test]
+    fn split_k_workspace_rejects_overflow_before_admission() {
+        for (batch, heads, dim) in [
+            (usize::MAX, 2, 64),
+            (1, 1, usize::MAX),
+            (1, 1, isize::MAX as usize / 64),
+        ] {
+            let error = scratch_layout(batch, heads, 1, dim).unwrap_err();
+            assert!(
+                error.to_string().contains("addressable capacity"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_k_workspace_requires_the_full_aligned_borrow_and_accepts_empty_rows() {
+        let layout = scratch_layout(1, 1, 1, 7).unwrap();
+        #[repr(align(16))]
+        struct Backing([u8; 576]);
+        let mut first = Backing([0; 576]);
+        let mut second = Backing([0; 576]);
+        let ptr = DevicePtrMut(first.0.as_mut_ptr().cast());
+        assert!(layout.bind(None).is_err());
+        assert!(layout.bind(Some(WorkspaceView::new(ptr, 575))).is_err());
+        assert!(
+            layout
+                .bind(Some(WorkspaceView::new(
+                    DevicePtrMut(first.0.as_mut_ptr().wrapping_add(4).cast()),
+                    576
+                )))
+                .is_err()
+        );
+        let [left] = layout.bind(Some(WorkspaceView::new(ptr, 576))).unwrap();
+        let [right] = layout
+            .bind(Some(WorkspaceView::new(
+                DevicePtrMut(second.0.as_mut_ptr().cast()),
+                576,
+            )))
+            .unwrap();
+        assert_ne!(left.ptr().0, right.ptr().0);
+        assert_eq!(
+            scratch_layout(0, 1, 1, 7).unwrap().bind(None).unwrap()[0].bytes(),
+            0
+        );
     }
 }

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
 use onnx_runtime_ep_api::{
     DeviceGraphResource, DevicePtr, DevicePtrMut, EpError, Kernel, KernelFactory, Result,
-    TensorMetadata, TensorMut, TensorView, WorkspaceRequirement, WorkspaceView,
+    TensorMetadata, TensorMut, TensorView, WorkspaceLayout, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
 
@@ -336,6 +336,232 @@ const GEMV_F16_ACTIVATION_VECTOR_ELEMENTS: usize = 8;
 
 fn decode_gemv_loop_rows_aligned(k: usize) -> bool {
     k.is_multiple_of(GEMV_F16_ACTIVATION_VECTOR_ELEMENTS)
+}
+
+fn checked_matmul_rows(shape: &[usize]) -> Result<usize> {
+    let Some((_, prefix)) = shape.split_last() else {
+        return Err(error(
+            "A must have rank >= 1; provide a trailing K dimension",
+        ));
+    };
+    if prefix.contains(&0) {
+        return Ok(0);
+    }
+    prefix
+        .iter()
+        .try_fold(1usize, |rows, &dim| rows.checked_mul(dim))
+        .ok_or_else(|| {
+            error(
+                "activation row count exceeds addressable capacity; reduce the batch/prefill shape",
+            )
+        })
+}
+
+fn f16_decode_row_loop(
+    m: usize,
+    k: usize,
+    gate_up: bool,
+    rmsnorm: bool,
+    decomposed_silu: bool,
+    limit: usize,
+) -> bool {
+    m > 1
+        && m <= limit
+        && decode_gemv_loop_rows_aligned(k)
+        && if gate_up { rmsnorm } else { !decomposed_silu }
+}
+
+#[derive(Clone, Copy)]
+struct MatMulPrefillGeometry {
+    dtype: DataType,
+    m: usize,
+    k: usize,
+    n: usize,
+    gate_up: bool,
+    rmsnorm: bool,
+    decomposed_silu: bool,
+}
+
+impl MatMulPrefillGeometry {
+    fn regions(self, loop_limit: usize, blas_bytes: usize) -> Result<[std::alloc::Layout; 3]> {
+        let fallback = matches!(self.dtype, DataType::Float16 | DataType::BFloat16)
+            && self.m > 1
+            && !f16_decode_row_loop(
+                self.m,
+                self.k,
+                self.gate_up,
+                self.rmsnorm,
+                self.decomposed_silu,
+                loop_limit,
+            );
+        let overflow = || {
+            error(
+                "prefill normalization/gate/BLAS workspace exceeds addressable capacity; reduce M, K or N",
+            )
+        };
+        let half_region = |width, needed| {
+            let bytes = if needed {
+                self.m
+                    .checked_mul(width)
+                    .and_then(|n| n.checked_mul(2))
+                    .ok_or_else(overflow)?
+            } else {
+                0
+            };
+            std::alloc::Layout::from_size_align(bytes, blas::WORKSPACE_ALIGNMENT)
+                .map_err(|_| overflow())
+        };
+        Ok([
+            half_region(self.k, fallback && self.rmsnorm)?,
+            half_region(self.n, fallback && self.gate_up)?,
+            std::alloc::Layout::from_size_align(blas_bytes, blas::WORKSPACE_ALIGNMENT)
+                .map_err(|_| overflow())?,
+        ])
+    }
+    #[cfg(test)]
+    fn layout(self, loop_limit: usize, blas_bytes: usize) -> Result<WorkspaceLayout<3>> {
+        WorkspaceLayout::new(self.regions(loop_limit, blas_bytes)?)
+    }
+}
+
+const MATMUL_MAX_INPUTS: usize = 8;
+const MATMUL_WORKSPACE_REGIONS: usize = 3 + MATMUL_MAX_INPUTS + 1;
+const BF16_MAX_CACHED_SCALES: usize = bf16_scale_slots(true).len();
+
+#[derive(Clone, Copy)]
+struct MatMulNBitsWorkspaceParts {
+    normalized: WorkspaceView,
+    gate: WorkspaceView,
+    blas: Option<WorkspaceView>,
+}
+
+impl MatMulNBitsWorkspaceParts {
+    const EMPTY: Self = Self {
+        normalized: WorkspaceView::new(DevicePtrMut(std::ptr::null_mut()), 0),
+        gate: WorkspaceView::new(DevicePtrMut(std::ptr::null_mut()), 0),
+        blas: None,
+    };
+}
+
+struct MatMulNBitsWorkspaceBinding {
+    prefill: MatMulNBitsWorkspaceParts,
+    inputs: [Option<WorkspaceView>; MATMUL_MAX_INPUTS],
+    input_elements: [usize; MATMUL_MAX_INPUTS],
+    result: Option<WorkspaceView>,
+    used: Option<WorkspaceView>,
+}
+
+struct MatMulNBitsWorkspaceLayout {
+    layout: WorkspaceLayout<MATMUL_WORKSPACE_REGIONS>,
+    staged: [bool; MATMUL_MAX_INPUTS],
+    input_elements: [usize; MATMUL_MAX_INPUTS],
+    bf16: bool,
+}
+
+fn checked_staging_elements(shape: &[usize]) -> Result<usize> {
+    if shape.contains(&0) {
+        return Ok(0);
+    }
+    shape
+        .iter()
+        .try_fold(1usize, |n, &dim| n.checked_mul(dim))
+        .ok_or_else(|| error("BF16 staging element count overflows; reduce the input shape"))
+}
+
+impl MatMulNBitsWorkspaceLayout {
+    fn new(
+        prefill: [std::alloc::Layout; 3],
+        inputs: &[TensorMetadata<'_>],
+        constants: &[bool],
+        gate_up: bool,
+        output_elements: usize,
+    ) -> Result<Self> {
+        if inputs.len() > MATMUL_MAX_INPUTS {
+            return Err(error(
+                "BF16 staging accepts at most eight positional inputs; use the declared fusion signature",
+            ));
+        }
+        let empty = std::alloc::Layout::from_size_align(0, blas::WORKSPACE_ALIGNMENT)
+            .map_err(|_| error("invalid BF16 workspace alignment"))?;
+        let mut regions = [empty; MATMUL_WORKSPACE_REGIONS];
+        regions[..3].copy_from_slice(&prefill);
+        let mut staged = [false; MATMUL_MAX_INPUTS];
+        let mut input_elements = [0; MATMUL_MAX_INPUTS];
+        let bf16 = inputs
+            .first()
+            .is_some_and(|input| input.present && input.dtype == DataType::BFloat16);
+        if bf16 {
+            let region = |elements: usize| {
+                let bytes = elements.checked_mul(2).ok_or_else(|| {
+                    error("BF16 staging byte count overflows; reduce the input/output shape")
+                })?;
+                std::alloc::Layout::from_size_align(bytes, blas::WORKSPACE_ALIGNMENT)
+                    .map_err(|_| error("BF16 staging exceeds addressable workspace capacity; reduce the input/output shape"))
+            };
+            for (index, input) in inputs.iter().enumerate() {
+                // Presence precedes scalar geometry: absent optionals also carry [].
+                if !input.present || input.dtype != DataType::BFloat16 {
+                    continue;
+                }
+                input_elements[index] = checked_staging_elements(input.shape)?;
+                let converted = region(input_elements[index])?;
+                if !bf16_scale_input_is_cacheable(constants, gate_up, index, input.dtype) {
+                    staged[index] = true;
+                    regions[3 + index] = converted;
+                }
+            }
+            regions[MATMUL_WORKSPACE_REGIONS - 1] = region(output_elements)?;
+        }
+        Ok(Self {
+            layout: WorkspaceLayout::new(regions)?,
+            staged,
+            input_elements,
+            bf16,
+        })
+    }
+
+    fn bytes(&self) -> usize {
+        self.layout.bytes()
+    }
+
+    fn bind(&self, workspace: Option<WorkspaceView>) -> Result<MatMulNBitsWorkspaceBinding> {
+        let views = self.layout.bind(workspace)?;
+        Ok(MatMulNBitsWorkspaceBinding {
+            prefill: MatMulNBitsWorkspaceParts {
+                normalized: views[0],
+                gate: views[1],
+                blas: (views[2].bytes() != 0).then_some(views[2]),
+            },
+            inputs: std::array::from_fn(|index| self.staged[index].then_some(views[3 + index])),
+            input_elements: self.input_elements,
+            result: self.bf16.then_some(views[MATMUL_WORKSPACE_REGIONS - 1]),
+            used: if self.bytes() == 0 {
+                None
+            } else {
+                Some(WorkspaceView::new(
+                    workspace.ok_or_else(|| error("nonempty staging borrow is missing; prepare workspace before execution"))?.ptr(),
+                    self.bytes(),
+                ))
+            },
+        })
+    }
+}
+
+/// Only scale operands may use immutable BF16 conversion storage. Other
+/// operands retain per-call staging even when a graph happens to freeze them.
+const fn bf16_scale_slots(gate_up_swiglu: bool) -> &'static [usize] {
+    if gate_up_swiglu { &[2, 4] } else { &[2] }
+}
+
+fn bf16_scale_input_is_cacheable(
+    constant_inputs: &[bool],
+    gate_up_swiglu: bool,
+    index: usize,
+    dtype: DataType,
+) -> bool {
+    dtype == DataType::BFloat16
+        && bf16_scale_slots(gate_up_swiglu).contains(&index)
+        && constant_inputs.get(index) == Some(&true)
 }
 
 fn marlin_weight_inputs_are_constant(constant_inputs: &[bool], gate_up_swiglu: bool) -> bool {
@@ -6750,7 +6976,6 @@ impl KernelFactory for MatMulNBitsFactory {
                 .and_then(onnx_runtime_ir::Attribute::as_float)
                 .unwrap_or(1e-5),
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_scratch: Mutex::new(Bf16Scratch::new(self.runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(self.runtime.clone())),
         }))
     }
@@ -6784,68 +7009,6 @@ impl Accuracy4Workspace {
 impl Accuracy4Workspace {
     fn device_graph_resource(&self) -> DeviceGraphResource {
         GraphDeviceAllocation::device_graph_resource(&self.allocation)
-    }
-}
-
-/// Reusable device scratch for the BFloat16 activation path.
-///
-/// BFloat16 operands are staged through Float16 (see
-/// [`MatMulNBitsKernel::run_bf16`]). A per-node allocation + free for each
-/// staging buffer would synchronize the device on every one of the hundreds of
-/// MatMulNBits nodes per decode step (`cuMemAlloc`/`cuMemFree` are synchronous),
-/// collapsing throughput. This grow-only arena is carved into per-call regions
-/// and reused across decode steps, so after the first step the BFloat16 path
-/// issues only asynchronous casts and the tuned fp16 matmul — no device sync.
-/// Each kernel instance owns its own arena, and consecutive uses are ordered on
-/// the EP stream, so region reuse never races.
-#[derive(Debug)]
-struct Bf16Scratch {
-    runtime: Arc<CudaRuntime>,
-    allocation: Option<Arc<GraphDeviceAllocation>>,
-    cap: usize,
-    used: bool,
-}
-
-impl Bf16Scratch {
-    fn new(runtime: Arc<CudaRuntime>) -> Self {
-        Self {
-            runtime,
-            allocation: None,
-            cap: 0,
-            used: false,
-        }
-    }
-
-    fn begin_call(&mut self) {
-        self.used = false;
-    }
-
-    /// Ensure the arena holds at least `bytes`, returning its base pointer.
-    fn ensure(&mut self, bytes: usize) -> Result<CUdeviceptr> {
-        self.used = true;
-        if bytes > self.cap {
-            if self.allocation.is_some() {
-                self.runtime.drain_for_unmap()?;
-            }
-            self.allocation = Some(GraphDeviceAllocation::allocate(
-                &self.runtime,
-                bytes.max(1),
-            )?);
-            self.cap = bytes;
-        }
-        Ok(self
-            .allocation
-            .as_ref()
-            .map_or(0, |allocation| allocation.ptr()))
-    }
-
-    fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
-        if !self.used {
-            return None;
-        }
-        self.allocation
-            .as_ref()
-            .map(GraphDeviceAllocation::device_graph_resource)
     }
 }
 
@@ -6888,7 +7051,10 @@ impl Bf16ConstCache {
     /// casting them on first use and reusing them thereafter. The staged buffer
     /// is allocated once (before CUDA-graph capture, during warmup) and never
     /// grows again for a given node, so replays hit only cache lookups.
-    fn staged(&mut self, consts: &[(CUdeviceptr, usize)]) -> Result<Vec<CUdeviceptr>> {
+    fn staged(
+        &mut self,
+        consts: &[(CUdeviceptr, usize)],
+    ) -> Result<[CUdeviceptr; BF16_MAX_CACHED_SCALES]> {
         self.used = true;
         let matches =
             self.slots.len() == consts.len()
@@ -6900,28 +7066,36 @@ impl Bf16ConstCache {
         if !matches {
             self.rebuild(consts)?;
         }
-        Ok(self
-            .slots
-            .iter()
-            .map(|(_, _, offset)| {
+        Ok(std::array::from_fn(|index| {
+            self.slots.get(index).map_or(0, |(_, _, offset)| {
                 self.allocation
                     .as_ref()
                     .map_or(0, |allocation| allocation.ptr())
                     + *offset as CUdeviceptr
             })
-            .collect())
+        }))
     }
 
     fn rebuild(&mut self, consts: &[(CUdeviceptr, usize)]) -> Result<()> {
-        const ALIGN: usize = 256;
-        let f16 = std::mem::size_of::<half::f16>();
-        let round = |bytes: usize| bytes.div_ceil(ALIGN) * ALIGN;
-        let mut slots = Vec::with_capacity(consts.len());
-        let mut total = 0usize;
-        for (src, numel) in consts {
-            slots.push((*src, *numel, total));
-            total += round(numel * f16);
+        if consts.len() > BF16_MAX_CACHED_SCALES {
+            return Err(error(
+                "too many BF16 scale-cache operands; use the declared gate/up signature",
+            ));
         }
+        let empty = std::alloc::Layout::from_size_align(0, blas::WORKSPACE_ALIGNMENT)
+            .map_err(|_| error("invalid BF16 scale-cache alignment"))?;
+        let mut regions = [empty; BF16_MAX_CACHED_SCALES];
+        for (index, (_, numel)) in consts.iter().enumerate() {
+            regions[index] = std::alloc::Layout::array::<half::f16>(*numel)
+                .and_then(|layout| layout.align_to(blas::WORKSPACE_ALIGNMENT))
+                .map(|layout| layout.pad_to_align())
+                .map_err(|_| error("BF16 scale-cache layout exceeds addressable capacity; reduce the scale tensor shapes"))?;
+        }
+        let layout = WorkspaceLayout::new(regions)?;
+        let total = layout.bytes();
+        // Once backing or contents may change, no previous descriptor may hit
+        // until every conversion has been submitted successfully.
+        self.slots.clear();
         if total > self.cap {
             if self.allocation.is_some() {
                 self.runtime.drain_for_unmap()?;
@@ -6936,15 +7110,22 @@ impl Bf16ConstCache {
             .allocation
             .as_ref()
             .map_or(0, |allocation| allocation.ptr());
-        for (src, numel, offset) in &slots {
+        let views = layout.bind(Some(WorkspaceView::new(
+            DevicePtrMut(raw_ptr(base)),
+            self.cap,
+        )))?;
+        let mut slots = Vec::with_capacity(consts.len());
+        for ((src, numel), region) in consts.iter().zip(views) {
+            let ptr = cuptr(region.ptr().0.cast_const());
             super::cast::launch_cast_raw(
                 &self.runtime,
-                cuptr(*src as *const c_void),
+                *src,
                 DataType::BFloat16,
-                base + *offset as CUdeviceptr,
+                ptr,
                 DataType::Float16,
                 *numel,
             )?;
+            slots.push((*src, *numel, (ptr - base) as usize));
         }
         self.slots = slots;
         Ok(())
@@ -6973,9 +7154,9 @@ pub struct MatMulNBitsKernel {
     /// Repacked immutable weights owned by this kernel. Owner scoping prevents a
     /// later kernel from hitting stale contents when CUDA reuses an address.
     marlin_repack_cache: marlin_gemm::RepackCache,
-    /// Session-lifetime graph constants. Only immutable weights may enter the
-    /// owner-scoped Marlin repack cache.
-    constant_inputs: [bool; 8],
+    /// Session-lifetime graph constants. Only proven immutable inputs may enter
+    /// the owner-scoped weight-repack or BF16 scale-conversion caches.
+    constant_inputs: [bool; MATMUL_MAX_INPUTS],
     /// Set when this node's bias input came from folding a standalone `Add`
     /// (see [`crate::optimizer::MATMUL_NBITS_FOLDED_BIAS_ATTR`]). The fp16 GEMV
     /// then reproduces the two-op `fp16(fp16(acc) + bias)` rounding.
@@ -6997,10 +7178,8 @@ pub struct MatMulNBitsKernel {
     /// the fused prologue reproduces its `1/sqrt(mean_sq + epsilon)`.
     rmsnorm_epsilon: f32,
     last_call_capture_safe: AtomicBool,
-    /// Reusable Float16 staging arena for the BFloat16 activation path.
-    bf16_scratch: Mutex<Bf16Scratch>,
-    /// Persistent Float16 staging of the BFloat16 *constant* inputs (scales,
-    /// gamma) so they are cast once rather than re-cast every decode step.
+    /// Persistent Float16 staging of proven immutable BFloat16 scales, so they
+    /// are cast once rather than re-cast every decode step.
     bf16_const_cache: Mutex<Bf16ConstCache>,
 }
 
@@ -7034,10 +7213,6 @@ impl MatMulNBitsKernel {
     ) -> Result<()> {
         self.last_call_capture_safe.store(false, Ordering::Relaxed);
         self.marlin_repack_cache.begin_call();
-        self.bf16_scratch
-            .lock()
-            .map_err(|_| error("BFloat16 scratch lock poisoned"))?
-            .begin_call();
         self.bf16_const_cache
             .lock()
             .map_err(|_| error("BFloat16 constant cache lock poisoned"))?
@@ -7051,10 +7226,11 @@ impl MatMulNBitsKernel {
             )));
         }
         if inputs[0].dtype == DataType::Float16 {
-            if self.gate_up_swiglu {
-                return self.run_f16_gate_up_swiglu(inputs, outputs, workspace);
-            }
-            return self.run_f16(inputs, outputs, workspace);
+            return self.dispatch_f16(
+                inputs,
+                outputs,
+                self.bind_prefill_workspace(inputs, workspace)?,
+            );
         }
         if inputs[0].dtype == DataType::BFloat16 {
             return self.run_bf16(inputs, outputs, workspace);
@@ -7444,7 +7620,9 @@ impl MatMulNBitsKernel {
         {
             return false;
         }
-        let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
+        let Ok(m) = checked_matmul_rows(a_shape) else {
+            return false;
+        };
         if m == 1 && !group_indices_present {
             return false;
         }
@@ -7471,18 +7649,131 @@ impl MatMulNBitsKernel {
         {
             return false;
         }
-        let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
+        let Ok(m) = checked_matmul_rows(a_shape) else {
+            return false;
+        };
+        if f16_decode_row_loop(
+            m,
+            self.k,
+            self.gate_up_swiglu,
+            self.rmsnorm_prologue,
+            self.decomposed_silu,
+            decode_gemv_loop_max_m(),
+        ) {
+            return false;
+        }
         // Deliberately looser than the launch-site gates: this only has to be an
         // upper bound. Declaring a workspace a call turns out not to need costs
         // nothing, whereas under-declaring makes `governed_gemm_ex` fail at
         // launch — after the dequantize has already run — and silently fall back.
-        dequant_f16_gemm_enabled()
+        m > 1
+            && dequant_f16_gemm_enabled()
             && m >= dequant_f16_gemm_min_m()
             && self.k.saturating_mul(self.n).saturating_mul(2)
                 <= dequant_f16_gemm_max_scratch_bytes()
     }
 
+    fn workspace_layout_for(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+    ) -> Result<MatMulNBitsWorkspaceLayout> {
+        let a = inputs.first();
+        let m = match a {
+            Some(a) if a.shape.last() == Some(&self.k) => checked_matmul_rows(a.shape)?,
+            _ => 0,
+        };
+        let blas = self.blas_workspace_requirement_for(inputs)?;
+        let prefill = MatMulPrefillGeometry {
+            dtype: a.map_or(DataType::Undefined, |a| a.dtype),
+            m,
+            k: self.k,
+            n: self.n,
+            gate_up: self.gate_up_swiglu,
+            rmsnorm: self.rmsnorm_prologue,
+            decomposed_silu: self.decomposed_silu,
+        }
+        .regions(
+            decode_gemv_loop_max_m(),
+            usize::try_from(blas.bytes)
+                .map_err(|_| error("BLAS workspace exceeds usize; reduce prefill dimensions"))?,
+        )?;
+        let output_elements = if a.is_some_and(|a| a.dtype == DataType::BFloat16) {
+            m.checked_mul(self.n).ok_or_else(|| {
+                error("BF16 result element count overflows; reduce the output shape")
+            })?
+        } else {
+            0
+        };
+        MatMulNBitsWorkspaceLayout::new(
+            prefill,
+            inputs,
+            &self.constant_inputs,
+            self.gate_up_swiglu,
+            output_elements,
+        )
+    }
+
     fn workspace_requirement_for(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
+        let layout = self.workspace_layout_for(inputs)?;
+        Ok(blas::governed_workspace_requirement(layout.bytes()))
+    }
+
+    fn bind_prefill_workspace(
+        &self,
+        inputs: &[TensorView],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<MatMulNBitsWorkspaceParts> {
+        // Single-token/empty half routes cannot reach a prefill or BLAS launch.
+        // Keep their established hot path free of metadata construction/planning.
+        let a = inputs
+            .first()
+            .ok_or_else(|| error("workspace binding requires activation input A"))?;
+        let m = if a.shape.last() == Some(&self.k) {
+            checked_matmul_rows(a.shape)?
+        } else {
+            0
+        };
+        if m <= 1
+            || f16_decode_row_loop(
+                m,
+                self.k,
+                self.gate_up_swiglu,
+                self.rmsnorm_prologue,
+                self.decomposed_silu,
+                decode_gemv_loop_max_m(),
+            )
+        {
+            return Ok(MatMulNBitsWorkspaceParts::EMPTY);
+        }
+        Ok(self.bind_workspace(inputs, workspace)?.prefill)
+    }
+
+    fn bind_workspace(
+        &self,
+        inputs: &[TensorView],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<MatMulNBitsWorkspaceBinding> {
+        // The concrete kernel accepts at most the positional facts it stores.
+        // Keep runtime refinement on the stack, including single-token decode.
+        if inputs.len() > self.constant_inputs.len() {
+            return Err(error(
+                "too many inputs to bind MatMulNBits workspace; use the declared fusion signature",
+            ));
+        }
+        let metadata: [_; MATMUL_MAX_INPUTS] = std::array::from_fn(|index| {
+            inputs
+                .get(index)
+                .map(|input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()))
+                .unwrap_or(TensorMetadata::new(DataType::Undefined, &[], false))
+        });
+        self.workspace_layout_for(&metadata[..inputs.len()])?
+            .bind(workspace)
+    }
+
+    fn blas_workspace_requirement_for(
         &self,
         inputs: &[TensorMetadata<'_>],
     ) -> Result<WorkspaceRequirement> {
@@ -7507,7 +7798,7 @@ impl MatMulNBitsKernel {
         } else {
             return Ok(WorkspaceRequirement::NONE);
         };
-        let m = a.shape[..a.shape.len() - 1].iter().product::<usize>();
+        let m = checked_matmul_rows(a.shape)?;
         if dtype == GemmDtype::F16 {
             // Take the larger of the bias and no-bias plans rather than trying to
             // predict which the launch will pick: the requirement only has to be
@@ -7543,6 +7834,21 @@ impl MatMulNBitsKernel {
         Ok(blas::governed_workspace_requirement(bytes))
     }
 
+    /// Route already-initialized FP16 execution without resetting resources.
+    /// BF16 staging holds its arena borrow while entering this same dispatch.
+    fn dispatch_f16(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        parts: MatMulNBitsWorkspaceParts,
+    ) -> Result<()> {
+        if self.gate_up_swiglu {
+            self.run_f16_gate_up_swiglu(inputs, outputs, parts)
+        } else {
+            self.run_f16(inputs, outputs, parts)
+        }
+    }
+
     /// BFloat16-activation path. The tuned int4/int8 GEMV/GEMM kernels are
     /// implemented for Float16 and Float32 activations only, so BFloat16 inputs
     /// are staged through Float16: every BFloat16 operand (activation, scales,
@@ -7554,7 +7860,8 @@ impl MatMulNBitsKernel {
     /// weights (the memory-bound term in decode) keep their int4/int8 layout, so
     /// the extra work is a handful of pointwise casts per node. Float16 losslessly
     /// represents the post-normalization magnitudes MatMulNBits consumes here.
-    /// The per-call scratch means this path is not graph-capture safe.
+    /// Capture eligibility follows the selected FP16 route and its retained
+    /// staging resources; conversion contents are refreshed for dynamic inputs.
     fn run_bf16(
         &self,
         inputs: &[TensorView],
@@ -7564,121 +7871,110 @@ impl MatMulNBitsKernel {
         require_dtype("A", inputs[0].dtype, DataType::BFloat16)?;
         require_dtype("Y", outputs[0].dtype, DataType::BFloat16)?;
 
-        // The scale slots are immutable weights (general path: input 2; the
-        // gate/up SwiGLU fusion adds a second scale at input 4). They dominate
-        // the BFloat16 staging traffic (~25% of the int4 weight bytes/token for
-        // Muse-Glimmer), so stage them once into the persistent const cache and
-        // reuse across decode steps. Every other BFloat16 input is either the
-        // per-step activation (input 0) or a per-token residual bound into the
-        // bias slot — both genuinely dynamic — so they keep going through the
-        // per-call arena. Caching keys on the weight pointer + element count and
-        // never uses pointer identity for the dynamic slots (a reused activation
-        // buffer has a stable pointer but changing contents).
-        let cache_slots: &[usize] = if self.gate_up_swiglu { &[2, 4] } else { &[2] };
-        let is_cached = |index: usize, dtype: DataType| {
-            dtype == DataType::BFloat16 && cache_slots.contains(&index)
-        };
-
-        // Lay out per-call Float16 regions inside the reusable arena: one region
-        // per dynamic BFloat16 input, plus one for the Float16 result. Regions
-        // are padded so each begins aligned for the tuned fp16 kernels'
-        // vectorized loads.
-        const ALIGN: usize = 256;
-        let f16 = std::mem::size_of::<half::f16>();
-        let round = |bytes: usize| bytes.div_ceil(ALIGN) * ALIGN;
-
-        let mut offsets: Vec<Option<usize>> = Vec::with_capacity(inputs.len());
-        let mut total = 0usize;
+        let a = &inputs[0];
+        if a.is_absent() || a.shape.last() != Some(&self.k) {
+            return Err(error(format!(
+                "A must be present with trailing K={}, got {:?}; provide the activation geometry",
+                self.k, a.shape
+            )));
+        }
+        let expected_output_shape = [&a.shape[..a.shape.len() - 1], &[self.n]].concat();
+        if outputs[0].shape != expected_output_shape {
+            return Err(error(format!(
+                "Y must have shape {expected_output_shape:?}, got {:?}",
+                outputs[0].shape
+            )));
+        }
         for (index, input) in inputs.iter().enumerate() {
-            if input.dtype == DataType::BFloat16 && !is_cached(index, input.dtype) {
-                offsets.push(Some(total));
-                total += round(input.numel() * f16);
-            } else {
-                offsets.push(None);
+            if !input.is_absent() && input.dtype == DataType::BFloat16 && !input.is_contiguous() {
+                return Err(error(format!(
+                    "BF16 input {index} must be contiguous; materialize it before MatMulNBits"
+                )));
             }
         }
-        let out_off = total;
-        let out_n = outputs[0].numel();
-        total += round(out_n * f16);
+        let parts = self.bind_workspace(inputs, workspace)?;
+        if self.runtime.is_capturing()?
+            && let Some(used) = parts.used
+        {
+            self.runtime
+                .require_registered_workspace_capture(used, "MatMulNBits BF16 staging")?;
+        }
+        let cache_slots = bf16_scale_slots(self.gate_up_swiglu);
+        let is_cached = |index: usize, input: &TensorView| {
+            !input.is_absent()
+                && bf16_scale_input_is_cacheable(
+                    &self.constant_inputs,
+                    self.gate_up_swiglu,
+                    index,
+                    input.dtype,
+                )
+        };
+        let out_n = checked_matmul_rows(a.shape)?
+            .checked_mul(self.n)
+            .ok_or_else(|| error("BF16 output extent overflows; reduce the output shape"))?;
 
         // Stage the constant scale slots once into the persistent cache (this is
         // allocation-free on every call after the first warmup call, so the
         // captured decode graph only replays cache hits).
-        let cached: Vec<(usize, CUdeviceptr)> = {
-            let consts: Vec<(CUdeviceptr, usize)> = cache_slots
-                .iter()
-                .filter(|index| **index < inputs.len() && is_cached(**index, inputs[**index].dtype))
-                .map(|index| {
-                    (
-                        cuptr(inputs[*index].data_ptr::<u8>() as *const c_void) as CUdeviceptr,
-                        inputs[*index].numel(),
-                    )
-                })
-                .collect();
-            if consts.is_empty() {
-                Vec::new()
-            } else {
-                let mut cache = self
-                    .bf16_const_cache
-                    .lock()
-                    .map_err(|_| error("MatMulNBits bf16 const cache mutex poisoned"))?;
-                let ptrs = cache.staged(&consts)?;
-                cache_slots
-                    .iter()
-                    .filter(|index| {
-                        **index < inputs.len() && is_cached(**index, inputs[**index].dtype)
-                    })
-                    .zip(ptrs)
-                    .map(|(index, ptr)| (*index, ptr))
-                    .collect()
+        let mut cached = [None; MATMUL_MAX_INPUTS];
+        let mut consts = [(0, 0); BF16_MAX_CACHED_SCALES];
+        let mut indices = [0; BF16_MAX_CACHED_SCALES];
+        let mut count = 0;
+        for &index in cache_slots {
+            if let Some(input) = inputs.get(index).filter(|input| is_cached(index, input)) {
+                indices[count] = index;
+                consts[count] = (
+                    cuptr(input.data_ptr::<u8>() as *const c_void),
+                    parts.input_elements[index],
+                );
+                count += 1;
             }
-        };
-
-        // Hold the arena for the whole call: the staging casts, the reused fp16
-        // matmul, and the narrowing cast all run stream-ordered against it. The
-        // fp16 path never touches `bf16_scratch`, so this cannot deadlock.
-        let mut arena = self
-            .bf16_scratch
-            .lock()
-            .map_err(|_| error("MatMulNBits bf16 scratch mutex poisoned"))?;
-        let base = arena.ensure(total)?;
-
-        let mut f16_inputs: Vec<TensorView> = Vec::with_capacity(inputs.len());
-        for (index, (input, offset)) in inputs.iter().zip(offsets.iter()).enumerate() {
-            if let Some((_, cached_ptr)) = cached.iter().find(|(slot, _)| *slot == index) {
-                f16_inputs.push(TensorView::new(
-                    DevicePtr(raw_ptr(*cached_ptr) as *const c_void),
+        }
+        if count != 0 {
+            let mut cache = self
+                .bf16_const_cache
+                .lock()
+                .map_err(|_| error("MatMulNBits bf16 const cache mutex poisoned"))?;
+            let pointers = cache.staged(&consts[..count])?;
+            for index in 0..count {
+                cached[indices[index]] = Some(pointers[index]);
+            }
+        }
+        let mut f16_inputs = std::array::from_fn::<_, MATMUL_MAX_INPUTS, _>(|_| {
+            TensorView::absent(DataType::Undefined)
+        });
+        for (index, input) in inputs.iter().enumerate() {
+            if let Some(ptr) = cached[index] {
+                f16_inputs[index] = TensorView::new(
+                    DevicePtr(raw_ptr(ptr).cast_const()),
                     DataType::Float16,
                     input.shape,
                     input.strides,
                     input.device,
-                ));
-                continue;
-            }
-            match offset {
-                Some(off) => {
-                    let ptr = base + *off as CUdeviceptr;
-                    super::cast::launch_cast_raw(
-                        &self.runtime,
-                        cuptr(input.data_ptr::<u8>() as *const c_void),
-                        DataType::BFloat16,
-                        ptr,
-                        DataType::Float16,
-                        input.numel(),
-                    )?;
-                    f16_inputs.push(TensorView::new(
-                        DevicePtr(raw_ptr(ptr) as *const c_void),
-                        DataType::Float16,
-                        input.shape,
-                        input.strides,
-                        input.device,
-                    ));
-                }
-                None => f16_inputs.push(*input),
+                );
+            } else if let Some(region) = parts.inputs[index] {
+                let ptr = cuptr(region.ptr().0.cast_const());
+                super::cast::launch_cast_raw(
+                    &self.runtime,
+                    cuptr(input.data_ptr::<u8>() as *const c_void),
+                    DataType::BFloat16,
+                    ptr,
+                    DataType::Float16,
+                    parts.input_elements[index],
+                )?;
+                f16_inputs[index] = TensorView::new(
+                    DevicePtr(raw_ptr(ptr).cast_const()),
+                    DataType::Float16,
+                    input.shape,
+                    input.strides,
+                    input.device,
+                );
+            } else {
+                f16_inputs[index] = *input;
             }
         }
-
-        let out_ptr = base + out_off as CUdeviceptr;
+        let result = parts.result.ok_or_else(|| error("BF16 staging result region is absent; query and pass the BF16 workspace requirement"))?;
+        let out_ptr = cuptr(result.ptr().0.cast_const());
         let out_shape = outputs[0].shape;
         let out_strides = outputs[0].strides;
         let out_device = outputs[0].device;
@@ -7702,7 +7998,13 @@ impl MatMulNBitsKernel {
             taken: false,
         });
         let previous = BF16_DIRECT_OUT.with(|cell| cell.replace(offer));
-        let run_result = self.run(&f16_inputs, std::slice::from_mut(&mut y_f16), workspace);
+        // Do not restart call initialization: preserve constant-resource use
+        // facts and carry the already-bound prefill/BLAS regions through dispatch.
+        let run_result = self.dispatch_f16(
+            &f16_inputs[..inputs.len()],
+            std::slice::from_mut(&mut y_f16),
+            parts.prefill,
+        );
         let settled = BF16_DIRECT_OUT.with(|cell| cell.replace(previous));
         run_result?;
         if !settled.is_some_and(|offer| offer.taken) {
@@ -7715,12 +8017,8 @@ impl MatMulNBitsKernel {
                 out_n,
             )?;
         }
-        // Capture-safety is inherited from the staged fp16 run: the M==1 decode
-        // GEMV is capture-safe, and the staging casts add only allocation-free,
-        // sync-free stream launches against the persistent arena (which is grown
-        // once, before capture). Prefill (M>1) leaves the flag cleared. So the
-        // flag `run` set during recursion is exactly right — do not override it.
-        drop(arena);
+        // Preserve the capture-eligibility flag set by the selected FP16 route.
+        // Staging casts are ordered against caller backing and constant owners.
         Ok(())
     }
 
@@ -7731,7 +8029,7 @@ impl MatMulNBitsKernel {
         &self,
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
-        workspace: Option<WorkspaceView>,
+        parts: MatMulNBitsWorkspaceParts,
     ) -> Result<()> {
         require_dtype("A", inputs[0].dtype, DataType::Float16)?;
         require_dtype("B", inputs[1].dtype, DataType::Uint8)?;
@@ -7818,7 +8116,8 @@ impl MatMulNBitsKernel {
             }
         }
 
-        let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
+        let m = checked_matmul_rows(a_shape)?;
+        let workspace = parts.blas;
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             let mut flops = (m as u64)
                 .saturating_mul(self.n as u64)
@@ -7851,6 +8150,11 @@ impl MatMulNBitsKernel {
             ));
         }
 
+        if m == 0 {
+            self.last_call_capture_safe.store(false, Ordering::Relaxed);
+            return Ok(());
+        }
+
         if m > 1 {
             // Small-batch decode fast path: for M within the crossover bound,
             // reuse the capture-safe single-row decode GEMV once per row instead
@@ -7869,11 +8173,14 @@ impl MatMulNBitsKernel {
             // sync-free, so the batch decode graph captures and replays it.
             // Streaming: the resident weight is read M times from VRAM, not
             // re-streamed, so the weight-offload HtoD 1/N amortization is intact.
-            if m <= decode_gemv_loop_max_m()
-                && decode_gemv_loop_rows_aligned(self.k)
-                && !self.gate_up_swiglu
-                && !self.decomposed_silu
-            {
+            if f16_decode_row_loop(
+                m,
+                self.k,
+                self.gate_up_swiglu,
+                self.rmsnorm_prologue,
+                self.decomposed_silu,
+                decode_gemv_loop_max_m(),
+            ) {
                 onnx_runtime_ep_api::record_kernel_variant!(
                     "gemv_f16_batched_loop",
                     "M={} small-batch decode: {} single-row decode GEMV launches (one per row), \
@@ -8127,6 +8434,7 @@ impl MatMulNBitsKernel {
                     m,
                     k_blocks,
                     bias_row_stride,
+                    parts.normalized,
                 );
             }
             onnx_runtime_ep_api::record_kernel_variant!(
@@ -8759,7 +9067,7 @@ impl MatMulNBitsKernel {
     /// per-token normalized activation (byte-identical to the standalone
     /// `skip_rmsnorm_f16_warp_half4` output) into scratch, then runs the
     /// portable tiled GEMM over it. Prefill is outside the persistent decode
-    /// graph, so the scratch allocation here is not on any captured path.
+    /// graph; normalized activation borrows the prepared composite workspace.
     #[allow(clippy::too_many_arguments)]
     fn launch_f16_gemm_rmsnorm_prefill(
         &self,
@@ -8773,10 +9081,9 @@ impl MatMulNBitsKernel {
         m: usize,
         k_blocks: usize,
         bias_row_stride: usize,
+        normalized_workspace: WorkspaceView,
     ) -> Result<()> {
-        let scratch = self
-            .runtime
-            .alloc_raw(m * self.k * std::mem::size_of::<half::f16>())?;
+        let scratch = cuptr(normalized_workspace.ptr().0.cast_const());
         let scratch_shape = [m, self.k];
         let scratch_strides = [self.k as i64, 1];
         let normalized = TensorView::new(
@@ -8786,27 +9093,20 @@ impl MatMulNBitsKernel {
             &scratch_strides,
             activation.device,
         );
-        let result = self
-            .launch_rmsnorm_prefill(activation, gamma, scratch, m)
-            .and_then(|()| {
-                self.launch_f16_gemm(
-                    &normalized,
-                    packed,
-                    scales,
-                    true,
-                    zero_points,
-                    bias,
-                    output,
-                    m,
-                    k_blocks,
-                    self.block_size * self.bits / 8,
-                    bias_row_stride,
-                )
-            });
-        // SAFETY: `scratch` came from `alloc_raw` above and is freed exactly
-        // once; `cuMemFree` waits for the preceding norm + GEMM stream work.
-        let free_scratch = unsafe { self.runtime.free_raw(scratch) };
-        result.and(free_scratch)
+        self.launch_rmsnorm_prefill(activation, gamma, scratch, m)?;
+        self.launch_f16_gemm(
+            &normalized,
+            packed,
+            scales,
+            true,
+            zero_points,
+            bias,
+            output,
+            m,
+            k_blocks,
+            self.block_size * self.bits / 8,
+            bias_row_stride,
+        )
     }
 
     /// Launches the standalone RMS-normalization prologue used by prefill. One
@@ -9073,7 +9373,7 @@ impl MatMulNBitsKernel {
         &self,
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
-        workspace: Option<WorkspaceView>,
+        parts: MatMulNBitsWorkspaceParts,
     ) -> Result<()> {
         // Contract from `CudaGateUpSwiGluFusion`:
         //   [x, W_gate, scales_gate, W_up, scales_up, (gamma?)@5, (zp_gate?)@6, (zp_up?)@7]
@@ -9117,7 +9417,7 @@ impl MatMulNBitsKernel {
                 self.k, a_shape
             )));
         }
-        let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
+        let m = checked_matmul_rows(a_shape)?;
         let expected_output_shape = [&a_shape[..a_shape.len() - 1], &[self.n]].concat();
         if outputs[0].shape != expected_output_shape {
             return Err(error(format!(
@@ -9180,6 +9480,7 @@ impl MatMulNBitsKernel {
                 )));
             }
         }
+        let workspace = parts.blas;
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             let rows = m as u64;
             let mut flops = rows
@@ -9237,9 +9538,14 @@ impl MatMulNBitsKernel {
             // decode-GEMV would change plain-path logits vs the two-op path by
             // more than 1 ULP. It stays on the prefill/Marlin path (advertised
             // capture-unsafe at M>1) pending a decision on that bound in #1334.
-            if m <= decode_gemv_loop_max_m()
-                && decode_gemv_loop_rows_aligned(self.k)
-                && let Some(gamma) = gamma
+            if f16_decode_row_loop(
+                m,
+                self.k,
+                self.gate_up_swiglu,
+                self.rmsnorm_prologue,
+                self.decomposed_silu,
+                decode_gemv_loop_max_m(),
+            ) && let Some(gamma) = gamma
             {
                 onnx_runtime_ep_api::record_kernel_variant!(
                     "gate_up_swiglu_rmsnorm_batched_loop",
@@ -9409,6 +9715,8 @@ impl MatMulNBitsKernel {
                     m,
                     k_blocks,
                     zp_row_bytes,
+                    parts.normalized,
+                    parts.gate,
                 );
             }
             onnx_runtime_ep_api::record_kernel_variant!(
@@ -9429,6 +9737,7 @@ impl MatMulNBitsKernel {
                 &mut outputs[0],
                 m,
                 k_blocks,
+                parts.gate,
             );
         }
 
@@ -9493,8 +9802,9 @@ impl MatMulNBitsKernel {
         output: &mut TensorMut,
         m: usize,
         k_blocks: usize,
+        gate_workspace: WorkspaceView,
     ) -> Result<()> {
-        let scratch = self.runtime.alloc_raw(output.byte_size())?;
+        let scratch = cuptr(gate_workspace.ptr().0.cast_const());
         let scratch_shape = output.shape.to_vec();
         let scratch_strides = output.strides.to_vec();
         let mut gate_output = TensorMut::new(
@@ -9505,49 +9815,41 @@ impl MatMulNBitsKernel {
             output.device,
         );
 
-        let result = (|| {
-            self.launch_f16_gemm(
-                activation,
-                packed_gate,
-                scales_gate,
-                true,
-                zp_gate,
-                None,
-                &mut gate_output,
-                m,
-                k_blocks,
-                self.block_size * self.bits / 8,
-                0,
-            )?;
-            self.launch_f16_gemm(
-                activation,
-                packed_up,
-                scales_up,
-                true,
-                zp_up,
-                None,
-                output,
-                m,
-                k_blocks,
-                self.block_size * self.bits / 8,
-                0,
-            )?;
-            let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
-            crate::kernels::elementwise::launch_silu_mul_f16_raw(
-                &self.runtime,
-                scratch,
-                output_ptr,
-                output_ptr,
-                output.numel(),
-                self.decomposed_silu,
-            )
-        })();
-
-        // Always release the prefill gate projection. `cuMemFree` waits for
-        // preceding stream work that uses this allocation, including SiluMul.
-        // SAFETY: `scratch` came from `alloc_raw` above and is freed exactly once.
-        let free_scratch = unsafe { self.runtime.free_raw(scratch) };
-        result.and(free_scratch)
+        self.launch_f16_gemm(
+            activation,
+            packed_gate,
+            scales_gate,
+            true,
+            zp_gate,
+            None,
+            &mut gate_output,
+            m,
+            k_blocks,
+            self.block_size * self.bits / 8,
+            0,
+        )?;
+        self.launch_f16_gemm(
+            activation,
+            packed_up,
+            scales_up,
+            true,
+            zp_up,
+            None,
+            output,
+            m,
+            k_blocks,
+            self.block_size * self.bits / 8,
+            0,
+        )?;
+        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        crate::kernels::elementwise::launch_silu_mul_f16_raw(
+            &self.runtime,
+            scratch,
+            output_ptr,
+            output_ptr,
+            output.numel(),
+            self.decomposed_silu,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9750,8 +10052,8 @@ impl MatMulNBitsKernel {
     /// Normalizes each token row into scratch (byte-identical to
     /// `skip_rmsnorm_f16_warp_half4`), then runs the standard paired gate/up
     /// SwiGLU prefill over the normalized activation. Prefill is outside the
-    /// persistent decode graph, so the scratch allocation is not on any captured
-    /// path.
+    /// persistent decode graph; normalization and gate output borrow disjoint
+    /// regions of the prepared composite workspace.
     #[allow(clippy::too_many_arguments)]
     fn launch_gate_up_swiglu_rmsnorm_prefill(
         &self,
@@ -9767,10 +10069,10 @@ impl MatMulNBitsKernel {
         m: usize,
         k_blocks: usize,
         _zp_row_bytes: usize,
+        normalized_workspace: WorkspaceView,
+        gate_workspace: WorkspaceView,
     ) -> Result<()> {
-        let scratch = self
-            .runtime
-            .alloc_raw(m * self.k * std::mem::size_of::<half::f16>())?;
+        let scratch = cuptr(normalized_workspace.ptr().0.cast_const());
         let scratch_shape = [m, self.k];
         let scratch_strides = [self.k as i64, 1];
         let normalized = TensorView::new(
@@ -9780,26 +10082,20 @@ impl MatMulNBitsKernel {
             &scratch_strides,
             activation.device,
         );
-        let result = self
-            .launch_rmsnorm_prefill(activation, gamma, scratch, m)
-            .and_then(|()| {
-                self.launch_gate_up_swiglu_prefill(
-                    &normalized,
-                    packed_gate,
-                    scales_gate,
-                    packed_up,
-                    scales_up,
-                    zp_gate,
-                    zp_up,
-                    output,
-                    m,
-                    k_blocks,
-                )
-            });
-        // SAFETY: `scratch` came from `alloc_raw` above and is freed exactly
-        // once; `cuMemFree` waits for the preceding norm + GEMM stream work.
-        let free_scratch = unsafe { self.runtime.free_raw(scratch) };
-        result.and(free_scratch)
+        self.launch_rmsnorm_prefill(activation, gamma, scratch, m)?;
+        self.launch_gate_up_swiglu_prefill(
+            &normalized,
+            packed_gate,
+            scales_gate,
+            packed_up,
+            scales_up,
+            zp_gate,
+            zp_up,
+            output,
+            m,
+            k_blocks,
+            gate_workspace,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -11173,7 +11469,11 @@ impl Kernel for MatMulNBitsKernel {
         self.run(inputs, outputs, None)
     }
 
-    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
         self.workspace_requirement_for(inputs)
     }
 
@@ -11196,11 +11496,6 @@ impl Kernel for MatMulNBitsKernel {
             && let Ok(workspace) = workspace.lock()
         {
             resources.push(workspace.device_graph_resource());
-        }
-        if let Ok(scratch) = self.bf16_scratch.lock()
-            && let Some(resource) = scratch.device_graph_resource()
-        {
-            resources.push(resource);
         }
         if let Ok(cache) = self.bf16_const_cache.lock()
             && let Some(resource) = cache.device_graph_resource()
@@ -11326,6 +11621,637 @@ mod tests {
     use onnx_runtime_ir::{DataType, DeviceId};
 
     use super::*;
+
+    /// These ignored Marlin probes mutate process-wide dispatch settings and
+    /// must be invoked serially (--test-threads=1), like their Marlin flag arms.
+    struct TiledMarlinRoute(std::option::Option<std::ffi::OsString>);
+    impl TiledMarlinRoute {
+        fn select() -> Self {
+            let old = std::env::var_os("ONNX_GENAI_DEQUANT_F16_GEMM");
+            // SAFETY: only serial, explicitly ignored device probes select this arm.
+            unsafe {
+                std::env::set_var("ONNX_GENAI_DEQUANT_F16_GEMM", "0");
+            }
+            Self(old)
+        }
+    }
+    impl Drop for TiledMarlinRoute {
+        fn drop(&mut self) {
+            // SAFETY: restore before leaving the serial device probe, including unwind.
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var("ONNX_GENAI_DEQUANT_F16_GEMM", value),
+                    None => std::env::remove_var("ONNX_GENAI_DEQUANT_F16_GEMM"),
+                }
+            }
+        }
+    }
+
+    /// Numerical fixtures own real backing through completion, without a kernel
+    /// allocation fallback. Zero-requirement decode fixtures add no allocation.
+    fn run_with_prepared_workspace(
+        kernel: &MatMulNBitsKernel,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+    ) -> Result<()> {
+        let metadata = inputs
+            .iter()
+            .map(|input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()))
+            .collect::<Vec<_>>();
+        let requirement = kernel.workspace_requirement_for(&metadata)?;
+        let owner = if requirement.bytes == 0 {
+            None
+        } else {
+            Some(GraphDeviceAllocation::allocate(
+                &kernel.runtime,
+                usize::try_from(requirement.bytes)
+                    .map_err(|_| error("test workspace size exceeds usize"))?,
+            )?)
+        };
+        let view = owner.as_ref().map(|owner| {
+            WorkspaceView::new(
+                DevicePtrMut(raw_ptr(owner.ptr())),
+                requirement.bytes as usize,
+            )
+        });
+        let result = kernel.run(inputs, outputs, view);
+        let completion = if owner.is_some() {
+            // Fixture completion must not inherit the optional eager-sync defer policy.
+            kernel
+                .runtime
+                .stream()
+                .synchronize()
+                .map_err(|error| driver_err("complete MatMulNBits workspace fixture", error))
+        } else {
+            Ok(())
+        };
+        match (result, completion) {
+            (Err(error), Err(completion)) => Err(super::error(format!(
+                "fixture execution failed: {error}; workspace completion also failed: {completion}"
+            ))),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+            _ => Ok(()),
+        }
+    }
+
+    #[test]
+    fn bf16_workspace_staging_preserves_optional_slots_and_excludes_constant_scales() {
+        let inputs = [
+            TensorMetadata::new(DataType::BFloat16, &[1, 16], true),
+            TensorMetadata::new(DataType::Uint8, &[8, 1, 16], true),
+            TensorMetadata::new(DataType::BFloat16, &[8, 1], true),
+            TensorMetadata::new(DataType::Uint8, &[8, 1, 16], true),
+            TensorMetadata::new(DataType::BFloat16, &[8, 1], true),
+            TensorMetadata::new(DataType::BFloat16, &[], false),
+            TensorMetadata::new(DataType::BFloat16, &[], true),
+        ];
+        let prefill = MatMulPrefillGeometry {
+            dtype: DataType::BFloat16,
+            m: 1,
+            k: 16,
+            n: 8,
+            gate_up: true,
+            rmsnorm: false,
+            decomposed_silu: false,
+        }
+        .regions(8, 0)
+        .unwrap();
+        let mut facts = [false; MATMUL_MAX_INPUTS];
+        facts[2] = true;
+        let layout = MatMulNBitsWorkspaceLayout::new(prefill, &inputs, &facts, true, 8).unwrap();
+        assert_eq!(layout.bytes(), 784);
+        #[repr(align(256))]
+        struct Backing([u8; 1280]);
+        let mut backing = Backing([0; 1280]);
+        let view = WorkspaceView::new(DevicePtrMut(backing.0.as_mut_ptr().cast()), 1280);
+        let parts = layout.bind(Some(view)).unwrap();
+        assert_eq!(parts.inputs[0].unwrap().bytes(), 32);
+        assert!(parts.inputs[2].is_none());
+        assert_eq!(parts.inputs[4].unwrap().bytes(), 16);
+        assert!(
+            parts.inputs[5].is_none(),
+            "absent BF16 scalar must not become a cast target"
+        );
+        assert_eq!(
+            parts.inputs[6].unwrap().bytes(),
+            2,
+            "present scalar still converts"
+        );
+        assert_eq!(parts.result.unwrap().bytes(), 16);
+        assert_eq!(parts.used.unwrap().bytes(), layout.bytes());
+        let start = view.ptr().0 as usize;
+        assert_eq!(parts.inputs[4].unwrap().ptr().0 as usize - start, 256);
+        assert_eq!(parts.inputs[6].unwrap().ptr().0 as usize - start, 512);
+        assert_eq!(parts.result.unwrap().ptr().0 as usize - start, 768);
+        assert!(layout.bind(None).is_err());
+        assert!(
+            layout
+                .bind(Some(WorkspaceView::new(view.ptr(), layout.bytes() - 1)))
+                .is_err()
+        );
+        assert!(
+            layout
+                .bind(Some(WorkspaceView::new(
+                    DevicePtrMut(backing.0.as_mut_ptr().wrapping_add(1).cast()),
+                    layout.bytes()
+                )))
+                .is_err()
+        );
+        facts[2] = false;
+        facts[4] = true;
+        let mixed = MatMulNBitsWorkspaceLayout::new(prefill, &inputs, &facts, true, 8).unwrap();
+        let parts = mixed.bind(Some(view)).unwrap();
+        assert!(parts.inputs[2].is_some());
+        assert!(parts.inputs[4].is_none());
+    }
+
+    #[test]
+    fn bf16_workspace_staging_coexists_with_prefill_and_rejects_overflow() {
+        let geometry = MatMulPrefillGeometry {
+            dtype: DataType::BFloat16,
+            m: 9,
+            k: 16,
+            n: 24,
+            gate_up: true,
+            rmsnorm: true,
+            decomposed_silu: false,
+        };
+        let inputs = [
+            TensorMetadata::new(DataType::BFloat16, &[9, 16], true),
+            TensorMetadata::new(DataType::Uint8, &[24, 1, 16], true),
+            TensorMetadata::new(DataType::BFloat16, &[24, 1], true),
+        ];
+        let layout = MatMulNBitsWorkspaceLayout::new(
+            geometry.regions(8, 96).unwrap(),
+            &inputs,
+            &[false; 8],
+            true,
+            9 * 24,
+        )
+        .unwrap();
+        #[repr(align(256))]
+        struct Backing([u8; 4096]);
+        let mut backing = Backing([0; 4096]);
+        let parts = layout
+            .bind(Some(WorkspaceView::new(
+                DevicePtrMut(backing.0.as_mut_ptr().cast()),
+                4096,
+            )))
+            .unwrap();
+        let mut regions = vec![
+            parts.prefill.normalized,
+            parts.prefill.gate,
+            parts.prefill.blas.unwrap(),
+        ];
+        regions.extend(parts.inputs.into_iter().flatten());
+        regions.push(parts.result.unwrap());
+        for pair in regions.windows(2) {
+            assert!(pair[0].ptr().0 as usize + pair[0].bytes() <= pair[1].ptr().0 as usize);
+        }
+        assert_eq!(parts.prefill.blas.unwrap().bytes(), 96);
+        let empty = MatMulPrefillGeometry {
+            dtype: DataType::Float16,
+            m: 1,
+            ..geometry
+        }
+        .regions(8, 0)
+        .unwrap();
+        assert_eq!(
+            MatMulNBitsWorkspaceLayout::new(
+                empty,
+                &[TensorMetadata::new(DataType::Float16, &[1, 16], true)],
+                &[],
+                false,
+                24
+            )
+            .unwrap()
+            .bytes(),
+            0
+        );
+        assert!(
+            MatMulNBitsWorkspaceLayout::new(
+                empty,
+                &[TensorMetadata::new(
+                    DataType::BFloat16,
+                    &[usize::MAX, 2],
+                    true
+                )],
+                &[],
+                false,
+                24
+            )
+            .is_err()
+        );
+        assert!(
+            MatMulNBitsWorkspaceLayout::new(
+                empty,
+                &[TensorMetadata::new(DataType::BFloat16, &[1], true)],
+                &[],
+                false,
+                usize::MAX
+            )
+            .is_err()
+        );
+        assert_eq!(
+            checked_staging_elements(&[usize::MAX, usize::MAX, 0]).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn bf16_workspace_staging_has_no_private_arena_and_checks_capture_before_casts() {
+        let source = include_str!("matmul_nbits.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        assert!(!source.contains("struct Bf16Scratch"));
+        assert!(!source.contains("bf16_scratch:"));
+        let body = source
+            .split_once("    fn run_bf16(")
+            .unwrap()
+            .1
+            .split_once("    /// Direct fp16-activation")
+            .unwrap()
+            .0;
+        assert!(
+            body.find("require_registered_workspace_capture").unwrap()
+                < body.find("cache.staged").unwrap()
+        );
+        assert!(
+            body.find("require_registered_workspace_capture").unwrap()
+                < body.find("launch_cast_raw").unwrap()
+        );
+        assert!(!body.contains("Vec<"));
+    }
+
+    #[test]
+    fn prefill_workspace_regions_cover_fallbacks_without_charging_decode() {
+        let base = MatMulPrefillGeometry {
+            dtype: DataType::Float16,
+            m: 9,
+            k: 16,
+            n: 24,
+            gate_up: true,
+            rmsnorm: true,
+            decomposed_silu: false,
+        };
+        for dtype in [DataType::Float16, DataType::BFloat16] {
+            let geometry = MatMulPrefillGeometry { dtype, ..base };
+            let layout = geometry.layout(8, 96).unwrap();
+            assert_eq!(layout.bytes(), 1120);
+            #[repr(align(256))]
+            struct Backing([u8; 1280]);
+            let mut backing = Backing([0; 1280]);
+            let view = WorkspaceView::new(DevicePtrMut(backing.0.as_mut_ptr().cast()), 1280);
+            let [normalized, gate, blas] = layout.bind(Some(view)).unwrap();
+            assert_eq!(
+                [normalized.bytes(), gate.bytes(), blas.bytes()],
+                [288, 432, 96]
+            );
+            let start = view.ptr().0 as usize;
+            assert_eq!(gate.ptr().0 as usize - start, 512);
+            assert_eq!(blas.ptr().0 as usize - start, 1024);
+            assert!(layout.bind(None).is_err());
+            assert!(
+                layout
+                    .bind(Some(WorkspaceView::new(view.ptr(), layout.bytes() - 1)))
+                    .is_err()
+            );
+            assert!(
+                layout
+                    .bind(Some(WorkspaceView::new(
+                        DevicePtrMut(backing.0.as_mut_ptr().wrapping_add(1).cast()),
+                        layout.bytes()
+                    )))
+                    .is_err()
+            );
+            for m in [0, 1, 2, 8] {
+                let layout = MatMulPrefillGeometry { m, ..geometry }
+                    .layout(8, 0)
+                    .unwrap();
+                assert_eq!(
+                    layout.bytes(),
+                    0,
+                    "M={m} should not reserve prefill scratch"
+                );
+                assert!(layout.bind(None).is_ok());
+            }
+            // Plain gate/up has no row-loop equivalent; small M still needs gate output.
+            let layout = MatMulPrefillGeometry {
+                m: 2,
+                rmsnorm: false,
+                ..geometry
+            }
+            .layout(8, 0)
+            .unwrap();
+            assert_eq!(layout.bytes(), 256);
+            // A row stride not aligned for vector loads must fund the prefill fallback.
+            let layout = MatMulPrefillGeometry {
+                m: 2,
+                k: 15,
+                ..geometry
+            }
+            .layout(8, 0)
+            .unwrap();
+            assert!(layout.bytes() > 0);
+            let layout = MatMulPrefillGeometry {
+                gate_up: false,
+                ..geometry
+            }
+            .layout(8, 0)
+            .unwrap();
+            assert_eq!(layout.bytes(), 512);
+        }
+        let f32_layout = MatMulPrefillGeometry {
+            dtype: DataType::Float32,
+            ..base
+        }
+        .layout(8, 96)
+        .unwrap();
+        assert_eq!(
+            f32_layout.bytes(),
+            96,
+            "f32 BLAS layout retains offset zero"
+        );
+        assert!(
+            MatMulPrefillGeometry {
+                m: usize::MAX,
+                ..base
+            }
+            .layout(8, 0)
+            .is_err()
+        );
+        assert!(base.layout(8, isize::MAX as usize).is_err());
+        assert_eq!(
+            checked_matmul_rows(&[usize::MAX, usize::MAX, 0, 16]).unwrap(),
+            0
+        );
+        assert!(checked_matmul_rows(&[usize::MAX, 2, 16]).is_err());
+    }
+
+    #[test]
+    fn prefill_workspace_row_loop_classification_is_shared_with_execution() {
+        for limit in [1, 8, 32] {
+            for m in [0, 1, 2, 8, 9, 33] {
+                for k in [15, 16, 24] {
+                    for gate_up in [false, true] {
+                        for rmsnorm in [false, true] {
+                            for decomposed_silu in [false, true] {
+                                let looped = f16_decode_row_loop(
+                                    m,
+                                    k,
+                                    gate_up,
+                                    rmsnorm,
+                                    decomposed_silu,
+                                    limit,
+                                );
+                                assert_eq!(
+                                    looped,
+                                    m > 1
+                                        && m <= limit
+                                        && k % 8 == 0
+                                        && if gate_up { rmsnorm } else { !decomposed_silu }
+                                );
+                                let geometry = MatMulPrefillGeometry {
+                                    dtype: DataType::Float16,
+                                    m,
+                                    k,
+                                    n: 7,
+                                    gate_up,
+                                    rmsnorm,
+                                    decomposed_silu,
+                                };
+                                let layout = geometry.layout(limit, 0).unwrap();
+                                if m <= 1 || looped || (!gate_up && !rmsnorm) {
+                                    assert_eq!(layout.bytes(), 0);
+                                } else {
+                                    assert!(layout.bytes() > 0);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable gpu-tests"
+    )]
+    #[test]
+    fn prefill_workspace_empty_half_routes_preserve_output_canary() {
+        let runtime = runtime().expect("empty prefill regression requires CUDA");
+        runtime
+            .require_nvrtc_half_headers("empty prefill regression")
+            .unwrap();
+        let (k, n, block_size) = (128usize, 8usize, 32usize);
+        let blocks = k / block_size;
+        let a_dev = runtime.alloc_raw(k * 2).unwrap();
+        let b_dev = runtime.alloc_raw(n * blocks * block_size / 2).unwrap();
+        let scales_dev = runtime.alloc_raw(n * blocks * 2).unwrap();
+        let gamma_dev = runtime.alloc_raw(k * 2).unwrap();
+        let y_dev = runtime.alloc_raw(n * 2).unwrap();
+        let a_shape = [0, k];
+        let a_strides = [k as i64, 1];
+        let b_shape = [n, blocks, block_size / 2];
+        let b_strides = [(blocks * block_size / 2) as i64, (block_size / 2) as i64, 1];
+        let scale_shape = [n, blocks];
+        let scale_strides = [blocks as i64, 1];
+        let gamma_shape = [k];
+        let gamma_strides = [1];
+        let y_shape = [0, n];
+        let y_strides = [n as i64, 1];
+        let device = DeviceId::cuda(0);
+        let canary = vec![0x5a5au16; n];
+        unsafe {
+            runtime
+                .htod(&vec![0x99; n * blocks * block_size / 2], b_dev)
+                .unwrap();
+        }
+        for dtype in [DataType::Float16, DataType::BFloat16] {
+            let one = if dtype == DataType::Float16 {
+                half::f16::ONE.to_bits()
+            } else {
+                half::bf16::ONE.to_bits()
+            };
+            unsafe {
+                runtime.htod(as_bytes(&vec![one; k]), a_dev).unwrap();
+                runtime
+                    .htod(as_bytes(&vec![one; n * blocks]), scales_dev)
+                    .unwrap();
+                runtime.htod(as_bytes(&vec![one; k]), gamma_dev).unwrap();
+            }
+            for gate_up in [false, true] {
+                for rmsnorm in [false, true] {
+                    let kernel = MatMulNBitsKernel {
+                        runtime: runtime.clone(),
+                        k,
+                        n,
+                        bits: 4,
+                        block_size,
+                        accuracy_level: 0,
+                        accuracy4_workspace: None,
+                        round_affine_weights: false,
+                        marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+                        constant_inputs: [false; 8],
+                        fold_bias_post_round: false,
+                        gate_up_swiglu: gate_up,
+                        decomposed_silu: false,
+                        rmsnorm_prologue: rmsnorm,
+                        rmsnorm_epsilon: 1e-5,
+                        last_call_capture_safe: AtomicBool::new(false),
+                        bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+                    };
+                    let weight = TensorView::new(
+                        device_ptr(b_dev),
+                        DataType::Uint8,
+                        &b_shape,
+                        &b_strides,
+                        device,
+                    );
+                    let scales = TensorView::new(
+                        device_ptr(scales_dev),
+                        dtype,
+                        &scale_shape,
+                        &scale_strides,
+                        device,
+                    );
+                    let gamma = TensorView::new(
+                        device_ptr(gamma_dev),
+                        dtype,
+                        &gamma_shape,
+                        &gamma_strides,
+                        device,
+                    );
+                    let mut inputs = vec![
+                        TensorView::new(device_ptr(a_dev), dtype, &a_shape, &a_strides, device),
+                        weight,
+                        scales,
+                    ];
+                    if gate_up {
+                        inputs.extend([weight, scales]);
+                    } else if rmsnorm {
+                        inputs.extend([
+                            TensorView::absent(DataType::Uint8),
+                            TensorView::absent(DataType::Int32),
+                            TensorView::absent(dtype),
+                        ]);
+                    }
+                    if rmsnorm {
+                        inputs.push(gamma);
+                    }
+                    unsafe {
+                        runtime.htod(as_bytes(&canary), y_dev).unwrap();
+                    }
+                    let mut outputs = [TensorMut::new(
+                        device_ptr_mut(y_dev),
+                        dtype,
+                        &y_shape,
+                        &y_strides,
+                        device,
+                    )];
+                    run_with_prepared_workspace(&kernel, &inputs, &mut outputs).unwrap();
+                    runtime.synchronize().unwrap();
+                    let mut got = vec![0u16; n];
+                    unsafe {
+                        runtime.dtoh(as_bytes_mut(&mut got), y_dev).unwrap();
+                    }
+                    assert_eq!(
+                        got, canary,
+                        "empty output was written: {dtype:?}, gate={gate_up}, norm={rmsnorm}"
+                    );
+                }
+            }
+        }
+        unsafe {
+            for ptr in [a_dev, b_dev, scales_dev, gamma_dev, y_dev] {
+                runtime.free_raw(ptr).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn prefill_workspace_has_no_private_temporary_allocation_fallback() {
+        let source = include_str!("matmul_nbits.rs");
+        for name in [
+            "launch_f16_gemm_rmsnorm_prefill",
+            "launch_gate_up_swiglu_prefill",
+            "launch_gate_up_swiglu_rmsnorm_prefill",
+        ] {
+            let key = format!("    fn {name}(");
+            let body = source
+                .split_once(&key)
+                .unwrap()
+                .1
+                .split_once("    #[allow(clippy::too_many_arguments)]")
+                .unwrap()
+                .0;
+            assert!(
+                !body.contains(".alloc_raw("),
+                "{name} regained private allocation"
+            );
+            assert!(
+                !body.contains(".free_raw("),
+                "{name} regained private retirement"
+            );
+        }
+    }
+
+    #[test]
+    fn bf16_staging_preserves_call_resource_initialization() {
+        let source = include_str!("matmul_nbits.rs");
+        let body = source
+            .split_once("    fn run_bf16(")
+            .unwrap()
+            .1
+            .split_once("    /// Direct fp16-activation")
+            .unwrap()
+            .0;
+        assert!(
+            !body.contains("self.run("),
+            "BF16 must not restart top-level call/resource initialization"
+        );
+        assert!(body.contains("self.dispatch_f16("));
+    }
+
+    #[test]
+    fn bf16_scale_cache_requires_exact_constant_proof_and_operand_role() {
+        for fused in [false, true] {
+            for index in 0..10 {
+                assert!(!bf16_scale_input_is_cacheable(
+                    &[],
+                    fused,
+                    index,
+                    DataType::BFloat16
+                ));
+                assert!(!bf16_scale_input_is_cacheable(
+                    &[false; 8],
+                    fused,
+                    index,
+                    DataType::BFloat16
+                ));
+                let eligible = index == 2 || (fused && index == 4);
+                assert_eq!(
+                    bf16_scale_input_is_cacheable(&[true; 8], fused, index, DataType::BFloat16),
+                    eligible
+                );
+                for dtype in [DataType::Float16, DataType::Float32, DataType::Uint8] {
+                    assert!(!bf16_scale_input_is_cacheable(
+                        &[true; 8], fused, index, dtype
+                    ));
+                }
+                let mut facts = [false; 8];
+                if index < facts.len() {
+                    facts[index] = true;
+                }
+                assert_eq!(
+                    bf16_scale_input_is_cacheable(&facts, fused, index, DataType::BFloat16),
+                    eligible
+                );
+            }
+        }
+    }
 
     #[test]
     fn marlin_repack_requires_constant_weight_inputs() {
@@ -11522,6 +12448,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     #[test]
     #[ignore = "perf microbench; requires a dedicated idle SM80+ CUDA device"]
     fn marlin_m_gt_1_op_wall_vs_tiled() {
+        let _route = TiledMarlinRoute::select();
         let Some(runtime) = runtime() else {
             eprintln!("skipping Marlin M>1 wall bench: CUDA runtime unavailable");
             return;
@@ -11618,7 +12545,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
 
@@ -11866,7 +12792,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: true,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
 
@@ -11888,7 +12813,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 &y_strides,
                 device,
             )];
-            kernel.run(&inputs, &mut outputs, None).unwrap();
+            run_with_prepared_workspace(&kernel, &inputs, &mut outputs).unwrap();
             runtime.synchronize().unwrap();
             let mut got = vec![f16::ZERO; m * n];
             // SAFETY: `output_dev` holds `m * n` fp16 values.
@@ -11942,6 +12867,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     /// cold call allocates pooled weights/scratch and is NOT capture-safe; a warm
     /// replay reuses them and IS capture-safe with byte-identical output.
     fn run_marlin_gate_up_parity(with_gamma: bool, decomposed: bool, check_capture: bool) {
+        let _route = TiledMarlinRoute::select();
         let Some(runtime) = runtime() else {
             eprintln!("skipping Marlin gate/up parity: CUDA runtime unavailable");
             return;
@@ -12116,7 +13042,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: with_gamma,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
 
@@ -12138,7 +13063,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 &y_strides,
                 device,
             )];
-            kernel.run(&inputs, &mut outputs, None).unwrap();
+            run_with_prepared_workspace(&kernel, &inputs, &mut outputs).unwrap();
             runtime.synchronize().unwrap();
             let mut got = vec![f16::ZERO; m * n];
             // SAFETY: `output_dev` holds `m * n` fp16 values.
@@ -12511,7 +13436,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
         // The default decode GEMV launch is a static grid that allocates
@@ -12522,7 +13446,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         // capture-unsafe. Hold the shared guard so the env-mutating interleave
         // test cannot flip the lever underneath this kernel run.
         let _levers = default_levers_guard();
-        kernel.run(&inputs, &mut outputs, None).unwrap();
+        run_with_prepared_workspace(&kernel, &inputs, &mut outputs).unwrap();
         runtime.synchronize().unwrap();
 
         assert!(
@@ -12717,7 +13641,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
 
@@ -12748,7 +13671,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 None => std::env::remove_var("ONNX_GENAI_ZP_SPLITK_PREFETCH"),
             }
         }
-        kernel.run(&inputs, &mut outputs, None).unwrap();
+        run_with_prepared_workspace(&kernel, &inputs, &mut outputs).unwrap();
         runtime.synchronize().unwrap();
         // `_guard` clears the levers as it drops, on the unwind path too.
         drop(_guard);
@@ -13128,6 +14051,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     #[test]
     #[ignore = "requires an SM80+ CUDA device"]
     fn marlin_m_gt_1_op_parity_and_capture_safety() {
+        let _route = TiledMarlinRoute::select();
         let Some(runtime) = runtime() else {
             eprintln!("skipping Marlin M>1 op parity: CUDA runtime unavailable");
             return;
@@ -13305,7 +14229,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
 
@@ -13324,7 +14247,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 &y_strides,
                 device,
             )];
-            kernel.run(&inputs, &mut outputs, None).unwrap();
+            run_with_prepared_workspace(&kernel, &inputs, &mut outputs).unwrap();
             runtime.synchronize().unwrap();
             let mut got = vec![f16::ZERO; m * n];
             // SAFETY: `output_dev` holds `m * n` fp16 values.
@@ -13746,7 +14669,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         }
     }
@@ -14471,10 +15393,9 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
-        kernel.run(&inputs, &mut outputs, None).unwrap();
+        run_with_prepared_workspace(&kernel, &inputs, &mut outputs).unwrap();
         runtime.synchronize().unwrap();
 
         assert!(
@@ -14627,7 +15548,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 rmsnorm_prologue: false,
                 rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
-                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
                 bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
             };
             let staged_source = format!("{GEMV_F16_SRC}\n{STAGED_DOWN_REFERENCE_SRC}");
@@ -15225,7 +16145,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 rmsnorm_prologue: false,
                 rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
-                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
                 bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
             };
 
@@ -15255,8 +16174,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 )];
                 // Warm once so scratch pools are allocated, then the measured run
                 // must report capture-safe (mirrors the M==1 decode contract).
-                kernel.run(&inputs_m, &mut outputs_m, None).unwrap();
-                kernel.run(&inputs_m, &mut outputs_m, None).unwrap();
+                run_with_prepared_workspace(&kernel, &inputs_m, &mut outputs_m).unwrap();
+                run_with_prepared_workspace(&kernel, &inputs_m, &mut outputs_m).unwrap();
                 runtime.synchronize().unwrap();
             }
             assert!(
@@ -15298,7 +16217,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                     &y_strides_1,
                     device,
                 )];
-                kernel.run(&inputs_1, &mut outputs_1, None).unwrap();
+                run_with_prepared_workspace(&kernel, &inputs_1, &mut outputs_1).unwrap();
                 runtime.synchronize().unwrap();
                 // SAFETY: `ref_out_dev` holds `n` fp16 values.
                 unsafe {
@@ -15502,7 +16421,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 rmsnorm_prologue: true,
                 rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
-                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
                 bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
             };
 
@@ -15534,9 +16452,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                     &y_strides_m,
                     device,
                 )];
-                kernel
-                    .run_f16_gate_up_swiglu(&inputs_m, &mut outputs_m, None)
-                    .unwrap();
+                run_with_prepared_workspace(&kernel, &inputs_m, &mut outputs_m).unwrap();
                 runtime.synchronize().unwrap();
             }
             assert!(
@@ -15582,9 +16498,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                     &y_strides_1,
                     device,
                 )];
-                kernel
-                    .run_f16_gate_up_swiglu(&inputs_1, &mut outputs_1, None)
-                    .unwrap();
+                run_with_prepared_workspace(&kernel, &inputs_1, &mut outputs_1).unwrap();
                 runtime.synchronize().unwrap();
                 // SAFETY: `ref_out_dev` holds `n` fp16 values.
                 unsafe {
@@ -16181,10 +17095,9 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
-        kernel.run(&inputs, &mut outputs, None).unwrap();
+        run_with_prepared_workspace(&kernel, &inputs, &mut outputs).unwrap();
         runtime.synchronize().unwrap();
 
         assert!(
@@ -16444,7 +17357,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
 
@@ -16718,7 +17630,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
         let kernel_fold = MatMulNBitsKernel {
@@ -16738,7 +17649,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
         kernel_nobias
@@ -17001,7 +17911,6 @@ extern "C" __global__ void ref_silu_mul_f16(
                 rmsnorm_prologue: false,
                 rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
-                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
                 bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
             };
             // Reference: two standalone MatMulNBits projections.
@@ -17111,9 +18020,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 scales_up_view,
             ];
             let mut outputs = [fused_out];
-            gemv_kernel
-                .run_f16_gate_up_swiglu(&inputs, &mut outputs, None)
-                .unwrap();
+            run_with_prepared_workspace(&gemv_kernel, &inputs, &mut outputs).unwrap();
             // Plain (gamma=None) gate/up SwiGLU keeps the original strict
             // invariant: ONLY M==1 decode is advertised capture-safe. Unlike the
             // rmsnorm-prologue path (see the companion assertion in
@@ -17392,7 +18299,6 @@ extern "C" __global__ void ref_silu_mul_f16(
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
         if m == 1 {
@@ -17494,9 +18400,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             scales_up_view,
         ];
         let mut outputs = [fused_out];
-        gemv_kernel
-            .run_f16_gate_up_swiglu(&inputs, &mut outputs, None)
-            .unwrap();
+        run_with_prepared_workspace(&gemv_kernel, &inputs, &mut outputs).unwrap();
         runtime.synchronize().unwrap();
 
         let mut reference = vec![f16::ZERO; output_elements];
@@ -17882,7 +18786,6 @@ extern "C" __global__ void ref_silu_mul_f16(
             rmsnorm_prologue: false,
             rmsnorm_epsilon: epsilon,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
         let fused_kernel = MatMulNBitsKernel {
@@ -17902,7 +18805,6 @@ extern "C" __global__ void ref_silu_mul_f16(
             rmsnorm_prologue: true,
             rmsnorm_epsilon: epsilon,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
 
@@ -18017,9 +18919,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             gamma_view,
         ];
         let mut outputs = [fused_out];
-        fused_kernel
-            .run_f16_gate_up_swiglu(&inputs, &mut outputs, None)
-            .unwrap();
+        run_with_prepared_workspace(&fused_kernel, &inputs, &mut outputs).unwrap();
         runtime.synchronize().unwrap();
 
         let mut reference = vec![f16::ZERO; output_elements];
@@ -18462,7 +19362,6 @@ extern "C" __global__ void ref_silu_mul_f16(
                 rmsnorm_prologue: false,
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
-                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
                 bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
             };
             let fused_swiglu = MatMulNBitsKernel {
@@ -18482,7 +19381,6 @@ extern "C" __global__ void ref_silu_mul_f16(
                 rmsnorm_prologue: true,
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
-                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
                 bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
             };
 
@@ -18549,13 +19447,15 @@ extern "C" __global__ void ref_silu_mul_f16(
                             zp_gate_view,
                             zp_up_view,
                         ];
-                        plain_swiglu
-                            .run_f16_gate_up_swiglu(&ref_inputs, &mut ref_outputs, None)
+                        run_with_prepared_workspace(&plain_swiglu, &ref_inputs, &mut ref_outputs)
                             .unwrap();
                     } else {
-                        plain_swiglu
-                            .run_f16_gate_up_swiglu(&ref_inputs_base, &mut ref_outputs, None)
-                            .unwrap();
+                        run_with_prepared_workspace(
+                            &plain_swiglu,
+                            &ref_inputs_base,
+                            &mut ref_outputs,
+                        )
+                        .unwrap();
                     }
                 }
             }
@@ -18583,13 +19483,15 @@ extern "C" __global__ void ref_silu_mul_f16(
                         zp_gate_view,
                         zp_up_view,
                     ];
-                    fused_swiglu
-                        .run_f16_gate_up_swiglu(&fused_inputs, &mut fused_outputs, None)
+                    run_with_prepared_workspace(&fused_swiglu, &fused_inputs, &mut fused_outputs)
                         .unwrap();
                 } else {
-                    fused_swiglu
-                        .run_f16_gate_up_swiglu(&fused_inputs_base, &mut fused_outputs, None)
-                        .unwrap();
+                    run_with_prepared_workspace(
+                        &fused_swiglu,
+                        &fused_inputs_base,
+                        &mut fused_outputs,
+                    )
+                    .unwrap();
                 }
             }
             // Capture-safety tracks the decode-GEMV *routing*, not a fixed
@@ -18844,7 +19746,6 @@ extern "C" __global__ void ref_silu_mul_f16(
                             rmsnorm_prologue: rmsnorm,
                             rmsnorm_epsilon: epsilon,
                             last_call_capture_safe: AtomicBool::new(false),
-                            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
                             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
                         };
 
@@ -18882,8 +19783,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                                     scales_up_view,
                                     gamma_view,
                                 ];
-                                kernel
-                                    .run_f16_gate_up_swiglu(&inputs, &mut outputs, None)
+                                run_with_prepared_workspace(&kernel, &inputs, &mut outputs)
                                     .unwrap();
                             } else {
                                 let inputs = [
@@ -18893,8 +19793,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                                     packed_up_view,
                                     scales_up_view,
                                 ];
-                                kernel
-                                    .run_f16_gate_up_swiglu(&inputs, &mut outputs, None)
+                                run_with_prepared_workspace(&kernel, &inputs, &mut outputs)
                                     .unwrap();
                             }
                             runtime.synchronize().unwrap();
@@ -19302,7 +20201,6 @@ extern "C" __global__ void ref_silu_mul_f16(
                 rmsnorm_prologue: rmsnorm,
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
-                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
                 bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
             };
 
@@ -19316,20 +20214,18 @@ extern "C" __global__ void ref_silu_mul_f16(
                     &hidden_strides,
                     device,
                 );
-                preceding_ref
-                    .run(
-                        &{
-                            let mut inputs =
-                                vec![activation_view, packed_pre_view, scales_pre_view];
-                            if let Some(zp) = zp_pre_view {
-                                inputs.push(zp);
-                            }
-                            inputs
-                        },
-                        std::slice::from_mut(&mut matmul_out),
-                        None,
-                    )
-                    .unwrap();
+                run_with_prepared_workspace(
+                    &preceding_ref,
+                    &{
+                        let mut inputs = vec![activation_view, packed_pre_view, scales_pre_view];
+                        if let Some(zp) = zp_pre_view {
+                            inputs.push(zp);
+                        }
+                        inputs
+                    },
+                    std::slice::from_mut(&mut matmul_out),
+                )
+                .unwrap();
             }
 
             let mut skip_node = Node::new(
@@ -19400,9 +20296,12 @@ extern "C" __global__ void ref_silu_mul_f16(
                     inputs.push(TensorView::absent(DataType::Int32));
                     inputs.push(bias_post_view);
                 }
-                following_ref
-                    .run(&inputs, std::slice::from_mut(&mut y_ref), None)
-                    .unwrap();
+                run_with_prepared_workspace(
+                    &following_ref,
+                    &inputs,
+                    std::slice::from_mut(&mut y_ref),
+                )
+                .unwrap();
             }
 
             // ── Fused: residual epilogue in preceding, norm prologue in following ──
@@ -19415,20 +20314,19 @@ extern "C" __global__ void ref_silu_mul_f16(
                     &hidden_strides,
                     device,
                 );
-                preceding_fused
-                    .run(
-                        &[
-                            activation_view,
-                            packed_pre_view,
-                            scales_pre_view,
-                            zp_pre_view.unwrap_or(TensorView::absent(DataType::Uint8)),
-                            TensorView::absent(DataType::Int32),
-                            residual_view,
-                        ],
-                        std::slice::from_mut(&mut pre_fused),
-                        None,
-                    )
-                    .unwrap();
+                run_with_prepared_workspace(
+                    &preceding_fused,
+                    &[
+                        activation_view,
+                        packed_pre_view,
+                        scales_pre_view,
+                        zp_pre_view.unwrap_or(TensorView::absent(DataType::Uint8)),
+                        TensorView::absent(DataType::Int32),
+                        residual_view,
+                    ],
+                    std::slice::from_mut(&mut pre_fused),
+                )
+                .unwrap();
             }
 
             let following_fused = make_kernel(hidden, post_n, false, true);
@@ -19453,9 +20351,12 @@ extern "C" __global__ void ref_silu_mul_f16(
                     inputs.push(TensorView::absent(DataType::Float16));
                 }
                 inputs.push(gamma_view);
-                following_fused
-                    .run(&inputs, std::slice::from_mut(&mut y_fused), None)
-                    .unwrap();
+                run_with_prepared_workspace(
+                    &following_fused,
+                    &inputs,
+                    std::slice::from_mut(&mut y_fused),
+                )
+                .unwrap();
             }
 
             runtime.synchronize().unwrap();
@@ -19670,7 +20571,6 @@ extern "C" __global__ void ref_silu_mul_f16(
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
 
@@ -19713,7 +20613,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             &y_strides,
             device,
         )];
-        kernel.run(&bf16_inputs, &mut got_out, None).unwrap();
+        run_with_prepared_workspace(&kernel, &bf16_inputs, &mut got_out).unwrap();
         runtime.synchronize().unwrap();
         let direct_stores = BF16_DIRECT_OUT_STORES.with(|count| count.get()) - before;
 
@@ -19773,7 +20673,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             &y_strides,
             device,
         )];
-        kernel.run(&ref_inputs, &mut ref_f16, None).unwrap();
+        run_with_prepared_workspace(&kernel, &ref_inputs, &mut ref_f16).unwrap();
         super::super::cast::launch_cast_raw(
             &runtime,
             ref_f16_dev,
@@ -19919,7 +20819,6 @@ extern "C" __global__ void ref_silu_mul_f16(
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
 
@@ -19962,7 +20861,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             &y_strides,
             device,
         )];
-        kernel.run(&bf16_inputs, &mut got_out, None).unwrap();
+        run_with_prepared_workspace(&kernel, &bf16_inputs, &mut got_out).unwrap();
         runtime.synchronize().unwrap();
         let direct_stores = BF16_DIRECT_OUT_STORES.with(|count| count.get()) - before;
 
@@ -20021,7 +20920,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             &y_strides,
             device,
         )];
-        kernel.run(&ref_inputs, &mut ref_f16, None).unwrap();
+        run_with_prepared_workspace(&kernel, &ref_inputs, &mut ref_f16).unwrap();
         super::super::cast::launch_cast_raw(
             &runtime,
             ref_f16_dev,
@@ -20077,14 +20976,15 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// and the tuned fp16 GEMV then reads identical scales. This test runs the
     /// bf16 path twice (cache miss, then cache hit) and compares it, bit for bit,
     /// to a reference that stages every bf16 input to Float16 inline.
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable gpu-tests"
+    )]
     #[test]
     fn bf16_scale_cache_is_bit_exact_to_inline_staging() {
         use half::bf16;
 
-        let Some(runtime) = runtime() else {
-            eprintln!("skipping MatMulNBits bf16 scale-cache test: CUDA runtime unavailable");
-            return;
-        };
+        let runtime = runtime().expect("BF16 scale-cache parity requires a CUDA runtime");
 
         let k = 256usize;
         let n = 64usize;
@@ -20185,7 +21085,6 @@ extern "C" __global__ void ref_silu_mul_f16(
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
 
@@ -20196,7 +21095,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             &y_strides,
             device,
         )];
-        kernel.run(&inputs, &mut out1, None).unwrap();
+        run_with_prepared_workspace(&kernel, &inputs, &mut out1).unwrap();
         let mut out2 = [TensorMut::new(
             device_ptr_mut(out2_dev),
             DataType::BFloat16,
@@ -20204,7 +21103,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             &y_strides,
             device,
         )];
-        kernel.run(&inputs, &mut out2, None).unwrap();
+        run_with_prepared_workspace(&kernel, &inputs, &mut out2).unwrap();
         runtime.synchronize().unwrap();
 
         // Reference: stage every bf16 input to Float16 inline (no cache) and run
@@ -20268,7 +21167,7 @@ extern "C" __global__ void ref_silu_mul_f16(
             &y_strides,
             device,
         )];
-        kernel.run(&ref_inputs, &mut ref_f16, None).unwrap();
+        run_with_prepared_workspace(&kernel, &ref_inputs, &mut ref_f16).unwrap();
         super::super::cast::launch_cast_raw(
             &runtime,
             ref_f16_dev,
@@ -20315,6 +21214,246 @@ extern "C" __global__ void ref_silu_mul_f16(
                 want[index].to_bits(),
                 "cached bf16 scale path diverged from inline staging at column {index}"
             );
+        }
+    }
+
+    /// Same-pointer mutation must be observed for ordinary scales and either
+    /// member of a gate/up pair when only its sibling is immutable.
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable gpu-tests"
+    )]
+    #[test]
+    fn bf16_scale_updates_same_address_for_dynamic_and_mixed_constant_pairs() {
+        use half::bf16;
+        use onnx_runtime_ep_api::ExecutionProvider;
+        let ep = crate::CudaExecutionProvider::new_default()
+            .expect("dynamic BF16 scales regression requires a CUDA provider");
+        let runtime = ep.runtime().clone();
+        runtime
+            .require_nvrtc_half_headers("dynamic BF16 scales regression")
+            .unwrap();
+        let (k, n, block_size) = (256usize, 8usize, 32usize);
+        let blocks = k / block_size;
+        let activation = vec![bf16::ONE; k];
+        // q=9 with implicit zero-point 8 produces one per weight.
+        let packed = vec![0x99u8; n * blocks * block_size / 2];
+        let scales = vec![bf16::from_f32(0.25); n * blocks];
+        let updated_scales = vec![bf16::from_f32(0.5); n * blocks];
+        let a_dev = runtime.alloc_raw(k * 2).unwrap();
+        let b_dev = runtime.alloc_raw(packed.len()).unwrap();
+        let gate_scale_dev = runtime.alloc_raw(scales.len() * 2).unwrap();
+        let up_scale_dev = runtime.alloc_raw(scales.len() * 2).unwrap();
+        let y_dev = runtime.alloc_raw(n * 2).unwrap();
+        let device = DeviceId::cuda(0);
+        let a_shape = [1, k];
+        let a_strides = [k as i64, 1];
+        let b_shape = [n, blocks, block_size / 2];
+        let b_strides = [(blocks * block_size / 2) as i64, (block_size / 2) as i64, 1];
+        let scale_shape = [n, blocks];
+        let scale_strides = [blocks as i64, 1];
+        let y_shape = [1, n];
+        let y_strides = [n as i64, 1];
+        // SAFETY: buffers cover the full typed host slices.
+        unsafe {
+            runtime.htod(as_bytes(&activation), a_dev).unwrap();
+            runtime.htod(&packed, b_dev).unwrap();
+        }
+        for (fused, dynamic_slot) in [(false, 2), (true, 2), (true, 4)] {
+            unsafe {
+                runtime.htod(as_bytes(&scales), gate_scale_dev).unwrap();
+                runtime.htod(as_bytes(&scales), up_scale_dev).unwrap();
+            }
+            let mut kernel = MatMulNBitsKernel {
+                runtime: runtime.clone(),
+                k,
+                n,
+                bits: 4,
+                block_size,
+                accuracy_level: 0,
+                accuracy4_workspace: None,
+                round_affine_weights: false,
+                marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
+                constant_inputs: [false; 8],
+                fold_bias_post_round: false,
+                gate_up_swiglu: fused,
+                decomposed_silu: false,
+                rmsnorm_prologue: false,
+                rmsnorm_epsilon: 1e-5,
+                last_call_capture_safe: AtomicBool::new(false),
+                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            };
+            if fused {
+                let mut constants = [false; 8];
+                constants[if dynamic_slot == 2 { 4 } else { 2 }] = true;
+                kernel.set_constant_inputs(&constants);
+            }
+            let mut inputs = vec![
+                TensorView::new(
+                    device_ptr(a_dev),
+                    DataType::BFloat16,
+                    &a_shape,
+                    &a_strides,
+                    device,
+                ),
+                TensorView::new(
+                    device_ptr(b_dev),
+                    DataType::Uint8,
+                    &b_shape,
+                    &b_strides,
+                    device,
+                ),
+                TensorView::new(
+                    device_ptr(gate_scale_dev),
+                    DataType::BFloat16,
+                    &scale_shape,
+                    &scale_strides,
+                    device,
+                ),
+            ];
+            if fused {
+                inputs.extend([
+                    TensorView::new(
+                        device_ptr(b_dev),
+                        DataType::Uint8,
+                        &b_shape,
+                        &b_strides,
+                        device,
+                    ),
+                    TensorView::new(
+                        device_ptr(up_scale_dev),
+                        DataType::BFloat16,
+                        &scale_shape,
+                        &scale_strides,
+                        device,
+                    ),
+                ]);
+            }
+            let metadata = inputs
+                .iter()
+                .map(|input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()))
+                .collect::<Vec<_>>();
+            let requirement = kernel.workspace_requirement_for(&metadata).unwrap();
+            let mut owner = ep
+                .allocate_workspace(
+                    requirement.bytes as usize,
+                    requirement.alignment,
+                    requirement.role(),
+                )
+                .unwrap();
+            let workspace = WorkspaceView::new(DevicePtrMut(owner.as_mut_ptr()), owner.len());
+            let scale_address = if dynamic_slot == 2 {
+                gate_scale_dev
+            } else {
+                up_scale_dev
+            };
+            for (iteration, expected) in if fused {
+                [4096.0, 8192.0]
+            } else {
+                [64.0, 128.0]
+            }
+            .into_iter()
+            .enumerate()
+            {
+                if iteration == 1 {
+                    // Same allocation and shape; only the mutable operand's contents change.
+                    unsafe {
+                        runtime
+                            .htod(as_bytes(&updated_scales), scale_address)
+                            .unwrap();
+                    }
+                }
+                let mut output = [TensorMut::new(
+                    device_ptr_mut(y_dev),
+                    DataType::BFloat16,
+                    &y_shape,
+                    &y_strides,
+                    device,
+                )];
+                kernel.run(&inputs, &mut output, Some(workspace)).unwrap();
+                runtime.synchronize().unwrap();
+                let mut got = vec![bf16::ZERO; n];
+                unsafe {
+                    runtime.dtoh(as_bytes_mut(&mut got), y_dev).unwrap();
+                }
+                for value in got {
+                    assert_eq!(
+                        value,
+                        bf16::from_f32(expected),
+                        "fused={fused}, dynamic_slot={dynamic_slot}, iteration={iteration}"
+                    );
+                }
+                assert_eq!(
+                    kernel.bf16_const_cache.lock().unwrap().slots.len(),
+                    usize::from(fused)
+                );
+                assert_eq!(
+                    kernel.device_graph_resources().len(),
+                    usize::from(fused),
+                    "only actual immutable cache owners belong to kernel resources"
+                );
+            }
+            let mut output = [TensorMut::new(
+                device_ptr_mut(y_dev),
+                DataType::BFloat16,
+                &y_shape,
+                &y_strides,
+                device,
+            )];
+            runtime.begin_graph_capture(&[&kernel]).unwrap();
+            let missing_pin = kernel
+                .run(&inputs, &mut output, Some(workspace))
+                .unwrap_err();
+            assert!(
+                missing_pin.to_string().contains("workspace"),
+                "{missing_pin}"
+            );
+            runtime.abort_graph_capture().unwrap();
+            runtime.reset_graph().unwrap();
+            kernel.run(&inputs, &mut output, Some(workspace)).unwrap();
+            runtime.stream().synchronize().unwrap();
+            let pin = owner
+                .device_graph_resource()
+                .unwrap()
+                .expect("governed workspace must expose a real pin");
+            runtime
+                .begin_graph_capture_with_resources(&[&kernel], vec![pin])
+                .unwrap();
+            let before = runtime.allocation_counts();
+            kernel.run(&inputs, &mut output, Some(workspace)).unwrap();
+            let after = runtime.allocation_counts();
+            assert_eq!(
+                (before.allocations, before.frees),
+                (after.allocations, after.frees),
+                "warm BF16 capture must not allocate or free private staging"
+            );
+            runtime.end_graph_capture().unwrap();
+            for (values, expected) in [
+                (&scales, if fused { 4096.0 } else { 64.0 }),
+                (&updated_scales, if fused { 8192.0 } else { 128.0 }),
+            ] {
+                unsafe {
+                    runtime.htod(as_bytes(values), scale_address).unwrap();
+                }
+                runtime.replay_graph().unwrap();
+                runtime.stream().synchronize().unwrap();
+                let mut got = vec![bf16::ZERO; n];
+                unsafe {
+                    runtime.dtoh(as_bytes_mut(&mut got), y_dev).unwrap();
+                }
+                assert!(
+                    got.iter().all(|value| *value == bf16::from_f32(expected)),
+                    "capture replay failed to refresh dynamic scales, fused={fused}, slot={dynamic_slot}"
+                );
+            }
+            runtime.reset_graph().unwrap();
+            ep.deallocate_workspace(owner).unwrap();
+        }
+        // SAFETY: every launch above completed; each allocation is retired once.
+        unsafe {
+            for pointer in [a_dev, b_dev, gate_scale_dev, up_scale_dev, y_dev] {
+                runtime.free_raw(pointer).unwrap();
+            }
         }
     }
 
@@ -20640,7 +21779,6 @@ extern "C" __global__ void ref_silu_mul_f16(
                     rmsnorm_prologue: false,
                     rmsnorm_epsilon: 1e-5,
                     last_call_capture_safe: AtomicBool::new(false),
-                    bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
                     bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
                 },
                 label,
