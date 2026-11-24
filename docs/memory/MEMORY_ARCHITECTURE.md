@@ -1498,6 +1498,54 @@ BlockQuantizedMoE route/capture suites are compiled for integration coverage.
 Device execution, atomic-contention impact and throughput remain unmeasured;
 512B separation is a conservative layout choice, not proof of equal performance.
 
+### Variable-length attention borrows one exact caller composite
+
+`pkg.nxrt::VarlenAttention` and `PackedVarlenAttention` register
+`WorkspacePlanning::Metadata`. Metadata-only planning returns Deferred because
+actual valid KV lengths determine scores. Execution-time preparation first
+clears any old invocation and rejects real stream capture, then reads each
+control tensor once, validates geometry/values/byte spans and publishes a
+Host-only invocation with a complete `Ready` requirement. There is no Bind hook,
+new admission protocol or control-pointer value cache. A rejected admission may
+leave Host preparation until the next call; the next preparation clears it.
+
+Both kernels borrow `[control pack, scores]` from one SessionPersistent caller
+owner. Regions keep 256B alignment; score extent uses actual maximum valid KV
+length, with the existing minimum stride of one for all-zero valid lengths.
+Checked array layouts and products cover controls, rows, scores and all operand
+and output byte spans. Padded int64 lengths must fit the existing int32 device
+control ABI. Packed batch labels must fit int32. Empty output still validates
+controls before returning a proven zero request, and executes without a control
+upload, kernel launch or new root reservation.
+
+Execution takes the invocation exactly once, checks input/output pointers,
+offsets, devices, dtypes, shapes and strides, observes real capture again, and
+binds the complete caller span before uploading. Missing/changed preparation or
+invalid backing fails without fallback, repeated readback or a private device
+allocation. Failure consumes the plan; callers prepare again before retrying.
+A workspace address may relocate independently from tensor bindings. This uses
+the existing exclusive-kernel preparation/admission/execution contract; operands
+must remain valid and stable throughout that interval. Bindings do not detect
+arbitrary same-address writes.
+
+Padded nonpad lengths are narrowed once into the Host snapshot. Packed controls
+include both validated cumulative arrays and the generated batch-label table in
+one pack: all three device pointers derive from that pack, so allocation bounds
+and device control values use the same snapshot even if live control storage is
+changed. Each execution uploads one pack. Device source, floating math, launch
+geometry and the existing trailing eager synchronization policy are unchanged.
+Both ops remain capture-unsupported: borrowing a reusable lane does not make
+synchronous control transfers legal during recording.
+
+Host tests cover exact extent, zero/overflow/layout refusal, dtype byte spans
+and stale tensor bindings. GPU fixtures compile real registry claims, repeated
+fitting-owner use with no private allocation, exact one/two control readbacks and
+one upload, same-address control updates across calls, packed snapshot parity,
+consumed failure plans, invalid caller spans, raw-capture refusal/recovery and
+zero demand. Original numerical parity suites also use the public preparation
+seam. No CUDA device was available to execute these tests; Host plan/lock/query
+cost and end-to-end throughput remain unmeasured.
+
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
 The dated audit and measurements below preserve historical evidence. The current

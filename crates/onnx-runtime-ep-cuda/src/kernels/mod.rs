@@ -136,6 +136,7 @@ pub mod trilu;
 pub mod unary_predicate;
 pub mod unique;
 pub mod varlen_attention;
+mod varlen_workspace;
 pub mod where_op;
 pub mod window;
 
@@ -1435,14 +1436,14 @@ pub fn build_cuda_registry_with_metrics(
     );
     reg.register(
         OpKey::new("PackedVarlenAttention", "pkg.nxrt", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(packed_varlen_attention::PackedVarlenAttentionFactory {
             runtime: runtime.clone(),
         }),
     );
     reg.register(
         OpKey::new("VarlenAttention", "pkg.nxrt", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(varlen_attention::VarlenAttentionFactory {
             runtime: runtime.clone(),
         }),

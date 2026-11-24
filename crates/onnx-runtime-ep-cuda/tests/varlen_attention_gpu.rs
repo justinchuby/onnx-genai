@@ -27,6 +27,8 @@
 //! `CUDA_VISIBLE_DEVICES=5 taskset -c 1 cargo test -p onnx-runtime-ep-cuda \
 //!   --test varlen_attention_gpu -- --nocapture`
 
+mod common;
+
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, Result, TensorMut, TensorView,
@@ -220,7 +222,48 @@ fn run_node(
         ep.device_id(),
     );
 
-    let result = kernel.execute(&input_views, std::slice::from_mut(&mut output_view));
+    let mut workspace = None;
+    let mut result = common::execute_kernel(
+        ep,
+        kernel.as_ref(),
+        &input_views,
+        std::slice::from_mut(&mut output_view),
+        &mut workspace,
+    );
+    if result.is_ok() {
+        let allocation_counts = ep.runtime().allocation_counts();
+        let transfers = ep.runtime().transfer_counts();
+        let owner_ptr = workspace.as_ref().map(|owner| owner.as_ptr());
+        result = common::execute_kernel(
+            ep,
+            kernel.as_ref(),
+            &input_views,
+            std::slice::from_mut(&mut output_view),
+            &mut workspace,
+        );
+        assert_eq!(
+            ep.runtime().allocation_counts(),
+            allocation_counts,
+            "warm execution may not allocate/free private scratch"
+        );
+        assert_eq!(
+            workspace.as_ref().map(|owner| owner.as_ptr()),
+            owner_ptr,
+            "warm fitting caller owner must be reused"
+        );
+        if out_elems != 0 {
+            assert_eq!(
+                ep.runtime().transfer_counts().device_to_host,
+                transfers.device_to_host + 1,
+                "controls are read exactly once during preparation"
+            );
+            assert_eq!(
+                ep.runtime().transfer_counts().host_to_device,
+                transfers.host_to_device + 1,
+                "one complete control upload per invocation"
+            );
+        }
+    }
     let mut bytes = vec![0u8; out_bytes];
     if result.is_ok() && !bytes.is_empty() {
         // SAFETY: the destination exactly covers the output allocation.
@@ -228,6 +271,9 @@ fn run_node(
             ep.runtime()
                 .dtoh(&mut bytes, cuptr(output_buffer.as_ptr()))?
         };
+    }
+    if let Some(owner) = workspace {
+        ep.deallocate_workspace(owner)?;
     }
     for buffer in input_buffers {
         ep.deallocate(buffer)?;
