@@ -113,6 +113,16 @@ pub enum OpsetVersion {
     Undeclared,
 }
 
+impl From<u64> for OpsetVersion {
+    fn from(version: u64) -> Self {
+        if version == u64::MAX {
+            Self::Undeclared
+        } else {
+            Self::Known(version)
+        }
+    }
+}
+
 impl std::fmt::Display for OpsetVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -399,11 +409,7 @@ mod error {
             } else {
                 format!("{:?}", node.name)
             };
-            let opset = if opset == u64::MAX {
-                OpsetVersion::Undeclared
-            } else {
-                OpsetVersion::Known(opset)
-            };
+            let opset = OpsetVersion::from(opset);
             Self::UnsupportedOp {
                 op_type: node.op_type.clone(),
                 domain,

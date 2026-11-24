@@ -1154,7 +1154,7 @@ impl KernelCache {
                     return Err(SessionError::CudaKernelCreationFailed {
                         node: build::format_node_identity("graph", node_id, node),
                         op_type: node.op_type.clone(),
-                        opset,
+                        opset: opset.into(),
                         source,
                     });
                 }

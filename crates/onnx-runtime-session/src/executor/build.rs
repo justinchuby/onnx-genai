@@ -580,7 +580,7 @@ pub(super) fn collect_cuda_coverage_issues(
                 return Err(SessionError::CudaKernelCreationFailed {
                     node: format_node_identity(scope, node_id, node),
                     op_type: node.op_type.clone(),
-                    opset,
+                    opset: opset.into(),
                     source: error,
                 });
             }
