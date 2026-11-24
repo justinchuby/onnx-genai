@@ -1,17 +1,19 @@
 //! `Gemm`: general matrix multiply `Y = alpha * A' * B' + beta * C` for floating
 //! point tensors (`docs/architecture/ORT2.md` §4.4).
 //!
-//! `A'`/`B'` are `A`/`B` optionally transposed per `transA`/`transB`. `A` is
-//! 2-D `[M,K]` (or `[K,M]` when transposed), `B` is `[K,N]` (or `[N,K]`). The
-//! optional bias `C` is unidirectionally broadcast to `[M,N]`.
+//! Before opset 29, both operands are matrices. From opset 29, A preserves
+//! its leading axes, and transA swaps its last two axes (if present).
 
 use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView, WorkspaceLayout,
     WorkspaceRequirement, WorkspaceView,
 };
+use onnx_runtime_ir::gemm::{GemmGeometry, ND_GEMM_OPSET, checked_elements, validate_bias};
 use onnx_runtime_ir::{DataType, Node};
 
 use std::alloc::Layout;
+
+pub(crate) const DTYPES: &[DataType] = super::FLOAT_DTYPES;
 
 use super::add::broadcast_apply;
 use super::check_arity;
@@ -27,6 +29,7 @@ pub struct GemmKernel {
     beta: f32,
     trans_a: bool,
     trans_b: bool,
+    nd: bool,
     /// Densification and weight-transpose memos for constant (initializer)
     /// operands, shared with `MatMul` so both ops cache a given weight once.
     prepack: MatMulPrepack,
@@ -59,6 +62,9 @@ impl KernelFactory for GemmFactory {
             beta,
             trans_a,
             trans_b,
+            nd: node
+                .local_opset()
+                .is_some_and(|version| version >= ND_GEMM_OPSET),
             prepack: MatMulPrepack::new(self.resources.clone()),
         }))
     }
@@ -78,12 +84,20 @@ impl GemmKernel {
         metadata: &[TensorMetadata<'_>],
         views: Option<&[TensorView<'_>]>,
     ) -> Result<WorkspaceLayout<2>> {
-        if metadata.len() < 2
-            || metadata[..2]
-                .iter()
-                .any(|input| !input.present || input.shape.len() != 2)
-        {
-            return Err(EpError::KernelFailed("Gemm workspace needs two present rank-2 operands A and B; provide concrete matrix metadata before preparation".into()));
+        let [a, b, ..] = metadata else {
+            return Err(EpError::KernelFailed(
+                "Gemm requires A and B metadata; provide both operands before planning workspace"
+                    .into(),
+            ));
+        };
+        if !a.present || !b.present {
+            return Err(EpError::KernelFailed(
+                "Gemm requires present A and B; supply both operands".into(),
+            ));
+        }
+        let geometry = self.geometry(a.shape, b.shape)?;
+        if geometry.elements == 0 || geometry.k == 0 {
+            return WorkspaceLayout::new([Layout::new::<[f32; 0]>(); 2]);
         }
         let half_direct = views.is_some_and(|views| {
             views.len() >= 2
@@ -92,12 +106,15 @@ impl GemmKernel {
                 && views[1].is_contiguous()
         });
         let mut regions = [Layout::new::<[f32; 0]>(); 2];
-        for (index, transpose) in [self.trans_a, self.trans_b].into_iter().enumerate() {
+        for (index, transpose) in [Self::transpose_a(geometry, a.shape.len()), self.trans_b]
+            .into_iter()
+            .enumerate()
+        {
             if !transpose || half_direct || self.retains_transpose(index) {
                 continue;
             }
             let shape = metadata[index].shape;
-            let elements = shape[0].checked_mul(shape[1]).ok_or_else(|| EpError::KernelFailed(format!("Gemm operand {index} shape {shape:?} overflows element capacity; use addressable matrix dimensions")))?;
+            let elements = checked_elements(shape).ok_or_else(|| EpError::KernelFailed(format!("Gemm operand {index} shape {shape:?} overflows element capacity; use addressable matrix dimensions")))?;
             let borrowed = views.is_some_and(|views| {
                 views
                     .get(index)
@@ -113,7 +130,19 @@ impl GemmKernel {
     fn borrowable(view: &TensorView<'_>, transpose: bool) -> bool {
         view.dtype == DataType::Float32
             && view.is_contiguous()
-            && (!transpose || view.shape.contains(&1) || view.shape.contains(&0))
+            && (!transpose || view.shape.iter().rev().take(2).any(|&dim| dim <= 1))
+    }
+
+    fn geometry(&self, a: &[usize], b: &[usize]) -> Result<GemmGeometry> {
+        GemmGeometry::new(a, b, self.trans_a, self.trans_b, self.nd).map_err(EpError::KernelFailed)
+    }
+
+    fn transpose_a(geometry: GemmGeometry, a_rank: usize) -> bool {
+        if a_rank == 2 {
+            geometry.axes.trans_a
+        } else {
+            geometry.transposes_a_storage()
+        }
     }
 
     /// The f16 decode GEMV and prefill packed-SGEMM routes, in that order.
@@ -309,32 +338,35 @@ impl GemmKernel {
         workspace: Option<WorkspaceView>,
     ) -> Result<()> {
         check_arity("Gemm", inputs, outputs, 2, 3, 1)?;
+        let bias = inputs.get(2).filter(|c| !c.is_absent());
+        // Older CPU kernels intentionally accept widening into f32 outputs.
+        onnx_runtime_ep_api::gemm::validate_dtypes(
+            DTYPES,
+            self.nd,
+            [inputs[0].dtype, inputs[1].dtype, outputs[0].dtype]
+                .into_iter()
+                .chain(bias.map(|c| c.dtype)),
+        )
+        .map_err(EpError::KernelFailed)?;
         let a_shape = inputs[0].shape;
         let b_shape = inputs[1].shape;
-        if a_shape.len() != 2 || b_shape.len() != 2 {
-            return Err(EpError::KernelFailed(format!(
-                "Gemm: A and B must be 2-D, got {a_shape:?} and {b_shape:?}"
-            )));
+        let geometry = self.geometry(a_shape, b_shape)?;
+        let GemmGeometry {
+            rows: m,
+            k,
+            n,
+            elements: output_elements,
+            ..
+        } = geometry;
+        let trans_a = Self::transpose_a(geometry, a_shape.len());
+        let y_shape = outputs[0].shape;
+        geometry
+            .validate_output(a_shape, b_shape, y_shape)
+            .map_err(EpError::KernelFailed)?;
+        Layout::array::<f32>(output_elements).map_err(|_| EpError::KernelFailed(format!("Gemm output {y_shape:?} exceeds addressable f32 storage; reduce the output dimensions")))?;
+        if let Some(c) = bias {
+            validate_bias(c.shape, y_shape).map_err(EpError::KernelFailed)?;
         }
-
-        // Logical M,K,N after honoring the transpose flags.
-        let (m, ka) = if self.trans_a {
-            (a_shape[1], a_shape[0])
-        } else {
-            (a_shape[0], a_shape[1])
-        };
-        let (kb, n) = if self.trans_b {
-            (b_shape[1], b_shape[0])
-        } else {
-            (b_shape[0], b_shape[1])
-        };
-        if ka != kb {
-            return Err(EpError::KernelFailed(format!(
-                "Gemm: inner dims disagree ({ka} vs {kb})"
-            )));
-        }
-        let k = ka;
-        let output_elements = m.checked_mul(n).filter(|&elements| Layout::array::<f32>(elements).is_ok()).ok_or_else(|| EpError::KernelFailed(format!("Gemm output [{m}, {n}] exceeds addressable f32 storage; reduce the output dimensions")))?;
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             // Conventional roofline estimate: one multiply and one add per GEMM
             // contraction, plus scale-and-add for each optional bias output.
@@ -342,7 +374,7 @@ impl GemmKernel {
                 .saturating_mul(n as u64)
                 .saturating_mul(k as u64)
                 .saturating_mul(2);
-            if inputs.len() == 3 && self.beta != 0.0 {
+            if bias.is_some() && self.beta != 0.0 {
                 flops = flops.saturating_add((m as u64).saturating_mul(n as u64).saturating_mul(2));
             }
             flops
@@ -359,22 +391,31 @@ impl GemmKernel {
         // at K=N=3584 it was 6.57x slower than ORT at M=1/1 thread and 46.67x
         // at M=1/8 threads, because that path never scales with thread count on
         // a single-row problem (10.07 ms at 1 thread, 10.26 ms at 8).
-        let half_fast_path: Option<Vec<f32>> = if self.trans_a {
+        let half_fast_path: Option<Vec<f32>> = if trans_a || output_elements == 0 || k == 0 {
             None
         } else {
             self.try_half_fast_path(&inputs[0], &inputs[1], m, k, n, self.trans_b)?
         };
 
-        let mut out = if let Some(mut half_output) = half_fast_path {
+        let mut out = if output_elements == 0 || k == 0 {
+            vec![0.0 * self.alpha; output_elements]
+        } else if let Some(mut half_output) = half_fast_path {
             if self.alpha != 1.0 {
                 for value in &mut half_output {
                     *value *= self.alpha;
                 }
             }
             half_output
-        } else if let Some(mut half_output) =
-            try_half_gemm(&inputs[0], &inputs[1], m, k, n, self.trans_a, self.trans_b)?
-        {
+        } else if let Some(mut half_output) = try_half_gemm_batched(
+            &inputs[0],
+            &inputs[1],
+            if trans_a { geometry.m } else { m },
+            k,
+            n,
+            trans_a,
+            self.trans_b,
+            if trans_a { geometry.batch } else { 1 },
+        )? {
             if self.alpha != 1.0 {
                 for value in &mut half_output {
                     *value *= self.alpha;
@@ -384,7 +425,7 @@ impl GemmKernel {
         } else {
             // Only transposes consume this workspace. Keep ordinary GEMM off
             // the layout-planning path, including its metadata construction.
-            let regions = if self.trans_a || self.trans_b {
+            let regions = if trans_a || self.trans_b {
                 let metadata = std::array::from_fn::<_, 2, _>(|index| {
                     TensorMetadata::new(inputs[index].dtype, inputs[index].shape, true)
                 });
@@ -420,6 +461,29 @@ impl GemmKernel {
                         )
                     }
                 };
+                if index == 0 && a_shape.len() > 2 {
+                    // Pack each trailing transpose once; one tall GEMM then
+                    // shares B's packing and thread dispatch across the batch.
+                    let dense = self.prepack.dense(index, source)?;
+                    let stride = geometry.m * k;
+                    for (src, dst) in dense
+                        .chunks_exact(stride)
+                        .zip(values.chunks_exact_mut(stride))
+                    {
+                        super::weight_transpose::transpose_map_uninit(
+                            k,
+                            geometry.m,
+                            dst,
+                            |i, j| src[i * geometry.m + j],
+                        )?;
+                    }
+                    // SAFETY: the source and scratch cover exactly batch full
+                    // matrices, and transpose_map_uninit initialized each one.
+                    let initialized = unsafe {
+                        std::slice::from_raw_parts(values.as_ptr().cast::<f32>(), values.len())
+                    };
+                    return Ok(matmul::DenseOperand::borrowed(initialized));
+                }
                 let initialized = if index == 0 && self.prepack.retains_constant(index) {
                     // Preserve the existing immutable A widening memo; a warm
                     // transpose need not reconvert a constant source each call.
@@ -442,7 +506,7 @@ impl GemmKernel {
                 };
                 Ok(matmul::DenseOperand::borrowed(initialized))
             };
-            let a_rm = prepare(0, self.trans_a)?;
+            let a_rm = prepare(0, trans_a)?;
             let b_rm = prepare(1, self.trans_b)?;
 
             let mut output = vec![0.0f32; output_elements];
@@ -457,17 +521,32 @@ impl GemmKernel {
             output
         };
 
-        // Optional bias: Y += beta * C, with C broadcast to [M,N].
-        if inputs.len() == 3 && self.beta != 0.0 {
-            let c = to_dense_f32_widen("Gemm", &inputs[2])?;
+        if let Some(bias) = bias.filter(|_| self.beta != 0.0 && output_elements != 0) {
+            let c = to_dense_f32_widen("Gemm", bias)?;
             let beta = self.beta;
-            broadcast_apply(&c, inputs[2].shape, &[m, n], |idx, v| out[idx] += beta * v)?;
+            if c.len() == 1 {
+                let bias = beta * c[0];
+                out.iter_mut().for_each(|y| *y += bias);
+            } else if c.len() == output_elements {
+                out.iter_mut()
+                    .zip(c.iter())
+                    .for_each(|(y, &c)| *y += beta * c);
+            } else if c.len() == n && bias.shape.last() == Some(&n) {
+                for row in out.chunks_exact_mut(n) {
+                    row.iter_mut()
+                        .zip(c.iter())
+                        .for_each(|(y, &c)| *y += beta * c);
+                }
+            } else {
+                broadcast_apply(&c, bias.shape, y_shape, |idx, v| out[idx] += beta * v)?;
+            }
         }
 
         write_dense_f32_narrow("Gemm", &mut outputs[0], &out)
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn try_half_gemm(
     a: &TensorView,
@@ -477,6 +556,20 @@ fn try_half_gemm(
     n: usize,
     trans_a: bool,
     trans_b: bool,
+) -> Result<Option<Vec<f32>>> {
+    try_half_gemm_batched(a, b, m, k, n, trans_a, trans_b, 1)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_half_gemm_batched(
+    a: &TensorView,
+    b: &TensorView,
+    m: usize,
+    k: usize,
+    n: usize,
+    trans_a: bool,
+    trans_b: bool,
+    batch: usize,
 ) -> Result<Option<Vec<f32>>> {
     let format = match (a.dtype, b.dtype) {
         (DataType::Float16, DataType::Float16) => HalfFormat::F16,
@@ -488,7 +581,7 @@ fn try_half_gemm(
     }
     a.validate()?;
     b.validate()?;
-    let mut output = vec![0.0; m * n];
+    let mut output = vec![0.0; batch * m * n];
     if output.is_empty() || k == 0 {
         return Ok(Some(output));
     }
@@ -507,17 +600,14 @@ fn try_half_gemm(
     } else {
         MatrixLayout::row_major(n)
     };
-    half_gemm::gemm(
-        format,
-        a_bits,
-        a_layout,
-        b_bits,
-        b_layout,
-        &mut output,
-        m,
-        k,
-        n,
-    );
+    for (a_matrix, y_matrix) in a_bits
+        .chunks_exact(m * k)
+        .zip(output.chunks_exact_mut(m * n))
+    {
+        half_gemm::gemm(
+            format, a_matrix, a_layout, b_bits, b_layout, y_matrix, m, k, n,
+        );
+    }
     Ok(Some(output))
 }
 
@@ -556,6 +646,78 @@ mod tests {
     use crate::kernels::testutil::Owned;
     use onnx_runtime_ir::{Attribute, Graph, NodeId, TensorData, WeightRef};
 
+    #[test]
+    fn gemm_29_vector_trans_a_with_explicitly_absent_bias() {
+        let mut node = Node::new(NodeId(0), "Gemm", vec![], vec![]);
+        node.version = Some(29);
+        node.attributes.insert("transA".into(), Attribute::Int(1));
+        let a = Owned::f32(&[3], &[1., 2., 3.]);
+        let b = Owned::f32(&[3, 2], &[1., 2., 3., 4., 5., 6.]);
+        let mut y = Owned::zeros_f32(&[2]);
+        let kernel = GemmFactory::default().create(&node, &[]).unwrap();
+        kernel
+            .execute(
+                &[a.view(), b.view(), TensorView::absent(DataType::Undefined)],
+                &mut [y.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(y.to_f32(), [22., 28.]);
+        let mixed_b = Owned::f16(&[3, 2], &[1., 2., 3., 4., 5., 6.]);
+        assert!(
+            kernel
+                .execute(&[a.view(), mixed_b.view()], &mut [y.view_mut()])
+                .unwrap_err()
+                .to_string()
+                .contains("share one dtype")
+        );
+        node.version = Some(28);
+        let old = GemmFactory::default().create(&node, &[]).unwrap();
+        assert!(
+            old.execute(&[a.view(), b.view()], &mut [y.view_mut()])
+                .unwrap_err()
+                .to_string()
+                .contains("rank 2 before opset 29")
+        );
+    }
+
+    #[test]
+    fn gemm_29_transposes_each_matrix_for_f32_and_half() {
+        let mut node = Node::new(NodeId(0), "Gemm", vec![], vec![]);
+        node.version = Some(29);
+        for attr in ["transA", "transB"] {
+            node.attributes.insert(attr.into(), Attribute::Int(1));
+        }
+        node.attributes
+            .insert("alpha".into(), Attribute::Float(0.25));
+        node.attributes.insert("beta".into(), Attribute::Float(0.5));
+        let kernel = GemmFactory::default().create(&node, &[]).unwrap();
+        for (dtype, tensor, read) in [
+            (
+                DataType::Float32,
+                Owned::f32 as fn(&[usize], &[f32]) -> Owned,
+                Owned::to_f32 as fn(&Owned) -> Vec<f32>,
+            ),
+            (DataType::Float16, Owned::f16, Owned::to_f16_as_f32),
+            (DataType::BFloat16, Owned::bf16, Owned::to_bf16_as_f32),
+        ] {
+            let a = tensor(
+                &[2, 1, 3, 2],
+                &[1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.],
+            );
+            let b = tensor(&[2, 3], &[1., 0., 1., 0., 1., 0.]);
+            let c = tensor(&[2, 1, 1, 2], &[10., 20., 30., 40.]);
+            let mut y = Owned::zeros(dtype, &[2, 1, 2, 2]);
+            kernel
+                .execute_prepared(&[a.view(), b.view(), c.view()], &mut [y.view_mut()])
+                .unwrap();
+            assert_eq!(
+                read(&y),
+                [6.5, 10.75, 7., 11., 19.5, 22.25, 20., 22.5],
+                "{dtype:?}"
+            );
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn gemm(
         alpha: f32,
@@ -572,6 +734,7 @@ mod tests {
             beta,
             trans_a: ta,
             trans_b: tb,
+            nd: false,
             prepack: MatMulPrepack::default(),
         };
         let mut ins = vec![a.view(), b.view()];
@@ -607,6 +770,7 @@ mod tests {
             beta: 1.,
             trans_a: true,
             trans_b: true,
+            nd: false,
             prepack: MatMulPrepack::new(resources),
         };
         let a = Owned::f32(&[3, 2], &[1.; 6]);
@@ -687,6 +851,7 @@ mod tests {
             beta: 1.,
             trans_a: true,
             trans_b: false,
+            nd: false,
             prepack: MatMulPrepack::new(resources),
         };
         kernel.set_constant_inputs(&[true, false]);
@@ -721,6 +886,7 @@ mod tests {
             beta: 1.,
             trans_a: true,
             trans_b: true,
+            nd: false,
             prepack: MatMulPrepack::default(),
         };
         let mut a = Owned::f64(&[3, 2], &[1., 2., 3., 4., 5., 6.]);
@@ -768,6 +934,7 @@ mod tests {
             beta: 1.,
             trans_a: true,
             trans_b: false,
+            nd: false,
             prepack: MatMulPrepack::default(),
         };
         for bf16 in [false, true] {
@@ -819,6 +986,7 @@ mod tests {
             beta: 1.,
             trans_a: true,
             trans_b: true,
+            nd: false,
             prepack: MatMulPrepack::default(),
         };
         let a = Owned::f32(&[3, 2], &[1.; 6]);
@@ -852,6 +1020,7 @@ mod tests {
             beta: 1.,
             trans_a: true,
             trans_b: false,
+            nd: false,
             prepack: MatMulPrepack::default(),
         };
         let mut a = Owned::f32(&[3, 1], &[1., 99., 2., 99., 3.]);
@@ -888,6 +1057,7 @@ mod tests {
             beta: 1.,
             trans_a: false,
             trans_b: false,
+            nd: false,
             prepack: MatMulPrepack::default(),
         };
         let a = Owned::f32(&[usize::MAX, 0], &[]);
@@ -911,6 +1081,7 @@ mod tests {
             beta: 1.,
             trans_a: true,
             trans_b: false,
+            nd: false,
             prepack: MatMulPrepack::default(),
         };
         let a = Owned::f32(&[3, 1], &[1., 2., 3.]);
@@ -999,6 +1170,7 @@ mod tests {
             beta: 1.0,
             trans_a: false,
             trans_b: false,
+            nd: false,
             prepack: MatMulPrepack::default(),
         }
         .execute_prepared(&[a.view(), b.view(), c.view()], &mut [out.view_mut()])
@@ -1029,6 +1201,7 @@ mod tests {
             beta: 1.0,
             trans_a: false,
             trans_b,
+            nd: false,
             prepack: MatMulPrepack::default(),
         };
         kernel.set_constant_inputs(&[false, true]);
@@ -1223,6 +1396,7 @@ mod tests {
             beta: 1.0,
             trans_a: false,
             trans_b: false,
+            nd: false,
             prepack: MatMulPrepack::default(),
         }
         .execute_prepared(&[a.view(), b.view()], &mut [out.view_mut()])
@@ -1257,6 +1431,7 @@ mod tests {
             beta: -0.5,
             trans_a: true,
             trans_b: true,
+            nd: false,
             prepack: MatMulPrepack::default(),
         };
 
@@ -1456,6 +1631,7 @@ mod tests {
             beta: 1.0,
             trans_a: false,
             trans_b: true,
+            nd: false,
             prepack: MatMulPrepack::default(),
         };
         kernel.set_constant_inputs(&[false, true]);
@@ -1617,6 +1793,7 @@ mod tests {
                 beta: 1.,
                 trans_a: false,
                 trans_b: true,
+                nd: false,
                 prepack: MatMulPrepack::new(resources.clone()),
             };
             kernel.set_constant_inputs(&[false, true]);
@@ -1667,6 +1844,7 @@ mod tests {
                 beta: 1.,
                 trans_a: false,
                 trans_b: true,
+                nd: false,
                 prepack: MatMulPrepack::new(resources),
             };
             kernel.set_constant_inputs(&[false, true]);
@@ -1718,6 +1896,7 @@ mod half_decode_route_tests {
             beta: 1.0,
             trans_a: false,
             trans_b,
+            nd: false,
             prepack: MatMulPrepack::new(
                 crate::CpuMemoryResources::default()
                     .with_cache_retention(crate::CpuCacheRetention::new(retain_caches)),
@@ -2059,6 +2238,7 @@ mod half_decode_route_tests {
             beta: 1.0,
             trans_a: false,
             trans_b: false,
+            nd: false,
             prepack: MatMulPrepack::default(),
         };
         kernel.set_constant_inputs(&[false, true]);
@@ -2093,6 +2273,7 @@ mod half_decode_route_tests {
             beta: 1.0,
             trans_a: false,
             trans_b,
+            nd: false,
             prepack: MatMulPrepack::default(),
         };
         kernel.set_constant_inputs(&[false, true]);
@@ -2182,6 +2363,7 @@ mod half_decode_route_bench {
             beta: 1.0,
             trans_a: false,
             trans_b: false,
+            nd: false,
             prepack: MatMulPrepack::default(),
         };
         kernel.set_constant_inputs(&[false, true]);

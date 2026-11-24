@@ -345,6 +345,7 @@ fn default_matches(value: &AttributeDefault, attr_type: AttributeType) -> bool {
 const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/matmul.yaml"),
     include_str!("../../schemas/standard/gemm.yaml"),
+    include_str!("../../schemas/standard/gemm_v29.yaml"),
     include_str!("../../schemas/standard/add.yaml"),
     include_str!("../../schemas/standard/sub.yaml"),
     include_str!("../../schemas/standard/div.yaml"),

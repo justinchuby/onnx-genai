@@ -1,7 +1,7 @@
 //! `Gemm` (ONNX standard domain) on the GPU: `Y = alpha·A'·B' + beta·C`, where
 //! `A'`/`B'` are `A`/`B` optionally transposed per the `transA`/`transB`
 //! attributes and the optional bias `C` is unidirectionally broadcast to
-//! `[M, N]` (`docs/architecture/ORT2.md` §15.3; RULES.md #4 — GEMM stays on cuBLASLt).
+//! the output (`docs/architecture/ORT2.md` §15.3; GEMM stays on cuBLASLt).
 //!
 //! ## Design — reuse the proven cuBLASLt path
 //!
@@ -17,13 +17,12 @@
 //!
 //! * **dtype:** f32 only (the bias epilogue is f32; f16/bf16 land with a
 //!   templated epilogue next).
-//! * **rank:** `A`/`B` must be 2-D; `C` (if present) must broadcast to `[M,N]`
-//!   (rank 0/1/2 with each dim `1`, `M`, or `N` as ONNX requires).
+//! * **rank:** B is always rank 2. Gemm-29 also accepts vector and N-D A.
 //! * **layout:** dense row-major inputs/outputs (a strided view returns a
 //!   "materialise first" error).
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
@@ -31,9 +30,11 @@ use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
     WorkspaceRequirement, WorkspaceView,
 };
+use onnx_runtime_ir::gemm::{GemmGeometry, ND_GEMM_OPSET, validate_bias};
 use onnx_runtime_ir::{DataType, Node};
 
-use crate::blas::{self, GemmDtype, GemmEx};
+use super::elementwise::BroadcastMetadataCache;
+use crate::blas::{self, GemmDtype, GemmEx, StridedBatchedGemmParams};
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
@@ -44,19 +45,49 @@ const BIAS_SRC: &str = r#"
 extern "C" __global__ void gemm_bias_f32(
     float*       y,             // [m, n] row-major, in/out
     const float* c,             // broadcastable bias
-    const int    m,
-    const int    n,
-    const int    c_row_stride,  // 0 if C broadcasts over rows, else n_c
-    const int    c_col_stride,  // 0 if C broadcasts over cols, else 1
+    const unsigned long long m,
+    const unsigned long long n,
+    const unsigned long long c_row_stride,  // 0 if C broadcasts over rows, else n_c
+    const unsigned long long c_col_stride,  // 0 if C broadcasts over cols, else 1
     const float  beta)
 {
-    const long total = (long)m * n;
-    for (long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
-         idx < total; idx += (long)gridDim.x * blockDim.x) {
-        const int row = (int)(idx / n);
-        const int col = (int)(idx % n);
-        const float cv = c[(long)row * c_row_stride + (long)col * c_col_stride];
+    const unsigned long long total = m * n;
+    for (unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total; idx += (unsigned long long)gridDim.x * blockDim.x) {
+        unsigned long long offset;
+        if (c_col_stride == 1 && c_row_stride == n) {
+            offset = idx;
+        } else if (total <= 0xffffffffULL) {
+            // Keep the normal-sized broadcast epilogue off 64-bit division.
+            const auto i = (unsigned int)idx;
+            const auto width = (unsigned int)n;
+            offset = (c_row_stride ? (i / width) * (unsigned int)c_row_stride : 0)
+                   + (c_col_stride ? i % width : 0);
+        } else {
+            offset = (c_row_stride ? (idx / n) * c_row_stride : 0)
+                   + (c_col_stride ? idx % n : 0);
+        }
+        const float cv = c[offset];
         y[idx] += beta * cv;
+    }
+}
+
+extern "C" __global__ void gemm_bias_nd_f32(
+    float* y, const float* c, const unsigned long long* metadata,
+    int rank, unsigned long long total, float beta, float empty_product, int add_product)
+{
+    const auto* strides = metadata + rank;
+    for (unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total; idx += (unsigned long long)gridDim.x * blockDim.x) {
+        auto remaining = idx;
+        unsigned long long offset = 0;
+        for (int d = rank - 1; d >= 0; --d) {
+            if (strides[d]) offset += (remaining % metadata[d]) * strides[d];
+            remaining /= metadata[d];
+        }
+        float v = add_product ? y[idx] : empty_product;
+        if (c) v += beta * c[offset];
+        y[idx] = v;
     }
 }
 "#;
@@ -64,6 +95,7 @@ extern "C" __global__ void gemm_bias_f32(
 const BIAS_MODULE: &str = "gemm_bias_f32";
 const BIAS_ENTRY: &str = "gemm_bias_f32";
 const BIAS_BLOCK: u32 = 256;
+pub(crate) const DTYPES: &[DataType] = &[DataType::Float32];
 
 /// Factory for [`GemmKernel`]; reads `alpha`/`beta` (default 1.0) and
 /// `transA`/`transB` (default 0) — all model-agnostic runtime attributes.
@@ -83,6 +115,10 @@ impl KernelFactory for GemmFactory {
             beta,
             trans_a,
             trans_b,
+            nd: node
+                .local_opset()
+                .is_some_and(|version| version >= ND_GEMM_OPSET),
+            bias_metadata: Mutex::new(BroadcastMetadataCache::new(self.runtime.clone())),
         }))
     }
 }
@@ -95,6 +131,8 @@ pub struct GemmKernel {
     beta: f32,
     trans_a: bool,
     trans_b: bool,
+    nd: bool,
+    bias_metadata: Mutex<BroadcastMetadataCache>,
 }
 
 /// Resolved `Gemm` problem geometry and the cuBLASLt leading dims / transpose
@@ -125,42 +163,25 @@ pub(super) fn plan_gemm(
     trans_a: bool,
     trans_b: bool,
 ) -> Result<GemmPlan> {
-    if a.len() != 2 || b.len() != 2 {
-        return Err(not_implemented(format!(
-            "Gemm with operand ranks {}D x {}D (Gemm requires 2-D A and B)",
-            a.len(),
-            b.len()
-        )));
-    }
-    let (ra, ca) = (a[0], a[1]);
-    let (rb, cb) = (b[0], b[1]);
-
-    // A' is [M,K]; B' is [K,N]. Resolve from the transpose flags.
-    let (m, ka) = if trans_a { (ca, ra) } else { (ra, ca) };
-    let (kb, n) = if trans_b { (cb, rb) } else { (rb, cb) };
-    if ka != kb {
-        return Err(EpError::KernelFailed(format!(
-            "cuda_ep Gemm: inner dimensions disagree — A' is [{m},{ka}] but B' is [{kb},{n}] \
-             (A {a:?} transA={trans_a}, B {b:?} transB={trans_b})"
-        )));
-    }
+    let geometry =
+        GemmGeometry::new(a, b, trans_a, trans_b, false).map_err(EpError::KernelFailed)?;
     Ok(GemmPlan {
-        m,
-        k: ka,
-        n,
+        m: geometry.m,
+        k: geometry.k,
+        n: geometry.n,
         // cuBLASLt first matrix = ONNX B, transposed iff transB; second = ONNX A,
         // transposed iff transA. Leading dims are the stored column counts.
         transa: trans_b,
         transb: trans_a,
-        ldb_operand: cb,
-        lda_operand: ca,
+        ldb_operand: b[1],
+        lda_operand: a[1],
     })
 }
 
 /// Broadcast strides (`c_row_stride`, `c_col_stride`) for a bias `C` of the
 /// given shape onto an `[M,N]` output, or an actionable error if `C` does not
 /// unidirectionally broadcast to `[M,N]` (ONNX Gemm requirement).
-fn bias_strides(c: &[usize], m: usize, n: usize) -> Result<(i32, i32)> {
+fn bias_strides(c: &[usize], m: usize, n: usize) -> Result<(usize, usize)> {
     // Normalise C to a 2-D [cr, cc] with trailing-dim alignment.
     let (cr, cc) = match c.len() {
         0 => (1usize, 1usize),
@@ -179,12 +200,62 @@ fn bias_strides(c: &[usize], m: usize, n: usize) -> Result<(i32, i32)> {
              (each C dim must be 1, M, or N)"
         )));
     }
-    let row_stride = if cr == 1 { 0 } else { cc as i32 };
+    let row_stride = if cr == 1 { 0 } else { cc };
     let col_stride = if cc == 1 { 0 } else { 1 };
     Ok((row_stride, col_stride))
 }
 
 impl GemmKernel {
+    fn geometry(&self, a: &[usize], b: &[usize]) -> Result<GemmGeometry> {
+        GemmGeometry::new(a, b, self.trans_a, self.trans_b, self.nd).map_err(EpError::KernelFailed)
+    }
+
+    fn single_params(&self, g: GemmGeometry, a_rank: usize, a: u64, b: u64, y: u64) -> GemmEx {
+        let trans_a = Self::transpose_a(g, a_rank);
+        GemmEx {
+            dtype: GemmDtype::F32,
+            transa: self.trans_b,
+            transb: trans_a,
+            m: g.n,
+            n: g.rows,
+            k: g.k,
+            alpha: self.alpha,
+            beta: 0.0,
+            a: b,
+            lda: if self.trans_b { g.k } else { g.n },
+            b: a,
+            ldb: if trans_a { g.m } else { g.k },
+            c: y,
+            ldc: g.n,
+            epilogue: None,
+        }
+    }
+
+    fn transpose_a(g: GemmGeometry, rank: usize) -> bool {
+        if rank == 2 {
+            g.axes.trans_a
+        } else {
+            g.transposes_a_storage()
+        }
+    }
+
+    fn batched_params(&self, g: GemmGeometry, a: u64, b: u64, y: u64) -> StridedBatchedGemmParams {
+        StridedBatchedGemmParams {
+            dtype: GemmDtype::F32,
+            a,
+            b,
+            c: y,
+            m: g.m,
+            k: g.k,
+            n: g.n,
+            batch: g.batch,
+            transpose_a: true,
+            transpose_b: self.trans_b,
+            a_batch_stride: g.m * g.k,
+            b_batch_stride: 0,
+        }
+    }
+
     fn run(
         &self,
         inputs: &[TensorView],
@@ -203,13 +274,14 @@ impl GemmKernel {
         let b = &inputs[1];
         let bias = inputs.get(2).filter(|c| !c.is_absent());
 
-        for (name, dt) in [("A", a.dtype), ("B", b.dtype), ("Y", outputs[0].dtype)] {
-            if dt != DataType::Float32 {
-                return Err(not_implemented(format!(
-                    "Gemm with {name} dtype {dt:?} (this slice is f32-only; f16/bf16 pending)"
-                )));
-            }
-        }
+        onnx_runtime_ep_api::gemm::validate_dtypes(
+            DTYPES,
+            self.nd,
+            [a.dtype, b.dtype, outputs[0].dtype]
+                .into_iter()
+                .chain(bias.map(|c| c.dtype)),
+        )
+        .map_err(EpError::KernelFailed)?;
         for (name, contiguous) in [
             ("A", a.is_contiguous()),
             ("B", b.is_contiguous()),
@@ -223,102 +295,88 @@ impl GemmKernel {
             }
         }
 
-        let plan = plan_gemm(a.shape, b.shape, self.trans_a, self.trans_b)?;
-        let expected_out = plan.m * plan.n;
-        if outputs[0].numel() != expected_out {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep Gemm: output has {} elements, expected {} ([M={},N={}])",
-                outputs[0].numel(),
-                expected_out,
-                plan.m,
-                plan.n
-            )));
-        }
+        let g = self.geometry(a.shape, b.shape)?;
+        let y_shape = outputs[0].shape;
+        g.validate_output(a.shape, b.shape, y_shape)
+            .map_err(EpError::KernelFailed)?;
 
         // Resolve the bias plan (strides) before touching the device.
         let bias_plan = match bias {
             None => None,
             Some(c) => {
-                if c.dtype != DataType::Float32 {
-                    return Err(not_implemented(format!(
-                        "Gemm bias C dtype {:?} (this slice is f32-only)",
-                        c.dtype
-                    )));
-                }
                 if !c.is_contiguous() {
                     return Err(not_implemented(
                         "Gemm with a non-contiguous (strided) bias C; materialise it first",
                     ));
                 }
-                let (rs, cs) = bias_strides(c.shape, plan.m, plan.n)?;
-                Some((c, rs, cs))
+                validate_bias(c.shape, y_shape).map_err(EpError::KernelFailed)?;
+                Some(c)
             }
         };
         crate::trace::record_kernel_metrics(inputs, outputs, || {
-            let mut flops = (plan.m as u64)
-                .saturating_mul(plan.n as u64)
-                .saturating_mul(plan.k as u64)
+            let mut flops = (g.rows as u64)
+                .saturating_mul(g.n as u64)
+                .saturating_mul(g.k as u64)
                 .saturating_mul(2);
             if bias_plan.is_some() && self.beta != 0.0 {
-                flops = flops.saturating_add(
-                    (plan.m as u64)
-                        .saturating_mul(plan.n as u64)
-                        .saturating_mul(2),
-                );
+                flops = flops
+                    .saturating_add((g.rows as u64).saturating_mul(g.n as u64).saturating_mul(2));
             }
             flops
         });
 
+        if g.elements == 0 {
+            return Ok(());
+        }
+        let bias = bias_plan.filter(|_| self.beta != 0.0);
+        let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+        if g.k == 0 {
+            self.apply_bias_nd(y_ptr, bias, y_shape, g.elements, false)?;
+            return self.runtime.synchronize();
+        }
         let a_ptr = cuptr(a.data_ptr::<u8>() as *const c_void);
         let b_ptr = cuptr(b.data_ptr::<u8>() as *const c_void);
-        let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
-        // Column-major Yᵀ[N,M] = alpha·(B')ᵀ·(A')ᵀ → row-major Y[M,N].
-        let params = GemmEx {
-            dtype: GemmDtype::F32,
-            transa: plan.transa,
-            transb: plan.transb,
-            m: plan.n,
-            n: plan.m,
-            k: plan.k,
-            alpha: self.alpha,
-            beta: 0.0,
-            a: b_ptr,
-            lda: plan.ldb_operand,
-            b: a_ptr,
-            ldb: plan.lda_operand,
-            c: y_ptr,
-            ldc: plan.n,
-            epilogue: None,
-        };
-
-        // SAFETY: A/B/Y are validated dense f32 device buffers sized for the
-        // planned shapes; `workspace` is live for the call; Y aliases neither A
-        // nor B (distinct output buffer); the context is bound by `alloc_raw`.
-        let gemm_res = unsafe {
-            blas::governed_gemm_ex(
-                self.runtime.blas(),
-                self.runtime.stream_ptr(),
-                &params,
-                workspace,
-                "Gemm",
-            )
-        };
-
-        // Fused bias epilogue: Y += beta·C (broadcast). Skipped when beta==0.
-        let bias_res = gemm_res.and_then(|()| {
-            if let Some((c, rs, cs)) = bias_plan {
-                if self.beta != 0.0 {
-                    self.apply_bias(y_ptr, c, plan.m, plan.n, rs, cs)
-                } else {
-                    Ok(())
-                }
+        // SAFETY: The executor provides distinct dense device buffers covering
+        // the validated shapes and the live workspace on this stream.
+        unsafe {
+            if g.batch > 1 && g.transposes_a_storage() {
+                let params = self.batched_params(g, a_ptr, b_ptr, y_ptr);
+                blas::governed_strided_batched_gemm(
+                    self.runtime.blas(),
+                    self.runtime.stream_ptr(),
+                    &params,
+                    self.alpha,
+                    workspace,
+                    "Gemm",
+                )?;
             } else {
-                Ok(())
+                let params = self.single_params(g, a.shape.len(), a_ptr, b_ptr, y_ptr);
+                blas::governed_gemm_ex(
+                    self.runtime.blas(),
+                    self.runtime.stream_ptr(),
+                    &params,
+                    workspace,
+                    "Gemm",
+                )?;
             }
-        });
+        }
 
-        bias_res.and_then(|()| self.runtime.synchronize())
+        if let Some(c) = bias {
+            if y_shape.len() == 2 {
+                let (rs, cs) = bias_strides(c.shape, g.rows, g.n)?;
+                self.apply_bias(y_ptr, c, g.rows, g.n, rs, cs)?;
+            } else if c.numel() == 1 {
+                self.apply_bias(y_ptr, c, g.rows, g.n, 0, 0)?;
+            } else if c.numel() == g.elements {
+                self.apply_bias(y_ptr, c, g.rows, g.n, g.n, 1)?;
+            } else if c.numel() == g.n && c.shape.last() == Some(&g.n) {
+                self.apply_bias(y_ptr, c, g.rows, g.n, 0, 1)?;
+            } else {
+                self.apply_bias_nd(y_ptr, Some(c), y_shape, g.elements, true)?;
+            }
+        }
+        self.runtime.synchronize()
     }
 
     fn workspace_requirement_for(
@@ -333,25 +391,17 @@ impl GemmKernel {
         if a.dtype != DataType::Float32 || b.dtype != DataType::Float32 {
             return Ok(WorkspaceRequirement::NONE);
         }
-        let plan = plan_gemm(a.shape, b.shape, self.trans_a, self.trans_b)?;
-        let params = GemmEx {
-            dtype: GemmDtype::F32,
-            transa: plan.transa,
-            transb: plan.transb,
-            m: plan.n,
-            n: plan.m,
-            k: plan.k,
-            alpha: self.alpha,
-            beta: 0.0,
-            a: 1,
-            lda: plan.ldb_operand,
-            b: 1,
-            ldb: plan.lda_operand,
-            c: 1,
-            ldc: plan.n,
-            epilogue: None,
+        let g = self.geometry(a.shape, b.shape)?;
+        if g.elements == 0 || g.k == 0 {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        let bytes = if g.batch > 1 && g.transposes_a_storage() {
+            let params = self.batched_params(g, 1, 1, 1);
+            blas::strided_batched_gemm_workspace_bytes(self.runtime.blas(), &params, "Gemm")?
+        } else {
+            let params = self.single_params(g, a.shape.len(), 1, 1, 1);
+            blas::gemm_ex_workspace_bytes(self.runtime.blas(), &params)?
         };
-        let bytes = blas::gemm_ex_workspace_bytes(self.runtime.blas(), &params)?;
         Ok(blas::governed_workspace_requirement(bytes))
     }
 
@@ -362,17 +412,13 @@ impl GemmKernel {
         c: &TensorView,
         m: usize,
         n: usize,
-        row_stride: i32,
-        col_stride: i32,
+        row_stride: usize,
+        col_stride: usize,
     ) -> Result<()> {
         let c_ptr = cuptr(c.data_ptr::<u8>() as *const c_void);
         let total = m * n;
-        let (m_i, n_i) = (
-            i32::try_from(m)
-                .map_err(|_| EpError::KernelFailed(format!("cuda_ep Gemm: M={m} exceeds i32")))?,
-            i32::try_from(n)
-                .map_err(|_| EpError::KernelFailed(format!("cuda_ep Gemm: N={n} exceeds i32")))?,
-        );
+        let (m, n, row_stride, col_stride) =
+            (m as u64, n as u64, row_stride as u64, col_stride as u64);
         let beta = self.beta;
         let func = self
             .runtime
@@ -388,18 +434,79 @@ impl GemmKernel {
         builder
             .arg(&y_ptr)
             .arg(&c_ptr)
-            .arg(&m_i)
-            .arg(&n_i)
+            .arg(&m)
+            .arg(&n)
             .arg(&row_stride)
             .arg(&col_stride)
             .arg(&beta);
         // SAFETY: `func` is the compiled bias entry; the argument list matches
-        // its (float*, const float*, int, int, int, int, float) signature; `y`
+        // its signature; `y`
         // covers [m,n] f32 and `c` is addressable at every broadcast index the
         // strides produce (validated by `bias_strides`).
         unsafe { builder.launch(cfg) }
             .map(|_| ())
             .map_err(|e| driver_err("launch gemm_bias_f32", e))
+    }
+
+    fn apply_bias_nd(
+        &self,
+        y: u64,
+        bias: Option<&TensorView>,
+        shape: &[usize],
+        elements: usize,
+        add_product: bool,
+    ) -> Result<()> {
+        let func = self
+            .runtime
+            .nvrtc_function(BIAS_MODULE, BIAS_SRC, "gemm_bias_nd_f32")?;
+        let mut cache = self.bias_metadata.lock().map_err(|_| {
+            EpError::KernelFailed(
+                "cuda_ep Gemm: bias metadata lock was poisoned; recreate the execution session"
+                    .into(),
+            )
+        })?;
+        let (c, metadata, rank) = if let Some(c) = bias {
+            let rank = i32::try_from(shape.len()).map_err(|_| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep Gemm: output rank {} exceeds i32; reduce tensor rank",
+                    shape.len()
+                ))
+            })?;
+            (
+                cuptr(c.data_ptr::<u8>().cast()),
+                cache.prepare(c.shape, &[], shape)?,
+                rank,
+            )
+        } else {
+            (0, 0, 0)
+        };
+        let total = elements as u64;
+        let empty_product = 0.0 * self.alpha;
+        let add_product = i32::from(add_product);
+        let cfg = LaunchConfig {
+            grid_dim: (
+                elements.div_ceil(BIAS_BLOCK as usize).clamp(1, 65_535) as u32,
+                1,
+                1,
+            ),
+            block_dim: (BIAS_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        builder
+            .arg(&y)
+            .arg(&c)
+            .arg(&metadata)
+            .arg(&rank)
+            .arg(&total)
+            .arg(&self.beta)
+            .arg(&empty_product)
+            .arg(&add_product);
+        // SAFETY: All pointers cover their validated shapes. The cache keeps
+        // the metadata live on the owning stream across this asynchronous read.
+        unsafe { builder.launch(cfg) }
+            .map(|_| ())
+            .map_err(|e| driver_err("launch gemm_bias_nd_f32", e))
     }
 }
 
@@ -479,7 +586,7 @@ mod tests {
     #[test]
     fn plan_rejects_non_2d() {
         let e = plan_gemm(&[2, 3, 4], &[4, 5], false, false).unwrap_err();
-        assert!(format!("{e}").contains("requires 2-D"), "{e}");
+        assert!(format!("{e}").contains("rank 2 before opset 29"), "{e}");
     }
 
     #[test]

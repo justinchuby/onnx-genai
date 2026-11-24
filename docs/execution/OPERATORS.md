@@ -59,7 +59,7 @@ plugin EPs (via C ABI bridge) handle them.
 | TopK | 11 | Sampling. |
 | ReduceMean | 18 | LayerNorm (when not fused). |
 | ReduceSum | 13 | |
-| Gemm | 7 | Fused MatMul+Bias. |
+| Gemm | 7 | Scaled matrix product with optional broadcast bias. Gemm-29 also accepts vector and N-D A; B remains rank 2. |
 
 ### Tier 2: Required (prefill + model structure)
 

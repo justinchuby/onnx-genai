@@ -55,6 +55,7 @@ mod domain;
 mod dtype;
 mod einsum;
 mod error;
+pub mod gemm;
 mod graph;
 mod graph_view;
 mod layout;

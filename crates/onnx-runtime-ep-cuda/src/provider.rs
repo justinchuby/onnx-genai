@@ -4094,6 +4094,15 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if let Some(reason) = onnx_runtime_ep_api::gemm::unsupported_reason(
+            op,
+            opset,
+            shapes,
+            input_dtypes,
+            crate::kernels::gemm::DTYPES,
+        ) {
+            return KernelMatch::unsupported(reason);
+        }
         if matches!(op.op_type.as_str(), "FusedMatMulBias" | "FusedGemm")
             && op.domain == "com.microsoft"
             && let Some(reason) = crate::kernels::fused_gemm::unsupported_reason(op, shapes)

@@ -111,7 +111,11 @@ pub enum ShapeInference {
     /// `QLinearMatMul` node from a plugin host.
     QLinearMatMul,
     /// Gemm: (trans_a, trans_b) flags.
-    Gemm { trans_a: bool, trans_b: bool },
+    Gemm {
+        trans_a: bool,
+        trans_b: bool,
+        nd: bool,
+    },
     /// Concat along `axis`.
     Concat { axis: i64 },
     /// Transpose with optional explicit permutation.
@@ -567,7 +571,8 @@ impl ShapeInference {
             "Gemm" => {
                 let trans_a = int_attr("transA").unwrap_or(0) != 0;
                 let trans_b = int_attr("transB").unwrap_or(0) != 0;
-                Self::Gemm { trans_a, trans_b }
+                let nd = node.local_opset().is_some_and(|version| version >= onnx_runtime_ir::gemm::ND_GEMM_OPSET);
+                Self::Gemm { trans_a, trans_b, nd }
             }
 
             // ── Concat ────────────────────────────────────────────────────
@@ -5160,18 +5165,23 @@ fn infer_shapes(
             Ok(vec![shape])
         }
 
-        ShapeInference::Gemm { trans_a, trans_b } => {
+        ShapeInference::Gemm {
+            trans_a,
+            trans_b,
+            nd,
+        } => {
             if inputs.len() < 2 {
                 return Err(format!("Gemm: expected ≥2 inputs, got {}", inputs.len()));
             }
             let a = inputs[0].shape;
             let b = inputs[1].shape;
-            if a.len() != 2 || b.len() != 2 {
-                return Err(format!("Gemm: inputs must be 2-D, got {a:?} and {b:?}"));
+            use onnx_runtime_ir::gemm::{GemmGeometry, validate_bias};
+            let g = GemmGeometry::new(a, b, *trans_a, *trans_b, *nd)?;
+            let y: Vec<_> = g.axes.output_dims(a, b).copied().collect();
+            if let Some(c) = inputs.get(2).filter(|v| !v.is_absent()) {
+                validate_bias(c.shape, &y)?;
             }
-            let m = if *trans_a { a[1] } else { a[0] };
-            let n = if *trans_b { b[0] } else { b[1] };
-            Ok(vec![vec![m, n]])
+            Ok(vec![y])
         }
 
         ShapeInference::Concat { axis } => {
@@ -7855,6 +7865,7 @@ fn after() {}
             &ShapeInference::Gemm {
                 trans_a: false,
                 trans_b: false,
+                nd: false,
             },
             &[view(&a, &at), view(&b, &bt)],
         )
@@ -7873,6 +7884,7 @@ fn after() {}
             &ShapeInference::Gemm {
                 trans_a: false,
                 trans_b: true,
+                nd: false,
             },
             &[view(&a, &at), view(&b, &bt)],
         )
