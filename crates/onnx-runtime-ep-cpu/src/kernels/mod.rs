@@ -581,6 +581,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         // CNN ops (feature-gated). `Conv` computes through MLAS in f32 and
         // rejects f64 in `ConvKernel::execute`, so it must not advertise it.
         ("Conv", "") => FLOAT_COMPUTE_DTYPES,
+        ("DeformConv", "") => onnx_runtime_ir::deform_conv::DTYPES,
 
         // The rest of the CNN family dispatches through `dispatch_float!` and
         // does handle f64.
@@ -728,6 +729,7 @@ operator_group_modules!(
     center_crop_pad,
     col2im,
     conv_transpose,
+    deform_conv,
     grid_sample,
     norm_ops,
     pooling,
@@ -955,6 +957,13 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(conv_transpose::ConvTransposeFactory),
     );
+    for version in [19, 22] {
+        registry.register(
+            OpKey::new("DeformConv", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(deform_conv::Factory(version)),
+        );
+    }
     registry.register(
         OpKey::new("Conv", "", 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -3508,11 +3517,12 @@ mod tests {
         // its `com.microsoft` spelling.
         // `STFT` and `DequantizePacked` each add a standard-domain registration.
         // The EP-owned affine and GGUF Gather and grouped-projection fusions each add one.
+        // DeformConv adds separate opset-19 and opset-22 entries.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
         // Opset 29 adds the three indexing revisions; ScatterElements also
         // gets a distinct opset 18 registration for max/min.
         // Opset-28 Cast adds one registration.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 122 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 124 + mlas_registrations);
         for op in PHASE1_OPS {
             let since = reg
                 .earliest_since_version(op, "")

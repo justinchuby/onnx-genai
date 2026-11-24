@@ -1019,10 +1019,12 @@ fn checked_layout_stride(value: usize, name: &str) -> Result<i64> {
 fn plan_strided_batched_gemm(
     handle: &CublasLt,
     p: &StridedBatchedGemmParams,
+    authority: PointerAlignmentAuthority,
+    op: &str,
 ) -> Result<PlannedMatmul> {
     if p.m == 0 || p.n == 0 || p.k == 0 || p.batch == 0 {
         return Err(EpError::KernelFailed(format!(
-            "cuda_ep Einsum: degenerate cuBLASLt contraction M={} K={} N={} batch={}",
+            "cuda_ep {op}: degenerate cuBLASLt contraction M={} K={} N={} batch={}",
             p.m, p.k, p.n, p.batch
         )));
     }
@@ -1063,7 +1065,7 @@ fn plan_strided_batched_gemm(
     if p.batch > 1 {
         let count = i32::try_from(p.batch).map_err(|_| {
             EpError::KernelFailed(format!(
-                "cuda_ep Einsum: cuBLASLt batch {} exceeds i32",
+                "cuda_ep {op}: cuBLASLt batch {} exceeds i32",
                 p.batch
             ))
         })?;
@@ -1077,7 +1079,7 @@ fn plan_strided_batched_gemm(
         )?;
         let c_stride = p.m.checked_mul(p.n).ok_or_else(|| {
             EpError::KernelFailed(format!(
-                "cuda_ep Einsum: output matrix stride overflows for M={} N={}",
+                "cuda_ep {op}: output matrix stride overflows for M={} N={}",
                 p.m, p.n
             ))
         })?;
@@ -1096,8 +1098,7 @@ fn plan_strided_batched_gemm(
         p.transpose_a,
     )?;
     let pointers = MatmulPointers::row_major(p.a, p.b, p.c);
-    let available_alignments =
-        pointers.alignments(p.dtype, PointerAlignmentAuthority::ActualAddress);
+    let available_alignments = pointers.alignments(p.dtype, authority);
     let pref = MatmulPref::new(WORKSPACE_BYTES, available_alignments, p.dtype)?;
     // SAFETY: all descriptor/layout handles are live for the query.
     let heuristic = unsafe {
@@ -1114,7 +1115,7 @@ fn plan_strided_batched_gemm(
     .map_err(|e| {
         cublas_err(
             &format!(
-                "no cuBLASLt algorithm for Einsum M={} K={} N={} batch={} \
+                "no cuBLASLt algorithm for {op} M={} K={} N={} batch={} \
                  transpose_a={} transpose_b={} dtype={:?}",
                 p.m, p.k, p.n, p.batch, p.transpose_a, p.transpose_b, p.dtype
             ),
@@ -1177,34 +1178,45 @@ impl CaptureStridedBatchedGemmPlan {
         p: &StridedBatchedGemmParams,
         workspace: CUdeviceptr,
     ) -> Result<()> {
-        self.0
-            .validate_pointers(MatmulPointers::row_major(p.a, p.b, p.c), "Einsum")?;
-        let alpha = 1.0f32;
-        let beta = 0.0f32;
-        // SAFETY: forwarded from the caller; all plan objects remain live.
-        unsafe {
-            let _section = onnx_runtime_cuda_memory::capture_gate::synchronizing_section();
-            result::matmul(
-                handle.handle,
-                self.0._desc.0,
-                (&alpha) as *const f32 as *const c_void,
-                (&beta) as *const f32 as *const c_void,
-                p.b as *const c_void,
-                self.0.a_layout.0,
-                p.a as *const c_void,
-                self.0.b_layout.0,
-                p.c as *const c_void,
-                self.0.c_layout.0,
-                p.c as *mut c_void,
-                self.0.c_layout.0,
-                (&self.0.algo) as *const sys::cublasLtMatmulAlgo_t,
-                workspace as *mut c_void,
-                self.0.workspace_bytes,
-                stream as sys::cudaStream_t,
-            )
-        }
-        .map_err(|e| cublas_err("cublasLtMatmul Einsum", e))
+        // SAFETY: forwarded from the caller.
+        unsafe { launch_strided_batched_gemm(handle, stream, p, &self.0, workspace, 1.0, "Einsum") }
     }
+}
+
+unsafe fn launch_strided_batched_gemm(
+    handle: &CublasLt,
+    stream: cudarc::driver::sys::CUstream,
+    p: &StridedBatchedGemmParams,
+    plan: &PlannedMatmul,
+    workspace: CUdeviceptr,
+    alpha: f32,
+    op: &str,
+) -> Result<()> {
+    plan.validate_pointers(MatmulPointers::row_major(p.a, p.b, p.c), op)?;
+    let beta = 0.0f32;
+    // SAFETY: all descriptors are live, and buffer validity is the caller's contract.
+    unsafe {
+        let _section = onnx_runtime_cuda_memory::capture_gate::synchronizing_section();
+        result::matmul(
+            handle.handle,
+            plan._desc.0,
+            (&alpha) as *const f32 as *const c_void,
+            (&beta) as *const f32 as *const c_void,
+            p.b as *const c_void,
+            plan.a_layout.0,
+            p.a as *const c_void,
+            plan.b_layout.0,
+            p.c as *const c_void,
+            plan.c_layout.0,
+            p.c as *mut c_void,
+            plan.c_layout.0,
+            (&plan.algo) as *const sys::cublasLtMatmulAlgo_t,
+            workspace as *mut c_void,
+            plan.workspace_bytes,
+            stream as sys::cudaStream_t,
+        )
+    }
+    .map_err(|e| cublas_err(&format!("cublasLtMatmul {op}"), e))
 }
 
 /// Select one reusable cuBLASLt plan for a canonical `Einsum` contraction.
@@ -1213,8 +1225,39 @@ pub fn plan_capture_strided_batched_gemm(
     p: &StridedBatchedGemmParams,
 ) -> Result<CaptureStridedBatchedGemmPlan> {
     Ok(CaptureStridedBatchedGemmPlan(plan_strided_batched_gemm(
-        handle, p,
+        handle,
+        p,
+        PointerAlignmentAuthority::ActualAddress,
+        "Einsum",
     )?))
+}
+
+pub(crate) fn strided_batched_gemm_workspace_bytes(
+    handle: &CublasLt,
+    p: &StridedBatchedGemmParams,
+    op: &str,
+) -> Result<usize> {
+    Ok(
+        plan_strided_batched_gemm(handle, p, PointerAlignmentAuthority::TypedMinimum, op)?
+            .workspace_bytes,
+    )
+}
+
+/// # Safety
+/// A/B/C must cover the given shape and strides, C must not overlap A/B, and
+/// workspace and stream must belong to the same live device context.
+pub(crate) unsafe fn governed_strided_batched_gemm(
+    handle: &CublasLt,
+    stream: cudarc::driver::sys::CUstream,
+    p: &StridedBatchedGemmParams,
+    alpha: f32,
+    workspace: Option<WorkspaceView>,
+    op: &str,
+) -> Result<()> {
+    let plan = plan_strided_batched_gemm(handle, p, PointerAlignmentAuthority::TypedMinimum, op)?;
+    let ptr = governed_workspace_ptr(workspace, plan.workspace_bytes, op)?;
+    // SAFETY: forwarded from the caller after validating the workspace size.
+    unsafe { launch_strided_batched_gemm(handle, stream, p, &plan, ptr, alpha, op) }
 }
 
 /// A single (non-batched) **column-major, native cuBLAS** GEMM request:

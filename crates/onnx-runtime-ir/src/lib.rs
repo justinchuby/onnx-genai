@@ -48,6 +48,7 @@
 
 pub mod affine_gather;
 mod arena;
+pub mod deform_conv;
 pub mod dequantize_packed;
 pub mod dequantize_packed_gather;
 mod device;
@@ -55,6 +56,7 @@ mod domain;
 mod dtype;
 mod einsum;
 mod error;
+pub mod gemm;
 mod graph;
 mod graph_view;
 mod layout;

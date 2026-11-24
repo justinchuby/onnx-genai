@@ -648,6 +648,8 @@ pub fn max_unpool(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "Conv", 1, conv);
     reg.register("", "ConvTranspose", 1, conv_transpose);
+    reg.register("", "DeformConv", 19, deform_conv);
+    reg.register("", "DeformConv", 22, deform_conv);
     reg.register("", "MaxPool", 1, pool);
     reg.register("", "AveragePool", 1, pool);
     // `LpPool` shares `MaxPool`/`AveragePool`'s windowed spatial formula (it
@@ -664,6 +666,85 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "Pad", 1, pad);
     reg.register("", "GridSample", 16, grid_sample);
     reg.register("", "AffineGrid", 20, affine_grid);
+}
+
+fn deform_conv(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    use onnx_runtime_ir::deform_conv::{Attributes, validate_types};
+
+    let invalid = |detail| ShapeInferError::Invalid {
+        op: "DeformConv".into(),
+        detail,
+    };
+    let attrs = Attributes::parse(ctx.node).map_err(invalid)?;
+    let dtypes = std::array::from_fn(|i| ctx.input_dtype(i));
+    validate_types(ctx.opset(""), dtypes, None).map_err(invalid)?;
+    let shapes: [Option<&[DimExpr]>; 5] = std::array::from_fn(|i| ctx.input_shape(i));
+    let [x, w, offset, ..] = shapes;
+    let Some(full_rank) = x.or(w).or(offset).map(<[_]>::len) else {
+        return Ok(());
+    };
+    let rank = full_rank.saturating_sub(2);
+    attrs.validate_rank(rank).map_err(invalid)?;
+    for (name, shape) in [("X", x), ("W", w), ("offset", offset)] {
+        if let Some(s) = shape
+            && s.len() != full_rank
+        {
+            return Err(invalid(format!(
+                "{name} has rank {}, expected {full_rank}",
+                s.len()
+            )));
+        }
+    }
+    let dim = |shape: Option<&[DimExpr]>, i: usize| shape.and_then(|s| s.get(i)).cloned();
+    let as_usize = |d: &DimExpr| d.as_const().and_then(|n| usize::try_from(n).ok());
+    let concrete =
+        shapes.map(|s| s.and_then(|s| s.iter().map(as_usize).collect::<Option<Vec<_>>>()));
+    if ctx
+        .node
+        .inputs
+        .iter()
+        .enumerate()
+        .all(|(i, slot)| slot.is_none() || concrete[i].is_some())
+    {
+        attrs
+            .resolve(concrete.each_ref().map(Option::as_deref))
+            .map_err(invalid)?;
+    }
+    let mut y = vec![dim(x, 0).or_else(|| dim(offset, 0)), dim(w, 0)];
+    for d in 0..rank {
+        let inferred = match (
+            dim(x, d + 2).as_ref().and_then(as_usize),
+            dim(w, d + 2).as_ref().and_then(as_usize),
+        ) {
+            (Some(input), Some(weight)) => {
+                let a = attrs.axis(rank, d, input, weight).map_err(invalid)?;
+                Some(
+                    i64::try_from(a.output)
+                        .map_err(|_| invalid(format!("output axis {d} exceeds i64")))?,
+                )
+            }
+            _ => None,
+        };
+        let actual = dim(offset, d + 2);
+        if let Some(n) = inferred {
+            if let Some(m) = actual.as_ref().and_then(DimExpr::as_const)
+                && n != m
+            {
+                return Err(invalid(format!(
+                    "offset spatial axis {d} has extent {m}, expected {n}"
+                )));
+            }
+            y.push(Some(DimExpr::constant(n)));
+        } else {
+            y.push(actual);
+        }
+    }
+    let y = y
+        .into_iter()
+        .map(|d| d.unwrap_or_else(|| ctx.fresh_dim()))
+        .collect();
+    ctx.set_output(0, dtypes[0].unwrap_or(DataType::Undefined), y);
+    Ok(())
 }
 
 /// One `ConvTranspose` spatial output extent.

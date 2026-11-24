@@ -109,14 +109,18 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "GatherND", 11, gather_nd);
     reg.register("", "GatherND", 12, gather_nd);
     reg.register("", "GatherND", 13, gather_nd);
+    reg.register("", "GatherND", 29, gather_nd);
     reg.register("", "Scatter", 9, scatter_elements);
     reg.register("", "ScatterElements", 11, scatter_elements);
     reg.register("", "ScatterElements", 13, scatter_elements);
     reg.register("", "ScatterElements", 16, scatter_elements);
+    reg.register("", "ScatterElements", 18, scatter_elements);
+    reg.register("", "ScatterElements", 29, scatter_elements);
     reg.register("", "ScatterND", 11, scatter_nd);
     reg.register("", "ScatterND", 13, scatter_nd);
     reg.register("", "ScatterND", 16, scatter_nd);
     reg.register("", "ScatterND", 18, scatter_nd);
+    reg.register("", "ScatterND", 29, scatter_nd);
     reg.register("", "TensorScatter", 24, tensor_scatter);
     reg.register("", "Trilu", 14, trilu);
     // `ReverseSequence` (opset 10) permutes elements but preserves the input's

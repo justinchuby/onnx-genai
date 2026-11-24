@@ -59,6 +59,7 @@ pub mod csa_state_group;
 pub mod cumprod;
 pub mod cumsum;
 pub mod data_transform;
+pub(crate) mod deform_conv;
 mod dequantize_packed;
 mod dequantize_packed_gather;
 pub(crate) mod device_argmax;
@@ -391,6 +392,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "QLinearMatMul",
     "Resize",
     "ConvTranspose",
+    "DeformConv",
     "GridSample",
     "GatherBlockQuantized",
     "CausalConvWithState",
@@ -557,6 +559,7 @@ static CUDA_EINSUM_DTYPES: &[DataType] = &[
 /// kernels. Fail closed to the float compute set for unrecognised ops.
 pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataType] {
     match (op_type, domain) {
+        ("Gemm", "" | "ai.onnx") => gemm::DTYPES,
         ("BitCast", "") => BIT_CAST_TYPES,
         ("CumProd", "") => CUM_PROD_TYPES,
         ("DFT", "") => CUDA_DFT_DTYPES,
@@ -564,6 +567,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("Unique", "") => CUDA_UNIQUE_DTYPES,
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
         ("Einsum", "") => CUDA_EINSUM_DTYPES,
+        ("DeformConv", "") => onnx_runtime_ir::deform_conv::DTYPES,
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
         ("DequantizePackedGather", onnx_runtime_ir::RUNTIME_DOMAIN) => &[
             DataType::Uint8,
@@ -1125,6 +1129,16 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
+    for version in [19, 22] {
+        reg.register(
+            OpKey::new("DeformConv", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(deform_conv::Factory {
+                runtime: runtime.clone(),
+                version,
+            }),
+        );
+    }
     for since_version in [16_u32, 20] {
         reg.register(
             OpKey::new("GridSample", "", u64::from(since_version)),

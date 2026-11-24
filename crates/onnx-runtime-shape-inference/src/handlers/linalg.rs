@@ -665,7 +665,7 @@ pub fn multi_head_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInfer
     Ok(())
 }
 
-/// `Gemm(A, B, C?)`: `Y = alpha * A' * B' + beta * C`, output `[M, N]`.
+/// `Gemm(A, B, C?)`: output `[M, N]` before opset 29, and `[..., N]` thereafter.
 pub fn gemm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let a = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
     let b = ctx.input_shape(1).map(<[DimExpr]>::to_vec);
@@ -673,14 +673,6 @@ pub fn gemm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let (Some(a), Some(b), Some(dtype)) = (a, b, dtype) else {
         return Ok(());
     };
-    if a.len() != 2 || b.len() != 2 {
-        return Err(ShapeInferError::InvalidRank {
-            op: "Gemm".into(),
-            index: if a.len() != 2 { 0 } else { 1 },
-            rank: if a.len() != 2 { a.len() } else { b.len() },
-            detail: "Gemm operands must be rank-2".into(),
-        });
-    }
     let trans_a = ctx
         .node
         .attr("transA")
@@ -693,9 +685,31 @@ pub fn gemm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         .and_then(|x| x.as_int())
         .unwrap_or(0)
         != 0;
-    let m = if trans_a { a[1].clone() } else { a[0].clone() };
-    let n = if trans_b { b[0].clone() } else { b[1].clone() };
-    ctx.set_output(0, dtype, vec![m, n]);
+    use onnx_runtime_ir::gemm::{GemmAxes, ND_GEMM_OPSET, bias_broadcasts};
+    let nd = ctx.opset("") >= ND_GEMM_OPSET;
+    let invalid = |detail| ShapeInferError::Invalid {
+        op: "Gemm".into(),
+        detail,
+    };
+    let axes = GemmAxes::new(a.len(), b.len(), trans_a, trans_b, nd).map_err(invalid)?;
+    let shape: Vec<_> = axes.output_dims(&a, &b).cloned().collect();
+    if nd {
+        if let (Some(ka), Some(kb)) = (a[axes.a_k].as_const(), b[axes.b_k].as_const())
+            && ka != kb
+        {
+            return Err(invalid(format!(
+                "A and B contraction dimensions differ ({ka} vs {kb}); make them equal after transposition"
+            )));
+        }
+        if let Some(c) = ctx.input_shape(2)
+            && !bias_broadcasts(c, &shape, DimExpr::as_const)
+        {
+            return Err(invalid(format!(
+                "bias C shape {c:?} does not broadcast to output {shape:?}; use right-aligned equal or singleton dimensions"
+            )));
+        }
+    }
+    ctx.set_output(0, dtype, shape);
     Ok(())
 }
 

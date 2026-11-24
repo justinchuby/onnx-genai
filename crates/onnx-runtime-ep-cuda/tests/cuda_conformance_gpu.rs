@@ -1212,6 +1212,91 @@ fn gemm_cases() -> Vec<Case> {
     ]
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA with gpu-tests enabled"
+)]
+#[test]
+fn gemm_29_shapes_and_values_match_onnx() {
+    let ep = require_cuda();
+    let a = [1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.];
+    let b = input(DataType::Float32, &[2, 3], &[1.0f32, 0., 1., 0., 1., 0.]);
+    let dtype = DataType::Float32;
+    let inputs = |shape, a: &[f32]| vec![input(dtype, shape, a), b.clone()];
+    let trans_b = ("transB", Attribute::Int(1));
+    let trans_a = ("transA", Attribute::Int(1));
+    let cases = [
+        (
+            "vector transA no-op",
+            inputs(&[3], &a[..3]),
+            vec![2],
+            vec![trans_a.clone(), trans_b.clone()],
+            vec![4., 2.],
+        ),
+        (
+            "rank-4 flatten",
+            inputs(&[2, 1, 2, 3], &a),
+            vec![2, 1, 2, 2],
+            vec![trans_b.clone()],
+            vec![4., 2., 10., 5., 16., 8., 22., 11.],
+        ),
+        (
+            "rank-4 transpose and batch bias",
+            {
+                let mut v = inputs(&[2, 1, 3, 2], &a);
+                v.push(input(dtype, &[2, 1, 1, 2], &[10.0f32, 20., 30., 40.]));
+                v
+            },
+            vec![2, 1, 2, 2],
+            vec![
+                trans_a,
+                trans_b.clone(),
+                ("alpha", Attribute::Float(0.25)),
+                ("beta", Attribute::Float(0.5)),
+            ],
+            vec![6.5, 10.75, 7., 11., 19.5, 22.25, 20., 22.5],
+        ),
+        (
+            "empty batch",
+            inputs(&[0, 3, 3], &[]),
+            vec![0, 3, 2],
+            vec![trans_b],
+            vec![],
+        ),
+        (
+            "empty features with bias",
+            vec![
+                input::<f32>(dtype, &[2, 2, 0], &[]),
+                input::<f32>(dtype, &[0, 2], &[]),
+                input(dtype, &[2, 1, 1], &[2.0f32, 4.]),
+            ],
+            vec![2, 2, 2],
+            vec![],
+            vec![2., 2., 2., 2., 4., 4., 4., 4.],
+        ),
+    ];
+    for (label, inputs, shape, attrs, expected) in cases {
+        let case = Case {
+            label: label.into(),
+            op: "Gemm",
+            domain: "",
+            opset: 29,
+            inputs,
+            outputs: vec![(dtype, shape)],
+            attrs,
+            compare: Compare::Float { tol: 1e-6 },
+        };
+        let actual = run_case(&ep, &case);
+        assert_close(
+            label,
+            dtype,
+            &decode_floats(&actual[0], dtype),
+            &expected,
+            1e-6,
+        );
+    }
+}
+
 /// `com.microsoft::SkipLayerNormalization` (fused residual add + layernorm),
 /// f32, exercising the optional `beta` and `bias` slots. Only the required `Y`
 /// output is requested.
@@ -2540,6 +2625,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(sweep("Resize", resize_cases()));
     p.push(sweep("ConvTranspose", conv_transpose_cases()));
     p.push(sweep("GridSample", grid_sample_cases()));
+    p.push(dedicated(
+        "DeformConv",
+        "deform_conv_gpu.rs",
+        "Upstream ONNX and independently calculated N-D fixtures on both native EPs",
+    ));
     p.push(sweep("Dropout", dropout_cases()));
     p.push(sweep("NonZero", nonzero_cases()));
     p.push(sweep(
