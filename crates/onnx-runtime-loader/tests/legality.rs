@@ -115,6 +115,114 @@ fn constant_fp8_tensor_requires_its_schema_opset() {
 }
 
 #[test]
+fn constant_fp8_tensor_checks_original_opsets_before_inlining() {
+    use onnx_runtime_loader::load_model_bytes;
+
+    // Test a literal function value, a nested literal, a bound tensor, and a
+    // root Constant whose import would be raised by an unrelated function.
+    for (nested, bound, root) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        let value = onnx::AttributeProto {
+            name: "value".into(),
+            r#type: onnx::attribute_proto::AttributeType::Tensor as i32,
+            t: Some(onnx::TensorProto {
+                data_type: onnx_runtime_ir::DataType::Float8E4M3FN.to_onnx(),
+                dims: vec![1],
+                raw_data: vec![0x7f],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut constant = node("Constant", &[], &["Y"]);
+        constant.name = "local_fp8".into();
+        constant.attribute = if bound {
+            vec![onnx::AttributeProto {
+                ref_attr_name: "value".into(),
+                t: None,
+                ..value.clone()
+            }]
+        } else {
+            vec![value.clone()]
+        };
+        let mut function = onnx::FunctionProto {
+            domain: "local".into(),
+            name: "Make".into(),
+            output: vec!["Y".into()],
+            opset_import: vec![onnx::OperatorSetIdProto {
+                version: if root { 24 } else { 18 },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut call = node("Make", &[], &["Y"]);
+        call.domain = "local".into();
+        if bound {
+            function.attribute.push("value".into());
+            call.attribute.push(value);
+        }
+        let main_node = if root {
+            // An unused function still contributes its imported version.
+            let mut other = node("Constant", &[], &["Y"]);
+            other.attribute.push(onnx::AttributeProto {
+                name: "value_int".into(),
+                r#type: onnx::attribute_proto::AttributeType::Int as i32,
+                i: 1,
+                ..Default::default()
+            });
+            function.node.push(other);
+            constant
+        } else {
+            if nested {
+                let branch = onnx::GraphProto {
+                    node: vec![constant],
+                    output: vec![value_info("Y")],
+                    ..Default::default()
+                };
+                let mut conditional = node("If", &["cond"], &["Y"]);
+                conditional.attribute = vec![
+                    graph_attr("then_branch", branch.clone()),
+                    graph_attr("else_branch", branch),
+                ];
+                function.input.push("cond".into());
+                function.node.push(conditional);
+                call.input.push("cond".into());
+            } else {
+                function.node.push(constant);
+            }
+            call
+        };
+        let mut source = model(onnx::GraphProto {
+            node: vec![main_node],
+            input: if nested {
+                vec![value_info("cond")]
+            } else {
+                vec![]
+            },
+            output: vec![value_info("Y")],
+            ..Default::default()
+        });
+        source.ir_version = 12;
+        source.opset_import[0].version = if root { 18 } else { 24 };
+        source.opset_import.push(onnx::OperatorSetIdProto {
+            domain: "local".into(),
+            version: 1,
+        });
+        source.functions.push(function);
+        let err = load_model_bytes(&source.encode_to_vec()).unwrap_err();
+        assert!(
+            matches!(&err, LoaderError::ConstantValueOpset {
+                node, opset: 18, minimum: 19, ..
+            } if node.contains("local_fp8")),
+            "nested={nested}, bound={bound}, root={root}: {err}"
+        );
+    }
+}
+
+#[test]
 fn duplicate_value_producer_is_rejected_and_unique_values_load() {
     let duplicate = onnx::GraphProto {
         input: vec![value_info("X")],
