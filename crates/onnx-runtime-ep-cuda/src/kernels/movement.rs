@@ -9,6 +9,7 @@ use onnx_runtime_ep_api::{
     DeviceGraphResource, DevicePtrMut, EpError, Kernel, KernelFactory, Result, TensorMut,
     TensorView, ViewOutput, WorkspaceLayout, WorkspaceView,
 };
+use onnx_runtime_ir::transpose::packed_lane_bits;
 use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
 
 use super::elementwise::{broadcast_strides, u64_bytes};
@@ -84,6 +85,34 @@ extern "C" __global__ void transpose_bytes(
     }
     for (int byte = 0; byte < elem_bytes; ++byte)
       output[out * elem_bytes + byte] = input[src * elem_bytes + byte];
+  }
+}
+
+extern "C" __global__ void transpose_packed(
+    const unsigned char* input, unsigned char* output,
+    const unsigned long long* metadata, int rank,
+    int bits, unsigned long long elements) {
+  const unsigned long long* dims = metadata;
+  const unsigned long long* strides = metadata + rank;
+  const unsigned int lanes = 8 / bits;
+  const unsigned int mask = (1u << bits) - 1;
+  const unsigned long long bytes = elements / lanes + (elements % lanes != 0);
+  // Own the entire destination byte; threads never race on packed lanes.
+  for (unsigned long long byte = blockIdx.x * blockDim.x + threadIdx.x; byte < bytes;
+       byte += (unsigned long long)gridDim.x * blockDim.x) {
+    const unsigned long long first = byte * lanes;
+    unsigned int packed = 0;
+    for (unsigned int lane = 0; lane < lanes && lane < elements - first; ++lane) {
+      unsigned long long rem = first + lane, src = 0;
+      for (int axis = rank - 1; axis >= 0; --axis) {
+        const unsigned long long coord = rem % dims[axis];
+        rem /= dims[axis];
+        src += coord * strides[axis];
+      }
+      const unsigned int value = (input[src / lanes] >> ((src % lanes) * bits)) & mask;
+      packed |= value << (lane * bits);
+    }
+    output[byte] = (unsigned char)packed;
   }
 }
 
@@ -295,12 +324,35 @@ pub(super) fn launch_persistent_metadata(
     if elements == 0 {
         return Ok(());
     }
-    let rank = i32::try_from(output.shape.len())
-        .map_err(|_| EpError::KernelFailed(format!("cuda_ep {entry}: rank exceeds i32")))?;
     let elem_bytes = i32::try_from(fixed_width(entry, input.dtype)?).map_err(|_| {
         EpError::KernelFailed(format!("cuda_ep {entry}: element width exceeds i32"))
     })?;
-    let elements_u64 = elements as u64;
+    launch_metadata_movement(
+        runtime,
+        entry,
+        input,
+        output,
+        metadata_ptr,
+        elem_bytes,
+        elements,
+    )
+}
+
+fn launch_metadata_movement(
+    runtime: &CudaRuntime,
+    entry: &'static str,
+    input: &TensorView,
+    output: &mut TensorMut,
+    metadata_ptr: CUdeviceptr,
+    width: i32,
+    work_items: usize,
+) -> Result<()> {
+    if work_items == 0 {
+        return Ok(());
+    }
+    let rank = i32::try_from(output.shape.len())
+        .map_err(|_| EpError::KernelFailed(format!("cuda_ep {entry}: rank exceeds i32")))?;
+    let elements_u64 = output.numel() as u64;
     let func = runtime.nvrtc_function("movement_ops", MOVEMENT_SOURCE, entry)?;
     let input_ptr = cuptr(input.data_ptr::<u8>() as *const c_void);
     let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
@@ -310,11 +362,11 @@ pub(super) fn launch_persistent_metadata(
         .arg(&output_ptr)
         .arg(&metadata_ptr)
         .arg(&rank)
-        .arg(&elem_bytes)
+        .arg(&width)
         .arg(&elements_u64);
     unsafe {
         builder.launch(LaunchConfig {
-            grid_dim: (grid(elements), 1, 1),
+            grid_dim: (grid(work_items), 1, 1),
             block_dim: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         })
@@ -817,13 +869,26 @@ impl Kernel for TransposeKernel {
         let metadata_candidate = persistent.stage(&metadata, "Transpose metadata")?;
         let metadata_ptr = metadata_candidate.ptr("Transpose")?;
         let metadata_bytes = metadata_candidate.allocation_bytes();
-        launch_persistent_metadata(
-            &self.runtime,
-            "transpose_bytes",
-            &inputs[0],
-            &mut outputs[0],
-            metadata_ptr,
-        )?;
+        if let Some(bits) = packed_lane_bits(inputs[0].dtype) {
+            let work_items = outputs[0].byte_size();
+            launch_metadata_movement(
+                &self.runtime,
+                "transpose_packed",
+                &inputs[0],
+                &mut outputs[0],
+                metadata_ptr,
+                bits as i32,
+                work_items,
+            )?;
+        } else {
+            launch_persistent_metadata(
+                &self.runtime,
+                "transpose_bytes",
+                &inputs[0],
+                &mut outputs[0],
+                metadata_ptr,
+            )?;
+        }
         TRANSPOSE_LAUNCHES.fetch_add(1, Ordering::Relaxed);
         TRANSPOSE_METADATA_BYTES_LAST.store(metadata_bytes as u64, Ordering::Relaxed);
         TRANSPOSE_MATERIALIZATION_BYTES_LAST

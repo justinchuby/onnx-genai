@@ -53,6 +53,7 @@
 use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,
 };
+use onnx_runtime_ir::transpose::packed_lane_bits;
 use onnx_runtime_ir::{Node, compute_contiguous_strides};
 
 use super::{check_arity, elem_size, to_dense_bytes, write_dense_bytes};
@@ -214,8 +215,17 @@ impl Kernel for TransposeKernel {
                 outputs[0].dtype, inputs[0].dtype
             )));
         }
-        let esize = elem_size(inputs[0].dtype)?;
         let out_shape: Vec<usize> = perm.iter().map(|&p| in_shape[p]).collect();
+        if outputs[0].shape != out_shape {
+            return Err(EpError::KernelFailed(format!(
+                "Transpose: output shape {:?}, expected {out_shape:?} for perm {perm:?}",
+                outputs[0].shape
+            )));
+        }
+        if let Some(bits) = packed_lane_bits(inputs[0].dtype) {
+            return permute_packed(&inputs[0], &mut outputs[0], &perm, bits);
+        }
+        let esize = elem_size(inputs[0].dtype)?;
         let total = numel(&out_shape);
         if total == 0 {
             // Nothing to move, but the output view still has to be valid: an
@@ -268,6 +278,8 @@ impl Kernel for TransposeKernel {
         _output_shapes: &[Vec<usize>],
         num_outputs: usize,
     ) -> Option<Vec<ViewOutput>> {
+        // The session gathers views in whole bytes. Packed outputs use the
+        // dense kernel rather than installing a view the session cannot read.
         if num_outputs != 1 || inputs.len() != 1 || inputs[0].dtype.byte_size() == 0 {
             return None;
         }
@@ -291,6 +303,69 @@ impl Kernel for TransposeKernel {
             byte_offset: input.byte_offset,
         }])
     }
+}
+
+fn permute_packed(
+    input: &TensorView,
+    output: &mut TensorMut,
+    perm: &[usize],
+    bits: usize,
+) -> Result<()> {
+    input.validate()?;
+    output.validate()?;
+    if !input.is_contiguous()
+        || !output.is_contiguous()
+        || !input.device.is_host_accessible()
+        || !output.device.is_host_accessible()
+    {
+        return Err(EpError::InvalidTensorView {
+            reason: format!(
+                "Transpose: packed {:?} requires contiguous host input and output buffers",
+                input.dtype
+            ),
+        });
+    }
+
+    let elements = output.numel();
+    if elements == 0 {
+        return Ok(());
+    }
+    let bytes = output.byte_size();
+    let src = input.data_ptr::<u8>();
+    let dst = output.data_ptr_mut::<u8>();
+    // SAFETY: the validated, dense host views have the same dtype and element
+    // count. Stage the source first if the byte ranges overlap.
+    let src = unsafe {
+        let src_bytes = std::slice::from_raw_parts(src, bytes);
+        if (src as usize).abs_diff(dst as usize) < bytes {
+            std::borrow::Cow::Owned(src_bytes.to_vec())
+        } else {
+            std::borrow::Cow::Borrowed(src_bytes)
+        }
+    };
+    // Initialize each output byte exactly once (including zeroed tail lanes)
+    // without borrowing the potentially uninitialized allocation as a slice.
+    let lanes = 8 / bits;
+    let mask = (1u8 << bits) - 1;
+    let in_strides = compute_contiguous_strides(input.shape);
+    for byte in 0..bytes {
+        let mut packed = 0;
+        let first = byte * lanes;
+        for lane in 0..lanes.min(elements - first) {
+            let mut rem = first + lane;
+            let mut source = 0;
+            for (&dim, &axis) in output.shape.iter().zip(perm).rev() {
+                source += (rem % dim) * in_strides[axis] as usize;
+                rem /= dim;
+            }
+            let value = (src[source / lanes] >> ((source % lanes) * bits)) & mask;
+            packed |= value << (lane * bits);
+        }
+        // SAFETY: each byte lies within the output view and does not overlap
+        // the borrowed input; overlapping input was copied above.
+        unsafe { dst.add(byte).write(packed) };
+    }
+    Ok(())
 }
 
 /// Whether `output` is a dense host tensor of `bytes` bytes that does not

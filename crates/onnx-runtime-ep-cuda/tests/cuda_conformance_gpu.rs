@@ -57,8 +57,60 @@ use std::path::Path;
 use common::{
     Tensor, assert_close, decode_floats, float_input, input, require_cuda, run_cpu, run_cuda,
 };
+use onnx_runtime_ep_api::ExecutionProvider;
 use onnx_runtime_ep_cuda::{CUDA_COVERED_OPS, CudaExecutionProvider};
-use onnx_runtime_ir::{Attribute, DataType};
+use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, static_shape};
+
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable gpu-tests"
+)]
+fn transpose_packed_cuda_matches_reference_bytes() {
+    let ep = require_cuda();
+    // Permute [3,1,5] -> [5,3,1]. Each column crosses packed source bytes,
+    // and the dirty high bits of the final source byte never reach the output.
+    let nibble_input = [0x70, 0x6e, 0x4d, 0x3c, 0x2a, 0x09, 0xf8, 0xf6];
+    let nibble_expected = [0x40, 0x79, 0x0c, 0x3e, 0x68, 0xfa, 0x2d, 0x06];
+    let two_bit_input = [0xac, 0xc1, 0x1a, 0xec];
+    let two_bit_expected = [0xd0, 0xe0, 0xe8, 0x29];
+    let float8_input = [0, 7, 14, 6, 13, 4, 12, 3, 10, 2, 9, 0, 8, 15, 6];
+    let float8_expected = [0, 4, 9, 7, 12, 0, 14, 3, 8, 6, 10, 15, 13, 2, 6];
+    let cases: [(DataType, u64, &[u8], &[u8]); 6] = [
+        (DataType::Int4, 21, &nibble_input, &nibble_expected),
+        (DataType::Uint4, 21, &nibble_input, &nibble_expected),
+        (DataType::Float4E2M1, 23, &nibble_input, &nibble_expected),
+        (DataType::Float8E8M0, 24, &float8_input, &float8_expected),
+        (DataType::Int2, 25, &two_bit_input, &two_bit_expected),
+        (DataType::Uint2, 25, &two_bit_input, &two_bit_expected),
+    ];
+    for (dtype, opset, payload, expected) in cases {
+        let claim = ep.supports_op(
+            &Node::new(NodeId(0), "Transpose", vec![], vec![]),
+            opset - 1,
+            &[static_shape([3, 1, 5])],
+            &[dtype],
+            &[],
+        );
+        assert!(
+            claim
+                .reason()
+                .is_some_and(|reason| reason.contains(&format!("use opset {opset}"))),
+            "CUDA must reject {dtype:?} before opset {opset}: {:?}",
+            claim.reason()
+        );
+        let outputs = run_cuda(
+            &ep,
+            "Transpose",
+            "",
+            opset,
+            &[input(dtype, &[3, 1, 5], payload)],
+            &[(dtype, vec![5, 3, 1])],
+            &[("perm", Attribute::Ints(vec![2, 0, 1]))],
+        );
+        assert_eq!(outputs[0], expected, "{dtype:?} at opset {opset}");
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Profile model

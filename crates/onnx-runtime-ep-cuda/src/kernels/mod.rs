@@ -632,6 +632,8 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("DsaIndexSelect", _)
         | ("LinearAttention", _) => CUDA_ATTENTION_DTYPES,
 
+        ("Transpose", "") => onnx_runtime_ir::transpose::DTYPES,
+
         // Byte-mover / structural ops: dtype-agnostic (copy/select, no
         // arithmetic on the values). Must advertise the full set so an integer
         // `Cast`/`Gather`/`Shape` in a partition does not sink it.
@@ -644,7 +646,6 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("Concat", _)
         | ("Slice", _)
         | ("Split", _)
-        | ("Transpose", _)
         | ("Gather", _)
         | ("GatherElements", _)
         | ("GatherND", _)
