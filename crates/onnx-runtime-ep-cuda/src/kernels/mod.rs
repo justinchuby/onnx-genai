@@ -51,6 +51,7 @@ pub mod data_transform;
 pub(crate) mod deform_conv;
 mod dequantize_packed;
 mod dequantize_packed_gather;
+mod det;
 pub(crate) mod device_argmax;
 pub(crate) mod device_token_writer;
 pub mod dft;
@@ -231,6 +232,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "FusedGemm",
     "Conv",
     "DFT",
+    "Det",
     "STFT",
     "MaxPool",
     "AveragePool",
@@ -560,6 +562,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("BitCast", "") => BIT_CAST_TYPES,
         ("CumProd", "") => CUM_PROD_TYPES,
         ("DFT", "") => CUDA_DFT_DTYPES,
+        ("Det", "") => onnx_runtime_ep_api::det::DTYPES,
         ("STFT", "") => CUDA_STFT_DTYPES,
         ("Unique", "") => CUDA_UNIQUE_DTYPES,
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
@@ -872,6 +875,11 @@ pub(crate) fn build_cuda_registry_for_contract(
     }
 
     let fft_plans = Arc::new(crate::cufft::CufftPlanCache::default());
+    reg.register(
+        OpKey::new("Det", "", 11),
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+        Box::new(det::Factory(runtime.clone())),
+    );
     reg.register(
         OpKey::new("DFT", "", 17),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,

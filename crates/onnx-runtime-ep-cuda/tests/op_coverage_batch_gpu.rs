@@ -1265,6 +1265,66 @@ fn prelu_matches_cpu() {
             assert_close("PRelu", dtype, &cuda_f, &cpu_f, tolerance);
         }
 
+        #[test]
+        #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires a CUDA device")]
+        fn native_det_cuda_no_cpu_fallback() {
+            use DataType::*;
+            // This helper checks CUDA's claim and invokes its kernel on CUDA-owned
+            // buffers. It never constructs a CPU EP or runs a mixed-provider session.
+            let ep = common::require_cuda();
+            let run = |opset, input: common::Tensor, shape: &[usize]| {
+                let dtype = input.dtype;
+                common::run_cuda(
+                    &ep,
+                    "Det",
+                    "",
+                    opset,
+                    &[input],
+                    &[(dtype, shape.to_vec())],
+                    &[],
+                )
+                .pop()
+                .unwrap()
+            };
+            let floats = |opset, dtype, shape: &[usize], values: &[f32], out: &[usize]| {
+                common::decode_floats(
+                    &run(opset, common::float_input(dtype, shape, values), out),
+                    dtype,
+                )
+            };
+
+            assert_eq!(floats(11, Float32, &[2, 2], &[0., 1., 2., 3.], &[]), [-2.]);
+            let fixture = [1., 2., 3., 4., 1., 2., 2., 1., 1., 3., 3., 1.];
+            let y = floats(22, Float32, &[3, 2, 2], &fixture, &[3]);
+            for (got, want) in y.into_iter().zip([-2., -3., -8.]) {
+                assert!((got - want).abs() <= 1e-6);
+            }
+            let pair = [0., 2., 3., 0., 1., 2., 1., 2.];
+            for (opset, dtype) in [(21, Float16), (22, BFloat16)] {
+                assert_eq!(
+                    floats(opset, dtype, &[1, 2, 2, 2], &pair, &[1, 2]),
+                    [-6., 0.]
+                );
+            }
+            // Cross the scratch slot cap to exercise grid-stride reuse.
+            let repeated = pair.repeat(70);
+            assert_eq!(
+                floats(22, Float32, &[140, 2, 2], &repeated, &[140]),
+                [-6., 0.].repeat(70)
+            );
+            assert_eq!(floats(22, Float32, &[2, 0, 0], &[], &[2]), [1., 1.]);
+            assert!(floats(22, Float32, &[0, 3, 3], &[], &[0]).is_empty());
+            assert_eq!(floats(22, Float32, &[2, 1, 1], &[-5., 7.], &[2]), [-5., 7.]);
+
+            let mut diag = [0.; 16];
+            for (i, v) in [1e200f64, 1e200, 1e-200, 1e-200].into_iter().enumerate() {
+                diag[i * 5] = v;
+            }
+            let bytes = run(11, common::input(Float64, &[4, 4], &diag), &[]);
+            let result = f64::from_ne_bytes(bytes.try_into().unwrap());
+            assert!((result - 1.0).abs() < 1e-14, "{result}");
+        }
+
         // Rank-0 scalar X with a rank-0 scalar slope (negative lane).
         let inputs = [
             Tensor {
