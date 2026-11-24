@@ -1,4 +1,4 @@
-//! Checked rank-sized metadata borrowed from the root caller lane.
+//! Checked record-sized metadata borrowed from the root caller lane.
 //!
 //! This helper owns only a layout. It never allocates, retains or releases device
 //! backing. Synchronous uploads preserve the existing host-data lifetime contract.
@@ -18,10 +18,10 @@ pub(super) struct MetadataWorkspace {
 }
 
 impl MetadataWorkspace {
-    pub(super) fn for_rank(
+    pub(super) fn for_records(
         op: &'static str,
-        rank: usize,
-        words_per_axis: usize,
+        records: usize,
+        words_per_record: usize,
         output: &OutputMetadata<'_>,
     ) -> Result<Self> {
         let empty = match output {
@@ -36,9 +36,9 @@ impl MetadataWorkspace {
         let bytes = if empty {
             0
         } else {
-            rank.checked_mul(words_per_axis).and_then(|words| words.checked_mul(8))
+            records.checked_mul(words_per_record).and_then(|words| words.checked_mul(8))
                 .ok_or_else(|| EpError::KernelFailed(format!(
-                    "cuda_ep {op}: rank {rank} with {words_per_axis} metadata words per axis overflows; reduce the tensor rank")))?
+                    "cuda_ep {op}: {records} metadata records with {words_per_record} words per record overflow; reduce the tensor shape")))?
         };
         let region = Layout::from_size_align(bytes, std::mem::align_of::<u64>())
             .map_err(|_| EpError::KernelFailed(format!(
@@ -61,40 +61,81 @@ impl MetadataWorkspace {
         }
     }
 
-    fn bind(&self, workspace: Option<WorkspaceView>, words: usize) -> Result<WorkspaceView> {
-        if words.checked_mul(8) != Some(self.layout.bytes()) {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep {}: payload has {words} metadata words but the prepared layout contains {} bytes; prepare the complete current-rank workspace",
-                self.op,
-                self.layout.bytes()
-            )));
-        }
-        self.layout
+    pub(super) fn bind(&self, workspace: Option<WorkspaceView>) -> Result<BoundMetadataUpload> {
+        let [region] = self
+            .layout
             .bind(workspace)
-            .map(|[region]| region)
             .map_err(|source| EpError::Backend {
                 operation: self.op,
                 source: Box::new(source),
-            })
+            })?;
+        Ok(BoundMetadataUpload {
+            op: self.op,
+            region,
+        })
     }
+}
 
-    pub(super) fn upload(
-        &self,
-        runtime: &CudaRuntime,
-        workspace: Option<WorkspaceView>,
-        values: &[u64],
-    ) -> Result<CUdeviceptr> {
-        let region = self.bind(workspace, values.len())?;
+/// Proof that the full current descriptor fits. This is only a borrowed view;
+/// the caller remains responsible for ownership, completion and retirement.
+#[derive(Debug)]
+pub(super) struct BoundMetadataUpload {
+    op: &'static str,
+    region: WorkspaceView,
+}
+
+impl BoundMetadataUpload {
+    fn validate_payload(&self, words: usize) -> Result<()> {
+        if words.checked_mul(8) != Some(self.region.bytes()) {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {}: payload has {words} metadata words but the prepared layout contains {} bytes; prepare the complete current-layout workspace",
+                self.op,
+                self.region.bytes()
+            )));
+        }
+        Ok(())
+    }
+    pub(super) fn upload(self, runtime: &CudaRuntime, values: &[u64]) -> Result<CUdeviceptr> {
+        self.validate_payload(values.len())?;
         if values.is_empty() {
             return Ok(0);
         }
-        // SAFETY: u64 contains no padding; the borrowed slice stays live until
-        // synchronous htod completes. The complete region was validated above.
-        let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), region.bytes()) };
-        let pointer = cuptr(region.ptr().0.cast_const());
+        // SAFETY: u64 has no padding, payload length equals the bound region,
+        // and the host slice stays live until synchronous htod completes.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), self.region.bytes()) };
+        let pointer = cuptr(self.region.ptr().0.cast_const());
         unsafe { runtime.htod(bytes, pointer) }?;
         Ok(pointer)
     }
+}
+
+/// Dense byte spans and strides must fit pointer arithmetic before control
+/// readback, offset generation or a device launch can consume their geometry.
+pub(super) fn checked_tensor_bytes(
+    op: &str,
+    name: &str,
+    dtype: onnx_runtime_ir::DataType,
+    shape: &[usize],
+) -> Result<usize> {
+    let elements = if shape.contains(&0) {
+        Some(0)
+    } else {
+        onnx_runtime_ir::checked_numel(shape)
+    };
+    let bytes = elements.and_then(|elements| dtype.checked_storage_bytes(elements))
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .ok_or_else(|| EpError::KernelFailed(format!(
+            "cuda_ep {op}: {name} shape {shape:?} with dtype {dtype:?} exceeds addressable storage; reduce the tensor shape")))?;
+    Ok(bytes)
+}
+
+pub(super) fn checked_metadata_strides(op: &str, name: &str, shape: &[usize]) -> Result<Vec<i64>> {
+    if shape.contains(&0) {
+        return Ok(vec![0; shape.len()]);
+    }
+    checked_tensor_bytes(op, name, onnx_runtime_ir::DataType::Uint8, shape)?;
+    Ok(onnx_runtime_ir::compute_contiguous_strides(shape))
 }
 
 #[cfg(test)]
@@ -103,13 +144,38 @@ mod tests {
     use onnx_runtime_ep_api::DevicePtrMut;
     use onnx_runtime_ir::DataType;
     #[test]
+    fn checked_dense_spans_reject_overflow_and_empty_strides_need_no_address_math() {
+        assert_eq!(
+            checked_metadata_strides("QLinearMatMul", "batches", &[2, 3, 4]).unwrap(),
+            vec![12, 4, 1]
+        );
+        assert_eq!(
+            checked_metadata_strides("CenterCropPad", "input", &[usize::MAX, usize::MAX, 0])
+                .unwrap(),
+            vec![0; 3]
+        );
+        assert_eq!(
+            checked_tensor_bytes("Col2Im", "input", DataType::Float32, &[usize::MAX, 0]).unwrap(),
+            0
+        );
+        for shape in [&[usize::MAX, 2][..], &[isize::MAX as usize][..]] {
+            assert!(
+                checked_tensor_bytes("Col2Im", "image", DataType::Float32, shape)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("addressable storage")
+            );
+        }
+    }
+
+    #[test]
     fn rank_metadata_sizes_are_one_persistent_requirement() {
         for (op, rank, words, bytes) in [
             ("Mod", 3, 3, 72),
             ("LpPool", 2, 6, 96),
             ("NonZero", 4, 1, 32),
         ] {
-            let plan = MetadataWorkspace::for_rank(
+            let plan = MetadataWorkspace::for_records(
                 op,
                 rank,
                 words,
@@ -129,10 +195,10 @@ mod tests {
     #[test]
     fn scalar_is_not_empty_but_needs_no_rank_metadata_and_empty_output_skips_overflow() {
         let scalar = OutputMetadata::tensor(DataType::Float32, &[]);
-        let plan = MetadataWorkspace::for_rank("Mod", 0, 3, &scalar).unwrap();
+        let plan = MetadataWorkspace::for_records("Mod", 0, 3, &scalar).unwrap();
         assert_eq!(plan.requirement(), WorkspaceRequirement::NONE);
-        plan.bind(None, 0).unwrap();
-        let empty = MetadataWorkspace::for_rank(
+        plan.bind(None).unwrap().validate_payload(0).unwrap();
+        let empty = MetadataWorkspace::for_records(
             "LpPool",
             usize::MAX,
             6,
@@ -140,9 +206,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(empty.requirement(), WorkspaceRequirement::NONE);
-        assert!(MetadataWorkspace::for_rank("Mod", usize::MAX, 3, &scalar).is_err());
+        assert!(MetadataWorkspace::for_records("Mod", usize::MAX, 3, &scalar).is_err());
         assert!(
-            MetadataWorkspace::for_rank("Mod", 1, 3, &OutputMetadata::Absent)
+            MetadataWorkspace::for_records("Mod", 1, 3, &OutputMetadata::Absent)
                 .err()
                 .unwrap()
                 .to_string()
@@ -151,7 +217,7 @@ mod tests {
     }
     #[test]
     fn complete_binding_rejects_missing_short_unaligned_and_stale_payload() {
-        let plan = MetadataWorkspace::for_rank(
+        let plan = MetadataWorkspace::for_records(
             "Mod",
             2,
             3,
@@ -164,16 +230,21 @@ mod tests {
             Some(view(0x10000usize, 47)),
             Some(view(0x10001usize, 48)),
         ] {
-            let error = plan.bind(backing, 6).unwrap_err().to_string();
+            let error = plan.bind(backing).unwrap_err().to_string();
             assert!(error.contains("Mod"), "{error}");
             assert!(error.contains("prepare and pass"), "{error}");
         }
         assert_eq!(
-            plan.bind(Some(view(0x10000usize, 64)), 6).unwrap().bytes(),
+            plan.bind(Some(view(0x10000usize, 64)))
+                .unwrap()
+                .region
+                .bytes(),
             48
         );
         assert!(
-            plan.bind(Some(view(0x10000usize, 64)), 5)
+            plan.bind(Some(view(0x10000usize, 64)))
+                .unwrap()
+                .validate_payload(5)
                 .unwrap_err()
                 .to_string()
                 .contains("payload has 5")

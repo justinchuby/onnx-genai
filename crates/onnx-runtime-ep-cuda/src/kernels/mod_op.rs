@@ -226,13 +226,14 @@ impl ModKernel {
         let fmod: i32 = i32::from(self.fmod);
 
         let metadata = broadcast_metadata(a.shape, b.shape, &out_shape);
-        let metadata_ptr = MetadataWorkspace::for_rank(
+        let metadata_ptr = MetadataWorkspace::for_records(
             "Mod",
             out_shape.len(),
             METADATA_WORDS_PER_AXIS,
             &OutputMetadata::from_view(&outputs[0]),
         )?
-        .upload(&self.runtime, workspace, &metadata)?;
+        .bind(workspace)?
+        .upload(&self.runtime, &metadata)?;
 
         let func = self.runtime.nvrtc_function(MODULE, SRC, entry)?;
         let cfg = LaunchConfig {
@@ -287,7 +288,7 @@ impl Kernel for ModKernel {
             .map_err(EpError::Ir)?;
         let rank = if shape.contains(&0) { 0 } else { shape.len() };
         Ok(WorkspacePreparation::Ready(
-            MetadataWorkspace::for_rank("Mod", rank, METADATA_WORDS_PER_AXIS, &outputs[0])?
+            MetadataWorkspace::for_records("Mod", rank, METADATA_WORDS_PER_AXIS, &outputs[0])?
                 .requirement(),
         ))
     }
