@@ -81,10 +81,14 @@ use onnx_runtime_tracer::{Args, SpanGuard, TraceContext, annotate_current_span_w
 
 use crate::SessionOutput;
 use crate::error::{Result, SessionError};
+use crate::opaque::{
+    ConvState, ConvStorage, KvRecord, KvRows, KvState, LinearState, LinearStorage, OpaqueStateKind,
+    OpaqueValue, SessionInput, StatePayload, StateRuntimeConfig,
+};
 use crate::sequence::{
     ConcatPlan, SeqTensor, SequenceError, SequenceValue, SplitSpec, split_tensor, stack_new_axis,
 };
-use crate::tensor::{DeviceBindingSpec, DeviceIoBinding, SharedTensorBuffer, Tensor};
+use crate::tensor::{DeviceBindingSpec, DeviceIoBinding, SharedTensorBuffer, Tensor, host_bytes};
 
 static NEXT_EXECUTOR_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_ARTIFACT_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -95,6 +99,41 @@ fn allocate_non_reusable_identity(counter: &AtomicU64, exhausted: &'static str) 
             next.checked_add(1)
         })
         .map_err(|_| EpError::KernelFailed(exhausted.to_string()).into())
+}
+
+pub(crate) const STATE_DOMAIN: &str = "org.onnx.experimental.state";
+
+pub(crate) fn state_op_kind(op_type: &str, domain: &str) -> Option<OpaqueStateKind> {
+    if domain != STATE_DOMAIN {
+        return None;
+    }
+    match op_type {
+        "AttentionWithCache" => Some(OpaqueStateKind::KVCache),
+        "LinearAttentionWithState" => Some(OpaqueStateKind::LinearAttentionState),
+        "CausalConvWithState" => Some(OpaqueStateKind::CausalConvState),
+        _ => None,
+    }
+}
+
+pub(crate) fn is_state_op(op_type: &str, domain: &str) -> bool {
+    state_op_kind(op_type, domain).is_some()
+}
+
+pub(crate) fn value_opaque_kind(value: &onnx_runtime_ir::Value) -> Option<OpaqueStateKind> {
+    let onnx_runtime_ir::onnx::type_proto::Value::OpaqueType(opaque) =
+        value.declared_type.as_ref()?.value.as_ref()?
+    else {
+        return None;
+    };
+    if opaque.domain != STATE_DOMAIN {
+        return None;
+    }
+    match opaque.name.as_str() {
+        "KVCache" => Some(OpaqueStateKind::KVCache),
+        "LinearAttentionState" => Some(OpaqueStateKind::LinearAttentionState),
+        "CausalConvState" => Some(OpaqueStateKind::CausalConvState),
+        _ => None,
+    }
 }
 
 fn issue_executor_instance_id() -> Result<ExecutorInstanceId> {
@@ -1116,6 +1155,7 @@ mod platform;
 mod prefetch;
 mod run;
 mod sequence_ops;
+mod stateful_ops;
 pub(crate) use platform::auto_detect_cpu_ep;
 pub use prefetch::{PrefetchStep, drive_double_buffer, plan_double_buffer};
 

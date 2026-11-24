@@ -119,11 +119,12 @@ impl Executor {
         // `&mut self` dispatch below; the span guard it yields owns its name
         // (and a cheap `Arc`-clone of the trace context), so it borrows nothing
         // from `self` and can stay live across the dispatch.
-        let (is_control_flow, is_sequence, _span) = {
+        let (is_control_flow, is_sequence, is_state, _span) = {
             let node = self.graph.node(self.plan[pi].node_id);
             let is_control_flow =
                 !self.plan[pi].graph_kernel && is_control_flow_op(&node.op_type, &node.domain);
             let is_sequence = is_sequence_op(&node.op_type, &node.domain);
+            let is_state = is_state_op(&node.op_type, &node.domain);
             // Open the span only when tracing is live so an untraced decode step
             // never allocates a span name or touches the thread-local span stack.
             // Everything that clones a node field lives inside this closure for
@@ -173,12 +174,14 @@ impl Executor {
                 capture.annotate();
                 span
             });
-            (is_control_flow, is_sequence, span)
+            (is_control_flow, is_sequence, is_state, span)
         };
         if is_control_flow {
             self.exec_control_flow(pi, resolved, outer_scope, external)
         } else if is_sequence {
             self.exec_sequence_node(pi, resolved, external)
+        } else if is_state {
+            self.exec_state_node(pi, resolved, external)
         } else {
             self.exec_kernel_node(pi, resolved, external, capture)
         }

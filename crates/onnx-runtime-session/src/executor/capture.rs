@@ -602,6 +602,7 @@ impl Executor {
                 || external_values.contains(&vid)
                 || self.graph.initializers.contains_key(&vid)
                 || self.sequence_values.contains(&vid)
+                || self.opaque_value_ids.contains(&vid)
             {
                 continue;
             }

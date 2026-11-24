@@ -259,6 +259,13 @@ impl ChildExecutor {
                             self.name
                         ),
                     }),
+                    SessionOutput::Opaque(_) => Err(SessionError::StateOp {
+                        op: "<control-flow output>".to_string(),
+                        reason: format!(
+                            "subgraph '{}' produced opaque state where this control-flow path requires a tensor",
+                            self.name
+                        ),
+                    }),
                 }
             })
             .collect()
