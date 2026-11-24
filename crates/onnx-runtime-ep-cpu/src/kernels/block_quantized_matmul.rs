@@ -77,6 +77,7 @@ const IQ4_NL_CODEBOOK: [i8; 16] = [
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum BlockFormat {
+    Onnx(onnx_runtime_ir::dequantize_packed::Format),
     Mxfp4,
     Iq4Nl,
     Iq4Xs,
@@ -95,6 +96,15 @@ pub(super) enum BlockFormat {
 }
 
 impl BlockFormat {
+    fn parse_projection(value: &str) -> Result<Self> {
+        if let Some(format) = onnx_runtime_ir::dequantize_packed::Format::parse(value) {
+            return Ok(
+                super::dequantize_packed::legacy_block_format(format).unwrap_or(Self::Onnx(format))
+            );
+        }
+        Self::parse(value)
+    }
+
     pub(super) fn parse(value: &str) -> Result<Self> {
         match value {
             "mxfp4" => Ok(Self::Mxfp4),
@@ -120,6 +130,7 @@ impl BlockFormat {
 
     pub(super) fn qk(self) -> usize {
         match self {
+            Self::Onnx(format) => format.block().0,
             Self::Mxfp4 => MXFP4_QK,
             Self::Iq4Nl => IQ4_NL_QK,
             Self::Iq4Xs
@@ -140,6 +151,7 @@ impl BlockFormat {
 
     pub(super) fn block_bytes(self) -> usize {
         match self {
+            Self::Onnx(format) => format.block().1,
             Self::Mxfp4 => MXFP4_BLOCK_BYTES,
             Self::Iq4Nl => IQ4_NL_BLOCK_BYTES,
             Self::Iq4Xs => IQ4_XS_BLOCK_BYTES,
@@ -160,6 +172,7 @@ impl BlockFormat {
 
     pub(super) fn scalar_decoder(self) -> fn(&[u8], &mut [f32]) {
         match self {
+            Self::Onnx(format) => super::dequantize_packed::decoder(format),
             Self::Mxfp4 => decode_mxfp4_block,
             Self::Iq4Nl => decode_iq4_nl_block,
             Self::Iq4Xs => decode_iq4_xs_block,
@@ -208,7 +221,7 @@ pub struct BlockQuantizedMatMulFactory {
 }
 
 pub(crate) fn packed_matmul_layout(name: &str) -> Option<(usize, usize)> {
-    let format = BlockFormat::parse(name).ok()?;
+    let format = BlockFormat::parse_projection(name).ok()?;
     Some((format.qk(), format.block_bytes()))
 }
 
@@ -235,7 +248,7 @@ impl KernelFactory for BlockQuantizedMatMulFactory {
             Some(attribute) => attribute
                 .as_str()
                 .ok_or_else(|| error("attribute 'format' must be a UTF-8 string"))
-                .and_then(BlockFormat::parse)?,
+                .and_then(BlockFormat::parse_projection)?,
             None => return Err(error("missing required string attribute 'format'")),
         };
 

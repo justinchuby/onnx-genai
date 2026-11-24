@@ -1,6 +1,9 @@
 use crate::dtype::{to_dense, to_dense_f32_widen, write_dense, write_dense_f32_narrow};
-use onnx_runtime_ep_api::packed_routed::{GroupLayout, fail, group_layout, validate};
+use onnx_runtime_ep_api::packed_routed::{
+    GroupLayout, fail, group_layout, packed_group_layout, validate,
+};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ir::dequantize_packed::Metadata;
 use onnx_runtime_ir::{DataType, Node, packed_routed::Op};
 
 pub(super) struct Factory;
@@ -132,6 +135,67 @@ impl KernelFactory for AffineFactory {
 }
 
 struct Affine(onnx_runtime_ep_api::packed_routed::AffineGrouped);
+
+pub(super) struct PackedFactory;
+
+impl KernelFactory for PackedFactory {
+    fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(Packed {
+            metadata: Metadata::from_node(node).map_err(|detail| {
+                EpError::KernelFailed(format!("PackedGroupedMatMul: {detail}"))
+            })?,
+        }))
+    }
+}
+
+struct Packed {
+    metadata: Metadata,
+}
+
+impl Kernel for Packed {
+    fn execute(&self, x: &[TensorView], y: &mut [TensorMut]) -> Result<()> {
+        let l = packed_group_layout(&self.metadata, x, y)?;
+        if l.lanes == 0 {
+            return Ok(());
+        }
+        if x.iter().any(|tensor| !tensor.is_contiguous()) || !y[0].is_contiguous() {
+            return Err(EpError::KernelFailed(
+                "PackedGroupedMatMul: inputs and output must use contiguous storage".into(),
+            ));
+        }
+        let routes = route_indices(Op::GroupedMatMul { transposed: true }, &x[2], l.groups)?;
+        let activation = super::to_dense_f32(&x[0])?;
+        // SAFETY: packed_group_layout validated the one-dimensional UINT8
+        // extent, and the contiguous CPU tensor remains live for this call.
+        let packed = unsafe {
+            std::slice::from_raw_parts(x[1].data_ptr::<u8>(), self.metadata.packed_bytes())
+        };
+        let (width, bytes) = self.metadata.format().block();
+        let blocks = l.k / width;
+        let decode = super::dequantize_packed::decoder(self.metadata.format());
+        let mut values = [0.0f32; 256];
+        let mut output = vec![0.0f32; l.lanes];
+        for (route, row) in output.chunks_exact_mut(l.n).enumerate() {
+            let expert = routes[route];
+            let token = route / l.selections;
+            for (column, out) in row.iter_mut().enumerate() {
+                let packed_row = (expert * l.n + column) * blocks * bytes;
+                let mut sum = 0.0f32;
+                for block in 0..blocks {
+                    let source = packed_row + block * bytes;
+                    decode(&packed[source..source + bytes], &mut values[..width]);
+                    let activation =
+                        &activation[token * l.k + block * width..token * l.k + (block + 1) * width];
+                    for (&a, &weight) in activation.iter().zip(&values[..width]) {
+                        sum += a * weight;
+                    }
+                }
+                *out = sum;
+            }
+        }
+        write_dense(&mut y[0], &output)
+    }
+}
 
 impl Kernel for Affine {
     fn execute(&self, x: &[TensorView], y: &mut [TensorMut]) -> Result<()> {

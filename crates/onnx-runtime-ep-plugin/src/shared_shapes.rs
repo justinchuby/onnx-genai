@@ -114,7 +114,10 @@ pub(crate) fn native_shape_operands(node: &Node) -> Option<&'static [usize]> {
     } else if node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
         && matches!(
             op,
-            onnx_runtime_ir::affine_gather::OP | onnx_runtime_ir::quantized_grouped::OP
+            onnx_runtime_ir::affine_gather::OP
+                | onnx_runtime_ir::quantized_grouped::OP
+                | onnx_runtime_ir::dequantize_packed_gather::OP
+                | onnx_runtime_ir::quantized_grouped::PACKED_OP
         )
     {
         return Some(&[]);

@@ -37,7 +37,7 @@ impl KernelFactory for Factory {
     }
 }
 
-fn shared_kind(format: Format) -> i32 {
+pub(super) fn decoder_kind(format: Format) -> i32 {
     match format {
         Format::Iq4Nl => BlockFormat::Iq4Nl,
         Format::Iq4Xs => BlockFormat::Iq4Xs,
@@ -65,9 +65,15 @@ fn shared_kind(format: Format) -> i32 {
         | Format::Tq1_0
         | Format::Tq2_0
         | Format::Mxfp4
-        | Format::Nvfp4 => return -1,
+        | Format::Nvfp4 => return -(format as i32) - 1,
     }
     .kernel_id()
+        + 32
+}
+
+pub(super) fn decoder_source() -> &'static str {
+    static SOURCE: OnceLock<String> = OnceLock::new();
+    SOURCE.get_or_init(|| decoder_prelude() + include_str!("dequantize_packed.cu"))
 }
 
 impl Kernel for PackedKernel {
@@ -95,15 +101,13 @@ impl Kernel for PackedKernel {
                 "input and output must use contiguous storage".into(),
             ));
         }
-        static SOURCE: OnceLock<String> = OnceLock::new();
-        let src = SOURCE.get_or_init(|| decoder_prelude() + include_str!("dequantize_packed.cu"));
+        let src = decoder_source();
         let func = self.runtime.nvrtc_function(ENTRY, src, ENTRY)?;
         let (width, bytes) = m.format().block();
         let width = width as i32;
         let bytes = bytes as i32;
         let total = m.elements() as u64;
-        let kind = m.format() as i32;
-        let shared = shared_kind(m.format());
+        let kind = decoder_kind(m.format());
         let dtype = m.dtype().to_onnx();
         let x = cuptr(x.data_ptr::<u8>().cast::<c_void>());
         let y = cuptr(y.data_ptr_mut::<u8>().cast::<c_void>());
@@ -121,7 +125,6 @@ impl Kernel for PackedKernel {
             .arg(&width)
             .arg(&bytes)
             .arg(&kind)
-            .arg(&shared)
             .arg(&dtype);
         // SAFETY: arguments match the device signature; validated buffers cover
         // the grid-stride loop's complete packed input and typed output ranges.

@@ -189,11 +189,14 @@ mod error {
         )]
         HeterogeneousPlacementRequired { unsupported_nodes: String },
 
+        #[error("the ordered provider cannot cover the whole graph: {reason}")]
+        OrderedProviderDeclined { reason: String },
+
         #[error(
-            "the opt-in heterogeneous executor cannot run this graph or API safely: \
+            "the heterogeneous executor cannot run this graph or API safely: \
              {placement_summary}. The first #603 execution slice supports fully-static, \
              tensor-only acyclic graphs through ordinary run/run_outputs; unset \
-             ONNX_GENAI_HETERO for legacy whole-session CPU fallback"
+             ONNX_GENAI_HETERO if you opted into mixed numeric placement"
         )]
         HeterogeneousExecutionUnsupported { placement_summary: String },
 
@@ -515,6 +518,32 @@ impl OptimizationLevel {
 
 pub use onnx_runtime_loader::KeyedWeightFile;
 
+type Provider = std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>;
+
+/// Initialized native execution providers in descending priority.
+///
+/// The first provider is mandatory. The session never discovers additional
+/// providers; the standalone CPU fallback follows the explicitly configured list.
+pub struct ExecutionProviderOrder {
+    primary: Provider,
+    additional: Vec<Provider>,
+}
+
+impl ExecutionProviderOrder {
+    pub fn new(primary: Provider) -> Self {
+        Self {
+            primary,
+            additional: Vec::new(),
+        }
+    }
+
+    /// Append a lower-priority provider.
+    pub fn then(mut self, provider: Provider) -> Self {
+        self.additional.push(provider);
+        self
+    }
+}
+
 /// Builder for advanced session configuration (§20.6).
 #[derive(Default)]
 pub struct SessionBuilder {
@@ -522,7 +551,7 @@ pub struct SessionBuilder {
     model_bytes: Option<Vec<u8>>,
     keyed_weight_files: Vec<KeyedWeightFile>,
     device: DevicePreference,
-    execution_provider: Option<std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>>,
+    execution_providers: Option<ExecutionProviderOrder>,
     fallback_execution_provider: Option<std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>>,
     memory_limit: Option<usize>,
     enable_profiling: bool,
@@ -563,7 +592,13 @@ impl SessionBuilder {
         mut self,
         execution_provider: std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>,
     ) -> Self {
-        self.execution_provider = Some(execution_provider);
+        self.execution_providers = Some(ExecutionProviderOrder::new(execution_provider));
+        self
+    }
+
+    /// Replace device auto-selection with this ordered provider list.
+    pub fn execution_providers(mut self, providers: ExecutionProviderOrder) -> Self {
+        self.execution_providers = Some(providers);
         self
     }
 
@@ -712,12 +747,13 @@ impl SessionBuilder {
         // for it (the general "keep-as-op iff a kernel claims it, else inline"
         // policy). With no fused kernel the predicate declines and inlining is
         // byte-identical to the default path.
-        let ep = {
+        let providers = {
             let mut span = trace_span("session.select_execution_provider", "session");
-            let ep = match self.execution_provider {
-                Some(ep) => ep,
-                None => select_execution_provider(&self.device)?,
+            let providers = match self.execution_providers {
+                Some(providers) => providers,
+                None => ExecutionProviderOrder::new(select_execution_provider(&self.device)?),
             };
+            let ep = &providers.primary;
             if let Some(span) = span.as_mut() {
                 span.set_args(
                     Args::new()
@@ -726,13 +762,16 @@ impl SessionBuilder {
                         .with("device_index", ep.device_id().index as u64),
                 );
             }
-            ep
+            providers
         };
 
         let (mut graph, weights, model_dir, model_metadata) = {
             let keep_as_op =
                 |node: &onnx_runtime_ir::Node, opset: u64, dtypes: &[onnx_runtime_ir::DataType]| {
-                    ep.supports_op(node, opset, &[], dtypes, &[]).is_supported()
+                    providers
+                        .primary
+                        .supports_op(node, opset, &[], dtypes, &[])
+                        .is_supported()
                 };
             match (self.model_path, self.model_bytes) {
                 (Some(path), _) => {
@@ -825,7 +864,7 @@ impl SessionBuilder {
             &model_dir,
             ep_context_config,
             model_metadata,
-            ep,
+            providers,
             self.fallback_execution_provider,
         )?;
         if !self.warmup_shapes.is_empty() {
@@ -1222,7 +1261,7 @@ impl InferenceSession {
             Path::new("."),
             EpContextDumpConfig::default(),
             ModelMetadata::default(),
-            executor::auto_detect_cpu_ep()?,
+            ExecutionProviderOrder::new(executor::auto_detect_cpu_ep()?),
             None,
         )
     }
@@ -1245,13 +1284,33 @@ impl InferenceSession {
         provider: std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>,
         fallback: Option<std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>>,
     ) -> Result<Self> {
+        Self::from_graph_with_providers(
+            graph,
+            weights,
+            model_dir,
+            ExecutionProviderOrder::new(provider),
+            fallback,
+        )
+    }
+
+    /// Build a session from in-memory IR with explicitly ordered native providers.
+    ///
+    /// The ordered path prefers a whole-graph provider. Numeric partitioning
+    /// still requires `ONNX_GENAI_HETERO=1` and the supported static subset.
+    pub fn from_graph_with_providers(
+        graph: onnx_runtime_ir::Graph,
+        weights: std::sync::Arc<onnx_runtime_loader::WeightStore>,
+        model_dir: &Path,
+        providers: ExecutionProviderOrder,
+        fallback: Option<Provider>,
+    ) -> Result<Self> {
         Self::from_parts(
             graph,
             weights,
             model_dir,
             EpContextDumpConfig::default(),
             ModelMetadata::default(),
-            provider,
+            providers,
             fallback,
         )
     }
@@ -1262,7 +1321,7 @@ impl InferenceSession {
         model_dir: &Path,
         ep_context_config: EpContextDumpConfig,
         model_metadata: ModelMetadata,
-        ep: std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>,
+        providers: ExecutionProviderOrder,
         fallback_provider: Option<std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>>,
     ) -> Result<Self> {
         // Establish the canonical-domain invariant for programmatically built
@@ -1304,6 +1363,7 @@ impl InferenceSession {
         // for an unloaded compiled EP fails with a clear `NoEpForContext`. The
         // executor then bypasses these nodes (they are pre-compiled, never run
         // as ordinary kernels).
+        let ep = &providers.primary;
         let eps: [(
             onnx_runtime_ep_api::EpId,
             &dyn onnx_runtime_ep_api::ExecutionProvider,
@@ -1322,7 +1382,8 @@ impl InferenceSession {
 
         let exec = {
             let mut span = trace_span("session.executor_build", "session");
-            let exec = executor::Executor::build(graph, weights, ep, fallback_provider)?;
+            let exec =
+                executor::Executor::build_ordered(graph, weights, providers, fallback_provider)?;
             if let Some(span) = span.as_mut() {
                 span.set_args(Args::new().with("cache_entries", exec.cache_stats().entries as u64));
             }
@@ -1969,7 +2030,7 @@ impl InferenceSession {
     }
 
     /// Per-provider node counts and cross-provider transfer count for an
-    /// opt-in heterogeneous session. `None` for the unchanged single-EP path.
+    /// heterogeneous session. `None` for the single-EP path.
     pub fn heterogeneous_placement_report(&self) -> Option<&str> {
         self.exec.heterogeneous_placement_report()
     }
@@ -2756,7 +2817,7 @@ mod option_tests {
     fn explicit_execution_provider_is_retained_by_builder() {
         let builder =
             SessionBuilder::new().execution_provider(executor::auto_detect_cpu_ep().unwrap());
-        assert!(builder.execution_provider.is_some());
+        assert!(builder.execution_providers.is_some());
     }
 
     #[test]

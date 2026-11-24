@@ -645,6 +645,7 @@ mod half_gemm;
 // path is unchanged, so the module is not compiled at all rather than left as
 // dead code.
 mod dequantize_packed;
+mod dequantize_packed_gather;
 pub mod governed_weight_cache;
 mod grouped_matmul;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1110,6 +1111,15 @@ pub(crate) fn build_cpu_registry_with_resources(
         ),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(grouped_matmul::AffineFactory),
+    );
+    rec.register(
+        OpKey::new(
+            onnx_runtime_ir::quantized_grouped::PACKED_OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(grouped_matmul::PackedFactory),
     );
     rec.register(
         OpKey::new(
@@ -1675,6 +1685,15 @@ pub(crate) fn build_cpu_registry_with_resources(
         OpKey::new("DequantizePacked", "", 29),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(dequantize_packed::Factory),
+    );
+    rec.register(
+        OpKey::new(
+            onnx_runtime_ir::dequantize_packed_gather::OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(dequantize_packed_gather::Factory),
     );
     rec.register(
         OpKey::new("DynamicQuantizeLinear", "", 11),
@@ -3470,9 +3489,9 @@ mod tests {
         // standard-domain `CausalConvWithState` (opset 27) adds one alongside
         // its `com.microsoft` spelling.
         // `STFT` and `DequantizePacked` each add a standard-domain registration.
-        // The EP-owned affine Gather and grouped-projection fusions each add one.
+        // The EP-owned affine and GGUF Gather and grouped-projection fusions each add one.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 114 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 116 + mlas_registrations);
         for op in PHASE1_OPS {
             let since = reg
                 .earliest_since_version(op, "")
