@@ -511,3 +511,30 @@ fn constant_gpu_fp32_and_i64_tensor_exact() {
     );
     eprintln!("Constant GPU executed: exact match (max abs error 0)");
 }
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn constant_gpu_packed_tensor_exact() {
+    let ep = require_cuda();
+    for (opset, dtype, count, payload) in [
+        (21, DataType::Int4, 3, [0x78, 0x0f]),
+        (23, DataType::Float4E2M1, 3, [0x95, 0x02]),
+        (25, DataType::Uint2, 5, [0xe4, 0x03]),
+    ] {
+        let value = Attribute::Tensor(TensorData::from_raw(dtype, vec![count], payload.to_vec()));
+        // Assert the EP claim and execute directly on device allocations.
+        let got = common::run_cuda(
+            &ep,
+            "Constant",
+            "",
+            opset,
+            &[],
+            &[(dtype, vec![count])],
+            &[("value", value)],
+        );
+        assert_eq!(got, vec![payload.to_vec()], "{dtype:?}");
+    }
+}
