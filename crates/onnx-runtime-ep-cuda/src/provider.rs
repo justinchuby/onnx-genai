@@ -4359,6 +4359,7 @@ impl ExecutionProvider for CudaExecutionProvider {
             && (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(reason) = crate::kernels::unique::unsupported_reason(
                 op,
+                opset,
                 shapes,
                 input_dtypes,
                 layouts,
