@@ -31,4 +31,10 @@ for r in validation['results']:
 for p,h in validation['source_sha256'].items():
  assert sha(gzip.decompress((v/'sources'/(p+'.gz')).read_bytes()))==h
  if len(sys.argv)>1:assert sha((Path(sys.argv[1])/p).read_bytes())==h,p
+standalone=folder/'qmoe-standalone-validation';q=json.loads((standalone/'validation.json').read_text());assert len(q['results'])==8 and all(r['exit']==0 for r in q['results'])
+assert all(validation['source_sha256'][p]==h for p,h in q['source_sha256'].items())
+for r in q['results']:
+ assert sha(gzip.decompress((standalone/(r['name']+'.log.gz')).read_bytes()))==r['log_sha256']
+ if 'test' in r['command'] and '--list' not in r['command']:assert r['counts'] and all(int(p)>0 and int(f)==0 for p,f,i in r['counts'])
+merge=json.loads((standalone/'merge-verification.json').read_text());assert merge['pr']==2666 and merge['whole_tree_identical'] and merge['validated_qmoe_source_matches'] and merge['present_in_origin_main']
 print(f'Verified {len(manifest)} payloads,90 complete shared-image outputs, original-fixture equality and cache-fix validation.')

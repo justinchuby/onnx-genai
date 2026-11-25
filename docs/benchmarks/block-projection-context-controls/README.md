@@ -76,6 +76,13 @@ built from the earlier candidate, not this cache fix, and is not timing evidence
 for the new Ready path. A read-only resource-design review found no cache/state
 contract blocker.
 
+The QMoE-only fix was then isolated, independently validated (native62/1 ignored,
+MLAS62/1, Session374, plugin cache19, host oracle1 and Clippy both), and merged as
+[#2666](https://github.com/justinchuby/onnx-genai/pull/2666) without waiting for CI.
+Its merge tree exactly matches the isolated reviewed tree. Standalone logs and
+source/merge receipts are retained under qmoe-standalone-validation/. The block
+execution-context candidate is still unmerged; no inconclusive cell was waived.
+
 The manifest hashes all payloads. Run python3 verify.py here to validate the
 complete90-process diagnostic, exact outputs and validation receipts. The optional
 checkout argument checks only the recorded cache-fix source set. The first study

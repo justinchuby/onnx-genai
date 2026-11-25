@@ -1,5 +1,5 @@
 {
-  "README.md": "eac472b4711afa226faee4b886036558bf2465e3e34da6b9da98271f0ac1cfc3",
+  "README.md": "b15f162aeba53d5f4fdab2897c78a4e250507f1cb352aca5b221e49677ee48f1",
   "assembly/assembly-comparison.json": "5d356c526a0ae138bcc595f45bc781664f1d8b9a602fe80112a89bc99631aec6",
   "assembly/assembly.json": "423e69449d6172588400c522bca8edb6d1118c5061ea39844c46c2006896ab2c",
   "assembly/assembly.py": "8d796ff47eb450950e584770d7f40d9a6cb4ef756ca74574d6f685a7b44805c2",
@@ -24,6 +24,17 @@
   "cache-validation/sources/crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs.gz": "37646ebbdc1edcaed39d292be73c40b5308e3af97f8e90f486b67d47aef4dc4c",
   "cache-validation/sources/crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs.gz": "c48f9761ff6c25d0b9dc89118e12da141a292a4f7742fab73bb56e1808d66348",
   "cache-validation/validation.json": "f4f97d30ca9ec1e1c260a550c598975adbf07612909528378225a137c225b1fe",
+  "qmoe-standalone-validation/clippy-mlas.log.gz": "2cdcecf499cc0ae7a83811465a402fcce5bbf5de72598944be4fcf09992d081a",
+  "qmoe-standalone-validation/clippy.log.gz": "346151eb579d676763fb9a0bc298e1dbec8155741cdbf1547a4ccc3d3cb64518",
+  "qmoe-standalone-validation/driver.py": "04c73b0e5e9b9f7b73f2af1d685f4e98a9d1fd35027c13419a59ec32987a738d",
+  "qmoe-standalone-validation/host-oracle.log.gz": "3087ba6af7aa5198e0f5597f8a319213e51bb1f4191525b9276cc1f97562b919",
+  "qmoe-standalone-validation/list.log.gz": "e6fa1cb8965c358dfa8107fc46ec72b42a4a832e51ba99c552d262684e810a1b",
+  "qmoe-standalone-validation/merge-verification.json": "bd94ef69bbe752a9f13e0733450c08b0cfe7774794d387226e24a4f1d7d5551c",
+  "qmoe-standalone-validation/plugin-cache.log.gz": "5092910ade4af30d823298fa760e00d8f165b542086f476ac46f70ca66448917",
+  "qmoe-standalone-validation/qmoe-mlas.log.gz": "82cac132cdb5230604eecad910dc5201408922f02a561a520800f75553912d7e",
+  "qmoe-standalone-validation/qmoe.log.gz": "ac67a6c5cfdedc5e5f90ab941275dd0c6903b967646ffe47157dcc65f5f495b4",
+  "qmoe-standalone-validation/session.log.gz": "14a4788bbc03f833ec29d4c918630ee29a054abf4872af2460ea2f6ed9d611c3",
+  "qmoe-standalone-validation/validation.json": "2626af7de269129daa67bb68135dce82c218356e7c809d57b264cfe9cd1a10ef",
   "shared-image/analyze.py": "b44086a7914f56efb0375f30ef531986d178d347a2ed7b97a49fe57249c43f59",
   "shared-image/binary-seal.json": "6c740fba1d42d1cc7c062aac434193147616a6ec234f6d3dcb4d567841571248",
   "shared-image/build.jsonl.gz": "ba2968fb0a9b4a5619561f7908f029f3fff3de44878a63e32ec59d1a82f98a18",
@@ -41,5 +52,5 @@
   "shared-image/results.json": "4e504151cea78b0e789564c0df9daff0b4578ea98edf43f0b1a70dc60aa20829",
   "shared-image/run.py": "e4330efa023d981d80103c0a2175507b305a2e470104df4a5c52390a525242de",
   "shared-image/single_image.py": "5edb87a2a0fa224bb225186b9d0c51ecba73f5e315cfedd49f5600f90c76fc39",
-  "verify.py": "3a92d2ae2b0400249e94179e6f3735f560508865feeed666bf94510e0544a7b0"
+  "verify.py": "d673244513b07824a0d261b769f2369489eca739a3925b3b8234847e02d83726"
 }
