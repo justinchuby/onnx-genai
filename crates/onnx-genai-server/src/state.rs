@@ -433,6 +433,9 @@ pub struct ServerConfig {
     /// (§34.8). Independent of any model; defaults to the hostname or a generated id.
     pub node_id: String,
     pub max_output_tokens: usize,
+    pub max_transcription_input_tokens: std::num::NonZeroUsize,
+    pub max_transcription_prompt_bytes: std::num::NonZeroUsize,
+    pub max_transcription_template_operations: std::num::NonZeroU64,
     pub max_transcription_frames: std::num::NonZeroUsize,
     pub max_transcription_text_bytes: std::num::NonZeroUsize,
     pub realtime: crate::realtime::RealtimeLimits,
@@ -536,6 +539,17 @@ impl Default for ServerConfig {
                 .expect("positive default reranking document budget"),
             max_rerank_media_bytes: std::num::NonZeroUsize::new(64 * 1024 * 1024).unwrap(),
             max_decision_media_bytes: std::num::NonZeroUsize::new(64 * 1024 * 1024).unwrap(),
+            max_transcription_input_tokens:
+                onnx_genai_engine::transcription::generative::PromptLimits::default()
+                    .max_input_tokens,
+            max_transcription_prompt_bytes:
+                onnx_genai_engine::transcription::generative::PromptLimits::default()
+                    .template
+                    .max_output_bytes,
+            max_transcription_template_operations:
+                onnx_genai_engine::transcription::generative::PromptLimits::default()
+                    .template
+                    .max_operations,
             max_transcription_frames:
                 onnx_genai_engine::transcription::TranscriptionLimits::default().max_frames,
             max_transcription_text_bytes:

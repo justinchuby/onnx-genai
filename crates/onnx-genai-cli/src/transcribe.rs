@@ -106,6 +106,8 @@ struct Transcriber {
     engine: Engine,
     execution: SpeechExecution,
     language: Option<String>,
+    prompt: Option<String>,
+    prompt_limits: onnx_genai::engine::transcription::generative::PromptLimits,
     max_new_tokens: Option<std::num::NonZeroUsize>,
 }
 impl Transcriber {
@@ -117,8 +119,9 @@ impl Transcriber {
                 .map_err(anyhow::Error::msg)?
         {
             anyhow::ensure!(
-                args.language.as_ref().is_none_or(|value| value.is_empty()),
-                "--language is not declared by this frame-transcription profile; omit it or select a conditioned speech package"
+                args.language.as_ref().is_none_or(|value| value.is_empty())
+                    && args.prompt.as_ref().is_none_or(|value| value.is_empty()),
+                "--language/--prompt conditioning is not declared by this frame-transcription profile; omit it or select a conditioned speech package"
             );
             let program = engine
                 .metadata()
@@ -134,6 +137,11 @@ impl Transcriber {
         } else {
             let setup=multimodal::load(model_dir)?.with_context(||format!("{} declares no composed speech workflow; select a frame-transcription profile or a generative package with an explicit audio input",model_dir.display()))?;
             let spec=setup.multimodal.audio.with_context(||format!("{} declares neither a frame-transcription profile nor an admitted audio workflow input; select a speech-to-text package",model_dir.display()))?;
+            anyhow::ensure!(
+                spec.transcription().is_some(),
+                "{} has no transcription_config.json; declare its decoder prompt and response boundaries",
+                model_dir.display()
+            );
             let tokenizer = Tokenizer::from_file(&setup.tokenizer_path).with_context(|| {
                 format!(
                     "load speech tokenizer {}; verify the package's tokenizer artifact",
@@ -149,6 +157,15 @@ impl Transcriber {
             engine,
             execution,
             language: args.language.clone(),
+            prompt: args.prompt.clone(),
+            prompt_limits: onnx_genai::engine::transcription::generative::PromptLimits {
+                max_input_tokens: args.max_input_tokens,
+                template: onnx_genai::ort::TemplateLimits {
+                    max_output_bytes: args.max_prompt_bytes,
+                    max_operations: args.max_template_operations,
+                },
+                max_text_bytes: args.max_text_bytes,
+            },
             max_new_tokens,
         })
     }
@@ -178,7 +195,10 @@ impl Transcriber {
                     };
                     let bytes =
                         onnx_genai::preprocess::audio::encode_wav_f32(samples, sample_rate, 1)?;
-                    let mut limits = TranscriptionLimits::default();
+                    let mut limits = TranscriptionLimits {
+                        max_text_bytes: self.prompt_limits.max_text_bytes,
+                        ..TranscriptionLimits::default()
+                    };
                     if let Some(maximum) = self.max_new_tokens {
                         limits.max_tokens = maximum;
                     }
@@ -197,39 +217,40 @@ impl Transcriber {
                 SpeechExecution::Generative { tokenizer, spec } => {
                     let input =
                         multimodal::MultimodalInput::from_samples(spec, samples, sample_rate)?;
-                    let token_ids =
-                        multimodal::audio_decoder_prompt(tokenizer, self.language.as_deref())?;
+                    let prepared=spec.transcription().context("generative transcription contract is absent; declare transcription_config.json")?
+                        .prepare(tokenizer,self.language.as_deref(),self.prompt.as_deref(),self.prompt_limits)?;
+                    let mut output = prepared.output;
                     let mut options = GenerateOptions {
                         temperature: 0.0,
+                        response_projection: prepared.projection,
                         ..Default::default()
                     };
                     if let Some(maximum) = self.max_new_tokens {
                         options.max_new_tokens = maximum.get();
                     }
                     let request = input.bind(PipelineGenerateRequest::new(GenerateRequest {
-                        prompt: GeneratePrompt::TokenIds(token_ids),
+                        prompt: GeneratePrompt::TokenIds(prepared.token_ids),
                         options,
                     }))?;
-                    let mut text = String::new();
                     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
                         if INTERRUPT_REQUESTED.load(Ordering::SeqCst) {
                             return Err(anyhow::Error::new(Interrupted));
                         }
-                        text.push_str(&token.text);
+                        output.push(&token.text)?;
                         Ok(())
                     };
-                    self.engine.generate_with_pipeline_callbacks(
+                    let result = self.engine.generate_with_pipeline_callbacks(
                         request,
                         None,
                         Some(&mut callback),
                     )?;
-                    Ok(text)
+                    Ok(output.finish(&result.text)?.text)
                 }
             }
         })();
         GENERATING.store(false, Ordering::SeqCst);
         crate::flush_deferred_tracing()?;
-        Ok(result?.trim().to_string())
+        result
     }
 }
 

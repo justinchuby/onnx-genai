@@ -107,6 +107,7 @@ pub(crate) async fn props(
             "lora_embeddings": handle.engine.adapters.as_ref().is_some_and(|state|state.capabilities.embeddings),
             "lora_sessions": handle.engine.adapters.as_ref().is_some_and(|state|state.capabilities.sessions),
             "frame_transcription": handle.engine.transcription.is_some(),
+            "generative_transcription": handle.multimodal.as_ref().and_then(|specs|specs.audio.as_ref()).is_some_and(|audio|audio.transcription().is_some()),
             "decision": handle.engine.decision.is_some(),
             "decision_image_limit": handle.engine.decision.as_ref().map(|contract| contract.media().iter().filter(|m| m.kind==onnx_genai_metadata::EncodedMediaKind::Image).count()),
             "decision_media_order": handle.engine.decision.as_ref().map(|contract|contract.media().iter().map(|m|m.kind).collect::<Vec<_>>()),

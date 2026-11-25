@@ -11830,6 +11830,180 @@ mod ctc_transcription {
             .collect()
     }
     #[tokio::test]
+    async fn authored_generative_transcription_conditions_native_inference_and_projects_sse() {
+        let model = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/transcription_projected");
+        let router = app(AppState::load(&model, Some("speech".into())).unwrap());
+        let bytes = onnx_genai_preprocess::audio::encode_wav_f32(&[0.0; 256], 8000, 1).unwrap();
+        for (extra, expected, tokens) in [
+            (None, "world", 2),
+            (Some(("language", "en")), "world", 2),
+            (Some(("language", "zh")), "hello", 3),
+            (Some(("prompt", "tok31")), "hello", 3),
+        ] {
+            let mut fields = vec![("model", "speech")];
+            if let Some(extra) = extra {
+                fields.push(extra);
+            }
+            let (status, body) =
+                send(router.clone(), "/v1/audio/transcriptions", &bytes, &fields).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let expected_json: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(expected_json["text"], expected);
+            assert_eq!(expected_json["usage"]["input_tokens"], tokens);
+            assert_eq!(expected_json["usage"]["output_tokens"], 3);
+            fields.push(("stream", "true"));
+            let (status, body) =
+                send(router.clone(), "/v1/audio/transcriptions", &bytes, &fields).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let events = transcript_events(&body);
+            assert_eq!(events.last().unwrap(), &expected_json);
+            let deltas = events
+                .iter()
+                .filter_map(|event| event["delta"].as_str())
+                .collect::<String>();
+            assert_eq!(deltas, expected);
+            assert!(!body.contains("tok16") && !body.contains("tok17"), "{body}");
+        }
+        let (status, body) = send(
+            router,
+            "/v1/audio/transcriptions",
+            &bytes,
+            &[
+                ("model", "speech"),
+                ("language", "unknown"),
+                ("stream", "true"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("language") && !body.contains("data:"),
+            "{body}"
+        );
+    }
+    #[tokio::test]
+    async fn generative_transcription_requires_declared_prompting_and_respects_prompt_budgets() {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/transcription_projected");
+        let bytes = onnx_genai_preprocess::audio::encode_wav_f32(&[0.0; 256], 8000, 1).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        for name in [
+            "inference_metadata.yaml",
+            "tokenizer.json",
+            "model.onnx.textproto",
+        ] {
+            std::fs::copy(source.join(name), scratch.path().join(name)).unwrap();
+        }
+        let absent = app(AppState::load(scratch.path(), Some("speech".into())).unwrap());
+        let (status, body) = send(
+            absent,
+            "/v1/audio/transcriptions",
+            &bytes,
+            &[("model", "speech")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+        assert!(body.contains("transcription_config.json"), "{body}");
+        for config in [
+            ServerConfig {
+                max_transcription_input_tokens: std::num::NonZeroUsize::new(1).unwrap(),
+                ..Default::default()
+            },
+            ServerConfig {
+                max_transcription_prompt_bytes: std::num::NonZeroUsize::new(2).unwrap(),
+                ..Default::default()
+            },
+            ServerConfig {
+                max_transcription_template_operations: std::num::NonZeroU64::new(1).unwrap(),
+                ..Default::default()
+            },
+        ] {
+            let router =
+                app(AppState::load_with_config(&source, Some("speech".into()), config).unwrap());
+            let (status, body) = send(
+                router,
+                "/v1/audio/transcriptions",
+                &bytes,
+                &[("model", "speech"), ("stream", "true")],
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(!body.contains("data:"), "{body}");
+        }
+    }
+    #[tokio::test]
+    async fn audio_chat_uses_normal_chat_templates_and_declared_single_turn_conditioning() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/transcription_projected");
+        let scratch = tempfile::tempdir().unwrap();
+        for name in [
+            "inference_metadata.yaml",
+            "tokenizer.json",
+            "model.onnx.textproto",
+        ] {
+            std::fs::copy(source.join(name), scratch.path().join(name)).unwrap();
+        }
+        let mut config: Value =
+            serde_json::from_slice(&std::fs::read(source.join("tokenizer_config.json")).unwrap())
+                .unwrap();
+        config["chat_template"] = json!("tok31 dog");
+        std::fs::write(
+            scratch.path().join("tokenizer_config.json"),
+            config.to_string(),
+        )
+        .unwrap();
+        let audio = STANDARD
+            .encode(onnx_genai_preprocess::audio::encode_wav_f32(&[0.0; 256], 8000, 1).unwrap());
+        for (directory, normal) in [(scratch.path(), true), (source.as_path(), false)] {
+            let router = app(AppState::load(directory, Some("speech".into())).unwrap());
+            let mut messages = vec![
+                json!({"role":"user","content":[{"type":"text","text":"tok31"},{"type":"input_audio","input_audio":{"format":"wav","data":audio}}]}),
+            ];
+            if normal {
+                messages.insert(
+                    0,
+                    json!({"role":"system","content":"keep this role history"}),
+                );
+            }
+            let request =
+                json!({"model":"speech","messages":messages,"max_tokens":3,"temperature":0.0});
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let result = json_body(response).await;
+            assert_eq!(status, StatusCode::OK, "{result}");
+            assert_eq!(result["choices"][0]["message"]["content"], "hello");
+            let props = json_body(
+                router
+                    .oneshot(
+                        Request::builder()
+                            .uri("/props")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                props["nxrt_capabilities"]["generative_transcription"],
+                !normal
+            );
+        }
+    }
+    #[tokio::test]
     async fn authored_feature_transcription_matches_encoded_native_workflow() {
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/onnx_genai_workflows");
@@ -11916,6 +12090,11 @@ mod ctc_transcription {
         std::fs::copy(
             source.join("tokenizer.json"),
             package.path().join("tokenizer.json"),
+        )
+        .unwrap();
+        std::fs::copy(
+            source.join("transcription_config.json"),
+            package.path().join("transcription_config.json"),
         )
         .unwrap();
         let head = std::fs::read_to_string(source.join("model.onnx.textproto"))

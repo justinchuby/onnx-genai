@@ -1,4 +1,5 @@
 //! One-pass frame decoding through a package-declared acoustic workflow.
+pub mod generative;
 use crate::{Engine, GenerateOptions, GeneratePrompt, GenerateRequest, PipelineGenerateRequest};
 use anyhow::{Context, ensure};
 use onnx_genai_metadata::transcription::{

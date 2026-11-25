@@ -132,11 +132,6 @@ pub(crate) async fn audio_transcriptions(
         };
         return transcription_response(result.text, usage, &response_format, stream);
     }
-    if prompt.as_ref().is_some_and(|value| !value.is_empty()) {
-        return Err(ApiError::invalid_request(
-            "prompt conditioning is not implemented by this generative speech input contract; omit prompt",
-        ));
-    }
     let spec = handle
         .multimodal
         .as_ref()
@@ -148,14 +143,43 @@ pub(crate) async fn audio_transcriptions(
     let input = MultimodalInput::from_audio_bytes(spec, &bytes)
         .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err:#}")))?;
     let max_tokens = output_limit.get();
-    let token_ids = audio_decoder_prompt(&handle.tokenizer, language.as_deref())?;
-    let prompt_tokens = token_ids.len();
+    let contract = spec.transcription().ok_or_else(||ApiError {status:StatusCode::NOT_IMPLEMENTED,kind:"not_supported_error",retry_after_secs:None,message:format!("model '{}' has no generative transcription contract; author transcription_config.json with its exact decoder prompt and response boundaries",handle.id)})?;
+    let input_limit = handle
+        .model_max_context
+        .map(|context| context.saturating_sub(max_tokens))
+        .unwrap_or(state.config.max_transcription_input_tokens.get())
+        .min(state.config.max_transcription_input_tokens.get());
+    let input_limit = std::num::NonZeroUsize::new(input_limit).ok_or_else(|| {
+        ApiError::invalid_request(
+            "max_tokens leaves no model context for the transcription prompt; lower max_tokens",
+        )
+    })?;
+    let prepared = contract
+        .prepare(
+            &handle.tokenizer,
+            language.as_deref(),
+            prompt.as_deref(),
+            onnx_genai_engine::transcription::generative::PromptLimits {
+                max_input_tokens: input_limit,
+                template: onnx_genai_ort::TemplateLimits {
+                    max_output_bytes: state.config.max_transcription_prompt_bytes,
+                    max_operations: state.config.max_transcription_template_operations,
+                },
+                max_text_bytes: state.config.max_transcription_text_bytes,
+            },
+        )
+        .map_err(|error| {
+            ApiError::invalid_request(format!("prepare transcription prompt: {error:#}"))
+        })?;
+    let prompt_tokens = prepared.token_ids.len();
+    let output = prepared.output;
     let request = GenerateRequest {
-        prompt: GeneratePrompt::TokenIds(token_ids),
+        prompt: GeneratePrompt::TokenIds(prepared.token_ids),
         options: GenerateOptions {
             max_new_tokens: max_tokens,
             temperature: 0.0,
             max_context: handle.model_max_context,
+            response_projection: prepared.projection,
             ..GenerateOptions::default()
         },
     };
@@ -175,24 +199,22 @@ pub(crate) async fn audio_transcriptions(
         return Ok(transcription_stream(
             generation.events,
             prompt_tokens,
-            state.config.max_transcription_text_bytes.get(),
+            output,
         ));
     }
     let result = collect_generation_result(generation.events)
         .await
         .map_err(generation_failure)?;
-    if result.text.len() > state.config.max_transcription_text_bytes.get() {
-        return Err(ApiError::invalid_request(
-            "transcription text exceeds --max-transcription-text-bytes; shorten audio or raise the render-buffer limit",
-        ));
-    }
+    let transcript = output
+        .finish(&result.text)
+        .map_err(|error| ApiError::invalid_request(format!("render transcription: {error:#}")))?;
     let usage = TranscriptionUsage {
         input: prompt_tokens,
         output: result.token_ids.len(),
         cached: result.prefix_cache_hit_len,
         audio_frames: None,
     };
-    transcription_response(result.text, usage, &response_format, false)
+    transcription_response(transcript.text, usage, &response_format, false)
 }
 #[derive(Clone, Copy)]
 struct TranscriptionUsage {
@@ -270,30 +292,24 @@ async fn transcript_event(
 fn transcription_stream(
     mut events: mpsc::Receiver<DriverEvent>,
     input_tokens: usize,
-    max_bytes: usize,
+    mut output: onnx_genai_engine::transcription::generative::TranscriptRenderer,
 ) -> Response {
     let (tx, rx) = mpsc::channel(16);
     tokio::spawn(async move {
         let outcome=async {
-            let mut published=String::new();
             loop {
                 let event=tokio::select! { biased; _=tx.closed()=>return Ok(()), event=events.recv()=>event };
                 match event {
                     Some(DriverEvent::Token(token))=>{
-                        let size=published.len().checked_add(token.text.len()).ok_or_else(||ApiError::internal("transcription delta size overflows; shorten audio"))?;
-                        if size>max_bytes {return Err(ApiError::invalid_request("transcription text exceeds --max-transcription-text-bytes; shorten audio or raise the render-buffer limit"));}
-                        if !token.text.is_empty() {
-                            if !transcript_event(&tx,transcript_delta(&token.text)?).await {return Ok(());}
-                            published.push_str(&token.text);
-                        }
+                        let delta=output.push(&token.text).map_err(|error|ApiError::invalid_request(format!("render transcription delta: {error:#}")))?;
+                        if !delta.is_empty() && !transcript_event(&tx,transcript_delta(&delta)?).await {return Ok(());}
                     }
                     Some(DriverEvent::WorkflowPublications(_))=>{}
                     Some(DriverEvent::Finished(result))=>{
-                        if result.text.len()>max_bytes {return Err(ApiError::invalid_request("transcription text exceeds --max-transcription-text-bytes; shorten audio or raise the render-buffer limit"));}
-                        let tail=result.text.strip_prefix(&published).ok_or_else(||ApiError::internal("committed transcription does not extend its published deltas; repair the tokenizer's incremental output contract"))?;
-                        if !tail.is_empty() && !transcript_event(&tx,transcript_delta(tail)?).await {return Ok(());}
+                        let transcript=output.finish(&result.text).map_err(|error|ApiError::invalid_request(format!("render committed transcription: {error:#}")))?;
+                        if !transcript.delta.is_empty() && !transcript_event(&tx,transcript_delta(&transcript.delta)?).await {return Ok(());}
                         let usage=TranscriptionUsage{input:input_tokens,output:result.token_ids.len(),cached:result.prefix_cache_hit_len,audio_frames:None};
-                        let _=transcript_event(&tx,usage.done(&result.text)?).await;
+                        let _=transcript_event(&tx,usage.done(&transcript.text)?).await;
                         let _=tx.send(Ok(Event::default().data("[DONE]"))).await;
                         return Ok(());
                     }
@@ -321,7 +337,13 @@ mod tests {
     #[tokio::test]
     async fn transcript_deltas_publish_before_completion_and_disconnect_releases_driver_receiver() {
         let (driver, events) = mpsc::channel(1);
-        let response = transcription_stream(events, 3, 1024);
+        let response = transcription_stream(
+            events,
+            3,
+            onnx_genai_engine::transcription::generative::TranscriptRenderer::plain(
+                std::num::NonZeroUsize::new(1024).unwrap(),
+            ),
+        );
         let mut body = response.into_body().into_data_stream();
         driver
             .send(DriverEvent::Token(onnx_genai_engine::GenerateToken {

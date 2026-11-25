@@ -675,8 +675,10 @@ File transcription now executes declared one-pass CTC/greedy acoustic workflows
 as well as the existing generative speech path. Both aliases expose typed
 transcript done/delta events, usage, request output budgets and SSE termination.
 Native waveform-dependent HTTP acceptance is documented in
-[transcription](TRANSCRIPTION.md); general ASR prompt/response projection and
-richer generative media accounting remain open.
+[transcription](TRANSCRIPTION.md); generative ASR uses a versioned model-authored prompt/response contract shared
+with CLI transcription. Declared language/context conditioning and bounded
+buffered/SSE projection execute as described there; richer generative media
+accounting remains open.
 
 CLI transcription also executes frame-decoding packages and uses compiled preprocessing
 windows at the actual source rate, preserving exact sample cutoffs; encoded-audio

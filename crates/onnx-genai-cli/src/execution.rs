@@ -410,10 +410,17 @@ pub(super) fn build_pipeline_request(
                     path.display()
                 )
             })?;
-        // Audio replaces the prompt: the transcription decoder is seeded with
-        // the model's own token sequence because the clip, not the typed text,
-        // carries the content.
-        let token_ids = multimodal::audio_decoder_prompt(tokenizer, None)?;
+        // The model's transcription contract owns decoder conditioning; typed
+        // text reaches its declared context prompt instead of being discarded.
+        let contract=spec.transcription().context("audio generation requires transcription_config.json; declare the model decoder prompt instead of guessing start tokens")?;
+        let token_ids = contract
+            .render(
+                tokenizer,
+                None,
+                (!prompt.is_empty()).then_some(prompt.as_str()),
+                onnx_genai::engine::transcription::generative::PromptLimits::default(),
+            )?
+            .token_ids;
         return input.bind(PipelineGenerateRequest::new(GenerateRequest {
             prompt: GeneratePrompt::TokenIds(token_ids),
             options,

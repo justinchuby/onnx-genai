@@ -144,11 +144,81 @@ HTTP aliases, JSON/text/SSE responses and incremental generative delivery.
 These are dataflow/protocol checks, not recognition-quality or GPU-performance
 claims.
 
-Other compressed codecs remain open. The existing generative convenience path rejects nonempty `prompt` conditioning
-rather than dropping it, and still needs a general model-authored ASR prompt/response projection and richer
-media accounting. Feature-input analysis now executes the named model-authored
-audio program, including its analysis geometry and source-rate clip limit. CLI frame execution and program-derived segmentation are implemented. Realtime sessions use their separate declared
+Additional codec coverage and richer generative media accounting remain open.
+Feature-input analysis executes the named model-authored audio program, including
+its analysis geometry and source-rate clip limit. CLI frame execution and
+program-derived segmentation are implemented. Realtime sessions use their separate
 [contract](REALTIME.md). This feature does not establish complete audio parity.
 
 Encoded audio support and decoder limitations are documented in
 [audio preprocessing](AUDIO_PREPROCESSING.md#encoded-audio-formats).
+
+## Generative decoder prompting and transcript projection
+
+A generative speech package declares `transcription_config.json` at its root.
+This versioned convenience artifact is separate from the core workflow schema,
+like tokenizer/chat-template assets. Missing configuration returns an actionable
+501 from file transcription; runtime code never guesses start/task/language
+control tokens from vocabulary spellings. `/props.nxrt_capabilities.generative_transcription`
+reports the loaded contract; `frame_transcription` remains independent. Frame
+profiles retain their own ABI.
+
+```json
+{
+  "version": 1,
+  "prompt_template": "{{ prompt or '' }} <speech>{% if language %}{{ language }}{% endif %}<answer>",
+  "languages": {"kind": "choices", "values": ["en", "zh"]},
+  "prompt_conditioning": true,
+  "response_template": {
+    "version": 1,
+    "start_anchor": "<speech>",
+    "fields": {"content": {"open": "<answer>", "close": "</answer>"}}
+  }
+}
+```
+
+The example spellings are model facts: author the real model's prompt and
+boundaries. `prompt_template` uses the canonical bounded Jinja renderer with
+`language` and `prompt` (null when absent). Tokenization disables automatic special
+insertion and enables registered special-token parsing. Languages may declare
+`unsupported` (the default), `any`, or distinct nonempty `choices`. Choice labels
+match exactly; the template owns any case conversion or control-token mapping.
+`prompt_conditioning` defaults to false. Undeclared conditioning fails before SSE.
+
+An omitted `response_template` returns raw decoded text. A declaration uses the
+same response-boundary parser and tokenizer framing policy as ordinary generated
+responses. Only its `content` channel becomes the transcript; markers, reasoning
+and opaque fields are not transcript text. Rendered prompt content seeds parser
+state and is excluded from newly recognized speech. Both raw and projected output
+are bounded. SSE deltas are reconciled against the committed raw generation,
+and concatenate to the same text returned by buffered JSON/text. Usage counts
+actual decoder input tokens and all generated token IDs, including framing.
+
+```sh
+curl http://localhost:8080/v1/audio/transcriptions \
+  -F model=speech-model -F file=@recording.flac -F language=zh \
+  -F prompt='prior transcript context' -F stream=true
+nxrt transcribe MODEL recording.flac --language zh --prompt 'prior transcript context'
+```
+
+Server budgets are `--max-transcription-input-tokens`,
+`--max-transcription-prompt-bytes`, `--max-transcription-template-operations` and
+`--max-transcription-text-bytes`; input also respects remaining model context.
+CLI transcription exposes `--max-input-tokens`, `--max-prompt-bytes`,
+`--max-template-operations` and `--max-text-bytes`. Template fuel/output and token
+limits fail during preparation, before generation. Raw output includes hidden
+regions for resource accounting, even when only a short transcript is visible.
+
+Audio chat with a normal `chat_template` retains its normal multimodal prompt
+and response handling. Without a chat template, audio-only generation renders
+the declared transcription prompt; one user message's text is supplied as the
+optional context prompt. Multi-turn text/role history requires a chat template.
+Chat response projection remains the standard tokenizer `response_template`;
+file transcription/CLI `transcribe` use the ASR-specific declaration above.
+CLI `generate --audio` uses declared conditioning and retains ordinary raw
+`generate` output semantics.
+
+The maintained `transcription_projected` Native fixture produces a
+waveform/conditioning-dependent token wrapped in declared framing. HTTP and CLI
+acceptance verifies actual conditioning, input/output usage, buffered/SSE parity,
+absence of framing in transcripts, and rejection of undeclared/over-budget input.

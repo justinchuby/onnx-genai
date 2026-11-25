@@ -124,3 +124,27 @@ fn native_generative_mp3_process_uses_the_authored_window_for_every_segment() {
         assert_eq!(rows[3]["end"], 0.1);
     }
 }
+
+#[test]
+fn native_authored_transcription_process_projects_framing_and_conditions_the_prompt() {
+    let scratch = tempfile::tempdir().unwrap();
+    let path = scratch.path().join("silent.wav");
+    std::fs::write(
+        &path,
+        onnx_genai::preprocess::audio::encode_wav_f32(&[0.0; 256], 8000, 1).unwrap(),
+    )
+    .unwrap();
+    for (extra, text) in [
+        (vec![], "world"),
+        (vec!["--language", "zh"], "hello"),
+        (vec!["--prompt", "tok31"], "hello"),
+    ] {
+        let rows = transcripts(
+            command(&model("transcription_projected"), &path, &extra, None)
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["text"], text);
+    }
+}

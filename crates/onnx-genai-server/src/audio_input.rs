@@ -8,6 +8,9 @@ use crate::types::InputAudio;
 pub struct AudioInputSpec {
     pub endpoint: String,
     binding: AudioInputBinding,
+    pub(crate) transcription: Option<
+        std::sync::Arc<onnx_genai_engine::transcription::generative::GenerativeTranscription>,
+    >,
 }
 #[derive(Clone, Debug)]
 enum AudioInputBinding {
@@ -18,6 +21,11 @@ enum AudioInputBinding {
     },
 }
 impl AudioInputSpec {
+    pub fn transcription(
+        &self,
+    ) -> Option<&onnx_genai_engine::transcription::generative::GenerativeTranscription> {
+        self.transcription.as_deref()
+    }
     pub fn from_input(
         endpoint: String,
         shape: &[i64],
@@ -46,6 +54,7 @@ impl AudioInputSpec {
         })?;
         Ok(Self {
             endpoint,
+            transcription: None,
             binding: AudioInputBinding::Features {
                 program: std::sync::Arc::new(program),
                 shape: [1, n_mels.get(), n_frames.get()],
@@ -60,6 +69,7 @@ impl AudioInputSpec {
             .context("compile declared encoded-audio preprocessing for serving")?;
         Ok(Self {
             endpoint,
+            transcription: None,
             binding: AudioInputBinding::Encoded(std::sync::Arc::new(program)),
         })
     }
