@@ -11795,6 +11795,74 @@ mod ctc_transcription {
             .collect()
     }
     #[tokio::test]
+    async fn generative_waveform_transcription_executes_without_a_mel_output_contract() {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/transcription_tokens");
+        let package = tempfile::tempdir().unwrap();
+        let mut metadata: Value =
+            serde_json::from_slice(&std::fs::read(source.join("inference_metadata.yaml")).unwrap())
+                .unwrap();
+        metadata["preprocessing"]["audio"]["transforms"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        metadata["preprocessing"]["audio"]["outputs"][0]["source"] = json!("padded");
+        metadata["preprocessing"]["audio"]["outputs"][0]["content"] = json!("waveform");
+        fn shape(value: &mut Value) {
+            match value {
+                Value::Object(map) => {
+                    for (key, value) in map {
+                        if key == "shape" && *value == json!([1, 7, 4]) {
+                            *value = json!([1, 256]);
+                        } else {
+                            shape(value);
+                        }
+                    }
+                }
+                Value::Array(items) => {
+                    for value in items {
+                        shape(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        shape(&mut metadata);
+        std::fs::write(
+            package.path().join("inference_metadata.yaml"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        std::fs::copy(
+            source.join("tokenizer.json"),
+            package.path().join("tokenizer.json"),
+        )
+        .unwrap();
+        let head = std::fs::read_to_string(source.join("model.onnx.textproto"))
+            .unwrap()
+            .replace(
+                "dim { dim_value: 7 } dim { dim_value: 4 }",
+                "dim { dim_value: 256 }",
+            )
+            .replace("float_data: -9", "float_data: 0.1");
+        std::fs::write(package.path().join("model.onnx.textproto"), head).unwrap();
+        let router = app(AppState::load(package.path(), Some("wave-speech".into())).unwrap());
+        for (sample, expected) in [(0.0, "world"), (0.5, "hello")] {
+            let recording =
+                onnx_genai_preprocess::audio::encode_wav_pcm16(&[sample; 256], 8000, 1).unwrap();
+            let (status, body) = send(
+                router.clone(),
+                "/v1/audio/transcriptions",
+                &recording,
+                &[("model", "wave-speech")],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let value: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["text"], expected);
+        }
+    }
+    #[tokio::test]
     async fn mp3_transcription_executes_both_native_speech_paths_and_recovers_after_bad_audio() {
         let mp3 = include_bytes!("../../../tests/fixtures/audio/stereo-tone.mp3");
         let decoded = onnx_genai_preprocess::audio::decode_audio(mp3).unwrap();

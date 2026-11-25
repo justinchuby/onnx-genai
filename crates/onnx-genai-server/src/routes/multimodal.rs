@@ -147,10 +147,7 @@ pub(crate) async fn audio_transcriptions(
         })?;
     let input = MultimodalInput::from_audio_bytes(spec, &bytes)
         .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err:#}")))?;
-    let max_tokens = spec
-        .max_tokens
-        .unwrap_or(output_limit.get())
-        .min(output_limit.get());
+    let max_tokens = output_limit.get();
     let token_ids = audio_decoder_prompt(&handle.tokenizer, language.as_deref())?;
     let prompt_tokens = token_ids.len();
     let request = GenerateRequest {

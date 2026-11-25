@@ -168,6 +168,10 @@ impl LogMelExtractor {
         })
     }
 
+    pub fn n_mels(&self) -> usize {
+        self.n_mels
+    }
+
     /// Extracts a dynamically sized `[1, n_mels, n_frames]` tensor.
     ///
     /// Frame count is `floor(resampled_samples / hop_length)`, using centered
@@ -188,14 +192,59 @@ impl LogMelExtractor {
         samples: &[f32],
         input_sample_rate: u32,
     ) -> Result<LogMelFeatures, AudioPreprocessError> {
-        let mut resampled = resample(samples, input_sample_rate, self.sample_rate)?;
         let target = usize::try_from(self.sample_rate)?
             .checked_mul(30)
+            .and_then(std::num::NonZeroUsize::new)
             .ok_or_else(|| {
                 AudioPreprocessError::InvalidConfig(
-                    "30-second sample count overflows; reduce sample_rate".into(),
+                    "30-second sample window overflows; reduce sample_rate".into(),
                 )
             })?;
+        self.extract_sample_window(samples, input_sample_rate, target)
+    }
+    /// Pad/truncate the waveform at this extractor's analysis rate so its
+    /// actual hop produces exactly the requested number of normalized frames.
+    pub fn extract_fixed_frames(
+        &self,
+        samples: &[f32],
+        input_sample_rate: u32,
+        frames: std::num::NonZeroUsize,
+    ) -> Result<LogMelFeatures, AudioPreprocessError> {
+        self.extract_sample_window(
+            samples,
+            input_sample_rate,
+            self.sample_window_for_frames(frames)?,
+        )
+    }
+    fn sample_window_for_frames(
+        &self,
+        frames: std::num::NonZeroUsize,
+    ) -> Result<std::num::NonZeroUsize, AudioPreprocessError> {
+        frames.get().checked_mul(self.hop_length).and_then(std::num::NonZeroUsize::new)
+            .ok_or_else(|| AudioPreprocessError::InvalidConfig("requested frames times analysis hop overflows the waveform window; reduce the frame count or hop".into()))
+    }
+    /// Exact source clip bound for fixed-frame extraction, through the same
+    /// compiled waveform-window admission used by authored audio programs.
+    pub fn maximum_input_samples_for_frames(
+        &self,
+        source_rate: u32,
+        frames: std::num::NonZeroUsize,
+    ) -> Result<std::num::NonZeroUsize, AudioPreprocessError> {
+        AudioProgram::fixed_waveform_window(self.sample_rate, self.sample_window_for_frames(frames)?)
+            .maximum_input_samples(source_rate)?
+            .ok_or_else(|| AudioPreprocessError::InvalidConfig("fixed analysis window lost its clipping bound; report this runtime invariant failure".into()))
+    }
+    fn extract_sample_window(
+        &self,
+        samples: &[f32],
+        input_sample_rate: u32,
+        target: std::num::NonZeroUsize,
+    ) -> Result<LogMelFeatures, AudioPreprocessError> {
+        let mut resampled = resample(samples, input_sample_rate, self.sample_rate)?;
+        let target = target.get();
+        if target > resampled.len() {
+            resampled.try_reserve_exact(target-resampled.len()).map_err(|e|AudioPreprocessError::InvalidConfig(format!("allocate {target}-sample analysis window: {e}; reduce the target frame count or free host memory")))?;
+        }
         resampled.resize(target, 0.0);
         self.extract_resampled(&resampled)
     }
@@ -604,6 +653,35 @@ pub fn encode_wav_pcm16(
     Ok(buffer.into_inner())
 }
 
+fn resampled_length(
+    samples: usize,
+    input_rate: u32,
+    output_rate: u32,
+) -> Result<usize, AudioPreprocessError> {
+    if input_rate == 0 || output_rate == 0 {
+        return Err(AudioPreprocessError::InvalidSampleRate);
+    }
+    usize::try_from((samples as u128 * u128::from(output_rate) + u128::from(input_rate) / 2) / u128::from(input_rate))
+        .map_err(|_| AudioPreprocessError::InvalidConfig("resampled waveform length exceeds this host's address range; shorten the clip or reduce the target sample rate".into()))
+}
+fn resampled_valid_range(
+    valid: &std::ops::Range<usize>,
+    input_rate: u32,
+    output_rate: u32,
+    output_samples: usize,
+) -> std::ops::Range<usize> {
+    let start = (valid.start as u128 * u128::from(output_rate) / u128::from(input_rate))
+        .min(output_samples as u128) as usize;
+    let end = if valid.is_empty() {
+        start
+    } else {
+        (valid.end as u128 * u128::from(output_rate))
+            .div_ceil(u128::from(input_rate))
+            .min(output_samples as u128) as usize
+    };
+    start..end
+}
+
 fn resample(
     samples: &[f32],
     input_rate: u32,
@@ -616,8 +694,7 @@ fn resample(
         return Ok(samples.to_vec());
     }
 
-    let output_len =
-        (samples.len() as f64 * f64::from(output_rate) / f64::from(input_rate)).round() as usize;
+    let output_len = resampled_length(samples.len(), input_rate, output_rate)?;
     let ratio = f64::from(input_rate) / f64::from(output_rate);
     let cutoff = (f64::from(output_rate) / f64::from(input_rate)).min(1.0);
     const RADIUS: isize = 16;

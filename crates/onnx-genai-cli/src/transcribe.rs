@@ -92,89 +92,144 @@ fn srt_timestamp(seconds: f32) -> String {
 }
 
 /// A loaded speech package plus everything needed to transcribe segments.
+enum SpeechExecution {
+    Frames {
+        contract: std::sync::Arc<onnx_genai::metadata::transcription::TranscriptionContract>,
+        program: Option<onnx_genai::preprocess::audio::AudioProgram>,
+    },
+    Generative {
+        tokenizer: Box<Tokenizer>,
+        spec: multimodal::AudioInputSpec,
+    },
+}
 struct Transcriber {
     engine: Engine,
-    tokenizer: Tokenizer,
-    spec: multimodal::AudioInputSpec,
+    execution: SpeechExecution,
     language: Option<String>,
-    max_new_tokens: Option<usize>,
+    max_new_tokens: Option<std::num::NonZeroUsize>,
 }
-
 impl Transcriber {
     fn load(model_dir: &Path, args: &TranscribeArgs) -> anyhow::Result<Self> {
-        let setup = multimodal::load(model_dir)?.with_context(|| {
-            format!(
-                "What: {} could not be loaded as a speech package. \
-                 Why: it declares no `pipeline`, so it has no audio encoder to run. \
-                 How: point `transcribe` at a speech-to-text package.",
-                model_dir.display()
-            )
-        })?;
-        let spec = setup.multimodal.audio.clone().with_context(|| {
-            format!(
-                "What: {} cannot transcribe audio. \
-                 Why: no component of its package declares an `input_features` audio input. \
-                 How: point `transcribe` at a speech-to-text package.",
-                model_dir.display()
-            )
-        })?;
-        let tokenizer = Tokenizer::from_file(&setup.tokenizer_path).map_err(|error| {
-            anyhow::anyhow!(
-                "What: the package's tokenizer could not be loaded from {}. \
-                 Why: {error}. \
-                 How: verify the package ships a valid tokenizer.json.",
-                setup.tokenizer_path.display()
-            )
-        })?;
+        let max_new_tokens=args.max_new_tokens.map(|value|std::num::NonZeroUsize::new(value).context("--max-new-tokens must be positive for transcription; use at least one committed output token")).transpose()?;
         let engine = Engine::from_dir(model_dir, args.engine.to_config())?;
+        let execution = if let Some(contract) =
+            onnx_genai::metadata::transcription::transcription_contract(engine.metadata())
+                .map_err(anyhow::Error::msg)?
+        {
+            anyhow::ensure!(
+                args.language.as_ref().is_none_or(|value| value.is_empty()),
+                "--language is not declared by this frame-transcription profile; omit it or select a conditioned speech package"
+            );
+            let program = engine
+                .metadata()
+                .preprocessing
+                .as_ref()
+                .and_then(|p| p.audio.as_ref())
+                .map(onnx_genai::preprocess::audio::AudioProgram::from_program)
+                .transpose()?;
+            SpeechExecution::Frames {
+                contract: std::sync::Arc::new(contract),
+                program,
+            }
+        } else {
+            let setup=multimodal::load(model_dir)?.with_context(||format!("{} declares no composed speech workflow; select a frame-transcription profile or a generative package with an explicit audio input",model_dir.display()))?;
+            let spec=setup.multimodal.audio.with_context(||format!("{} declares neither a frame-transcription profile nor an admitted audio workflow input; select a speech-to-text package",model_dir.display()))?;
+            let tokenizer = Tokenizer::from_file(&setup.tokenizer_path).with_context(|| {
+                format!(
+                    "load speech tokenizer {}; verify the package's tokenizer artifact",
+                    setup.tokenizer_path.display()
+                )
+            })?;
+            SpeechExecution::Generative {
+                tokenizer: Box::new(tokenizer),
+                spec,
+            }
+        };
         Ok(Self {
             engine,
-            tokenizer,
-            spec,
+            execution,
             language: args.language.clone(),
-            max_new_tokens: args.max_new_tokens,
+            max_new_tokens,
         })
     }
-
-    /// The model's declared input window, in seconds.
-    fn window_seconds(&self) -> f32 {
-        multimodal::audio_window_seconds(&self.spec)
+    fn maximum_input_samples(
+        &self,
+        source_rate: u32,
+    ) -> anyhow::Result<Option<std::num::NonZeroUsize>> {
+        match &self.execution {
+            SpeechExecution::Frames {
+                program: Some(program),
+                ..
+            } => Ok(program.maximum_input_samples(source_rate)?),
+            SpeechExecution::Frames { program: None, .. } => Ok(None),
+            SpeechExecution::Generative { spec, .. } => spec.maximum_input_samples(source_rate),
+        }
     }
 
     /// Transcribe one segment of `[-1, 1]` mono samples.
     fn transcribe(&mut self, samples: &[f32], sample_rate: u32) -> anyhow::Result<String> {
-        let input = multimodal::MultimodalInput::from_samples(&self.spec, samples, sample_rate)?;
-        let token_ids =
-            multimodal::audio_decoder_prompt(&self.tokenizer, self.language.as_deref())?;
-        let mut options = GenerateOptions {
-            temperature: 0.0,
-            ..GenerateOptions::default()
-        };
-        if let Some(max_new_tokens) = self.max_new_tokens.or(self.spec.max_tokens) {
-            options.max_new_tokens = max_new_tokens;
-        }
-        let request = input.bind(PipelineGenerateRequest::new(GenerateRequest {
-            prompt: GeneratePrompt::TokenIds(token_ids),
-            options,
-        }))?;
-
         INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
         GENERATING.store(true, Ordering::SeqCst);
-        let mut text = String::new();
-        let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
-            if INTERRUPT_REQUESTED.load(Ordering::SeqCst) {
-                return Err(anyhow::Error::new(Interrupted));
+        let result = (|| -> anyhow::Result<String> {
+            match &self.execution {
+                SpeechExecution::Frames { contract, .. } => {
+                    use onnx_genai::engine::transcription::{
+                        PreparedTranscription, TranscriptionLimits,
+                    };
+                    let bytes =
+                        onnx_genai::preprocess::audio::encode_wav_pcm16(samples, sample_rate, 1)?;
+                    let mut limits = TranscriptionLimits::default();
+                    if let Some(maximum) = self.max_new_tokens {
+                        limits.max_tokens = maximum;
+                    }
+                    let request = PreparedTranscription::prepare(
+                        std::sync::Arc::clone(contract),
+                        bytes.into(),
+                        limits,
+                    )?
+                    .with_output_limit(limits.max_tokens)?;
+                    let result = self.engine.transcribe(request)?;
+                    if INTERRUPT_REQUESTED.load(Ordering::SeqCst) {
+                        return Err(anyhow::Error::new(Interrupted));
+                    }
+                    Ok(result.text)
+                }
+                SpeechExecution::Generative { tokenizer, spec } => {
+                    let input =
+                        multimodal::MultimodalInput::from_samples(spec, samples, sample_rate)?;
+                    let token_ids =
+                        multimodal::audio_decoder_prompt(tokenizer, self.language.as_deref())?;
+                    let mut options = GenerateOptions {
+                        temperature: 0.0,
+                        ..Default::default()
+                    };
+                    if let Some(maximum) = self.max_new_tokens {
+                        options.max_new_tokens = maximum.get();
+                    }
+                    let request = input.bind(PipelineGenerateRequest::new(GenerateRequest {
+                        prompt: GeneratePrompt::TokenIds(token_ids),
+                        options,
+                    }))?;
+                    let mut text = String::new();
+                    let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
+                        if INTERRUPT_REQUESTED.load(Ordering::SeqCst) {
+                            return Err(anyhow::Error::new(Interrupted));
+                        }
+                        text.push_str(&token.text);
+                        Ok(())
+                    };
+                    self.engine.generate_with_pipeline_callbacks(
+                        request,
+                        None,
+                        Some(&mut callback),
+                    )?;
+                    Ok(text)
+                }
             }
-            text.push_str(&token.text);
-            Ok(())
-        };
-        let result =
-            self.engine
-                .generate_with_pipeline_callbacks(request, None, Some(&mut callback));
+        })();
         GENERATING.store(false, Ordering::SeqCst);
         crate::flush_deferred_tracing()?;
-        result?;
-        Ok(text.trim().to_string())
+        Ok(result?.trim().to_string())
     }
 }
 
@@ -190,15 +245,6 @@ pub(super) fn transcribe(args: TranscribeArgs, profiling: &ProfileArgs) -> anyho
         Some(decode_backend_name(transcriber.engine.decode_backend()).to_string());
     profile.phase("model load", load_started.elapsed());
 
-    let window = transcriber.window_seconds();
-    let segment_seconds = args.segment_seconds.unwrap_or(window);
-    if segment_seconds > window {
-        anyhow::bail!(
-            "What: --segment-seconds {segment_seconds} was rejected. \
-             Why: this model's declared audio input holds at most {window:.2}s, so a longer segment could not be encoded. \
-             How: request at most {window:.2}s per segment."
-        );
-    }
     let writer = TranscriptWriter {
         format: args.format,
     };
@@ -212,24 +258,9 @@ pub(super) fn transcribe(args: TranscribeArgs, profiling: &ProfileArgs) -> anyho
     let mut totals = TranscriptionTotals::default();
     for source in &sources {
         if source.as_os_str() == "-" {
-            index = transcribe_stream(
-                &mut transcriber,
-                &args,
-                segment_seconds,
-                &writer,
-                index,
-                &mut totals,
-            )?;
+            index = transcribe_stream(&mut transcriber, &args, &writer, index, &mut totals)?;
         } else {
-            index = transcribe_file(
-                &mut transcriber,
-                source,
-                &args,
-                segment_seconds,
-                &writer,
-                index,
-                &mut totals,
-            )?;
+            index = transcribe_file(&mut transcriber, source, &args, &writer, index, &mut totals)?;
         }
     }
     totals.record(&mut profile);
@@ -278,24 +309,50 @@ impl TranscriptionTotals {
 /// Build the segmenter for a stream at `sample_rate`.
 fn build_segmenter(
     args: &TranscribeArgs,
-    segment_seconds: f32,
     sample_rate: u32,
-) -> anyhow::Result<StreamSegmenter> {
-    let config = SegmentConfig::from_seconds(
-        sample_rate,
-        segment_seconds,
-        args.silence_seconds,
-        args.silence_threshold,
-        args.min_segment_seconds,
-    )
-    .map_err(|error| {
-        anyhow::anyhow!(
-            "What: the segmentation settings were rejected. \
-             Why: {error}. \
-             How: give positive --segment-seconds and a sample rate above zero."
-        )
-    })?;
-    Ok(StreamSegmenter::new(config))
+    limit: Option<std::num::NonZeroUsize>,
+) -> anyhow::Result<(StreamSegmenter, f32)> {
+    for (field, value) in [
+        ("--silence-seconds", args.silence_seconds),
+        ("--silence-threshold", args.silence_threshold),
+        ("--min-segment-seconds", args.min_segment_seconds),
+    ] {
+        anyhow::ensure!(
+            value.is_finite() && value >= 0.0,
+            "{field} {value} must be finite and nonnegative; choose a finite segmentation setting"
+        );
+    }
+    let seconds = match (args.segment_seconds, limit) {
+        (Some(seconds), _) => {
+            anyhow::ensure!(
+                seconds.is_finite() && seconds > 0.0,
+                "--segment-seconds {seconds} must be finite and positive; choose a bounded audio segment duration"
+            );
+            seconds
+        }
+        (None, Some(maximum)) => maximum.get() as f32 / sample_rate as f32,
+        (None, None) => anyhow::bail!(
+            "audio preprocessing declares no bounded trimming window; pass --segment-seconds explicitly or author a fixed_window/trim on the published audio path"
+        ),
+    };
+    let mut config=SegmentConfig::from_seconds(sample_rate,seconds,args.silence_seconds,args.silence_threshold,args.min_segment_seconds)
+        .context("build audio segmenter; use positive finite segmentation settings and the recording's actual sample rate")?;
+    if let Some(maximum) = limit {
+        if args.segment_seconds.is_some() {
+            anyhow::ensure!(
+                config.max_samples <= maximum.get(),
+                "--segment-seconds {seconds} uses {} samples at {sample_rate} Hz, beyond this program's {}-sample input window; lower the duration to at most {} seconds",
+                config.max_samples,
+                maximum,
+                maximum.get() as f64 / f64::from(sample_rate)
+            );
+        } else {
+            config.max_samples = maximum.get();
+            config.min_samples = config.min_samples.min(config.max_samples);
+        }
+    }
+    let seconds = config.max_samples as f32 / sample_rate as f32;
+    Ok((StreamSegmenter::new(config), seconds))
 }
 
 /// Transcribe every segment a segmenter yields, reporting progress.
@@ -337,7 +394,6 @@ fn transcribe_file(
     transcriber: &mut Transcriber,
     path: &Path,
     args: &TranscribeArgs,
-    segment_seconds: f32,
     writer: &TranscriptWriter,
     mut index: usize,
     totals: &mut TranscriptionTotals,
@@ -360,7 +416,11 @@ fn transcribe_file(
     })?;
 
     let started = std::time::Instant::now();
-    let mut segmenter = build_segmenter(args, segment_seconds, audio.sample_rate)?;
+    let (mut segmenter, _) = build_segmenter(
+        args,
+        audio.sample_rate,
+        transcriber.maximum_input_samples(audio.sample_rate)?,
+    )?;
     let mut audio_seconds = drain(
         transcriber,
         segmenter.push(&audio.samples),
@@ -384,7 +444,6 @@ fn transcribe_file(
 fn transcribe_stream(
     transcriber: &mut Transcriber,
     args: &TranscribeArgs,
-    segment_seconds: f32,
     writer: &TranscriptWriter,
     mut index: usize,
     totals: &mut TranscriptionTotals,
@@ -392,7 +451,11 @@ fn transcribe_stream(
     let stdin = io::stdin();
     let mut reader = PcmStreamReader::new(stdin.lock(), args.sample_rate, args.channels)?;
     let sample_rate = reader.sample_rate();
-    let mut segmenter = build_segmenter(args, segment_seconds, sample_rate)?;
+    let (mut segmenter, segment_seconds) = build_segmenter(
+        args,
+        sample_rate,
+        transcriber.maximum_input_samples(sample_rate)?,
+    )?;
 
     eprintln!(
         "listening on stdin: {sample_rate} Hz, {} channel{}, up to {segment_seconds:.2}s per segment (Ctrl-C to stop)",
@@ -710,5 +773,152 @@ fn read_wav_stream_header<R: BufRead>(reader: &mut R) -> anyhow::Result<StreamHe
                 remaining -= want as u64;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod native_transcription_tests {
+    use super::*;
+    use clap::Parser;
+    fn args(model: &str, extra: &[&str]) -> TranscribeArgs {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows")
+            .join(model);
+        let mut argv = vec!["nxrt", "transcribe", root.to_str().unwrap()];
+        argv.extend_from_slice(extra);
+        let crate::Commands::Transcribe(args) = crate::Cli::try_parse_from(argv).unwrap().command
+        else {
+            panic!("transcribe command")
+        };
+        *args
+    }
+    #[test]
+    fn native_transcription_cli_runs_ctc_and_enforces_output_and_conditioning_budgets() {
+        let args = args("transcription_ctc", &[]);
+        let mut transcriber = Transcriber::load(&args.model, &args).unwrap();
+        let samples = [-0.5, -0.5, 0.125, -0.5, 0.0, 0.5, 0.5, 0.125, 0.5];
+        assert_eq!(transcriber.transcribe(&samples, 8000).unwrap(), "bb aa");
+        assert_eq!(
+            transcriber.transcribe(&samples.map(|v| -v), 8000).unwrap(),
+            "aa bb"
+        );
+        transcriber.max_new_tokens = std::num::NonZeroUsize::new(1);
+        assert_eq!(transcriber.transcribe(&samples, 8000).unwrap(), "b");
+        for extra in [["--language", "en"], ["--max-new-tokens", "0"]] {
+            let args = self::args("transcription_ctc", &extra);
+            let error = Transcriber::load(&args.model, &args)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains(extra[0]), "{error}");
+        }
+    }
+    #[test]
+    fn native_transcription_cli_windows_follow_actual_program_and_source_rate() {
+        for (model, count) in [("transcription_ctc", 12), ("transcription_tokens", 256)] {
+            let args = args(model, &["--min-segment-seconds", "0"]);
+            let transcriber = Transcriber::load(&args.model, &args).unwrap();
+            for (rate, expected) in [(8000, count), (16000, count * 2)] {
+                assert_eq!(
+                    transcriber
+                        .maximum_input_samples(rate)
+                        .unwrap()
+                        .unwrap()
+                        .get(),
+                    expected
+                );
+                let (mut segmenter, _) = build_segmenter(
+                    &args,
+                    rate,
+                    transcriber.maximum_input_samples(rate).unwrap(),
+                )
+                .unwrap();
+                let segments = segmenter.push(&vec![0.5; expected * 2]);
+                assert_eq!(segments.len(), 2);
+                assert!(
+                    segments
+                        .iter()
+                        .all(|segment| segment.samples.len() == expected)
+                );
+            }
+        }
+    }
+    #[test]
+    fn native_transcription_cli_keeps_generative_speech_audio_dependent() {
+        let args = args("transcription_tokens", &[]);
+        let mut transcriber = Transcriber::load(&args.model, &args).unwrap();
+        assert_eq!(transcriber.transcribe(&[0.0; 32], 8000).unwrap(), "world");
+        assert_eq!(transcriber.transcribe(&[0.5; 32], 8000).unwrap(), "hello");
+    }
+    #[test]
+    fn native_transcription_cli_requires_explicit_duration_when_no_window_is_authored() {
+        let mut args = args("transcription_ctc", &[]);
+        let error = build_segmenter(&args, 8000, None)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("--segment-seconds") && error.contains("no bounded"),
+            "{error}"
+        );
+        args.segment_seconds = Some(0.25);
+        let (mut segmenter, _) = build_segmenter(&args, 8000, None).unwrap();
+        assert_eq!(segmenter.push(&[0.5; 2000])[0].samples.len(), 2000);
+        args.silence_seconds = f32::NAN;
+        assert!(
+            build_segmenter(&args, 8000, None)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("--silence-seconds")
+        );
+        args.silence_seconds = 0.5;
+        args.min_segment_seconds = f32::INFINITY;
+        assert!(
+            build_segmenter(&args, 8000, None)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("--min-segment-seconds")
+        );
+        args.min_segment_seconds = 0.1;
+        args.silence_threshold = -0.1;
+        assert!(
+            build_segmenter(&args, 8000, None)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("--silence-threshold")
+        );
+    }
+    #[test]
+    fn native_transcription_cli_rejects_oversized_or_nonfinite_segment_requests() {
+        let mut args = args("transcription_ctc", &[]);
+        let transcriber = Transcriber::load(&args.model, &args).unwrap();
+        for seconds in [0.002, 0.0, -1.0, f32::INFINITY, f32::NAN] {
+            args.segment_seconds = Some(seconds);
+            let error = build_segmenter(
+                &args,
+                8000,
+                transcriber.maximum_input_samples(8000).unwrap(),
+            )
+            .err()
+            .unwrap()
+            .to_string();
+            assert!(
+                error.contains("--segment-seconds")
+                    && (error.contains("window") || error.contains("finite")),
+                "{error}"
+            );
+        }
+        args.segment_seconds = Some(0.001);
+        assert!(
+            build_segmenter(
+                &args,
+                8000,
+                transcriber.maximum_input_samples(8000).unwrap()
+            )
+            .is_ok()
+        );
     }
 }
