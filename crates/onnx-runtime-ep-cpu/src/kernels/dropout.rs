@@ -45,13 +45,13 @@ impl Kernel for DropoutKernel {
         validate_data_output(data, &outputs[0])?;
         let (data_outputs, mask_outputs) = outputs.split_at_mut(1);
         let mask = mask_outputs.first_mut().filter(|v| !v.is_absent());
-        if let Some(mask) = mask.as_ref() {
-            if mask.dtype != DataType::Bool || mask.shape != data.shape {
-                return Err(EpError::KernelFailed(format!(
-                    "Dropout: mask must be Bool with shape {:?}, got {:?}{:?}",
-                    data.shape, mask.dtype, mask.shape
-                )));
-            }
+        if let Some(mask) = mask.as_ref()
+            && (mask.dtype != DataType::Bool || mask.shape != data.shape)
+        {
+            return Err(EpError::KernelFailed(format!(
+                "Dropout: mask must be Bool with shape {:?}, got {:?}{:?}",
+                data.shape, mask.dtype, mask.shape
+            )));
         }
 
         let ratio = inputs.get(1).filter(|input| !input.is_absent());
