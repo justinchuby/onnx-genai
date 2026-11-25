@@ -57,6 +57,9 @@ pub enum LoaderError {
     )]
     InvalidEinsum { node: String, detail: String },
 
+    #[error("illegal ONNX model at node {node}: {detail}")]
+    InvalidTopK { node: String, detail: String },
+
     #[error(
         "unsupported ONNX model: operator {domain}::{op_type} at node {node} carries a \
          subgraph attribute '{attr}' (control-flow / nested-graph op) that this runtime cannot \

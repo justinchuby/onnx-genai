@@ -317,6 +317,7 @@ fn build_from_bytes_with_weights(
     validate_loaded_model(&graph)?;
     prepare_graph_for_execution(&mut graph)?;
     infer_shapes(&mut graph)?;
+    validate_topk_nodes(&graph)?;
 
     Ok((graph, Arc::new(store)))
 }
@@ -612,6 +613,7 @@ fn infer_shapes(graph: &mut Graph) -> Result<(), LoaderError> {
 /// 1. [`validate_opset_imports`] — every node's domain must declare an opset.
 /// 2. [`validate_einsum_nodes`] — resolve `Einsum-12`/`Einsum-28` from the
 ///    imported opset and validate every statically known equation/type/shape.
+///    Check the BF16 TopK schema revision where X's dtype is known.
 /// 3. [`validate_no_control_flow`] — allow the implemented subgraph-bearing ops
 ///    (`If`/`Loop`/`Scan`) and reject any other op carrying a `GraphProto`
 ///    attribute the executor cannot run.
@@ -632,10 +634,36 @@ fn infer_shapes(graph: &mut Graph) -> Result<(), LoaderError> {
 pub fn validate_model(graph: &Graph) -> Result<(), LoaderError> {
     validate_opset_imports(graph)?;
     validate_einsum_nodes(graph)?;
+    validate_topk_nodes(graph)?;
     validate_no_control_flow(graph)?;
     validate_no_dangling_refs(graph)?;
     validate_no_initializer_producer(graph)?;
     Ok(())
+}
+
+fn validate_topk_nodes(graph: &Graph) -> Result<(), LoaderError> {
+    fn check(graph: &Graph, default_opset: Option<u64>) -> Result<(), LoaderError> {
+        let default_opset = graph.opset_imports.get("").copied().or(default_opset);
+        for (_, node) in graph.nodes.iter() {
+            if let Some(opset) = node.local_opset().or(default_opset)
+                && let Some(input) = node.inputs.first().copied().flatten()
+                && let Some(value) = graph.values.get(input)
+            {
+                onnx_runtime_ir::topk::validate_bfloat16_opset(node, opset, value.dtype).map_err(
+                    |detail| LoaderError::InvalidTopK {
+                        node: node_label(node),
+                        detail,
+                    },
+                )?;
+            }
+        }
+        for subgraph in graph.subgraphs.values() {
+            check(subgraph, default_opset)?;
+        }
+        Ok(())
+    }
+
+    check(graph, None)
 }
 
 /// Resolve and validate every default-domain `Einsum` against the model's
