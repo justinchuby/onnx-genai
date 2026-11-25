@@ -98,6 +98,7 @@ impl GenerationClock {
     ) {
         self.step_started = Some(now);
         self.sample.get_or_insert(crate::config::GenerationTimings {
+            speculative: None,
             prompt_tokens: prompt_tokens.saturating_sub(cached_prompt_tokens),
             cached_prompt_tokens,
             generated_tokens: 0,
@@ -145,6 +146,12 @@ impl GenerationClock {
     fn pause_work_at(&mut self, now: std::time::Instant) {
         if let (Some(start), Some(sample)) = (self.step_started.take(), self.sample.as_mut()) {
             sample.generation_elapsed += now.duration_since(start);
+        }
+    }
+    #[cfg(feature = "native-backend")]
+    pub(crate) fn record_speculative(&mut self, stats: crate::SpeculativeStats) {
+        if let Some(sample) = self.sample.as_mut() {
+            sample.speculative = Some(stats);
         }
     }
     pub(crate) fn snapshot(&self) -> Option<crate::config::GenerationTimings> {

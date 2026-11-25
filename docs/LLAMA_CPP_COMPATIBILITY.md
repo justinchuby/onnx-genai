@@ -388,6 +388,14 @@ work remains included in the generation cost. Multi-token target verification
 requires one logits row per draft position and a consistent nonempty vocabulary.
 A mismatch returns an actionable error and rolls back provisional state; a
 last-token-only target can use `num_speculative_tokens=1`.
+When Native speculative verification has proposed tokens, these timing snapshots
+also contain `draft_n` and `draft_n_accepted`: cumulative proposed and accepted
+draft tokens, excluding the target's bonus token. Acceptance describes the
+verified block even when an output stop later truncates publication. These
+fields are absent before an actual proposal and on ordinary decode; no zero
+measurements are invented for executors without the timing contract. Buffered
+completion and SSE project the same engine-owned counter snapshots.
+
 For ordinary decoder SSE on native/OpenAI completions, chat and infill,
 `return_progress=true` publishes `prompt_progress` with `total`, `cache`,
 `processed` and elapsed `time_ms`. As upstream, `processed` includes cached tokens.
