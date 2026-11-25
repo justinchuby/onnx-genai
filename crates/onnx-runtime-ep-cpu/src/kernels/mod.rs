@@ -673,7 +673,7 @@ mod half_gemm;
 // dead code.
 mod dequantize_packed;
 mod dequantize_packed_gather;
-mod fourier_workspace;
+mod float_workspace;
 pub mod governed_weight_cache;
 mod grouped_matmul;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

@@ -407,6 +407,28 @@ sequences are inert. Pending decoder bytes are finalized before semantic commit,
 so an EOF text stop receives its actual stop reason, and a decoding or byte-bound
 failure leaves session state and callbacks uncommitted.
 
+`n_indent` requests a minimum number of space or tab characters after generated
+newlines. Each tab counts once. Omission, `null` and zero disable the control;
+numeric fractions truncate toward zero and the resulting value must fit
+0 through INT32_MAX. It requires a package tokenizer. The request is shared by
+native and OpenAI completion/chat, Responses and Anthropic generation.
+
+Indentation checks follow the pinned server's token-observation order: the first
+visible newline arms a later observation, and subsequent observations advance
+the newline scan. An insufficiently indented line stops generation normally;
+its leading whitespace remains in final text while its body is removed. EOS and
+prediction-time labels can take precedence without undoing that text clipping.
+The triggering token remains committed and counted. Native reports `limit`;
+OpenAI reports `length`. Generic workflows finish the current loop body
+atomically; specialized execution repairs the accepted prefix before commit.
+
+SSE publishes text whose indentation is already safe, withholding potentially
+retractable line content until the final boundary is known. A request that ends
+before the delayed indentation check releases any retained valid suffix. This
+avoids the pinned implementation's send-before-truncate ordering producing a
+streamed body that disagrees with final text. Token IDs and usage still account
+for every committed token.
+
 Ordinary runtime-owned decoder generation returns llama.cpp `timings` in native,
 OpenAI completion and chat buffered results and final SSE chunks. Setting
 `timings_per_token=true` adds cumulative token-boundary measurements to SSE,
