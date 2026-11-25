@@ -457,7 +457,7 @@ parity. These upstream capabilities remain incomplete:
   partial function-call fragment projection, broader pressure/overlap acceptance and
   device-backed wire acceptance; see [realtime](REALTIME.md) for the implemented
   WebSocket session modes, resource bounds and Native CPU evidence.
-- Video decision inputs, broader audio codecs and waveform/normalization dataflow,
+- Video decision inputs, broader audio codecs and additional DSP operations/conventions,
   joint/packed decision heads and shared generation/decision entry points.
 - Device-state/multi-sequence slot persistence; arbitrary GGUF/PEFT LoRA imports and device-fused LoRA.
 - GGUF package import, quantization selectors and selective sidecar management.
@@ -660,5 +660,7 @@ request-local. Raw grammar recognition continues to inspect model bytes and IDs.
 Audio preprocessing admits package-authored mel counts, sample rates, FFT/hop
 and Hann-window lengths through the executable log-mel program. Numerical
 acceptance includes an independent direct DFT and Native workflows using
-nonstandard geometry. Pure-waveform transform dataflow, additional window/mel
-conventions and audio codecs remain open; this does not imply full audio parity.
+nonstandard geometry. Pure-waveform normalization, named transform dataflow and validity publication
+execute as described in [audio preprocessing](AUDIO_PREPROCESSING.md). Additional
+DSP operations, window/mel conventions and codecs remain open; this does not imply
+full audio parity.
