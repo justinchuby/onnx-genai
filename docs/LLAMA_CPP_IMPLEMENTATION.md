@@ -2163,3 +2163,20 @@ Byte checks include stereo interleaving, float precision, symmetric PCM16
 rounding, full signed-range post-adapter conversion, and both HTTP PCM mappings.
 This checkpoint does not establish audio quality or GPU behavior and does not
 complete the remaining compatibility acceptance rows above.
+
+
+## Native speculative response counters
+
+Native prompt-lookup and MTP timing snapshots now carry actual proposal and
+accepted-draft totals through commit-only token publication. The shared server
+timing renderer exposes `draft_n` and `draft_n_accepted` only after a real
+proposal, matching the pinned upstream response fields. Acceptance counts
+verification work, excluding target bonus tokens; it is not reconstructed from
+published text length. Ordinary decode omits both fields. ORT speculative,
+composite and continuous-batch measurement contracts remain open.
+
+Real Native reporting tests cover multi-token acceptance, per-token/final
+snapshot consistency and clean retries after progress/phase cancellation.
+Native MTP is exercised in a subprocess with the ORT library unavailable. The
+actual server driver checks the same counter snapshots after an aborted turn
+and successful retry. This increment does not close the broader acceptance rows.

@@ -20,7 +20,7 @@ pub(crate) fn render(sample: GenerationTimings) -> Value {
             0.0
         }
     };
-    json!({
+    let mut wire = json!({
         "cache_n":sample.cached_prompt_tokens,
         "prompt_n":sample.prompt_tokens,
         "prompt_ms":prompt_ms,
@@ -30,7 +30,12 @@ pub(crate) fn render(sample: GenerationTimings) -> Value {
         "predicted_ms":predicted_ms,
         "predicted_per_token_ms":per_token(predicted_ms,steps),
         "predicted_per_second":per_second(predicted_ms,steps)
-    })
+    });
+    if let Some(stats) = sample.speculative.filter(|stats| stats.proposed_tokens > 0) {
+        wire["draft_n"] = json!(stats.proposed_tokens);
+        wire["draft_n_accepted"] = json!(stats.accepted_tokens);
+    }
+    wire
 }
 
 pub(crate) fn render_prompt_progress(
@@ -45,8 +50,32 @@ mod tests {
     use super::*;
     use std::time::Duration;
     #[test]
+    fn speculative_counts_are_emitted_only_after_actual_proposals() {
+        let mut sample = GenerationTimings {
+            speculative: None,
+            prompt_tokens: 1,
+            cached_prompt_tokens: 0,
+            generated_tokens: 3,
+            prompt_elapsed: Duration::from_millis(1),
+            generation_elapsed: Duration::from_millis(2),
+        };
+        assert!(render(sample).get("draft_n").is_none());
+        sample.speculative = Some(onnx_genai_engine::SpeculativeStats::default());
+        assert!(render(sample).get("draft_n_accepted").is_none());
+        sample.speculative = Some(onnx_genai_engine::SpeculativeStats {
+            proposed_tokens: 7,
+            accepted_tokens: 4,
+            verification_steps: 3,
+            multi_token_accepts: 1,
+        });
+        assert_eq!(render(sample)["draft_n"], 7);
+        assert_eq!(render(sample)["draft_n_accepted"], 4);
+    }
+
+    #[test]
     fn llama_timings_rates_count_the_first_token_as_prompt_work() {
         let mut sample = GenerationTimings {
+            speculative: None,
             prompt_tokens: 3,
             cached_prompt_tokens: 4,
             generated_tokens: 3,

@@ -2298,6 +2298,9 @@ pub struct TokenLogprob {
 /// additional generation forward, matching llama.cpp's rate denominator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenerationTimings {
+    /// Actual speculative verification counters at this committed boundary.
+    /// Absent when no speculative verification has run.
+    pub speculative: Option<crate::SpeculativeStats>,
     pub prompt_tokens: usize,
     pub cached_prompt_tokens: usize,
     pub generated_tokens: usize,
