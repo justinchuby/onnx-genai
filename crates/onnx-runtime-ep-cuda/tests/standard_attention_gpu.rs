@@ -23,10 +23,11 @@ use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, EpError, ExecutionProvider, KernelMatch, Result,
     TensorMut, TensorView,
 };
+use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ir::{
-    Attribute, DataType, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
+    Attribute, DataType, DeviceId, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
 };
 use onnx_runtime_loader::Model;
 
@@ -624,6 +625,109 @@ fn run_result_core_inner(
         )));
     }
     Ok(result)
+}
+
+fn run_cpu_opt(
+    op: &str,
+    opset: u64,
+    inputs: &[Option<Tensor>],
+    outputs: &[(DataType, Vec<usize>)],
+    attrs: &[(&str, Attribute)],
+) -> Vec<Vec<u8>> {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), opset);
+    let input_values = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, input)| {
+            input.as_ref().map(|input| {
+                let value = graph.create_named_value(
+                    format!("input_{i}"),
+                    input.dtype,
+                    static_shape(input.shape.iter().copied()),
+                );
+                graph.add_input(value);
+                value
+            })
+        })
+        .collect::<Vec<_>>();
+    let output_values = outputs
+        .iter()
+        .enumerate()
+        .map(|(i, (dtype, shape))| {
+            graph.create_named_value(
+                format!("output_{i}"),
+                *dtype,
+                static_shape(shape.iter().copied()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut node = Node::new(
+        NodeId(0),
+        op,
+        input_values.into_iter().collect(),
+        output_values.clone(),
+    );
+    for (name, value) in attrs {
+        node.attributes.insert((*name).into(), value.clone());
+    }
+    let node_id = graph.insert_node(node);
+    for output in output_values {
+        graph.add_output(output);
+    }
+    let model = Model::new(&graph);
+    let kernel = CpuExecutionProvider::new()
+        .get_kernel(model.graph.node(node_id), &[], opset)
+        .unwrap();
+
+    let input_strides = inputs
+        .iter()
+        .map(|input| {
+            input
+                .as_ref()
+                .map(|input| compute_contiguous_strides(&input.shape))
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let input_views = inputs
+        .iter()
+        .zip(&input_strides)
+        .map(|(input, strides)| match input {
+            Some(input) => TensorView::new(
+                DevicePtr(input.bytes.as_ptr().cast()),
+                input.dtype,
+                &input.shape,
+                strides,
+                DeviceId::cpu(),
+            ),
+            None => TensorView::absent(DataType::Float32),
+        })
+        .collect::<Vec<_>>();
+    let mut output_buffers = outputs
+        .iter()
+        .map(|(dtype, shape)| vec![0; dtype.storage_bytes(shape.iter().product())])
+        .collect::<Vec<_>>();
+    let output_strides = outputs
+        .iter()
+        .map(|(_, shape)| compute_contiguous_strides(shape))
+        .collect::<Vec<_>>();
+    let mut output_views = outputs
+        .iter()
+        .zip(output_buffers.iter_mut())
+        .zip(&output_strides)
+        .map(|(((dtype, shape), bytes), strides)| {
+            TensorMut::new(
+                DevicePtrMut(bytes.as_mut_ptr().cast()),
+                *dtype,
+                shape,
+                strides,
+                DeviceId::cpu(),
+            )
+        })
+        .collect::<Vec<_>>();
+    kernel.execute(&input_views, &mut output_views).unwrap();
+    drop(output_views);
+    output_buffers
 }
 
 fn f32s(bytes: &[u8]) -> Vec<f32> {
