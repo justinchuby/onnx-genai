@@ -145,6 +145,19 @@ fn unary(op: &'static str, opset: u64, values: Vec<f32>, abs_tol: f32) -> OpCase
     }
 }
 
+fn unary_vector(op: &'static str, opset: u64, values: Vec<f32>, abs_tol: f32) -> OpCase {
+    let len = values.len();
+    OpCase {
+        op,
+        domain: "",
+        opset,
+        attrs: vec![],
+        inputs: vec![Inp::F(vec![len], values)],
+        out_shape: vec![len],
+        abs_tol,
+    }
+}
+
 fn binary(op: &'static str, opset: u64, abs_tol: f32) -> OpCase {
     OpCase {
         op,
@@ -533,11 +546,11 @@ fn opset_22_activations_match_independent_bf16_goldens() {
                 .collect(),
         ),
         (
-            unary("Softplus", 22, values.clone(), 0.0),
+            unary_vector("Softplus", 22, values.clone(), 0.0),
             values.iter().map(|&x| (1.0 + x.exp()).ln()).collect(),
         ),
         (
-            unary("Softsign", 22, values.clone(), 0.0),
+            unary_vector("Softsign", 22, values.clone(), 0.0),
             values.iter().map(|&x| x / (1.0 + x.abs())).collect(),
         ),
     ];
