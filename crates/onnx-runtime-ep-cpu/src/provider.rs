@@ -455,7 +455,7 @@ impl ExecutionProvider for CpuExecutionProvider {
         } else {
             &op.domain
         };
-        if !self.registry.supports(&op.op_type, &op.domain, opset) {
+        let Some(factory) = self.registry.lookup(&op.op_type, &op.domain, opset) else {
             if let Some(since) = self
                 .registry
                 .earliest_since_version(&op.op_type, &op.domain)
@@ -475,7 +475,7 @@ impl ExecutionProvider for CpuExecutionProvider {
                 op.op_type,
                 opset
             );
-        }
+        };
         if op.is_default_domain()
             && op.op_type == "Transpose"
             && let Some(&dtype) = input_dtypes.first()
@@ -649,51 +649,10 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(format!("DeformConv: {reason}"));
         }
-        // Attribute-level capability limits for the attention and MoE family.
-        //
-        // Every one of these mirrors a rejection its kernel factory raises, and
-        // mirroring is mandatory rather than tidy: `GetCapability` consults only
-        // the dtype and shape filters, so a factory rejection arrives *after*
-        // ORT has compiled the node onto this EP and is a hard session failure
-        // that no fallback recovers from. Claiming an op we cannot configure is
-        // therefore strictly worse for the user than never claiming it — it
-        // turns a model that runs on ORT's CPU EP into one that does not load.
-        //
-        // Each `unsupported_reason` runs the factory's own attribute parse, so
-        // a new limit cannot be added to a factory without appearing here.
-        //
-        // These are *capability* declines, never performance ones: every entry
-        // is a kernel we owe. See the benchmark doc's §23.6.
-        let attribute_reason = match (op.op_type.as_str(), domain) {
-            ("MoE", "com.microsoft") => crate::kernels::moe::unsupported_reason(op),
-            ("QMoE", "com.microsoft") => crate::kernels::qmoe::unsupported_reason(op),
-            ("GroupQueryAttention", "com.microsoft") => {
-                crate::kernels::group_query_attention::unsupported_reason(op)
-            }
-            ("MultiHeadAttention", "com.microsoft") => {
-                crate::kernels::multi_head_attention::unsupported_reason(op)
-            }
-            ("Attention", "com.microsoft") => {
-                crate::kernels::msft_attention::unsupported_reason(op)
-            }
-            ("Attention", "ai.onnx") => crate::kernels::attention::unsupported_reason(
-                op,
-                opset,
-                shapes.first().map(|shape| shape.len()),
-            ),
-            _ => None,
-        };
-        if let Some(reason) = attribute_reason {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "PackedMultiHeadAttention"
-            && op.domain == "com.microsoft"
-            && let Some(reason) = crate::kernels::packed_multi_head_attention::unsupported_reason(
-                op,
-                shapes,
-                input_dtypes,
-            )
-        {
+        // Structural kernel limits belong to the versioned factory selected
+        // above, alongside the parser that creation uses. No operator-name
+        // dispatch table is needed here to keep those two boundaries aligned.
+        if let Some(reason) = factory.unsupported_reason(op, opset, shapes, input_dtypes) {
             return KernelMatch::unsupported(reason);
         }
         if matches!(op.op_type.as_str(), "ScatterND" | "ScatterElements")
@@ -1837,6 +1796,151 @@ mod tests {
             "PackedMultiHeadAttention's attribute mirror was not reached; the node declined \
              for `{reason}` instead, so this case would not catch the mirror being removed"
         );
+    }
+
+    #[test]
+    fn claim_uses_selected_factory_metadata_without_creating_a_kernel() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Gate {
+            revision: usize,
+            queried: Arc<AtomicUsize>,
+            created: Arc<AtomicUsize>,
+        }
+        impl onnx_runtime_ep_api::KernelFactory for Gate {
+            fn unsupported_reason(
+                &self,
+                node: &Node,
+                opset: u64,
+                shapes: &[Shape],
+                dtypes: &[DataType],
+            ) -> Option<String> {
+                assert_eq!(node.op_type, "FactoryMetadataProbe");
+                assert_eq!(
+                    node.attr("marker")
+                        .and_then(onnx_runtime_ir::Attribute::as_int),
+                    Some(42)
+                );
+                assert_eq!(shapes, &[onnx_runtime_ir::static_shape([2, 3, 4])]);
+                assert_eq!(dtypes, &[DataType::Float32]);
+                assert_eq!(usize::from(opset >= 13), self.revision);
+                self.queried.fetch_add(1, Ordering::Relaxed);
+                Some(format!(
+                    "factory revision {} rejects this metadata",
+                    self.revision
+                ))
+            }
+            fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+                self.created.fetch_add(1, Ordering::Relaxed);
+                panic!("claim must not construct or prepare a kernel")
+            }
+        }
+        struct NoGate;
+        impl onnx_runtime_ep_api::KernelFactory for NoGate {
+            fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+                panic!("default metadata query must not construct a kernel")
+            }
+        }
+        let mut ep = CpuExecutionProvider::new();
+        let created = Arc::new(AtomicUsize::new(0));
+        let queried = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        for (revision, since) in [(0, 1), (1, 13)] {
+            ep.registry.register(
+                onnx_runtime_ep_api::OpKey::new("FactoryMetadataProbe", "pkg.claim", since),
+                onnx_runtime_ep_api::WorkspacePlanning::None,
+                Box::new(Gate {
+                    revision,
+                    queried: queried[revision].clone(),
+                    created: created.clone(),
+                }),
+            );
+        }
+        let mut node = Node::new(NodeId(0), "FactoryMetadataProbe", vec![], vec![]);
+        node.domain = "pkg.claim".into();
+        node.attributes
+            .insert("marker".into(), onnx_runtime_ir::Attribute::Int(42));
+        for opset in [1, 12, 13, 29] {
+            let claim = ep.supports_op(
+                &node,
+                opset,
+                &[onnx_runtime_ir::static_shape([2, 3, 4])],
+                &[DataType::Float32],
+                &[],
+            );
+            let expected = format!(
+                "factory revision {} rejects this metadata",
+                usize::from(opset >= 13)
+            );
+            assert_eq!(claim.reason(), Some(expected.as_str()));
+        }
+        assert_eq!(created.load(Ordering::Relaxed), 0);
+        assert_eq!(queried[0].load(Ordering::Relaxed), 2);
+        assert_eq!(queried[1].load(Ordering::Relaxed), 2);
+        ep.registry.register(
+            onnx_runtime_ep_api::OpKey::new("NoExtraGate", "pkg.claim", 1),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(NoGate),
+        );
+        let mut node = Node::new(NodeId(1), "NoExtraGate", vec![], vec![]);
+        node.domain = "pkg.claim".into();
+        assert!(ep.supports_op(&node, 1, &[], &[], &[]).is_supported());
+    }
+
+    #[cfg(feature = "ops-cnn")]
+    #[test]
+    fn conv_claim_and_factory_share_the_registered_rank_boundary() {
+        let ep = CpuExecutionProvider::new();
+        let node = Node::new(NodeId(0), "Conv", vec![], vec![]);
+        for rank in [2, 5] {
+            let shapes = vec![onnx_runtime_ir::static_shape(vec![2; rank]); 2];
+            let claim = ep.supports_op(&node, 18, &shapes, &[DataType::Float32; 2], &[]);
+            let reason = claim
+                .reason()
+                .expect("unsupported ranks must fail during claim");
+            assert!(
+                reason.contains("matching rank-3 NCL or rank-4 NCHW"),
+                "{reason}"
+            );
+            let concrete = vec![vec![2; rank]; 2];
+            let error = ep
+                .get_kernel(&node, &concrete, 18)
+                .err()
+                .expect("factory must reject the same rank")
+                .to_string();
+            assert!(error.contains(reason), "claim={reason}; factory={error}");
+        }
+        // The current claim metadata cannot distinguish absent rank from a
+        // scalar Shape. Concrete construction still knows and rejects rank 0.
+        assert!(ep.get_kernel(&node, &[vec![], vec![]], 18).is_err());
+        let mismatched = [
+            onnx_runtime_ir::static_shape([1, 2, 9]),
+            onnx_runtime_ir::static_shape([4, 2, 3, 3]),
+        ];
+        assert!(
+            !ep.supports_op(&node, 18, &mismatched, &[DataType::Float32; 2], &[])
+                .is_supported()
+        );
+        for shapes in [
+            vec![
+                onnx_runtime_ir::static_shape([1, 2, 9]),
+                onnx_runtime_ir::static_shape([4, 2, 3]),
+            ],
+            vec![
+                onnx_runtime_ir::static_shape([1, 2, 7, 9]),
+                onnx_runtime_ir::static_shape([4, 2, 3, 3]),
+            ],
+            vec![vec![onnx_runtime_ir::Dim::Symbolic(onnx_runtime_ir::SymbolId(0)); 3]; 2],
+            vec![vec![]; 2],
+            vec![vec![], onnx_runtime_ir::static_shape([4, 2, 3])],
+            vec![onnx_runtime_ir::static_shape([1, 2, 9]), vec![]],
+            vec![],
+        ] {
+            assert!(
+                ep.supports_op(&node, 18, &shapes, &[DataType::Float32; 2], &[])
+                    .is_supported(),
+                "{shapes:?}"
+            );
+        }
     }
 
     #[test]

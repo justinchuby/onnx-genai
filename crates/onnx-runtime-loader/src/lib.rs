@@ -319,6 +319,7 @@ fn build_from_bytes_with_weights(
     infer_shapes(&mut graph)?;
     validate_topk_nodes(&graph)?;
     validate_shape_size_dtypes(&graph, &graph.opset_imports)?;
+    validate_split_to_sequence_nodes(&graph)?;
 
     Ok((graph, Arc::new(store)))
 }
@@ -615,15 +616,18 @@ fn infer_shapes(graph: &mut Graph) -> Result<(), LoaderError> {
 ///    FP8 tensor-valued `Constant` attributes must meet their schema version.
 /// 2. [`validate_einsum_nodes`] — resolve `Einsum-12`/`Einsum-28` from the
 ///    imported opset and validate every statically known equation/type/shape.
-///    Check the BF16 TopK schema revision where X's dtype is known.
-/// 3. [`validate_shape_size_dtypes`] — reject input types that require a newer
+/// 3. [`validate_topk_nodes`] — check the BF16 TopK schema revision where X's
+///    dtype is known.
+/// 4. [`validate_shape_size_dtypes`] — reject input types that require a newer
 ///    revision of Shape or Size than the effective imported opset.
-/// 4. [`validate_no_control_flow`] — allow the implemented subgraph-bearing ops
+/// 5. [`validate_split_to_sequence_nodes`] — enforce the v24 bfloat16 type
+///    boundary before the executor's sequence-op routing bypasses EP claims.
+/// 6. [`validate_no_control_flow`] — allow the implemented subgraph-bearing ops
 ///    (`If`/`Loop`/`Scan`) and reject any other op carrying a `GraphProto`
 ///    attribute the executor cannot run.
-/// 5. [`validate_no_dangling_refs`] — every consumed tensor must be sourced
+/// 7. [`validate_no_dangling_refs`] — every consumed tensor must be sourced
 ///    (graph input, initializer, or an upstream node output).
-/// 6. [`validate_no_initializer_producer`] — an initializer must be a constant
+/// 8. [`validate_no_initializer_producer`] — an initializer must be a constant
 ///    source; reject any initializer value that is also a node output (shares a
 ///    `ValueId` with a producer), which the IR structural check does not cover.
 ///
@@ -640,6 +644,7 @@ pub fn validate_model(graph: &Graph) -> Result<(), LoaderError> {
     validate_einsum_nodes(graph)?;
     validate_topk_nodes(graph)?;
     validate_shape_size_dtypes(graph, &graph.opset_imports)?;
+    validate_split_to_sequence_nodes(graph)?;
     validate_no_control_flow(graph)?;
     validate_no_dangling_refs(graph)?;
     validate_no_initializer_producer(graph)?;
@@ -722,6 +727,109 @@ fn validate_topk_nodes(graph: &Graph) -> Result<(), LoaderError> {
     }
 
     check(graph, None)
+}
+
+/// Validate the versioned tensor-type constraint for default-domain
+/// `SplitToSequence`.
+pub fn validate_split_to_sequence_nodes(graph: &Graph) -> Result<(), LoaderError> {
+    use onnx_runtime_ir::DataType;
+
+    fn dtype_through_identity(graph: &Graph, mut value: onnx_runtime_ir::ValueId) -> DataType {
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            let value_info = graph.value(value);
+            if value_info.dtype != DataType::Undefined {
+                return value_info.dtype;
+            }
+            if !visited.insert(value) {
+                return DataType::Undefined;
+            }
+            let Some(producer) = value_info.producer.map(|id| graph.node(id)) else {
+                return DataType::Undefined;
+            };
+            if !producer.is_default_domain()
+                || producer.op_type != "Identity"
+                || !producer.overload.is_empty()
+                || producer.outputs.as_slice() != [Some(value)]
+            {
+                return DataType::Undefined;
+            }
+            let Some(input) = producer.inputs.first().copied().flatten() else {
+                return DataType::Undefined;
+            };
+            value = input;
+        }
+    }
+
+    fn admitted(dtype: DataType, opset: u64) -> bool {
+        matches!(
+            dtype,
+            DataType::Float32
+                | DataType::Uint8
+                | DataType::Int8
+                | DataType::Uint16
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::String
+                | DataType::Bool
+                | DataType::Float16
+                | DataType::Float64
+                | DataType::Uint32
+                | DataType::Uint64
+                | DataType::Complex64
+                | DataType::Complex128
+        ) || (dtype == DataType::BFloat16 && opset >= 24)
+    }
+
+    fn check_graph(
+        graph: &Graph,
+        imports: &std::collections::HashMap<String, u64>,
+    ) -> Result<(), LoaderError> {
+        for (_, node) in graph.nodes.iter() {
+            if !node.is_default_domain() || node.op_type != "SplitToSequence" {
+                continue;
+            }
+            let opset = node
+                .local_opset()
+                .or_else(|| imports.get("").copied())
+                .unwrap_or(1);
+            if opset < 11 {
+                return Err(LoaderError::InvalidSplitToSequence {
+                    node: node_label(node),
+                    detail: format!(
+                        "opset {opset} predates SplitToSequence; import ai.onnx opset 11 or newer"
+                    ),
+                });
+            }
+            let Some(input_id) = node.inputs.first().copied().flatten() else {
+                continue;
+            };
+            let dtype = dtype_through_identity(graph, input_id);
+            if dtype == DataType::Undefined {
+                continue;
+            }
+            if !admitted(dtype, opset) {
+                let requirement = if dtype == DataType::BFloat16 {
+                    "bfloat16 requires opset 24 or newer"
+                } else {
+                    "SplitToSequence-24 admits only the classic IR4 tensor types plus bfloat16; newer float and packed integer types are not legal"
+                };
+                return Err(LoaderError::InvalidSplitToSequence {
+                    node: node_label(node),
+                    detail: format!(
+                        "input dtype {dtype:?} is unsupported at opset {opset}; {requirement}"
+                    ),
+                });
+            }
+        }
+        for subgraph in graph.subgraphs.values() {
+            check_graph(subgraph, imports)?;
+        }
+        Ok(())
+    }
+
+    check_graph(graph, &graph.opset_imports)
 }
 
 /// Resolve and validate every default-domain `Einsum` against the model's

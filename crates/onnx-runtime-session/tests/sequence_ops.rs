@@ -22,6 +22,9 @@ fn f32_bytes(data: &[f32]) -> Vec<u8> {
 fn i64_bytes(data: &[i64]) -> Vec<u8> {
     data.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
+fn u16_bytes(data: &[u16]) -> Vec<u8> {
+    data.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
 
 fn f32_init(g: &mut Graph, name: &str, dims: &[usize], data: &[f32]) -> ValueId {
     let vid = g.create_named_value(name, DataType::Float32, static_shape(dims.iter().copied()));
@@ -43,6 +46,18 @@ fn i64_init(g: &mut Graph, name: &str, dims: &[usize], data: &[i64]) -> ValueId 
             DataType::Int64,
             dims.to_vec(),
             i64_bytes(data),
+        )),
+    );
+    vid
+}
+fn bf16_init(g: &mut Graph, name: &str, dims: &[usize], bits: &[u16]) -> ValueId {
+    let vid = g.create_named_value(name, DataType::BFloat16, static_shape(dims.iter().copied()));
+    g.set_initializer(
+        vid,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::BFloat16,
+            dims.to_vec(),
+            u16_bytes(bits),
         )),
     );
     vid
@@ -365,6 +380,151 @@ fn split_then_concat_roundtrips() {
     let out = s.run(&[]).expect("run");
     assert_eq!(out[0].shape, vec![3, 2]);
     assert_eq!(out[0].to_vec_f32(), vec![1., 2., 3., 4., 5., 6.]);
+}
+
+#[test]
+fn split_bfloat16_runs_at_opset_24_with_exact_bits() {
+    let mut g = Graph::new();
+    g.opset_imports.insert(String::new(), 24);
+    let bits = [0x3f80, 0x4000, 0x4040, 0x4080];
+    let data = bf16_init(&mut g, "data", &[2, 2], &bits);
+    let seq = op(
+        &mut g,
+        "SplitToSequence",
+        &[data],
+        DataType::BFloat16,
+        &[],
+        &[("axis", Attribute::Int(0))],
+    );
+    for (name, index) in [("first", 0), ("second", 1)] {
+        let idx = i64_init(&mut g, name, &[], &[index]);
+        let at = op(
+            &mut g,
+            "SequenceAt",
+            &[seq, idx],
+            DataType::BFloat16,
+            &[1, 2],
+            &[],
+        );
+        g.add_output(at);
+    }
+
+    let mut session = InferenceSession::from_graph(g).expect("opset 24 BF16 must build");
+    let output = session.run(&[]).expect("opset 24 BF16 must run");
+    assert_eq!(output[0].shape, [1, 2]);
+    assert_eq!(output[0].as_bytes(), u16_bytes(&bits[..2]));
+    assert_eq!(output[1].shape, [1, 2]);
+    assert_eq!(output[1].as_bytes(), u16_bytes(&bits[2..]));
+}
+
+#[test]
+fn split_bfloat16_is_rejected_before_opset_24() {
+    let mut g = Graph::new();
+    g.opset_imports.insert(String::new(), 23);
+    let data = bf16_init(&mut g, "data", &[2], &[0x3f80, 0x4000]);
+    let seq = op(
+        &mut g,
+        "SplitToSequence",
+        &[data],
+        DataType::BFloat16,
+        &[],
+        &[],
+    );
+    let len = op(&mut g, "SequenceLength", &[seq], DataType::Int64, &[], &[]);
+    g.add_output(len);
+
+    let Err(error) = InferenceSession::from_graph(g) else {
+        panic!("opset 23 BF16 must be rejected");
+    };
+    let message = error.to_string();
+    assert!(message.contains("SplitToSequence"), "{message}");
+    assert!(message.contains("BFloat16"), "{message}");
+    assert!(message.contains("opset 23"), "{message}");
+    assert!(message.contains("opset 24"), "{message}");
+}
+
+#[test]
+fn split_is_rejected_before_its_opset_11_introduction() {
+    let mut g = Graph::new();
+    g.opset_imports.insert(String::new(), 10);
+    let data = f32_init(&mut g, "data", &[2], &[1.0, 2.0]);
+    let seq = op(
+        &mut g,
+        "SplitToSequence",
+        &[data],
+        DataType::Float32,
+        &[],
+        &[],
+    );
+    let len = op(&mut g, "SequenceLength", &[seq], DataType::Int64, &[], &[]);
+    g.add_output(len);
+
+    let Err(error) = InferenceSession::from_graph(g) else {
+        panic!("opset 10 SplitToSequence must be rejected");
+    };
+    let message = error.to_string();
+    assert!(message.contains("opset 10"), "{message}");
+    assert!(message.contains("opset 11"), "{message}");
+}
+
+#[test]
+fn split_rejects_known_newer_dtype_even_when_type_metadata_is_unknown() {
+    let mut g = Graph::new();
+    g.opset_imports.insert(String::new(), 24);
+    let data = g.create_named_value("data", DataType::Float8E4M3FN, static_shape([2]));
+    g.mark_value_type_unknown(data);
+    g.add_input(data);
+    let seq = op(
+        &mut g,
+        "SplitToSequence",
+        &[data],
+        DataType::Float8E4M3FN,
+        &[],
+        &[],
+    );
+    let len = op(&mut g, "SequenceLength", &[seq], DataType::Int64, &[], &[]);
+    g.add_output(len);
+
+    let Err(error) = InferenceSession::from_graph(g) else {
+        panic!("SplitToSequence-24 must reject Float8E4M3FN");
+    };
+    let message = error.to_string();
+    assert!(message.contains("Float8E4M3FN"), "{message}");
+    assert!(message.contains("opset 24"), "{message}");
+    assert!(message.contains("not legal"), "{message}");
+}
+
+#[test]
+fn split_rejects_bfloat16_from_unannotated_identity_direct_graph() {
+    let mut g = Graph::new();
+    g.opset_imports.insert(String::new(), 23);
+    let data = bf16_init(&mut g, "data", &[2], &[0x3f80, 0x4000]);
+    let inferred = g.create_value(DataType::Undefined, static_shape([2]));
+    g.insert_node(Node::new(
+        NodeId(0),
+        "Identity",
+        vec![Some(data)],
+        vec![inferred],
+    ));
+    let seq = op(
+        &mut g,
+        "SplitToSequence",
+        &[inferred],
+        DataType::BFloat16,
+        &[],
+        &[],
+    );
+    let len = op(&mut g, "SequenceLength", &[seq], DataType::Int64, &[], &[]);
+    g.add_output(len);
+
+    let Err(error) = InferenceSession::from_graph(g) else {
+        panic!("opset 23 BF16 behind an unannotated Identity must be rejected");
+    };
+    let message = error.to_string();
+    assert!(message.contains("SplitToSequence"), "{message}");
+    assert!(message.contains("BFloat16"), "{message}");
+    assert!(message.contains("opset 23"), "{message}");
+    assert!(message.contains("opset 24"), "{message}");
 }
 
 /// SplitToSequence with keepdims=0 squeezes the split axis; each element is a
