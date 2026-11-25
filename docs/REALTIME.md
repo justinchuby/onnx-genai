@@ -153,6 +153,21 @@ and parameter validation, and a natural model stop must satisfy required-tool
 postconditions. Raw partial function-call fragments are not yet projected onto
 wire call items; completed batches retain atomic admission.
 
+`response.cancel` is idempotent: without an active response it emits no error
+or acknowledgement, including before the first turn and after completion. An
+active response still executes native cancellation and publishes its terminal
+events. A repeated cancel cannot cancel a later response that has not started.
+
+Realtime error envelopes match the pinned llama-server classification: an empty
+`response.create` uses `error.type: conversation_empty`, and an empty audio
+commit uses `error.type: input_audio_buffer_commit_empty`. Other rejected client
+events use `invalid_request_error`; native failures use `server_error` and close
+the connection after flushing the error. `error.code` and `error.param` are null.
+Every envelope retains its actionable message and generated top-level event ID.
+The native text WebSocket regression checks both specialized errors, repeated
+idle cancellation before/after a response, ordinary invalid requests and a
+successful budgeted native response on the same connection.
+
 ## Remaining conformance work
 
 Turn-based tagged-json tool forcing is connected for workflows declaring

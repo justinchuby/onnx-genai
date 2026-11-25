@@ -25,22 +25,38 @@ impl ItemId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProtocolErrorKind {
+    InvalidRequest,
+    EmptyConversation,
+    EmptyAudioCommit,
+}
+impl ProtocolErrorKind {
+    pub(super) fn error_type(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request_error",
+            Self::EmptyConversation => "conversation_empty",
+            Self::EmptyAudioCommit => "input_audio_buffer_commit_empty",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub(super) struct ProtocolError {
-    pub(super) code: Option<&'static str>,
+    pub(super) kind: ProtocolErrorKind,
     message: String,
 }
 impl ProtocolError {
     fn invalid(message: impl Into<String>) -> Self {
         Self {
-            code: None,
+            kind: ProtocolErrorKind::InvalidRequest,
             message: message.into(),
         }
     }
-    fn code(code: &'static str, message: impl Into<String>) -> Self {
+    fn typed(kind: ProtocolErrorKind, message: impl Into<String>) -> Self {
         Self {
-            code: Some(code),
+            kind,
             message: message.into(),
         }
     }
@@ -104,8 +120,8 @@ impl Conversation {
     }
     pub(super) fn commit_audio(&mut self, item: ItemId) -> Result<Vec<Value>, ProtocolError> {
         if !self.audio_uncommitted {
-            return Err(ProtocolError::code(
-                "input_audio_buffer_commit_empty",
+            return Err(ProtocolError::typed(
+                ProtocolErrorKind::EmptyAudioCommit,
                 "input_audio_buffer.commit: the audio buffer is empty; append PCM audio before committing",
             ));
         }
@@ -206,8 +222,8 @@ impl Conversation {
             ));
         }
         if !self.input_turn && !self.tool_results {
-            return Err(ProtocolError::code(
-                "conversation_empty",
+            return Err(ProtocolError::typed(
+                ProtocolErrorKind::EmptyConversation,
                 "response.create: commit audio or create a message/tool result first",
             ));
         }
@@ -342,8 +358,8 @@ mod tests {
     fn clear_acknowledges_ingested_audio_without_losing_the_committable_turn() {
         let mut conversation = Conversation::default();
         assert_eq!(
-            conversation.commit_audio(item("empty")).unwrap_err().code,
-            Some("input_audio_buffer_commit_empty")
+            conversation.commit_audio(item("empty")).unwrap_err().kind,
+            ProtocolErrorKind::EmptyAudioCommit
         );
         conversation.audio_appended(false);
         assert!(!conversation.started());
@@ -357,8 +373,8 @@ mod tests {
         assert_eq!(events[0]["item_id"], "audio1");
         assert_eq!(events[1]["item"]["content"][0]["type"], "input_audio");
         assert_eq!(
-            conversation.commit_audio(item("empty2")).unwrap_err().code,
-            Some("input_audio_buffer_commit_empty")
+            conversation.commit_audio(item("empty2")).unwrap_err().kind,
+            ProtocolErrorKind::EmptyAudioCommit
         );
     }
     #[test]
@@ -375,8 +391,8 @@ mod tests {
                     true
                 )
                 .unwrap_err()
-                .code,
-            Some("conversation_empty")
+                .kind,
+            ProtocolErrorKind::EmptyConversation
         );
         conversation.audio_appended(true);
         let admission = conversation
@@ -424,8 +440,8 @@ mod tests {
                     true
                 )
                 .unwrap_err()
-                .code,
-            Some("conversation_empty")
+                .kind,
+            ProtocolErrorKind::EmptyConversation
         );
         assert!(
             conversation.started(),
