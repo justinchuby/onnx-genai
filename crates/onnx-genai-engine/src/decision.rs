@@ -12,6 +12,17 @@ mod input;
 pub use input::DecisionQuestion;
 use std::{collections::BTreeMap, num::NonZeroUsize};
 
+/// Actual workflow media expansion exceeded the caller/model input allowance.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "decision variant {variant} uses {used} tokens including media, exceeding its {limit}-token input budget; reduce media/state or raise the configured input limit within model context"
+)]
+pub struct DecisionInputLimitError {
+    pub variant: usize,
+    pub used: usize,
+    pub limit: usize,
+}
+
 /// Independent token, rendered-byte and template-execution admission limits.
 #[derive(Debug, Clone, Copy)]
 pub struct DecisionLimits {
@@ -56,20 +67,59 @@ struct Variant {
     mask: Vec<i64>,
     segments: Vec<i64>,
 }
+/// One typed media position; its bytes are shared across questions/variants.
+#[derive(Debug, Clone)]
+pub struct DecisionMedia {
+    pub kind: onnx_genai_metadata::EncodedMediaKind,
+    pub bytes: std::sync::Arc<[u8]>,
+}
+impl DecisionMedia {
+    pub fn image(bytes: std::sync::Arc<[u8]>) -> Self {
+        Self {
+            kind: onnx_genai_metadata::EncodedMediaKind::Image,
+            bytes,
+        }
+    }
+    pub fn audio(bytes: std::sync::Arc<[u8]>) -> Self {
+        Self {
+            kind: onnx_genai_metadata::EncodedMediaKind::Audio,
+            bytes,
+        }
+    }
+}
+/// Structured state, typed ordered media and independently bound spoken audio.
+pub struct DecisionInput<'a> {
+    pub state: &'a serde_json::Value,
+    pub media: &'a [DecisionMedia],
+    pub spoken: Option<&'a std::sync::Arc<[u8]>>,
+}
+impl<'a> DecisionInput<'a> {
+    pub fn text(state: &'a serde_json::Value) -> Self {
+        Self {
+            state,
+            media: &[],
+            spoken: None,
+        }
+    }
+}
+
 /// Tokenizer features and output cardinality admitted before any inference.
 #[derive(Debug)]
 pub struct PreparedDecision {
     contract: std::sync::Arc<DecisionContract>,
     question: DecisionQuestion,
     variants: Vec<Variant>,
+    inputs: Vec<(String, std::sync::Arc<[u8]>)>,
+    max_input_tokens: NonZeroUsize,
 }
 impl PreparedDecision {
     pub fn prepare(
         tokenizer: &Tokenizer,
-        state: &serde_json::Value,
+        input: DecisionInput<'_>,
         question: DecisionQuestion,
         limits: DecisionLimits,
     ) -> anyhow::Result<Self> {
+        let state = input.state;
         let max_input_tokens = limits.max_input_tokens;
         let contract = std::sync::Arc::clone(question.contract());
         contract
@@ -77,6 +127,36 @@ impl PreparedDecision {
             .state
             .validate(state, "state")
             .map_err(anyhow::Error::msg)?;
+        contract.admit_media(
+            &input
+                .media
+                .iter()
+                .map(|media| media.kind)
+                .collect::<Vec<_>>(),
+        )?;
+        ensure!(
+            question.is_spoken() == input.spoken.is_some(),
+            "decision spoken-question bytes must be supplied exactly when question.instructions is input_audio; prepare matching encoded audio instead of dropping or inventing instructions"
+        );
+        let mut inputs = contract
+            .media()
+            .iter()
+            .zip(input.media)
+            .map(|(binding, media)| {
+                binding.input.admit_bytes(media.bytes.len())?;
+                Ok((
+                    binding.input.endpoint().to_owned(),
+                    std::sync::Arc::clone(&media.bytes),
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        if let Some(bytes) = input.spoken {
+            let binding = contract
+                .spoken_input()
+                .context("decision has no spoken input binding; select an audio-capable package")?;
+            binding.admit_bytes(bytes.len())?;
+            inputs.push((binding.endpoint().to_owned(), std::sync::Arc::clone(bytes)));
+        }
         let n = match contract.spec().variants {
             DecisionVariants::Direct => 1,
             DecisionVariants::ReverseAverage => 2,
@@ -90,6 +170,34 @@ impl PreparedDecision {
             };
             let kwargs = BTreeMap::from([
                 ("state".into(), state.clone()),
+                (
+                    "image_count".into(),
+                    serde_json::json!(
+                        input
+                            .media
+                            .iter()
+                            .filter(|m| m.kind == onnx_genai_metadata::EncodedMediaKind::Image)
+                            .count()
+                    ),
+                ),
+                (
+                    "audio_count".into(),
+                    serde_json::json!(
+                        input
+                            .media
+                            .iter()
+                            .filter(|m| m.kind == onnx_genai_metadata::EncodedMediaKind::Audio)
+                            .count()
+                    ),
+                ),
+                (
+                    "media_types".into(),
+                    serde_json::to_value(input.media.iter().map(|m| m.kind).collect::<Vec<_>>())?,
+                ),
+                (
+                    "spoken_instructions".into(),
+                    serde_json::json!(question.is_spoken()),
+                ),
                 ("instructions".into(), question.instructions().clone()),
                 ("type".into(), serde_json::to_value(question.kind())?),
                 ("options".into(), serde_json::to_value(options)?),
@@ -135,6 +243,8 @@ impl PreparedDecision {
             contract: contract.clone(),
             question,
             variants,
+            inputs,
+            max_input_tokens,
         })
     }
 }
@@ -231,13 +341,17 @@ impl Serialize for SortedJson<'_> {
 
 impl Engine {
     pub fn decide(&mut self, request: PreparedDecision) -> anyhow::Result<DecisionResult> {
-        let contract=decision_contract(self.metadata())?.context("model has no decision v1 workflow profile; select a package declaring a non-generative probability head")?;
+        let contract=decision_contract(self.metadata())?.context("model has no decision workflow profile; select a package declaring a non-generative probability head")?;
         ensure!(
             &contract == request.contract.as_ref(),
             "prepared decision does not match this model's admitted profile; prepare it against the executing model's decision contract"
         );
         let PreparedDecision {
-            question, variants, ..
+            question,
+            variants,
+            inputs,
+            max_input_tokens,
+            ..
         } = request;
         let count = question.option_values().len();
         let holder = crate::engine::memory_plan::Holder::Activations;
@@ -260,9 +374,7 @@ impl Engine {
                     "decision input exceeds model context limit {limit}; shorten the request"
                 );
             }
-            prompt_tokens = prompt_tokens
-                .checked_add(variant.mask.iter().filter(|x| **x != 0).count())
-                .context("decision token usage overflow; reduce input length")?;
+            let text_tokens = variant.mask.iter().filter(|x| **x != 0).count();
             let shape = [1, i64::try_from(variant.ids.len())?];
             let mut execution = PipelineGenerateRequest::new(GenerateRequest {
                 prompt: GeneratePrompt::TokenIds(variant.ids),
@@ -286,12 +398,50 @@ impl Engine {
                 };
                 execution = execution.with_input(name, value);
             }
+            for (name, bytes) in &inputs {
+                execution = execution.with_input(name, self.encoded_media_value(name, bytes)?);
+            }
             let outputs = self.run_pipeline_outputs(execution).with_context(|| {
                 format!(
                     "execute decision profile '{}' variant {index}",
                     contract.profile()
                 )
             })?;
+            let used = if let Some(name) = contract.prompt_tokens_output() {
+                let usage = outputs.aggregate(name).with_context(|| {
+                    format!("decision workflow did not emit token-usage output '{name}'")
+                })?;
+                ensure!(
+                    usage.numel() == 1,
+                    "decision token-usage output '{name}' must contain one count per variant"
+                );
+                let count = usage.to_vec_i64().with_context(|| {
+                    format!("decision token-usage output '{name}' must be host-readable int64")
+                })?[0];
+                let count = usize::try_from(count).with_context(|| format!("decision token-usage output '{name}' returned invalid count {count}; emit a nonnegative representable count"))?;
+                ensure!(
+                    count >= text_tokens,
+                    "decision token-usage output '{name}' underreports {count} tokens for {text_tokens} admitted text tokens; include text and media expansion in usage"
+                );
+                let limit = self
+                    .effective_max_context(&GenerateOptions::default())
+                    .unwrap_or(usize::MAX)
+                    .min(max_input_tokens.get());
+                if count > limit {
+                    return Err(DecisionInputLimitError {
+                        variant: index,
+                        used: count,
+                        limit,
+                    }
+                    .into());
+                }
+                count
+            } else {
+                text_tokens
+            };
+            prompt_tokens = prompt_tokens
+                .checked_add(used)
+                .context("decision token usage overflow; reduce input length")?;
             let value = outputs.aggregate(contract.output()).with_context(|| {
                 format!(
                     "decision workflow did not emit probability output '{}'",
@@ -452,7 +602,7 @@ mod tests {
             for (state, best) in [("hello", 0), ("world", 1)] {
                 let prepared = PreparedDecision::prepare(
                     &tokenizer,
-                    &serde_json::json!(state),
+                    DecisionInput::text(&serde_json::json!(state)),
                     question(&contract, kind),
                     DecisionLimits {
                         max_input_tokens: NonZeroUsize::new(64).unwrap(),
@@ -507,7 +657,7 @@ mod tests {
         for (state, level) in [("hello", 0.0), ("world", 1.0)] {
             let prepared = PreparedDecision::prepare(
                 &tokenizer,
-                &serde_json::json!(state),
+                DecisionInput::text(&serde_json::json!(state)),
                 question(&contract, DecisionKind::Score),
                 DecisionLimits {
                     max_input_tokens: NonZeroUsize::new(64).unwrap(),
@@ -588,7 +738,7 @@ initializer {{ name: "option_axis" data_type: 7 dims: 1 int64_data: 1 }}
                 .unwrap();
                 let prepared = PreparedDecision::prepare(
                     &tokenizer,
-                    &serde_json::json!("quick"),
+                    DecisionInput::text(&serde_json::json!("quick")),
                     question,
                     DecisionLimits::default(),
                 )
@@ -628,7 +778,7 @@ initializer {{ name: "option_axis" data_type: 7 dims: 1 int64_data: 1 }}
             .unwrap();
             let prepared = PreparedDecision::prepare(
                 &tokenizer,
-                &serde_json::Value::Null,
+                DecisionInput::text(&serde_json::Value::Null),
                 q,
                 DecisionLimits::default(),
             )
@@ -682,7 +832,7 @@ node {{ input: "scaled.probabilities" output: "probabilities" op_type: "Cast" at
                     std::sync::Arc::new(decision_contract(engine.metadata()).unwrap().unwrap());
                 let prepared = PreparedDecision::prepare(
                     &tokenizer,
-                    &serde_json::json!("hello"),
+                    DecisionInput::text(&serde_json::json!("hello")),
                     question(&contract, DecisionKind::Choice),
                     DecisionLimits::default(),
                 )
@@ -717,7 +867,7 @@ node {{ input: "scaled.probabilities" output: "probabilities" op_type: "Cast" at
         let contract = std::sync::Arc::new(decision_contract(engine.metadata()).unwrap().unwrap());
         let prepared = PreparedDecision::prepare(
             &tokenizer,
-            &serde_json::json!("hello"),
+            DecisionInput::text(&serde_json::json!("hello")),
             question(&contract, DecisionKind::Choice),
             DecisionLimits {
                 max_input_tokens: NonZeroUsize::new(64).unwrap(),
@@ -754,7 +904,7 @@ node {{ input: "scaled.probabilities" output: "probabilities" op_type: "Cast" at
         assert!(
             PreparedDecision::prepare(
                 &tokenizer,
-                &serde_json::json!("hello"),
+                DecisionInput::text(&serde_json::json!("hello")),
                 question(&contract, DecisionKind::Choice),
                 DecisionLimits {
                     max_input_tokens: NonZeroUsize::new(2).unwrap(),

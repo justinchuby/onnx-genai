@@ -1,0 +1,129 @@
+{
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/moe.rs": "8d094cd82795029ddc0fe4dccd6a00a833d62d1f23e0a287380029b3111fd888",
+    "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs": "7a88cad80ec56bdff4a25ede6a86da3e4614be3d2c640de0d77da7654b4d8307",
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs": "c84436ea8e419893babe9be607440628ceb983b4cef83df4ab29e032d08d2dcd"
+  },
+  "results": [
+    {
+      "name": "list",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "routing_scratch_tests::",
+        "--",
+        "--list"
+      ],
+      "exit": 0,
+      "log_sha256": "419de7e081d9fec9ddfaef35af06b2f04931cecff8ba3f1b14bd203cd9d0d0c7"
+    },
+    {
+      "name": "native",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib"
+      ],
+      "exit": 0,
+      "log_sha256": "149b3419516943a6184558cc8c6644071ff14e26c20c36204ee0517ded7c03da",
+      "counts": [
+        [
+          "2071",
+          "0",
+          "21"
+        ]
+      ]
+    },
+    {
+      "name": "mlas",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "--features",
+        "mlas"
+      ],
+      "exit": 0,
+      "log_sha256": "861d731a9e6089127f474e3abea410d891d45388671cda811e2e252c71f10859",
+      "counts": [
+        [
+          "2113",
+          "0",
+          "37"
+        ]
+      ]
+    },
+    {
+      "name": "oracles",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cuda",
+        "--test",
+        "block_quantized_cpu_oracle",
+        "--test",
+        "qmoe_cpu_oracle"
+      ],
+      "exit": 0,
+      "log_sha256": "d03106bee0409e3586bfa0ca0b091a3131a22947ed71b84a5c27f81bd0676c91",
+      "counts": [
+        [
+          "2",
+          "0",
+          "0"
+        ],
+        [
+          "1",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit": 0,
+      "log_sha256": "eaae07c0655c362de84f92db0dacfaa76a7941f34286039f5200d6af1c25ad35"
+    },
+    {
+      "name": "clippy-mlas",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--all-targets",
+        "--features",
+        "mlas",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit": 0,
+      "log_sha256": "b8aaed0bbc99a329b48697248212ad07fda3788966821c80ee2c13bc72a3ec84"
+    }
+  ]
+}

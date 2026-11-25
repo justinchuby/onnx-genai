@@ -19,14 +19,16 @@ fn tiled_decoder_reuses_shard_state_and_preserves_partial_columns_and_bias() {
             let factories = AtomicUsize::new(0);
             let decoded = Mutex::new(Vec::new());
             let projected = Mutex::new(Vec::new());
-            let actual = pool.install(|| {
-                decoded_projection::linear_decoded_grouped::<4, _>(
+            let mut actual = vec![f32::NAN; m * n];
+            pool.install(|| {
+                decoded_projection::linear_decoded_grouped_into::<4, _>(
                     "tile fixture",
                     &input,
                     m,
                     k,
                     n,
                     Some(&bias),
+                    &mut actual,
                     || {
                         factories.fetch_add(1, Ordering::Relaxed);
                         let decoded = &decoded;
@@ -94,13 +96,15 @@ fn tiled_decoder_reuses_shard_state_and_preserves_partial_columns_and_bias() {
 #[test]
 fn incomplete_decoder_shards_fail_before_creating_state_or_projecting() {
     let factories = AtomicUsize::new(0);
-    let result = decoded_projection::linear_decoded_grouped::<4, _>(
+    let mut output = [37.0; 6];
+    let result = decoded_projection::linear_decoded_grouped_into::<4, _>(
         "malformed tile fixture",
         &[1.; 6],
         2,
         3,
         3,
         None,
+        &mut output,
         || {
             factories.fetch_add(1, Ordering::Relaxed);
             |_, _: &mut [f32]| panic!("malformed shards must not decode")
@@ -119,6 +123,7 @@ fn incomplete_decoder_shards_fail_before_creating_state_or_projecting() {
         "{message}"
     );
     assert_eq!(factories.load(Ordering::Relaxed), 0);
+    assert_eq!(output, [37.0; 6]);
 }
 
 #[test]
@@ -348,4 +353,165 @@ fn zeroed_prefix_keeps_whole_bank_initialization_separate() {
     scratch.initialized().fill(42.);
     assert_eq!(scratch.zeroed_prefix(3).unwrap(), [0.; 3]);
     assert_eq!(scratch.initialized(), [0., 0., 0., 42., 42., 42., 42., 42.]);
+}
+
+#[test]
+fn caller_destination_preserves_rows_bias_zero_axes_and_guards() {
+    for (m, k, n) in [
+        (0, 3, 5),
+        (3, 3, 0),
+        (1, 3, 5),
+        (3, 3, 1),
+        (3, 0, 5),
+        (3, 3, 5),
+    ] {
+        for offset in [0, 1, 3] {
+            let input: Vec<_> = (0..m * k).map(|i| i as f32 * 0.125 - 1.).collect();
+            let bias: Vec<_> = (0..n).map(|i| i as f32 * 0.25 - 0.5).collect();
+            let expected: Vec<_> = (0..m)
+                .flat_map(|row| {
+                    let input = &input;
+                    let bias = &bias;
+                    (0..n).map(move |feature| {
+                        (0..k).fold(0., |sum, p| {
+                            sum + input[row * k + p] * (feature + p + 1) as f32
+                        }) + bias[feature]
+                    })
+                })
+                .collect();
+            let mut storage = vec![29.0f32; offset + m * n + 7];
+            storage[offset..offset + m * n].fill(f32::NAN);
+            let pointer = storage.as_ptr().wrapping_add(offset) as usize;
+            let calls = AtomicUsize::new(0);
+            decoded_projection::linear_decoded_grouped_into::<4, _>(
+                "caller destination fixture",
+                &input,
+                m,
+                k,
+                n,
+                Some(&bias),
+                &mut storage[offset..offset + m * n],
+                || {
+                    |feature, weights: &mut [f32]| {
+                        for (p, w) in weights.iter_mut().enumerate() {
+                            *w = (feature + p + 1) as f32;
+                        }
+                        Ok(())
+                    }
+                },
+                |input, weights, output, rows, width, features| {
+                    for feature in 0..features {
+                        for row in 0..rows {
+                            output[feature * rows + row] = (0..width).fold(0., |sum, p| {
+                                sum + input[row * width + p] * weights[feature * width + p]
+                            });
+                        }
+                    }
+                    Ok(())
+                },
+                |columns, rows, compute| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    if m == 1 || n == 1 {
+                        assert_eq!(
+                            columns.as_ptr() as usize,
+                            pointer,
+                            "unit axes must consume caller storage directly"
+                        );
+                    } else {
+                        assert_ne!(
+                            columns.as_ptr() as usize,
+                            pointer,
+                            "multirow columns need separate transpose staging"
+                        );
+                    }
+                    decoded_projection::rayon_decoded_columns(columns, rows, compute)
+                },
+            )
+            .unwrap();
+            assert_eq!(&storage[offset..offset + m * n], expected);
+            assert!(
+                storage[..offset]
+                    .iter()
+                    .chain(&storage[offset + m * n..])
+                    .all(|&x| x == 29.)
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), usize::from(m != 0 && n != 0));
+        }
+    }
+}
+
+#[test]
+fn invalid_caller_geometry_refuses_before_dispatch_or_destination_writes() {
+    for (input, m, k, n, bias, output_len) in [
+        (&[1.; 5][..], 2, 3, 3, None, 6),
+        (&[1.; 6][..], 2, 3, 3, Some(&[1.; 2][..]), 6),
+        (&[1.; 6][..], 2, 3, 3, None, 5),
+        (&[1.; 6][..], 2, 3, 3, None, 7),
+        (&[][..], usize::MAX, 0, 2, None, 0),
+    ] {
+        let mut output = vec![31.0; output_len + 2];
+        let error = decoded_projection::linear_decoded_grouped_into::<1, _>(
+            "rejected caller destination",
+            input,
+            m,
+            k,
+            n,
+            bias,
+            &mut output[..output_len],
+            || |_, _: &mut [f32]| panic!("invalid geometry must never decode"),
+            |_, _, _, _, _, _| panic!("invalid geometry must never project"),
+            |_, _, _| panic!("invalid geometry must never dispatch"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("rejected caller destination"));
+        assert!(error.to_string().contains("supply"), "{error}");
+        assert!(output.iter().all(|&x| x == 31.));
+    }
+}
+
+#[test]
+fn late_decoder_failure_respects_transpose_publication_and_staging_guards() {
+    for rows in [1, 2] {
+        let input = vec![1.; rows];
+        let mut output = vec![41.; rows * 3 + 4];
+        let error = decoded_projection::linear_decoded_grouped_into::<1, _>(
+            "late failure fixture",
+            &input,
+            rows,
+            1,
+            3,
+            None,
+            &mut output[..rows * 3],
+            || {
+                |feature, weights: &mut [f32]| {
+                    if feature == 1 {
+                        return Err(onnx_runtime_ep_api::EpError::KernelFailed(
+                            "decoder channel 1 refused".into(),
+                        ));
+                    }
+                    weights.fill(2.);
+                    Ok(())
+                }
+            },
+            |_, _, output, _, _, _| {
+                output.fill(2.);
+                Ok(())
+            },
+            |columns, _, compute| compute(0, columns),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("decoder channel 1 refused"));
+        if rows == 1 {
+            assert_eq!(
+                output[0], 2.,
+                "work before refusal may modify caller staging"
+            );
+        } else {
+            assert!(
+                output[..rows * 3].iter().all(|&x| x == 41.),
+                "failed column staging must not transpose"
+            );
+        }
+        assert!(output[rows * 3..].iter().all(|&x| x == 41.));
+    }
 }

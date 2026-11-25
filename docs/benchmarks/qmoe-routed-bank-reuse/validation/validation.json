@@ -1,0 +1,62 @@
+{
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/moe.rs": "094a9f26ea3bd6f09ebc53c14807c3e9151417f9f239219764a8ffa7ac3bee58",
+    "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs": "60deb57c7ba81aa21129c9f08cf6b76a6a165b881cc2b77c9c168abf931ce6e1"
+  },
+  "checks": [
+    {
+      "name": "full",
+      "sha256": "41a568d591963f1e4ba5e51c7e4da27b6b47f19d028fe0b9472cbfe538240a83",
+      "counts": [
+        [
+          "ok",
+          "2061",
+          "0",
+          "21"
+        ],
+        [
+          "ok",
+          "2103",
+          "0",
+          "37"
+        ],
+        [
+          "ok",
+          "14",
+          "0",
+          "0"
+        ],
+        [
+          "ok",
+          "373",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "final",
+      "sha256": "ecc06e9e7e669abf37dbda8a5daa20f45bb418ba671bcabec9a1e62d6915fada",
+      "counts": [
+        [
+          "ok",
+          "1",
+          "0",
+          "0"
+        ],
+        [
+          "ok",
+          "1",
+          "0",
+          "0"
+        ],
+        [
+          "ok",
+          "1",
+          "0",
+          "0"
+        ]
+      ]
+    }
+  ]
+}

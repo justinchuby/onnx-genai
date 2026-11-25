@@ -1,0 +1,6 @@
+{
+  "mechanism_hypothesis": "four independent maxima, two exp vectors and four normalization vectors per loop",
+  "observed_codegen": "screen native public entry is 940 bytes and calls outlined softmax_neon::softmax_row; original row-body control is 2008 bytes with inline row body",
+  "limit": "The screen cannot attribute benefit solely to loop unrolling. Matched entry control is currently building. If positive, test the old arithmetic with a forced independent row function before choosing the more complex unrolled implementation.",
+  "source": "binary-bound codegen.json and native/original disassembly artifacts"
+}

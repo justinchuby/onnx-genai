@@ -1,0 +1,9 @@
+{
+  "machdep.cpu.brand_string": "Apple M1 Max",
+  "hw.memsize": "34359738368",
+  "hw.logicalcpu": "10",
+  "hardware_read_command": "/usr/sbin/sysctl -n machdep.cpu.brand_string hw.memsize hw.logicalcpu",
+  "hardware_read_exit": 0,
+  "hardware_read_authority": "separate escalated read-only command; sandbox sysctl was denied before any build or timing",
+  "hardware_read_time_utc": "2026-11-24T19:43:28.315736+00:00"
+}

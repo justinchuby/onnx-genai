@@ -8,7 +8,7 @@ use onnx_genai_metadata::{RuntimeInputRole, SemanticInputRole, TensorDimension};
 use onnx_genai_ort::{DataType, PipelineModelDirectory, PipelineModels, Tokenizer, Value};
 
 pub use crate::audio_input::{AudioInputSpec, AudioTensor, preprocess_samples, preprocess_wav};
-pub use crate::image_input::MAX_EXPANDED_PROMPT_TOKENS;
+pub use crate::media_input::MAX_EXPANDED_PROMPT_TOKENS;
 
 #[derive(Debug, Clone)]
 pub struct VisionInputSpec {
@@ -441,6 +441,15 @@ fn derive_specs(
             )
         })
         .collect::<Vec<_>>();
+    // A preprocessing program is executable workflow data, not authority for
+    // the chat/audio frontends. Task profiles may own application-sourced
+    // images independently; only runtime Media roles grant these bindings.
+    if media_inputs.is_empty() {
+        return Ok(MultimodalSpecs {
+            vision: None,
+            audio: None,
+        });
+    }
     let encoded_media = media_inputs
         .iter()
         .find(|(_, input)| input.contract.dtype == "uint8" && input.contract.rank() == 1);

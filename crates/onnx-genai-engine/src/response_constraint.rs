@@ -163,7 +163,7 @@ impl ContentConstraint {
     pub(crate) fn text(
         tokenizer: &Tokenizer,
         grammar: &crate::config::TextGrammar,
-        template: std::sync::Arc<crate::response_template::ResponseTemplate>,
+        projection_kind: ProjectionKind,
         prefix: &str,
         max_bytes: usize,
         endings: Vec<TokenId>,
@@ -179,7 +179,7 @@ impl ContentConstraint {
             tokenizer,
             cursor,
             Normalization::Literal,
-            ProjectionKind::Declared(template),
+            projection_kind,
             prefix,
             max_bytes,
             ConstraintTokens {
@@ -325,7 +325,11 @@ impl ContentConstraint {
     }
 
     fn token_allowed(&self, state: &mut State, id: TokenId) -> anyhow::Result<bool> {
-        match self.inspect(state, id) {
+        Self::admit_preview(self.inspect(state, id))
+    }
+
+    fn admit_preview(result: anyhow::Result<bool>) -> anyhow::Result<bool> {
+        match result {
             Err(error)
                 if error.is::<std::str::Utf8Error>()
                     || error.is::<IncompleteResponseUtf8>()
@@ -340,6 +344,44 @@ impl ContentConstraint {
             }
             result => result,
         }
+    }
+
+    /// Test end of the logical decoded text without inventing an EOS token.
+    /// Ordinary ending tokens may contain real grammar characters; checking a
+    /// candidate ending is therefore different from checking existing output.
+    pub(crate) fn can_finish(&self, context: &ProcessorContext) -> anyhow::Result<bool> {
+        self.allowed_next_tokens(context, &[])?;
+        let mut state = self.state.lock().map_err(|_| anyhow::anyhow!("response content constraint state is poisoned; restart generation with a fresh constraint"))?;
+        if state.ended {
+            return Ok(true);
+        }
+        let mut decoder = state.decoder.clone();
+        let pending = match (&self.codec, &mut decoder) {
+            (Codec::Bytes(_), DecoderState::Bytes(state)) => state.finish(),
+            (Codec::Canonical(tokenizer), DecoderState::Canonical(state)) => {
+                state.finish(tokenizer)?.into_bytes()
+            }
+            _ => anyhow::bail!(
+                "logical completion decoder does not match its tokenizer contract; restart generation with a fresh constraint"
+            ),
+        };
+        let State {
+            projection,
+            json,
+            raw,
+            normalized,
+            ..
+        } = &mut *state;
+        Self::admit_preview(projection.with_preview(&pending, true, |view| {
+            Self::inspect_grammar(
+                view,
+                json,
+                raw,
+                normalized.canonical(),
+                true,
+                self.normalization,
+            )
+        }))
     }
 
     fn decode(
@@ -542,6 +584,59 @@ mod tests {
         Tokenizer::from_file(path).unwrap()
     }
 
+    #[test]
+    fn logical_text_grammar_checks_ordinary_eos_without_special_registration() {
+        let tokenizer = Tokenizer::from_file(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/onnx_genai_workflows/realtime/tokenizer.json"),
+        )
+        .unwrap();
+        let grammar = ContentConstraint::text(
+            &tokenizer,
+            &crate::config::TextGrammar::Regex("hello world <eos>".into()),
+            ProjectionKind::Plain,
+            "",
+            4096,
+            vec![3],
+            &Default::default(),
+        )
+        .unwrap();
+        let eos = [TokenCandidate {
+            token_id: 3,
+            text: "<eos>".into(),
+            is_eos: true,
+        }];
+        for (tokens, expected) in [(vec![], false), (vec![4], false), (vec![4, 5], true)] {
+            let context = ProcessorContext {
+                generated_tokens: tokens,
+                ..Default::default()
+            };
+            assert_eq!(
+                grammar.allowed_next_tokens(&context, &eos).unwrap(),
+                [expected]
+            );
+        }
+        let plain = ContentConstraint::text(
+            &tokenizer,
+            &crate::config::TextGrammar::Regex("hello world".into()),
+            ProjectionKind::Plain,
+            "",
+            4096,
+            vec![3],
+            &Default::default(),
+        )
+        .unwrap();
+        let context = ProcessorContext {
+            generated_tokens: vec![4, 5],
+            ..Default::default()
+        };
+        assert!(plain.can_finish(&context).unwrap());
+        assert_eq!(
+            plain.allowed_next_tokens(&context, &eos).unwrap(),
+            [false],
+            "an ordinary ending piece would add unwanted text after the completed root"
+        );
+    }
     #[test]
     fn projected_text_grammars_allow_reasoning_then_constrain_literal_content_and_rewinds() {
         use crate::config::TextGrammar;

@@ -44,6 +44,10 @@ pub(crate) struct RenderedToolRequest {
 pub struct ToolProtocol(ParsedToolProtocol);
 
 impl ToolProtocol {
+    pub(crate) fn parsed(&self) -> ParsedToolProtocol {
+        self.0
+    }
+
     pub fn declaration(&self) -> (&'static str, &'static str) {
         self.0.declaration()
     }
@@ -113,6 +117,34 @@ pub(crate) fn resolve(
     metadata_path: &Path,
 ) -> Result<ToolProtocol, ToolProtocolError> {
     resolve_tool_protocol(declaration, metadata_path).map(ToolProtocol)
+}
+
+/// Responses and realtime share the same flattened function-tool vocabulary.
+/// Lower it once into the canonical chat tool transaction input.
+pub(crate) fn responses_tools(
+    tools: serde_json::Value,
+) -> Result<serde_json::Value, ToolProtocolError> {
+    use serde_json::{Value, json};
+    let Value::Array(tools) = tools else {
+        return Err(ToolProtocolError("tools must be an array".into()));
+    };
+    let mut lowered = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let Value::Object(mut object) = tool else {
+            return Err(ToolProtocolError(
+                "each Responses tool must be an object".into(),
+            ));
+        };
+        if object.remove("type") != Some(json!("function")) {
+            return Err(ToolProtocolError(
+                "Responses tools must be type=function; hosted tools are not implemented".into(),
+            ));
+        }
+        // The canonical tool transaction owns strict argument admission.
+        object.remove("strict");
+        lowered.push(json!({"type":"function","function":object}));
+    }
+    Ok(json!(lowered))
 }
 
 pub(crate) fn validate_request(

@@ -1412,7 +1412,7 @@ async fn preprocess_chat_images(
     let max_prompt_tokens =
         crate::multimodal::expansion_token_budget(model_max_context, max_tokens)
             .map_err(|err| ApiError::invalid_request(format!("{err:#}")))?;
-    let images = crate::image_input::fetch_images(image_urls)
+    let images = crate::media_input::fetch_images(image_urls)
         .await
         .map_err(|err| ApiError::invalid_request(format!("invalid image input: {err:#}")))?;
     let GeneratePrompt::TokenIds(mut token_ids) = std::mem::replace(

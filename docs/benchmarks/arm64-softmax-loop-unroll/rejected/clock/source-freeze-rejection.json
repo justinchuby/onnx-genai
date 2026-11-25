@@ -1,0 +1,5 @@
+{
+  "recorded_utc": "2026-11-24T20:15:25.384071+00:00",
+  "rejected_for_adoption_claims": true,
+  "reason": "A portability review gated the POSIX-only diagnostic on unix after the wrapper had already frozen source hashes. The source hash comparison fails. The run is retained as protocol diagnosis only; collect again from the final frozen source before adopting results."
+}

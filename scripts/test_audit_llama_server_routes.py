@@ -76,6 +76,14 @@ ctx_http.get("/real", handler); // end
         with self.assertRaisesRegex(ValueError, "must not execute"):
             audit.contracts(fixture, 'router.route("/tools", post(exec_tools))')
 
+    def test_explicit_websocket_registration_is_distinct_from_plain_get(self):
+        fixture = {"registrations": [{"method": "WS", "path": "/v1/realtime", "source_line": 1}]}
+        plain = audit.contracts(fixture, 'router.route("/v1/realtime", get(normal_http))')
+        self.assertEqual(plain[0]["status"], "missing")
+        upgraded = audit.contracts(fixture, 'router.route("/v1/realtime", ws(realtime::websocket::upgrade))')
+        self.assertEqual(upgraded[0]["status"], "present")
+        self.assertEqual(upgraded[0]["handler"], "realtime::websocket::upgrade")
+
     def test_local_ambiguity_and_unsupported_grammar_fail_closed(self):
         for source in [
             'router.route("/a", get(one)).route("/a", get(two))',

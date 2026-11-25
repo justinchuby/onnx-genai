@@ -34,6 +34,7 @@ pub mod pipeline_cache;
 pub(crate) mod platform_capacity;
 pub(crate) mod processors;
 pub mod ranking;
+pub mod realtime;
 pub mod reasoning;
 mod response_constraint;
 pub mod response_template;
@@ -42,6 +43,7 @@ pub mod runtime_trace;
 pub mod sampling;
 pub(crate) mod session;
 pub mod speculative;
+mod task_inputs;
 mod text_projection;
 pub mod tokenization;
 

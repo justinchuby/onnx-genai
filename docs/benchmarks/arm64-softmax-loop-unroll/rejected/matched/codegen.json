@@ -1,0 +1,66 @@
+{
+  "binary_sha256": "b0d704c2c17d1dc26645fb7f4772e9cdf732f4a3278369d50965514d5bc28d86",
+  "llvm": "Homebrew LLVM version 23.1.5",
+  "records": [
+    {
+      "symbol": "__RNvNtNtCs9Xuh1DSS2Xc_19onnx_runtime_ep_cpu7kernels7softmax30softmax_rows_serial_out_native",
+      "start": 4298116552,
+      "stop": 4298117492,
+      "bytes": 940,
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/llvm-objdump",
+        "-d",
+        "--start-address=4298116552",
+        "--stop-address=4298117492",
+        "/tmp/nxrt-neon-unroll-matched/measured.binary"
+      ],
+      "raw_sha256": "ff210b097b9abe4572bb25d9aa50807ed4ae432cb2ea4c556d20f60d2c74b518",
+      "artifact": "native.disasm.gz"
+    },
+    {
+      "symbol": "__RNvNtNtNtCs9Xuh1DSS2Xc_19onnx_runtime_ep_cpu7kernels7softmax12softmax_neon11softmax_row",
+      "start": 4299053436,
+      "stop": 4299055248,
+      "bytes": 1812,
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/llvm-objdump",
+        "-d",
+        "--start-address=4299053436",
+        "--stop-address=4299055248",
+        "/tmp/nxrt-neon-unroll-matched/measured.binary"
+      ],
+      "raw_sha256": "a5e546b0840a5d1509f479ef275ab9b8151f4cd197726b8e6cc2ebbcc1814463",
+      "artifact": "native-row.disasm.gz"
+    },
+    {
+      "symbol": "__RNvNtNtNtNtCs9Xuh1DSS2Xc_19onnx_runtime_ep_cpu7kernels7softmax12softmax_neon12unroll_tests13original_rows",
+      "start": 4299115316,
+      "stop": 4299116996,
+      "bytes": 1680,
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/llvm-objdump",
+        "-d",
+        "--start-address=4299115316",
+        "--stop-address=4299116996",
+        "/tmp/nxrt-neon-unroll-matched/measured.binary"
+      ],
+      "raw_sha256": "63fead99064c0bc1cd464972edb41da4f7c51b6b8363d42bad6985de8b964ae6",
+      "artifact": "original-rows.disasm.gz"
+    },
+    {
+      "symbol": "__RNvNtNtNtNtCs9Xuh1DSS2Xc_19onnx_runtime_ep_cpu7kernels7softmax12softmax_neon12unroll_tests8original",
+      "start": 4299117308,
+      "stop": 4299117468,
+      "bytes": 160,
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/llvm-objdump",
+        "-d",
+        "--start-address=4299117308",
+        "--stop-address=4299117468",
+        "/tmp/nxrt-neon-unroll-matched/measured.binary"
+      ],
+      "raw_sha256": "2d0ebc4aa2d94e8ae550756e1a7b90ba2d25634d3ac917fa859592c740850eae",
+      "artifact": "original-wrapper.disasm.gz"
+    }
+  ]
+}

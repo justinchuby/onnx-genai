@@ -889,11 +889,15 @@ const KNOWN_PROFILE_KINDS: &[&str] = &[
     "classification",
     "reward",
     "transcription",
+    "realtime",
 ];
 
 /// A required profile must be executable by this reader; an ignorable profile
 /// may be skipped. Unknown core fields still fail through `deny_unknown_fields`.
 fn validate_profiles(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
+    if let Err(error) = crate::realtime::realtime_contract(metadata) {
+        errors.push(error);
+    }
     if let Err(error) = crate::decision::decision_contract(metadata) {
         errors.push(error.to_string());
     }
@@ -1270,24 +1274,44 @@ fn validate_preprocessing_program(
     program_outputs: Option<Vec<PreprocessingOutputView<'_>>>,
     errors: &mut Vec<String>,
 ) {
-    const ABI_VERSION: &str = "1";
-
+    use crate::extensions::PreprocessingOutputScope;
     let adapters = workflow
         .components
         .iter()
-        .filter(|(_, component)| {
-            matches!(
-                &component.implementation,
-                crate::schema::ComponentImplementation::Adapter { abi: component_abi, version, .. }
-                    if component_abi == abi && version == ABI_VERSION
-            )
+        .filter_map(|(name, component)| {
+            let crate::schema::ComponentImplementation::Adapter {
+                abi: component_abi,
+                version,
+                ..
+            } = &component.implementation
+            else {
+                return None;
+            };
+            if component_abi != abi {
+                return None;
+            }
+            let scope = match PreprocessingOutputScope::for_version(version) {
+                Ok(scope) => scope,
+                Err(error) => {
+                    errors.push(format!(
+                        "workflow preprocessing component '{name}' using {abi}: {error}"
+                    ));
+                    return None;
+                }
+            };
+            Some((name, component, scope, version))
         })
         .collect::<Vec<_>>();
     if program_outputs.is_none() && !adapters.is_empty() {
-        errors.push(format!(
-            "workflow adapter components using {abi}@{ABI_VERSION} require \
-                 preprocessing.{kind} metadata"
-        ));
+        for version in adapters
+            .iter()
+            .map(|(_, _, _, version)| *version)
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            errors.push(format!(
+                "workflow adapter components using {abi}@{version} require preprocessing.{kind} metadata"
+            ));
+        }
         return;
     }
     let Some(program_outputs) = program_outputs else {
@@ -1297,12 +1321,12 @@ fn validate_preprocessing_program(
     if adapters.len() != 1 {
         errors.push(format!(
             "preprocessing.{kind} requires exactly one workflow adapter component using \
-                 {abi}@{ABI_VERSION}, found {}",
+                 {abi}, found {}",
             adapters.len()
         ));
         return;
     }
-    let (adapter_name, adapter) = adapters[0];
+    let (adapter_name, adapter, scope, version) = adapters[0];
     match adapter.ports.inputs.get("encoded") {
         Some(contract) if contract.dtype == "uint8" && contract.rank() == 1 => {}
         Some(contract) => errors.push(format!(
@@ -1355,15 +1379,16 @@ fn validate_preprocessing_program(
     };
     let mut invocations = Vec::new();
     collect_invocations(&compiled.graph, adapter_name, &mut invocations);
-    if invocations.len() != 1 {
+    if invocations.is_empty()
+        || (scope == PreprocessingOutputScope::WorkflowValue && invocations.len() != 1)
+    {
         errors.push(format!(
-            "workflow {kind} preprocessing adapter '{adapter_name}' must be invoked exactly once, \
-                 found {} invocations",
+            "workflow {kind} preprocessing adapter '{adapter_name}' version {version} requires {}; found {} invocations",
+            if scope == PreprocessingOutputScope::WorkflowValue { "exactly one invocation with workflow-scoped output names" } else { "at least one invocation with component-local output ports" },
             invocations.len()
         ));
         return;
     }
-    let invocation_outputs = invocations[0];
     for output in &program_outputs {
         if output.optional {
             errors.push(format!(
@@ -1385,15 +1410,21 @@ fn validate_preprocessing_program(
                 output.name, output.dtype, contract.dtype
             ));
         }
-        let port = invocation_outputs
-            .iter()
-            .find_map(|(port, value)| (value == output.name).then_some(port));
+        let port = match scope {
+            PreprocessingOutputScope::WorkflowValue => invocations[0]
+                .iter()
+                .find_map(|(port, value)| (value == output.name).then_some(port.as_str())),
+            PreprocessingOutputScope::ComponentPort => {
+                for invocation in &invocations {
+                    if !invocation.contains_key(output.name) {
+                        errors.push(format!("preprocessing.{kind} output port '{}' must be bound by every invocation of '{adapter_name}'", output.name));
+                    }
+                }
+                Some(output.name)
+            }
+        };
         let Some(port) = port else {
-            errors.push(format!(
-                "preprocessing.{kind} output '{}' must be a declared SSA output of adapter \
-                     invocation '{adapter_name}'",
-                output.name
-            ));
+            errors.push(format!("preprocessing.{kind} output '{}' must be a declared SSA output of adapter invocation '{adapter_name}'", output.name));
             continue;
         };
         match adapter.ports.outputs.get(port) {
