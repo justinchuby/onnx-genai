@@ -133,7 +133,7 @@ fn candidate(
     }
     region.extend([activation.id, p1.node.id, p2.node.id]);
 
-    let dims = |v| g.value(v).tensor_shape().and_then(as_static_shape);
+    let dims = |v| g.value(v).tensor_shape().and_then(|s| as_static_shape(s));
     let xd = dims(x).ok_or("expected static activation geometry")?;
     let &[tokens, experts] = dims(router)
         .as_deref()

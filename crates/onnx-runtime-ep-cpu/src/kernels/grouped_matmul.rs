@@ -185,6 +185,7 @@ impl<'a> AffineBank<'a> {
             ));
         }
         fn read<'a>(view: &'a TensorView<'_>) -> Result<std::borrow::Cow<'a, [u8]>> {
+            view.validate()?;
             if !view.is_contiguous() {
                 return super::to_dense_bytes(view).map(std::borrow::Cow::Owned);
             }

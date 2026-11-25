@@ -101,32 +101,34 @@ fn unpack(g: &mut Graph, x: ValueId, e: usize, n: usize, b: usize, final_dim: i6
 }
 
 fn bank(g: &mut Graph, names: [&str; 3], n: usize, d: usize) -> ValueId {
+    const BLOCK: usize = 16;
+    let blocks = d / BLOCK;
     let w = input(g, names[0], D::Uint8, &[3, n, d / 2]);
-    let s = input(g, names[1], D::Float32, &[3, n, 1]);
+    let s = input(g, names[1], D::Float32, &[3, n, blocks]);
     let z = input(g, names[2], D::Uint8, &[3, n, 1]);
     let codes = unpack(g, w, 3, n, d / 2, d as i64);
     let zero = unpack(g, z, 3, n, 1, -1);
     let zero_axis = ints(g, &[2]);
     let zero_start = ints(g, &[0]);
-    let zero_end = ints(g, &[1]);
+    let zero_end = ints(g, &[blocks as i64]);
     let zero = op(
         g,
         "Slice",
         &[zero, zero_start, zero_end, zero_axis],
         D::Uint8,
-        &[3, n, 1],
+        &[3, n, blocks],
         &[],
     );
     let attr = [("to", A::Int(21))];
     let codes = op(g, "Cast", &[codes], D::Uint4, &[3, n, d], &attr);
-    let zero = op(g, "Cast", &[zero], D::Uint4, &[3, n, 1], &attr);
+    let zero = op(g, "Cast", &[zero], D::Uint4, &[3, n, blocks], &attr);
     op(
         g,
         "DequantizeLinear",
         &[codes, s, zero],
         D::Float32,
         &[3, n, d],
-        &[("axis", A::Int(2)), ("block_size", A::Int(d as i64))],
+        &[("axis", A::Int(2)), ("block_size", A::Int(BLOCK as i64))],
     )
 }
 
@@ -323,7 +325,7 @@ fn fixture(t: usize) -> Fixture {
 
 #[test]
 fn affine_moe_cpu_executes_selected_fusion_against_standard_graph() {
-    for t in [1, 3] {
+    for t in [1, 4] {
         let Fixture { graph, banks, .. } = fixture(t);
         let mut reference = graph.clone();
         for bank in banks {
@@ -355,8 +357,24 @@ fn affine_moe_cpu_executes_selected_fusion_against_standard_graph() {
                 .count(),
             2
         );
-        let x: Vec<_> = (0..t * 16).map(|i| (i as f32 % 17.0 - 8.0) / 8.0).collect();
-        let logits = [2.0f32, 2.0, 7.0, 2.0, -30.0, -31.0, f32::NAN, 1.0, 1.0];
+        let mut x: Vec<_> = (0..t * 16).map(|i| (i as f32 % 17.0 - 8.0) / 8.0).collect();
+        if t > 1 {
+            x[32] = f32::NAN;
+        }
+        let logits = [
+            2.0f32,
+            2.0,
+            7.0,
+            -30.0,
+            2.0,
+            -31.0,
+            -31.0,
+            2.0,
+            1.0,
+            f32::NAN,
+            1.0,
+            1.0,
+        ];
         let packed = |n: usize, d: usize| {
             (0..3 * n * (d / 2))
                 .map(|i| (i.wrapping_mul(47) ^ (i / 9)) as u8)
@@ -364,6 +382,19 @@ fn affine_moe_cpu_executes_selected_fusion_against_standard_graph() {
         };
         let w1 = packed(64usize, 16usize);
         let w2 = packed(16usize, 32usize);
+        let s2: Vec<_> = (0..96)
+            .map(|i| {
+                // Expert 0 is selected with a small but nonzero probability on
+                // row 1. Its down projection is nonfinite, and must be masked.
+                if i < 32 {
+                    f32::MAX
+                } else if i % 2 == 0 {
+                    0.0625
+                } else {
+                    0.125
+                }
+            })
+            .collect();
         let tensors = [
             ("x", Tensor::from_f32(&[1, t, 16], &x).unwrap()),
             (
@@ -386,10 +417,7 @@ fn affine_moe_cpu_executes_selected_fusion_against_standard_graph() {
                 "w2",
                 Tensor::from_raw(D::Uint8, vec![3, 16, 16], &w2).unwrap(),
             ),
-            (
-                "s2",
-                Tensor::from_f32(&[3, 16, 1], &[0.0625f32; 48]).unwrap(),
-            ),
+            ("s2", Tensor::from_f32(&[3, 16, 2], &s2).unwrap()),
             (
                 "z2",
                 Tensor::from_raw(D::Uint8, vec![3, 16, 1], &[0xe9u8; 48]).unwrap(),
@@ -405,7 +433,16 @@ fn affine_moe_cpu_executes_selected_fusion_against_standard_graph() {
         let got = got[0].to_vec_f32();
         let want = want[0].to_vec_f32();
         assert!(want[..16].iter().any(|v| v.abs() > 0.01));
+        if t > 1 {
+            assert!(want[16..32].iter().all(|v| v.is_finite()));
+            assert!(want[32..48].iter().all(|v| v.is_nan()));
+            assert!(want[48..64].iter().all(|&v| v == 0.0));
+        }
         for (got, want) in got.into_iter().zip(want) {
+            if want.is_nan() {
+                assert!(got.is_nan());
+                continue;
+            }
             assert!(
                 (got - want).abs() <= 1e-6 * (1.0 + want.abs()),
                 "{got} != {want}"
