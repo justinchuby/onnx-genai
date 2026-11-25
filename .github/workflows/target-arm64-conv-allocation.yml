@@ -1,0 +1,23 @@
+name: Target Windows ARM64 Conv allocation
+
+on:
+  push:
+    branches:
+      - justinchuby-fix-arm64-conv-allocations
+
+permissions:
+  contents: read
+
+jobs:
+  conv-allocation:
+    name: Conv allocation (Windows ARM64)
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Run the native Conv allocation probe
+        run: cargo test --locked -p onnx-runtime-ep-cpu --test conv_im2col_allocation -- --exact native_conv_im2col_buffer_is_optional_and_reused_across_batches_and_groups --nocapture
