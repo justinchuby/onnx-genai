@@ -319,6 +319,7 @@ fn build_from_bytes_with_weights(
     infer_shapes(&mut graph)?;
     validate_topk_nodes(&graph)?;
     validate_shape_size_dtypes(&graph, &graph.opset_imports)?;
+    validate_split_to_sequence_nodes(&graph)?;
 
     Ok((graph, Arc::new(store)))
 }
