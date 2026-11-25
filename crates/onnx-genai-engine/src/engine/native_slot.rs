@@ -255,19 +255,41 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn native_slot_retains_successful_speculative_cache_but_not_explicit_cold_cache()
+    fn native_slot_cold_start_skips_reuse_but_retains_committed_speculative_cache()
     -> anyhow::Result<()> {
         let mut e = engine("tiny-mtp-full")?;
-        e.generate(request())?;
-        assert!(e.native_slot_state().unwrap().materialized_tokens > 0);
+        let warm = e.generate(request())?;
+        assert_eq!(warm.prefix_cache_hit_len, 0);
+        assert!(warm.retained_cache_tokens > 0);
+        assert_eq!(
+            warm.retained_cache_tokens,
+            e.native_slot_state().unwrap().materialized_tokens
+        );
         let mut file = Vec::new();
-        e.write_native_slot_state(&mut file, Default::default())?;
+        let saved = e.write_native_slot_state(&mut file, Default::default())?;
+        let reused = e.generate(request())?;
+        assert!(reused.prefix_cache_hit_len > 0);
+        assert_eq!(reused.token_ids, warm.token_ids);
         let mut r = request();
         r.options.cold_start = true;
-        e.generate(r)?;
+        let cold = e.generate(r)?;
+        assert_eq!(cold.prefix_cache_hit_len, 0);
+        assert_eq!(cold.token_ids, warm.token_ids);
+        assert!(cold.retained_cache_tokens > 0);
+        assert_eq!(
+            cold.retained_cache_tokens,
+            e.native_slot_state().unwrap().materialized_tokens
+        );
+        assert_eq!(e.erase_native_slot_state()?, cold.retained_cache_tokens);
         assert_eq!(e.native_slot_state().unwrap().materialized_tokens, 0);
         e.restore_native_slot_state(&mut file.as_slice(), Default::default())?;
-        assert!(e.native_slot_state().unwrap().materialized_tokens > 0);
+        assert_eq!(
+            e.native_slot_state().unwrap().materialized_tokens,
+            saved.materialized_tokens
+        );
+        let restored = e.generate(request())?;
+        assert!(restored.prefix_cache_hit_len > 0);
+        assert_eq!(restored.token_ids, warm.token_ids);
         Ok(())
     }
 }
