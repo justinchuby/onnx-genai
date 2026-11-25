@@ -113,6 +113,25 @@ impl CpuExecutionProvider {
 
     /// Construct all CPU factories with the same immutable session resources.
     pub fn with_resources(resources: CpuMemoryResources) -> Self {
+        let mut ep = Self::shared_kernels(resources);
+        ep.registry.register(
+            onnx_runtime_ep_api::OpKey::new(
+                onnx_runtime_optimizer::affine_moe::OP,
+                onnx_runtime_ir::RUNTIME_DOMAIN,
+                1,
+            ),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(crate::kernels::affine_moe::Factory),
+        );
+        ep
+    }
+
+    /// CPU provider for the ORT plugin: exclude standalone-only registry entries and passes.
+    pub fn for_ort_plugin() -> Self {
+        Self::shared_kernels(CpuMemoryResources::default())
+    }
+
+    fn shared_kernels(resources: CpuMemoryResources) -> Self {
         Self {
             device: DeviceId::cpu(),
             initialized: false,
@@ -662,6 +681,9 @@ impl ExecutionProvider for CpuExecutionProvider {
         let attribute_reason = match (op.op_type.as_str(), domain) {
             ("MoE", "com.microsoft") => crate::kernels::moe::unsupported_reason(op),
             ("QMoE", "com.microsoft") => crate::kernels::qmoe::unsupported_reason(op),
+            (onnx_runtime_optimizer::affine_moe::OP, onnx_runtime_ir::RUNTIME_DOMAIN) => {
+                crate::kernels::affine_moe::unsupported_reason(op)
+            }
             ("GroupQueryAttention", "com.microsoft") => {
                 crate::kernels::group_query_attention::unsupported_reason(op)
             }
@@ -765,7 +787,18 @@ impl ExecutionProvider for CpuExecutionProvider {
     }
 
     fn custom_passes(&self) -> Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> {
-        cpu_optimization_passes()
+        let mut passes = cpu_optimization_passes();
+        if self.registry.supports(
+            onnx_runtime_optimizer::affine_moe::OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ) {
+            // Run after the affine grouped projection rewrite.
+            passes.push(Box::new(
+                onnx_runtime_optimizer::affine_moe::AffineMoeFusion,
+            ));
+        }
+        passes
     }
 
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {

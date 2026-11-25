@@ -653,6 +653,7 @@ mod half_gemm;
 // The GEMV is an F16C/AVX2 kernel with no portable body: off x86 the decode
 // path is unchanged, so the module is not compiled at all rather than left as
 // dead code.
+pub(crate) mod affine_moe;
 mod dequantize_packed;
 mod dequantize_packed_gather;
 pub mod governed_weight_cache;
