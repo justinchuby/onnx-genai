@@ -89,6 +89,7 @@ pub(super) fn run_ep_scoped_passes(
         .is_ok()
     {
         *graph = refreshed;
+        onnx_runtime_loader::validate_split_to_sequence_nodes(graph)?;
     }
     Ok(())
 }
