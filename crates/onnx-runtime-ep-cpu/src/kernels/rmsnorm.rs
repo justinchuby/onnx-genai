@@ -277,14 +277,22 @@ impl RmsNormKernel {
                 .map_or(OutputMetadata::Absent, OutputMetadata::from_view)
         });
         let geometry = self.geometry(&metadata, &output_metadata[..outputs.len()])?;
-        for input in inputs {
-            validate_f32_widen_input(op, input)?;
+        for (index, input) in inputs.iter().enumerate() {
+            validate_f32_widen_input(op, input).map_err(|error| EpError::KernelFailed(format!(
+                "{op}: input {index} ({}) view is invalid: {error}; bind a valid floating Host-accessible view", if index == 0 { "X" } else { "scale" }
+            )))?;
         }
-        for output in outputs.iter().filter(|output| !output.is_absent()) {
-            output.validate()?;
+        for (index, output) in outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, output)| !output.is_absent())
+        {
+            output.validate().map_err(|error| EpError::KernelFailed(format!(
+                "{op}: output {index} view is invalid: {error}; bind a valid floating Host-accessible output view"
+            )))?;
             if !output.device.is_host_accessible() {
                 return Err(EpError::KernelFailed(format!(
-                    "{op}: output on {:?} must be transferred to Host-accessible storage before CPU execution",
+                    "{op}: output {index} on {:?} must be transferred to Host-accessible storage before CPU execution",
                     output.device
                 )));
             }
@@ -1076,10 +1084,25 @@ mod tests {
         );
         let mut invalid = x.view();
         invalid.strides = &[];
+        let error = kernel
+            .execute(&[invalid, scale.view()], &mut [y.view_mut()])
+            .unwrap_err()
+            .to_string();
         assert!(
-            kernel
-                .execute(&[invalid, scale.view()], &mut [y.view_mut()])
-                .is_err()
+            error.contains("SimplifiedLayerNormalization: input 0 (X)")
+                && error.contains("rank mismatch"),
+            "{error}"
+        );
+        let mut bad_output = y.view_mut();
+        bad_output.strides = &[];
+        let error = kernel
+            .execute(&[x.view(), scale.view()], &mut [bad_output])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("SimplifiedLayerNormalization: output 0")
+                && error.contains("rank mismatch"),
+            "{error}"
         );
         let zero_width = Owned::zeros_f32(&[2, 0]);
         let mut zero_out = Owned::zeros_f32(&[2, 0]);
