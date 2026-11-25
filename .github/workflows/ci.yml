@@ -1427,6 +1427,18 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test content_preserving_transition
 
+      # The shared CPU fixture target is outside the GPU inventory scan and the
+      # crate is deny-listed from workspace test lanes. Execute it explicitly so
+      # relocated host-only assertions remain behavioral tests rather than
+      # compile-only coverage.
+      - name: Verify shared CUDA CPU fixtures
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          source scripts/test_step.sh
+          run_test_step "shared CUDA CPU fixtures" \
+            cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test cpu_fixture_checks
+
       # Non-`_gpu` targets in this crate run in no other lane: the honesty
       # script skips them and workspace_test_packages.py deny-lists the crate
       # from the offline lanes. Without this step the relocated CPU-only tests
