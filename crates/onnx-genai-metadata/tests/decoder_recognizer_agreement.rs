@@ -82,6 +82,22 @@ const MATRIX: &[Row] = &[
         None,
     ),
     row(
+        "tests/fixtures/onnx_genai_workflows/transcription_features/inference_metadata.yaml",
+        1,
+        SingleGraph,
+        None,
+        false,
+        None,
+    ),
+    row(
+        "tests/fixtures/onnx_genai_workflows/transcription_projected/inference_metadata.yaml",
+        2,
+        Composite,
+        None,
+        false,
+        None,
+    ),
+    row(
         "tests/fixtures/onnx_genai_workflows/audio_waveform/inference_metadata.yaml",
         2,
         Composite,

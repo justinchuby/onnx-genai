@@ -73,6 +73,7 @@ pub mod quantized_matmul;
 pub mod scatter;
 pub mod standard_math;
 pub mod topk;
+pub mod trig;
 
 /// Descriptor for the same vendored schema that defines [`onnx`].
 pub const ONNX_FILE_DESCRIPTOR_SET: &[u8] =

@@ -488,6 +488,11 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if let Some(reason) = input_dtypes.first().and_then(|&dtype| {
+            onnx_runtime_ir::trig::bf16_unsupported_reason(&op.op_type, &op.domain, opset, dtype)
+        }) {
+            return KernelMatch::unsupported(reason);
+        }
         if let Some(reason) =
             onnx_runtime_ep_api::standard_math::unsupported_reason(op, shapes, input_dtypes)
         {
@@ -1193,6 +1198,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot spawn the child process this needs")]
     fn workspace_context_is_lazy_and_distinguishes_selected_pool_widths() {
         const CHILD: &str = "NXRT_WORKSPACE_CONTEXT_CHILD";
         if std::env::var_os(CHILD).is_some() {
