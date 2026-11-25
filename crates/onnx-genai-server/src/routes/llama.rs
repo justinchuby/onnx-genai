@@ -70,6 +70,7 @@ pub(crate) async fn props(
             "n_ctx": handle.model_max_context,
             "params": {
                 "n_predict": state.config.max_output_tokens,
+                "t_max_predict_ms": -1,
                 "seed": -1,
                 "temperature": if options.greedy { 0.0 } else { options.temperature },
                 "top_k": options.top_k, "top_p": options.top_p, "min_p": options.min_p,
@@ -260,7 +261,7 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
             // These opt into optional progress/control facilities, not a different decoding algorithm.
             "return_progress" | "timings_per_token" => value.is_boolean(),
             "sse_ping_interval" => {
-                crate::SsePingInterval::parse(value)?;
+                let _ = crate::SsePingInterval::parse(value)?;
                 true
             }
             "cache_prompt" | "ignore_eos" => value.is_boolean(),

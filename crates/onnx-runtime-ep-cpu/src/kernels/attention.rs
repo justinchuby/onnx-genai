@@ -84,7 +84,7 @@ pub struct AttentionFactory {
 /// after ORT has compiled the node onto this EP and is a hard session failure
 /// that no fallback recovers from. Implemented by running the factory's own
 /// attribute parse, so the two cannot disagree.
-pub(crate) fn unsupported_reason(node: &Node, opset: u64, q_rank: Option<usize>) -> Option<String> {
+fn unsupported_reason(node: &Node, opset: u64, q_rank: Option<usize>) -> Option<String> {
     attributes_from_node(node, opset as u32, q_rank)
         .err()
         .map(|e| e.to_string())
@@ -147,6 +147,20 @@ fn attributes_from_node(
 }
 
 impl KernelFactory for AttentionFactory {
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        _opset: u64,
+        shapes: &[onnx_runtime_ir::Shape],
+        _input_dtypes: &[onnx_runtime_ir::DataType],
+    ) -> Option<String> {
+        unsupported_reason(
+            node,
+            u64::from(self.since_version),
+            shapes.first().map(Vec::len),
+        )
+    }
+
     fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(attributes_from_node(
             node,

@@ -2,7 +2,7 @@
 
 use onnx_runtime_ep_api::bitshift::BitShiftTypes;
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Attribute, DataType, Node};
+use onnx_runtime_ir::{Attribute, DataType, Node, Shape};
 
 use super::add::{broadcast_apply, require_same_dtype};
 use super::check_arity;
@@ -23,6 +23,27 @@ pub struct BitShiftKernel {
 pub struct BitShiftFactory(pub BitShiftTypes);
 
 impl KernelFactory for BitShiftFactory {
+    fn unsupported_reason(
+        &self,
+        _node: &Node,
+        _opset: u64,
+        _shapes: &[Shape],
+        input_dtypes: &[DataType],
+    ) -> Option<String> {
+        let &dtype = input_dtypes.first()?;
+        if let Err(reason) = self.0.validate_dtype(dtype) {
+            return Some(reason);
+        }
+        if let Some(&rhs) = input_dtypes.get(1)
+            && dtype != rhs
+        {
+            return Some(format!(
+                "BitShift: operands must have the same dtype (got {dtype:?} and {rhs:?})"
+            ));
+        }
+        None
+    }
+
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let direction = match node.attr("direction").and_then(Attribute::as_str) {
             Some("LEFT") => Direction::Left,
@@ -231,6 +252,27 @@ mod tests {
                 .create(&node, &[])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn bitshift_claim_follows_factory_revision_in_both_default_domains() {
+        let cpu = crate::CpuExecutionProvider::new();
+        let mut node = Node::new(onnx_runtime_ir::NodeId(0), "BitShift", vec![], vec![]);
+        for domain in ["", "ai.onnx"] {
+            node.domain = domain.into();
+            let claim =
+                |opset, dtypes: &[DataType]| cpu.supports_op(&node, opset, &[], dtypes, &[]);
+            let signed = &[DataType::Int32; 2];
+            assert!(claim(27, signed).reason().unwrap().contains("opset 28"));
+            assert!(claim(28, signed).is_supported());
+            assert!(claim(28, &[DataType::Uint32; 2]).is_supported());
+            assert!(
+                claim(28, &[DataType::Int32, DataType::Uint32])
+                    .reason()
+                    .unwrap()
+                    .contains("same dtype")
+            );
+        }
     }
 
     #[test]

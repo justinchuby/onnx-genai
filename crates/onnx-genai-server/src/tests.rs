@@ -7905,8 +7905,22 @@ mod llama_compat {
                 json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":1}),
             ),
         ] {
-            for value in [json!(-1), json!(0), json!(1), json!(-2), json!(0.5)] {
-                let valid = value.as_i64().is_some_and(|n| n >= -1);
+            for (value, valid) in [
+                (json!(-1), true),
+                (json!(0), true),
+                (json!(1), true),
+                (json!(null), true),
+                (json!(0.5), true),
+                (json!(1.5), true),
+                (json!(-1.9), true),
+                (json!(2147483647.9), true),
+                (json!(-2), false),
+                (json!(-2.1), false),
+                (json!(2147483648u64), false),
+                (json!(true), false),
+                (json!("1"), false),
+                (json!(u64::MAX), false),
+            ] {
                 let mut body = body.clone();
                 body["sse_ping_interval"] = value;
                 body["stream"] = json!(true);
@@ -8355,6 +8369,202 @@ mod native_compat {
             .await
             .unwrap()
     }
+    #[tokio::test]
+    async fn prediction_time_limit_wire_domain_is_shared_across_generation_protocols() {
+        let router = app(tiny_state());
+        for (path, body) in [
+            ("/completion", json!({"prompt":"hello","n_predict":1})),
+            ("/v1/completions", json!({"prompt":"hello","max_tokens":1})),
+            (
+                "/v1/chat/completions",
+                json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":1}),
+            ),
+            (
+                "/v1/responses",
+                json!({"input":"hello","max_output_tokens":1}),
+            ),
+            (
+                "/v1/messages",
+                json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":1}),
+            ),
+        ] {
+            for (value, valid) in [
+                (json!(-1), true),
+                (json!(0), true),
+                (json!(1), true),
+                (json!(i64::MAX), true),
+                (json!(null), true),
+                (json!(1.5), true),
+                (json!(-1.9), true),
+                (json!(-2), false),
+                (json!(true), false),
+                (json!("1"), false),
+                (json!(u64::MAX), false),
+            ] {
+                let mut body = body.clone();
+                body["t_max_predict_ms"] = value;
+                body["stream"] = json!(true);
+                let response = request(router.clone(), path, body).await;
+                assert_eq!(
+                    response.status(),
+                    if valid {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    },
+                    "{path}"
+                );
+                let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                if valid {
+                    assert!(
+                        std::str::from_utf8(&bytes).unwrap().contains("data:"),
+                        "{path}"
+                    );
+                } else {
+                    assert!(
+                        std::str::from_utf8(&bytes)
+                            .unwrap()
+                            .contains("t_max_predict_ms"),
+                        "{path}"
+                    );
+                }
+            }
+        }
+        let response = request(
+            router.clone(),
+            "/completion",
+            json!({"prompt":[2,4,3],"n_predict":0,"t_max_predict_ms":1}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["tokens_predicted"], 0);
+    }
+
+    #[tokio::test]
+    async fn native_final_metadata_reports_prepared_settings_prompt_and_visible_stop_state() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        copy_tree(&source, scratch.path());
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+        vocab.remove("tok22");
+        vocab.insert("line\nEND".into(), json!(22));
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let router = app(AppState::load(scratch.path(), Some("metadata".into())).unwrap());
+        for stream in [false, true] {
+            for (stop, budget, visible_newline) in
+                [("END", 4, true), ("line\nEND", 4, false), ("END", 0, false)]
+            {
+                let body = json!({"prompt":[2,4,3],"n_predict":budget,"stream":stream,
+                    "temperature":0,"top_k":7,"top_p":0.5,"seed":17,"ignore_eos":true,
+                    "samplers":["top_k","temperature"],"logit_bias":{"22":100},"stop":["unmatched",stop]});
+                let response = request(router.clone(), "/completion", body.clone()).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let value = if stream {
+                    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                    sse_json_events(&bytes).last().unwrap().clone()
+                } else {
+                    json_body(response).await
+                };
+                assert_eq!(value["prompt"], "<bos> hello <eos>");
+                assert_eq!(value["has_new_line"], visible_newline);
+                assert_eq!(value["stopping_word"], if budget == 0 { "" } else { stop });
+                #[cfg(feature = "native-backend")]
+                assert_eq!(value["id_slot"], 0);
+                let settings = &value["generation_settings"];
+                assert_eq!(settings["top_k"], 7);
+                assert_eq!(settings["top_p"], 0.5);
+                assert_eq!(settings["temperature"], 0.0);
+                assert_eq!(settings["seed"], 17);
+                assert_eq!(settings["n_predict"], budget);
+                assert_eq!(settings["max_tokens"], budget);
+                assert_eq!(settings["ignore_eos"], true);
+                assert_eq!(settings["stream"], stream);
+                assert_eq!(settings["samplers"], json!(["top_k", "temperature"]));
+                assert_eq!(settings["logit_bias"], json!([{"token":22,"bias":100.0}]));
+                let mut projected = body;
+                projected["response_fields"] = json!([
+                    "prompt",
+                    "generation_settings/top_k",
+                    "has_new_line",
+                    "stopping_word"
+                ]);
+                let response = request(router.clone(), "/completion", projected).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let projected = if stream {
+                    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                    sse_json_events(&bytes).last().unwrap().clone()
+                } else {
+                    json_body(response).await
+                };
+                assert_eq!(
+                    projected,
+                    json!({"prompt":value["prompt"],"generation_settings/top_k":7,"has_new_line":visible_newline,"stopping_word":value["stopping_word"]})
+                );
+            }
+        }
+        for stream in [false, true] {
+            let response = request(
+                router.clone(),
+                "/completion",
+                json!({
+                    "prompt":["hello","world"],"n_predict":1,"stream":stream,
+                    "response_fields":["prompt","generation_settings/n_predict"]
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let rows = if stream {
+                let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                sse_json_events(&bytes)
+                    .into_iter()
+                    .filter(|row| row.get("prompt").is_some())
+                    .collect::<Vec<_>>()
+            } else {
+                json_body(response).await.as_array().unwrap().clone()
+            };
+            assert_eq!(rows.len(), 2);
+            for (row, text) in rows.iter().zip(["hello", "world"]) {
+                assert!(row["prompt"].as_str().unwrap().contains(text));
+                assert_eq!(row["generation_settings/n_predict"], 1);
+            }
+        }
+        let fim = app(
+            tiny_state().with_default_fim_config(Some(onnx_genai_engine::FimConfig {
+                prefix_token: "<PRE>".into(),
+                middle_token: "<MID>".into(),
+                suffix_token: "<SUF>".into(),
+                format: onnx_genai_engine::FimFormat::PSM,
+            })),
+        );
+        for stream in [false, true] {
+            let response = request(
+                fim.clone(),
+                "/infill",
+                json!({
+                    "input_prefix":"hello","input_suffix":"world","n_predict":1,"stream":stream,
+                    "response_fields":["prompt","generation_settings/n_predict"]
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let row = if stream {
+                let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                sse_json_events(&bytes).last().unwrap().clone()
+            } else {
+                json_body(response).await
+            };
+            let prompt = row["prompt"].as_str().unwrap();
+            assert!(
+                prompt.contains("hello") && prompt.contains("world"),
+                "{prompt}"
+            );
+            assert_eq!(row["generation_settings/n_predict"], 1);
+        }
+    }
+
     #[tokio::test]
     async fn native_response_fields_project_actual_results_and_preserve_stream_batch_completion() {
         let router = app(tiny_state());

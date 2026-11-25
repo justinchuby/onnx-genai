@@ -2734,3 +2734,64 @@ fn eos_context_fork_and_batching_preserve_candidate_tree_boundaries() -> anyhow:
     );
     Ok(())
 }
+
+#[test]
+fn prediction_time_limit_preserves_candidate_tree_committed_path_and_retry() -> anyhow::Result<()> {
+    for streaming in [false, true] {
+        let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[1, 3, 0, 5, 0, 0, 2])?;
+        install_tool_protocol_tokenizer(
+            &root,
+            &[(0, "zero\n"), (2, "two\n"), (3, "three\n"), (5, "five\n")],
+        )?;
+        let mut engine = Engine::from_dir(&root, ort_config())?;
+        let mut request = greedy_request(20);
+        request.options.max_prediction_time = Some(std::time::Duration::from_millis(50));
+        let control = GenerationControl::new().with_checkpoint(|boundary| {
+            if boundary == GenerationBoundary::AfterVerifier {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Ok(())
+        });
+        let mut delivered = Vec::new();
+        let mut callback = |token: onnx_genai_engine::GenerateToken| {
+            delivered.push(token);
+            Ok(())
+        };
+        let result = engine.generate_with_control_callbacks(
+            request.clone(),
+            control,
+            None,
+            if streaming { Some(&mut callback) } else { None },
+        )?;
+        assert_eq!(result.finish_reason, FinishReason::PredictionTimeLimit);
+        assert!(!result.token_ids.is_empty() && result.token_ids.len() < 20);
+        assert!(result.text.contains('\n'));
+        let traces = engine.take_candidate_tree_block_traces();
+        assert!(!traces.is_empty());
+        assert_eq!(
+            traces
+                .iter()
+                .flat_map(|trace| trace.committed_tokens.iter())
+                .copied()
+                .collect::<Vec<_>>(),
+            result.token_ids
+        );
+        if streaming {
+            assert_eq!(
+                delivered
+                    .iter()
+                    .map(|token| token.token_id)
+                    .collect::<Vec<_>>(),
+                result.token_ids
+            );
+            assert_eq!(
+                delivered.last().unwrap().finish_reason,
+                Some(FinishReason::PredictionTimeLimit)
+            );
+        }
+        request.options.max_prediction_time = None;
+        request.options.max_new_tokens = 3;
+        assert_eq!(engine.generate(request)?.token_ids, vec![1, 3, 5]);
+    }
+    Ok(())
+}

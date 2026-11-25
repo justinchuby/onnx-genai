@@ -37,6 +37,25 @@ fn norm_domain(domain: &str) -> &str {
 
 /// Creates kernels for a specific op.
 pub trait KernelFactory: Send + Sync {
+    /// A structural capability rejection from immutable node metadata.
+    ///
+    /// Registries query the selected versioned factory before partitioning.
+    /// Return None when no additional restriction is known from the supplied
+    /// metadata. Input dimensions may be symbolic, and metadata arrays may be
+    /// incomplete; empty claim shapes can also represent unknown rank under
+    /// the current IR contract. Keep this query free of kernel preparation, device work,
+    /// thread-pool initialization and memory grants; never decline on timing.
+    /// Factory creation must retain its final validation for concrete shapes.
+    fn unsupported_reason(
+        &self,
+        _node: &Node,
+        _opset: u64,
+        _input_shapes: &[Shape],
+        _input_dtypes: &[DataType],
+    ) -> Option<String> {
+        None
+    }
+
     fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>>;
 }
 
