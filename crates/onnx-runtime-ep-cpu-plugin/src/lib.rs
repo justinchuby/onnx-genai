@@ -169,13 +169,16 @@ pub unsafe extern "C" fn CreateEpFactories(
             && !out_num_raw.is_null()
             && unsafe { *out_num_raw } > 0
         {
-            // SAFETY: CPU kernels and their host workers join before returning;
-            // replacement/release use the same synchronous CPU provider.
+            // SAFETY: the live factory has its registry and has not been
+            // exposed to ORT. CPU kernels and their host workers join before
+            // returning; replacement/release use the same synchronous provider.
             unsafe {
-                onnx_runtime_ep_plugin::factory::register_ordered_workspace_execution(
-                    *out_factories_raw,
-                    None,
-                )
+                let factory = *out_factories_raw;
+                onnx_runtime_ep_plugin::factory::exclude_operators(
+                    factory,
+                    onnx_runtime_ep_plugin::ep::STANDALONE_RNN_EXCLUSION,
+                );
+                onnx_runtime_ep_plugin::factory::register_ordered_workspace_execution(factory, None)
             }
         } else {
             status

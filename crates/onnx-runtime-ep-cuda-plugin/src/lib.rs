@@ -439,6 +439,13 @@ pub unsafe extern "C" fn CreateEpFactories(
             };
             if status.is_null() && !out_factories.is_null() && max_factories != 0 {
                 let factory = unsafe { *out_factories };
+                // SAFETY: the live factory has its registry and has not yet been exposed to ORT.
+                unsafe {
+                    onnx_runtime_ep_plugin::factory::exclude_operators(
+                        factory,
+                        onnx_runtime_ep_plugin::ep::STANDALONE_RNN_EXCLUSION,
+                    );
+                }
                 let api = unsafe {
                     (*api_base)
                         .GetApi

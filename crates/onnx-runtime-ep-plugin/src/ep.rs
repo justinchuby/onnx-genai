@@ -175,6 +175,13 @@ pub struct OperatorExclusion {
 
 pub type OperatorExclusions = &'static [OperatorExclusion];
 
+/// Native RNN support is standalone-only; ORT retains its existing RNN placement.
+pub const STANDALONE_RNN_EXCLUSION: OperatorExclusions = &[OperatorExclusion {
+    domain: "",
+    op_type: "RNN",
+    since_version: 0,
+}];
+
 pub(crate) fn first_excluded_revision(
     exclusions: OperatorExclusions,
     domain: &str,
