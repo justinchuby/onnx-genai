@@ -637,8 +637,8 @@ refiner before admission. Output storage is uninitialized: only layout and
 pointer origins may be inspected. Kernel-sized output paths explicitly have no
 final output storage yet. The caller retains exclusive execution ownership from
 refinement through admission and launch. Most kernels implement only the metadata
-hook; only address/value-dependent kernels need an execution refiner. ORT caches
-metadata preparations, including `Deferred`, and refines on each Compute; exact
+hook; only address/value/context-dependent kernels need an execution refiner.
+ORT caches metadata preparations, including `Deferred`, and refines on each Compute; exact
 address/value-dependent bytes never enter that geometry cache. Cached ready
 preparations avoid repeating the metadata query.
 
@@ -659,8 +659,13 @@ Integer QMoE's execution refiner selects the actual decode plan before admission
 clears any previous plan on failure and publishes only a successful selection.
 Launch consumes that exact plan under the existing exclusive kernel boundary;
 it never recomputes a different shard count from the thread pool. Cached metadata
-does not skip this selection. Shape preparation can remain complete while a
-changed execution context takes the normal cold reprepare/growth path; existing
+does not skip this selection. A Ready bound from the same kernel, tensor metadata
+and provider context is reused without repeating metadata planning; None/Deferred
+still run the checked planner. This preserves the default refiner's warm-cache
+contract while fixing the dispatch plan. Actual-view/layout validation remains
+in execution, and failed uncached preparation clears any earlier selection.
+Shape preparation can remain complete while a changed execution context takes
+the normal cold reprepare/growth path; existing
 capture guards still reject replacing pinned backing.
 
 ActualAddress workspace sizes across alignment classes need not be monotonic.
