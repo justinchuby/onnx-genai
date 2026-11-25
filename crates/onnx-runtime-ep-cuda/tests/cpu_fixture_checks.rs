@@ -1,10 +1,13 @@
 //! CPU reference checks for the corresponding CUDA fixtures; no device is needed.
 
 mod common;
+
 #[path = "fixtures/deform_conv.rs"]
 mod deform_conv;
 #[path = "fixtures/packed_validation_workspace.rs"]
 mod packed_validation_workspace;
+#[path = "fixtures/standard_attention_windows.rs"]
+mod standard_attention_windows;
 
 #[test]
 fn deform_conv_cpu_matches_fixtures() {
@@ -30,6 +33,41 @@ fn shared_validation_gpu_fixture_expectations_match_cpu() {
             common::try_run_cpu(name, domain, opset, &inputs, &[(dtype, shape)], &attrs).unwrap();
         assert_eq!(actual, [expected], "{name}");
     }
+}
+
+/// An allocator that does not serve this EP's device is refused before any
+/// device access is attempted.
+#[test]
+fn an_allocator_for_the_wrong_device_is_refused() {
+    let error = onnx_runtime_ep_cuda::CudaExecutionProvider::from_config(
+        0,
+        onnx_runtime_ep_cuda::CudaProviderConfig {
+            memory: Some(std::sync::Arc::new(onnx_runtime_memory_api::HostAllocator)),
+            ..Default::default()
+        },
+    )
+    .expect_err("host memory is not CUDA device memory");
+    let message = error.to_string();
+    assert!(
+        message.contains("CUDA device 0"),
+        "the error must name the device that was expected: {message}"
+    );
+}
+
+#[test]
+fn standard_attention_opset25_windows_cpu() {
+    standard_attention_windows::assert_cases(|inputs, outputs, attrs| {
+        let inputs = inputs
+            .iter()
+            .map(|input| common::Tensor {
+                dtype: input.dtype,
+                shape: input.shape.clone(),
+                bytes: input.bytes.clone(),
+                absent: input.absent,
+            })
+            .collect::<Vec<_>>();
+        common::run_cpu("Attention", "", 25, &inputs, outputs, attrs)
+    });
 }
 
 #[path = "fixtures/pooling.rs"]

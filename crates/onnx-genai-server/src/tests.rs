@@ -8356,6 +8356,87 @@ mod native_compat {
             .unwrap()
     }
     #[tokio::test]
+    async fn native_response_fields_project_actual_results_and_preserve_stream_batch_completion() {
+        let router = app(tiny_state());
+        let baseline = request(
+            router.clone(),
+            "/completion",
+            json!({"prompt":"hello","n_predict":1,"return_tokens":true,"response_fields":[]}),
+        )
+        .await;
+        assert_eq!(baseline.status(), StatusCode::OK);
+        let baseline = json_body(baseline).await;
+        let response=request(router.clone(),"/completion",json!({"prompt":"hello","n_predict":1,"return_tokens":true,"response_fields":["content","tokens","timings/predicted_n","missing","tokens/0"]})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let selected = json_body(response).await;
+        assert_eq!(
+            selected,
+            json!({"content":baseline["content"],"tokens":baseline["tokens"],"timings/predicted_n":1})
+        );
+        for stream in [false, true] {
+            let response=request(router.clone(),"/completion",json!({"prompt":["hello","world"],"n_predict":1,"stream":stream,"response_fields":["tokens_predicted"]})).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            if stream {
+                let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                let events = sse_json_events(&bytes);
+                let final_count = events
+                    .iter()
+                    .filter(|value| **value == json!({"tokens_predicted":1}))
+                    .count();
+                assert_eq!(final_count, 2, "{}", String::from_utf8_lossy(&bytes));
+                assert!(
+                    events
+                        .iter()
+                        .filter(|value| value.get("stop").is_some())
+                        .all(|value| value["stop"] == false)
+                );
+            } else {
+                assert_eq!(
+                    json_body(response).await,
+                    json!([{"tokens_predicted":1},{"tokens_predicted":1}])
+                );
+            }
+        }
+        for stream in [false, true] {
+            let response=request(router.clone(),"/completion",json!({"prompt":[2,4,3],"n_predict":0,"stream":stream,"response_fields":["tokens_predicted","timings/predicted_n"]})).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let expected = json!({"tokens_predicted":0,"timings/predicted_n":0});
+            if stream {
+                let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                assert_eq!(sse_json_events(&bytes), vec![expected]);
+            } else {
+                assert_eq!(json_body(response).await, expected);
+            }
+        }
+        let fim = app(
+            tiny_state().with_default_fim_config(Some(onnx_genai_engine::FimConfig {
+                prefix_token: "<PRE>".into(),
+                middle_token: "<MID>".into(),
+                suffix_token: "<SUF>".into(),
+                format: onnx_genai_engine::FimFormat::PSM,
+            })),
+        );
+        let response=request(fim,"/infill",json!({"input_prefix":"hello","input_suffix":"world","n_predict":1,"response_fields":["tokens_predicted"]})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await, json!({"tokens_predicted":1}));
+        for fields in [json!(null), json!("content"), json!(["content", 1])] {
+            let response = request(
+                router.clone(),
+                "/completion",
+                json!({"prompt":"hello","response_fields":fields}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(
+                json_body(response).await["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("response_fields")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn native_dynamic_temperature_matches_the_entropy_interval_endpoint() {
         let router = app(tiny_state());
         // Exponent zero maps every distribution to the upper endpoint. A real

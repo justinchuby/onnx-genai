@@ -478,6 +478,38 @@ fn text_ops_infer_broadcast_match_and_dynamic_split_shapes() {
 }
 
 #[test]
+fn trig_bf16_requires_opset_22() {
+    for (name, original) in [
+        ("Sin", 7),
+        ("Cos", 7),
+        ("Tan", 7),
+        ("Asin", 7),
+        ("Acos", 7),
+        ("Atan", 7),
+        ("Sinh", 9),
+        ("Cosh", 9),
+        ("Asinh", 9),
+        ("Acosh", 9),
+        ("Atanh", 9),
+    ] {
+        let n = node(name, 1, 1);
+        let inputs = |dtype| vec![tin(dtype, vec![c(2), c(3)])];
+        let error = try_run(&n, inputs(DataType::BFloat16), 21).unwrap_err();
+        assert_invalid(error, name, "does not accept BF16 (BFloat16) at opset 21");
+        let out = run(&n, inputs(DataType::BFloat16), 22);
+        assert_eq!(out_dtype(&out), DataType::BFloat16, "{name}");
+        assert_eq!(out_shape(&out), vec![c(2), c(3)], "{name}");
+        for opset in [original, 21, 22] {
+            for dtype in [DataType::Float16, DataType::Float32, DataType::Float64] {
+                let out = run(&n, inputs(dtype), opset);
+                assert_eq!(out_dtype(&out), dtype, "{name} at opset {opset}");
+                assert_eq!(out_shape(&out), vec![c(2), c(3)], "{name} at opset {opset}");
+            }
+        }
+    }
+}
+
+#[test]
 fn standard_math_opset_gate_and_shape_contracts() {
     for (name, since) in onnx_runtime_ir::standard_math::OPS {
         let arity = if ["SwiGLU", "GeGLU"].contains(&name) {
@@ -7367,7 +7399,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "ConstantOfShape", 1),
     ("", "Conv", 1),
     ("", "ConvTranspose", 1),
-    ("", "Cos", 1),
+    ("", "Cos", 7),
     ("", "Cosh", 9),
     ("", "CumProd", 26),
     ("", "CumSum", 11),
@@ -7528,7 +7560,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Sigmoid", 1),
     ("", "Sign", 1),
     ("", "SimplifiedLayerNormalization", 1),
-    ("", "Sin", 1),
+    ("", "Sin", 7),
     ("", "Sinh", 9),
     ("", "Size", 1),
     ("", "Slice", 1),
