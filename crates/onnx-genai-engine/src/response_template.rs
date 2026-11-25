@@ -1366,6 +1366,10 @@ impl ResponseParser {
         self.preview_bytes(text.as_bytes(), final_chunk)
     }
 
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.buffer.len() + self.utf8_tail.bytes().len()
+    }
+
     /// Inspect lossless byte pieces; partial UTF-8 is retained only within the trial.
     /// Final candidates must end on a complete UTF-8 scalar.
     pub fn preview_bytes(&mut self, bytes: &[u8], final_chunk: bool) -> anyhow::Result<ChatText> {

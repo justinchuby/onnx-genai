@@ -95,7 +95,7 @@ pub(crate) fn build_processor_chain(
                 ).context("resolve tokenizer.decoder byte contract for raw grammar")?.context("raw grammar requires a resolved lossless tokenizer.decoder byte contract; use a tokenizer with supported byte decoding instead of contextual decoded-token guesses")?;
                 anyhow::ensure!(
                     contract.new_state().is_identity(),
-                    "raw grammar cannot yet interpret tokenizer.decoder stream-initial stripping with model-token references; use a context-free byte decoder or a content-only response_format constraint"
+                    "raw grammar cannot yet interpret tokenizer.decoder stream-initial stripping or trailing stripping with model-token references; use a context-free byte decoder or a content-only response_format constraint"
                 );
                 // GBNF inspects raw pieces, including declared special tokens.
                 // Only explicitly resolved ending roles receive an EOS frame.
