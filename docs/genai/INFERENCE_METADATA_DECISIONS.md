@@ -2241,3 +2241,16 @@ and kind order, never encoded spoken bytes. Workflow metadata owns preprocessing
 and expansion accounting; transport supports PCM16 WAV and does not infer a model
 family or fetch remote decision media. Video requires executable support before
 its kind can be declared.
+
+## Audio analysis geometry is runtime data
+
+The log-mel extractor accepts explicit `LogMelConfig`: mel count, target sample
+rate, FFT size, hop and periodic-Hann window length. Audio programs consume the
+existing metadata fields rather than accepting only 80/128 bins and a fixed
+16 kHz / 400 / 160 recipe. Invalid or unallocatable dimensions return actionable
+errors. The established convenience recipe and Slaney filter reference values
+remain numerically unchanged. Centered reflection and terminal-frame discard
+remain explicit implementation conventions; other windows/scales fail closed.
+No new serialized field or adapter ABI is needed for this geometry change.
+This does not repair broader transform SSA/source execution or add pure-waveform
+programs; those remain required follow-up work.

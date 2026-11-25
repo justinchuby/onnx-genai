@@ -224,8 +224,9 @@ The maintained `decision_audio` fixture runs Native CPU image-preprocess@2,
 repeated audio-preprocess@2 and a real ONNX probability head. Independent state
 and question audio alter probabilities; changing clip length changes authored
 usage, and total media expansion obeys the input-token limit. This proves data
-flow, not recognition quality. Broader waveform/log-mel preprocessing and codecs
-remain separate compatibility work.
+flow, not recognition quality. Log-mel bin count, sample rate, FFT length, hop and Hann window length are
+package-authored geometry. Broader waveform dataflow, normalization modes and
+codecs remain separate compatibility work.
 
 ## Limits and remaining work
 
