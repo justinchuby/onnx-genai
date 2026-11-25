@@ -243,6 +243,8 @@ impl QMoEKernel {
         inputs: &[TensorMetadata<'_>],
         plan: DecodedProjectionPlan,
     ) -> Result<WorkspaceRequirement> {
+        #[cfg(test)]
+        WORKSPACE_METADATA_QUERIES.with(|queries| queries.set(queries.get() + 1));
         let input = inputs
             .first()
             .filter(|input| input.present)
@@ -292,13 +294,19 @@ impl Kernel for QMoEKernel {
         _outputs: &[TensorMut],
         metadata: &[TensorMetadata<'_>],
         _output_metadata: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-        _cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
+        cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
     ) -> Result<onnx_runtime_ep_api::WorkspaceExecutionPreparation> {
         // Exclusive kernel ownership spans refinement, admission and launch.
         // Failed preparation must not leave a previously selected plan usable.
         self.prepared_projection.set(None);
         let plan = DecodedProjectionPlan::for_current_pool(std::num::NonZeroUsize::new(1).unwrap());
-        let requirement = self.workspace_for_plan(metadata, plan)?;
+        // The caller already matched this kernel, tensor metadata and provider
+        // context. Preserve the default hook's Ready-cache fast path; capture a
+        // fresh dispatch plan even when no metadata calculation is needed.
+        let requirement = match cached {
+            Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(requirement)) => requirement,
+            _ => self.workspace_for_plan(metadata, plan)?,
+        };
         self.prepared_projection.set(Some(plan));
         Ok(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready(
             requirement,
@@ -2346,6 +2354,13 @@ fn error(message: impl Into<String>) -> EpError {
     EpError::KernelFailed(format!("QMoE: {}", message.into()))
 }
 
+// Test-only observation of actual metadata planning, scoped to the calling
+// thread so unrelated parallel tests cannot turn a warm-cache check into noise.
+#[cfg(test)]
+thread_local! {
+    static WORKSPACE_METADATA_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -3149,15 +3164,24 @@ mod tests {
                                     w2.view(),
                                     sc2.view(),
                                 ];
+                                let preparation = match warm {
+                                    0 => Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(req)),
+                                    1 => Some(onnx_runtime_ep_api::WorkspacePreparation::Deferred),
+                                    _ => None,
+                                };
+                                let queries_before = WORKSPACE_METADATA_QUERIES.with(std::cell::Cell::get);
                                 kernel
                                     .workspace_requirement_for_execution(
                                         &inputs,
                                         &[output.view_mut()],
                                         metadata,
                                         &[],
-                                        Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(req)),
+                                        preparation,
                                     )?
                                     .require_ready()?;
+                                assert_eq!(WORKSPACE_METADATA_QUERIES.with(std::cell::Cell::get) - queries_before,
+                                    usize::from(!matches!(preparation, Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(_)))),
+                                    "Ready reuses metadata, while Deferred/None must run the checked planner");
                                 kernel.execute_with_workspace(
                                     &inputs,
                                     &mut [output.view_mut()],
