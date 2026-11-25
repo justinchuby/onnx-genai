@@ -32,6 +32,7 @@ pub(crate) mod native_speculative;
 pub mod pipeline;
 pub mod pipeline_cache;
 pub(crate) mod platform_capacity;
+mod prediction_limit;
 pub(crate) mod processors;
 pub mod ranking;
 pub mod realtime;

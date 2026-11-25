@@ -54,6 +54,16 @@ pub struct TensorScatterKernel {
 pub struct TensorScatterFactory;
 
 impl KernelFactory for TensorScatterFactory {
+    fn unsupported_reason(
+        &self,
+        _node: &Node,
+        _opset: u64,
+        _shapes: &[onnx_runtime_ir::Shape],
+        input_dtypes: &[DataType],
+    ) -> Option<String> {
+        tensor_scatter_unsupported_reason(input_dtypes)
+    }
+
     fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let mode = match node.attr("mode").and_then(Attribute::as_str) {
             None | Some("linear") => WriteMode::Linear,
@@ -73,7 +83,7 @@ impl KernelFactory for TensorScatterFactory {
 
 /// Claim-time rejection reasons, so an unsupported shape declines rather than
 /// failing mid-execution.
-pub(crate) fn tensor_scatter_unsupported_reason(input_dtypes: &[DataType]) -> Option<String> {
+fn tensor_scatter_unsupported_reason(input_dtypes: &[DataType]) -> Option<String> {
     if input_dtypes.is_empty() {
         return None;
     }

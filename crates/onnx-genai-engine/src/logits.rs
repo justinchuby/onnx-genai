@@ -53,8 +53,11 @@ pub struct ProcessorContext {
 /// Non-logit side-channel emitted by processors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessorSignal {
+    PredictionTimeLimit,
     /// A configured stop sequence matched the current generated output.
-    StopSequence { index: usize },
+    StopSequence {
+        index: usize,
+    },
 }
 
 /// A candidate token considered by a constrained decoder.
@@ -212,6 +215,13 @@ pub trait LogitProcessor: Send + Sync {
         None
     }
 
+    /// True only when processing leaves logits/candidates and selection feedback
+    /// unchanged, and the processor observes committed output solely via signal.
+    /// Such processors can share a raw-greedy speculative verification path.
+    fn only_observes_committed_output(&self) -> bool {
+        false
+    }
+
     /// Whether this processor is guaranteed to leave the position of the maximum
     /// logit unchanged, for every possible input.
     ///
@@ -312,6 +322,12 @@ impl ProcessorChain {
     /// vocabulary on the host.
     pub fn is_empty(&self) -> bool {
         self.processors.is_empty()
+    }
+    #[cfg(feature = "native-backend")]
+    pub(crate) fn only_observes_committed_output(&self) -> bool {
+        self.processors
+            .iter()
+            .all(|processor| processor.only_observes_committed_output())
     }
 
     /// Whether greedy selection over the raw logits gives the same token as
@@ -1544,6 +1560,9 @@ impl LogitProcessor for StopSequenceProcessor {
     /// [`signal`](Self::signal), which the loop reads through
     /// `finish_reason_after_token` on every step whether or not the chain was
     /// applied. So skipping the chain here loses nothing.
+    fn only_observes_committed_output(&self) -> bool {
+        true
+    }
     fn preserves_argmax(&self) -> bool {
         true
     }

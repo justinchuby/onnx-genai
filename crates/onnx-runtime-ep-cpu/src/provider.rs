@@ -529,15 +529,6 @@ impl ExecutionProvider for CpuExecutionProvider {
         ) {
             return KernelMatch::unsupported(reason);
         }
-        if let Some(reason) = onnx_runtime_ep_api::gemm::unsupported_reason(
-            op,
-            opset,
-            shapes,
-            input_dtypes,
-            crate::kernels::gemm::DTYPES,
-        ) {
-            return KernelMatch::unsupported(reason);
-        }
         if op.op_type == "DequantizePacked"
             && onnx_runtime_ir::is_default_domain(&op.domain)
             && let Err(reason) =
@@ -551,85 +542,6 @@ impl ExecutionProvider for CpuExecutionProvider {
                 onnx_runtime_ir::dropout::validate_claim(op, opset, shapes, input_dtypes)
         {
             deny!("Dropout: {reason}");
-        }
-        if op.op_type == "CompressedSparseAttention"
-            && op.domain == "pkg.nxrt"
-            && let Some(reason) = crate::kernels::compressed_sparse_attention::unsupported_reason(
-                op,
-                shapes,
-                input_dtypes,
-            )
-        {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "BlockQuantizedMoE"
-            && op.domain == "pkg.nxrt"
-            && let Some(reason) =
-                crate::kernels::block_quantized_moe::unsupported_reason(op, shapes, input_dtypes)
-        {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "IndexShare"
-            && op.domain == "pkg.nxrt"
-            && let Some(reason) =
-                crate::kernels::index_share::unsupported_reason(op, shapes, input_dtypes)
-        {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "DsaIndexSelect"
-            && op.domain == "pkg.nxrt"
-            && let Some(reason) =
-                crate::kernels::dsa_index_select::unsupported_reason(op, shapes, input_dtypes)
-        {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "VarlenAttention"
-            && op.domain == "pkg.nxrt"
-            && let Some(reason) =
-                crate::kernels::varlen_attention::unsupported_reason(op, shapes, input_dtypes)
-        {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "PackedVarlenAttention"
-            && op.domain == "pkg.nxrt"
-            && let Some(reason) = crate::kernels::packed_varlen_attention::unsupported_reason(
-                op,
-                shapes,
-                input_dtypes,
-            )
-        {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "TensorScatter"
-            && op.domain.is_empty()
-            && let Some(reason) =
-                crate::kernels::tensor_scatter::tensor_scatter_unsupported_reason(input_dtypes)
-        {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "STFT"
-            && op.domain.is_empty()
-            && let Some(reason) = crate::kernels::stft::unsupported_dtype_reason(input_dtypes)
-        {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "Einsum"
-            && op.domain.is_empty()
-            && let Some(reason) = crate::kernels::einsum::unsupported_reason_for_opset(
-                op,
-                opset,
-                shapes,
-                input_dtypes,
-            )
-        {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "Unique"
-            && op.is_default_domain()
-            && let Some(&dtype) = input_dtypes.first()
-            && let Some(reason) = crate::kernels::unique::unsupported_dtype_for_opset(dtype, opset)
-        {
-            return KernelMatch::unsupported(reason);
         }
         // The numeric extrema kernel predates BOOL, which entered both schemas in opset 20.
         if opset < 20
@@ -656,24 +568,10 @@ impl ExecutionProvider for CpuExecutionProvider {
                 op.op_type
             );
         }
-        if op.op_type == "DeformConv"
-            && domain.is_empty()
-            && let Err(reason) =
-                onnx_runtime_ir::deform_conv::validate_claim(op, opset, shapes, input_dtypes)
-        {
-            return KernelMatch::unsupported(format!("DeformConv: {reason}"));
-        }
         // Structural kernel limits belong to the versioned factory selected
         // above, alongside the parser that creation uses. No operator-name
         // dispatch table is needed here to keep those two boundaries aligned.
         if let Some(reason) = factory.unsupported_reason(op, opset, shapes, input_dtypes) {
-            return KernelMatch::unsupported(reason);
-        }
-        if matches!(op.op_type.as_str(), "ScatterND" | "ScatterElements")
-            && (op.domain.is_empty() || op.domain == "ai.onnx")
-            && let Some(reason) =
-                crate::kernels::indexing::scatter_unsupported_reason(op, opset, input_dtypes)
-        {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "GatherND"
@@ -681,13 +579,6 @@ impl ExecutionProvider for CpuExecutionProvider {
             && let Some(&dtype) = input_dtypes.get(1)
             && let Err(reason) =
                 onnx_runtime_ir::scatter::validate_nd_index_type("GatherND", opset, dtype)
-        {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "QLinearMatMul"
-            && (op.domain.is_empty() || op.domain == "ai.onnx")
-            && let Some(reason) =
-                crate::kernels::qlinear_matmul::unsupported_reason(input_dtypes, shapes)
         {
             return KernelMatch::unsupported(reason);
         }
@@ -2037,6 +1928,98 @@ mod tests {
                 "{op_type}"
             );
         }
+    }
+
+    #[test]
+    fn registered_kernel_limits_cover_both_default_domain_spellings() {
+        for domain in ["", "ai.onnx"] {
+            let ep = CpuExecutionProvider::new();
+            let mut node = Node::new(NodeId(0), "STFT", vec![], vec![]);
+            node.domain = domain.into();
+            let unsupported =
+                ep.supports_op(&node, 17, &[], &[DataType::Float64, DataType::Int64], &[]);
+            let reason = unsupported
+                .reason()
+                .expect("STFT f64 is not implemented by the f32 kernel");
+            assert!(reason.contains("STFT signal must"), "{domain}: {reason}");
+            assert!(
+                ep.supports_op(&node, 17, &[], &[DataType::Float32, DataType::Int64], &[])
+                    .is_supported()
+            );
+            node.op_type = "TensorScatter".into();
+            let unsupported = ep.supports_op(&node, 24, &[], &[DataType::Bool; 2], &[]);
+            let reason = unsupported
+                .reason()
+                .expect("TensorScatter cannot dispatch BOOL arithmetic");
+            assert!(
+                reason.contains("TensorScatter: cache dtype Bool"),
+                "{domain}: {reason}"
+            );
+            assert!(
+                ep.supports_op(&node, 24, &[], &[DataType::Int32; 2], &[])
+                    .is_supported()
+            );
+            node.op_type = "Einsum".into();
+            node.attributes.insert(
+                "equation".into(),
+                onnx_runtime_ir::Attribute::String("ij,jk->ik".into()),
+            );
+            let shapes = [
+                onnx_runtime_ir::static_shape([2, 3]),
+                onnx_runtime_ir::static_shape([3, 4]),
+            ];
+            assert!(
+                !ep.supports_op(&node, 12, &shapes, &[DataType::BFloat16; 2], &[])
+                    .is_supported()
+            );
+            assert!(
+                ep.supports_op(&node, 12, &shapes, &[DataType::Float32; 2], &[])
+                    .is_supported()
+            );
+        }
+    }
+
+    #[cfg(feature = "ops-cnn")]
+    #[test]
+    fn deform_conv_claim_preserves_schema_versions_and_unknown_rank() {
+        let ep = CpuExecutionProvider::new();
+        let mut node = Node::new(
+            NodeId(0),
+            "DeformConv",
+            (0..3).map(|i| Some(onnx_runtime_ir::ValueId(i))).collect(),
+            vec![onnx_runtime_ir::ValueId(3)],
+        );
+        let shapes = [
+            onnx_runtime_ir::static_shape([1, 1, 3, 3]),
+            onnx_runtime_ir::static_shape([1, 1, 1, 1]),
+            onnx_runtime_ir::static_shape([1, 2, 3, 3]),
+        ];
+        for domain in ["", "ai.onnx"] {
+            node.domain = domain.into();
+            let old = ep.supports_op(&node, 19, &shapes, &[DataType::BFloat16; 3], &[]);
+            let reason = old.reason().expect("BF16 entered DeformConv at opset 22");
+            assert!(reason.contains("bfloat16 requires opset 22+"), "{reason}");
+            assert!(
+                ep.supports_op(&node, 22, &shapes, &[DataType::BFloat16; 3], &[])
+                    .is_supported()
+            );
+            assert!(
+                ep.supports_op(&node, 19, &vec![vec![]; 3], &[DataType::Float32; 3], &[])
+                    .is_supported()
+            );
+        }
+        let partial = [vec![], onnx_runtime_ir::static_shape([1, 1]), vec![]];
+        assert!(
+            !ep.supports_op(&node, 19, &partial, &[DataType::Float32; 3], &[])
+                .is_supported()
+        );
+        node.inputs.push(Some(onnx_runtime_ir::ValueId(4)));
+        node.inputs.push(Some(onnx_runtime_ir::ValueId(5)));
+        node.inputs.push(Some(onnx_runtime_ir::ValueId(6)));
+        assert!(
+            !ep.supports_op(&node, 19, &[], &[DataType::Float32; 6], &[])
+                .is_supported()
+        );
     }
 
     #[test]

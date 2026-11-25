@@ -41,6 +41,12 @@ pub(crate) fn build_processor_chain(
             biases: options.logit_bias.clone(),
         }));
     }
+    if let Some(limit) = options.max_prediction_time.filter(|limit| !limit.is_zero()) {
+        chain.add(Box::new(crate::prediction_limit::PredictionTimeLimit::new(
+            limit,
+            options.stop_sequences.clone(),
+        )));
+    }
     if !options.stop_sequences.is_empty() {
         chain.add(Box::new(StopSequenceProcessor::new(
             options.stop_sequences.clone(),
@@ -656,9 +662,10 @@ pub(crate) fn finish_reason_after_token(
         return Some(FinishReason::EosToken);
     }
 
-    chain
-        .signal(context)
-        .map(|ProcessorSignal::StopSequence { index }| FinishReason::StopSequence { index })
+    chain.signal(context).map(|signal| match signal {
+        ProcessorSignal::StopSequence { index } => FinishReason::StopSequence { index },
+        ProcessorSignal::PredictionTimeLimit => FinishReason::PredictionTimeLimit,
+    })
 }
 
 #[cfg(test)]

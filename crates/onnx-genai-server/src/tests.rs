@@ -7905,8 +7905,22 @@ mod llama_compat {
                 json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":1}),
             ),
         ] {
-            for value in [json!(-1), json!(0), json!(1), json!(-2), json!(0.5)] {
-                let valid = value.as_i64().is_some_and(|n| n >= -1);
+            for (value, valid) in [
+                (json!(-1), true),
+                (json!(0), true),
+                (json!(1), true),
+                (json!(null), true),
+                (json!(0.5), true),
+                (json!(1.5), true),
+                (json!(-1.9), true),
+                (json!(2147483647.9), true),
+                (json!(-2), false),
+                (json!(-2.1), false),
+                (json!(2147483648u64), false),
+                (json!(true), false),
+                (json!("1"), false),
+                (json!(u64::MAX), false),
+            ] {
                 let mut body = body.clone();
                 body["sse_ping_interval"] = value;
                 body["stream"] = json!(true);
@@ -8355,6 +8369,77 @@ mod native_compat {
             .await
             .unwrap()
     }
+    #[tokio::test]
+    async fn prediction_time_limit_wire_domain_is_shared_across_generation_protocols() {
+        let router = app(tiny_state());
+        for (path, body) in [
+            ("/completion", json!({"prompt":"hello","n_predict":1})),
+            ("/v1/completions", json!({"prompt":"hello","max_tokens":1})),
+            (
+                "/v1/chat/completions",
+                json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":1}),
+            ),
+            (
+                "/v1/responses",
+                json!({"input":"hello","max_output_tokens":1}),
+            ),
+            (
+                "/v1/messages",
+                json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":1}),
+            ),
+        ] {
+            for (value, valid) in [
+                (json!(-1), true),
+                (json!(0), true),
+                (json!(1), true),
+                (json!(i64::MAX), true),
+                (json!(null), true),
+                (json!(1.5), true),
+                (json!(-1.9), true),
+                (json!(-2), false),
+                (json!(true), false),
+                (json!("1"), false),
+                (json!(u64::MAX), false),
+            ] {
+                let mut body = body.clone();
+                body["t_max_predict_ms"] = value;
+                body["stream"] = json!(true);
+                let response = request(router.clone(), path, body).await;
+                assert_eq!(
+                    response.status(),
+                    if valid {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    },
+                    "{path}"
+                );
+                let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                if valid {
+                    assert!(
+                        std::str::from_utf8(&bytes).unwrap().contains("data:"),
+                        "{path}"
+                    );
+                } else {
+                    assert!(
+                        std::str::from_utf8(&bytes)
+                            .unwrap()
+                            .contains("t_max_predict_ms"),
+                        "{path}"
+                    );
+                }
+            }
+        }
+        let response = request(
+            router.clone(),
+            "/completion",
+            json!({"prompt":[2,4,3],"n_predict":0,"t_max_predict_ms":1}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["tokens_predicted"], 0);
+    }
+
     #[tokio::test]
     async fn native_response_fields_project_actual_results_and_preserve_stream_batch_completion() {
         let router = app(tiny_state());

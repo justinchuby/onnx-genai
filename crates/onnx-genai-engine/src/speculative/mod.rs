@@ -2546,6 +2546,7 @@ impl Engine {
                 chain,
                 self.require_tokenizer()?,
                 callback.as_deref_mut(),
+                None,
             )?;
             *generated_tokens = commit_state.generated_tokens;
             *generated_text = commit_state.generated_text;
