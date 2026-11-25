@@ -7133,6 +7133,76 @@ fn sealed_bqmoe_cuda_session_fixture() -> (
 
 #[cfg(feature = "gpu-tests")]
 #[test]
+fn unique_28_bfloat16_executes_in_strict_cuda_session() {
+    use onnx_runtime_ep_cuda::{
+        CudaExecutionProvider, reset_unique_execution_stats, unique_execution_stats,
+    };
+
+    // Pinned ONNX 622adf94d4e720142950aa8178f7357d52e63db0:
+    // test_unique_bfloat16_sorted_without_axis, with concrete fixture output
+    // extents because the standalone executor preallocates leaf outputs.
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 28);
+    let input_id = graph.create_named_value("x", DataType::BFloat16, static_shape([6]));
+    graph.add_input(input_id);
+    let outputs = [
+        ("y", DataType::BFloat16, 4),
+        ("indices", DataType::Int64, 4),
+        ("inverse_indices", DataType::Int64, 6),
+        ("counts", DataType::Int64, 4),
+    ]
+    .map(|(name, dtype, len)| graph.create_named_value(name, dtype, static_shape([len])));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Unique",
+        vec![Some(input_id)],
+        outputs.to_vec(),
+    ));
+    for output in outputs {
+        graph.add_output(output);
+    }
+
+    let mut cuda = CudaExecutionProvider::new(0).expect("CUDA device 0");
+    cuda.initialize(&onnx_runtime_ep_api::EpConfig::default())
+        .expect("initialize CUDA");
+    let mut executor = Executor::build_with_cuda_requirement(
+        graph,
+        Arc::new(WeightStore::new()),
+        Arc::new(cuda),
+        true,
+    )
+    .expect("strict CUDA must place Unique-28 without CPU fallback");
+    let bytes =
+        |values: &[u16]| -> Vec<u8> { values.iter().flat_map(|bits| bits.to_le_bytes()).collect() };
+    let x = Tensor::from_raw(
+        DataType::BFloat16,
+        vec![6],
+        &bytes(&[0x4000, 0x3f80, 0x3f80, 0x4040, 0x4080, 0x4040]),
+    )
+    .unwrap();
+    reset_unique_execution_stats();
+    let y = executor.run(&[("x", &x)]).expect("native CUDA Unique-28");
+    assert_eq!(y.len(), 4);
+    assert_eq!(y[0].dtype, DataType::BFloat16);
+    assert_eq!(y[0].shape, [4]);
+    assert_eq!(y[0].as_bytes(), bytes(&[0x3f80, 0x4000, 0x4040, 0x4080]));
+    for (output, expected) in y[1..].iter().zip([
+        &[1, 0, 3, 4][..],
+        &[1, 0, 0, 2, 3, 2][..],
+        &[2, 1, 2, 1][..],
+    ]) {
+        assert_eq!(output.dtype, DataType::Int64);
+        assert_eq!(output.shape, [expected.len()]);
+        assert_eq!(output.to_vec_i64(), expected);
+    }
+    let stats = unique_execution_stats();
+    assert_eq!(stats.metadata_launches, 1);
+    assert_eq!(stats.materialize_launches, 1);
+    assert_eq!(stats.d2h_bytes, 8);
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
 fn sealed_bqmoe_executes_through_production_session_path() {
     use onnx_runtime_ep_cpu::kernels::block_quantized_moe::BLOCK_QUANT_MOE_DENSE_EXPANSIONS;
     use onnx_runtime_ep_cuda::CudaExecutionProvider;
@@ -9100,6 +9170,7 @@ fn coverage_collector_surfaces_ep_decline_reason() {
         "graph",
         &mut issues,
         false,
+        false,
     )
     .unwrap();
 
@@ -9168,7 +9239,7 @@ fn cuda_coverage_report_groups_all_distinct_failure_classes_deterministically() 
     )
     .unwrap();
     let report = || {
-        cuda_fallback_report(&graph, &ep, artifact_config, false)
+        cuda_fallback_report(&graph, &ep, artifact_config, false, false)
             .unwrap()
             .expect("CUDA declines must produce a fallback report")
             .to_string()
@@ -10591,11 +10662,12 @@ fn strict_cuda_partial_multinode_admission_rolls_back_once() {
         Ok(_) => panic!("strict CUDA must reject partial multi-node admission"),
         Err(error) => error,
     };
-    assert!(
-        error
-            .to_string()
-            .contains("injected kernel admission failure at decline_after_two_publications")
-    );
+    let SessionError::CudaKernelCreationFailed { node, source, .. } = error else {
+        panic!("expected a kernel creation failure, not a provider decline: {error}");
+    };
+    assert!(node.contains("decline_after_two_publications"), "{node}");
+    assert!(matches!(source, EpError::KernelFailed(message)
+        if message.contains("injected kernel admission failure at decline_after_two_publications")));
     assert_probe_rolled_back_once(&ep, 3);
 }
 

@@ -16,12 +16,15 @@ pub(crate) fn unsupported_reason_at_opset(
     let result = match node.op_type.as_str() {
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
         "GatherND" => gather_nd(node, opset, input_dtypes),
-        "ConvTranspose" => conv_transpose(node, opset, input_shapes, input_dtypes),
+        "Dropout" => {
+            onnx_runtime_ir::dropout::validate_claim(node, opset, input_shapes, input_dtypes)
+        }
         "AveragePool" => {
             return super::pooling::validate_average_claim(node, opset, input_shapes, input_dtypes)
                 .err()
                 .map(|error| error.to_string());
         }
+        "ConvTranspose" => conv_transpose(node, opset, input_shapes, input_dtypes),
         _ => return unsupported_reason(node, input_shapes, input_dtypes),
     };
     result
@@ -60,7 +63,6 @@ pub(crate) fn unsupported_reason(
         "DequantizePacked" => {
             onnx_runtime_ir::dequantize_packed::validate_claim(node, input_shapes, input_dtypes)
         }
-        "Dropout" => dropout(node, input_dtypes),
         "NonZero" => nonzero(node, input_dtypes),
         "AffineGrid" => affine_grid(node, input_dtypes),
         "BatchNormalization" => batch_normalization(node, input_dtypes),
@@ -379,11 +381,6 @@ fn dequantize_linear(node: &Node, input_dtypes: &[DataType]) -> Result<(), Strin
         return Err("zero_point dtype must match x".into());
     }
     Ok(())
-}
-
-fn dropout(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
-    required_arity(node, input_dtypes, 1, 1, 2)?;
-    require_fixed_width(input_dtypes, 0, "data")
 }
 
 fn nonzero(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {

@@ -338,6 +338,7 @@ pub fn output_dtype_constraints_for_op(
 pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataType] {
     // Byte-mover ops: dtype-agnostic (just copy bytes, no arithmetic).
     match (op_type, domain) {
+        ("Transpose", "") => onnx_runtime_ir::transpose::DTYPES,
         ("Identity", "")
         | ("Reshape", "")
         | ("Flatten", "")
@@ -347,7 +348,6 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("Concat", "")
         | ("Slice", "")
         | ("Split", "")
-        | ("Transpose", "")
         | ("Gather", "")
         | ("GatherElements", "")
         | ("GatherND", "")
@@ -602,6 +602,9 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("InstanceNormalization", "")
         | ("GroupNormalization", "")
         | ("PRelu", "") => FLOAT_DTYPES,
+        ("MeanVarianceNormalization", "") => {
+            onnx_runtime_ep_api::mean_variance_normalization::DTYPES
+        }
 
         // NCHWC domain ops: f32-only.
         (_, "com.microsoft.nchwc") => F32_ONLY,
@@ -742,6 +745,11 @@ pub mod conv;
 #[cfg(all(feature = "ops-cnn", not(feature = "mlas")))]
 #[path = "conv_ref.rs"]
 pub mod conv;
+// Research-only independent native Conv. The registry keeps its existing
+// feature-selected factory; backend_ab exposes the explicit comparison pair.
+#[cfg(all(feature = "ops-cnn", feature = "mlas"))]
+#[path = "conv_ref.rs"]
+pub(crate) mod conv_native;
 #[cfg(all(feature = "ops-cnn", feature = "mlas"))]
 pub mod nchwc;
 
@@ -1024,6 +1032,11 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
         OpKey::new("InstanceNormalization", "", 6),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(norm_ops::InstanceNormFactory),
+    );
+    registry.register(
+        OpKey::new("MeanVarianceNormalization", "", 29),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(norm_ops::MeanVarianceNormalizationFactory),
     );
     registry.register(
         OpKey::new("GroupNormalization", "", 18),
@@ -1660,16 +1673,13 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(unique::UniqueFactory),
     );
-    rec.register(
-        OpKey::new("Dropout", "", 13),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(dropout::DropoutFactory),
-    );
-    rec.register(
-        OpKey::new("Dropout", "", 22),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(dropout::DropoutFactory),
-    );
+    for version in [13, 22] {
+        rec.register(
+            OpKey::new("Dropout", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(dropout::DropoutFactory { opset: version }),
+        );
+    }
     rec.register(
         OpKey::new("Pad", "", 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -3529,7 +3539,8 @@ mod tests {
         // Opset 29 adds the three indexing revisions; ScatterElements also
         // gets a distinct opset 18 registration for max/min.
         // Opset-28 Cast adds one registration.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 124 + mlas_registrations);
+        // MeanVarianceNormalization-29 adds one registration.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 125 + mlas_registrations);
         for op in PHASE1_OPS {
             let since = reg
                 .earliest_since_version(op, "")
@@ -3655,6 +3666,8 @@ mod tests {
         assert!(reg.lookup("BatchNormalization", "", 7).is_some());
         assert!(reg.lookup("BatchNormalization", "", 6).is_none());
         assert!(reg.lookup("InstanceNormalization", "", 6).is_some());
+        assert!(reg.lookup("MeanVarianceNormalization", "", 29).is_some());
+        assert!(reg.lookup("MeanVarianceNormalization", "", 28).is_none());
         assert!(reg.lookup("GroupNormalization", "", 18).is_some());
         assert!(reg.lookup("GroupNormalization", "", 21).is_some());
         assert!(reg.lookup("GroupNormalization", "", 17).is_none());

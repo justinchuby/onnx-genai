@@ -1,0 +1,187 @@
+{
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/backend_ab.rs": "085185ee8924c85c002840dd89d2b5953de9dfcb8d469a3502e5ef77fd894707",
+    "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs": "56b5bf1de760e2d366dcac344d51f1c81a43dd32c1626ac5cf6bdd9d7bc95c53",
+    "crates/onnx-runtime-ep-cpu/src/kernels/mod.rs": "d789d04a9b1c4d2a1057d531292ff55734df24787ffa830befb9dcf216e29865",
+    "crates/onnx-runtime-ep-cpu/tests/conv_same_binary.rs": "565e3817a651d303d26fefb83fa5b62599420d43b3d163f46ff428b69973766b"
+  },
+  "results": [
+    {
+      "name": "default-conv",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::conv::tests::"
+      ],
+      "extra_env": {},
+      "exit": 0,
+      "log_sha256": "9c107ff0c37e53042406bb16d07f976ae4b67f40b54fc13faa7c31d6253f91b6",
+      "counts": [
+        [
+          "46",
+          "0",
+          "1"
+        ]
+      ]
+    },
+    {
+      "name": "default-registry",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--test",
+        "conv_same_binary",
+        "--",
+        "--nocapture"
+      ],
+      "extra_env": {},
+      "exit": 0,
+      "log_sha256": "a84a2563a00d25e871e0a93aec8e745653598c72167a4e0318e3fc092b63c499",
+      "counts": [
+        [
+          "1",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "allocation",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--test",
+        "conv_im2col_allocation"
+      ],
+      "extra_env": {},
+      "exit": 0,
+      "log_sha256": "9780596df2b00f6737fdb79503206c03710e5696985c84bc66a6e7d9aadd4147",
+      "counts": [
+        [
+          "1",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "pair-list",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--features",
+        "mlas",
+        "--test",
+        "conv_same_binary",
+        "--",
+        "--list"
+      ],
+      "extra_env": {},
+      "exit": 0,
+      "log_sha256": "79bb42c241d2f7de96d992e2648dca586da5f7fbe9fada95fcdbf9bf50aa5545"
+    },
+    {
+      "name": "pair",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--features",
+        "mlas",
+        "--test",
+        "conv_same_binary",
+        "--",
+        "--nocapture"
+      ],
+      "extra_env": {
+        "NXRT_CPU_GEMM_BACKEND": "mlas"
+      },
+      "exit": 0,
+      "log_sha256": "39a05bba18c8e2f3246ee17512d7f0df29f2a79b598d6d1655a8acc3cfd71a98",
+      "counts": [
+        [
+          "1",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "native-linked",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--features",
+        "mlas",
+        "--lib",
+        "kernels::conv_native::tests::"
+      ],
+      "extra_env": {
+        "NXRT_CPU_GEMM_BACKEND": "mlas"
+      },
+      "exit": 0,
+      "log_sha256": "b57c5883476635f34268b7b650eebdd7396aa7245b2c7d9f9be8ccc1822897d1",
+      "counts": [
+        [
+          "46",
+          "0",
+          "1"
+        ]
+      ]
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "extra_env": {},
+      "exit": 0,
+      "log_sha256": "85dc59b83f1d79d845405d19b5c7e9d0a3340b26ea43ae2fdede4b1bb90034cf"
+    },
+    {
+      "name": "clippy-mlas",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--features",
+        "mlas",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "extra_env": {},
+      "exit": 0,
+      "log_sha256": "5f6804a048090a9d9fa873d5114b410dae89d20ce791f7d03aeaac043317f73e"
+    }
+  ]
+}

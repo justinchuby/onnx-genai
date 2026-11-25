@@ -60,6 +60,216 @@ fn f32_initializer(name: &str) -> onnx::TensorProto {
 }
 
 #[test]
+fn constant_fp8_tensor_requires_its_schema_opset() {
+    use onnx_runtime_ir::DataType;
+    use onnx_runtime_loader::load_model_bytes;
+
+    for (dtype, minimum) in [
+        (DataType::Float8E4M3FN, 19),
+        (DataType::Float8E4M3FNUZ, 19),
+        (DataType::Float8E5M2, 19),
+        (DataType::Float8E5M2FNUZ, 19),
+        (DataType::Float8E8M0, 24),
+    ] {
+        let payload = vec![0x01, 0x7f, 0xff];
+        let mut constant = node("Constant", &[], &["Y"]);
+        constant.name = "fp8_value".into();
+        constant.attribute = vec![onnx::AttributeProto {
+            name: "value".into(),
+            r#type: onnx::attribute_proto::AttributeType::Tensor as i32,
+            t: Some(onnx::TensorProto {
+                data_type: dtype.to_onnx(),
+                dims: vec![3],
+                raw_data: payload.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        let mut model = model(onnx::GraphProto {
+            output: vec![value_info("Y")],
+            node: vec![constant],
+            ..Default::default()
+        });
+        model.ir_version = 12;
+        model.opset_import[0].version = minimum - 1;
+        let err = load_model_bytes(&model.encode_to_vec()).unwrap_err();
+        assert!(
+            matches!(&err, LoaderError::ConstantValueOpset {
+                node, dtype: rejected, opset, minimum: required
+            } if node.contains("fp8_value")
+                && *rejected == dtype
+                && *opset == (minimum - 1) as u64
+                && *required == minimum as u64),
+            "{dtype:?}: {err}"
+        );
+
+        model.opset_import[0].version = minimum;
+        let graph = load_model_bytes(&model.encode_to_vec()).unwrap();
+        let (_, node) = graph.nodes.iter().next().unwrap();
+        let Some(onnx_runtime_ir::Attribute::Tensor(value)) = node.attr("value") else {
+            panic!("loader must preserve the Constant node's tensor-valued attribute");
+        };
+        assert_eq!(value.dtype, dtype);
+        assert_eq!(value.data, payload);
+    }
+}
+
+#[test]
+fn constant_fp8_tensor_checks_original_opsets_before_inlining() {
+    use onnx_runtime_loader::load_model_bytes;
+
+    // Test a literal function value, a nested literal, a bound tensor, and a
+    // root Constant whose import would be raised by an unrelated function.
+    for (nested, bound, root) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        let value = onnx::AttributeProto {
+            name: "value".into(),
+            r#type: onnx::attribute_proto::AttributeType::Tensor as i32,
+            t: Some(onnx::TensorProto {
+                data_type: onnx_runtime_ir::DataType::Float8E4M3FN.to_onnx(),
+                dims: vec![1],
+                raw_data: vec![0x7f],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut constant = node("Constant", &[], &["Y"]);
+        constant.name = "local_fp8".into();
+        constant.attribute = if bound {
+            vec![onnx::AttributeProto {
+                ref_attr_name: "value".into(),
+                t: None,
+                ..value.clone()
+            }]
+        } else {
+            vec![value.clone()]
+        };
+        let mut function = onnx::FunctionProto {
+            domain: "local".into(),
+            name: "Make".into(),
+            output: vec!["Y".into()],
+            opset_import: vec![onnx::OperatorSetIdProto {
+                version: if root { 24 } else { 18 },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut call = node("Make", &[], &["Y"]);
+        call.domain = "local".into();
+        if bound {
+            function.attribute.push("value".into());
+            call.attribute.push(value);
+        }
+        let main_node = if root {
+            // An unused function still contributes its imported version.
+            let mut other = node("Constant", &[], &["Y"]);
+            other.attribute.push(onnx::AttributeProto {
+                name: "value_int".into(),
+                r#type: onnx::attribute_proto::AttributeType::Int as i32,
+                i: 1,
+                ..Default::default()
+            });
+            function.node.push(other);
+            constant
+        } else {
+            if nested {
+                let branch = onnx::GraphProto {
+                    node: vec![constant],
+                    output: vec![value_info("Y")],
+                    ..Default::default()
+                };
+                let mut conditional = node("If", &["cond"], &["Y"]);
+                conditional.attribute = vec![
+                    graph_attr("then_branch", branch.clone()),
+                    graph_attr("else_branch", branch),
+                ];
+                function.input.push("cond".into());
+                function.node.push(conditional);
+                call.input.push("cond".into());
+            } else {
+                function.node.push(constant);
+            }
+            call
+        };
+        let mut source = model(onnx::GraphProto {
+            node: vec![main_node],
+            input: if nested {
+                vec![value_info("cond")]
+            } else {
+                vec![]
+            },
+            output: vec![value_info("Y")],
+            ..Default::default()
+        });
+        source.ir_version = 12;
+        source.opset_import[0].version = if root { 18 } else { 24 };
+        source.opset_import.push(onnx::OperatorSetIdProto {
+            domain: "local".into(),
+            version: 1,
+        });
+        source.functions.push(function);
+        let err = load_model_bytes(&source.encode_to_vec()).unwrap_err();
+        assert!(
+            matches!(&err, LoaderError::ConstantValueOpset {
+                node, opset: 18, minimum: 19, ..
+            } if node.contains("local_fp8")),
+            "nested={nested}, bound={bound}, root={root}: {err}"
+        );
+    }
+}
+
+#[test]
+fn load_topk_checks_bfloat16_opset_after_inference() {
+    use onnx_runtime_ir::DataType;
+    for (opset, dtype, accepted) in [
+        (10, DataType::BFloat16, false),
+        (23, DataType::BFloat16, false),
+        (24, DataType::BFloat16, true),
+        (10, DataType::Float32, true),
+    ] {
+        let mut m = model(onnx::GraphProto {
+            node: vec![
+                node("Identity", &["source"], &["X"]),
+                node("TopK", &["X", "K"], &["Y", "I"]),
+            ],
+            initializer: vec![
+                onnx::TensorProto {
+                    name: "source".into(),
+                    dims: vec![2],
+                    data_type: dtype.to_onnx(),
+                    raw_data: vec![0; dtype.storage_bytes(2)],
+                    ..Default::default()
+                },
+                onnx::TensorProto {
+                    name: "K".into(),
+                    dims: vec![1],
+                    data_type: DataType::Int64.to_onnx(),
+                    int64_data: vec![1],
+                    ..Default::default()
+                },
+            ],
+            output: vec![value_info("Y"), value_info("I")],
+            ..Default::default()
+        });
+        m.opset_import[0].version = opset;
+        let loaded = onnx_runtime_loader::load_model_bytes(&m.encode_to_vec());
+        if accepted {
+            assert!(
+                loaded.is_ok(),
+                "opset={opset}, {dtype:?}: {:?}",
+                loaded.err()
+            );
+        } else {
+            assert!(matches!(loaded, Err(LoaderError::InvalidTopK { .. })));
+        }
+    }
+}
+
+#[test]
 fn duplicate_value_producer_is_rejected_and_unique_values_load() {
     let duplicate = onnx::GraphProto {
         input: vec![value_info("X")],

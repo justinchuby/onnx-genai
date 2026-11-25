@@ -1,0 +1,90 @@
+{
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs": "efe67a79c0e45ef7c6d6ad306772e97066bb99b77ebfd71305e618d20eb5e55f",
+    "crates/onnx-runtime-ep-cpu/tests/conv_im2col_allocation.rs": "92ec6e6f315d451882c4aa01321c4e2f08936efa6afff44698dc907a187fc8d8"
+  },
+  "results": [
+    {
+      "name": "list",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::conv::tests::",
+        "--",
+        "--list"
+      ],
+      "extra_env": {},
+      "exit": 0,
+      "log_sha256": "6372f21f0540f3d396ec1f942acf5205560dd4966fc2fc86b85546aa81aaa821"
+    },
+    {
+      "name": "conv",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::conv::tests::"
+      ],
+      "extra_env": {},
+      "exit": 0,
+      "log_sha256": "c480b7faaaabb009b28f28f494c04ba39634f512fca420c1794a282ccb2d41aa",
+      "counts": [
+        [
+          "46",
+          "0",
+          "1"
+        ]
+      ]
+    },
+    {
+      "name": "conv-generic",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::conv::tests::gemm_driver_matches_exact_scalar_values_across_groups_batches_and_empty_axes",
+        "--",
+        "--exact"
+      ],
+      "extra_env": {
+        "NXRT_CPU_GEMM_BACKEND": "generic"
+      },
+      "exit": 0,
+      "log_sha256": "a4fbc43d601d1cbf270047c805336de647d092b5ff21ea92a9095c1be761ccc9",
+      "counts": [
+        [
+          "1",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "allocation",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--test",
+        "conv_im2col_allocation",
+        "--",
+        "--nocapture"
+      ],
+      "extra_env": {},
+      "exit": 101,
+      "log_sha256": "eddef2be779f7e8a8c9fb3f703b51311acc23ba6f0cef15b4c2086ecf76db5d3"
+    }
+  ]
+}
