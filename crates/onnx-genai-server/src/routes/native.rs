@@ -874,10 +874,18 @@ fn final_value(
         value["timings"] = crate::timings::render(sample);
     }
     let content = text_before_stop(&result.text, stops);
-    let stopping_word = match result.finish_reason {
-        FinishReason::StopSequence { index } => stops.get(index).map(String::as_str).unwrap_or(""),
-        _ => "",
-    };
+    // The upstream diagnostic survives a later time/EOS stop-type override.
+    let stopping_word = onnx_genai_engine::logits::first_text_stop(
+        &result.text,
+        stops
+            .iter()
+            .enumerate()
+            .map(|(index, stop)| (index, stop.as_str())),
+        0,
+    )
+    .and_then(|(_, index)| stops.get(index))
+    .map(String::as_str)
+    .unwrap_or("");
     metadata.decorate(&mut value, content.contains('\n'), stopping_word);
     value
 }

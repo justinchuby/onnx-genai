@@ -8450,16 +8450,18 @@ mod native_compat {
         let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
         vocab.remove("tok22");
-        vocab.insert("line\nEND".into(), json!(22));
+        vocab.insert("line\nENDtail".into(), json!(22));
         std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
         let router = app(AppState::load(scratch.path(), Some("metadata".into())).unwrap());
         for stream in [false, true] {
-            for (stop, budget, visible_newline) in
-                [("END", 4, true), ("line\nEND", 4, false), ("END", 0, false)]
-            {
+            for (stop, budget, visible_newline) in [
+                ("END", 4, true),
+                ("line\nENDtail", 4, false),
+                ("END", 0, false),
+            ] {
                 let body = json!({"prompt":[2,4,3],"n_predict":budget,"stream":stream,
                     "temperature":0,"top_k":7,"top_p":0.5,"seed":17,"ignore_eos":true,
-                    "samplers":["top_k","temperature"],"logit_bias":{"22":100},"stop":["unmatched",stop]});
+                    "samplers":["top_k","temperature"],"logit_bias":{"22":100},"stop":["tail",stop]});
                 let response = request(router.clone(), "/completion", body.clone()).await;
                 assert_eq!(response.status(), StatusCode::OK);
                 let value = if stream {
@@ -8470,6 +8472,7 @@ mod native_compat {
                 };
                 assert_eq!(value["prompt"], "<bos> hello <eos>");
                 assert_eq!(value["has_new_line"], visible_newline);
+                assert_eq!(value["tokens_predicted"], if budget == 0 { 0 } else { 1 });
                 assert_eq!(value["stopping_word"], if budget == 0 { "" } else { stop });
                 #[cfg(feature = "native-backend")]
                 assert_eq!(value["id_slot"], 0);
@@ -8503,6 +8506,53 @@ mod native_compat {
                     projected,
                     json!({"prompt":value["prompt"],"generation_settings/top_k":7,"has_new_line":visible_newline,"stopping_word":value["stopping_word"]})
                 );
+            }
+        }
+        for path in ["/v1/completions", "/v1/chat/completions"] {
+            for stream in [false, true] {
+                let chat = path.contains("/chat/");
+                let mut body = json!({"max_tokens":4,"temperature":0,"logit_bias":{"22":100},
+                    "stop":["tail","END"],"stream":stream});
+                if chat {
+                    body["messages"] = json!([{"role":"user","content":"hello"}]);
+                    body["logprobs"] = json!(true);
+                    body["top_logprobs"] = json!(1);
+                } else {
+                    body["prompt"] = json!("hello");
+                    body["logprobs"] = json!(1);
+                }
+                let response = request(router.clone(), path, body).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                if stream {
+                    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                    let events = sse_json_events(&bytes);
+                    assert!(
+                        events
+                            .iter()
+                            .any(|event| event["choices"][0]["finish_reason"] == "stop")
+                    );
+                    let text = events
+                        .iter()
+                        .filter_map(|event| {
+                            if chat {
+                                event["choices"][0]["delta"]["content"].as_str()
+                            } else {
+                                event["choices"][0]["text"].as_str()
+                            }
+                        })
+                        .collect::<String>();
+                    assert_eq!(text, "line\n");
+                } else {
+                    let value = json_body(response).await;
+                    assert_eq!(value["choices"][0]["finish_reason"], "stop");
+                    assert_eq!(value["usage"]["completion_tokens"], 1);
+                    let text = if chat {
+                        &value["choices"][0]["message"]["content"]
+                    } else {
+                        &value["choices"][0]["text"]
+                    };
+                    assert_eq!(text, "line\n");
+                }
             }
         }
         for stream in [false, true] {
@@ -8562,6 +8612,68 @@ mod native_compat {
                 "{prompt}"
             );
             assert_eq!(row["generation_settings/n_predict"], 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_stop_word_diagnostic_survives_a_real_eos_priority_override() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        copy_tree(&source, scratch.path());
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+        vocab.remove("tok22");
+        vocab.insert("line\nENDtail".into(), json!(22));
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let path = scratch.path().join("inference_metadata.yaml");
+        let mut metadata: serde_yaml::Value =
+            serde_yaml::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        metadata["schema_version"] = serde_yaml::Value::String("v1.9".into());
+        metadata["pipeline"]["workflow"]["publication_mode"] =
+            serde_yaml::Value::String("commit_only".into());
+        for output in metadata["pipeline"]["workflow"]["outputs"]
+            .as_mapping_mut()
+            .unwrap()
+            .values_mut()
+        {
+            output["family"] = serde_yaml::to_value(json!({"kind":"materialized"})).unwrap();
+        }
+        metadata["package"] = serde_yaml::to_value(json!({"tokenizer":{
+            "algorithm":"wordlevel","vocab_size":32,"byte_level":false,
+            "artifacts":[{"location":"tokenizer.json"}],"special_tokens":{"eos_token_id":[22]}
+        }}))
+        .unwrap();
+        std::fs::write(path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
+        let router = app(AppState::load(scratch.path(), Some("stop-eos".into())).unwrap());
+        for stream in [false, true] {
+            let response = request(
+                router.clone(),
+                "/completion",
+                json!({
+                    "prompt":"hello","n_predict":4,"temperature":0,"logit_bias":{"22":100},
+                    "preserved_tokens":["line\nENDtail"],"stop":["tail","END"],"stream":stream
+                }),
+            )
+            .await;
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
+            let result = if stream {
+                sse_json_events(&bytes).last().unwrap().clone()
+            } else {
+                serde_json::from_slice::<Value>(&bytes).unwrap()
+            };
+            assert_eq!(result["stop_type"], "eos");
+            assert_eq!(result["stopping_word"], "END");
+            assert_eq!(result["tokens_predicted"], 1);
+            assert_eq!(result["has_new_line"], true);
         }
     }
 
