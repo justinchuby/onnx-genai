@@ -2314,3 +2314,28 @@ passed with one inherited ignore, full server library 593 passed with two
 inherited ignores. Default engine/server all-target strict Clippy, no-default
 engine strict Clippy, formatting and diff checks passed on macOS ARM64 CPU.
 The unchecked goal acceptance rows remain required.
+
+
+## Authored workflow output stops
+
+The shared output observer now applies ordinary text/token stop sequences to
+candidate-tree, DFlash and generic authored loops as well as prediction time.
+The shared processor builder preserves observer priority. Token-only controls
+work without a tokenizer; text controls require one explicitly. Generic loops
+also enforce request-wide token budgets and EOS independently of authored loop
+iteration bounds. Their current body finishes atomically before the next body
+is suppressed; over-budget atomic emission rejects the whole turn.
+
+Specialized drivers retain the accepted prefix before state recomputation.
+Terminal decoder flushing occurs before semantic commit, allowing pending UTF-8
+to trigger a text stop and preserving rollback if its byte budget fails.
+Tests compare real specialized state continuations with budgeted references,
+exercise a real ONNX generic recurrence, and check buffered/callback publication,
+EOF decoding, EOS priority, missing-tokenizer admission and failed-turn retry.
+Validation: full DFlash 26, candidate-tree 32 and workflow policy 28 tests
+passed. After rebasing onto main 1ef2439da, full engine library 1086 passed
+with one inherited ignore and full server library 593 passed with two inherited
+ignores. Default engine/server all-target strict Clippy, no-default engine
+all-target strict Clippy, formatting and diff checks passed on macOS ARM64 CPU.
+The general goal remains incomplete; indentation stopping and unchecked
+acceptance rows remain required.

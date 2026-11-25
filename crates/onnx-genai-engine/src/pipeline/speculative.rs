@@ -585,7 +585,7 @@ struct CandidateTreeWorkflowHost<'a> {
     loop_stop: Option<super::GenerationStopReason>,
     staged_output_observer: Option<&'a mut super::ToolCallStagedOutputObserver>,
     staged_output_finalized: bool,
-    prediction_limit: Option<super::generation::PredictionLimitObserver>,
+    output_observer: Option<super::generation::GenerationOutputObserver>,
 }
 
 impl CandidateTreeWorkflowHost<'_> {
@@ -638,6 +638,17 @@ impl CandidateTreeWorkflowHost<'_> {
     fn finalize_staged_output(&mut self, boundary: &'static str) -> anyhow::Result<()> {
         if self.staged_output_finalized {
             return Ok(());
+        }
+        if let Some(output) = self.output_observer.as_mut() {
+            output
+                .finish(self.tokenizer, self.options)
+                .with_context(|| {
+                    format!("finalize candidate-tree output controls at {boundary}")
+                })?;
+            if let Some(reason) = output.stop_reason() {
+                self.finish_reason = reason.finish_reason();
+                self.loop_stop = Some(reason.clone());
+            }
         }
         if let Some(stop) =
             finalize_candidate_staged_output(self.staged_output_observer.as_deref_mut(), boundary)?
@@ -868,20 +879,11 @@ impl CandidateTreeWorkflowHost<'_> {
              the authored control path must not enter the seam after it becomes zero-trip",
             self.plan.target_path
         );
-        if let Some(limit) = self.prediction_limit.as_mut() {
-            let accepted = limit.observe_prefix(
-                self.tokenizer.context(
-                    "candidate-tree prediction time limits require the package tokenizer",
-                )?,
-                &committed,
-            )?;
+        if let Some(limit) = self.output_observer.as_mut() {
+            let accepted = limit.observe_prefix(self.tokenizer, &committed, self.options)?;
             committed.truncate(accepted);
-            if limit.stopped()
-                && !committed
-                    .last()
-                    .is_some_and(|token| self.options.terminates(*token))
-            {
-                self.finish_reason = FinishReason::PredictionTimeLimit;
+            if let Some(reason) = limit.stop_reason() {
+                self.finish_reason = reason.finish_reason();
             }
         }
         let mut accepted_context = pending.context.clone();
@@ -919,8 +921,12 @@ impl CandidateTreeWorkflowHost<'_> {
                     )
                 })?;
         }
-        let loop_stop = if self.finish_reason == FinishReason::PredictionTimeLimit {
-            Some(super::GenerationStopReason::PredictionTimeLimit)
+        let loop_stop = if let Some(reason) = self
+            .output_observer
+            .as_ref()
+            .and_then(|observer| observer.stop_reason())
+        {
+            Some(reason.clone())
         } else if self.finish_reason == FinishReason::EosToken {
             Some(super::GenerationStopReason::EosCommitted)
         } else if self.generated.len() >= self.options.max_new_tokens {
@@ -946,8 +952,7 @@ impl CandidateTreeWorkflowHost<'_> {
         let mut context = self.complete_target(values)?;
         if self.plan.execution_mode == CandidateTreeExecutionMode::DrainAtSeam {
             while self.generated.len() < self.options.max_new_tokens
-                && self.finish_reason != FinishReason::EosToken
-                && self.finish_reason != FinishReason::PredictionTimeLimit
+                && self.loop_stop.is_none()
                 && !self
                     .options
                     .max_context
@@ -956,7 +961,7 @@ impl CandidateTreeWorkflowHost<'_> {
                 self.invoke_proposer(context, values)?;
                 context = self.complete_target(values)?;
             }
-            if self.finish_reason != FinishReason::PredictionTimeLimit
+            if self.loop_stop.is_none()
                 && self
                     .options
                     .max_context
@@ -1711,15 +1716,12 @@ impl WorkflowRuntime {
                 &options.effective_preserved_tokens(),
             );
         }
-        if options
-            .max_prediction_time
-            .is_some_and(|limit| !limit.is_zero())
-        {
-            anyhow::ensure!(
-                tokenizer.is_some(),
-                "candidate-tree prediction time limits require the package tokenizer; declare one before requesting the limit"
-            );
-        }
+        let output_observer = super::generation::GenerationOutputObserver::new(
+            options,
+            tokenizer,
+            super::generation::OutputObservationMode::AcceptedPrefix,
+        )
+        .context("admit candidate-tree generation output controls")?;
         let mut execution = super::WorkflowExecutionPlan::new_candidate_tree_driver(self, request)?;
         let mut host = CandidateTreeWorkflowHost {
             runtime: self,
@@ -1743,10 +1745,7 @@ impl WorkflowRuntime {
             loop_stop: None,
             staged_output_observer,
             staged_output_finalized: false,
-            prediction_limit: options
-                .max_prediction_time
-                .filter(|limit| !limit.is_zero())
-                .map(|limit| super::generation::PredictionLimitObserver::new(options, limit)),
+            output_observer,
         };
         {
             let mut hosted: Option<&mut dyn super::workflow::WorkflowNodeHost> = Some(&mut host);
@@ -2406,15 +2405,12 @@ impl WorkflowRuntime {
                 budget_cap: None,
             });
         }
-        if options
-            .max_prediction_time
-            .is_some_and(|limit| !limit.is_zero())
-        {
-            anyhow::ensure!(
-                tokenizer.is_some(),
-                "DFlash prediction time limits require the package tokenizer; declare one before requesting the limit"
-            );
-        }
+        let mut output_observer = super::generation::GenerationOutputObserver::new(
+            options,
+            tokenizer,
+            super::generation::OutputObservationMode::AcceptedPrefix,
+        )
+        .context("admit DFlash generation output controls")?;
         let mut turn = super::TurnTransaction::admit_runtime_participant(
             self.worker.next_turn_transaction_id(),
         );
@@ -2423,10 +2419,6 @@ impl WorkflowRuntime {
         }
         let mut context_start = i64::try_from(initial_tokens.len())
             .context("DFlash prompt length exceeds the absolute position type")?;
-        let mut prediction_limit = options
-            .max_prediction_time
-            .filter(|limit| !limit.is_zero())
-            .map(|limit| super::generation::PredictionLimitObserver::new(options, limit));
         let mut generated = Vec::with_capacity(options.max_new_tokens);
         let mut random = StdRng::seed_from_u64(options.seed.unwrap_or(0));
         let mut finish_reason = FinishReason::MaxTokens;
@@ -2561,7 +2553,7 @@ impl WorkflowRuntime {
             {
                 committed_path.truncate(eos + 1);
             }
-            if let Some(limit) = prediction_limit.as_mut() {
+            if let Some(limit) = output_observer.as_mut() {
                 let observed = committed_path
                     .iter()
                     .map(|token| {
@@ -2569,19 +2561,12 @@ impl WorkflowRuntime {
                             .context("DFlash predicted token is outside the u32 domain")
                     })
                     .collect::<anyhow::Result<Vec<_>>>()
-                    .and_then(|tokens| {
-                        limit.observe_prefix(
-                            tokenizer.context(
-                                "DFlash prediction time limits require the package tokenizer",
-                            )?,
-                            &tokens,
-                        )
-                    });
+                    .and_then(|tokens| limit.observe_prefix(tokenizer, &tokens, options));
                 match observed {
                     Ok(accepted) => committed_path.truncate(accepted),
                     Err(error) => {
                         let mut error = error.context(
-                            "DFlash prediction time-limit observation failed before state commit",
+                            "DFlash generation output observation failed before state commit",
                         );
                         if let Err(rollback) = self.abort_dflash_state_transaction(
                             transaction,
@@ -2589,23 +2574,19 @@ impl WorkflowRuntime {
                             super::TurnAbortReason::ExecutionFailure,
                         ) {
                             error = error.context(format!(
-                                "restore DFlash prediction observer baseline failed: {rollback:#}"
+                                "restore DFlash output observer baseline failed: {rollback:#}"
                             ));
                         }
                         if let Err(abort) = turn.abort(super::TurnAbortReason::ExecutionFailure) {
                             error = error.context(format!(
-                                "abort DFlash prediction observer turn failed: {abort:#}"
+                                "abort DFlash output observer turn failed: {abort:#}"
                             ));
                         }
                         return Err(error);
                     }
                 }
-                if limit.stopped()
-                    && !committed_path.last().is_some_and(|token| {
-                        options.terminates(u32::try_from(*token).unwrap_or(u32::MAX))
-                    })
-                {
-                    finish_reason = FinishReason::PredictionTimeLimit;
+                if let Some(reason) = limit.stop_reason() {
+                    finish_reason = reason.finish_reason();
                 }
             }
             let committed_drafts = acceptance
@@ -2701,12 +2682,29 @@ impl WorkflowRuntime {
             staged_contract_executions = staged_contract_executions.saturating_add(1);
             if matches!(
                 finish_reason,
-                FinishReason::EosToken | FinishReason::PredictionTimeLimit
+                FinishReason::EosToken
+                    | FinishReason::PredictionTimeLimit
+                    | FinishReason::StopSequence { .. }
             ) {
                 break;
             }
         }
 
+        if let Some(output) = output_observer.as_mut() {
+            if let Err(error) = output.finish(tokenizer, options) {
+                let mut error =
+                    error.context("finalize DFlash output controls before semantic commit");
+                if let Err(abort) = turn.abort(super::TurnAbortReason::ExecutionFailure) {
+                    error = error.context(format!(
+                        "abort DFlash output finalization failed: {abort:#}"
+                    ));
+                }
+                return Err(error);
+            }
+            if let Some(reason) = output.stop_reason() {
+                finish_reason = reason.finish_reason();
+            }
+        }
         let text = tokenizer
             .map(|tokenizer| {
                 crate::tokenization::decode_output(

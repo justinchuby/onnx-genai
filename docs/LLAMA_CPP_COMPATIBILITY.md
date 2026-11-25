@@ -393,8 +393,19 @@ toward zero before checking the signed 64-bit millisecond range; for example,
 Native, OpenAI completion/chat, Responses and Anthropic generation share this
 request field. Native speculative, candidate-tree and DFlash execution stop at
 the accepted token prefix and finalize physical state before publication.
-Generic authored workflows observe their declared emitted units and stop before
-the next unit; an already emitted unit is retained atomically.
+Generic authored workflows observe emitted tokens and stop before entering the
+next loop body. The current body finishes atomically, including its declared
+state updates. The request token budget bounds all emitted output even when an
+authored loop declares a larger iteration count; a body that would exceed that
+budget fails and rolls back the turn before publication.
+
+Text and token-ID stop sequences also apply to generic authored workflows,
+candidate-tree and DFlash execution. Specialized drivers truncate the accepted
+prefix before repairing state. Text stops and prediction-time limits require a
+package tokenizer; token-ID stops, EOS and token budgets do not. Empty stop
+sequences are inert. Pending decoder bytes are finalized before semantic commit,
+so an EOF text stop receives its actual stop reason, and a decoding or byte-bound
+failure leaves session state and callbacks uncommitted.
 
 Ordinary runtime-owned decoder generation returns llama.cpp `timings` in native,
 OpenAI completion and chat buffered results and final SSE chunks. Setting

@@ -8,10 +8,13 @@ use onnx_genai_engine::{
 use onnx_genai_ort::{DataType, SessionOptions, Value};
 
 fn package(name: &str, metadata: &str, models: &[(&str, &str)]) -> anyhow::Result<PathBuf> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/test-fixtures/workflow-policy")
-        .join(name);
+    let root =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-fixtures/workflow-policy");
     fs::create_dir_all(&root)?;
+    let root = tempfile::Builder::new()
+        .prefix(&format!("{name}-"))
+        .tempdir_in(root)?
+        .keep();
     fs::write(root.join("inference_metadata.yaml"), metadata)?;
     for (name, model) in models {
         fs::write(root.join(name), model)?;
@@ -3577,10 +3580,7 @@ pipeline:
     Ok(())
 }
 
-#[test]
-fn prediction_time_limit_stops_generic_authored_emission_without_cancelling_commit()
--> anyhow::Result<()> {
-    let metadata = r#"
+const GENERIC_OUTPUT_LOOP: &str = r#"
 pipeline:
   workflow:
     manifest: {adapter_abis: {}}
@@ -3617,6 +3617,11 @@ pipeline:
         max_iterations: iterations
         carried: []
 "#;
+
+#[test]
+fn prediction_time_limit_stops_generic_authored_emission_without_cancelling_commit()
+-> anyhow::Result<()> {
+    let metadata = GENERIC_OUTPUT_LOOP;
     for streaming in [false, true] {
         let root = package(
             if streaming {
@@ -3674,5 +3679,495 @@ pipeline:
         request.options.max_new_tokens = 4;
         assert_eq!(engine.generate(request)?.token_ids, vec![0; 4]);
     }
+    Ok(())
+}
+
+#[test]
+fn output_stops_control_generic_loops_without_requiring_tokenizers_for_token_ids()
+-> anyhow::Result<()> {
+    use onnx_genai_engine::logits::StopSequence;
+    use onnx_genai_engine::{FinishReason, GenerationControl};
+    for text_stop in [false, true] {
+        for streaming in [false, true] {
+            let root = package("output-stop-generic", GENERIC_OUTPUT_LOOP, &[])?;
+            assert!(!root.join("tokenizer.json").exists());
+            if text_stop {
+                fs::write(
+                    root.join("tokenizer.json"),
+                    serde_json::to_vec(&serde_json::json!({
+                        "version":"1.0","added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,
+                        "model":{"type":"WordLevel","vocab":{"preENDtail":0,"<unk>":1},"unk_token":"<unk>"}
+                    }))?,
+                )?;
+            }
+            let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+            let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![]));
+            request.options.max_new_tokens = 8;
+            request.options.stop_on_eos = false;
+            request.options.stop_sequences = if text_stop {
+                vec![
+                    StopSequence::Text("tail".into()),
+                    StopSequence::Text("END".into()),
+                ]
+            } else {
+                request.options.max_constraint_bytes = 0;
+                vec![StopSequence::Tokens(vec![0, 0])]
+            };
+            let count = if text_stop { 1 } else { 2 };
+            let reason = FinishReason::StopSequence {
+                index: usize::from(text_stop),
+            };
+            let mut delivered = Vec::new();
+            let mut callback = |token: onnx_genai_engine::GenerateToken| {
+                delivered.push(token);
+                Ok(())
+            };
+            let result = engine.generate_with_control_callbacks(
+                request.clone(),
+                GenerationControl::new(),
+                None,
+                if streaming { Some(&mut callback) } else { None },
+            )?;
+            assert_eq!(result.token_ids, vec![0; count]);
+            assert_eq!(result.finish_reason, reason);
+            if !text_stop {
+                assert!(result.text.is_empty());
+            }
+            if streaming {
+                assert_eq!(
+                    delivered
+                        .iter()
+                        .map(|token| token.token_id)
+                        .collect::<Vec<_>>(),
+                    result.token_ids
+                );
+                assert_eq!(delivered.last().unwrap().finish_reason, Some(reason));
+            }
+            engine.take_committed_workflow_publications();
+            if text_stop {
+                let mut invalid = request.clone();
+                invalid.options.max_constraint_bytes = 0;
+                let mut unexpected = Vec::new();
+                let error = engine
+                    .generate_with_control_callbacks(
+                        invalid,
+                        GenerationControl::new(),
+                        None,
+                        Some(&mut |token| {
+                            unexpected.push(token);
+                            Ok(())
+                        }),
+                    )
+                    .expect_err("output observer must reject its byte bound before commit");
+                assert!(
+                    format!("{error:#}").contains("max_constraint_bytes=0"),
+                    "{error:#}"
+                );
+                assert!(unexpected.is_empty());
+                assert!(engine.take_committed_workflow_publications().is_empty());
+            }
+            request.options.stop_sequences.clear();
+            request.options.max_new_tokens = 4;
+            assert_eq!(engine.generate(request)?.token_ids, vec![0; 4]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn output_stops_reject_missing_text_tokenizers_but_accept_inert_controls() -> anyhow::Result<()> {
+    use onnx_genai_engine::logits::StopSequence;
+    let root = package("output-stop-generic-admission", GENERIC_OUTPUT_LOOP, &[])?;
+    assert!(!root.join("tokenizer.json").exists());
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![]));
+    request.options.max_new_tokens = 4;
+    request.options.stop_on_eos = false;
+    request.options.stop_sequences = vec![StopSequence::Text("END".into())];
+    let mut unexpected = Vec::new();
+    let error = engine
+        .generate_with_control_callbacks(
+            request.clone(),
+            onnx_genai_engine::GenerationControl::new(),
+            None,
+            Some(&mut |token| {
+                unexpected.push(token);
+                Ok(())
+            }),
+        )
+        .expect_err("text control must require a tokenizer before execution");
+    assert!(
+        format!("{error:#}").contains("package tokenizer"),
+        "{error:#}"
+    );
+    assert!(unexpected.is_empty());
+    assert!(engine.take_committed_workflow_publications().is_empty());
+    request.options.max_prediction_time = Some(std::time::Duration::ZERO);
+    request.options.stop_sequences = vec![
+        StopSequence::Text(String::new()),
+        StopSequence::Tokens(vec![]),
+    ];
+    let result = engine.generate(request)?;
+    assert_eq!(result.token_ids, vec![0; 4]);
+    assert_eq!(
+        result.finish_reason,
+        onnx_genai_engine::FinishReason::MaxTokens
+    );
+    Ok(())
+}
+
+const STATEFUL_OUTPUT_LOOP: &str = r#"
+schema_version: v1.9
+pipeline:
+  workflow:
+    publication_mode: commit_only
+    manifest: {adapter_abis: {}}
+    inputs:
+      initial:
+        contract: {dtype: int64, shape: [1]}
+        role: {kind: opaque}
+        source: {kind: literal}
+        default: 0
+      increment:
+        contract: {dtype: int64, shape: [1]}
+        role: {kind: opaque}
+        source: {kind: literal}
+        default: 1
+      active:
+        contract: {dtype: bool, shape: []}
+        role: {kind: opaque}
+        source: {kind: literal}
+        default: true
+      iterations:
+        contract: {dtype: int64, shape: []}
+        role: {kind: runtime, version: v1, role: max_output_tokens}
+        source: {kind: request}
+        required: true
+    outputs:
+      tokens:
+        contract: {dtype: int64, shape: [generated]}
+        role: tokens
+        family: {kind: materialized}
+        stage: pre_adapter
+    components:
+      update:
+        implementation: {kind: onnx, artifact: counter.onnx.textproto}
+        ports:
+          inputs:
+            current: {dtype: int64, shape: [1]}
+            update: {dtype: int64, shape: [1]}
+          outputs:
+            next: {dtype: int64, shape: [1]}
+    state:
+      counter:
+        contract: {dtype: int64, shape: [1]}
+        class: semantic
+        scope: session
+        initializer: initial
+        recurrence: {kind: invariant}
+        session: {policy: exclusive}
+    steps:
+      - kind: loop
+        steps:
+          - kind: emit
+            value: counter
+            output: tokens
+            mode: append
+          - kind: invoke
+            component: update
+            inputs: {current: counter, update: increment}
+            outputs: {next: counter.next}
+        continue_when: active
+        max_iterations: iterations
+        carried: [{cell: counter, next: counter.next}]
+"#;
+
+#[test]
+fn output_stops_commit_real_generic_recurrence_and_roll_back_observer_failure() -> anyhow::Result<()>
+{
+    use onnx_genai_engine::logits::StopSequence;
+    use onnx_genai_engine::{FinishReason, GenerationControl};
+    for text_stop in [false, true] {
+        for streaming in [false, true] {
+            let model = ADD_STATE.replace("shape {}", "shape { dim { dim_value: 1 } }");
+            let root = package(
+                "output-stop-generic-state",
+                STATEFUL_OUTPUT_LOOP,
+                &[("counter.onnx.textproto", &model)],
+            )?;
+            if text_stop {
+                let vocab: serde_json::Map<String, serde_json::Value> = (0..16)
+                    .map(|id| {
+                        let name = match id {
+                            0 => "preENDtail".into(),
+                            1 => "<unk>".into(),
+                            _ => format!("word_{id}"),
+                        };
+                        (name, serde_json::json!(id))
+                    })
+                    .collect();
+                fs::write(
+                    root.join("tokenizer.json"),
+                    serde_json::to_vec(&serde_json::json!({
+                        "version":"1.0","added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,
+                        "model":{"type":"WordLevel","vocab":vocab,"unk_token":"<unk>"}
+                    }))?,
+                )?;
+            }
+            let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+            let session = engine.create_session()?;
+            let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![]));
+            request.options.max_new_tokens = 8;
+            request.options.stop_on_eos = false;
+            request.options.stop_sequences = if text_stop {
+                vec![
+                    StopSequence::Text("tail".into()),
+                    StopSequence::Text("END".into()),
+                ]
+            } else {
+                vec![StopSequence::Tokens(vec![0, 1])]
+            };
+            let count = if text_stop { 1 } else { 2 };
+            let mut delivered = Vec::new();
+            let mut callback = |token: onnx_genai_engine::GenerateToken| {
+                delivered.push(token);
+                Ok(())
+            };
+            let result = engine.generate_in_session_with_control_callbacks(
+                session,
+                request.clone(),
+                GenerationControl::new(),
+                None,
+                if streaming { Some(&mut callback) } else { None },
+            )?;
+            assert_eq!(result.token_ids, (0..count as u32).collect::<Vec<_>>());
+            assert_eq!(
+                result.finish_reason,
+                FinishReason::StopSequence {
+                    index: usize::from(text_stop)
+                }
+            );
+            assert_eq!(engine.session_token_count(session)?, count);
+            if streaming {
+                assert_eq!(
+                    delivered
+                        .iter()
+                        .map(|token| token.token_id)
+                        .collect::<Vec<_>>(),
+                    result.token_ids
+                );
+            }
+            engine.take_committed_workflow_publications();
+            if text_stop {
+                let mut invalid = request.clone();
+                invalid.options.max_constraint_bytes = 0;
+                let mut unexpected = Vec::new();
+                let error = engine
+                    .generate_in_session_with_control_callbacks(
+                        session,
+                        invalid,
+                        GenerationControl::new(),
+                        None,
+                        Some(&mut |token| {
+                            unexpected.push(token);
+                            Ok(())
+                        }),
+                    )
+                    .expect_err("observer failure must abort the real counter turn");
+                assert!(
+                    format!("{error:#}").contains("max_constraint_bytes=0"),
+                    "{error:#}"
+                );
+                assert!(unexpected.is_empty());
+                assert!(engine.take_committed_workflow_publications().is_empty());
+                assert_eq!(engine.session_token_count(session)?, count);
+            }
+            request.options.stop_sequences.clear();
+            request.options.max_new_tokens = 4;
+            let retry = engine.generate_in_session(session, request)?;
+            assert_eq!(
+                retry.token_ids,
+                (count as u32..count as u32 + 4).collect::<Vec<_>>()
+            );
+            assert_eq!(engine.session_token_count(session)?, count + 4);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn output_stops_honor_generic_eos_alone_and_before_token_stops() -> anyhow::Result<()> {
+    use onnx_genai_engine::logits::StopSequence;
+    use onnx_genai_engine::{FinishReason, GenerationControl};
+    for token_stop in [false, true] {
+        let root = package("output-stop-generic-eos", GENERIC_OUTPUT_LOOP, &[])?;
+        let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![]));
+        request.options.max_new_tokens = 8;
+        request.options.eos_token_id = Some(0);
+        request.options.stop_on_eos = true;
+        if token_stop {
+            request.options.stop_sequences = vec![StopSequence::Tokens(vec![0])];
+        }
+        let mut delivered = Vec::new();
+        let result = engine.generate_with_control_callbacks(
+            request,
+            GenerationControl::new(),
+            None,
+            Some(&mut |token: onnx_genai_engine::GenerateToken| {
+                delivered.push(token);
+                Ok(())
+            }),
+        )?;
+        assert_eq!(result.token_ids, vec![0]);
+        assert_eq!(result.finish_reason, FinishReason::EosToken);
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].finish_reason, Some(FinishReason::EosToken));
+    }
+    Ok(())
+}
+
+#[test]
+fn output_stops_enforce_the_request_budget_and_reject_an_oversized_atomic_body()
+-> anyhow::Result<()> {
+    use onnx_genai_engine::{FinishReason, GenerationControl};
+    let metadata=GENERIC_OUTPUT_LOOP.replace(
+        "role: {kind: runtime, version: v1, role: max_output_tokens}\n        source: {kind: request}\n        required: true",
+        "role: {kind: opaque}\n        source: {kind: literal}\n        default: 20");
+    assert!(metadata.contains("default: 20"));
+    let root = package("output-stop-fixed-loop-budget", &metadata, &[])?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![]));
+    request.options.max_new_tokens = 3;
+    request.options.stop_on_eos = false;
+    let mut delivered = Vec::new();
+    let result = engine.generate_with_control_callbacks(
+        request.clone(),
+        GenerationControl::new(),
+        None,
+        Some(&mut |token: onnx_genai_engine::GenerateToken| {
+            delivered.push(token);
+            Ok(())
+        }),
+    )?;
+    assert_eq!(result.token_ids, vec![0; 3]);
+    assert_eq!(result.finish_reason, FinishReason::MaxTokens);
+    assert_eq!(delivered.len(), 3);
+    assert_eq!(
+        delivered.last().unwrap().finish_reason,
+        Some(FinishReason::MaxTokens)
+    );
+    let grouped=metadata.replacen("        continue_when: active",
+        "          - kind: emit\n            value: token\n            output: tokens\n            mode: append\n        continue_when: active",1);
+    assert_eq!(grouped.matches("kind: emit").count(), 2);
+    let root = package("output-stop-atomic-loop-budget", &grouped, &[])?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    request.options.max_new_tokens = 1;
+    let mut unexpected = Vec::new();
+    let error = engine
+        .generate_with_control_callbacks(
+            request.clone(),
+            GenerationControl::new(),
+            None,
+            Some(&mut |token| {
+                unexpected.push(token);
+                Ok(())
+            }),
+        )
+        .expect_err("an atomic body cannot publish beyond the request budget");
+    assert!(
+        format!("{error:#}").contains("max_new_tokens=1"),
+        "{error:#}"
+    );
+    assert!(unexpected.is_empty());
+    assert!(engine.take_committed_workflow_publications().is_empty());
+    request.options.max_new_tokens = 2;
+    let result = engine.generate(request)?;
+    assert_eq!(result.token_ids, vec![0; 2]);
+    assert_eq!(result.finish_reason, FinishReason::MaxTokens);
+    Ok(())
+}
+
+#[test]
+fn output_stops_finalize_pending_utf8_before_committing_real_generic_state() -> anyhow::Result<()> {
+    use onnx_genai_engine::logits::StopSequence;
+    use onnx_genai_engine::{FinishReason, GenerationControl};
+    let model = ADD_STATE.replace("shape {}", "shape { dim { dim_value: 1 } }");
+    let root = package(
+        "output-stop-generic-eof",
+        STATEFUL_OUTPUT_LOOP,
+        &[("counter.onnx.textproto", &model)],
+    )?;
+    fs::write(
+        root.join("tokenizer.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version":"1.0","added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,
+            "decoder":{"type":"ByteFallback"},"model":{"type":"WordLevel","vocab":{"<0xC3>":0,"<unk>":1},"unk_token":"<unk>"}
+        }))?,
+    )?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let session = engine.create_session()?;
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![]));
+    request.options.max_new_tokens = 1;
+    request.options.stop_on_eos = false;
+    request.options.stop_sequences = vec![StopSequence::Text("�".into())];
+    let mut delivered = Vec::new();
+    let result = engine.generate_in_session_with_control_callbacks(
+        session,
+        request.clone(),
+        GenerationControl::new(),
+        None,
+        Some(&mut |token: onnx_genai_engine::GenerateToken| {
+            delivered.push(token);
+            Ok(())
+        }),
+    )?;
+    assert_eq!(result.token_ids, vec![0]);
+    assert_eq!(result.text, "�");
+    assert_eq!(
+        result.finish_reason,
+        FinishReason::StopSequence { index: 0 }
+    );
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].text, "�");
+    assert_eq!(
+        delivered[0].finish_reason,
+        Some(FinishReason::StopSequence { index: 0 })
+    );
+    engine.take_committed_workflow_publications();
+    let failed_session = engine.create_session()?;
+    let mut invalid = request.clone();
+    invalid.options.max_constraint_bytes = 0;
+    let mut unexpected = Vec::new();
+    let error = engine
+        .generate_in_session_with_control_callbacks(
+            failed_session,
+            invalid,
+            GenerationControl::new(),
+            None,
+            Some(&mut |token| {
+                unexpected.push(token);
+                Ok(())
+            }),
+        )
+        .expect_err("terminal decoding must obey its byte bound before state commit");
+    assert!(
+        format!("{error:#}").contains("max_constraint_bytes=0"),
+        "{error:#}"
+    );
+    assert!(unexpected.is_empty());
+    assert!(engine.take_committed_workflow_publications().is_empty());
+    assert_eq!(engine.session_token_count(failed_session)?, 0);
+    request.options.stop_sequences.clear();
+    assert_eq!(
+        engine
+            .generate_in_session(failed_session, request.clone())?
+            .token_ids,
+        vec![0]
+    );
+    assert_eq!(
+        engine.generate_in_session(session, request)?.token_ids,
+        vec![1]
+    );
     Ok(())
 }
