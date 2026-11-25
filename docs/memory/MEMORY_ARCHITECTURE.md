@@ -176,6 +176,16 @@ zero/nonzero groups, positive construction peaks for empty final payloads,
 positive splitting/retirement and zero-capacity rejection.
 This establishes callback behavior, not a measured inference speedup.
 
+CPU derived-weight group control metadata uses inline storage for the common
+one-to-three projection set. Larger groups spill normally; inline capacity is
+not an eligibility or budget limit. Block-format MoE uses the same storage for
+its short projection/source/key/size/spec lists. Payload buffers remain separate,
+exactly charged owners; whole-group missing-build peaks are still preflighted
+once, and cache entries are published only after every builder succeeds. The
+[allocation diagnostic](../benchmarks/weight-group-metadata/README.md) scopes
+its result to private warm cache-hit metadata, not routing, numerical compute,
+whole-kernel allocations or inference throughput.
+
 Cold replacement borrows the caller's `Option<WorkspaceAllocation>`. The option
 retains the original owner until the provider actually takes it for retirement.
 CUDA rejects real stream capture before release-barrier waiting, growth grants,
@@ -928,6 +938,25 @@ explicitly unsupported until metadata preparation has a capture-safe contract.
 No new pool, quota interface or issuer callback is introduced in execution.
 CUDA numerical, asynchronous-failure and throughput validation require a device.
 
+### CPU expert routing metadata
+
+CPU MoE, QMoE and BlockQuantizedMoE share one dispatch-local routing scratch.
+The index, exponential and selected-pair vectors retain capacity across rows;
+borrowed selections are consumed before the next row, and the scratch retires
+before expert weight admission, computation or prefetch. QMoE consumes its final
+contribution slots using the already validated row/k geometry instead of keeping
+a second copy of every selected route just to recover each row's count. Sorting,
+normalization and contribution addition order are preserved. This metadata is
+still outside the governed projection lane; cold setup, growth and grouping
+allocations remain. See the [routing evidence and limits](../benchmarks/cpu-routing-scratch/README.md).
+
+QMoE route-first statistics also borrow their per-expert counts directly from
+the existing task-group lengths. They do not maintain another per-dispatch
+count map, including when offload is disabled. Process/per-layer accumulated
+statistics and their lock order remain unchanged. The [route-count evidence](../benchmarks/qmoe-route-counts/README.md)
+separates this removed diagnostic index from persistent metrics and governed
+payloads.
+
 ### CPU compressed-projection scratch
 
 CPU `BlockQuantizedMatMul` and `BlockQuantizedMoE` declare metadata-planned,
@@ -1030,6 +1059,18 @@ Preparation and execution share checked geometry: inter is FC2's packed input
 axis times 8/bits, never inferred backward from FC1. FC2 metadata is therefore
 required during preparation. Zero rows have zero banks; zero hidden retains
 input/weight/routing validation and can still need nonempty FC1 storage.
+QMoE's prefetch-scope preparation owns the shared-bank eligibility check as
+well as funding. It refuses ineligible operations before inspecting selected
+experts, locking payloads, pinning readers or requesting capacity, including
+for local/ungoverned sources. Callers retain only enabled/group-count scheduling
+checks; a scope carries the existing capacity proof and mode-specific funding
+contract (local sources remain on demand). Its borrow keeps the operation and
+registry proof alive.
+Streaming still avoids registry locking; governed streaming uses one two-slot
+window, while local streaming remains on demand. Warm retained hits pin existing
+owners without new issuer callbacks. See the
+[prefetch-entry resource tests and negative control](../benchmarks/qmoe-prefetch-entry/README.md).
+
 The prefetch worker owns weights independently. The main compute dispatch owns
 the lane; joined projection tasks borrow disjoint decode slices. Weight
 request/read/join order and final contribution

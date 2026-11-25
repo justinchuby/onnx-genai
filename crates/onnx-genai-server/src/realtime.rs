@@ -57,7 +57,10 @@ pub(crate) enum RealtimeInputOwned {
     Audio(Vec<f32>),
     Text(Vec<u32>),
     Commit,
-    Generate(Vec<u32>),
+    Generate {
+        tokens: Vec<u32>,
+        constraint: Option<onnx_genai_engine::GenerateConstraint>,
+    },
     Configure {
         mode: RealtimeMode,
         tokens: Vec<u32>,
@@ -76,7 +79,10 @@ impl RealtimeInputOwned {
             Self::Configure { mode, tokens } => return session.configure(*mode, tokens, control),
             Self::Audio(samples) => RealtimeInput::Audio(samples),
             Self::Text(tokens) => RealtimeInput::Text(tokens),
-            Self::Generate(tokens) => RealtimeInput::Generate(tokens),
+            Self::Generate { tokens, constraint } => {
+                session.set_constraint(constraint.clone())?;
+                RealtimeInput::Generate(tokens)
+            }
             Self::Commit => RealtimeInput::Commit,
             Self::Poll => RealtimeInput::Poll,
             Self::Cancel => RealtimeInput::Cancel,
@@ -133,9 +139,11 @@ pub(crate) struct RealtimeCommand {
     ready: oneshot::Sender<anyhow::Result<RealtimeOutput>>,
     steps: mpsc::Receiver<Step>,
     cancelled: Arc<AtomicBool>,
-    guard: WorkerRealtimeGuard,
+    // Release admission before publishing the worker as idle. Fields drop in
+    // declaration order, including initialization failures and disconnects.
     _admission: OwnedSemaphorePermit,
     runtime: tokio::runtime::Handle,
+    guard: WorkerRealtimeGuard,
 }
 impl EngineDriver {
     pub(crate) async fn open_realtime(
@@ -314,7 +322,10 @@ mod tests {
         assert!(pcm.next_frame()?.is_none());
         assert!(native.step(RealtimeInputOwned::Cancel).await?.done);
         assert_eq!(
-            response.finish(true).last().unwrap()["response"]["status"],
+            response
+                .finish(events::ResponseEnd::Cancelled)
+                .last()
+                .unwrap()["response"]["status"],
             "cancelled"
         );
         drop(native);
@@ -361,7 +372,10 @@ mod tests {
         assert!(!connection.step(RealtimeInputOwned::Commit).await?.done);
         assert!(
             connection
-                .step(RealtimeInputOwned::Generate(vec![]))
+                .step(RealtimeInputOwned::Generate {
+                    tokens: vec![],
+                    constraint: None
+                })
                 .await?
                 .done
         );

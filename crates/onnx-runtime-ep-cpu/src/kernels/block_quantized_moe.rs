@@ -22,6 +22,7 @@
 //! not an integer/quantized-domain dot product.
 
 use super::weight_cache::{WeightCache, WeightCacheStatus, WeightLoad, WeightSpec};
+use smallvec::{SmallVec, smallvec};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -39,7 +40,7 @@ use super::block_quantized_matmul::{
 };
 use super::decoded_projection::ProjectionScratch;
 use super::moe::{
-    DenseExpertWeights, ExpertProjection, MoeAttributes, MoeWorkspace, routing_weights,
+    DenseExpertWeights, ExpertProjection, MoeAttributes, MoeWorkspace, RoutingScratch,
 };
 use super::{check_arity, to_dense_f32, write_dense_f32};
 
@@ -402,9 +403,10 @@ impl BlockQuantizedMoEKernel {
         let fc3_bias = optional_dense(inputs, 7)?;
 
         let mut tasks = BTreeMap::<usize, Vec<(usize, f32)>>::new();
+        let mut routing = RoutingScratch::default();
         for row in 0..rows {
             let range = row * experts..(row + 1) * experts;
-            let mut route = routing_weights(
+            let route = routing.weights(
                 &router_logits[range.clone()],
                 router_weights
                     .as_deref()
@@ -413,11 +415,12 @@ impl BlockQuantizedMoEKernel {
                 self.attributes.normalize_routing_weights,
             );
             route.sort_unstable_by_key(|&(expert, _)| expert);
-            for (expert, weight) in route {
+            for &(expert, weight) in route.iter() {
                 tasks.entry(expert).or_default().push((row, weight));
             }
         }
 
+        drop(routing);
         let output = accumulator.zeroed_prefix(rows * hidden)?;
         // A dense resident set must fit as a whole: separately admitting
         // projections can evict an Arc still held by this expert call and
@@ -567,7 +570,7 @@ impl BlockQuantizedMoEKernel {
                             projection.out_features,
                             bias,
                             plan,
-                            scratch.initialized(),
+                            &mut scratch,
                             output,
                         )
                     },
@@ -602,7 +605,7 @@ impl BlockQuantizedMoEKernel {
         expert: usize,
         dims: Dimensions,
     ) -> Result<WeightLoad> {
-        let mut projections = vec![
+        let mut projections: SmallVec<[_; 3]> = smallvec![
             (2, dims.fc1_size, dims.hidden, self.formats.fc1, 1u8),
             (4, dims.hidden, dims.inter, self.formats.fc2, 2u8),
         ];
@@ -617,9 +620,9 @@ impl BlockQuantizedMoEKernel {
                 3,
             ));
         }
-        let mut sources = Vec::with_capacity(projections.len());
-        let mut keys = Vec::with_capacity(projections.len());
-        let mut sizes = Vec::with_capacity(projections.len());
+        let mut sources: SmallVec<[_; 3]> = SmallVec::new();
+        let mut keys: SmallVec<[_; 3]> = SmallVec::new();
+        let mut sizes: SmallVec<[_; 3]> = SmallVec::new();
         for (slot, out_features, in_features, format, role) in projections {
             let packed = &inputs[slot];
             let layout = ProjectionLayout::new(format, out_features, in_features, dims.experts);
@@ -652,14 +655,14 @@ impl BlockQuantizedMoEKernel {
                 resolved.and_then(|resolved| resolved.payload),
             ));
         }
-        let specs: Vec<_> = keys
+        let specs: SmallVec<[_; 3]> = keys
             .iter()
             .zip(&sizes)
             .map(|(key, bytes)| match key.as_deref() {
                 Some(key) => WeightSpec::cached(key),
                 None => Ok(WeightSpec::transient(*bytes)),
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<SmallVec<[_; 3]>>>()?;
         let loaded = self.weight_cache.load_group(&specs, |index, output| {
             BLOCK_QUANT_MOE_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
             let (packed, layout, format, out_features, in_features, payload) = &mut sources[index];
@@ -3865,7 +3868,7 @@ mod tests {
                                     p.out_features,
                                     bias,
                                     plan,
-                                    &mut old_decode,
+                                    &mut ProjectionScratch::test_binding(&mut old_decode),
                                     &mut output,
                                 )?;
                                 Ok(output)
@@ -3924,7 +3927,7 @@ mod tests {
                                             p.out_features,
                                             bias,
                                             plan,
-                                            decode.initialized(),
+                                            &mut decode,
                                             output,
                                         )
                                     },

@@ -317,6 +317,8 @@ fn build_from_bytes_with_weights(
     validate_loaded_model(&graph)?;
     prepare_graph_for_execution(&mut graph)?;
     infer_shapes(&mut graph)?;
+    validate_topk_nodes(&graph)?;
+    validate_shape_size_dtypes(&graph, &graph.opset_imports)?;
 
     Ok((graph, Arc::new(store)))
 }
@@ -609,15 +611,19 @@ fn infer_shapes(graph: &mut Graph) -> Result<(), LoaderError> {
 /// [`validate_model_proto`], before graph construction coalesces names or drops
 /// protobuf-only fields. This IR-level phase then runs:
 ///
-/// 1. [`validate_opset_imports`] — every node's domain must declare an opset.
+/// 1. [`validate_opset_imports`] — every node's domain must declare an opset;
+///    FP8 tensor-valued `Constant` attributes must meet their schema version.
 /// 2. [`validate_einsum_nodes`] — resolve `Einsum-12`/`Einsum-28` from the
 ///    imported opset and validate every statically known equation/type/shape.
-/// 3. [`validate_no_control_flow`] — allow the implemented subgraph-bearing ops
+///    Check the BF16 TopK schema revision where X's dtype is known.
+/// 3. [`validate_shape_size_dtypes`] — reject input types that require a newer
+///    revision of Shape or Size than the effective imported opset.
+/// 4. [`validate_no_control_flow`] — allow the implemented subgraph-bearing ops
 ///    (`If`/`Loop`/`Scan`) and reject any other op carrying a `GraphProto`
 ///    attribute the executor cannot run.
-/// 4. [`validate_no_dangling_refs`] — every consumed tensor must be sourced
+/// 5. [`validate_no_dangling_refs`] — every consumed tensor must be sourced
 ///    (graph input, initializer, or an upstream node output).
-/// 5. [`validate_no_initializer_producer`] — an initializer must be a constant
+/// 6. [`validate_no_initializer_producer`] — an initializer must be a constant
 ///    source; reject any initializer value that is also a node output (shares a
 ///    `ValueId` with a producer), which the IR structural check does not cover.
 ///
@@ -632,10 +638,90 @@ fn infer_shapes(graph: &mut Graph) -> Result<(), LoaderError> {
 pub fn validate_model(graph: &Graph) -> Result<(), LoaderError> {
     validate_opset_imports(graph)?;
     validate_einsum_nodes(graph)?;
+    validate_topk_nodes(graph)?;
+    validate_shape_size_dtypes(graph, &graph.opset_imports)?;
     validate_no_control_flow(graph)?;
     validate_no_dangling_refs(graph)?;
     validate_no_initializer_producer(graph)?;
     Ok(())
+}
+
+fn validate_shape_size_dtypes(
+    graph: &Graph,
+    imports: &std::collections::HashMap<String, u64>,
+) -> Result<(), LoaderError> {
+    use onnx_runtime_ir::DataType;
+
+    for node in graph.nodes.values() {
+        if !node.is_default_domain() || !matches!(node.op_type.as_str(), "Shape" | "Size") {
+            continue;
+        }
+        let Some(id) = node.inputs.first().copied().flatten() else {
+            continue;
+        };
+        let Some(input) = graph
+            .values
+            .get(id)
+            .filter(|_| graph.value_type_is_known(id))
+        else {
+            continue;
+        };
+        // The two schema histories share the same input-type additions.
+        // Keep this table scoped to the ONNX 19–24 revisions.
+        let since = match input.dtype {
+            DataType::Float8E4M3FN
+            | DataType::Float8E4M3FNUZ
+            | DataType::Float8E5M2
+            | DataType::Float8E5M2FNUZ => 19,
+            DataType::Int4 | DataType::Uint4 => 21,
+            DataType::Float4E2M1 => 23,
+            DataType::Float8E8M0 => 24,
+            _ => continue,
+        };
+        let opset = node
+            .local_opset()
+            .or_else(|| imports.get("").copied())
+            .unwrap_or(1);
+        if opset < since {
+            return Err(LoaderError::ShapeSizeDtypeBeforeOpset {
+                op: node.op_type.clone(),
+                node: node_label(node),
+                input: input.name.clone().unwrap_or_else(|| format!("{id:?}")),
+                dtype: input.dtype,
+                opset,
+                since,
+            });
+        }
+    }
+    for subgraph in graph.subgraphs.values() {
+        validate_shape_size_dtypes(subgraph, imports)?;
+    }
+    Ok(())
+}
+
+fn validate_topk_nodes(graph: &Graph) -> Result<(), LoaderError> {
+    fn check(graph: &Graph, default_opset: Option<u64>) -> Result<(), LoaderError> {
+        let default_opset = graph.opset_imports.get("").copied().or(default_opset);
+        for (_, node) in graph.nodes.iter() {
+            if let Some(opset) = node.local_opset().or(default_opset)
+                && let Some(input) = node.inputs.first().copied().flatten()
+                && let Some(value) = graph.values.get(input)
+            {
+                onnx_runtime_ir::topk::validate_bfloat16_opset(node, opset, value.dtype).map_err(
+                    |detail| LoaderError::InvalidTopK {
+                        node: node_label(node),
+                        detail,
+                    },
+                )?;
+            }
+        }
+        for subgraph in graph.subgraphs.values() {
+            check(subgraph, default_opset)?;
+        }
+        Ok(())
+    }
+
+    check(graph, None)
 }
 
 /// Resolve and validate every default-domain `Einsum` against the model's
@@ -1083,19 +1169,13 @@ pub fn validate_no_initializer_producer(graph: &Graph) -> Result<(), LoaderError
 /// ONNX treats `""` and `"ai.onnx"` as equivalent spellings of the default
 /// domain. Model-level imports also govern nodes nested in subgraphs.
 pub fn validate_opset_imports(graph: &Graph) -> Result<(), LoaderError> {
-    // Loaded IR is canonical: the default domain is `""` for both node domains
-    // and opset-import keys, so a direct lookup suffices (no dual-spelling
-    // fallback needed — see `onnx_runtime_ir::normalize_domain`).
-    fn has_import(imports: &std::collections::HashMap<String, u64>, domain: &str) -> bool {
-        imports.contains_key(domain)
-    }
-
     fn validate_graph(
         graph: &Graph,
         imports: &std::collections::HashMap<String, u64>,
     ) -> Result<(), LoaderError> {
         for (_, node) in graph.nodes.iter() {
-            if !has_import(imports, &node.domain) {
+            // Loaded IR uses canonical domains for both nodes and imports.
+            if !imports.contains_key(&node.domain) {
                 let domain = if node.domain.is_empty() {
                     "ai.onnx".to_string()
                 } else {
@@ -1119,5 +1199,57 @@ pub fn validate_opset_imports(graph: &Graph) -> Result<(), LoaderError> {
         Ok(())
     }
 
-    validate_graph(graph, &graph.opset_imports)
+    validate_graph(graph, &graph.opset_imports)?;
+    validate_constant_value_opsets(graph)
+}
+
+fn validate_constant_value_opset(
+    dtype: onnx_runtime_ir::DataType,
+    opset: u64,
+    label: impl FnOnce() -> String,
+) -> Result<(), LoaderError> {
+    use onnx_runtime_ir::DataType;
+    // Pinned ONNX Constant-19 uses IR9 types; Constant-24 uses IR12.
+    let minimum = match dtype {
+        DataType::Float8E4M3FN
+        | DataType::Float8E4M3FNUZ
+        | DataType::Float8E5M2
+        | DataType::Float8E5M2FNUZ => 19,
+        DataType::Float8E8M0 => 24,
+        _ => return Ok(()),
+    };
+    if opset < minimum {
+        return Err(LoaderError::ConstantValueOpset {
+            node: label(),
+            dtype,
+            opset,
+            minimum,
+        });
+    }
+    Ok(())
+}
+
+fn validate_constant_value_opsets(graph: &Graph) -> Result<(), LoaderError> {
+    fn walk(graph: &Graph, opset: u64) -> Result<(), LoaderError> {
+        for (_, node) in graph.nodes.iter() {
+            if node.op_type == "Constant"
+                && node.is_default_domain()
+                && let Some(onnx_runtime_ir::Attribute::Tensor(value)) = node.attr("value")
+            {
+                validate_constant_value_opset(
+                    value.dtype,
+                    node.local_opset().unwrap_or(opset),
+                    || node_label(node),
+                )?;
+            }
+        }
+        for subgraph in graph.subgraphs.values() {
+            walk(subgraph, opset)?;
+        }
+        for function in graph.model_functions.values() {
+            validate_constant_value_opsets(&function.body)?;
+        }
+        Ok(())
+    }
+    walk(graph, graph.opset_imports.get("").copied().unwrap_or(0))
 }

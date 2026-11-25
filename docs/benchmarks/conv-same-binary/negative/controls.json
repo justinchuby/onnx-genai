@@ -1,0 +1,56 @@
+[
+  {
+    "name": "alias-reference",
+    "source_path": "crates/onnx-runtime-ep-cpu/src/backend_ab.rs",
+    "original_sha256": "085185ee8924c85c002840dd89d2b5953de9dfcb8d469a3502e5ef77fd894707",
+    "mutant_sha256": "9f33e12c7d22ffaf32418edc349c162b67a5f7efff5557f1da34d02e2cee90f7",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "-p",
+      "onnx-runtime-ep-cpu",
+      "--features",
+      "mlas",
+      "--test",
+      "conv_same_binary",
+      "linked::linked_conv_factories_are_independent_and_match_f64_on_real_execute",
+      "--",
+      "--exact",
+      "--nocapture"
+    ],
+    "extra_env": {
+      "NXRT_CPU_GEMM_BACKEND": "mlas"
+    },
+    "exit": 101,
+    "log_sha256": "80da9c26d6efa43202e24e4b2b13d3571861d410e4ce01864b78c4dd51180103",
+    "expected_failure": true
+  },
+  {
+    "name": "ambient-mlas",
+    "source_path": "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs",
+    "original_sha256": "56b5bf1de760e2d366dcac344d51f1c81a43dd32c1626ac5cf6bdd9d7bc95c53",
+    "mutant_sha256": "f8d7fe9907f9ae123b9e4dd4fb50b1cd121e0f4a561a87105ea8c3484a82dcc6",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "-p",
+      "onnx-runtime-ep-cpu",
+      "--features",
+      "mlas",
+      "--test",
+      "conv_same_binary",
+      "linked::linked_conv_factories_are_independent_and_match_f64_on_real_execute",
+      "--",
+      "--exact",
+      "--nocapture"
+    ],
+    "extra_env": {
+      "NXRT_CPU_GEMM_BACKEND": "mlas"
+    },
+    "exit": 101,
+    "log_sha256": "988cda9441999fc59b2151df6c6990826525662da93d8c0a5f2da0e4e53135e0",
+    "expected_failure": true
+  }
+]

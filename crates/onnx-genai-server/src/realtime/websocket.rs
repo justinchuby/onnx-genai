@@ -3,7 +3,7 @@ use super::{
     RealtimeConnection, RealtimeInputOwned, RealtimeLimits,
     conditioning::{Conditioning, PromptOperation},
     conversation::{Conversation, ItemId, ResponseId, ResponseKind},
-    events::{ResponseEvents, TranscriptionEvents},
+    events::{ResponseEnd, ResponseEvents, TranscriptionEvents},
     pcm::PcmInput,
     settings::{Capabilities, Modalities, OutputBudget, SessionSettings},
     tools::ToolArguments,
@@ -242,33 +242,42 @@ fn string<'a>(object: &'a Value, key: &str) -> anyhow::Result<&'a str> {
         .and_then(Value::as_str)
         .with_context(|| format!("realtime field {key} must be a string"))
 }
+enum FailureKind {
+    Protocol(super::conversation::ProtocolErrorKind),
+    Native,
+}
 struct Failure {
     message: String,
-    code: Option<&'static str>,
-    fatal: bool,
+    kind: FailureKind,
 }
 impl Failure {
+    fn fatal(&self) -> bool {
+        matches!(self.kind, FailureKind::Native)
+    }
+    fn error_type(&self) -> &'static str {
+        match self.kind {
+            FailureKind::Protocol(kind) => kind.error_type(),
+            FailureKind::Native => "server_error",
+        }
+    }
     fn invalid(error: impl std::fmt::Display) -> Self {
         Self {
             message: error.to_string(),
-            code: None,
-            fatal: false,
+            kind: FailureKind::Protocol(super::conversation::ProtocolErrorKind::InvalidRequest),
         }
     }
     fn native(error: anyhow::Error) -> Self {
         Self {
             message: format!("{error:#}"),
-            code: None,
-            fatal: true,
+            kind: FailureKind::Native,
         }
     }
 }
 impl From<super::conversation::ProtocolError> for Failure {
     fn from(error: super::conversation::ProtocolError) -> Self {
         Self {
-            code: error.code,
+            kind: FailureKind::Protocol(error.kind),
             message: error.to_string(),
-            fatal: false,
         }
     }
 }
@@ -318,8 +327,8 @@ impl Runner {
         .context("realtime output writer closed")
     }
     async fn error(&self, out: &mpsc::Sender<Outgoing>, failure: &Failure) -> anyhow::Result<()> {
-        let value = json!({"type":"error","error":{"type":if failure.fatal {"server_error"} else {"invalid_request_error"},"code":failure.code,"message":failure.message,"param":null}});
-        if failure.fatal {
+        let value = json!({"type":"error","error":{"type":failure.error_type(),"code":null,"message":failure.message,"param":null}});
+        if failure.fatal() {
             let (flushed, reply) = oneshot::channel();
             out.send(Outgoing {
                 value: WireOutput::Event(value),
@@ -359,7 +368,7 @@ impl Runner {
                 Ok(false) => {}
                 Err(failure) => {
                     self.error(out, &failure).await?;
-                    if failure.fatal {
+                    if failure.fatal() {
                         return Ok(());
                     }
                 }
@@ -424,7 +433,7 @@ impl Runner {
         };
         if let Err(failure) = result {
             self.error(out, &failure).await?;
-            return Ok(!failure.fatal);
+            return Ok(!failure.fatal());
         }
         Ok(true)
     }
@@ -809,6 +818,29 @@ impl Runner {
                     .map_err(Failure::native)?
                     .options
                     .clone();
+                let constraint = if self.contract.spec().inputs.token_mask.is_some() {
+                    let request: crate::types::ChatCompletionRequest = serde_json::from_value(json!({
+                        "messages": [],
+                        "tools": crate::tool_protocol::responses_tools(settings.tools.clone()).map_err(anyhow::Error::new).map_err(Failure::native)?,
+                        "tool_choice": super::settings::choice_name(&settings.response.tool_choice),
+                    })).map_err(anyhow::Error::new).map_err(Failure::native)?;
+                    match self
+                        .model
+                        .tool_protocol
+                        .as_ref()
+                        .map(|protocol| protocol.output_constraint(&request))
+                        .transpose()
+                        .map_err(anyhow::Error::new)
+                        .map_err(Failure::native)?
+                    {
+                        Some(crate::tool_protocol::ToolOutputConstraint::Set(constraint)) => {
+                            constraint
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 let tokens = self
                     .conditioning
                     .tokens(
@@ -820,16 +852,19 @@ impl Runner {
                         None,
                     )
                     .map_err(Failure::native)?;
-                self.quantum(RealtimeInputOwned::Generate(tokens), false, out)
-                    .await?;
+                self.quantum(
+                    RealtimeInputOwned::Generate { tokens, constraint },
+                    false,
+                    out,
+                )
+                .await?;
             }
             "response.cancel" => {
-                if self.active.is_none() {
-                    return Err(Failure::invalid(
-                        "response.cancel requires an active response",
-                    ));
+                // Upstream cancellation is idempotent: an idle response has
+                // nothing to cancel and emits no acknowledgement or error.
+                if self.active.is_some() {
+                    self.quantum(RealtimeInputOwned::Cancel, true, out).await?;
                 }
-                self.quantum(RealtimeInputOwned::Cancel, true, out).await?;
             }
             _ => {
                 return Err(Failure::invalid(format!(
@@ -842,10 +877,7 @@ impl Runner {
     fn budget_exhausted(&self) -> bool {
         self.active
             .as_ref()
-            .is_some_and(|active| match active.budget {
-                OutputBudget::Unlimited => false,
-                OutputBudget::Tokens(limit) => active.used >= u64::from(limit.get()),
-            })
+            .is_some_and(|active| active.budget.exhausted(active.used))
     }
     async fn quantum(
         &mut self,
@@ -861,7 +893,7 @@ impl Runner {
                     if remaining == 0
                         && matches!(
                             input,
-                            RealtimeInputOwned::Generate(_) | RealtimeInputOwned::Poll
+                            RealtimeInputOwned::Generate { .. } | RealtimeInputOwned::Poll
                         )
                     {
                         input = RealtimeInputOwned::Cancel;
@@ -966,6 +998,13 @@ impl Runner {
             self.active = Some(active);
             return Ok(());
         }
+        let end = if cancelled {
+            ResponseEnd::Cancelled
+        } else if active.budget.exhausted(active.used) {
+            ResponseEnd::TokenLimit
+        } else {
+            ResponseEnd::Model
+        };
         let mut calls = Vec::new();
         let final_events = match active.renderer {
             Rendered::Response(mut renderer) => {
@@ -996,7 +1035,7 @@ impl Runner {
                                 self.emit(out, event).await.map_err(Failure::native)?;
                             }
                         }
-                        ToolParseOutcome::Incomplete if cancelled => {}
+                        ToolParseOutcome::Incomplete if end.permits_unfinished_tools() => {}
                         other => {
                             return Err(Failure::native(anyhow::anyhow!(
                                 "realtime tool protocol did not finish a valid envelope: {other:?}"
@@ -1004,7 +1043,7 @@ impl Runner {
                         }
                     }
                 }
-                if !cancelled
+                if !end.permits_unfinished_tools()
                     && self.conversation.active().is_some_and(|response| {
                         response.options.tool_choice == crate::types::ToolChoiceMode::Required
                     })
@@ -1014,7 +1053,7 @@ impl Runner {
                         "native realtime response did not satisfy tool_choice=required; repair the model tool constraint workflow"
                     )));
                 }
-                renderer.finish(cancelled)
+                renderer.finish(end)
             }
             Rendered::Transcription(renderer) => {
                 self.configured = false;
@@ -1055,6 +1094,7 @@ fn ensure_user_role(item: &Value) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
     use tokio::net::{TcpListener, TcpStream};
     #[test]
     fn tool_batch_admission_rejects_a_late_undeclared_call_before_publication() {
@@ -1106,7 +1146,19 @@ mod tests {
     async fn server_for_package(
         root: &std::path::Path,
     ) -> (AppState, std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-        let state = AppState::load(root, Some("native-realtime".into())).unwrap();
+        server_for_package_with_config(root, crate::ServerConfig::default()).await
+    }
+    async fn server_for_package_with_config(
+        root: &std::path::Path,
+        config: crate::ServerConfig,
+    ) -> (AppState, std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let state =
+            AppState::load_with_config(root, Some("native-realtime".into()), config).unwrap();
+        server_for_state(state).await
+    }
+    async fn server_for_state(
+        state: AppState,
+    ) -> (AppState, std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let router = crate::app(state.clone());
@@ -1116,18 +1168,241 @@ mod tests {
         (state, address, task)
     }
     async fn connect(address: std::net::SocketAddr) -> Client {
-        let stream = TcpStream::connect(address).await.unwrap();
-        tokio_tungstenite::client_async(
-            format!("ws://{address}/v1/realtime?model=native-realtime"),
-            stream,
-        )
-        .await
-        .unwrap()
-        .0
+        connect_model(address, "native-realtime").await.unwrap()
     }
-    fn tool_package(envelope: &str) -> tempfile::TempDir {
+    async fn connect_model(
+        address: std::net::SocketAddr,
+        model: &str,
+    ) -> Result<Client, tokio_tungstenite::tungstenite::Error> {
+        let stream = TcpStream::connect(address).await?;
+        tokio_tungstenite::client_async(format!("ws://{address}/v1/realtime?model={model}"), stream)
+            .await
+            .map(|(client, _)| client)
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_models_isolate_native_state_and_release_closed_worker() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/onnx_genai_workflows/realtime");
+        let package = tempfile::tempdir().unwrap();
+        for file in ["model.onnx.textproto", "tokenizer.json"] {
+            std::fs::copy(root.join(file), package.path().join(file)).unwrap();
+        }
+        let metadata = std::fs::read_to_string(root.join("inference_metadata.yaml"))
+            .unwrap()
+            .replacen("default_mode: realtime", "default_mode: duplex", 1);
+        std::fs::write(package.path().join("inference_metadata.yaml"), metadata).unwrap();
+        let specs = ["alpha", "beta"]
+            .into_iter()
+            .map(|id| crate::models_config::ModelSpec {
+                id: id.into(),
+                path: package.path().to_owned(),
+                eager: true,
+                warmup: false,
+            })
+            .collect();
+        let state = AppState::load_from_specs(specs, crate::ServerConfig::default()).unwrap();
+        let (state, address, task) = server_for_state(state).await;
+        let mut alpha = connect_model(address, "alpha").await.unwrap();
+        let alpha_created = event(&mut alpha).await;
+        assert_eq!(alpha_created["session"]["model"], "alpha");
+        let mut beta = connect_model(address, "beta").await.unwrap();
+        let beta_created = event(&mut beta).await;
+        assert_eq!(beta_created["session"]["model"], "beta");
+        assert_ne!(
+            alpha_created["session"]["id"],
+            beta_created["session"]["id"]
+        );
+        match connect_model(address, "alpha").await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                let body: Value =
+                    serde_json::from_slice(response.body().as_ref().unwrap()).unwrap();
+                assert!(
+                    body["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("realtime"),
+                    "{body}"
+                );
+            }
+            other => {
+                panic!("an occupied model must reject a second realtime connection: {other:?}")
+            }
+        }
+        async fn audio(client: &mut Client, sample: i16) -> Vec<u8> {
+            let bytes: Vec<_> = (0..320).flat_map(|_| sample.to_le_bytes()).collect();
+            send(
+                client,
+                json!({"type":"input_audio_buffer.append","audio":STANDARD.encode(bytes)}),
+            )
+            .await;
+            loop {
+                let output = event(client).await;
+                assert_ne!(output["type"], "error", "{output}");
+                if output["type"] == "response.output_audio.delta" {
+                    let bytes = STANDARD.decode(output["delta"].as_str().unwrap()).unwrap();
+                    assert_eq!(
+                        bytes.len(),
+                        640,
+                        "one native frame must contain 320 PCM16 samples"
+                    );
+                    return bytes;
+                }
+            }
+        }
+        assert!(audio(&mut alpha, 0).await.iter().all(|b| *b == 0));
+        assert!(audio(&mut beta, 100).await.iter().any(|b| *b != 0));
+        alpha.close(None).await.unwrap();
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), alpha.next())
+            .await
+            .expect("alpha close handshake timed out")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(closed, Message::Close(_)));
+        drop(alpha);
+        // The close ACK can precede native cleanup. Retry only transient busy
+        // admission within a bounded deadline; other handshake failures fail.
+        let mut alpha = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match connect_model(address, "alpha").await {
+                    Ok(client) => break client,
+                    Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                        if response.status() == StatusCode::SERVICE_UNAVAILABLE =>
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("reopen alpha after native cleanup: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("closed model worker was not released");
+        let reopened = event(&mut alpha).await;
+        assert_ne!(reopened["session"]["id"], alpha_created["session"]["id"]);
+        assert_eq!(reopened["session"]["model"], "alpha");
+        assert!(audio(&mut alpha, 0).await.iter().all(|b| *b == 0));
+        // Beta keeps its own accumulated native audio state across Alpha's
+        // disconnect/reset/reopen. A zero frame therefore still produces audio.
+        assert!(audio(&mut beta, 0).await.iter().any(|b| *b != 0));
+        alpha.close(None).await.unwrap();
+        beta.close(None).await.unwrap();
+        drop((alpha, beta));
+        for id in ["alpha", "beta"] {
+            let model = state.registry.resolve(id).unwrap().unwrap();
+            tokio::task::spawn_blocking(move || model.engine.shutdown())
+                .await
+                .unwrap();
+        }
+        task.abort();
+        let _ = task.await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_rejected_frames_and_pcm_pressure_preserve_native_transcription() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/realtime");
+        let mut config = crate::ServerConfig::default();
+        config.realtime.source_bytes = NonZeroUsize::new(640).unwrap();
+        let (state, address, task) = server_for_package_with_config(&root, config).await;
+        let mut client = connect(address).await;
+        assert_eq!(event(&mut client).await["type"], "session.created");
+        let rejected = [
+            (Message::Text("{".into()), "valid JSON"),
+            (Message::Binary(vec![0, 1].into()), "JSON text frames"),
+            (Message::Text("null".into()), "type must be a string"),
+            (
+                Message::Text(json!({"type":"unknown"}).to_string().into()),
+                "unknown realtime event",
+            ),
+            (
+                Message::Text(
+                    json!({"type":"input_audio_buffer.append","audio":"!!!"})
+                        .to_string()
+                        .into(),
+                ),
+                "valid base64",
+            ),
+            (
+                Message::Text(
+                    json!({"type":"input_audio_buffer.append","audio":STANDARD.encode([0])})
+                        .to_string()
+                        .into(),
+                ),
+                "even byte count",
+            ),
+            (
+                Message::Text(
+                    json!({"type":"input_audio_buffer.append","audio":STANDARD.encode([0;642])})
+                        .to_string()
+                        .into(),
+                ),
+                "640-byte PCM queue budget",
+            ),
+        ];
+        let mut ids = BTreeSet::new();
+        for (frame, diagnostic) in rejected {
+            client.send(frame).await.unwrap();
+            let failure = event(&mut client).await;
+            assert_eq!(failure["type"], "error", "{failure}");
+            assert_eq!(failure["error"]["type"], "invalid_request_error");
+            assert!(
+                failure["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(diagnostic),
+                "{failure}"
+            );
+            assert!(ids.insert(failure["event_id"].as_str().unwrap().to_owned()));
+        }
+        // Rejected audio must neither freeze session conditioning nor consume
+        // input quota/state. A full-budget valid frame still starts an ASR turn.
+        send(
+            &mut client,
+            json!({"type":"session.update","session":{"type":"transcription"}}),
+        )
+        .await;
+        assert_eq!(event(&mut client).await["type"], "session.updated");
+        send(
+            &mut client,
+            json!({"type":"input_audio_buffer.append","audio":STANDARD.encode([0;640])}),
+        )
+        .await;
+        send(&mut client, json!({"type":"input_audio_buffer.commit"})).await;
+        let committed = event(&mut client).await;
+        assert_eq!(committed["type"], "input_audio_buffer.committed");
+        let item = committed["item_id"].clone();
+        let mut transcript = String::new();
+        loop {
+            let output = event(&mut client).await;
+            assert_ne!(output["type"], "error", "{output}");
+            if output["type"] == "conversation.item.input_audio_transcription.delta" {
+                assert_eq!(output["item_id"], item);
+                transcript.push_str(output["delta"].as_str().unwrap());
+            }
+            if output["type"] == "conversation.item.input_audio_transcription.completed" {
+                assert_eq!(output["item_id"], item);
+                assert_eq!(output["transcript"], "hello world");
+                break;
+            }
+        }
+        assert_eq!(transcript, "hello world");
+        client.close(None).await.unwrap();
+        drop(client);
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+    }
+    fn tool_package(envelope: &str) -> tempfile::TempDir {
+        tool_package_from("realtime", envelope)
+    }
+    fn tool_package_from(fixture: &str, envelope: &str) -> tempfile::TempDir {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows")
+            .join(fixture);
         let package = tempfile::tempdir().unwrap();
         std::fs::copy(
             root.join("model.onnx.textproto"),
@@ -1143,7 +1418,7 @@ mod tests {
             .unwrap()
             .remove("tok16");
         tokenizer["model"]["vocab"][envelope] = json!(16);
-        tokenizer["added_tokens"] = json!([{"id":16,"content":envelope,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}]);
+        tokenizer["added_tokens"].as_array_mut().unwrap().push(json!({"id":16,"content":envelope,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}));
         std::fs::write(
             package.path().join("tokenizer.json"),
             serde_json::to_vec(&tokenizer).unwrap(),
@@ -1166,6 +1441,125 @@ mod tests {
         )
         .unwrap();
         package
+    }
+    fn streaming_tool_package(native_budget_stop: bool) -> tempfile::TempDir {
+        let package = tool_package_from("realtime-constrained", "<tool_call>\n");
+        let path = package.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let tail = "{\"name\":\"lookup\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>";
+        tokenizer["model"]["vocab"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tok17");
+        tokenizer["model"]["vocab"][tail] = json!(17);
+        tokenizer["added_tokens"].as_array_mut().unwrap().push(json!({"id":17,"content":tail,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}));
+        tokenizer["decoder"] = json!({"type":"Fuse"});
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let path = package.path().join("model.onnx.textproto");
+        let mut graph = std::fs::read_to_string(&path).unwrap()
+            .replace("node { input: \"generating\" input: \"asr\"", "initializer { name: \"polling_op\" data_type: 7 int64_data: 7 }\nnode { input: \"operation\" input: \"polling_op\" output: \"polling\" op_type: \"Equal\" }\nnode { input: \"generating\" input: \"polling\" output: \"decoding\" op_type: \"Or\" }\nnode { input: \"decoding\" input: \"asr\"")
+            .replace("node { input: \"generating\" output: \"candidate_tokens\"", "node { input: \"decoding\" output: \"candidate_tokens\"")
+            .replace("node { input: \"responding\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }", "node { input: \"tokens_out\" output: \"emitted_id\" op_type: \"ReduceSum\" attribute { name: \"keepdims\" i: 0 type: INT } }\nnode { input: \"emitted_id\" input: \"three\" output: \"ending\" op_type: \"Equal\" }\nnode { input: \"ending\" input: \"cancelling\" output: \"model_done\" op_type: \"Or\" }");
+        if native_budget_stop {
+            graph = graph.replace("node { input: \"ending\" input: \"cancelling\" output: \"model_done\" op_type: \"Or\" }", "node { input: \"ending\" input: \"cancelling\" output: \"model_done\" op_type: \"Or\" }\nnode { input: \"output_token_budget\" input: \"zero\" output: \"limited\" op_type: \"GreaterOrEqual\" }\nnode { input: \"output_token_budget\" input: \"count\" output: \"at_limit\" op_type: \"Equal\" }\nnode { input: \"limited\" input: \"at_limit\" output: \"budget_done\" op_type: \"And\" }\nnode { input: \"budget_done\" input: \"model_done\" output: \"done\" op_type: \"Or\" }");
+        } else {
+            graph = graph.replace(
+                "output: \"model_done\" op_type: \"Or\" }",
+                "output: \"done\" op_type: \"Or\" }",
+            );
+        }
+        std::fs::write(path, graph).unwrap();
+        package
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_tool_prefix_at_token_limit_completes_and_keeps_session_usable() {
+        for native_budget_stop in [false, true] {
+            let package = streaming_tool_package(native_budget_stop);
+            let (state, address, task) = server_for_package(package.path()).await;
+            let mut client = connect(address).await;
+            assert_eq!(event(&mut client).await["type"], "session.created");
+            send(&mut client,json!({"type":"session.update","session":{"output_modalities":["text"],"max_output_tokens":1,"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"city":{"const":"Paris"}},"required":["city"],"additionalProperties":false}}],"tool_choice":"required"}})).await;
+            assert_eq!(event(&mut client).await["type"], "session.updated");
+            let mut previous = None;
+            for turn in 0..2 {
+                send(&mut client,json!({"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}})).await;
+                assert_eq!(event(&mut client).await["type"], "conversation.item.added");
+                assert_eq!(event(&mut client).await["type"], "conversation.item.done");
+                send(&mut client,json!({"type":"response.create","response":{"max_output_tokens":if turn==0 {1} else {4}}})).await;
+                loop {
+                    let output = event(&mut client).await;
+                    assert_ne!(
+                        output["type"], "error",
+                        "native_budget_stop={native_budget_stop}: {output}"
+                    );
+                    if output["type"] == "response.done" {
+                        assert_eq!(output["response"]["status"], "completed");
+                        if turn == 0 {
+                            assert_eq!(output["response"]["usage"]["output_tokens"], 1);
+                            assert_eq!(output["response"]["output"], json!([]));
+                        } else {
+                            assert_eq!(output["response"]["usage"]["output_tokens"], 3);
+                            assert_eq!(output["response"]["output"][0]["name"], "lookup");
+                        }
+                        assert_ne!(previous, Some(output["response"]["id"].clone()));
+                        previous = Some(output["response"]["id"].clone());
+                        break;
+                    }
+                }
+            }
+            client.close(None).await.unwrap();
+            drop(client);
+            let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+            tokio::task::spawn_blocking(move || model.engine.shutdown())
+                .await
+                .unwrap();
+            task.abort();
+            let _ = task.await;
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_required_tool_grammar_masks_native_selection() {
+        let package = tool_package_from(
+            "realtime-constrained",
+            "<tool_call>\n{\"name\":\"lookup\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>",
+        );
+        let (state, address, task) = server_for_package(package.path()).await;
+        let mut client = connect(address).await;
+        assert_eq!(event(&mut client).await["type"], "session.created");
+        send(&mut client, json!({"type":"session.update","session":{"output_modalities":["text"],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"city":{"const":"Paris"}},"required":["city"],"additionalProperties":false}}],"tool_choice":"required"}})).await;
+        assert_eq!(event(&mut client).await["type"], "session.updated");
+        send(&mut client, json!({"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}})).await;
+        assert_eq!(event(&mut client).await["type"], "conversation.item.added");
+        assert_eq!(event(&mut client).await["type"], "conversation.item.done");
+        send(&mut client, json!({"type":"response.create"})).await;
+        let mut observed = Vec::new();
+        loop {
+            let output = event(&mut client).await;
+            observed.push(output.clone());
+            assert_ne!(output["type"], "error", "{observed:?}");
+            if output["type"] == "response.done" {
+                assert_eq!(output["response"]["usage"]["output_tokens"], 1);
+                assert_eq!(output["response"]["output"][0]["name"], "lookup");
+                assert_eq!(
+                    serde_json::from_str::<Value>(
+                        output["response"]["output"][0]["arguments"]
+                            .as_str()
+                            .unwrap()
+                    )
+                    .unwrap(),
+                    json!({"city":"Paris"})
+                );
+                break;
+            }
+        }
+        client.close(None).await.unwrap();
+        drop(client);
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn websocket_initializes_native_session_with_rendered_prompt_tokens() {
@@ -1300,9 +1694,18 @@ node { input: "starting" input: "operation""#);
             created["session"]["audio"]["input"]["format"]["rate"],
             16000
         );
+        // Idle/repeated cancellation is silent, including before the first turn.
+        send(&mut client, json!({"type":"response.cancel"})).await;
+        send(&mut client, json!({"type":"response.cancel"})).await;
+        send(&mut client, json!({"type":"response.create"})).await;
+        let empty = event(&mut client).await;
+        assert_eq!(empty["type"], "error");
+        assert_eq!(empty["error"]["type"], "conversation_empty");
+        assert!(empty["error"]["code"].is_null());
         send(&mut client, json!({"type":"input_audio_buffer.commit"})).await;
         let error = event(&mut client).await;
-        assert_eq!(error["error"]["code"], "input_audio_buffer_commit_empty");
+        assert_eq!(error["error"]["type"], "input_audio_buffer_commit_empty");
+        assert!(error["error"]["code"].is_null());
         send(&mut client,json!({"type":"session.update","session":{"instructions":"hello","output_modalities":["text"],"max_output_tokens":1}})).await;
         assert_eq!(event(&mut client).await["type"], "session.updated");
         send(&mut client,json!({"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"world"}]}})).await;
@@ -1322,12 +1725,23 @@ node { input: "starting" input: "operation""#);
             }
         }
         assert_eq!(text, "hello");
+        send(&mut client, json!({"type":"response.cancel"})).await;
+        send(&mut client, json!({"type":"response.cancel"})).await;
+        send(
+            &mut client,
+            json!({"type":"session.update","session":{"max_output_tokens":2}}),
+        )
+        .await;
+        assert_eq!(event(&mut client).await["type"], "session.updated");
         send(
             &mut client,
             json!({"type":"session.update","session":{"instructions":"changed"}}),
         )
         .await;
-        assert_eq!(event(&mut client).await["type"], "error");
+        let invalid = event(&mut client).await;
+        assert_eq!(invalid["type"], "error");
+        assert_eq!(invalid["error"]["type"], "invalid_request_error");
+        assert!(invalid["error"]["code"].is_null());
         client.close(None).await.unwrap();
         drop(client);
         let model = state.registry.resolve("native-realtime").unwrap().unwrap();

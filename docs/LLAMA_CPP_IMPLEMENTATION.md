@@ -1914,3 +1914,303 @@ each invocation publishes its own SSA values. ABI v1 keeps its established
 workflow-scoped single-invocation contract. Chat media capabilities derive from
 runtime Media roles, independently of task-owned application inputs. See
 [reranking](RERANKING.md) for the public contract and native fixture.
+
+
+## Ordered image decisions
+
+Decision v2 uses core schema v1.14 to declare ordered image endpoints and a
+workflow-owned total prompt-token count. The HTTP transport preserves upstream
+files/images/chat-media ordering, strips only image parts from textual state,
+and bounds unique retained media through the image loader shared with reranking.
+Prepared decisions retain shared encoded images across questions and variants;
+native workflow steps perform vision preprocessing and calibrated probability
+inference. Negative/underreported usage is rejected, and a typed input-limit
+error reaches HTTP as a client error. See [SystemOne](SYSTEMONE.md) for the
+explicit contract and the remaining audio/video, joint/packed and shared-entry
+work. This increment does not close the overall compatibility acceptance rows.
+
+### SystemOne mixed audio contracts
+
+Decision v3 (core v1.15) binds ordered typed state media and a distinct spoken
+instruction endpoint. HTTP extraction preserves state structure and media order;
+PCM16 WAV bytes enter authored reusable audio-preprocess@2 components. Actual
+workflow token usage includes media expansion and is bounded. Native fixture
+and HTTP acceptance cover independent spoken questions, byte-budget sharing,
+invalid media and capability discovery; see [SystemOne](SYSTEMONE.md).
+
+## Native prompt-only prefix reuse
+
+`n_predict=0` now retains and reuses actual Native prompt state, with exact full
+hits, suffix appends and permitted KV prefix rewinds. The physical owner and the
+package's `prefix_reusable` declarations decide reuse; a token-history match
+alone does not. Non-sliceable state resets for destructive prefix replacement.
+Cold requests force full evaluation. HTTP checks cover buffered/SSE zero-output
+responses, cache counts and the committed idle slot cursor. Engine tests compare
+content-dependent key/value tensors with a cold oracle across repeated, appended,
+diverged, shortened and complete-context prompts, pin no-reset behavior on a full
+hit, and preserve the existing cancellation/rollback checks.
+
+Prefill responses also distinguish input reuse from post-task retention:
+`PrefillResult.prefix_cache_hit_len` measures reused input, while
+`retained_cache_tokens` supplies native-wire `tokens_cached`. Cold evaluation
+still retains evaluated cache. ORT reference results inspect governed snapshots
+and cached pages rather than claiming token-history-only retention. The same
+wire correction for general generation remains required work.
+
+
+### Ordinary generation retained-cache reporting
+
+`GenerateResult.retained_cache_tokens` records physical state retained at the
+completion boundary, separately from `prefix_cache_hit_len` (input reuse).
+Native final buffered/SSE responses publish the retained count as `tokens_cached`.
+Native stateless cold execution resets before evaluation and retains its newly
+evaluated state afterward. ORT ephemeral sessions report only shared snapshot
+or page payloads surviving session closure; named and prioritized results report
+their materialized session state. Generic workflows without an exposed token-cache
+contract report zero. Cached-prompt usage in OpenAI-shaped responses remains an
+input-reuse statistic.
+
+
+### Decoder timing propagation
+
+Ordinary decoder generation records prompt-forward and generation work in the
+shared token policy. `GenerationClock` closes each active step before external
+callbacks and survives priority-drive suspension. `GenerateToken` snapshots and
+`GenerateResult` carry the canonical engine measurements. Native commit-only
+journals retain the snapshots; ORT collects a private timing journal, checks its
+token ids before commit, then pairs snapshots with authoritative reconstructed
+text during post-commit delivery. No timing event can expose an aborted turn.
+
+Native completions and OpenAI completion/chat responses render the pinned
+[llama.cpp stats fields and rate denominators](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-common.cpp#L147).
+First-token rate is zero (no extra generation forward), and zero-duration values
+remain finite. `timings_per_token=true` publishes cumulative SSE measurements;
+chat timing-only chunks have empty choices, as accepted by pinned Llama Chat.
+Standalone prefill, speculative execution, and generic authored workflow timing
+remain distinct unfinished contracts. Prompt progress events are still open.
+
+
+### Prompt-forward progress and prefix provenance
+
+`GenerationControl` has an independent typed prompt-progress observer alongside
+its cancellation/checkpoint authority. Ordinary decoder hosts report real prompt
+forward boundaries, before token publication. Native/OpenAI completion, chat and
+infill SSE only serialize these updates for `return_progress=true`. Buffered
+collectors and other transports ignore this execution metadata. FIM execution
+now uses the same cancellation/progress authority and committed token callbacks.
+
+The pinned [upstream progress assignment](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-context.cpp#L2306)
+counts cached tokens in `processed`. A whole-prompt forward therefore starts at
+`cache` and completes at `total`; it does not invent intermediate percentages.
+Progress is not semantic state publication: an aborted turn may have reported
+work, but still publishes no tokens, workflow output, or success completion.
+
+`PreparedPrompt` distinguishes reused prefix state from a semantic prefix freshly
+evaluated in the same request. Native incremental decode resumes from the physical
+cursor in either case, while input-reuse statistics use only the former. The
+clock includes fresh prefix evaluation in prompt work, and progress reports its
+actual intermediate boundary. A compressed record-state fixture with a partial
+carry proves fresh prefill and cross-session snapshot restoration match an
+independent complete cold evaluation. Declared `prefix_reusable=false` and memory
+admission guards remain in place. The new snapshot and its memory lease remain
+private until semantic commit; observer failure or cancellation cannot publish
+that provisional prefix. Failure injection before prefill, after the partial
+boundary and after full prompt evaluation proves cache/history publication stays
+atomic and retry recomputes the prefix. SSE replay coverage includes progress
+and timing frames in its byte-exact retained history. Speculative/composite,
+continuous-batch and standalone prefill progress contracts are still unfinished.
+
+
+### JSON property-key escape identity
+
+The pinned llguidance 1.9.1 compiler used serialized raw known-key literals but
+JSON-quoted generic string lexemes. This rejected escaped DEL in a declared key
+and could classify an alternatively escaped known key through a different
+property branch. The local compiler patch builds one quoted-name regex (retaining
+the existing raw spelling) and reuses that exact regex for property recognition
+and pattern/additional exclusion, including impossible optional properties.
+The JSON prefix normalizer also canonicalizes legal raw DEL inside strings;
+original prompt/output text remains untouched. Normalization-sensitive vocabulary
+pieces bypass the literal-byte trie; optimized masks are checked against the
+canonical recognition path for split and whole-token DEL keys and values.
+
+The workspace uses one canonical patched dependency in `vendor/llguidance`.
+Its MIT license, published archive SHA-256, all original file hashes, and exact
+patched-file hashes are recorded there. `scripts/check_llguidance_vendor.py`
+verifies the patch footprint without network access and runs in the existing CI
+gates. The initial declared-key regression failed before the patch. Conformance
+covers every escape split, known/free keys, pattern ownership, unsatisfiable
+optional keys, anyOf branches, Unicode/surrogate keys and literal backslashes.
+HTTP continuation forces valid/invalid competing suffixes through the actual
+model in buffered/SSE mode, with and without response projection.
+
+This workspace patch and bundled source-distribution path are distinct from a
+registry-only dependency install; publishing dependent crates to crates.io removes
+local dependency paths. Upstream or publish the compiler fix before claiming
+this extended key-escape behavior for registry-only crate distributions.
+
+Full server verification also exposed a realtime disconnect release race.
+Admission capacity now drops before the worker reservation advertises idle,
+including early initialization failures; the existing disconnect regression
+checks both resources before admitting a fresh connection.
+
+
+### Prompt-only evaluation progress and timings
+
+`n_predict=0` now carries actual `GenerationTimings` from Native prompt evaluation
+and the explicit ORT reference path. Prompt tokens count fresh work; reused input
+is `cache_n`, retained cache remains `tokens_cached`, and no generation work is
+invented. Fully cached Native prompts execute no forward and report zero elapsed
+prompt work. Observer delivery, preparation and network waits are outside the
+measured forward interval.
+
+The existing atomic prefill transaction emits typed start/completion progress
+before commit. Callback failure or cancellation at either boundary rolls back
+provisional state and prevents prefix publication. The server reserves admission
+before opening SSE, then drains a bounded progress channel concurrently with the
+committed result. Dropping the receiver requests cancellation through the shared
+control probe; terminal delivery follows slot publication and permit release.
+Buffered responses and the final SSE frame include timings; `return_progress`
+remains opt-in and does not create output tokens. Native/ORT regressions cover
+cold, reused and extended prompts, complete Native cache hits, observer failure
+and cancellation, plus real buffered and streamed HTTP responses.
+
+
+### Native speculative progress and timing reports
+
+The Native prompt-lookup/MTP block driver now uses the shared execution clock and
+request control. It reports the real target-prompt start/completion, with zero
+input reuse because this path resets the target cache. Proposal, target verify,
+accepted-state restoration and token selection contribute to generation work;
+progress/checkpoint callbacks and time between blocks do not. Every accepted
+output token advances cumulative counts even when several share one verification
+forward. Final and per-token measurements travel through the existing commit-only
+output journal and server event adapters.
+
+Deterministic clock tests cover paused observer gaps and multiple accepted tokens.
+A real repetitive-context fixture forces multi-token acceptance and compares all
+outputs with plain greedy decoding, including monotonic per-token measurements
+and final-sample identity. Failure/cancellation at prompt and proposal/verification
+boundaries aborts without externally publishing tokens, and retry matches a fresh
+engine. The server driver regression checks prompt events precede the committed
+ordered token/timing journal, including a staged-output failure and retry. Ordinary
+native generation keeps its existing path. ORT speculative, composite and
+continuous-batch reporting remain separate open work; no GPU performance claim is
+made by these CPU functional tests.
+
+The multi-token fixture also exposed a preexisting out-of-bounds acceptance path
+when a target returned last-token-only logits for a wider verification window.
+The driver now validates exact verify-row count and vocabulary width before
+indexing accepted/bonus positions. A malformed-target regression proves this
+fails actionably without a panic or token publication and that ordinary retry
+matches a fresh engine. The positive fixture explicitly expands its target
+logits along the runtime input sequence, rather than claiming multi-token
+coverage from the original one-row fixture.
+
+The Native MTP subprocess regression explicitly removes the ORT backend selection
+and points its ORT library at a nonexistent path. It validates real proposal and
+verification, prompt/final/per-token timing reports, and cancellation/retry after
+both head proposal and target verification. This proves the same reporting and
+abort contracts on the actual Native head path rather than only prompt lookup.
+
+
+### Contextual fused trailing Strip decoding
+
+The shared byte-stream contract now resolves finite trailing Strip after fusion
+(ByteLevel is already fused). Ordered initial/trailing stages retain only their
+bounded suffixes, preserve split UTF-8 and never retract published bytes. Terminal
+flushing removes only complete matching characters; incomplete scalars remain
+visible to strict terminal validation. Token-local stages before the byte stage
+keep their existing semantics. Chunk-local post-ByteFallback Strip still needs
+an explicit Fuse, and other unresolved contextual transforms remain rejected.
+
+Content constraints inspect both the provisional retained suffix and actual
+reachable terminal outputs. When multiple characters are withheld, a bounded
+state search releases only prefixes that a real continuation of the composed
+decoder can expose. It includes split-scalar completions and skips unchanged
+window-filling runs. This accepts a partially released valid ending without
+inventing an ending between composed stages. Published plus retained bytes share
+the response limit; per-chain retention and search work have explicit guards.
+Literal-byte vocabulary masks remain unchanged for context-free decoders.
+
+Reasoning-budget token markers are admitted only when the trailing decoder leaves
+them visible at the declared token boundary. Tool observation uses the same
+ordered decoder and includes retained bytes in its response budget. Its deferred
+contextual-decoder regression now uses an unresolved Replace stage, preserving
+that fallback coverage after fused trailing Strip became supported. Existing
+panic fences still preserve dependency decoder failures and their causes.
+
+Conformance covers ASCII/multibyte tails and every chunk width, ordered composed
+stages, bounded retention, partial-scalar EOF refusal, large finite windows,
+semantic candidate masks, and stable reasoning markers. A real Native HTTP
+fixture competes a higher-biased schema-invalid token against a valid token whose
+encoded suffix is stripped, through buffered/SSE and ordinary/logprob output.
+
+
+## Buffered speech PCM transport
+
+Native `/tts` now supports default WAV, float32 little-endian `pcm`, and signed
+16-bit `pcm16`; OpenAI speech aliases map `pcm` to signed 16-bit samples. Typed
+transport selection reaches the declared audio output through the owner driver.
+Package rates and channel layouts are retained and described in raw PCM MIME
+parameters. Float waveform encoding precedes quantization; validated post-adapter
+PCM16 WAV conversion preserves the already quantized source. Nonfinite samples
+and incomplete post-adapter frames fail explicitly. Streaming speech remains open.
+
+Validation on Native CPU: 14 audio unit tests, both ONNX-owned audio workflow
+tests, and the complete server library (580 passed, 2 inherited ignores) pass.
+Byte checks include stereo interleaving, float precision, symmetric PCM16
+rounding, full signed-range post-adapter conversion, and both HTTP PCM mappings.
+This checkpoint does not establish audio quality or GPU behavior and does not
+complete the remaining compatibility acceptance rows above.
+
+
+## Native speculative response counters
+
+Native prompt-lookup and MTP timing snapshots now carry actual proposal and
+accepted-draft totals through commit-only token publication. The shared server
+timing renderer exposes `draft_n` and `draft_n_accepted` only after a real
+proposal, matching the pinned upstream response fields. Acceptance counts
+verification work, excluding target bonus tokens; it is not reconstructed from
+published text length. Ordinary decode omits both fields. ORT speculative,
+composite and continuous-batch measurement contracts remain open.
+
+Real Native reporting tests cover multi-token acceptance, per-token/final
+snapshot consistency and clean retries after progress/phase cancellation.
+Native MTP is exercised in a subprocess with the ORT library unavailable. The
+actual server driver checks the same counter snapshots after an aborted turn
+and successful retry. This increment does not close the broader acceptance rows.
+
+
+## SSE idle comment pings
+
+The previously accepted but ignored `sse_ping_interval` now configures actual
+idle comment pings for generation transports. A typed policy shares CLI,
+server-default, request validation and `/props` reporting. Default 30 seconds
+matches the pinned upstream; -1 and 0 disable pings. Data resets the idle timer
+and source EOF terminates it. Native completion/infill, OpenAI completion/chat,
+Responses and Anthropic adapters apply the same policy. Replay retains exact
+comment bytes rather than removing them and shifting reconnect offsets.
+
+Wire tests cover idle reset, disablement and termination; HTTP tests cover
+request overrides and rejection across five generation protocols; a real replay
+middleware test checks offsets across comment and UTF-8 payload bytes. This
+increment does not check off unrelated remaining compatibility acceptance rows.
+
+
+## Native final-response field projection
+
+`response_fields` now projects actual native completion/infill terminal results,
+including buffered batches, SSE batches and prompt-only evaluation. An empty
+selector preserves the original response. The pinned source traverses object
+keys and retains the complete slash path as the output key; this differs from
+its README's leaf-renaming description. Missing paths are omitted, array indices
+and JSON Pointer escapes are not inferred. Intermediate token/progress events
+and errors keep their protocol contracts. Native batch completion remains tied
+to its owner outcome channel rather than projected JSON fields.
+
+Unit cases pin nested objects, empty segments, duplicate/missing paths, arrays
+and literal tildes. Real HTTP coverage exercises unchanged empty-selection
+results, nested timing selection, buffered/SSE batches without stop/index,
+prompt-only output, admitted infill, and invalid selector types. This remains an
+increment toward the original compatibility scope, not completion of its rows.

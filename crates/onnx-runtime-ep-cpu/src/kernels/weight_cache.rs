@@ -3,6 +3,7 @@
 //! Flat vectors and native packed panels share admission, reader lifetime,
 //! cold-fill and idle-pressure rules. Dense expansion limits remain policy.
 
+use smallvec::{SmallVec, smallvec};
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -157,9 +158,11 @@ impl<'a, K: WeightCacheKey> WeightSpec<'a, K> {
     }
 }
 
+// Most consumers hold one projection or an expert's two/three projections.
+// Larger groups spill normally; inline capacity is not an admission limit.
 pub(super) struct LoadedWeights<P = Vec<f32>> {
-    pub(super) weights: Vec<Arc<GrantedWeight<P>>>,
-    pub(super) statuses: Vec<WeightCacheStatus>,
+    pub(super) weights: SmallVec<[Arc<GrantedWeight<P>>; 3]>,
+    pub(super) statuses: SmallVec<[WeightCacheStatus; 3]>,
 }
 
 pub(super) enum WeightLoad<P = Vec<f32>> {
@@ -272,12 +275,12 @@ impl<K: WeightCacheKey, P: WeightPayload> WeightCache<K, P> {
         Some(value)
     }
 
-    fn lookup(&self, specs: &[WeightSpec<'_, K>]) -> Vec<Option<Arc<GrantedWeight<P>>>> {
+    fn lookup(&self, specs: &[WeightSpec<'_, K>]) -> SmallVec<[Option<Arc<GrantedWeight<P>>>; 3]> {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let values: Vec<_> = specs
+        let values: SmallVec<[_; 3]> = specs
             .iter()
             .map(|spec| {
                 spec.key
@@ -301,13 +304,26 @@ impl<K: WeightCacheKey, P: WeightPayload> WeightCache<K, P> {
         values
     }
 
-    fn ready_hits(values: Vec<Option<Arc<GrantedWeight<P>>>>) -> WeightLoad<P> {
-        let statuses = vec![WeightCacheStatus::Hit; values.len()];
+    fn complete_weights(
+        values: SmallVec<[Option<Arc<GrantedWeight<P>>>; 3]>,
+    ) -> SmallVec<[Arc<GrantedWeight<P>>; 3]> {
+        let complete = |value: Option<Arc<GrantedWeight<P>>>| {
+            value.expect("every dense projection hit or built successfully")
+        };
+        if values.spilled() {
+            // Vec's owning map can reuse this heap buffer for equal-sized
+            // Option<Arc>/Arc elements. SmallVec's iterator cannot transfer it
+            // to a new SmallVec, so preserve the existing spill allocation.
+            SmallVec::from_vec(values.into_vec().into_iter().map(complete).collect())
+        } else {
+            values.into_iter().map(complete).collect()
+        }
+    }
+
+    fn ready_hits(values: SmallVec<[Option<Arc<GrantedWeight<P>>>; 3]>) -> WeightLoad<P> {
+        let statuses = smallvec![WeightCacheStatus::Hit; values.len()];
         WeightLoad::Ready(LoadedWeights {
-            weights: values
-                .into_iter()
-                .map(|value| value.expect("complete dense-cache hit set"))
-                .collect(),
+            weights: Self::complete_weights(values),
             statuses,
         })
     }
@@ -347,7 +363,7 @@ impl<K: WeightCacheKey, P: WeightPayload> WeightCache<K, P> {
         let mut values = if keyed {
             self.lookup(specs)
         } else {
-            vec![None; specs.len()]
+            smallvec![None; specs.len()]
         };
         if values.iter().all(Option::is_some) {
             return Ok(Self::ready_hits(values));
@@ -407,7 +423,7 @@ impl<K: WeightCacheKey, P: WeightPayload> WeightCache<K, P> {
             WeightAdmission::Granted(grant) => grant,
             WeightAdmission::Declined(reason) => return Ok(WeightLoad::Declined(reason)),
         };
-        let mut statuses = vec![WeightCacheStatus::Hit; specs.len()];
+        let mut statuses = smallvec![WeightCacheStatus::Hit; specs.len()];
         for (index, spec) in specs.iter().enumerate() {
             if values[index].is_some() {
                 continue;
@@ -442,10 +458,7 @@ impl<K: WeightCacheKey, P: WeightPayload> WeightCache<K, P> {
                 inner.builds = inner.builds.saturating_add(1);
             }
         }
-        let weights: Vec<_> = values
-            .into_iter()
-            .map(|value| value.expect("every dense projection hit or built successfully"))
-            .collect();
+        let weights = Self::complete_weights(values);
         if keyed {
             let mut inner = self
                 .inner
@@ -1139,6 +1152,84 @@ mod tests {
     }
 
     #[test]
+    fn larger_projection_groups_keep_atomic_admission_and_reader_lifetimes() {
+        use crate::kernels::testutil::RecordingGovernor;
+        // Four members exercise the dynamic path beyond the usual expert set.
+        let packed: Vec<_> = (1..=4).map(|n| Owned::u8(&[4], &[n; 4])).collect();
+        let keys: Vec<_> = packed.iter().map(key).collect();
+        let specs: Vec<_> = keys.iter().map(|key| cached(key)).collect();
+        let books = RecordingGovernor::new_host(63);
+        let cache =
+            WeightCache::<DenseWeightCacheKey>::new(books.weight_memory(HolderId::new(13)), 64);
+        assert!(matches!(
+            cache
+                .load_group(&specs, |_, _| panic!(
+                    "whole-group refusal precedes every builder"
+                ))
+                .unwrap(),
+            WeightLoad::Declined(MemoryError::TierExhausted { requested: 64, .. })
+        ));
+        assert_eq!(books.used(Tier::Host), 0);
+        assert_eq!(cache.stats(), (0, 0));
+
+        let books = RecordingGovernor::new_host(64);
+        let cache =
+            WeightCache::<DenseWeightCacheKey>::new(books.weight_memory(HolderId::new(13)), 64);
+        let error = cache
+            .load_group(&specs, |index, output| {
+                if index == 3 {
+                    return Err(EpError::KernelFailed(
+                        "fourth projection rejected its block".into(),
+                    ));
+                }
+                output.fill(index as f32 + 1.);
+                Ok(())
+            })
+            .err()
+            .expect("last builder must fail");
+        assert!(error.to_string().contains("fourth projection"));
+        assert_eq!(cache.stats(), (0, 0));
+        assert_eq!(books.used(Tier::Host), 0, "all earlier slices must refund");
+
+        let loaded = ready(
+            cache
+                .load_group(&specs, |index, output| {
+                    output.fill(index as f32 + 1.);
+                    Ok(())
+                })
+                .unwrap(),
+        );
+        assert_eq!(cache.stats(), (4, 64));
+        assert_eq!(books.used(Tier::Host), 64);
+        let before = (books.claims(), books.releases());
+        let warm = ready(
+            cache
+                .load_group(&specs, |_, _| panic!("warm group must not rebuild"))
+                .unwrap(),
+        );
+        assert_eq!((books.claims(), books.releases()), before);
+        assert_eq!(warm.weights.len(), 4);
+        for (index, (cold, hit)) in loaded.weights.iter().zip(&warm.weights).enumerate() {
+            assert!(Arc::ptr_eq(cold, hit));
+            assert_eq!(hit.as_slice(), &[index as f32 + 1.; 4]);
+        }
+        assert!(
+            warm.statuses
+                .iter()
+                .all(|status| *status == WeightCacheStatus::Hit)
+        );
+        drop(cache);
+        drop(loaded);
+        assert_eq!(
+            books.used(Tier::Host),
+            64,
+            "live readers outlast cache membership"
+        );
+        drop(warm);
+        assert_eq!(books.used(Tier::Host), 0);
+    }
+
+    #[test]
     fn partial_rekey_replaces_only_missing_projection_under_an_exact_group_budget() {
         let p1 = Owned::u8(&[4], &[1; 4]);
         let p2 = Owned::u8(&[4], &[2; 4]);
@@ -1174,7 +1265,7 @@ mod tests {
         assert_eq!(builds, 1);
         assert!(Arc::ptr_eq(&retained, &second.weights[0]));
         assert_eq!(
-            second.statuses,
+            second.statuses.as_slice(),
             [WeightCacheStatus::Hit, WeightCacheStatus::MissStored]
         );
         assert_eq!(governor.used(Tier::Host), 32);

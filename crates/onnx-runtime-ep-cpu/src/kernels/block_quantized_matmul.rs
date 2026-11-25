@@ -546,7 +546,7 @@ impl BlockQuantizedMatMulKernel {
                 self.n,
                 bias.as_deref(),
                 plan,
-                scratch.initialized(),
+                &mut scratch,
                 &mut result,
             )?;
             return write_dense_f32_narrow(OP, &mut outputs[0], &result);
@@ -974,7 +974,7 @@ pub(super) fn linear_packed_prepared(
     out_features: usize,
     bias: Option<&[f32]>,
     plan: super::decoded_projection::DecodedProjectionPlan,
-    scratch: &mut [f32],
+    scratch: &mut ProjectionScratch<'_>,
     output: &mut [f32],
 ) -> Result<()> {
     if super::matmul::serial_projection_is_portable() {
@@ -1117,7 +1117,7 @@ fn linear_packed_prepared_tiled<const FEATURE_TILE: usize>(
     out_features: usize,
     bias: Option<&[f32]>,
     plan: super::decoded_projection::DecodedProjectionPlan,
-    scratch: &mut [f32],
+    scratch: &mut ProjectionScratch<'_>,
     output: &mut [f32],
 ) -> Result<()> {
     let packed_rows =
@@ -2068,7 +2068,7 @@ mod tests {
                     n,
                     Some(&bias),
                     plan,
-                    &mut scratch,
+                    &mut ProjectionScratch::test_binding(&mut scratch),
                     &mut actual,
                 )
                 .unwrap();
@@ -2088,7 +2088,7 @@ mod tests {
                     n,
                     Some(&bias),
                     plan,
-                    &mut scratch,
+                    &mut ProjectionScratch::test_binding(&mut scratch),
                     &mut next,
                 )
                 .unwrap();
@@ -2124,7 +2124,7 @@ mod tests {
             n,
             Some(&bias),
             plan,
-            &mut scratch,
+            &mut ProjectionScratch::test_binding(&mut scratch),
             &mut backing[1..1 + elements],
         )
         .unwrap();
@@ -2152,7 +2152,7 @@ mod tests {
                 n,
                 Some(&bias),
                 plan,
-                &mut scratch[..workspace_len],
+                &mut ProjectionScratch::test_binding(&mut scratch[..workspace_len]),
                 &mut output,
             )
             .unwrap_err()

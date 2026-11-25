@@ -79,6 +79,12 @@ impl TextView<'_> {
 }
 
 impl TextProjection {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Plain(text) => text.bytes.len(),
+            Self::Declared(parser) => parser.retained_bytes(),
+        }
+    }
     pub(crate) fn plain_pending(&self) -> anyhow::Result<Option<&[u8]>> {
         match self {
             Self::Declared(_) => Ok(None),

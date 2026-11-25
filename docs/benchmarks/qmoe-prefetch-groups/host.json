@@ -1,0 +1,7 @@
+{
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "cpu": "Apple M1 Max",
+  "base": "e5784b939e40a4d40bdebb4e5e27bbc19038dc65",
+  "cuda_execution": false
+}

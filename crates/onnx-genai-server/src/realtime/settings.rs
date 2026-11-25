@@ -58,6 +58,10 @@ pub(super) enum OutputBudget {
     Tokens(NonZeroU32),
 }
 impl OutputBudget {
+    pub(super) fn exhausted(self, used: u64) -> bool {
+        matches!(self,Self::Tokens(limit) if used >= u64::from(limit.get()))
+    }
+
     fn parse(value: &Value) -> anyhow::Result<Self> {
         if value == "inf" {
             return Ok(Self::Unlimited);
@@ -351,7 +355,7 @@ fn selection(value: &Value, field: &str) -> anyhow::Result<Option<String>> {
         .with_context(|| format!("{field} must be a string or null"))?;
     Ok((!value.is_empty()).then(|| value.to_owned()))
 }
-fn choice_name(choice: &ToolChoiceMode) -> &'static str {
+pub(super) fn choice_name(choice: &ToolChoiceMode) -> &'static str {
     match choice {
         ToolChoiceMode::Auto => "auto",
         ToolChoiceMode::None => "none",

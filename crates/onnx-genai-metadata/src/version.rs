@@ -151,7 +151,7 @@ pub enum SchemaVersionError {
 pub const INITIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 0);
 
 /// The newest version this build can read.
-pub const SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 13);
+pub const SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 16);
 
 /// Every inference-metadata schema version this build reads.
 pub const SUPPORTED_SCHEMA_VERSIONS: SupportedSchemaVersions = SupportedSchemaVersions {
@@ -203,6 +203,15 @@ pub const MULTIMODAL_RERANKING_SCHEMA_VERSION: SchemaVersion = SchemaVersion::ne
 /// The version that introduced session-scoped realtime quantum contracts.
 pub const REALTIME_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 13);
 
+/// The version that introduced explicit decision image inputs and usage outputs.
+pub const MULTIMODAL_DECISION_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 14);
+
+/// The version introducing typed mixed decision media and spoken questions.
+pub const DECISION_AUDIO_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 15);
+
+/// The version introducing external named audio feature input programs.
+pub const AUDIO_FEATURE_INPUT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 16);
+
 /// A serialized feature whose presence is bounded by one schema version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaFeature {
@@ -214,6 +223,9 @@ pub enum SchemaFeature {
     DecisionInputPolicies,
     MultimodalReranking,
     RealtimeSessions,
+    MultimodalDecisions,
+    DecisionAudio,
+    AudioFeatureInputs,
 }
 
 impl SchemaFeature {
@@ -227,6 +239,9 @@ impl SchemaFeature {
             Self::DecisionInputPolicies => DECISION_INPUT_SCHEMA_VERSION,
             Self::MultimodalReranking => MULTIMODAL_RERANKING_SCHEMA_VERSION,
             Self::RealtimeSessions => REALTIME_SCHEMA_VERSION,
+            Self::MultimodalDecisions => MULTIMODAL_DECISION_SCHEMA_VERSION,
+            Self::DecisionAudio => DECISION_AUDIO_SCHEMA_VERSION,
+            Self::AudioFeatureInputs => AUDIO_FEATURE_INPUT_SCHEMA_VERSION,
         }
     }
 
@@ -241,6 +256,11 @@ impl SchemaFeature {
             Self::DecisionInputPolicies => "explicit decision request policies",
             Self::MultimodalReranking => "ordered multimodal reranking inputs",
             Self::RealtimeSessions => "session-scoped realtime audio/text quanta",
+            Self::MultimodalDecisions => "ordered decision image inputs and authoritative usage",
+            Self::DecisionAudio => "typed mixed decision media and spoken instructions",
+            Self::AudioFeatureInputs => {
+                "externally executed audio programs bound to feature media inputs"
+            }
             Self::DecisionProfiles => "model-authored non-generative decision profiles",
             Self::PreferredEnding => "preferred end-of-turn token role within the package EOS set",
             Self::CompressedStateGroups => {
@@ -260,7 +280,16 @@ impl SchemaFeature {
                  `publication_mode: provisional_revisions`"
             }
             Self::DecisionProfiles => "Declare decision prompting and answer policies explicitly",
+            Self::AudioFeatureInputs => {
+                "Declare the audio program output with the same name as its feature media input"
+            }
+            Self::MultimodalDecisions => {
+                "Declare decision v2 image endpoints and prompt_tokens output explicitly"
+            }
             Self::DecisionInputPolicies => "Declare decision.input_policy explicitly",
+            Self::DecisionAudio => {
+                "Declare decision v3 media kinds/endpoints and spoken-instruction audio explicitly"
+            }
             Self::RealtimeSessions => {
                 "Declare realtime session inputs, rates and output bindings explicitly"
             }
@@ -303,6 +332,15 @@ pub fn gate_feature_use(
              {required}. Remove `pipeline.workflow.publication_mode` to keep a pre-{required} \
              document, or upgrade `schema_version` to \"{required}\" and author a valid mode \
              (`commit_only` or `provisional_revisions`)"
+        )),
+        SchemaFeature::AudioFeatureInputs => Err(format!(
+            "{path} requires minimum schema version {required}; declare the named external audio feature binding in schema_version '{required}', or use an encoded-input workflow adapter"
+        )),
+        SchemaFeature::DecisionAudio => Err(format!(
+            "{path} requires minimum schema version {required}; declare typed decision v3 media/spoken inputs in schema_version '{required}', or omit the audio contract"
+        )),
+        SchemaFeature::MultimodalDecisions => Err(format!(
+            "{path} requires minimum schema version {required}; declare decision v2 image endpoints and token usage in schema_version '{required}', or use a text-only decision v1 profile"
         )),
         SchemaFeature::RealtimeSessions => Err(format!(
             "{path} requires minimum schema version {required}; author a realtime v1 quantum contract in schema_version '{required}', or remove the realtime profile"
@@ -437,7 +475,7 @@ mod tests {
 
     #[test]
     fn a_canonical_version_prints_the_way_a_document_should_write_it() {
-        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.13");
+        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.16");
         assert_eq!(INITIAL_SCHEMA_VERSION.to_string(), "v1.0");
     }
 
@@ -476,10 +514,10 @@ mod tests {
 
     #[test]
     fn a_newer_minor_is_refused_by_number_rather_than_by_field_name() {
-        let error = gate(Some("1.14")).expect_err("1.14 is newer than this build");
+        let error = gate(Some("1.17")).expect_err("1.17 is newer than this build");
         let error = error.to_string();
         assert!(
-            error.contains("declares unsupported schema version v1.14"),
+            error.contains("declares unsupported schema version v1.17"),
             "{error}"
         );
         assert!(
@@ -538,7 +576,7 @@ mod tests {
             gate(Some("1.11")).expect("1.11"),
             DECISION_INPUT_SCHEMA_VERSION
         );
-        assert_eq!(gate(Some("1.13")).expect("1.13"), SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(gate(Some("1.16")).expect("1.16"), SUPPORTED_SCHEMA_VERSION);
     }
 
     #[test]
