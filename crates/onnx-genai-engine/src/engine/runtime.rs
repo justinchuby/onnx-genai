@@ -1578,6 +1578,15 @@ impl Engine {
                         } else {
                             self.prepare_session_prefix(session, &mut state, &tokens)?
                         };
+                        if let Some(control) = &control {
+                            control.report_prompt_progress(crate::pipeline::PromptProgress {
+                                total: tokens.len(),
+                                cache: prefix_cache_hit_len,
+                                processed: prefix_cache_hit_len,
+                                elapsed: std::time::Duration::ZERO,
+                            })?;
+                        }
+                        let started = std::time::Instant::now();
                         // This also runs a no-KV decoder: ensure_session_kv_current
                         // alone would skip its entire forward pass.
                         let _ = next_session_token_logits(
@@ -1588,12 +1597,26 @@ impl Engine {
                             &mut state,
                         )?;
                         self.ensure_session_kv_current(session, &mut state)?;
+                        let elapsed = started.elapsed();
                         if let Some(control) = &control {
                             control
                                 .check(crate::pipeline::GenerationBoundary::AfterDecoderForward)?;
+                            control.report_prompt_progress(crate::pipeline::PromptProgress {
+                                total: tokens.len(),
+                                cache: prefix_cache_hit_len,
+                                processed: tokens.len(),
+                                elapsed,
+                            })?;
                             control.require_commit()?;
                         }
                         Ok(PrefillResult {
+                            timings: crate::GenerationTimings {
+                                prompt_tokens: tokens.len() - prefix_cache_hit_len,
+                                cached_prompt_tokens: prefix_cache_hit_len,
+                                generated_tokens: 0,
+                                prompt_elapsed: elapsed,
+                                generation_elapsed: std::time::Duration::ZERO,
+                            },
                             prompt_tokens: tokens.len(),
                             prefix_cache_hit_len,
                             retained_cache_tokens: 0,
@@ -1698,17 +1721,42 @@ impl Engine {
                     native.rewind(reused)?;
                 }
                 let pending = &tokens[reused..];
-                if !pending.is_empty() {
+                if let Some(control) = control {
+                    control.report_prompt_progress(crate::pipeline::PromptProgress {
+                        total: tokens.len(),
+                        cache: reused,
+                        processed: reused,
+                        elapsed: std::time::Duration::ZERO,
+                    })?;
+                }
+                let elapsed = if !pending.is_empty() {
                     let workspace =
                         native.prepare_generation_workspace_preserving_state(pending)?;
                     crate::native_decode::accept_eager_workspace_preparation(workspace);
+                    let started = std::time::Instant::now();
                     native.prefill_prefix(pending)?;
-                }
+                    started.elapsed()
+                } else {
+                    std::time::Duration::ZERO
+                };
                 if let Some(control) = control {
                     control.check(crate::pipeline::GenerationBoundary::AfterDecoderForward)?;
+                    control.report_prompt_progress(crate::pipeline::PromptProgress {
+                        total: tokens.len(),
+                        cache: reused,
+                        processed: tokens.len(),
+                        elapsed,
+                    })?;
                     control.require_commit()?;
                 }
                 Ok(PrefillResult {
+                    timings: crate::GenerationTimings {
+                        prompt_tokens: tokens.len() - reused,
+                        cached_prompt_tokens: reused,
+                        generated_tokens: 0,
+                        prompt_elapsed: elapsed,
+                        generation_elapsed: std::time::Duration::ZERO,
+                    },
                     prompt_tokens: tokens.len(),
                     prefix_cache_hit_len: reused,
                     retained_cache_tokens: native.current_len(),
@@ -6015,6 +6063,121 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prompt_only_progress_reports_actual_work_without_observer_time_or_generated_tokens()
+    -> anyhow::Result<()> {
+        use std::sync::{Arc, Mutex};
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for backend in [EngineDecodeBackend::Native, EngineDecodeBackend::Ort] {
+            let mut engine = Engine::from_dir(
+                &fixture,
+                EngineConfig {
+                    decode_backend: backend,
+                    native_device: Some(crate::NativeDecodeDevice::Cpu),
+                    ..Default::default()
+                },
+            )?;
+            for cold in [true, false] {
+                let updates = Arc::new(Mutex::new(Vec::new()));
+                let sink = updates.clone();
+                let control =
+                    crate::GenerationControl::new().with_prompt_progress(move |progress| {
+                        sink.lock().unwrap().push(progress);
+                        // Observer work is not model work and must not enter the
+                        // accumulated execution time reported by later updates.
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        Ok(())
+                    });
+                let mut request = prefill_request(&[2, 4, 3]);
+                request.cold_start = cold;
+                let result = engine.prefill_with_callbacks(request, Some(control), None)?;
+                let updates = updates.lock().unwrap();
+                assert_eq!(updates.len(), 2);
+                let cache = if cold {
+                    0
+                } else if backend == EngineDecodeBackend::Native {
+                    3
+                } else {
+                    2
+                };
+                assert_eq!(result.prefix_cache_hit_len, cache);
+                assert_eq!(result.timings.cached_prompt_tokens, cache);
+                assert_eq!(result.timings.prompt_tokens, 3 - cache);
+                assert_eq!(result.timings.generated_tokens, 0);
+                assert_eq!(result.timings.generation_elapsed, std::time::Duration::ZERO);
+                assert_eq!(updates[0].processed, cache);
+                assert_eq!(updates[0].elapsed, std::time::Duration::ZERO);
+                assert_eq!(updates[1].processed, 3);
+                assert_eq!(updates[1].elapsed, result.timings.prompt_elapsed);
+                for progress in updates.iter() {
+                    assert_eq!(progress.total, 3);
+                    assert_eq!(progress.cache, cache);
+                }
+                if cache == 3 {
+                    assert_eq!(result.timings.prompt_elapsed, std::time::Duration::ZERO);
+                } else {
+                    assert!(!result.timings.prompt_elapsed.is_zero());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prompt_only_progress_observer_error_or_cancel_never_publishes_provisional_cache()
+    -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for backend in [EngineDecodeBackend::Native, EngineDecodeBackend::Ort] {
+            for at in [0, 3] {
+                for cancel in [false, true] {
+                    let mut engine = Engine::from_dir(
+                        &fixture,
+                        EngineConfig {
+                            decode_backend: backend,
+                            native_device: Some(crate::NativeDecodeDevice::Cpu),
+                            ..Default::default()
+                        },
+                    )?;
+                    let authority = crate::GenerationControl::new();
+                    let cancellation = authority.clone();
+                    let control = authority.with_prompt_progress(move |progress| {
+                        if progress.processed == at {
+                            if cancel {
+                                cancellation.cancel();
+                            } else {
+                                anyhow::bail!("injected prompt-only progress failure");
+                            }
+                        }
+                        Ok(())
+                    });
+                    let error = engine
+                        .prefill_with_callbacks(prefill_request(&[2, 4, 3]), Some(control), None)
+                        .unwrap_err();
+                    if cancel {
+                        assert!(
+                            error.downcast_ref::<crate::GenerationCancelled>().is_some(),
+                            "{error:#}"
+                        );
+                    } else {
+                        assert!(
+                            format!("{error:#}").contains("injected prompt-only progress failure")
+                        );
+                    }
+                    assert_eq!(engine.scheduler.running_count(), 0);
+                    let result = engine.prefill(prefill_request(&[2, 4, 3]))?;
+                    assert_eq!(
+                        result.prefix_cache_hit_len, 0,
+                        "failed work must be recomputed: {backend:?}, {at}, {cancel}"
+                    );
+                    assert_eq!(result.retained_cache_tokens, 3);
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn prompt_only_prefill_publishes_real_ort_cache_without_output() -> anyhow::Result<()> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
@@ -6030,6 +6193,7 @@ mod tests {
         assert_eq!(
             result,
             PrefillResult {
+                timings: result.timings,
                 prompt_tokens: 3,
                 prefix_cache_hit_len: 0,
                 retained_cache_tokens: 3,
