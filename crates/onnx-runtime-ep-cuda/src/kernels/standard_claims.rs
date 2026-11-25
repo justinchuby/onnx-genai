@@ -142,7 +142,11 @@ fn global_lp_pool(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> 
 fn lp_normalization(node: &Node, opset: u64, input_dtypes: &[DataType]) -> Result<(), String> {
     global_pool(node, input_dtypes)?;
     let optimizer_created = node.attr("fused_reduce_chain").and_then(Attribute::as_int) == Some(1);
-    if input_dtypes.first() == Some(&DataType::BFloat16) && opset < 22 && !optimizer_created {
+    if input_dtypes.first() == Some(&DataType::BFloat16)
+        && opset < 22
+        && !optimizer_created
+        && !onnx_runtime_ep_api::schema_authority::authoritative_schema_validation_active()
+    {
         return Err(format!(
             "input 'X' dtype BFloat16 requires ONNX opset 22 or later; export this node at opset 22+, or use Float16 or Float32 at opset {opset}"
         ));
@@ -884,4 +888,42 @@ fn mod_op(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
         return Err("Float32 Mod requires fmod=1".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod lp_normalization_claim_tests {
+    use super::*;
+    use onnx_runtime_ir::{NodeId, ValueId};
+
+    fn node() -> Node {
+        Node::new(
+            NodeId(0),
+            "LpNormalization",
+            vec![Some(ValueId(0))],
+            vec![ValueId(1)],
+        )
+    }
+
+    #[test]
+    fn bf16_boundary_distinguishes_standalone_plugin_and_optimizer_nodes() {
+        let node = node();
+        let dtype = [DataType::BFloat16];
+
+        assert!(lp_normalization(&node, 21, &dtype).is_err());
+        assert!(lp_normalization(&node, 22, &dtype).is_ok());
+
+        let plugin_claim = unsafe {
+            onnx_runtime_ep_api::schema_authority::with_authoritative_schema_validation(|| {
+                lp_normalization(&node, 21, &dtype)
+            })
+        };
+        assert!(plugin_claim.is_ok());
+        assert!(lp_normalization(&node, 21, &dtype).is_err());
+
+        let mut optimizer_node = node;
+        optimizer_node
+            .attributes
+            .insert("fused_reduce_chain".into(), Attribute::Int(1));
+        assert!(lp_normalization(&optimizer_node, 21, &dtype).is_ok());
+    }
 }

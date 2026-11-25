@@ -45,6 +45,7 @@ pub mod mean_variance_normalization;
 pub mod packed_routed;
 pub mod provider;
 pub mod registry;
+pub mod schema_authority;
 pub mod standard_activation;
 pub mod standard_math;
 pub mod tensor;

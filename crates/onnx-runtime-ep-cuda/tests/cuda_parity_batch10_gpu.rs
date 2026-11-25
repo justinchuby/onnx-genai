@@ -258,6 +258,31 @@ fn lp_normalization_dtype_admission_changes_at_opset22_gpu() {
         &[3.0, 4.0, 0.0, 0.0, 0.0, 5.0],
     )];
     let outputs = vec![(DataType::BFloat16, vec![2, 3])];
+    let (graph, node_id) = build_graph("LpNormalization", "", 21, &inputs, &outputs, &[]);
+    let model = Model::new(&graph);
+    let plugin_claim = unsafe {
+        onnx_runtime_ep_api::schema_authority::with_authoritative_schema_validation(|| {
+            ep.supports_op(
+                model.graph.node(node_id),
+                21,
+                &[static_shape([2, 3])],
+                &[DataType::BFloat16],
+                &[],
+            )
+        })
+    };
+    assert!(
+        plugin_claim.is_supported(),
+        "host-validated CUDA plugin capability must preserve the executable BF16 lane: {:?}",
+        plugin_claim.reason()
+    );
+
+    let inputs = vec![float_input(
+        DataType::BFloat16,
+        &[2, 3],
+        &[3.0, 4.0, 0.0, 0.0, 0.0, 5.0],
+    )];
+    let outputs = vec![(DataType::BFloat16, vec![2, 3])];
     let attrs = vec![("fused_reduce_chain", Attribute::Int(1))];
     let (graph, node_id) = build_graph("LpNormalization", "", 21, &inputs, &outputs, &attrs);
     let model = Model::new(&graph);

@@ -151,6 +151,34 @@ fn lp_normalization_dtype_admission_changes_at_opset22() {
     assert!(reason.contains("BFloat16"), "{reason}");
     assert!(reason.contains("opset 22"), "{reason}");
 
+    let plugin_admitted = unsafe {
+        onnx_runtime_ep_api::schema_authority::with_authoritative_schema_validation(|| {
+            ep.supports_op(
+                &node,
+                21,
+                std::slice::from_ref(&shape),
+                &[DataType::BFloat16],
+                &[],
+            )
+        })
+    };
+    assert!(
+        plugin_admitted.is_supported(),
+        "host-validated plugin capability must preserve the executable BF16 lane: {:?}",
+        plugin_admitted.reason()
+    );
+    assert!(
+        !ep.supports_op(
+            &node,
+            21,
+            std::slice::from_ref(&shape),
+            &[DataType::BFloat16],
+            &[],
+        )
+        .is_supported(),
+        "leaving host-schema scope must restore standalone rejection"
+    );
+
     let admitted = ep.supports_op(
         &node,
         22,
