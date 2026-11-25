@@ -493,6 +493,11 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if let Some(reason) =
+            onnx_runtime_ep_api::standard_activation::unsupported_reason(op, opset, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if let Some(reason) = onnx_runtime_ep_api::mean_variance_normalization::unsupported_reason(
             op,
             shapes,
@@ -1872,6 +1877,26 @@ mod tests {
         assert!(reason.contains("registers Gelu since opset 20"), "{reason}");
 
         assert!(ep.supports_op(&gelu, 20, &[], &[], &[]).is_supported());
+    }
+
+    #[test]
+    fn activation_bf16_claims_start_at_opset_22() {
+        let ep = CpuExecutionProvider::new();
+        for op_type in ["Elu", "HardSigmoid", "Selu", "Softplus", "Softsign"] {
+            let node = Node::new(onnx_runtime_ir::NodeId(0), op_type, vec![], vec![]);
+            let rejected = ep.supports_op(&node, 21, &[], &[DataType::BFloat16], &[]);
+            let reason = rejected.reason().expect("opset 21 BF16 must be declined");
+            assert!(
+                reason.contains("does not admit BF16 at opset 21"),
+                "{reason}"
+            );
+            assert!(reason.contains("opset 22"), "{reason}");
+            assert!(
+                ep.supports_op(&node, 22, &[], &[DataType::BFloat16], &[])
+                    .is_supported(),
+                "{op_type}"
+            );
+        }
     }
 
     #[test]
