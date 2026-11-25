@@ -1411,6 +1411,7 @@ pub(super) fn run_expert(
     linear(&activated, fc2_weights, fc2_bias, hidden, inter)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_expert_grouped(
     input: &[f32],
@@ -1475,6 +1476,7 @@ impl ExpertProjection for DenseExpertProjection<'_> {
         self.in_features
     }
 }
+#[cfg(test)]
 impl DenseExpertProjection<'_> {
     fn apply(&self, input: &[f32], rows: usize, bias: Option<&[f32]>) -> Result<Vec<f32>> {
         linear_grouped(
@@ -1488,6 +1490,7 @@ impl DenseExpertProjection<'_> {
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_expert_projections<P: ExpertProjection>(
     input: &[f32],
@@ -1578,6 +1581,7 @@ pub(super) fn run_expert_projections<P: ExpertProjection>(
 /// for both operands. Neither materializes the `[in_features, out_features]`
 /// copy the old portable path built - a 29 MiB strided scatter per call for a
 /// Mixtral-sized expert, previously the single largest term in the operator.
+#[cfg(test)]
 fn linear_grouped(
     input: &[f32],
     rows: usize,

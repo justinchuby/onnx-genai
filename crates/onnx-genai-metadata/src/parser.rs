@@ -201,7 +201,7 @@ pub fn load_metadata_from_dir(
 }
 
 /// Recognized inference-metadata filenames, in the order they are preferred.
-const METADATA_FILE_NAMES: [&str; 3] = [
+pub const METADATA_FILE_NAMES: [&str; 3] = [
     "inference_metadata.yaml",
     "inference_metadata.yml",
     "inference_metadata.json",
@@ -312,6 +312,17 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
         .and_then(serde_yaml::Value::as_mapping)
     {
         for (name, profile) in profiles {
+            if profile.get("reranking").is_some() {
+                crate::version::gate_feature_use(
+                    version,
+                    crate::version::SchemaFeature::MultimodalReranking,
+                    &format!(
+                        "profiles.{}.reranking",
+                        name.as_str().unwrap_or("<invalid-name>")
+                    ),
+                )
+                .map_err(crate::MetadataError::Parse)?;
+            }
             if profile.get("decision").is_some() {
                 crate::version::gate_feature_use(
                     version,

@@ -162,6 +162,20 @@ does not refund those bytes. Idle capacity can be reclaimed under pressure.
 Pending asynchronous work, active readers and capture pins prevent reuse, and
 quarantined backing retains its charge until physical release is settled.
 
+CPU derived-weight payloads also treat zero bytes as an explicit empty grant.
+An empty grant cannot split off positive bytes; a zero-byte split of any grant
+produces another empty value without cloning an accountant lease. Positive
+governed payloads still claim and retain their exact physical capacity, and
+partially split owners return only their own bytes. This removes empty
+projection-group admission callbacks without relabeling zero capacity as the
+unbounded local/ungoverned mode. The configured source's one-time zero-byte
+authority anchor remains validated at construction; it is not a payload claim.
+QMoE uses the same empty-owner conversion for on-demand and transient experts.
+Direct issuer-counter tests cover empty groups, full-capacity pressure, mixed
+zero/nonzero groups, positive construction peaks for empty final payloads,
+positive splitting/retirement and zero-capacity rejection.
+This establishes callback behavior, not a measured inference speedup.
+
 Cold replacement borrows the caller's `Option<WorkspaceAllocation>`. The option
 retains the original owner until the provider actually takes it for retirement.
 CUDA rejects real stream capture before release-barrier waiting, growth grants,
@@ -628,6 +642,27 @@ metadata preparations, including `Deferred`, and refines on each Compute; exact
 address/value-dependent bytes never enter that geometry cache. Cached ready
 preparations avoid repeating the metadata query.
 
+Metadata workspace caches also include a provider-scoped execution-context key.
+The key describes ambient facts that can change a fixed kernel's bound; it is
+neither a memory owner nor an admission token. Providers with context-independent
+bounds use the default stable reader. CPU uses the selected Rayon width inside
+workers and a separate stable class for external callers of the immutable global
+pool. Reading the key does not initialize that pool. Same-width pools are
+capacity-equivalent; switching between an external caller and a global worker
+may conservatively miss. Native complete-preparation memos and both ORT hot and
+bounded metadata caches compare this key before serving a bound. Delegators
+forward the originating provider's reader. ORT captures it once while retaining
+the origin, so warm Compute adds no Shared-provider lock, allocation or quota
+operation. The Copy callback reader itself does not keep its module alive.
+
+Integer QMoE's execution refiner selects the actual decode plan before admission,
+clears any previous plan on failure and publishes only a successful selection.
+Launch consumes that exact plan under the existing exclusive kernel boundary;
+it never recomputes a different shard count from the thread pool. Cached metadata
+does not skip this selection. Shape preparation can remain complete while a
+changed execution context takes the normal cold reprepare/growth path; existing
+capture guards still reject replacing pinned backing.
+
 ActualAddress workspace sizes across alignment classes need not be monotonic.
 The selected host plan, rather than a second heuristic query, is the authority
 for both exact admission and borrowed-workspace execution. Exhaustively querying
@@ -942,6 +977,75 @@ zero-byte calls; physical backing remains charged through idle retention and
 returns to zero only after trim. CPU fixture results do not establish model
 throughput, CUDA correctness or universal zero overhead.
 
+
+### Caller-owned row-decoded destinations
+
+The shared dynamic row-decoded projection core writes an initialized caller
+destination instead of returning an owned Vec. Complete input/bias/output
+geometry is checked before any dispatch or write. Unit axes let the column
+producer write that destination directly; multirow/multicolumn execution keeps
+its temporary column-major buffer and transposes only after successful work.
+Later decoder/dispatch errors may modify staging, so staging is not permission
+to publish a partial tensor.
+
+QMoE streams projections directly into its expert banks; the block-format
+owned test oracle allocates its reference staging at the ownership edge.
+MatMulNBits deliberately retains independent staging and copies into its
+possibly direct Float32 tensor output only after success. Decoder state,
+bounded tile allocation, scheduling, K reduction and bias order remain.
+No old returned-Vec alias or public EP interface is retained/added.
+
+### CPU integer QMoE projection banks
+
+Integer QMoE reuses the same private two-bank driver as float MoE and
+BlockQuantizedMoE. One StepScoped composite covers grouped input, FC1/optional FC3,
+activation, expert output, route-ordered contributions and one serial decode
+lane. FC banks are reused
+serially across expert groups. Nongated banks are R*H and R*I f32 values; gated banks are R*max(H,I) and
+R*max(FC1+separate_FC3,H), for total input rows R. There is no expert-count or
+top-k multiplier for the FC banks. Contributions additionally retain R*k*H
+f32 values in their original route slots. Once all experts and the prefetch
+scope finish, bank A is dead; its R*H prefix is zeroed to +0 and reused for the
+final accumulator, preserving row/route-slot += order before publication. No
+separate accumulator region is added. A singleton still borrows its contiguous
+original input row and declares FC and contribution capacity.
+
+Preparation and execution share checked geometry: inter is FC2's packed input
+axis times 8/bits, never inferred backward from FC1. FC2 metadata is therefore
+required during preparation. Zero rows have zero banks; zero hidden retains
+input/weight/routing validation and can still need nonempty FC1 storage.
+The prefetch worker owns weights independently. The main compute dispatch owns
+the lane; joined projection tasks borrow disjoint decode slices. Weight
+request/read/join order and final contribution
+accumulation/publication order remain unchanged.
+
+This accounts retained FC and contribution capacity previously allocated as
+per-expert or per-dispatch Vecs;
+it does not establish RSS savings or a process-memory cap. Tensor widening,
+and routing remain outside this lane. Decoded rows and column-major staging now
+share a fourth region in the same composite. Its capacity is the maximum complete
+FC1/FC2/effective separate-FC3 projection layout, because these phases execute
+serially, rather than the sum of independently maximal row and column parts.
+The execution-selected plan retains tile1 and the original serial GEMM arithmetic;
+shards receive disjoint row scratch. Dense expert paths never initialize the
+decode region; the first streamed projection initializes it once per dispatch.
+No per-row, per-tile or per-expert workspace admission is introduced.
+Transient/retained weight grants retain their existing authority. Warm workspace checkout/return does not call its
+issuer; this is distinct from unchanged positive transient weight admissions.
+
+The [decode-workspace study](../benchmarks/qmoe-decoder-workspace/README.md)
+retains192 complete terminal-process CPU/wall receipts, including both cross-pool
+directions. CPU qualification passes7/8 cells and wall8/8; dense4-thread CPU
+A/A noise remains explicitly inconclusive. No speedup or universal zero-overhead
+claim is made.
+
+The earlier [FC-bank public-session study](../benchmarks/qmoe-fc-projection-banks/README.md)
+retains144 terminal-process CPU receipts, complete outputs and actual path
+traces, plus setup/doubled-work/A/A controls. All six aggregate cells qualify;
+small single-row CPU costs are not excluded. This is not CUDA, mmap-prefetch
+performance or full-model throughput evidence. The subsequent
+[contribution/bank-A reuse study](../benchmarks/qmoe-routed-bank-reuse/README.md)
+compares the full three-region composite against that merged FC-bank baseline.
 
 ### CPU float MoE projection banks
 

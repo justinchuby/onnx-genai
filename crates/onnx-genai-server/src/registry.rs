@@ -187,11 +187,45 @@ impl ModelHandle {
 pub(crate) struct ModelStatus {
     pub(crate) id: String,
     pub(crate) loaded: bool,
+    pub(crate) cached: bool,
+    pub(crate) transfer: Option<crate::model_management::TransferSnapshot>,
     pub(crate) is_default: bool,
     /// `last_request_at` (epoch millis) if the model is currently loaded.
     pub(crate) last_request_at: Option<u64>,
 }
 
+/// A configured path never grants managed-cache deletion authority.
+#[derive(Clone)]
+enum Registration {
+    Configured(ModelSpec),
+    Cached(Arc<crate::model_cache::PublishedPackage>),
+    Transfer(Arc<crate::model_management::TransferJob>),
+}
+impl Registration {
+    fn spec(&self) -> anyhow::Result<ModelSpec> {
+        match self {
+            Self::Configured(spec) => Ok(spec.clone()),
+            Self::Cached(package) => Ok(package.spec()),
+            Self::Transfer(job) => Err(ModelDownloadPending {
+                model: job.id().into(),
+            }
+            .into()),
+        }
+    }
+    fn package(&self) -> Option<Arc<crate::model_cache::PublishedPackage>> {
+        match self {
+            Self::Configured(_) | Self::Transfer(_) => None,
+            Self::Cached(package) => Some(Arc::clone(package)),
+        }
+    }
+}
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "model '{model}' has an incomplete download; wait for completion or POST /models to resume it before inference"
+)]
+pub(crate) struct ModelDownloadPending {
+    model: String,
+}
 /// Mutable interior of the registry, guarded by a single `RwLock`.
 struct RegistryInner {
     /// Currently loaded models, keyed by id.
@@ -203,7 +237,7 @@ struct RegistryInner {
     default_id: Option<String>,
     /// Every configured spec, whether currently loaded or not.  Populated fully
     /// at startup so that lazy / unloaded models can be (re)loaded on demand.
-    available: HashMap<String, ModelSpec>,
+    available: HashMap<String, Registration>,
 }
 
 #[derive(Debug)]
@@ -263,7 +297,7 @@ pub(crate) struct ModelRegistry {
     config: Arc<ServerConfig>,
     /// Per-id load guards, ensuring two concurrent requests for the same lazy id
     /// build the model only once; the second waiter observes the first result.
-    load_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    load_locks: Arc<tokio::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
     policy_lock: Arc<tokio::sync::RwLock<()>>,
     authority_provider: Arc<ServerMemoryAuthorities>,
 }
@@ -405,15 +439,31 @@ impl ModelRegistry {
     ///
     /// This is a **blocking** constructor (it builds eager models synchronously)
     /// and is only called at startup.
-    pub(crate) fn from_specs(specs: &[ModelSpec], config: ServerConfig) -> anyhow::Result<Self> {
-        if specs.is_empty() {
-            anyhow::bail!("at least one model spec is required");
-        }
+    pub(crate) fn from_sources(
+        specs: &[ModelSpec],
+        cached: Vec<Arc<crate::model_cache::PublishedPackage>>,
+        config: ServerConfig,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !specs.is_empty() || !cached.is_empty() || config.model_cache_dir.is_some(),
+            "at least one model source is required; configure a model or enable a managed cache"
+        );
         let mut available = HashMap::new();
         for spec in specs {
-            available.insert(spec.id.clone(), spec.clone());
+            available.insert(spec.id.clone(), Registration::Configured(spec.clone()));
         }
-        let default_id = Some(specs[0].id.clone());
+        for package in cached {
+            anyhow::ensure!(
+                !available.contains_key(package.id()),
+                "cached model '{}' conflicts with an operator-configured model; choose a different configured id or a separate cache",
+                package.id()
+            );
+            available.insert(package.id().into(), Registration::Cached(package));
+        }
+        let default_id = specs
+            .first()
+            .map(|spec| spec.id.clone())
+            .or_else(|| available.keys().min().cloned());
         let inner = RegistryInner {
             models: HashMap::new(),
             order: Vec::new(),
@@ -510,6 +560,15 @@ impl ModelRegistry {
         Ok(self.read()?.available.contains_key(id))
     }
 
+    pub(crate) fn cached_request(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::model_hub::HubModel>, RegistryError> {
+        Ok(match self.read()?.available.get(id) {
+            Some(Registration::Cached(package)) => Some(package.request().clone()),
+            _ => None,
+        })
+    }
     /// Returns the ids of all currently loaded models in insertion order.
     #[cfg(test)]
     pub(crate) fn ids(&self) -> Result<Vec<String>, RegistryError> {
@@ -534,6 +593,11 @@ impl ModelRegistry {
                 ModelStatus {
                     id: id.clone(),
                     loaded: loaded.is_some(),
+                    cached: matches!(inner.available.get(id), Some(Registration::Cached(_))),
+                    transfer: match inner.available.get(id) {
+                        Some(Registration::Transfer(job)) => Some(job.snapshot()),
+                        _ => None,
+                    },
                     is_default: default == Some(id.as_str()),
                     last_request_at: loaded.map(|h| h.last_request_at.load(Ordering::Relaxed)),
                 }
@@ -555,10 +619,10 @@ impl ModelRegistry {
         if let Some(handle) = self.get_loaded(id)? {
             return Ok(handle);
         }
-        // Validate the id is configured before doing any work.
-        let spec = self
-            .spec_for(id)?
-            .ok_or_else(|| anyhow::anyhow!("unknown model id '{id}'"))?;
+        // Reject unknown ids before allocating a per-id guard. Resolve the spec
+        // only after that guard, so a waiting load cannot resurrect a removed
+        // registration or open a superseded package path.
+        anyhow::ensure!(self.contains_available(id)?, "unknown model id '{id}'");
 
         // Serialise concurrent loads of the same id.
         let guard = self.load_guard(id).await;
@@ -568,14 +632,28 @@ impl ModelRegistry {
         if let Some(handle) = self.get_loaded(id)? {
             return Ok(handle);
         }
+        let registration = self.registration_for(id)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "model '{id}' was removed while waiting to load; install or register the model again before retrying"
+            )
+        })?;
+        let spec = registration.spec()?;
 
         let _policy = self.policy_lock.read().await;
         let config = self.config_for_load()?;
         let authority_provider = Arc::clone(&self.authority_provider);
         let spec_for_build = spec.clone();
+        let package = registration.package();
         tracing::info!(id = %spec.id, path = %spec.path.display(), "lazy-loading model");
         let handle = tokio::task::spawn_blocking(move || {
-            build_handle_with_authorities(&spec_for_build, &config, authority_provider)
+            // Construction retains the cache capability even if the request
+            // waiting for this blocking task is cancelled.
+            let handle =
+                build_handle_with_authorities(&spec_for_build, &config, authority_provider)?;
+            if let Some(package) = package {
+                handle.engine.workers.bind_cached_package(&package)?;
+            }
+            Ok::<_, anyhow::Error>(handle)
         })
         .await
         .context("model load task panicked")?
@@ -653,8 +731,155 @@ impl ModelRegistry {
         Ok(self.read()?.models.get(id).map(Arc::clone))
     }
 
-    fn spec_for(&self, id: &str) -> Result<Option<ModelSpec>, RegistryError> {
+    fn registration_for(&self, id: &str) -> Result<Option<Registration>, RegistryError> {
         Ok(self.read()?.available.get(id).cloned())
+    }
+
+    pub(crate) fn register_transfer(
+        &self,
+        job: Arc<crate::model_management::TransferJob>,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.write()?;
+        anyhow::ensure!(
+            !inner.available.contains_key(job.id()),
+            "model '{}' is already registered; refresh /models before starting another source",
+            job.id()
+        );
+        inner
+            .available
+            .insert(job.id().into(), Registration::Transfer(job));
+        Ok(())
+    }
+    pub(crate) fn transfer(
+        &self,
+        id: &str,
+    ) -> Result<Option<Arc<crate::model_management::TransferJob>>, RegistryError> {
+        Ok(match self.read()?.available.get(id) {
+            Some(Registration::Transfer(job)) => Some(Arc::clone(job)),
+            _ => None,
+        })
+    }
+    pub(crate) fn transfers(
+        &self,
+    ) -> Result<Vec<Arc<crate::model_management::TransferJob>>, RegistryError> {
+        Ok(self
+            .read()?
+            .available
+            .values()
+            .filter_map(|source| match source {
+                Registration::Transfer(job) => Some(Arc::clone(job)),
+                _ => None,
+            })
+            .collect())
+    }
+    pub(crate) fn unregister_transfer(
+        &self,
+        job: &Arc<crate::model_management::TransferJob>,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.write()?;
+        anyhow::ensure!(
+            matches!(inner.available.get(job.id()),Some(Registration::Transfer(current)) if Arc::ptr_eq(current,job)),
+            "model '{}' changed registration during transfer removal; refresh /models and retry",
+            job.id()
+        );
+        inner.available.remove(job.id());
+        Ok(())
+    }
+    pub(crate) async fn register_cached(
+        &self,
+        package: Arc<crate::model_cache::PublishedPackage>,
+        transfer: Option<Arc<crate::model_management::TransferJob>>,
+    ) -> Result<(), crate::model_cache::CacheOperationError> {
+        let id = package.id().to_owned();
+        let guard = self.load_guard(&id).await;
+        let _held = guard.lock().await;
+        let result = (|| -> anyhow::Result<()> {
+            let mut inner = self.write()?;
+            anyhow::ensure!(
+                match (inner.available.get(&id), transfer.as_ref()) {
+                    (None, None) => true,
+                    (Some(Registration::Transfer(current)), Some(expected)) =>
+                        Arc::ptr_eq(current, expected),
+                    _ => false,
+                },
+                "model '{id}' is already registered; delete its managed cache entry or choose a different model identifier"
+            );
+            if inner.default_id.is_none() {
+                inner.default_id = Some(id.clone());
+            }
+            inner
+                .available
+                .insert(id, Registration::Cached(Arc::clone(&package)));
+            Ok(())
+        })();
+        result.map_err(|cause| crate::model_cache::CacheOperationError { package, cause })
+    }
+
+    pub(crate) async fn remove_cached(
+        &self,
+        cache: crate::model_cache::ModelCache,
+        id: String,
+    ) -> anyhow::Result<()> {
+        if !self.contains_available(&id)? {
+            return Ok(());
+        }
+        let held = self.load_guard(&id).await.lock_owned().await;
+        let registry = self.clone();
+        // Once admitted, mutation and cleanup finish even if the HTTP waiter
+        // disconnects. The blocking task owns the per-model guard throughout.
+        tokio::task::spawn_blocking(move || {
+            let _held = held;
+            registry.remove_cached_owned(&cache, &id)
+        })
+        .await
+        .context("cached model removal task panicked")?
+    }
+    fn remove_cached_owned(
+        &self,
+        cache: &crate::model_cache::ModelCache,
+        id: &str,
+    ) -> anyhow::Result<()> {
+        let (package, handle) = {
+            let mut inner = self.write()?;
+            match inner.available.get(id) {
+                None => return Ok(()),
+                Some(Registration::Configured(_)) => anyhow::bail!(
+                    "model '{id}' is operator-configured and is not owned by the model cache; use /models/unload to release it, and edit the model configuration to remove it"
+                ),
+                Some(Registration::Cached(_)) => {}
+                Some(Registration::Transfer(_)) => anyhow::bail!(
+                    "model '{id}' still has an incomplete transfer; pause and cancel it through /models before removing the cached source"
+                ),
+            }
+            let Some(Registration::Cached(package)) = inner.available.remove(id) else {
+                unreachable!("checked cached registration under exclusive lock")
+            };
+            (package, inner.remove_loaded(id))
+        };
+        if let Some(handle) = handle {
+            // Deletion explicitly stops the instance, unlike an ordinary
+            // unload that may let retained request handles finish later.
+            handle.shutdown();
+        }
+        if let Err(failure) = cache.remove(package) {
+            self.write()?
+                .available
+                .insert(id.into(), Registration::Cached(failure.package));
+            return Err(failure.cause.context(format!(
+                "remove cached model '{id}'; its registration was restored"
+            )));
+        }
+        let mut inner = self.write()?;
+        if inner.default_id.as_deref() == Some(id) {
+            inner.default_id = inner
+                .available
+                .iter()
+                .filter(|(_, source)| !matches!(source, Registration::Transfer(_)))
+                .map(|(id, _)| id)
+                .min()
+                .cloned();
+        }
+        Ok(())
     }
 
     fn read(&self) -> Result<RwLockReadGuard<'_, RegistryInner>, RegistryError> {
@@ -668,11 +893,13 @@ impl ModelRegistry {
     /// Get-or-create the per-id async load guard.
     async fn load_guard(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.load_locks.lock().await;
-        Arc::clone(
-            locks
-                .entry(id.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-        )
+        if let Some(guard) = locks.get(id).and_then(std::sync::Weak::upgrade) {
+            return guard;
+        }
+        locks.retain(|_, guard| guard.strong_count() > 0);
+        let guard = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(id.into(), Arc::downgrade(&guard));
+        guard
     }
 }
 
@@ -699,7 +926,7 @@ impl Drop for ModelRegistry {
 
 impl RegistryInner {
     /// Insert a loaded handle, appending to `order` if the id is new.  Never
-    /// changes `default_id` (that is fixed at construction).
+    /// changes `default_id` (registration and removal own that policy).
     fn insert_loaded(&mut self, handle: Arc<ModelHandle>) {
         let id = handle.id.clone();
         if !self.models.contains_key(&id) {
@@ -886,6 +1113,170 @@ mod tests {
     use super::*;
     use crate::driver::EngineDriver;
 
+    async fn cached_fixture() -> (
+        tempfile::TempDir,
+        crate::model_cache::ModelCache,
+        Arc<crate::model_cache::PublishedPackage>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let (cache, _, _) = crate::model_cache::ModelCache::open(
+            root.path(),
+            crate::model_cache::CacheLimits {
+                bytes: 4 * 1024 * 1024,
+                files: 32,
+                models: 2,
+            },
+        )
+        .unwrap();
+        let (client, task) =
+            crate::model_hub::tests::hub(crate::model_hub::tests::Transfer::Valid).await;
+        let plan = client
+            .plan(
+                crate::model_hub::HubModel::new("owner/package".into(), "main".into()).unwrap(),
+                cache.hub_limits(),
+            )
+            .await
+            .unwrap();
+        let package = crate::model_cache::tests::complete(&cache, &client, plan).await;
+        (root, cache, package, task)
+    }
+    #[tokio::test]
+    async fn cached_models_stop_their_workers_before_deleting_their_files() {
+        let (_root, cache, package, task) = cached_fixture().await;
+        let path = package.spec().path;
+        let registry = ModelRegistry::new_for_test();
+        registry.register_cached(package, None).await.unwrap();
+        let handle = registry.load("owner/package").await.unwrap();
+        registry
+            .remove_cached(cache, "owner/package".into())
+            .await
+            .unwrap();
+        assert!(
+            handle
+                .engine
+                .workers
+                .sender_for(crate::worker::WorkerId::PRIMARY)
+                .is_err()
+        );
+        assert!(
+            handle
+                .engine
+                .workers
+                .worker(crate::worker::WorkerId::PRIMARY)
+                .unwrap()
+                .is_joined()
+        );
+        drop(handle);
+        assert!(!path.exists());
+        assert!(!registry.contains_available("owner/package").unwrap());
+        assert!(registry.default_id().unwrap().is_none());
+        task.abort();
+    }
+    #[tokio::test]
+    async fn cached_model_delete_failure_restores_the_available_registration() {
+        let (_root, cache, package, task) = cached_fixture().await;
+        let other = tempfile::tempdir().unwrap();
+        let (wrong_cache, _, _) = crate::model_cache::ModelCache::open(
+            other.path(),
+            crate::model_cache::CacheLimits {
+                bytes: 4 * 1024 * 1024,
+                files: 32,
+                models: 2,
+            },
+        )
+        .unwrap();
+        let registry = ModelRegistry::new_for_test();
+        registry.register_cached(package, None).await.unwrap();
+        let error = registry
+            .remove_cached(wrong_cache, "owner/package".into())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("different cache"),
+            "{error:#}"
+        );
+        assert!(registry.contains_available("owner/package").unwrap());
+        let handle = registry.load("owner/package").await.unwrap();
+        drop(handle);
+        registry
+            .remove_cached(cache, "owner/package".into())
+            .await
+            .unwrap();
+        task.abort();
+    }
+    #[tokio::test]
+    async fn cached_model_delete_never_removes_operator_configured_paths() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("operator-data"), "keep").unwrap();
+        let registry = ModelRegistry::from_sources(
+            &[ModelSpec {
+                id: "configured".into(),
+                path: root.path().into(),
+                eager: false,
+                warmup: false,
+            }],
+            Vec::new(),
+            ServerConfig::default(),
+        )
+        .unwrap();
+        let cache_root = tempfile::tempdir().unwrap();
+        let (cache, _, _) = crate::model_cache::ModelCache::open(
+            cache_root.path(),
+            crate::model_cache::CacheLimits {
+                bytes: 4 * 1024 * 1024,
+                files: 32,
+                models: 2,
+            },
+        )
+        .unwrap();
+        let error = registry
+            .remove_cached(cache, "configured".into())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("operator-configured"),
+            "{error:#}"
+        );
+        assert!(registry.contains_available("configured").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("operator-data")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[tokio::test]
+    async fn lazy_load_rechecks_registration_after_waiting_for_its_guard() {
+        let registry = ModelRegistry::new_for_test();
+        registry.write().unwrap().available.insert(
+            "removed".into(),
+            Registration::Configured(ModelSpec {
+                id: "removed".into(),
+                path: PathBuf::from("must-not-be-opened"),
+                eager: false,
+                warmup: false,
+            }),
+        );
+        let guard = registry.load_guard("removed").await;
+        let held = guard.lock().await;
+        let mut load = Box::pin(registry.load("removed"));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(load.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        registry.write().unwrap().available.remove("removed");
+        drop(held);
+        let error = load
+            .await
+            .err()
+            .expect("removed registration must fail before opening its old path");
+        assert!(
+            error.to_string().contains("removed while waiting"),
+            "{error:#}"
+        );
+    }
+
     /// Build a minimal `ModelHandle` stub backed by the tiny-llm tokenizer fixture.
     /// The stub has a dead command channel (no engine thread); it is only used to
     /// exercise registry ordering / eviction — never for actual generation.
@@ -1038,7 +1429,8 @@ mod tests {
                 warmup: false,
             },
         ];
-        let registry = ModelRegistry::from_specs(&specs, ServerConfig::default()).unwrap();
+        let registry =
+            ModelRegistry::from_sources(&specs, Vec::new(), ServerConfig::default()).unwrap();
         let first = registry.resolve("first").unwrap().unwrap();
         let second = registry.resolve("second").unwrap().unwrap();
         let first_accounting = first.engine.memory_accounting.as_ref().unwrap().clone();
@@ -1104,7 +1496,7 @@ mod tests {
         ];
         let mut config = ServerConfig::default();
         config.engine_config.allow_runtime_override = true;
-        let registry = ModelRegistry::from_specs(&specs, config).unwrap();
+        let registry = ModelRegistry::from_sources(&specs, Vec::new(), config).unwrap();
         let new_limit = onnx_genai_engine::ResourceLimit::Bytes(7 << 30);
         let snapshot = registry.set_vram_limit(new_limit).await.unwrap().unwrap();
         let effective_limit = snapshot.vram.limit;
@@ -1132,7 +1524,7 @@ mod tests {
         }];
         let mut config = ServerConfig::default();
         config.engine_config.allow_runtime_override = true;
-        let registry = ModelRegistry::from_specs(&specs, config).unwrap();
+        let registry = ModelRegistry::from_sources(&specs, Vec::new(), config).unwrap();
         let old_policy = registry.authority_provider.configured_limit().unwrap();
         let handle = registry.resolve("model").unwrap().unwrap();
         let before = handle.engine.resource_snapshot().await.unwrap();
@@ -1175,7 +1567,7 @@ mod tests {
         ];
         let mut config = ServerConfig::default();
         config.engine_config.allow_runtime_override = true;
-        let registry = ModelRegistry::from_specs(&specs, config).unwrap();
+        let registry = ModelRegistry::from_sources(&specs, Vec::new(), config).unwrap();
         registry.unload("eager").unwrap();
         let new_limit = onnx_genai_engine::ResourceLimit::Bytes(7 << 30);
 
@@ -1265,7 +1657,8 @@ mod tests {
             eager: true,
             warmup: false,
         }];
-        let registry = ModelRegistry::from_specs(&specs, ServerConfig::default()).unwrap();
+        let registry =
+            ModelRegistry::from_sources(&specs, Vec::new(), ServerConfig::default()).unwrap();
         // Keep the worker addressable without keeping the *handle* alive: the
         // registry must be the last owner for the unload to be able to join.
         let worker = {
@@ -1296,7 +1689,8 @@ mod tests {
             eager: true,
             warmup: false,
         }];
-        let registry = ModelRegistry::from_specs(&specs, ServerConfig::default()).unwrap();
+        let registry =
+            ModelRegistry::from_sources(&specs, Vec::new(), ServerConfig::default()).unwrap();
         let worker = {
             let handle = registry.resolve("tiny").unwrap().unwrap();
             Arc::clone(handle.engine.workers.primary())
@@ -1323,7 +1717,8 @@ mod tests {
             eager: true,
             warmup: false,
         }];
-        let registry = ModelRegistry::from_specs(&specs, ServerConfig::default()).unwrap();
+        let registry =
+            ModelRegistry::from_sources(&specs, Vec::new(), ServerConfig::default()).unwrap();
         let in_flight = registry.resolve("tiny").unwrap().unwrap();
 
         registry.unload("tiny").expect("unload loaded model");

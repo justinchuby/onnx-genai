@@ -212,6 +212,10 @@ pub struct TaskProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoding: Option<SequenceDecodingSpec>,
 
+    /// Ordered encoded-image endpoints for the reranking v2 task ABI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reranking: Option<RerankingSpec>,
+
     /// Explicit non-generative decision prompting and answer interpretation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<DecisionSpec>,
@@ -220,6 +224,17 @@ pub struct TaskProfile {
     /// in cache correctness dependencies.
     #[serde(default)]
     pub generation_affecting: bool,
+}
+
+/// Model-authored query/document image positions. Each name references an
+/// application-sourced uint8 vector; the workflow owns decoding and vision math.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RerankingSpec {
+    #[serde(default)]
+    pub query_images: Vec<String>,
+    #[serde(default)]
+    pub document_images: Vec<String>,
 }
 
 /// Model-authored decision semantics; calibration belongs to the workflow.

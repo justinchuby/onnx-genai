@@ -3457,6 +3457,27 @@
       ],
       "type": "object"
     },
+    "RerankingSpec": {
+      "additionalProperties": false,
+      "description": "Model-authored query/document image positions. Each name references an\napplication-sourced uint8 vector; the workflow owns decoding and vision math.",
+      "properties": {
+        "document_images": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "query_images": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
     "RuntimeConfigurable": {
       "additionalProperties": false,
       "description": "Features whose concrete settings may be selected by the runtime.",
@@ -5043,6 +5064,17 @@
           "default": "required",
           "description": "Whether a reader that does not understand this profile may skip it."
         },
+        "reranking": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RerankingSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Ordered encoded-image endpoints for the reranking v2 task ABI."
+        },
         "version": {
           "description": "Version of this profile's own contract.",
           "minLength": 1,
@@ -5443,7 +5475,7 @@
           "description": "Declared output dtype. Always explicit; never inferred from the model."
         },
         "name": {
-          "description": "Workflow SSA value produced by the preprocessing adapter invocation.",
+          "description": "Output name: a workflow SSA value under preprocessing ABI v1, or a\ncomponent-local output port under image-preprocess ABI v2. The latter\nallows repeated invocations to bind independent workflow SSA values.",
           "examples": [
             "image.pixel_values"
           ],
