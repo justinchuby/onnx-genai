@@ -24,7 +24,7 @@ struct ReverseSequence {
 
 impl Kernel for ReverseSequence {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        check_arity("ReverseSequence", inputs, outputs, 2, 1, 1)?;
+        check_arity("ReverseSequence", inputs, outputs, 2, 2, 1)?;
         let plan = self
             .axes
             .plan(self.version, &inputs[0], &inputs[1], &outputs[0])?;
