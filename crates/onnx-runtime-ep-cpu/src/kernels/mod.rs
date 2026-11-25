@@ -1455,12 +1455,12 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("SimplifiedLayerNormalization", "com.microsoft", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(contrib_fused::SimplifiedLayerNormFactory),
     );
     rec.register(
         OpKey::new("SimplifiedLayerNormalization", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(contrib_fused::SimplifiedLayerNormFactory),
     );
     rec.register(
@@ -1493,7 +1493,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     // `ai.onnx::RMSNormalization` added at opset 23.
     rec.register(
         OpKey::new("RMSNormalization", "", 23),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(rmsnorm::RmsNormFactory),
     );
     rec.register(

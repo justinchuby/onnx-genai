@@ -7,7 +7,7 @@ use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
 use super::layernorm::layer_norm_dense;
-use super::rmsnorm::rms_norm_dense;
+use super::rmsnorm::RmsNormKernel;
 use super::simd_activations;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
@@ -298,71 +298,16 @@ impl Kernel for SkipLayerNormKernel {
     }
 }
 
-pub struct SimplifiedLayerNormKernel {
-    axis: i64,
-    epsilon: f32,
-}
-
 pub struct SimplifiedLayerNormFactory;
 
 impl KernelFactory for SimplifiedLayerNormFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(SimplifiedLayerNormKernel {
-            axis: node.attr("axis").and_then(|a| a.as_int()).unwrap_or(-1),
-            epsilon: node
-                .attr("epsilon")
+        Ok(Box::new(RmsNormKernel::simplified(
+            node.attr("axis").and_then(|a| a.as_int()).unwrap_or(-1),
+            node.attr("epsilon")
                 .and_then(|a| a.as_float())
                 .unwrap_or(1e-5),
-        }))
-    }
-}
-
-impl Kernel for SimplifiedLayerNormKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        const OP: &str = "SimplifiedLayerNormalization";
-        // ORT SimplifiedLayerNormalization: `output` (0, required) plus optional
-        // `inv_std_var` (1). Only the primary output is mandatory.
-        check_arity(OP, inputs, outputs, 2, 2, 1)?;
-        let x = to_dense_f32_widen(OP, &inputs[0])?;
-        let scale = to_dense_f32_widen(OP, &inputs[1])?;
-        // Reuse the shared RMSNorm core, honouring `axis` (default -1) so the
-        // group spans dims `[axis..rank)` and `scale` broadcasts over it.
-        let y = rms_norm_dense(
-            &x,
-            inputs[0].shape,
-            &scale,
-            inputs[1].shape,
-            self.axis,
-            self.epsilon,
-        )?;
-        write_dense_f32_narrow(OP, &mut outputs[0], &y)?;
-        // Optional InvStdDev output: the per-group `1 / sqrt(mean(x²) + eps)`,
-        // one value per normalized group (reduced shape). `rms_norm_dense`
-        // already validated `axis`, so normalization here cannot fail.
-        if outputs.len() > 1 {
-            let rank = inputs[0].shape.len();
-            let axis = if self.axis < 0 {
-                (self.axis + rank as i64) as usize
-            } else {
-                self.axis as usize
-            };
-            let norm_size: usize = inputs[0].shape[axis..].iter().product();
-            let num_groups: usize = inputs[0].shape[..axis].iter().product();
-            let inv_std = (0..num_groups)
-                .map(|g| {
-                    let slice = &x[g * norm_size..g * norm_size + norm_size];
-                    let mean_sq =
-                        crate::kernels::simd_sumsq::sum_of_squares(slice) / norm_size as f32;
-                    1.0 / (mean_sq + self.epsilon).sqrt()
-                })
-                .collect::<Vec<_>>();
-            write_dense_f32_narrow(OP, &mut outputs[1], &inv_std)?;
-        }
-        Ok(())
-    }
-
-    fn supports_strided_input(&self, _input_idx: usize) -> bool {
-        true
+        )))
     }
 }
 
@@ -371,7 +316,7 @@ mod tests {
     use super::*;
     use crate::CpuExecutionProvider;
     use crate::kernels::elementwise::erf;
-    use crate::kernels::testutil::Owned;
+    use crate::kernels::testutil::{Owned, PreparedTestKernel};
     use onnx_runtime_ep_api::ExecutionProvider;
     use onnx_runtime_ir::{Attribute, DataType, Graph, Node, NodeId, static_shape};
     use onnx_runtime_loader::{Model, encode_model_proto};
@@ -604,12 +549,9 @@ mod tests {
         let x = Owned::f32(&[2, 4], &[1., 2., 3., 4., -2., 0., 2., 4.]);
         let scale = Owned::f32(&[4], &[1., 2., 0.5, 1.5]);
         let mut out = Owned::zeros_f32(&[2, 4]);
-        SimplifiedLayerNormKernel {
-            axis: -1,
-            epsilon: 1e-5,
-        }
-        .execute(&[x.view(), scale.view()], &mut [out.view_mut()])
-        .unwrap();
+        RmsNormKernel::simplified(-1, 1e-5)
+            .execute_prepared(&[x.view(), scale.view()], &mut [out.view_mut()])
+            .unwrap();
         let scale_data = [1., 2., 0.5, 1.5];
         let mut want = Vec::new();
         for row in [1., 2., 3., 4., -2., 0., 2., 4.].as_chunks::<4>().0 {
@@ -714,15 +656,12 @@ mod tests {
                 stats_shape[axis_index..].fill(1);
                 let mut inv_std = Owned::zeros(dtype, &stats_shape);
 
-                SimplifiedLayerNormKernel {
-                    axis: *axis,
-                    epsilon: EPSILON,
-                }
-                .execute(
-                    &[x.view(), scale.view()],
-                    &mut [output.view_mut(), inv_std.view_mut()],
-                )
-                .unwrap();
+                RmsNormKernel::simplified(*axis, EPSILON)
+                    .execute_prepared(
+                        &[x.view(), scale.view()],
+                        &mut [output.view_mut(), inv_std.view_mut()],
+                    )
+                    .unwrap();
 
                 let tolerance = match dtype {
                     DataType::Float16 => 2e-3,
@@ -784,10 +723,10 @@ mod tests {
         let mut standard = Owned::zeros_f32(&[2, 4]);
         let mut contrib = Owned::zeros_f32(&[2, 4]);
         simplified_layer_norm_kernel("", 21)
-            .execute(&[x.view(), scale.view()], &mut [standard.view_mut()])
+            .execute_prepared(&[x.view(), scale.view()], &mut [standard.view_mut()])
             .unwrap();
         simplified_layer_norm_kernel("com.microsoft", 1)
-            .execute(&[x.view(), scale.view()], &mut [contrib.view_mut()])
+            .execute_prepared(&[x.view(), scale.view()], &mut [contrib.view_mut()])
             .unwrap();
         assert_close(&standard.to_f32(), &contrib.to_f32());
     }
@@ -1018,15 +957,12 @@ mod tests {
         let mut out = Owned::zeros_f32(&[2, 2, 2]);
         let mut inv_std = Owned::zeros_f32(&[2, 1, 1]);
         let eps = 1e-5;
-        SimplifiedLayerNormKernel {
-            axis: 1,
-            epsilon: eps,
-        }
-        .execute(
-            &[x.view(), scale.view()],
-            &mut [out.view_mut(), inv_std.view_mut()],
-        )
-        .unwrap();
+        RmsNormKernel::simplified(1, eps)
+            .execute_prepared(
+                &[x.view(), scale.view()],
+                &mut [out.view_mut(), inv_std.view_mut()],
+            )
+            .unwrap();
         let scale_data = [1., 2., 0.5, 1.5];
         let mut want = Vec::new();
         let mut want_inv = Vec::new();
