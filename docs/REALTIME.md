@@ -197,6 +197,24 @@ This proves rejection did not consume input quota or freeze conditioning. It
 does not establish oversized WebSocket frame closure, slow-reader backpressure,
 all rate epochs or device execution conformance.
 
+### Executed model isolation and reconnect
+
+`websocket_models_isolate_native_state_and_release_closed_worker` loads two
+independent Native CPU model entries from the same authored duplex fixture and
+opens both routed WebSocket sessions simultaneously. Each handshake identifies
+its selected model and a distinct session. An additional connection to the
+occupied first model receives HTTP 503 before upgrade; it cannot steal that
+worker or prevent the second model from executing.
+
+The fixture accumulates ingested audio in native state. Zero audio in the first
+model and nonzero audio in the second produce independent PCM output. Closing
+and reopening the first connection releases its worker and creates fresh native
+state, while the second connection preserves its previous accumulated state.
+The test checks complete native frame sizes and actual output bytes after
+reconnect. The close handshake and retry-on-busy cleanup wait are bounded. This
+establishes routed CPU state isolation and reconnect cleanup, rather than device
+isolation, arbitrary worker-pool sizing or recognition/synthesis quality.
+
 Tool execution belongs exclusively to the external harness. This transport
 accepts definitions/results and emits model calls; it provides no tool runtime.
 A Native CPU WebSocket regression covers two tool-call rounds with an external
