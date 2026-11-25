@@ -6,6 +6,8 @@ use crate::DataType;
 // math/old.cc passes the original f16/f32/f64 list explicitly.
 pub const BF16_SINCE: u64 = 22;
 pub const OPS: &[(&str, u64)] = &[
+    ("Sin", 7),
+    ("Cos", 7),
     ("Tan", 7),
     ("Asin", 7),
     ("Acos", 7),

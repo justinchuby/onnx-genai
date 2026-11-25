@@ -182,6 +182,8 @@ fn reduce(op: &'static str, values: Vec<f32>, abs_tol: f32) -> OpCase {
 
 fn trig_cases() -> impl Iterator<Item = OpCase> {
     [
+        ("Sin", sample6()),
+        ("Cos", sample6()),
         ("Tan", sample6()),
         ("Atan", sample6()),
         ("Sinh", sample6()),
@@ -235,9 +237,7 @@ fn cases() -> Vec<OpCase> {
     v.push(unary("Sqrt", 13, positive6(), 0.02));
     v.push(unary("Exp", 13, sample6(), 0.05));
     v.push(unary("Log", 13, positive6(), 0.05));
-    for op in ["Sin", "Cos", "Tanh"] {
-        v.push(unary(op, 13, sample6(), 0.03));
-    }
+    v.push(unary("Tanh", 13, sample6(), 0.03));
     v.extend(trig_cases());
     v.push(unary("Erf", 13, sample6(), 0.02));
 

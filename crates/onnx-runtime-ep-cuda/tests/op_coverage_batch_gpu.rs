@@ -13,7 +13,7 @@
     clippy::clone_on_copy
 )]
 //! GPU parity tests for the issue #67 CUDA op-coverage batch: the
-//! trigonometric/hyperbolic unary-math family (`Tan`, `Sinh`, `Cosh`, `Asin`,
+//! trigonometric/hyperbolic unary-math family (`Sin`, `Cos`, `Tan`, `Sinh`, `Cosh`, `Asin`,
 //! `Acos`, `Atan`, `Asinh`, `Acosh`, `Atanh`), the metadata/movement ops
 //! `Identity`, `Flatten`, `Size`, and the triangular mask `Trilu`.
 //!
@@ -377,6 +377,8 @@ fn trig_hyperbolic_unary_matches_cpu() {
     let ep = require_cuda();
     // (op, domain-safe inputs).
     let cases: &[(&str, &[f32])] = &[
+        ("Sin", &[-3.0, -1.0, 0.0, 1.0, 3.0]),
+        ("Cos", &[-3.0, -1.0, 0.0, 1.0, 3.0]),
         ("Tan", &[-1.2, -0.4, 0.0, 0.5, 1.1]),
         ("Sinh", &[-2.0, -0.7, 0.0, 0.9, 2.5]),
         ("Cosh", &[-2.0, -0.7, 0.0, 0.9, 2.5]),
@@ -397,6 +399,7 @@ fn trig_hyperbolic_unary_matches_cpu() {
             "{op}: expected an opset-specific CUDA rejection, got {:?}",
             rejected.reason()
         );
+        assert_cuda_trig_execution_rejects_bf16(&ep, &node, &reason);
         for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
             let opset = if dtype == DataType::BFloat16 { 22 } else { 17 };
             let shape = vec![values.len()];
@@ -422,6 +425,38 @@ fn trig_hyperbolic_unary_matches_cpu() {
         }
         eprintln!("{op}: CUDA matches CPU EP across f32/f16/bf16");
     }
+}
+
+fn assert_cuda_trig_execution_rejects_bf16(ep: &CudaExecutionProvider, node: &Node, reason: &str) {
+    let shape = [1];
+    let stride = [1];
+    let dtype = DataType::BFloat16;
+    let input = ep.allocate(2, 256).unwrap();
+    let mut output = ep.allocate(2, 256).unwrap();
+    // SAFETY: the CUDA buffer is live and holds one BF16 value.
+    unsafe { ep.runtime().htod(&[0, 0], cuptr(input.as_ptr())) }.unwrap();
+    let kernel = ep.get_kernel(node, &[shape.to_vec()], 21).unwrap();
+    let error = kernel
+        .execute(
+            &[TensorView::new(
+                DevicePtr(input.as_ptr()),
+                dtype,
+                &shape,
+                &stride,
+                ep.device_id(),
+            )],
+            &mut [TensorMut::new(
+                DevicePtrMut(output.as_mut_ptr()),
+                dtype,
+                &shape,
+                &stride,
+                ep.device_id(),
+            )],
+        )
+        .unwrap_err();
+    ep.deallocate(input).unwrap();
+    ep.deallocate(output).unwrap();
+    assert!(error.to_string().contains(reason), "{error}");
 }
 
 /// `Identity` and `Flatten` are dtype-agnostic byte copies; assert exact byte

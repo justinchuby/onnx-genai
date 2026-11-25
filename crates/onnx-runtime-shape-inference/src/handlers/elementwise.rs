@@ -274,8 +274,6 @@ pub fn register(reg: &mut InferenceRegistry) {
         "Log",
         "Neg",
         "Abs",
-        "Sin",
-        "Cos",
         "Reciprocal",
         "Softplus",
         "Softsign",

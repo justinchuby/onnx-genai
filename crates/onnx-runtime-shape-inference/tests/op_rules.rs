@@ -480,6 +480,8 @@ fn text_ops_infer_broadcast_match_and_dynamic_split_shapes() {
 #[test]
 fn trig_bf16_requires_opset_22() {
     for (name, original) in [
+        ("Sin", 7),
+        ("Cos", 7),
         ("Tan", 7),
         ("Asin", 7),
         ("Acos", 7),
@@ -7364,7 +7366,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "ConstantOfShape", 1),
     ("", "Conv", 1),
     ("", "ConvTranspose", 1),
-    ("", "Cos", 1),
+    ("", "Cos", 7),
     ("", "Cosh", 9),
     ("", "CumProd", 26),
     ("", "CumSum", 11),
@@ -7525,7 +7527,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Sigmoid", 1),
     ("", "Sign", 1),
     ("", "SimplifiedLayerNormalization", 1),
-    ("", "Sin", 1),
+    ("", "Sin", 7),
     ("", "Sinh", 9),
     ("", "Size", 1),
     ("", "Slice", 1),
