@@ -2053,3 +2053,24 @@ Full server verification also exposed a realtime disconnect release race.
 Admission capacity now drops before the worker reservation advertises idle,
 including early initialization failures; the existing disconnect regression
 checks both resources before admitting a fresh connection.
+
+
+### Prompt-only evaluation progress and timings
+
+`n_predict=0` now carries actual `GenerationTimings` from Native prompt evaluation
+and the explicit ORT reference path. Prompt tokens count fresh work; reused input
+is `cache_n`, retained cache remains `tokens_cached`, and no generation work is
+invented. Fully cached Native prompts execute no forward and report zero elapsed
+prompt work. Observer delivery, preparation and network waits are outside the
+measured forward interval.
+
+The existing atomic prefill transaction emits typed start/completion progress
+before commit. Callback failure or cancellation at either boundary rolls back
+provisional state and prevents prefix publication. The server reserves admission
+before opening SSE, then drains a bounded progress channel concurrently with the
+committed result. Dropping the receiver requests cancellation through the shared
+control probe; terminal delivery follows slot publication and permit release.
+Buffered responses and the final SSE frame include timings; `return_progress`
+remains opt-in and does not create output tokens. Native/ORT regressions cover
+cold, reused and extended prompts, complete Native cache hits, observer failure
+and cancellation, plus real buffered and streamed HTTP responses.
