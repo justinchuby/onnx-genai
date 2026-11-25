@@ -1218,6 +1218,7 @@ impl Engine {
                         tokenizer,
                         &block_runtime,
                         &mut stats,
+                        control,
                         Some(&mut stage_token),
                     )
                 })();
@@ -5681,6 +5682,286 @@ mod tests {
             assert_eq!(
                 actual.token_ids, expected.token_ids,
                 "cancelled cold state leaked into retry"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn native_speculative_per_position_fixture(directory: &Path) -> anyhow::Result<Engine> {
+        use onnx_runtime_loader::proto::onnx::{self, AttributeProto, NodeProto, TensorProto};
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+        for file in ["inference_metadata.yaml", "tokenizer.json"] {
+            std::fs::copy(source.join(file), directory.join(file))?;
+        }
+        let mut model = onnx_std::textproto::from_textproto(&std::fs::read_to_string(
+            source.join("model.onnx.textproto"),
+        )?)?
+        .to_proto()?;
+        let graph = model.graph.as_mut().context("speculative fixture graph")?;
+        let constant = graph
+            .node
+            .iter_mut()
+            .find(|node| node.output == ["logits"])
+            .context("fixture logits constant")?;
+        constant.output = vec!["base_logits".into()];
+        graph.initializer.push(TensorProto {
+            name: "vocab_width".into(),
+            dims: vec![1],
+            data_type: onnx::tensor_proto::DataType::Int64 as i32,
+            int64_data: vec![2],
+            ..Default::default()
+        });
+        graph.node.extend([
+            NodeProto {
+                op_type: "Shape".into(),
+                input: vec!["input_ids".into()],
+                output: vec!["token_shape".into()],
+                ..Default::default()
+            },
+            NodeProto {
+                op_type: "Concat".into(),
+                input: vec!["token_shape".into(), "vocab_width".into()],
+                output: vec!["logits_shape".into()],
+                attribute: vec![AttributeProto {
+                    name: "axis".into(),
+                    i: 0,
+                    r#type: onnx::attribute_proto::AttributeType::Int as i32,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            NodeProto {
+                op_type: "Expand".into(),
+                input: vec!["base_logits".into(), "logits_shape".into()],
+                output: vec!["logits".into()],
+                ..Default::default()
+            },
+        ]);
+        let output = graph
+            .output
+            .iter_mut()
+            .find(|port| port.name == "logits")
+            .context("fixture logits output")?;
+        let Some(onnx::type_proto::Value::TensorType(tensor)) =
+            output.r#type.as_mut().and_then(|kind| kind.value.as_mut())
+        else {
+            anyhow::bail!("fixture logits tensor type");
+        };
+        tensor.shape.as_mut().context("fixture logits shape")?.dim[1].value = Some(
+            onnx::tensor_shape_proto::dimension::Value::DimParam("sequence".into()),
+        );
+        std::fs::write(
+            directory.join("model.onnx.textproto"),
+            onnx_std::textproto::to_textproto(&onnx_std::Model::from_proto(model)?)?,
+        )?;
+        Engine::from_dir(
+            directory,
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                native_device: Some(crate::NativeDecodeDevice::Cpu),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_speculative_reporting_rejects_last_only_verify_rows_without_panicking_or_publication()
+    -> anyhow::Result<()> {
+        let mut engine = tiny_native_cold_engine()?;
+        let mut request = tiny_native_cold_request(true);
+        request.prompt = GeneratePrompt::TokenIds(vec![0, 1, 1, 1, 0]);
+        request.options.max_new_tokens = 8;
+        let mut output = Vec::new();
+        let error = engine
+            .generate_with_callback(
+                request.clone(),
+                Some(&mut |token| {
+                    output.push(token);
+                    Ok(())
+                }),
+            )
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("1 logits row(s) for 2 draft tokens"),
+            "{message}"
+        );
+        assert!(message.contains("num_speculative_tokens=1"), "{message}");
+        assert!(output.is_empty());
+        assert_eq!(engine.scheduler.running_count(), 0);
+        request.options.speculative_mode = None;
+        assert_eq!(
+            engine.generate(request.clone())?.token_ids,
+            tiny_native_cold_engine()?.generate(request)?.token_ids
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_speculative_reporting_preserves_multi_token_counts_and_commit_only_delivery()
+    -> anyhow::Result<()> {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+        let directory = tempfile::tempdir()?;
+        let mut engine = native_speculative_per_position_fixture(directory.path())?;
+        let mut request = tiny_native_cold_request(true);
+        request.prompt = GeneratePrompt::TokenIds(vec![0, 1, 1, 1, 0]);
+        request.options.max_new_tokens = 8;
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let published = Arc::new(AtomicBool::new(false));
+        let progress = updates.clone();
+        let publication = published.clone();
+        let control = crate::GenerationControl::new().with_prompt_progress(move |update| {
+            assert!(
+                !publication.load(Ordering::SeqCst),
+                "progress must precede committed output"
+            );
+            progress.lock().unwrap().push(update);
+            Ok(())
+        });
+        let mut tokens = Vec::new();
+        let result = engine.generate_with_control_callbacks(
+            request.clone(),
+            control,
+            None,
+            Some(&mut |token| {
+                published.store(true, Ordering::SeqCst);
+                tokens.push(token);
+                Ok(())
+            }),
+        )?;
+        assert!(engine.last_speculative_stats().multi_token_accepts > 0);
+        assert_eq!(
+            result.token_ids,
+            native_speculative_per_position_fixture(directory.path())?
+                .generate({
+                    request.options.speculative_mode = None;
+                    request
+                })?
+                .token_ids
+        );
+        assert_eq!(tokens.len(), 8);
+        let updates = updates.lock().unwrap();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].processed, 0);
+        assert_eq!(updates[1].processed, 5);
+        for update in updates.iter() {
+            assert_eq!(update.total, 5);
+            assert_eq!(update.cache, 0);
+        }
+        let timing = result.timings.context("native speculative final timing")?;
+        assert_eq!(timing.prompt_tokens, 5);
+        assert_eq!(timing.cached_prompt_tokens, 0);
+        assert_eq!(timing.generated_tokens, 8);
+        assert_eq!(timing.prompt_elapsed, updates[1].elapsed);
+        assert!(!timing.prompt_elapsed.is_zero());
+        assert!(!timing.generation_elapsed.is_zero());
+        for (index, token) in tokens.iter().enumerate() {
+            let sample = token.timings.context("native speculative token timing")?;
+            assert_eq!(sample.generated_tokens, index + 1);
+            assert_eq!(sample.prompt_elapsed, timing.prompt_elapsed);
+            if index > 0 {
+                assert!(
+                    sample.generation_elapsed
+                        >= tokens[index - 1].timings.unwrap().generation_elapsed
+                );
+            }
+        }
+        assert_eq!(tokens.last().unwrap().timings, result.timings);
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_speculative_reporting_failures_and_phase_cancellation_abort_without_output()
+    -> anyhow::Result<()> {
+        for at in [0, 3] {
+            for cancel in [false, true] {
+                let mut engine = tiny_native_cold_engine()?;
+                let mut request = tiny_native_cold_request(true);
+                request.prompt = GeneratePrompt::TokenIds(vec![1, 1, 1]);
+                let authority = crate::GenerationControl::new();
+                let cancellation = authority.clone();
+                let control = authority.with_prompt_progress(move |update| {
+                    if update.processed == at {
+                        if cancel {
+                            cancellation.cancel();
+                        } else {
+                            anyhow::bail!("injected speculative progress failure");
+                        }
+                    }
+                    Ok(())
+                });
+                let mut output = Vec::new();
+                let error = engine
+                    .generate_with_control_callbacks(
+                        request.clone(),
+                        control,
+                        None,
+                        Some(&mut |token| {
+                            output.push(token);
+                            Ok(())
+                        }),
+                    )
+                    .unwrap_err();
+                assert!(output.is_empty());
+                assert_eq!(engine.scheduler.running_count(), 0);
+                if cancel {
+                    assert!(
+                        error.downcast_ref::<crate::GenerationCancelled>().is_some(),
+                        "{error:#}"
+                    );
+                } else {
+                    assert!(format!("{error:#}").contains("injected speculative progress failure"));
+                }
+                assert_eq!(
+                    engine.generate(request.clone())?.token_ids,
+                    tiny_native_cold_engine()?.generate(request)?.token_ids
+                );
+            }
+        }
+        for boundary in [
+            crate::GenerationBoundary::AfterProposer,
+            crate::GenerationBoundary::AfterVerifier,
+        ] {
+            let mut engine = tiny_native_cold_engine()?;
+            let authority = crate::GenerationControl::new();
+            let cancellation = authority.clone();
+            let control = authority.with_checkpoint(move |at| {
+                if at == boundary {
+                    cancellation.cancel();
+                }
+                Ok(())
+            });
+            let mut output = Vec::new();
+            let mut request = tiny_native_cold_request(true);
+            request.prompt = GeneratePrompt::TokenIds(vec![1, 1, 1]);
+            let error = engine
+                .generate_with_control_callbacks(
+                    request.clone(),
+                    control,
+                    None,
+                    Some(&mut |token| {
+                        output.push(token);
+                        Ok(())
+                    }),
+                )
+                .unwrap_err();
+            assert!(
+                error.downcast_ref::<crate::GenerationCancelled>().is_some(),
+                "{error:#}"
+            );
+            assert!(output.is_empty());
+            assert_eq!(engine.scheduler.running_count(), 0);
+            assert_eq!(
+                engine.generate(request.clone())?.token_ids,
+                tiny_native_cold_engine()?.generate(request)?.token_ids
             );
         }
         Ok(())

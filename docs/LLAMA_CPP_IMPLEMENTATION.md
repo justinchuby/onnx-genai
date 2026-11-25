@@ -2074,3 +2074,41 @@ Buffered responses and the final SSE frame include timings; `return_progress`
 remains opt-in and does not create output tokens. Native/ORT regressions cover
 cold, reused and extended prompts, complete Native cache hits, observer failure
 and cancellation, plus real buffered and streamed HTTP responses.
+
+
+### Native speculative progress and timing reports
+
+The Native prompt-lookup/MTP block driver now uses the shared execution clock and
+request control. It reports the real target-prompt start/completion, with zero
+input reuse because this path resets the target cache. Proposal, target verify,
+accepted-state restoration and token selection contribute to generation work;
+progress/checkpoint callbacks and time between blocks do not. Every accepted
+output token advances cumulative counts even when several share one verification
+forward. Final and per-token measurements travel through the existing commit-only
+output journal and server event adapters.
+
+Deterministic clock tests cover paused observer gaps and multiple accepted tokens.
+A real repetitive-context fixture forces multi-token acceptance and compares all
+outputs with plain greedy decoding, including monotonic per-token measurements
+and final-sample identity. Failure/cancellation at prompt and proposal/verification
+boundaries aborts without externally publishing tokens, and retry matches a fresh
+engine. The server driver regression checks prompt events precede the committed
+ordered token/timing journal, including a staged-output failure and retry. Ordinary
+native generation keeps its existing path. ORT speculative, composite and
+continuous-batch reporting remain separate open work; no GPU performance claim is
+made by these CPU functional tests.
+
+The multi-token fixture also exposed a preexisting out-of-bounds acceptance path
+when a target returned last-token-only logits for a wider verification window.
+The driver now validates exact verify-row count and vocabulary width before
+indexing accepted/bonus positions. A malformed-target regression proves this
+fails actionably without a panic or token publication and that ordinary retry
+matches a fresh engine. The positive fixture explicitly expands its target
+logits along the runtime input sequence, rather than claiming multi-token
+coverage from the original one-row fixture.
+
+The Native MTP subprocess regression explicitly removes the ORT backend selection
+and points its ORT library at a nonexistent path. It validates real proposal and
+verification, prompt/final/per-token timing reports, and cancellation/retry after
+both head proposal and target verification. This proves the same reporting and
+abort contracts on the actual Native head path rather than only prompt lookup.

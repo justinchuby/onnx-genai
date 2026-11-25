@@ -374,7 +374,13 @@ Standalone prompt-only evaluation (`n_predict=0`) reports the same measurements
 with zero predicted tokens and generation duration. A Native full-cache hit
 executes no forward and reports zero prompt work/time; the ORT test reference
 retains its real final-token reevaluation. Executors without this timing contract
-(including speculative/composite paths) omit the measurements.
+(including ORT speculative and composite paths) omit the measurements. Native
+speculative prompt-lookup/MTP loops report actual prompt, proposal, verification
+and accepted-path work with cumulative accepted-token counts; rejected draft
+work remains included in the generation cost. Multi-token target verification
+requires one logits row per draft position and a consistent nonempty vocabulary.
+A mismatch returns an actionable error and rolls back provisional state; a
+last-token-only target can use `num_speculative_tokens=1`.
 For ordinary decoder SSE on native/OpenAI completions, chat and infill,
 `return_progress=true` publishes `prompt_progress` with `total`, `cache`,
 `processed` and elapsed `time_ms`. As upstream, `processed` includes cached tokens.
@@ -387,8 +393,11 @@ cancellation; it does not expose tokens or promise a committed turn. Observer
 failure follows ordinary atomic rollback. Native prompt-only SSE also reports
 start/completion boundaries, including cache-only hits, and delivers progress
 while evaluation is running. Closing its receiver cancels provisional work;
-its final result follows state/slot and capacity publication. Speculative/composite
-execution and continuous batching progress remain open contracts.
+its final result follows state/slot and capacity publication. Native speculative
+execution reports the actual initial target-prompt forward and checks cancellation
+at proposal/verification boundaries; it currently evaluates a cold prompt and
+reports zero input reuse. ORT speculative/composite execution and continuous
+batching progress remain open contracts.
 `/props.nxrt_capabilities` advertises resumable streams and the live reasoning
 control endpoint.
 An SSE request with `X-Conversation-Id` retains generation independently of its
