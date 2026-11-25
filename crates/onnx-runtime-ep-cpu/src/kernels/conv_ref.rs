@@ -1,4 +1,4 @@
-//! Three-tier ONNX `Conv` kernel with BNNS, im2col+GEMM, and scalar reference dispatch.
+//! Native 1D/2D ONNX `Conv` with BNNS, direct NEON and im2col+GEMM dispatch.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{Attribute, DataType, Node};
@@ -26,9 +26,6 @@ static CONV_POINTWISE_GEMM_TEST_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[cfg(target_arch = "aarch64")]
 static CONV_NEON_DEPTHWISE_TEST_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-static CONV_SCALAR_REF_TEST_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 // Aggregate counters above prove coverage across the process. Exclusion tests
@@ -59,10 +56,19 @@ pub struct ConvKernel {
     w_shape: Vec<usize>,
     output_shape: Vec<usize>,
     group: usize,
-    strides: Vec<usize>,
-    dilations: Vec<usize>,
-    pads: Vec<usize>,
+    geometry: Conv2dGeometry,
     relu: bool,
+}
+
+/// Factory-resolved physical geometry. Logical rank-3 I/O remains NCL, while
+/// every production compute route receives fixed NCHW geometry.
+struct Conv2dGeometry {
+    x: [usize; 4],
+    w: [usize; 4],
+    output: [usize; 4],
+    strides: [usize; 2],
+    dilations: [usize; 2],
+    pads: [usize; 4],
 }
 
 fn positive_attribute(node: &Node, name: &str, rank: usize, default: usize) -> Result<Vec<usize>> {
@@ -159,6 +165,7 @@ fn output_geometry(
     Ok((output, pads))
 }
 
+#[cfg(test)]
 fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
     let mut strides = vec![1; shape.len()];
     for axis in (0..shape.len().saturating_sub(1)).rev() {
@@ -231,14 +238,37 @@ impl KernelFactory for ConvFactory {
             node.attr("activation").and_then(Attribute::as_str),
             Some("Relu")
         );
+        let geometry = if spatial_rank == 1 {
+            Conv2dGeometry {
+                x: [x_shape[0], x_shape[1], 1, x_shape[2]],
+                w: [w_shape[0], w_shape[1], 1, w_shape[2]],
+                output: [output_shape[0], output_shape[1], 1, output_shape[2]],
+                strides: [1, strides[0]],
+                dilations: [1, dilations[0]],
+                pads: [0, pads[0], 0, pads[1]],
+            }
+        } else {
+            // The matching rank-3/rank-4 check above leaves only 2D here.
+            Conv2dGeometry {
+                x: [x_shape[0], x_shape[1], x_shape[2], x_shape[3]],
+                w: [w_shape[0], w_shape[1], w_shape[2], w_shape[3]],
+                output: [
+                    output_shape[0],
+                    output_shape[1],
+                    output_shape[2],
+                    output_shape[3],
+                ],
+                strides: [strides[0], strides[1]],
+                dilations: [dilations[0], dilations[1]],
+                pads: [pads[0], pads[1], pads[2], pads[3]],
+            }
+        };
         Ok(Box::new(ConvKernel {
             x_shape: x_shape.clone(),
             w_shape: w_shape.clone(),
             output_shape,
             group,
-            strides,
-            dilations,
-            pads,
+            geometry,
             relu,
         }))
     }
@@ -290,87 +320,23 @@ impl Kernel for ConvKernel {
             .map(|value| to_dense_f32_widen(OP, value))
             .transpose()?;
 
-        // Promote rank-3 (1D conv) shapes to rank-4 by inserting H=1 so the
-        // BNNS and im2col+GEMM tiers handle them without a separate code path.
-        // Data layout is unchanged: [N, C, W] → [N, C, 1, W] is a logical
-        // reshape with no memory movement.
-        let (x_shape_4d, w_shape_4d, out_shape_4d, strides_2d, dilations_2d, pads_2d);
-        let (eff_x_shape, eff_w_shape, eff_out_shape, eff_strides, eff_dilations, eff_pads);
-        if self.x_shape.len() == 3 {
-            // 1D → 2D: insert H=1 at spatial index 0
-            x_shape_4d = [self.x_shape[0], self.x_shape[1], 1, self.x_shape[2]];
-            w_shape_4d = [self.w_shape[0], self.w_shape[1], 1, self.w_shape[2]];
-            out_shape_4d = [
-                self.output_shape[0],
-                self.output_shape[1],
-                1,
-                self.output_shape[2],
-            ];
-            strides_2d = [1, self.strides[0]];
-            dilations_2d = [1, self.dilations[0]];
-            pads_2d = [0, self.pads[0], 0, self.pads[1]];
-            eff_x_shape = x_shape_4d.as_slice();
-            eff_w_shape = w_shape_4d.as_slice();
-            eff_out_shape = out_shape_4d.as_slice();
-            eff_strides = strides_2d.as_slice();
-            eff_dilations = dilations_2d.as_slice();
-            eff_pads = pads_2d.as_slice();
-        } else {
-            eff_x_shape = &self.x_shape;
-            eff_w_shape = &self.w_shape;
-            eff_out_shape = &self.output_shape;
-            eff_strides = &self.strides;
-            eff_dilations = &self.dilations;
-            eff_pads = &self.pads;
-        }
+        let eff_x_shape = &self.geometry.x;
+        let eff_w_shape = &self.geometry.w;
+        let eff_out_shape = &self.geometry.output;
+        let eff_strides = &self.geometry.strides;
+        let eff_dilations = &self.geometry.dilations;
+        let eff_pads = &self.geometry.pads;
 
-        let is_rank4 = eff_x_shape.len() == 4;
+        // Try Tier 1 (BNNS) for undilated convolutions, unless the pointwise
+        // guard below says BNNS would lose. See skip_bnns_for_pointwise_1x1.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            let skip_bnns = skip_bnns_for_pointwise_1x1(eff_w_shape, eff_out_shape);
 
-        let output = if is_rank4 {
-            // Try Tier 1 (BNNS) for undilated convolutions, unless the pointwise
-            // guard below says BNNS would lose. See skip_bnns_for_pointwise_1x1.
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            {
-                let skip_bnns = skip_bnns_for_pointwise_1x1(eff_w_shape, eff_out_shape);
-
-                if self.group == 1
-                    && eff_dilations.iter().all(|&d| d == 1)
-                    && !skip_bnns
-                    && let Some(result) = bnns::bnns_conv_execute(
-                        &x,
-                        &weights,
-                        bias.as_deref(),
-                        eff_x_shape,
-                        eff_w_shape,
-                        eff_out_shape,
-                        eff_strides,
-                        eff_pads,
-                        1,
-                        self.relu,
-                    )
-                {
-                    CONV_BNNS_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    #[cfg(test)]
-                    APPLE_CONV_LAST_DISPATCH.with(|route| route.set(Some(AppleConvDispatch::Bnns)));
-                    write_dense_f32_narrow(OP, &mut outputs[0], &result)?;
-                    record_conv_metrics(inputs, outputs, self);
-                    return Ok(());
-                }
-            }
-
-            // Tier 2a: Direct NEON depthwise convolution (aarch64 only).
-            // Depthwise proper: groups == in_channels == out_channels, ic_per_group == 1.
-            // This eliminates the im2col buffer entirely — depthwise is memory-bound
-            // (M=1, K=kernel_size per group), so the im2col expansion costs more in
-            // memory traffic than it saves in arithmetic density.
-            #[cfg(target_arch = "aarch64")]
-            if self.group > 1
-                && eff_w_shape[1] == 1
-                && self.group == eff_x_shape[1]
-                && eff_w_shape[0] == eff_x_shape[1]
-            {
-                CONV_NEON_DEPTHWISE_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let result = neon_depthwise::depthwise_conv_execute(
+            if self.group == 1
+                && eff_dilations.iter().all(|&d| d == 1)
+                && !skip_bnns
+                && let Some(result) = bnns::bnns_conv_execute(
                     &x,
                     &weights,
                     bias.as_deref(),
@@ -378,64 +344,80 @@ impl Kernel for ConvKernel {
                     eff_w_shape,
                     eff_out_shape,
                     eff_strides,
-                    eff_dilations,
                     eff_pads,
+                    1,
                     self.relu,
-                );
+                )
+            {
+                CONV_BNNS_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(test)]
+                APPLE_CONV_LAST_DISPATCH.with(|route| route.set(Some(AppleConvDispatch::Bnns)));
                 write_dense_f32_narrow(OP, &mut outputs[0], &result)?;
                 record_conv_metrics(inputs, outputs, self);
                 return Ok(());
             }
+        }
 
-            // Tier 2b: im2col + GEMM.
-            CONV_IM2COL_GEMM_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // Track pointwise 1×1 convolutions that bypassed BNNS and reached
-            // the direct GEMM fast path due to low spatial reuse. The predicate
-            // is the *same function* the dispatch used above — re-deriving it
-            // here let the counter and the dispatch drift apart silently, which
-            // would make the manifest claim prove the wrong thing.
-            //
-            // Gated to the same platforms as the BNNS attempt: where BNNS does
-            // not exist there is nothing to bypass, and counting there would
-            // report a bypass that never happened.
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            if skip_bnns_for_pointwise_1x1(eff_w_shape, eff_out_shape) {
-                CONV_POINTWISE_GEMM_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                #[cfg(test)]
-                APPLE_CONV_LAST_DISPATCH
-                    .with(|route| route.set(Some(AppleConvDispatch::PointwiseGemm)));
-            }
-            convolution_gemm_execute(
+        // Tier 2a: Direct NEON depthwise convolution (aarch64 only).
+        // Depthwise proper: groups == in_channels == out_channels, ic_per_group == 1.
+        // This eliminates the im2col buffer entirely — depthwise is memory-bound
+        // (M=1, K=kernel_size per group), so the im2col expansion costs more in
+        // memory traffic than it saves in arithmetic density.
+        #[cfg(target_arch = "aarch64")]
+        if self.group > 1
+            && eff_w_shape[1] == 1
+            && self.group == eff_x_shape[1]
+            && eff_w_shape[0] == eff_x_shape[1]
+        {
+            CONV_NEON_DEPTHWISE_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let result = neon_depthwise::depthwise_conv_execute(
                 &x,
                 &weights,
                 bias.as_deref(),
                 eff_x_shape,
                 eff_w_shape,
                 eff_out_shape,
-                self.group,
                 eff_strides,
                 eff_dilations,
                 eff_pads,
                 self.relu,
-            )?
-        } else {
-            // Tier 3: scalar reference for non-spatial convolutions (should not reach here
-            // after the rank-3→rank-4 promotion above, but kept as a safety net).
-            CONV_SCALAR_REF_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            scalar_ref_execute(
-                &x,
-                &weights,
-                bias.as_deref(),
-                &self.x_shape,
-                &self.w_shape,
-                &self.output_shape,
-                self.group,
-                &self.strides,
-                &self.dilations,
-                &self.pads,
-                self.relu,
-            )
-        };
+            );
+            write_dense_f32_narrow(OP, &mut outputs[0], &result)?;
+            record_conv_metrics(inputs, outputs, self);
+            return Ok(());
+        }
+
+        // Tier 2b: im2col + GEMM.
+        CONV_IM2COL_GEMM_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Track pointwise 1×1 convolutions that bypassed BNNS and reached
+        // the direct GEMM fast path due to low spatial reuse. The predicate
+        // is the *same function* the dispatch used above — re-deriving it
+        // here let the counter and the dispatch drift apart silently, which
+        // would make the manifest claim prove the wrong thing.
+        //
+        // Gated to the same platforms as the BNNS attempt: where BNNS does
+        // not exist there is nothing to bypass, and counting there would
+        // report a bypass that never happened.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if skip_bnns_for_pointwise_1x1(eff_w_shape, eff_out_shape) {
+            CONV_POINTWISE_GEMM_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(test)]
+            APPLE_CONV_LAST_DISPATCH
+                .with(|route| route.set(Some(AppleConvDispatch::PointwiseGemm)));
+        }
+        let output = convolution_gemm_execute(
+            &x,
+            &weights,
+            bias.as_deref(),
+            eff_x_shape,
+            eff_w_shape,
+            eff_out_shape,
+            self.group,
+            eff_strides,
+            eff_dilations,
+            eff_pads,
+            self.relu,
+        )?;
 
         write_dense_f32_narrow(OP, &mut outputs[0], &output)?;
         record_conv_metrics(inputs, outputs, self);
@@ -1154,6 +1136,7 @@ mod neon_depthwise {
     }
 }
 
+#[cfg(test)]
 fn scalar_ref_execute(
     x: &[f32],
     weights: &[f32],
@@ -1815,41 +1798,96 @@ mod tests {
         );
     }
 
-    // ─── Scalar reference reachability and exclusion ────────────────────
+    // ─── Scalar oracle and accelerated-path guards ────────────────────
 
     #[test]
-    fn scalar_ref_fires_for_non_rank4_safety_net() {
-        // Construct a ConvKernel directly with a 5D shape to force the scalar
-        // reference path. This bypasses the factory (which rejects rank != 3|4)
-        // and proves the counter is live. The scalar reference handles arbitrary
-        // spatial rank correctly.
-        let before = super::CONV_SCALAR_REF_TEST_HITS.load(Ordering::Relaxed);
-
-        // 3D convolution: [N=1, C=1, D=2, H=2, W=2], kernel [1, 1, 1, 1, 1]
-        let kernel = super::ConvKernel {
-            x_shape: vec![1, 1, 2, 2, 2],
-            w_shape: vec![1, 1, 1, 1, 1],
-            output_shape: vec![1, 1, 2, 2, 2],
-            group: 1,
-            strides: vec![1, 1, 1],
-            dilations: vec![1, 1, 1],
-            pads: vec![0, 0, 0, 0, 0, 0],
-            relu: false,
-        };
-        let x = Owned::f32(&[1, 1, 2, 2, 2], &[1., 2., 3., 4., 5., 6., 7., 8.]);
-        let w = Owned::f32(&[1, 1, 1, 1, 1], &[2.0]);
-        let mut output = Owned::zeros_f32(&[1, 1, 2, 2, 2]);
-        kernel
-            .execute(&[x.view(), w.view()], &mut [output.view_mut()])
-            .unwrap();
-
-        let after = super::CONV_SCALAR_REF_TEST_HITS.load(Ordering::Relaxed);
-        assert!(
-            after > before,
-            "5D conv did not reach scalar reference path"
+    fn scalar_oracle_handles_generic_spatial_rank() {
+        let output = scalar_ref_execute(
+            &[1., 2., 3., 4., 5., 6., 7., 8.],
+            &[2.0],
+            None,
+            &[1, 1, 2, 2, 2],
+            &[1, 1, 1, 1, 1],
+            &[1, 1, 2, 2, 2],
+            1,
+            &[1, 1, 1],
+            &[1, 1, 1],
+            &[0, 0, 0, 0, 0, 0],
+            false,
         );
-        // Verify correctness: 1x1x1 kernel with weight=2 is a pointwise multiply
-        assert_eq!(output.to_f32(), vec![2., 4., 6., 8., 10., 12., 14., 16.]);
+        assert_eq!(output, vec![2., 4., 6., 8., 10., 12., 14., 16.]);
+    }
+
+    #[test]
+    fn factory_rejects_unsupported_ranks_before_geometry_preparation() {
+        let node = Node::new(NodeId(0), OP, vec![], vec![]);
+        for (x, w) in [
+            (vec![], vec![]),
+            (vec![1, 2], vec![3, 2]),
+            (vec![1, 2, 3, 4, 5], vec![3, 2, 1, 1, 1]),
+            (vec![1, 2, 3], vec![3, 2, 1, 1]),
+        ] {
+            let error = ConvFactory
+                .create(&node, &[x.clone(), w.clone()])
+                .err()
+                .expect("unsupported logical ranks must fail at the factory")
+                .to_string();
+            assert!(
+                error.contains("matching rank-3 NCL or rank-4 NCHW"),
+                "{error}"
+            );
+            assert!(error.contains(&format!("X={x:?}, W={w:?}")), "{error}");
+        }
+    }
+
+    #[test]
+    fn factory_prepares_physical_geometry_and_preserves_logical_shapes() {
+        let mut node = Node::new(NodeId(0), OP, vec![], vec![]);
+        node.attributes.insert("group".into(), Attribute::Int(2));
+        node.attributes
+            .insert("strides".into(), Attribute::Ints(vec![2]));
+        node.attributes
+            .insert("dilations".into(), Attribute::Ints(vec![3]));
+        node.attributes
+            .insert("pads".into(), Attribute::Ints(vec![1, 2]));
+        let kernel = ConvFactory
+            .create(&node, &[vec![2, 6, 9], vec![4, 3, 3]])
+            .unwrap();
+        let kernel = kernel
+            .as_ref()
+            .as_any()
+            .downcast_ref::<ConvKernel>()
+            .unwrap();
+        assert_eq!(kernel.x_shape, [2, 6, 9]);
+        assert_eq!(kernel.w_shape, [4, 3, 3]);
+        assert_eq!(kernel.output_shape, [2, 4, 3]);
+        assert_eq!(kernel.geometry.x, [2, 6, 1, 9]);
+        assert_eq!(kernel.geometry.w, [4, 3, 1, 3]);
+        assert_eq!(kernel.geometry.output, [2, 4, 1, 3]);
+        assert_eq!(kernel.geometry.strides, [1, 2]);
+        assert_eq!(kernel.geometry.dilations, [1, 3]);
+        assert_eq!(kernel.geometry.pads, [0, 1, 0, 2]);
+        node.attributes
+            .insert("strides".into(), Attribute::Ints(vec![2, 1]));
+        node.attributes
+            .insert("dilations".into(), Attribute::Ints(vec![2, 2]));
+        node.attributes
+            .insert("pads".into(), Attribute::Ints(vec![1, 0, 2, 3]));
+        let kernel = ConvFactory
+            .create(&node, &[vec![1, 6, 7, 9], vec![4, 3, 2, 3]])
+            .unwrap();
+        let kernel = kernel
+            .as_ref()
+            .as_any()
+            .downcast_ref::<ConvKernel>()
+            .unwrap();
+        assert_eq!(kernel.x_shape, kernel.geometry.x);
+        assert_eq!(kernel.w_shape, kernel.geometry.w);
+        assert_eq!(kernel.output_shape, kernel.geometry.output);
+        assert_eq!(kernel.geometry.output, [1, 4, 4, 8]);
+        assert_eq!(kernel.geometry.strides, [2, 1]);
+        assert_eq!(kernel.geometry.dilations, [2, 2]);
+        assert_eq!(kernel.geometry.pads, [1, 0, 2, 3]);
     }
 
     #[test]
