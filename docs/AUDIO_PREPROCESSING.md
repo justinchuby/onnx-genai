@@ -64,6 +64,21 @@ Sample validity follows these operations. `emit_valid_samples` and
 `emit_validity_mask` publishes a batch-aligned int64 mask. Ragged published
 waveform/feature/mask rows fail with padding guidance.
 
+## Input windows
+
+`AudioProgram::maximum_input_samples(source_rate)` derives the largest source
+clip whose valid samples survive every published path's `trim`/`fixed_window`.
+It uses execution's integer resampling lengths and valid intervals, including
+multiple resamplers and left/right padding. Trimming padding does not count as
+losing real audio. An unpublished branch does not constrain the window. `None`
+means no live clipping bound was declared; a caller must choose its own segment
+allowance instead of assuming a model-specific duration. Zero source rate and
+windows too small to preserve one source sample fail with guidance.
+
+The CLI uses this proof for both file and live transcription after resolving the
+recording's actual source rate. Serving encoded audio binds the compiled program,
+not a guessed rank-3 mel output or a fixed hop/rate formula.
+
 ## Log-mel and normalization
 
 `log_mel` consumes its named waveform, using the declared mel count, sample rate,

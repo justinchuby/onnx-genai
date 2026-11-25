@@ -85,6 +85,10 @@ the configured key count; it does not contain credentials or their digests.
 | POST | `/slots/{id_slot}?action=save\|restore\|erase` | Owner-thread state actions under opt-in bounded `--slot-save-path`; nxrt state file encoding |
 | GET | `/metrics` | Existing nxrt Prometheus metrics when compiled with `metrics`; names are not llama metric aliases |
 
+Serial Native completion publishes the owner slot snapshot and releases admission
+capacity before its terminal event/reply. A following `/slots` read observes the
+committed `n_past` and idle state without waiting for a worker-loop epilogue.
+
 `/props?model=ID&autoload=false` never loads a model. The default is
 `autoload=true`. The UI uses `autoload=false` for discovery. Unknown/unloaded
 models are reported explicitly. Model load/unload requests complete when the
@@ -671,3 +675,7 @@ transcript done/delta events, usage, request output budgets and SSE termination.
 Native waveform-dependent HTTP acceptance is documented in
 [transcription](TRANSCRIPTION.md); general ASR prompt/response projection and
 richer generative media accounting remain open.
+
+CLI transcription also executes frame-decoding packages and uses compiled preprocessing
+windows at the actual source rate, preserving exact sample cutoffs; encoded-audio
+serving accepts waveform outputs without a mel shape. See [transcription](TRANSCRIPTION.md).

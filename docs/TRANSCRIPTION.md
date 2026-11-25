@@ -109,6 +109,31 @@ normalization). Positive limits are checked during argument parsing. Violations
 name the resource and tell clients to shorten audio or operators to raise its
 configured allowance.
 
+## CLI files and live segments
+
+`nxrt transcribe` executes the same declared CTC/greedy contract as the server,
+without constructing generative prompt tokens. Generative speech retains its
+separate decoder path. Both accept file audio; stdin remains PCM16/WAV.
+
+```sh
+nxrt transcribe path/to/speech-package recording.mp3 --format json --max-new-tokens 128
+```
+
+`--max-new-tokens` is a positive per-segment output budget. Frame profiles reject
+`--language` when they declare no such conditioning. File and live segmentation
+resolve the actual source rate before computing the package's input limit.
+The compiled audio program follows every published branch, accounting for integer
+resampling, padding and valid-sample trimming; unused branches do not impose a
+limit. Default cuts preserve the exact integer sample allowance. Explicit longer
+segments fail instead of letting the workflow silently trim speech.
+
+If the program declares no live trimming window, pass `--segment-seconds`
+explicitly. A feature tensor's mel/frame shape is not a duration declaration for
+an encoded-audio program. Encoded waveform outputs need no mel-shaped contract.
+Legacy server-owned feature extraction accepts arbitrary positive mel counts,
+but retains its documented convenience analysis; authored preprocessing remains
+the route for explicit analysis rate/FFT/hop/window choices.
+
 ## Validation and remaining work
 
 The maintained `transcription_ctc` package runs actual Native CPU WAV preprocessing
@@ -121,6 +146,6 @@ claims.
 
 Other compressed codecs remain open. The existing generative convenience path rejects nonempty `prompt` conditioning
 rather than dropping it, and still needs a general model-authored ASR prompt/response projection and richer
-media accounting; its legacy feature-input geometry and CLI transcription path
-also need further generalization. Realtime sessions use their separate declared
+media accounting; its legacy feature-input analysis also needs a fully authored
+contract. CLI frame execution and program-derived segmentation are implemented. Realtime sessions use their separate declared
 [contract](REALTIME.md). This feature does not establish complete audio parity.

@@ -2051,6 +2051,7 @@ dependencies = [
  "onnx-runtime-ep-cuda",
  "pyo3",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing-subscriber",
  "unicode-width 0.2.2",
