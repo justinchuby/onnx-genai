@@ -227,6 +227,7 @@ impl NativeFinalMetadata {
             "adaptive_target":options.adaptive_p.target,"adaptive_decay":options.adaptive_p.decay,
             "n_predict":budget,"max_tokens":budget,"n_indent":options.minimum_indent,"ignore_eos":!options.stop_on_eos,
             "stream":request.sampling.stream,"stop":stops,"samplers":stages,
+            "grammar_trigger_collation":request.sampling.grammar_trigger_collation.unwrap_or_default(),
             "n_probs":options.top_logprobs.unwrap_or(0),"post_sampling_probs":request.probabilities.post,
             "cache_prompt":!options.cold_start,"preserved_tokens":options.effective_preserved_tokens(),
             "dynatemp_range":options.dynamic_temperature.map_or(0.0, |c| c.range),

@@ -2363,3 +2363,29 @@ Real Native ordinary/speculative and ORT reference prefixes, EOS override,
 tokenizer admission, HTTP numeric bounds and buffered/SSE equality are covered.
 There are no performance or GPU claims. Unchecked goal acceptance rows remain
 required; this increment does not complete the broader compatibility goal.
+
+
+## C-locale collating and equivalence trigger classes
+
+Trigger brackets support collating elements and standalone
+equivalence/POSIX classes, including named characters and scalar range endpoints.
+Real C++ checks exposed distinct libc++ and libstdc++ classic-locale name and
+primary-equivalence behavior. A typed `GrammarCollation` travels with immutable
+activation configuration; the request extension `grammar_trigger_collation`
+selects `libcxx` (omitted/null default) or `libstdcxx`. Properties advertise both.
+Production matching does not depend on the host's compiler or locale.
+
+Paired actual-compiler fixtures cover the same 504 patterns, every one-byte
+input for each valid expression, named aliases/controls, negation, range roles,
+NUL and primary-key edge cases. Runtime observers retain existing source, input,
+program, class-item and VM work bounds. Real Native/ORT HTTP tests exercise both
+profiles through pattern/full-pattern activation, captures within model tokens,
+framing, buffered/SSE projection and pre-SSE error admission. The 33 GBNF and
+5 wire tests passed. Final validation on main 6d9898009: engine library 1096
+passed with one inherited ignore; server library 600 passed with two inherited
+ignores. Default engine/server all-target strict Clippy, no-default engine
+all-target strict Clippy, GenAI Python all-target compilation, formatting and
+whole-change whitespace checks passed on macOS ARM64 CPU. Both actual compiler
+oracles were regenerated with canonical data formatting. These are functional
+checks, with no Linux/GPU execution or performance claims. Lazy JSON, contextual
+raw grammars and other unchecked goal rows remain required.
