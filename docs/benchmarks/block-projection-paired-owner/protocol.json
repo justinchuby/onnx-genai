@@ -1,0 +1,38 @@
+{
+  "scope": "same-process warm wall blocks, not per-arm CPU or end-to-end process latency",
+  "repetitions": 3,
+  "normal_calls": 8192,
+  "double_calls": 16384,
+  "geometry": [
+    8,
+    128,
+    256
+  ],
+  "execution_width": 1,
+  "construction_widths": [
+    1,
+    4
+  ],
+  "normal_order": "ABBA BAAB, reversed on odd repetitions",
+  "physical_bytes": 16384,
+  "shared_input_tensors": true,
+  "shared_physical_owner": true,
+  "factory_selection": "thread local, cold only; no process env mutation",
+  "cold_build_warm5_drop_and_validation": "outside each wall window, included in whole-process CPU/wall envelope",
+  "quality": {
+    "aa": [
+      0.95,
+      1.05
+    ],
+    "adjusted_double": [
+      1.7,
+      2.3
+    ],
+    "work_wall_s_min": 0.05,
+    "empty_fraction_max": 0.01,
+    "physical_cpu_wall_factor": 11
+  },
+  "attempts": 1,
+  "max_cells": 2,
+  "no_gpu": true
+}

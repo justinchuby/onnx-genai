@@ -614,7 +614,7 @@ impl Executor {
             if resolved.contains_key(&vid)
                 || external_values.contains(&vid)
                 || self.graph.initializers.contains_key(&vid)
-                || self.sequence_values.contains(&vid)
+                || self.is_container_value(vid)
             {
                 continue;
             }

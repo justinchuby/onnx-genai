@@ -2,6 +2,45 @@
 use crate::{DevicePtrMut, EpError, Result, WorkspaceView};
 use std::alloc::Layout;
 
+/// Provider-scoped facts that can change metadata-only workspace requirements.
+/// Equality means the same fixed kernel and tensor metadata have the same safe
+/// bound. This is not a memory owner or a quota/admission token.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct WorkspaceContextKey(u64);
+
+impl WorkspaceContextKey {
+    /// Requirements are independent of the caller's execution environment.
+    pub const STABLE: Self = Self(0);
+
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// Allocation-free reader for ambient execution facts. The selected reader is
+/// immutable for its provider's lifetime; fixed provider configuration already
+/// belongs to the compiled kernel, not to an arbitrary environment epoch.
+/// This Copy value does not own its callback code: callers must keep the
+/// originating provider/module alive through every read. Plugin adapters retain
+/// that owner alongside this reader; it cannot be used as a module keepalive.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WorkspaceContextReader(Option<fn() -> WorkspaceContextKey>);
+
+impl WorkspaceContextReader {
+    pub const STABLE: Self = Self(None);
+
+    pub const fn new(read: fn() -> WorkspaceContextKey) -> Self {
+        Self(Some(read))
+    }
+
+    pub fn read(self) -> WorkspaceContextKey {
+        match self.0 {
+            Some(read) => read(),
+            None => WorkspaceContextKey::STABLE,
+        }
+    }
+}
+
 /// A fixed set of disjoint regions within one executor workspace.
 ///
 /// This describes byte ranges only. Binding produces raw device views, never

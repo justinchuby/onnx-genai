@@ -11,11 +11,15 @@ categories = ["science", "multimedia"]
 [dependencies]
 anyhow = { workspace = true }
 hound = { workspace = true }
+symphonia = { workspace = true }
 image = { workspace = true, features = ["jpeg", "png"] }
 onnx-genai-metadata = { workspace = true }
 rustfft = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

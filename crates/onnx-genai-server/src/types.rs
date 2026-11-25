@@ -150,8 +150,52 @@ impl GrammarTriggerRequest {
     }
 }
 
+fn deserialize_prediction_time<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<std::time::Duration>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let milliseconds = parse_llama_integer(&value, "t_max_predict_ms", i64::MAX)
+        .map_err(<D::Error as serde::de::Error>::custom)?;
+    Ok(milliseconds
+        .filter(|number| *number > 0)
+        .map(|number| std::time::Duration::from_millis(number as u64)))
+}
+
+/// Pinned field_num signed integer semantics, without unsafe overflow casts.
+/// A null field is absent; each caller retains its configured default.
+pub(crate) fn parse_llama_integer(
+    value: &serde_json::Value,
+    field: &str,
+    maximum: i64,
+) -> Result<Option<i64>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    // Match field_num<int64_t>: floating numbers truncate toward zero before
+    // the inclusive lower bound is checked. Reject representations that cannot
+    // be converted safely rather than relying on an out-of-range C++ cast.
+    let number = value
+        .as_i64()
+        .or_else(|| {
+            value.as_f64().filter(|number| {
+                number.is_finite()
+                    && number.trunc() >= -1.0
+                    && number.trunc() < 9_223_372_036_854_775_808.0
+            }).map(|number| number.trunc() as i64)
+        })
+        .filter(|number| *number >= -1 && *number <= maximum)
+        .ok_or_else(|| format!("{field} must be numeric and truncate to an integer from -1 through {maximum}; use -1 or 0 to disable, or null to inherit the configured default"))?;
+    Ok(Some(number))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
+    #[serde(
+        rename = "t_max_predict_ms",
+        default,
+        deserialize_with = "deserialize_prediction_time"
+    )]
+    pub prediction_time_limit: Option<std::time::Duration>,
     #[serde(default)]
     pub model: String,
     pub messages: Vec<ChatMessage>,
@@ -839,12 +883,34 @@ pub struct ImageUrl {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InputAudio {
     pub data: String,
+    /// Client container/encoding label; content autodetection selects the decoder.
     pub format: String,
 }
 
 #[derive(Debug, Serialize)]
-pub struct AudioTranscriptionResponse {
-    pub text: String,
+#[serde(tag = "type")]
+pub enum TranscriptResponse {
+    #[serde(rename = "transcript.text.delta")]
+    Delta { delta: String },
+    #[serde(rename = "transcript.text.done")]
+    Done {
+        text: String,
+        usage: TranscriptTokenUsage,
+    },
+}
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename = "tokens")]
+pub struct TranscriptTokenUsage {
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub total_tokens: usize,
+    pub input_tokens_details: TranscriptInputTokenDetails,
+}
+#[derive(Debug, Serialize)]
+pub struct TranscriptInputTokenDetails {
+    pub cached_tokens: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_frames: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -945,6 +1011,8 @@ impl StopInput {
 
 #[derive(Debug, Serialize)]
 pub struct ChatCompletionResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<serde_json::Value>,
     pub id: String,
     pub object: &'static str,
     pub created: u64,
@@ -999,6 +1067,8 @@ pub struct Usage {
 
 #[derive(Debug, Serialize)]
 pub struct CompletionResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<serde_json::Value>,
     pub id: String,
     pub object: &'static str,
     pub created: u64,

@@ -206,7 +206,8 @@ pub fn bind_ir_function_attributes(
         Ok(())
     }
 
-    bind_graph(body, call, function)
+    bind_graph(body, call, function)?;
+    crate::validate_constant_value_opsets(body)
 }
 
 /// Per-inline claim context: the caller's keep-as-op predicate plus the
@@ -358,6 +359,11 @@ fn inline_functions_impl<'a>(
         .graph
         .as_ref()
         .ok_or_else(|| LoaderError::GraphBuild("ModelProto has no graph".into()))?;
+    // Merging function imports must not reinterpret a source Constant.
+    validate_proto_constant_opsets(&graph.node, &model.opset_import)?;
+    for function in &model.functions {
+        validate_proto_constant_opsets(&function.node, &function.opset_import)?;
+    }
 
     // Claim context (value dtypes + per-domain opset) for the keep-as-op
     // predicate, built once from the (merged) top-level metadata. `None` when no
@@ -405,6 +411,42 @@ fn inline_functions_impl<'a>(
     }
     out.functions.clear();
     Ok(Cow::Owned(out))
+}
+
+fn validate_proto_constant_opsets(
+    nodes: &[NodeProto],
+    imports: &[OperatorSetIdProto],
+) -> Result<(), LoaderError> {
+    fn walk(nodes: &[NodeProto], opset: u64) -> Result<(), LoaderError> {
+        for node in nodes {
+            if node.op_type == "Constant" && normalize_domain(&node.domain).is_empty() {
+                for attr in &node.attribute {
+                    if attr.name == "value"
+                        && let Some(tensor) = &attr.t
+                        && let Some(dtype) = DataType::from_onnx(tensor.data_type)
+                    {
+                        crate::validate_constant_value_opset(dtype, opset, || node_label(node))?;
+                    }
+                }
+            }
+            for attr in &node.attribute {
+                if let Some(graph) = &attr.g {
+                    walk(&graph.node, opset)?;
+                }
+                for graph in &attr.graphs {
+                    walk(&graph.node, opset)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let opset = imports
+        .iter()
+        .find(|import| normalize_domain(&import.domain).is_empty())
+        .and_then(|import| u64::try_from(import.version).ok())
+        .unwrap_or(0);
+    walk(nodes, opset)
 }
 
 /// Conservative default `ai.onnx` opset version used only when inlining
@@ -733,6 +775,9 @@ fn instantiate(
 
             instantiated.push(nn);
         }
+
+        // A tensor-valued attribute may have arrived through a formal binding.
+        validate_proto_constant_opsets(&instantiated, &func.opset_import)?;
 
         // Boundary `Identity` aliases for pass-through outputs (BUG 3). Appended
         // last so their source values are already produced. `Identity` is a

@@ -2523,6 +2523,7 @@ impl Engine {
             self.scheduler.advance(session_id);
             let prompt_tokens = state.tokens[..base_len.min(state.tokens.len())].to_vec();
             let mut commit_state = DecodeLoopState {
+                clock: Default::default(),
                 generated_tokens: std::mem::take(generated_tokens),
                 generated_text: std::mem::take(generated_text),
                 text_decoder: std::mem::take(text_decoder),
@@ -2545,6 +2546,7 @@ impl Engine {
                 chain,
                 self.require_tokenizer()?,
                 callback.as_deref_mut(),
+                None,
             )?;
             *generated_tokens = commit_state.generated_tokens;
             *generated_text = commit_state.generated_text;

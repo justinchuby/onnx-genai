@@ -1332,6 +1332,9 @@ impl From<SamplerSequence> for Vec<SamplerStage> {
 /// User-controllable decoding options for Phase 1 generation.
 #[derive(Debug, Clone)]
 pub struct GenerateOptions {
+    /// Normal stop on a newly generated newline after this wall-clock prediction
+    /// budget, measured from the first selected token. None/zero disables it.
+    pub max_prediction_time: Option<std::time::Duration>,
     /// Declared adapter composition per request row. Absence selects the base model.
     pub adapter_selection: Option<crate::pipeline::AdapterSelection>,
     /// Maximum tokens to produce after the prompt.
@@ -1434,6 +1437,7 @@ pub struct GenerateOptions {
 impl Default for GenerateOptions {
     fn default() -> Self {
         Self {
+            max_prediction_time: None,
             adapter_selection: None,
             max_new_tokens: 128,
             max_constraint_bytes: 4 * 1024 * 1024,
@@ -2140,8 +2144,12 @@ pub struct PrefillRequest {
 /// Actual prompt evaluation and the prefix reused from an earlier request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrefillResult {
+    /// Actual prompt work; generation counts and duration remain zero.
+    pub timings: GenerationTimings,
     pub prompt_tokens: usize,
     pub prefix_cache_hit_len: usize,
+    /// Materialized cache retained after commit, independent of input reuse.
+    pub retained_cache_tokens: usize,
 }
 
 /// A single generation request.
@@ -2211,6 +2219,8 @@ pub struct PrioritizedGenerateResult {
 /// Why generation stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinishReason {
+    /// Prediction time elapsed and a new newline was committed.
+    PredictionTimeLimit,
     /// The configured maximum number of new tokens was reached.
     MaxTokens,
     /// The configured EOS token was generated.
@@ -2237,6 +2247,8 @@ pub struct GenerationBudgetCap {
 /// Final generation output.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerateResult {
+    /// Measured decoder work, absent when the executor has no timing contract.
+    pub timings: Option<GenerationTimings>,
     /// Detokenized generated text.
     pub text: String,
     /// Resolved output policy used when reconstructing per-token publication.
@@ -2251,6 +2263,9 @@ pub struct GenerateResult {
     pub tool_calls: Vec<onnx_genai_metadata::ToolCall>,
     /// Number of prompt/context tokens whose KV state was reused from the prefix cache.
     pub prefix_cache_hit_len: usize,
+    /// Materialized token state retained after this transaction. Zero when the
+    /// executor exposes no retained token-cache contract; never input reuse.
+    pub retained_cache_tokens: usize,
     /// Per-generated-token log probabilities, or `None` when not requested.
     pub logprobs: Option<Vec<TokenLogprob>>,
     /// Present when scheduler admission capped `max_new_tokens` below the
@@ -2281,9 +2296,29 @@ pub struct TokenLogprob {
     pub top: Vec<(TokenId, f32)>,
 }
 
+/// Cumulative decoder measurements at a committed token boundary.
+///
+/// Prompt time ends at the first forward's logits. Generation time counts
+/// token selection and subsequent forward/policy work; callback delivery and
+/// scheduler suspension are excluded. The first generated token consumes no
+/// additional generation forward, matching llama.cpp's rate denominator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationTimings {
+    /// Actual speculative verification counters at this committed boundary.
+    /// Absent when no speculative verification has run.
+    pub speculative: Option<crate::SpeculativeStats>,
+    pub prompt_tokens: usize,
+    pub cached_prompt_tokens: usize,
+    pub generated_tokens: usize,
+    pub prompt_elapsed: std::time::Duration,
+    pub generation_elapsed: std::time::Duration,
+}
+
 /// Per-token streaming event shape for future callback/iterator APIs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerateToken {
+    /// Cumulative measurements taken before external publication of this token.
+    pub timings: Option<GenerationTimings>,
     /// Probability for this committed token, when requested.
     pub logprob: Option<TokenLogprob>,
     pub token_id: TokenId,

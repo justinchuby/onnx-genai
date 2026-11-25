@@ -1,0 +1,21 @@
+{
+  "README.md": "5f1167d6fc5f77de720b817337e9329a9a430d0e1a73cf79db9c12d4e180cd3e",
+  "baseline.rs.gz": "b31702fa9ac32c9bde505d96d80b75c15a18109e78af018c38a000a8457047f4",
+  "host.json": "903126a0bb68705e50980e8d8695502cce69348eaee0a139dc56351a9e0f62a5",
+  "negative/driver.py": "44f61a0cacfc0cef30808992fdb9c5d491f9fa9b538e9475422471cd53b6eb10",
+  "negative/mutant.rs.gz": "013814ebe1d395e6d2380832cfae1e1967cf8ba52773e5a85258225e6b5d5042",
+  "negative/negative.log.gz": "7f239b07cc7631cdd2a328404083e9fd09131d45b4f264a2cc9b507ac7746fe8",
+  "negative/original.rs.gz": "676c86f602089400aee4d71a814550f5204567cb1f9ceeb4d1d59f4ab98d82d7",
+  "negative/receipt.json": "6574e3a0d32c3678a8953c2a8d5c2e8255b63f6c6ccc772f70e5e908c2dcba22",
+  "source-seal.json": "8357691ab99a63626caf1cc7af49b9bc5c3ad19061bbdfd6f0b94328cf927cb0",
+  "validation/clippy-mlas.log.gz": "dc7e640b98f6f990260efd0756487da606550a49d6ad8b4f3451358ebcb8c7be",
+  "validation/clippy.log.gz": "4174c14248a3113fbc6ee88a688b0cc3d1705aab7562f18a51b200fa8878e834",
+  "validation/driver.py": "2f069dba9ea36bc158b5446c1065ae33cd4125f1e0ce118fa713a6a93895f71b",
+  "validation/initial-clippy.log.gz": "d6832ac71a2e97d0d16033faad20e59568e91da8115a1ce0f9cd7444dddac1f7",
+  "validation/list-qmoe.log.gz": "3f26c128e41d9f6b0c0a69681e0f0dfaf4c24a69818dec133904d49e4331a6d4",
+  "validation/oracle.log.gz": "b4c7298478fa6c15c94cebf6fc193ca77f5a2208f8f7d9701036315447e8bcfc",
+  "validation/qmoe-mlas.log.gz": "d3f8d450659d5eae2b051e9476aa52b6b56ce33223018dd7ab21d1f28aa50871",
+  "validation/qmoe.log.gz": "3fd48041ca3283b88b6cdf580d9690a8b78f5477ac054684183978c766ab74d0",
+  "validation/validation.json": "1ee269ea65d91ccafa4e0893f4d4835ee418287baaf050fa8537d5fb5bc021e8",
+  "verify.py": "f60c159f709ec38ebf77a5d9c6c1bc46ea829ba2c47959cc293ea0fb443a7802"
+}

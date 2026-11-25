@@ -12,9 +12,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use onnx_genai_engine::pipeline::speculative::DFlashGenerationCancelled;
 use onnx_genai_engine::{
-    Engine, EngineConfig, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
-    GenerationBoundary, GenerationControl, PackageExecutionError, PipelineGenerateRequest,
-    SessionForkError, SessionPosition, ToolCallPolicy, package_execution_error,
+    Engine, EngineConfig, EngineDecodeBackend, FinishReason, GenerateOptions, GeneratePrompt,
+    GenerateRequest, GenerationBoundary, GenerationControl, PackageExecutionError,
+    PipelineGenerateRequest, SessionForkError, SessionPosition, ToolCallPolicy,
+    package_execution_error,
 };
 use onnx_genai_ort::{DataType, Environment, Session, SessionOptions, Value};
 use rand::rngs::StdRng;
@@ -890,6 +891,13 @@ fn pipeline_request() -> PipelineGenerateRequest {
     })
 }
 
+fn ort_config() -> EngineConfig {
+    EngineConfig {
+        decode_backend: EngineDecodeBackend::Ort,
+        ..EngineConfig::default()
+    }
+}
+
 fn expect_error<T>(result: anyhow::Result<T>) -> anyhow::Error {
     match result {
         Ok(_) => panic!("DFlash raw workflow API unexpectedly executed"),
@@ -900,7 +908,7 @@ fn expect_error<T>(result: anyhow::Result<T>) -> anyhow::Error {
 #[test]
 fn every_raw_workflow_api_typed_refuses_before_dflash_component_execution() -> anyhow::Result<()> {
     let root = package("1", false, &[0, 0, 0, 0, 0, 0, 0, 0])?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     for (operation, error) in [
         (
             "Engine::run_pipeline",
@@ -957,7 +965,7 @@ fn every_raw_workflow_api_typed_refuses_before_dflash_component_execution() -> a
 #[test]
 fn consecutive_blocks_commit_anchor_and_never_condition_on_rejected_suffix() -> anyhow::Result<()> {
     let root = package_with_target("1", false, &[1, 1, 1, 1, 1, 1, 1, 1], CONTEXTUAL_TARGET)?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let result = engine.generate(pipeline_request().request)?;
     assert_eq!(
         result.token_ids,
@@ -980,7 +988,7 @@ fn consecutive_blocks_commit_anchor_and_never_condition_on_rejected_suffix() -> 
 fn dflash_batching_uses_isolated_generation_and_fork_declines_before_child_allocation()
 -> anyhow::Result<()> {
     let root = package_with_target("1", false, &[1, 1, 1, 1, 1, 1, 1, 1], CONTEXTUAL_TARGET)?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let expected = engine.generate(pipeline_request().request)?;
     let batched = engine
         .generate_batched_static(vec![pipeline_request().request, pipeline_request().request])?;
@@ -1009,7 +1017,7 @@ fn dflash_batching_uses_isolated_generation_and_fork_declines_before_child_alloc
 #[test]
 fn output_callback_failure_is_post_commit_and_retry_is_deterministic() -> anyhow::Result<()> {
     let root = package_with_target("1", false, &[1, 1, 1, 1, 1, 1, 1, 1], CONTEXTUAL_TARGET)?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let mut delivered = Vec::new();
     let mut callback = |token: onnx_genai_engine::GenerateToken| -> anyhow::Result<()> {
         delivered.push(token.token_id);
@@ -1039,7 +1047,7 @@ fn output_callback_failure_is_post_commit_and_retry_is_deterministic() -> anyhow
 #[test]
 fn alternate_block_geometry_uses_the_same_structural_dispatch() -> anyhow::Result<()> {
     let root = alternate_geometry_package()?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let diagnostic = engine.dflash_diagnostic().expect("DFlash diagnostic");
     assert_eq!(diagnostic.max_proposal_width, 4);
     assert_eq!(diagnostic.target_hidden_sources.len(), 3);
@@ -1072,7 +1080,7 @@ fn proposer_failure_publishes_nothing_and_a_valid_retry_is_deterministic() -> an
         1,
     );
     fs::write(proposer_path, proposer)?;
-    let mut failed = Engine::from_dir(&invalid, EngineConfig::default())?;
+    let mut failed = Engine::from_dir(&invalid, ort_config())?;
     let error = failed
         .generate(pipeline_request().request)
         .expect_err("out-of-vocabulary proposer output must fail before commit");
@@ -1090,7 +1098,7 @@ fn proposer_failure_publishes_nothing_and_a_valid_retry_is_deterministic() -> an
     );
 
     let valid = package_with_target("1", false, &[1, 1, 1, 1, 1, 1, 1, 1], CONTEXTUAL_TARGET)?;
-    let mut retry = Engine::from_dir(&valid, EngineConfig::default())?;
+    let mut retry = Engine::from_dir(&valid, ort_config())?;
     assert_eq!(
         retry.generate(pipeline_request().request)?.token_ids,
         vec![2, 2, 2, 2]
@@ -1101,7 +1109,7 @@ fn proposer_failure_publishes_nothing_and_a_valid_retry_is_deterministic() -> an
 #[test]
 fn eos_anchor_commits_once_and_stops_before_any_suffix_is_exposed() -> anyhow::Result<()> {
     let root = package_with_target("1", false, &[1, 1, 1, 1, 1, 1, 1, 1], CONTEXTUAL_TARGET)?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let mut request = pipeline_request().request;
     request.options.stop_on_eos = true;
     request.options.eos_token_ids = vec![2];
@@ -1122,7 +1130,7 @@ fn engine_dispatches_dflash_v1_to_real_target_and_proposer_sessions() -> anyhow:
         &[1, 1, 1, 1, 1, 1, 1, 1][..],
     ] {
         let root = package("1", false, candidates)?;
-        let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&root, ort_config())?;
         let result = engine.generate(GenerateRequest {
             prompt: GeneratePrompt::TokenIds(vec![1, 2]),
             options: GenerateOptions {
@@ -1160,7 +1168,7 @@ fn dflash_waits_for_budget_boundary_across_complete_call_blocks() -> anyhow::Res
         0,
         r#"<tool_call>{"name":"weather","arguments":{"city":"Paris"}}</tool_call>"#,
     )?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let result = engine.generate_with_pipeline_request(
         PipelineGenerateRequest::new(GenerateRequest {
             prompt: GeneratePrompt::TokenIds(vec![1, 2]),
@@ -1184,7 +1192,7 @@ fn dflash_waits_for_budget_boundary_across_complete_call_blocks() -> anyhow::Res
 fn sampling_without_declared_proposal_probabilities_refuses_before_a_block_runs()
 -> anyhow::Result<()> {
     let root = package("1", false, &[0, 0, 0, 0, 0, 0, 0, 0])?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let error = engine
         .generate(GenerateRequest {
             prompt: GeneratePrompt::TokenIds(vec![1]),
@@ -1216,7 +1224,7 @@ fn sampling_reference(seed: u64) -> u32 {
 #[test]
 fn dispatched_dflash_sampling_matches_the_declared_rejection_reference() -> anyhow::Result<()> {
     let root = package("1", true, &[0, 0, 0, 0, 0, 0, 0, 0])?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let mut observed = [0_usize; 4];
     for seed in 0..128_u64 {
         let result = engine.generate(GenerateRequest {
@@ -1248,7 +1256,7 @@ fn dispatched_dflash_sampling_matches_the_declared_rejection_reference() -> anyh
 #[test]
 fn context_exhaustion_finishes_before_the_first_dflash_component_run() -> anyhow::Result<()> {
     let root = package("1", false, &[0, 0, 0, 0, 0, 0, 0, 0])?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let result = engine.generate(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![1, 2]),
         options: GenerateOptions {
@@ -1279,7 +1287,7 @@ fn dflash_context_exhaustion_enforces_required_tool_policy_before_component_run(
         0,
         r#"<tool_call>{"name":"weather","arguments":{}}</tool_call>"#,
     )?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let error = engine
         .generate_with_pipeline_request(
             PipelineGenerateRequest::new(GenerateRequest {
@@ -1340,7 +1348,7 @@ fn fault_at(boundary: GenerationBoundary) -> GenerationControl {
 }
 
 fn clean_second_turn(root: &Path, request: GenerateRequest) -> anyhow::Result<Vec<u32>> {
-    let mut engine = Engine::from_dir(root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(root, ort_config())?;
     let session = engine.create_session()?;
     engine.generate_in_session(session, request.clone())?;
     Ok(engine.generate_in_session(session, request)?.token_ids)
@@ -1350,7 +1358,7 @@ fn assert_cancelled_retry(boundary: GenerationBoundary) -> anyhow::Result<()> {
     let root = package("1", true, &[0, 0, 0, 0, 0, 0, 0, 0])?;
     let request = controlled_request();
     let expected = clean_second_turn(&root, request.clone())?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let session = engine.create_session()?;
     engine.generate_in_session(session, request.clone())?;
     let baseline_tokens = engine.session_token_count(session)?;
@@ -1420,7 +1428,7 @@ fn cancellation_at_semantic_precommit_restores_same_session_and_retries_determin
 #[test]
 fn cancellation_after_commit_is_delivery_only_and_cannot_roll_back() -> anyhow::Result<()> {
     let root = package_with_target("1", false, &[1, 1, 1, 1, 1, 1, 1, 1], CONTEXTUAL_TARGET)?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let control = GenerationControl::new();
     let cancellation = control.clone();
     let won = Arc::new(AtomicBool::new(true));
@@ -1455,7 +1463,7 @@ fn assert_fault_retry(boundary: GenerationBoundary) -> anyhow::Result<()> {
     let root = package("1", true, &[0, 0, 0, 0, 0, 0, 0, 0])?;
     let request = controlled_request();
     let expected = clean_second_turn(&root, request.clone())?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let session = engine.create_session()?;
     engine.generate_in_session(session, request.clone())?;
     let baseline_tokens = engine.session_token_count(session)?;
@@ -1515,7 +1523,7 @@ fn qwen_geometry_binds_five_real_taps_and_each_changes_proposer_output() -> anyh
     let base_scales = [1.0, 2.0, 3.0, 4.0, 4.0];
     let root =
         package_with_target_scales("1", false, &candidates, CONTEXTUAL_TARGET, &base_scales)?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     assert_eq!(
         engine
             .dflash_diagnostic()
@@ -1543,7 +1551,7 @@ fn qwen_geometry_binds_five_real_taps_and_each_changes_proposer_output() -> anyh
         let mut scales = base_scales;
         scales[tap] += 1.0;
         let root = package_with_target_scales("1", false, &candidates, CONTEXTUAL_TARGET, &scales)?;
-        let mut changed = Engine::from_dir(&root, EngineConfig::default())?;
+        let mut changed = Engine::from_dir(&root, ort_config())?;
         changed.generate(pipeline_request().request)?;
         let changed_trace = changed.take_dflash_block_traces();
         assert_ne!(
@@ -1682,7 +1690,7 @@ fn every_required_block_input_independently_changes_the_proposer_output() -> any
 }
 
 fn first_proposer_candidates(root: &Path) -> anyhow::Result<Vec<i64>> {
-    let mut engine = Engine::from_dir(root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(root, ort_config())?;
     engine.generate(pipeline_request().request)?;
     Ok(engine
         .take_dflash_block_traces()
@@ -1753,7 +1761,7 @@ fn runtime_consumes_exact_shared_embedding_and_lm_head_identity() -> anyhow::Res
         let metadata_path = root.join("inference_metadata.yaml");
         let metadata = fs::read_to_string(&metadata_path)?.replace(declared, decoy);
         fs::write(metadata_path, metadata)?;
-        let error = match Engine::from_dir(&root, EngineConfig::default()) {
+        let error = match Engine::from_dir(&root, ort_config()) {
             Ok(_) => panic!("compatible-shape shared-weight misbinding must fail admission"),
             Err(error) => error,
         };
@@ -1774,7 +1782,7 @@ fn disconnected_required_dflash_input_fails_package_admission() -> anyhow::Resul
         r#"node { input: "positions_f32" input: "history_axis" output: "attention_sum" op_type: "ReduceSum" attribute { name: "keepdims" i: 0 type: INT } }"#,
     );
     fs::write(proposer_path, proposer)?;
-    let error = match Engine::from_dir(&root, EngineConfig::default()) {
+    let error = match Engine::from_dir(&root, ort_config()) {
         Ok(_) => panic!("disconnected attention_mask must fail before execution"),
         Err(error) => error,
     };
@@ -1803,7 +1811,7 @@ fn disconnected_required_dflash_input_fails_package_admission() -> anyhow::Resul
         let target_path = root.join("target.onnx.textproto");
         let target = fs::read_to_string(&target_path)?.replace(initializer, replacement);
         fs::write(target_path, target)?;
-        let error = match Engine::from_dir(&root, EngineConfig::default()) {
+        let error = match Engine::from_dir(&root, ort_config()) {
             Ok(_) => panic!("disconnected shared initializer must fail admission"),
             Err(error) => error,
         };
@@ -1826,5 +1834,90 @@ fn selector_convolution_v2_stays_a_typed_pre_mutation_refusal() -> anyhow::Resul
         package_execution_error(&error),
         Some(PackageExecutionError::DFlashExecutionUnavailable { version, .. }) if version == "2"
     ));
+    Ok(())
+}
+
+#[test]
+fn prediction_time_limit_commits_only_the_real_dflash_accepted_prefix() -> anyhow::Result<()> {
+    for streaming in [false, true] {
+        let root = package("1", false, &[0; 8])?;
+        install_tool_protocol_tokenizer(&root, 0, "\n")?;
+        let mut engine = Engine::from_dir(&root, ort_config())?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1, 2]));
+        request.options.max_new_tokens = 20;
+        request.options.greedy = true;
+        request.options.stop_on_eos = false;
+        request.options.max_prediction_time = Some(std::time::Duration::from_millis(50));
+        let control = GenerationControl::new().with_checkpoint(|boundary| {
+            if boundary == GenerationBoundary::AfterVerifier {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Ok(())
+        });
+        let mut delivered = Vec::new();
+        let mut callback = |token: onnx_genai_engine::GenerateToken| {
+            delivered.push(token);
+            Ok(())
+        };
+        let result = engine.generate_with_control_callbacks(
+            request.clone(),
+            control,
+            None,
+            if streaming { Some(&mut callback) } else { None },
+        )?;
+        assert_eq!(result.finish_reason, FinishReason::PredictionTimeLimit);
+        assert!(!result.token_ids.is_empty() && result.token_ids.len() < 20);
+        assert!(result.text.contains('\n'));
+        let traces = engine.take_dflash_block_traces();
+        assert!(!traces.is_empty());
+        assert_eq!(
+            traces
+                .iter()
+                .flat_map(|trace| trace.committed_tokens.iter())
+                .copied()
+                .collect::<Vec<_>>(),
+            result
+                .token_ids
+                .iter()
+                .copied()
+                .map(i64::from)
+                .collect::<Vec<_>>()
+        );
+        if streaming {
+            assert_eq!(
+                delivered
+                    .iter()
+                    .map(|token| token.token_id)
+                    .collect::<Vec<_>>(),
+                result.token_ids
+            );
+            assert_eq!(
+                delivered.last().unwrap().finish_reason,
+                Some(FinishReason::PredictionTimeLimit)
+            );
+        }
+        let mut invalid = request.clone();
+        invalid.options.max_constraint_bytes = 0;
+        let mut unexpected = Vec::new();
+        let error = engine
+            .generate_with_callbacks(
+                invalid,
+                None,
+                Some(&mut |token| {
+                    unexpected.push(token);
+                    Ok(())
+                }),
+            )
+            .expect_err("time observer byte budget must reject output before commit");
+        assert!(
+            format!("{error:#}").contains("max_constraint_bytes=0"),
+            "{error:#}"
+        );
+        assert!(unexpected.is_empty());
+        assert!(engine.take_dflash_block_traces().is_empty());
+        request.options.max_prediction_time = None;
+        request.options.max_new_tokens = 4;
+        assert_eq!(engine.generate(request)?.token_ids, vec![0; 4]);
+    }
     Ok(())
 }

@@ -32,8 +32,10 @@ pub(crate) mod native_speculative;
 pub mod pipeline;
 pub mod pipeline_cache;
 pub(crate) mod platform_capacity;
+mod prediction_limit;
 pub(crate) mod processors;
 pub mod ranking;
+pub mod realtime;
 pub mod reasoning;
 mod response_constraint;
 pub mod response_template;
@@ -42,8 +44,10 @@ pub mod runtime_trace;
 pub mod sampling;
 pub(crate) mod session;
 pub mod speculative;
+mod task_inputs;
 mod text_projection;
 pub mod tokenization;
+pub mod transcription;
 
 #[cfg(feature = "native-backend")]
 pub use engine::{
@@ -68,17 +72,18 @@ pub use engine::{
     DynamicTemperatureConfig, Eagle3Config, Engine, EngineConfig, EngineConfigError,
     EngineDecodeBackend, EngineGovernorError, EngineResourceGovernor, FinishReason,
     GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
-    GenerateToken, GenerateTokenCallback, GenerationBudgetCap, GrammarActivation, GrammarTrigger,
-    KvConnectorBackend, KvConnectorConfig, LayerWeightBytes, LimitParseError, LogprobSource,
-    MemoryPolicyApplication, MemoryStrategy, MemoryStrategyDecision, MemoryStrategyPlan,
-    MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
-    OrtEngineWorkerFactory, OrtSessionWorkerLoadError, PackageExecutionError, PrefillRequest,
-    PrefillResult, PrioritizedGenerateRequest, PrioritizedGenerateResult, RewindTokenCount,
-    SamplerSequence, SamplerStage, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint,
-    SessionForkError, SessionForkParticipant, SessionForkParticipantKind, SessionForkPlan,
-    SessionId, SessionPosition, SessionPrefillCarry, SpeculativeMode, TokenLogprob, ToolCallPolicy,
-    WeightAccessPattern, WeightPlacementReport, XtcConfig, package_execution_error,
-    parse_device_policy, parse_resource_limit, resolve_device_vram_limit_bytes,
+    GenerateToken, GenerateTokenCallback, GenerationBudgetCap, GenerationTimings,
+    GrammarActivation, GrammarTrigger, KvConnectorBackend, KvConnectorConfig, LayerWeightBytes,
+    LimitParseError, LogprobSource, MemoryPolicyApplication, MemoryStrategy,
+    MemoryStrategyDecision, MemoryStrategyPlan, MirostatConfig, MirostatVersion, MtpCacheScope,
+    MtpConfig, MtpHiddenLayout, MtpWeightSource, OrtEngineWorkerFactory, OrtSessionWorkerLoadError,
+    PackageExecutionError, PrefillRequest, PrefillResult, PrioritizedGenerateRequest,
+    PrioritizedGenerateResult, RewindTokenCount, SamplerSequence, SamplerStage, SamplingOverrides,
+    ScheduledGenerateArrival, SessionCheckpoint, SessionForkError, SessionForkParticipant,
+    SessionForkParticipantKind, SessionForkPlan, SessionId, SessionPosition, SessionPrefillCarry,
+    SpeculativeMode, TokenLogprob, ToolCallPolicy, WeightAccessPattern, WeightPlacementReport,
+    XtcConfig, package_execution_error, parse_device_policy, parse_resource_limit,
+    resolve_device_vram_limit_bytes,
 };
 pub use fim::{FimConfig, FimFormat};
 pub use logits::{
@@ -200,8 +205,8 @@ pub struct VmmArenaStats {
 #[cfg(feature = "native-backend")]
 pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{
-    AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection, EncodedAudio,
-    GenerationBoundary, GenerationCancelled, GenerationControl, GenerationStopReason,
+    AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection, AudioOutputFormat,
+    EncodedAudio, GenerationBoundary, GenerationCancelled, GenerationControl, GenerationStopReason,
     PipelineGenerateRequest, PipelineTensors, RowPlan, RowScopedState, RowTable,
     StagedOutputCheckpoint, StagedOutputObservation, StagedOutputObservationError,
     ToolCallStagedOutputObserver, WorkflowSessionCheckpoint, is_missing_required_input,

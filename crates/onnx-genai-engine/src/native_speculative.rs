@@ -167,6 +167,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
         tokenizer: &Tokenizer,
         runtime: &crate::pipeline::WorkflowRuntime,
         stats: &mut SpeculativeStats,
+        control: Option<&crate::GenerationControl>,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         if prompt_tokens.is_empty() {
@@ -204,6 +205,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
             // KV by one committed token.
             pending: prompt_tokens.to_vec(),
             stats,
+            control,
             callback,
         };
         let request = crate::pipeline::PipelineGenerateRequest::new(crate::GenerateRequest {
@@ -241,7 +243,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
             &cursor,
             &block.state.generated_tokens,
         )?;
-        match finished {
+        let result = match finished {
             Some(result) => Ok(result),
             None => finish_result(
                 tokenizer,
@@ -251,7 +253,11 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 block.state.logprobs.as_deref(),
                 &options.effective_preserved_tokens(),
             ),
-        }
+        };
+        result.map(|mut result| {
+            result.timings = block.state.clock.snapshot();
+            result
+        })
     }
 
     /// Cumulative per-phase timings for this generation.
@@ -288,6 +294,10 @@ impl<'a> NativeSpeculativeDriver<'a> {
             phase_profile,
             ..
         } = *block;
+        let control = block.control;
+        if let Some(control) = control {
+            control.check(crate::GenerationBoundary::BeforeWorkflowNode)?;
+        }
         let state = &mut block.state;
         let pending = &mut block.pending;
         let stats = &mut *block.stats;
@@ -316,17 +326,48 @@ impl<'a> NativeSpeculativeDriver<'a> {
 
         // Fold the trailing committed token(s) into the KV and read the
         // target's next-token distribution for the first uncommitted position.
+        let first_forward = !state.clock.has_finished_prompt();
+        if first_forward && let Some(control) = control {
+            control.report_prompt_progress(state.clock.initial_progress(prompt_len, 0))?;
+            control.check(crate::GenerationBoundary::BeforeWorkflowNode)?;
+        }
         let past = self.session.current_len();
+        state.clock.begin_forward(prompt_len, 0);
         let t0 = phase_profile.then(std::time::Instant::now);
         let base_logits = self
             .session
             .decode(pending, past)?
             .pop()
             .context("native speculative decode produced no base logits")?;
+        anyhow::ensure!(
+            !base_logits.is_empty(),
+            "native speculative target returned an empty logits vocabulary for its base forward; export nonempty next-token logits"
+        );
         if let Some(t0) = t0 {
             self.t_base += t0.elapsed().as_secs_f64() * 1e3;
             self.n_base += 1;
         }
+        state.clock.finish_forward();
+        state.clock.pause_work();
+        if let Some(control) = control {
+            control.check(crate::GenerationBoundary::AfterDecoderForward)?;
+            if first_forward {
+                control.report_prompt_progress(crate::pipeline::PromptProgress {
+                    total: prompt_len,
+                    cache: 0,
+                    processed: prompt_len,
+                    elapsed: state
+                        .clock
+                        .snapshot()
+                        .context(
+                            "native speculative prompt timing is unavailable after its forward",
+                        )?
+                        .prompt_elapsed,
+                })?;
+            }
+            control.check(crate::GenerationBoundary::BeforeProposer)?;
+        }
+        state.clock.resume_work();
         pending.clear();
         let base = self.session.current_len();
         debug_assert_eq!(base, context_len);
@@ -398,11 +439,17 @@ impl<'a> NativeSpeculativeDriver<'a> {
         if let Some(tp) = tp {
             self.t_propose += tp.elapsed().as_secs_f64() * 1e3;
         }
+        state.clock.pause_work();
+        if let Some(control) = control {
+            control.check(crate::GenerationBoundary::AfterProposer)?;
+        }
+        state.clock.resume_work();
 
         if draft.is_empty() {
             // No proposal: fall back to a single plain greedy step. Worst case
             // is "no regression", never a slowdown (design §10).
             let token = sample_greedy(&base_logits);
+            state.clock.resume_work();
             if let Some(reason) = commit_selected_token(
                 state,
                 prompt_tokens,
@@ -411,6 +458,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 chain,
                 tokenizer,
                 callback.as_deref_mut(),
+                None,
             )? {
                 return Ok(Some(finish_result(
                     tokenizer,
@@ -446,10 +494,29 @@ impl<'a> NativeSpeculativeDriver<'a> {
         // the token AFTER each draft token). current_len advances to base + K.
         let tv = phase_profile.then(std::time::Instant::now);
         let rows = self.session.decode_verify(&draft, base)?;
+        anyhow::ensure!(
+            rows.len() == draft.len(),
+            "native speculative verification returned {} logits row(s) for {} draft tokens; export per-position target logits or set num_speculative_tokens=1 for a last-token-only decoder",
+            rows.len(),
+            draft.len()
+        );
+        for (index, row) in rows.iter().enumerate() {
+            anyhow::ensure!(
+                row.len() == base_logits.len(),
+                "native speculative verification logits row {index} has vocabulary width {}, but the base forward has {}; export consistent target logits for every draft position",
+                row.len(),
+                base_logits.len()
+            );
+        }
         if let Some(tv) = tv {
             self.t_verify += tv.elapsed().as_secs_f64() * 1e3;
             self.n_verify += 1;
         }
+        state.clock.pause_work();
+        if let Some(control) = control {
+            control.check(crate::GenerationBoundary::AfterVerifier)?;
+        }
+        state.clock.resume_work();
 
         // ==== WP3 device-accept seam ====
         // Host argmax over the [K+1, vocab] rows. `target_tokens[idx]` is the
@@ -479,6 +546,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
         if accepted >= 2 {
             stats.multi_token_accepts += 1;
         }
+        state.clock.record_speculative(*stats);
 
         // Roll the device KV back to the committed length: accepted draft
         // columns stay resident, unaccepted columns are dropped, and the bonus
@@ -546,6 +614,30 @@ impl<'a> NativeSpeculativeDriver<'a> {
                     break;
                 }
             }
+            state.clock.resume_work();
+            let mut finalize_stop_prefix = |reason: Option<&FinishReason>| -> anyhow::Result<()> {
+                if reason.is_some() && !is_bonus && idx + 1 < accepted {
+                    let keep = idx + 1;
+                    let result = match recurrent_snapshot.as_ref() {
+                        Some(snapshot) => self.session.commit_recurrent_state_to_accepted(
+                            snapshot,
+                            base,
+                            &draft[..keep],
+                        ),
+                        None => {
+                            // Refresh the last retained token too: merely slicing
+                            // KV would leave hidden conditioning from a later row.
+                            self.session.rewind(base + idx).and_then(|()| {
+                                self.session
+                                    .decode(&draft[idx..keep], base + idx)
+                                    .map(|_| ())
+                            })
+                        }
+                    };
+                    result.with_context(||format!("restore Native speculative stop prefix {keep}/{accepted} before publication"))?;
+                }
+                Ok(())
+            };
             if let Some(reason) = commit_selected_token(
                 state,
                 prompt_tokens,
@@ -554,6 +646,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 chain,
                 tokenizer,
                 callback.as_deref_mut(),
+                Some(&mut finalize_stop_prefix),
             )? {
                 return Ok(Some(finish_result(
                     tokenizer,
@@ -583,6 +676,7 @@ struct NativeSpeculativeBlock<'a, 'callback> {
     state: DecodeLoopState,
     pending: Vec<TokenId>,
     stats: &'a mut SpeculativeStats,
+    control: Option<&'a crate::GenerationControl>,
     callback: Option<&'a mut GenerateTokenCallback<'callback>>,
 }
 

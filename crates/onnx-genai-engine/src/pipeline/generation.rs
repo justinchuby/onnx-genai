@@ -384,6 +384,7 @@ pub(crate) trait GenerationCore: WorkflowNodeHost {
     fn prefix_cache_hit_len(&self) -> usize;
     /// Per-token logprobs, when the request asked for them.
     fn logprobs(&self) -> Option<Vec<crate::config::TokenLogprob>>;
+    fn timings(&self) -> Option<crate::config::GenerationTimings>;
     /// The tokens this core committed, cross-checked against the emitted stream.
     fn committed_tokens(&self) -> Vec<crate::TokenId>;
     /// Whether this core already delivered each token to the request callback.
@@ -479,6 +480,14 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
             "the generation loop ran two decoder forward passes without applying its token \
              policy between them; the second pass's scores would replace the first's unread"
         );
+        let first_forward = !self.state.clock.has_finished_prompt();
+        if first_forward && let Some(control) = self.control {
+            control.report_prompt_progress(
+                self.state
+                    .clock
+                    .initial_progress(self.backend.context_len(), self.state.prefix_cache_hit_len),
+            )?;
+        }
         self.pending_forward = Some(forward_step(
             self.backend,
             self.state,
@@ -487,6 +496,15 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
         )?);
         if let Some(control) = self.control {
             control.check(super::GenerationBoundary::AfterDecoderForward)?;
+            if first_forward && let Some(sample) = self.state.clock.snapshot() {
+                let total = sample.prompt_tokens + sample.cached_prompt_tokens;
+                control.report_prompt_progress(super::PromptProgress {
+                    total,
+                    cache: sample.cached_prompt_tokens,
+                    processed: total,
+                    elapsed: sample.prompt_elapsed,
+                })?;
+            }
         }
         Ok(())
     }
@@ -682,6 +700,9 @@ impl<B: DecodeLoopBackend + ?Sized> GenerationCore for GenerationNodeHost<'_, '_
     fn committed_tokens(&self) -> Vec<crate::TokenId> {
         self.state.generated_tokens.clone()
     }
+    fn timings(&self) -> Option<crate::config::GenerationTimings> {
+        self.state.clock.snapshot()
+    }
 
     fn streams_tokens(&self) -> bool {
         self.callback.is_some()
@@ -696,53 +717,153 @@ impl<B: DecodeLoopBackend + ?Sized> GenerationCore for GenerationNodeHost<'_, '_
 ///
 /// It implements no component contracts; it only participates in the same
 /// transaction and loop-stop hooks as a fused decode core.
-struct StagedOutputObserverHost<'a> {
-    tokenizer: &'a Tokenizer,
-    observer: &'a mut ToolCallStagedOutputObserver,
+pub(super) struct PredictionLimitObserver {
+    limit: crate::prediction_limit::PredictionTimeLimit,
+    decoder: crate::tokenization::TokenTextDecoder,
+    context: crate::logits::ProcessorContext,
+    max_tokens: usize,
+    max_bytes: usize,
+    stopped: bool,
+}
+impl PredictionLimitObserver {
+    pub(super) fn new(options: &GenerateOptions, limit: std::time::Duration) -> Self {
+        Self {
+            limit: crate::prediction_limit::PredictionTimeLimit::new(
+                limit,
+                options.stop_sequences.clone(),
+            ),
+            decoder: crate::tokenization::TokenTextDecoder::with_preserved_tokens(
+                &options.effective_preserved_tokens(),
+            ),
+            context: Default::default(),
+            max_tokens: options.max_new_tokens,
+            max_bytes: options.max_constraint_bytes,
+            stopped: false,
+        }
+    }
+    fn append_text(&mut self, text: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.context
+                .generated_text
+                .len()
+                .checked_add(text.len())
+                .is_some_and(|size| size <= self.max_bytes),
+            "prediction time-limit observer exceeds max_constraint_bytes={}; shorten generated output or increase its explicit byte budget",
+            self.max_bytes
+        );
+        self.context.generated_text.push_str(text);
+        use crate::logits::LogitProcessor;
+        self.stopped |= self.limit.signal(&self.context).is_some();
+        Ok(())
+    }
+    fn observe(&mut self, tokenizer: &Tokenizer, tokens: &[crate::TokenId]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.context
+                .generated_tokens
+                .len()
+                .checked_add(tokens.len())
+                .is_some_and(|size| size <= self.max_tokens),
+            "prediction time-limit observer received more than max_new_tokens={}; repair the workflow's token emission budget",
+            self.max_tokens
+        );
+        for &token in tokens {
+            self.context.generated_tokens.push(token);
+            let text = self.decoder.step(tokenizer, token)?;
+            self.append_text(&text)?;
+            self.context.step += 1;
+        }
+        Ok(())
+    }
+    pub(super) fn stopped(&self) -> bool {
+        self.stopped
+    }
+    pub(super) fn observe_prefix(
+        &mut self,
+        tokenizer: &Tokenizer,
+        tokens: &[crate::TokenId],
+    ) -> anyhow::Result<usize> {
+        for (index, &token) in tokens.iter().enumerate() {
+            self.observe(tokenizer, std::slice::from_ref(&token))?;
+            if self.stopped {
+                return Ok(index + 1);
+            }
+        }
+        Ok(tokens.len())
+    }
+    fn finish(&mut self, tokenizer: &Tokenizer) -> anyhow::Result<()> {
+        let text = self.decoder.finish(tokenizer)?;
+        self.append_text(&text)
+    }
 }
 
+struct StagedOutputObserverHost<'a> {
+    tokenizer: &'a Tokenizer,
+    observer: Option<&'a mut ToolCallStagedOutputObserver>,
+    prediction: Option<PredictionLimitObserver>,
+}
 impl WorkflowNodeHost for StagedOutputObserverHost<'_> {
     fn hosted_contracts(&self) -> &'static [&'static str] {
         &[]
     }
-
     fn begin_turn(&mut self, _turn: &super::TurnTransaction) -> anyhow::Result<()> {
-        self.observer.begin_turn();
+        if let Some(observer) = self.observer.as_deref_mut() {
+            observer.begin_turn();
+        }
         Ok(())
     }
-
     fn before_turn_commit(&mut self, _turn: &super::TurnTransaction) -> anyhow::Result<()> {
-        self.observer
-            .finish("semantic commit")
-            .context("validate staged generated tool protocol before semantic commit")?;
+        if let Some(prediction) = self.prediction.as_mut() {
+            prediction.finish(self.tokenizer)?;
+        }
+        if let Some(observer) = self.observer.as_deref_mut() {
+            observer
+                .finish("semantic commit")
+                .context("validate staged generated tool protocol before semantic commit")?;
+        }
         Ok(())
     }
-
     fn turn_committed(&mut self, _outcome: super::TurnTransactionOutcome) {
-        self.observer.commit_turn();
+        if let Some(observer) = self.observer.as_deref_mut() {
+            observer.commit_turn();
+        }
     }
-
     fn turn_aborted(&mut self, _outcome: super::TurnTransactionOutcome) {
-        self.observer.abort_turn();
+        if let Some(observer) = self.observer.as_deref_mut() {
+            observer.abort_turn();
+        }
     }
-
     fn loop_host_outcome(&self) -> super::workflow::WorkflowLoopHostOutcome {
-        self.observer.stop_reason().map_or(
+        let reason = self
+            .observer
+            .as_deref()
+            .and_then(|observer| observer.stop_reason())
+            .or_else(|| {
+                self.prediction
+                    .as_ref()
+                    .filter(|prediction| prediction.stopped)
+                    .map(|_| GenerationStopReason::PredictionTimeLimit)
+            });
+        reason.map_or(
             super::workflow::WorkflowLoopHostOutcome::Continue,
             super::workflow::WorkflowLoopHostOutcome::Stop,
         )
     }
-
     fn observe_staged_generation_tokens(
         &mut self,
         tokens: &[crate::TokenId],
     ) -> anyhow::Result<()> {
-        self.observer
-            .observe_tokens(self.tokenizer, tokens)
-            .context("observe staged generated output before output publication")?;
+        if let Some(prediction) = self.prediction.as_mut() {
+            prediction
+                .observe(self.tokenizer, tokens)
+                .context("observe staged output for the prediction time limit")?;
+        }
+        if let Some(observer) = self.observer.as_deref_mut() {
+            observer
+                .observe_tokens(self.tokenizer, tokens)
+                .context("observe staged generated output before output publication")?;
+        }
         Ok(())
     }
-
     fn execute_contract_node(&mut self, _request: WorkflowNodeRequest<'_>) -> anyhow::Result<bool> {
         Ok(false)
     }
@@ -782,6 +903,16 @@ pub(crate) fn run_declared_generation(
         request.request.options.validate_preserved_tokens(tokenizer.context("preserved_tokens requires a package tokenizer; declare one before preserving output tokens")?)?;
     }
     let preserved_tokens = request.request.options.effective_preserved_tokens();
+    let prediction = if core.is_none() {
+        request
+            .request
+            .options
+            .max_prediction_time
+            .filter(|limit| !limit.is_zero())
+            .map(|limit| PredictionLimitObserver::new(&request.request.options, limit))
+    } else {
+        None
+    };
     let mut plan = WorkflowExecutionPlan::new_hosted(runtime, request, hosted)?;
     let generic_execution = core.is_none();
     let (outputs, host_stop_reason) = {
@@ -790,15 +921,16 @@ pub(crate) fn run_declared_generation(
             "a decode core owns staged-output observation; a second observer host would duplicate \
              parser authority"
         );
-        let mut observer_host = match (core.is_none(), tokenizer, staged_output_observer) {
-            (true, Some(tokenizer), Some(observer)) => Some(StagedOutputObserverHost {
-                tokenizer,
-                observer,
-            }),
-            (true, None, Some(_)) => anyhow::bail!(
-                "tool-call output observation requires the package tokenizer for canonical decode"
-            ),
-            _ => None,
+        let mut observer_host = if core.is_none()
+            && (staged_output_observer.is_some() || prediction.is_some())
+        {
+            Some(StagedOutputObserverHost {
+                tokenizer:tokenizer.context("staged output observation and prediction time limits require the package tokenizer; declare one before requesting these controls")?,
+                observer:staged_output_observer,
+                prediction,
+            })
+        } else {
+            None
         };
         let mut host: Option<&mut dyn WorkflowNodeHost> = match core.as_deref_mut() {
             Some(core) => Some(core as &mut dyn WorkflowNodeHost),
@@ -931,6 +1063,7 @@ pub(crate) fn run_declared_generation(
         let pieces = crate::tokenization::token_texts(tokenizer, &token_ids, &preserved_tokens)?;
         for (index, (token_id, token_text)) in token_ids.iter().copied().zip(pieces).enumerate() {
             callback(crate::config::GenerateToken {
+                timings: None,
                 logprob: logprobs
                     .as_ref()
                     .and_then(|values| values.get(index))
@@ -943,6 +1076,8 @@ pub(crate) fn run_declared_generation(
     }
 
     Ok(GenerateResult {
+        timings: core.as_deref().and_then(GenerationCore::timings),
+        retained_cache_tokens: 0,
         text,
         preserved_tokens,
         token_ids,

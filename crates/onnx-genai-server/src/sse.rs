@@ -14,6 +14,10 @@ use crate::types::{ChatLogprobs, ChatMessageToolCall, CompletionLogprobs};
 
 #[derive(Debug, Serialize)]
 pub(crate) struct CompletionChunk {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_progress: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timings: Option<serde_json::Value>,
     id: String,
     object: &'static str,
     created: u64,
@@ -31,6 +35,10 @@ pub(crate) struct CompletionChunkChoice {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ChatCompletionChunk {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_progress: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timings: Option<serde_json::Value>,
     id: String,
     object: &'static str,
     created: u64,
@@ -330,6 +338,8 @@ pub(crate) fn completion_chunk(
     logprobs: Option<CompletionLogprobs>,
 ) -> CompletionChunk {
     CompletionChunk {
+        prompt_progress: None,
+        timings: None,
         id: id.to_string(),
         object: "text_completion",
         created,
@@ -351,6 +361,8 @@ pub(crate) fn completion_done_chunk(
     finish_reason: &'static str,
 ) -> CompletionChunk {
     CompletionChunk {
+        prompt_progress: None,
+        timings: None,
         id: id.to_string(),
         object: "text_completion",
         created,
@@ -371,6 +383,8 @@ pub(crate) fn role_chunk(
     prompt_tokens: usize,
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
+        prompt_progress: None,
+        timings: None,
         id: id.to_string(),
         nxrt_prompt_tokens: Some(prompt_tokens),
         object: "chat.completion.chunk",
@@ -399,6 +413,8 @@ pub(crate) fn content_chunk(
     logprobs: Option<ChatLogprobs>,
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
+        prompt_progress: None,
+        timings: None,
         id: id.to_string(),
         nxrt_prompt_tokens: None,
         object: "chat.completion.chunk",
@@ -427,6 +443,8 @@ pub(crate) fn reasoning_chunk(
     reasoning: String,
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
+        prompt_progress: None,
+        timings: None,
         id: id.to_string(),
         nxrt_prompt_tokens: None,
         object: "chat.completion.chunk",
@@ -498,6 +516,8 @@ fn tool_call_delta_chunk(
     tool_call: ChunkToolCall,
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
+        prompt_progress: None,
+        timings: None,
         id: id.to_string(),
         nxrt_prompt_tokens: None,
         object: "chat.completion.chunk",
@@ -525,6 +545,8 @@ pub(crate) fn done_chunk(
     finish_reason: &'static str,
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
+        prompt_progress: None,
+        timings: None,
         id: id.to_string(),
         nxrt_prompt_tokens: None,
         object: "chat.completion.chunk",
@@ -552,7 +574,9 @@ pub(crate) fn done_chunk_with_stop(
         created,
         model,
         match reason {
-            FinishReason::MaxTokens | FinishReason::Length => "length",
+            FinishReason::MaxTokens | FinishReason::Length | FinishReason::PredictionTimeLimit => {
+                "length"
+            }
             FinishReason::ToolCalls => "tool_calls",
             _ => "stop",
         },
@@ -813,5 +837,59 @@ mod stop_boundary_tests {
         let mut buffer = StopBoundaryBuffer::new(vec!["停住".into()]);
         assert_eq!(buffer.push("hello停"), "hello");
         assert_eq!(buffer.flush(), "停");
+    }
+}
+
+impl ChatCompletionChunk {
+    pub(crate) fn with_prompt_progress(
+        mut self,
+        progress: onnx_genai_engine::pipeline::PromptProgress,
+    ) -> Self {
+        self.prompt_progress = Some(crate::timings::render_prompt_progress(progress));
+        self
+    }
+
+    pub(crate) fn with_timings(
+        mut self,
+        sample: Option<onnx_genai_engine::GenerationTimings>,
+    ) -> Self {
+        self.timings = sample.map(crate::timings::render);
+        self
+    }
+}
+
+impl CompletionChunk {
+    pub(crate) fn with_prompt_progress(
+        mut self,
+        progress: onnx_genai_engine::pipeline::PromptProgress,
+    ) -> Self {
+        self.prompt_progress = Some(crate::timings::render_prompt_progress(progress));
+        self
+    }
+
+    pub(crate) fn with_timings(
+        mut self,
+        sample: Option<onnx_genai_engine::GenerationTimings>,
+    ) -> Self {
+        self.timings = sample.map(crate::timings::render);
+        self
+    }
+}
+
+pub(crate) fn timing_chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    sample: onnx_genai_engine::GenerationTimings,
+) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: id.into(),
+        object: "chat.completion.chunk",
+        created,
+        model: model.into(),
+        choices: Vec::new(),
+        nxrt_prompt_tokens: None,
+        prompt_progress: None,
+        timings: Some(crate::timings::render(sample)),
     }
 }

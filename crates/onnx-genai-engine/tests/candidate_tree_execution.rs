@@ -7,9 +7,10 @@ use onnx_genai_engine::pipeline::{
     OutputFinality, TypedRevisionOperation, WorkflowOutputPublication,
 };
 use onnx_genai_engine::{
-    Engine, EngineConfig, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
-    GenerationBoundary, GenerationControl, PackageExecutionError, PipelineGenerateRequest,
-    SessionForkError, SessionPosition, ToolCallPolicy, package_execution_error,
+    Engine, EngineConfig, EngineDecodeBackend, FinishReason, GenerateOptions, GeneratePrompt,
+    GenerateRequest, GenerationBoundary, GenerationControl, PackageExecutionError,
+    PipelineGenerateRequest, SessionForkError, SessionPosition, ToolCallPolicy,
+    package_execution_error,
 };
 use proptest::prelude::*;
 use rand::SeedableRng as _;
@@ -1158,6 +1159,13 @@ fn install_tool_protocol_tokenizer(root: &Path, token_texts: &[(u64, &str)]) -> 
     Ok(())
 }
 
+fn ort_config() -> EngineConfig {
+    EngineConfig {
+        decode_backend: EngineDecodeBackend::Ort,
+        ..EngineConfig::default()
+    }
+}
+
 fn assert_preload_candidate_refusal(
     root: &Path,
     expected: &[&str],
@@ -1172,7 +1180,7 @@ fn assert_preload_candidate_refusal(
         }
     }
     let error = expect_error(
-        Engine::from_dir(root, EngineConfig::default()),
+        Engine::from_dir(root, ort_config()),
         "candidate-tree composition must fail before component loading",
     );
     let reason = match package_execution_error(&error) {
@@ -1210,7 +1218,7 @@ fn with_control_flow_support(metadata: String) -> String {
 #[test]
 fn composed_candidate_tree_runs_setup_branches_effects_and_all_outputs() -> anyhow::Result<()> {
     let root = composed_parent_package(true, false)?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let session = engine.create_session()?;
     let result = engine.generate_in_session(session, greedy_request(3))?;
     assert_eq!(result.token_ids, vec![2, 4, 0]);
@@ -1492,7 +1500,7 @@ fn canonical_candidate_output_requires_one_dominated_proven_emit() -> anyhow::Re
             1,
         )
     })?;
-    let mut engine = Engine::from_dir(&phi, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&phi, ort_config())?;
     let result = engine.generate(greedy_request(3))?;
     assert_eq!(result.token_ids, vec![2, 4, 0]);
     Ok(())
@@ -1503,7 +1511,7 @@ fn candidate_output_authority_matches_s4_result_callback_and_tool_observer() -> 
     let root = composed_parent_package(true, false)?;
     let tool = r#"<tool_call>{"name":"weather","arguments":{}}</tool_call>"#;
     install_tool_protocol_tokenizer(&root, &[(2, tool)])?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let mut callback = Vec::new();
     let mut observe_callback = |token: onnx_genai_engine::GenerateToken| {
         callback.push((token.token_id, token.text));
@@ -1624,7 +1632,7 @@ fn intervening_work_at_the_exact_verification_seam_refuses_before_loading() -> a
 #[test]
 fn zero_trip_setup_and_component_map_reorder_preserve_semantics() -> anyhow::Result<()> {
     let zero_trip = composed_parent_package(false, false)?;
-    let mut engine = Engine::from_dir(&zero_trip, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&zero_trip, ort_config())?;
     let result = engine.generate(greedy_request(3))?;
     assert!(result.token_ids.is_empty());
     let invocations = engine.component_invocations();
@@ -1643,10 +1651,9 @@ fn zero_trip_setup_and_component_map_reorder_preserve_semantics() -> anyhow::Res
 
     let ordered = composed_parent_package(true, false)?;
     let reordered = composed_parent_package(true, true)?;
-    let ordered_result =
-        Engine::from_dir(&ordered, EngineConfig::default())?.generate(greedy_request(3))?;
+    let ordered_result = Engine::from_dir(&ordered, ort_config())?.generate(greedy_request(3))?;
     let reordered_result =
-        Engine::from_dir(&reordered, EngineConfig::default())?.generate(greedy_request(3))?;
+        Engine::from_dir(&reordered, ort_config())?.generate(greedy_request(3))?;
     assert_eq!(ordered_result.token_ids, reordered_result.token_ids);
     Ok(())
 }
@@ -1656,7 +1663,7 @@ fn zero_trip_candidate_workflow_finishes_required_policy_and_aborts_authored_mut
 -> anyhow::Result<()> {
     let root = composed_parent_package(false, false)?;
     install_tool_protocol_tokenizer(&root, &[])?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let session = engine.create_session()?;
     let mut delivered = Vec::new();
     let mut callback = |token: onnx_genai_engine::GenerateToken| {
@@ -1692,7 +1699,7 @@ fn zero_trip_candidate_workflow_finishes_required_policy_and_aborts_authored_mut
 #[test]
 fn sampling_candidate_path_executes_inside_the_composed_workflow() -> anyhow::Result<()> {
     let root = composed_parent_package(true, false)?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let result = engine.generate(sampling_request(23, 2))?;
     assert!(!result.token_ids.is_empty());
     let invocations = engine.component_invocations();
@@ -1721,7 +1728,7 @@ fn token_output_identity_is_selected_by_role_not_by_name() -> anyhow::Result<()>
             .replacen("      tokens:\n", "      generated_ids:\n", 1)
             .replacen("output: tokens", "output: generated_ids", 1)
     })?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let result = engine.generate(greedy_request(3))?;
     assert_eq!(result.token_ids, vec![2, 4, 0]);
     assert!(engine.take_committed_workflow_publications().iter().all(
@@ -1741,7 +1748,7 @@ fn token_output_identity_is_selected_by_role_not_by_name() -> anyhow::Result<()>
 #[test]
 fn authored_loop_repeats_only_its_body_and_never_duplicates_setup() -> anyhow::Result<()> {
     let root = repeated_composed_parent_package(2)?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let result = engine.generate(greedy_request(6))?;
     assert!(!result.token_ids.is_empty());
     let invocations = engine.component_invocations();
@@ -1778,7 +1785,7 @@ fn composed_loop_does_not_reenter_after_candidate_budget_or_eos_stop() -> anyhow
         ),
     ] {
         let root = repeated_composed_parent_package(3)?;
-        let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&root, ort_config())?;
         let result = engine.generate(request)?;
         assert_eq!(
             result.token_ids, expected,
@@ -1900,7 +1907,7 @@ fn parent_tree_engine_dispatches_nonzero_root_and_deep_paths() -> anyhow::Result
         ([1, 3, 0, 5, 0, 0, 2], vec![1, 3, 5, 0, 2]),
     ] {
         let root = parent_package(&parents, &decisions)?;
-        let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&root, ort_config())?;
         let result = engine.generate(greedy_request(expected.len()))?;
         assert_eq!(result.token_ids, expected);
         assert_eq!(
@@ -1937,7 +1944,7 @@ fn candidate_tree_waits_for_budget_boundary_across_complete_call_blocks() -> any
             ),
         ],
     )?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let result = engine.generate_with_pipeline_request(
         PipelineGenerateRequest::new(greedy_request(5)).with_tool_call_policy(ToolCallPolicy::Auto),
     )?;
@@ -1959,7 +1966,7 @@ fn initial_context_exhaustion_enforces_tool_policy_without_session_mutation() ->
 {
     let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[2, 0, 4, 0, 0, 0, 0])?;
     install_tool_protocol_tokenizer(&root, &[])?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let session = engine.create_session()?;
     let session_id = session.to_string();
     let mut delivered = Vec::new();
@@ -2026,7 +2033,7 @@ fn incomplete_candidate_tool_output_aborts_and_same_session_disabled_retry_is_cl
     let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[2, 0, 4, 0, 0, 0, 0])?;
     let incomplete = r#"<tool_call>{"name":"weather","arguments":{"city":"#;
     install_tool_protocol_tokenizer(&root, &[(2, incomplete)])?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let session = engine.create_session()?;
     let mut delivered = Vec::new();
     let mut callback = |token: onnx_genai_engine::GenerateToken| {
@@ -2075,7 +2082,7 @@ fn incomplete_candidate_tool_output_aborts_and_same_session_disabled_retry_is_cl
 #[test]
 fn ancestor_mask_tree_sampling_executes_second_real_fixture() -> anyhow::Result<()> {
     let root = ancestor_package()?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let session = engine.create_session()?;
     let result = engine.generate_in_session(
         session,
@@ -2203,7 +2210,7 @@ fn sampling_reference(seed: u64) -> Vec<u32> {
 fn dispatched_sampling_matches_independent_reference_and_distribution_support() -> anyhow::Result<()>
 {
     let root = ancestor_package()?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let mut observed = [0_usize; 5];
     for seed in 0..128 {
         let result = engine.generate(sampling_request(seed, 1))?;
@@ -2229,7 +2236,7 @@ fn sampling_without_both_declared_distributions_refuses_before_mutation() -> any
             "",
         )
     })?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let error = engine
         .generate(GenerateRequest {
             prompt: GeneratePrompt::TokenIds(vec![1]),
@@ -2254,7 +2261,7 @@ fn sampling_without_both_declared_distributions_refuses_before_mutation() -> any
 #[test]
 fn malformed_parent_mask_and_probability_outputs_abort_before_commit() -> anyhow::Result<()> {
     let invalid_parent = parent_package(&[-1, 4, 0, 1, 2, 4], &[1, 4, 0, 0, 0, 0, 0])?;
-    let mut engine = Engine::from_dir(&invalid_parent, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&invalid_parent, ort_config())?;
     let error = engine
         .generate(greedy_request(1))
         .expect_err("forward parent must fail dynamically");
@@ -2270,7 +2277,7 @@ fn malformed_parent_mask_and_probability_outputs_abort_before_commit() -> anyhow
         1,
     );
     let root = ancestor_package_with_sources(&invalid_mask, ANCESTOR_TARGET)?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let error = engine
         .generate(sampling_request(1, 1))
         .expect_err("missing self edge must fail dynamically");
@@ -2279,7 +2286,7 @@ fn malformed_parent_mask_and_probability_outputs_abort_before_commit() -> anyhow
 
     let invalid_probability = ANCESTOR_PROPOSER.replacen("float_data: 0.25", "float_data: 0.35", 1);
     let root = ancestor_package_with_sources(&invalid_probability, ANCESTOR_TARGET)?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let error = engine
         .generate(sampling_request(1, 1))
         .expect_err("unnormalized proposal row must fail dynamically");
@@ -2291,7 +2298,7 @@ fn malformed_parent_mask_and_probability_outputs_abort_before_commit() -> anyhow
 #[test]
 fn raw_pipeline_apis_typed_refuse_before_candidate_components_run() -> anyhow::Result<()> {
     let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[1, 4, 0, 0, 0, 0, 0])?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let request = || PipelineGenerateRequest::new(greedy_request(1));
     for (operation, error) in [
         (
@@ -2374,7 +2381,7 @@ struct ComposedSecondTurn {
 }
 
 fn clean_composed_second_turn(root: &Path) -> anyhow::Result<ComposedSecondTurn> {
-    let mut engine = Engine::from_dir(root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(root, ort_config())?;
     let session = engine.create_session()?;
     engine.generate_in_session(session, greedy_request(1))?;
     engine.take_candidate_tree_block_traces();
@@ -2411,7 +2418,7 @@ fn assert_composed_controlled_retry(
 ) -> anyhow::Result<()> {
     let root = retryable_composed_parent_package()?;
     let expected = clean_composed_second_turn(&root)?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let session = engine.create_session()?;
     engine.generate_in_session(session, greedy_request(1))?;
     engine.take_candidate_tree_block_traces();
@@ -2497,7 +2504,7 @@ fn assert_composed_controlled_retry(
 }
 
 fn clean_second_turn(root: &Path) -> anyhow::Result<(Vec<u32>, Vec<u32>)> {
-    let mut engine = Engine::from_dir(root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(root, ort_config())?;
     let session = engine.create_session()?;
     engine.generate_in_session(session, greedy_request(1))?;
     engine.take_candidate_tree_block_traces();
@@ -2511,7 +2518,7 @@ fn clean_second_turn(root: &Path) -> anyhow::Result<(Vec<u32>, Vec<u32>)> {
 fn assert_controlled_retry(boundary: GenerationBoundary, cancellation: bool) -> anyhow::Result<()> {
     let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[1, 4, 0, 0, 0, 0, 0])?;
     let expected = clean_second_turn(&root)?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let session = engine.create_session()?;
     engine.generate_in_session(session, greedy_request(1))?;
     engine.take_candidate_tree_block_traces();
@@ -2586,7 +2593,7 @@ fn composed_faults_and_cancellation_restore_setup_branch_state_effects_and_outpu
 fn committed_outputs_are_ordered_exactly_once_and_callback_failure_is_delivery_only()
 -> anyhow::Result<()> {
     let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[2, 0, 4, 0, 0, 0, 0])?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let result = engine.generate(greedy_request(3))?;
     assert_eq!(result.token_ids, vec![2, 4, 0]);
     let publications = engine.take_committed_workflow_publications();
@@ -2605,7 +2612,7 @@ fn committed_outputs_are_ordered_exactly_once_and_callback_failure_is_delivery_o
     assert_eq!(payload.to_vec_i64()?, vec![2, 4, 0]);
     assert_eq!(*finality, OutputFinality::Final);
 
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let session = engine.create_session()?;
     let mut delivered = Vec::new();
     let mut callback = |token: onnx_genai_engine::GenerateToken| -> anyhow::Result<()> {
@@ -2631,7 +2638,7 @@ fn committed_outputs_are_ordered_exactly_once_and_callback_failure_is_delivery_o
 #[test]
 fn revision_fixture_finalizes_after_committed_token_appends() -> anyhow::Result<()> {
     let root = ancestor_package()?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let result = engine.generate(sampling_request(17, 3))?;
     let publications = engine.take_committed_workflow_publications();
     assert_eq!(publications.len(), 2);
@@ -2676,7 +2683,7 @@ proptest! {
                 1,
             )
         }).expect("write provisional candidate-tree metadata");
-        let mut engine = Engine::from_dir(&root, EngineConfig::default())
+        let mut engine = Engine::from_dir(&root, ort_config())
             .expect("revision-only candidate-tree workflow loads");
         let error = match engine.generate(greedy_request(max_new_tokens)) {
             Ok(_) => panic!("candidate-tree host cannot publish provisional revisions"),
@@ -2692,7 +2699,7 @@ proptest! {
 #[test]
 fn eos_context_fork_and_batching_preserve_candidate_tree_boundaries() -> anyhow::Result<()> {
     let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[2, 0, 4, 0, 0, 0, 0])?;
-    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
     let mut eos = greedy_request(5);
     eos.options.stop_on_eos = true;
     eos.options.eos_token_ids = vec![2];
@@ -2725,5 +2732,66 @@ fn eos_context_fork_and_batching_preserve_candidate_tree_boundaries() -> anyhow:
             .iter()
             .all(|result| result.token_ids == expected.token_ids)
     );
+    Ok(())
+}
+
+#[test]
+fn prediction_time_limit_preserves_candidate_tree_committed_path_and_retry() -> anyhow::Result<()> {
+    for streaming in [false, true] {
+        let root = parent_package(&[-1, -1, 0, 1, 2, 4], &[1, 3, 0, 5, 0, 0, 2])?;
+        install_tool_protocol_tokenizer(
+            &root,
+            &[(0, "zero\n"), (2, "two\n"), (3, "three\n"), (5, "five\n")],
+        )?;
+        let mut engine = Engine::from_dir(&root, ort_config())?;
+        let mut request = greedy_request(20);
+        request.options.max_prediction_time = Some(std::time::Duration::from_millis(50));
+        let control = GenerationControl::new().with_checkpoint(|boundary| {
+            if boundary == GenerationBoundary::AfterVerifier {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Ok(())
+        });
+        let mut delivered = Vec::new();
+        let mut callback = |token: onnx_genai_engine::GenerateToken| {
+            delivered.push(token);
+            Ok(())
+        };
+        let result = engine.generate_with_control_callbacks(
+            request.clone(),
+            control,
+            None,
+            if streaming { Some(&mut callback) } else { None },
+        )?;
+        assert_eq!(result.finish_reason, FinishReason::PredictionTimeLimit);
+        assert!(!result.token_ids.is_empty() && result.token_ids.len() < 20);
+        assert!(result.text.contains('\n'));
+        let traces = engine.take_candidate_tree_block_traces();
+        assert!(!traces.is_empty());
+        assert_eq!(
+            traces
+                .iter()
+                .flat_map(|trace| trace.committed_tokens.iter())
+                .copied()
+                .collect::<Vec<_>>(),
+            result.token_ids
+        );
+        if streaming {
+            assert_eq!(
+                delivered
+                    .iter()
+                    .map(|token| token.token_id)
+                    .collect::<Vec<_>>(),
+                result.token_ids
+            );
+            assert_eq!(
+                delivered.last().unwrap().finish_reason,
+                Some(FinishReason::PredictionTimeLimit)
+            );
+        }
+        request.options.max_prediction_time = None;
+        request.options.max_new_tokens = 3;
+        assert_eq!(engine.generate(request)?.token_ids, vec![1, 3, 5]);
+    }
     Ok(())
 }

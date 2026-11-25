@@ -318,6 +318,16 @@ impl Conv1dAdaptation {
 }
 
 impl KernelFactory for ConvFactory {
+    fn unsupported_reason(
+        &self,
+        _node: &Node,
+        _opset: u64,
+        shapes: &[onnx_runtime_ir::Shape],
+        _input_dtypes: &[DataType],
+    ) -> Option<String> {
+        super::conv_rank::claim_rejection(shapes)
+    }
+
     fn create(&self, node: &Node, shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let x_shape = shapes
             .first()
@@ -325,6 +335,12 @@ impl KernelFactory for ConvFactory {
         let w_shape = shapes
             .get(1)
             .ok_or_else(|| EpError::KernelFailed("Conv: missing W shape".into()))?;
+
+        if let Some(reason) = super::conv_rank::concrete_rejection(shapes) {
+            return Err(EpError::KernelFailed(format!(
+                "{reason}; X={x_shape:?}, W={w_shape:?}"
+            )));
+        }
 
         // Rank-3 (1-D) `Conv` adaptation shim: lift `X`/`W` and the spatial
         // attributes to rank-4 so the general 2-D NCHW path below runs verbatim.
@@ -335,12 +351,6 @@ impl KernelFactory for ConvFactory {
         let node = adaptation.as_ref().map_or(node, |a| &a.node);
         let x_shape = adaptation.as_ref().map_or(x_shape, |a| &a.lifted_x_shape);
         let w_shape = adaptation.as_ref().map_or(w_shape, |a| &a.lifted_w_shape);
-
-        if x_shape.len() != 4 || w_shape.len() != 4 {
-            return Err(EpError::KernelFailed(format!(
-                "Conv: MLAS kernel currently supports 2-D NCHW or 1-D NCL tensors; got X={x_shape:?}, W={w_shape:?}"
-            )));
-        }
 
         let group = node.attr("group").and_then(Attribute::as_int).unwrap_or(1);
         if group <= 0 {

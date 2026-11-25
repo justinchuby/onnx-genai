@@ -1,0 +1,6 @@
+{
+  "crates/onnx-runtime-ep-cpu/src/backend_ab.rs": "085185ee8924c85c002840dd89d2b5953de9dfcb8d469a3502e5ef77fd894707",
+  "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs": "56b5bf1de760e2d366dcac344d51f1c81a43dd32c1626ac5cf6bdd9d7bc95c53",
+  "crates/onnx-runtime-ep-cpu/src/kernels/mod.rs": "d789d04a9b1c4d2a1057d531292ff55734df24787ffa830befb9dcf216e29865",
+  "crates/onnx-runtime-ep-cpu/tests/conv_same_binary.rs": "565e3817a651d303d26fefb83fa5b62599420d43b3d163f46ff428b69973766b"
+}
