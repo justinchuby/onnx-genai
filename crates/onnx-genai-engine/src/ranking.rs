@@ -142,7 +142,7 @@ impl Engine {
             request = request.with_input(name, Value::from_vec_i64(row.clone(), &shape)?);
         }
         for (name, bytes) in pair.images {
-            let value = self.encoded_image_value(&name, &bytes)?;
+            let value = self.encoded_media_value(&name, &bytes)?;
             request = request.with_input(name, value);
         }
         let outputs = self

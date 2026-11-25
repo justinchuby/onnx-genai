@@ -9,6 +9,7 @@ use std::sync::Arc;
 enum Instructions {
     Provided(Value),
     ModelDefault,
+    Spoken,
 }
 #[derive(Debug)]
 enum Options {
@@ -66,31 +67,43 @@ impl DecisionQuestion {
         };
         policy.require_type(kind).map_err(anyhow::Error::msg)?;
         let provided = object.remove("instructions");
-        let instructions = match &policy.instructions {
-            DecisionInstructions::Required { payload } => {
-                let value = provided.context(
-                    "question.instructions must be provided under this model's input policy",
-                )?;
-                payload
-                    .validate(&value, "question.instructions")
-                    .map_err(anyhow::Error::msg)?;
-                Instructions::Provided(value)
-            }
-            DecisionInstructions::Optional { payload, .. } => match provided {
-                Some(value) => {
+        let spoken = provided
+            .as_ref()
+            .is_some_and(|value| value.get("type").and_then(Value::as_str) == Some("input_audio"));
+        contract.admit_spoken(spoken)?;
+        let instructions = if spoken {
+            ensure!(
+                !matches!(policy.instructions, DecisionInstructions::Forbidden),
+                "question.instructions is forbidden by the model's fixed-task policy"
+            );
+            Instructions::Spoken
+        } else {
+            match &policy.instructions {
+                DecisionInstructions::Required { payload } => {
+                    let value = provided.context(
+                        "question.instructions must be provided under this model's input policy",
+                    )?;
                     payload
                         .validate(&value, "question.instructions")
                         .map_err(anyhow::Error::msg)?;
                     Instructions::Provided(value)
                 }
-                None => Instructions::ModelDefault,
-            },
-            DecisionInstructions::Forbidden => {
-                ensure!(
-                    provided.as_ref().is_none_or(Value::is_null),
-                    "question.instructions is forbidden: this model's prompt supplies its fixed task; omit instructions"
-                );
-                Instructions::Provided(Value::Null)
+                DecisionInstructions::Optional { payload, .. } => match provided {
+                    Some(value) => {
+                        payload
+                            .validate(&value, "question.instructions")
+                            .map_err(anyhow::Error::msg)?;
+                        Instructions::Provided(value)
+                    }
+                    None => Instructions::ModelDefault,
+                },
+                DecisionInstructions::Forbidden => {
+                    ensure!(
+                        provided.as_ref().is_none_or(Value::is_null),
+                        "question.instructions is forbidden: this model's prompt supplies its fixed task; omit instructions"
+                    );
+                    Instructions::Provided(Value::Null)
+                }
             }
         };
         let mut criteria = object.remove("criteria").unwrap_or(Value::Null);
@@ -256,10 +269,15 @@ impl DecisionQuestion {
             contract.option_count()
         );
         ensure!(
-            question.instructions().get("type").and_then(Value::as_str) != Some("input_audio"),
+            question.is_spoken()
+                || question.instructions().get("type").and_then(Value::as_str)
+                    != Some("input_audio"),
             "spoken instructions require a multimodal decision contract; supply text instructions"
         );
         Ok(question)
+    }
+    pub fn is_spoken(&self) -> bool {
+        matches!(self.instructions, Instructions::Spoken)
     }
     pub(super) fn kind(&self) -> DecisionKind {
         self.kind
@@ -276,6 +294,7 @@ impl DecisionQuestion {
     pub(super) fn instructions(&self) -> &Value {
         match &self.instructions {
             Instructions::Provided(value) => value,
+            Instructions::Spoken => &Value::Null,
             Instructions::ModelDefault => {
                 match &self.options.contract.input_policy().instructions {
                     DecisionInstructions::Optional { default, .. } => default,

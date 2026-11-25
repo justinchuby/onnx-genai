@@ -353,6 +353,22 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
                 )
                 .map_err(crate::MetadataError::Parse)?;
             }
+            if profile
+                .get("decision")
+                .is_some_and(|d| d.get("media").is_some() || d.get("spoken_instructions").is_some())
+                || (profile.get("kind").and_then(|k| k.as_str()) == Some("decision")
+                    && profile.get("version").and_then(|v| v.as_str()) == Some("3"))
+            {
+                crate::version::gate_feature_use(
+                    version,
+                    crate::version::SchemaFeature::DecisionAudio,
+                    &format!(
+                        "profiles.{}.decision.media",
+                        name.as_str().unwrap_or("<invalid-name>")
+                    ),
+                )
+                .map_err(crate::MetadataError::Parse)?;
+            }
             if profile.get("decision").is_some() {
                 crate::version::gate_feature_use(
                     version,

@@ -1928,3 +1928,12 @@ inference. Negative/underreported usage is rejected, and a typed input-limit
 error reaches HTTP as a client error. See [SystemOne](SYSTEMONE.md) for the
 explicit contract and the remaining audio/video, joint/packed and shared-entry
 work. This increment does not close the overall compatibility acceptance rows.
+
+### SystemOne mixed audio contracts
+
+Decision v3 (core v1.15) binds ordered typed state media and a distinct spoken
+instruction endpoint. HTTP extraction preserves state structure and media order;
+PCM16 WAV bytes enter authored reusable audio-preprocess@2 components. Actual
+workflow token usage includes media expansion and is bounded. Native fixture
+and HTTP acceptance cover independent spoken questions, byte-budget sharing,
+invalid media and capability discovery; see [SystemOne](SYSTEMONE.md).

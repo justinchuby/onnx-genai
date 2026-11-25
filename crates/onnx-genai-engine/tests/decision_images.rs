@@ -1,7 +1,7 @@
 //! Actual Native CPU vision preprocessing and decision-v2 input/usage contracts.
 use onnx_genai_engine::{
     Engine, EngineConfig,
-    decision::{DecisionInput, DecisionLimits, DecisionQuestion, PreparedDecision},
+    decision::{DecisionInput, DecisionLimits, DecisionMedia, DecisionQuestion, PreparedDecision},
 };
 use onnx_genai_metadata::decision::decision_contract;
 use onnx_genai_ort::Tokenizer;
@@ -51,7 +51,12 @@ fn native_decision_images_decode_in_order_and_report_media_usage() {
             &tokenizer,
             DecisionInput {
                 state: &json!("hello"),
-                images: &ordered,
+                media: &ordered
+                    .iter()
+                    .cloned()
+                    .map(DecisionMedia::image)
+                    .collect::<Vec<_>>(),
+                spoken: None,
             },
             question(&engine),
             DecisionLimits::default(),
@@ -86,7 +91,12 @@ fn native_decision_images_admit_positions_and_bytes_before_execution() {
             &tokenizer,
             DecisionInput {
                 state: &json!("hello"),
-                images: &ordered,
+                media: &ordered
+                    .iter()
+                    .cloned()
+                    .map(DecisionMedia::image)
+                    .collect::<Vec<_>>(),
+                spoken: None,
             },
             question(&engine),
             DecisionLimits::default(),
@@ -105,7 +115,12 @@ fn native_decision_image_expansion_obeys_total_input_budget() {
         &tokenizer,
         DecisionInput {
             state: &json!("hello"),
-            images: &ordered,
+            media: &ordered
+                .iter()
+                .cloned()
+                .map(DecisionMedia::image)
+                .collect::<Vec<_>>(),
+            spoken: None,
         },
         question(&engine),
         DecisionLimits {
@@ -116,7 +131,7 @@ fn native_decision_image_expansion_obeys_total_input_budget() {
     .unwrap();
     let failure = engine.decide(prepared).unwrap_err();
     assert!(
-        failure.to_string().contains("including images, exceeding"),
+        failure.to_string().contains("including media, exceeding"),
         "{failure:#}"
     );
 }
@@ -164,7 +179,12 @@ fn native_decision_image_usage_rejects_negative_and_underreported_counts() {
             &tokenizer,
             DecisionInput {
                 state: &json!("hello"),
-                images: &ordered,
+                media: &ordered
+                    .iter()
+                    .cloned()
+                    .map(DecisionMedia::image)
+                    .collect::<Vec<_>>(),
+                spoken: None,
             },
             question(&engine),
             DecisionLimits::default(),
@@ -185,7 +205,12 @@ fn native_decision_image_variants_retain_media_and_sum_actual_usage() {
         &tokenizer,
         DecisionInput {
             state: &json!("hello"),
-            images: &ordered,
+            media: &ordered
+                .iter()
+                .cloned()
+                .map(DecisionMedia::image)
+                .collect::<Vec<_>>(),
+            spoken: None,
         },
         question(&engine),
         DecisionLimits::default(),

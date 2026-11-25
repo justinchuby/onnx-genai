@@ -1,24 +1,24 @@
-//! Shared task-owned encoded-image staging with retained memory ownership.
+//! Shared task-owned encoded-media staging with retained memory ownership.
 use crate::Engine;
 use anyhow::Context;
 use onnx_genai_ort::{DataType, Value};
 use std::sync::Arc;
 impl Engine {
-    pub(crate) fn encoded_image_value(
+    pub(crate) fn encoded_media_value(
         &self,
         endpoint: &str,
         bytes: &[u8],
     ) -> anyhow::Result<Value> {
         let size = i64::try_from(bytes.len()).with_context(|| {
-            format!("encoded image '{endpoint}' exceeds tensor dimensions; reduce the image size")
+            format!("encoded media '{endpoint}' exceeds tensor dimensions; reduce the media size")
         })?;
         let holder = crate::engine::memory_plan::Holder::Activations;
         let lease = onnx_runtime_memory_governor::MemoryGovernor::reserve(
             self.governor.memory(), onnx_runtime_memory_api::Tier::Host,
             u64::try_from(bytes.len())?, holder.role(), holder.id(),
-        ).with_context(|| format!("reserve encoded image '{endpoint}' input staging; reduce image bytes or increase the host memory budget"))?;
+        ).with_context(|| format!("reserve encoded media '{endpoint}' input staging; reduce media bytes or increase the host memory budget"))?;
         let mut owned = Vec::new();
-        owned.try_reserve_exact(bytes.len()).with_context(|| format!("allocate encoded image '{endpoint}' input staging; reduce image bytes or free host memory"))?;
+        owned.try_reserve_exact(bytes.len()).with_context(|| format!("allocate encoded media '{endpoint}' input staging; reduce media bytes or free host memory"))?;
         owned.extend_from_slice(bytes);
         Value::from_raw_bytes(owned, &[size], DataType::Uint8)?
             .with_owner(Arc::new(lease))
@@ -37,7 +37,7 @@ mod tests {
         let tier = onnx_runtime_memory_api::Tier::Host;
         let before = engine.governor().leased_bytes_on(tier);
         let value = engine
-            .encoded_image_value("request.picture", &bytes)
+            .encoded_media_value("request.picture", &bytes)
             .unwrap();
         let alias = value
             .try_alias_clone()
