@@ -104,7 +104,7 @@ pub(crate) async fn audio_transcriptions(
         }
         let bytes=tokio::task::spawn_blocking(move ||onnx_genai_preprocess::audio::decode_audio(&bytes).map(|_|bytes)).await
             .map_err(|error|ApiError::internal(format!("validate transcription file: decoding task stopped: {error}; retry or inspect server logs")))?
-            .map_err(|error|ApiError::invalid_request(format!("file is not supported audio: {error}; provide a PCM16 WAV or MP3 recording")))?;
+            .map_err(|error|ApiError::invalid_request(format!("file is not supported audio: {error}; provide a supported encoded audio recording")))?;
         let limits=onnx_genai_engine::transcription::TranscriptionLimits {
             max_frames:state.config.max_transcription_frames,
             max_tokens:std::num::NonZeroUsize::new(state.config.max_output_tokens).ok_or_else(||ApiError::internal("max_output_tokens is zero; configure a positive transcription output token allowance"))?,

@@ -1,7 +1,7 @@
 use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use onnx_genai_preprocess::audio::{
-    LogMelExtractor, WHISPER_SAMPLE_RATE, decode_audio, encode_wav_pcm16,
+    LogMelExtractor, WHISPER_SAMPLE_RATE, decode_audio, encode_wav_f32,
 };
 
 use crate::types::InputAudio;
@@ -93,14 +93,13 @@ pub struct AudioTensor {
 }
 
 pub(crate) fn decode_chat_audio(input: &InputAudio) -> anyhow::Result<Vec<u8>> {
-    match input.format.as_str() {
-        "wav" | "mp3" => STANDARD
-            .decode(&input.data)
-            .context("input_audio.data must be valid base64"),
-        format => anyhow::bail!(
-            "unsupported input_audio format '{format}'; use wav or mp3 with base64-encoded audio"
-        ),
-    }
+    anyhow::ensure!(
+        !input.format.trim().is_empty(),
+        "input_audio.format must be a nonempty audio format label (e.g. wav, flac, mp3); encoded content determines the decoder"
+    );
+    STANDARD
+        .decode(&input.data)
+        .context("input_audio.data must contain valid base64 encoded audio")
 }
 
 pub fn preprocess_audio(bytes: &[u8], spec: &AudioInputSpec) -> anyhow::Result<AudioTensor> {
@@ -143,10 +142,10 @@ pub fn preprocess_samples(
     })
 }
 
-/// Re-encodes `[-1, 1]` mono samples into a PCM16 WAV container.
+/// Re-encodes finite mono samples into a float32 WAV container.
 ///
 /// A package whose preprocessing program starts at `decode` accepts a container,
 /// not bare samples, so a stream segment has to be wrapped before it is bound.
 pub fn encode_samples_wav(samples: &[f32], sample_rate: u32) -> anyhow::Result<Vec<u8>> {
-    Ok(encode_wav_pcm16(samples, sample_rate, 1)?)
+    Ok(encode_wav_f32(samples, sample_rate, 1)?)
 }

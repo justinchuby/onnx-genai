@@ -44,8 +44,8 @@ The same executable program semantics apply to both.
 
 ## Waveforms and validity
 
-`decode` accepts PCM16 WAV and MP3 by content and averages channels to mono.
-MP3 decoding runs in portable Rust without external binaries, preserving the
+`decode` accepts [supported encoded audio](#encoded-audio-formats) by content and averages channels to mono.
+Decoding runs in portable Rust without external binaries, preserving the
 source sample rate and applying declared codec delay/padding metadata. Invalid
 packets and changing rate/channel layouts fail with context. An explicit
 `downmix` therefore supports `channels: 1`; multichannel waveform outputs and
@@ -110,3 +110,17 @@ and an ONNX head, checking independently normalized/rescaled branches, padding,
 masks and lengths. Direct processor tests cover branching, batching, explicit
 rates and failure cases. These establish dataflow and numerical behavior, not
 speech-recognition quality or device performance.
+
+### Encoded audio formats
+
+Audio inputs use one content-probed Symphonia decoder, including WAV (integer
+and floating point), MP3/MP2, FLAC, Vorbis/Ogg, AAC (ADTS/MP4), ALAC, AIFF, CAF
+and supported audio tracks in Matroska. The codec inside the container must also
+be supported. Chat `input_audio.format` is a nonempty descriptive label; bytes
+determine the actual format. Decoding preserves the source sample rate and uses
+the arithmetic channel mean; internal WAV transport uses float32.
+
+Opus is unsupported in Symphonia 0.6.1. MP4 edit lists are not applied, so priming
+that depends on an edit list remains audible to preprocessing. Midstream rate or
+channel changes are rejected. Convert such inputs to a supported WAV file first.
+Live stdin framing continues to use its documented WAV/PCM16 protocol.

@@ -318,7 +318,7 @@ struct AttachmentArgs {
     #[arg(long = "image", value_name = "PATH")]
     images: Vec<PathBuf>,
 
-    /// PCM16 WAV or MP3 file sent with the prompt. Requires a pipeline package that
+    /// Supported encoded audio file sent with the prompt. Requires a pipeline package that
     /// declares an `input_features` audio input.
     #[arg(long = "audio", value_name = "PATH")]
     audio: Vec<PathBuf>,
@@ -399,7 +399,7 @@ struct TranscribeArgs {
     /// Model directory, or a config file inside it (e.g. inference_metadata.yaml).
     model: PathBuf,
 
-    /// PCM16 WAV or MP3 files to transcribe. Use `-` to read PCM16/WAV from standard
+    /// Supported encoded audio files to transcribe. Use `-` to read PCM16/WAV from standard
     /// input, which is transcribed live: each segment is printed as soon as it
     /// is recognized. Defaults to `-` when no path is given.
     #[arg(value_name = "AUDIO")]

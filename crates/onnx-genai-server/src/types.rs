@@ -839,6 +839,7 @@ pub struct ImageUrl {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InputAudio {
     pub data: String,
+    /// Client container/encoding label; content autodetection selects the decoder.
     pub format: String,
 }
 

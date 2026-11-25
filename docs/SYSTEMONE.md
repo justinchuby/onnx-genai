@@ -197,7 +197,7 @@ State media order is `files`, then `images`, then chat-state parts. Top-level
 entries accept image/audio base64 data URIs. Embedded `input_audio` parts and
 spoken instructions accept `{data: base64_or_audio_data_uri}` or
 `{url: base64_or_audio_data_uri}` inside `input_audio`; `data` takes precedence.
-Audio accepts PCM16 WAV and MP3 by content. HTTP/file URLs, video and other codecs fail
+Audio accepts [supported encoded audio](AUDIO_PREPROCESSING.md#encoded-audio-formats) by content. HTTP/file URLs, video and unsupported codecs fail
 with field-specific errors before inference. For example, with an image/audio
 state contract and a spoken endpoint:
 
@@ -254,3 +254,6 @@ component-local outputs, so separate state and question clips can retain their
 own features and valid lengths. This prerequisite does not yet admit audio at
 `/v1/systemone`: ordered audio/spoken-question metadata, transport preparation
 and broader waveform/log-mel transform support remain required.
+
+Encoded audio support and decoder limitations are documented in
+[audio preprocessing](AUDIO_PREPROCESSING.md#encoded-audio-formats).
