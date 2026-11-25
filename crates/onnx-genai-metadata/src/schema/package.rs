@@ -216,6 +216,10 @@ pub struct TaskProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reranking: Option<RerankingSpec>,
 
+    /// Session-scoped audio/text quantum ABI for realtime transports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realtime: Option<RealtimeSpec>,
+
     /// Explicit non-generative decision prompting and answer interpretation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<DecisionSpec>,
@@ -237,10 +241,96 @@ pub struct RerankingSpec {
     pub document_images: Vec<String>,
 }
 
+/// A bounded native invocation advances one realtime session. Codec, temporal
+/// and acoustic state belongs to session-scoped workflow state, not transport.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RealtimeSpec {
+    pub default_mode: RealtimeMode,
+    /// Jinja context: operation, text, call_id and the complete session settings.
+    pub prompt_template: String,
+    #[serde(default)]
+    pub voices: RealtimeSelections,
+    #[serde(default)]
+    pub languages: RealtimeSelections,
+    pub modes: Vec<RealtimeMode>,
+    pub input_sample_rate_hz: u32,
+    pub input_frame_samples: usize,
+    pub output_sample_rate_hz: Option<u32>,
+    pub inputs: RealtimeInputs,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RealtimeMode {
+    Realtime,
+    Transcription,
+    Duplex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RealtimeInputs {
+    /// Optional bool vocabulary mask: empty means unconstrained; otherwise one
+    /// admission bit per tokenizer ID, consumed before native token selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_mask: Option<String>,
+    pub output_token_budget: String,
+    pub operation: String,
+    pub audio: String,
+    pub tokens: String,
+}
+
+/// Explicit conditioning admission: absence defaults to no override, not an
+/// inferred list or unrestricted model support.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RealtimeSelections {
+    #[default]
+    Unsupported,
+    Any,
+    Choices {
+        values: Vec<String>,
+    },
+}
+impl RealtimeSelections {
+    pub fn admit_selection(&self, value: Option<&str>, field: &str) -> Result<(), String> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        if value.is_empty() {
+            return Err(format!(
+                "{field} must be nonempty or omitted for the model default"
+            ));
+        }
+        match self {
+            Self::Unsupported => Err(format!(
+                "{field} is not supported by this realtime profile; omit it or select a package declaring that conditioning input"
+            )),
+            Self::Any => Ok(()),
+            Self::Choices { values } if values.iter().any(|allowed| allowed == value) => Ok(()),
+            Self::Choices { values } => Err(format!(
+                "{field} contains unknown selection {value:?}; choose one of the package's declared values {values:?}"
+            )),
+        }
+    }
+}
+
 /// Model-authored decision semantics; calibration belongs to the workflow.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DecisionSpec {
+    /// Ordered encoded state-image workflow endpoints (decision v2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
+    /// Ordered typed state-media endpoints (decision v3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<DecisionMediaBinding>,
+    /// Encoded audio endpoint for a spoken question (decision v3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spoken_instructions: Option<String>,
     /// Jinja context: state, instructions, type, options (key/description), variant.
     pub prompt_template: String,
     /// Request semantics authored explicitly in schema v1.11 and newer.
@@ -251,6 +341,19 @@ pub struct DecisionSpec {
     pub choice_confidence: DecisionConfidence,
     pub score_confidence: DecisionConfidence,
     pub score: DecisionScore,
+}
+/// Declared encoded-media kind; no content or model-family guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EncodedMediaKind {
+    Image,
+    Audio,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionMediaBinding {
+    pub kind: EncodedMediaKind,
+    pub input: String,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]

@@ -532,7 +532,7 @@ impl ApiError {
         }
     }
 
-    fn payload_too_large(message: impl Into<String>) -> Self {
+    pub(crate) fn payload_too_large(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             message: message.into(),
@@ -759,7 +759,7 @@ fn map_registry_error(err: crate::registry::RegistryError) -> ApiError {
 ///   all; never falls back to the default model for a named request.
 /// - **Empty `requested`** — falls back to the default model, lazily loading it
 ///   if necessary, preserving the single-model UX where clients omit `model`.
-async fn resolve_model(
+pub(crate) async fn resolve_model(
     registry: &crate::registry::ModelRegistry,
     requested: &str,
 ) -> Result<Arc<ModelHandle>, ApiError> {

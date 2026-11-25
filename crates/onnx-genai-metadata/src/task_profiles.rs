@@ -7,8 +7,9 @@ use crate::{
 /// Unsupported versions of an ignorable task contract have no semantic effect.
 pub(crate) fn skip_unsupported_version(profile: &crate::TaskProfile) -> bool {
     let supported = match profile.kind.as_str() {
-        "embedding" | "decision" => profile.version == "1",
+        "embedding" | "realtime" => profile.version == "1",
         "reranking" => matches!(profile.version.as_str(), "1" | "2"),
+        "decision" => matches!(profile.version.as_str(), "1" | "2" | "3"),
         _ => return false,
     };
     profile.requirement == ProfileRequirement::Ignorable && !supported
@@ -21,21 +22,21 @@ pub enum PairFeature {
     TokenTypeIds,
 }
 
-/// One encoded-image endpoint owned by a reranking profile.
+/// One encoded-media endpoint owned by an admitted task profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RerankingImageInput {
+pub struct EncodedMediaInput {
     endpoint: String,
-    required: bool,
+    pub(crate) required: bool,
     encoded_bytes: Option<usize>,
 }
-impl RerankingImageInput {
+impl EncodedMediaInput {
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
     pub fn admit_bytes(&self, bytes: usize) -> Result<(), TaskProfileContractError> {
         if bytes == 0 {
             return Err(invalid(format!(
-                "reranking image '{}' is empty; supply nonempty encoded image bytes",
+                "encoded media '{}' is empty; supply nonempty encoded media bytes",
                 self.endpoint
             )));
         }
@@ -43,12 +44,37 @@ impl RerankingImageInput {
             && expected != bytes
         {
             return Err(invalid(format!(
-                "reranking image '{}' contains {bytes} bytes, but its declared input requires {expected}; supply an image matching the package's byte contract",
+                "encoded media '{}' contains {bytes} bytes, but its declared input requires {expected}; supply media matching the package's byte contract",
                 self.endpoint
             )));
         }
         Ok(())
     }
+}
+
+/// Resolve positions once at the metadata boundary; task runtimes consume the
+/// resulting endpoint/shape proof rather than rediscovering input semantics.
+pub(crate) fn resolve_encoded_media_inputs(
+    workflow: &crate::WorkflowSpec,
+    names: &[String],
+    path: &str,
+    used: &mut std::collections::BTreeSet<String>,
+) -> Result<Vec<EncodedMediaInput>, TaskProfileContractError> {
+    names.iter().map(|name| {
+        if !used.insert(name.clone()) {
+            return Err(invalid(format!("{path} binds input '{name}' more than once; use a distinct workflow endpoint for each media position")));
+        }
+        let input = workflow.inputs.get(name).ok_or_else(|| invalid(format!("{path} references undeclared workflow input '{name}'")))?;
+        if !matches!(input.source, WorkflowInputSource::Application { .. })
+            || input.role != SemanticInputRole::Opaque
+            || input.contract.dtype != "uint8" || input.contract.shape.len() != 1 {
+            return Err(invalid(format!("{path} input '{name}' must be an opaque application-sourced uint8 [encoded_bytes] vector; the profile owns binding and its workflow owns media decoding")));
+        }
+        let encoded_bytes = if let TensorDimension::Fixed(size) = input.contract.shape[0] {
+            Some(usize::try_from(size).ok().filter(|size| *size > 0).ok_or_else(|| invalid(format!("{path} input '{name}' requires a positive encoded byte length")))?)
+        } else { None };
+        Ok(EncodedMediaInput { endpoint: name.clone(), required: input.required && input.default.is_none(), encoded_bytes })
+    }).collect()
 }
 
 /// Proof that a package declares one executable token-pair reranking profile.
@@ -59,8 +85,8 @@ pub struct RerankingContract {
     prompt_tokens_output: Option<String>,
     bindings: Vec<(String, PairFeature)>,
     fixed_sequence_length: Option<usize>,
-    query_images: Vec<RerankingImageInput>,
-    document_images: Vec<RerankingImageInput>,
+    query_images: Vec<EncodedMediaInput>,
+    document_images: Vec<EncodedMediaInput>,
 }
 impl RerankingContract {
     pub fn profile(&self) -> &str {
@@ -78,10 +104,10 @@ impl RerankingContract {
     pub fn fixed_sequence_length(&self) -> Option<usize> {
         self.fixed_sequence_length
     }
-    pub fn query_images(&self) -> &[RerankingImageInput] {
+    pub fn query_images(&self) -> &[EncodedMediaInput] {
         &self.query_images
     }
-    pub fn document_images(&self) -> &[RerankingImageInput] {
+    pub fn document_images(&self) -> &[EncodedMediaInput] {
         &self.document_images
     }
     pub fn admit_images(
@@ -217,24 +243,14 @@ pub fn reranking_contract(
             None
         };
         let mut media_names = std::collections::BTreeSet::new();
-        let mut resolve_images =
-            |names: &[String]| -> Result<Vec<RerankingImageInput>, TaskProfileContractError> {
-                names.iter().map(|input_name| {
-                if !media_names.insert(input_name.clone()) {
-                    return Err(invalid(format!("profiles.{name}.reranking binds input '{input_name}' more than once; use a distinct workflow endpoint for each image position")));
-                }
-                let input = workflow.inputs.get(input_name).ok_or_else(|| invalid(format!("profiles.{name}.reranking references undeclared workflow input '{input_name}'")))?;
-                if !matches!(input.source, WorkflowInputSource::Application { .. })
-                    || input.role != SemanticInputRole::Opaque
-                    || input.contract.dtype != "uint8" || input.contract.shape.len() != 1 {
-                    return Err(invalid(format!("profiles.{name}.reranking input '{input_name}' must be an opaque application-sourced uint8 [encoded_bytes] vector; the profile owns binding and its workflow owns image decoding")));
-                }
-                let encoded_bytes = if let TensorDimension::Fixed(size) = input.contract.shape[0] {
-                    Some(usize::try_from(size).ok().filter(|size| *size > 0).ok_or_else(|| invalid(format!("profiles.{name}.reranking input '{input_name}' requires a positive encoded byte length")))?)
-                } else { None };
-                Ok(RerankingImageInput { endpoint: input_name.clone(), required: input.required && input.default.is_none(), encoded_bytes })
-            }).collect()
-            };
+        let mut resolve_images = |names: &[String]| {
+            resolve_encoded_media_inputs(
+                workflow,
+                names,
+                &format!("profiles.{name}.reranking"),
+                &mut media_names,
+            )
+        };
         let (query_images, document_images) = if profile.version == "2" {
             let spec = profile.reranking.as_ref().ok_or_else(|| invalid(format!("profiles.{name} reranking v2 requires an explicit reranking image-input contract")))?;
             (

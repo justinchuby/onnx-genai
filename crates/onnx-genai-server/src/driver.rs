@@ -69,6 +69,7 @@ pub(crate) struct EngineDriver {
     pub(crate) runtime_sampling: bool,
     pub(crate) reranking: Option<Arc<onnx_genai_metadata::task_profiles::RerankingContract>>,
     pub(crate) decision: Option<Arc<onnx_genai_metadata::decision::DecisionContract>>,
+    pub(crate) realtime: Option<Arc<onnx_genai_metadata::realtime::RealtimeContract>>,
     /// One lock-free KV mirror per worker. The legacy aggregate fields continue
     /// to report worker 0; debug/status expose this full list.
     pub(crate) worker_kv_telemetry: Arc<Vec<Arc<KvTelemetry>>>,
@@ -127,6 +128,7 @@ impl BatchingReport {
 }
 
 pub(crate) enum DriverCommand {
+    Realtime(crate::realtime::RealtimeCommand),
     Slot {
         operation: crate::slots::SlotOperation,
         response: oneshot::Sender<anyhow::Result<serde_json::Value>>,
@@ -309,6 +311,14 @@ impl DriverFailure {
                 kind: DriverFailureKind::InvalidRequest,
             };
         }
+        if let Some(limit) = error.chain().find_map(|source| {
+            source.downcast_ref::<onnx_genai_engine::decision::DecisionInputLimitError>()
+        }) {
+            return Self {
+                message: limit.to_string(),
+                kind: DriverFailureKind::InvalidRequest,
+            };
+        }
         let memory_overload = error.chain().any(|source| {
             matches!(
                 source.downcast_ref::<SchedulerAdmissionError>(),
@@ -359,6 +369,7 @@ pub(crate) enum GenerateSubmitError {
 
 fn generate_submit_worker_error(error: WorkerUnavailable) -> GenerateSubmitError {
     match error {
+        WorkerUnavailable::Busy(_) => GenerateSubmitError::Overloaded,
         WorkerUnavailable::Failed(_) => {
             GenerateSubmitError::Failed(DriverFailure::from_worker_unavailable(error))
         }
@@ -449,6 +460,7 @@ struct EngineWorkerReady {
     runtime_sampling: bool,
     reranking: Option<Arc<onnx_genai_metadata::task_profiles::RerankingContract>>,
     decision: Option<Arc<onnx_genai_metadata::decision::DecisionContract>>,
+    realtime: Option<Arc<onnx_genai_metadata::realtime::RealtimeContract>>,
 }
 
 fn prepare_engine_worker<DropProbe>(
@@ -478,6 +490,9 @@ fn prepare_engine_worker<DropProbe>(
         .transpose()?;
     let decision =
         onnx_genai_metadata::decision::decision_contract(engine.metadata())?.map(Arc::new);
+    let realtime = onnx_genai_metadata::realtime::realtime_contract(engine.metadata())
+        .map_err(anyhow::Error::msg)?
+        .map(Arc::new);
     let reranking =
         onnx_genai_metadata::task_profiles::reranking_contract(engine.metadata())?.map(Arc::new);
     let batching = Arc::new(BatchingReport::from_capability(
@@ -519,6 +534,7 @@ fn prepare_engine_worker<DropProbe>(
         runtime_sampling,
         reranking,
         decision,
+        realtime,
     };
     Ok((
         EngineWorkerState {
@@ -762,6 +778,7 @@ impl EngineDriver {
                 runtime_sampling: first_ready.runtime_sampling,
                 reranking: first_ready.reranking,
                 decision: first_ready.decision,
+                realtime: first_ready.realtime,
                 worker_kv_telemetry,
             },
             ready_payload,
@@ -2199,6 +2216,7 @@ fn route_continuous_events(
 
 fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
     match command {
+        DriverCommand::Realtime(command) => command.run(engine),
         DriverCommand::Slot {
             operation,
             response,
@@ -3358,6 +3376,7 @@ mod admission_tests {
             native_slot: None,
             reranking: None,
             decision: None,
+            realtime: None,
             runtime_sampling: false,
             workflow_facts: crate::driver::WorkflowFacts {
                 components: 0,
@@ -3719,6 +3738,7 @@ mod admission_tests {
             native_slot: None,
             reranking: None,
             decision: None,
+            realtime: None,
             runtime_sampling: false,
             workflow_facts: WorkflowFacts {
                 components: 0,
@@ -3776,6 +3796,7 @@ mod admission_tests {
             native_slot: None,
             reranking: None,
             decision: None,
+            realtime: None,
             runtime_sampling: false,
             workflow_facts: WorkflowFacts {
                 components: 0,

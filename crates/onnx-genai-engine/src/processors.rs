@@ -177,7 +177,9 @@ pub(crate) fn build_processor_chain(
                     Box::new(crate::response_constraint::ContentConstraint::text(
                         tokenizer,
                         &crate::config::TextGrammar::Regex(pattern.clone()),
-                        projection.template().clone(),
+                        crate::text_projection::ProjectionKind::Declared(
+                            projection.template().clone(),
+                        ),
                         projection.prefix(),
                         max_bytes,
                         endings(),
@@ -203,7 +205,9 @@ pub(crate) fn build_processor_chain(
                     Box::new(crate::response_constraint::ContentConstraint::text(
                         tokenizer,
                         &crate::config::TextGrammar::Lark(grammar.clone()),
-                        projection.template().clone(),
+                        crate::text_projection::ProjectionKind::Declared(
+                            projection.template().clone(),
+                        ),
                         projection.prefix(),
                         max_bytes,
                         endings(),
