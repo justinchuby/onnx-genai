@@ -602,7 +602,11 @@ fn unresolved_if_branch_outputs_remain_deferred() {
 fn unresolved_if_output_still_checks_a_known_declared_dtype() {
     fn unresolved_branch() -> Graph {
         let mut branch = Graph::new();
-        let output = branch.create_named_value("output", DataType::Undefined, Shape::new());
+        let output = branch.create_named_value(
+            "unresolved_branch_output",
+            DataType::Undefined,
+            Shape::new(),
+        );
         branch.mark_value_type_unknown(output);
         branch.mark_value_shape_unknown(output);
         branch.add_output(output);
