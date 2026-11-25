@@ -11,6 +11,27 @@ fn value_info(name: &str) -> onnx::ValueInfoProto {
     }
 }
 
+fn typed_value_info(name: &str, dtype: onnx_runtime_ir::DataType) -> onnx::ValueInfoProto {
+    onnx::ValueInfoProto {
+        name: name.to_string(),
+        r#type: Some(onnx::TypeProto {
+            value: Some(onnx::type_proto::Value::TensorType(
+                onnx::type_proto::Tensor {
+                    elem_type: dtype.to_onnx(),
+                    shape: Some(onnx::TensorShapeProto {
+                        dim: vec![onnx::tensor_shape_proto::Dimension {
+                            value: Some(onnx::tensor_shape_proto::dimension::Value::DimValue(2)),
+                            ..Default::default()
+                        }],
+                    }),
+                },
+            )),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 fn node(op_type: &str, inputs: &[&str], outputs: &[&str]) -> onnx::NodeProto {
     onnx::NodeProto {
         op_type: op_type.to_string(),
@@ -56,6 +77,34 @@ fn f32_initializer(name: &str) -> onnx::TensorProto {
         dims: vec![1],
         raw_data: vec![0; 4],
         ..Default::default()
+    }
+}
+
+#[test]
+fn split_to_sequence_revalidates_dtype_inferred_from_producer() {
+    use onnx_runtime_ir::DataType;
+    use onnx_runtime_loader::load_model_bytes;
+
+    for (dtype, opset) in [(DataType::BFloat16, 23), (DataType::Float8E4M3FN, 24)] {
+        let mut model = model(onnx::GraphProto {
+            input: vec![typed_value_info("X", dtype)],
+            output: vec![value_info("sequence")],
+            node: vec![
+                node("Identity", &["X"], &["inferred"]),
+                node("SplitToSequence", &["inferred"], &["sequence"]),
+            ],
+            ..Default::default()
+        });
+        model.ir_version = 12;
+        model.opset_import[0].version = opset;
+
+        let err = load_model_bytes(&model.encode_to_vec()).unwrap_err();
+        assert!(
+            matches!(&err, LoaderError::InvalidSplitToSequence { detail, .. }
+                if detail.contains(&format!("{dtype:?}"))
+                    && detail.contains(&format!("opset {opset}"))),
+            "{dtype:?} at opset {opset}: {err}"
+        );
     }
 }
 
