@@ -1,10 +1,62 @@
 //! Inverse NCHW spatial-block permutations.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::Node;
 use onnx_runtime_ir::space_depth::{Direction, Order, SpaceDepth};
+use onnx_runtime_ir::{Attribute, Node};
 
-use super::{check_arity, to_dense_bytes, write_dense_bytes};
+use super::{check_arity, elem_size, to_dense_bytes, write_dense_bytes};
+
+pub struct LegacySpaceToDepthFactory;
+
+impl KernelFactory for LegacySpaceToDepthFactory {
+    fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let block = node
+            .attr("blocksize")
+            .and_then(Attribute::as_int)
+            .ok_or_else(|| EpError::KernelFailed("SpaceToDepth: blocksize is required".into()))?;
+        if block <= 0 {
+            return Err(EpError::KernelFailed(
+                "SpaceToDepth: blocksize must be positive".into(),
+            ));
+        }
+        Ok(Box::new(LegacySpaceToDepth(block as usize)))
+    }
+}
+
+struct LegacySpaceToDepth(usize);
+
+impl Kernel for LegacySpaceToDepth {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        check_arity("SpaceToDepth", inputs, outputs, 1, 1, 1)?;
+        let input = &inputs[0];
+        let shape @ [n, c, h, w] = <[usize; 4]>::try_from(input.shape)
+            .map_err(|_| EpError::KernelFailed("SpaceToDepth: input must have rank 4".into()))?;
+        let block = self.0;
+        if h % block != 0 || w % block != 0 {
+            return Err(EpError::KernelFailed(format!(
+                "SpaceToDepth: spatial dimensions {h}x{w} must be divisible by blocksize {block}"
+            )));
+        }
+        let output_shape = [n, c * block * block, h / block, w / block];
+        if outputs[0].dtype != input.dtype || outputs[0].shape != output_shape {
+            return Err(EpError::KernelFailed(format!(
+                "SpaceToDepth: output must have dtype {:?} and shape {output_shape:?}",
+                input.dtype
+            )));
+        }
+        let element_size = elem_size(input.dtype)?;
+        let input_bytes = to_dense_bytes(input)?;
+        let mut output_bytes = vec![0; input_bytes.len()];
+        if !input_bytes.is_empty() {
+            permute::<true, false>(shape, block, element_size, &input_bytes, &mut output_bytes);
+        }
+        write_dense_bytes(&mut outputs[0], &output_bytes)
+    }
+
+    fn supports_strided_input(&self, _: usize) -> bool {
+        true
+    }
+}
 
 struct SpaceDepthKernel {
     params: SpaceDepth,
@@ -234,5 +286,64 @@ mod tests {
             assert!(!claims(first, invalid, DataType::Int64), "{op}");
             assert!(!claims(first, valid, DataType::String), "{op}");
         }
+    }
+
+    #[test]
+    fn ort_plugin_keeps_the_space_to_depth_13_contract() {
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_ir::{DataType, ValueId, static_shape};
+
+        let plugin = crate::CpuExecutionProvider::for_ort_plugin();
+        let (_, descriptors) = crate::build_cpu_registry_with_descriptors();
+        let spatial: Vec<_> = descriptors
+            .iter()
+            .filter(|d| {
+                d.domain.is_empty() && matches!(d.op_type.as_str(), "SpaceToDepth" | "DepthToSpace")
+            })
+            .collect();
+        let [descriptor] = spatial.as_slice() else {
+            panic!(
+                "unexpected number of plugin spatial descriptors: {}",
+                spatial.len()
+            );
+        };
+        assert_eq!(descriptor.op_type, "SpaceToDepth");
+        assert_eq!(descriptor.since_version, 13);
+        assert_eq!(descriptor.end_version, u64::MAX);
+        assert_eq!(
+            descriptor.supported_dtypes,
+            &[
+                DataType::Float32,
+                DataType::Float16,
+                DataType::BFloat16,
+                DataType::Float64
+            ]
+        );
+
+        let mut node = Node::new(
+            NodeId(0),
+            "SpaceToDepth",
+            vec![Some(ValueId(0))],
+            vec![ValueId(1)],
+        );
+        node.attributes
+            .insert("blocksize".into(), Attribute::Int(2));
+        node.attributes
+            .insert("mode".into(), Attribute::String(b"CRD".to_vec()));
+        let shapes = [static_shape([1, 2, 2, 2])];
+        let claims = |opset| {
+            plugin
+                .supports_op(&node, opset, &shapes, &[DataType::Float32], &[])
+                .is_supported()
+        };
+        assert!(!claims(12));
+        assert!(claims(28));
+        let kernel = plugin.get_kernel(&node, &[vec![1, 2, 2, 2]], 28).unwrap();
+        let input = Owned::f32(&[1, 2, 2, 2], &[0., 1., 2., 3., 4., 5., 6., 7.]);
+        let mut output = Owned::zeros_f32(&[1, 8, 1, 1]);
+        kernel
+            .execute(&[input.view()], &mut [output.view_mut()])
+            .unwrap();
+        assert_eq!(output.to_f32(), [0., 4., 1., 5., 2., 6., 3., 7.]);
     }
 }

@@ -38,6 +38,7 @@ use crate::optimizer::cpu_optimization_passes;
 /// registry is also exposed to the session (Track D) so placement and kernel
 /// instantiation share one source of truth.
 pub struct CpuExecutionProvider {
+    standalone: bool,
     device: DeviceId,
     initialized: bool,
     registry: OpRegistry,
@@ -113,7 +114,7 @@ impl CpuExecutionProvider {
 
     /// Construct all CPU factories with the same immutable session resources.
     pub fn with_resources(resources: CpuMemoryResources) -> Self {
-        let mut ep = Self::shared_kernels(resources);
+        let mut ep = Self::shared_kernels(resources, true);
         ep.registry.register(
             onnx_runtime_ep_api::OpKey::new(
                 onnx_runtime_optimizer::affine_moe::OP,
@@ -128,14 +129,15 @@ impl CpuExecutionProvider {
 
     /// CPU provider for the ORT plugin: exclude standalone-only registry entries and passes.
     pub fn for_ort_plugin() -> Self {
-        Self::shared_kernels(CpuMemoryResources::default())
+        Self::shared_kernels(CpuMemoryResources::default(), false)
     }
 
-    fn shared_kernels(resources: CpuMemoryResources) -> Self {
+    fn shared_kernels(resources: CpuMemoryResources, standalone: bool) -> Self {
         Self {
+            standalone,
             device: DeviceId::cpu(),
             initialized: false,
-            registry: build_cpu_registry_with_resources(resources.clone()),
+            registry: build_cpu_registry_with_resources(resources.clone(), standalone),
             resources,
             local_workspace: std::sync::OnceLock::new(),
             memory: default_cpu_memory(),
@@ -595,7 +597,8 @@ impl ExecutionProvider for CpuExecutionProvider {
         if let Some(reason) = factory.unsupported_reason(op, opset, shapes, input_dtypes) {
             return KernelMatch::unsupported(reason);
         }
-        if onnx_runtime_ir::space_depth::Direction::from_node(op).is_some()
+        if self.standalone
+            && onnx_runtime_ir::space_depth::Direction::from_node(op).is_some()
             && let Err(reason) = onnx_runtime_ir::space_depth::SpaceDepth::validate_claim(
                 op,
                 opset,

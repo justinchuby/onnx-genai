@@ -20,7 +20,6 @@
 //! op without a shape rule fails, and adding a shape rule without removing the
 //! op from the allowlist also fails. Neither direction can pass silently.
 
-use onnx_runtime_ep_cpu::kernels::build_cpu_registry;
 use onnx_runtime_ep_plugin::compute::ShapeInference;
 use onnx_runtime_ir::{Attribute, Node, NodeId, ValueId};
 
@@ -84,7 +83,6 @@ const DECLINED: &[(&str, &str)] = &[
     ("", "LpPool"),
     ("", "MaxPool"),
     ("", "SpaceToDepth"),
-    ("", "DepthToSpace"),
     //       Inferrable from attributes or a fixed rule.
     ("", "ArgMax"), // reduce over `axis`, honouring `keepdims`
     ("", "ArgMin"),
@@ -236,7 +234,8 @@ fn declines(op_type: &str, domain: &str) -> bool {
 /// an inventory built on descriptors. `keys()` is the same set `supports_op`
 /// consults, which is what makes it the right source of truth here.
 fn registered_ops() -> Vec<(String, String)> {
-    let registry = build_cpu_registry();
+    let ep = onnx_runtime_ep_cpu::CpuExecutionProvider::for_ort_plugin();
+    let registry = ep.registry();
     let mut ops: Vec<(String, String)> = registry
         .keys()
         .filter(|k| !TEST_ONLY.contains(&k.op_type.as_str()))

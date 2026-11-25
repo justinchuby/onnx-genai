@@ -135,4 +135,11 @@ mod tests {
         assert!(find_cpu_operator("ai.onnx", "Attention", 22).is_none());
         assert!(find_cpu_operator("ai.onnx", "Attention", 23).is_some());
     }
+
+    #[test]
+    fn standalone_spatial_transforms_select_cnn_from_opset_one() {
+        for op in ["DepthToSpace", "SpaceToDepth"] {
+            assert_eq!(find_cpu_operator("", op, 1).unwrap().group, OPS_CNN);
+        }
+    }
 }

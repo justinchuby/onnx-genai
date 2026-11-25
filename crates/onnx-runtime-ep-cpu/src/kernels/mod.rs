@@ -381,7 +381,6 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("OneHot", "")
         | ("Dropout", "")
         | ("Unique", "") => ALL_DTYPES,
-        ("DepthToSpace" | "SpaceToDepth", "" | "ai.onnx") => onnx_runtime_ir::space_depth::DTYPES,
 
         ("StringConcat", "") => STRING_ONLY,
         ("RegexFullMatch", "") => STRING_BOOL_DTYPES,
@@ -615,6 +614,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("AffineGrid", "")
         | ("Col2Im", "")
         | ("CenterCropPad", "")
+        | ("SpaceToDepth", "")
         | ("BatchNormalization", "")
         | ("InstanceNormalization", "")
         | ("GroupNormalization", "")
@@ -1050,13 +1050,11 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(pooling::GlobalLpPoolFactory),
     );
-    for op in ["DepthToSpace", "SpaceToDepth"] {
-        registry.register(
-            OpKey::new(op, "", 1),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(space_depth::SpaceDepthFactory),
-        );
-    }
+    registry.register(
+        OpKey::new("SpaceToDepth", "", 13),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(space_depth::LegacySpaceToDepthFactory),
+    );
     // BatchNormalization inference semantics are stable since opset 7, when
     // the legacy `is_test` attribute was removed.
     registry.register(
@@ -1099,14 +1097,14 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
 /// `lookup` picks the highest applicable version, so future opset-specialized
 /// kernels can be added alongside these.
 pub fn build_cpu_registry() -> OpRegistry {
-    build_cpu_registry_with_resources(crate::CpuMemoryResources::default())
+    build_cpu_registry_with_resources(crate::CpuMemoryResources::default(), true)
 }
 
 /// Build the CPU registry AND return its plugin-visible registrations for
 /// kernel-registry type-constraint advertisement. Native-only revisions remain
 /// dispatchable without changing the shipped ORT plugin contract.
 pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor>) {
-    let reg = build_cpu_registry();
+    let reg = build_cpu_registry_with_resources(crate::CpuMemoryResources::default(), false);
     let descriptors = descriptors_from_registry(&reg);
     (reg, descriptors)
 }
@@ -1163,6 +1161,7 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
 /// Build all factories against one immutable set of session memory resources.
 pub(crate) fn build_cpu_registry_with_resources(
     resources: crate::CpuMemoryResources,
+    standalone: bool,
 ) -> OpRegistry {
     let host_cache = resources.expert_cache().clone();
     let derived_weights = resources.weight_memory().clone();
@@ -1222,6 +1221,22 @@ pub(crate) fn build_cpu_registry_with_resources(
         );
     }
     register_cnn_ops(&mut rec);
+    #[cfg(feature = "ops-cnn")]
+    if standalone {
+        for (op, version) in [
+            ("DepthToSpace", 1),
+            ("SpaceToDepth", 1),
+            ("SpaceToDepth", 13),
+        ] {
+            rec.register(
+                OpKey::new(op, "", version),
+                onnx_runtime_ep_api::WorkspacePlanning::None,
+                Box::new(space_depth::SpaceDepthFactory),
+            );
+        }
+    }
+    #[cfg(not(feature = "ops-cnn"))]
+    let _ = standalone;
     rec.register(
         OpKey::new("MatMul", "", 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -3989,8 +4004,8 @@ mod tests {
 
     #[test]
     fn descriptors_derived_from_real_registry_not_hand_maintained() {
-        // Every registered op other than explicitly standalone-only RoiAlign
-        // must have a descriptor.
+        // Every registered op revision other than the standalone-only
+        // revisions must have a plugin descriptor.
         //
         // This used to allow a delta of up to 50 and documented CNN ops as the
         // expected difference. That tolerance was hiding a real bug: the plugin
@@ -4018,6 +4033,7 @@ mod tests {
         let expected = onnx_runtime_ir::roi_align::VERSIONS
             .into_iter()
             .map(|version| ("RoiAlign", "", version))
+            .chain([("DepthToSpace", "", 1), ("SpaceToDepth", "", 1)])
             .collect();
         #[cfg(not(feature = "ops-cnn"))]
         let expected = std::collections::BTreeSet::new();

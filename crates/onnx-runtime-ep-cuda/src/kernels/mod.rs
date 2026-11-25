@@ -559,7 +559,6 @@ static CUDA_EINSUM_DTYPES: &[DataType] = &[
 pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataType] {
     match (op_type, domain) {
         ("Gemm", "" | "ai.onnx") => gemm::DTYPES,
-        ("DepthToSpace" | "SpaceToDepth", "" | "ai.onnx") => onnx_runtime_ir::space_depth::DTYPES,
         ("BitCast", "") => BIT_CAST_TYPES,
         ("CumProd", "") => CUM_PROD_TYPES,
         ("DFT", "") => CUDA_DFT_DTYPES,
@@ -722,7 +721,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
     }
 }
 
-/// Derive plugin kernel-registry descriptors from the real CUDA [`OpRegistry`].
+/// Derive kernel-registry descriptors from the ORT plugin's CUDA [`OpRegistry`].
 ///
 /// One descriptor per plugin-eligible `(op_type, domain, since_version)` key, with
 /// the domain taken verbatim from the registry (so `com.microsoft` kernels are
@@ -983,12 +982,28 @@ pub(crate) fn build_cuda_registry_for_contract(
             }),
         );
     }
-    for op in ["DepthToSpace", "SpaceToDepth"] {
+    let standalone = matches!(
+        conv_transpose_contract,
+        conv_transpose::Contract::Standalone
+    );
+    if standalone {
+        for op in ["DepthToSpace", "SpaceToDepth"] {
+            reg.register(
+                OpKey::new(op, "", 1),
+                onnx_runtime_ep_api::WorkspacePlanning::None,
+                Box::new(structural::SpaceDepthFactory {
+                    runtime: runtime.clone(),
+                    standalone,
+                }),
+            );
+        }
+    } else {
         reg.register(
-            OpKey::new(op, "", 1),
+            OpKey::new("SpaceToDepth", "", 13),
             onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(structural::SpaceDepthFactory {
                 runtime: runtime.clone(),
+                standalone,
             }),
         );
     }

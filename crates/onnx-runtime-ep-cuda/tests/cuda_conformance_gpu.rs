@@ -4017,6 +4017,59 @@ fn space_depth_modes_match_onnx() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
+fn ort_plugin_keeps_the_space_to_depth_13_contract() {
+    let ep = CudaExecutionProvider::new_for_ort_plugin().expect("CUDA device for ORT plugin");
+    let descriptors = onnx_runtime_ep_cuda::build_cuda_registry_descriptors(ep.registry());
+    let spatial: Vec<_> = descriptors
+        .iter()
+        .filter(|d| {
+            d.domain.is_empty() && matches!(d.op_type.as_str(), "SpaceToDepth" | "DepthToSpace")
+        })
+        .collect();
+    let [descriptor] = spatial.as_slice() else {
+        panic!(
+            "unexpected number of plugin spatial descriptors: {}",
+            spatial.len()
+        );
+    };
+    assert_eq!(descriptor.op_type, "SpaceToDepth");
+    assert_eq!(descriptor.since_version, 13);
+    assert_eq!(descriptor.end_version, u64::MAX);
+    assert_eq!(
+        descriptor.supported_dtypes,
+        &[DataType::Float32, DataType::Float16, DataType::BFloat16]
+    );
+    assert!(!ep.registry().supports("SpaceToDepth", "", 12));
+    assert!(!ep.registry().supports("DepthToSpace", "", 28));
+    // At the legacy provider boundary, `mode` was ignored by both the claim
+    // and kernel. Keep this probe below the plugin's independent shape filter.
+    let output = run_cuda(
+        &ep,
+        "SpaceToDepth",
+        "",
+        28,
+        &[input(
+            DataType::Float32,
+            &[1, 2, 2, 2],
+            &[0_f32, 1., 2., 3., 4., 5., 6., 7.],
+        )],
+        &[(DataType::Float32, vec![1, 8, 1, 1])],
+        &[
+            ("blocksize", Attribute::Int(2)),
+            ("mode", Attribute::String(b"CRD".to_vec())),
+        ],
+    );
+    assert_eq!(
+        decode_floats(&output[0], DataType::Float32),
+        [0., 4., 1., 5., 2., 6., 3., 7.]
+    );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
 fn tensor_scatter_batch_offsets_match_cpu() {
     let ep = require_cuda();
     for case in tensor_scatter_cases() {

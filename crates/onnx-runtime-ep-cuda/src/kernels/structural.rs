@@ -403,24 +403,47 @@ impl Kernel for GatherNdKernel {
 
 pub struct SpaceDepthFactory {
     pub runtime: Arc<CudaRuntime>,
+    pub standalone: bool,
 }
 
 impl KernelFactory for SpaceDepthFactory {
     fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let params =
-            SpaceDepth::parse(node, node.local_opset().unwrap_or(1)).map_err(|detail| {
-                EpError::KernelFailed(format!("cuda_ep {}: {detail}", node.op_type))
-            })?;
+        let config = if self.standalone {
+            let params =
+                SpaceDepth::parse(node, node.local_opset().unwrap_or(1)).map_err(|detail| {
+                    EpError::KernelFailed(format!("cuda_ep {}: {detail}", node.op_type))
+                })?;
+            SpaceDepthConfig::Standalone(params)
+        } else {
+            let block = node
+                .attr("blocksize")
+                .and_then(Attribute::as_int)
+                .ok_or_else(|| {
+                    EpError::KernelFailed("cuda_ep SpaceToDepth: blocksize is required".into())
+                })?;
+            if block <= 0 {
+                return Err(EpError::KernelFailed(
+                    "cuda_ep SpaceToDepth: blocksize must be positive".into(),
+                ));
+            }
+            SpaceDepthConfig::Legacy(block as usize)
+        };
         Ok(Box::new(SpaceDepthKernel {
-            params,
+            config,
             op: node.op_type.clone(),
             runtime: self.runtime.clone(),
         }))
     }
 }
 
+#[derive(Clone, Copy)]
+enum SpaceDepthConfig {
+    Legacy(usize),
+    Standalone(SpaceDepth),
+}
+
 struct SpaceDepthKernel {
-    params: SpaceDepth,
+    config: SpaceDepthConfig,
     op: String,
     runtime: Arc<CudaRuntime>,
 }
@@ -437,28 +460,65 @@ impl Kernel for SpaceDepthKernel {
         }
         require_dense(&self.op, inputs, outputs)?;
         let input = &inputs[0];
-        let output_shape = self
-            .params
-            .output_shape(input.shape)
-            .map_err(|detail| EpError::KernelFailed(format!("cuda_ep {}: {detail}", self.op)))?;
+        let (output_shape, direction, order, block) = match self.config {
+            SpaceDepthConfig::Legacy(block) => {
+                let [n, c, h, w] = <[usize; 4]>::try_from(input.shape).map_err(|_| {
+                    EpError::KernelFailed("cuda_ep SpaceToDepth: input must have rank 4".into())
+                })?;
+                if h % block != 0 || w % block != 0 {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep SpaceToDepth: spatial dimensions {h}x{w} must be divisible by blocksize {block}"
+                    )));
+                }
+                (
+                    [n, c * block * block, h / block, w / block],
+                    Direction::SpaceToDepth,
+                    Order::Dcr,
+                    block as u64,
+                )
+            }
+            SpaceDepthConfig::Standalone(params) => {
+                let shape = params.output_shape(input.shape).map_err(|detail| {
+                    EpError::KernelFailed(format!("cuda_ep {}: {detail}", self.op))
+                })?;
+                (
+                    shape,
+                    params.direction,
+                    params.order,
+                    params.blocksize() as u64,
+                )
+            }
+        };
         if outputs[0].dtype != input.dtype || outputs[0].shape != output_shape {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep {}: output must have dtype {:?} and shape {output_shape:?}",
                 self.op, input.dtype,
             )));
         }
-        let element_bytes = SpaceDepth::element_bytes(input.dtype)
-            .map_err(|detail| EpError::KernelFailed(format!("cuda_ep {}: {detail}", self.op)))?
-            as i32;
-        if output_shape.contains(&0) {
+        let standalone_bytes = match self.config {
+            SpaceDepthConfig::Legacy(_) => None,
+            SpaceDepthConfig::Standalone(_) => {
+                Some(SpaceDepth::element_bytes(input.dtype).map_err(|detail| {
+                    EpError::KernelFailed(format!("cuda_ep {}: {detail}", self.op))
+                })?)
+            }
+        };
+        let elements = if standalone_bytes.is_some() {
+            if output_shape.contains(&0) {
+                return Ok(());
+            }
+            product(&output_shape, &self.op)?
+        } else {
+            outputs[0].numel()
+        };
+        if elements == 0 {
             return Ok(());
         }
-        let elements = product(&output_shape, &self.op)?;
-        let [_, channels, height, width] = match self.params.direction {
+        let [_, channels, height, width] = match direction {
             Direction::SpaceToDepth => input.shape.try_into().expect("rank already validated"),
             Direction::DepthToSpace => output_shape,
         };
-        let name = match (self.params.direction, self.params.order) {
+        let name = match (direction, order) {
             (Direction::SpaceToDepth, Order::Dcr) => "space_to_depth_bytes",
             (Direction::SpaceToDepth, Order::Crd) => "space_to_depth_crd_bytes",
             (Direction::DepthToSpace, Order::Dcr) => "depth_to_space_bytes",
@@ -470,7 +530,10 @@ impl Kernel for SpaceDepthKernel {
         let channels = channels as u64;
         let height = height as u64;
         let width = width as u64;
-        let block = self.params.blocksize() as u64;
+        let element_bytes = match standalone_bytes {
+            Some(bytes) => bytes,
+            None => fixed_width(&self.op, input.dtype)?,
+        } as i32;
         let elements_u64 = elements as u64;
         let mut builder = self.runtime.stream().launch_builder(&function);
         builder
