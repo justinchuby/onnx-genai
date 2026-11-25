@@ -428,6 +428,7 @@ fn hex(bytes: &[u8]) -> String {
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    pub api_keys: crate::ApiKeys,
     /// Node-level identifier reported by `GET /v1/status` for the cluster router
     /// (§34.8). Independent of any model; defaults to the hostname or a generated id.
     pub node_id: String,
@@ -513,6 +514,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         let decision = onnx_genai_engine::decision::DecisionLimits::default();
         Self {
+            api_keys: crate::ApiKeys::default(),
             node_id: default_node_id(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             realtime: crate::realtime::RealtimeLimits::default(),
