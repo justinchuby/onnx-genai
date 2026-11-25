@@ -1193,6 +1193,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot spawn the child process this needs")]
     fn workspace_context_is_lazy_and_distinguishes_selected_pool_widths() {
         const CHILD: &str = "NXRT_WORKSPACE_CONTEXT_CHILD";
         if std::env::var_os(CHILD).is_some() {
