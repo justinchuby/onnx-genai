@@ -53,6 +53,75 @@ impl KernelFactory for LayerNormFactory {
     }
 }
 
+/// The dense coefficient walk follows from broadcast geometry, never values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AffineLayout {
+    Normalized,
+    Scalar,
+    Broadcast,
+}
+
+impl AffineLayout {
+    fn prepare(
+        op: &str,
+        slot: usize,
+        parameter: &[usize],
+        signal: &[usize],
+        axis: usize,
+    ) -> Result<Self> {
+        if !onnx_runtime_ir::gemm::bias_broadcasts(parameter, signal, |&dim| Some(dim)) {
+            return Err(EpError::KernelFailed(format!(
+                "{op}: affine input {slot} shape {parameter:?} cannot broadcast into X {signal:?}; use a right-aligned shape with equal or singleton dimensions"
+            )));
+        }
+        // Leading unit dimensions do not change a contiguous row's coefficients.
+        // Shape equality is required: equal element counts can vary by group.
+        if parameter
+            .iter()
+            .skip_while(|&&d| d == 1)
+            .eq(signal[axis..].iter().skip_while(|&&d| d == 1))
+        {
+            Ok(Self::Normalized)
+        } else if parameter.iter().all(|&d| d == 1) {
+            Ok(Self::Scalar)
+        } else {
+            Ok(Self::Broadcast)
+        }
+    }
+
+    #[inline]
+    fn value(
+        self,
+        values: &[f32],
+        parameter: &[usize],
+        signal: &[usize],
+        local: usize,
+        flat: usize,
+    ) -> f32 {
+        match self {
+            Self::Normalized => values[local],
+            Self::Scalar => values[0],
+            Self::Broadcast => {
+                // Only called for a nonempty X: every divisor is positive.
+                // Geometry already checked both dense suffix-stride products.
+                let mut remaining = flat;
+                let mut stride = 1usize;
+                let mut index = 0usize;
+                let offset = signal.len() - parameter.len();
+                for d in (0..parameter.len()).rev() {
+                    let coordinate = remaining % signal[offset + d];
+                    remaining /= signal[offset + d];
+                    if parameter[d] != 1 {
+                        index += coordinate * stride;
+                    }
+                    stride *= parameter[d];
+                }
+                values[index]
+            }
+        }
+    }
+}
+
 struct LayerNormGeometry {
     norm_size: usize,
     groups: usize,
@@ -60,6 +129,7 @@ struct LayerNormGeometry {
     scale_slot: usize,
     bias_slot: usize,
     writes: [bool; 4],
+    affine: [AffineLayout; 2],
     workspace: FloatWorkspace<4>,
 }
 
@@ -128,6 +198,7 @@ impl LayerNormKernel {
         })?;
         let scale_slot = if skip { 2 } else { 1 };
         let bias_slot = scale_slot + 1;
+        let mut affine = [AffineLayout::Normalized; 2];
         for (i, input) in inputs.iter().enumerate().filter(|(_, input)| input.present) {
             if !super::FLOAT_DTYPES.contains(&input.dtype)
                 || (skip
@@ -155,10 +226,14 @@ impl LayerNormKernel {
                 }
             } else if i >= scale_slot {
                 let n = product(input.shape, "parameter")?;
-                if n != norm_size {
+                if skip && n != norm_size {
                     return Err(EpError::KernelFailed(format!(
                         "{op}: input {i} parameter has {n} elements, expected {norm_size} for normalized axes {axis}..{rank}; provide a complete normalized parameter"
                     )));
+                }
+                if !skip {
+                    affine[i - scale_slot] =
+                        AffineLayout::prepare(op, i, input.shape, shape, axis)?;
                 }
             }
         }
@@ -236,6 +311,7 @@ impl LayerNormKernel {
             scale_slot,
             bias_slot,
             writes,
+            affine,
             workspace,
         })
     }
@@ -357,14 +433,44 @@ impl LayerNormKernel {
                     } else {
                         x.as_ref()
                     };
-                    layer_norm_into(
-                        data,
-                        &scale,
-                        beta.as_deref(),
-                        geometry.norm_size,
-                        self.epsilon,
-                        [y, means, invs],
-                    );
+                    if geometry.affine == [AffineLayout::Normalized; 2] {
+                        // Preserve the complete normalized-parameter inner loop:
+                        // no broadcast coordinate arithmetic on this route.
+                        layer_norm_into(
+                            data,
+                            geometry.norm_size,
+                            self.epsilon,
+                            [y, means, invs],
+                            |e, _, norm| {
+                                let mut out = norm * scale[e];
+                                if let Some(b) = beta.as_deref() {
+                                    out += b[e];
+                                }
+                                out
+                            },
+                        );
+                    } else {
+                        let shape = inputs[0].shape;
+                        let scale_shape = inputs[geometry.scale_slot].shape;
+                        let beta_shape = inputs
+                            .get(geometry.bias_slot)
+                            .map_or(&[][..], |input| input.shape);
+                        layer_norm_into(
+                            data,
+                            geometry.norm_size,
+                            self.epsilon,
+                            [y, means, invs],
+                            |e, flat, norm| {
+                                let coefficient =
+                                    geometry.affine[0].value(&scale, scale_shape, shape, e, flat);
+                                let mut out = norm * coefficient;
+                                if let Some(b) = beta.as_deref() {
+                                    out += geometry.affine[1].value(b, beta_shape, shape, e, flat);
+                                }
+                                out
+                            },
+                        );
+                    }
                     // Finish every input read and all computations before publishing outputs.
                     write_dense_f32_narrow(op, &mut outputs[0], y)?;
                     if geometry.writes[1] {
@@ -410,11 +516,10 @@ impl Kernel for LayerNormKernel {
 
 fn layer_norm_into(
     x: &[f32],
-    scale: &[f32],
-    bias: Option<&[f32]>,
     norm_size: usize,
     epsilon: f32,
     [y, means, inv_stds]: [&mut [f32]; 3],
+    affine: impl Fn(usize, usize, f32) -> f32,
 ) {
     let mut means = means.iter_mut();
     let mut inv_stds = inv_stds.iter_mut();
@@ -431,11 +536,7 @@ fn layer_norm_into(
         }
         for e in 0..norm_size {
             let norm = (slice[e] - mean) * inv_std;
-            let mut out = norm * scale[e];
-            if let Some(b) = bias {
-                out += b[e];
-            }
-            y[base + e] = out;
+            y[base + e] = affine(e, base + e, norm);
         }
     }
 }
@@ -1040,6 +1141,12 @@ mod tests {
         let x = Owned::f32(&[2, 4], &[1., 2., 3., 4., 2., 3., 4., 5.]);
         let skip = Owned::f32(&[2, 4], &[0.5, -1., 1., 0., 1., 0., -1., 2.]);
         let scale = Owned::f32(&[4], &[1.; 4]);
+        let scalar = Owned::f32(&[], &[1.]);
+        let group = Owned::f32(&[2, 1], &[1., 2.]);
+        let scalar_inputs = [x.view(), scalar.view()];
+        let group_inputs = [x.view(), group.view()];
+        let scalar_meta = metadata(&scalar_inputs);
+        let group_meta = metadata(&group_inputs);
         let ordinary = [x.view(), scale.view()];
         let residual = [x.view(), skip.view(), scale.view()];
         let ordinary_meta = metadata(&ordinary);
@@ -1084,10 +1191,11 @@ mod tests {
         let mut inv = Owned::zeros_f32(&[2, 1]);
         let mut sum = Owned::zeros_f32(&[2, 4]);
         for i in 0..4096 {
-            let (which, inputs, meta, nout) = if i % 2 == 0 {
-                (0, &ordinary[..], &ordinary_meta[..], 3)
-            } else {
-                (1, &residual[..], &residual_meta[..], 4)
+            let (which, inputs, meta, nout) = match i % 4 {
+                0 => (0, &ordinary[..], &ordinary_meta[..], 3),
+                1 => (1, &residual[..], &residual_meta[..], 4),
+                2 => (0, &scalar_inputs[..], &scalar_meta[..], 3),
+                _ => (0, &group_inputs[..], &group_meta[..], 3),
             };
             let request = kernels[which]
                 .workspace_requirement_for_execution(inputs, &[], meta, &outputs[..nout], None)
@@ -1120,10 +1228,366 @@ mod tests {
             "including zero-byte callbacks"
         );
         assert_eq!(sum.to_f32(), [1.5, 1., 4., 4., 3., 3., 3., 7.]);
+        for (g, row) in [1f32, 2., 3., 4., 2., 3., 4., 5.]
+            .chunks_exact(4)
+            .enumerate()
+        {
+            let mean = row.iter().sum::<f32>() / 4.;
+            let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / 4.;
+            let inv = 1. / (var + 1e-5).sqrt();
+            for (e, &value) in row.iter().enumerate() {
+                assert_eq!(
+                    y.to_f32()[g * 4 + e].to_bits(),
+                    ((value - mean) * inv * (g + 1) as f32).to_bits()
+                );
+            }
+        }
         assert_eq!(books.used(Tier::Host), 80);
         assert_eq!(manager.process_used(Tier::Host), 80);
         pool.trim_idle(80).unwrap();
         assert_eq!(books.used(Tier::Host), 0);
         assert_eq!(manager.process_used(Tier::Host), 0);
+    }
+    fn affine_fixtures(offset: f32) -> Vec<(Vec<usize>, Vec<f32>, Vec<f32>)> {
+        let shapes: [&[usize]; 9] = [
+            &[],
+            &[4],
+            &[3, 1],
+            &[2, 1, 1],
+            &[1, 3, 1],
+            &[3, 4],
+            &[2, 3, 4],
+            &[1, 1, 1],
+            &[1, 3, 4],
+        ];
+        shapes
+            .iter()
+            .enumerate()
+            .map(|(case, shape)| {
+                let n = shape.iter().product::<usize>();
+                let values = (0..n)
+                    .map(|i| offset + i as f32 * 0.125)
+                    .collect::<Vec<_>>();
+                let mut expanded = Vec::new();
+                for batch in 0..2 {
+                    for row in 0..3 {
+                        for column in 0..4 {
+                            let index = match case {
+                                0 | 7 => 0,
+                                1 => column,
+                                2 | 4 => row,
+                                3 => batch,
+                                5 | 8 => row * 4 + column,
+                                6 => batch * 12 + row * 4 + column,
+                                _ => unreachable!(),
+                            };
+                            expanded.push(values[index]);
+                        }
+                    }
+                }
+                (shape.to_vec(), values, expanded)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn layernorm_affine_broadcast_matrix_matches_independent_f64_coordinates() {
+        let values = (0..24)
+            .map(|i| (i as f32 * 0.375).sin() * 3. + i as f32 * 0.125)
+            .collect::<Vec<_>>();
+        let x = Owned::f32(&[2, 3, 4], &values);
+        let scales = affine_fixtures(0.5);
+        let biases = affine_fixtures(-0.25);
+        let mut cells = 0;
+        for raw_axis in [-3, -2, -1, 0, 1, 2] {
+            let axis = if raw_axis < 0 {
+                (raw_axis + 3) as usize
+            } else {
+                raw_axis as usize
+            };
+            let width = [2, 3, 4][axis..].iter().product::<usize>();
+            let groups = 24 / width;
+            let mut reduced = [2, 3, 4];
+            reduced[axis..].fill(1);
+            for (ss, sv, se) in &scales {
+                for (bs, bv, be) in &biases {
+                    let scale = Owned::f32(ss, sv);
+                    let bias = Owned::f32(bs, bv);
+                    let mut y = Owned::zeros_f32(&[2, 3, 4]);
+                    let mut mean = Owned::zeros_f32(&reduced);
+                    let mut inv = Owned::zeros_f32(&reduced);
+                    let kernel = LayerNormKernel {
+                        axis: raw_axis,
+                        epsilon: 1e-5,
+                        kind: LayerNormKind::Standard,
+                    };
+                    let inputs = [x.view(), scale.view(), bias.view()];
+                    let outputs = [
+                        OutputMetadata::from_view(&y.view_mut()),
+                        OutputMetadata::from_view(&mean.view_mut()),
+                        OutputMetadata::from_view(&inv.view_mut()),
+                    ];
+                    let request = kernel
+                        .workspace_requirement(&metadata(&inputs), &outputs)
+                        .unwrap()
+                        .require_ready()
+                        .unwrap();
+                    assert_eq!(
+                        request.bytes,
+                        ((24 + 2 * groups) * 4) as u64,
+                        "coefficients never expand into workspace"
+                    );
+                    kernel
+                        .execute_prepared(
+                            &inputs,
+                            &mut [y.view_mut(), mean.view_mut(), inv.view_mut()],
+                        )
+                        .unwrap();
+                    let actual = y.to_f32();
+                    let means = mean.to_f32();
+                    let inverses = inv.to_f32();
+                    for (g, row) in values.chunks_exact(width).enumerate() {
+                        let m = row.iter().map(|&x| f64::from(x)).sum::<f64>() / width as f64;
+                        let v = row.iter().map(|&x| (f64::from(x) - m).powi(2)).sum::<f64>()
+                            / width as f64;
+                        let r = 1. / (v + 1e-5).sqrt();
+                        assert!((f64::from(means[g]) - m).abs() < 1e-5);
+                        assert!((f64::from(inverses[g]) - r).abs() < 1e-5);
+                        for (e, &value) in row.iter().enumerate() {
+                            let flat = g * width + e;
+                            let expected = (f64::from(value) - m) * r * f64::from(se[flat])
+                                + f64::from(be[flat]);
+                            assert!(
+                                (f64::from(actual[flat]) - expected).abs() < 2e-5,
+                                "axis={raw_axis}, Scale={ss:?}, B={bs:?}, lane={flat}: {} vs {expected}",
+                                actual[flat]
+                            );
+                        }
+                    }
+                    cells += 1;
+                }
+            }
+        }
+        assert_eq!(cells, 486);
+    }
+
+    #[test]
+    fn equal_parameter_and_normalized_counts_do_not_imply_row_local_coefficients() {
+        let x = Owned::f32(&[2, 2], &[-1., 1., -1., 1.]);
+        let group = Owned::f32(&[2, 1], &[10., 20.]);
+        let unit = Owned::f32(&[2], &[1., 1.]);
+        let zero = Owned::f32(&[], &[0.]);
+        let mut y = Owned::zeros_f32(&[2, 2]);
+        let kernel = LayerNormKernel {
+            axis: -1,
+            epsilon: 0.,
+            kind: LayerNormKind::Standard,
+        };
+        kernel
+            .execute_prepared(&[x.view(), group.view(), zero.view()], &mut [y.view_mut()])
+            .unwrap();
+        assert_eq!(y.to_f32(), [-10., 10., -20., 20.]);
+        kernel
+            .execute_prepared(&[x.view(), unit.view(), group.view()], &mut [y.view_mut()])
+            .unwrap();
+        assert_eq!(y.to_f32(), [9., 11., 19., 21.]);
+    }
+
+    #[test]
+    fn affine_shape_refusals_keep_empty_guards_and_skip_contract() {
+        let x = Owned::f32(&[2, 4], &[1.; 8]);
+        let scale = Owned::f32(&[4], &[1.; 4]);
+        let mut y = Owned::f32(&[2, 4], &[-123.; 8]);
+        for shape in [&[2usize, 2][..], &[4, 1][..], &[1, 1, 4][..]] {
+            let parameter = Owned::f32(shape, &vec![1.; shape.iter().product()]);
+            for slot in [1, 2] {
+                let inputs = if slot == 1 {
+                    [x.view(), parameter.view(), scale.view()]
+                } else {
+                    [x.view(), scale.view(), parameter.view()]
+                };
+                let error = standard()
+                    .execute_prepared(&inputs, &mut [y.view_mut()])
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains(&format!("affine input {slot}"))
+                        && error.contains("cannot broadcast"),
+                    "{error}"
+                );
+                assert_eq!(y.to_f32(), [-123.; 8]);
+            }
+        }
+        let empty = TensorMetadata::new(DataType::Float32, &[0, 4], true);
+        let incompatible = TensorMetadata::new(DataType::Float32, &[2, 1], true);
+        assert!(
+            standard()
+                .workspace_requirement(&[empty, incompatible], &[])
+                .unwrap_err()
+                .to_string()
+                .contains("cannot broadcast")
+        );
+        let huge_shape = [1, isize::MAX as usize / 4 + 1];
+        let huge = TensorMetadata::new(DataType::Float32, &huge_shape, true);
+        let scalar = TensorMetadata::new(DataType::Float32, &[], true);
+        assert!(
+            standard()
+                .workspace_requirement(&[huge, scalar], &[])
+                .unwrap_err()
+                .to_string()
+                .contains("Y staging")
+        );
+        let scalar = Owned::f32(&[], &[1.]);
+        assert!(
+            LayerNormKernel::skip(1e-5)
+                .execute_prepared(&[x.view(), x.view(), scalar.view()], &mut [y.view_mut()])
+                .unwrap_err()
+                .to_string()
+                .contains("expected 4")
+        );
+    }
+
+    fn affine_owned(dtype: DataType, shape: &[usize], data: &[f32]) -> Owned {
+        match dtype {
+            DataType::Float16 => Owned::f16(shape, data),
+            DataType::BFloat16 => Owned::bf16(shape, data),
+            DataType::Float32 => Owned::f32(shape, data),
+            DataType::Float64 => Owned::f64(
+                shape,
+                &data.iter().map(|&x| f64::from(x)).collect::<Vec<_>>(),
+            ),
+            _ => unreachable!(),
+        }
+    }
+    fn affine_values(value: &Owned) -> Vec<f32> {
+        match value.dtype {
+            DataType::Float16 => value.to_f16_as_f32(),
+            DataType::BFloat16 => value.to_bf16_as_f32(),
+            DataType::Float32 => value.to_f32(),
+            DataType::Float64 => value.to_f64().into_iter().map(|x| x as f32).collect(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn broadcast_affine_preserves_supported_storage_dtypes_and_strided_half_io() {
+        let values = (0..24).map(|i| i as f32 - 12.).collect::<Vec<_>>();
+        for dtype in [
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Float32,
+            DataType::Float64,
+        ] {
+            let x = affine_owned(dtype, &[2, 3, 4], &values);
+            let scale = affine_owned(dtype, &[2, 1, 1], &[0.5, 1.5]);
+            let bias = affine_owned(dtype, &[3, 1], &[-0.125, 0.25, -0.5]);
+            let mut y = Owned::zeros(dtype, &[2, 3, 4]);
+            let kernel = LayerNormKernel {
+                axis: 1,
+                epsilon: 1e-5,
+                kind: LayerNormKind::Standard,
+            };
+            kernel
+                .execute_prepared(&[x.view(), scale.view(), bias.view()], &mut [y.view_mut()])
+                .unwrap();
+            for (g, row) in values.chunks_exact(12).enumerate() {
+                let m = row.iter().map(|&x| f64::from(x)).sum::<f64>() / 12.;
+                let v = row.iter().map(|&x| (f64::from(x) - m).powi(2)).sum::<f64>() / 12.;
+                let r = 1. / (v + 1e-5).sqrt();
+                for (e, &x) in row.iter().enumerate() {
+                    let want = (f64::from(x) - m) * r * [0.5, 1.5][g] + [-0.125, 0.25, -0.5][e / 4];
+                    let got = affine_values(&y)[g * 12 + e];
+                    let tolerance = if dtype == DataType::BFloat16 {
+                        0.02
+                    } else if dtype == DataType::Float16 {
+                        0.002
+                    } else {
+                        1e-5
+                    };
+                    assert!(
+                        (f64::from(got) - want).abs() < tolerance,
+                        "{dtype:?} {got} vs {want}"
+                    );
+                }
+            }
+        }
+        let padded = values.iter().flat_map(|&x| [x, 123.]).collect::<Vec<_>>();
+        let x = Owned::f16(&[2, 3, 8], &padded).with_view(&[2, 3, 4], &[24, 8, 2]);
+        let scale = Owned::f16(&[6], &[1., 456., 2., 456., 0.5, 456.]).with_view(&[3, 1], &[2, 1]);
+        let bias = Owned::f16(&[], &[-0.25]);
+        let mut y = Owned::f16(&[2, 3, 8], &[-123.; 48]).with_view(&[2, 3, 4], &[24, 8, 2]);
+        let kernel = LayerNormKernel {
+            axis: 1,
+            epsilon: 1e-5,
+            kind: LayerNormKind::Standard,
+        };
+        kernel
+            .execute_prepared(&[x.view(), scale.view(), bias.view()], &mut [y.view_mut()])
+            .unwrap();
+        let physical = y.to_f16_as_f32();
+        for (g, row) in values.chunks_exact(12).enumerate() {
+            let m = row.iter().map(|&x| f64::from(x)).sum::<f64>() / 12.;
+            let v = row.iter().map(|&x| (f64::from(x) - m).powi(2)).sum::<f64>() / 12.;
+            let r = 1. / (v + 1e-5).sqrt();
+            for (e, &x) in row.iter().enumerate() {
+                let want = (f64::from(x) - m) * r * [1., 2., 0.5][e / 4] - 0.25;
+                assert!((f64::from(physical[(g * 12 + e) * 2]) - want).abs() < 0.002);
+                assert_eq!(physical[(g * 12 + e) * 2 + 1], -123.);
+            }
+        }
+    }
+
+    #[test]
+    fn broadcast_coefficients_can_alias_output_without_early_overwrite() {
+        use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
+        use onnx_runtime_ir::DeviceId;
+        let values = (0..24).map(|i| i as f32 - 12.).collect::<Vec<_>>();
+        let x = Owned::f32(&[2, 3, 4], &values);
+        let scale = Owned::f32(&[2, 1, 1], &[0.5, 1.5]);
+        let bias = Owned::f32(&[3, 1], &[-0.125, 0.25, -0.5]);
+        let mut y = Owned::zeros_f32(&[2, 3, 4]);
+        let kernel = LayerNormKernel {
+            axis: 1,
+            epsilon: 1e-5,
+            kind: LayerNormKind::Standard,
+        };
+        kernel
+            .execute_prepared(&[x.view(), scale.view(), bias.view()], &mut [y.view_mut()])
+            .unwrap();
+        let expected = y.to_f32();
+        for slot in 0..3 {
+            let mut shared = values.clone();
+            let source = if slot == 0 {
+                &values[..]
+            } else if slot == 1 {
+                &[0.5, 1.5][..]
+            } else {
+                &[-0.125, 0.25, -0.5][..]
+            };
+            shared[..source.len()].copy_from_slice(source);
+            let ptr = shared.as_mut_ptr();
+            let mut inputs = [x.view(), scale.view(), bias.view()];
+            let (shape, strides): (&[usize], &[i64]) = match slot {
+                0 => (&[2, 3, 4], &[12, 4, 1]),
+                1 => (&[2, 1, 1], &[1, 1, 1]),
+                _ => (&[3, 1], &[1, 1]),
+            };
+            inputs[slot] = TensorView::new(
+                DevicePtr(ptr.cast()),
+                DataType::Float32,
+                shape,
+                strides,
+                DeviceId::cpu(),
+            );
+            let out = TensorMut::new(
+                DevicePtrMut(ptr.cast()),
+                DataType::Float32,
+                &[2, 3, 4],
+                &[12, 4, 1],
+                DeviceId::cpu(),
+            );
+            kernel.execute_prepared(&inputs, &mut [out]).unwrap();
+            assert_eq!(shared, expected);
+        }
     }
 }

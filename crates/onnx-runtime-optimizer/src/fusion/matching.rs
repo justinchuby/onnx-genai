@@ -81,7 +81,11 @@ fn named_nodes(matched: &Match<'_>, names: &[&str]) -> Result<Vec<NodeId>> {
 }
 
 impl FusionPattern {
-    pub(super) fn prepare_matches(&self, graph: &Graph) -> Result<BTreeMap<NodeId, PatternMatch>> {
+    pub(super) fn prepare_matches(
+        &self,
+        graph: &Graph,
+        ctx: &PassContext,
+    ) -> Result<BTreeMap<NodeId, PatternMatch>> {
         let session = MatchSession::new(graph)?;
         let mut scaled_outputs = HashSet::new();
         let mut transposes = HashMap::new();
@@ -95,8 +99,13 @@ impl FusionPattern {
             )? {
                 let scores = capture_value(&matched, "scores")?;
                 let scaled = capture_value(&matched, "scaled")?;
-                if score_multiplier(graph, scores, graph.node(capture_node(&matched, "scaled")?))
-                    .is_some()
+                if score_multiplier(
+                    graph,
+                    scores,
+                    graph.node(capture_node(&matched, "scaled")?),
+                    ctx,
+                )
+                .is_some()
                 {
                     scaled_outputs.insert(scaled);
                 }
@@ -218,7 +227,7 @@ impl FusionPattern {
                 external_inputs,
                 output,
             };
-            if self.match_is_fusable(graph, &candidate) {
+            if self.match_is_fusable(graph, &candidate, ctx) {
                 prepared.insert(anchor, candidate);
             }
         }
@@ -226,14 +235,19 @@ impl FusionPattern {
     }
 }
 
-pub(super) fn score_multiplier(graph: &Graph, scores: ValueId, node: &Node) -> Option<f32> {
+pub(super) fn score_multiplier(
+    graph: &Graph,
+    scores: ValueId,
+    node: &Node,
+    ctx: &PassContext,
+) -> Option<f32> {
     let a = node.inputs[0]?;
     let b = node.inputs[1]?;
     if node.op_type == "Div" {
         if a != scores {
             return None;
         }
-        let divisor = read_scalar_const_f32(graph, b, scores)?;
+        let divisor = read_scalar_const_f32(graph, b, scores, ctx)?;
         (divisor != 0.0).then_some(1.0 / divisor)
     } else {
         let constant = if a == scores {
@@ -243,7 +257,7 @@ pub(super) fn score_multiplier(graph: &Graph, scores: ValueId, node: &Node) -> O
         } else {
             return None;
         };
-        read_scalar_const_f32(graph, constant, scores)
+        read_scalar_const_f32(graph, constant, scores, ctx)
     }
 }
 
@@ -261,16 +275,24 @@ pub(super) fn transpose_eligible(graph: &Graph, node: &Node, score: NodeId) -> b
         })
 }
 
-pub(super) fn scaled_is(graph: &Graph, node: &Node, x: ValueId, divisor: f32, factor: f32) -> bool {
+pub(super) fn scaled_is(
+    graph: &Graph,
+    node: &Node,
+    x: ValueId,
+    divisor: f32,
+    factor: f32,
+    ctx: &PassContext,
+) -> bool {
     match node.inputs.as_slice() {
         [Some(a), Some(b)] if node.op_type == "Div" && *a == x => {
-            read_scalar_const_f32(graph, *b, x).is_some_and(|value| approx(value, divisor))
+            read_scalar_const_f32(graph, *b, x, ctx).is_some_and(|value| approx(value, divisor))
         }
         [Some(a), Some(b)] if node.op_type == "Mul" => {
             (*a == x
-                && read_scalar_const_f32(graph, *b, x).is_some_and(|value| approx(value, factor)))
+                && read_scalar_const_f32(graph, *b, x, ctx)
+                    .is_some_and(|value| approx(value, factor)))
                 || (*b == x
-                    && read_scalar_const_f32(graph, *a, x)
+                    && read_scalar_const_f32(graph, *a, x, ctx)
                         .is_some_and(|value| approx(value, factor)))
         }
         _ => false,
