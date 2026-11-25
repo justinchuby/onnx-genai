@@ -3367,7 +3367,7 @@ fn stop_boundary_buffer_holds_partial_stop_sequence() {
     assert_eq!(buffer.push("k"), "");
     assert_eq!(buffer.push("2"), "");
     assert_eq!(buffer.push("1"), "tok21");
-    assert_eq!(buffer.flush(), "");
+    assert_eq!(buffer.finish("tok21").unwrap(), "");
 }
 
 #[test]
@@ -3375,7 +3375,7 @@ fn stop_boundary_buffer_suppresses_matched_stop_sequence() {
     let mut buffer = StopBoundaryBuffer::new(vec!["tok20".to_string()]);
     assert_eq!(buffer.push("hello tok"), "hello ");
     assert_eq!(buffer.push("20"), "");
-    assert_eq!(buffer.flush(), "");
+    assert_eq!(buffer.finish("hello tok20").unwrap(), "");
 }
 
 #[tokio::test]
@@ -8369,6 +8369,190 @@ mod native_compat {
             .await
             .unwrap()
     }
+    #[tokio::test]
+    async fn indentation_stops_native_buffered_and_streamed_real_generation() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        copy_tree(&source, scratch.path());
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+        vocab.remove("tok22");
+        vocab.insert("head\n bad".into(), json!(22));
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let router = app(AppState::load(scratch.path(), Some("indent".into())).unwrap());
+        for stream in [false, true] {
+            for budget in [1, 8] {
+                let response=request(router.clone(),"/completion",json!({"prompt":[2,4,3],"n_predict":budget,
+                    "n_indent":2,"temperature":0,"ignore_eos":true,"logit_bias":{"22":100},"stream":stream})).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let expected = if budget == 1 { "head\n bad" } else { "head\n " };
+                let result = if stream {
+                    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                    let events = sse_json_events(&bytes);
+                    assert!(
+                        !std::str::from_utf8(&bytes)
+                            .unwrap()
+                            .contains("event: error"),
+                        "{}",
+                        String::from_utf8_lossy(&bytes)
+                    );
+                    let content = events
+                        .iter()
+                        .filter_map(|event| event["content"].as_str())
+                        .collect::<String>();
+                    assert_eq!(content, expected);
+                    events.last().unwrap().clone()
+                } else {
+                    let value = json_body(response).await;
+                    assert_eq!(value["content"], expected);
+                    value
+                };
+                assert_eq!(result["tokens_predicted"], if budget == 1 { 1 } else { 3 });
+                assert_eq!(result["stop_type"], "limit");
+                assert_eq!(result["generation_settings"]["n_indent"], 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn indentation_openai_streams_preserve_held_text_on_early_word_stops() {
+        let scratch = tempfile::tempdir().unwrap();
+        copy_tree(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm"),
+            scratch.path(),
+        );
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+        vocab.remove("tok22");
+        vocab.insert("title\n bad".into(), json!(22));
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        std::fs::write(
+            scratch.path().join("tokenizer_config.json"),
+            r#"{"chat_template":"."}"#,
+        )
+        .unwrap();
+        let router = app(AppState::load(scratch.path(), Some("indent".into())).unwrap());
+        for chat in [false, true] {
+            for stream in [false, true] {
+                for (budget, word, expected) in [
+                    (1, false, "title\n bad"),
+                    (8, false, "title\n "),
+                    (8, true, "title\n b"),
+                ] {
+                    let mut body = json!({"max_tokens":budget,"n_indent":2,"temperature":0,"ignore_eos":true,"logit_bias":{"22":100},"stream":stream});
+                    let path = if chat {
+                        body["messages"] = json!([{"role":"user","content":"hello"}]);
+                        "/v1/chat/completions"
+                    } else {
+                        body["prompt"] = json!([2, 4, 3]);
+                        "/v1/completions"
+                    };
+                    if word {
+                        body["stop"] = json!(["ad"]);
+                    }
+                    let response = request(router.clone(), path, body).await;
+                    if response.status() != StatusCode::OK {
+                        panic!(
+                            "{path} chat={chat} stream={stream}: {}",
+                            json_body(response).await
+                        );
+                    }
+                    let content = if stream {
+                        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                        assert!(
+                            !std::str::from_utf8(&bytes)
+                                .unwrap()
+                                .contains("event: error"),
+                            "{}",
+                            String::from_utf8_lossy(&bytes)
+                        );
+                        sse_json_events(&bytes)
+                            .iter()
+                            .filter_map(|event| {
+                                if chat {
+                                    event["choices"][0]["delta"]["content"].as_str()
+                                } else {
+                                    event["choices"][0]["text"].as_str()
+                                }
+                            })
+                            .collect::<String>()
+                    } else {
+                        let value = json_body(response).await;
+                        if chat {
+                            value["choices"][0]["message"]["content"]
+                                .as_str()
+                                .unwrap()
+                                .to_owned()
+                        } else {
+                            value["choices"][0]["text"].as_str().unwrap().to_owned()
+                        }
+                    };
+                    assert_eq!(
+                        content, expected,
+                        "chat={chat} stream={stream} word={word} budget={budget}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn indentation_wire_bounds_are_shared_across_generation_protocols() {
+        let router = app(tiny_state());
+        for (path, base) in [
+            ("/completion", json!({"prompt":"hello","n_predict":1})),
+            ("/v1/completions", json!({"prompt":"hello","max_tokens":1})),
+            (
+                "/v1/chat/completions",
+                json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":1}),
+            ),
+            (
+                "/v1/responses",
+                json!({"input":"hello","max_output_tokens":1}),
+            ),
+            (
+                "/v1/messages",
+                json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":1}),
+            ),
+        ] {
+            for (value, valid) in [
+                (json!(null), true),
+                (json!(0), true),
+                (json!(2.9), true),
+                (json!(-0.5), true),
+                (json!(i32::MAX), true),
+                (json!(-1), false),
+                (json!(2147483648_u64), false),
+                (json!(true), false),
+                (json!("2"), false),
+            ] {
+                let mut body = base.clone();
+                body["n_indent"] = value;
+                body["stream"] = json!(true);
+                let response = request(router.clone(), path, body).await;
+                assert_eq!(
+                    response.status(),
+                    if valid {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    },
+                    "{path}"
+                );
+                let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                if !valid {
+                    assert!(
+                        std::str::from_utf8(&bytes).unwrap().contains("n_indent"),
+                        "{path}"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn prediction_time_limit_wire_domain_is_shared_across_generation_protocols() {
         let router = app(tiny_state());

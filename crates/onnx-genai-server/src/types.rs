@@ -188,8 +188,26 @@ pub(crate) fn parse_llama_integer(
     Ok(Some(number))
 }
 
+fn deserialize_minimum_indent<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<usize, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let minimum = parse_llama_integer(&value, "n_indent", i64::from(i32::MAX))
+        .map_err(|_| serde::de::Error::custom("n_indent must be numeric and truncate to an integer from 0 through 2147483647; use 0 or null to disable indentation stopping"))?
+        .unwrap_or(0);
+    usize::try_from(minimum).map_err(|_| serde::de::Error::custom(
+        "n_indent must truncate to an integer from 0 through 2147483647; use 0 or null to disable indentation stopping"
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
+    #[serde(
+        rename = "n_indent",
+        default,
+        deserialize_with = "deserialize_minimum_indent"
+    )]
+    pub minimum_indent: usize,
     #[serde(
         rename = "t_max_predict_ms",
         default,
