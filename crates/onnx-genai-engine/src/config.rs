@@ -2239,6 +2239,8 @@ pub struct GenerationBudgetCap {
 /// Final generation output.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerateResult {
+    /// Measured decoder work, absent when the executor has no timing contract.
+    pub timings: Option<GenerationTimings>,
     /// Detokenized generated text.
     pub text: String,
     /// Resolved output policy used when reconstructing per-token publication.
@@ -2286,9 +2288,26 @@ pub struct TokenLogprob {
     pub top: Vec<(TokenId, f32)>,
 }
 
+/// Cumulative decoder measurements at a committed token boundary.
+///
+/// Prompt time ends at the first forward's logits. Generation time counts
+/// token selection and subsequent forward/policy work; callback delivery and
+/// scheduler suspension are excluded. The first generated token consumes no
+/// additional generation forward, matching llama.cpp's rate denominator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationTimings {
+    pub prompt_tokens: usize,
+    pub cached_prompt_tokens: usize,
+    pub generated_tokens: usize,
+    pub prompt_elapsed: std::time::Duration,
+    pub generation_elapsed: std::time::Duration,
+}
+
 /// Per-token streaming event shape for future callback/iterator APIs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerateToken {
+    /// Cumulative measurements taken before external publication of this token.
+    pub timings: Option<GenerationTimings>,
     /// Probability for this committed token, when requested.
     pub logprob: Option<TokenLogprob>,
     pub token_id: TokenId,

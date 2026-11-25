@@ -222,6 +222,7 @@ impl DecoderTurnParticipant {
     fn publish_committed_tokens(
         tokenizer: &onnx_genai_ort::Tokenizer,
         result: &GenerateResult,
+        token_timings: &[(TokenId, Option<crate::config::GenerationTimings>)],
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<()> {
         let Some(callback) = callback else {
@@ -234,6 +235,7 @@ impl DecoderTurnParticipant {
         )?;
         for (index, (token_id, text)) in result.token_ids.iter().copied().zip(pieces).enumerate() {
             callback(crate::config::GenerateToken {
+                timings: token_timings.get(index).and_then(|(_, sample)| *sample),
                 logprob: result
                     .logprobs
                     .as_ref()
@@ -2548,6 +2550,15 @@ impl Engine {
         };
         self.last_speculative_stats = SpeculativeStats::default();
 
+        let record_timings = callback.is_some();
+        let mut token_timings = Vec::new();
+        let mut record_token = |token: crate::config::GenerateToken| -> anyhow::Result<()> {
+            token_timings
+                .try_reserve(1)
+                .context("failed to reserve a committed token timing entry")?;
+            token_timings.push((token.token_id, token.timings));
+            Ok(())
+        };
         let result = (|| -> anyhow::Result<GenerateResult> {
             if let Some(control) = &control {
                 control.check(crate::pipeline::GenerationBoundary::BeforeWorkflowNode)?;
@@ -2626,10 +2637,15 @@ impl Engine {
                     max_context,
                 },
                 tool_observer.as_mut(),
-                None,
+                if record_timings { Some(&mut record_token) } else { None },
             )
         })()
         .and_then(|mut result| {
+            if record_timings && result.timings.is_some() {
+                anyhow::ensure!(token_timings.len() == result.token_ids.len()
+                    && token_timings.iter().zip(&result.token_ids).all(|((id,_),expected)| id == expected),
+                    "decoder timing journal does not match the generated token stream; refusing to commit divergent measurements");
+            }
             if !exceeded_context_limit(state.tokens.len(), max_context) {
                 self.ensure_session_kv_current(session_id, &mut state)?;
             }
@@ -2692,6 +2708,7 @@ impl Engine {
             DecoderTurnParticipant::publish_committed_tokens(
                 self.require_tokenizer()?,
                 &result,
+                &token_timings,
                 callback,
             )?;
             Ok(result)
@@ -3761,6 +3778,7 @@ impl Engine {
             request.priority,
         );
         Ok(ActiveGenerate {
+            clock: loop_state.clock,
             cursor,
             turn,
             session_id: request.session_id,
@@ -3786,6 +3804,7 @@ impl Engine {
         active: &mut ActiveGenerate,
     ) -> anyhow::Result<Option<GenerateResult>> {
         let mut loop_state = DecodeLoopState {
+            clock: active.clock.clone(),
             generated_tokens: std::mem::take(&mut active.generated_tokens),
             generated_text: std::mem::take(&mut active.generated_text),
             text_decoder: std::mem::take(&mut active.text_decoder),
@@ -3875,6 +3894,7 @@ impl Engine {
                 None => None,
             }
         };
+        active.clock = loop_state.clock;
         active.generated_tokens = loop_state.generated_tokens;
         active.generated_text = loop_state.generated_text;
         active.text_decoder = loop_state.text_decoder;
@@ -3882,6 +3902,7 @@ impl Engine {
         active.step = loop_state.step;
         active.rng = loop_state.rng;
         if let Some(mut result) = step_result {
+            result.timings = active.clock.snapshot();
             result.budget_cap = active.budget_cap;
             return Ok(Some(result));
         }
@@ -3895,6 +3916,7 @@ impl Engine {
                     &active.options.effective_preserved_tokens(),
                 )
                 .map(|mut result| {
+                    result.timings = active.clock.snapshot();
                     result.budget_cap = active.budget_cap;
                     Some(result)
                 });
@@ -4155,6 +4177,7 @@ impl Engine {
         preserved_tokens: &std::collections::BTreeSet<TokenId>,
     ) -> anyhow::Result<GenerateResult> {
         Ok(GenerateResult {
+            timings: None,
             retained_cache_tokens: 0,
             text: crate::tokenization::decode_output(
                 self.require_tokenizer()?,
@@ -5171,6 +5194,51 @@ mod tests {
 
     #[cfg(feature = "native-backend")]
     #[test]
+    fn generation_timings_survive_commit_only_native_and_ort_publication() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for backend in [EngineDecodeBackend::Native, EngineDecodeBackend::Ort] {
+            let mut engine = Engine::from_dir(
+                &fixture,
+                EngineConfig {
+                    decode_backend: backend,
+                    native_device: Some(crate::NativeDecodeDevice::Cpu),
+                    ..Default::default()
+                },
+            )?;
+            for cold in [true, false] {
+                let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
+                request.options.max_new_tokens = 3;
+                request.options.greedy = true;
+                request.options.stop_on_eos = false;
+                request.options.cold_start = cold;
+                let mut snapshots = Vec::new();
+                let mut callback = |token: crate::config::GenerateToken| {
+                    snapshots.push(token.timings);
+                    Ok(())
+                };
+                let result = engine.generate_with_callback(request, Some(&mut callback))?;
+                assert_eq!(snapshots.len(), 3);
+                assert_eq!(snapshots.last().copied().flatten(), result.timings);
+                for (index, sample) in snapshots.into_iter().enumerate() {
+                    let sample =
+                        sample.context("ordinary decoder must preserve measured token timing")?;
+                    assert_eq!(sample.generated_tokens, index + 1);
+                    assert_eq!(sample.prompt_tokens + sample.cached_prompt_tokens, 3);
+                    assert!(!sample.prompt_elapsed.is_zero());
+                    assert!(!sample.generation_elapsed.is_zero());
+                    if cold {
+                        assert_eq!(sample.cached_prompt_tokens, 0);
+                    }
+                }
+                let last = result.timings.unwrap();
+                assert_eq!(last.cached_prompt_tokens, result.prefix_cache_hit_len);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
     fn generation_cache_reports_materialized_retention_after_cold_and_warm_turns()
     -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
@@ -5611,6 +5679,13 @@ mod tests {
         }])?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].result.prefix_cache_hit_len, 0);
+        let timing = results[0]
+            .result
+            .timings
+            .context("prioritized decoder timing")?;
+        assert_eq!(timing.prompt_tokens, 3);
+        assert_eq!(timing.generated_tokens, 2);
+        assert!(!timing.prompt_elapsed.is_zero());
         let state = &engine.sessions[&session_id];
         assert!(state.kv_token_count >= 3);
         assert_eq!(

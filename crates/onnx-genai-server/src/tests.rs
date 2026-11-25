@@ -8678,6 +8678,63 @@ mod native_compat {
     }
 
     #[tokio::test]
+    async fn decoder_timings_reach_native_and_chat_buffered_and_streamed_responses() {
+        let router = app(tiny_state());
+        for path in ["/completion", "/v1/completions", "/v1/chat/completions"] {
+            for streaming in [false, true] {
+                for per_token in [false, true] {
+                    let mut body = json!({"max_tokens":2,"temperature":0,"ignore_eos":true,
+                        "stream":streaming,"timings_per_token":per_token});
+                    if path != "/v1/chat/completions" {
+                        body["prompt"] = json!([2, 4, 3]);
+                    } else {
+                        body["messages"] = json!([{"role":"user","content":"hello"}]);
+                    }
+                    let response = request(router.clone(), path, body).await;
+                    let status = response.status();
+                    let values = if streaming {
+                        sse_json_events(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    } else {
+                        vec![json_body(response).await]
+                    };
+                    assert_eq!(status, StatusCode::OK, "{path}: {values:?}");
+                    let measured = values
+                        .iter()
+                        .filter_map(|value| value.get("timings"))
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        measured.len(),
+                        if streaming && per_token { 3 } else { 1 },
+                        "{path}: {values:?}"
+                    );
+                    let final_sample = *measured.last().unwrap();
+                    assert_eq!(final_sample["predicted_n"], 2);
+                    assert!(final_sample["prompt_ms"].as_f64().unwrap() > 0.0);
+                    assert!(final_sample["predicted_ms"].as_f64().unwrap() > 0.0);
+                    let mut previous = 0.0;
+                    for sample in &measured {
+                        assert!(sample["predicted_ms"].as_f64().unwrap() >= previous);
+                        previous = sample["predicted_ms"].as_f64().unwrap();
+                        assert_eq!(sample["prompt_ms"], final_sample["prompt_ms"]);
+                        for field in [
+                            "prompt_per_token_ms",
+                            "prompt_per_second",
+                            "predicted_per_token_ms",
+                            "predicted_per_second",
+                        ] {
+                            assert!(sample[field].as_f64().unwrap().is_finite(), "{sample}");
+                        }
+                    }
+                    if streaming && per_token {
+                        assert_eq!(measured[0]["predicted_n"], 1);
+                        assert_eq!(measured[0]["predicted_per_second"], 0.0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn native_generation_reports_retained_cache_in_buffered_and_streamed_results() {
         let router = app(tiny_state());
         for streaming in [false, true] {

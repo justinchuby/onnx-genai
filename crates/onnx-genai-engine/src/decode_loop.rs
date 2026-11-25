@@ -14,7 +14,66 @@ use crate::processors::{
 use crate::sampling::{Sampler, SamplingRng};
 use onnx_genai_ort::Tokenizer;
 
+/// Carries only active decoder work across scheduler turns. Every step closes
+/// before invoking the caller's callback, so delayed publication cannot inflate
+/// model throughput measurements.
+#[derive(Clone, Default)]
+pub(crate) struct GenerationClock {
+    step_started: Option<std::time::Instant>,
+    sample: Option<crate::config::GenerationTimings>,
+    prompt_finished: bool,
+}
+impl GenerationClock {
+    fn begin_forward(&mut self, prompt_tokens: usize, cached_prompt_tokens: usize) {
+        self.begin_forward_at(
+            std::time::Instant::now(),
+            prompt_tokens,
+            cached_prompt_tokens,
+        );
+    }
+    fn begin_forward_at(
+        &mut self,
+        now: std::time::Instant,
+        prompt_tokens: usize,
+        cached_prompt_tokens: usize,
+    ) {
+        self.step_started = Some(now);
+        self.sample.get_or_insert(crate::config::GenerationTimings {
+            prompt_tokens: prompt_tokens.saturating_sub(cached_prompt_tokens),
+            cached_prompt_tokens,
+            generated_tokens: 0,
+            prompt_elapsed: std::time::Duration::ZERO,
+            generation_elapsed: std::time::Duration::ZERO,
+        });
+    }
+    fn finish_forward(&mut self) {
+        self.finish_forward_at(std::time::Instant::now());
+    }
+    fn finish_forward_at(&mut self, now: std::time::Instant) {
+        if !self.prompt_finished {
+            if let (Some(start), Some(sample)) = (self.step_started, self.sample.as_mut()) {
+                sample.prompt_elapsed = now.duration_since(start);
+                self.step_started = Some(now);
+            }
+            self.prompt_finished = true;
+        }
+    }
+    fn token_selected(&mut self, generated_tokens: usize) {
+        self.token_selected_at(std::time::Instant::now(), generated_tokens);
+    }
+    fn token_selected_at(&mut self, now: std::time::Instant, generated_tokens: usize) {
+        if let (Some(start), Some(sample)) = (self.step_started.take(), self.sample.as_mut()) {
+            sample.generation_elapsed += now.duration_since(start);
+            sample.generated_tokens = generated_tokens;
+        }
+    }
+    pub(crate) fn snapshot(&self) -> Option<crate::config::GenerationTimings> {
+        self.sample
+    }
+}
+
 pub(crate) struct DecodeLoopState {
+    pub(crate) clock: GenerationClock,
     pub(crate) generated_tokens: Vec<TokenId>,
     pub(crate) generated_text: String,
     pub(crate) text_decoder: crate::tokenization::TokenTextDecoder,
@@ -45,6 +104,7 @@ impl DecodeLoopState {
         top_logprobs: Option<usize>,
     ) -> Self {
         Self {
+            clock: GenerationClock::default(),
             generated_tokens: Vec::new(),
             generated_text: String::new(),
             text_decoder: Default::default(),
@@ -118,6 +178,23 @@ pub(crate) struct ForwardOutcome {
 
 /// Run one decoder forward pass, taking the device fast path when it applies.
 pub(crate) fn forward_step<B: DecodeLoopBackend + ?Sized>(
+    backend: &mut B,
+    state: &mut DecodeLoopState,
+    options: &GenerateOptions,
+    chain: &ProcessorChain,
+) -> anyhow::Result<ForwardOutcome> {
+    state.clock.begin_forward(
+        backend
+            .context_len()
+            .saturating_sub(state.generated_tokens.len()),
+        state.prefix_cache_hit_len,
+    );
+    let outcome = forward_step_inner(backend, state, options, chain)?;
+    state.clock.finish_forward();
+    Ok(outcome)
+}
+
+fn forward_step_inner<B: DecodeLoopBackend + ?Sized>(
     backend: &mut B,
     state: &mut DecodeLoopState,
     options: &GenerateOptions,
@@ -312,8 +389,10 @@ pub(crate) fn commit_selected_token(
             finish_reason = finish_reason_after_token(token_id, options, chain, &context);
         }
     }
+    state.clock.token_selected(state.generated_tokens.len());
     if let Some(callback) = callback {
         callback(GenerateToken {
+            timings: state.clock.snapshot(),
             logprob: state
                 .logprobs
                 .as_ref()
@@ -337,6 +416,7 @@ pub(crate) fn finish_result(
     preserved_tokens: &std::collections::BTreeSet<TokenId>,
 ) -> anyhow::Result<GenerateResult> {
     Ok(GenerateResult {
+        timings: None,
         retained_cache_tokens: 0,
         text: crate::tokenization::decode_output(tokenizer, generated_tokens, preserved_tokens)?,
         preserved_tokens: preserved_tokens.clone(),
@@ -1191,5 +1271,40 @@ mod tests {
         assert_eq!(backend.committed, tokens);
         assert_eq!(observer.committed_calls().len(), 1);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod generation_clock_tests {
+    use super::GenerationClock;
+    use std::time::{Duration, Instant};
+    #[test]
+    fn generation_clock_excludes_delivery_and_scheduler_gaps_from_decode_work() {
+        let mut clock = GenerationClock::default();
+        assert_eq!(clock.snapshot(), None);
+        let start = Instant::now();
+        clock.begin_forward_at(start, 7, 4);
+        clock.finish_forward_at(start + Duration::from_millis(10));
+        clock.token_selected_at(start + Duration::from_millis(12), 1);
+        let first = clock.snapshot().unwrap();
+        assert_eq!(first.prompt_tokens, 3);
+        assert_eq!(first.cached_prompt_tokens, 4);
+        assert_eq!(first.generated_tokens, 1);
+        assert_eq!(first.prompt_elapsed, Duration::from_millis(10));
+        assert_eq!(first.generation_elapsed, Duration::from_millis(2));
+        // Clone exactly as the prioritized drive suspends/restores its clock.
+        let mut resumed = clock.clone();
+        resumed.begin_forward_at(start + Duration::from_millis(100), 7, 4);
+        resumed.finish_forward_at(start + Duration::from_millis(103));
+        resumed.token_selected_at(start + Duration::from_millis(105), 2);
+        let second = resumed.snapshot().unwrap();
+        assert_eq!(second.prompt_elapsed, first.prompt_elapsed);
+        assert_eq!(second.generation_elapsed, Duration::from_millis(7));
+        assert_eq!(second.generated_tokens, 2);
+        assert_eq!(
+            clock.snapshot(),
+            Some(first),
+            "an earlier published snapshot is immutable"
+        );
     }
 }
