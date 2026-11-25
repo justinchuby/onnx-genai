@@ -650,7 +650,7 @@ fn final_value(
     };
     json!({"content":text_before_stop(&result.text, stops),"tokens":if return_tokens && !streaming { result.token_ids.clone() } else {vec![]},
         "stop":true,"index":index,"model":model,"tokens_predicted":result.token_ids.len(),
-        "tokens_evaluated":prompt_tokens,"tokens_cached":result.prefix_cache_hit_len,
+        "tokens_evaluated":prompt_tokens,"tokens_cached":result.retained_cache_tokens,
         "stop_type":stop_type,"truncated":matches!(result.finish_reason, FinishReason::Length)})
 }
 

@@ -2253,6 +2253,9 @@ pub struct GenerateResult {
     pub tool_calls: Vec<onnx_genai_metadata::ToolCall>,
     /// Number of prompt/context tokens whose KV state was reused from the prefix cache.
     pub prefix_cache_hit_len: usize,
+    /// Materialized token state retained after this transaction. Zero when the
+    /// executor exposes no retained token-cache contract; never input reuse.
+    pub retained_cache_tokens: usize,
     /// Per-generated-token log probabilities, or `None` when not requested.
     pub logprobs: Option<Vec<TokenLogprob>>,
     /// Present when scheduler admission capped `max_new_tokens` below the

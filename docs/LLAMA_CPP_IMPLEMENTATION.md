@@ -1956,3 +1956,16 @@ Prefill responses also distinguish input reuse from post-task retention:
 still retains evaluated cache. ORT reference results inspect governed snapshots
 and cached pages rather than claiming token-history-only retention. The same
 wire correction for general generation remains required work.
+
+
+### Ordinary generation retained-cache reporting
+
+`GenerateResult.retained_cache_tokens` records physical state retained at the
+completion boundary, separately from `prefix_cache_hit_len` (input reuse).
+Native final buffered/SSE responses publish the retained count as `tokens_cached`.
+Native stateless cold execution resets before evaluation and retains its newly
+evaluated state afterward. ORT ephemeral sessions report only shared snapshot
+or page payloads surviving session closure; named and prioritized results report
+their materialized session state. Generic workflows without an exposed token-cache
+contract report zero. Cached-prompt usage in OpenAI-shaped responses remains an
+input-reuse statistic.

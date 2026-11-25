@@ -943,6 +943,7 @@ pub(crate) fn run_declared_generation(
     }
 
     Ok(GenerateResult {
+        retained_cache_tokens: 0,
         text,
         preserved_tokens,
         token_ids,
