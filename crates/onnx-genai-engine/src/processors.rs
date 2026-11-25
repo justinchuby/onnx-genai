@@ -16,6 +16,21 @@ use anyhow::Context;
 use onnx_genai_ort::Tokenizer;
 use std::path::Path;
 
+/// Preserve one output-stop priority for ordinary and authored generation.
+pub(crate) fn append_output_observers(chain: &mut ProcessorChain, options: &GenerateOptions) {
+    if let Some(limit) = options.max_prediction_time.filter(|limit| !limit.is_zero()) {
+        chain.add(Box::new(crate::prediction_limit::PredictionTimeLimit::new(
+            limit,
+            options.stop_sequences.clone(),
+        )));
+    }
+    if !options.stop_sequences.is_empty() {
+        chain.add(Box::new(StopSequenceProcessor::new(
+            options.stop_sequences.clone(),
+        )));
+    }
+}
+
 /// Build mandatory safety processors and the effective ordered sampler list.
 /// An explicit greedy policy bypasses stochastic warpers; a temperature-zero
 /// stage instead creates its point mass at the requested position. Hard bias,
@@ -41,17 +56,7 @@ pub(crate) fn build_processor_chain(
             biases: options.logit_bias.clone(),
         }));
     }
-    if let Some(limit) = options.max_prediction_time.filter(|limit| !limit.is_zero()) {
-        chain.add(Box::new(crate::prediction_limit::PredictionTimeLimit::new(
-            limit,
-            options.stop_sequences.clone(),
-        )));
-    }
-    if !options.stop_sequences.is_empty() {
-        chain.add(Box::new(StopSequenceProcessor::new(
-            options.stop_sequences.clone(),
-        )));
-    }
+    append_output_observers(&mut chain, options);
 
     if let Some(constraint) = &options.constraint {
         let tokenizer = tokenizer.context("constrained decoding requires a tokenizer")?;
