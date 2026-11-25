@@ -279,13 +279,20 @@ same projection for buffered, SSE and logprob output. Capabilities are checked
 before generation/SSE admission. Supported combinations currently use literal
 boundaries or regex boundaries with a resolved byte DFA, plus
 ByteLevel/ByteFallback or canonical non-byte decoders. Byte decoder sequences
-also support token-local Replace/Strip before one byte stage, Fuse, and initial
-Strip after fusion. These capabilities follow decoder metadata and preserve
+also support token-local Replace/Strip before one byte stage, Fuse, and finite
+initial/trailing Strip after fusion. These capabilities follow decoder metadata and preserve
 generated-stream boundaries, including split Unicode and special-token policy. Pending Unicode bytes,
 regex priority, greedy/lazy continuations and EOF assertions share the publication
 parser's boundary rules. Regexes requiring unsupported DFA look assertions
-and other contextual byte-decoder stages (including trailing stripping) remain
-open compatibility work; errors identify the unsupported decoder path.
+and other unresolved contextual byte-decoder stages remain open compatibility
+work; errors identify the unsupported decoder path. Trailing stripping retains
+bounded UTF-8 suffixes and checks actual reachable endings before admitting a
+candidate; a withheld tail cannot hide a schema violation inside an incomplete
+value. Combined published/retained bytes share the request response budget, and
+composed Strip retention is capped at 4 MiB. Ambiguous suffix viability has an
+explicit 4096-state, bounded retained-state analysis budget and fails actionably
+when exceeded. Reasoning token-ID boundaries must be stable after their final
+token; markers delayed by trailing stripping are rejected before execution.
 Projected JSON accepts split Unicode escapes and surrogate pairs, including
 string constants, known property names, string patterns and scalar length limits.
 An unfinished escape must have a schema-valid scalar completion and never permits
@@ -632,7 +639,7 @@ repetitions above 2,000 are refused and larger upper bounds become unbounded.
 The model must declare a dense, resolved, token-local byte vocabulary. Actual
 raw pieces include special-token spellings; only explicitly declared ending IDs
 receive terminal semantics. Token names and angle brackets do not guess roles.
-Non-byte contextual decoders and stream-initial stripping currently return an
+Non-byte contextual decoders and stream-initial/trailing stripping currently return an
 actionable capability error before SSE.
 
 Both raw grammar forms conflict with JSON `response_format`, forced `tool_choice`, and
