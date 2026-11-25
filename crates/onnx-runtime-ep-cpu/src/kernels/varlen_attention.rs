@@ -43,6 +43,16 @@ pub(super) struct PackedAttentionSpec<'a> {
 }
 
 impl KernelFactory for VarlenAttentionFactory {
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        _opset: u64,
+        shapes: &[onnx_runtime_ir::Shape],
+        input_dtypes: &[DataType],
+    ) -> Option<String> {
+        unsupported_reason(node, shapes, input_dtypes).map(|reason| reason.into_owned())
+    }
+
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let softcap = node
             .attr("softcap")
