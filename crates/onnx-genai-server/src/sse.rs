@@ -122,25 +122,19 @@ impl StopBoundaryBuffer {
             return text.to_owned();
         }
         pending.push_str(text);
-        if let Some(stop_start) = self
-            .stop_sequences
-            .iter()
-            .filter_map(|sequence| pending.find(sequence))
-            .min()
-        {
-            let safe = pending[..stop_start].to_owned();
+        let boundary = onnx_genai_engine::logits::text_stop_boundary(
+            pending,
+            self.stop_sequences
+                .iter()
+                .enumerate()
+                .map(|(index, stop)| (index, stop.as_str())),
+        );
+        if boundary.matched_sequence.is_some() {
+            let safe = pending[..boundary.visible_bytes].to_owned();
             self.state = StopBoundaryState::Stopped;
             return safe;
         }
-        let mut keep = 0;
-        for sequence in &self.stop_sequences {
-            for (prefix_len, _) in sequence.char_indices().skip(1) {
-                if pending.ends_with(&sequence[..prefix_len]) {
-                    keep = keep.max(prefix_len);
-                }
-            }
-        }
-        let emit_len = pending.len().saturating_sub(keep);
+        let emit_len = boundary.visible_bytes;
         let safe = pending[..emit_len].to_owned();
         pending.drain(..emit_len);
         safe
@@ -288,12 +282,15 @@ pub(crate) fn buffered_workflow_publication(
 /// Render the same semantic record for an SSE data field. Delivery failure from
 /// the caller of this function cannot change the already committed envelope.
 pub(crate) fn text_before_stop<'a>(text: &'a str, stops: &[String]) -> &'a str {
-    let cutoff = stops
-        .iter()
-        .filter(|stop| !stop.is_empty())
-        .filter_map(|stop| text.find(stop))
-        .min()
-        .unwrap_or(text.len());
+    let cutoff = onnx_genai_engine::logits::first_text_stop(
+        text,
+        stops
+            .iter()
+            .enumerate()
+            .map(|(index, stop)| (index, stop.as_str())),
+        0,
+    )
+    .map_or(text.len(), |(position, _)| position);
     &text[..cutoff]
 }
 
