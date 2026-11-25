@@ -176,7 +176,7 @@ pub unsafe extern "C" fn CreateEpFactories(
                 let factory = *out_factories_raw;
                 onnx_runtime_ep_plugin::factory::exclude_operators(
                     factory,
-                    onnx_runtime_ep_plugin::ep::STANDALONE_OPERATOR_EXCLUSIONS,
+                    onnx_runtime_ep_plugin::ep::STANDALONE_RNN_EXCLUSION,
                 );
                 onnx_runtime_ep_plugin::factory::register_ordered_workspace_execution(factory, None)
             }
