@@ -2494,3 +2494,20 @@ all grant/refund operations remain unchanged; no finer quota is introduced.
 The [state/resource checks and mutation control](../benchmarks/decoded-scratch-prefix/README.md)
 cover sparse actual expert groups and pool changes. No inference latency, RSS,
 CUDA runtime or complete-process memory conclusion follows from this change.
+
+
+### Idle workspace pressure uses queue operations
+
+Host workspace idle slots now use a deque. A pressure sweep pops the front
+without shifting every remaining owner after each physical release. Warm
+best-fit and growth selection still remove from the back by swapping, preserving
+the previous Vec's logical order and boxed ownership. Physical release stays
+outside the idle lock; an error stops the sweep with remaining slots intact.
+
+The real-ledger regression holds eight independently funded execution lanes,
+partially trims them, checks the remaining allocation identities, reuses the
+best-fit box without issuer callbacks, and verifies the existing swapped release
+order before settling to zero. Existing concurrent, borrowed/foreign return and
+incomplete-release guards remain. This changes neither allocation granularity,
+EP APIs nor quota operations. It removes repeated queue bookkeeping on pressure;
+no inference latency, RSS or universally zero pool-overhead claim is made.

@@ -39,6 +39,8 @@ mod model_hub;
 mod model_management;
 mod models_config;
 pub mod multimodal;
+mod ping;
+pub use ping::SsePingInterval;
 mod realtime;
 mod reasoning_request;
 mod registry;

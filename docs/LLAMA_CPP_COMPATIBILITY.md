@@ -420,6 +420,15 @@ HTTP reader. Reconnect with `/v1/stream?conv_id=ID&from=BYTE_OFFSET`; DELETE can
 the producer. Retention defaults to 16 streams and 4 MiB per stream, with completed
 history expiring after five minutes. Old offsets fail explicitly once evicted.
 Requests without a conversation ID close their driver reader on disconnect.
+SSE generation streams use a 30-second idle comment ping interval by default,
+matching the pinned server. `--sse-ping-interval SECONDS` sets the server default;
+request `sse_ping_interval` overrides it. Values are integer seconds from -1
+through 2147483647; -1 and 0 disable pings. Data resets the idle timer, and EOF
+ends the timer with the source. This applies to native completion/infill,
+OpenAI completion/chat, Responses and Anthropic streams. Pings are SSE comments,
+not generation events. Resumable streams retain their actual comment bytes,
+so reconnect offsets continue to refer to the exact transmitted byte sequence.
+
 The driver carries that cancellation authority into generic workflows and fused
 ORT/native decode. Execution observes cancellation between workflow nodes and
 after decoder forwards, aborts uncommitted state and releases scheduler capacity.
