@@ -175,12 +175,19 @@ pub struct OperatorExclusion {
 
 pub type OperatorExclusions = &'static [OperatorExclusion];
 
-/// Native RNN support is standalone-only; ORT retains its existing RNN placement.
-pub const STANDALONE_RNN_EXCLUSION: OperatorExclusions = &[OperatorExclusion {
-    domain: "",
-    op_type: "RNN",
-    since_version: 0,
-}];
+/// Standalone native operators that neither shipped ORT plugin should claim.
+pub const STANDALONE_OPERATOR_EXCLUSIONS: OperatorExclusions = &[
+    OperatorExclusion {
+        domain: "",
+        op_type: "RNN",
+        since_version: 0,
+    },
+    OperatorExclusion {
+        domain: "",
+        op_type: "RoiAlign",
+        since_version: 0,
+    },
+];
 
 pub(crate) fn first_excluded_revision(
     exclusions: OperatorExclusions,

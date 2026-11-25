@@ -1344,8 +1344,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn standalone_rnn_exclusion_removes_registry_revisions_and_splits_claims() {
-        use crate::ep::{KernelRegistryEntry, STANDALONE_RNN_EXCLUSION, query_plugin_capabilities};
+    fn standalone_exclusions_remove_registry_revisions_and_split_claims() {
+        use crate::ep::{
+            KernelRegistryEntry, STANDALONE_OPERATOR_EXCLUSIONS, query_plugin_capabilities,
+        };
         use onnx_runtime_ep_cpu::CpuExecutionProvider;
         use onnx_runtime_ir::{Graph, GraphView, GraphViewCache, NodeId, static_shape};
 
@@ -1366,32 +1368,61 @@ mod tests {
             entry("", "RNN", 14),
             entry("ai.onnx", "RNN", 22),
             entry("example", "RNN", 1),
+            entry("", "RoiAlign", 10),
+            entry("ai.onnx", "RoiAlign", 16),
+            entry("", "RoiAlign", 22),
+            entry("example", "RoiAlign", 1),
             entry("", "Identity", 19),
         ];
         let raw: *mut ExportedFactory = &mut *factory;
         // SAFETY: the owned factory is live, configured, and has not been exposed.
-        unsafe { exclude_operators(raw.cast(), STANDALONE_RNN_EXCLUSION) };
+        unsafe { exclude_operators(raw.cast(), STANDALONE_OPERATOR_EXCLUSIONS) };
         assert_eq!(
             factory
                 .kernel_registry_entries
                 .iter()
                 .map(|entry| (entry.domain, entry.op_type, entry.since_version))
                 .collect::<Vec<_>>(),
-            [("example", "RNN", 1), ("", "Identity", 19)]
+            [
+                ("example", "RNN", 1),
+                ("example", "RoiAlign", 1),
+                ("", "Identity", 19)
+            ]
         );
 
         let ep = CpuExecutionProvider::new();
-        for revision in [14, 22] {
+        for (op, revision) in [
+            ("RNN", 14),
+            ("RNN", 22),
+            ("RoiAlign", 10),
+            ("RoiAlign", 16),
+            ("RoiAlign", 22),
+        ] {
             let mut graph = Graph::new();
             graph.opset_imports.insert(String::new(), revision as u64);
-            let mut value = |name, shape| graph.create_named_value(name, DataType::Float32, shape);
-            let x = value("x", static_shape([1, 1, 1]));
-            let w = value("w", static_shape([1, 1, 1]));
-            let r = value("r", static_shape([1, 1, 1]));
-            let prepared = value("prepared", static_shape([1, 1, 1]));
-            let recurrent = value("recurrent", static_shape([1, 1, 1, 1]));
-            let output = value("output", static_shape([1, 1, 1, 1]));
-            for input in [x, w, r] {
+            let mut value = |name, dtype, shape| graph.create_named_value(name, dtype, shape);
+            let f32 = DataType::Float32;
+            let input_shape = if op == "RNN" {
+                static_shape([1, 1, 1])
+            } else {
+                static_shape([1, 1, 1, 1])
+            };
+            let x = value("x", f32, input_shape.clone());
+            let prepared = value("prepared", f32, input_shape);
+            let (second, third) = if op == "RNN" {
+                (
+                    value("w", f32, static_shape([1, 1, 1])),
+                    value("r", f32, static_shape([1, 1, 1])),
+                )
+            } else {
+                (
+                    value("rois", f32, static_shape([1, 4])),
+                    value("batch_indices", DataType::Int64, static_shape([1])),
+                )
+            };
+            let middle_output = value("middle_output", f32, static_shape([1, 1, 1, 1]));
+            let output = value("output", f32, static_shape([1, 1, 1, 1]));
+            for input in [x, second, third] {
                 graph.add_input(input);
             }
             let before = graph.insert_node(Node::new(
@@ -1400,25 +1431,30 @@ mod tests {
                 vec![Some(x)],
                 vec![prepared],
             ));
-            let mut rnn = Node::new(
+            let mut middle = Node::new(
                 NodeId(1),
-                "RNN",
-                vec![Some(prepared), Some(w), Some(r)],
-                vec![recurrent],
+                op,
+                vec![Some(prepared), Some(second), Some(third)],
+                vec![middle_output],
             );
-            rnn.version = Some(revision);
-            let rnn = graph.insert_node(rnn);
+            middle.version = Some(revision);
+            let middle = graph.insert_node(middle);
             let after = graph.insert_node(Node::new(
                 NodeId(2),
                 "Identity",
-                vec![Some(recurrent)],
+                vec![Some(middle_output)],
                 vec![output],
             ));
             graph.add_output(output);
             let cache = GraphViewCache::build(&graph).unwrap();
             let view = GraphView::new(&graph, &cache);
             let unfiltered = query_plugin_capabilities(&view, &ep, &[], |_, _| true).unwrap();
-            assert!(unfiltered.iter().any(|claim| claim.node_ids.contains(&rnn)));
+            assert!(
+                unfiltered
+                    .iter()
+                    .any(|claim| claim.node_ids.contains(&middle)),
+                "standalone CPU must claim {op}-{revision} before applying the ORT policy"
+            );
 
             let claims =
                 query_plugin_capabilities(&view, &ep, factory.operator_exclusions, |_, _| true)
