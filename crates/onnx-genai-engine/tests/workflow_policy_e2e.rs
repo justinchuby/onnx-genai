@@ -3576,3 +3576,103 @@ pipeline:
     }
     Ok(())
 }
+
+#[test]
+fn prediction_time_limit_stops_generic_authored_emission_without_cancelling_commit()
+-> anyhow::Result<()> {
+    let metadata = r#"
+pipeline:
+  workflow:
+    manifest: {adapter_abis: {}}
+    inputs:
+      token:
+        contract: {dtype: int64, shape: [1]}
+        role: {kind: opaque}
+        source: {kind: literal}
+        default: 0
+      active:
+        contract: {dtype: bool, shape: []}
+        role: {kind: opaque}
+        source: {kind: literal}
+        default: true
+      iterations:
+        contract: {dtype: int64, shape: []}
+        role: {kind: runtime, version: v1, role: max_output_tokens}
+        source: {kind: request}
+        required: true
+    outputs:
+      tokens:
+        contract: {dtype: int64, shape: [generated]}
+        role: tokens
+        stage: pre_adapter
+    components: {}
+    steps:
+      - kind: loop
+        steps:
+          - kind: emit
+            value: token
+            output: tokens
+            mode: append
+        continue_when: active
+        max_iterations: iterations
+        carried: []
+"#;
+    for streaming in [false, true] {
+        let root = package(
+            if streaming {
+                "prediction-limit-generic-stream"
+            } else {
+                "prediction-limit-generic-buffer"
+            },
+            metadata,
+            &[],
+        )?;
+        fs::write(
+            root.join("tokenizer.json"),
+            serde_json::to_vec(
+                &serde_json::json!({"version":"1.0","added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"\n":0,"<unk>":1},"unk_token":"<unk>"}}),
+            )?,
+        )?;
+        let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![]));
+        request.options.max_new_tokens = 8;
+        request.options.stop_on_eos = false;
+        request.options.max_prediction_time = Some(std::time::Duration::from_millis(1));
+        let control = onnx_genai_engine::GenerationControl::new().with_checkpoint(|boundary| {
+            if boundary == onnx_genai_engine::GenerationBoundary::BeforeWorkflowNode {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(())
+        });
+        let mut delivered = Vec::new();
+        let mut callback = |token: onnx_genai_engine::GenerateToken| {
+            delivered.push(token);
+            Ok(())
+        };
+        let result = engine.generate_with_control_callbacks(
+            request.clone(),
+            control,
+            None,
+            if streaming { Some(&mut callback) } else { None },
+        )?;
+        assert_eq!(
+            result.finish_reason,
+            onnx_genai_engine::FinishReason::PredictionTimeLimit
+        );
+        assert_eq!(result.token_ids, vec![0, 0]);
+        assert!(result.text.contains('\n'));
+        if streaming {
+            assert_eq!(
+                delivered
+                    .iter()
+                    .map(|token| token.token_id)
+                    .collect::<Vec<_>>(),
+                result.token_ids
+            );
+        }
+        request.options.max_prediction_time = None;
+        request.options.max_new_tokens = 4;
+        assert_eq!(engine.generate(request)?.token_ids, vec![0; 4]);
+    }
+    Ok(())
+}

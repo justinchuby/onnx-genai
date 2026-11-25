@@ -1836,3 +1836,88 @@ fn selector_convolution_v2_stays_a_typed_pre_mutation_refusal() -> anyhow::Resul
     ));
     Ok(())
 }
+
+#[test]
+fn prediction_time_limit_commits_only_the_real_dflash_accepted_prefix() -> anyhow::Result<()> {
+    for streaming in [false, true] {
+        let root = package("1", false, &[0; 8])?;
+        install_tool_protocol_tokenizer(&root, 0, "\n")?;
+        let mut engine = Engine::from_dir(&root, ort_config())?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1, 2]));
+        request.options.max_new_tokens = 20;
+        request.options.greedy = true;
+        request.options.stop_on_eos = false;
+        request.options.max_prediction_time = Some(std::time::Duration::from_millis(50));
+        let control = GenerationControl::new().with_checkpoint(|boundary| {
+            if boundary == GenerationBoundary::AfterVerifier {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Ok(())
+        });
+        let mut delivered = Vec::new();
+        let mut callback = |token: onnx_genai_engine::GenerateToken| {
+            delivered.push(token);
+            Ok(())
+        };
+        let result = engine.generate_with_control_callbacks(
+            request.clone(),
+            control,
+            None,
+            if streaming { Some(&mut callback) } else { None },
+        )?;
+        assert_eq!(result.finish_reason, FinishReason::PredictionTimeLimit);
+        assert!(!result.token_ids.is_empty() && result.token_ids.len() < 20);
+        assert!(result.text.contains('\n'));
+        let traces = engine.take_dflash_block_traces();
+        assert!(!traces.is_empty());
+        assert_eq!(
+            traces
+                .iter()
+                .flat_map(|trace| trace.committed_tokens.iter())
+                .copied()
+                .collect::<Vec<_>>(),
+            result
+                .token_ids
+                .iter()
+                .copied()
+                .map(i64::from)
+                .collect::<Vec<_>>()
+        );
+        if streaming {
+            assert_eq!(
+                delivered
+                    .iter()
+                    .map(|token| token.token_id)
+                    .collect::<Vec<_>>(),
+                result.token_ids
+            );
+            assert_eq!(
+                delivered.last().unwrap().finish_reason,
+                Some(FinishReason::PredictionTimeLimit)
+            );
+        }
+        let mut invalid = request.clone();
+        invalid.options.max_constraint_bytes = 0;
+        let mut unexpected = Vec::new();
+        let error = engine
+            .generate_with_callbacks(
+                invalid,
+                None,
+                Some(&mut |token| {
+                    unexpected.push(token);
+                    Ok(())
+                }),
+            )
+            .expect_err("time observer byte budget must reject output before commit");
+        assert!(
+            format!("{error:#}").contains("max_constraint_bytes=0"),
+            "{error:#}"
+        );
+        assert!(unexpected.is_empty());
+        assert!(engine.take_dflash_block_traces().is_empty());
+        request.options.max_prediction_time = None;
+        request.options.max_new_tokens = 4;
+        assert_eq!(engine.generate(request)?.token_ids, vec![0; 4]);
+    }
+    Ok(())
+}
