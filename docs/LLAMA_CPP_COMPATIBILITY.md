@@ -31,6 +31,24 @@ Node/npm and network access are not needed to build the Rust server or use its U
 The removed `run` REPL has no alias or migration shim. `generate`, `transcribe`,
 model inspection, profiling and command-line streaming remain available.
 
+## API keys
+
+Authentication is optional. Start with `nxrt serve MODEL --api-key-file keys.txt`;
+the UTF-8 file contains one key per line, with blank lines and lines starting
+with `#` ignored. `--api-key` accepts comma-separated CSV and may be repeated.
+The upstream environment variables `LLAMA_API_KEY` and `LLAMA_ARG_API_KEY_FILE`
+are also accepted. Keys from both sources are combined.
+
+Send `Authorization: Bearer YOUR_KEY`, a raw `Authorization: YOUR_KEY`, or
+`X-Api-Key: YOUR_KEY`. A nonempty Authorization header takes precedence over
+X-Api-Key. Missing or incorrect credentials return HTTP 401 with
+`error.type: authentication_error` and `error.code: 401`.
+Health endpoints and exact embedded UI assets remain public. All other API
+requests, including replay, management and realtime upgrade requests, pass
+through key admission before routing. With no configured keys, requests keep
+the existing open behavior. Server configuration Debug output exposes only
+the configured key count; it does not contain credentials or their digests.
+
 ## Implemented surface
 
 | Method | Paths | Contract |
@@ -55,7 +73,7 @@ model inspection, profiling and command-line streaming remain available.
 | POST | `/v1/chat/completions/input_tokens`, `/chat/completions/input_tokens`, `/v1/responses/input_tokens`, `/responses/input_tokens`, `/v1/messages/count_tokens` | Input token counts from the shared inference preparation path |
 | GET, DELETE | `/v1/stream` | Byte-offset replay or explicit producer cancellation by `conv_id` |
 | POST | `/v1/streams/lookup` | Lookup only requested conversation IDs, including model-qualified IDs |
-| POST | `/v1/audio/transcriptions`, `/audio/transcriptions` | Existing multipart transcription contract |
+| POST | `/v1/audio/transcriptions`, `/audio/transcriptions` | Native frame-decoding and generative multipart transcription; typed JSON/SSE, budgets and usage; [contract](TRANSCRIPTION.md) |
 | POST | `/v1/audio/speech`, `/audio/speech`, `/tts` | Declared buffered speech workflow; native input/prompt and raw-prompt handling |
 | WS | `/v1/realtime` | Metadata-declared native streaming audio/text sessions; [contract and current limits](REALTIME.md) |
 | GET | `/models/sse` | Model status, actual per-file download progress, pause/failure and removal events |
@@ -435,10 +453,12 @@ including actual native image preprocessing and model-owned token usage. See
 This is a functional Llama Chat integration, not a claim of complete llama-server
 parity. These upstream capabilities remain incomplete:
 
-- Realtime tool grammar enforcement, full tool argument schema validation and
+- Realtime grammar forcing beyond declared turn-based tagged-json mask workflows,
+  partial function-call fragment projection, broader pressure/overlap acceptance and
   device-backed wire acceptance; see [realtime](REALTIME.md) for the implemented
   WebSocket session modes, resource bounds and Native CPU evidence.
-- Multimodal/joint decision heads and shared generation/decision entry points.
+- Video decision inputs, broader audio codecs and additional DSP operations/conventions,
+  joint/packed decision heads and shared generation/decision entry points.
 - Device-state/multi-sequence slot persistence; arbitrary GGUF/PEFT LoRA imports and device-fused LoRA.
 - GGUF package import, quantization selectors and selective sidecar management.
   Hugging Face nxrt-package download, resume and deletion are supported.
@@ -446,8 +466,12 @@ parity. These upstream capabilities remain incomplete:
 `/v1/systemone` executes text/structured-state decision profiles, with explicit
 model-authored prompting, calibration outputs, variants and answer policies.
 Core schema v1.11 declares input defaults, instruction/payload rules, option
-ordering, score ranges and canonical legends. Multimodal/joint heads and shared
-generation/decision entry points remain open; see [SystemOne](SYSTEMONE.md). Route presence does not
+ordering, score ranges and canonical legends. Decision v2 in core schema v1.14 additionally executes ordered state images,
+including `files`/`images` and embedded chat image parts, with actual media-aware
+usage. Decision v3 in core schema v1.15 adds ordered mixed image/audio state and
+per-question spoken instructions using PCM16 WAV. Video, broader audio codecs,
+joint/packed heads and shared generation/decision
+entry points remain open; see [SystemOne](SYSTEMONE.md). Route presence does not
 claim every upstream decision-model format is admitted.
 
 Model download/delete require `--model-cache-dir`; operator-configured paths
@@ -514,6 +538,14 @@ Temporary fixtures, proxy, Chrome and server processes are cleaned up, with
 bounded startup/observer waits. Append an optional screenshot path after the
 Playwright module path to save an image of the baseline chat. Coordinate this
 inference workload with other sessions using the shared host lock.
+
+For API-key onboarding, run
+`node scripts/test_llama_chat_auth.mjs /absolute/path/to/playwright/index.mjs /absolute/path/to/onnx-genai-server`
+under the same lock. This uses real Chrome and Native CPU inference to enter an
+incorrect key, retry a correct key through the UI, chat, reload the persisted
+login, and check private byte-exact replay. A fresh browser context must still
+require a key. The script uses an ephemeral loopback port and removes its
+synthetic key file, browser and server on exit.
 
 
 ## Raw GBNF and llguidance constraints
@@ -624,3 +656,18 @@ the tokenizer; regex boundaries can declare individual registered spellings in
 tokenizer is not mutated, and buffered/SSE output uses the same policy, including
 logprob delivery and transactional publication. UTF-8 decoder lookbehind remains
 request-local. Raw grammar recognition continues to inspect model bytes and IDs.
+
+Audio preprocessing admits package-authored mel counts, sample rates, FFT/hop
+and Hann-window lengths through the executable log-mel program. Numerical
+acceptance includes an independent direct DFT and Native workflows using
+nonstandard geometry. Pure-waveform normalization, named transform dataflow and validity publication
+execute as described in [audio preprocessing](AUDIO_PREPROCESSING.md). Additional
+DSP operations, window/mel conventions and codecs remain open; this does not imply
+full audio parity.
+
+File transcription now executes declared one-pass CTC/greedy acoustic workflows
+as well as the existing generative speech path. Both aliases expose typed
+transcript done/delta events, usage, request output budgets and SSE termination.
+Native waveform-dependent HTTP acceptance is documented in
+[transcription](TRANSCRIPTION.md); MP3, general ASR prompt/response projection and
+richer generative media accounting remain open.

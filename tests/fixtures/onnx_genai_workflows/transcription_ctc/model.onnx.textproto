@@ -1,0 +1,20 @@
+ir_version: 11
+opset_import { domain: "" version: 24 }
+graph { name: "waveform_ctc_logits"
+node { input: "wave" input: "zero" output: "zero.wave" op_type: "Mul" }
+node { input: "zero.wave" input: "blank_bias" output: "blank" op_type: "Add" }
+node { input: "wave" output: "negative" op_type: "Neg" }
+node { input: "wave" output: "magnitude" op_type: "Abs" }
+node { input: "delimiter_bias" input: "magnitude" output: "delimiter" op_type: "Sub" }
+node { input: "blank" input: "axis" output: "blank.row" op_type: "Unsqueeze" }
+node { input: "wave" input: "axis" output: "positive.row" op_type: "Unsqueeze" }
+node { input: "delimiter" input: "axis" output: "delimiter.row" op_type: "Unsqueeze" }
+node { input: "negative" input: "axis" output: "negative.row" op_type: "Unsqueeze" }
+node { input: "blank.row" input: "positive.row" input: "delimiter.row" input: "negative.row" output: "logits" op_type: "Concat" attribute { name: "axis" i: 2 type: INT } }
+initializer { name: "zero" data_type: 1 float_data: 0 }
+initializer { name: "blank_bias" data_type: 1 float_data: 0.2 }
+initializer { name: "delimiter_bias" data_type: 1 float_data: 0.3 }
+initializer { name: "axis" data_type: 7 dims: 1 int64_data: 2 }
+input { name: "wave" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 12 } } } } }
+output { name: "logits" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 12 } dim { dim_value: 4 } } } } }
+}

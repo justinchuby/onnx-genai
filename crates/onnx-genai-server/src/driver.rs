@@ -69,6 +69,8 @@ pub(crate) struct EngineDriver {
     pub(crate) runtime_sampling: bool,
     pub(crate) reranking: Option<Arc<onnx_genai_metadata::task_profiles::RerankingContract>>,
     pub(crate) decision: Option<Arc<onnx_genai_metadata::decision::DecisionContract>>,
+    pub(crate) transcription:
+        Option<Arc<onnx_genai_metadata::transcription::TranscriptionContract>>,
     pub(crate) realtime: Option<Arc<onnx_genai_metadata::realtime::RealtimeContract>>,
     /// One lock-free KV mirror per worker. The legacy aggregate fields continue
     /// to report worker 0; debug/status expose this full list.
@@ -210,6 +212,12 @@ pub(crate) enum DriverCommand {
         reply: oneshot::Sender<Result<onnx_genai_engine::PrefillResult, DriverFailure>>,
         permit: WorkerPermit,
     },
+    Transcribe {
+        request: Box<onnx_genai_engine::transcription::PreparedTranscription>,
+        reply:
+            oneshot::Sender<anyhow::Result<onnx_genai_engine::transcription::TranscriptionResult>>,
+        permit: WorkerPermit,
+    },
     Decide {
         request: Box<onnx_genai_engine::decision::PreparedDecision>,
         reply: oneshot::Sender<anyhow::Result<onnx_genai_engine::decision::DecisionResult>>,
@@ -308,6 +316,22 @@ impl DriverFailure {
         {
             return Self {
                 message: prefix.to_string(),
+                kind: DriverFailureKind::InvalidRequest,
+            };
+        }
+        if let Some(limit) = error.chain().find_map(|source| {
+            source.downcast_ref::<onnx_genai_engine::decision::DecisionInputLimitError>()
+        }) {
+            return Self {
+                message: limit.to_string(),
+                kind: DriverFailureKind::InvalidRequest,
+            };
+        }
+        if let Some(limit) = error.chain().find_map(|source| {
+            source.downcast_ref::<onnx_genai_engine::transcription::TranscriptionLimitError>()
+        }) {
+            return Self {
+                message: limit.to_string(),
                 kind: DriverFailureKind::InvalidRequest,
             };
         }
@@ -452,6 +476,7 @@ struct EngineWorkerReady {
     runtime_sampling: bool,
     reranking: Option<Arc<onnx_genai_metadata::task_profiles::RerankingContract>>,
     decision: Option<Arc<onnx_genai_metadata::decision::DecisionContract>>,
+    transcription: Option<Arc<onnx_genai_metadata::transcription::TranscriptionContract>>,
     realtime: Option<Arc<onnx_genai_metadata::realtime::RealtimeContract>>,
 }
 
@@ -480,6 +505,10 @@ fn prepare_engine_worker<DropProbe>(
             )
         })
         .transpose()?;
+    let transcription =
+        onnx_genai_metadata::transcription::transcription_contract(engine.metadata())
+            .map_err(anyhow::Error::msg)?
+            .map(Arc::new);
     let decision =
         onnx_genai_metadata::decision::decision_contract(engine.metadata())?.map(Arc::new);
     let realtime = onnx_genai_metadata::realtime::realtime_contract(engine.metadata())
@@ -526,6 +555,7 @@ fn prepare_engine_worker<DropProbe>(
         runtime_sampling,
         reranking,
         decision,
+        transcription,
         realtime,
     };
     Ok((
@@ -770,6 +800,7 @@ impl EngineDriver {
                 runtime_sampling: first_ready.runtime_sampling,
                 reranking: first_ready.reranking,
                 decision: first_ready.decision,
+                transcription: first_ready.transcription,
                 realtime: first_ready.realtime,
                 worker_kv_telemetry,
             },
@@ -1201,6 +1232,26 @@ impl EngineDriver {
             }
         }
         anyhow::bail!("generation stream ended before result")
+    }
+
+    pub(crate) async fn transcribe(
+        &self,
+        request: onnx_genai_engine::transcription::PreparedTranscription,
+    ) -> Result<onnx_genai_engine::transcription::TranscriptionResult, GenerateSubmitError> {
+        let (commands, permit) = self.reserve_stateless_command()?;
+        let (reply, response) = oneshot::channel();
+        commands
+            .send(DriverCommand::Transcribe {
+                request: Box::new(request),
+                reply,
+                permit,
+            })
+            .await
+            .map_err(|_| GenerateSubmitError::DriverStopped)?;
+        response
+            .await
+            .map_err(|_| GenerateSubmitError::DriverStopped)?
+            .map_err(|error| GenerateSubmitError::Failed(DriverFailure::from_engine_error(&error)))
     }
 
     pub(crate) async fn decide(
@@ -1997,6 +2048,7 @@ fn deferred_permit_holder_count(deferred: &VecDeque<DriverCommand>) -> usize {
                     | DriverCommand::Embed { .. }
                     | DriverCommand::ScorePair { .. }
                     | DriverCommand::Decide { .. }
+                    | DriverCommand::Transcribe { .. }
                     | DriverCommand::Prefill { .. }
             )
         })
@@ -2404,6 +2456,15 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
                 crate::metrics::add_prompt_tokens(result.prompt_tokens);
             }
             let _ = reply.send(result);
+        }
+        DriverCommand::Transcribe {
+            request,
+            reply,
+            permit: _permit,
+        } => {
+            if !reply.is_closed() {
+                let _ = reply.send(engine.transcribe(*request));
+            }
         }
         DriverCommand::Decide {
             request,
@@ -3368,6 +3429,7 @@ mod admission_tests {
             native_slot: None,
             reranking: None,
             decision: None,
+            transcription: None,
             realtime: None,
             runtime_sampling: false,
             workflow_facts: crate::driver::WorkflowFacts {
@@ -3730,6 +3792,7 @@ mod admission_tests {
             native_slot: None,
             reranking: None,
             decision: None,
+            transcription: None,
             realtime: None,
             runtime_sampling: false,
             workflow_facts: WorkflowFacts {
@@ -3788,6 +3851,7 @@ mod admission_tests {
             native_slot: None,
             reranking: None,
             decision: None,
+            transcription: None,
             realtime: None,
             runtime_sampling: false,
             workflow_facts: WorkflowFacts {

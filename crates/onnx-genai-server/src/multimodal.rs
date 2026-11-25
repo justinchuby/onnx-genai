@@ -8,7 +8,7 @@ use onnx_genai_metadata::{RuntimeInputRole, SemanticInputRole, TensorDimension};
 use onnx_genai_ort::{DataType, PipelineModelDirectory, PipelineModels, Tokenizer, Value};
 
 pub use crate::audio_input::{AudioInputSpec, AudioTensor, preprocess_samples, preprocess_wav};
-pub use crate::image_input::MAX_EXPANDED_PROMPT_TOKENS;
+pub use crate::media_input::MAX_EXPANDED_PROMPT_TOKENS;
 
 #[derive(Debug, Clone)]
 pub struct VisionInputSpec {
@@ -319,6 +319,18 @@ pub fn audio_decoder_prompt(
 }
 
 pub fn build(directory: &PipelineModelDirectory) -> anyhow::Result<MultimodalSpecs> {
+    if let Some(metadata) = directory.metadata.as_ref()
+        && onnx_genai_metadata::transcription::transcription_contract(metadata)
+            .map_err(anyhow::Error::msg)?
+            .is_some()
+    {
+        // A frame-decoding task owns this encoded input. It is not permission
+        // to feed audio into the generative chat convenience path.
+        return Ok(MultimodalSpecs {
+            vision: None,
+            audio: None,
+        });
+    }
     derive_specs(
         &directory.spec.workflow,
         directory.preprocessing.as_ref(),

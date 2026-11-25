@@ -38,12 +38,11 @@ use crate::{
     },
     state::{AppState, DEFAULT_MAX_OUTPUT_TOKENS, ServerConfig},
     types::{
-        AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest, ChatCompletionResponse,
-        ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageToolCall, ChatTokenLogprob,
-        ChatTopLogprob, CompletionChoice, CompletionLogprobs, CompletionRequest,
-        CompletionResponse, EmbeddingData, EmbeddingInput, EmbeddingRequest, EmbeddingResponse,
-        EmbeddingUsage, EmbeddingVector, InputAudio, ReasoningEffort, ResponseFormat, StopInput,
-        ToolChoice, ToolChoiceMode, Usage,
+        ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatLogprobs, ChatMessage,
+        ChatMessageContent, ChatMessageToolCall, ChatTokenLogprob, ChatTopLogprob,
+        CompletionChoice, CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData,
+        EmbeddingInput, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector,
+        InputAudio, ReasoningEffort, ResponseFormat, StopInput, ToolChoice, ToolChoiceMode, Usage,
     },
 };
 
@@ -532,7 +531,7 @@ impl ApiError {
         }
     }
 
-    fn payload_too_large(message: impl Into<String>) -> Self {
+    pub(crate) fn payload_too_large(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             message: message.into(),

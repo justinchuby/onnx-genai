@@ -1290,7 +1290,15 @@ fn validate_preprocessing_program(
             if component_abi != abi {
                 return None;
             }
-            let scope = PreprocessingOutputScope::for_version(version).ok()?;
+            let scope = match PreprocessingOutputScope::for_version(version) {
+                Ok(scope) => scope,
+                Err(error) => {
+                    errors.push(format!(
+                        "workflow preprocessing component '{name}' using {abi}: {error}"
+                    ));
+                    return None;
+                }
+            };
             Some((name, component, scope, version))
         })
         .collect::<Vec<_>>();
@@ -3897,7 +3905,7 @@ fn describe_batch_layout(layout: &crate::schema::BatchLayout) -> String {
 /// axis. Stating that exactly is what lets a runtime index it without knowing
 /// what the value means.
 #[allow(clippy::too_many_arguments)]
-fn validate_valid_lengths_shape(
+pub(crate) fn validate_valid_lengths_shape(
     path: &str,
     contract: &crate::schema::TensorContract,
     dimension: &str,

@@ -30,6 +30,13 @@ use crate::{
         .args(["model", "models_dir", "models_config", "model_cache_dir"])
 ))]
 pub struct ServeArgs {
+    /// API keys as comma-separated CSV; repeat the option to add keys.
+    #[arg(long, env = "LLAMA_API_KEY", hide_env_values = true)]
+    pub api_key: Vec<String>,
+    /// UTF-8 file with one key per line; empty lines and # comments are ignored.
+    #[arg(long, env = "LLAMA_ARG_API_KEY_FILE")]
+    pub api_key_file: Option<PathBuf>,
+
     /// Single-model mode: path to a model directory containing the ONNX model
     /// and tokenizer, given positionally as every other subcommand takes it.
     /// Mutually exclusive with --models-dir and --models-config.
@@ -83,9 +90,15 @@ pub struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1:8080")]
     pub addr: SocketAddr,
 
-    /// Maximum requested output tokens per chat completion. Falls back to ONNX_GENAI_MAX_OUTPUT_TOKENS.
+    /// Maximum decoded output tokens per completion or file transcription. Falls back to ONNX_GENAI_MAX_OUTPUT_TOKENS.
     #[arg(long, env = "ONNX_GENAI_MAX_OUTPUT_TOKENS", default_value_t = 4096)]
     pub max_output_tokens: usize,
+    /// Maximum acoustic frames decoded per file transcription.
+    #[arg(long, default_value_t = onnx_genai_engine::transcription::TranscriptionLimits::default().max_frames)]
+    pub max_transcription_frames: std::num::NonZeroUsize,
+    /// Maximum rendered UTF-8 bytes per file transcription.
+    #[arg(long, default_value_t = onnx_genai_engine::transcription::TranscriptionLimits::default().max_text_bytes)]
+    pub max_transcription_text_bytes: std::num::NonZeroUsize,
     /// Maximum completion prompts in one native or OpenAI request.
     #[arg(long, default_value = "128")]
     pub max_completion_prompts: std::num::NonZeroUsize,
@@ -98,6 +111,10 @@ pub struct ServeArgs {
     /// Unique encoded image bytes retained by one reranking request.
     #[arg(long, default_value = "67108864")]
     pub max_rerank_media_bytes: std::num::NonZeroUsize,
+
+    /// Unique encoded image bytes retained by one SystemOne request.
+    #[arg(long, default_value = "67108864")]
+    pub max_decision_media_bytes: std::num::NonZeroUsize,
 
     /// Maximum tokens per non-generative decision prompt variant.
     #[arg(long, default_value_t = onnx_genai_engine::decision::DecisionLimits::default().max_input_tokens)]
@@ -163,12 +180,12 @@ pub struct ServeArgs {
     pub max_batch: Option<usize>,
 
     /// Enable /v1/debug/* introspection endpoints. Off by default. Use only on loopback-bound
-    /// servers or behind an authenticated proxy. Falls back to ONNX_GENAI_DEBUG_ENDPOINTS=1.
+    /// servers or with API keys/an authenticated proxy. Falls back to ONNX_GENAI_DEBUG_ENDPOINTS=1.
     #[arg(long, env = "ONNX_GENAI_DEBUG_ENDPOINTS")]
     pub enable_debug_endpoints: bool,
 
     /// Enable /v1/admin/models/* runtime model-management endpoints (load, unload, list).
-    /// Off by default. Use only on loopback-bound servers or behind an authenticated proxy.
+    /// Off by default. Use only on loopback-bound servers or with API keys/an authenticated proxy.
     /// Falls back to ONNX_GENAI_ADMIN_ENDPOINTS=1.
     #[arg(long, env = "ONNX_GENAI_ADMIN_ENDPOINTS")]
     pub enable_admin_endpoints: bool,
@@ -218,7 +235,7 @@ pub struct ServeArgs {
     pub cpu: CpuArgs,
 }
 
-fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
+fn server_config_from_args(args: &ServeArgs) -> anyhow::Result<ServerConfig> {
     let mut engine_config = args.engine.to_config();
     engine_config.kv_cache_dtype = args.kv_cache_dtype;
     // #1064: `--max-batch N` is what *requests* the native persistent decode
@@ -233,9 +250,12 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
         engine_config.native_decode_batch = Some(max_batch);
     }
 
-    ServerConfig {
+    Ok(ServerConfig {
+        api_keys: crate::ApiKeys::from_sources(&args.api_key, args.api_key_file.as_deref())?,
         node_id: args.node_id.clone().unwrap_or_else(default_node_id),
         max_output_tokens: args.max_output_tokens,
+        max_transcription_frames: args.max_transcription_frames,
+        max_transcription_text_bytes: args.max_transcription_text_bytes,
         realtime: crate::RealtimeLimits::default(),
         endpoint_props: args.props,
         model_cache_dir: args.model_cache_dir.clone(),
@@ -247,6 +267,7 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
         max_rerank_input_tokens: args.max_rerank_input_tokens,
         max_rerank_documents: args.max_rerank_documents,
         max_rerank_media_bytes: args.max_rerank_media_bytes,
+        max_decision_media_bytes: args.max_decision_media_bytes,
         max_decision_input_tokens: args.max_decision_input_tokens,
         max_decision_prompt_bytes: args.max_decision_prompt_bytes,
         max_decision_template_operations: args.max_decision_template_operations,
@@ -269,13 +290,13 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
         max_loaded_models: args.max_loaded_models,
         eviction_policy: Default::default(),
         engine_config,
-    }
+    })
 }
 
 /// Build the server state from [`ServeArgs`] and serve until shutdown.
 pub async fn run_serve(mut args: ServeArgs) -> anyhow::Result<()> {
     args.cpu.apply().map_err(anyhow::Error::msg)?;
-    let server_config = server_config_from_args(&args);
+    let server_config = server_config_from_args(&args)?;
     let model_path = args.model.take();
 
     // Build the model spec list from whichever source flag was provided.
@@ -330,6 +351,36 @@ mod tests {
     }
 
     #[test]
+    fn api_key_options_combine_csv_and_file_and_fail_on_unreadable_file() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "# comment\nfile-key\n").unwrap();
+        let args = TestCli::try_parse_from([
+            "test",
+            "model",
+            "--api-key",
+            "one,two",
+            "--api-key",
+            "three",
+            "--api-key-file",
+            file.path().to_str().unwrap(),
+        ])
+        .unwrap();
+        let config = server_config_from_args(&args.serve).unwrap();
+        assert!(format!("{:?}", config.api_keys).contains("4"));
+        assert!(!format!("{config:?}").contains("file-key"));
+        let missing = TestCli::try_parse_from([
+            "test",
+            "model",
+            "--api-key-file",
+            "/this-api-key-file-does-not-exist",
+        ])
+        .unwrap();
+        assert!(
+            format!("{:#}", server_config_from_args(&missing.serve).unwrap_err())
+                .contains("read API key file")
+        );
+    }
+    #[test]
     fn managed_cache_startup_combines_with_one_source_and_keeps_positive_bounds() {
         let args = TestCli::try_parse_from([
             "test",
@@ -345,7 +396,7 @@ mod tests {
             "2",
         ])
         .unwrap();
-        let config = server_config_from_args(&args.serve);
+        let config = server_config_from_args(&args.serve).unwrap();
         assert_eq!(
             config.model_cache_dir.as_deref(),
             Some(std::path::Path::new("cache"))
@@ -388,9 +439,17 @@ mod tests {
     #[test]
     fn lora_init_without_apply_flag_preserves_explicit_operator_choice() {
         let disabled = TestCli::parse_from(["test", "model-dir", "--lora-init-without-apply"]);
-        assert!(server_config_from_args(&disabled.serve).lora_init_without_apply);
+        assert!(
+            server_config_from_args(&disabled.serve)
+                .unwrap()
+                .lora_init_without_apply
+        );
         let defaults = TestCli::parse_from(["test", "model-dir"]);
-        assert!(!server_config_from_args(&defaults.serve).lora_init_without_apply);
+        assert!(
+            !server_config_from_args(&defaults.serve)
+                .unwrap()
+                .lora_init_without_apply
+        );
     }
 
     #[test]
@@ -408,7 +467,7 @@ mod tests {
             "3",
         ])
         .unwrap();
-        let config = server_config_from_args(&args.serve);
+        let config = server_config_from_args(&args.serve).unwrap();
         assert_eq!(
             config.slot_save_path.as_deref(),
             Some(std::path::Path::new("states"))
@@ -428,9 +487,17 @@ mod tests {
     #[test]
     fn props_acknowledgement_requires_explicit_enable() {
         let disabled = TestCli::parse_from(["test", "model-dir"]);
-        assert!(!server_config_from_args(&disabled.serve).endpoint_props);
+        assert!(
+            !server_config_from_args(&disabled.serve)
+                .unwrap()
+                .endpoint_props
+        );
         let enabled = TestCli::parse_from(["test", "model-dir", "--props"]);
-        assert!(server_config_from_args(&enabled.serve).endpoint_props);
+        assert!(
+            server_config_from_args(&enabled.serve)
+                .unwrap()
+                .endpoint_props
+        );
     }
 
     #[test]
@@ -510,7 +577,7 @@ mod tests {
     fn the_shared_device_flag_selects_the_native_backend() {
         let cli = TestCli::parse_from(["test", "model-dir", "--device", "cpu"]);
 
-        let config = server_config_from_args(&cli.serve).engine_config;
+        let config = server_config_from_args(&cli.serve).unwrap().engine_config;
         assert_eq!(
             config.decode_backend,
             onnx_genai_engine::EngineDecodeBackend::Native
@@ -532,6 +599,7 @@ mod tests {
 
         assert_eq!(
             server_config_from_args(&cli.serve)
+                .unwrap()
                 .engine_config
                 .native_decode_batch,
             Some(4)
@@ -549,12 +617,14 @@ mod tests {
 
         assert_eq!(
             server_config_from_args(&omitted.serve)
+                .unwrap()
                 .engine_config
                 .native_decode_batch,
             None
         );
         assert_eq!(
             server_config_from_args(&explicit_one.serve)
+                .unwrap()
                 .engine_config
                 .native_decode_batch,
             None
@@ -565,7 +635,7 @@ mod tests {
     fn serve_vram_limit_flows_into_engine_config_before_load() {
         let cli = TestCli::parse_from(["test", "model-dir", "--vram-limit", "6000000000"]);
 
-        let config = server_config_from_args(&cli.serve);
+        let config = server_config_from_args(&cli.serve).unwrap();
 
         assert_eq!(
             config.engine_config.limits.vram_limit,
@@ -580,6 +650,7 @@ mod tests {
 
         assert_eq!(
             server_config_from_args(&fraction.serve)
+                .unwrap()
                 .engine_config
                 .limits
                 .vram_limit,
@@ -587,6 +658,7 @@ mod tests {
         );
         assert_eq!(
             server_config_from_args(&auto.serve)
+                .unwrap()
                 .engine_config
                 .limits
                 .vram_limit,
@@ -598,6 +670,7 @@ mod tests {
         let cli = TestCli::parse_from(["test", "model-dir", "--max-completion-prompts", "3"]);
         assert_eq!(
             server_config_from_args(&cli.serve)
+                .unwrap()
                 .max_completion_prompts
                 .get(),
             3
@@ -607,10 +680,32 @@ mod tests {
         assert!(error.to_string().contains("--max-completion-prompts"));
     }
     #[test]
+    fn transcription_resource_limits_are_positive_and_forwarded() {
+        let cli = TestCli::parse_from([
+            "test",
+            "model-dir",
+            "--max-transcription-frames",
+            "17",
+            "--max-transcription-text-bytes",
+            "512",
+        ]);
+        let config = server_config_from_args(&cli.serve).unwrap();
+        assert_eq!(config.max_transcription_frames.get(), 17);
+        assert_eq!(config.max_transcription_text_bytes.get(), 512);
+        for flag in [
+            "--max-transcription-frames",
+            "--max-transcription-text-bytes",
+        ] {
+            assert!(TestCli::try_parse_from(["test", "model-dir", flag, "0"]).is_err());
+        }
+    }
+    #[test]
     fn decision_resource_limits_are_positive_and_forwarded() {
         let args = TestCli::parse_from([
             "test",
             "model-dir",
+            "--max-decision-media-bytes",
+            "4096",
             "--max-decision-input-tokens",
             "256",
             "--max-decision-questions",
@@ -618,11 +713,13 @@ mod tests {
             "--max-decision-options",
             "8",
         ]);
-        let config = server_config_from_args(&args.serve);
+        let config = server_config_from_args(&args.serve).unwrap();
+        assert_eq!(config.max_decision_media_bytes.get(), 4096);
         assert_eq!(config.max_decision_input_tokens.get(), 256);
         assert_eq!(config.max_decision_questions.get(), 3);
         assert_eq!(config.max_decision_options.get(), 8);
         for flag in [
+            "--max-decision-media-bytes",
             "--max-decision-input-tokens",
             "--max-decision-questions",
             "--max-decision-prompt-bytes",
@@ -648,7 +745,7 @@ mod tests {
             "--max-rerank-media-bytes",
             "2048",
         ]);
-        let config = server_config_from_args(&cli.serve);
+        let config = server_config_from_args(&cli.serve).unwrap();
         assert_eq!(config.max_rerank_input_tokens.get(), 256);
         assert_eq!(config.max_rerank_documents.get(), 8);
         assert_eq!(config.max_rerank_media_bytes.get(), 2048);
