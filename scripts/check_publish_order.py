@@ -15,10 +15,12 @@ preparing a package, even though consumers do not build them.
 from __future__ import annotations
 
 import collections
+import hashlib
 import json
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +80,46 @@ def cargo_metadata(root: Path = ROOT) -> dict[str, Any]:
 
 def _is_publishable(package: dict[str, Any]) -> bool:
     return package.get("publish") != []
+
+
+def vendored_registry_packages(metadata: dict[str, Any], workspace_paths: dict) -> tuple[dict, list[str]]:
+    """Recognize explicitly audited published sources, never omitted owned crates."""
+    root = Path(metadata.get("workspace_root", ROOT)).resolve()
+    declared = (metadata.get("metadata") or {}).get("vendored-crates", [])
+    accepted, problems = {}, []
+    if not isinstance(declared, list):
+        return {}, ["workspace vendored-crates metadata must list provenance paths"]
+    for relative in declared:
+        try:
+            if not isinstance(relative, str):
+                raise ValueError("provenance path must be a string")
+            record_path = (root / relative).resolve()
+            if not record_path.is_relative_to(root):
+                raise ValueError("provenance path escapes the workspace")
+            directory = record_path.parent
+            if directory in workspace_paths:
+                raise ValueError("a workspace-owned package cannot be declared as external vendored source")
+            record = json.loads(record_path.read_text())
+            manifest_bytes = (directory / "Cargo.toml").read_bytes()
+            package = tomllib.loads(manifest_bytes.decode())["package"]
+            name, version = record["crate"], record["version"]
+            if package["name"] != name or package["version"] != version:
+                raise ValueError("published provenance and package identity differ")
+            if record["source"] != f"https://crates.io/api/v1/crates/{name}/{version}/download":
+                raise ValueError("vendored source must identify its published crate archive")
+            if not re.fullmatch(r"[0-9a-f]{64}", record["sha256"]):
+                raise ValueError("published archive SHA-256 is missing or invalid")
+            # The published manifest owns release identity/version. Code patches
+            # are checked independently; a manifest identity rewrite is not an exemption.
+            expected = record["upstream_file_sha256"]["Cargo.toml"]
+            if hashlib.sha256(manifest_bytes).hexdigest() != expected:
+                raise ValueError("vendored package manifest differs from its published snapshot")
+            if directory in accepted:
+                raise ValueError("vendored provenance path is repeated")
+            accepted[directory] = (name, version)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            problems.append(f"invalid vendored provenance {relative!r}: {error}; restore the published snapshot or audit its declaration")
+    return accepted, problems
 
 
 def validate_publish_order(
@@ -181,6 +223,8 @@ def validate_publish_order(
     position = {crate: index for index, crate in enumerate(order)}
     edge_count = 0
     workspace_root = Path(metadata.get("workspace_root", ROOT)).resolve()
+    vendored, vendor_problems = vendored_registry_packages(metadata, workspace_paths)
+    problems.extend(vendor_problems)
     for crate in order:
         entries = workspace_names.get(crate, [])
         if len(entries) != 1:
@@ -197,6 +241,11 @@ def validate_publish_order(
             resolved_path = Path(dependency_path).resolve()
             dependency_entries = workspace_paths.get(resolved_path, [])
             if not dependency_entries:
+                if resolved_path in vendored:
+                    name, version = vendored[resolved_path]
+                    if dependency.get("name") != name or dependency.get("req") not in {f"^{version}", f"={version}"}:
+                        problems.append(f"{crate} vendored dependency identity/version differs from the audited published {name} {version}")
+                    continue
                 if resolved_path.is_relative_to(workspace_root):
                     problems.append(
                         f"{crate} has workspace-local path dependency "

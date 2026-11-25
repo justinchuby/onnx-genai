@@ -184,6 +184,11 @@ impl JsonPrefix {
                     segment_start = at;
                     continue;
                 }
+                0x7f if in_string => {
+                    canonical.push_str(&text[segment_start..at]);
+                    canonical.push_str("\\u007f");
+                    segment_start = at + 1;
+                }
                 _ => {}
             }
             at += 1;
@@ -382,6 +387,96 @@ mod tests {
                 .unwrap(),
             GrammarCandidate::Viable { complete: true }
         ));
+    }
+
+    #[test]
+    fn json_property_escapes_match_declared_key_identity_and_value_constraints() {
+        let schema = json!({"type":"object","properties":{"\u{7f}":{"const":1}},"required":["\u{7f}"],"additionalProperties":false});
+        for spelling in [r#"{"\u007f":1}"#, r#"{"\u007F":1}"#] {
+            for end in 0..=spelling.len() {
+                assert!(
+                    accepts(&schema, &spelling[..end]),
+                    "schema={schema}; prefix={:?}",
+                    &spelling[..end]
+                );
+            }
+        }
+        assert!(!accepts(&schema, r#"{"\u007f":2}"#));
+        let mixed = json!({"type":"object","properties":{"\u{7f}":{"const":1}},"additionalProperties":{"const":2}});
+        assert!(accepts(&mixed, r#"{"\u007f":1}"#));
+        assert!(
+            !accepts(&mixed, r#"{"\u007f":2}"#),
+            "an escaped known key must not bypass its schema through additionalProperties"
+        );
+        assert!(accepts(&mixed, r#"{"other":2}"#));
+    }
+
+    #[test]
+    fn json_property_quoting_keeps_known_pattern_and_additional_ownership_aligned() {
+        for key in [
+            "\0",
+            "\n",
+            "\u{1f}",
+            "\u{7f}",
+            "\"",
+            "\\",
+            "/",
+            "é",
+            "😀",
+            "\u{7f}x\u{7f}",
+            r"\u007f",
+        ] {
+            let escaped = key
+                .encode_utf16()
+                .map(|unit| format!("\\u{unit:04X}"))
+                .collect::<String>();
+            for name in [
+                serde_json::to_string(key).unwrap(),
+                format!("\"{escaped}\""),
+            ] {
+                let correct = format!("{{{name}:1}}");
+                let incorrect = format!("{{{name}:2}}");
+                for schema in [
+                    json!({"type":"object","properties":{key:{"const":1}},"additionalProperties":{"const":2}}),
+                    json!({"type":"object","properties":{key:{"const":1}},"patternProperties":{".*":{"enum":[1,2]}}}),
+                ] {
+                    for end in correct
+                        .char_indices()
+                        .map(|(at, _)| at)
+                        .chain(std::iter::once(correct.len()))
+                    {
+                        assert!(
+                            accepts(&schema, &correct[..end]),
+                            "key={key:?}; prefix={:?}",
+                            &correct[..end]
+                        );
+                    }
+                    assert!(
+                        !accepts(&schema, &incorrect),
+                        "escaped key must obey declared value: key={key:?}, {schema}"
+                    );
+                    assert!(accepts(&schema, r#"{"other":2}"#));
+                }
+                let unsatisfiable = json!({"type":"object","properties":{key:false},"additionalProperties":{"const":2}});
+                assert!(
+                    !accepts(&unsatisfiable, &incorrect),
+                    "an impossible optional key must remain excluded: {key:?}"
+                );
+                assert!(accepts(&unsatisfiable, r#"{"other":2}"#));
+                let union = json!({"anyOf":[
+                    {"type":"object","properties":{key:{"const":1}},"additionalProperties":false},
+                    {"type":"object","additionalProperties":{"const":2}}
+                ]});
+                assert!(accepts(&union, &correct));
+                assert!(accepts(&union, &incorrect));
+            }
+        }
+        let free = json!({"type":"object","additionalProperties":{"type":"string"}});
+        assert!(accepts(&free, "{\"\u{7f}\":\"\u{7f}\"}"));
+        assert!(
+            !accepts(&free, "{\"x\":\"\u{1f}\"}"),
+            "raw RFC 8259 control bytes remain invalid"
+        );
     }
 
     #[test]

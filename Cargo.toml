@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/llguidance"]
 members = [
     "xtask",
     "crates/onnx-genai",
@@ -294,3 +295,7 @@ libloading = "0.8"
 memmap2 = "0.9"
 prost-reflect = { version = "0.14" }
 smallvec = "1"
+
+# Published external source snapshots are not workspace release crates.
+[workspace.metadata]
+vendored-crates = ["vendor/llguidance/UPSTREAM.json"]

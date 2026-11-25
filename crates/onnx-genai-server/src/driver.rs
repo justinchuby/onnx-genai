@@ -129,6 +129,13 @@ impl BatchingReport {
     }
 }
 
+/// Receiver lifetime cancels provisional prompt work through its control probe.
+pub(crate) struct SubmittedPrefill {
+    pub(crate) admission: oneshot::Receiver<Result<(), DriverFailure>>,
+    pub(crate) progress: mpsc::Receiver<DriverEvent>,
+    pub(crate) result: oneshot::Receiver<Result<onnx_genai_engine::PrefillResult, DriverFailure>>,
+}
+
 pub(crate) enum DriverCommand {
     Realtime(crate::realtime::RealtimeCommand),
     Slot {
@@ -208,6 +215,7 @@ pub(crate) enum DriverCommand {
     },
     Prefill {
         request: onnx_genai_engine::PrefillRequest,
+        admission: oneshot::Sender<Result<(), DriverFailure>>,
         control: GenerationControl,
         reply: oneshot::Sender<Result<onnx_genai_engine::PrefillResult, DriverFailure>>,
         permit: WorkerPermit,
@@ -1374,33 +1382,27 @@ impl EngineDriver {
     pub(crate) async fn prefill(
         &self,
         request: onnx_genai_engine::PrefillRequest,
-    ) -> Result<onnx_genai_engine::PrefillResult, GenerateSubmitError> {
-        struct CancelOnDrop(GenerationControl);
-        impl Drop for CancelOnDrop {
-            fn drop(&mut self) {
-                self.0.cancel();
-            }
-        }
+    ) -> Result<SubmittedPrefill, GenerateSubmitError> {
         let (commands, permit) = self.reserve_stateless_command()?;
-        let control = GenerationControl::default();
-        let _cancel = CancelOnDrop(control.clone());
-        let (reply, response) = oneshot::channel();
-        if commands
+        let (events, progress) = mpsc::channel(16);
+        let control = generation_control_for_events(&events);
+        let (reply, result) = oneshot::channel();
+        let (admission, admitted) = oneshot::channel();
+        commands
             .send(DriverCommand::Prefill {
                 request,
+                admission,
                 control,
                 reply,
                 permit,
             })
             .await
-            .is_err()
-        {
-            return Err(GenerateSubmitError::DriverStopped);
-        }
-        response
-            .await
-            .map_err(|_| GenerateSubmitError::DriverStopped)?
-            .map_err(GenerateSubmitError::Failed)
+            .map_err(|_| GenerateSubmitError::DriverStopped)?;
+        Ok(SubmittedPrefill {
+            admission: admitted,
+            progress,
+            result,
+        })
     }
 
     pub(crate) async fn generate_fim(
@@ -2472,17 +2474,31 @@ fn handle_driver_command(
         }
         DriverCommand::Prefill {
             request,
+            admission,
             control,
             reply,
             permit: _permit,
         } => {
+            let mut admission = Some(admission);
             let result = engine
-                .prefill_with_callbacks(request, Some(control), None)
+                .prefill_with_callbacks(
+                    request,
+                    Some(control),
+                    Some(&mut || {
+                        if let Some(sender) = admission.take() {
+                            let _ = sender.send(Ok(()));
+                        }
+                    }),
+                )
                 .map_err(|error| DriverFailure::from_engine_error(&error));
+            let rejected = admission.zip(result.as_ref().err().cloned());
             if let Ok(result) = &result {
                 crate::metrics::add_prompt_tokens(result.prompt_tokens);
             }
             complete_driver_reply(engine, completion, reply, result, _permit);
+            if let Some((sender, failure)) = rejected {
+                let _ = sender.send(Err(failure));
+            }
         }
         DriverCommand::Transcribe {
             request,

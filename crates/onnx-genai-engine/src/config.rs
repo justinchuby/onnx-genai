@@ -2140,6 +2140,8 @@ pub struct PrefillRequest {
 /// Actual prompt evaluation and the prefix reused from an earlier request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrefillResult {
+    /// Actual prompt work; generation counts and duration remain zero.
+    pub timings: GenerationTimings,
     pub prompt_tokens: usize,
     pub prefix_cache_hit_len: usize,
     /// Materialized cache retained after commit, independent of input reuse.
