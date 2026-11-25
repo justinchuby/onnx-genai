@@ -1865,3 +1865,22 @@ kernels, preserve registry selection and witness actual Native GEMM dispatch.
 Factory-alias and backend-override mutations must fail those guards. This creates
 an inspectable comparison boundary; it measures no performance gap, graduates no
 family and removes none of the outstanding optional reference capabilities.
+
+
+## Conv gap study distinguishes production auto from Generic
+
+The [M1 Max complete-operator study](../benchmarks/conv-reference-gap/README.md)
+uses terminal parent wait4 CPU and setup/work/double/A/A controls. Ten of twelve
+production/reference comparisons qualify; both dilated production cells fail
+A/A and are retained without a performance conclusion. Qualified default
+ordinary 3x3 and large-weight 1x1 use less CPU than MLAS. Grouped and depthwise
+retain reuse CPU ratios about 1.83 and 2.37, respectively. Rank3 changes direction
+between reused and freshly constructed kernels, so lifecycle is part of the cost.
+
+The 1x1 research Generic/reference ratio is about 12.50, while actual production
+on the same geometry uses less CPU than reference. Generic is not a proxy for
+production auto selection. Frozen-binary inspection also finds NCHWc block size
+one, so this ARM64 reference uses fallback ConvPlan; NCHWc packed-filter reuse is
+not an explanation of these observations. Boundary/tail work and grouped im2col
+are candidates for separate profiling, not established causal attributions.
+No runtime policy, quota, cache, graduation verdict or whole-model claim changes.
