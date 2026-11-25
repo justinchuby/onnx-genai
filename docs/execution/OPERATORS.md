@@ -109,7 +109,7 @@ rounding. The CUDA plugin declines runtime-valued shape reads for `Range`.
 | SpaceToDepth | 1 | |
 | GridSample | 20 | |
 | DeformConv | 19, 22 | Native CPU and CUDA. Opset 22 adds bfloat16; CUDA supports up to 32 spatial axes. |
-| Compress | 9, 11, 28 | Compress-28 adds BF16. Native CPU and CUDA preserve BF16 element bits during selection. String is not implemented. |
+| Compress | 9, 11, 28 | Compress-28 adds BF16. Native CPU and CUDA preserve BF16 element bits during selection. String tensors are not handled by the CUDA kernel. |
 | Scatter | 9 | |
 | Unique | 11 | |
 | NMS (NonMaxSuppression) | 10 | Detection models. |
