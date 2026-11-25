@@ -273,6 +273,10 @@ unsafe fn session_with_fallback(
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device and ORT; enable the gpu-tests feature on a CUDA runner"
+)]
 fn cuda_plugin_dft_declines_implicit_irfft_but_claims_rfft() {
     let _lock = lock_ort();
     let session = unsafe { session_with_fallback("dft_modes", "cuda_dft_modes", false) }
