@@ -1,0 +1,193 @@
+{
+  "schema": 2,
+  "protocol_phase": "matched-entry-with-outline-control",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/softmax_neon.rs": "85ca246828856a8a0f70a264e9365ab035205b95368eced5b7ff4a0a4f6b4ea6",
+    "crates/onnx-runtime-ep-cpu/src/kernels/softmax_neon_unroll_tests.rs": "7fabf8f85b4fc61a8d85ae8632af2356f1356e364b8c55444158b1602d63cc5d"
+  },
+  "parent": "4aae0c84dbfc056754b3f467dddfc23902132fbc",
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "lock_inode": 339651569,
+  "lock_parent_pid": 55670,
+  "lock_busy_control": true,
+  "load_before": [
+    2.03857421875,
+    2.06982421875,
+    2.19580078125
+  ],
+  "foreign_cpu_instrument": "unavailable on Darwin; no claim of foreign CPU absence",
+  "receipts": [
+    {
+      "sweep": 0,
+      "width": 1,
+      "pid": 56601,
+      "exit": 0,
+      "wall_s": 0.7475000830017962,
+      "cpu_s": 0.744071,
+      "maxrss_bytes": 33947648,
+      "load_after": [
+        3.2783203125,
+        2.58837890625,
+        2.36572265625
+      ],
+      "fpcr_start": 0,
+      "fpcr_end_equality_assertion_passed": true
+    },
+    {
+      "sweep": 0,
+      "width": 4,
+      "pid": 56603,
+      "exit": 0,
+      "wall_s": 0.617433000006713,
+      "cpu_s": 0.812876,
+      "maxrss_bytes": 34160640,
+      "load_after": [
+        3.2783203125,
+        2.58837890625,
+        2.36572265625
+      ],
+      "fpcr_start": 0,
+      "fpcr_end_equality_assertion_passed": true
+    },
+    {
+      "sweep": 0,
+      "width": 8,
+      "pid": 56606,
+      "exit": 0,
+      "wall_s": 0.600642292003613,
+      "cpu_s": 0.936351,
+      "maxrss_bytes": 34799616,
+      "load_after": [
+        3.2783203125,
+        2.58837890625,
+        2.36572265625
+      ],
+      "fpcr_start": 0,
+      "fpcr_end_equality_assertion_passed": true
+    },
+    {
+      "sweep": 1,
+      "width": 4,
+      "pid": 56607,
+      "exit": 0,
+      "wall_s": 0.6105409170268103,
+      "cpu_s": 0.798002,
+      "maxrss_bytes": 34160640,
+      "load_after": [
+        3.2783203125,
+        2.58837890625,
+        2.36572265625
+      ],
+      "fpcr_start": 0,
+      "fpcr_end_equality_assertion_passed": true
+    },
+    {
+      "sweep": 1,
+      "width": 8,
+      "pid": 56610,
+      "exit": 0,
+      "wall_s": 0.592950375052169,
+      "cpu_s": 0.9282509999999999,
+      "maxrss_bytes": 34226176,
+      "load_after": [
+        3.2783203125,
+        2.58837890625,
+        2.36572265625
+      ],
+      "fpcr_start": 0,
+      "fpcr_end_equality_assertion_passed": true
+    },
+    {
+      "sweep": 1,
+      "width": 1,
+      "pid": 56611,
+      "exit": 0,
+      "wall_s": 0.7450410419842228,
+      "cpu_s": 0.742661,
+      "maxrss_bytes": 33964032,
+      "load_after": [
+        3.2783203125,
+        2.58837890625,
+        2.36572265625
+      ],
+      "fpcr_start": 0,
+      "fpcr_end_equality_assertion_passed": true
+    },
+    {
+      "sweep": 2,
+      "width": 8,
+      "pid": 56612,
+      "exit": 0,
+      "wall_s": 0.5905397080350667,
+      "cpu_s": 0.928257,
+      "maxrss_bytes": 34242560,
+      "load_after": [
+        3.2783203125,
+        2.58837890625,
+        2.36572265625
+      ],
+      "fpcr_start": 0,
+      "fpcr_end_equality_assertion_passed": true
+    },
+    {
+      "sweep": 2,
+      "width": 1,
+      "pid": 56613,
+      "exit": 0,
+      "wall_s": 0.7623061249614693,
+      "cpu_s": 0.748207,
+      "maxrss_bytes": 33964032,
+      "load_after": [
+        3.17578125,
+        2.578125,
+        2.36328125
+      ],
+      "fpcr_start": 0,
+      "fpcr_end_equality_assertion_passed": true
+    },
+    {
+      "sweep": 2,
+      "width": 4,
+      "pid": 56622,
+      "exit": 0,
+      "wall_s": 0.5969807920046151,
+      "cpu_s": 0.781574,
+      "maxrss_bytes": 34160640,
+      "load_after": [
+        3.17578125,
+        2.578125,
+        2.36328125
+      ],
+      "fpcr_start": 0,
+      "fpcr_end_equality_assertion_passed": true
+    }
+  ],
+  "arms": {
+    "0": "original_same_arithmetic",
+    "1": "unrolled_native",
+    "2": "unrolled_native_aa",
+    "3": "mlas",
+    "4": "original_outlined"
+  },
+  "cpu_unit": "ns; process user+system from getrusage, all threads",
+  "repetitions": 15,
+  "sweeps": 3,
+  "machdep.cpu.brand_string": "Apple M1 Max",
+  "hw.memsize": "34359738368",
+  "hw.logicalcpu": "10",
+  "hardware_read_command": "/usr/sbin/sysctl -n machdep.cpu.brand_string hw.memsize hw.logicalcpu",
+  "hardware_read_exit": 0,
+  "hardware_read_authority": "separate escalated read-only command; sandbox sysctl was denied before any build or timing",
+  "hardware_read_time_utc": "2026-11-24T19:43:28.315736+00:00",
+  "binary": "/tmp/nxrt-erf-nan-target/release/deps/onnx_runtime_ep_cpu-6ee16d18d97c5fef",
+  "binary_sha256": "2140d3835092e0222124d322ea3bcebd45d020d8dfed79d8a151af7481de0490",
+  "load_after": [
+    3.17578125,
+    2.578125,
+    2.36328125
+  ],
+  "runner_sha256": "9b215e6a20809d3a6add2e8ba423951462b28e894d9680f8ac0ad617bdd96737",
+  "raw_sha256": "788ae00328f47df19e7c080fc05261380cfb2d194d1559440b48bcf890e7be4b"
+}

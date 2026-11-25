@@ -341,7 +341,21 @@ fn copy_host_bytes(src: &[u8], dst: &mut [u8]) {
         .for_each(|(d, s)| d.copy_from_slice(s));
 }
 
+fn current_workspace_context() -> onnx_runtime_ep_api::WorkspaceContextKey {
+    // Outside a worker, kernels use Rayon's lazy, immutable global pool.
+    // Do not initialize that pool for graphs that need no Rayon workspace.
+    if rayon::current_thread_index().is_none() {
+        onnx_runtime_ep_api::WorkspaceContextKey::STABLE
+    } else {
+        onnx_runtime_ep_api::WorkspaceContextKey::new(rayon::current_num_threads() as u64)
+    }
+}
+
 impl ExecutionProvider for CpuExecutionProvider {
+    fn workspace_preparation_context(&self) -> onnx_runtime_ep_api::WorkspaceContextReader {
+        onnx_runtime_ep_api::WorkspaceContextReader::new(current_workspace_context)
+    }
+
     fn prepare_static_constants(
         &self,
         node: &Node,
@@ -1102,6 +1116,49 @@ mod host_copy_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn workspace_context_is_lazy_and_distinguishes_selected_pool_widths() {
+        const CHILD: &str = "NXRT_WORKSPACE_CONTEXT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let ep = CpuExecutionProvider::with_resources(Default::default());
+            assert_eq!(
+                ep.workspace_preparation_context().read(),
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE
+            );
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build_global()
+                .expect("context getter must not eagerly initialize global Rayon");
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap();
+            assert_eq!(
+                pool.install(|| ep.workspace_preparation_context().read()),
+                onnx_runtime_ep_api::WorkspaceContextKey::new(4)
+            );
+            assert_eq!(
+                ep.workspace_preparation_context().read(),
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE
+            );
+            return;
+        }
+        let name =
+            "provider::tests::workspace_context_is_lazy_and_distinguishes_selected_pool_widths";
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(
+            result.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(stdout.contains(&format!("test {name} ... ok")), "{stdout}");
+    }
+
     use onnx_runtime_ep_api::abi::OrtGraphView;
     use onnx_runtime_ir::{Attribute, FrozenGraph, Graph, NodeId, static_shape};
     use std::ffi::c_void;

@@ -147,6 +147,10 @@ struct AssignedOracle<'a> {
 }
 
 impl ExecutionProvider for AssignedOracle<'_> {
+    fn workspace_preparation_context(&self) -> onnx_runtime_ep_api::WorkspaceContextReader {
+        self.inner.workspace_preparation_context()
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }

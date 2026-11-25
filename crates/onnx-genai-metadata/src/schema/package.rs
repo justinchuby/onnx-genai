@@ -212,10 +212,249 @@ pub struct TaskProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoding: Option<SequenceDecodingSpec>,
 
+    /// Ordered encoded-image endpoints for the reranking v2 task ABI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reranking: Option<RerankingSpec>,
+
+    /// Session-scoped audio/text quantum ABI for realtime transports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realtime: Option<RealtimeSpec>,
+
+    /// Explicit non-generative decision prompting and answer interpretation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<DecisionSpec>,
+
     /// Whether this profile changes generated output and therefore participates
     /// in cache correctness dependencies.
     #[serde(default)]
     pub generation_affecting: bool,
+}
+
+/// Model-authored query/document image positions. Each name references an
+/// application-sourced uint8 vector; the workflow owns decoding and vision math.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RerankingSpec {
+    #[serde(default)]
+    pub query_images: Vec<String>,
+    #[serde(default)]
+    pub document_images: Vec<String>,
+}
+
+/// A bounded native invocation advances one realtime session. Codec, temporal
+/// and acoustic state belongs to session-scoped workflow state, not transport.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RealtimeSpec {
+    pub default_mode: RealtimeMode,
+    /// Jinja context: operation, text, call_id and the complete session settings.
+    pub prompt_template: String,
+    #[serde(default)]
+    pub voices: RealtimeSelections,
+    #[serde(default)]
+    pub languages: RealtimeSelections,
+    pub modes: Vec<RealtimeMode>,
+    pub input_sample_rate_hz: u32,
+    pub input_frame_samples: usize,
+    pub output_sample_rate_hz: Option<u32>,
+    pub inputs: RealtimeInputs,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RealtimeMode {
+    Realtime,
+    Transcription,
+    Duplex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RealtimeInputs {
+    /// Optional bool vocabulary mask: empty means unconstrained; otherwise one
+    /// admission bit per tokenizer ID, consumed before native token selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_mask: Option<String>,
+    pub output_token_budget: String,
+    pub operation: String,
+    pub audio: String,
+    pub tokens: String,
+}
+
+/// Explicit conditioning admission: absence defaults to no override, not an
+/// inferred list or unrestricted model support.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RealtimeSelections {
+    #[default]
+    Unsupported,
+    Any,
+    Choices {
+        values: Vec<String>,
+    },
+}
+impl RealtimeSelections {
+    pub fn admit_selection(&self, value: Option<&str>, field: &str) -> Result<(), String> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        if value.is_empty() {
+            return Err(format!(
+                "{field} must be nonempty or omitted for the model default"
+            ));
+        }
+        match self {
+            Self::Unsupported => Err(format!(
+                "{field} is not supported by this realtime profile; omit it or select a package declaring that conditioning input"
+            )),
+            Self::Any => Ok(()),
+            Self::Choices { values } if values.iter().any(|allowed| allowed == value) => Ok(()),
+            Self::Choices { values } => Err(format!(
+                "{field} contains unknown selection {value:?}; choose one of the package's declared values {values:?}"
+            )),
+        }
+    }
+}
+
+/// Model-authored decision semantics; calibration belongs to the workflow.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionSpec {
+    /// Jinja context: state, instructions, type, options (key/description), variant.
+    pub prompt_template: String,
+    /// Request semantics authored explicitly in schema v1.11 and newer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_policy: Option<DecisionInputPolicy>,
+    pub max_options: std::num::NonZeroUsize,
+    pub variants: DecisionVariants,
+    pub choice_confidence: DecisionConfidence,
+    pub score_confidence: DecisionConfidence,
+    pub score: DecisionScore,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionVariants {
+    Direct,
+    ReverseAverage,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionConfidence {
+    UniformMargin,
+    ModeDistance,
+    NormalizedEntropy,
+    MaximumProbability,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionScore {
+    ExpectedLevel,
+    MedianLevel,
+}
+
+/// Decision question categories shared by metadata, preparation and transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionKind {
+    Choice,
+    Score,
+    Noul,
+}
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionOption {
+    pub key: String,
+    pub description: serde_json::Value,
+}
+
+/// Complete model-authored request rules. Absent task policies disable that type.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionInputPolicy {
+    pub state: DecisionPayload,
+    pub instructions: DecisionInstructions,
+    pub default_type: Option<DecisionKind>,
+    pub max_questions: Option<std::num::NonZeroUsize>,
+    pub choice: Option<DecisionChoices>,
+    pub score: Option<DecisionLevels>,
+    pub noul: Option<DecisionBoolean>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionPayload {
+    Any,
+    AnyNonNull,
+    Payload,
+    PayloadOrNull,
+    NonemptyPayload,
+    Text,
+}
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DecisionInstructions {
+    Required {
+        payload: DecisionPayload,
+    },
+    Optional {
+        default: serde_json::Value,
+        payload: DecisionPayload,
+    },
+    Forbidden,
+}
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DecisionChoices {
+    Dynamic {
+        minimum: std::num::NonZeroUsize,
+        order: DecisionOrder,
+        descriptions: DecisionPayload,
+        nonempty_keys: bool,
+    },
+    Fixed {
+        options: Vec<DecisionOption>,
+    },
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionOrder {
+    Lexical,
+    Request,
+}
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionLevels {
+    pub minimum: std::num::NonZeroUsize,
+    pub maximum: std::num::NonZeroUsize,
+    pub descriptions: DecisionPayload,
+    pub legend: DecisionLegend,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionLegend {
+    Structured,
+    CanonicalJsonText,
+}
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionBoolean {
+    pub order: DecisionBooleanOrder,
+    pub criteria: DecisionBooleanCriteria,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionBooleanOrder {
+    FalseFirst,
+    TrueFirst,
+    CriteriaTrueFirst,
+}
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DecisionBooleanCriteria {
+    Forbidden,
+    Strict { descriptions: DecisionPayload },
+    Permissive { no_yes_aliases: bool },
 }
 
 /// Whether a reader may ignore a profile it does not understand.

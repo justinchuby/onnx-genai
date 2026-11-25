@@ -45,7 +45,7 @@ mod workflow;
 
 pub use adapters::{AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection};
 pub use arg_reduce::{ArgReduceRewrites, WideArgReduceLowering, lower_degenerate_arg_reductions};
-pub use audio::{EncodedAudio, encode_pcm16_wav, resample_planar};
+pub use audio::{EncodedAudio, StreamingResampler, encode_pcm16_wav, resample_planar};
 pub use batching::{
     BatchContractError, ComposedOwnership, OwnershipLevelValues, PackedOwnership,
     PackedRequestView, PackedTensor, PackedValueView, RebasedI64Slice, batch_contract_error,
