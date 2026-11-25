@@ -51,6 +51,7 @@ mod slots;
 mod speech;
 mod sse;
 mod state;
+mod timings;
 mod tool_protocol;
 mod types;
 mod webui;
@@ -72,14 +73,14 @@ pub use state::{
 };
 pub use tool_protocol::{ToolProtocol, ToolProtocolError};
 pub use types::{
-    AudioSpeechRequest, AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest,
-    ChatCompletionResponse, ChatContinuation, ChatLogprobs, ChatMessage, ChatMessageContent,
-    ChatMessageContentPart, ChatMessageToolCall, ChatMessageToolCallFunction, ChatTokenLogprob,
-    ChatTool, ChatToolFunction, ChatTopLogprob, CompletionChoice, CompletionLogprobs,
-    CompletionRequest, CompletionResponse, EmbeddingData, EmbeddingEncodingFormat, EmbeddingInput,
-    EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, ImageUrl, InputAudio,
-    JsonSchemaSpec, ResponseFormat, StopInput, ToolChoice, ToolChoiceFunction, ToolChoiceMode,
-    ToolChoiceSpecific, Usage,
+    AudioSpeechRequest, ChatChoice, ChatCompletionRequest, ChatCompletionResponse,
+    ChatContinuation, ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageContentPart,
+    ChatMessageToolCall, ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatToolFunction,
+    ChatTopLogprob, CompletionChoice, CompletionLogprobs, CompletionRequest, CompletionResponse,
+    EmbeddingData, EmbeddingEncodingFormat, EmbeddingInput, EmbeddingRequest, EmbeddingResponse,
+    EmbeddingUsage, EmbeddingVector, ImageUrl, InputAudio, JsonSchemaSpec, ResponseFormat,
+    StopInput, ToolChoice, ToolChoiceFunction, ToolChoiceMode, ToolChoiceSpecific,
+    TranscriptInputTokenDetails, TranscriptResponse, TranscriptTokenUsage, Usage,
 };
 
 pub use auth::ApiKeys;

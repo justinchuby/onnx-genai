@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "prompt_template": "hello{% if language %} .{% endif %} world .",
+  "languages": {
+    "kind": "choices",
+    "values": [
+      "en"
+    ]
+  },
+  "prompt_conditioning": false
+}

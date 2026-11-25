@@ -1,0 +1,162 @@
+{
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/decoded_projection.rs": "ce76aabaa6dce9b7c843d232146f163196de1afa50595d0a702029bce8be1854",
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs": "3bba3e5020f58621c041edf105c71a24db3bb3ba1e8c7d7c477f14bb225e7b1d",
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs": "53597034cb68e08ec6ec7188f2660efce873d42b662a4e5fd238e417942c35ef",
+    "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs": "06fc7ec0d3ed24c6101adb9599e8a6f05e2257c24261fced12b89a4b4917ca8b",
+    "crates/onnx-runtime-ep-cpu/tests/decoded_projection_layout.rs": "07b99ef664d48894a6b5b43ea8d4996664ba9eac032342b4816591e959a718a1"
+  },
+  "results": [
+    {
+      "name": "list",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--features",
+        "mlas",
+        "--lib",
+        "kernels::decoded_projection::tests::",
+        "--",
+        "--list"
+      ],
+      "exit": 0,
+      "log_sha256": "4ece6ab89874c0f448f6ff309b73efe9a6991840470272c6f096acbd06d91fd4"
+    },
+    {
+      "name": "projection",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--features",
+        "mlas",
+        "--lib",
+        "kernels::decoded_projection::tests::"
+      ],
+      "exit": 0,
+      "log_sha256": "a8fef35623d06ff11ecd7dd780c0c246470a934360b7585f86ffe9481bbbc3de",
+      "counts": [
+        [
+          "8",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "block-matmul",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--features",
+        "mlas",
+        "--lib",
+        "kernels::block_quantized_matmul::tests::"
+      ],
+      "exit": 0,
+      "log_sha256": "f14c405681c875a023bb936a64edecd63648bc787a66be2fd30b151f41a1d0ac",
+      "counts": [
+        [
+          "39",
+          "0",
+          "1"
+        ]
+      ]
+    },
+    {
+      "name": "block-moe",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--features",
+        "mlas",
+        "--lib",
+        "kernels::block_quantized_moe::tests::"
+      ],
+      "exit": 0,
+      "log_sha256": "775540d87a37d4940f319af0760b7209462bacc7ffc992d39584b1e939d622e4",
+      "counts": [
+        [
+          "31",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "qmoe",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--features",
+        "mlas",
+        "--lib",
+        "kernels::qmoe::tests::"
+      ],
+      "exit": 0,
+      "log_sha256": "777a9df144b3cb2581652df1a3ed95ec56f592436e2e1bc197a6907448e620b5",
+      "counts": [
+        [
+          "68",
+          "0",
+          "1"
+        ]
+      ]
+    },
+    {
+      "name": "layout",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--features",
+        "mlas",
+        "--test",
+        "decoded_projection_layout"
+      ],
+      "exit": 0,
+      "log_sha256": "531cdcffcb055836d8515af84ed9d8d41dff8ff06df2274fc6293e1998996792",
+      "counts": [
+        [
+          "17",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--features",
+        "mlas",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit": 0,
+      "log_sha256": "77ef0aa6bf80bb29b21c9869ba7885623487d45935f7984ba2dc2cd74636e375"
+    }
+  ]
+}

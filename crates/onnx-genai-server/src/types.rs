@@ -839,12 +839,34 @@ pub struct ImageUrl {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InputAudio {
     pub data: String,
+    /// Client container/encoding label; content autodetection selects the decoder.
     pub format: String,
 }
 
 #[derive(Debug, Serialize)]
-pub struct AudioTranscriptionResponse {
-    pub text: String,
+#[serde(tag = "type")]
+pub enum TranscriptResponse {
+    #[serde(rename = "transcript.text.delta")]
+    Delta { delta: String },
+    #[serde(rename = "transcript.text.done")]
+    Done {
+        text: String,
+        usage: TranscriptTokenUsage,
+    },
+}
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename = "tokens")]
+pub struct TranscriptTokenUsage {
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub total_tokens: usize,
+    pub input_tokens_details: TranscriptInputTokenDetails,
+}
+#[derive(Debug, Serialize)]
+pub struct TranscriptInputTokenDetails {
+    pub cached_tokens: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_frames: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -945,6 +967,8 @@ impl StopInput {
 
 #[derive(Debug, Serialize)]
 pub struct ChatCompletionResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<serde_json::Value>,
     pub id: String,
     pub object: &'static str,
     pub created: u64,
@@ -999,6 +1023,8 @@ pub struct Usage {
 
 #[derive(Debug, Serialize)]
 pub struct CompletionResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<serde_json::Value>,
     pub id: String,
     pub object: &'static str,
     pub created: u64,

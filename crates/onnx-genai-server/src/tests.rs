@@ -999,13 +999,22 @@ fn chat_sampling_defaults_stay_greedy_while_seed_enables_sampling() {
 }
 
 #[test]
-fn transcription_json_response_has_openai_shape() {
-    let response = crate::types::AudioTranscriptionResponse {
-        text: "hello".to_string(),
+fn transcription_json_response_has_llama_usage_and_openai_text() {
+    let response = crate::types::TranscriptResponse::Done {
+        text: "hello".into(),
+        usage: crate::types::TranscriptTokenUsage {
+            input_tokens: 3,
+            output_tokens: 1,
+            total_tokens: 4,
+            input_tokens_details: crate::types::TranscriptInputTokenDetails {
+                cached_tokens: 0,
+                audio_frames: None,
+            },
+        },
     };
     assert_eq!(
         serde_json::to_value(response).unwrap(),
-        json!({"text": "hello"})
+        json!({"type":"transcript.text.done","text":"hello","usage":{"type":"tokens","input_tokens":3,"output_tokens":1,"total_tokens":4,"input_tokens_details":{"cached_tokens":0}}})
     );
 }
 
@@ -1686,9 +1695,9 @@ async fn embeddings_success_path_returns_openai_compatible_response() {
 }
 
 #[tokio::test]
-async fn transcription_multipart_against_non_audio_model_returns_400() {
+async fn transcription_multipart_against_non_audio_model_returns_501() {
     // Send the correct model name (tiny-llm) so routing succeeds, then the handler
-    // returns 400 because tiny-llm has no audio input spec.
+    // returns 501 because tiny-llm declares no transcription capability.
     let (boundary, body) = multipart_audio_body_for_model("tiny-llm", "json");
     let response = app(tiny_state())
         .oneshot(
@@ -1705,14 +1714,14 @@ async fn transcription_multipart_against_non_audio_model_returns_400() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body: Value = serde_json::from_slice(&body).unwrap();
     let message = body["error"]["message"].as_str().unwrap();
     assert!(message.contains("What:"), "message: {message}");
     assert!(message.contains("How:"), "message: {message}");
     assert!(
-        message.contains("input_features"),
+        message.contains("audio input"),
         "the missing contract must be named: {message}"
     );
 }
@@ -7391,6 +7400,10 @@ mod llama_compat {
             (25, "2\":0}"),
             (26, "e00\""),
             (27, "f00\""),
+            (28, "f\":0}"),
+            (29, "e\":0}"),
+            (30, "0}"),
+            (31, "1}"),
         ] {
             let old = vocab
                 .iter()
@@ -7423,6 +7436,20 @@ mod llama_compat {
                     24,
                     25,
                     "1\":0}",
+                ),
+                (
+                    r#"{"\u007"#,
+                    json!({"type":"object","properties":{"\u{7f}":{"const":0}},"required":["\u{7f}"],"additionalProperties":false}),
+                    28,
+                    29,
+                    "f\":0}",
+                ),
+                (
+                    r#"{"\u007F":"#,
+                    json!({"type":"object","properties":{"\u{7f}":{"const":0}},"additionalProperties":{"const":1}}),
+                    30,
+                    31,
+                    "0}",
                 ),
                 (r#""\ud83d\ud"#, json!({"const":"😀"}), 26, 27, "e00\""),
             ] {
@@ -8669,6 +8696,330 @@ mod native_compat {
     }
 
     #[tokio::test]
+    async fn prompt_progress_is_opt_in_and_reports_real_cold_and_cached_prompt_work() {
+        let router = app(tiny_state().with_default_fim_config(Some(
+            onnx_genai_engine::FimConfig {
+                prefix_token: "<PRE>".into(),
+                middle_token: "<MID>".into(),
+                suffix_token: "<SUF>".into(),
+                format: onnx_genai_engine::FimFormat::PSM,
+            },
+        )));
+        for path in [
+            "/completion",
+            "/v1/completions",
+            "/v1/chat/completions",
+            "/infill",
+        ] {
+            for (report, cold) in [(false, true), (true, true), (true, false)] {
+                let mut body = json!({"max_tokens":1,"temperature":0,"ignore_eos":true,"stream":true,
+                    "return_progress":report,"cache_prompt":!cold});
+                match path {
+                    "/v1/chat/completions" => {
+                        body["messages"] = json!([{"role":"user","content":"hello"}])
+                    }
+                    "/infill" => {
+                        body["input_prefix"] = json!("prefix");
+                        body["input_suffix"] = json!("suffix");
+                    }
+                    _ => body["prompt"] = json!([2, 4, 3]),
+                }
+                let response = request(router.clone(), path, body).await;
+                let status = response.status();
+                let values =
+                    sse_json_events(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap());
+                assert_eq!(status, StatusCode::OK, "{path}: {values:?}");
+                let updates = values
+                    .iter()
+                    .filter_map(|value| value.get("prompt_progress"))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    updates.len(),
+                    if report { 2 } else { 0 },
+                    "{path}: {values:?}"
+                );
+                let final_timing = values
+                    .iter()
+                    .filter_map(|value| value.get("timings"))
+                    .next_back()
+                    .expect("final decoder timing");
+                if report {
+                    let initial = updates[0];
+                    let done = updates[1];
+                    assert_eq!(initial["processed"], initial["cache"]);
+                    assert_eq!(initial["time_ms"], 0);
+                    assert_eq!(done["processed"], done["total"]);
+                    assert_eq!(done["cache"], initial["cache"]);
+                    assert_eq!(
+                        done["total"].as_u64().unwrap(),
+                        final_timing["cache_n"].as_u64().unwrap()
+                            + final_timing["prompt_n"].as_u64().unwrap()
+                    );
+                    assert_eq!(done["cache"], final_timing["cache_n"]);
+                    if cold {
+                        assert_eq!(done["cache"], 0);
+                    }
+                    if !cold && path == "/completion" {
+                        assert!(done["cache"].as_u64().unwrap() > 0);
+                    }
+                    let first_progress = values
+                        .iter()
+                        .position(|value| value.get("prompt_progress").is_some())
+                        .unwrap();
+                    let first_output = values
+                        .iter()
+                        .position(|value| {
+                            value["tokens_predicted"]
+                                .as_u64()
+                                .is_some_and(|count| count > 0)
+                                || value["content"]
+                                    .as_str()
+                                    .is_some_and(|text| !text.is_empty())
+                                || value["choices"][0]["delta"]["content"]
+                                    .as_str()
+                                    .is_some_and(|text| !text.is_empty())
+                                || value["choices"][0]["text"]
+                                    .as_str()
+                                    .is_some_and(|text| !text.is_empty())
+                        })
+                        .unwrap();
+                    assert!(first_progress < first_output, "{values:?}");
+                }
+                assert_eq!(final_timing["predicted_n"], 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn decoder_timings_reach_native_and_chat_buffered_and_streamed_responses() {
+        let router = app(tiny_state());
+        for path in ["/completion", "/v1/completions", "/v1/chat/completions"] {
+            for streaming in [false, true] {
+                for per_token in [false, true] {
+                    let mut body = json!({"max_tokens":2,"temperature":0,"ignore_eos":true,
+                        "stream":streaming,"timings_per_token":per_token});
+                    if path != "/v1/chat/completions" {
+                        body["prompt"] = json!([2, 4, 3]);
+                    } else {
+                        body["messages"] = json!([{"role":"user","content":"hello"}]);
+                    }
+                    let response = request(router.clone(), path, body).await;
+                    let status = response.status();
+                    let values = if streaming {
+                        sse_json_events(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    } else {
+                        vec![json_body(response).await]
+                    };
+                    assert_eq!(status, StatusCode::OK, "{path}: {values:?}");
+                    let measured = values
+                        .iter()
+                        .filter_map(|value| value.get("timings"))
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        measured.len(),
+                        if streaming && per_token { 3 } else { 1 },
+                        "{path}: {values:?}"
+                    );
+                    let final_sample = *measured.last().unwrap();
+                    assert_eq!(final_sample["predicted_n"], 2);
+                    assert!(final_sample["prompt_ms"].as_f64().unwrap() > 0.0);
+                    assert!(final_sample["predicted_ms"].as_f64().unwrap() > 0.0);
+                    let mut previous = 0.0;
+                    for sample in &measured {
+                        assert!(sample["predicted_ms"].as_f64().unwrap() >= previous);
+                        previous = sample["predicted_ms"].as_f64().unwrap();
+                        assert_eq!(sample["prompt_ms"], final_sample["prompt_ms"]);
+                        for field in [
+                            "prompt_per_token_ms",
+                            "prompt_per_second",
+                            "predicted_per_token_ms",
+                            "predicted_per_second",
+                        ] {
+                            assert!(sample[field].as_f64().unwrap().is_finite(), "{sample}");
+                        }
+                    }
+                    if streaming && per_token {
+                        assert_eq!(measured[0]["predicted_n"], 1);
+                        assert_eq!(measured[0]["predicted_per_second"], 0.0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_generation_reports_retained_cache_in_buffered_and_streamed_results() {
+        let router = app(tiny_state());
+        for streaming in [false, true] {
+            for cache_prompt in [false, true] {
+                let response = request(
+                    router.clone(),
+                    "/completion",
+                    json!({
+                        "prompt":[2,4,3], "n_predict":2, "temperature":0,
+                        "stream":streaming, "cache_prompt":cache_prompt
+                    }),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let value = if streaming {
+                    sse_json_events(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                        .into_iter()
+                        .find(|value| value["stop"] == true)
+                        .expect("final SSE result")
+                } else {
+                    json_body(response).await
+                };
+                let slots = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/slots")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(slots.status(), StatusCode::OK);
+                let slots = json_body(slots).await;
+                assert_eq!(
+                    value["tokens_cached"], slots[0]["n_past"],
+                    "{value}; {slots}"
+                );
+                assert!(value["tokens_cached"].as_u64().unwrap() >= 3, "{value}");
+                assert_eq!(slots[0]["is_processing"], false);
+                assert_eq!(value["tokens_predicted"], 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_prompt_only_progress_and_timings_follow_cold_cached_and_extended_work() {
+        use onnx_genai_engine::EngineDecodeBackend;
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for backend in [EngineDecodeBackend::Native, EngineDecodeBackend::Ort] {
+            let state = AppState::load_with_config(
+                &model_dir,
+                Some("tiny-llm".into()),
+                ServerConfig {
+                    engine_config: EngineConfig {
+                        decode_backend: backend,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let router = app(state);
+            for (stream, report, cold, tokens) in [
+                (false, true, true, vec![2, 4, 3]),
+                (true, false, true, vec![2, 4, 3]),
+                (true, true, true, vec![2, 4, 3]),
+                (true, true, false, vec![2, 4, 3]),
+                (true, true, false, vec![2, 4, 3, 5]),
+            ] {
+                let response = request(
+                    router.clone(),
+                    "/completion",
+                    json!({
+                        "prompt":tokens,"n_predict":0,"stream":stream,"return_progress":report,
+                        "cache_prompt":!cold,"return_tokens":true
+                    }),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let values = if stream {
+                    sse_json_events(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                } else {
+                    vec![json_body(response).await]
+                };
+                let terminal = values.last().unwrap();
+                assert_eq!(terminal["stop"], true, "{values:?}");
+                assert_eq!(terminal["content"], "");
+                assert_eq!(terminal["tokens"], json!([]));
+                let cache = if cold {
+                    0
+                } else if tokens.len() == 4 || backend == EngineDecodeBackend::Native {
+                    3
+                } else {
+                    2
+                };
+                let timing = &terminal["timings"];
+                assert_eq!(timing["cache_n"], cache);
+                assert_eq!(timing["prompt_n"], tokens.len() - cache);
+                assert_eq!(timing["predicted_n"], 0);
+                for name in [
+                    "predicted_ms",
+                    "predicted_per_token_ms",
+                    "predicted_per_second",
+                ] {
+                    assert_eq!(timing[name].as_f64(), Some(0.0));
+                }
+                let updates = values
+                    .iter()
+                    .filter_map(|value| value.get("prompt_progress"))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    updates.len(),
+                    if stream && report { 2 } else { 0 },
+                    "{values:?}"
+                );
+                if stream && report {
+                    assert_eq!(values.len(), 3);
+                    assert_eq!(updates[0]["processed"], cache);
+                    assert_eq!(updates[1]["processed"], tokens.len());
+                    for update in updates {
+                        assert_eq!(update["cache"], cache);
+                        assert_eq!(update["total"], tokens.len());
+                    }
+                }
+                if cache == tokens.len() {
+                    assert_eq!(timing["prompt_ms"].as_f64(), Some(0.0));
+                } else {
+                    assert!(timing["prompt_ms"].as_f64().unwrap() > 0.0);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_prompt_only_rejects_unavailable_execution_before_sse_admission() {
+        let scratch = tempfile::tempdir().unwrap();
+        let package = workflow_session_package(&scratch);
+        let router = app(AppState::load(&package, Some("workflow".into())).unwrap());
+        for stream in [false, true] {
+            let response = request(
+                router.clone(),
+                "/completion",
+                json!({
+                    "prompt":[2,4,3],"n_predict":0,"stream":stream,"return_progress":true
+                }),
+            )
+            .await;
+            let status = response.status();
+            assert!(
+                !response
+                    .headers()
+                    .get("content-type")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .contains("event-stream")
+            );
+            let error = json_body(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("runtime-owned decode executor"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn native_prompt_only_prefill_returns_zero_output_and_real_cache_reuse() {
         let router = app(tiny_state());
         let response = request(
@@ -8685,6 +9036,60 @@ mod native_compat {
         assert_eq!(body["tokens_predicted"], 0);
         assert_eq!(body["tokens_evaluated"], 3);
         assert_eq!(body["stop"], true);
+        assert_eq!(
+            body["tokens_cached"], 3,
+            "cold evaluation still retains the evaluated prompt"
+        );
+        for streaming in [false, true] {
+            let response = request(
+                router.clone(),
+                "/completion",
+                json!({"prompt":[2,4,3],"n_predict":0,"stream":streaming}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = if streaming {
+                sse_json_events(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    .remove(0)
+            } else {
+                json_body(response).await
+            };
+            assert_eq!(value["tokens_cached"], 3, "{value}");
+            assert_eq!(value["tokens_predicted"], 0);
+            assert_eq!(value["content"], "");
+        }
+        let response = request(
+            router.clone(),
+            "/completion",
+            json!({"prompt":[2,4,3,5],"n_predict":0}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(value["tokens_cached"], 4, "{value}");
+        assert_eq!(value["tokens_evaluated"], 4);
+        let slots = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/slots")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(slots.status(), StatusCode::OK);
+        let slots = json_body(slots).await;
+        assert_eq!(slots[0]["n_past"], 4, "{slots}");
+        assert_eq!(slots[0]["is_processing"], false, "{slots}");
+        let response = request(
+            router.clone(),
+            "/completion",
+            json!({"prompt":[2,4,3,5],"n_predict":0,"cache_prompt":false}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["tokens_cached"], 4);
         let response = request(
             router.clone(),
             "/completion",
@@ -8705,7 +9110,7 @@ mod native_compat {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(json_body(response).await["tokens_cached"], 0);
+        assert_eq!(json_body(response).await["tokens_cached"], 3);
         for streaming in [false, true] {
             let response = request(
                 router.clone(),
@@ -10014,9 +10419,18 @@ mod native_compat {
         let router = app(tiny_state());
         let response = router.clone().oneshot(Request::builder().method("POST").uri("/v1/chat/completions")
             .header(header::CONTENT_TYPE,"application/json").header("x-conversation-id","known::tiny-llm")
-            .body(Body::from(json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":2,"stream":true}).to_string())).unwrap()).await.unwrap();
+            .body(Body::from(json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":2,"stream":true,"return_progress":true,"timings_per_token":true}).to_string())).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let original = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let events = sse_json_events(&original);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.get("prompt_progress").is_some())
+                .count(),
+            2
+        );
+        assert!(events.iter().any(|event| event.get("timings").is_some()));
         let response = router
             .clone()
             .oneshot(
@@ -11534,6 +11948,76 @@ mod systemone_audio {
         (response.status(), json_body(response).await)
     }
     #[tokio::test]
+    async fn systemone_mp3_state_and_spoken_questions_execute_native_audio_preprocessing() {
+        let mp3 = include_bytes!("../../../tests/fixtures/audio/stereo-tone.mp3");
+        let decoded = onnx_genai_preprocess::audio::decode_audio(mp3).unwrap();
+        let wav = onnx_genai_preprocess::audio::encode_wav_pcm16(
+            &decoded.samples,
+            decoded.sample_rate,
+            1,
+        )
+        .unwrap();
+        let router = router(1024 * 1024);
+        let mut results = Vec::new();
+        for (mime, bytes) in [
+            ("audio/mpeg", mp3.as_slice()),
+            ("audio/wav", wav.as_slice()),
+        ] {
+            let mut request = body();
+            request["files"][1] = json!(format!("data:{mime};base64,{}", STANDARD.encode(bytes)));
+            request["questions"]["route"]["instructions"]["input_audio"]["data"] =
+                json!(STANDARD.encode(bytes));
+            let (status, result) = post(router.clone(), request).await;
+            assert_eq!(status, StatusCode::OK, "{result}");
+            results.push(result);
+        }
+        assert_eq!(results[0]["usage"], results[1]["usage"]);
+        for key in ["a", "b"] {
+            let a = results[0]["answers"]["route"]["probabilities"][key]
+                .as_f64()
+                .unwrap();
+            let b = results[1]["answers"]["route"]["probabilities"][key]
+                .as_f64()
+                .unwrap();
+            assert!((a - b).abs() < 0.001, "{key}: {a} vs {b}");
+        }
+    }
+    #[tokio::test]
+    async fn systemone_codec_matrix_preserves_state_and_spoken_question_results() {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/audio/codec-matrix");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(fixtures.join("manifest.json")).unwrap())
+                .unwrap();
+        let router = router(1024 * 1024);
+        for case in manifest["cases"].as_array().unwrap() {
+            let file = case["file"].as_str().unwrap();
+            let bytes = std::fs::read(fixtures.join(file)).unwrap();
+            let decoded = onnx_genai_preprocess::audio::decode_audio(&bytes).unwrap();
+            let reference = onnx_genai_preprocess::audio::encode_wav_f32(
+                &decoded.samples,
+                decoded.sample_rate,
+                1,
+            )
+            .unwrap();
+            let mut results = Vec::new();
+            for bytes in [&bytes, &reference] {
+                let mut request = body();
+                request["files"][1] = json!(format!(
+                    "data:audio/{};base64,{}",
+                    case["codec"].as_str().unwrap(),
+                    STANDARD.encode(bytes)
+                ));
+                request["questions"]["route"]["instructions"]["input_audio"]["data"] =
+                    json!(STANDARD.encode(bytes));
+                let (status, result) = post(router.clone(), request).await;
+                assert_eq!(status, StatusCode::OK, "{file}: {result}");
+                results.push(result);
+            }
+            assert_eq!(results[0], results[1], "{file}");
+        }
+    }
+    #[tokio::test]
     async fn systemone_audio_spoken_questions_are_independent_and_usage_is_actual() {
         let router = router(1024 * 1024);
         let request = body();
@@ -11622,7 +12106,7 @@ mod systemone_audio {
             (1, "questions.route"),
             (2, "questions.route"),
             (3, "questions.route"),
-            (4, "PCM16"),
+            (4, "supported encoded audio"),
             (5, "omits required"),
         ] {
             let mut request = body();
@@ -11677,5 +12161,764 @@ mod systemone_audio {
                 .contains("--max-decision-media-bytes"),
             "{result}"
         );
+    }
+}
+
+mod ctc_transcription {
+    use super::*;
+    fn root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/transcription_ctc")
+    }
+    fn wav(negate: bool) -> Vec<u8> {
+        let samples = [-0.5, -0.5, 0.125, -0.5, 0.0, 0.5, 0.5, 0.125, 0.5]
+            .map(|v| if negate { -v } else { v });
+        onnx_genai_preprocess::audio::encode_wav_pcm16(&samples, 8000, 1).unwrap()
+    }
+    fn router(config: ServerConfig) -> axum::Router {
+        app(AppState::load_with_config(&root(), Some("ctc".into()), config).unwrap())
+    }
+    async fn send(
+        router: axum::Router,
+        path: &str,
+        bytes: &[u8],
+        fields: &[(&str, &str)],
+    ) -> (StatusCode, String) {
+        let boundary = "nxrt-ctc-test";
+        let mut body = Vec::new();
+        for (field, value) in fields {
+            body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"\r\n\r\n{value}\r\n").as_bytes());
+        }
+        body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"clip.wav\"\r\nContent-Type: audio/wav\r\n\r\n").as_bytes());
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+    async fn post(
+        router: axum::Router,
+        path: &str,
+        bytes: &[u8],
+        format: &str,
+        extra: Option<(&str, &str)>,
+    ) -> (StatusCode, String) {
+        let mut fields = vec![("model", "ctc"), ("response_format", format)];
+        if let Some(extra) = extra {
+            fields.push(extra);
+        }
+        send(router, path, bytes, &fields).await
+    }
+    fn transcript_events(body: &str) -> Vec<Value> {
+        let values = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .collect::<Vec<_>>();
+        assert_eq!(values.last(), Some(&"[DONE]"), "{body}");
+        values[..values.len() - 1]
+            .iter()
+            .map(|value| serde_json::from_str(value).unwrap())
+            .collect()
+    }
+    #[tokio::test]
+    async fn authored_generative_transcription_conditions_native_inference_and_projects_sse() {
+        let model = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/transcription_projected");
+        let router = app(AppState::load(&model, Some("speech".into())).unwrap());
+        let bytes = onnx_genai_preprocess::audio::encode_wav_f32(&[0.0; 256], 8000, 1).unwrap();
+        for (extra, expected, tokens) in [
+            (None, "world", 2),
+            (Some(("language", "en")), "world", 2),
+            (Some(("language", "zh")), "hello", 3),
+            (Some(("prompt", "tok31")), "hello", 3),
+        ] {
+            let mut fields = vec![("model", "speech")];
+            if let Some(extra) = extra {
+                fields.push(extra);
+            }
+            let (status, body) =
+                send(router.clone(), "/v1/audio/transcriptions", &bytes, &fields).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let expected_json: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(expected_json["text"], expected);
+            assert_eq!(expected_json["usage"]["input_tokens"], tokens);
+            assert_eq!(expected_json["usage"]["output_tokens"], 3);
+            fields.push(("stream", "true"));
+            let (status, body) =
+                send(router.clone(), "/v1/audio/transcriptions", &bytes, &fields).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let events = transcript_events(&body);
+            assert_eq!(events.last().unwrap(), &expected_json);
+            let deltas = events
+                .iter()
+                .filter_map(|event| event["delta"].as_str())
+                .collect::<String>();
+            assert_eq!(deltas, expected);
+            assert!(!body.contains("tok16") && !body.contains("tok17"), "{body}");
+        }
+        let (status, body) = send(
+            router,
+            "/v1/audio/transcriptions",
+            &bytes,
+            &[
+                ("model", "speech"),
+                ("language", "unknown"),
+                ("stream", "true"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("language") && !body.contains("data:"),
+            "{body}"
+        );
+    }
+    #[tokio::test]
+    async fn generative_transcription_requires_declared_prompting_and_respects_prompt_budgets() {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/transcription_projected");
+        let bytes = onnx_genai_preprocess::audio::encode_wav_f32(&[0.0; 256], 8000, 1).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        for name in [
+            "inference_metadata.yaml",
+            "tokenizer.json",
+            "model.onnx.textproto",
+        ] {
+            std::fs::copy(source.join(name), scratch.path().join(name)).unwrap();
+        }
+        let absent = app(AppState::load(scratch.path(), Some("speech".into())).unwrap());
+        let (status, body) = send(
+            absent,
+            "/v1/audio/transcriptions",
+            &bytes,
+            &[("model", "speech")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+        assert!(body.contains("transcription_config.json"), "{body}");
+        for config in [
+            ServerConfig {
+                max_transcription_input_tokens: std::num::NonZeroUsize::new(1).unwrap(),
+                ..Default::default()
+            },
+            ServerConfig {
+                max_transcription_prompt_bytes: std::num::NonZeroUsize::new(2).unwrap(),
+                ..Default::default()
+            },
+            ServerConfig {
+                max_transcription_template_operations: std::num::NonZeroU64::new(1).unwrap(),
+                ..Default::default()
+            },
+        ] {
+            let router =
+                app(AppState::load_with_config(&source, Some("speech".into()), config).unwrap());
+            let (status, body) = send(
+                router,
+                "/v1/audio/transcriptions",
+                &bytes,
+                &[("model", "speech"), ("stream", "true")],
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(!body.contains("data:"), "{body}");
+        }
+    }
+    #[tokio::test]
+    async fn audio_chat_uses_normal_chat_templates_and_declared_single_turn_conditioning() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/transcription_projected");
+        let scratch = tempfile::tempdir().unwrap();
+        for name in [
+            "inference_metadata.yaml",
+            "tokenizer.json",
+            "model.onnx.textproto",
+        ] {
+            std::fs::copy(source.join(name), scratch.path().join(name)).unwrap();
+        }
+        let mut config: Value =
+            serde_json::from_slice(&std::fs::read(source.join("tokenizer_config.json")).unwrap())
+                .unwrap();
+        config["chat_template"] = json!("tok31 dog");
+        std::fs::write(
+            scratch.path().join("tokenizer_config.json"),
+            config.to_string(),
+        )
+        .unwrap();
+        let audio = STANDARD
+            .encode(onnx_genai_preprocess::audio::encode_wav_f32(&[0.0; 256], 8000, 1).unwrap());
+        for (directory, normal) in [(scratch.path(), true), (source.as_path(), false)] {
+            let router = app(AppState::load(directory, Some("speech".into())).unwrap());
+            let mut messages = vec![
+                json!({"role":"user","content":[{"type":"text","text":"tok31"},{"type":"input_audio","input_audio":{"format":"wav","data":audio}}]}),
+            ];
+            if normal {
+                messages.insert(
+                    0,
+                    json!({"role":"system","content":"keep this role history"}),
+                );
+            }
+            let request =
+                json!({"model":"speech","messages":messages,"max_tokens":3,"temperature":0.0});
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let result = json_body(response).await;
+            assert_eq!(status, StatusCode::OK, "{result}");
+            assert_eq!(result["choices"][0]["message"]["content"], "hello");
+            let props = json_body(
+                router
+                    .oneshot(
+                        Request::builder()
+                            .uri("/props")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                props["nxrt_capabilities"]["generative_transcription"],
+                !normal
+            );
+        }
+    }
+    #[tokio::test]
+    async fn authored_feature_transcription_matches_encoded_native_workflow() {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows");
+        let encoded = app(AppState::load(
+            &fixtures.join("transcription_tokens"),
+            Some("speech".into()),
+        )
+        .unwrap());
+        let features = app(AppState::load(
+            &fixtures.join("transcription_features"),
+            Some("speech".into()),
+        )
+        .unwrap());
+        for (amplitude, expected_text) in [(0.0, "world"), (0.5, "hello")] {
+            let values = (0..512)
+                .map(|i| amplitude * (i as f32 * 0.23).sin())
+                .collect::<Vec<_>>();
+            let bytes = onnx_genai_preprocess::audio::encode_wav_f32(&values, 16000, 1).unwrap();
+            let mut results = Vec::new();
+            for router in [&encoded, &features] {
+                let (status, body) = send(
+                    router.clone(),
+                    "/v1/audio/transcriptions",
+                    &bytes,
+                    &[("model", "speech")],
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let result: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(result["text"], expected_text);
+                let (status, body) = send(
+                    router.clone(),
+                    "/v1/audio/transcriptions",
+                    &bytes,
+                    &[("model", "speech"), ("stream", "true")],
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(transcript_events(&body).last().unwrap(), &result);
+                results.push(result);
+            }
+            assert_eq!(results[0], results[1]);
+        }
+    }
+    #[tokio::test]
+    async fn generative_waveform_transcription_executes_without_a_mel_output_contract() {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/transcription_tokens");
+        let package = tempfile::tempdir().unwrap();
+        let mut metadata: Value =
+            serde_json::from_slice(&std::fs::read(source.join("inference_metadata.yaml")).unwrap())
+                .unwrap();
+        metadata["preprocessing"]["audio"]["transforms"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        metadata["preprocessing"]["audio"]["outputs"][0]["source"] = json!("padded");
+        metadata["preprocessing"]["audio"]["outputs"][0]["content"] = json!("waveform");
+        fn shape(value: &mut Value) {
+            match value {
+                Value::Object(map) => {
+                    for (key, value) in map {
+                        if key == "shape" && *value == json!([1, 7, 4]) {
+                            *value = json!([1, 256]);
+                        } else {
+                            shape(value);
+                        }
+                    }
+                }
+                Value::Array(items) => {
+                    for value in items {
+                        shape(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        shape(&mut metadata);
+        std::fs::write(
+            package.path().join("inference_metadata.yaml"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        std::fs::copy(
+            source.join("tokenizer.json"),
+            package.path().join("tokenizer.json"),
+        )
+        .unwrap();
+        std::fs::copy(
+            source.join("transcription_config.json"),
+            package.path().join("transcription_config.json"),
+        )
+        .unwrap();
+        let head = std::fs::read_to_string(source.join("model.onnx.textproto"))
+            .unwrap()
+            .replace(
+                "dim { dim_value: 7 } dim { dim_value: 4 }",
+                "dim { dim_value: 256 }",
+            )
+            .replace("float_data: -9", "float_data: 0.1");
+        std::fs::write(package.path().join("model.onnx.textproto"), head).unwrap();
+        let router = app(AppState::load(package.path(), Some("wave-speech".into())).unwrap());
+        for (sample, expected) in [(0.0, "world"), (0.5, "hello")] {
+            let recording =
+                onnx_genai_preprocess::audio::encode_wav_pcm16(&[sample; 256], 8000, 1).unwrap();
+            let (status, body) = send(
+                router.clone(),
+                "/v1/audio/transcriptions",
+                &recording,
+                &[("model", "wave-speech")],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let value: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["text"], expected);
+        }
+    }
+    #[tokio::test]
+    async fn codec_matrix_executes_native_transcription_and_streaming() {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/audio/codec-matrix");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(fixtures.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["cases"].as_array().unwrap().len(), 17);
+        for (name, directory) in [
+            ("ctc", "transcription_ctc"),
+            ("speech", "transcription_tokens"),
+        ] {
+            let model = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/onnx_genai_workflows")
+                .join(directory);
+            let router = app(AppState::load(&model, Some(name.into())).unwrap());
+            let (status, error) = send(
+                router.clone(),
+                "/v1/audio/transcriptions",
+                &std::fs::read(fixtures.join("unsupported-opus.ogg")).unwrap(),
+                &[("model", name)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+            assert!(error.contains("codec"), "{error}");
+            for case in manifest["cases"].as_array().unwrap() {
+                let file = case["file"].as_str().unwrap();
+                let bytes = std::fs::read(fixtures.join(file)).unwrap();
+                let decoded = onnx_genai_preprocess::audio::decode_audio(&bytes).unwrap();
+                if name == "speech" {
+                    use base64::{Engine as _, engine::general_purpose::STANDARD};
+                    let request = json!({"model":name,"messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":STANDARD.encode(&bytes),"format":file}}]}],"max_tokens":2,"temperature":0.0});
+                    let response = router
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method("POST")
+                                .uri("/v1/chat/completions")
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(Body::from(request.to_string()))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    let status = response.status();
+                    let result = json_body(response).await;
+                    assert_eq!(status, StatusCode::OK, "chat/{file}: {result}");
+                    assert!(
+                        result["choices"][0]["message"]["content"].is_string(),
+                        "{result}"
+                    );
+                }
+                let reference = onnx_genai_preprocess::audio::encode_wav_f32(
+                    &decoded.samples,
+                    decoded.sample_rate,
+                    1,
+                )
+                .unwrap();
+                let (status, body) = send(
+                    router.clone(),
+                    "/v1/audio/transcriptions",
+                    &reference,
+                    &[("model", name)],
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{name}/{file}: {body}");
+                let expected: Value = serde_json::from_str(&body).unwrap();
+                let (status, body) = send(
+                    router.clone(),
+                    "/v1/audio/transcriptions",
+                    &bytes,
+                    &[("model", name)],
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{name}/{file}: {body}");
+                assert_eq!(
+                    serde_json::from_str::<Value>(&body).unwrap(),
+                    expected,
+                    "{name}/{file}"
+                );
+                let (status, body) = send(
+                    router.clone(),
+                    "/v1/audio/transcriptions",
+                    &bytes,
+                    &[("model", name), ("stream", "true")],
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{name}/{file}: {body}");
+                assert_eq!(
+                    transcript_events(&body).last().unwrap(),
+                    &expected,
+                    "{name}/{file}"
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn mp3_transcription_executes_both_native_speech_paths_and_recovers_after_bad_audio() {
+        let mp3 = include_bytes!("../../../tests/fixtures/audio/stereo-tone.mp3");
+        let decoded = onnx_genai_preprocess::audio::decode_audio(mp3).unwrap();
+        let equivalent = onnx_genai_preprocess::audio::encode_wav_pcm16(
+            &decoded.samples,
+            decoded.sample_rate,
+            1,
+        )
+        .unwrap();
+        for (name, directory) in [
+            ("ctc", "transcription_ctc"),
+            ("speech", "transcription_tokens"),
+        ] {
+            let model = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/onnx_genai_workflows")
+                .join(directory);
+            let router = app(AppState::load(&model, Some(name.into())).unwrap());
+            let (status, error) = send(
+                router.clone(),
+                "/audio/transcriptions",
+                b"ID3bad",
+                &[("model", name)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+            assert!(error.contains("audio"), "{error}");
+            let (status, wav) = send(
+                router.clone(),
+                "/audio/transcriptions",
+                &equivalent,
+                &[("model", name)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{wav}");
+            let expected: Value = serde_json::from_str(&wav).unwrap();
+            assert!(!expected["text"].as_str().unwrap().is_empty(), "{expected}");
+            for path in ["/audio/transcriptions", "/v1/audio/transcriptions"] {
+                // Deliberately retains the helper's .wav filename: bytes own format detection.
+                let (status, body) = send(router.clone(), path, mp3, &[("model", name)]).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let actual: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(actual, expected);
+            }
+            let (status, body) = send(
+                router.clone(),
+                "/v1/audio/transcriptions",
+                mp3,
+                &[("model", name), ("stream", "true")],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(transcript_events(&body).last().unwrap(), &expected);
+            if name == "speech" {
+                use base64::{Engine as _, engine::general_purpose::STANDARD};
+                let body = json!({"model":name,"messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":STANDARD.encode(mp3),"format":"mp3"}}]}],"max_tokens":2,"temperature":0.0});
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/v1/chat/completions")
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let result = json_body(response).await;
+                assert_eq!(status, StatusCode::OK, "{result}");
+                assert_eq!(result["choices"][0]["message"]["content"], "hello");
+            }
+        }
+    }
+    #[tokio::test]
+    async fn ctc_http_transcription_is_native_audio_dependent_and_supports_both_aliases() {
+        let router = router(Default::default());
+        for path in ["/v1/audio/transcriptions", "/audio/transcriptions"] {
+            for (negate, expected) in [(false, "bb aa"), (true, "aa bb")] {
+                let (status, body) = post(router.clone(), path, &wav(negate), "json", None).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let value: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(value["type"], "transcript.text.done");
+                assert_eq!(value["text"], expected);
+                assert_eq!(
+                    value["usage"],
+                    json!({"type":"tokens","input_tokens":9,"output_tokens":5,"total_tokens":14,"input_tokens_details":{"cached_tokens":0,"audio_frames":9}})
+                );
+                let (status, text) = post(router.clone(), path, &wav(negate), "text", None).await;
+                assert_eq!(status, StatusCode::OK, "{text}");
+                assert_eq!(text, expected);
+            }
+        }
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/props")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let props = json_body(response).await;
+        assert_eq!(props["nxrt_capabilities"]["frame_transcription"], true);
+    }
+    #[tokio::test]
+    async fn ctc_http_rejects_bad_audio_conditioning_and_resource_limits_without_poisoning_model() {
+        let router = router(Default::default());
+        for (bytes, format, extra, diagnostic) in [
+            (vec![0, 1, 2], "json", None, "audio"),
+            (wav(false), "verbose_json", None, "response_format"),
+            (wav(false), "json", Some(("language", "en")), "conditioning"),
+            (
+                wav(false),
+                "json",
+                Some(("prompt", "names")),
+                "conditioning",
+            ),
+        ] {
+            let (status, body) = post(
+                router.clone(),
+                "/v1/audio/transcriptions",
+                &bytes,
+                format,
+                extra,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains(diagnostic), "{body}");
+        }
+        let (status, body) = post(
+            router,
+            "/v1/audio/transcriptions",
+            &wav(false),
+            "json",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for config in [
+            ServerConfig {
+                max_transcription_frames: std::num::NonZeroUsize::new(8).unwrap(),
+                ..Default::default()
+            },
+            ServerConfig {
+                max_transcription_text_bytes: std::num::NonZeroUsize::new(1).unwrap(),
+                ..Default::default()
+            },
+        ] {
+            let (status, body) = post(
+                self::router(config),
+                "/v1/audio/transcriptions",
+                &wav(false),
+                "json",
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("shorten the audio"), "{body}");
+        }
+    }
+    #[tokio::test]
+    async fn ctc_transcription_streams_typed_events_and_honors_per_request_output_limits() {
+        let router = router(Default::default());
+        for path in ["/v1/audio/transcriptions", "/audio/transcriptions"] {
+            for budget in [1, 8] {
+                let maximum = budget.to_string();
+                let (status, body) = send(
+                    router.clone(),
+                    path,
+                    &wav(false),
+                    &[
+                        ("model", "ctc"),
+                        ("stream", "true"),
+                        ("max_tokens", &maximum),
+                    ],
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let events = transcript_events(&body);
+                assert!(events.len() > 1, "{body}");
+                let final_event = events.last().unwrap();
+                assert_eq!(final_event["type"], "transcript.text.done");
+                let text = events[..events.len() - 1]
+                    .iter()
+                    .map(|event| {
+                        assert_eq!(event["type"], "transcript.text.delta");
+                        event["delta"].as_str().unwrap()
+                    })
+                    .collect::<String>();
+                assert_eq!(final_event["text"], text);
+                assert_eq!(text, if budget == 1 { "b" } else { "bb aa" });
+                assert_eq!(final_event["usage"]["input_tokens"], 9);
+                let count = final_event["usage"]["output_tokens"].as_u64().unwrap();
+                assert!(count > 0 && count <= budget);
+            }
+        }
+        let (status, body) = post(
+            self::router(ServerConfig {
+                max_output_tokens: 1,
+                ..Default::default()
+            }),
+            "/v1/audio/transcriptions",
+            &wav(false),
+            "json",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["text"], "b");
+        assert_eq!(value["usage"]["output_tokens"], 1);
+        for (field, value) in [
+            ("max_tokens", "0"),
+            ("max_tokens", "oops"),
+            ("max_tokens", "99999"),
+            ("stream", "oops"),
+        ] {
+            let (status, body) = post(
+                router.clone(),
+                "/v1/audio/transcriptions",
+                &wav(false),
+                "json",
+                Some((field, value)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains(field), "{body}");
+        }
+        let (status, body) = post(
+            router,
+            "/v1/audio/transcriptions",
+            &wav(false),
+            "text",
+            Some(("stream", "true")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    #[tokio::test]
+    async fn generative_transcription_uses_typed_buffered_and_live_stream_responses() {
+        let model = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/transcription_tokens");
+        let router = app(AppState::load(&model, Some("speech".into())).unwrap());
+        let (status, buffered) = send(
+            router.clone(),
+            "/v1/audio/transcriptions",
+            &wav(false),
+            &[("model", "speech"), ("max_tokens", "2")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{buffered}");
+        let buffered: Value = serde_json::from_str(&buffered).unwrap();
+        assert_eq!(buffered["type"], "transcript.text.done");
+        assert!(buffered["usage"]["input_tokens"].as_u64().unwrap() > 0);
+        assert!(buffered["usage"]["output_tokens"].as_u64().unwrap() <= 2);
+        assert_eq!(buffered["text"], "hello");
+        let silence = onnx_genai_preprocess::audio::encode_wav_pcm16(&[0.0; 9], 8000, 1).unwrap();
+        let (status, silent) = send(
+            router.clone(),
+            "/v1/audio/transcriptions",
+            &silence,
+            &[("model", "speech"), ("max_tokens", "2")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{silent}");
+        let silent: Value = serde_json::from_str(&silent).unwrap();
+        assert_eq!(silent["text"], "world");
+        let (status, rejected) = send(
+            router.clone(),
+            "/v1/audio/transcriptions",
+            &wav(false),
+            &[("model", "speech"), ("prompt", "names")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected}");
+        assert!(rejected.contains("prompt conditioning"), "{rejected}");
+        let (status, stream) = send(
+            router,
+            "/audio/transcriptions",
+            &wav(false),
+            &[("model", "speech"), ("max_tokens", "2"), ("stream", "true")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{stream}");
+        let events = transcript_events(&stream);
+        let final_event = events.last().unwrap();
+        assert_eq!(final_event["type"], "transcript.text.done");
+        assert_eq!(final_event["text"], buffered["text"]);
+        let text = events[..events.len() - 1]
+            .iter()
+            .map(|event| {
+                assert_eq!(event["type"], "transcript.text.delta");
+                event["delta"].as_str().unwrap()
+            })
+            .collect::<String>();
+        assert_eq!(final_event["text"], text);
     }
 }

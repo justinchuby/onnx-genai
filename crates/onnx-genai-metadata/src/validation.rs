@@ -1263,7 +1263,15 @@ fn validate_preprocessing_workflow(metadata: &InferenceMetadata, errors: &mut Ve
         ),
     ];
     for (kind, abi, program_outputs) in programs {
-        validate_preprocessing_program(workflow, kind, abi, program_outputs, errors);
+        validate_preprocessing_program(
+            workflow,
+            kind,
+            abi,
+            program_outputs,
+            crate::version::normalize(metadata.schema_version.as_deref())
+                .unwrap_or(crate::version::INITIAL_SCHEMA_VERSION),
+            errors,
+        );
     }
 }
 
@@ -1272,6 +1280,7 @@ fn validate_preprocessing_program(
     kind: &str,
     abi: &str,
     program_outputs: Option<Vec<PreprocessingOutputView<'_>>>,
+    version: crate::version::SchemaVersion,
     errors: &mut Vec<String>,
 ) {
     use crate::extensions::PreprocessingOutputScope;
@@ -1318,6 +1327,53 @@ fn validate_preprocessing_program(
         return;
     };
     validate_program_companion_roles(kind, &program_outputs, errors);
+    // An external feature program binds a named runtime media tensor directly;
+    // an encoded program instead belongs to its workflow adapter invocation.
+    if kind == "audio" && adapters.is_empty() {
+        let bindings = program_outputs
+            .iter()
+            .filter_map(|output| {
+                let input = workflow.inputs.get(output.name)?;
+                (input.contract.dtype == "float32"
+                    && input.contract.rank() == 3
+                    && matches!(
+                        input.role,
+                        crate::schema::SemanticInputRole::Runtime {
+                            role: crate::schema::RuntimeInputRole::Media,
+                            ..
+                        }
+                    ))
+                .then_some((output, input))
+            })
+            .collect::<Vec<_>>();
+        if !bindings.is_empty() {
+            if let Err(error) = crate::version::gate_feature_use(
+                version,
+                crate::version::SchemaFeature::AudioFeatureInputs,
+                "preprocessing.audio feature input binding",
+            ) {
+                errors.push(error);
+            }
+            if bindings.len() != 1 {
+                errors.push("preprocessing.audio external feature binding is ambiguous; declare exactly one named float32 rank-3 runtime media input".into());
+            }
+            for (output, input) in bindings {
+                if output.dtype != "float32"
+                    || output.content != "audio_features"
+                    || output.optional
+                    || !matches!(input.source, crate::schema::WorkflowInputSource::Request)
+                {
+                    errors.push(format!("preprocessing.audio output '{}' must be required float32 audio_features bound to a request-sourced media input; correct its content/dtype/source", output.name));
+                }
+                if let Some(contract) = output.contract
+                    && !contract.representation_compatible_with(&input.contract)
+                {
+                    errors.push(format!("preprocessing.audio external feature output '{}' disagrees with its media input; match dtype, shape, batch layout and padding",output.name));
+                }
+            }
+            return;
+        }
+    }
     if adapters.len() != 1 {
         errors.push(format!(
             "preprocessing.{kind} requires exactly one workflow adapter component using \
@@ -3905,7 +3961,7 @@ fn describe_batch_layout(layout: &crate::schema::BatchLayout) -> String {
 /// axis. Stating that exactly is what lets a runtime index it without knowing
 /// what the value means.
 #[allow(clippy::too_many_arguments)]
-fn validate_valid_lengths_shape(
+pub(crate) fn validate_valid_lengths_shape(
     path: &str,
     contract: &crate::schema::TensorContract,
     dimension: &str,

@@ -547,6 +547,10 @@ pub const CORE_CONFORMANCE: &[(SchemaVersion, &str)] = &[
         crate::version::DECISION_AUDIO_SCHEMA_VERSION,
         "Decision v3 profiles declare typed mixed state-media inputs and an explicit spoken-question audio endpoint with authoritative per-variant usage.",
     ),
+    (
+        crate::version::AUDIO_FEATURE_INPUT_SCHEMA_VERSION,
+        "Externally executed audio programs bind explicitly named float32 feature media inputs; analysis semantics and clip bounds come from the selected program output.",
+    ),
 ];
 
 /// Look up a built-in extension by its exact declared identity and version.

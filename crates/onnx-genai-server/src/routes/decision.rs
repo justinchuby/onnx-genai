@@ -55,7 +55,7 @@ fn audio_url(value: &Value, field: &str) -> Result<MediaUrl, ApiError> {
         .and_then(Value::as_str)
         .ok_or_else(|| {
             ApiError::invalid_request(format!(
-                "{field}.data or .url must contain base64 PCM16 WAV bytes or an audio data URI"
+                "{field}.data or .url must contain base64 supported encoded audio bytes or an audio data URI"
             ))
         })?;
     if source.contains("://")
@@ -63,7 +63,7 @@ fn audio_url(value: &Value, field: &str) -> Result<MediaUrl, ApiError> {
         || (source.starts_with("data:") && !source.starts_with("data:audio/"))
     {
         return Err(ApiError::invalid_request(format!(
-            "{field} must contain base64 PCM16 WAV audio; remote/file URLs and non-audio data URIs are not fetched"
+            "{field} must contain base64 supported encoded audio; remote/file URLs and non-audio data URIs are not fetched"
         )));
     }
     Ok(MediaUrl {
