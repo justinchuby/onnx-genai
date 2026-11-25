@@ -802,8 +802,24 @@ answer (alongside the route's normal prompt/messages fields):
 As in the pinned upstream sampler, raw `%llguidance` Lark remains eager and
 ignores lazy token/pattern effects, while tokenizer-level word preservation is
 still validated. Lazy JSON `response_format` without a raw GBNF grammar is still
-unsupported and returns a pre-SSE error. Collating/equivalence bracket forms are
-also explicitly unsupported. Trigger source/input bytes, combined translated
+unsupported and returns a pre-SSE error. Collating symbols (`[[.a.]]`,
+`[[.space.]]`) and equivalence classes (`[[=a=]]`) have explicit classic-locale
+byte semantics. Because C++ libraries disagree, nxrt accepts the request extension
+`grammar_trigger_collation`: omission/null or `"libcxx"` preserves the existing
+libc++ contract; `"libstdcxx"` selects GNU collating names and ASCII-case primary
+equivalence. For example, `[[=a=]]` matches a in the former and a/A in the latter.
+There is no ambient-locale or host-compiler inference, or Unicode/accent folding.
+Model properties advertise both choices and the fixed default.
+
+Named punctuation, controls and digits follow the selected library; accepted
+names and legacy NUL behavior are covered by paired C++ reference fixtures.
+Unsupported names and malformed delimiters fail before SSE with profile and byte
+location. The default profile permits collating symbols at both range ends and
+independent equivalence/POSIX terms followed by a hyphen: `[[.a.]-[.c.]]` matches
+a through c, while `[[=a=]-c]` matches a, hyphen or c. GNU requires a literal
+right endpoint (`[[.a.]-c]`) and rejects a class as a range start. Its otherwise
+unmatched closing bracket is literal; the default profile rejects it.
+Trigger source/input bytes, combined translated
 program size, captures, nesting, repetitions, character-class items, history
 length and backtracking have declared bounds; exhaustion is an actionable error.
 Neutral `grammar_lazy=false`, `grammar_triggers=[]` and `preserved_tokens=[]`

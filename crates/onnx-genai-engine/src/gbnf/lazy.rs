@@ -143,7 +143,7 @@ fn resolve_activation(
                 source_bytes <= max_bytes,
                 "grammar trigger patterns exceed the shared max_constraint_bytes={max_bytes} budget; shorten their combined source"
             );
-            let pattern = EcmaBytePattern::compile(&pattern, max_bytes)
+            let pattern = EcmaBytePattern::compile(&pattern, max_bytes, activation.collation())
                 .with_context(|| format!("compile grammar_triggers[{index}]"))?;
             program_bytes = program_bytes
                 .checked_add(pattern.program_bytes())
@@ -425,7 +425,9 @@ mod tests {
         GenerateOptions {
             constraint: Some(GenerateConstraint::Gbnf {
                 grammar: grammar.into(),
-                activation: Some(GrammarActivation::new(triggers).unwrap()),
+                activation: Some(
+                    GrammarActivation::new(triggers, crate::GrammarCollation::Libcxx).unwrap(),
+                ),
             }),
             eos_token_id: Some(3),
             greedy: true,
@@ -538,7 +540,7 @@ mod tests {
     }
     #[test]
     fn lazy_chain_validates_triggers_before_sampling_and_bounds_pending_history() {
-        assert!(GrammarActivation::new(vec![]).is_err());
+        assert!(GrammarActivation::new(vec![], crate::GrammarCollation::Libcxx).is_err());
         let tokenizer = tokenizer();
         for trigger in [
             GrammarTrigger::Token(99),
