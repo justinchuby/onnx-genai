@@ -1,0 +1,11 @@
+domain: ""
+name: HardSigmoid
+since_version: 22
+doc: Element-wise hard sigmoid activation.
+attributes:
+  - { name: alpha, type: float, default: 0.2 }
+  - { name: beta, type: float, default: 0.5 }
+inputs: [{ name: X, type_str: T }]
+outputs: [{ name: Y, type_str: T }]
+type_constraints:
+  - { type_param: T, allowed: [bfloat16, float16, float32, float64] }

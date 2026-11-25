@@ -1,4 +1,4 @@
-//! Additional f32 reduction kernels: `ReduceSum`, `ReduceMax`, `ReduceMin`,
+//! Additional CPU reduction kernels: `ReduceSum`, `ReduceMax`, `ReduceMin`,
 //! `ReduceProd`, `ReduceSumSquare`, `ReduceL1`, `ReduceL2`, `ReduceLogSum`, and
 //! `ReduceLogSumExp` (`docs/architecture/ORT2.md` §4.4).
 //!
@@ -16,7 +16,7 @@
 //! dense buffer matches it element-for-element because reduced axes contribute
 //! either a retained size-1 dim (keepdims) or nothing (squeezed).
 
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use crate::dtype::{to_dense, to_dense_f32_widen, write_dense, write_dense_f32_narrow};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node, compute_contiguous_strides};
 
@@ -105,7 +105,7 @@ impl ReduceOp {
     }
 }
 
-/// f32 reduction kernel carrying the op, the attribute `axes` (opset < 13/18),
+/// Reduction kernel carrying the op, the attribute `axes` (opset < 13/18),
 /// `keepdims` and `noop_with_empty_axes`.
 pub struct ReduceKernel {
     op: ReduceOp,
@@ -165,6 +165,11 @@ impl Kernel for ReduceKernel {
             )
         {
             return self.execute_integer(inputs, &mut outputs[0]);
+        }
+        if inputs[0].dtype == DataType::Float64
+            && matches!(self.op, ReduceOp::LogSum | ReduceOp::LogSumExp)
+        {
+            return self.execute_f64_logarithmic(inputs, &mut outputs[0]);
         }
         let x = to_dense_f32_widen(self.op.name(), &inputs[0])?;
         let in_shape = inputs[0].shape;
@@ -246,6 +251,77 @@ impl Kernel for ReduceKernel {
 }
 
 impl ReduceKernel {
+    fn execute_f64_logarithmic(&self, inputs: &[TensorView], output: &mut TensorMut) -> Result<()> {
+        let x = to_dense::<f64>(&inputs[0])?;
+        let in_shape = inputs[0].shape;
+        let rank = in_shape.len();
+        let reduce = self.resolve_axes(inputs, rank)?;
+        let kept_shape = (0..rank)
+            .filter(|&axis| !reduce[axis])
+            .map(|axis| in_shape[axis])
+            .collect::<Vec<_>>();
+        let kept_count = numel(&kept_shape);
+        let in_strides = compute_contiguous_strides(in_shape);
+        let kept_strides = compute_contiguous_strides(&kept_shape);
+        let mut acc = vec![0.0f64; kept_count.max(1)];
+        let mut logsumexp_max = vec![f64::NEG_INFINITY; kept_count.max(1)];
+
+        if numel(in_shape) > 0 {
+            let mut index = vec![0; rank];
+            loop {
+                let mut input_offset = 0;
+                let mut output_offset = 0;
+                let mut kept_axis = 0;
+                for axis in 0..rank {
+                    input_offset += in_strides[axis] as usize * index[axis];
+                    if !reduce[axis] {
+                        output_offset += kept_strides[kept_axis] as usize * index[axis];
+                        kept_axis += 1;
+                    }
+                }
+                let value = x[input_offset];
+                if matches!(self.op, ReduceOp::LogSumExp) {
+                    let max = logsumexp_max[output_offset];
+                    if value.is_nan() || max.is_nan() {
+                        logsumexp_max[output_offset] = f64::NAN;
+                        acc[output_offset] = f64::NAN;
+                    } else if max == f64::NEG_INFINITY {
+                        acc[output_offset] = 1.0;
+                        logsumexp_max[output_offset] = value;
+                    } else if max == f64::INFINITY {
+                        // Any group containing +inf reduces to +inf without
+                        // evaluating the indeterminate expression inf - inf.
+                    } else if value > max {
+                        acc[output_offset] = acc[output_offset] * (max - value).exp() + 1.0;
+                        logsumexp_max[output_offset] = value;
+                    } else {
+                        acc[output_offset] += (value - max).exp();
+                    }
+                } else {
+                    acc[output_offset] += value;
+                }
+                if !next_index(in_shape, &mut index) {
+                    break;
+                }
+            }
+        }
+
+        let values = if matches!(self.op, ReduceOp::LogSumExp) {
+            acc.iter()
+                .zip(&logsumexp_max)
+                .take(kept_count)
+                .map(|(&sum, &max)| max + sum.ln())
+                .collect::<Vec<_>>()
+        } else {
+            acc.iter()
+                .take(kept_count)
+                .map(|&sum| sum.ln())
+                .collect::<Vec<_>>()
+        };
+        let _ = self.keepdims;
+        write_dense::<f64>(output, &values)
+    }
+
     fn resolve_axes(&self, inputs: &[TensorView], rank: usize) -> Result<Vec<bool>> {
         let axes_input_present = inputs.len() == 2 && !inputs[1].is_absent();
         let axes_raw = if axes_input_present {
@@ -594,6 +670,75 @@ mod tests {
         let mut out = Owned::zeros_f32(&[1]);
         run_attr(ReduceOp::LogSumExp, Some(vec![0]), &x, &mut out);
         assert!((out.to_f32()[0] - (1_001.0 + (-1_f32).exp().ln_1p())).abs() < 1e-5);
+    }
+
+    #[test]
+    fn log_sum_f64_keeps_finite_extreme_values() {
+        let x = Owned::f64(&[2, 2], &[1.0e300, 1.0e300, 16_777_216.0, 1.0]);
+        let mut out = Owned::zeros(DataType::Float64, &[2, 1]);
+        run_attr(ReduceOp::LogSum, Some(vec![1]), &x, &mut out);
+        let actual = out.to_f64();
+        let expected = [(2.0e300_f64).ln(), 16_777_217.0_f64.ln()];
+        assert!(actual[0].is_finite());
+        assert!((actual[0] - expected[0]).abs() < 1e-12);
+        assert!((actual[1] - expected[1]).abs() < 1e-12);
+    }
+
+    #[test]
+    fn log_sum_exp_f64_preserves_sub_f32_axis_delta() {
+        let x = Owned::f64(&[2, 2], &[1_000.0, 1_000.0 + 1.0e-10, -1_000.0, -999.0]);
+        let axes = Owned::i64(&[1], &[-1]);
+        let mut out = Owned::zeros(DataType::Float64, &[2]);
+        ReduceKernel {
+            op: ReduceOp::LogSumExp,
+            axes_attr: None,
+            keepdims: false,
+            noop_with_empty_axes: false,
+        }
+        .execute(&[x.view(), axes.view()], &mut [out.view_mut()])
+        .unwrap();
+        let expected = [
+            1_000.0 + (1.0 + 1.0e-10_f64.exp()).ln(),
+            -999.0 + (-1.0_f64).exp().ln_1p(),
+        ];
+        assert!(
+            out.to_f64()
+                .iter()
+                .zip(expected)
+                .all(|(&actual, expected)| (actual - expected).abs() < 1e-12)
+        );
+    }
+
+    #[test]
+    fn logarithmic_f64_empty_reduced_axis_is_negative_infinity() {
+        let x = Owned::f64(&[2, 0], &[]);
+        for op in [ReduceOp::LogSum, ReduceOp::LogSumExp] {
+            let mut out = Owned::zeros(DataType::Float64, &[2, 1]);
+            run_attr(op, Some(vec![1]), &x, &mut out);
+            assert_eq!(out.to_f64(), vec![f64::NEG_INFINITY; 2]);
+        }
+    }
+
+    #[test]
+    fn logarithmic_integer_kernel_behavior_is_unchanged() {
+        let x = Owned::i64(&[2], &[1, 3]);
+        for op in [ReduceOp::LogSum, ReduceOp::LogSumExp] {
+            let mut out = Owned::zeros(DataType::Int64, &[1]);
+            let error = ReduceKernel {
+                op,
+                axes_attr: Some(vec![0]),
+                keepdims: true,
+                noop_with_empty_axes: false,
+            }
+            .execute(&[x.view()], &mut [out.view_mut()])
+            .expect_err("the baseline kernel rejects integer logarithmic inputs");
+            let message = error.to_string();
+            assert!(
+                message.contains("unsupported element type Int64"),
+                "{message}"
+            );
+            assert!(message.contains("insert a `Cast`"), "{message}");
+        }
     }
 
     #[test]

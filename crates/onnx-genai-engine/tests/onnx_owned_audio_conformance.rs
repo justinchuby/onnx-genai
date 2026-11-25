@@ -72,7 +72,8 @@ fn onnx_owned_speech_workflow_encodes_buffered_pcm16_wav() -> anyhow::Result<()>
     assert!(audio.to_vec_f32()?.iter().all(|sample| sample.is_finite()));
 
     // The engine encodes the declared media contract into a canonical WAV.
-    let encoded = engine.encode_audio_output(&outputs, "audio")?;
+    let encoded =
+        engine.encode_audio_output(&outputs, "audio", onnx_genai_engine::AudioOutputFormat::Wav)?;
     assert_eq!(encoded.content_type, "audio/wav");
     assert_eq!(encoded.sample_rate_hz, 24000);
     assert_eq!(encoded.channels, 2);
@@ -98,10 +99,57 @@ fn onnx_owned_speech_workflow_encodes_buffered_pcm16_wav() -> anyhow::Result<()>
         "resampled stereo 16-bit sample bytes"
     );
 
+    let pcm16 = engine.encode_audio_output(
+        &outputs,
+        "audio",
+        onnx_genai_engine::AudioOutputFormat::PcmS16Le,
+    )?;
+    assert_eq!(pcm16.bytes, wav[44..]);
+    assert_eq!(
+        pcm16.content_type,
+        "audio/pcm;rate=24000;channels=2;encoding=signed-int;bits=16"
+    );
+    let float = engine.encode_audio_output(
+        &outputs,
+        "audio",
+        onnx_genai_engine::AudioOutputFormat::PcmF32Le,
+    )?;
+    assert_eq!(float.bytes.len(), 32 * 2 * 4);
+    assert_eq!(
+        float.content_type,
+        "audio/pcm;rate=24000;channels=2;encoding=float;bits=32"
+    );
+    let floats: Vec<f32> = float
+        .bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    let quantized: Vec<i16> = pcm16
+        .bytes
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    for (sample, pcm) in floats.iter().zip(&quantized) {
+        assert_eq!((sample.clamp(-1.0, 1.0) * 32767.0).round() as i16, *pcm);
+    }
+    assert!(
+        floats
+            .iter()
+            .zip(&quantized)
+            .any(|(sample, pcm)| (*sample - f32::from(*pcm) / 32768.0).abs() > 1e-7),
+        "float transport must retain pre-quantization precision"
+    );
+
     // Encoding binds to the exact declared output name, not "the first audio
     // output": an unknown or non-audio name fails closed.
     assert!(
-        engine.encode_audio_output(&outputs, "waveform").is_err(),
+        engine
+            .encode_audio_output(
+                &outputs,
+                "waveform",
+                onnx_genai_engine::AudioOutputFormat::Wav
+            )
+            .is_err(),
         "an undeclared output name must not be encoded"
     );
     Ok(())

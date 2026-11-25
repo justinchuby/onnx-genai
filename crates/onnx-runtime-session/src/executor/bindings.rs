@@ -16,7 +16,7 @@ pub(super) fn workspace_planning_for_node(
         return WorkspacePlanning::Metadata;
     }
     if is_control_flow_op(&node.op_type, &node.domain)
-        || is_sequence_op(&node.op_type, &node.domain)
+        || is_container_op(&node.op_type, &node.domain)
     {
         return WorkspacePlanning::None;
     }
@@ -1279,6 +1279,13 @@ impl Executor {
         if self.heterogeneous.is_some() {
             return Err(heterogeneous_api_error(
                 "mixed-provider device-graph capture",
+            ));
+        }
+        if optional_ops::graph_uses_optional_ops(&self.graph) {
+            return Ok(DeviceGraphCaptureResult::NotCapturable(
+                CaptureDeclineReport::one(CaptureDecline::graph(
+                    "Optional operators use host orchestration and may alias run-scoped payload storage; run this graph eagerly",
+                )),
             ));
         }
         if self.cap().device_graph_token.is_some() {

@@ -68,8 +68,9 @@
 //! so a value with no recorded `ValueType` is a plain tensor and the tensor-only
 //! path is byte-identical. The full **Sequence** family is registered, container
 //! types thread through the control-flow bodies (`If`/`Loop`/`Scan`/
-//! `SequenceMap`) and across subgraph scope capture. The **Optional** and **Map**
-//! op handlers remain a smaller staged follow-up (the `ValueType::Optional`/`Map`
+//! `SequenceMap`) and across subgraph scope capture. The **Optional** family
+//! propagates tensor and tensor-sequence element types. **Map** op handlers remain
+//! a staged follow-up (the `ValueType::Map`
 //! representation already exists). See issues #355 and #449.
 
 #![forbid(unsafe_code)]

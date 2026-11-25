@@ -1,0 +1,6 @@
+{
+  "base": "25d406ea7e17c0071dce194e05d4e9b880a0ed97",
+  "default_conv_reconstructs_base_byte_for_byte": true,
+  "base_conv_sha256": "efe67a79c0e45ef7c6d6ad306772e97066bb99b77ebfd71305e618d20eb5e55f",
+  "final_conv_sha256": "56b5bf1de760e2d366dcac344d51f1c81a43dd32c1626ac5cf6bdd9d7bc95c53"
+}

@@ -1,22 +1,23 @@
 //! `Constant`: materialize a compile-time constant tensor from an attribute
 //! (`docs/architecture/ORT2.md` §4.4).
 //!
-//! Opset-12 supports several mutually-exclusive value attributes; this kernel
-//! handles the numeric ones the BERT target uses: `value` (a full tensor),
-//! `value_float`, `value_floats`, `value_int`, and `value_ints`. The attribute
-//! is decoded once at factory time into the dense little-endian element bytes,
-//! which are then copied into the pre-allocated output view (whose shape/dtype
-//! the loader derives from the same attribute).
+//! Handles tensor-valued `value` (including packed numeric tensors) and the
+//! numeric `value_float`, `value_floats`, `value_int`, and `value_ints` forms.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Attribute, Node};
+use onnx_runtime_ir::{Attribute, DataType, Node, TensorData};
 
 use super::{check_arity, write_dense_bytes};
 
-/// Constant kernel carrying the decoded element bytes (`None` if no supported
+enum ConstantValue {
+    ByteAligned(Vec<u8>),
+    Packed(TensorData),
+}
+
+/// Constant kernel carrying the decoded value (`None` if no supported
 /// value attribute was present; execution then errors).
 pub struct ConstantKernel {
-    bytes: Option<Vec<u8>>,
+    value: Option<ConstantValue>,
 }
 
 /// Factory decoding the constant's value attribute.
@@ -24,16 +25,35 @@ pub struct ConstantFactory;
 
 impl KernelFactory for ConstantFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let bytes = decode_value(node);
-        Ok(Box::new(ConstantKernel { bytes }))
+        Ok(Box::new(ConstantKernel {
+            value: decode_value(node),
+        }))
     }
 }
 
-/// Decode the first recognized `value*` attribute into dense LE element bytes.
-fn decode_value(node: &Node) -> Option<Vec<u8>> {
+fn decode_value(node: &Node) -> Option<ConstantValue> {
     if let Some(Attribute::Tensor(t)) = node.attr("value") {
-        return Some(t.data.clone());
+        // Only the packed types in the pinned ONNX Constant schema. The IR also
+        // represents FLOAT6, which that schema does not admit.
+        return Some(
+            if matches!(
+                t.dtype,
+                DataType::Int4
+                    | DataType::Uint4
+                    | DataType::Float4E2M1
+                    | DataType::Int2
+                    | DataType::Uint2
+            ) {
+                ConstantValue::Packed(t.clone())
+            } else {
+                ConstantValue::ByteAligned(t.data.clone())
+            },
+        );
     }
+    decode_numeric_bytes(node).map(ConstantValue::ByteAligned)
+}
+
+fn decode_numeric_bytes(node: &Node) -> Option<Vec<u8>> {
     if let Some(Attribute::Float(f)) = node.attr("value_float") {
         return Some(f.to_le_bytes().to_vec());
     }
@@ -52,18 +72,65 @@ fn decode_value(node: &Node) -> Option<Vec<u8>> {
 impl Kernel for ConstantKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Constant", inputs, outputs, 0, 0, 1)?;
-        let bytes = self.bytes.as_ref().ok_or_else(|| {
-            EpError::KernelFailed("Constant: no supported value attribute".into())
-        })?;
-        write_dense_bytes(&mut outputs[0], bytes)
+        let out = &mut outputs[0];
+        match &self.value {
+            Some(ConstantValue::ByteAligned(bytes)) => write_dense_bytes(out, bytes),
+            Some(ConstantValue::Packed(value)) => write_packed_value(out, value),
+            None => Err(EpError::KernelFailed(
+                "Constant: no supported value attribute".into(),
+            )),
+        }
     }
+}
+
+fn write_packed_value(out: &mut TensorMut<'_>, value: &TensorData) -> Result<()> {
+    if out.dtype != value.dtype || out.shape != value.dims.as_slice() {
+        return Err(EpError::KernelFailed(format!(
+            "Constant: packed value has dtype {:?} and shape {:?}, but output declares {:?} {:?}; the output must match the value tensor",
+            value.dtype, value.dims, out.dtype, out.shape
+        )));
+    }
+    let expected = value.checked_expected_bytes().ok_or_else(|| {
+        EpError::KernelFailed(format!(
+            "Constant: packed storage size overflows for dtype {:?} and shape {:?}",
+            value.dtype, value.dims
+        ))
+    })?;
+    if value.data.len() != expected {
+        return Err(EpError::KernelFailed(format!(
+            "Constant: packed value for {:?} {:?} has {} bytes; expected {expected}",
+            value.dtype,
+            value.dims,
+            value.data.len()
+        )));
+    }
+    out.validate()?;
+    if expected == 0 {
+        return Ok(());
+    }
+    if !out.is_contiguous() {
+        return Err(EpError::KernelFailed(
+            "Constant: packed output must be contiguous row-major; use a contiguous output buffer"
+                .into(),
+        ));
+    }
+    // SAFETY: the CPU caller supplies a writable allocation for the contiguous
+    // output at its byte origin. Its dtype/shape imply exactly `expected` bytes
+    // there, and the attribute storage is owned separately by the kernel.
+    unsafe {
+        std::ptr::copy_nonoverlapping(value.data.as_ptr(), out.data_ptr_mut::<u8>(), expected);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
-    use onnx_runtime_ir::{DataType, NodeId, TensorData};
+    use onnx_runtime_ep_api::{DevicePtrMut, ExecutionProvider};
+    use onnx_runtime_ir::{DeviceId, NodeId, compute_contiguous_strides};
+
+    use crate::CpuExecutionProvider;
 
     fn kernel_from(node: &Node) -> Box<dyn Kernel> {
         ConstantFactory.create(node, &[]).unwrap()
@@ -129,5 +196,124 @@ mod tests {
         let mut out = Owned::zeros(DataType::BFloat16, &[3]);
         k.execute(&[], &mut [out.view_mut()]).unwrap();
         assert_eq!(out.to_u16_bits(), bits);
+    }
+
+    #[test]
+    fn constant_fp8_tensor_opsets_preserve_exact_storage() {
+        let ep = CpuExecutionProvider::new();
+        let payload = [0x01, 0x7f, 0xff];
+        for (opset, dtype) in [
+            (19, DataType::Float8E4M3FN),
+            (19, DataType::Float8E4M3FNUZ),
+            (19, DataType::Float8E5M2),
+            (19, DataType::Float8E5M2FNUZ),
+            (24, DataType::Float8E8M0),
+        ] {
+            let shape = [payload.len()];
+            let node = node_with(
+                "value",
+                Attribute::Tensor(TensorData::from_raw(
+                    dtype,
+                    shape.to_vec(),
+                    payload.to_vec(),
+                )),
+            );
+            let claim = ep.supports_op(&node, opset, &[], &[], &[]);
+            assert!(claim.is_supported(), "{dtype:?}: {:?}", claim.reason());
+            let kernel = ep.get_kernel(&node, &[], opset).unwrap();
+            let mut out = Owned::zeros(dtype, &shape);
+            kernel.execute(&[], &mut [out.view_mut()]).unwrap();
+            assert_eq!(out.bytes, payload, "{dtype:?}");
+        }
+    }
+
+    #[test]
+    fn constant_packed_tensor_opsets_preserve_exact_storage() {
+        let ep = CpuExecutionProvider::new();
+        // First Constant schema admitting each dtype at the pinned ONNX commit.
+        let cases: &[(u64, DataType, &[usize], &[u8])] = &[
+            (21, DataType::Int4, &[3], &[0x78, 0x0f]),
+            (21, DataType::Uint4, &[], &[0x0b]),
+            (23, DataType::Float4E2M1, &[1, 3], &[0x95, 0x02]),
+            (25, DataType::Int2, &[5], &[0xe4, 0x03]),
+            (25, DataType::Uint2, &[0, 3], &[]),
+        ];
+        for &(opset, dtype, shape, payload) in cases {
+            let node = node_with(
+                "value",
+                Attribute::Tensor(TensorData::from_raw(
+                    dtype,
+                    shape.to_vec(),
+                    payload.to_vec(),
+                )),
+            );
+            // Direct provider dispatch: the optimizer would fold this node.
+            let claim = ep.supports_op(&node, opset, &[], &[], &[]);
+            assert!(claim.is_supported(), "{dtype:?}: {:?}", claim.reason());
+            let kernel = ep.get_kernel(&node, &[], opset).unwrap();
+            let strides = compute_contiguous_strides(shape);
+            let mut storage = vec![0xA5u8; payload.len() + 2];
+            let out = TensorMut::new(
+                DevicePtrMut(storage.as_mut_ptr().cast()),
+                dtype,
+                shape,
+                &strides,
+                DeviceId::cpu(),
+            )
+            .with_byte_offset(1);
+            kernel.execute(&[], &mut [out]).unwrap();
+            assert_eq!(storage[0], 0xA5, "{dtype:?}: prefix overwritten");
+            assert_eq!(&storage[1..storage.len() - 1], payload, "{dtype:?}");
+            assert_eq!(
+                storage[storage.len() - 1],
+                0xA5,
+                "{dtype:?}: suffix overwritten"
+            );
+        }
+    }
+
+    #[test]
+    fn constant_packed_tensor_rejects_mismatched_output_or_storage() {
+        type RejectedOutputCase<'a> = (DataType, &'a [usize], &'a [i64], &'a [u8], &'a str);
+        let cases: &[RejectedOutputCase<'_>] = &[
+            (
+                DataType::Uint4,
+                &[3],
+                &[1],
+                &[0x78, 0x0f],
+                "output declares",
+            ),
+            (DataType::Int4, &[4], &[1], &[0x78, 0x0f], "output declares"),
+            (
+                DataType::Int4,
+                &[3],
+                &[2],
+                &[0x78, 0x0f],
+                "contiguous row-major",
+            ),
+            (DataType::Int4, &[3], &[1], &[0x78], "expected 2"),
+        ];
+        for &(dtype, shape, strides, payload, expected_error) in cases {
+            let node = node_with(
+                "value",
+                Attribute::Tensor(TensorData::from_raw(
+                    DataType::Int4,
+                    vec![3],
+                    payload.to_vec(),
+                )),
+            );
+            let kernel = kernel_from(&node);
+            let mut storage = [0xA5u8; 3];
+            let out = TensorMut::new(
+                DevicePtrMut(storage.as_mut_ptr().cast()),
+                dtype,
+                shape,
+                strides,
+                DeviceId::cpu(),
+            );
+            let err = kernel.execute(&[], &mut [out]).unwrap_err().to_string();
+            assert!(err.contains(expected_error), "{err}");
+            assert_eq!(storage, [0xA5; 3]);
+        }
     }
 }

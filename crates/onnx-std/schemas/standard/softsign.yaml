@@ -1,0 +1,9 @@
+domain: ""
+name: Softsign
+since_version: 1
+until_version: 21
+doc: Element-wise softsign activation.
+inputs: [{ name: X, type_str: T }]
+outputs: [{ name: Y, type_str: T }]
+type_constraints:
+  - { type_param: T, allowed: [float16, float32, float64] }
