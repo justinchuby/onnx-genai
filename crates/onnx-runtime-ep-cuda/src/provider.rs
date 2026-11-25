@@ -4358,6 +4358,11 @@ impl ExecutionProvider for CudaExecutionProvider {
         ) {
             return KernelMatch::unsupported(reason);
         }
+        if let Some(reason) =
+            onnx_runtime_ir::roi_align::unsupported_reason(op, opset, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if let Some(reason) = onnx_runtime_ep_api::gemm::unsupported_reason(
             op,
             opset,

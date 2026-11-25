@@ -197,9 +197,10 @@ pub(crate) enum NativeSpeculationKind {
 /// Decide whether a native request should run through the speculative driver.
 ///
 /// Returns `Some` only for an implemented, greedy prompt-lookup request with no
-/// processor chain and no logprobs — the exact regime in which host-argmax
-/// acceptance reproduces plain greedy selection. Every other request (including
-/// non-greedy, processor-chain, logprobs, or the default `None` mode) returns
+/// logits-changing processors and no logprobs — the regime in which host-argmax
+/// acceptance reproduces plain greedy selection. Output-only stop observers run
+/// at each accepted token boundary. Every other request (including non-greedy,
+/// logits processors, logprobs, or the default `None` mode) returns
 /// `None` and stays on the untouched plain fast path.
 #[cfg(feature = "native-backend")]
 pub(crate) fn native_speculation_plan(
@@ -221,7 +222,7 @@ pub(crate) fn native_speculation_plan(
         _ => return None,
     };
     let greedy = options.selects_greedily();
-    if !greedy || !chain.is_empty() || options.top_logprobs.is_some() {
+    if !greedy || !chain.only_observes_committed_output() || options.top_logprobs.is_some() {
         return None;
     }
     let width = options
@@ -230,4 +231,34 @@ pub(crate) fn native_speculation_plan(
         .unwrap_or(default_width)
         .max(1);
     Some(NativeSpeculationPlan { kind, width })
+}
+
+#[cfg(all(test, feature = "native-backend"))]
+mod prediction_limit_tests {
+    use super::*;
+    #[test]
+    fn prediction_time_limit_keeps_observation_only_speculation_but_not_logit_transforms()
+    -> anyhow::Result<()> {
+        let options = GenerateOptions {
+            max_prediction_time: Some(std::time::Duration::from_millis(1)),
+            speculative_mode: Some(SpeculativeMode::PromptLookup {
+                ngram: 1,
+                max_tokens: 2,
+            }),
+            ..Default::default()
+        };
+        let mut chain = crate::processors::build_processor_chain(&options, None, false)?;
+        assert!(native_speculation_plan(&options, &chain).is_some());
+        chain.add(Box::new(crate::logits::StopSequenceProcessor::new(vec![
+            crate::logits::StopSequence::Text("stop".into()),
+        ])));
+        assert!(native_speculation_plan(&options, &chain).is_some());
+        chain.add(Box::new(crate::logits::TopKProcessor { top_k: 1 }));
+        assert!(chain.preserves_argmax());
+        assert!(
+            native_speculation_plan(&options, &chain).is_none(),
+            "rank preservation alone must not admit speculative logit transforms"
+        );
+        Ok(())
+    }
 }

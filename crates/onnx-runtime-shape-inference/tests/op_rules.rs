@@ -429,6 +429,33 @@ fn out_dtype(outs: &[NodeIo]) -> DataType {
 }
 
 #[test]
+fn roi_align_22_infers_symbolic_shape_and_checks_schema() {
+    let n = with_attr(node("RoiAlign", 3, 1), "output_width", Attribute::Int(3));
+    let inputs = |count, index_type| {
+        vec![
+            NodeIo::typed(TypeInfo::new(
+                DataType::BFloat16,
+                vec![c(2), sym(1), c(5), c(5)],
+            )),
+            NodeIo::typed(TypeInfo::new(DataType::BFloat16, vec![sym(2), c(4)])),
+            NodeIo::typed(TypeInfo::new(index_type, vec![count])),
+        ]
+    };
+    let outs = run(&n, inputs(sym(3), DataType::Int64), 22);
+    assert_eq!(out_dtype(&outs), DataType::BFloat16);
+    assert_eq!(out_shape(&outs), vec![sym(2), sym(1), c(1), c(3)]);
+    let outs = run(&n, inputs(c(0), DataType::Int64), 22);
+    assert_eq!(out_shape(&outs), vec![c(0), sym(1), c(1), c(3)]);
+    for (opset, indices, message) in [
+        (16, DataType::Int64, "requires opset 22"),
+        (22, DataType::Int32, "must be Int64"),
+    ] {
+        let err = try_run(&n, inputs(sym(2), indices), opset).unwrap_err();
+        assert!(err.to_string().contains(message), "{err}");
+    }
+}
+
+#[test]
 fn opset26_bitcast_and_cumprod_validate_while_preserving_shape() {
     let mut cast = node("BitCast", 1, 1);
     cast.attributes.insert(
@@ -643,7 +670,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
     assert_eq!(
         registry.operator_count(),
-        240,
+        243,
         "shape-inference operator count moved: `left` is the live registry, `right` is this \
          pin. If you added or removed a handler, repin to `left` in the same commit and cover \
          the rule with a test (RULES.md §8); if you did not, a registration changed by \
@@ -652,7 +679,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     );
     assert_eq!(
         registry.entry_count(),
-        291,
+        294,
         "shape-inference entry count moved: `left` is the live registry, `right` is this pin. \
          One operator can carry several opset-versioned entries, so this count does not always \
          move in step with the operator count -- read both numbers off the failure rather than \
@@ -6744,6 +6771,11 @@ fn seq_in(dtype: DataType, shape: Option<Vec<DimExpr>>) -> NodeIo {
 
 #[test]
 fn optional_operand_forms_follow_opset() {
+    let constructed = run(&node("Optional", 1, 1), vec![f32in(vec![c(2)])], 15);
+    assert_eq!(
+        out_value_type(&constructed),
+        &ValueType::Optional(Box::new(ValueType::tensor(DataType::Float32, vec![c(2)])))
+    );
     for op in ["OptionalHasElement", "OptionalGetElement"] {
         let n = node(op, 1, 1);
         assert!(try_run(&n, vec![f32in(vec![c(2)])], 15).is_err());
@@ -7496,6 +7528,9 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Not", 1),
     ("", "OneHot", 9),
     ("", "OneHot", 11),
+    ("", "Optional", 15),
+    ("", "OptionalGetElement", 15),
+    ("", "OptionalHasElement", 15),
     ("", "Or", 1),
     ("", "PRelu", 16),
     ("", "Pack", 29),
@@ -7712,5 +7747,58 @@ fn expanded_registry_catalog_is_pinned() {
          rejected.",
         render(&added),
         render(&removed),
+    );
+}
+
+#[test]
+fn dft_real_inverse_shapes_match_implicit_explicit_and_unknown_controls() {
+    for opset in [17, 20] {
+        let n = with_attr(
+            with_attr(node("DFT", 1, 1), "inverse", Attribute::Int(1)),
+            "onesided",
+            Attribute::Int(1),
+        );
+        let implicit = run(&n, vec![f32in(vec![c(2), c(4), c(2)])], opset);
+        assert_eq!(out_shape(&implicit), vec![c(2), c(6), c(1)]);
+        let n = with_attr(
+            with_attr(node("DFT", 2, 1), "inverse", Attribute::Int(1)),
+            "onesided",
+            Attribute::Int(1),
+        );
+        let explicit = run(
+            &n,
+            vec![f32in(vec![c(2), c(4), c(2)]), i64_scalar(5)],
+            opset,
+        );
+        assert_eq!(out_shape(&explicit), vec![c(2), c(5), c(1)]);
+        assert!(
+            try_run(
+                &n,
+                vec![f32in(vec![c(2), c(4), c(1)]), i64_scalar(5)],
+                opset
+            )
+            .is_err()
+        );
+    }
+    let mut n = with_attr(
+        with_attr(node("DFT", 3, 1), "inverse", Attribute::Int(1)),
+        "onesided",
+        Attribute::Int(1),
+    );
+    n.inputs[1] = None;
+    let unknown = run(
+        &n,
+        vec![
+            f32in(vec![c(2), c(4), c(3), c(2)]),
+            NodeIo::default(),
+            NodeIo::default(),
+        ],
+        20,
+    );
+    assert_eq!(out_shape(&unknown).last(), Some(&c(1)));
+    assert!(
+        out_shape(&unknown)[..3]
+            .iter()
+            .all(|d| d.as_const().is_none())
     );
 }

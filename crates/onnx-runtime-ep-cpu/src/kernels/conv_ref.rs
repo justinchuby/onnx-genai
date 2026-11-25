@@ -175,6 +175,16 @@ fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
 }
 
 impl KernelFactory for ConvFactory {
+    fn unsupported_reason(
+        &self,
+        _node: &Node,
+        _opset: u64,
+        shapes: &[onnx_runtime_ir::Shape],
+        _input_dtypes: &[DataType],
+    ) -> Option<String> {
+        super::conv_rank::claim_rejection(shapes)
+    }
+
     fn create(&self, node: &Node, shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let x_shape = shapes
             .first()
@@ -182,9 +192,9 @@ impl KernelFactory for ConvFactory {
         let w_shape = shapes
             .get(1)
             .ok_or_else(|| EpError::KernelFailed(format!("{OP}: missing W shape")))?;
-        if x_shape.len() != w_shape.len() || !matches!(x_shape.len(), 3 | 4) {
+        if let Some(reason) = super::conv_rank::concrete_rejection(shapes) {
             return Err(EpError::KernelFailed(format!(
-                "{OP}: requires matching rank-3 NCL or rank-4 NCHW tensors, got X={x_shape:?}, W={w_shape:?}"
+                "{reason}; X={x_shape:?}, W={w_shape:?}"
             )));
         }
         let spatial_rank = x_shape.len() - 2;

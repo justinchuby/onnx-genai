@@ -2769,6 +2769,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(sweep("QLinearMatMul", qlinear_matmul_cases()));
     p.push(sweep("Resize", resize_cases()));
     p.push(sweep("ConvTranspose", conv_transpose_cases()));
+    p.push(dedicated(
+        "RoiAlign",
+        "session:roi_align.rs",
+        "Pinned ONNX vectors and batch-index validation with CPU fallback disabled",
+    ));
     p.push(sweep("GridSample", grid_sample_cases()));
     p.push(dedicated(
         "DeformConv",

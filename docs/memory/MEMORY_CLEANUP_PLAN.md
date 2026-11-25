@@ -2511,3 +2511,109 @@ order before settling to zero. Existing concurrent, borrowed/foreign return and
 incomplete-release guards remain. This changes neither allocation granularity,
 EP APIs nor quota operations. It removes repeated queue bookkeeping on pressure;
 no inference latency, RSS or universally zero pool-overhead claim is made.
+
+
+### Structural claim checks travel with their registered factory
+
+`KernelFactory::unsupported_reason` is a pure metadata capability query on the
+same versioned factory the CPU provider will use for construction. The seven
+migrated Attention/MoE parser gates now live with that factory rather than in a
+second operator-name synchronization table. The selected factory receives the effective opset, original
+node, shapes and dtypes. The query does not call factory `create`, prepare device
+storage, initialize a thread pool or obtain an allocation grant. Existing parsers
+may produce small typed attribute values; those are metadata, not execution
+preparation. Execution and its coarse workspace/weight ownership paths do not
+call the gate.
+
+Native and linked-reference Conv share one rank rule for claim and concrete
+construction. Claim treats empty shapes conservatively as unknown rank, matching
+the current IR's scalar/unknown ambiguity; nonempty symbolic shapes retain known
+rank. Concrete construction still rejects scalar or unsupported/mismatched ranks.
+This is a shared structural capability boundary, not a performance-based decline
+or a new dynamic-rank execution guarantee.
+
+Regression tests query different registered factory revisions, verify metadata
+forwarding and zero kernel construction, preserve existing parser declines, and
+cover Conv known/unknown rank behavior. The real ORT plugin regression retains
+three unsupported MoE/attention assignments on ORT's fallback provider while their
+sessions load successfully. No additional per-op quota or scheduler is introduced.
+
+
+### Complete the factory-owned metadata boundary
+
+The remaining fifteen kernel-specific CPU claim gates now travel with their
+registered factories, including sparse attention/MoE, indexing, Gemm and
+DeformConv. Shared ONNX schema gates stay in the provider. Registry resolution
+also makes the default domain spellings (`""` and `ai.onnx`) use the same kernel
+limits; versioned Scatter and DeformConv queries use the selected factory's
+schema revision, matching construction.
+
+CompressedSparseAttention shares a plain attribute parser between claim and
+construction. Claim no longer constructs and immediately drops a kernel just to
+validate attributes. A constructor observer with a positive control covers this
+boundary. No execution buffers, pools or resource grants are prepared by it.
+
+DeformConv's previously unreachable provider check is now a factory capability
+query. The shared IR attribute parser retains its required-input and three-to-five-slot
+arity checks, with errors now naming the missing slot or invalid count. Empty claim shapes defer rank validation
+because the current IR also uses them for unknown rank; known invalid ranks are
+still rejected, and concrete execution retains strict shape validation. Tests
+cover domain aliases, BF16 schema versions and partially unknown shapes. These
+are claim-time changes; they introduce no inference-path quota operations or
+performance, RSS or CUDA execution claim.
+
+
+### STFT frames borrow one execution workspace
+
+STFT's four frame-length f32 buffers now occupy disjoint checked regions in the
+existing StepScoped execution domain. One lane serves every frame and batch;
+there is no per-frame resource admission or node-owned scratch pool. Existing
+zero initialization and DFT/vDSP arithmetic remain unchanged. The provider's
+registered planning fact declares metadata preparation.
+
+A present window supplies the exact metadata bound. Without a window, a runtime
+frame_length scalar leaves metadata preparation Deferred; execution reads the
+Host-accessible scalar and admits precisely four frames before dispatch. No
+signal-length-sized reserve, scalar-value memo or new EP API is introduced.
+Scalar reads no longer allocate a dense one-element vector. Empty batches still
+validate scalar parameters, signal/window views and accessibility, but use no
+frame scratch. Missing/short/misaligned backing fails before output writes.
+
+Controls cover poisoned reuse across changing frame lengths, independent f64
+references, strided/half input, overflow, empty-batch guards and exact Host
+refunds. A real two-node executor prepares max(48,64)=64 bytes, reuses one
+managed identity, and separately exercises scalar-only deferred preparation and
+48-to-64-byte growth. The real governor observer includes live zero-byte claim
+and refund controls; 4,096 warm checkout/execute/return cycles make no further
+issuer callbacks. This is an accounting invariant, not zero total runtime cost.
+
+Signal/window materialization, the output staging Vec and Apple DSP setup's
+internal allocations remain outside these four admitted regions. This does not
+establish complete STFT/RSS accounting, inference latency or CUDA behavior.
+
+
+### DFT mode correctness before scratch migration
+
+Inspection of the remaining DFT allocations exposed a pre-existing semantic
+error: inverse+onesided used a real input, a complex inverse and truncated
+complex output instead of IRFFT. The resource migration is kept separate while
+this contract is corrected. The shared IR mode now determines accepted input
+components, implicit transform length, output length and real/complex width.
+CPU execution, symbolic shape inference and plugin runtime sizing consume it.
+The [ONNX schemas 17/20](https://onnx.ai/onnx/operators/onnx__DFT.html) and
+[official reference](https://github.com/onnx/onnx/blob/main/onnx/reference/ops/op_dft.py)
+define the same real-inverse contract.
+
+CPU IRFFT pads/truncates positive-frequency bins, ignores imaginary DC and even-
+length Nyquist components, reconstructs the conjugate half and uses the existing
+normalized inverse transform. Its default length is twice (input bins minus
+one); explicit odd lengths are preserved. Output has one real component.
+Complete output geometry is checked before writes. Forward and full inverse
+arithmetic retain their existing compute-in-f32 contract.
+
+The cuFFT adapter has no IRFFT pack/unpack implementation. Its factory and
+claim query now explicitly reject that mode with a CPU selection instruction;
+this is not a CUDA execution result. Independent f64 sums cover odd/even sizes,
+padding/truncation and batches; a real encoded model exercises RFFT/IRFFT
+roundtrips for both schemas. Existing scalar/control, widening, output staging
+and per-batch DFT allocations still require their own workspace migration.

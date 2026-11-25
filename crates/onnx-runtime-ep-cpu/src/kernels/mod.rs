@@ -582,6 +582,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         // rejects f64 in `ConvKernel::execute`, so it must not advertise it.
         ("Conv", "") => FLOAT_COMPUTE_DTYPES,
         ("DeformConv", "") => onnx_runtime_ir::deform_conv::DTYPES,
+        ("RoiAlign", "") => onnx_runtime_ir::roi_align::DTYPES,
 
         // The rest of the CNN family dispatches through `dispatch_float!` and
         // does handle f64.
@@ -737,6 +738,7 @@ operator_group_modules!(
     norm_ops,
     pooling,
     resize,
+    roi_align,
     space_to_depth,
 );
 
@@ -745,6 +747,8 @@ pub mod conv;
 #[cfg(all(feature = "ops-cnn", not(feature = "mlas")))]
 #[path = "conv_ref.rs"]
 pub mod conv;
+#[cfg(feature = "ops-cnn")]
+mod conv_rank;
 // Research-only independent native Conv. The registry keeps its existing
 // feature-selected factory; backend_ab exposes the explicit comparison pair.
 #[cfg(all(feature = "ops-cnn", feature = "mlas"))]
@@ -940,6 +944,13 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(grid_sample::GridSampleFactory { since_version: 20 }),
     );
+    for version in onnx_runtime_ir::roi_align::VERSIONS {
+        registry.register(
+            OpKey::new("RoiAlign", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(roi_align::Factory(version)),
+        );
+    }
     registry.register(
         OpKey::new("Resize", "", 10),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -1093,6 +1104,8 @@ pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor
 fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
     let mut descriptors: Vec<CpuOpDescriptor> = reg
         .keys()
+        // RoiAlign is currently supported only in standalone nxrt.
+        .filter(|key| !(key.op_type == "RoiAlign" && key.domain.is_empty()))
         .map(|key| {
             let supports_raw_tensor_abi = input_dtype_constraints_for_op(&key.op_type, &key.domain)
                 .iter()
@@ -2126,7 +2139,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("STFT", "", 17),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(stft::StftFactory),
     );
     rec.register(
@@ -3540,7 +3553,13 @@ mod tests {
         // gets a distinct opset 18 registration for max/min.
         // Opset-28 Cast adds one registration.
         // MeanVarianceNormalization-29 adds one registration.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 125 + mlas_registrations);
+        assert_eq!(
+            reg.len(),
+            PHASE1_OPS.len()
+                + 125
+                + mlas_registrations
+                + onnx_runtime_ir::roi_align::VERSIONS.len()
+        );
         for op in PHASE1_OPS {
             let since = reg
                 .earliest_since_version(op, "")
@@ -3786,7 +3805,8 @@ mod tests {
 
     #[test]
     fn descriptors_derived_from_real_registry_not_hand_maintained() {
-        // Every registered op must have a descriptor -- not "close to", exactly.
+        // Every registered op other than explicitly standalone-only RoiAlign
+        // must have a descriptor.
         //
         // This used to allow a delta of up to 50 and documented CNN ops as the
         // expected difference. That tolerance was hiding a real bug: the plugin
@@ -3803,23 +3823,25 @@ mod tests {
             .iter()
             .map(|d| (d.op_type.as_str(), d.domain.as_str(), d.since_version))
             .collect();
-        let missing: Vec<String> = reg
+        let missing: std::collections::BTreeSet<_> = reg
             .keys()
             .filter(|k| {
                 !described.contains(&(k.op_type.as_str(), k.domain.as_str(), k.since_version))
             })
-            .map(|k| format!("{}::{}@{}", k.domain, k.op_type, k.since_version))
+            .map(|k| (k.op_type.as_str(), k.domain.as_str(), k.since_version))
             .collect();
-        assert!(
-            missing.is_empty(),
-            "{} registered ops have no descriptor, so the plugin would decline \
-             them to ORT's CPU EP: {missing:?}",
-            missing.len()
-        );
+        #[cfg(feature = "ops-cnn")]
+        let expected = onnx_runtime_ir::roi_align::VERSIONS
+            .into_iter()
+            .map(|version| ("RoiAlign", "", version))
+            .collect();
+        #[cfg(not(feature = "ops-cnn"))]
+        let expected = std::collections::BTreeSet::new();
+        assert_eq!(missing, expected);
         assert_eq!(
-            descriptors.len(),
+            descriptors.len() + missing.len(),
             reg.len(),
-            "descriptor count must equal registry size exactly"
+            "plugin descriptors plus standalone-only entries must match the registry exactly"
         );
     }
 
