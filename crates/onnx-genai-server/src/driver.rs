@@ -3813,10 +3813,23 @@ mod admission_tests {
             );
             let mut tokens = Vec::new();
             let mut finished = None;
+            let mut progress = Vec::new();
+            let mut samples = Vec::new();
             while let Ok(event) = events_rx.try_recv() {
                 match event {
-                    DriverEvent::Token(token) => tokens.push(token.token_id),
-                    DriverEvent::PromptProgress(_) => {}
+                    DriverEvent::Token(token) => {
+                        assert_eq!(
+                            progress.len(),
+                            2,
+                            "{route} must report prompt before committed tokens"
+                        );
+                        samples.push(token.timings.expect("committed token timing"));
+                        tokens.push(token.token_id);
+                    }
+                    DriverEvent::PromptProgress(update) => {
+                        assert!(tokens.is_empty());
+                        progress.push(update);
+                    }
                     DriverEvent::WorkflowPublications(_) => {}
                     DriverEvent::Finished(result) => finished = Some(result),
                     DriverEvent::Error(failure) => {
@@ -3830,6 +3843,20 @@ mod admission_tests {
                 "{route} retry token event order"
             );
             assert_eq!(tokens, vec![1, 1, 1], "{route} retry must be deterministic");
+            assert_eq!(progress[0].processed, 0);
+            assert_eq!(progress[1].processed, 1);
+            assert_eq!(
+                samples
+                    .iter()
+                    .map(|sample| sample.generated_tokens)
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3]
+            );
+            assert_eq!(finished.timings, samples.last().copied());
+            assert_eq!(
+                finished.timings.unwrap().prompt_elapsed,
+                progress[1].elapsed
+            );
         }
     }
 
