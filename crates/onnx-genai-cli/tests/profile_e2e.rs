@@ -8,9 +8,8 @@
 //! afterwards. The guard's own advice is to isolate a policy phase in its own
 //! process, so these drive the real binary and read the profile it wrote.
 //!
-//! Only the `generate` command is covered here: the `transcribe` counterpart
-//! needs the `tiny-whisper` package, which is not one of the canonical fixtures
-//! this branch keeps, so it would assert against a model that does not exist.
+//! Generation profiles are covered here. `transcription_e2e` exercises maintained
+//! frame/token speech packages and verifies the real CLI's Native profile too.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

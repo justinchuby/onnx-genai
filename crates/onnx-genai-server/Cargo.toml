@@ -96,6 +96,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 getrandom = "0.3"
 base64 = "0.22"
 sha2 = { workspace = true }
+subtle = "2.6"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 image = { workspace = true, features = ["png"] }

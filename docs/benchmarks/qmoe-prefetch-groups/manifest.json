@@ -1,0 +1,22 @@
+{
+  "README.md": "9cc805e2b9417258f09b2bf635d635ac4359771bb2caa9b4523530e19afc4800",
+  "baseline.rs.gz": "676c86f602089400aee4d71a814550f5204567cb1f9ceeb4d1d59f4ab98d82d7",
+  "controls/controls.json": "fca838f5ef5ea6af6080b002dfc55e1f437a38f0028e7ba655d1316dfef2c70f",
+  "controls/driver.py": "cec60c49f073b28304af088dac0b1e1d6f111ccb4d8f731ae7e5bd731c018aa9",
+  "controls/restoration.json": "8cef61aa44dbca0046992cab02e9e3d1f9ac8f8824eee6af1cdca83859e8ff17",
+  "controls/spawn-failure-qmoe.rs.gz": "d6c89459f2c4404ed9183faf93686a1eaabd05d64c890a31db8a97602e2667cb",
+  "controls/spawn-failure.log.gz": "641c57866d379a52dd20c159fb7bf2eb8d046687bd68414a9663732e147ec65f",
+  "controls/wrong-id-qmoe.rs.gz": "b8e1260cda012ad7c66b921ebaab624424f70866e58fa7f05e6d33b4a0e1c3f5",
+  "controls/wrong-id.log.gz": "87ffc5b8df69934ad2c0e35307d08bcd5193af4da582ba2e9f35ff13817ee777",
+  "final.rs.gz": "3e3b2524e52f016f45cd4d8f622f2dec52f98420485fecfc45c5a74290c45c19",
+  "host.json": "ba4d0d8876e1c179e074568d083e5997284453a29aeead9db734f899764ea23d",
+  "validation/clippy-mlas.log.gz": "9f0993b8242fad3bf580fb983b699655c7bcdf6aa419dda42bdf7bd206978210",
+  "validation/clippy.log.gz": "121b269abf195ba6769ff723ed542dfd99ee824160f10878cfd9a82c00a56dd0",
+  "validation/driver.py": "e6d7e3a91f3a870812a0f7c68bdfbf330dbc40b555a779f52a899b87c13c80c4",
+  "validation/list-qmoe.log.gz": "0142851c25a93d879f79ca29d28777f1b916b317a2f90f8e772d0696fb0f47ab",
+  "validation/oracle.log.gz": "a1729ad1ece6d22d5ce755663b09b373badbfe2d675b8d8a9b3d16a256ab08e9",
+  "validation/qmoe-mlas.log.gz": "f89873aa21ae250e8042bfc6107dcb64d827d729e23d6e2132bd0e45c9b76a30",
+  "validation/qmoe.log.gz": "6946172ff564ac1bff0cc019fc2573cc2c75b0432a7fc9ce9f7fc9952123b193",
+  "validation/validation.json": "67b3f5ceed2fa426434ec849f60b98b9f8e7d5a0c586fbbdcf08a264ca04c717",
+  "verify.py": "6a2ae6bb8e75ffe1b026eeec408dab0e3c2eec50634f405553ad82f58eb41e63"
+}

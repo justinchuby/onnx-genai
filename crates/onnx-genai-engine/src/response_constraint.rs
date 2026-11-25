@@ -487,9 +487,14 @@ impl Constraint for ContentConstraint {
                     .map(|candidate| {
                         let id = candidate.token_id;
                         let piece = contract.pieces.get(id as usize);
+                        // The trie walks literal model bytes. Escapes and DEL
+                        // can change JSON recognizer spelling, so preview those
+                        // through the canonical normalization/projection path.
                         if !self.endings.contains(&id)
-                            && let Some(piece) =
-                                piece.filter(|piece| !piece.is_empty() && !piece.contains(&b'\\'))
+                            && let Some(piece) = piece.filter(|piece| {
+                                !piece.is_empty()
+                                    && !piece.iter().any(|&byte| matches!(byte, b'\\' | 0x7f))
+                            })
                             && !(state.normalized.canonical().is_empty()
                                 && piece.first().is_some_and(u8::is_ascii_whitespace))
                         {
@@ -766,6 +771,95 @@ mod tests {
             )
             .unwrap();
         logits
+    }
+
+    #[test]
+    fn json_vocabulary_fast_path_preserves_raw_del_normalization_and_key_ownership() {
+        let tokenizer = byte_tokenizer(
+            true,
+            &[
+                (4, "<0x7F>"),
+                (5, "\""),
+                (6, "{"),
+                (7, "}"),
+                (8, ":"),
+                (9, "1"),
+                (10, "2"),
+                (11, "\\u007f"),
+                (12, "x"),
+                (13, "{\"\u{7f}\":1}"),
+                (14, "<0x1F>"),
+                (15, "\"\u{7f}\""),
+                (16, "{\"x\":\"\u{7f}\"}"),
+            ],
+        );
+        let candidates = (0..32)
+            .map(|token_id| TokenCandidate {
+                token_id,
+                text: String::new(),
+                is_eos: token_id == 3,
+            })
+            .collect::<Vec<_>>();
+        for (schema, sequences) in [
+            (json!({"const":"\u{7f}"}), vec![vec![5, 4, 5], vec![15]]),
+            (
+                json!({"type":"object","properties":{"\u{7f}":{"const":1}},"additionalProperties":{"const":2}}),
+                vec![vec![6, 5, 4, 5, 8, 9, 7], vec![13]],
+            ),
+            (
+                json!({"type":"object","additionalProperties":{"const":"\u{7f}"}}),
+                vec![vec![6, 5, 12, 5, 8, 5, 4, 5, 7], vec![16]],
+            ),
+        ] {
+            for sequence in sequences {
+                let fast = ContentConstraint::json_schema(
+                    &tokenizer,
+                    &schema,
+                    ProjectionKind::Plain,
+                    "",
+                    4096,
+                    vec![3],
+                    &Default::default(),
+                )
+                .unwrap();
+                let mut reference = ContentConstraint::json_schema(
+                    &tokenizer,
+                    &schema,
+                    ProjectionKind::Plain,
+                    "",
+                    4096,
+                    vec![3],
+                    &Default::default(),
+                )
+                .unwrap();
+                assert!(fast.plain_vocabulary.is_some());
+                reference.plain_vocabulary = None;
+                for end in 0..=sequence.len() {
+                    let context = ProcessorContext {
+                        generated_tokens: sequence[..end].to_vec(),
+                        ..Default::default()
+                    };
+                    let actual = fast.allowed_next_tokens(&context, &candidates).unwrap();
+                    assert_eq!(
+                        actual,
+                        reference
+                            .allowed_next_tokens(&context, &candidates)
+                            .unwrap(),
+                        "history={:?}",
+                        context.generated_tokens
+                    );
+                    assert!(
+                        actual[*sequence.get(end).unwrap_or(&3) as usize],
+                        "history={:?}",
+                        context.generated_tokens
+                    );
+                    assert!(
+                        !actual[14],
+                        "raw RFC control bytes cannot enter a JSON string"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

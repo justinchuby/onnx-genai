@@ -292,6 +292,26 @@ pub const AB_COVERED: &[KernelFamily] = &[
     KernelFamily::AttentionTranspose,
 ];
 
+/// Explicit independent Conv factories for a linked-reference research build.
+/// Native keeps BNNS/NEON selection and fixes its GEMM fallback to Generic,
+/// regardless of `NXRT_CPU_GEMM_BACKEND`. This is not a performance comparison
+/// of every production auto-selected backend. The registered factory is unchanged.
+#[cfg(all(feature = "mlas", feature = "ops-cnn"))]
+pub struct ConvComparisonFactories {
+    pub native_generic_gemm: Box<dyn onnx_runtime_ep_api::KernelFactory>,
+    pub mlas: Box<dyn onnx_runtime_ep_api::KernelFactory>,
+}
+
+/// Construct both Conv implementations in the same binary without ORT CPU EP
+/// delegation, process environment mutation or a runtime production toggle.
+#[cfg(all(feature = "mlas", feature = "ops-cnn"))]
+pub fn convolution_factories() -> ConvComparisonFactories {
+    ConvComparisonFactories {
+        native_generic_gemm: Box::new(crate::kernels::conv_native::ConvFactory),
+        mlas: Box::new(crate::kernels::conv::ConvFactory),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
