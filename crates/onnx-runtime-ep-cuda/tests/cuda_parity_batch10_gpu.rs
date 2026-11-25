@@ -20,7 +20,8 @@ use common::{
     assert_close, build_graph, decode_floats, float_input, input, require_cuda, run_cpu, run_cuda,
 };
 use onnx_runtime_ep_api::ExecutionProvider;
-use onnx_runtime_ir::{Attribute, DataType, Model, static_shape};
+use onnx_runtime_ir::{Attribute, DataType, static_shape};
+use onnx_runtime_loader::Model;
 
 fn tolerance(dtype: DataType) -> f32 {
     match dtype {
