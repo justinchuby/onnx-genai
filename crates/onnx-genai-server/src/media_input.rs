@@ -137,7 +137,7 @@ impl MediaRequest {
             }
             Ok(bytes)
         }).await.map_err(|error|ApiError::internal(format!("validate {field}: media decoding task stopped: {error}; retry or inspect server logs")))?
-            .map_err(|error|ApiError::invalid_request({ let (label,guidance)=match kind {onnx_genai_metadata::EncodedMediaKind::Image=>("image","valid PNG or JPEG data"),onnx_genai_metadata::EncodedMediaKind::Audio=>("audio","valid PCM16 WAV or MP3 data")}; format!("{field} is not a supported encoded {label}: {error:#}; provide {guidance}") }))?;
+            .map_err(|error|ApiError::invalid_request({ let (label,guidance)=match kind {onnx_genai_metadata::EncodedMediaKind::Image=>("image","valid PNG or JPEG data"),onnx_genai_metadata::EncodedMediaKind::Audio=>("audio","valid supported encoded audio data")}; format!("{field} is not a supported encoded {label}: {error:#}; provide {guidance}") }))?;
         self.remaining -= bytes.len();
         let bytes: std::sync::Arc<[u8]> = bytes.into();
         self.media
@@ -155,7 +155,7 @@ fn decode_audio(source: &str, limit: std::num::NonZeroUsize) -> anyhow::Result<V
     } else {
         anyhow::ensure!(
             !source.contains("://") && !source.starts_with("data:") && !source.starts_with("file:"),
-            "audio must be base64 PCM16 WAV or MP3 bytes or an audio data URI; remote/file URLs are not fetched"
+            "audio must be base64 supported encoded audio bytes or an audio data URI; remote/file URLs are not fetched"
         );
         source
     };
@@ -166,7 +166,7 @@ fn decode_audio(source: &str, limit: std::num::NonZeroUsize) -> anyhow::Result<V
     );
     let bytes = STANDARD
         .decode(encoded)
-        .context("audio must contain valid base64 PCM16 WAV or MP3 bytes")?;
+        .context("audio must contain valid base64 supported encoded audio bytes")?;
     anyhow::ensure!(
         bytes.len() <= max,
         "decoded audio exceeds its {max}-byte input limit; reduce the clip"

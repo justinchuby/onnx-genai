@@ -11578,6 +11578,41 @@ mod systemone_audio {
         }
     }
     #[tokio::test]
+    async fn systemone_codec_matrix_preserves_state_and_spoken_question_results() {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/audio/codec-matrix");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(fixtures.join("manifest.json")).unwrap())
+                .unwrap();
+        let router = router(1024 * 1024);
+        for case in manifest["cases"].as_array().unwrap() {
+            let file = case["file"].as_str().unwrap();
+            let bytes = std::fs::read(fixtures.join(file)).unwrap();
+            let decoded = onnx_genai_preprocess::audio::decode_audio(&bytes).unwrap();
+            let reference = onnx_genai_preprocess::audio::encode_wav_f32(
+                &decoded.samples,
+                decoded.sample_rate,
+                1,
+            )
+            .unwrap();
+            let mut results = Vec::new();
+            for bytes in [&bytes, &reference] {
+                let mut request = body();
+                request["files"][1] = json!(format!(
+                    "data:audio/{};base64,{}",
+                    case["codec"].as_str().unwrap(),
+                    STANDARD.encode(bytes)
+                ));
+                request["questions"]["route"]["instructions"]["input_audio"]["data"] =
+                    json!(STANDARD.encode(bytes));
+                let (status, result) = post(router.clone(), request).await;
+                assert_eq!(status, StatusCode::OK, "{file}: {result}");
+                results.push(result);
+            }
+            assert_eq!(results[0], results[1], "{file}");
+        }
+    }
+    #[tokio::test]
     async fn systemone_audio_spoken_questions_are_independent_and_usage_is_actual() {
         let router = router(1024 * 1024);
         let request = body();
@@ -11666,7 +11701,7 @@ mod systemone_audio {
             (1, "questions.route"),
             (2, "questions.route"),
             (3, "questions.route"),
-            (4, "PCM16"),
+            (4, "supported encoded audio"),
             (5, "omits required"),
         ] {
             let mut request = body();
@@ -11863,6 +11898,102 @@ mod ctc_transcription {
         }
     }
     #[tokio::test]
+    async fn codec_matrix_executes_native_transcription_and_streaming() {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/audio/codec-matrix");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(fixtures.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["cases"].as_array().unwrap().len(), 17);
+        for (name, directory) in [
+            ("ctc", "transcription_ctc"),
+            ("speech", "transcription_tokens"),
+        ] {
+            let model = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/onnx_genai_workflows")
+                .join(directory);
+            let router = app(AppState::load(&model, Some(name.into())).unwrap());
+            let (status, error) = send(
+                router.clone(),
+                "/v1/audio/transcriptions",
+                &std::fs::read(fixtures.join("unsupported-opus.ogg")).unwrap(),
+                &[("model", name)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+            assert!(error.contains("codec"), "{error}");
+            for case in manifest["cases"].as_array().unwrap() {
+                let file = case["file"].as_str().unwrap();
+                let bytes = std::fs::read(fixtures.join(file)).unwrap();
+                let decoded = onnx_genai_preprocess::audio::decode_audio(&bytes).unwrap();
+                if name == "speech" {
+                    use base64::{Engine as _, engine::general_purpose::STANDARD};
+                    let request = json!({"model":name,"messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":STANDARD.encode(&bytes),"format":file}}]}],"max_tokens":2,"temperature":0.0});
+                    let response = router
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method("POST")
+                                .uri("/v1/chat/completions")
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(Body::from(request.to_string()))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    let status = response.status();
+                    let result = json_body(response).await;
+                    assert_eq!(status, StatusCode::OK, "chat/{file}: {result}");
+                    assert!(
+                        result["choices"][0]["message"]["content"].is_string(),
+                        "{result}"
+                    );
+                }
+                let reference = onnx_genai_preprocess::audio::encode_wav_f32(
+                    &decoded.samples,
+                    decoded.sample_rate,
+                    1,
+                )
+                .unwrap();
+                let (status, body) = send(
+                    router.clone(),
+                    "/v1/audio/transcriptions",
+                    &reference,
+                    &[("model", name)],
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{name}/{file}: {body}");
+                let expected: Value = serde_json::from_str(&body).unwrap();
+                let (status, body) = send(
+                    router.clone(),
+                    "/v1/audio/transcriptions",
+                    &bytes,
+                    &[("model", name)],
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{name}/{file}: {body}");
+                assert_eq!(
+                    serde_json::from_str::<Value>(&body).unwrap(),
+                    expected,
+                    "{name}/{file}"
+                );
+                let (status, body) = send(
+                    router.clone(),
+                    "/v1/audio/transcriptions",
+                    &bytes,
+                    &[("model", name), ("stream", "true")],
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{name}/{file}: {body}");
+                assert_eq!(
+                    transcript_events(&body).last().unwrap(),
+                    &expected,
+                    "{name}/{file}"
+                );
+            }
+        }
+    }
+    #[tokio::test]
     async fn mp3_transcription_executes_both_native_speech_paths_and_recovers_after_bad_audio() {
         let mp3 = include_bytes!("../../../tests/fixtures/audio/stereo-tone.mp3");
         let decoded = onnx_genai_preprocess::audio::decode_audio(mp3).unwrap();
@@ -11888,7 +12019,7 @@ mod ctc_transcription {
             )
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
-            assert!(error.contains("MP3"), "{error}");
+            assert!(error.contains("audio"), "{error}");
             let (status, wav) = send(
                 router.clone(),
                 "/audio/transcriptions",
@@ -11972,7 +12103,7 @@ mod ctc_transcription {
     async fn ctc_http_rejects_bad_audio_conditioning_and_resource_limits_without_poisoning_model() {
         let router = router(Default::default());
         for (bytes, format, extra, diagnostic) in [
-            (vec![0, 1, 2], "json", None, "PCM16 WAV"),
+            (vec![0, 1, 2], "json", None, "audio"),
             (wav(false), "verbose_json", None, "response_format"),
             (wav(false), "json", Some(("language", "en")), "conditioning"),
             (

@@ -406,7 +406,7 @@ pub(super) fn build_pipeline_request(
                 format!(
                     "What: the audio file {} could not be preprocessed. \
                      Why: it is not usable as this model's declared audio input. \
-                     How: provide a valid PCM16 WAV or MP3 file.",
+                     How: provide a valid supported encoded audio file.",
                     path.display()
                 )
             })?;

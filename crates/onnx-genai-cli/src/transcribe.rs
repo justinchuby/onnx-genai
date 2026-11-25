@@ -177,7 +177,7 @@ impl Transcriber {
                         PreparedTranscription, TranscriptionLimits,
                     };
                     let bytes =
-                        onnx_genai::preprocess::audio::encode_wav_pcm16(samples, sample_rate, 1)?;
+                        onnx_genai::preprocess::audio::encode_wav_f32(samples, sample_rate, 1)?;
                     let mut limits = TranscriptionLimits::default();
                     if let Some(maximum) = self.max_new_tokens {
                         limits.max_tokens = maximum;
@@ -410,7 +410,7 @@ fn transcribe_file(
         anyhow::anyhow!(
             "What: the audio file {} could not be decoded. \
              Why: {error}. \
-             How: provide a valid PCM16 WAV or MP3 file.",
+             How: provide a valid supported audio file (e.g. WAV, FLAC, MP3 or AAC/M4A).",
             path.display()
         )
     })?;

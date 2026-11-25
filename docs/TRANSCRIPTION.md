@@ -1,8 +1,8 @@
 # File transcription
 
 Both `POST /v1/audio/transcriptions` and `/audio/transcriptions` accept multipart
-`file`, `model`, `response_format`, `max_tokens` and `stream` fields. PCM16 WAV and
-MP3 are supported by content, regardless of the upload filename. The model is
+`file`, `model`, `response_format`, `max_tokens` and `stream` fields. Supported encoded audio is detected
+by content, regardless of the upload filename; see [formats](AUDIO_PREPROCESSING.md#encoded-audio-formats). The model is
 selected before execution; a package with no
 admitted speech path returns `501 not_supported_error`.
 
@@ -149,3 +149,6 @@ rather than dropping it, and still needs a general model-authored ASR prompt/res
 media accounting; its legacy feature-input analysis also needs a fully authored
 contract. CLI frame execution and program-derived segmentation are implemented. Realtime sessions use their separate declared
 [contract](REALTIME.md). This feature does not establish complete audio parity.
+
+Encoded audio support and decoder limitations are documented in
+[audio preprocessing](AUDIO_PREPROCESSING.md#encoded-audio-formats).
