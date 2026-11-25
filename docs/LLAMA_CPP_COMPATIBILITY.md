@@ -31,6 +31,24 @@ Node/npm and network access are not needed to build the Rust server or use its U
 The removed `run` REPL has no alias or migration shim. `generate`, `transcribe`,
 model inspection, profiling and command-line streaming remain available.
 
+## API keys
+
+Authentication is optional. Start with `nxrt serve MODEL --api-key-file keys.txt`;
+the UTF-8 file contains one key per line, with blank lines and lines starting
+with `#` ignored. `--api-key` accepts comma-separated CSV and may be repeated.
+The upstream environment variables `LLAMA_API_KEY` and `LLAMA_ARG_API_KEY_FILE`
+are also accepted. Keys from both sources are combined.
+
+Send `Authorization: Bearer YOUR_KEY`, a raw `Authorization: YOUR_KEY`, or
+`X-Api-Key: YOUR_KEY`. A nonempty Authorization header takes precedence over
+X-Api-Key. Missing or incorrect credentials return HTTP 401 with
+`error.type: authentication_error` and `error.code: 401`.
+Health endpoints and exact embedded UI assets remain public. All other API
+requests, including replay, management and realtime upgrade requests, pass
+through key admission before routing. With no configured keys, requests keep
+the existing open behavior. Server configuration Debug output exposes only
+the configured key count; it does not contain credentials or their digests.
+
 ## Implemented surface
 
 | Method | Paths | Contract |
@@ -436,7 +454,7 @@ This is a functional Llama Chat integration, not a claim of complete llama-serve
 parity. These upstream capabilities remain incomplete:
 
 - Realtime grammar forcing beyond declared turn-based tagged-json mask workflows,
-  full tool argument schema validation and
+  partial function-call fragment projection, broader pressure/overlap acceptance and
   device-backed wire acceptance; see [realtime](REALTIME.md) for the implemented
   WebSocket session modes, resource bounds and Native CPU evidence.
 - Multimodal/joint decision heads and shared generation/decision entry points.
@@ -515,6 +533,14 @@ Temporary fixtures, proxy, Chrome and server processes are cleaned up, with
 bounded startup/observer waits. Append an optional screenshot path after the
 Playwright module path to save an image of the baseline chat. Coordinate this
 inference workload with other sessions using the shared host lock.
+
+For API-key onboarding, run
+`node scripts/test_llama_chat_auth.mjs /absolute/path/to/playwright/index.mjs /absolute/path/to/onnx-genai-server`
+under the same lock. This uses real Chrome and Native CPU inference to enter an
+incorrect key, retry a correct key through the UI, chat, reload the persisted
+login, and check private byte-exact replay. A fresh browser context must still
+require a key. The script uses an ephemeral loopback port and removes its
+synthetic key file, browser and server on exit.
 
 
 ## Raw GBNF and llguidance constraints
