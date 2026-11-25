@@ -1,0 +1,23 @@
+{
+  "source_path": "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs",
+  "source_sha256": "f6593d1753c0b3a6efa5a60e651882db668d2acfde422832e84365af9743f4e7",
+  "mutant_sha256": "6be00eec278abf782d23df602b5dac0c69c0de3d19edfc508f3c091ed24da9fd",
+  "mutation": "remove only the entry eligibility guard; caller already has scheduling-only condition",
+  "command": [
+    "cargo",
+    "test",
+    "--offline",
+    "-p",
+    "onnx-runtime-ep-cpu",
+    "--lib",
+    "kernels::qmoe::tests::prefetch_scope_rejects_partial_banks_before_payload_lock_or_expert_inputs",
+    "--",
+    "--exact",
+    "--nocapture"
+  ],
+  "exit": 101,
+  "expected_test_failure": true,
+  "compile_error": false,
+  "log_sha256": "065fc40c4dc02510718cefed8e05de9986f31a0f3847480fcfe5accd8694594f",
+  "restored": true
+}

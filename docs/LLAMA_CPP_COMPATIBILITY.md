@@ -31,6 +31,24 @@ Node/npm and network access are not needed to build the Rust server or use its U
 The removed `run` REPL has no alias or migration shim. `generate`, `transcribe`,
 model inspection, profiling and command-line streaming remain available.
 
+## API keys
+
+Authentication is optional. Start with `nxrt serve MODEL --api-key-file keys.txt`;
+the UTF-8 file contains one key per line, with blank lines and lines starting
+with `#` ignored. `--api-key` accepts comma-separated CSV and may be repeated.
+The upstream environment variables `LLAMA_API_KEY` and `LLAMA_ARG_API_KEY_FILE`
+are also accepted. Keys from both sources are combined.
+
+Send `Authorization: Bearer YOUR_KEY`, a raw `Authorization: YOUR_KEY`, or
+`X-Api-Key: YOUR_KEY`. A nonempty Authorization header takes precedence over
+X-Api-Key. Missing or incorrect credentials return HTTP 401 with
+`error.type: authentication_error` and `error.code: 401`.
+Health endpoints and exact embedded UI assets remain public. All other API
+requests, including replay, management and realtime upgrade requests, pass
+through key admission before routing. With no configured keys, requests keep
+the existing open behavior. Server configuration Debug output exposes only
+the configured key count; it does not contain credentials or their digests.
+
 ## Implemented surface
 
 | Method | Paths | Contract |
@@ -49,7 +67,7 @@ model inspection, profiling and command-line streaming remain available.
 | POST | `/v1/embeddings` | Existing OpenAI embedding contract |
 | POST | `/completion`, `/completions`, `/infill` | Native buffered/streaming completion, bounded text/token/mixed batches, declared FIM metadata |
 | POST | `/embedding`, `/embeddings` | Native pooled embeddings with requested normalization |
-| POST | `/rerank`, `/reranking`, `/v1/rerank`, `/v1/reranking` | Declared token-pair scoring workflow with Jina/TEI response shapes |
+| POST | `/rerank`, `/reranking`, `/v1/rerank`, `/v1/reranking` | Declared text/image-pair scoring workflow with Jina/TEI response shapes |
 | POST | `/v1/responses`, `/responses` | Responses wire adapter over admitted chat generation |
 | POST | `/v1/messages` | Anthropic Messages wire adapter over admitted chat generation |
 | POST | `/v1/chat/completions/input_tokens`, `/chat/completions/input_tokens`, `/v1/responses/input_tokens`, `/responses/input_tokens`, `/v1/messages/count_tokens` | Input token counts from the shared inference preparation path |
@@ -57,8 +75,10 @@ model inspection, profiling and command-line streaming remain available.
 | POST | `/v1/streams/lookup` | Lookup only requested conversation IDs, including model-qualified IDs |
 | POST | `/v1/audio/transcriptions`, `/audio/transcriptions` | Existing multipart transcription contract |
 | POST | `/v1/audio/speech`, `/audio/speech`, `/tts` | Declared buffered speech workflow; native input/prompt and raw-prompt handling |
-| GET | `/models/sse` | Initial state and changes to committed model load status; one-second polling, no invented progress |
-| POST | `/models/load`, `/models/unload` | Configured model IDs; requires `--enable-admin-endpoints` |
+| WS | `/v1/realtime` | Metadata-declared native streaming audio/text sessions; [contract and current limits](REALTIME.md) |
+| GET | `/models/sse` | Model status, actual per-file download progress, pause/failure and removal events |
+| POST | `/models/load`, `/models/unload` | Configured and cached model IDs; cache mode also supports pausing downloads |
+| POST, DELETE | `/models` | Opt-in bounded Hugging Face nxrt-package download, resume and deletion |
 | GET, POST | `/tools`, `/cors-proxy` | Outside scope: execution and MCP transport belong to an external harness |
 | GET, POST | `/lora-adapters` | Model-bound declared catalog and atomic default scale replacement; request `lora` overrides execute actual adapter weights |
 | GET | `/slots` | Actual serial Native slot status; model/autoload selection and fail-on-busy polling |
@@ -69,9 +89,12 @@ model inspection, profiling and command-line streaming remain available.
 `autoload=true`. The UI uses `autoload=false` for discovery. Unknown/unloaded
 models are reported explicitly. Model load/unload requests complete when the
 operation completes; clients can inspect the committed status afterward.
-Models are configured with `--models-dir` or `--models-config`; this does not
-implement llama.cpp's Hugging Face/GGUF download manager. Load `extra_args` are
-rejected because these models execute in-process with explicit nxrt settings.
+Models are configured with `--models-dir` or `--models-config`. Opt-in
+`--model-cache-dir` also admits managed Hugging Face nxrt packages, with durable
+pause/resume and deletion; see [model management](MODEL_MANAGEMENT.md).
+Load/unload requires this cache option or `--enable-admin-endpoints`.
+Load `extra_args` are rejected because these models execute in-process with
+explicit nxrt settings.
 
 ## Request compatibility
 
@@ -421,14 +444,23 @@ Declared host LoRA serving supports global defaults, per-request overrides,
 model isolation and replayed conversation history. See [LoRA serving](LORA_SERVING.md)
 for package contracts, memory admission and remaining source/device limitations.
 
+Reranking accepts ordered query/document images through an explicit v2 profile,
+including actual native image preprocessing and model-owned token usage. See
+[reranking](RERANKING.md) for the package ABI, request shapes and resource bounds.
+
 ## Remaining differences
 
 This is a functional Llama Chat integration, not a claim of complete llama-server
-parity. These upstream protocols are still unimplemented:
+parity. These upstream capabilities remain incomplete:
 
-- Multimodal reranking, realtime audio/WebSocket inference, and multimodal/joint decision heads.
+- Realtime grammar forcing beyond declared turn-based tagged-json mask workflows,
+  full tool argument schema validation and
+  device-backed wire acceptance; see [realtime](REALTIME.md) for the implemented
+  WebSocket session modes, resource bounds and Native CPU evidence.
+- Multimodal/joint decision heads and shared generation/decision entry points.
 - Device-state/multi-sequence slot persistence; arbitrary GGUF/PEFT LoRA imports and device-fused LoRA.
-- GGUF/Hugging Face model downloads and deletion.
+- GGUF package import, quantization selectors and selective sidecar management.
+  Hugging Face nxrt-package download, resume and deletion are supported.
 
 `/v1/systemone` executes text/structured-state decision profiles, with explicit
 model-authored prompting, calibration outputs, variants and answer policies.
@@ -437,7 +469,8 @@ ordering, score ranges and canonical legends. Multimodal/joint heads and shared
 generation/decision entry points remain open; see [SystemOne](SYSTEMONE.md). Route presence does not
 claim every upstream decision-model format is admitted.
 
-Model download/delete remain disabled. `--props` enables `POST /props`, matching
+Model download/delete require `--model-cache-dir`; operator-configured paths
+cannot be deleted. `--props` enables `POST /props`, matching
 upstream's current acknowledgement-only contract: it returns `{"success":true}`
 and does not read or change generation settings. `GET /props` advertises the
 configured `endpoint_props` value in router and model modes. When disabled, POST
@@ -500,6 +533,14 @@ Temporary fixtures, proxy, Chrome and server processes are cleaned up, with
 bounded startup/observer waits. Append an optional screenshot path after the
 Playwright module path to save an image of the baseline chat. Coordinate this
 inference workload with other sessions using the shared host lock.
+
+For API-key onboarding, run
+`node scripts/test_llama_chat_auth.mjs /absolute/path/to/playwright/index.mjs /absolute/path/to/onnx-genai-server`
+under the same lock. This uses real Chrome and Native CPU inference to enter an
+incorrect key, retry a correct key through the UI, chat, reload the persisted
+login, and check private byte-exact replay. A fresh browser context must still
+require a key. The script uses an ephemeral loopback port and removes its
+synthetic key file, browser and server on exit.
 
 
 ## Raw GBNF and llguidance constraints

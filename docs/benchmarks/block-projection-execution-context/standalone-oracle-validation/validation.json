@@ -1,0 +1,104 @@
+{
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cuda/tests/block_quantized_cpu_oracle.rs": "6dc5779906341184e7ab16d3b9bc1c640f140bf3f768b42edcb1d77188f5f4da",
+    "crates/onnx-runtime-ep-cuda/tests/block_quantized_matmul_gpu.rs": "6f383fdd36efc11d89dc5ebcfa37d0bd53403f1e6f23a0cac2c27ba328a70c02",
+    "crates/onnx-runtime-ep-cuda/tests/block_quantized_moe_gpu.rs": "26d66ccf7ba99b42d2c707ec28e719233f68d1476b81d4f3d3107482fdfb84d7"
+  },
+  "runtime_source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs": "c3036f31baef263be616a056181513f7ddb34787efcac7d84eaf02e3f71f9d6e",
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs": "07004f9b636c800215f7ce645dad9d715cd29b415d13a8660ebf38e69577c278",
+    "crates/onnx-runtime-session/src/executor/workspace_context_tests.rs": "401d5be69b939ab23c7866187c6d29df503656e72a5dac4703cab7cb81ab42c5"
+  },
+  "results": [
+    {
+      "name": "source-guard",
+      "command": [
+        "python3",
+        ".github/scripts/verify_cuda_test_honesty.py",
+        "--source-scan"
+      ],
+      "exit": 0,
+      "log_sha256": "0d4b3a5f245b86c81f0f9786d03a26b97f45ef6887fd32d8bc60ed5ef93b79f3"
+    },
+    {
+      "name": "host-list",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cuda",
+        "--test",
+        "block_quantized_cpu_oracle",
+        "--",
+        "--list"
+      ],
+      "exit": 0,
+      "log_sha256": "267b5188bda971ea6179dc55a7319eb8adccd3f1a8a630f6bb37134352d5cb23"
+    },
+    {
+      "name": "host",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cuda",
+        "--test",
+        "block_quantized_cpu_oracle"
+      ],
+      "exit": 0,
+      "log_sha256": "a79bc8785b9d2ee575f0b746539bf24430736e6bf88a6cca909a190181269058",
+      "counts": [
+        [
+          "2",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "gpu-fixtures-list",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cuda",
+        "--test",
+        "block_quantized_matmul_gpu",
+        "--test",
+        "block_quantized_moe_gpu",
+        "--features",
+        "gpu-tests",
+        "--",
+        "--list"
+      ],
+      "exit": 0,
+      "log_sha256": "1afaeb46d44b671cde57f5f06440bfd4d9fc55809722deca7d41f942b451257b",
+      "listed_tests": 28,
+      "gpu_execution": false
+    },
+    {
+      "name": "clippy-fixtures",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cuda",
+        "--test",
+        "block_quantized_cpu_oracle",
+        "--test",
+        "block_quantized_matmul_gpu",
+        "--test",
+        "block_quantized_moe_gpu",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit": 0,
+      "log_sha256": "133a9d6efaae21931cf79213b478cd7d2bd5e4fc36284e709481c1263b0d3c87"
+    }
+  ]
+}
