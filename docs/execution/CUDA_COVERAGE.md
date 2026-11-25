@@ -379,9 +379,11 @@ CUDA additionally exposes `com.microsoft::Attention`.
 
 The three standard-domain text operators listed above consume managed string
 tensors, which stay on the host. There are no CUDA kernels for these operators.
+`Compress` with `tensor(string)` data also runs on the host, using its rank-one
+BOOL condition; CUDA's `Compress` kernel accepts only fixed-width data.
 Standalone nxrt can still place eligible numeric subgraphs on CUDA when CPU
-fallback is allowed; strict CUDA placement rejects graphs that require these
-text operators.
+fallback is allowed; strict CUDA placement rejects graphs that require managed
+strings.
 
 `com.microsoft::MoE` (the float/unquantized form, with dense f32/f16/bf16 FC
 weight tensors) is present in the CPU EP but is **not a real CUDA gap**: no
