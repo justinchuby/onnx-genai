@@ -164,6 +164,56 @@ pub struct KernelRegistryEntry {
     pub output_dtype_constraints: &'static [(usize, &'static [DataType])],
 }
 
+/// Exclude an operator starting at a particular schema revision (inclusive).
+#[derive(Clone, Copy, Debug)]
+pub struct OperatorExclusion {
+    pub domain: &'static str,
+    pub op_type: &'static str,
+    /// Zero excludes every revision.
+    pub since_version: u32,
+}
+
+pub type OperatorExclusions = &'static [OperatorExclusion];
+
+pub(crate) fn first_excluded_revision(
+    exclusions: OperatorExclusions,
+    domain: &str,
+    op_type: &str,
+) -> Option<u32> {
+    let domain = onnx_runtime_ir::normalize_domain(domain);
+    exclusions
+        .iter()
+        .filter(|rule| {
+            onnx_runtime_ir::normalize_domain(rule.domain) == domain && rule.op_type == op_type
+        })
+        .map(|rule| rule.since_version)
+        .min()
+}
+
+pub(crate) fn query_plugin_capabilities(
+    view: &onnx_runtime_ir::GraphView<'_>,
+    ep: &dyn ExecutionProvider,
+    exclusions: OperatorExclusions,
+    mut node_admissible: impl FnMut(NodeIndex, bool) -> bool,
+) -> onnx_runtime_ep_api::Result<Vec<onnx_runtime_ep_api::SubgraphClaim>> {
+    onnx_runtime_ep_api::abi::OrtGraphView::new(view).query_capabilities_filtered(
+        ep,
+        |index, graph_kernel| {
+            let node = view.node(index);
+            // Exclude before partitioning so an unsupported node cannot take
+            // supported neighbors out with it in the later registry filter.
+            let excluded = first_excluded_revision(exclusions, &node.domain, &node.op_type)
+                .is_some_and(|since| {
+                    // This is the schema revision from ORT's Node_GetSinceVersion.
+                    // A graph import cannot establish that an unknown revision is eligible.
+                    node.version
+                        .is_none_or(|version| version <= 0 || version >= i64::from(since))
+                });
+            !excluded && node_admissible(index, graph_kernel)
+        },
+    )
+}
+
 /// A heap-allocated EP whose raw pointer is returned as `OrtEp*`.
 ///
 /// The first field is `OrtEp` so the pointer can be cast directly.
@@ -183,6 +233,7 @@ pub struct ExportedEp {
     /// that `GetCapability` can dtype-filter claims against the same source of
     /// truth. Empty when no registry entries were provided.
     pub registry_entries: Vec<KernelRegistryEntry>,
+    pub(crate) operator_exclusions: OperatorExclusions,
     /// Whether ORT places this EP's tensors in host-accessible memory, copied
     /// from the factory's `DeviceSupport::host_accessible` in `CreateEp`.
     ///
@@ -330,6 +381,7 @@ impl ExportedEp {
             name_cstr,
             kernel_registry: registry,
             registry_entries: entries,
+            operator_exclusions: &[],
             host_accessible: false,
             workspace_execution: None,
         }
@@ -395,7 +447,6 @@ fn ep_get_capability_inner(
         }
     };
     let view = onnx_runtime_ir::GraphView::new(ir_graph, &cache);
-    let ort_view = onnx_runtime_ep_api::abi::OrtGraphView::new(&view);
 
     // Is this a non-CPU (GPU) EP? Two capability-time gates below are specific to
     // the GPU plugin and must not disturb the CPU plugin, whose paths already
@@ -434,8 +485,9 @@ fn ep_get_capability_inner(
     // so the deferral cannot be reintroduced by overriding a default — there is
     // nothing left to override.
     let mut graph_kernel_nodes = std::collections::HashSet::new();
+    let exclusions = exported.operator_exclusions;
     let claims = exported.ep.with(|ep| {
-        ort_view.query_capabilities_filtered(ep, |node, graph_kernel| {
+        query_plugin_capabilities(&view, ep, exclusions, |node, graph_kernel| {
             if graph_kernel {
                 if ep.executor_kernel_scope(view.node(node))
                     == onnx_runtime_ep_api::ExecutorKernelScope::Required
