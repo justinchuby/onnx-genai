@@ -1914,3 +1914,26 @@ each invocation publishes its own SSA values. ABI v1 keeps its established
 workflow-scoped single-invocation contract. Chat media capabilities derive from
 runtime Media roles, independently of task-owned application inputs. See
 [reranking](RERANKING.md) for the public contract and native fixture.
+
+
+## Ordered image decisions
+
+Decision v2 uses core schema v1.14 to declare ordered image endpoints and a
+workflow-owned total prompt-token count. The HTTP transport preserves upstream
+files/images/chat-media ordering, strips only image parts from textual state,
+and bounds unique retained media through the image loader shared with reranking.
+Prepared decisions retain shared encoded images across questions and variants;
+native workflow steps perform vision preprocessing and calibrated probability
+inference. Negative/underreported usage is rejected, and a typed input-limit
+error reaches HTTP as a client error. See [SystemOne](SYSTEMONE.md) for the
+explicit contract and the remaining audio/video, joint/packed and shared-entry
+work. This increment does not close the overall compatibility acceptance rows.
+
+### SystemOne mixed audio contracts
+
+Decision v3 (core v1.15) binds ordered typed state media and a distinct spoken
+instruction endpoint. HTTP extraction preserves state structure and media order;
+PCM16 WAV bytes enter authored reusable audio-preprocess@2 components. Actual
+workflow token usage includes media expansion and is bounded. Native fixture
+and HTTP acceptance cover independent spoken questions, byte-budget sharing,
+invalid media and capability discovery; see [SystemOne](SYSTEMONE.md).

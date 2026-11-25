@@ -20,7 +20,7 @@ pub enum RealtimeInput<'a> {
     Cancel,
 }
 
-/// Explicit per-quantum generation allowance. Unlimited duplex execution never
+/// Remaining response allowance supplied with each quantum. Unlimited duplex execution never
 /// inherits an ordinary GenerateOptions default.
 #[derive(Debug, Clone, Copy)]
 pub enum RealtimeTokenBudget {
@@ -367,14 +367,6 @@ impl RealtimeSession<'_> {
             .map(RealtimeGrammar::mask)
             .transpose()?;
         let inputs = &self.contract.spec().inputs;
-        let budget = if mask.is_some() {
-            match budget {
-                RealtimeTokenBudget::Unlimited => RealtimeTokenBudget::Remaining(1),
-                RealtimeTokenBudget::Remaining(n) => RealtimeTokenBudget::Remaining(n.min(1)),
-            }
-        } else {
-            budget
-        };
         let budget_wire = budget.wire()?;
         let mut request = PipelineGenerateRequest::new(GenerateRequest {
             prompt: GeneratePrompt::TokenIds(Vec::new()),
@@ -505,6 +497,11 @@ impl RealtimeSession<'_> {
             );
             let needs_input = needs_input.to_vec_bool()?[0];
             let output_tokens = count("output_tokens")?;
+            ensure!(
+                output_tokens >= tokens.len(),
+                "realtime output_tokens={output_tokens} underreports {} emitted text tokens; report actual generated-token usage so response budgets remain enforceable",
+                tokens.len()
+            );
             if let RealtimeTokenBudget::Remaining(remaining) = budget {
                 ensure!(
                     u64::try_from(output_tokens)? <= remaining,
@@ -518,7 +515,12 @@ impl RealtimeSession<'_> {
                 grammar.text_ended |= tokens
                     .last()
                     .is_some_and(|token| grammar.endings.contains(token));
-                if done && operation != RealtimeOperation::Cancel && !grammar.text_ended {
+                let at_response_limit = matches!(budget, RealtimeTokenBudget::Remaining(limit) if u64::try_from(output_tokens)? == limit);
+                if done
+                    && operation != RealtimeOperation::Cancel
+                    && !grammar.text_ended
+                    && !at_response_limit
+                {
                     let complete = grammar.can_finish()?;
                     ensure!(
                         complete,
@@ -662,8 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn native_realtime_zero_budget_cannot_be_bypassed_by_underreported_usage() -> anyhow::Result<()>
-    {
+    fn native_realtime_budget_cannot_be_bypassed_by_underreported_usage() -> anyhow::Result<()> {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/onnx_genai_workflows/realtime-constrained");
         let package = tempfile::tempdir()?;
@@ -686,21 +687,21 @@ mod tests {
             &[],
             crate::GenerationControl::new(),
         )?;
-        session.set_constraint(Some(crate::GenerateConstraint::Regex {
-            pattern: "hello".into(),
-            prefix: String::new(),
-        }))?;
-        let failure = session
-            .step(
-                RealtimeInput::Generate(&[]),
-                RealtimeTokenBudget::Remaining(0),
-                crate::GenerationControl::new(),
-            )
-            .unwrap_err();
-        assert!(
-            failure.to_string().contains("only 0 remaining"),
-            "{failure:#}"
-        );
+        for (remaining, diagnostic) in [(0, "only 0 remaining"), (2, "underreports")] {
+            session.configure(RealtimeMode::Realtime, &[], crate::GenerationControl::new())?;
+            session.set_constraint(Some(crate::GenerateConstraint::Regex {
+                pattern: "hello".into(),
+                prefix: String::new(),
+            }))?;
+            let failure = session
+                .step(
+                    RealtimeInput::Generate(&[]),
+                    RealtimeTokenBudget::Remaining(remaining),
+                    crate::GenerationControl::new(),
+                )
+                .unwrap_err();
+            assert!(failure.to_string().contains(diagnostic), "{failure:#}");
+        }
         Ok(())
     }
 
@@ -853,6 +854,92 @@ attribute { name: "else_branch" type: GRAPH g { name: "live_audio" node { input:
         )?;
         assert_eq!(output.tokens, [40]);
         assert!(output.done);
+        Ok(())
+    }
+
+    #[test]
+    fn native_realtime_transmits_remaining_response_budget_without_quantum_clamping()
+    -> anyhow::Result<()> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/realtime-constrained");
+        let package = tempfile::tempdir()?;
+        for file in ["tokenizer.json", "inference_metadata.yaml"] {
+            std::fs::copy(root.join(file), package.path().join(file))?;
+        }
+        let graph = std::fs::read_to_string(root.join("model.onnx.textproto"))?.replace("node { input: \"responding\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }", "node { input: \"output_token_budget\" input: \"count\" output: \"limit_equal\" op_type: \"Equal\" }\nnode { input: \"limit_equal\" input: \"responding\" output: \"limit_done\" op_type: \"And\" }\nnode { input: \"limit_done\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }");
+        std::fs::write(package.path().join("model.onnx.textproto"), graph)?;
+        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+        let (mut session, _) = engine.open_realtime_session(
+            RealtimeMode::Realtime,
+            &[],
+            crate::GenerationControl::new(),
+        )?;
+        session.set_constraint(Some(crate::GenerateConstraint::Regex {
+            pattern: "hello world".into(),
+            prefix: String::new(),
+        }))?;
+        let output = session.step(
+            RealtimeInput::Generate(&[]),
+            RealtimeTokenBudget::Remaining(4),
+            crate::GenerationControl::new(),
+        )?;
+        assert_eq!(output.tokens, [4]);
+        assert!(
+            !output.done,
+            "one quantum must not masquerade as the remaining response allowance"
+        );
+        assert!(
+            session
+                .step(
+                    RealtimeInput::Cancel,
+                    RealtimeTokenBudget::Unlimited,
+                    crate::GenerationControl::new()
+                )?
+                .done
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_realtime_allows_budget_truncation_but_rejects_premature_model_completion()
+    -> anyhow::Result<()> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/realtime-constrained");
+        let mut engine = Engine::from_dir(&root, crate::EngineConfig::default())?;
+        let (mut session, _) = engine.open_realtime_session(
+            RealtimeMode::Realtime,
+            &[],
+            crate::GenerationControl::new(),
+        )?;
+        session.set_constraint(Some(crate::GenerateConstraint::Regex {
+            pattern: "hello world".into(),
+            prefix: String::new(),
+        }))?;
+        let output = session.step(
+            RealtimeInput::Generate(&[]),
+            RealtimeTokenBudget::Remaining(1),
+            crate::GenerationControl::new(),
+        )?;
+        assert_eq!(output.tokens, [4]);
+        assert!(output.done);
+        session.configure(RealtimeMode::Realtime, &[], crate::GenerationControl::new())?;
+        session.set_constraint(Some(crate::GenerateConstraint::Regex {
+            pattern: "hello world".into(),
+            prefix: String::new(),
+        }))?;
+        let failure = session
+            .step(
+                RealtimeInput::Generate(&[]),
+                RealtimeTokenBudget::Remaining(4),
+                crate::GenerationControl::new(),
+            )
+            .unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("completed before its constrained grammar"),
+            "{failure:#}"
+        );
         Ok(())
     }
 

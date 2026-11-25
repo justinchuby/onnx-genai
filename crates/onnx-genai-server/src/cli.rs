@@ -106,6 +106,10 @@ pub struct ServeArgs {
     #[arg(long, default_value = "67108864")]
     pub max_rerank_media_bytes: std::num::NonZeroUsize,
 
+    /// Unique encoded image bytes retained by one SystemOne request.
+    #[arg(long, default_value = "67108864")]
+    pub max_decision_media_bytes: std::num::NonZeroUsize,
+
     /// Maximum tokens per non-generative decision prompt variant.
     #[arg(long, default_value_t = onnx_genai_engine::decision::DecisionLimits::default().max_input_tokens)]
     pub max_decision_input_tokens: std::num::NonZeroUsize,
@@ -255,6 +259,7 @@ fn server_config_from_args(args: &ServeArgs) -> anyhow::Result<ServerConfig> {
         max_rerank_input_tokens: args.max_rerank_input_tokens,
         max_rerank_documents: args.max_rerank_documents,
         max_rerank_media_bytes: args.max_rerank_media_bytes,
+        max_decision_media_bytes: args.max_decision_media_bytes,
         max_decision_input_tokens: args.max_decision_input_tokens,
         max_decision_prompt_bytes: args.max_decision_prompt_bytes,
         max_decision_template_operations: args.max_decision_template_operations,
@@ -671,6 +676,8 @@ mod tests {
         let args = TestCli::parse_from([
             "test",
             "model-dir",
+            "--max-decision-media-bytes",
+            "4096",
             "--max-decision-input-tokens",
             "256",
             "--max-decision-questions",
@@ -679,10 +686,12 @@ mod tests {
             "8",
         ]);
         let config = server_config_from_args(&args.serve).unwrap();
+        assert_eq!(config.max_decision_media_bytes.get(), 4096);
         assert_eq!(config.max_decision_input_tokens.get(), 256);
         assert_eq!(config.max_decision_questions.get(), 3);
         assert_eq!(config.max_decision_options.get(), 8);
         for flag in [
+            "--max-decision-media-bytes",
             "--max-decision-input-tokens",
             "--max-decision-questions",
             "--max-decision-prompt-bytes",

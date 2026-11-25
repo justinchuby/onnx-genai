@@ -2201,3 +2201,72 @@ The package's target manifest states which parameters are adaptable. The
 runtime owns loading, caching, eviction, and kernel selection. Because adapter
 selection participates in dataflow and cache dependencies, two requests with
 different adapters cannot accidentally share an incompatible prefix cache.
+
+### 10.7 Decision image workflows (v1.14)
+
+Decision v2 adds explicit `decision.images` endpoint order and requires a
+`prompt_tokens` output alongside calibrated probabilities. Encoded image inputs
+are opaque application uint8 vectors; workflow steps own vision preprocessing.
+Both typed admission and parser gates require core v1.14. The shared encoded-image
+endpoint resolver also serves reranking, with no model-name inference or
+backward aliases. Task-owned media does not become an ordinary chat Media role.
+See [SystemOne](../SYSTEMONE.md) for preparation, request order, limits and usage.
+
+### 10.8 Reusable audio preprocessing
+
+`onnx-genai.audio-preprocess@2` gives program output names component-local
+meaning, like image-preprocess@2. Each invocation explicitly maps those ports
+to independent workflow SSA values. Feature tensors and valid-length outputs
+therefore survive repeated clips with different encoded lengths and frame
+counts. The adapter uses the existing audio transform executor and its explicit
+format/algorithm limits; reuse does not imply new codec or transform support.
+ABI v1 retains its single-invocation, workflow-output-name contract. Unknown
+output-scope versions fail with a component/ABI/version diagnostic.
+
+This optional semantic extension uses existing core fields and needs no new
+core schema version. Its registry floor is v1; the fixture uses the current
+explicit publication contract. This is a prerequisite for state audio and spoken
+decision questions; the SystemOne HTTP audio contract is declared by decision v3
+below.
+
+## Decision v3: explicit mixed media and spoken input (core v1.15)
+
+V3 declares ordered typed `media` bindings and a separate optional
+`spoken_instructions` encoded-audio endpoint. It omits v2 `images`; v1/v2 retain
+their exact contracts. All media endpoints share canonical opaque application
+uint8-vector admission, including reranking images. Duplicate endpoint ownership,
+missing required inputs, kind/order mismatches, forbidden spoken instructions,
+and missing actual-usage outputs fail before execution. Rendering receives counts
+and kind order, never encoded spoken bytes. Workflow metadata owns preprocessing
+and expansion accounting; transport supports PCM16 WAV and does not infer a model
+family or fetch remote decision media. Video requires executable support before
+its kind can be declared.
+
+## Audio analysis geometry is runtime data
+
+The log-mel extractor accepts explicit `LogMelConfig`: mel count, target sample
+rate, FFT size, hop and periodic-Hann window length. Audio programs consume the
+existing metadata fields rather than accepting only 80/128 bins and a fixed
+16 kHz / 400 / 160 recipe. Invalid or unallocatable dimensions return actionable
+errors. The established convenience recipe and Slaney filter reference values
+remain numerically unchanged. Centered reflection and terminal-frame discard
+remain explicit implementation conventions; other windows/scales fail closed.
+No new serialized field or adapter ABI is needed for this geometry change.
+Transform SSA/source execution and pure-waveform programs follow the explicit
+semantics below.
+
+## Audio programs execute typed processor-local values
+
+Audio compilation resolves each transform's explicit input or preceding value
+to a typed value ID. Names have unique producers; output `source` binds the exact
+computed result. Output roles validate waveform/features/mask/sample-length/frame-
+length types rather than selecting a global final tensor. Branches, omitted
+inputs, population-variance waveform normalization, rescaling, left/right/batch
+padding, trimming and validity publication now execute directly. Raw log-mel and
+its separately declared normalization are distinct values; no implicit resample
+or normalization is applied by the program. `emit_valid_frames` requires a hop
+when reading waveform instead of borrowing an unrelated branch's analysis rate.
+Unsupported operations fail during compilation instead of silently doing nothing.
+These existing fields need no schema bump; pre-release metadata callers must
+author the transforms they need. Both admitted audio adapter ABIs execute these
+semantics. See [executable audio preprocessing](../AUDIO_PREPROCESSING.md).

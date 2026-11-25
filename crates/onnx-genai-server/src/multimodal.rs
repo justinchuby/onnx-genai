@@ -8,7 +8,7 @@ use onnx_genai_metadata::{RuntimeInputRole, SemanticInputRole, TensorDimension};
 use onnx_genai_ort::{DataType, PipelineModelDirectory, PipelineModels, Tokenizer, Value};
 
 pub use crate::audio_input::{AudioInputSpec, AudioTensor, preprocess_samples, preprocess_wav};
-pub use crate::image_input::MAX_EXPANDED_PROMPT_TOKENS;
+pub use crate::media_input::MAX_EXPANDED_PROMPT_TOKENS;
 
 #[derive(Debug, Clone)]
 pub struct VisionInputSpec {
