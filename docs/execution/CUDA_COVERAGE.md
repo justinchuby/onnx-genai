@@ -461,7 +461,9 @@ worth stating precisely:
 and `kernels/stft.rs`. DFT packs arbitrary ONNX signal axes into contiguous
 complex batches and executes cuFFT C2C or Z2Z. DFT-20 IRFFT reconstructs the
 Hermitian spectrum before the inverse transform and returns a real signal;
-without an explicit length it uses `2 * (bins - 1)`. This common
+without an explicit length it uses `2 * (bins - 1)`. CUDA IRFFT is standalone
+only; the shipped CUDA ORT plugin still declines it, including with both
+optional controls omitted. This common
 packed-batch/plan-cache seam is reused by STFT, whose fused pack kernel extracts
 complete frames and applies the optional window before one batched cuFFT call.
 

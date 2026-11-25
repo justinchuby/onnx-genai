@@ -195,7 +195,7 @@ impl Kernel for DftKernel {
             axis,
             length: dft_length,
         };
-        if self.opset >= 20 && input.dtype == DataType::Float64 {
+        if input.dtype == DataType::Float64 {
             let bytes = super::to_dense_bytes(input)?;
             let data: Vec<f64> = bytes
                 .chunks_exact(8)
@@ -799,60 +799,66 @@ mod tests {
             );
             assert!(output.to_f32().iter().all(|&v| v == 123.));
         }
+    }
 
-        #[test]
-        fn dft_v20_real_inverse_preserves_float64_precision() {
-            let delta = 2f64.powi(-40);
-            let spectrum = Owned::f64(&[2, 2], &[1.0 + delta, 9.0, 1.0, 11.0]);
+    #[test]
+    fn dft_real_inverse_preserves_float64_precision_in_both_opsets() {
+        let delta = 2f64.powi(-40);
+        let spectrum = Owned::f64(&[2, 2], &[1.0 + delta, 9.0, 1.0, 11.0]);
+        for opset in [17, 20] {
+            let mut node = irfft_node(opset);
+            if opset == 17 {
+                node.attributes.insert("axis".into(), Attribute::Int(-2));
+            }
             let mut output = Owned::f64(&[2, 1], &[0.; 2]);
             DftFactory
-                .create(&irfft_node(20), &[])
+                .create(&node, &[])
                 .unwrap()
                 .execute(&[spectrum.view()], &mut [output.view_mut()])
                 .unwrap();
             // NumPy irfft ignores the imaginary components of DC and even Nyquist.
             assert_eq!(
                 output.bytes,
-                Owned::f64(&[2, 1], &[1.0 + delta / 2.0, delta / 2.0]).bytes
+                Owned::f64(&[2, 1], &[1.0 + delta / 2.0, delta / 2.0]).bytes,
+                "opset {opset}"
             );
-        }
-
-        #[test]
-        fn dft_v20_real_inverse_accepts_rank_zero_int32_length_on_nondefault_axis() {
-            let spectrum = Owned::f32(&[2, 2, 2], &[1., 9., 2., -8., 3., 4., -2., 1.]);
-            let length = Owned::i32(&[], &[5]);
-            let axis = Owned::i64(&[], &[-3]);
-            let mut output = Owned::zeros_f32(&[5, 2, 1]);
-            DftFactory
-                .create(&irfft_node(20), &[])
-                .unwrap()
-                .execute(
-                    &[spectrum.view(), length.view(), axis.view()],
-                    &mut [output.view_mut()],
-                )
-                .unwrap();
-            // NumPy irfft([[1+9j, 2-8j], [3+4j, -2+1j]], n=5, axis=0).
-            let expected = [
-                1.4,
-                -0.4,
-                -0.95087004,
-                -0.2276362,
-                -1.7112768,
-                0.8120995,
-                0.16963601,
-                1.2823277,
-                2.0925107,
-                0.533209,
-            ];
-            for (i, (actual, expected)) in output.to_f32().into_iter().zip(expected).enumerate() {
-                assert!(
-                    (actual - expected).abs() < 2e-6,
-                    "index {i}: expected {expected}, got {actual}"
-                );
-            }
         }
     }
 
+    #[test]
+    fn dft_v20_real_inverse_accepts_rank_zero_int32_length_on_nondefault_axis() {
+        let spectrum = Owned::f32(&[2, 2, 2], &[1., 9., 2., -8., 3., 4., -2., 1.]);
+        let length = Owned::i32(&[], &[5]);
+        let axis = Owned::i64(&[], &[-3]);
+        let mut output = Owned::zeros_f32(&[5, 2, 1]);
+        DftFactory
+            .create(&irfft_node(20), &[])
+            .unwrap()
+            .execute(
+                &[spectrum.view(), length.view(), axis.view()],
+                &mut [output.view_mut()],
+            )
+            .unwrap();
+        // NumPy irfft([[1+9j, 2-8j], [3+4j, -2+1j]], n=5, axis=0).
+        let expected = [
+            1.4,
+            -0.4,
+            -0.95087004,
+            -0.2276362,
+            -1.7112768,
+            0.8120995,
+            0.16963601,
+            1.2823277,
+            2.0925107,
+            0.533209,
+        ];
+        for (i, (actual, expected)) in output.to_f32().into_iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() < 2e-6,
+                "index {i}: expected {expected}, got {actual}"
+            );
+        }
+    }
     /// Verify the radix-2 FFT matches the naive DFT within tolerance.
     #[test]
     fn fft_matches_naive_forward() {

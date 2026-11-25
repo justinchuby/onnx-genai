@@ -1734,6 +1734,7 @@ pub struct CudaExecutionProvider {
     memory_cleanup_armed: AtomicBool,
     workspace_release_barrier: WorkspaceReleaseBarrier,
     registry: OpRegistry,
+    ort_plugin: bool,
     csa_metrics: Arc<CsaMetrics>,
     /// Device weight-offload policy resolved from the environment. When enabled,
     /// the EP advertises the `nxrt` weight-paging capability and pages lazy
@@ -2201,6 +2202,7 @@ impl CudaExecutionProvider {
             memory_cleanup_armed: AtomicBool::new(false),
             workspace_release_barrier: WorkspaceReleaseBarrier::default(),
             registry,
+            ort_plugin: false,
             csa_metrics,
             offload_policy,
             residency,
@@ -2702,6 +2704,27 @@ impl CudaExecutionProvider {
         Self::new(0)
     }
 
+    /// Create a CUDA provider with the shipped ORT plugin's admission contract.
+    pub fn new_for_ort_plugin() -> Result<Self> {
+        let mut provider = Self::new_default()?;
+        provider.ort_plugin = true;
+        Ok(provider)
+    }
+
+    fn validate_execution_surface(&self, node: &Node) -> Result<()> {
+        if self.ort_plugin
+            && node.op_type == "DFT"
+            && onnx_runtime_ir::is_default_domain(&node.domain)
+            && onnx_runtime_ir::dft::DftMode::parse(node).map_err(EpError::KernelFailed)?
+                == onnx_runtime_ir::dft::DftMode::RealInverse
+        {
+            return Err(EpError::KernelFailed(
+                "CUDA ORT plugin does not support DFT IRFFT; select a CPU EP or run DFT-20 in standalone nxrt".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Return whether a fully initialized CUDA EP can be constructed for this
     /// device right now. This checks the driver, wheel/system libraries, device,
     /// and thread binding rather than reporting a compile-time feature.
@@ -2725,6 +2748,7 @@ impl CudaExecutionProvider {
         shapes: &[Vec<usize>],
         opset: u64,
     ) -> Result<Box<dyn Kernel>> {
+        self.validate_execution_surface(op)?;
         let factory = self
             .registry
             .lookup(&op.op_type, &op.domain, opset)
@@ -4355,6 +4379,9 @@ impl ExecutionProvider for CudaExecutionProvider {
             )
         {
             return KernelMatch::unsupported(reason);
+        }
+        if let Err(error) = self.validate_execution_surface(op) {
+            return KernelMatch::unsupported(error.to_string());
         }
         if op.op_type == "DFT"
             && (op.domain.is_empty() || op.domain == "ai.onnx")

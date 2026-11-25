@@ -126,13 +126,13 @@ impl DftMode {
         } else {
             length
         }
+    }
 
-        pub fn input_length(self, length: usize) -> usize {
-            if self == Self::RealInverse {
-                length / 2 + 1
-            } else {
-                length
-            }
+    pub fn input_length(self, length: usize) -> usize {
+        if self == Self::RealInverse {
+            length / 2 + 1
+        } else {
+            length
         }
     }
 }
