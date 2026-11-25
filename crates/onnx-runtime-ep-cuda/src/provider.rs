@@ -4300,6 +4300,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if let Some(reason) = onnx_runtime_ep_api::mean_variance_normalization::unsupported_reason(
+            op,
+            shapes,
+            input_dtypes,
+        ) {
+            return KernelMatch::unsupported(reason);
+        }
         if let Some(reason) = onnx_runtime_ep_api::gemm::unsupported_reason(
             op,
             opset,
@@ -4563,7 +4570,9 @@ impl ExecutionProvider for CudaExecutionProvider {
                 .workspace_planning(&op.op_type, &op.domain, opset)
                 .expect("supported kernel has a versioned registration"),
             cost,
-            required_input_layouts: None,
+            required_input_layouts: (op.op_type
+                == onnx_runtime_ep_api::mean_variance_normalization::OP)
+                .then(|| vec![TensorLayout::contiguous()]),
             output_layouts,
         }
     }

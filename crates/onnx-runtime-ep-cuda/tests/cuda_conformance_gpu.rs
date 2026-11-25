@@ -2637,6 +2637,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         instance_normalization_cases(),
     ));
     p.push(sweep("GroupNormalization", group_normalization_cases()));
+    p.push(dedicated(
+        "MeanVarianceNormalization",
+        "mean_variance_normalization_gpu.rs",
+        "opset 29 native CPU/CUDA against independently calculated goldens",
+    ));
     p.push(sweep("LpPool", lp_pool_cases()));
     p.push(sweep("CenterCropPad", center_crop_pad_cases()));
     p.push(sweep("Col2Im", col2im_cases()));

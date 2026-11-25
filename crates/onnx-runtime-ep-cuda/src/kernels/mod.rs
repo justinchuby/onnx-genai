@@ -95,6 +95,7 @@ pub mod log_softmax;
 pub mod marlin_gemm;
 pub mod matmul;
 pub mod matmul_nbits;
+mod mean_variance_normalization;
 mod metadata_workspace;
 pub mod mod_op;
 pub mod movement;
@@ -391,6 +392,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "LpNormalization",
     "InstanceNormalization",
     "GroupNormalization",
+    "MeanVarianceNormalization",
     "CenterCropPad",
     "Col2Im",
     "QLinearMatMul",
@@ -669,6 +671,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("CastLike", _)
         | ("TopK", _)
         | ("EyeLike", _) => CUDA_ALL_DTYPES,
+        ("MeanVarianceNormalization", "") => onnx_runtime_ep_api::mean_variance_normalization::DTYPES,
         ("Range", "") => &[
             DataType::Float32, DataType::Float64, DataType::Float16, DataType::BFloat16,
             DataType::Int16, DataType::Int32, DataType::Int64,
@@ -1005,6 +1008,15 @@ pub fn build_cuda_registry_with_metrics(
         Box::new(group_normalization::InstanceNormalizationFactory {
             runtime: runtime.clone(),
         }),
+    );
+    reg.register(
+        OpKey::new("MeanVarianceNormalization", "", 29),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(
+            mean_variance_normalization::MeanVarianceNormalizationFactory {
+                runtime: runtime.clone(),
+            },
+        ),
     );
     for since_version in [18, 21] {
         reg.register(

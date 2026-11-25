@@ -602,6 +602,9 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("InstanceNormalization", "")
         | ("GroupNormalization", "")
         | ("PRelu", "") => FLOAT_DTYPES,
+        ("MeanVarianceNormalization", "") => {
+            onnx_runtime_ep_api::mean_variance_normalization::DTYPES
+        }
 
         // NCHWC domain ops: f32-only.
         (_, "com.microsoft.nchwc") => F32_ONLY,
@@ -1029,6 +1032,11 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
         OpKey::new("InstanceNormalization", "", 6),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(norm_ops::InstanceNormFactory),
+    );
+    registry.register(
+        OpKey::new("MeanVarianceNormalization", "", 29),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(norm_ops::MeanVarianceNormalizationFactory),
     );
     registry.register(
         OpKey::new("GroupNormalization", "", 18),
@@ -3534,7 +3542,8 @@ mod tests {
         // Opset 29 adds the three indexing revisions; ScatterElements also
         // gets a distinct opset 18 registration for max/min.
         // Opset-28 Cast adds one registration.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 124 + mlas_registrations);
+        // MeanVarianceNormalization-29 adds one registration.
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 125 + mlas_registrations);
         for op in PHASE1_OPS {
             let since = reg
                 .earliest_since_version(op, "")
@@ -3660,6 +3669,8 @@ mod tests {
         assert!(reg.lookup("BatchNormalization", "", 7).is_some());
         assert!(reg.lookup("BatchNormalization", "", 6).is_none());
         assert!(reg.lookup("InstanceNormalization", "", 6).is_some());
+        assert!(reg.lookup("MeanVarianceNormalization", "", 29).is_some());
+        assert!(reg.lookup("MeanVarianceNormalization", "", 28).is_none());
         assert!(reg.lookup("GroupNormalization", "", 18).is_some());
         assert!(reg.lookup("GroupNormalization", "", 21).is_some());
         assert!(reg.lookup("GroupNormalization", "", 17).is_none());
