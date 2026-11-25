@@ -348,6 +348,19 @@ operation independently. If that preflight does not fit, execution stays serial,
 preserving the serial dense/row choice and cache admission statistics. This
 reservation is an active-operation admission bound, not a measured RSS peak.
 
+Route-first prefetch borrows the canonical `BTreeMap` of unique expert groups
+for funding, then consumes that same map in ascending key order. The worker
+receives typed actual expert IDs; there is no second ordering vector or positional
+lookup. The driver receives the current payload, requests the next group, and
+computes the current group on the caller. Only the loader and returned weights
+cross threads. Callback errors close the channels before scoped joining, retiring
+pending weights; thread-start errors preserve the original OS cause and suggest
+reducing concurrent work or disabling prefetch. The driver holds at most current
+and next weights, while the cache may retain other payloads under its existing
+policy. This changes neither quota granularity nor admission/refund rules.
+See [the protocol checks](../benchmarks/qmoe-prefetch-groups/README.md) for sparse-ID,
+failure and serial-equivalence evidence; no latency improvement is claimed.
+
 Default standalone CPU resources remain ungoverned. These grants cover full
 dense weight payloads, not row scratch, activation/output buffers or allocator
 metadata. Other packed caches, CPU Device/Host physical-capacity reconciliation,

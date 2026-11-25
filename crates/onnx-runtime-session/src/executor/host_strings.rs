@@ -1,8 +1,10 @@
 //! Native host-only execution for kernels consuming managed string tensors.
 
 use super::*;
-use onnx_runtime_ep_api::{HostKernelData, HostStringInput};
-use onnx_runtime_ir::checked_expected_bytes;
+use onnx_runtime_ep_api::{HostKernelData, HostKernelInput, HostStringInput};
+use onnx_runtime_ir::{checked_expected_bytes, compute_contiguous_strides};
+
+use super::geometry::{gather_view, view_bounds};
 
 pub(crate) const MANAGED_STRING_DEVICE_DECLINE: &str =
     "managed tensor(string) values have no device representation; use a string-aware host provider";
@@ -95,14 +97,6 @@ impl Executor {
             )
             .into());
         }
-        if plan
-            .input_dtypes
-            .iter()
-            .any(|&dtype| dtype != DataType::String)
-        {
-            return Err(fail("managed string execution requires string tensors on every input; mixed raw/string inputs are not supported").into());
-        }
-
         self.refill_input_shapes(pi, resolved);
         let plan = &self.plan[pi];
         let node = self.graph.node(plan.node_id);
@@ -110,21 +104,49 @@ impl Executor {
         let string_values = &self.string_values;
         let string_initializers = &self.string_initializers;
         let graph = &self.graph;
+        let bool_inputs = plan
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| {
+                let value = slot.ok_or_else(|| {
+                    EpError::KernelFailed(format!("{op}: required host input {index} is missing"))
+                })?;
+                let shape = &input_shapes[index];
+                match plan.input_dtypes[index] {
+                    DataType::String => Ok(None),
+                    DataType::Bool => self
+                        .host_bool_bytes(value, shape, external)
+                        .map(Some),
+                    dtype => Err(EpError::KernelFailed(format!(
+                        "{op}: managed host input {index} has unsupported dtype {dtype:?}; expected tensor(string) or tensor(bool)"
+                    ))
+                    .into()),
+                }
+            })
+            .collect::<Result<smallvec::SmallVec<[_; 2]>>>()?;
         let inputs = plan
             .inputs
             .iter()
-            .map(|slot| {
-                let value = slot.ok_or_else(|| fail("a required string input is missing"))?;
+            .enumerate()
+            .map(|(index, slot)| {
+                if let Some(bytes) = &bool_inputs[index] {
+                    return Ok(HostKernelInput::Bool {
+                        shape: &input_shapes[index],
+                        bytes,
+                    });
+                }
+                let value = slot.ok_or_else(|| fail("a required host input is missing"))?;
                 let tensor = string_values
                     .get(&value)
                     .or_else(|| string_initializers.get(&value))
                     .ok_or_else(|| missing_host_string(graph, value))?;
-                Ok(HostStringInput {
+                Ok(HostKernelInput::Strings(HostStringInput {
                     shape: &tensor.shape,
                     values: tensor
                         .as_strings()
                         .ok_or_else(|| missing_host_string(graph, value))?,
-                })
+                }))
             })
             .collect::<Result<smallvec::SmallVec<[_; 2]>>>()?;
         let shape_facts = self.kernel_shape_facts[pi];
@@ -155,7 +177,7 @@ impl Executor {
             self.kernel_bindings[pi] = Some(key);
             kernel
         };
-        let outputs = kernel.execute_host_strings(&inputs)?;
+        let outputs = kernel.execute_managed_host(&inputs)?;
         drop(inputs);
         if outputs.len() != plan.outputs.len() {
             return Err(fail(
@@ -222,5 +244,30 @@ impl Executor {
             }
         }
         Ok(())
+    }
+
+    fn host_bool_bytes(
+        &self,
+        value: ValueId,
+        shape: &[usize],
+        external: &ExternalBindings,
+    ) -> Result<Vec<u8>> {
+        let Some(binding) = external.inputs.get(&value) else {
+            return self.contiguous_bytes(value, shape, DataType::Bool);
+        };
+        let strides = binding
+            .strides
+            .as_deref()
+            .map_or_else(|| compute_contiguous_strides(shape), <[i64]>::to_vec);
+        view_bounds(shape, &strides, 0, DataType::Bool, binding.len).map_err(|cause| {
+            SessionError::Internal(format!(
+                "managed host BOOL input value#{} cannot read shape {shape:?} from its external binding: {cause}; bind storage that covers the input layout",
+                value.0
+            ))
+        })?;
+        let buffer = binding.readable_buffer()?;
+        let mut bytes = vec![0; buffer.len()];
+        self.ep.copy_to_host(&buffer, &mut bytes)?;
+        Ok(gather_view(&bytes, shape, &strides, 0, 1))
     }
 }

@@ -15,7 +15,7 @@ use onnx_runtime_ep_api::{
     CaptureSupport, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
     WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
-use onnx_runtime_ir::dft::{self as dft_rules, Spectrum};
+use onnx_runtime_ir::dft::{self as dft_rules, DftMode};
 use onnx_runtime_ir::{DataType, Node, Shape, TensorLayout};
 
 use crate::cufft::{CufftPlan, CufftPlanCache, CufftPlanKey, DftDirection, DftInputKind};
@@ -150,14 +150,12 @@ pub(crate) struct DftFactory {
 
 impl KernelFactory for DftFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let inverse = bool_attr(node, "inverse")?;
-        let onesided = bool_attr(node, "onesided")?;
         let opset = node.local_opset().unwrap_or(17);
+        let mode = supported_mode(node, opset).map_err(dft_error)?;
         Ok(Box::new(DftKernel {
             runtime: self.runtime.clone(),
             plans: self.plans.clone(),
-            inverse,
-            spectrum: Spectrum::from_flags(opset, inverse, onesided),
+            mode,
             opset,
             default_axis: dft_rules::default_axis(node, opset),
             prepared_plan: Mutex::new(None),
@@ -165,20 +163,20 @@ impl KernelFactory for DftFactory {
     }
 }
 
-fn bool_attr(node: &Node, name: &str) -> Result<bool> {
-    match node.attr(name).and_then(|attribute| attribute.as_int()) {
-        None | Some(0) => Ok(false),
-        Some(1) => Ok(true),
-        Some(value) => Err(EpError::KernelFailed(format!(
-            "cuda_ep DFT: attribute '{name}' must be 0 or 1, got {value}"
-        ))),
+fn supported_mode(node: &Node, opset: u64) -> std::result::Result<DftMode, String> {
+    let mode = DftMode::parse(node)?;
+    if opset < 20 && mode == DftMode::RealInverse {
+        return Err(
+            "CUDA IRFFT requires DFT opset 20 or newer; select the CPU EP for opset 17".into(),
+        );
     }
+    Ok(mode)
 }
 
 #[derive(Clone, Debug)]
 struct DftSpec {
     dtype: DataType,
-    spectrum: Spectrum,
+    mode: DftMode,
     input_shape: Vec<usize>,
     output_shape: Vec<usize>,
     axis: usize,
@@ -263,8 +261,7 @@ fn align_up(value: usize, alignment: usize) -> Result<usize> {
 struct DftKernel {
     runtime: Arc<CudaRuntime>,
     plans: Arc<CufftPlanCache>,
-    inverse: bool,
-    spectrum: Spectrum,
+    mode: DftMode,
     opset: u64,
     default_axis: i64,
     prepared_plan: Mutex<Option<(CufftPlanKey, Arc<Mutex<CufftPlan>>)>>,
@@ -322,7 +319,7 @@ impl DftKernel {
         length: Option<i64>,
     ) -> Result<DftSpec> {
         data_kernels(self.opset, dtype).map_err(dft_error)?;
-        make_spec(shape, dtype, axis, length, self.inverse, self.spectrum)
+        make_spec(shape, dtype, axis, length, self.mode)
     }
 
     fn plan(&self, spec: &DftSpec) -> Result<Arc<Mutex<CufftPlan>>> {
@@ -426,8 +423,8 @@ impl DftKernel {
             .map_err(|_| EpError::KernelFailed("cuda_ep DFT: axis exceeds i32".into()))?;
         let signal_length = spec.signal_length as u64;
         let dft_length = spec.dft_length as u64;
-        let input_bins = spec.spectrum.input_extent(spec.dft_length) as u64;
-        let inverse_real = i32::from(spec.spectrum == Spectrum::OneSidedInput);
+        let input_bins = spec.mode.input_length(spec.dft_length) as u64;
+        let inverse_real = i32::from(spec.mode == DftMode::RealInverse);
         let batch = spec.batch as u64;
         let complex_components = match spec.input_kind {
             DftInputKind::Real => 1i32,
@@ -475,13 +472,13 @@ impl DftKernel {
         let unpack = self.runtime.nvrtc_function(MODULE, SOURCE, unpack_name)?;
         let output = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
         let output_length = spec.output_length as u64;
-        let output_components = spec.spectrum.output_components() as i32;
-        let scale_f32 = if self.inverse {
+        let output_components = spec.mode.output_components() as i32;
+        let scale_f32 = if spec.mode.inverse() {
             1.0f32 / spec.dft_length as f32
         } else {
             1.0
         };
-        let scale_f64 = if self.inverse {
+        let scale_f64 = if spec.mode.inverse() {
             1.0f64 / spec.dft_length as f64
         } else {
             1.0
@@ -568,8 +565,7 @@ fn make_spec(
     dtype: DataType,
     axis_raw: i64,
     length: Option<i64>,
-    inverse: bool,
-    spectrum: Spectrum,
+    mode: DftMode,
 ) -> Result<DftSpec> {
     let rank = input_shape.len();
     if rank < 2 {
@@ -579,8 +575,7 @@ fn make_spec(
     }
     let axis = dft_rules::normalize_axis(axis_raw, rank).map_err(dft_error)?;
     let complex_components = input_shape[rank - 1];
-    spectrum
-        .validate_components(complex_components)
+    mode.validate_components(complex_components)
         .map_err(dft_error)?;
     let input_kind = if complex_components == 1 {
         DftInputKind::Real
@@ -591,10 +586,10 @@ fn make_spec(
         .map(dft_rules::explicit_length)
         .transpose()
         .map_err(dft_error)?;
-    let dft_length = spectrum
-        .transform_length(explicit, input_shape[axis])
+    let dft_length = explicit
+        .map_or_else(|| mode.default_length(input_shape[axis]), Ok)
         .map_err(dft_error)?;
-    let output_length = spectrum.output_extent(dft_length);
+    let output_length = mode.output_length(dft_length);
     let batch = input_shape
         .iter()
         .enumerate()
@@ -606,10 +601,10 @@ fn make_spec(
         })?;
     let mut output_shape = input_shape.to_vec();
     output_shape[axis] = output_length;
-    output_shape[rank - 1] = spectrum.output_components();
+    output_shape[rank - 1] = mode.output_components();
     Ok(DftSpec {
         dtype,
-        spectrum,
+        mode,
         input_shape: input_shape.to_vec(),
         output_shape,
         axis,
@@ -618,7 +613,7 @@ fn make_spec(
         output_length,
         batch,
         input_kind,
-        direction: if inverse {
+        direction: if mode.inverse() {
             DftDirection::Inverse
         } else {
             DftDirection::Forward
@@ -811,11 +806,9 @@ pub(crate) fn unsupported_reason(
         {
             return Err("data input layout must be contiguous".into());
         }
-        let onesided = bool_attr(node, "onesided").map_err(|error| error.to_string())?;
-        let inverse = bool_attr(node, "inverse").map_err(|error| error.to_string())?;
-        let spectrum = Spectrum::from_flags(opset, inverse, onesided);
+        let mode = supported_mode(node, opset)?;
         if let Some(components) = shape.last().and_then(|dimension| dimension.as_static()) {
-            spectrum.validate_components(components)?;
+            mode.validate_components(components)?;
         }
         if node.inputs.get(2).is_none_or(Option::is_none) {
             let axis =
@@ -823,7 +816,7 @@ pub(crate) fn unsupported_reason(
             if node.inputs.get(1).is_none_or(Option::is_none)
                 && let Some(extent) = shape[axis].as_static()
             {
-                spectrum.transform_length(None, extent)?;
+                mode.default_length(extent)?;
             }
         }
         Ok(())
@@ -836,16 +829,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn opset17_real_inverse_still_declines_before_runtime_access() {
+        let mut node = Node::new(onnx_runtime_ir::NodeId(0), "DFT", vec![], vec![]);
+        for name in ["inverse", "onesided"] {
+            node.attributes
+                .insert(name.into(), onnx_runtime_ir::Attribute::Int(1));
+        }
+        assert!(supported_mode(&node, 17).unwrap_err().contains("CPU EP"));
+        assert_eq!(supported_mode(&node, 20).unwrap(), DftMode::RealInverse);
+    }
+
+    #[test]
     fn workspace_layout_is_aligned_and_contains_all_regions() {
-        let spec = make_spec(
-            &[2, 4, 1],
-            DataType::Float32,
-            -2,
-            Some(7),
-            false,
-            Spectrum::Full,
-        )
-        .unwrap();
+        let spec = make_spec(&[2, 4, 1], DataType::Float32, -2, Some(7), DftMode::Forward).unwrap();
         let layout = WorkspaceLayout::new(&spec, 123).unwrap();
         assert_eq!(layout.packed_offset % WORKSPACE_ALIGNMENT, 0);
         assert_eq!(layout.work_offset % WORKSPACE_ALIGNMENT, 0);
@@ -860,8 +856,7 @@ mod tests {
             DataType::Float32,
             -2,
             Some(4),
-            false,
-            Spectrum::OneSidedOutput,
+            DftMode::RealForward,
         )
         .unwrap_err();
         assert!(error.to_string().contains("valid only for real input"));
@@ -874,8 +869,7 @@ mod tests {
             DataType::Float32,
             1,
             Some(8),
-            false,
-            Spectrum::OneSidedOutput,
+            DftMode::RealForward,
         )
         .unwrap();
         assert_eq!(spec.output_shape, [2, 5, 5, 2]);

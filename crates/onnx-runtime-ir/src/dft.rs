@@ -1,104 +1,187 @@
-//! Shared shape rules for the native ONNX DFT paths.
+//! Shared ONNX DFT mode and real/complex geometry.
+//! See <https://onnx.ai/onnx/operators/onnx__DFT.html> (schemas 17 and 20).
 
 use crate::{DataType, Node};
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Spectrum {
-    Full,
-    OneSidedOutput,
-    OneSidedInput,
-}
-
-impl Spectrum {
-    pub fn from_flags(opset: u64, inverse: bool, onesided: bool) -> Self {
-        match (onesided, inverse && opset >= 20) {
-            (false, _) => Self::Full,
-            (true, false) => Self::OneSidedOutput,
-            (true, true) => Self::OneSidedInput,
-        }
-    }
-
-    pub fn validate_components(self, components: usize) -> Result<(), String> {
-        match (self, components) {
-            (Self::Full, 1 | 2) | (Self::OneSidedOutput, 1) | (Self::OneSidedInput, 2) => Ok(()),
-            (Self::OneSidedOutput, _) => Err(format!(
-                "onesided=1 is valid only for real input (last dimension 1), got {components}"
-            )),
-            (Self::OneSidedInput, _) => Err(format!(
-                "inverse one-sided DFT requires complex input (last dimension 2), got {components}"
-            )),
-            (Self::Full, _) => Err(format!(
-                "last input dimension must be 1 (real) or 2 (complex), got {components}"
-            )),
-        }
-    }
-
-    pub fn output_components(self) -> usize {
-        if self == Self::OneSidedInput { 1 } else { 2 }
-    }
-
-    pub fn transform_length(self, explicit: Option<usize>, extent: usize) -> Result<usize, String> {
-        let length = match explicit {
-            Some(length) => length,
-            None if self == Self::OneSidedInput => extent
-                .checked_sub(1)
-                .and_then(|bins| bins.checked_mul(2))
-                .ok_or_else(|| format!("cannot infer inverse real length from {extent} bins; provide a positive dft_length"))?,
-            None => extent,
-        };
-        if length == 0 {
-            return Err("dft_length must be positive; provide an explicit positive dft_length when the default is zero".into());
-        }
-        Ok(length)
-    }
-
-    pub fn output_extent(self, length: usize) -> usize {
-        if self == Self::OneSidedOutput {
-            length / 2 + 1
-        } else {
-            length
-        }
-    }
-
-    pub fn input_extent(self, length: usize) -> usize {
-        if self == Self::OneSidedInput {
-            length / 2 + 1
-        } else {
-            length
-        }
-    }
-}
 
 pub fn default_axis(node: &Node, opset: u64) -> i64 {
     if opset >= 20 {
         -2
     } else {
         node.attr("axis")
-            .and_then(|attribute| attribute.as_int())
+            .and_then(|attr| attr.as_int())
             .unwrap_or(1)
     }
 }
 
 pub fn normalize_axis(axis: i64, rank: usize) -> Result<usize, String> {
-    let r = i64::try_from(rank).map_err(|_| format!("input rank {rank} exceeds i64"))?;
+    let r = i64::try_from(rank).map_err(|_| format!("DFT: rank {rank} exceeds i64"))?;
     let normalized = if axis < 0 { axis + r } else { axis };
     if normalized < 0 || normalized >= r - 1 {
         return Err(format!(
-            "axis {axis} is invalid for rank {rank}; the last dimension is the complex component and cannot be transformed"
+            "DFT: axis {axis} is invalid for rank {rank}; the final complex-component dimension is not a signal axis"
         ));
     }
     Ok(normalized as usize)
 }
 
 pub fn explicit_length(length: i64) -> Result<usize, String> {
-    usize::try_from(length)
-        .ok()
-        .filter(|&n| n > 0)
-        .ok_or_else(|| {
-            format!("dft_length must be positive and fit the native index size, got {length}")
-        })
+    let length = usize::try_from(length).map_err(|_| {
+        format!("DFT: dft_length must be positive and fit the native index size, got {length}")
+    })?;
+    DftMode::validate_length(length)?;
+    Ok(length)
 }
 
 pub fn is_length_dtype(dtype: DataType) -> bool {
     matches!(dtype, DataType::Int32 | DataType::Int64)
+}
+
+/// The transform's semantic mode, independent of backend or FFT algorithm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DftMode {
+    Forward,
+    Inverse,
+    RealForward,
+    RealInverse,
+}
+
+impl DftMode {
+    pub fn from_flags(inverse: bool, onesided: bool) -> Self {
+        match (inverse, onesided) {
+            (false, false) => Self::Forward,
+            (true, false) => Self::Inverse,
+            (false, true) => Self::RealForward,
+            (true, true) => Self::RealInverse,
+        }
+    }
+
+    pub fn parse(node: &Node) -> Result<Self, String> {
+        let flag = |name| match node.attr(name) {
+            None => Ok(false),
+            Some(value) => match value.as_int() {
+                Some(0) => Ok(false),
+                Some(1) => Ok(true),
+                _ => Err(format!(
+                    "DFT: attribute '{name}' must be integer 0 or 1, got {value:?}"
+                )),
+            },
+        };
+        Ok(Self::from_flags(flag("inverse")?, flag("onesided")?))
+    }
+
+    pub fn inverse(self) -> bool {
+        matches!(self, Self::Inverse | Self::RealInverse)
+    }
+
+    pub fn validate_components(self, components: usize) -> Result<(), String> {
+        let valid = match self {
+            Self::RealForward => components == 1,
+            Self::RealInverse => components == 2,
+            _ => matches!(components, 1 | 2),
+        };
+        if valid {
+            Ok(())
+        } else {
+            let expected = match self {
+                Self::RealForward => {
+                    "onesided=1 with inverse=0 is valid only for real input (last dimension 1)"
+                }
+                Self::RealInverse => {
+                    "onesided=1 with inverse=1 requires a complex half-spectrum (last dimension 2)"
+                }
+                _ => "full transforms require last dimension 1 (real) or 2 (complex)",
+            };
+            Err(format!(
+                "DFT: mode {self:?} cannot consume last dimension {components}; {expected}"
+            ))
+        }
+    }
+
+    pub fn output_components(self) -> usize {
+        if self == Self::RealInverse { 1 } else { 2 }
+    }
+
+    pub fn default_length(self, input_length: usize) -> Result<usize, String> {
+        let length = if self == Self::RealInverse {
+            input_length.checked_sub(1).and_then(|n| n.checked_mul(2))
+                .ok_or_else(|| format!("DFT: one-sided input length {input_length} cannot produce an addressable inverse length; provide a positive dft_length"))?
+        } else {
+            input_length
+        };
+        Self::validate_length(length)?;
+        Ok(length)
+    }
+
+    pub fn validate_length(length: usize) -> Result<(), String> {
+        if length == 0 {
+            Err("DFT: transform length must be positive; provide a positive dft_length or a nonempty signal axis (at least two spectrum bins for an implicit real inverse)".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn output_length(self, length: usize) -> usize {
+        if self == Self::RealForward {
+            length / 2 + 1
+        } else {
+            length
+        }
+
+        pub fn input_length(self, length: usize) -> usize {
+            if self == Self::RealInverse {
+                length / 2 + 1
+            } else {
+                length
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attributes_reject_invalid_flags_with_the_argument_name() {
+        for name in ["inverse", "onesided"] {
+            for value in [
+                crate::Attribute::Int(2),
+                crate::Attribute::Int(-1),
+                crate::Attribute::String("true".into()),
+            ] {
+                let mut node = Node::new(crate::NodeId(0), "DFT", vec![], vec![]);
+                node.attributes.insert(name.into(), value);
+                let error = DftMode::parse(&node).unwrap_err();
+                assert!(
+                    error.contains(name) && error.contains("integer 0 or 1"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn modes_bind_input_kind_output_width_and_default_length() {
+        for (inverse, onesided, expected, components, output, length) in [
+            (false, false, DftMode::Forward, 1, 2, 4),
+            (true, false, DftMode::Inverse, 2, 2, 4),
+            (false, true, DftMode::RealForward, 1, 2, 4),
+            (true, true, DftMode::RealInverse, 2, 1, 6),
+        ] {
+            let mode = DftMode::from_flags(inverse, onesided);
+            assert_eq!(mode, expected);
+            mode.validate_components(components).unwrap();
+            assert_eq!(mode.output_components(), output);
+            assert_eq!(mode.default_length(4).unwrap(), length);
+            assert_eq!(
+                mode.output_length(5),
+                if mode == DftMode::RealForward { 3 } else { 5 }
+            );
+        }
+        assert!(DftMode::RealForward.validate_components(2).is_err());
+        assert!(DftMode::RealInverse.validate_components(1).is_err());
+        for n in [0, 1, usize::MAX] {
+            assert!(DftMode::RealInverse.default_length(n).is_err());
+        }
+    }
 }

@@ -95,6 +95,7 @@ pub mod log_softmax;
 pub mod marlin_gemm;
 pub mod matmul;
 pub mod matmul_nbits;
+mod mean_variance_normalization;
 mod metadata_workspace;
 pub mod mod_op;
 pub mod movement;
@@ -391,6 +392,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "LpNormalization",
     "InstanceNormalization",
     "GroupNormalization",
+    "MeanVarianceNormalization",
     "CenterCropPad",
     "Col2Im",
     "QLinearMatMul",
@@ -438,15 +440,8 @@ pub struct CudaOpDescriptor {
 /// Float compute types the CUDA kernels handle (cuBLASLt + custom kernels).
 static CUDA_FLOAT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Float16, DataType::BFloat16];
 
-/// Union of versioned DFT data and scalar input dtypes; placement checks each slot.
-static CUDA_DFT_DTYPES: &[DataType] = &[
-    DataType::Float32,
-    DataType::Float64,
-    DataType::Float16,
-    DataType::BFloat16,
-    DataType::Int32,
-    DataType::Int64,
-];
+/// DFT data/output are f32; its optional length and axis inputs are i64.
+static CUDA_DFT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
 
 /// STFT data/output/window are f32; frame scalars may be i32 or i64.
 static CUDA_STFT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int32, DataType::Int64];
@@ -540,8 +535,8 @@ static CUDA_ATTENTION_DTYPES: &[DataType] = &[
     DataType::Int64,
 ];
 
-/// Bounded CUDA Unique consumes f32 and returns f32 Y plus i64 metadata.
-static CUDA_UNIQUE_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
+/// Bounded CUDA Unique preserves the input dtype and produces i64 metadata.
+static CUDA_UNIQUE_DTYPES: &[DataType] = &[DataType::Float32, DataType::BFloat16, DataType::Int64];
 static CUDA_NMS_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
 static CUDA_EINSUM_DTYPES: &[DataType] = &[
     DataType::Float16,
@@ -639,6 +634,8 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("DsaIndexSelect", _)
         | ("LinearAttention", _) => CUDA_ATTENTION_DTYPES,
 
+        ("Transpose", "") => onnx_runtime_ir::transpose::DTYPES,
+
         // Byte-mover / structural ops: dtype-agnostic (copy/select, no
         // arithmetic on the values). Must advertise the full set so an integer
         // `Cast`/`Gather`/`Shape` in a partition does not sink it.
@@ -651,7 +648,6 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("Concat", _)
         | ("Slice", _)
         | ("Split", _)
-        | ("Transpose", _)
         | ("Gather", _)
         | ("GatherElements", _)
         | ("GatherND", _)
@@ -676,6 +672,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("CastLike", _)
         | ("TopK", _)
         | ("EyeLike", _) => CUDA_ALL_DTYPES,
+        ("MeanVarianceNormalization", "") => onnx_runtime_ep_api::mean_variance_normalization::DTYPES,
         ("Range", "") => &[
             DataType::Float32, DataType::Float64, DataType::Float16, DataType::BFloat16,
             DataType::Int16, DataType::Int32, DataType::Int64,
@@ -1013,6 +1010,15 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
+    reg.register(
+        OpKey::new("MeanVarianceNormalization", "", 29),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(
+            mean_variance_normalization::MeanVarianceNormalizationFactory {
+                runtime: runtime.clone(),
+            },
+        ),
+    );
     for since_version in [18, 21] {
         reg.register(
             OpKey::new("GroupNormalization", "", since_version),
@@ -1166,6 +1172,7 @@ pub fn build_cuda_registry_with_metrics(
             onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(dropout::DropoutFactory {
                 runtime: runtime.clone(),
+                opset: version,
             }),
         );
     }
@@ -2449,7 +2456,7 @@ mod tests {
         assert_eq!(
             cuda_supported_dtypes_for_op("DFT", ""),
             CUDA_DFT_DTYPES,
-            "DFT must advertise the union of supported data and scalar dtypes"
+            "DFT must advertise f32 data plus its Int64 scalar inputs"
         );
     }
 

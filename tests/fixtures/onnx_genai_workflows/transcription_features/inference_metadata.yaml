@@ -1,0 +1,175 @@
+{
+  "schema_version": "v1.16",
+  "package": {
+    "tokenizer": {
+      "algorithm": "word_level",
+      "vocab_size": 32,
+      "artifacts": [
+        {
+          "location": "tokenizer.json"
+        }
+      ],
+      "special_tokens": {
+        "bos_token_id": 2,
+        "eos_token_id": [
+          3
+        ]
+      }
+    }
+  },
+  "preprocessing": {
+    "audio": {
+      "transforms": [
+        {
+          "op": "decode",
+          "outputs": [
+            "raw"
+          ]
+        },
+        {
+          "op": "resample",
+          "sample_rate": 8000,
+          "outputs": [
+            "resampled"
+          ]
+        },
+        {
+          "op": "pad",
+          "mode": "fixed_window",
+          "target_length": 256,
+          "inputs": [
+            "resampled"
+          ],
+          "outputs": [
+            "padded"
+          ]
+        },
+        {
+          "op": "log_mel",
+          "sample_rate": 8000,
+          "num_mel_bins": 7,
+          "n_fft": 128,
+          "hop_length": 64,
+          "inputs": [
+            "padded"
+          ],
+          "outputs": [
+            "features"
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "request.features",
+          "source": "features",
+          "content": "audio_features",
+          "dtype": "float32",
+          "contract": {
+            "dtype": "float32",
+            "shape": [
+              1,
+              7,
+              4
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "pipeline": {
+    "workflow": {
+      "publication_mode": "commit_only",
+      "manifest": {
+        "adapter_abis": {}
+      },
+      "inputs": {
+        "request.prompt": {
+          "contract": {
+            "dtype": "int64",
+            "shape": [
+              1,
+              "prompt_tokens"
+            ],
+            "batch_layout": {
+              "kind": "request_aligned",
+              "axis": 0
+            }
+          },
+          "role": {
+            "kind": "runtime",
+            "version": "1.0",
+            "role": "prompt_tokens"
+          },
+          "source": {
+            "kind": "request"
+          }
+        },
+        "request.features": {
+          "contract": {
+            "dtype": "float32",
+            "shape": [
+              1,
+              7,
+              4
+            ]
+          },
+          "role": {
+            "kind": "runtime",
+            "version": "1.0",
+            "role": "media"
+          },
+          "source": {
+            "kind": "request"
+          }
+        }
+      },
+      "outputs": {
+        "tokens": {
+          "contract": {
+            "dtype": "int64",
+            "shape": [
+              1,
+              1
+            ],
+            "batch_layout": {
+              "kind": "request_aligned",
+              "axis": 0
+            }
+          },
+          "family": {
+            "kind": "materialized"
+          },
+          "role": "tokens",
+          "stage": "pre_adapter"
+        }
+      },
+      "components": {
+        "head": {
+          "implementation": {
+            "kind": "onnx",
+            "artifact": "model.onnx.textproto"
+          }
+        }
+      },
+      "steps": [
+        {
+          "kind": "invoke",
+          "component": "head",
+          "inputs": {
+            "features": "request.features",
+            "prompt": "request.prompt"
+          },
+          "outputs": {
+            "tokens": "tokens"
+          }
+        },
+        {
+          "kind": "emit",
+          "value": "tokens",
+          "output": "tokens",
+          "mode": "replace"
+        }
+      ]
+    }
+  }
+}

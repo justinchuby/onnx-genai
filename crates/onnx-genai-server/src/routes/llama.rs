@@ -70,6 +70,7 @@ pub(crate) async fn props(
             "n_ctx": handle.model_max_context,
             "params": {
                 "n_predict": state.config.max_output_tokens,
+                "t_max_predict_ms": -1,
                 "seed": -1,
                 "temperature": if options.greedy { 0.0 } else { options.temperature },
                 "top_k": options.top_k, "top_p": options.top_p, "min_p": options.min_p,
@@ -84,12 +85,13 @@ pub(crate) async fn props(
                 "top_n_sigma": -1.0, "adaptive_target": -1.0, "adaptive_decay": 0.9,
                 "samplers": onnx_genai_engine::SamplerSequence::DEFAULT.iter().filter(|&&stage| stage != onnx_genai_engine::SamplerStage::TopA).collect::<Vec<_>>(),
                 "backend_sampling": false, "timings_per_token": false,
+                "sse_ping_interval":state.config.sse_ping_interval.seconds(),
                 "stop": []
             }
         },
         "modalities": {
             "vision": modalities.is_some_and(|m| m.vision.is_some()),
-            "audio": modalities.is_some_and(|m| m.audio.is_some()), "video": false
+            "audio": handle.engine.transcription.is_some() || modalities.is_some_and(|m| m.audio.is_some()), "video": false
         },
         "chat_template": handle.chat_template.as_ref().map_or("", |t| t.source()),
         "chat_template_caps": {},
@@ -106,7 +108,13 @@ pub(crate) async fn props(
             "lora": handle.engine.adapters.is_some(),
             "lora_embeddings": handle.engine.adapters.as_ref().is_some_and(|state|state.capabilities.embeddings),
             "lora_sessions": handle.engine.adapters.as_ref().is_some_and(|state|state.capabilities.sessions),
+            "frame_transcription": handle.engine.transcription.is_some(),
+            "generative_transcription": handle.multimodal.as_ref().and_then(|specs|specs.audio.as_ref()).is_some_and(|audio|audio.transcription().is_some()),
             "decision": handle.engine.decision.is_some(),
+            "decision_image_limit": handle.engine.decision.as_ref().map(|contract| contract.media().iter().filter(|m| m.kind==onnx_genai_metadata::EncodedMediaKind::Image).count()),
+            "decision_media_order": handle.engine.decision.as_ref().map(|contract|contract.media().iter().map(|m|m.kind).collect::<Vec<_>>()),
+            "decision_audio_limit": handle.engine.decision.as_ref().map(|contract|contract.media().iter().filter(|m|m.kind==onnx_genai_metadata::EncodedMediaKind::Audio).count()),
+            "decision_spoken_instructions": handle.engine.decision.as_ref().is_some_and(|contract|contract.spoken_input().is_some()),
             "reranking": handle.engine.reranking.is_some(),
             "reranking_image_limits": handle.engine.reranking.as_ref().map(|contract|json!({"query":contract.query_images().len(),"document":contract.document_images().len()}))
         }
@@ -252,7 +260,10 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
             "reasoning_format" => value == "auto" || value == "deepseek",
             // These opt into optional progress/control facilities, not a different decoding algorithm.
             "return_progress" | "timings_per_token" => value.is_boolean(),
-            "sse_ping_interval" => value.as_f64().is_some_and(|n| n >= 0.0),
+            "sse_ping_interval" => {
+                let _ = crate::SsePingInterval::parse(value)?;
+                true
+            }
             "cache_prompt" | "ignore_eos" => value.is_boolean(),
             "logit_bias" => value.is_object() || value.is_array(),
             "dry_penalty_last_n" => value

@@ -8,6 +8,7 @@
 use anyhow::Context as _;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::MirostatVersion;
 use llguidance::api::TopLevelGrammar;
@@ -22,19 +23,11 @@ pub type TokenId = u32;
 /// A stop sequence expressed either as generated text or token ids.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopSequence {
-    /// Stop when generated text ends with this string.
+    /// Stop when this string first appears in generated text, including inside
+    /// a token's decoded fragment.
     Text(String),
     /// Stop when generated token ids end with this sequence.
     Tokens(Vec<TokenId>),
-}
-
-impl StopSequence {
-    fn is_empty(&self) -> bool {
-        match self {
-            Self::Text(text) => text.is_empty(),
-            Self::Tokens(tokens) => tokens.is_empty(),
-        }
-    }
 }
 
 /// Context passed to logit processors.
@@ -53,8 +46,11 @@ pub struct ProcessorContext {
 /// Non-logit side-channel emitted by processors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessorSignal {
+    PredictionTimeLimit,
     /// A configured stop sequence matched the current generated output.
-    StopSequence { index: usize },
+    StopSequence {
+        index: usize,
+    },
 }
 
 /// A candidate token considered by a constrained decoder.
@@ -212,6 +208,13 @@ pub trait LogitProcessor: Send + Sync {
         None
     }
 
+    /// True only when processing leaves logits/candidates and selection feedback
+    /// unchanged, and the processor observes committed output solely via signal.
+    /// Such processors can share a raw-greedy speculative verification path.
+    fn only_observes_committed_output(&self) -> bool {
+        false
+    }
+
     /// Whether this processor is guaranteed to leave the position of the maximum
     /// logit unchanged, for every possible input.
     ///
@@ -312,6 +315,12 @@ impl ProcessorChain {
     /// vocabulary on the host.
     pub fn is_empty(&self) -> bool {
         self.processors.is_empty()
+    }
+    #[cfg(feature = "native-backend")]
+    pub(crate) fn only_observes_committed_output(&self) -> bool {
+        self.processors
+            .iter()
+            .all(|processor| processor.only_observes_committed_output())
     }
 
     /// Whether greedy selection over the raw logits gives the same token as
@@ -1525,13 +1534,85 @@ impl LogitProcessor for DryProcessor {
     }
 }
 
+/// Request-owned observer of append-only generated output. A context at step
+/// zero starts a new scan; repeated observations of a matched context agree.
+/// Stop sequences remain immutable for the lifetime of the scan.
 pub struct StopSequenceProcessor {
-    pub sequences: Vec<StopSequence>,
+    sequences: Vec<StopSequence>,
+    text_overlap: usize,
+    observed_text: AtomicUsize,
 }
 
 impl StopSequenceProcessor {
     pub fn new(sequences: Vec<StopSequence>) -> Self {
-        Self { sequences }
+        let text_overlap = sequences
+            .iter()
+            .filter_map(|sequence| match sequence {
+                StopSequence::Text(text) => Some(text.len().saturating_sub(1)),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        Self {
+            sequences,
+            text_overlap,
+            observed_text: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Earliest textual occurrence; configured order resolves equal positions.
+pub fn first_text_stop<'a>(
+    text: &str,
+    sequences: impl Iterator<Item = (usize, &'a str)>,
+    from: usize,
+) -> Option<(usize, usize)> {
+    let mut from = from.min(text.len());
+    while !text.is_char_boundary(from) {
+        from -= 1;
+    }
+    sequences
+        .filter(|(_, stop)| !stop.is_empty())
+        .filter_map(|(index, stop)| {
+            text[from..]
+                .find(stop)
+                .map(|position| (from + position, index))
+        })
+        .min()
+}
+
+/// Output delivery boundary after full stops and incomplete stop prefixes.
+pub struct TextStopBoundary {
+    /// UTF-8-safe prefix that can be published now.
+    pub visible_bytes: usize,
+    /// Full stop's configured index; none means any held suffix is incomplete.
+    pub matched_sequence: Option<usize>,
+}
+
+/// Match the same full-stop/held-prefix visibility rule as output delivery.
+pub fn text_stop_boundary<'a>(
+    text: &str,
+    sequences: impl Iterator<Item = (usize, &'a str)> + Clone,
+) -> TextStopBoundary {
+    if let Some((position, index)) = first_text_stop(text, sequences.clone(), 0) {
+        return TextStopBoundary {
+            visible_bytes: position,
+            matched_sequence: Some(index),
+        };
+    }
+    let held = sequences
+        .map(|(_, stop)| {
+            stop.char_indices()
+                .skip(1)
+                .filter_map(|(length, _)| text.ends_with(&stop[..length]).then_some(length))
+                .max()
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0);
+    TextStopBoundary {
+        visible_bytes: text.len() - held,
+        matched_sequence: None,
     }
 }
 
@@ -1544,26 +1625,53 @@ impl LogitProcessor for StopSequenceProcessor {
     /// [`signal`](Self::signal), which the loop reads through
     /// `finish_reason_after_token` on every step whether or not the chain was
     /// applied. So skipping the chain here loses nothing.
+    fn only_observes_committed_output(&self) -> bool {
+        true
+    }
     fn preserves_argmax(&self) -> bool {
         true
     }
 
     fn signal(&self, context: &ProcessorContext) -> Option<ProcessorSignal> {
-        self.sequences
+        let text = &context.generated_text;
+        let previous = self.observed_text.load(Ordering::Relaxed);
+        // Each request owns its chain. A new/reset context starts scanning at
+        // zero; append-only steps scan only new text plus the longest overlap.
+        let from = if context.step == 0 || previous > text.len() {
+            0
+        } else {
+            previous.saturating_sub(self.text_overlap)
+        };
+        let text_match = first_text_stop(
+            text,
+            self.sequences
+                .iter()
+                .enumerate()
+                .filter_map(|(index, sequence)| match sequence {
+                    StopSequence::Text(stop) => Some((index, stop.as_str())),
+                    _ => None,
+                }),
+            from,
+        );
+        let token_match = self
+            .sequences
             .iter()
             .enumerate()
-            .find_map(|(index, sequence)| {
-                if sequence.is_empty() {
-                    return None;
+            .find_map(|(index, sequence)| match sequence {
+                StopSequence::Tokens(tokens)
+                    if !tokens.is_empty() && context.generated_tokens.ends_with(tokens) =>
+                {
+                    Some((text.len(), index))
                 }
-
-                let matched = match sequence {
-                    StopSequence::Text(text) => context.generated_text.ends_with(text),
-                    StopSequence::Tokens(tokens) => context.generated_tokens.ends_with(tokens),
-                };
-
-                matched.then_some(ProcessorSignal::StopSequence { index })
-            })
+                _ => None,
+            });
+        let matched = text_match.into_iter().chain(token_match).min();
+        // Retain a matched position so repeated observation remains idempotent.
+        self.observed_text.store(
+            matched.map_or(text.len(), |(position, _)| position),
+            Ordering::Relaxed,
+        );
+        matched.map(|(_, index)| ProcessorSignal::StopSequence { index })
     }
 
     fn name(&self) -> &str {
@@ -4660,6 +4768,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stop_sequence_selects_the_earliest_occurrence_inside_a_fragment() {
+        let processor = StopSequenceProcessor::new(vec![
+            StopSequence::Text("LATE".into()),
+            StopSequence::Text("END".into()),
+            StopSequence::Text("END".into()),
+            StopSequence::Text(String::new()),
+            StopSequence::Tokens(vec![]),
+        ]);
+        let context = ProcessorContext {
+            generated_text: "🙂 ENDtail LATE".into(),
+            step: 1,
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                processor.signal(&context),
+                Some(ProcessorSignal::StopSequence { index: 1 })
+            );
+        }
+        let boundary = text_stop_boundary(
+            &context.generated_text,
+            ["LATE", "END"].into_iter().enumerate(),
+        );
+        assert_eq!(boundary.matched_sequence, Some(1));
+        assert_eq!(&context.generated_text[..boundary.visible_bytes], "🙂 ");
+    }
+
+    #[test]
+    fn stop_sequence_scans_utf8_overlap_and_resets_with_a_new_context() {
+        let processor = StopSequenceProcessor::new(vec![StopSequence::Text("Xé".into())]);
+        let mut context = ProcessorContext {
+            generated_text: "🙂X".into(),
+            ..Default::default()
+        };
+        assert_eq!(processor.signal(&context), None);
+        context.generated_text.push_str("étail");
+        context.step = 1;
+        assert_eq!(
+            processor.signal(&context),
+            Some(ProcessorSignal::StopSequence { index: 0 })
+        );
+        context.generated_text = "Xétail".into();
+        context.step = 0;
+        assert_eq!(
+            processor.signal(&context),
+            Some(ProcessorSignal::StopSequence { index: 0 })
+        );
+        assert_eq!(
+            first_text_stop("Xétail", ["Xé"].into_iter().enumerate(), 0),
+            Some((0, 0))
+        );
+    }
+
     fn json_token_texts() -> Vec<Option<String>> {
         vec![
             Some("not-json".to_string()),
@@ -5021,6 +5183,7 @@ mod tests {
             "type":"object", "properties":{"\n":{"const":1}}, "required":["\n"]
         })
         .to_string();
+        let del_key_schema = serde_json::json!({"type":"object","properties":{"\u{7f}":{"const":1}},"required":["\u{7f}"],"additionalProperties":false}).to_string();
         for (kind, grammar, prefix, suffix) in [
             (
                 GrammarConstraintKind::JsonSchema,
@@ -5032,6 +5195,12 @@ mod tests {
                 GrammarConstraintKind::JsonSchema,
                 control_key_schema.as_str(),
                 r#"{"\u000a":1"#,
+                "}",
+            ),
+            (
+                GrammarConstraintKind::JsonSchema,
+                del_key_schema.as_str(),
+                r#"{"\u007F":1"#,
                 "}",
             ),
             (GrammarConstraintKind::Regex, r"\\u005bx", r"\u005b", "x"),

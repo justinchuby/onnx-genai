@@ -69,6 +69,8 @@ pub(crate) struct EngineDriver {
     pub(crate) runtime_sampling: bool,
     pub(crate) reranking: Option<Arc<onnx_genai_metadata::task_profiles::RerankingContract>>,
     pub(crate) decision: Option<Arc<onnx_genai_metadata::decision::DecisionContract>>,
+    pub(crate) transcription:
+        Option<Arc<onnx_genai_metadata::transcription::TranscriptionContract>>,
     pub(crate) realtime: Option<Arc<onnx_genai_metadata::realtime::RealtimeContract>>,
     /// One lock-free KV mirror per worker. The legacy aggregate fields continue
     /// to report worker 0; debug/status expose this full list.
@@ -125,6 +127,13 @@ impl BatchingReport {
             reason: "test stub handle: no engine, single-sequence".to_string(),
         }
     }
+}
+
+/// Receiver lifetime cancels provisional prompt work through its control probe.
+pub(crate) struct SubmittedPrefill {
+    pub(crate) admission: oneshot::Receiver<Result<(), DriverFailure>>,
+    pub(crate) progress: mpsc::Receiver<DriverEvent>,
+    pub(crate) result: oneshot::Receiver<Result<onnx_genai_engine::PrefillResult, DriverFailure>>,
 }
 
 pub(crate) enum DriverCommand {
@@ -186,6 +195,7 @@ pub(crate) enum DriverCommand {
     SynthesizeSpeech {
         request: Box<GenerateRequest>,
         audio_output: String,
+        format: onnx_genai_engine::AudioOutputFormat,
         reply: oneshot::Sender<anyhow::Result<EncodedAudio>>,
         permit: WorkerPermit,
     },
@@ -206,8 +216,15 @@ pub(crate) enum DriverCommand {
     },
     Prefill {
         request: onnx_genai_engine::PrefillRequest,
+        admission: oneshot::Sender<Result<(), DriverFailure>>,
         control: GenerationControl,
         reply: oneshot::Sender<Result<onnx_genai_engine::PrefillResult, DriverFailure>>,
+        permit: WorkerPermit,
+    },
+    Transcribe {
+        request: Box<onnx_genai_engine::transcription::PreparedTranscription>,
+        reply:
+            oneshot::Sender<anyhow::Result<onnx_genai_engine::transcription::TranscriptionResult>>,
         permit: WorkerPermit,
     },
     Decide {
@@ -252,6 +269,7 @@ pub(crate) enum DriverCommand {
 
 #[derive(Debug)]
 pub(crate) enum DriverEvent {
+    PromptProgress(onnx_genai_engine::pipeline::PromptProgress),
     Token(GenerateToken),
     WorkflowPublications(Vec<serde_json::Value>),
     Finished(GenerateResult),
@@ -308,6 +326,22 @@ impl DriverFailure {
         {
             return Self {
                 message: prefix.to_string(),
+                kind: DriverFailureKind::InvalidRequest,
+            };
+        }
+        if let Some(limit) = error.chain().find_map(|source| {
+            source.downcast_ref::<onnx_genai_engine::decision::DecisionInputLimitError>()
+        }) {
+            return Self {
+                message: limit.to_string(),
+                kind: DriverFailureKind::InvalidRequest,
+            };
+        }
+        if let Some(limit) = error.chain().find_map(|source| {
+            source.downcast_ref::<onnx_genai_engine::transcription::TranscriptionLimitError>()
+        }) {
+            return Self {
+                message: limit.to_string(),
                 kind: DriverFailureKind::InvalidRequest,
             };
         }
@@ -452,6 +486,7 @@ struct EngineWorkerReady {
     runtime_sampling: bool,
     reranking: Option<Arc<onnx_genai_metadata::task_profiles::RerankingContract>>,
     decision: Option<Arc<onnx_genai_metadata::decision::DecisionContract>>,
+    transcription: Option<Arc<onnx_genai_metadata::transcription::TranscriptionContract>>,
     realtime: Option<Arc<onnx_genai_metadata::realtime::RealtimeContract>>,
 }
 
@@ -480,6 +515,10 @@ fn prepare_engine_worker<DropProbe>(
             )
         })
         .transpose()?;
+    let transcription =
+        onnx_genai_metadata::transcription::transcription_contract(engine.metadata())
+            .map_err(anyhow::Error::msg)?
+            .map(Arc::new);
     let decision =
         onnx_genai_metadata::decision::decision_contract(engine.metadata())?.map(Arc::new);
     let realtime = onnx_genai_metadata::realtime::realtime_contract(engine.metadata())
@@ -526,6 +565,7 @@ fn prepare_engine_worker<DropProbe>(
         runtime_sampling,
         reranking,
         decision,
+        transcription,
         realtime,
     };
     Ok((
@@ -770,6 +810,7 @@ impl EngineDriver {
                 runtime_sampling: first_ready.runtime_sampling,
                 reranking: first_ready.reranking,
                 decision: first_ready.decision,
+                transcription: first_ready.transcription,
                 realtime: first_ready.realtime,
                 worker_kv_telemetry,
             },
@@ -1195,12 +1236,33 @@ impl EngineDriver {
         while let Some(event) = receiver.blocking_recv() {
             match event {
                 DriverEvent::Token(_) => {}
+                DriverEvent::PromptProgress(_) => {}
                 DriverEvent::WorkflowPublications(_) => {}
                 DriverEvent::Finished(_) => return Ok(()),
                 DriverEvent::Error(error) => anyhow::bail!(error.message),
             }
         }
         anyhow::bail!("generation stream ended before result")
+    }
+
+    pub(crate) async fn transcribe(
+        &self,
+        request: onnx_genai_engine::transcription::PreparedTranscription,
+    ) -> Result<onnx_genai_engine::transcription::TranscriptionResult, GenerateSubmitError> {
+        let (commands, permit) = self.reserve_stateless_command()?;
+        let (reply, response) = oneshot::channel();
+        commands
+            .send(DriverCommand::Transcribe {
+                request: Box::new(request),
+                reply,
+                permit,
+            })
+            .await
+            .map_err(|_| GenerateSubmitError::DriverStopped)?;
+        response
+            .await
+            .map_err(|_| GenerateSubmitError::DriverStopped)?
+            .map_err(|error| GenerateSubmitError::Failed(DriverFailure::from_engine_error(&error)))
     }
 
     pub(crate) async fn decide(
@@ -1247,6 +1309,7 @@ impl EngineDriver {
         &self,
         request: GenerateRequest,
         audio_output: String,
+        format: onnx_genai_engine::AudioOutputFormat,
     ) -> Result<EncodedAudio, GenerateSubmitError> {
         let (commands, permit) = self.reserve_stateless_command()?;
         let (reply, response) = oneshot::channel();
@@ -1255,6 +1318,7 @@ impl EngineDriver {
             .send(DriverCommand::SynthesizeSpeech {
                 request: Box::new(request),
                 audio_output,
+                format,
                 reply,
                 permit,
             })
@@ -1321,33 +1385,27 @@ impl EngineDriver {
     pub(crate) async fn prefill(
         &self,
         request: onnx_genai_engine::PrefillRequest,
-    ) -> Result<onnx_genai_engine::PrefillResult, GenerateSubmitError> {
-        struct CancelOnDrop(GenerationControl);
-        impl Drop for CancelOnDrop {
-            fn drop(&mut self) {
-                self.0.cancel();
-            }
-        }
+    ) -> Result<SubmittedPrefill, GenerateSubmitError> {
         let (commands, permit) = self.reserve_stateless_command()?;
-        let control = GenerationControl::default();
-        let _cancel = CancelOnDrop(control.clone());
-        let (reply, response) = oneshot::channel();
-        if commands
+        let (events, progress) = mpsc::channel(16);
+        let control = generation_control_for_events(&events);
+        let (reply, result) = oneshot::channel();
+        let (admission, admitted) = oneshot::channel();
+        commands
             .send(DriverCommand::Prefill {
                 request,
+                admission,
                 control,
                 reply,
                 permit,
             })
             .await
-            .is_err()
-        {
-            return Err(GenerateSubmitError::DriverStopped);
-        }
-        response
-            .await
-            .map_err(|_| GenerateSubmitError::DriverStopped)?
-            .map_err(GenerateSubmitError::Failed)
+            .map_err(|_| GenerateSubmitError::DriverStopped)?;
+        Ok(SubmittedPrefill {
+            admission: admitted,
+            progress,
+            result,
+        })
     }
 
     pub(crate) async fn generate_fim(
@@ -1508,11 +1566,11 @@ fn run_fallback_engine_driver(
     slot: Option<&Arc<crate::slots::NativeSlot>>,
 ) {
     while let Some(command) = rx.blocking_recv() {
-        let _slot_execution = slot.map(crate::slots::NativeSlot::begin);
-        handle_driver_command(engine, command);
-        if let Some(slot) = slot {
-            slot.finish(engine);
-        }
+        let mut completion = slot.map(crate::slots::NativeSlot::begin);
+        handle_driver_command(engine, command, &mut completion);
+        // Covers closed consumers and commands with owner-side handshakes.
+        // Published terminal paths already completed this guard, so this is a no-op.
+        publish_slot_completion(engine, &mut completion);
         refresh_resource_snapshot(resource_snapshot, engine);
     }
 }
@@ -1581,7 +1639,7 @@ fn run_static_engine_driver(
                 refresh_resource_snapshot(resource_snapshot, engine);
             }
             command => {
-                handle_driver_command(engine, command);
+                handle_driver_command(engine, command, &mut None);
                 refresh_resource_snapshot(resource_snapshot, engine);
             }
         }
@@ -1732,7 +1790,7 @@ fn run_static_batch_until_idle(
         let pending = initial
             .pop()
             .expect("the first generation request was queued");
-        run_generation(engine, None, None, pending);
+        run_generation(engine, &mut None, None, None, pending);
         return;
     }
 
@@ -1997,6 +2055,7 @@ fn deferred_permit_holder_count(deferred: &VecDeque<DriverCommand>) -> usize {
                     | DriverCommand::Embed { .. }
                     | DriverCommand::ScorePair { .. }
                     | DriverCommand::Decide { .. }
+                    | DriverCommand::Transcribe { .. }
                     | DriverCommand::Prefill { .. }
             )
         })
@@ -2206,7 +2265,27 @@ fn route_continuous_events(
     }
 }
 
-fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
+fn publish_slot_completion(engine: &Engine, completion: &mut Option<crate::slots::SlotExecution>) {
+    if let Some(completion) = completion {
+        completion.finish(engine);
+    }
+}
+fn complete_driver_reply<T, P>(
+    engine: &Engine,
+    completion: &mut Option<crate::slots::SlotExecution>,
+    reply: oneshot::Sender<T>,
+    result: T,
+    permit: P,
+) {
+    publish_slot_completion(engine, completion);
+    drop(permit);
+    let _ = reply.send(result);
+}
+fn handle_driver_command(
+    engine: &mut Engine,
+    command: DriverCommand,
+    completion: &mut Option<crate::slots::SlotExecution>,
+) {
     match command {
         DriverCommand::Realtime(command) => command.run(engine),
         DriverCommand::Slot {
@@ -2215,7 +2294,8 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             _permit,
         } => {
             if !response.is_closed() {
-                let _ = response.send(operation.run(engine));
+                let result = operation.run(engine);
+                complete_driver_reply(engine, completion, response, result, _permit);
             }
         }
         DriverCommand::CreateSession {
@@ -2297,19 +2377,21 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
                 accounting.session_closed();
             }
             drop(held_lease);
-            let _ = response.send(result);
+            complete_driver_reply(engine, completion, response, result, ());
         }
         DriverCommand::SessionTokenCount {
             session_id,
             response,
         } => {
-            let _ = response.send(engine.session_token_count(session_id));
+            let result = engine.session_token_count(session_id);
+            complete_driver_reply(engine, completion, response, result, ());
         }
         DriverCommand::SessionPrefillCarry {
             session_id,
             response,
         } => {
-            let _ = response.send(engine.session_prefill_carry(session_id));
+            let result = engine.session_prefill_carry(session_id);
+            complete_driver_reply(engine, completion, response, result, ());
         }
         DriverCommand::Generate {
             session_id,
@@ -2322,6 +2404,7 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             permit,
         } => run_generation(
             engine,
+            completion,
             session_id,
             input,
             PendingGeneration {
@@ -2343,6 +2426,7 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             permit,
         } => run_fim_generation(
             engine,
+            completion,
             prefix,
             suffix,
             fim_config,
@@ -2356,14 +2440,15 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
         DriverCommand::SynthesizeSpeech {
             request,
             audio_output,
+            format,
             reply,
             permit,
         } => {
             let _permit = permit;
             let result = engine
                 .run_pipeline_outputs(PipelineGenerateRequest::new(*request))
-                .and_then(|outputs| engine.encode_audio_output(&outputs, &audio_output));
-            let _ = reply.send(result);
+                .and_then(|outputs| engine.encode_audio_output(&outputs, &audio_output, format));
+            complete_driver_reply(engine, completion, reply, result, _permit);
         }
         DriverCommand::GenerateImage {
             request,
@@ -2389,21 +2474,45 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
                     shape: image.shape().to_vec(),
                 })
             })();
-            let _ = reply.send(result);
+            complete_driver_reply(engine, completion, reply, result, (_permit, _metrics));
         }
         DriverCommand::Prefill {
             request,
+            admission,
             control,
             reply,
             permit: _permit,
         } => {
+            let mut admission = Some(admission);
             let result = engine
-                .prefill_with_callbacks(request, Some(control), None)
+                .prefill_with_callbacks(
+                    request,
+                    Some(control),
+                    Some(&mut || {
+                        if let Some(sender) = admission.take() {
+                            let _ = sender.send(Ok(()));
+                        }
+                    }),
+                )
                 .map_err(|error| DriverFailure::from_engine_error(&error));
+            let rejected = admission.zip(result.as_ref().err().cloned());
             if let Ok(result) = &result {
                 crate::metrics::add_prompt_tokens(result.prompt_tokens);
             }
-            let _ = reply.send(result);
+            complete_driver_reply(engine, completion, reply, result, _permit);
+            if let Some((sender, failure)) = rejected {
+                let _ = sender.send(Err(failure));
+            }
+        }
+        DriverCommand::Transcribe {
+            request,
+            reply,
+            permit: _permit,
+        } => {
+            if !reply.is_closed() {
+                let result = engine.transcribe(*request);
+                complete_driver_reply(engine, completion, reply, result, _permit);
+            }
         }
         DriverCommand::Decide {
             request,
@@ -2415,7 +2524,7 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
                 if let Ok(result) = &result {
                     crate::metrics::add_prompt_tokens(result.prompt_tokens());
                 }
-                let _ = reply.send(result);
+                complete_driver_reply(engine, completion, reply, result, _permit);
             }
         }
         DriverCommand::ScorePair {
@@ -2428,7 +2537,7 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
                 if let Ok(score) = &result {
                     crate::metrics::add_prompt_tokens(score.prompt_tokens);
                 }
-                let _ = reply.send(result);
+                complete_driver_reply(engine, completion, reply, result, _permit);
             }
         }
         DriverCommand::Embed {
@@ -2437,17 +2546,19 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             reply,
             permit: _permit,
         } => {
-            let _ = reply.send(engine.embed_with_options(&input_ids, options));
+            let result = engine.embed_with_options(&input_ids, options);
+            complete_driver_reply(engine, completion, reply, result, _permit);
         }
         #[cfg(test)]
         DriverCommand::ResourceSnapshot(reply) => {
-            let _ = reply.send(Ok(engine.resource_snapshot()));
+            let result = Ok(engine.resource_snapshot());
+            complete_driver_reply(engine, completion, reply, result, ());
         }
         DriverCommand::SetVramLimit { limit, reply } => {
             let result = engine
                 .set_vram_limit(limit)
                 .map(|_| engine.resource_snapshot());
-            let _ = reply.send(Ok(result));
+            complete_driver_reply(engine, completion, reply, Ok(result), ());
         }
         #[cfg(test)]
         DriverCommand::BarrierGenerate {
@@ -2457,7 +2568,9 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             response,
         } => {
             barrier.wait();
-            let _ = response.send(engine.generate_in_session(session_id, *request));
+            let result = engine.generate_in_session(session_id, *request);
+            publish_slot_completion(engine, completion);
+            let _ = response.send(result);
         }
         #[cfg(test)]
         DriverCommand::Block { entered, release } => {
@@ -2610,8 +2723,18 @@ impl std::error::Error for DriverDeliveryError {}
 /// bound tensors are what the request arrived with, and a request carrying them
 /// is bound as a workflow request because that is the only way to deliver them.
 /// Neither branch asks what kind of package is loaded.
+fn generation_control_for_events(events: &mpsc::Sender<DriverEvent>) -> GenerationControl {
+    let cancellation_events = events.clone();
+    let progress_events = events.clone();
+    GenerationControl::from_cancellation_probe(move || cancellation_events.is_closed())
+        .with_prompt_progress(move |progress| {
+            deliver_event(&progress_events, DriverEvent::PromptProgress(progress))
+        })
+}
+
 fn run_generation(
     engine: &mut Engine,
+    completion: &mut Option<crate::slots::SlotExecution>,
     session_id: Option<SessionId>,
     input: Option<MultimodalInput>,
     pending: PendingGeneration,
@@ -2637,15 +2760,14 @@ fn run_generation(
         Ok(bound) => bound,
         Err(error) => {
             let failure = DriverFailure::internal(format!("{error:#}"));
+            publish_slot_completion(engine, completion);
             drop(permit);
             let _ = admission.send(Err(failure.clone()));
             let _ = events.try_send(DriverEvent::Error(failure));
             return;
         }
     };
-    let cancellation_events = events.clone();
-    let generation_control =
-        GenerationControl::from_cancellation_probe(move || cancellation_events.is_closed());
+    let generation_control = generation_control_for_events(&events);
     let bound = bound.map(|request| request.with_generation_control(generation_control.clone()));
     let mut admission = Some(admission);
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
@@ -2689,6 +2811,8 @@ fn run_generation(
             ),
         }
     };
+    // Commit the readable owner state before any terminal channel can wake a client.
+    publish_slot_completion(engine, completion);
     // The engine has committed whatever this turn wrote to the session, so the
     // conversation is consistent and the next turn may take the lease. Released
     // *before* the terminal event rather than after this function returns: a
@@ -2740,6 +2864,7 @@ fn run_generation(
 
 fn run_fim_generation(
     engine: &mut Engine,
+    completion: &mut Option<crate::slots::SlotExecution>,
     prefix: String,
     suffix: String,
     fim_config: FimConfig,
@@ -2753,6 +2878,11 @@ fn run_fim_generation(
     let (admission, events, permit) = delivery;
     let mut metrics = GenerationMetrics::start();
     let mut admission = Some(admission);
+    let control = generation_control_for_events(&events);
+    let mut callback = |token| {
+        metrics.token();
+        deliver_event(&events, DriverEvent::Token(token))
+    };
     let result = {
         let mut admitted = || {
             if let Some(sender) = admission.take() {
@@ -2764,10 +2894,12 @@ fn run_fim_generation(
             suffix,
             options,
             &fim_config,
+            Some(control),
             Some(&mut admitted),
-            None,
+            Some(&mut callback),
         )
     };
+    publish_slot_completion(engine, completion);
     drop(permit);
     match result {
         Ok(result) => {
@@ -3368,6 +3500,7 @@ mod admission_tests {
             native_slot: None,
             reranking: None,
             decision: None,
+            transcription: None,
             realtime: None,
             runtime_sampling: false,
             workflow_facts: crate::driver::WorkflowFacts {
@@ -3439,13 +3572,10 @@ mod admission_tests {
         // `encoded: true` is the branch that hands the package its bytes
         // untouched, so this needs no feature extractor and no mel-shaped
         // fixture -- it is the shortest route to a genuinely bound tensor.
-        let spec = crate::audio_input::AudioInputSpec {
-            endpoint: "audio_bytes".to_string(),
-            n_mels: 80,
-            n_frames: 100,
-            max_tokens: None,
-            encoded: true,
-        };
+        let program=serde_json::from_value(serde_json::json!({"transforms":[{"op":"decode","outputs":["wave"]}],"outputs":[{"name":"wave","source":"wave","content":"waveform","dtype":"float32"}]})).unwrap();
+        let spec =
+            crate::audio_input::AudioInputSpec::from_encoded_input("audio_bytes".into(), &program)
+                .unwrap();
         let input = MultimodalInput::from_samples(&spec, &[0.0f32; 16], 16_000)
             .expect("an encoded-audio spec binds the samples it is handed");
 
@@ -3476,6 +3606,7 @@ mod admission_tests {
 
         run_generation(
             &mut engine,
+            &mut None,
             None,
             Some(input),
             PendingGeneration {
@@ -3501,6 +3632,81 @@ mod admission_tests {
         }
     }
 
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_slot_state_and_capacity_are_committed_before_terminal_replies() {
+        let model = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-native-engine");
+        let mut engine = Engine::from_dir(
+            &model,
+            onnx_genai_engine::EngineConfig {
+                decode_backend: onnx_genai_engine::EngineDecodeBackend::Native,
+                native_device: Some(onnx_genai_engine::NativeDecodeDevice::Cpu),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let slot = crate::slots::NativeSlot::from_engine(&engine).unwrap();
+        let capacity = Arc::new(Semaphore::new(1));
+        let mut completion = Some(slot.begin());
+        let (admission, _admission_rx) = oneshot::channel();
+        let (events, mut receiver) = mpsc::channel(64);
+        let mut request = GenerateRequest::new(onnx_genai::GeneratePrompt::TokenIds(vec![0]));
+        request.options.max_new_tokens = 3;
+        request.options.temperature = 0.0;
+        request.options.greedy = true;
+        request.options.stop_on_eos = false;
+        run_generation(
+            &mut engine,
+            &mut completion,
+            None,
+            None,
+            PendingGeneration {
+                request,
+                tool_call_policy: ToolCallPolicy::Disabled,
+                lease: None,
+                admission,
+                events,
+                permit: WorkerPermit::untracked(Arc::clone(&capacity).try_acquire_owned().unwrap()),
+            },
+        );
+        let mut finished = false;
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                DriverEvent::Finished(_) => finished = true,
+                DriverEvent::Error(error) => panic!("{}", error.message),
+                _ => {}
+            }
+        }
+        assert!(finished);
+        // The guard remains alive and the fallback-loop epilogue has NOT run.
+        let snapshot = slot.snapshot().unwrap();
+        assert!(snapshot.n_past > 1);
+        assert!(!snapshot.is_processing);
+        assert_eq!(
+            snapshot.n_past,
+            engine.native_slot_state().unwrap().materialized_tokens
+        );
+        assert_eq!(capacity.available_permits(), 1);
+        let before = snapshot.n_past;
+        completion = Some(slot.begin());
+        let (response, mut reply) = oneshot::channel();
+        handle_driver_command(
+            &mut engine,
+            DriverCommand::Slot {
+                operation: crate::slots::SlotOperation::Erase,
+                response,
+                _permit: Arc::clone(&capacity).try_acquire_owned().unwrap(),
+            },
+            &mut completion,
+        );
+        let result = reply.try_recv().unwrap().unwrap();
+        assert_eq!(result["n_erased"], before);
+        let snapshot = slot.snapshot().unwrap();
+        assert_eq!(snapshot.n_past, 0);
+        assert!(!snapshot.is_processing);
+        assert_eq!(capacity.available_permits(), 1);
+    }
     #[test]
     fn native_cold_and_prompt_lookup_abort_without_driver_token_or_finished_events() {
         fn pending(
@@ -3556,7 +3762,7 @@ mod admission_tests {
             // to enter the commit-only journal, so token one was already staged.
             engine.set_native_output_staging_limit_for_test(Some(1));
             let (pending_generation, mut admission_rx, mut events_rx) = pending(request.clone());
-            run_generation(&mut engine, None, None, pending_generation);
+            run_generation(&mut engine, &mut None, None, None, pending_generation);
             assert!(
                 admission_rx
                     .try_recv()
@@ -3564,38 +3770,44 @@ mod admission_tests {
                     .is_ok(),
                 "{route} must report scheduler admission before executing"
             );
-            match events_rx
-                .try_recv()
-                .expect("aborted generation must report its error")
-            {
-                DriverEvent::Error(failure) => assert!(
-                    failure.message.contains(
-                        "output staging exhausted its 1-token admission after buffering 1"
+            let mut saw_error = false;
+            while let Ok(event) = events_rx.try_recv() {
+                match event {
+                    DriverEvent::Error(failure) => {
+                        assert!(!saw_error, "{route} duplicated its terminal error");
+                        saw_error = true;
+                        assert!(
+                            failure.message.contains(
+                                "output staging exhausted its 1-token admission after buffering 1"
+                            ),
+                            "{route} must fail after staging token one: {}",
+                            failure.message
+                        );
+                    }
+                    DriverEvent::PromptProgress(_) => assert!(
+                        !saw_error,
+                        "{route} emitted progress after its terminal error"
                     ),
-                    "{route} must fail after staging token one: {}",
-                    failure.message
-                ),
-                DriverEvent::Token(token) => {
-                    panic!(
+                    DriverEvent::Token(token) => panic!(
                         "{route} leaked DriverEvent::Token({}) from an aborted turn",
                         token.token_id
-                    )
-                }
-                DriverEvent::WorkflowPublications(_) => {
-                    panic!("{route} leaked workflow publications from an aborted turn")
-                }
-                DriverEvent::Finished(_) => {
-                    panic!("{route} leaked a success completion from an aborted turn")
+                    ),
+                    DriverEvent::WorkflowPublications(_) => {
+                        panic!("{route} leaked workflow publications from an aborted turn")
+                    }
+                    DriverEvent::Finished(_) => {
+                        panic!("{route} leaked a success completion from an aborted turn")
+                    }
                 }
             }
             assert!(
-                events_rx.try_recv().is_err(),
-                "{route} must publish no token or success completion after its error"
+                saw_error,
+                "aborted generation must report its terminal error"
             );
 
             engine.set_native_output_staging_limit_for_test(None);
             let (pending_generation, mut admission_rx, mut events_rx) = pending(request);
-            run_generation(&mut engine, None, None, pending_generation);
+            run_generation(&mut engine, &mut None, None, None, pending_generation);
             assert!(
                 admission_rx
                     .try_recv()
@@ -3605,9 +3817,23 @@ mod admission_tests {
             );
             let mut tokens = Vec::new();
             let mut finished = None;
+            let mut progress = Vec::new();
+            let mut samples = Vec::new();
             while let Ok(event) = events_rx.try_recv() {
                 match event {
-                    DriverEvent::Token(token) => tokens.push(token.token_id),
+                    DriverEvent::Token(token) => {
+                        assert_eq!(
+                            progress.len(),
+                            2,
+                            "{route} must report prompt before committed tokens"
+                        );
+                        samples.push(token.timings.expect("committed token timing"));
+                        tokens.push(token.token_id);
+                    }
+                    DriverEvent::PromptProgress(update) => {
+                        assert!(tokens.is_empty());
+                        progress.push(update);
+                    }
                     DriverEvent::WorkflowPublications(_) => {}
                     DriverEvent::Finished(result) => finished = Some(result),
                     DriverEvent::Error(failure) => {
@@ -3621,6 +3847,39 @@ mod admission_tests {
                 "{route} retry token event order"
             );
             assert_eq!(tokens, vec![1, 1, 1], "{route} retry must be deterministic");
+            assert_eq!(progress[0].processed, 0);
+            assert_eq!(progress[1].processed, 1);
+            assert_eq!(
+                samples
+                    .iter()
+                    .map(|sample| sample.generated_tokens)
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3]
+            );
+            assert_eq!(finished.timings, samples.last().copied());
+            let timing = finished.timings.unwrap();
+            let wire = crate::timings::render(timing);
+            if speculative {
+                let stats = timing.speculative.expect("verified prompt-lookup counters");
+                assert_eq!(stats, engine.last_speculative_stats());
+                assert!(stats.proposed_tokens > 0);
+                assert_eq!(wire["draft_n"], stats.proposed_tokens);
+                assert_eq!(wire["draft_n_accepted"], stats.accepted_tokens);
+                assert!(
+                    samples
+                        .iter()
+                        .filter_map(|sample| sample.speculative)
+                        .all(|sample| sample.proposed_tokens <= stats.proposed_tokens)
+                );
+            } else {
+                assert!(timing.speculative.is_none());
+                assert!(wire.get("draft_n").is_none());
+                assert!(wire.get("draft_n_accepted").is_none());
+            }
+            assert_eq!(
+                finished.timings.unwrap().prompt_elapsed,
+                progress[1].elapsed
+            );
         }
     }
 
@@ -3730,6 +3989,7 @@ mod admission_tests {
             native_slot: None,
             reranking: None,
             decision: None,
+            transcription: None,
             realtime: None,
             runtime_sampling: false,
             workflow_facts: WorkflowFacts {
@@ -3788,6 +4048,7 @@ mod admission_tests {
             native_slot: None,
             reranking: None,
             decision: None,
+            transcription: None,
             realtime: None,
             runtime_sampling: false,
             workflow_facts: WorkflowFacts {
@@ -3967,6 +4228,7 @@ mod driver_delivery_tests {
 
     fn token(id: u32) -> GenerateToken {
         GenerateToken {
+            timings: None,
             logprob: None,
             token_id: id,
             text: format!("t{id}"),
@@ -3976,6 +4238,8 @@ mod driver_delivery_tests {
 
     fn result(tokens: usize) -> GenerateResult {
         GenerateResult {
+            timings: None,
+            retained_cache_tokens: 0,
             preserved_tokens: Default::default(),
             text: "done".to_string(),
             token_ids: (0..tokens as u32).collect(),
@@ -4009,6 +4273,7 @@ mod driver_delivery_tests {
         while let Some(event) = rx.blocking_recv() {
             match event {
                 DriverEvent::Token(_) => tokens += 1,
+                DriverEvent::PromptProgress(_) => {}
                 DriverEvent::WorkflowPublications(_) => {}
                 DriverEvent::Finished(_) => {
                     finished = true;
@@ -4134,6 +4399,7 @@ mod driver_delivery_tests {
         while let Some(event) = events_rx.recv().await {
             match event {
                 DriverEvent::Token(token) => tokens.push(token.token_id),
+                DriverEvent::PromptProgress(_) => {}
                 DriverEvent::WorkflowPublications(_) => {}
                 DriverEvent::Finished(_) => finished = true,
                 DriverEvent::Error(error) => panic!("unexpected failure: {error:?}"),
@@ -4181,6 +4447,7 @@ mod driver_delivery_tests {
             Some(DriverEvent::Token(token)) => {
                 panic!("aborted turn leaked DriverEvent::Token({})", token.token_id)
             }
+            Some(DriverEvent::PromptProgress(_)) => {}
             Some(DriverEvent::WorkflowPublications(_)) => {
                 panic!("aborted turn leaked committed workflow publications")
             }

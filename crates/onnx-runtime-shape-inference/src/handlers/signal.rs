@@ -11,7 +11,6 @@
 //! rank (and the always-known dimensions, such as the trailing complex `2`)
 //! even when the data-dependent extents are unknown.
 
-use onnx_runtime_ir::dft::{self as dft_rules, Spectrum};
 use onnx_runtime_ir::{Attribute, DataType};
 
 use crate::context::InferenceContext;
@@ -40,11 +39,6 @@ fn output_datatype(ctx: &InferenceContext) -> DataType {
         .unwrap_or(DataType::Float32)
 }
 
-/// Whether integer attribute `name` is set and non-zero (a boolean flag).
-fn flag(ctx: &InferenceContext, name: &str) -> bool {
-    ctx.node.attr(name).and_then(Attribute::as_int).unwrap_or(0) != 0
-}
-
 /// The size of the onesided (nonredundant) half-spectrum of an `n`-point DFT:
 /// `floor(n / 2) + 1`.
 fn onesided_bins(n: i64) -> i64 {
@@ -54,8 +48,12 @@ fn onesided_bins(n: i64) -> i64 {
 /// `DFT` (opset 17 and 20): the discrete Fourier transform along one signal
 /// axis.
 ///
-/// The trailing dimension identifies real or complex output. A dynamic axis
-/// keeps that dimension known even when the signal dimensions go symbolic.
+/// The output matches the input rank. Full/RFFT output has two components;
+/// IRFFT has one real component and a default length of twice (input bins - 1). The signal axis becomes `dft_length` when
+/// that optional scalar input is given. Only forward onesided output is halved
+/// to `floor(n / 2) + 1`. In opset 20 the axis moved from an attribute (default `1`)
+/// to an optional scalar input (default `-2`); when that input is present but
+/// not statically known, the component width still follows the transform mode.
 fn dft(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(input) = ctx.input_type(0).cloned() else {
         return Ok(());
@@ -71,80 +69,82 @@ fn dft(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         });
     }
 
-    let opset = ctx.opset("");
-    let spectrum = Spectrum::from_flags(opset, flag(ctx, "inverse"), flag(ctx, "onesided"));
-    let has_dft_length = ctx.has_input(1);
-    let last = rank - 1;
     let invalid = |detail| ShapeInferError::Invalid {
         op: "DFT".into(),
         detail,
     };
-    if opset >= 20
-        && let Some(components) = input.shape[last].as_const()
-    {
+    let mode = onnx_runtime_ir::dft::DftMode::parse(ctx.node).map_err(invalid)?;
+    let has_dft_length = ctx.has_input(1);
+    let last = rank - 1;
+    if let Some(components) = input.shape[last].as_const() {
         let components = usize::try_from(components)
             .map_err(|_| invalid(format!("invalid input component dimension {components}")))?;
-        spectrum.validate_components(components).map_err(invalid)?;
+        mode.validate_components(components).map_err(invalid)?;
     }
 
     // Opset 20 carries the axis as an optional input; earlier opsets use an
     // attribute. The default differs accordingly: `-2` for the input form,
     // `1` for the attribute form.
-    let axis_is_input = opset >= 20 && ctx.has_input(2);
+    let axis_is_input = ctx.opset("") >= 20 && ctx.has_input(2);
     let axis_value: Option<i64> = if axis_is_input {
         scalar_int(ctx, 2)
     } else {
-        Some(dft_rules::default_axis(ctx.node, opset))
+        Some(onnx_runtime_ir::dft::default_axis(ctx.node, ctx.opset("")))
     };
 
     let mut out = input.shape.clone();
-    let output_components = DimExpr::constant(spectrum.output_components() as i64);
 
     let Some(axis) = axis_value else {
         // Opset-20 axis input present but not statically known. When onesided or
         // dft_length would rewrite the signal axis we cannot know which axis
         // that is, so every signal extent becomes a fresh symbol; otherwise the
-        // input shape is preserved.
-        if spectrum != Spectrum::Full || has_dft_length {
+        // input shape is preserved. Component width follows the transform mode.
+        if matches!(
+            mode,
+            onnx_runtime_ir::dft::DftMode::RealForward | onnx_runtime_ir::dft::DftMode::RealInverse
+        ) || has_dft_length
+        {
             out = (0..rank).map(|_| ctx.fresh_dim()).collect();
         }
-        out[last] = output_components;
+        out[last] = DimExpr::constant(mode.output_components() as i64);
         ctx.set_output(0, dtype, out);
         return Ok(());
     };
 
-    let axis_idx = dft_rules::normalize_axis(axis, rank).map_err(invalid)?;
+    let axis_idx = onnx_runtime_ir::dft::normalize_axis(axis, rank).map_err(invalid)?;
 
-    if has_dft_length {
-        out[axis_idx] = match scalar_int(ctx, 1) {
-            Some(length) => {
-                if opset >= 20 {
-                    dft_rules::explicit_length(length).map_err(invalid)?;
-                }
-                DimExpr::constant(length)
-            }
+    let length = if has_dft_length {
+        scalar_int(ctx, 1)
+            .map(onnx_runtime_ir::dft::explicit_length)
+            .transpose()
+            .map_err(invalid)?
+    } else {
+        input.shape[axis_idx]
+            .as_const()
+            .map(|n| {
+                let n = usize::try_from(n)
+                    .map_err(|_| invalid(format!("invalid signal-axis extent {n}")))?;
+                mode.default_length(n).map_err(invalid)
+            })
+            .transpose()?
+    };
+    out[axis_idx] = if !has_dft_length
+        && matches!(
+            mode,
+            onnx_runtime_ir::dft::DftMode::Forward | onnx_runtime_ir::dft::DftMode::Inverse
+        ) {
+        input.shape[axis_idx].clone()
+    } else {
+        match length {
+            Some(n) => DimExpr::constant(i64::try_from(mode.output_length(n)).map_err(|_| {
+                invalid(format!(
+                    "DFT output extent for length {n} exceeds i64; reduce the transform length"
+                ))
+            })?),
             None => ctx.fresh_dim(),
-        };
-    } else if spectrum == Spectrum::OneSidedInput {
-        out[axis_idx] = match out[axis_idx].as_const() {
-            Some(bins) => {
-                let extent = usize::try_from(bins)
-                    .map_err(|_| invalid(format!("invalid input signal extent {bins}")))?;
-                let length = spectrum.transform_length(None, extent).map_err(invalid)?;
-                DimExpr::constant(i64::try_from(length).map_err(|_| invalid(format!(
-                    "inverse real dft_length from {bins} bins exceeds i64; provide an explicit dft_length"
-                )))?)
-            }
-            None => ctx.fresh_dim(),
-        };
-    }
-    if spectrum == Spectrum::OneSidedOutput {
-        out[axis_idx] = match out[axis_idx].as_const() {
-            Some(n) => DimExpr::constant(onesided_bins(n)),
-            None => ctx.fresh_dim(),
-        };
-    }
-    out[last] = output_components;
+        }
+    };
+    out[last] = DimExpr::constant(mode.output_components() as i64);
     ctx.set_output(0, dtype, out);
     Ok(())
 }

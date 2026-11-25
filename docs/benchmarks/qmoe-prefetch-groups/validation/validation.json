@@ -1,0 +1,122 @@
+{
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs": "65bd190dff36e124fd224399fa401980f84baf64abfd915bba441c11c5fe7458"
+  },
+  "results": [
+    {
+      "name": "list-qmoe",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::qmoe::tests::",
+        "--",
+        "--list"
+      ],
+      "exit": 0,
+      "log_sha256": "1b8d4f89bb93cad9d64090416af983984ab95274c3fdc4bf19b0b28e9e03d9e3"
+    },
+    {
+      "name": "qmoe",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::qmoe::tests::"
+      ],
+      "exit": 0,
+      "log_sha256": "982f9554acd9d3c52380c98588e8a964cf5c869b67be1bd82a5e5eaf1532c060",
+      "counts": [
+        [
+          "68",
+          "0",
+          "1"
+        ]
+      ]
+    },
+    {
+      "name": "qmoe-mlas",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "--features",
+        "mlas",
+        "kernels::qmoe::tests::"
+      ],
+      "exit": 0,
+      "log_sha256": "06617e47456defc21e0319bebc145136122fa2df7160b783b2b4b6e04eb88a8f",
+      "counts": [
+        [
+          "68",
+          "0",
+          "1"
+        ]
+      ]
+    },
+    {
+      "name": "oracle",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cuda",
+        "--test",
+        "qmoe_cpu_oracle"
+      ],
+      "exit": 0,
+      "log_sha256": "df19e3c3eaf7dae8fc7b074ff836fd18696ed8f635c2b7fd5bf0d6d32a55d0c1",
+      "counts": [
+        [
+          "1",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit": 0,
+      "log_sha256": "48c9e596ac03f42540abee89fb8442de3813e3cd3c8ca6af923401f0e4af8726"
+    },
+    {
+      "name": "clippy-mlas",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--all-targets",
+        "--features",
+        "mlas",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit": 0,
+      "log_sha256": "48c460cecfaae050e0ce5c27892368a67c84c8b5e2120619c53626940584e15f"
+    }
+  ]
+}

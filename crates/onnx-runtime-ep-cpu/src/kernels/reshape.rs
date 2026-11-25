@@ -1,12 +1,10 @@
 //! `Reshape`: a metadata-only op for contiguous inputs, with a logical-order
 //! copy fallback for strided inputs.
 
-use onnx_runtime_ep_api::{
-    EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,
-};
+use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput};
 use onnx_runtime_ir::{Node, compute_contiguous_strides, is_contiguous};
 
-use super::{check_arity, to_dense_bytes, to_dense_i64, write_dense_bytes};
+use super::{check_arity, movement_ops::copy_shape_only, to_dense_i64};
 
 pub struct ReshapeKernel {
     allowzero: bool,
@@ -26,20 +24,13 @@ impl KernelFactory for ReshapeFactory {
 }
 
 impl Kernel for ReshapeKernel {
-    fn may_produce_views(&self) -> bool {
+    fn may_produce_views(&self, _input_dtypes: &[onnx_runtime_ir::DataType]) -> bool {
         true
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Reshape", inputs, outputs, 1, 2, 1)?;
-        if outputs[0].dtype != inputs[0].dtype {
-            return Err(EpError::KernelFailed(format!(
-                "Reshape: output dtype {:?} must match input dtype {:?}",
-                outputs[0].dtype, inputs[0].dtype
-            )));
-        }
-        let data = to_dense_bytes(&inputs[0])?;
-        write_dense_bytes(&mut outputs[0], &data)
+        copy_shape_only("Reshape", &inputs[0], &mut outputs[0])
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {

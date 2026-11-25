@@ -172,6 +172,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `SimplifiedLayerNormalization` | `com.microsoft` | ✅ | **NVRTC-custom** (fused) | Contrib-domain registration of the same fused RMS-normalization implementation. |
 | `BatchNormalization` | `` | ✅ | **NVRTC-custom** | Inference-mode channel-wise normalization for contiguous f32/f16/bf16 NCHW-style tensors; custom epsilon and per-channel scale/bias/mean/variance (`batch_normalization.rs`). |
 | `InstanceNormalization`, `GroupNormalization` | `` | ✅ | **NVRTC block reduction** | Arbitrary-rank contiguous NCHW-style f32/f16/bf16 normalization. Instance normalization reduces per `(N,C)` slice; group normalization supports opset-18 per-group and opset-21 per-channel affine parameters with float stash semantics (`group_normalization.rs`). |
+| `MeanVarianceNormalization` | `` | ✅ | **NVRTC block reduction** | Opset 29 and later; arbitrary reduction axes on contiguous f16/bf16/f32/f64 tensors. Computes centered variance without device intermediates, adds epsilon after the square root, and widens f16/bf16 to f32 for the calculation. |
 | `LpNormalization` | `` | ✅ | **NVRTC block reduction** | Axis-wise p=1/p=2 normalization for f32/f16/bf16, including negative and interior axes with CPU-matched tiny-norm clamping (`global_reduction.rs`). |
 | `ReduceMean` | `` | ✅ | **cuDNN** `cudnnReduceTensor` | See reductions below. |
 
@@ -223,7 +224,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Flatten` | `` | ✅ | **memcpy** (D2D) | Dtype-agnostic D2D copy; the 2-D output shape is metadata-only, so the bytes are copied unchanged (`movement.rs`). |
 | `Concat` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic byte copy, arbitrary/negative axis, multiple inputs. |
 | `Reshape`, `Squeeze`, `Unsqueeze` | `` | ✅ | **memcpy** | Dtype-agnostic D2D copy into the executor's pre-shaped output; modern axes inputs and legacy attributes are accepted. |
-| `Transpose` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic indexed byte copy; explicit permutation or default axis reversal. |
+| `Transpose` | `` | ✅ | **NVRTC-custom** | Indexed byte copy or bit-exact 4-/2-bit packed permutation, including odd element counts. Explicit permutation or default axis reversal. |
 | `Gather` | `` | ✅ | **NVRTC-custom** | Axis-parametric contiguous indexed copy; Int32/Int64 indices, negative index wrap, arbitrary index rank. |
 | `AffineQuantizedGather` | `pkg.nxrt` | ✅ | **NVRTC-custom** | EP fusion for single-use per-tensor FLOAT `DequantizeLinear` on INT8/UINT8 data feeding `Gather`; decodes only selected elements. |
 | `AffineQuantizedGroupedMatMul` | `pkg.nxrt` | ✅ | **NVRTC-custom** | Eager fusion of row-packed unsigned 4-bit affine weights into `GroupedMatMul`; only selected experts are decoded. Routing and intervening MoE operations stay separate. |
@@ -241,7 +242,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Split` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic byte copy; split input, legacy attribute, even split, negative axis, and opset-18 `num_outputs`. |
 | `Tile` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic repeated indexed copy across arbitrary axes. |
 | `Where` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic branch selection with right-aligned broadcasting across condition, x, and y. |
-| `Constant` | `` | ✅ | **host + H2D** | Uploads `value` tensors and numeric `value_*` attribute forms to the device. |
+| `Constant` | `` | ✅ | **host + H2D** | Uploads `value` tensors (including packed storage and FP8: E4M3/E5M2 variants from opset 19, E8M0 from opset 24) and numeric `value_*` attributes to the device. |
 | `BiasGelu` | `com.microsoft` | ✅ | **NVRTC-custom** | Exact (erf) GELU of `X + bias` with the bias broadcast over the last dimension; f32/f16/bf16, GELU evaluated in `double` and the `-inf → 0` guard matched to the CPU EP (`fused_gelu.rs`). |
 | `FastGelu` | `com.microsoft` | ✅ | **NVRTC-custom** | Tanh-approximation GELU of `X` plus an optional last-dim bias (1- or 2-input arity); f32/f16/bf16, matched to the CPU EP. |
 | `QuickGelu` | `com.microsoft` | ✅ | **NVRTC-custom** | `X · sigmoid(alpha · X)` with the `com.microsoft` default `alpha=1.702`; f32/f16/bf16, numerically stable sigmoid matched to the CPU EP. |
@@ -258,7 +259,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Range` | `` | ✅ | **NVRTC-custom** | FP32/FP64, FP16/BF16, and Int16/32/64; opset 27 supports FLOAT and DOUBLE stash precision. CUDA graph capture cannot resolve a scalar-dependent output length. The ORT CUDA plugin declines runtime-valued shape reads rather than claiming them. |
 | `ScatterND` | `` | ✅ | **NVRTC-custom** | f32/f16/bf16/Int64 slice updates with negative index wrapping and ordered assignment/legacy reductions. Opset 29 adds Int32 indices and parallel `mean` including the original data, with exact integer sums and truncation toward zero (`indexing.rs`). |
 | `HannWindow`, `HammingWindow`, `BlackmanWindow` (v17) | `` | ✅ | **NVRTC-custom** | Periodic or symmetric signal windows generated directly on device in f16/bf16/f32/f64, with the scalar size and `output_datatype` contract matched to the CPU EP (`window.rs`). |
-| `DFT` (v17/v20) | `` | ✅ | **cuFFT + NVRTC pack/unpack** | Contiguous data, arbitrary signal axis, and truncating/zero-padding `dft_length`. v17 retains the f32 path and axis attribute; v20 adds inverse real transforms (complex half-spectrum to real output), f64/f16/bf16, Int32 or Int64 length, and optional Int64 axis. f16/bf16 compute in f32. Governed workspace and a bounded 16-entry plan cache back the C2C/Z2Z paths. CUDA-graph capture is unsupported (`dft.rs`, `cufft.rs`). |
+| `DFT` (v17/v20) | `` | ✅ | **cuFFT + NVRTC pack/unpack** | Native v17 supports f32 full transforms and RFFT; select CPU for v17 IRFFT. Native v20 adds IRFFT, f64/f16/bf16, Int32 or Int64 `dft_length`, and an optional Int64 axis. f16/bf16 compute in f32. Arbitrary signal axes and truncation/zero padding use governed workspace with cached C2C/Z2Z plans. CUDA-graph capture is unsupported (`dft.rs`, `cufft.rs`). |
 | `NonMaxSuppression` (v10) | `` | ✅ | **NVRTC bounded sort/suppress + DeviceWorkspace** | Static contiguous f32 boxes `[B,N,4]` and scores `[B,C,N]`, with `N <= 256` and `B*C <= 256`. One block per batch/class filters and bitonic-sorts scores deterministically, then performs bounded sequential suppression; a second metadata launch reduces per-group counts. Only the 8-byte selected count crosses D2H before one device materialization launch writes exact Int64 rows. Optional scalar inputs remain device-resident. |
 | `STFT` (v17) | `` | ✅ | **cuFFT + fused NVRTC frame/window pack + unpack** | Contiguous f32 `[batch, signal, 1|2]`, dynamic Int32/Int64 `frame_step` and optional `frame_length`, optional matching f32 window, complete unpadded frames, full spectrum or real-input onesided output. All frames across the signal batch execute in one PlanMany call through DFT's shared 16-entry plan cache and governed workspace. Runtime scalar reads/plan selection deliberately decline CUDA-graph capture (`stft.rs`, `cufft.rs`). |
 | `CenterCropPad` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic fixed-width centered crop/zero-pad over all or selected axes, including negative axes and CPU-matched odd-difference placement (`index_transform.rs`). |
@@ -379,9 +380,11 @@ CUDA additionally exposes `com.microsoft::Attention`.
 
 The three standard-domain text operators listed above consume managed string
 tensors, which stay on the host. There are no CUDA kernels for these operators.
+`Compress` with `tensor(string)` data also runs on the host, using its rank-one
+BOOL condition; CUDA's `Compress` kernel accepts only fixed-width data.
 Standalone nxrt can still place eligible numeric subgraphs on CUDA when CPU
-fallback is allowed; strict CUDA placement rejects graphs that require these
-text operators.
+fallback is allowed; strict CUDA placement rejects graphs that require managed
+strings.
 
 `com.microsoft::MoE` (the float/unquantized form, with dense f32/f16/bf16 FC
 weight tensors) is present in the CPU EP but is **not a real CUDA gap**: no
@@ -454,11 +457,10 @@ worth stating precisely:
   prevent future re-investigation.
 
 `ai.onnx::DFT` and `ai.onnx::STFT` are implemented for CUDA in `kernels/dft.rs`
-and `kernels/stft.rs`. The DFT path packs arbitrary ONNX signal axes into
-contiguous complex batches, executes cuFFT C2C or Z2Z, and unpacks to the
-requested spectrum or real signal. DFT-20 inverse real uses an even length of
-`2 * (bins - 1)` by default; an explicit positive length also supports odd signals.
-This common
+and `kernels/stft.rs`. DFT packs arbitrary ONNX signal axes into contiguous
+complex batches and executes cuFFT C2C or Z2Z. DFT-20 IRFFT reconstructs the
+Hermitian spectrum before the inverse transform and returns a real signal;
+without an explicit length it uses `2 * (bins - 1)`. This common
 packed-batch/plan-cache seam is reused by STFT, whose fused pack kernel extracts
 complete frames and applies the optional window before one batched cuFFT call.
 
@@ -466,13 +468,17 @@ complete frames and applies the optional window before one batched cuFFT call.
 |---------|------------------------------|-----------|
 | **CUTLASS / cuDNN SDPA** | `FusedAttention` | Flash/SDPA implementation avoids materialising the O(S²) score tensor. |
 
-`Unique` now has an honest bounded NVRTC slice: flattened, contiguous Float32
-inputs with at most 1024 elements (further clamped to the device's
+`Unique` supports flattened, contiguous Float32 inputs since opset 11 and
+BFloat16 inputs since opset 28, with at most 1024 elements (further clamped to the device's
 threads-per-block limit). One device bitonic-sort/grouping phase leaves reusable
-state in governed workspace, copies only the 8-byte count to host for ORT output
-allocation, then launches one device materialization phase. Axis mode, dynamic
-input extents, other dtypes, larger inputs, strided layouts, and CUDA graph
-capture decline at placement with an explicit reason.
+state in governed workspace, copies only the 8-byte count to host for output
+allocation, then gathers `Y` in the input dtype and produces int64 metadata
+on-device. BF16 NaNs compare unequal (as in ONNX's NumPy BF16 reference);
+sorted CUDA output places them after numeric values. The standalone session
+executor still needs concrete output extents for this kernel; dynamic
+`DeviceWorkspace` allocation is available through the ORT plugin adapter.
+Axis mode, dynamic input extents, other dtypes, larger inputs, strided layouts,
+and CUDA graph capture remain outside this slice.
 
 ### Historical coverage-wave snapshots — not current totals
 
@@ -510,6 +516,10 @@ trigonometric/hyperbolic unary family (`Tan`, `Sinh`, `Cosh`, `Asin`, `Acos`,
 the dtypes/attributes it claims (trig ops in f32/f16/bf16; `Trilu` upper/lower
 with positive/negative `k` in f32/Int64), raising CPU standard-domain op-type
 coverage to **88 / 141**.
+The trig parity fixture also covers `Sin` and `Cos`, uses opset 22 for BF16,
+and retains opset 17 for f32/f16. It checks opset-21 BF16 rejection at both CUDA
+claim and direct execution. Float64 is legal in both ONNX revisions but is not
+implemented by these CUDA kernels.
 
 The issue #67 operator-coverage batch 2 adds eleven more advertised op names —
 the extended f32 reductions (`ReduceProd`, `ReduceSumSquare`, `ReduceL1`,
@@ -601,6 +611,14 @@ covers signed and unsigned quantization, saturation and ties-to-even rounding,
 multi-output Dropout, multiple ranks, narrow float storage, signed zero, and
 NaN. This raises `CUDA_COVERED_OPS` from **140** to **144** and CPU
 standard-domain parity from **111 / 141** to **115 / 141**.
+
+CUDA `Dropout` accepts an optional scalar ratio (ignored in inference) and an
+omitted or false `training_mode`. Opset 22 adds BFloat16 ratios and the four ONNX
+FP8 data and ratio types. Explicit `training_mode` requires a scalar device
+read and therefore declines CUDA graph capture; omit it to keep capture
+available. CUDA rejects `training_mode=true`; stochastic training is not
+implemented on either provider. Both providers now reject off-schema integer
+data rather than treating it as inference identity.
 
 The issue #67 operator-coverage batch 10 adds `AffineGrid`,
 `BatchNormalization`, `Compress`, `DynamicQuantizeLinear`,

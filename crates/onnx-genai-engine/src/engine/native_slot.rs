@@ -181,6 +181,26 @@ mod tests {
             },
         )
     }
+    fn speculative_engine() -> anyhow::Result<Engine> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-mtp-full");
+        let metadata = onnx_genai_metadata::load_metadata(&root.join("inference_metadata.yaml"))?;
+        let resolved = crate::config::ResolvedMtpConfig::from_canonical_metadata(
+            &metadata,
+            &root,
+            metadata.model.as_ref().unwrap().vocab_size.unwrap(),
+            3,
+        )?;
+        Engine::from_dir(
+            &root,
+            EngineConfig {
+                native_state_files: crate::NativeStateFilePolicy::WhenSupported,
+                native_device: Some(crate::NativeDecodeDevice::Cpu),
+                speculative_mode: crate::SpeculativeMode::Mtp(resolved.public_config),
+                num_speculative_tokens: 3,
+                ..Default::default()
+            },
+        )
+    }
     fn request() -> GenerateRequest {
         let mut r = GenerateRequest::new(GeneratePrompt::TokenIds(vec![0]));
         r.options.max_new_tokens = 3;
@@ -255,19 +275,64 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn native_slot_retains_successful_speculative_cache_but_not_explicit_cold_cache()
+    fn native_slot_cold_start_skips_reuse_and_successful_speculation_retains_cache()
     -> anyhow::Result<()> {
-        let mut e = engine("tiny-mtp-full")?;
-        e.generate(request())?;
-        assert!(e.native_slot_state().unwrap().materialized_tokens > 0);
+        let mut e = engine("tiny-native-engine")?;
+        let mut cacheable = request();
+        cacheable.prompt = GeneratePrompt::TokenIds(vec![0, 1]);
+        let warm = e.generate(cacheable.clone())?;
+        assert_eq!(warm.prefix_cache_hit_len, 0);
+        assert!(warm.retained_cache_tokens > 0);
+        assert_eq!(
+            warm.retained_cache_tokens,
+            e.native_slot_state().unwrap().materialized_tokens
+        );
         let mut file = Vec::new();
-        e.write_native_slot_state(&mut file, Default::default())?;
-        let mut r = request();
-        r.options.cold_start = true;
-        e.generate(r)?;
+        let saved = e.write_native_slot_state(&mut file, Default::default())?;
+        let reused = e.generate(cacheable.clone())?;
+        assert!(reused.prefix_cache_hit_len > 0);
+        assert_eq!(reused.token_ids, warm.token_ids);
+        cacheable.options.cold_start = true;
+        let cold = e.generate(cacheable.clone())?;
+        assert_eq!(cold.prefix_cache_hit_len, 0);
+        assert_eq!(cold.token_ids, warm.token_ids);
+        assert!(cold.retained_cache_tokens > 0);
+        assert_eq!(
+            cold.retained_cache_tokens,
+            e.native_slot_state().unwrap().materialized_tokens
+        );
+        assert_eq!(e.erase_native_slot_state()?, cold.retained_cache_tokens);
         assert_eq!(e.native_slot_state().unwrap().materialized_tokens, 0);
         e.restore_native_slot_state(&mut file.as_slice(), Default::default())?;
-        assert!(e.native_slot_state().unwrap().materialized_tokens > 0);
+        assert_eq!(
+            e.native_slot_state().unwrap().materialized_tokens,
+            saved.materialized_tokens
+        );
+        cacheable.options.cold_start = false;
+        let restored = e.generate(cacheable)?;
+        assert!(restored.prefix_cache_hit_len > 0);
+        assert_eq!(restored.token_ids, warm.token_ids);
+
+        let mut speculative = speculative_engine()?;
+        let mut speculative_request = request();
+        speculative_request.prompt = GeneratePrompt::TokenIds(vec![0, 1]);
+        let first = speculative.generate(speculative_request.clone())?;
+        assert_eq!(first.prefix_cache_hit_len, 0);
+        assert!(first.retained_cache_tokens > 0);
+        let first_stats = speculative.last_speculative_stats();
+        assert!(first_stats.proposed_tokens > 0);
+        assert!(first_stats.verification_steps > 0);
+        let second = speculative.generate(speculative_request)?;
+        assert_eq!(second.prefix_cache_hit_len, 0);
+        assert_eq!(second.token_ids, first.token_ids);
+        assert!(second.retained_cache_tokens > 0);
+        let second_stats = speculative.last_speculative_stats();
+        assert!(second_stats.proposed_tokens > 0);
+        assert!(second_stats.verification_steps > 0);
+        assert_eq!(
+            second.retained_cache_tokens,
+            speculative.native_slot_state().unwrap().materialized_tokens
+        );
         Ok(())
     }
 }

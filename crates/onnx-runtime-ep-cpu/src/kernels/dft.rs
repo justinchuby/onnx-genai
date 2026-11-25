@@ -10,11 +10,13 @@ use std::f32::consts::PI;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::dft::{self as dft_rules, Spectrum};
-use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_ir::{
+    DataType, Node,
+    dft::{self, DftMode},
+};
 use rustfft::{FftPlanner, num_complex::Complex};
 
-use super::{check_arity, to_dense_bytes, write_dense_bytes};
+use super::check_arity;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::numel;
 
@@ -87,22 +89,43 @@ fn record_fast_path_hit() {
 pub struct DftFactory;
 
 impl KernelFactory for DftFactory {
-    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let inverse = node.attr("inverse").and_then(|a| a.as_int()).unwrap_or(0) != 0;
-        let onesided = node.attr("onesided").and_then(|a| a.as_int()).unwrap_or(0) != 0;
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        _opset: u64,
+        shapes: &[onnx_runtime_ir::Shape],
+        _dtypes: &[onnx_runtime_ir::DataType],
+    ) -> Option<String> {
+        let mode = match DftMode::parse(node) {
+            Ok(mode) => mode,
+            Err(reason) => return Some(reason),
+        };
+        shapes
+            .first()
+            .and_then(|shape| shape.last())
+            .and_then(|dim| dim.as_static())
+            .and_then(|components| mode.validate_components(components).err())
+    }
+
+    fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let mode = DftMode::parse(node).map_err(EpError::KernelFailed)?;
+        if let Some(&components) = input_shapes.first().and_then(|shape| shape.last()) {
+            mode.validate_components(components)
+                .map_err(EpError::KernelFailed)?;
+        }
+        // Opset < 20: axis is an attribute (default 1).
+        // Opset >= 20: axis is an input, handled at execute time.
         let opset = node.local_opset().unwrap_or(17);
         Ok(Box::new(DftKernel {
-            inverse,
-            spectrum: Spectrum::from_flags(opset, inverse, onesided),
+            mode,
             opset,
-            default_axis: dft_rules::default_axis(node, opset),
+            default_axis: dft::default_axis(node, opset),
         }))
     }
 }
 
 struct DftKernel {
-    inverse: bool,
-    spectrum: Spectrum,
+    mode: DftMode,
     opset: u64,
     default_axis: i64,
 }
@@ -124,59 +147,74 @@ impl Kernel for DftKernel {
         }
 
         // Determine the signal axis.
-        let axis_raw = scalar(inputs, 2, "axis", |dtype| dtype == DataType::Int64)?
-            .unwrap_or(self.default_axis);
-        let axis = dft_rules::normalize_axis(axis_raw, rank).map_err(dft_error)?;
+        let axis_raw = if inputs.len() >= 3 && !inputs[2].is_absent() {
+            // Opset 20: axis as input
+            scalar_int(&inputs[2], "axis", |dtype| dtype == DataType::Int64)?
+        } else {
+            self.default_axis
+        };
+
+        let axis = dft::normalize_axis(axis_raw, rank).map_err(EpError::KernelFailed)?;
         let last = rank - 1;
-        self.spectrum
-            .validate_components(input.shape[last])
-            .map_err(dft_error)?;
-        let explicit = scalar(inputs, 1, "dft_length", dft_rules::is_length_dtype)?
-            .map(dft_rules::explicit_length)
-            .transpose()
-            .map_err(dft_error)?;
-        let dft_length = self
-            .spectrum
-            .transform_length(explicit, input.shape[axis])
-            .map_err(dft_error)?;
-        let mut expected = input.shape.to_vec();
-        expected[axis] = self.spectrum.output_extent(dft_length);
-        expected[last] = self.spectrum.output_components();
+
+        // The last dimension is the complex component dimension (1 for real, 2 for complex).
+        let complex_dim = input.shape[last];
+        self.mode
+            .validate_components(complex_dim)
+            .map_err(EpError::KernelFailed)?;
+
+        // Determine DFT length.
+        let signal_len = input.shape[axis];
+        let dft_length = if inputs.len() >= 2 && !inputs[1].is_absent() {
+            let length = scalar_int(&inputs[1], "dft_length", dft::is_length_dtype)?;
+            dft::explicit_length(length).map_err(EpError::KernelFailed)?
+        } else {
+            self.mode
+                .default_length(signal_len)
+                .map_err(EpError::KernelFailed)?
+        };
+
+        // Validate output shape.
+        let out_signal_len = self.mode.output_length(dft_length);
+        let out_components = self.mode.output_components();
         let output = &mut outputs[0];
-        if output.shape != expected || output.dtype != input.dtype {
-            return Err(dft_error(format!(
-                "expected output {:?} {expected:?}, got {:?} {:?}",
-                input.dtype, output.dtype, output.shape
+        let mut expected_shape = input.shape.to_vec();
+        expected_shape[axis] = out_signal_len;
+        expected_shape[last] = out_components;
+        if output.shape != expected_shape || output.dtype != input.dtype {
+            return Err(EpError::KernelFailed(format!(
+                "DFT: mode {:?} output shape mismatch or dtype mismatch: expected {:?} {expected_shape:?}, got {:?} {:?}",
+                self.mode, input.dtype, output.dtype, output.shape
             )));
         }
 
         let geometry = DftGeometry {
-            input_shape: input.shape,
-            output_shape: output.shape,
+            mode: self.mode,
+            input: input.shape,
+            output: output.shape,
             axis,
-            dft_length,
-            spectrum: self.spectrum,
+            length: dft_length,
         };
-        if input.dtype == DataType::Float64 && self.opset >= 20 {
-            let bytes = to_dense_bytes(input)?;
+        if self.opset >= 20 && input.dtype == DataType::Float64 {
+            let bytes = super::to_dense_bytes(input)?;
             let data: Vec<f64> = bytes
                 .chunks_exact(8)
-                .map(|chunk| f64::from_ne_bytes(chunk.try_into().expect("8-byte chunk")))
+                .map(|b| f64::from_ne_bytes(b.try_into().expect("8-byte chunk")))
                 .collect();
             let mut planner = FftPlanner::<f64>::new();
-            let plan = if self.inverse {
+            let plan = if self.mode.inverse() {
                 planner.plan_fft_inverse(dft_length)
             } else {
                 planner.plan_fft_forward(dft_length)
             };
             let mut scratch = vec![Complex::default(); plan.get_inplace_scratch_len()];
             let mut work = vec![Complex::default(); dft_length];
-            let scale = if self.inverse {
+            let scale = if self.mode.inverse() {
                 1.0 / dft_length as f64
             } else {
                 1.0
             };
-            let data = geometry.transform(&data, |real, imag, real_out, imag_out| {
+            let result = geometry.transform(&data, |real, imag, real_out, imag_out| {
                 for (i, value) in work.iter_mut().enumerate() {
                     *value = Complex::new(real[i], imag[i]);
                 }
@@ -186,122 +224,116 @@ impl Kernel for DftKernel {
                     imag_out[i] = value.im * scale;
                 }
             });
-            let bytes: Vec<u8> = data.into_iter().flat_map(f64::to_ne_bytes).collect();
-            write_dense_bytes(output, &bytes)
+            let bytes: Vec<u8> = result.into_iter().flat_map(f64::to_ne_bytes).collect();
+            super::write_dense_bytes(output, &bytes)
         } else {
             let data = to_dense_f32_widen("DFT", input)?;
-            let plan = DftPlan::new(dft_length, self.inverse);
-            let data = geometry.transform(&data, |r, i, ro, io| plan.transform(r, i, ro, io));
-            write_dense_f32_narrow("DFT", output, &data)
+            let plan = DftPlan::new(dft_length, self.mode.inverse());
+            let result = geometry.transform(&data, |r, i, ro, io| plan.transform(r, i, ro, io));
+            write_dense_f32_narrow("DFT", output, &result)
         }
     }
 }
 
-fn dft_error(reason: String) -> EpError {
-    EpError::KernelFailed(format!("DFT: {reason}"))
-}
-
-fn scalar(
-    inputs: &[TensorView],
-    index: usize,
-    name: &str,
-    valid_type: impl Fn(DataType) -> bool,
-) -> Result<Option<i64>> {
-    let Some(input) = inputs.get(index).filter(|input| !input.is_absent()) else {
-        return Ok(None);
-    };
-    if !input.shape.is_empty() || !valid_type(input.dtype) {
-        return Err(dft_error(format!(
-            "{name} must be a scalar of type {}, got {:?} {:?}",
-            if index == 1 {
-                "Int32 or Int64"
-            } else {
-                "Int64"
-            },
-            input.dtype,
-            input.shape
+fn scalar_int(input: &TensorView, name: &str, accepts: impl Fn(DataType) -> bool) -> Result<i64> {
+    if !input.shape.is_empty() || !accepts(input.dtype) {
+        let expected = if name == "axis" {
+            "Int64"
+        } else {
+            "Int32 or Int64"
+        };
+        return Err(EpError::KernelFailed(format!(
+            "DFT: {name} must be a rank-zero {expected} scalar, got {:?} {:?}",
+            input.dtype, input.shape
         )));
     }
-    Ok(Some(super::to_dense_i64(input)?[0]))
+    Ok(super::to_dense_i64(input)?[0])
 }
 
 struct DftGeometry<'a> {
-    input_shape: &'a [usize],
-    output_shape: &'a [usize],
+    mode: DftMode,
+    input: &'a [usize],
+    output: &'a [usize],
     axis: usize,
-    dft_length: usize,
-    spectrum: Spectrum,
+    length: usize,
 }
 
 impl DftGeometry<'_> {
     fn transform<T: Copy + Default + std::ops::Neg<Output = T>>(
         &self,
         input: &[T],
-        mut transform: impl FnMut(&[T], &[T], &mut [T], &mut [T]),
+        mut fft: impl FnMut(&[T], &[T], &mut [T], &mut [T]),
     ) -> Vec<T> {
         let axis = self.axis;
-        let last = self.input_shape.len() - 1;
-        let n = self.dft_length;
-        let bins = self.spectrum.input_extent(n);
-        let keep = bins.min(self.input_shape[axis]);
-        let real_output = self.spectrum == Spectrum::OneSidedInput;
-        let batch_shape: Vec<_> = self.input_shape[..last]
+        let last = self.input.len() - 1;
+        let n = self.length;
+        let bins = self.mode.input_length(n);
+        let copied = self.input[axis].min(bins);
+        let batch_shape: Vec<_> = self.input[..last]
             .iter()
             .enumerate()
             .filter_map(|(i, &d)| (i != axis).then_some(d))
             .collect();
         let batch_count: usize = batch_shape.iter().product();
-        let input_strides = row_major_strides(self.input_shape);
-        let output_strides = row_major_strides(self.output_shape);
-        let mut output = vec![T::default(); numel(self.output_shape)];
+        let input_strides = row_major_strides(self.input);
+        let output_strides = row_major_strides(self.output);
+        let mut output_data = vec![T::default(); numel(self.output)];
         if batch_count == 0 {
-            return output;
+            return output_data;
         }
-        let mut real = vec![T::default(); n];
-        let mut imag = vec![T::default(); n];
+        let mut real_in = vec![T::default(); n];
+        let mut imag_in = vec![T::default(); n];
         let mut real_out = vec![T::default(); n];
         let mut imag_out = vec![T::default(); n];
         let mut batch_indices = vec![0usize; batch_shape.len()];
         for _ in 0..batch_count {
+            // Map batch indices to input/output coordinates.
             let (in_base, out_base) = compute_bases(
                 &batch_indices,
-                self.input_shape,
-                self.output_shape,
+                self.input,
+                self.output,
                 axis,
                 last,
                 &input_strides,
                 &output_strides,
             );
 
-            for i in 0..keep {
+            for i in 0..copied {
                 let idx = in_base + i * input_strides[axis];
-                real[i] = input[idx];
-                if self.input_shape[last] == 2 {
-                    imag[i] = input[idx + 1];
+                real_in[i] = input[idx];
+                if self.input[last] == 2 {
+                    imag_in[i] = input[idx + 1];
                 }
             }
-            if real_output {
-                // DC and the even-length Nyquist bin are their own conjugates.
-                imag[0] = T::default();
-                if n % 2 == 0 {
-                    imag[n / 2] = T::default();
+
+            if self.mode == DftMode::RealInverse {
+                // DC and an even-length Nyquist bin are real. Fill missing
+                // negative frequencies by conjugation after padding/truncation.
+                imag_in[0] = T::default();
+                if n.is_multiple_of(2) {
+                    imag_in[n / 2] = T::default();
                 }
                 for i in bins..n {
-                    real[i] = real[n - i];
-                    imag[i] = -imag[n - i];
+                    real_in[i] = real_in[n - i];
+                    imag_in[i] = -imag_in[n - i];
                 }
             }
-            transform(&real, &imag, &mut real_out, &mut imag_out);
-            for i in 0..self.output_shape[axis] {
+            fft(&real_in, &imag_in, &mut real_out, &mut imag_out);
+
+            // Write to output.
+            for i in 0..self.output[axis] {
                 let idx = out_base + i * output_strides[axis];
-                output[idx] = real_out[i];
-                if !real_output {
-                    output[idx + 1] = imag_out[i];
+                output_data[idx] = real_out[i];
+                if self.output[last] == 2 {
+                    output_data[idx + 1] = imag_out[i];
                 }
             }
+
+            // Advance batch indices.
             advance_indices(&mut batch_indices, &batch_shape);
         }
-        output
+
+        output_data
     }
 }
 
@@ -668,6 +700,159 @@ mod tests {
             .unwrap();
     }
 
+    fn irfft_node(version: i64) -> Node {
+        let mut n = make_dft_node(-2, 1);
+        n.version = Some(version);
+        n.attributes.insert("inverse".into(), Attribute::Int(1));
+        n
+    }
+
+    #[test]
+    fn real_inverse_defaults_to_full_real_signal_and_ignores_endpoint_imaginary_parts() {
+        for version in [17, 20] {
+            let input = Owned::f32(&[1, 3, 2], &[10., 99., -2., 2., -2., -77.]);
+            let mut output = Owned::zeros_f32(&[1, 4, 1]);
+            DftFactory
+                .create(&irfft_node(version), &[vec![1, 3, 2]])
+                .unwrap()
+                .execute(&[input.view()], &mut [output.view_mut()])
+                .unwrap();
+            for (actual, expected) in output.to_f32().iter().zip([1., 2., 3., 4.]) {
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "{version}: {actual} versus {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn real_inverse_even_odd_padded_and_truncated_spectra_match_independent_f64_sums() {
+        for n in [1usize, 2, 3, 4, 5, 6, 9, 10] {
+            for bins in [0usize, 1, 3, 7] {
+                let values = (0..2)
+                    .flat_map(|batch| {
+                        (0..bins).flat_map(move |k| {
+                            [
+                                (batch + 1) as f32 * 0.375 + k as f32 * 0.25,
+                                0.125 - k as f32 * 0.125,
+                            ]
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let input = Owned::f32(&[2, bins, 2], &values);
+                let length = Owned::i64(&[], &[n as i64]);
+                let mut output = Owned::zeros_f32(&[2, n, 1]);
+                DftFactory
+                    .create(&irfft_node(20), &[vec![2, bins, 2]])
+                    .unwrap()
+                    .execute(&[input.view(), length.view()], &mut [output.view_mut()])
+                    .unwrap();
+                let actual = output.to_f32();
+                for batch in 0..2 {
+                    for t in 0..n {
+                        let mut expected = 0f64;
+                        for k in 0..bins.min(n / 2 + 1) {
+                            let re = values[(batch * bins + k) * 2] as f64;
+                            let im = values[(batch * bins + k) * 2 + 1] as f64;
+                            let angle = 2. * std::f64::consts::PI * (k * t) as f64 / n as f64;
+                            expected += if k == 0 || (n.is_multiple_of(2) && k == n / 2) {
+                                re * angle.cos()
+                            } else {
+                                2. * (re * angle.cos() - im * angle.sin())
+                            };
+                        }
+                        expected /= n as f64;
+                        assert!(
+                            (actual[batch * n + t] as f64 - expected).abs() < 1e-4,
+                            "n={n}, bins={bins}, batch={batch}, t={t}: {} versus {expected}",
+                            actual[batch * n + t]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn real_inverse_rejects_real_spectrum_and_wrong_output_geometry_before_writing() {
+        let n = irfft_node(20);
+        let shapes = [onnx_runtime_ir::static_shape([1, 3, 1])];
+        assert!(
+            DftFactory
+                .unsupported_reason(&n, 20, &shapes, &[])
+                .unwrap()
+                .contains("RealInverse")
+        );
+        assert!(DftFactory.create(&n, &[vec![1, 3, 1]]).is_err());
+        let input = Owned::f32(&[1, 3, 2], &[1.; 6]);
+        let kernel = DftFactory.create(&n, &[]).unwrap();
+        for shape in [vec![1], vec![2, 4, 1], vec![1, 3, 2]] {
+            let count = shape.iter().product();
+            let mut output = Owned::f32(&shape, &vec![123.; count]);
+            let error = kernel
+                .execute(&[input.view()], &mut [output.view_mut()])
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("output shape mismatch"),
+                "{error}"
+            );
+            assert!(output.to_f32().iter().all(|&v| v == 123.));
+        }
+
+        #[test]
+        fn dft_v20_real_inverse_preserves_float64_precision() {
+            let delta = 2f64.powi(-40);
+            let spectrum = Owned::f64(&[2, 2], &[1.0 + delta, 9.0, 1.0, 11.0]);
+            let mut output = Owned::f64(&[2, 1], &[0.; 2]);
+            DftFactory
+                .create(&irfft_node(20), &[])
+                .unwrap()
+                .execute(&[spectrum.view()], &mut [output.view_mut()])
+                .unwrap();
+            // NumPy irfft ignores the imaginary components of DC and even Nyquist.
+            assert_eq!(
+                output.bytes,
+                Owned::f64(&[2, 1], &[1.0 + delta / 2.0, delta / 2.0]).bytes
+            );
+        }
+
+        #[test]
+        fn dft_v20_real_inverse_accepts_rank_zero_int32_length_on_nondefault_axis() {
+            let spectrum = Owned::f32(&[2, 2, 2], &[1., 9., 2., -8., 3., 4., -2., 1.]);
+            let length = Owned::i32(&[], &[5]);
+            let axis = Owned::i64(&[], &[-3]);
+            let mut output = Owned::zeros_f32(&[5, 2, 1]);
+            DftFactory
+                .create(&irfft_node(20), &[])
+                .unwrap()
+                .execute(
+                    &[spectrum.view(), length.view(), axis.view()],
+                    &mut [output.view_mut()],
+                )
+                .unwrap();
+            // NumPy irfft([[1+9j, 2-8j], [3+4j, -2+1j]], n=5, axis=0).
+            let expected = [
+                1.4,
+                -0.4,
+                -0.95087004,
+                -0.2276362,
+                -1.7112768,
+                0.8120995,
+                0.16963601,
+                1.2823277,
+                2.0925107,
+                0.533209,
+            ];
+            for (i, (actual, expected)) in output.to_f32().into_iter().zip(expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() < 2e-6,
+                    "index {i}: expected {expected}, got {actual}"
+                );
+            }
+        }
+    }
+
     /// Verify the radix-2 FFT matches the naive DFT within tolerance.
     #[test]
     fn fft_matches_naive_forward() {
@@ -814,9 +999,10 @@ mod tests {
         let input = Owned::f32(&[1, 4, 2], &[0.0; 8]);
         let mut output = Owned::zeros_f32(&[1, 3, 2]);
         let node = make_dft_node(-2, 1);
+        assert!(DftFactory.create(&node, &[vec![1, 4, 2]]).is_err());
         let kernel = DftFactory
-            .create(&node, &[vec![1, 4, 2]])
-            .expect("factory create");
+            .create(&node, &[])
+            .expect("unresolved shape defers validation");
         let error = kernel
             .execute(&[input.view()], &mut [output.view_mut()])
             .expect_err("onesided complex DFT must be rejected");
@@ -930,79 +1116,5 @@ mod tests {
              -- a per-thread counter that sees another thread's work turns every exact \
              dispatch equality in this crate back into a lower bound, silently"
         );
-    }
-    fn irfft20() -> Box<dyn Kernel> {
-        let mut node = versioned_dft_node(20, None);
-        node.attributes.insert("inverse".into(), Attribute::Int(1));
-        DftFactory.create(&node, &[]).unwrap()
-    }
-
-    #[test]
-    fn dft_v20_irfft_odd_int32_pads_missing_bins_on_a_non_last_axis() {
-        let signal = Owned::f32(&[2, 2, 2], &[1., 9., 2., -8., 3., 4., -2., 1.]);
-        let length = Owned::i32(&[], &[5]);
-        let axis = Owned::i64(&[], &[-3]);
-        let mut output = Owned::zeros_f32(&[5, 2, 1]);
-        irfft20()
-            .execute(
-                &[signal.view(), length.view(), axis.view()],
-                &mut [output.view_mut()],
-            )
-            .unwrap();
-        // np.fft.irfft([[1+9j, 2-8j], [3+4j, -2+1j]], n=5, axis=0)
-        let expected = [
-            1.4,
-            -0.4,
-            -0.95087004,
-            -0.2276362,
-            -1.7112768,
-            0.8120995,
-            0.16963601,
-            1.2823277,
-            2.0925107,
-            0.533209,
-        ];
-        let output_view = output.view();
-        let actual = to_dense_f32_widen("DFT test", &output_view).unwrap();
-        for (i, (&a, e)) in actual.iter().zip(expected).enumerate() {
-            assert!((a - e).abs() < 2e-6, "index {i}: expected {e}, got {a}");
-        }
-    }
-
-    #[test]
-    fn dft_v20_irfft_default_length_preserves_float64_precision() {
-        let delta = 2f64.powi(-40);
-        let signal = Owned::f64(&[2, 2], &[1.0 + delta, 9.0, 1.0, 11.0]);
-        let mut output = Owned::f64(&[2, 1], &[0.; 2]);
-        irfft20()
-            .execute(&[signal.view()], &mut [output.view_mut()])
-            .unwrap();
-        // np.fft.irfft([1+2**-40+9j, 1+11j]); both imaginary parts are ignored.
-        assert_eq!(
-            output.bytes,
-            Owned::f64(&[2, 1], &[1.0 + delta / 2.0, delta / 2.0]).bytes
-        );
-    }
-
-    #[test]
-    fn dft_v20_irfft_accepts_lower_precision_and_int64_length() {
-        let f16 = Owned::f16(&[3, 2], &[1., 9., 3., 4., 5., -6.]);
-        let bf16 = Owned::bf16(&[3, 2], &[1., 9., 3., 4., 5., -6.]);
-        let length = Owned::i64(&[], &[4]);
-        for (signal, mut output) in [
-            (f16, Owned::f16(&[4, 1], &[0.; 4])),
-            (bf16, Owned::bf16(&[4, 1], &[0.; 4])),
-        ] {
-            irfft20()
-                .execute(&[signal.view(), length.view()], &mut [output.view_mut()])
-                .unwrap();
-            // np.fft.irfft([1+9j, 3+4j, 5-6j])
-            assert_eq!(
-                to_dense_f32_widen("DFT test", &output.view())
-                    .unwrap()
-                    .as_ref(),
-                &[3., -3., 0., 1.]
-            );
-        }
     }
 }
