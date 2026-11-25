@@ -1912,14 +1912,7 @@ fn write_grouped_contributions(
                 fc3_bias.map(|bias| &bias[fc3_bias_range]),
                 attributes,
                 |projection, input, rows, bias, output| {
-                    projection.apply_prepared(
-                        input,
-                        rows,
-                        bias,
-                        output,
-                        plan,
-                        decoder.initialized(),
-                    )
+                    projection.apply_prepared(input, rows, bias, output, plan, decoder)
                 },
             )?
         }
@@ -2238,7 +2231,7 @@ impl QuantizedExpertProjection<'_, '_> {
         bias: Option<&[f32]>,
         output: &mut [f32],
         plan: DecodedProjectionPlan,
-        scratch: &mut [f32],
+        scratch: &mut ProjectionScratch<'_>,
     ) -> Result<()> {
         (|| {
             let (columns, decoded) =
@@ -3029,7 +3022,9 @@ mod tests {
                                                 Some(&bias),
                                                 &mut actual[..rows * n],
                                                 plan,
-                                                &mut scratch[..count],
+                                                &mut ProjectionScratch::test_binding(
+                                                    &mut scratch[..count],
+                                                ),
                                             )
                                         })
                                         .unwrap();
@@ -3054,7 +3049,9 @@ mod tests {
                                                 Some(&bias),
                                                 &mut actual[..rows * n],
                                                 plan,
-                                                &mut scratch[..count - 1]
+                                                &mut ProjectionScratch::test_binding(
+                                                    &mut scratch[..count - 1]
+                                                )
                                             )
                                             .is_err()
                                     );
@@ -3081,7 +3078,9 @@ mod tests {
         const H: usize = 16;
         const I: usize = 32;
         const E: usize = 4;
-        for (construction, execution) in [(1, 4), (4, 1)] {
+        for (construction, execution, sparse) in
+            [(1, 4, false), (4, 1, false), (1, 4, true), (4, 1, true)]
+        {
             let constructor = rayon::ThreadPoolBuilder::new()
                 .num_threads(construction)
                 .build()
@@ -3124,7 +3123,14 @@ mod tests {
                 .install(|| QMoEKernel::new(graph.node(node), cache))
                 .unwrap();
             let x = Owned::f32(&[R, H], &[1.; R * H]);
-            let router = Owned::f32(&[R, E], &[0.; R * E]);
+            let router = Owned::f32(
+                &[R, E],
+                if sparse {
+                    &[4., 4., 0., 0., 0., 0., 4., 4., 4., 0., 0., 4.]
+                } else {
+                    &[0.; R * E]
+                },
+            );
             let w1 = Owned::u8(&[E, I, H / 2], &[0x99; E * I * H / 2]);
             let sc1 = Owned::f32(&[E, I, H / 16], &[1.; E * I * H / 16]);
             let w2 = Owned::u8(&[E, H, I / 2], &[0x99; E * H * I / 2]);
@@ -3276,6 +3282,24 @@ mod tests {
                     assert!(
                         output.to_f32().iter().all(|x| *x == (H * I) as f32),
                         "warm={warm}"
+                    );
+                    let group_rows = if sparse { 2 } else { R };
+                    let used_decoder = (group_rows * I + active_width * H)
+                        .max(group_rows * H + active_width * I)
+                        * 4;
+                    if sparse {
+                        assert!(banks + used_decoder < active_bytes);
+                    }
+                    // SAFETY: the live exclusive CPU allocation was poisoned above.
+                    let unused = unsafe {
+                        std::slice::from_raw_parts(
+                            backing.as_ptr().cast::<u8>().add(banks + used_decoder),
+                            bytes - banks - used_decoder,
+                        )
+                    };
+                    assert!(
+                        unused.iter().all(|&b| b == 0xff),
+                        "only actual grouped projections may initialize decoder prefixes"
                     );
                     let before_return = (books.claims(), books.releases());
                     cpu.deallocate_workspace(backing).unwrap();
