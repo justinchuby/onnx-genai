@@ -1,5 +1,5 @@
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Attribute, DataType, Node};
+use onnx_runtime_ir::{Attribute, DataType, Node, Shape};
 use onnx_runtime_optimizer::affine_moe::{OP, THRESHOLD};
 
 use super::grouped_matmul::AffineBank;
@@ -24,10 +24,16 @@ impl KernelFactory for Factory {
     fn create(&self, n: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         AffineMoe::parse(n).map(|config| Box::new(config) as Box<dyn Kernel>)
     }
-}
 
-pub(crate) fn unsupported_reason(node: &Node) -> Option<String> {
-    AffineMoe::parse(node).err().map(|error| error.to_string())
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        _opset: u64,
+        _input_shapes: &[Shape],
+        _input_dtypes: &[DataType],
+    ) -> Option<String> {
+        AffineMoe::parse(node).err().map(|error| error.to_string())
+    }
 }
 
 impl AffineMoe {

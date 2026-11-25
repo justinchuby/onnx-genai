@@ -2511,3 +2511,29 @@ order before settling to zero. Existing concurrent, borrowed/foreign return and
 incomplete-release guards remain. This changes neither allocation granularity,
 EP APIs nor quota operations. It removes repeated queue bookkeeping on pressure;
 no inference latency, RSS or universally zero pool-overhead claim is made.
+
+
+### Structural claim checks travel with their registered factory
+
+`KernelFactory::unsupported_reason` is a pure metadata capability query on the
+same versioned factory the CPU provider will use for construction. The seven
+migrated Attention/MoE parser gates now live with that factory rather than in a
+second operator-name synchronization table. The selected factory receives the effective opset, original
+node, shapes and dtypes. The query does not call factory `create`, prepare device
+storage, initialize a thread pool or obtain an allocation grant. Existing parsers
+may produce small typed attribute values; those are metadata, not execution
+preparation. Execution and its coarse workspace/weight ownership paths do not
+call the gate.
+
+Native and linked-reference Conv share one rank rule for claim and concrete
+construction. Claim treats empty shapes conservatively as unknown rank, matching
+the current IR's scalar/unknown ambiguity; nonempty symbolic shapes retain known
+rank. Concrete construction still rejects scalar or unsupported/mismatched ranks.
+This is a shared structural capability boundary, not a performance-based decline
+or a new dynamic-rank execution guarantee.
+
+Regression tests query different registered factory revisions, verify metadata
+forwarding and zero kernel construction, preserve existing parser declines, and
+cover Conv known/unknown rank behavior. The real ORT plugin regression retains
+three unsupported MoE/attention assignments on ORT's fallback provider while their
+sessions load successfully. No additional per-op quota or scheduler is introduced.
