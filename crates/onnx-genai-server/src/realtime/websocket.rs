@@ -1137,7 +1137,14 @@ mod tests {
     async fn server_for_package(
         root: &std::path::Path,
     ) -> (AppState, std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-        let state = AppState::load(root, Some("native-realtime".into())).unwrap();
+        server_for_package_with_config(root, crate::ServerConfig::default()).await
+    }
+    async fn server_for_package_with_config(
+        root: &std::path::Path,
+        config: crate::ServerConfig,
+    ) -> (AppState, std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let state =
+            AppState::load_with_config(root, Some("native-realtime".into()), config).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let router = crate::app(state.clone());
@@ -1155,6 +1162,105 @@ mod tests {
         .await
         .unwrap()
         .0
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_rejected_frames_and_pcm_pressure_preserve_native_transcription() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/realtime");
+        let mut config = crate::ServerConfig::default();
+        config.realtime.source_bytes = NonZeroUsize::new(640).unwrap();
+        let (state, address, task) = server_for_package_with_config(&root, config).await;
+        let mut client = connect(address).await;
+        assert_eq!(event(&mut client).await["type"], "session.created");
+        let rejected = [
+            (Message::Text("{".into()), "valid JSON"),
+            (Message::Binary(vec![0, 1].into()), "JSON text frames"),
+            (Message::Text("null".into()), "type must be a string"),
+            (
+                Message::Text(json!({"type":"unknown"}).to_string().into()),
+                "unknown realtime event",
+            ),
+            (
+                Message::Text(
+                    json!({"type":"input_audio_buffer.append","audio":"!!!"})
+                        .to_string()
+                        .into(),
+                ),
+                "valid base64",
+            ),
+            (
+                Message::Text(
+                    json!({"type":"input_audio_buffer.append","audio":STANDARD.encode([0])})
+                        .to_string()
+                        .into(),
+                ),
+                "even byte count",
+            ),
+            (
+                Message::Text(
+                    json!({"type":"input_audio_buffer.append","audio":STANDARD.encode([0;642])})
+                        .to_string()
+                        .into(),
+                ),
+                "640-byte PCM queue budget",
+            ),
+        ];
+        let mut ids = BTreeSet::new();
+        for (frame, diagnostic) in rejected {
+            client.send(frame).await.unwrap();
+            let failure = event(&mut client).await;
+            assert_eq!(failure["type"], "error", "{failure}");
+            assert_eq!(failure["error"]["type"], "invalid_request_error");
+            assert!(
+                failure["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(diagnostic),
+                "{failure}"
+            );
+            assert!(ids.insert(failure["event_id"].as_str().unwrap().to_owned()));
+        }
+        // Rejected audio must neither freeze session conditioning nor consume
+        // input quota/state. A full-budget valid frame still starts an ASR turn.
+        send(
+            &mut client,
+            json!({"type":"session.update","session":{"type":"transcription"}}),
+        )
+        .await;
+        assert_eq!(event(&mut client).await["type"], "session.updated");
+        send(
+            &mut client,
+            json!({"type":"input_audio_buffer.append","audio":STANDARD.encode([0;640])}),
+        )
+        .await;
+        send(&mut client, json!({"type":"input_audio_buffer.commit"})).await;
+        let committed = event(&mut client).await;
+        assert_eq!(committed["type"], "input_audio_buffer.committed");
+        let item = committed["item_id"].clone();
+        let mut transcript = String::new();
+        loop {
+            let output = event(&mut client).await;
+            assert_ne!(output["type"], "error", "{output}");
+            if output["type"] == "conversation.item.input_audio_transcription.delta" {
+                assert_eq!(output["item_id"], item);
+                transcript.push_str(output["delta"].as_str().unwrap());
+            }
+            if output["type"] == "conversation.item.input_audio_transcription.completed" {
+                assert_eq!(output["item_id"], item);
+                assert_eq!(output["transcript"], "hello world");
+                break;
+            }
+        }
+        assert_eq!(transcript, "hello world");
+        client.close(None).await.unwrap();
+        drop(client);
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
     }
     fn tool_package(envelope: &str) -> tempfile::TempDir {
         tool_package_from("realtime", envelope)

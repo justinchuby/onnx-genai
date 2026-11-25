@@ -454,7 +454,7 @@ This is a functional Llama Chat integration, not a claim of complete llama-serve
 parity. These upstream capabilities remain incomplete:
 
 - Realtime grammar forcing beyond declared turn-based tagged-json mask workflows,
-  full tool argument schema validation and
+  partial function-call fragment projection, broader pressure/overlap acceptance and
   device-backed wire acceptance; see [realtime](REALTIME.md) for the implemented
   WebSocket session modes, resource bounds and Native CPU evidence.
 - Multimodal/joint decision heads and shared generation/decision entry points.
