@@ -742,6 +742,11 @@ pub mod conv;
 #[cfg(all(feature = "ops-cnn", not(feature = "mlas")))]
 #[path = "conv_ref.rs"]
 pub mod conv;
+// Research-only independent native Conv. The registry keeps its existing
+// feature-selected factory; backend_ab exposes the explicit comparison pair.
+#[cfg(all(feature = "ops-cnn", feature = "mlas"))]
+#[path = "conv_ref.rs"]
+pub(crate) mod conv_native;
 #[cfg(all(feature = "ops-cnn", feature = "mlas"))]
 pub mod nchwc;
 

@@ -1848,3 +1848,20 @@ The [allocation and equivalence checks](../benchmarks/conv-gemm-driver/README.md
 cover actual native execute calls and old/new same-image drivers. This removes
 redundant ownership and decisions; it does not claim inference latency, full
 memory accounting, Convolution graduation or removal of its MLAS reference.
+
+
+## Independent Conv comparison in a linked-reference build
+
+With `mlas` and `ops-cnn`, `backend_ab::convolution_factories()` exposes named
+native-Generic-GEMM and MLAS Conv factories together. The native source is
+privately compiled in addition to the unchanged registered reference factory.
+Its GEMM fallback is fixed to Generic only in this research module, so an MLAS
+environment override cannot make the two arms share the reference arithmetic.
+BNNS/NEON remain native routes; default production auto detection is unchanged.
+
+The [same-binary correctness checks](../benchmarks/conv-same-binary/README.md)
+compare 36 f32 cases against independent f64 results, verify different concrete
+kernels, preserve registry selection and witness actual Native GEMM dispatch.
+Factory-alias and backend-override mutations must fail those guards. This creates
+an inspectable comparison boundary; it measures no performance gap, graduates no
+family and removes none of the outstanding optional reference capabilities.
