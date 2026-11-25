@@ -157,6 +157,13 @@ if ! cargo test --locked -p onnx-runtime-session --features gpu-tests \
     echo -e "${RED}FAILED: Packed producer graph tests${NC}"
     exit 1
 fi
+
+echo "── Packed shape-only transport without CPU fallback ──"
+if ! ONNX_GENAI_REQUIRE_CUDA=1 cargo test --locked -p onnx-runtime-session --features gpu-tests \
+    --test hetero_cuda_gpu -- packed_shape_only_cuda_no_fallback --exact --nocapture 2>&1; then
+    echo -e "${RED}FAILED: Packed shape-only CUDA transport${NC}"
+    exit 1
+fi
 echo ""
 
 # Run only the physical CUDA selectors, with gpu-tests enabling both.

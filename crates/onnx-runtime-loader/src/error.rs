@@ -87,6 +87,19 @@ pub enum LoaderError {
     },
 
     #[error(
+        "illegal ONNX {op} at node {node}: {slot} dtype {dtype:?} is not valid at opset \
+         {opset}; use opset {since} or newer"
+    )]
+    InvalidShapeOnlyDtype {
+        node: String,
+        op: String,
+        slot: &'static str,
+        dtype: onnx_runtime_ir::DataType,
+        opset: u64,
+        since: u64,
+    },
+
+    #[error(
         "illegal ONNX SplitToSequence at node {node}: {detail}. RULES #1: the input tensor dtype \
          must match the schema selected by the imported ai.onnx opset. Expected: use an ai.onnx \
          opset whose SplitToSequence schema admits the input dtype, or cast the input to a dtype \

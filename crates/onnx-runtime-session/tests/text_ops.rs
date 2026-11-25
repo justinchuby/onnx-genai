@@ -136,9 +136,14 @@ fn string_compress_requires_a_rank_one_bool_condition() {
     );
 
     let bad_condition = Tensor::from_i64(&[2], &[0, 1]).unwrap();
-    let result = InferenceSession::from_graph(compress_graph(28, None, DataType::Int64, &[2]))
-        .and_then(|mut session| session.run(&[("X", &x), ("condition", &bad_condition)]));
-    let detail = result.unwrap_err().to_string();
+    let detail = match InferenceSession::from_graph(compress_graph(28, None, DataType::Int64, &[2]))
+    {
+        Ok(mut session) => session
+            .run(&[("X", &x), ("condition", &bad_condition)])
+            .unwrap_err()
+            .to_string(),
+        Err(error) => error.to_string(),
+    };
     assert!(
         detail.contains("Compress") && detail.to_ascii_lowercase().contains("bool"),
         "{detail}"
