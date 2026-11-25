@@ -1,0 +1,51 @@
+{
+  "binary_sha256": "7b9e067556fb129a4befa0a85e2f7b9102be359c84c1c41f696f70b694ee4e3b",
+  "llvm": "Homebrew LLVM version 23.1.5",
+  "records": [
+    {
+      "symbol": "__RNvNtNtCs9Xuh1DSS2Xc_19onnx_runtime_ep_cpu7kernels7softmax30softmax_rows_serial_out_native",
+      "start": 4298116552,
+      "stop": 4298117492,
+      "bytes": 940,
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/llvm-objdump",
+        "-d",
+        "--start-address=4298116552",
+        "--stop-address=4298117492",
+        "/tmp/nxrt-neon-unroll-study/measured.binary"
+      ],
+      "raw_sha256": "b4d2b2042c5996b3ab509746b274c89ba03f9c441b6890b855c8ccdc100afff0",
+      "artifact": "native.disasm.gz"
+    },
+    {
+      "symbol": "__RNvNtNtNtCs9Xuh1DSS2Xc_19onnx_runtime_ep_cpu7kernels7softmax12softmax_neon11softmax_row",
+      "start": 4299053436,
+      "stop": 4299055248,
+      "bytes": 1812,
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/llvm-objdump",
+        "-d",
+        "--start-address=4299053436",
+        "--stop-address=4299055248",
+        "/tmp/nxrt-neon-unroll-study/measured.binary"
+      ],
+      "raw_sha256": "00f68aad258e93acd068d251574e5e7b6568219732dff616ea076a7bbbfb371c",
+      "artifact": "native-row.disasm.gz"
+    },
+    {
+      "symbol": "__RNvNtNtNtNtCs9Xuh1DSS2Xc_19onnx_runtime_ep_cpu7kernels7softmax12softmax_neon12unroll_tests8original",
+      "start": 4299115628,
+      "stop": 4299117636,
+      "bytes": 2008,
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/llvm-objdump",
+        "-d",
+        "--start-address=4299115628",
+        "--stop-address=4299117636",
+        "/tmp/nxrt-neon-unroll-study/measured.binary"
+      ],
+      "raw_sha256": "529a5f78706799e1291ea5bedb8e074f69be37c54e625d33f52d6f043c7a12ca",
+      "artifact": "original-wrapper.disasm.gz"
+    }
+  ]
+}

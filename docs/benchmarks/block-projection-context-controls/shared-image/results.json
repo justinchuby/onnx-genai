@@ -1,0 +1,274 @@
+{
+  "processes": 90,
+  "scope": "diagnostic shared image, not original two-binary matrix",
+  "cells": [
+    {
+      "case": 0,
+      "shape": [
+        1,
+        64,
+        128,
+        1,
+        0,
+        1,
+        1,
+        0
+      ],
+      "metrics": {
+        "cpu_s": {
+          "qualified": true,
+          "reasons": [],
+          "aa": {
+            "baseline": 1.001159882607229,
+            "candidate": 0.9961485266708054
+          },
+          "setup_fractions": {
+            "baseline": 0.0014059399712950946,
+            "candidate": 0.0012307212015525196,
+            "null-baseline": 0.0012292184530195635,
+            "null-candidate": 0.0014676587078543404
+          },
+          "adjusted_double": {
+            "baseline": 2.002249664840738,
+            "candidate": 2.0175158008427716
+          },
+          "work_s": {
+            "baseline": 5.5962559999999995,
+            "candidate": 5.599156,
+            "null-baseline": 5.602747,
+            "null-candidate": 5.577591
+          },
+          "setup_s": {
+            "baseline": 0.007868,
+            "candidate": 0.0068909999999999996,
+            "null-baseline": 0.006887,
+            "null-candidate": 0.008185999999999999
+          },
+          "paired_ratios": [
+            1.0153996301549912,
+            0.9954347736548135,
+            1.0005182035989777
+          ],
+          "candidate_over_baseline": 1.0005182035989777
+        },
+        "wall_s": {
+          "qualified": true,
+          "reasons": [],
+          "aa": {
+            "baseline": 1.0011881210810507,
+            "candidate": 0.996464912118066
+          },
+          "setup_fractions": {
+            "baseline": 0.0017593070337641246,
+            "candidate": 0.0015478666206874484,
+            "null-baseline": 0.0015673842780967169,
+            "null-candidate": 0.0018579883441915438
+          },
+          "adjusted_double": {
+            "baseline": 2.0021622668103976,
+            "candidate": 2.017601966673871
+          },
+          "work_s": {
+            "baseline": 5.599316541978624,
+            "candidate": 5.60225337499287,
+            "null-baseline": 5.605969208001625,
+            "null-candidate": 5.582448916975409
+          },
+          "setup_s": {
+            "baseline": 0.009850916976574808,
+            "candidate": 0.008671540999785066,
+            "null-baseline": 0.00878670800011605,
+            "null-candidate": 0.010372125019785017
+          },
+          "paired_ratios": [
+            1.0152908930370688,
+            0.9952491236961126,
+            1.0005244984798105
+          ],
+          "candidate_over_baseline": 1.0005244984798105
+        }
+      },
+      "outputs_bit_identical": true
+    },
+    {
+      "case": 1,
+      "shape": [
+        8,
+        128,
+        256,
+        1,
+        0,
+        0,
+        4,
+        1
+      ],
+      "metrics": {
+        "cpu_s": {
+          "qualified": false,
+          "reasons": [
+            "an arm fails 5% A/A bar"
+          ],
+          "aa": {
+            "baseline": 1.014994805100602,
+            "candidate": 0.9482368440281794
+          },
+          "setup_fractions": {
+            "baseline": 0.007385930889703859,
+            "candidate": 0.007537040459744423,
+            "null-baseline": 0.007065574373499105,
+            "null-candidate": 0.00896385334637304
+          },
+          "adjusted_double": {
+            "baseline": 1.9414518975126116,
+            "candidate": 1.9447687826849576
+          },
+          "work_s": {
+            "baseline": 0.9374579999999999,
+            "candidate": 0.930604,
+            "null-baseline": 0.9515149999999999,
+            "null-candidate": 0.8824329999999999
+          },
+          "setup_s": {
+            "baseline": 0.006924,
+            "candidate": 0.007013999999999999,
+            "null-baseline": 0.006723,
+            "null-candidate": 0.00791
+          },
+          "paired_ratios": [
+            0.9772508025260924,
+            1.0144369405333309,
+            0.9926887391221795
+          ],
+          "candidate_over_baseline": 0.9926887391221795
+        },
+        "wall_s": {
+          "qualified": false,
+          "reasons": [
+            "an arm fails 5% A/A bar"
+          ],
+          "aa": {
+            "baseline": 1.013602481879283,
+            "candidate": 0.9470519250465284
+          },
+          "setup_fractions": {
+            "baseline": 0.00918500164853206,
+            "candidate": 0.009367623747110882,
+            "null-baseline": 0.008909327789538044,
+            "null-candidate": 0.011072445205983815
+          },
+          "adjusted_double": {
+            "baseline": 1.939292716715398,
+            "candidate": 1.9443514912810562
+          },
+          "work_s": {
+            "baseline": 0.9404870420112275,
+            "candidate": 0.9336057080072351,
+            "null-baseline": 0.9532799999578856,
+            "null-candidate": 0.884173083002679
+          },
+          "setup_s": {
+            "baseline": 0.008638375031296164,
+            "candidate": 0.008745667000766844,
+            "null-baseline": 0.008493083994835615,
+            "null-candidate": 0.009789958014152944
+          },
+          "paired_ratios": [
+            0.9769389534560541,
+            1.0151662116577873,
+            0.9926832229508695
+          ],
+          "candidate_over_baseline": 0.9926832229508695
+        }
+      },
+      "outputs_bit_identical": true
+    },
+    {
+      "case": 2,
+      "shape": [
+        8,
+        128,
+        256,
+        4,
+        1,
+        0,
+        4,
+        1
+      ],
+      "metrics": {
+        "cpu_s": {
+          "qualified": true,
+          "reasons": [],
+          "aa": {
+            "baseline": 0.991476206467416,
+            "candidate": 0.9975494834988594
+          },
+          "setup_fractions": {
+            "baseline": 0.07022499654307332,
+            "candidate": 0.07014852520744719,
+            "null-baseline": 0.07063945090304136,
+            "null-candidate": 0.07042070680340719
+          },
+          "adjusted_double": {
+            "baseline": 1.984543638990397,
+            "candidate": 1.996753977181424
+          },
+          "work_s": {
+            "baseline": 0.10124599999999999,
+            "candidate": 0.10038699999999999,
+            "null-baseline": 0.10038299999999999,
+            "null-candidate": 0.100141
+          },
+          "setup_s": {
+            "baseline": 0.00711,
+            "candidate": 0.007042,
+            "null-baseline": 0.007091,
+            "null-candidate": 0.007051999999999999
+          },
+          "paired_ratios": [
+            1.0020762834526198,
+            0.9750409892736505,
+            0.9962591916300646
+          ],
+          "candidate_over_baseline": 0.9962591916300646
+        },
+        "wall_s": {
+          "qualified": true,
+          "reasons": [],
+          "aa": {
+            "baseline": 0.9939478507766621,
+            "candidate": 0.9910902466171626
+          },
+          "setup_fractions": {
+            "baseline": 0.08348604413843709,
+            "candidate": 0.08083059356399439,
+            "null-baseline": 0.08115425211566778,
+            "null-candidate": 0.08095811424508727
+          },
+          "adjusted_double": {
+            "baseline": 1.999000442477163,
+            "candidate": 1.9823220823692158
+          },
+          "work_s": {
+            "baseline": 0.10215379198780283,
+            "candidate": 0.10195758397458121,
+            "null-baseline": 0.10153554199496284,
+            "null-candidate": 0.10104916704585776
+          },
+          "setup_s": {
+            "baseline": 0.008528415986802429,
+            "candidate": 0.0082412920310162,
+            "null-baseline": 0.008240040973760188,
+            "null-candidate": 0.00818075001006946
+          },
+          "paired_ratios": [
+            1.0086410556300434,
+            0.9756143757643606,
+            0.994756253746437
+          ],
+          "candidate_over_baseline": 0.994756253746437
+        }
+      },
+      "outputs_bit_identical": true
+    }
+  ]
+}

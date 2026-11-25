@@ -52,6 +52,17 @@ including where a budget refuses everything else.
 4. **Port the mechanism, not the dependency**, and re-measure in a build that does
    *not* have the `mlas` feature, because that is what users run.
 
+CPU accounting must close against physical capacity. In the
+[ARM64 Softmax experiment](../benchmarks/arm64-softmax-loop-unroll/README.md),
+short multithreaded `getrusage` and `CLOCK_PROCESS_CPUTIME_ID` deltas exceeded
+`logical_cpus × wall_time` even when A/A passed. Those samples are rejected.
+When that happens, keep both implementations in one binary but interleave
+single-arm child processes and collect terminal CPU with parent `wait4`.
+Include explicit setup-only and doubled-work controls, record complete-process
+CPU/RSS and output identity, and state that this changes the same-address-space
+condition. Complete-process CPU includes startup and validation; it is not a
+per-kernel latency or model-throughput measurement. A/A cannot validate a clock.
+
 Step 3 is where the value is. The instinct is to skip to "prepack like they do",
 which usually reintroduces the memory cost that made the dependency unattractive.
 

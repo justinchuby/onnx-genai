@@ -158,8 +158,12 @@ impl NativeDeviceAllocation {
         self.bytes
     }
 
+    pub(crate) fn identity(owner: &Arc<Self>) -> usize {
+        Arc::as_ptr(owner) as usize
+    }
+
     pub(crate) fn device_graph_resource(owner: &Arc<Self>) -> DeviceGraphResource {
-        DeviceGraphResource::new(Arc::as_ptr(owner) as usize, Arc::clone(owner))
+        DeviceGraphResource::new(Self::identity(owner), Arc::clone(owner))
     }
 
     pub(crate) fn release(&mut self) -> Result<()> {

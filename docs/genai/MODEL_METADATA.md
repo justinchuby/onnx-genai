@@ -76,3 +76,14 @@ unsupported, unresolved, unordered, or ill-typed documents fail before execution
 Policy artifact port contracts and minimal workflows are specified in
 [WORKFLOW_POLICY_COMPONENTS.md](WORKFLOW_POLICY_COMPONENTS.md). The normative contract
 is [INFERENCE_METADATA_DECISIONS.md](INFERENCE_METADATA_DECISIONS.md).
+
+## Non-generative decision profiles (v1.10)
+
+`profiles.<name>.decision` declares the prompt, option bound, variant ensemble,
+confidence formulas and score policy for a `kind: decision`, `version: '1'`
+profile. This core field requires schema v1.10; unknown required profiles and
+unsupported versions fail before execution. The workflow supplies calibrated
+floating probabilities, independent of model architecture or execution provider.
+See [the SystemOne contract](../SYSTEMONE.md) and the executable
+`tests/fixtures/onnx_genai_workflows/decision` package for precise input/output
+roles, shape/resource admission, and remaining multimodal/entry-point work.

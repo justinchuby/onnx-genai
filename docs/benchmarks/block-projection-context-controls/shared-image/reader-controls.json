@@ -1,0 +1,73 @@
+{
+  "accepted_complete_matrix": true,
+  "synthetic_all_qualified": true,
+  "controls": [
+    {
+      "name": "empty",
+      "rejected": true
+    },
+    {
+      "name": "missing",
+      "rejected": true
+    },
+    {
+      "name": "duplicate",
+      "rejected": true
+    },
+    {
+      "name": "wrong executable arm",
+      "rejected": true
+    },
+    {
+      "name": "wrong calls",
+      "rejected": true
+    },
+    {
+      "name": "wrong capacity",
+      "rejected": true
+    },
+    {
+      "name": "wrong logical capacity",
+      "rejected": true
+    },
+    {
+      "name": "wrong constructor width",
+      "rejected": true
+    },
+    {
+      "name": "unrefunded quota",
+      "rejected": true
+    },
+    {
+      "name": "impossible cpu",
+      "rejected": true
+    },
+    {
+      "name": "bad output",
+      "rejected": true
+    }
+  ],
+  "quality_controls": [
+    {
+      "arm": "baseline",
+      "metric": "cpu_s",
+      "failed_aa_remains_unqualified": true
+    },
+    {
+      "arm": "baseline",
+      "metric": "wall_s",
+      "failed_aa_remains_unqualified": true
+    },
+    {
+      "arm": "candidate",
+      "metric": "cpu_s",
+      "failed_aa_remains_unqualified": true
+    },
+    {
+      "arm": "candidate",
+      "metric": "wall_s",
+      "failed_aa_remains_unqualified": true
+    }
+  ],
+  "reader_sha256": "b44086a7914f56efb0375f30ef531986d178d347a2ed7b97a49fe57249c43f59"
+}
