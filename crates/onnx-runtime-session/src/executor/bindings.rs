@@ -16,7 +16,7 @@ pub(super) fn workspace_planning_for_node(
         return WorkspacePlanning::Metadata;
     }
     if is_control_flow_op(&node.op_type, &node.domain)
-        || is_sequence_op(&node.op_type, &node.domain)
+        || is_container_op(&node.op_type, &node.domain)
     {
         return WorkspacePlanning::None;
     }
@@ -621,11 +621,13 @@ impl Executor {
         let external = self.prepare_external_bindings_mode(bindings, true)?;
         let symbols = self.bind_symbols(inputs, &external)?;
         let stats = self.cache.stats();
+        let workspace_context = self.ep.workspace_preparation_context().read();
         // Input/external-binding validation above always runs. The immutable
         // graph and weights plus this exact symbol map determine every planned
         // shape (including nested shapes and capacity bounds). New/evicted
         // specializations conservatively invalidate the metadata-only plan.
         if let Some(memo) = &self.workspace_preparation_memo
+            && memo.context == workspace_context
             && memo.symbols == symbols
             && memo.output_bindings.matches(&external)
             && memo.growing_symbols == self.capture_growing_symbols
@@ -830,6 +832,7 @@ impl Executor {
         }
         let stats = self.cache.stats();
         self.workspace_preparation_memo = Some(WorkspacePreparationMemo {
+            context: workspace_context,
             output_bindings: WorkspaceOutputBindings::from_external(&external),
             symbols,
             growing_symbols: self.capture_growing_symbols.clone(),
@@ -1276,6 +1279,13 @@ impl Executor {
         if self.heterogeneous.is_some() {
             return Err(heterogeneous_api_error(
                 "mixed-provider device-graph capture",
+            ));
+        }
+        if optional_ops::graph_uses_optional_ops(&self.graph) {
+            return Ok(DeviceGraphCaptureResult::NotCapturable(
+                CaptureDeclineReport::one(CaptureDecline::graph(
+                    "Optional operators use host orchestration and may alias run-scoped payload storage; run this graph eagerly",
+                )),
             ));
         }
         if self.cap().device_graph_token.is_some() {

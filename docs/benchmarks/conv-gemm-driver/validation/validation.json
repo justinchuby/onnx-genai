@@ -1,0 +1,140 @@
+{
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs": "efe67a79c0e45ef7c6d6ad306772e97066bb99b77ebfd71305e618d20eb5e55f",
+    "crates/onnx-runtime-ep-cpu/tests/conv_im2col_allocation.rs": "c4dd1e6825e6ba89224ff0fbb0f8ecc14419e34d9cad3a0a7795ef9623fdb1f0"
+  },
+  "results": [
+    {
+      "name": "list",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::conv::tests::",
+        "--",
+        "--list"
+      ],
+      "extra_env": {},
+      "exit": 0,
+      "log_sha256": "42753abddac4e9e490cee48d0aa52394d739d3b3238472144ab8e9914c93251d"
+    },
+    {
+      "name": "conv",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::conv::tests::"
+      ],
+      "extra_env": {},
+      "exit": 0,
+      "log_sha256": "fbd66cd5a52b3dcf6510bf90dfc6475c1b00f97a170e604f20fa9a55746e40d4",
+      "counts": [
+        [
+          "46",
+          "0",
+          "1"
+        ]
+      ]
+    },
+    {
+      "name": "conv-generic",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::conv::tests::gemm_driver_matches_exact_scalar_values_across_groups_batches_and_empty_axes",
+        "--",
+        "--exact"
+      ],
+      "extra_env": {
+        "NXRT_CPU_GEMM_BACKEND": "generic"
+      },
+      "exit": 0,
+      "log_sha256": "1c3b36d858e1a6155eb3b4229975aa9427659b42fe3ea1688e8545fde95716f3",
+      "counts": [
+        [
+          "1",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "allocation",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--test",
+        "conv_im2col_allocation",
+        "--",
+        "--nocapture"
+      ],
+      "extra_env": {},
+      "exit": 0,
+      "log_sha256": "2221d81fa5bdd7f75a3fa0dda49931cad5679a81a091362514d7e82c3b8cb230",
+      "counts": [
+        [
+          "1",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "allocation-generic",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--test",
+        "conv_im2col_allocation",
+        "--",
+        "--nocapture"
+      ],
+      "extra_env": {
+        "NXRT_CPU_GEMM_BACKEND": "generic"
+      },
+      "exit": 0,
+      "log_sha256": "31d762338b4f5441c91df96300565adf755af6c66f02dccf9813c3a9c5c46a00",
+      "counts": [
+        [
+          "1",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "extra_env": {},
+      "exit": 0,
+      "log_sha256": "a80ccd4e498b61c95e12951b61f9bd2e80cfecd897cbac090bb973e4c8de77d9"
+    }
+  ]
+}

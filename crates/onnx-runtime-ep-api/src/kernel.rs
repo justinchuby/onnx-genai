@@ -1035,9 +1035,20 @@ pub struct BlockQuantizedMoeTraffic {
 }
 
 /// A borrowed, dense host string tensor. It has no byte or device representation.
+#[derive(Clone, Copy)]
 pub struct HostStringInput<'a> {
     pub shape: &'a [usize],
     pub values: &'a [String],
+}
+
+/// Borrowed dense operands for native host kernels on managed-string nodes.
+pub enum HostKernelInput<'a> {
+    Strings(HostStringInput<'a>),
+    /// One byte per BOOL element, interpreted as false for zero and true otherwise.
+    Bool {
+        shape: &'a [usize],
+        bytes: &'a [u8],
+    },
 }
 
 /// An owned output whose shape may be determined by the string kernel.
@@ -1054,10 +1065,10 @@ pub enum HostKernelData {
 
 /// A kernel ready to execute a specific op with specific shapes (§4.2).
 pub trait Kernel: Send + KernelType {
-    /// Execute on borrowed host strings without a raw-byte tensor ABI.
-    fn execute_host_strings(
+    /// Execute a managed-string node using borrowed host operands.
+    fn execute_managed_host(
         &self,
-        _inputs: &[HostStringInput<'_>],
+        _inputs: &[HostKernelInput<'_>],
     ) -> Result<Vec<HostKernelOutput>> {
         Err(crate::EpError::KernelFailed(
             "kernel does not support native host string tensors; use a string-aware host kernel"
@@ -1248,7 +1259,8 @@ pub trait Kernel: Send + KernelType {
     /// remain Unresolved. Return Deferred when values or storage origins are
     /// needed; Ready(NONE) means a proven zero requirement, never unknown.
     /// Runtime layout facts may refine this bound before dispatch. For a fixed
-    /// compiled kernel and both input/output metadata this is a stable upper bound: executors may
+    /// compiled kernel, provider workspace context and input/output metadata this
+    /// is a stable upper bound: executors may
     /// memoize it. It must cover both cold and warm cache residency; values or
     /// layouts that refine the bound belong in the execution-time hook below.
     fn workspace_requirement(
@@ -1264,8 +1276,8 @@ pub trait Kernel: Send + KernelType {
     /// Output storage is uninitialized: inspect geometry and pointer alignment,
     /// never read output values. The caller keeps exclusive kernel execution
     /// ownership through this refinement, admission and the following launch.
-    /// `cached` contains only the same kernel's metadata-only preparation;
-    /// address/value-dependent refinements must not enter a geometry cache.
+    /// `cached` contains only the same kernel's metadata-only preparation in the
+    /// same provider workspace context; address/value-dependent refinements must not enter a geometry cache.
     /// None asks the default to query metadata once; Some avoids that query.
     ///
     /// Prepare-only reservation walks have only [`TensorMetadata`], so
@@ -1383,7 +1395,7 @@ pub trait Kernel: Send + KernelType {
     /// Heterogeneous execution uses independently owned boundary buffers. Its
     /// first slice rejects view-producing kernels before execution rather than
     /// discovering an alias after an upstream partition has already run.
-    fn may_produce_views(&self) -> bool {
+    fn may_produce_views(&self, _input_dtypes: &[DataType]) -> bool {
         false
     }
 

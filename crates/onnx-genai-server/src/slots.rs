@@ -37,25 +37,42 @@ impl NativeSlot {
         if let Ok(mut state) = self.snapshot.lock() {
             state.is_processing = true;
         }
-        SlotExecution(Arc::clone(self))
-    }
-    pub(crate) fn finish(&self, engine: &onnx_genai::Engine) {
-        #[cfg(feature = "native-backend")]
-        if let Some(actual) = engine.native_slot_state()
-            && let Ok(mut state) = self.snapshot.lock()
-        {
-            state.n_past = actual.materialized_tokens;
-            state.n_ctx = actual.max_context;
-            state.state_files = actual.state_files;
+        SlotExecution {
+            slot: Arc::clone(self),
+            completed: false,
         }
-        #[cfg(not(feature = "native-backend"))]
-        let _ = engine;
+    }
+    fn finish(&self, engine: &onnx_genai::Engine) {
+        if let Ok(mut state) = self.snapshot.lock() {
+            #[cfg(feature = "native-backend")]
+            if let Some(actual) = engine.native_slot_state() {
+                state.n_past = actual.materialized_tokens;
+                state.n_ctx = actual.max_context;
+                state.state_files = actual.state_files;
+            }
+            #[cfg(not(feature = "native-backend"))]
+            let _ = engine;
+            state.is_processing = false;
+        }
     }
 }
-pub(crate) struct SlotExecution(Arc<NativeSlot>);
+pub(crate) struct SlotExecution {
+    slot: Arc<NativeSlot>,
+    completed: bool,
+}
+impl SlotExecution {
+    pub(crate) fn finish(&mut self, engine: &onnx_genai::Engine) {
+        if !self.completed {
+            self.slot.finish(engine);
+            self.completed = true;
+        }
+    }
+}
 impl Drop for SlotExecution {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.0.snapshot.lock() {
+        if !self.completed
+            && let Ok(mut state) = self.slot.snapshot.lock()
+        {
             state.is_processing = false;
         }
     }

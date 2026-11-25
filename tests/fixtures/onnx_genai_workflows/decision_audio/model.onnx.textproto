@@ -1,0 +1,41 @@
+ir_version: 11
+opset_import { domain: "" version: 24 }
+graph { name: "mixed_media_spoken_decision_head"
+node { input: "ids" output: "text.float" op_type: "Cast" attribute { name: "to" i: 1 type: INT } }
+node { input: "text.float" output: "text.mean" op_type: "ReduceMean" attribute { name: "keepdims" i: 0 type: INT } }
+node { input: "text.mean" input: "text_scale" output: "text.logit" op_type: "Mul" }
+node { input: "state_features" output: "state.mean" op_type: "ReduceMean" attribute { name: "keepdims" i: 0 type: INT } }
+node { input: "question_features" output: "question.mean" op_type: "ReduceMean" attribute { name: "keepdims" i: 0 type: INT } }
+node { input: "state.mean" input: "question.mean" output: "audio.logit" op_type: "Sub" }
+node { input: "pixels" output: "image.mean" op_type: "ReduceMean" attribute { name: "keepdims" i: 0 type: INT } }
+node { input: "image.mean" input: "bias" output: "image.logit" op_type: "Sub" }
+node { input: "audio.logit" input: "image.logit" output: "media.logit" op_type: "Add" }
+node { input: "media.logit" input: "text.logit" output: "logit" op_type: "Add" }
+node { input: "logit" output: "probability" op_type: "Sigmoid" }
+node { input: "one" input: "probability" output: "complement" op_type: "Sub" }
+node { input: "probability" input: "axis_zero" output: "probability.row" op_type: "Unsqueeze" }
+node { input: "complement" input: "axis_zero" output: "complement.row" op_type: "Unsqueeze" }
+node { input: "probability.row" input: "complement.row" output: "probabilities" op_type: "Concat" attribute { name: "axis" i: 0 type: INT } }
+node { input: "mask" input: "axis_one" output: "text.tokens" op_type: "ReduceSum" attribute { name: "keepdims" i: 0 type: INT } }
+node { input: "state_features" output: "state.shape" op_type: "Shape" }
+node { input: "question_features" output: "question.shape" op_type: "Shape" }
+node { input: "state.shape" input: "frame_index" output: "state.tokens" op_type: "Gather" attribute { name: "axis" i: 0 type: INT } }
+node { input: "question.shape" input: "frame_index" output: "question.tokens" op_type: "Gather" attribute { name: "axis" i: 0 type: INT } }
+node { input: "state.tokens" input: "question.tokens" output: "audio.tokens" op_type: "Add" }
+node { input: "audio.tokens" input: "image_tokens" output: "media.tokens" op_type: "Add" }
+node { input: "text.tokens" input: "media.tokens" output: "usage" op_type: "Add" }
+initializer { name: "one" data_type: 1 float_data: 1 }
+initializer { name: "bias" data_type: 1 float_data: 0.5 }
+initializer { name: "text_scale" data_type: 1 float_data: 0.01 }
+initializer { name: "image_tokens" data_type: 7 int64_data: 1 }
+initializer { name: "frame_index" data_type: 7 int64_data: 2 }
+initializer { name: "axis_zero" data_type: 7 dims: 1 int64_data: 0 }
+initializer { name: "axis_one" data_type: 7 dims: 1 int64_data: 1 }
+input { name: "ids" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_param: "sequence" } } } } }
+input { name: "mask" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_param: "sequence" } } } } }
+input { name: "pixels" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 3 } dim { dim_value: 2 } dim { dim_value: 2 } } } } }
+input { name: "state_features" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 80 } dim { dim_param: "state_frames" } } } } }
+input { name: "question_features" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 80 } dim { dim_param: "question_frames" } } } } }
+output { name: "probabilities" type { tensor_type { elem_type: 1 shape { dim { dim_value: 2 } } } } }
+output { name: "usage" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } } } } }
+}

@@ -2441,3 +2441,56 @@ ignored per configuration), as do block MoE tests (29 each) and strict all-targe
 CPU Clippy in both configurations. Caller-owned poisoned targets, separate prior
 outputs, guard regions, short/oversized destinations, malformed input/packed/bias
 spans, short scratch, empty axes and partial blocks are covered.
+
+
+### BlockQuantizedMoE FC intermediates reuse the float expert banks
+
+The packed projection destination seam now feeds the same two-bank private
+expert driver as float MoE. One checked StepScoped layout combines maximum
+decode scratch, bank A, bank B and the final accumulator. Nongated A holds
+gather/output and B holds FC1/activation; gated A holds gather/activation and B
+holds FC1+optional FC3/output. Actual prefixes are initialized, and safe short
+borrows prevent overwriting still-live inputs. Expert ordering, projection/bias
+math, gate indexing and late tensor publication remain. A singleton group
+borrows its input row. There is no per-expert grant, new allocator or public EP
+interface.
+
+Bank widths share the float rule and cover streamed fallback even on dense
+hits. Their conservative retained capacity is now charged; this can exceed the
+old declared workspace that omitted FC Vec storage. It does not establish an
+RSS saving or a complete process cap. Routing, widening, strided compressed
+copies, GEMM internals and final output storage remain separate.
+
+The exact-bit regression compares the packed bank driver with the owned
+activation path across two formats, asymmetric and zero axes, row gathering
+and poisoned bank reuse. Existing dense/streamed parity remains. It also exposed
+and fixed the old owned driver's fused zero-width chunks_exact(0) panic: empty
+FC1 has no channel chunks, but zero-K FC2 still runs and adds its bias. Existing
+QMoE owned callers retain their legitimate storage contract, with that fix.
+
+[Two complete public-session matrices](../benchmarks/block-moe-projection-banks/README.md)
+preserve the original gated CPU regression and a one-line inline-hint refinement.
+Each matrix has 144 interleaved whole-process CPU receipts with baseline/null,
+setup-only and double-work controls. All six aggregate cells qualify in each;
+individual noisy repetitions remain visible. The final single-row gated point
+change is +1.4%, so a small cost is not excluded; no universal zero-overhead or
+model-throughput conclusion is made. Host resource tests retain exact full-lane
+charges, zero warm issuer callbacks and trim-to-zero checks.
+
+
+### Initialize decoded workspace according to live projections
+
+The one admitted BlockMatMul/BlockMoE/QMoE decode lane now initializes only the
+prefix requested by the current projection. A monotone dispatch-local prefix
+replaces the full-lane bool: first use clears its live span, larger later phases
+clear only new elements, and smaller phases retain initialized storage. A fresh
+binding discards the prior dispatch's proof. Prepared helpers pass the owner to
+the canonical checked plan split rather than clearing a complete maximum lane.
+
+Capacity/overflow errors precede writes. Decoder failures preserve valid f32
+initialization without publishing partial tensor output. Dense hits still leave
+decoder scratch untouched. The maximum capacity, charge, logical shard plan and
+all grant/refund operations remain unchanged; no finer quota is introduced.
+The [state/resource checks and mutation control](../benchmarks/decoded-scratch-prefix/README.md)
+cover sparse actual expert groups and pool changes. No inference latency, RSS,
+CUDA runtime or complete-process memory conclusion follows from this change.

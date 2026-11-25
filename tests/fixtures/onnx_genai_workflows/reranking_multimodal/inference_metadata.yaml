@@ -1,0 +1,102 @@
+schema_version: v1.12
+package:
+  tokenizer:
+    algorithm: word_level
+    vocab_size: 32
+    artifacts: [{ location: tokenizer.json }]
+    special_tokens: { bos_token_id: 2, eos_token_id: [3] }
+profiles:
+  relevance:
+    kind: reranking
+    version: '2'
+    outputs: { score: probability, prompt_tokens: usage }
+    reranking:
+      query_images: [request.query_picture]
+      document_images: [request.document_primary, request.document_secondary]
+preprocessing:
+  image:
+    transforms:
+      - { op: decode, outputs: [decoded] }
+      - { op: convert_rgb, inputs: [decoded], outputs: [rgb] }
+      - { op: resize, inputs: [rgb], outputs: [resized], size: 2, mode: stretch, interpolation: bilinear }
+      - { op: rescale, inputs: [resized], outputs: [pixels], scale: 0.00392156862745098 }
+    outputs:
+      - source: pixels
+        name: pixel_values
+        content: pixels
+        dtype: float32
+        contract: { dtype: float32, shape: [image_batch, 3, 2, 2] }
+pipeline:
+  workflow:
+    publication_mode: commit_only
+    manifest:
+      adapter_abis: { onnx-genai.image-preprocess: '2' }
+    inputs:
+      pair.ids:
+        contract: { dtype: int64, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: runtime, version: '1.0', role: prompt_tokens }
+        source: { kind: request }
+      pair.mask:
+        contract: { dtype: int64, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: attention_mask }
+      pair.segments:
+        contract: { dtype: int64, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: token_type_ids }
+      request.query_picture:
+        contract: { dtype: uint8, shape: [query_bytes] }
+        role: { kind: opaque }
+        source: { kind: application, name: query_picture }
+      request.document_primary:
+        contract: { dtype: uint8, shape: [primary_bytes] }
+        role: { kind: opaque }
+        source: { kind: application, name: document_primary }
+      request.document_secondary:
+        contract: { dtype: uint8, shape: [secondary_bytes] }
+        role: { kind: opaque }
+        source: { kind: application, name: document_secondary }
+    outputs:
+      probability:
+        contract: { dtype: float32, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        family: { kind: materialized }
+        role: tensor
+        stage: pre_adapter
+      usage:
+        contract: { dtype: int64, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        family: { kind: materialized }
+        role: tensor
+        stage: pre_adapter
+    components:
+      image_preprocess:
+        implementation: { kind: adapter, abi: onnx-genai.image-preprocess, version: '2' }
+        ports:
+          inputs: { encoded: { dtype: uint8, shape: [encoded_bytes] } }
+          outputs: { pixel_values: { dtype: float32, shape: [image_batch, 3, 2, 2] } }
+      classifier:
+        implementation: { kind: onnx, artifact: model.onnx.textproto }
+    steps:
+      - kind: invoke
+        component: image_preprocess
+        inputs: { encoded: request.query_picture }
+        outputs: { pixel_values: pixels.query }
+      - kind: invoke
+        component: image_preprocess
+        inputs: { encoded: request.document_primary }
+        outputs: { pixel_values: pixels.primary }
+      - kind: invoke
+        component: image_preprocess
+        inputs: { encoded: request.document_secondary }
+        outputs: { pixel_values: pixels.secondary }
+      - kind: invoke
+        component: classifier
+        inputs:
+          input_ids: pair.ids
+          attention_mask: pair.mask
+          token_type_ids: pair.segments
+          query_pixels: pixels.query
+          primary_pixels: pixels.primary
+          secondary_pixels: pixels.secondary
+        outputs: { score: inference.score, prompt_tokens: inference.usage }
+      - { kind: emit, value: inference.score, output: probability, mode: replace }
+      - { kind: emit, value: inference.usage, output: usage, mode: replace }

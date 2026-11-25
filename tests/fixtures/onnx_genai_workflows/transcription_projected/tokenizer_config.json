@@ -1,0 +1,17 @@
+{
+  "response_template": {
+    "version": 1,
+    "start_anchor": "dog",
+    "fields": {
+      "content": {
+        "open": "tok16 ",
+        "close": " tok17",
+        "optional": false
+      }
+    },
+    "preserved_tokens": [
+      "tok16",
+      "tok17"
+    ]
+  }
+}

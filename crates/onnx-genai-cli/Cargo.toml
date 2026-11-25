@@ -94,6 +94,7 @@ tracing-subscriber = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
+tempfile = "3"
 # The CLI e2e tests write a sample PNG and read back the rendered image and WAV.
 image = { workspace = true, features = ["png"] }
 onnx-genai = { workspace = true }
