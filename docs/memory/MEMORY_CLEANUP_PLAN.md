@@ -2561,3 +2561,32 @@ still rejected, and concrete execution retains strict shape validation. Tests
 cover domain aliases, BF16 schema versions and partially unknown shapes. These
 are claim-time changes; they introduce no inference-path quota operations or
 performance, RSS or CUDA execution claim.
+
+
+### STFT frames borrow one execution workspace
+
+STFT's four frame-length f32 buffers now occupy disjoint checked regions in the
+existing StepScoped execution domain. One lane serves every frame and batch;
+there is no per-frame resource admission or node-owned scratch pool. Existing
+zero initialization and DFT/vDSP arithmetic remain unchanged. The provider's
+registered planning fact declares metadata preparation.
+
+A present window supplies the exact metadata bound. Without a window, a runtime
+frame_length scalar leaves metadata preparation Deferred; execution reads the
+Host-accessible scalar and admits precisely four frames before dispatch. No
+signal-length-sized reserve, scalar-value memo or new EP API is introduced.
+Scalar reads no longer allocate a dense one-element vector. Empty batches still
+validate scalar parameters, signal/window views and accessibility, but use no
+frame scratch. Missing/short/misaligned backing fails before output writes.
+
+Controls cover poisoned reuse across changing frame lengths, independent f64
+references, strided/half input, overflow, empty-batch guards and exact Host
+refunds. A real two-node executor prepares max(48,64)=64 bytes, reuses one
+managed identity, and separately exercises scalar-only deferred preparation and
+48-to-64-byte growth. The real governor observer includes live zero-byte claim
+and refund controls; 4,096 warm checkout/execute/return cycles make no further
+issuer callbacks. This is an accounting invariant, not zero total runtime cost.
+
+Signal/window materialization, the output staging Vec and Apple DSP setup's
+internal allocations remain outside these four admitted regions. This does not
+establish complete STFT/RSS accounting, inference latency or CUDA behavior.
