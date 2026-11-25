@@ -4290,6 +4290,13 @@ impl ExecutionProvider for CudaExecutionProvider {
                 opset
             );
         }
+        if op.is_default_domain()
+            && op.op_type == "Transpose"
+            && let Some(&dtype) = input_dtypes.first()
+            && let Err(reason) = onnx_runtime_ir::transpose::validate_dtype(dtype, opset)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if let Some(reason) =
             onnx_runtime_ep_api::packed_routed::unsupported_reason(op, shapes, input_dtypes)
         {

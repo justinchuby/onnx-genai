@@ -80,6 +80,7 @@ pub const ONNX_FILE_DESCRIPTOR_SET: &[u8] =
 mod scan_inline;
 mod shape;
 mod tensor;
+pub mod transpose;
 mod value;
 
 pub use arena::{Arena, ArenaKey};

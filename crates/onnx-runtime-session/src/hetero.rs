@@ -1424,7 +1424,12 @@ impl HeterogeneousExecutor {
                     ),
                 });
             }
-            if kernel.may_produce_views() {
+            let input_dtypes = node
+                .inputs
+                .iter()
+                .map(|input| input.map_or(DataType::Undefined, |value| graph.value(value).dtype))
+                .collect::<Vec<_>>();
+            if kernel.may_produce_views(&input_dtypes) {
                 let domain = if node.domain.is_empty() {
                     "ai.onnx"
                 } else {

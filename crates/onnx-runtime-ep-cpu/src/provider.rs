@@ -476,6 +476,13 @@ impl ExecutionProvider for CpuExecutionProvider {
                 opset
             );
         }
+        if op.is_default_domain()
+            && op.op_type == "Transpose"
+            && let Some(&dtype) = input_dtypes.first()
+            && let Err(reason) = onnx_runtime_ir::transpose::validate_dtype(dtype, opset)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if let Some(reason) =
             onnx_runtime_ep_api::packed_routed::unsupported_reason(op, shapes, input_dtypes)
         {
@@ -1819,6 +1826,29 @@ mod tests {
             ep.supports_op(&conv, 17, &[], &[], &[]).is_supported(),
             cfg!(feature = "ops-cnn")
         );
+    }
+
+    #[test]
+    fn transpose_packed_cpu_claim_respects_onnx_type_versions() {
+        let ep = CpuExecutionProvider::new();
+        let node = Node::new(onnx_runtime_ir::NodeId(0), "Transpose", vec![], vec![]);
+        let shapes = [onnx_runtime_ir::static_shape([3, 5])];
+        for (dtype, since) in [
+            (DataType::Int4, 21),
+            (DataType::Uint4, 21),
+            (DataType::Float4E2M1, 23),
+            (DataType::Float8E8M0, 24),
+            (DataType::Int2, 25),
+            (DataType::Uint2, 25),
+        ] {
+            let rejected = ep.supports_op(&node, since - 1, &shapes, &[dtype], &[]);
+            let reason = rejected.reason().expect("older opset must be declined");
+            assert!(reason.contains(&format!("use opset {since}")), "{reason}");
+            assert!(
+                ep.supports_op(&node, since, &shapes, &[dtype], &[])
+                    .is_supported()
+            );
+        }
     }
 
     #[test]

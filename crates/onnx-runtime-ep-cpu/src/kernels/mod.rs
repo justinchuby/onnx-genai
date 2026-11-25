@@ -338,6 +338,7 @@ pub fn output_dtype_constraints_for_op(
 pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataType] {
     // Byte-mover ops: dtype-agnostic (just copy bytes, no arithmetic).
     match (op_type, domain) {
+        ("Transpose", "") => onnx_runtime_ir::transpose::DTYPES,
         ("Identity", "")
         | ("Reshape", "")
         | ("Flatten", "")
@@ -347,7 +348,6 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         | ("Concat", "")
         | ("Slice", "")
         | ("Split", "")
-        | ("Transpose", "")
         | ("Gather", "")
         | ("GatherElements", "")
         | ("GatherND", "")

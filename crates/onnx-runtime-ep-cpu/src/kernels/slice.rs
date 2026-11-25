@@ -142,7 +142,7 @@ impl KernelFactory for SliceFactory {
 }
 
 impl Kernel for SliceKernel {
-    fn may_produce_views(&self) -> bool {
+    fn may_produce_views(&self, _input_dtypes: &[onnx_runtime_ir::DataType]) -> bool {
         true
     }
 
