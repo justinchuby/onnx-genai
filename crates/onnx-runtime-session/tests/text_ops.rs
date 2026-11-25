@@ -110,9 +110,12 @@ fn string_compress_loads_opsets_19_and_28_and_preserves_values() {
 
 #[test]
 fn string_compress_requires_a_rank_one_bool_condition() {
-    let error = InferenceSession::from_graph(compress_graph(19, None, DataType::Bool, &[1, 2]))
+    let graph = compress_graph(19, None, DataType::Bool, &[1, 2]);
+    let model =
+        onnx_runtime_loader::encode_model(&onnx_runtime_loader::Model::new(&graph)).unwrap();
+    let error = InferenceSession::load_bytes(&model)
         .err()
-        .expect("rank-two condition must be rejected");
+        .expect("ONNX loading must reject a declared rank-two condition");
     let detail = error.to_string();
     assert!(
         detail.contains("Compress") && detail.contains("rank 1"),
@@ -120,6 +123,17 @@ fn string_compress_requires_a_rank_one_bool_condition() {
     );
 
     let x = strings(&[2, 3], &["a", "b", "c", "d", "e", "f"]);
+    // In-memory graphs may reach the kernel without the loader's shape inference.
+    let rank_two = Tensor::from_raw(DataType::Bool, vec![1, 2], &[0, 1]).unwrap();
+    let result = InferenceSession::from_graph(graph)
+        .and_then(|mut session| session.run(&[("X", &x), ("condition", &rank_two)]));
+    let detail = result.unwrap_err().to_string();
+    assert!(
+        detail.contains("Compress")
+            && (detail.contains("one-dimensional") || detail.contains("rank 1")),
+        "{detail}"
+    );
+
     let bad_condition = Tensor::from_i64(&[2], &[0, 1]).unwrap();
     let result = InferenceSession::from_graph(compress_graph(28, None, DataType::Int64, &[2]))
         .and_then(|mut session| session.run(&[("X", &x), ("condition", &bad_condition)]));
