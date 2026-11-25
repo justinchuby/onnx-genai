@@ -1,0 +1,268 @@
+{
+  "schema_version": "v1.14",
+  "package": {
+    "tokenizer": {
+      "algorithm": "word_level",
+      "vocab_size": 32,
+      "artifacts": [
+        {
+          "location": "tokenizer.json"
+        }
+      ],
+      "special_tokens": {
+        "bos_token_id": 2,
+        "eos_token_id": [
+          3
+        ]
+      }
+    }
+  },
+  "preprocessing": {
+    "audio": {
+      "transforms": [
+        {
+          "op": "decode",
+          "outputs": [
+            "raw"
+          ]
+        },
+        {
+          "op": "resample",
+          "sample_rate": 8000,
+          "outputs": [
+            "resampled"
+          ]
+        },
+        {
+          "op": "pad",
+          "mode": "fixed_window",
+          "target_length": 12,
+          "pad_value": -0.5,
+          "outputs": [
+            "padded"
+          ]
+        },
+        {
+          "op": "emit_valid_samples",
+          "inputs": [
+            "padded"
+          ],
+          "outputs": [
+            "length"
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "wave",
+          "source": "padded",
+          "content": "waveform",
+          "dtype": "float32",
+          "contract": {
+            "dtype": "float32",
+            "shape": [
+              1,
+              12
+            ]
+          }
+        },
+        {
+          "name": "length",
+          "source": "length",
+          "content": "valid_samples",
+          "dtype": "int64",
+          "contract": {
+            "dtype": "int64",
+            "shape": [
+              1
+            ],
+            "batch_layout": {
+              "kind": "request_aligned",
+              "axis": 0
+            }
+          }
+        }
+      ]
+    }
+  },
+  "pipeline": {
+    "workflow": {
+      "publication_mode": "commit_only",
+      "manifest": {
+        "adapter_abis": {
+          "onnx-genai.audio-preprocess": "2"
+        }
+      },
+      "inputs": {
+        "request.audio": {
+          "contract": {
+            "dtype": "uint8",
+            "shape": [
+              "encoded_bytes"
+            ]
+          },
+          "role": {
+            "kind": "runtime",
+            "version": "1.0",
+            "role": "media"
+          },
+          "source": {
+            "kind": "request"
+          }
+        }
+      },
+      "outputs": {
+        "logits": {
+          "contract": {
+            "dtype": "float32",
+            "shape": [
+              1,
+              "frames",
+              4
+            ],
+            "batch_layout": {
+              "kind": "request_aligned",
+              "axis": 0
+            },
+            "padding": [
+              {
+                "dimension": "frames",
+                "valid_lengths": "frame_lengths"
+              }
+            ]
+          },
+          "role": "tensor",
+          "stage": "pre_adapter",
+          "family": {
+            "kind": "materialized"
+          }
+        },
+        "frame_lengths": {
+          "contract": {
+            "dtype": "int64",
+            "shape": [
+              1
+            ],
+            "batch_layout": {
+              "kind": "request_aligned",
+              "axis": 0
+            }
+          },
+          "role": "tensor",
+          "stage": "pre_adapter",
+          "family": {
+            "kind": "materialized"
+          }
+        }
+      },
+      "components": {
+        "audio": {
+          "implementation": {
+            "kind": "adapter",
+            "abi": "onnx-genai.audio-preprocess",
+            "version": "2"
+          },
+          "ports": {
+            "inputs": {
+              "encoded": {
+                "dtype": "uint8",
+                "shape": [
+                  "encoded_bytes"
+                ]
+              }
+            },
+            "outputs": {
+              "wave": {
+                "dtype": "float32",
+                "shape": [
+                  1,
+                  12
+                ]
+              },
+              "length": {
+                "dtype": "int64",
+                "shape": [
+                  1
+                ],
+                "batch_layout": {
+                  "kind": "request_aligned",
+                  "axis": 0
+                }
+              }
+            }
+          }
+        },
+        "head": {
+          "implementation": {
+            "kind": "onnx",
+            "artifact": "model.onnx.textproto"
+          }
+        }
+      },
+      "steps": [
+        {
+          "kind": "invoke",
+          "component": "audio",
+          "inputs": {
+            "encoded": "request.audio"
+          },
+          "outputs": {
+            "wave": "wave",
+            "length": "length"
+          }
+        },
+        {
+          "kind": "invoke",
+          "component": "head",
+          "inputs": {
+            "wave": "wave"
+          },
+          "outputs": {
+            "logits": "logits.value"
+          }
+        },
+        {
+          "kind": "emit",
+          "value": "logits.value",
+          "output": "logits",
+          "mode": "replace"
+        },
+        {
+          "kind": "emit",
+          "value": "length",
+          "output": "frame_lengths",
+          "mode": "replace"
+        }
+      ]
+    }
+  },
+  "profiles": {
+    "transcription": {
+      "kind": "transcription",
+      "version": "1.0",
+      "outputs": {
+        "logits": "logits",
+        "frame_lengths": "frame_lengths"
+      },
+      "decoding": {
+        "kind": "ctc",
+        "blank_id": 0,
+        "collapse_repeats": true,
+        "time_axis": 1,
+        "class_axis": 2,
+        "lengths": "frame_lengths",
+        "vocabulary": {
+          "source": "inline",
+          "size": 4,
+          "tokens": [
+            "<blank>",
+            "a",
+            "|",
+            "b"
+          ],
+          "word_delimiter": "|"
+        }
+      }
+    }
+  }
+}

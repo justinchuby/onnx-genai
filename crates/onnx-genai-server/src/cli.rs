@@ -90,9 +90,15 @@ pub struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1:8080")]
     pub addr: SocketAddr,
 
-    /// Maximum requested output tokens per chat completion. Falls back to ONNX_GENAI_MAX_OUTPUT_TOKENS.
+    /// Maximum decoded output tokens per completion or file transcription. Falls back to ONNX_GENAI_MAX_OUTPUT_TOKENS.
     #[arg(long, env = "ONNX_GENAI_MAX_OUTPUT_TOKENS", default_value_t = 4096)]
     pub max_output_tokens: usize,
+    /// Maximum acoustic frames decoded per file transcription.
+    #[arg(long, default_value_t = onnx_genai_engine::transcription::TranscriptionLimits::default().max_frames)]
+    pub max_transcription_frames: std::num::NonZeroUsize,
+    /// Maximum rendered UTF-8 bytes per file transcription.
+    #[arg(long, default_value_t = onnx_genai_engine::transcription::TranscriptionLimits::default().max_text_bytes)]
+    pub max_transcription_text_bytes: std::num::NonZeroUsize,
     /// Maximum completion prompts in one native or OpenAI request.
     #[arg(long, default_value = "128")]
     pub max_completion_prompts: std::num::NonZeroUsize,
@@ -248,6 +254,8 @@ fn server_config_from_args(args: &ServeArgs) -> anyhow::Result<ServerConfig> {
         api_keys: crate::ApiKeys::from_sources(&args.api_key, args.api_key_file.as_deref())?,
         node_id: args.node_id.clone().unwrap_or_else(default_node_id),
         max_output_tokens: args.max_output_tokens,
+        max_transcription_frames: args.max_transcription_frames,
+        max_transcription_text_bytes: args.max_transcription_text_bytes,
         realtime: crate::RealtimeLimits::default(),
         endpoint_props: args.props,
         model_cache_dir: args.model_cache_dir.clone(),
@@ -670,6 +678,26 @@ mod tests {
         let error = TestCli::try_parse_from(["test", "model-dir", "--max-completion-prompts", "0"])
             .unwrap_err();
         assert!(error.to_string().contains("--max-completion-prompts"));
+    }
+    #[test]
+    fn transcription_resource_limits_are_positive_and_forwarded() {
+        let cli = TestCli::parse_from([
+            "test",
+            "model-dir",
+            "--max-transcription-frames",
+            "17",
+            "--max-transcription-text-bytes",
+            "512",
+        ]);
+        let config = server_config_from_args(&cli.serve).unwrap();
+        assert_eq!(config.max_transcription_frames.get(), 17);
+        assert_eq!(config.max_transcription_text_bytes.get(), 512);
+        for flag in [
+            "--max-transcription-frames",
+            "--max-transcription-text-bytes",
+        ] {
+            assert!(TestCli::try_parse_from(["test", "model-dir", flag, "0"]).is_err());
+        }
     }
     #[test]
     fn decision_resource_limits_are_positive_and_forwarded() {

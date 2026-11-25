@@ -84,6 +84,8 @@ the executable program applies only the transforms it actually declares.
 Unsupported operations such as standalone `spectrogram` fail explicitly instead
 of being accepted as no-ops. More DSP operations, windows/scales, codecs and the
 server's remaining legacy feature-input path still require compatibility work.
+Declared pure-waveform CTC/greedy packages execute through the
+[file transcription API](TRANSCRIPTION.md).
 
 The maintained `audio_waveform` fixture executes actual Native CPU preprocessing
 and an ONNX head, checking independently normalized/rescaled branches, padding,

@@ -29,6 +29,7 @@ pub mod session_state;
 mod state_plan;
 pub mod task_profiles;
 pub mod tool_protocol;
+pub mod transcription;
 pub mod validation;
 pub mod version;
 
