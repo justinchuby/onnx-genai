@@ -7400,6 +7400,10 @@ mod llama_compat {
             (25, "2\":0}"),
             (26, "e00\""),
             (27, "f00\""),
+            (28, "f\":0}"),
+            (29, "e\":0}"),
+            (30, "0}"),
+            (31, "1}"),
         ] {
             let old = vocab
                 .iter()
@@ -7432,6 +7436,20 @@ mod llama_compat {
                     24,
                     25,
                     "1\":0}",
+                ),
+                (
+                    r#"{"\u007"#,
+                    json!({"type":"object","properties":{"\u{7f}":{"const":0}},"required":["\u{7f}"],"additionalProperties":false}),
+                    28,
+                    29,
+                    "f\":0}",
+                ),
+                (
+                    r#"{"\u007F":"#,
+                    json!({"type":"object","properties":{"\u{7f}":{"const":0}},"additionalProperties":{"const":1}}),
+                    30,
+                    31,
+                    "0}",
                 ),
                 (r#""\ud83d\ud"#, json!({"const":"😀"}), 26, 27, "e00\""),
             ] {

@@ -2019,3 +2019,37 @@ boundary and after full prompt evaluation proves cache/history publication stays
 atomic and retry recomputes the prefix. SSE replay coverage includes progress
 and timing frames in its byte-exact retained history. Speculative/composite,
 continuous-batch and standalone prefill progress contracts are still unfinished.
+
+
+### JSON property-key escape identity
+
+The pinned llguidance 1.9.1 compiler used serialized raw known-key literals but
+JSON-quoted generic string lexemes. This rejected escaped DEL in a declared key
+and could classify an alternatively escaped known key through a different
+property branch. The local compiler patch builds one quoted-name regex (retaining
+the existing raw spelling) and reuses that exact regex for property recognition
+and pattern/additional exclusion, including impossible optional properties.
+The JSON prefix normalizer also canonicalizes legal raw DEL inside strings;
+original prompt/output text remains untouched. Normalization-sensitive vocabulary
+pieces bypass the literal-byte trie; optimized masks are checked against the
+canonical recognition path for split and whole-token DEL keys and values.
+
+The workspace uses one canonical patched dependency in `vendor/llguidance`.
+Its MIT license, published archive SHA-256, all original file hashes, and exact
+patched-file hashes are recorded there. `scripts/check_llguidance_vendor.py`
+verifies the patch footprint without network access and runs in the existing CI
+gates. The initial declared-key regression failed before the patch. Conformance
+covers every escape split, known/free keys, pattern ownership, unsatisfiable
+optional keys, anyOf branches, Unicode/surrogate keys and literal backslashes.
+HTTP continuation forces valid/invalid competing suffixes through the actual
+model in buffered/SSE mode, with and without response projection.
+
+This workspace patch and bundled source-distribution path are distinct from a
+registry-only dependency install; publishing dependent crates to crates.io removes
+local dependency paths. Upstream or publish the compiler fix before claiming
+this extended key-escape behavior for registry-only crate distributions.
+
+Full server verification also exposed a realtime disconnect release race.
+Admission capacity now drops before the worker reservation advertises idle,
+including early initialization failures; the existing disconnect regression
+checks both resources before admitting a fresh connection.
