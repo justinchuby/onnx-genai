@@ -1819,7 +1819,7 @@ fn control_flow_and_sequence_fail_during_planning() {
 
     let sequence = build_chain(&["SequenceEmpty"]);
     let error = plan(&sequence, &providers).unwrap_err().to_string();
-    assert!(error.contains("sequence"), "{error}");
+    assert!(error.contains("structural container operator"), "{error}");
     assert!(error.contains("SequenceEmpty"), "{error}");
 }
 

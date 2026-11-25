@@ -18921,3 +18921,139 @@ fn kernel_cache_and_prebinding_require_exact_cold_shape_facts() {
 
 #[path = "workspace_context_tests.rs"]
 mod workspace_context_tests;
+
+#[test]
+fn stft_frames_share_one_prepared_peak_and_scalar_lengths_refine_before_dispatch() {
+    use onnx_runtime_memory_api::{DeviceKey, Tier};
+    use onnx_runtime_memory_governor::{
+        HolderId, HostWorkspacePool, LeaseLedger, LedgerGovernor, MemoryGovernor,
+        ProcessMemoryManager,
+    };
+    for scalar_only in [false, true] {
+        let books = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+            DeviceKey::HOST,
+            0,
+            64,
+            0,
+        )));
+        let manager = ProcessMemoryManager::new().unwrap();
+        let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+        let resources = onnx_runtime_ep_cpu::CpuMemoryResources::new(
+            onnx_runtime_ep_cpu::DerivedWeightMemory::governed(books.as_ref(), HolderId::new(13))
+                .unwrap(),
+            Default::default(),
+        )
+        .unwrap()
+        .with_workspace_pool(pool.clone())
+        .unwrap();
+        let ep = Arc::new(CpuExecutionProvider::initialized_with_resources(resources).unwrap());
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let signal = graph.create_named_value("signal", DataType::Float32, static_shape([1, 8, 1]));
+        let step = graph.create_named_value("step", DataType::Int64, static_shape([]));
+        graph.add_input(signal);
+        graph.add_input(step);
+        if scalar_only {
+            let length = graph.create_named_value("length", DataType::Int64, static_shape([]));
+            graph.add_input(length);
+            let output = graph.create_named_value("spectrum", DataType::Float32, vec![]);
+            graph.add_output(output);
+            let mut node = Node::new(
+                NodeId(0),
+                "STFT",
+                vec![Some(signal), Some(step), None, Some(length)],
+                vec![output],
+            );
+            node.attributes
+                .insert("onesided".into(), onnx_runtime_ir::Attribute::Int(0));
+            graph.insert_node(node);
+        } else {
+            for (id, n) in [(0, 3), (1, 4)] {
+                let window = graph.create_named_value(
+                    format!("window{n}"),
+                    DataType::Float32,
+                    static_shape([n]),
+                );
+                let output = graph.create_named_value(
+                    format!("spectrum{n}"),
+                    DataType::Float32,
+                    static_shape([1, 3, n, 2]),
+                );
+                graph.add_input(window);
+                graph.add_output(output);
+                let mut node = Node::new(
+                    NodeId(id),
+                    "STFT",
+                    vec![Some(signal), Some(step), Some(window)],
+                    vec![output],
+                );
+                node.attributes
+                    .insert("onesided".into(), onnx_runtime_ir::Attribute::Int(0));
+                graph.insert_node(node);
+            }
+        }
+        let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), ep, None).unwrap();
+        let floats = |shape, count| {
+            Tensor::from_raw(
+                DataType::Float32,
+                shape,
+                &[1f32.to_le_bytes(); 8][..count].concat(),
+            )
+            .unwrap()
+        };
+        let signal = floats(vec![1, 8, 1], 8);
+        let step = Tensor::from_raw(DataType::Int64, vec![], &2i64.to_le_bytes()).unwrap();
+        let w3 = floats(vec![3], 3);
+        let w4 = floats(vec![4], 4);
+        let mut identity = None;
+        for n in [3i64, 4, 3, 4] {
+            let length = Tensor::from_raw(DataType::Int64, vec![], &n.to_le_bytes()).unwrap();
+            let mut inputs = vec![("signal", &signal), ("step", &step)];
+            if scalar_only {
+                inputs.push(("length", &length));
+                assert!(
+                    executor
+                        .prepare_with_device_bindings(&inputs, &mut [])
+                        .unwrap()
+                        .require_complete()
+                        .is_err(),
+                    "runtime scalar must not enter the metadata-only plan"
+                );
+            } else {
+                inputs.extend([("window3", &w3), ("window4", &w4)]);
+                let peak = executor
+                    .prepare_with_device_bindings(&inputs, &mut [])
+                    .unwrap()
+                    .require_complete()
+                    .unwrap();
+                assert_eq!(
+                    peak.step().bytes,
+                    64,
+                    "max(48,64), not sum or signal length"
+                );
+            }
+            let outputs = executor.run(&inputs).unwrap();
+            assert_eq!(outputs.len(), if scalar_only { 1 } else { 2 });
+            for (index, output) in outputs.iter().enumerate() {
+                let width = if scalar_only { n as usize } else { index + 3 };
+                assert_eq!(output.shape, [1, 3, width, 2]);
+                for frame in output.try_as_slice_f32().unwrap().chunks_exact(width * 2) {
+                    assert!((frame[0] - width as f32).abs() < 1e-4);
+                    assert!(frame[1..].iter().all(|v| v.abs() < 1e-4));
+                }
+            }
+            let snapshot = manager.snapshot().unwrap();
+            assert_eq!(snapshot.allocations.len(), 1);
+            // Scalar 3 -> 4 grows once; thereafter both lengths reuse the peak.
+            if !scalar_only || n == 4 {
+                let expected = identity.get_or_insert(snapshot.allocations[0].identity);
+                assert_eq!(snapshot.allocations[0].identity, *expected);
+                assert_eq!(books.used(Tier::Host), 64);
+            }
+        }
+        drop(executor);
+        pool.trim_idle(u64::MAX).unwrap();
+        assert_eq!(books.used(Tier::Host), 0);
+        assert_eq!(manager.process_used(Tier::Host), 0);
+    }
+}
