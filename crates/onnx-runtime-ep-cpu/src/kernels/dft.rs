@@ -962,7 +962,8 @@ mod tests {
             2.0925107,
             0.533209,
         ];
-        let actual = to_dense_f32_widen("DFT test", &output.view()).unwrap();
+        let output_view = output.view();
+        let actual = to_dense_f32_widen("DFT test", &output_view).unwrap();
         for (i, (&a, e)) in actual.iter().zip(expected).enumerate() {
             assert!((a - e).abs() < 2e-6, "index {i}: expected {e}, got {a}");
         }
@@ -997,8 +998,10 @@ mod tests {
                 .unwrap();
             // np.fft.irfft([1+9j, 3+4j, 5-6j])
             assert_eq!(
-                to_dense_f32_widen("DFT test", &output.view()).unwrap(),
-                [3., -3., 0., 1.]
+                to_dense_f32_widen("DFT test", &output.view())
+                    .unwrap()
+                    .as_ref(),
+                &[3., -3., 0., 1.]
             );
         }
     }
