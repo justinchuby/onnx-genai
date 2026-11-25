@@ -146,8 +146,8 @@ claims.
 
 Other compressed codecs remain open. The existing generative convenience path rejects nonempty `prompt` conditioning
 rather than dropping it, and still needs a general model-authored ASR prompt/response projection and richer
-media accounting; its legacy feature-input analysis also needs a fully authored
-contract. CLI frame execution and program-derived segmentation are implemented. Realtime sessions use their separate declared
+media accounting. Feature-input analysis now executes the named model-authored
+audio program, including its analysis geometry and source-rate clip limit. CLI frame execution and program-derived segmentation are implemented. Realtime sessions use their separate declared
 [contract](REALTIME.md). This feature does not establish complete audio parity.
 
 Encoded audio support and decoder limitations are documented in

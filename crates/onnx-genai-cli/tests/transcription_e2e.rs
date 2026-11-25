@@ -104,21 +104,23 @@ fn native_frame_transcription_process_handles_files_wav_stdin_and_raw_pcm_withou
 fn native_generative_mp3_process_uses_the_authored_window_for_every_segment() {
     let input =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/audio/stereo-tone.mp3");
-    let rows = transcripts(
-        command(&model("transcription_tokens"), &input, &[], None)
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(
-        rows.len(),
-        4,
-        "100 ms recording uses three 32 ms windows and one tail"
-    );
-    for (index, row) in rows.iter().enumerate() {
-        assert_eq!(row["index"], index);
-        assert_eq!(row["text"], "hello");
+    for package in ["transcription_tokens", "transcription_features"] {
+        let rows = transcripts(
+            command(&model(package), &input, &[], None)
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(
+            rows.len(),
+            4,
+            "100 ms recording uses three 32 ms windows and one tail"
+        );
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row["index"], index);
+            assert_eq!(row["text"], "hello");
+        }
+        assert_eq!(rows[0]["end"], 0.032);
+        assert_eq!(rows[3]["start"], 0.096);
+        assert_eq!(rows[3]["end"], 0.1);
     }
-    assert_eq!(rows[0]["end"], 0.032);
-    assert_eq!(rows[3]["start"], 0.096);
-    assert_eq!(rows[3]["end"], 0.1);
 }

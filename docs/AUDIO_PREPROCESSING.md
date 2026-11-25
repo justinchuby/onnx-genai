@@ -124,3 +124,20 @@ Opus is unsupported in Symphonia 0.6.1. MP4 edit lists are not applied, so primi
 that depends on an edit list remains audible to preprocessing. Midstream rate or
 channel changes are rejected. Convert such inputs to a supported WAV file first.
 Live stdin framing continues to use its documented WAV/PCM16 protocol.
+
+## Feature tensor inputs
+
+Schema v1.16 admits externally executed audio feature programs.
+A rank-3 float32 runtime media input also requires `preprocessing.audio`.
+The program output whose `name` exactly matches that workflow input must declare
+`content: audio_features` and `dtype: float32`. Serving executes that output's
+program before binding the tensor and verifies the result against the workflow
+shape. The same program determines source-rate clip limits for CLI segmentation.
+There is no implicit sample rate, FFT, hop, window or normalization recipe.
+Other program outputs do not impose a clip limit on the selected feature branch.
+
+For example, `transcription_features` binds `request.features` after its authored
+8 kHz / 128 FFT / 64 hop / 7 mel / 4 frame program. Its Native head and the
+encoded-input `transcription_tokens` package produce matching buffered/SSE
+transcripts and usage from the same waveform. Missing programs, output-name or
+dtype mismatches, and actual feature-shape mismatches fail with repair guidance.
