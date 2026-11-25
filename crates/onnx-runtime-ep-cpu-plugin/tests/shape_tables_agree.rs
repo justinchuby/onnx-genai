@@ -232,6 +232,7 @@ fn dft_opset17_default_axis_agrees() {
         &node("DFT", 1, &[("onesided", 1)], 17),
         17,
         ShapeInference::Dft {
+            inverse: false,
             onesided: true,
             axis_attr: None,
             default_axis: 1,
