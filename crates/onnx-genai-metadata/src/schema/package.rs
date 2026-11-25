@@ -322,6 +322,9 @@ impl RealtimeSelections {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DecisionSpec {
+    /// Ordered encoded state-image workflow endpoints (decision v2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
     /// Jinja context: state, instructions, type, options (key/description), variant.
     pub prompt_template: String,
     /// Request semantics authored explicitly in schema v1.11 and newer.

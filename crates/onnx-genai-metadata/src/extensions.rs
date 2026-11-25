@@ -528,6 +528,10 @@ pub const CORE_CONFORMANCE: &[(SchemaVersion, &str)] = &[
         crate::version::REALTIME_SCHEMA_VERSION,
         "Realtime v1 profiles declare session-owned bounded audio/text quanta, native rates, frame bounds, control operations and actual per-quantum usage.",
     ),
+    (
+        crate::version::MULTIMODAL_DECISION_SCHEMA_VERSION,
+        "Decision v2 profiles declare ordered encoded-image inputs and authoritative text/media token usage; decision v1 remains text-only.",
+    ),
 ];
 
 /// Look up a built-in extension by its exact declared identity and version.

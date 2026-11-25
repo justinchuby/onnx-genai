@@ -11301,3 +11301,181 @@ mod systemone_decisions {
         assert_eq!(status, StatusCode::OK);
     }
 }
+
+mod systemone_images {
+    use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    fn root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/decision_images")
+    }
+    fn uri(name: &str) -> String {
+        format!(
+            "data:image/png;base64,{}",
+            STANDARD.encode(std::fs::read(root().join(name)).unwrap())
+        )
+    }
+    fn router(limit: usize) -> axum::Router {
+        let config = ServerConfig {
+            max_decision_media_bytes: std::num::NonZeroUsize::new(limit).unwrap(),
+            ..Default::default()
+        };
+        app(AppState::load_with_config(&root(), Some("vision-decisions".into()), config).unwrap())
+    }
+    async fn post(router: axum::Router, body: Value) -> (StatusCode, Value) {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/systemone")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        (response.status(), json_body(response).await)
+    }
+    fn body() -> Value {
+        json!({"state":"hello", "questions":{"route":{"criteria":{"a":"first","b":"second"}}}})
+    }
+    #[tokio::test]
+    async fn systemone_images_files_and_chat_forms_keep_native_input_order() {
+        let router = router(1024 * 1024);
+        let white = uri("white.png");
+        let black = uri("black.png");
+        for wrapped in [false, true] {
+            for image_url in [json!(white), json!({"url":white})] {
+                let messages = json!([{"role":"user","content":[{"type":"text","text":"hello"}]}]);
+                let state = if wrapped {
+                    json!({"messages":messages,"extra":"preserved"})
+                } else {
+                    messages
+                };
+                let mut direct = body();
+                direct["state"] = state.clone();
+                direct["files"] = json!([white, black, white]);
+                let (status, expected) = post(router.clone(), direct).await;
+                assert_eq!(status, StatusCode::OK, "{expected}");
+                let mut mixed = body();
+                mixed["state"] = state;
+                mixed["files"] = json!([white]);
+                mixed["images"] = json!([black]);
+                let messages = if wrapped {
+                    &mut mixed["state"]["messages"]
+                } else {
+                    &mut mixed["state"]
+                };
+                messages[0]["content"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"type":"image_url","image_url":image_url}));
+                let (status, actual) = post(router.clone(), mixed.clone()).await;
+                assert_eq!(status, StatusCode::OK, "{actual}");
+                assert_eq!(
+                    actual, expected,
+                    "media extraction must preserve textual state and file order"
+                );
+                mixed["images"] = json!([white]);
+                let messages = if wrapped {
+                    &mut mixed["state"]["messages"]
+                } else {
+                    &mut mixed["state"]
+                };
+                messages[0]["content"][1]["image_url"] = json!(black);
+                let (status, swapped) = post(router.clone(), mixed).await;
+                assert_eq!(status, StatusCode::OK, "{swapped}");
+                assert_ne!(
+                    actual["answers"]["route"]["probabilities"],
+                    swapped["answers"]["route"]["probabilities"]
+                );
+                assert_eq!(actual["usage"]["output_tokens"], 0);
+            }
+        }
+    }
+    #[tokio::test]
+    async fn systemone_images_share_budget_and_reject_media_before_inference() {
+        let bytes = std::fs::read(root().join("white.png")).unwrap().len();
+        let router = router(bytes);
+        let white = uri("white.png");
+        let black = uri("black.png");
+        let mut request = body();
+        request["images"] = json!([white, white, white]);
+        let (status, result) = post(router.clone(), request.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "duplicate image references share one encoded allocation: {result}"
+        );
+        let baseline_usage = result["usage"]["input_tokens"].as_u64().unwrap();
+        let mut multiple = request.clone();
+        multiple["questions"]["again"] = multiple["questions"]["route"].clone();
+        let (status, shared) = post(router.clone(), multiple).await;
+        assert_eq!(status, StatusCode::OK, "{shared}");
+        assert_eq!(shared["answers"].as_object().unwrap().len(), 2);
+        assert_eq!(shared["usage"]["input_tokens"], 2 * baseline_usage);
+        request["images"] = json!([white, black, white]);
+        let (status, result) = post(router.clone(), request).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{result}");
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("--max-decision-media-bytes")
+        );
+        for images in [
+            json!([white, white]),
+            json!([white, white, white, white]),
+            json!(["http://127.0.0.1:1/no-fetch", white, white]),
+            json!(["data:image/png;base64,AA==", white, white]),
+        ] {
+            let mut request = body();
+            request["images"] = images;
+            let (status, result) = post(router.clone(), request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+            assert!(
+                result["error"]["message"].as_str().unwrap().len() > 30,
+                "{result}"
+            );
+        }
+        // A rejected request must not consume request-local media quota or poison the model.
+        let mut request = body();
+        request["files"] = json!([white, white, white]);
+        let (status, result) = post(router, request).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+    }
+    #[tokio::test]
+    async fn systemone_image_expansion_limit_is_an_actionable_client_error() {
+        let tokenizer =
+            onnx_genai_ort::Tokenizer::from_file(root().join("tokenizer.json")).unwrap();
+        let count = tokenizer
+            .inner()
+            .encode("\"hello\" the", true)
+            .unwrap()
+            .get_attention_mask()
+            .iter()
+            .filter(|x| **x != 0)
+            .count();
+        let config = ServerConfig {
+            max_decision_input_tokens: std::num::NonZeroUsize::new(count).unwrap(),
+            ..Default::default()
+        };
+        let router =
+            app(
+                AppState::load_with_config(&root(), Some("vision-decisions".into()), config)
+                    .unwrap(),
+            );
+        let mut request = body();
+        let white = uri("white.png");
+        request["files"] = json!([white, white, white]);
+        let (status, result) = post(router, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("including images, exceeding"),
+            "{result}"
+        );
+    }
+}

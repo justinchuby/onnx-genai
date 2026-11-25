@@ -71,3 +71,54 @@ fn decode_base64_image(encoded: &str, max_bytes: usize) -> anyhow::Result<Vec<u8
     }
     Ok(bytes)
 }
+
+/// One request owns fetched media. Repeated image references share their
+/// allocation; the byte budget covers all unique retained encoded images.
+pub(crate) struct ImageRequest {
+    remaining: usize,
+    budget_hint: &'static str,
+    images: std::collections::HashMap<String, std::sync::Arc<[u8]>>,
+}
+impl ImageRequest {
+    pub(crate) fn new(limit: std::num::NonZeroUsize, budget_hint: &'static str) -> Self {
+        Self {
+            remaining: limit.get(),
+            images: std::collections::HashMap::new(),
+            budget_hint,
+        }
+    }
+    pub(crate) async fn load(
+        &mut self,
+        urls: &[String],
+        field: &str,
+    ) -> Result<Vec<std::sync::Arc<[u8]>>, crate::routes::ApiError> {
+        let mut images = Vec::with_capacity(urls.len());
+        for (index, url) in urls.iter().enumerate() {
+            if let Some(bytes) = self.images.get(url) {
+                images.push(std::sync::Arc::clone(bytes));
+                continue;
+            }
+            let remaining = std::num::NonZeroUsize::new(self.remaining).ok_or_else(|| {
+                crate::routes::ApiError::payload_too_large(format!(
+                    "{field}[{index}] exceeds the request media budget; reduce images or raise {}",
+                    self.budget_hint
+                ))
+            })?;
+            let bytes = crate::image_input::fetch_image(url, remaining).await.map_err(|error| crate::routes::ApiError::invalid_request(format!("{field}[{index}] could not be loaded within the remaining {remaining}-byte media budget ({}): {error:#}", self.budget_hint)))?;
+            let bytes = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
+                image::ImageReader::new(std::io::Cursor::new(&bytes))
+                    .with_guessed_format()?
+                    .decode()?;
+                Ok(bytes)
+            }).await
+                .map_err(|error| crate::routes::ApiError::internal(format!("validate {field}[{index}]: image decoding task stopped: {error}; retry the request or inspect server logs")))?
+                .map_err(|error| crate::routes::ApiError::invalid_request(format!("{field}[{index}] is not a supported encoded image: {error:#}; provide valid PNG or JPEG data")))?;
+            self.remaining -= bytes.len();
+            let bytes: std::sync::Arc<[u8]> = bytes.into();
+            self.images
+                .insert(url.clone(), std::sync::Arc::clone(&bytes));
+            images.push(bytes);
+        }
+        Ok(images)
+    }
+}

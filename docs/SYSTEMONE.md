@@ -1,7 +1,7 @@
 # Non-generative SystemOne decisions
 
 `POST /v1/systemone` evaluates a model-declared decision head. It does not ask a
-chat model to generate an answer. A package must declare a `decision` v1 task
+chat model to generate an answer. A package must declare a `decision` v1 or v2 task
 profile; ordinary generation/embedding/reranking packages receive actionable
 `501 not_supported_error`. `/props` advertises `nxrt_capabilities.decision`.
 
@@ -137,6 +137,52 @@ budget is zero. Model execution uses the ordinary bounded engine worker queue,
 and dropped clients do not execute pending commands. Converted probabilities
 retain canonical host-memory ownership through the returned engine result.
 
+## Ordered image inputs (decision v2)
+
+Schema v1.14 adds decision v2 image workflows. The profile declares
+`decision.images` as an ordered array of workflow endpoint names and exposes
+both `outputs.probabilities` and `outputs.prompt_tokens`. Image endpoints must be
+opaque application-sourced `uint8 [encoded_bytes]` vectors; the authored workflow
+owns image decoding, preprocessing and the probability head. Fixed encoded-byte
+lengths and required/optional input positions are admitted before execution.
+The template additionally receives `image_count`. Decision v1 stays text-only.
+
+For example, a package with two image endpoints can receive:
+
+```json
+{
+  "state": "Compare the two images",
+  "images": ["data:image/png;base64,...", "data:image/png;base64,..."],
+  "questions": {"match": {"type": "choice", "instructions": "Choose a result",
+    "criteria": {"same": "Same subject", "different": "Different subjects"}}}
+}
+```
+
+Input order matches the upstream transport: `files`, then its `images` alias,
+then image parts in chat-state message order. State can be a messages array or
+an object containing `messages`; `image_url` parts accept a data URI directly or
+`{url: data_uri}`. Those parts are removed from textual state while other parts,
+message fields and wrapper fields remain intact. Only image data URIs are
+accepted on this path; it does not fetch HTTP URLs. Audio/video and spoken
+instructions require further contracts and are still rejected explicitly.
+
+`--max-decision-media-bytes` defaults to 64 MiB of unique retained encoded bytes
+per request. Repeated image references share their allocation across questions
+and variants. Position counts are checked before loading; all images must decode
+and all questions/variants must prepare before any model work is submitted.
+The existing bounded image loader is shared with reranking. Encoded tensor
+staging reserves engine host memory before allocation; the tensor and its
+no-copy aliases retain that reservation until their final owner is released.
+
+The workflow reports total `prompt_tokens`, including text and model-authored
+image expansion, once per variant. Counts must be nonnegative, cover admitted
+nonpadding text tokens and fit the configured/model input limit. Usage sums the
+actual counts over questions and variants; output tokens remain zero. No hidden
+image-token formula or model identity determines the expansion. The
+`decision_images` fixture executes Native CPU image-preprocess@2 and a real ONNX
+probability head; changing ordered image positions changes its output. This is
+functional evidence, not recognition-quality or device-performance evidence.
+
 ## Limits and remaining work
 
 `--max-decision-input-tokens` defaults to 8192 per prompt variant (also capped by
@@ -148,9 +194,9 @@ Rendered-byte and interpreter-fuel limits fail before model execution, including
 large template loops. All questions/variants are prepared before any inference is submitted.
 The package's exact tokenizer padding/truncation contract remains authoritative.
 
-This v1 execution path supports text and structured JSON state/instructions.
-Files/images/video, chat media parts and spoken instructions are refused before
-execution. Multimodal decision preparation, joint/packed decision heads and shared generative /
+The v1 execution path supports text and structured JSON state/instructions; v2
+adds ordered images as described above. Audio/video and spoken instructions,
+joint/packed decision heads and shared generative /
 decision workflow entry points still need explicit metadata and runtime support.
 GGUF decision-head import is not implemented by registering this HTTP route.
 The small native ONNX fixture proves actual input-dependent head execution,
