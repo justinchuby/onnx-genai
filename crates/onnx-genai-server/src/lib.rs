@@ -38,6 +38,7 @@ mod model_hub;
 mod model_management;
 mod models_config;
 pub mod multimodal;
+mod realtime;
 mod reasoning_request;
 mod registry;
 mod replay;
@@ -80,10 +81,22 @@ pub use types::{
     ToolChoiceSpecific, Usage,
 };
 
+pub use realtime::RealtimeLimits;
+
+/// Declare an HTTP-upgrade protocol separately from ordinary GET contracts.
+fn ws<H, T>(handler: H) -> axum::routing::MethodRouter<AppState>
+where
+    H: axum::handler::Handler<T, AppState>,
+    T: 'static,
+{
+    get(handler)
+}
+
 pub fn app(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/health", get(routes::health))
         .route("/v1/health", get(routes::health))
+        .route("/v1/realtime", ws(realtime::websocket::upgrade))
         .route("/v1/responses", post(routes::transports::responses))
         .route("/responses", post(routes::transports::responses))
         .route(

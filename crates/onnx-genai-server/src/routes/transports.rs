@@ -193,22 +193,11 @@ fn response_request(mut body: Map<String, Value>) -> Result<ChatCompletionReques
         body.insert("response_format".into(), format);
     }
     if let Some(tools) = body.remove("tools") {
-        let mut lowered = Vec::new();
-        for mut tool in array(tools, "tools")? {
-            let object = tool.as_object_mut().ok_or_else(|| {
-                ApiError::invalid_request("each Responses tool must be an object")
-            })?;
-            if object.remove("type") != Some(json!("function")) {
-                return Err(ApiError::invalid_request(
-                    "Responses tools must be type=function; hosted tools are not implemented",
-                ));
-            }
-            // Strictness is enforced by the package's typed tool transaction.
-            object.remove("strict");
-            lowered.push(json!({"type":"function","function":object}));
-        }
-        body.insert("tools".into(), json!(lowered));
+        let lowered = crate::tool_protocol::responses_tools(tools)
+            .map_err(|error| ApiError::invalid_request(error.to_string()))?;
+        body.insert("tools".into(), lowered);
     }
+
     if let Some(choice) = body.remove("tool_choice") {
         let choice = if choice.is_object() {
             json!({"type":"function","function":{"name":string(&choice["name"],"tool_choice.name")?}})
