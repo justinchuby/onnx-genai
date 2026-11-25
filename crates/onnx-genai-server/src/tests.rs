@@ -7400,6 +7400,10 @@ mod llama_compat {
             (25, "2\":0}"),
             (26, "e00\""),
             (27, "f00\""),
+            (28, "f\":0}"),
+            (29, "e\":0}"),
+            (30, "0}"),
+            (31, "1}"),
         ] {
             let old = vocab
                 .iter()
@@ -7432,6 +7436,20 @@ mod llama_compat {
                     24,
                     25,
                     "1\":0}",
+                ),
+                (
+                    r#"{"\u007"#,
+                    json!({"type":"object","properties":{"\u{7f}":{"const":0}},"required":["\u{7f}"],"additionalProperties":false}),
+                    28,
+                    29,
+                    "f\":0}",
+                ),
+                (
+                    r#"{"\u007F":"#,
+                    json!({"type":"object","properties":{"\u{7f}":{"const":0}},"additionalProperties":{"const":1}}),
+                    30,
+                    31,
+                    "0}",
                 ),
                 (r#""\ud83d\ud"#, json!({"const":"😀"}), 26, 27, "e00\""),
             ] {
@@ -8872,6 +8890,132 @@ mod native_compat {
                 assert_eq!(slots[0]["is_processing"], false);
                 assert_eq!(value["tokens_predicted"], 2);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_prompt_only_progress_and_timings_follow_cold_cached_and_extended_work() {
+        use onnx_genai_engine::EngineDecodeBackend;
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for backend in [EngineDecodeBackend::Native, EngineDecodeBackend::Ort] {
+            let state = AppState::load_with_config(
+                &model_dir,
+                Some("tiny-llm".into()),
+                ServerConfig {
+                    engine_config: EngineConfig {
+                        decode_backend: backend,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let router = app(state);
+            for (stream, report, cold, tokens) in [
+                (false, true, true, vec![2, 4, 3]),
+                (true, false, true, vec![2, 4, 3]),
+                (true, true, true, vec![2, 4, 3]),
+                (true, true, false, vec![2, 4, 3]),
+                (true, true, false, vec![2, 4, 3, 5]),
+            ] {
+                let response = request(
+                    router.clone(),
+                    "/completion",
+                    json!({
+                        "prompt":tokens,"n_predict":0,"stream":stream,"return_progress":report,
+                        "cache_prompt":!cold,"return_tokens":true
+                    }),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let values = if stream {
+                    sse_json_events(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                } else {
+                    vec![json_body(response).await]
+                };
+                let terminal = values.last().unwrap();
+                assert_eq!(terminal["stop"], true, "{values:?}");
+                assert_eq!(terminal["content"], "");
+                assert_eq!(terminal["tokens"], json!([]));
+                let cache = if cold {
+                    0
+                } else if tokens.len() == 4 || backend == EngineDecodeBackend::Native {
+                    3
+                } else {
+                    2
+                };
+                let timing = &terminal["timings"];
+                assert_eq!(timing["cache_n"], cache);
+                assert_eq!(timing["prompt_n"], tokens.len() - cache);
+                assert_eq!(timing["predicted_n"], 0);
+                for name in [
+                    "predicted_ms",
+                    "predicted_per_token_ms",
+                    "predicted_per_second",
+                ] {
+                    assert_eq!(timing[name].as_f64(), Some(0.0));
+                }
+                let updates = values
+                    .iter()
+                    .filter_map(|value| value.get("prompt_progress"))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    updates.len(),
+                    if stream && report { 2 } else { 0 },
+                    "{values:?}"
+                );
+                if stream && report {
+                    assert_eq!(values.len(), 3);
+                    assert_eq!(updates[0]["processed"], cache);
+                    assert_eq!(updates[1]["processed"], tokens.len());
+                    for update in updates {
+                        assert_eq!(update["cache"], cache);
+                        assert_eq!(update["total"], tokens.len());
+                    }
+                }
+                if cache == tokens.len() {
+                    assert_eq!(timing["prompt_ms"].as_f64(), Some(0.0));
+                } else {
+                    assert!(timing["prompt_ms"].as_f64().unwrap() > 0.0);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_prompt_only_rejects_unavailable_execution_before_sse_admission() {
+        let scratch = tempfile::tempdir().unwrap();
+        let package = workflow_session_package(&scratch);
+        let router = app(AppState::load(&package, Some("workflow".into())).unwrap());
+        for stream in [false, true] {
+            let response = request(
+                router.clone(),
+                "/completion",
+                json!({
+                    "prompt":[2,4,3],"n_predict":0,"stream":stream,"return_progress":true
+                }),
+            )
+            .await;
+            let status = response.status();
+            assert!(
+                !response
+                    .headers()
+                    .get("content-type")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .contains("event-stream")
+            );
+            let error = json_body(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("runtime-owned decode executor"),
+                "{error}"
+            );
         }
     }
 

@@ -455,6 +455,13 @@ fn prepare(
         },
     })
 }
+fn prefill_value(model: &str, index: usize, result: onnx_genai_engine::PrefillResult) -> Value {
+    json!({"content":"","tokens":[],"stop":true,"index":index,"model":model,
+        "tokens_predicted":0,"tokens_evaluated":result.prompt_tokens,
+        "tokens_cached":result.retained_cache_tokens,"stop_type":"limit","truncated":false,
+        "timings":crate::timings::render(result.timings)})
+}
+
 async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, ApiError> {
     let PreparedNative {
         request,
@@ -464,21 +471,73 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
     let (tokens, options) = match operation {
         NativeOperation::Generate { tokens, options } => (tokens, *options),
         NativeOperation::Prefill(input) => {
-            let result = handle
+            let mut prefill = handle
                 .engine
                 .prefill(input)
                 .await
                 .map_err(map_generate_submit_error)?;
-            let value = json!({"content":"","tokens":[],"stop":true,"index":index,"model":handle.id,
-                "tokens_predicted":0,"tokens_evaluated":result.prompt_tokens,
-                "tokens_cached":result.retained_cache_tokens,"stop_type":"limit","truncated":false});
+            super::completions::await_driver_admission(prefill.admission).await?;
+            let return_progress = request
+                .sampling
+                .extensions
+                .get("return_progress")
+                .and_then(Value::as_bool)
+                == Some(true);
+            let model = handle.id.clone();
             if !request.sampling.stream {
-                return Ok(NativeOutput::Buffered(value));
+                let mut open = true;
+                loop {
+                    tokio::select! {
+                        biased;
+                        progress = prefill.progress.recv(), if open => { open = progress.is_some(); }
+                        result = &mut prefill.result => {
+                            let result = result.map_err(|_| ApiError::internal("prompt-only worker stopped before returning its committed result; inspect server logs and retry"))?
+                                .map_err(generation_failure)?;
+                            return Ok(NativeOutput::Buffered(prefill_value(&model, index, result)));
+                        }
+                    }
+                }
             }
-            let (tx, receiver) = mpsc::channel(1);
+            let (tx, receiver) = mpsc::channel(16);
             let (completed, outcome) = oneshot::channel();
-            let _ = tx.send(Ok(Event::default().data(value.to_string()))).await;
-            let _ = completed.send(());
+            tokio::spawn(async move {
+                let mut open = true;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = tx.closed() => break,
+                        progress = prefill.progress.recv(), if open => {
+                            match progress {
+                                Some(DriverEvent::PromptProgress(progress)) if return_progress => {
+                                    let value = json!({"content":"","tokens":[],"stop":false,"index":index,
+                                        "tokens_predicted":0,"tokens_evaluated":progress.total,
+                                        "prompt_progress":crate::timings::render_prompt_progress(progress)});
+                                    if tx.send(Ok(Event::default().data(value.to_string()))).await.is_err() { break; }
+                                }
+                                None => open = false,
+                                _ => {}
+                            }
+                        }
+                        result = &mut prefill.result => {
+                            let result = result.map_err(|_| ApiError::internal("prompt-only worker stopped before returning its committed result; inspect server logs and retry"))
+                                .and_then(|result| result.map_err(generation_failure));
+                            match result {
+                                Ok(result) => {
+                                    let value = prefill_value(&model, index, result);
+                                    if tx.send(Ok(Event::default().data(value.to_string()))).await.is_ok() {
+                                        let _ = completed.send(());
+                                    }
+                                }
+                                Err(error) => {
+                                    let value = json!({"error":{"message":error.message,"type":error.kind,"code":500},"index":index});
+                                    let _ = tx.send(Ok(Event::default().event("error").data(value.to_string()))).await;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            });
             return Ok(NativeOutput::Stream {
                 receiver,
                 completed: outcome,
