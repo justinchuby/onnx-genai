@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Attribute, DataType, Node};
+use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
@@ -539,7 +539,7 @@ impl Kernel for ConvTransposeKernel {
 mod tests {
     use super::*;
     use crate::kernels::standard_claims::unsupported_reason_at_opset;
-    use onnx_runtime_ir::{NodeId, ValueId, static_shape};
+    use onnx_runtime_ir::{Attribute, NodeId, ValueId, static_shape};
 
     fn node(attributes: &[(&str, Attribute)]) -> Node {
         let mut node = Node::new(
