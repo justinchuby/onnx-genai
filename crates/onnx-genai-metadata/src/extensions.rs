@@ -543,6 +543,10 @@ pub const CORE_CONFORMANCE: &[(SchemaVersion, &str)] = &[
         crate::version::MULTIMODAL_DECISION_SCHEMA_VERSION,
         "Decision v2 profiles declare ordered encoded-image inputs and authoritative text/media token usage; decision v1 remains text-only.",
     ),
+    (
+        crate::version::DECISION_AUDIO_SCHEMA_VERSION,
+        "Decision v3 profiles declare typed mixed state-media inputs and an explicit spoken-question audio endpoint with authoritative per-variant usage.",
+    ),
 ];
 
 /// Look up a built-in extension by its exact declared identity and version.

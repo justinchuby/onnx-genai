@@ -10,13 +10,19 @@ pub enum DecisionFeature {
     TokenTypeIds,
     OptionCount { vector: bool },
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionMediaInput {
+    pub kind: crate::EncodedMediaKind,
+    pub input: crate::task_profiles::EncodedMediaInput,
+}
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecisionContract {
     profile: String,
     input_policy: std::sync::Arc<crate::DecisionInputPolicy>,
     output: String,
     prompt_tokens_output: Option<String>,
-    images: Vec<crate::task_profiles::EncodedImageInput>,
+    media: Vec<DecisionMediaInput>,
+    spoken_input: Option<crate::task_profiles::EncodedMediaInput>,
     spec: DecisionSpec,
     bindings: Vec<(String, DecisionFeature)>,
     sequence_length: Option<usize>,
@@ -32,33 +38,64 @@ impl DecisionContract {
     pub fn output(&self) -> &str {
         &self.output
     }
-    pub fn images(&self) -> &[crate::task_profiles::EncodedImageInput] {
-        &self.images
+    pub fn media(&self) -> &[DecisionMediaInput] {
+        &self.media
+    }
+    pub fn spoken_input(&self) -> Option<&crate::task_profiles::EncodedMediaInput> {
+        self.spoken_input.as_ref()
     }
     pub fn prompt_tokens_output(&self) -> Option<&str> {
         self.prompt_tokens_output.as_deref()
     }
-    pub fn admit_images(&self, count: usize) -> Result<(), DecisionContractError> {
-        if count > self.images.len() {
+    pub fn admit_media(
+        &self,
+        kinds: &[crate::EncodedMediaKind],
+    ) -> Result<(), DecisionContractError> {
+        if kinds.len() > self.media.len() {
             return Err(invalid(format!(
-                "decision profile '{}' declares {} ordered state-image inputs, but request supplies {count}; reduce images or select a compatible package",
+                "decision profile '{}' declares {} ordered state-media inputs, but request supplies {}; reduce media or select a compatible package",
                 self.profile,
-                self.images.len()
+                self.media.len(),
+                kinds.len()
             )));
         }
+        for (index, (actual, binding)) in kinds.iter().zip(&self.media).enumerate() {
+            if *actual != binding.kind {
+                return Err(invalid(format!(
+                    "decision state media[{index}] is {actual:?}, but profile '{}' input '{}' requires {:?}; preserve the declared mixed-media order",
+                    self.profile,
+                    binding.input.endpoint(),
+                    binding.kind
+                )));
+            }
+        }
         if let Some(binding) = self
-            .images
+            .media
             .iter()
-            .skip(count)
-            .find(|binding| binding.required)
+            .skip(kinds.len())
+            .find(|binding| binding.input.required)
         {
             return Err(invalid(format!(
-                "decision profile '{}' omits required state-image input '{}'; supply the declared ordered images",
+                "decision profile '{}' omits required state-media input '{}'; supply the declared ordered media",
                 self.profile,
-                binding.endpoint()
+                binding.input.endpoint()
             )));
         }
         Ok(())
+    }
+    pub fn admit_spoken(&self, spoken: bool) -> Result<(), DecisionContractError> {
+        match (&self.spoken_input, spoken) {
+            (None, true) => Err(invalid(format!(
+                "decision profile '{}' does not declare spoken_instructions; supply text or select an audio-capable decision v3 package",
+                self.profile
+            ))),
+            (Some(binding), false) if binding.required => Err(invalid(format!(
+                "decision profile '{}' requires spoken instructions at '{}'; provide an input_audio question",
+                self.profile,
+                binding.endpoint()
+            ))),
+            _ => Ok(()),
+        }
     }
     pub fn spec(&self) -> &DecisionSpec {
         &self.spec
@@ -120,6 +157,21 @@ pub fn decision_contract(
             )
             .map_err(invalid)?;
         }
+        if (profile.kind == "decision" && profile.version == "3")
+            || profile
+                .decision
+                .as_ref()
+                .is_some_and(|spec| !spec.media.is_empty() || spec.spoken_instructions.is_some())
+        {
+            let version =
+                crate::version::normalize(metadata.schema_version.as_deref()).map_err(invalid)?;
+            crate::version::gate_feature_use(
+                version,
+                crate::version::SchemaFeature::DecisionAudio,
+                &format!("profiles.{name}.decision.media"),
+            )
+            .map_err(invalid)?;
+        }
         if crate::task_profiles::skip_unsupported_version(profile) {
             continue;
         }
@@ -131,9 +183,9 @@ pub fn decision_contract(
             }
             continue;
         }
-        if !matches!(profile.version.as_str(), "1" | "2") {
+        if !matches!(profile.version.as_str(), "1" | "2" | "3") {
             return Err(invalid(format!(
-                "profiles.{name}.version '{}' is unsupported for decision; use version '1' or '2' or mark an unsupported profile ignorable",
+                "profiles.{name}.version '{}' is unsupported for decision; use version '1', '2' or '3' or mark an unsupported profile ignorable",
                 profile.version
             )));
         }
@@ -143,9 +195,26 @@ pub fn decision_contract(
             ));
         }
         let spec=profile.decision.as_ref().ok_or_else(||invalid(format!("profiles.{name}.decision must declare prompt_template, max_options, variants, confidence and score policies")))?;
-        if (profile.version == "2") == spec.images.is_empty() {
+        let valid_media = match profile.version.as_str() {
+            "1" => {
+                spec.images.is_empty()
+                    && spec.media.is_empty()
+                    && spec.spoken_instructions.is_none()
+            }
+            "2" => {
+                !spec.images.is_empty()
+                    && spec.media.is_empty()
+                    && spec.spoken_instructions.is_none()
+            }
+            "3" => {
+                spec.images.is_empty()
+                    && (!spec.media.is_empty() || spec.spoken_instructions.is_some())
+            }
+            _ => false,
+        };
+        if !valid_media {
             return Err(invalid(format!(
-                "profiles.{name} decision v2 requires nonempty decision.images; decision v1 must omit images"
+                "profiles.{name}: decision v1 omits media; v2 requires images only; v3 requires typed media and/or spoken_instructions and omits images"
             )));
         }
         if let Some(policy) = &spec.input_policy {
@@ -181,13 +250,13 @@ pub fn decision_contract(
                 "profiles.{name} decision profiles must execute a non-generative workflow without text/token outputs; expose a separate decision-head workflow instead of reporting generated tokens as decisions"
             )));
         }
-        let expected_outputs = if profile.version == "2" { 2 } else { 1 };
+        let expected_outputs = if profile.version == "1" { 1 } else { 2 };
         if profile.outputs.len() != expected_outputs
             || !profile.outputs.contains_key("probabilities")
-            || (profile.version == "2" && !profile.outputs.contains_key("prompt_tokens"))
+            || (profile.version != "1" && !profile.outputs.contains_key("prompt_tokens"))
         {
             return Err(invalid(format!(
-                "profiles.{name}.outputs must name probabilities (and prompt_tokens for decision v2); compute calibrated option probabilities and complete media-aware usage in the workflow"
+                "profiles.{name}.outputs must name probabilities (and prompt_tokens for decision v2/v3); compute calibrated option probabilities and complete media-aware usage in the workflow"
             )));
         }
         let output = &profile.outputs["probabilities"];
@@ -210,14 +279,65 @@ pub fn decision_contract(
             TensorDimension::Fixed(n)=>Some(usize::try_from(*n).ok().filter(|n|*n>0 && *n<=spec.max_options.get()).ok_or_else(||invalid(format!("profiles.{name} probability dimension must be positive and within decision.max_options")))?),
             _=>None,
         };
-        let images = crate::task_profiles::resolve_encoded_images(
+        let names = if profile.version == "2" {
+            spec.images.clone()
+        } else {
+            spec.media
+                .iter()
+                .map(|binding| binding.input.clone())
+                .collect()
+        };
+        let mut used = std::collections::BTreeSet::new();
+        let media = crate::task_profiles::resolve_encoded_media_inputs(
             workflow,
-            &spec.images,
-            &format!("profiles.{name}.decision.images"),
-            &mut std::collections::BTreeSet::new(),
+            &names,
+            &format!(
+                "profiles.{name}.decision.{}",
+                if profile.version == "2" {
+                    "images"
+                } else {
+                    "media"
+                }
+            ),
+            &mut used,
         )
-        .map_err(|error| invalid(error.to_string()))?;
-        let prompt_tokens_output = if profile.version == "2" {
+        .map_err(|error| invalid(error.to_string()))?
+        .into_iter()
+        .enumerate()
+        .map(|(index, input)| DecisionMediaInput {
+            kind: if profile.version == "2" {
+                crate::EncodedMediaKind::Image
+            } else {
+                spec.media[index].kind
+            },
+            input,
+        })
+        .collect::<Vec<_>>();
+        let spoken_input = spec
+            .spoken_instructions
+            .as_ref()
+            .map(|endpoint| {
+                crate::task_profiles::resolve_encoded_media_inputs(
+                    workflow,
+                    std::slice::from_ref(endpoint),
+                    &format!("profiles.{name}.decision.spoken_instructions"),
+                    &mut used,
+                )
+                .map_err(|error| invalid(error.to_string()))
+                .map(|mut inputs| inputs.remove(0))
+            })
+            .transpose()?;
+        if spoken_input.is_some()
+            && matches!(
+                input_policy.instructions,
+                crate::DecisionInstructions::Forbidden
+            )
+        {
+            return Err(invalid(format!(
+                "profiles.{name}.decision.spoken_instructions conflicts with forbidden instructions; allow question instructions or remove the spoken endpoint"
+            )));
+        }
+        let prompt_tokens_output = if profile.version != "1" {
             let endpoint = &profile.outputs["prompt_tokens"];
             let usage = workflow.outputs.get(endpoint).ok_or_else(|| {
                 invalid(format!(
@@ -245,9 +365,12 @@ pub fn decision_contract(
         let mut bindings = Vec::new();
         let mut sequence_length = None;
         for (input_name, input) in &workflow.inputs {
-            if images
+            if media
                 .iter()
-                .any(|binding| binding.endpoint() == input_name)
+                .any(|binding| binding.input.endpoint() == input_name)
+                || spoken_input
+                    .as_ref()
+                    .is_some_and(|binding| binding.endpoint() == input_name)
             {
                 continue;
             }
@@ -324,7 +447,8 @@ pub fn decision_contract(
             input_policy,
             output: output.clone(),
             prompt_tokens_output,
-            images,
+            media,
+            spoken_input,
             spec: spec.clone(),
             bindings,
             sequence_length,
@@ -456,12 +580,14 @@ mod image_contract_tests {
     fn decision_images_resolve_positions_usage_and_reject_invalid_bindings() {
         let metadata = document();
         let contract = decision_contract(&metadata).unwrap().unwrap();
-        assert_eq!(contract.images().len(), 3);
+        assert_eq!(contract.media().len(), 3);
         assert_eq!(contract.prompt_tokens_output(), Some("usage"));
-        contract.admit_images(3).unwrap();
+        contract
+            .admit_media(&[crate::EncodedMediaKind::Image; 3])
+            .unwrap();
         assert!(
             contract
-                .admit_images(2)
+                .admit_media(&[crate::EncodedMediaKind::Image; 2])
                 .unwrap_err()
                 .to_string()
                 .contains("omits required")
@@ -509,6 +635,75 @@ mod image_contract_tests {
             assert!(
                 decision_contract(&metadata).is_err(),
                 "invalid mutation {mutation} admitted"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod audio_contract_tests {
+    use super::*;
+    const SOURCE: &str = include_str!(
+        "../../../tests/fixtures/onnx_genai_workflows/decision_audio/inference_metadata.yaml"
+    );
+    fn document() -> InferenceMetadata {
+        crate::parse_metadata(SOURCE, None).unwrap()
+    }
+    #[test]
+    fn decision_audio_has_parser_and_typed_schema_floor() {
+        let error = crate::parse_metadata(&SOURCE.replace("v1.15", "v1.14"), None).unwrap_err();
+        assert!(error.to_string().contains("v1.15"), "{error}");
+        let mut metadata = document();
+        metadata.schema_version = Some("v1.14".into());
+        let error = decision_contract(&metadata).unwrap_err();
+        assert!(error.to_string().contains("v1.15"), "{error}");
+    }
+    #[test]
+    fn decision_audio_proves_kind_order_and_required_spoken_endpoint() {
+        use crate::EncodedMediaKind::{Audio, Image};
+        let contract = decision_contract(&document()).unwrap().unwrap();
+        contract.admit_media(&[Image, Audio]).unwrap();
+        contract.admit_spoken(true).unwrap();
+        assert_eq!(
+            contract.spoken_input().unwrap().endpoint(),
+            "question.audio"
+        );
+        assert!(contract.admit_media(&[Audio, Image]).is_err());
+        assert!(contract.admit_media(&[Image]).is_err());
+        assert!(contract.admit_spoken(false).is_err());
+        for case in 0..7 {
+            let mut metadata = document();
+            let profile = metadata.profiles.get_mut("decision_head").unwrap();
+            let spec = profile.decision.as_mut().unwrap();
+            match case {
+                0 => spec.spoken_instructions = Some(spec.media[0].input.clone()),
+                1 => spec.media[1].input = spec.media[0].input.clone(),
+                2 => spec.images.push("state.picture".into()),
+                3 => profile.version = "2".into(),
+                4 => {
+                    profile.outputs.remove("prompt_tokens");
+                }
+                5 => {
+                    spec.input_policy.as_mut().unwrap().instructions =
+                        crate::DecisionInstructions::Forbidden
+                }
+                6 => {
+                    metadata
+                        .pipeline
+                        .as_mut()
+                        .unwrap()
+                        .workflow
+                        .inputs
+                        .get_mut("question.audio")
+                        .unwrap()
+                        .contract
+                        .dtype = "float32".into()
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                decision_contract(&metadata).is_err(),
+                "invalid case {case} admitted"
             );
         }
     }

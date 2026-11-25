@@ -11474,7 +11474,207 @@ mod systemone_images {
             result["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("including images, exceeding"),
+                .contains("including media, exceeding"),
+            "{result}"
+        );
+    }
+}
+
+mod systemone_audio {
+    use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    fn root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/decision_audio")
+    }
+    fn audio(samples: usize, tone: bool) -> String {
+        let values = (0..samples)
+            .map(|i| {
+                if tone {
+                    (i as f32 * 0.19).sin() * 0.5
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>();
+        STANDARD.encode(onnx_genai_preprocess::audio::encode_wav_pcm16(&values, 16000, 1).unwrap())
+    }
+    fn image() -> String {
+        format!(
+            "data:image/png;base64,{}",
+            STANDARD.encode(std::fs::read(root().join("white.png")).unwrap())
+        )
+    }
+    fn router(limit: usize) -> axum::Router {
+        app(AppState::load_with_config(
+            &root(),
+            Some("audio-decisions".into()),
+            ServerConfig {
+                max_decision_media_bytes: std::num::NonZeroUsize::new(limit).unwrap(),
+                ..Default::default()
+            },
+        )
+        .unwrap())
+    }
+    fn body() -> Value {
+        json!({"state":"hello","files":[image(),format!("data:audio/wav;base64,{}",audio(1600,false))],"questions":{"route":{"instructions":{"type":"input_audio","input_audio":{"data":audio(3200,false)}},"criteria":{"a":"first","b":"second"}}}})
+    }
+    async fn post(router: axum::Router, body: Value) -> (StatusCode, Value) {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/systemone")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        (response.status(), json_body(response).await)
+    }
+    #[tokio::test]
+    async fn systemone_audio_spoken_questions_are_independent_and_usage_is_actual() {
+        let router = router(1024 * 1024);
+        let request = body();
+        let (status, one) = post(router.clone(), request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{one}");
+        let mut multiple = request;
+        multiple["questions"]["other"] = multiple["questions"]["route"].clone();
+        multiple["questions"]["other"]["instructions"]["input_audio"] =
+            json!({"url":format!("data:audio/wav;base64,{}",audio(3200,true))});
+        let (status, two) = post(router.clone(), multiple).await;
+        assert_eq!(status, StatusCode::OK, "{two}");
+        assert_eq!(two["answers"]["route"], one["answers"]["route"]);
+        assert_ne!(
+            two["answers"]["other"]["probabilities"],
+            one["answers"]["route"]["probabilities"]
+        );
+        assert_eq!(
+            two["usage"]["input_tokens"].as_u64().unwrap(),
+            2 * one["usage"]["input_tokens"].as_u64().unwrap()
+        );
+        assert_eq!(two["usage"]["output_tokens"], 0);
+        let mut longer = body();
+        longer["questions"]["route"]["instructions"]["input_audio"]["data"] =
+            json!(audio(4800, false));
+        let (status, result) = post(router.clone(), longer).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(
+            result["usage"]["input_tokens"].as_u64().unwrap(),
+            one["usage"]["input_tokens"].as_u64().unwrap() + 10
+        );
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/props")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let props = json_body(response).await;
+        assert_eq!(
+            props["nxrt_capabilities"]["decision_media_order"],
+            json!(["image", "audio"])
+        );
+        assert_eq!(
+            props["nxrt_capabilities"]["decision_spoken_instructions"],
+            true
+        );
+    }
+    #[tokio::test]
+    async fn systemone_audio_chat_parts_preserve_state_and_media_order() {
+        let router = router(1024 * 1024);
+        for wrapped in [false, true] {
+            let messages = json!([{"role":"user","content":[{"type":"text","text":"hello"}]}]);
+            let state = if wrapped {
+                json!({"messages":messages,"extra":17})
+            } else {
+                messages
+            };
+            let mut direct = body();
+            direct["state"] = state.clone();
+            let (status, expected) = post(router.clone(), direct).await;
+            assert_eq!(status, StatusCode::OK, "{expected}");
+            let mut embedded = body();
+            embedded["state"] = state;
+            embedded["files"] = json!([]);
+            let content = if wrapped {
+                &mut embedded["state"]["messages"][0]["content"]
+            } else {
+                &mut embedded["state"][0]["content"]
+            };
+            content.as_array_mut().unwrap().extend([
+                json!({"type":"image_url","image_url":{"url":image()}}),
+                json!({"type":"input_audio","input_audio":{"data":audio(1600,false)}}),
+            ]);
+            let (status, result) = post(router.clone(), embedded).await;
+            assert_eq!(status, StatusCode::OK, "{result}");
+            assert_eq!(result, expected);
+        }
+    }
+    #[tokio::test]
+    async fn systemone_audio_rejects_invalid_media_and_shares_request_budget() {
+        let router = router(1024 * 1024);
+        for (mutation, diagnostic) in [
+            (0, "order"),
+            (1, "questions.route"),
+            (2, "questions.route"),
+            (3, "questions.route"),
+            (4, "PCM16"),
+            (5, "omits required"),
+        ] {
+            let mut request = body();
+            match mutation {
+                0 => request["files"].as_array_mut().unwrap().swap(0, 1),
+                1 => request["questions"]["route"]["instructions"] = json!("text"),
+                2 => {
+                    request["questions"]["route"]["instructions"]["input_audio"] =
+                        json!({"url":"http://127.0.0.1:1/no-fetch"})
+                }
+                3 => {
+                    request["questions"]["route"]["instructions"]["input_audio"] =
+                        json!({"data":null,"url":audio(3200,false)})
+                }
+                4 => {
+                    request["questions"]["route"]["instructions"]["input_audio"] =
+                        json!({"data":"AA=="})
+                }
+                5 => request["files"] = json!([image()]),
+                _ => unreachable!(),
+            }
+            let (status, result) = post(router.clone(), request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "case {mutation}: {result}");
+            assert!(
+                result["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(diagnostic),
+                "case {mutation}: {result}"
+            );
+        }
+        // Identical references share encoded allocations across state and questions.
+        let image_bytes = std::fs::read(root().join("white.png")).unwrap().len();
+        let wav_bytes = STANDARD.decode(audio(1600, false)).unwrap().len();
+        let limited = self::router(image_bytes + wav_bytes);
+        let mut request = body();
+        request["questions"]["route"]["instructions"]["input_audio"]["data"] =
+            json!(audio(1600, false));
+        // Use the same representation as state so cache identity is exact.
+        request["questions"]["route"]["instructions"]["input_audio"]["data"] =
+            request["files"][1].clone();
+        let (status, result) = post(limited.clone(), request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        request["questions"]["route"]["instructions"]["input_audio"]["data"] =
+            json!(audio(1600, true));
+        let (status, result) = post(limited, request).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{result}");
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("--max-decision-media-bytes"),
             "{result}"
         );
     }

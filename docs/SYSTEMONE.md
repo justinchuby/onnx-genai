@@ -1,7 +1,7 @@
 # Non-generative SystemOne decisions
 
 `POST /v1/systemone` evaluates a model-declared decision head. It does not ask a
-chat model to generate an answer. A package must declare a `decision` v1 or v2 task
+chat model to generate an answer. A package must declare a `decision` v1, v2 or v3 task
 profile; ordinary generation/embedding/reranking packages receive actionable
 `501 not_supported_error`. `/props` advertises `nxrt_capabilities.decision`.
 
@@ -162,9 +162,9 @@ Input order matches the upstream transport: `files`, then its `images` alias,
 then image parts in chat-state message order. State can be a messages array or
 an object containing `messages`; `image_url` parts accept a data URI directly or
 `{url: data_uri}`. Those parts are removed from textual state while other parts,
-message fields and wrapper fields remain intact. Only image data URIs are
-accepted on this path; it does not fetch HTTP URLs. Audio/video and spoken
-instructions require further contracts and are still rejected explicitly.
+message fields and wrapper fields remain intact. Decision v2 admits image data URIs; v3 additionally admits the audio forms below.
+This decision transport does not fetch remote URLs. Video requires further
+executable metadata and runtime support.
 
 `--max-decision-media-bytes` defaults to 64 MiB of unique retained encoded bytes
 per request. Repeated image references share their allocation across questions
@@ -183,6 +183,50 @@ image-token formula or model identity determines the expansion. The
 probability head; changing ordered image positions changes its output. This is
 functional evidence, not recognition-quality or device-performance evidence.
 
+## Mixed audio and spoken instructions (decision v3)
+
+Core schema v1.15 adds `decision.media`, an ordered list of
+`{kind: image|audio, input: workflow_endpoint}` bindings, and an optional
+`decision.spoken_instructions` audio endpoint. V3 omits the v2 `images` field;
+state media and spoken instructions use distinct opaque application-sourced
+`uint8 [encoded_bytes]` inputs. The same endpoint cannot bind twice. Required
+endpoints must be supplied; the declared mixed-media order is preserved.
+Both probabilities and actual prompt-token usage are required outputs.
+
+State media order is `files`, then `images`, then chat-state parts. Top-level
+entries accept image/audio base64 data URIs. Embedded `input_audio` parts and
+spoken instructions accept `{data: base64_or_audio_data_uri}` or
+`{url: base64_or_audio_data_uri}` inside `input_audio`; `data` takes precedence.
+Audio currently requires PCM16 WAV. HTTP/file URLs, video and other codecs fail
+with field-specific errors before inference. For example, with an image/audio
+state contract and a spoken endpoint:
+
+```json
+{
+  "state": "Compare the recording with the picture",
+  "files": ["data:image/png;base64,...", "data:audio/wav;base64,..."],
+  "questions": {"match": {
+    "instructions": {"type": "input_audio", "input_audio": {"data": "..."}},
+    "criteria": {"same": "Same subject", "different": "Different subjects"}
+  }}
+}
+```
+
+The template receives `media_types`, `image_count`, `audio_count` and
+`spoken_instructions` (boolean). Spoken instructions render no encoded bytes;
+the audio travels through the declared workflow endpoint. Each question has its
+own spoken input, while state media and repeated identical references share the
+request-local encoded-byte budget. All media and questions are prepared before
+execution. `/props` exposes `decision_media_order`, `decision_image_limit`,
+`decision_audio_limit` and `decision_spoken_instructions`.
+
+The maintained `decision_audio` fixture runs Native CPU image-preprocess@2,
+repeated audio-preprocess@2 and a real ONNX probability head. Independent state
+and question audio alter probabilities; changing clip length changes authored
+usage, and total media expansion obeys the input-token limit. This proves data
+flow, not recognition quality. Broader waveform/log-mel preprocessing and codecs
+remain separate compatibility work.
+
 ## Limits and remaining work
 
 `--max-decision-input-tokens` defaults to 8192 per prompt variant (also capped by
@@ -195,7 +239,7 @@ large template loops. All questions/variants are prepared before any inference i
 The package's exact tokenizer padding/truncation contract remains authoritative.
 
 The v1 execution path supports text and structured JSON state/instructions; v2
-adds ordered images as described above. Audio/video and spoken instructions,
+adds ordered images; v3 adds mixed state audio and spoken instructions. Video,
 joint/packed decision heads and shared generative /
 decision workflow entry points still need explicit metadata and runtime support.
 GGUF decision-head import is not implemented by registering this HTTP route.

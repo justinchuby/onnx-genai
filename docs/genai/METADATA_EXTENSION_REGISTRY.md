@@ -23,6 +23,7 @@ A reader that accepts a schema version must implement that version's typed SSA/d
 | `v1.12` | Reranking v2 profiles declare ordered query/document encoded-image inputs; reusable image preprocessing v2 names component-local output ports. |
 | `v1.13` | Realtime v1 profiles declare session-owned bounded audio/text quanta, native rates, frame bounds, control operations and actual per-quantum usage. |
 | `v1.14` | Decision v2 profiles declare ordered encoded-image inputs and authoritative text/media token usage; decision v1 remains text-only. |
+| `v1.15` | Decision v3 profiles declare typed mixed state-media inputs and an explicit spoken-question audio endpoint with authoritative per-variant usage. |
 
 ## Optional semantic extensions
 

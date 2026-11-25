@@ -1905,6 +1905,22 @@
       ],
       "type": "object"
     },
+    "DecisionMediaBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "input": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/EncodedMediaKind"
+        }
+      },
+      "required": [
+        "kind",
+        "input"
+      ],
+      "type": "object"
+    },
     "DecisionOption": {
       "additionalProperties": false,
       "properties": {
@@ -1974,6 +1990,13 @@
           "minimum": 1,
           "type": "integer"
         },
+        "media": {
+          "description": "Ordered typed state-media endpoints (decision v3).",
+          "items": {
+            "$ref": "#/$defs/DecisionMediaBinding"
+          },
+          "type": "array"
+        },
         "prompt_template": {
           "description": "Jinja context: state, instructions, type, options (key/description), variant.",
           "type": "string"
@@ -1983,6 +2006,13 @@
         },
         "score_confidence": {
           "$ref": "#/$defs/DecisionConfidence"
+        },
+        "spoken_instructions": {
+          "description": "Encoded audio endpoint for a spoken question (decision v3).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "variants": {
           "$ref": "#/$defs/DecisionVariants"
@@ -2117,6 +2147,14 @@
           "type": "string"
         }
       ]
+    },
+    "EncodedMediaKind": {
+      "description": "Declared encoded-media kind; no content or model-family guessing.",
+      "enum": [
+        "image",
+        "audio"
+      ],
+      "type": "string"
     },
     "EquivalenceClass": {
       "description": "Correctness bound on substituting an equivalent component implementation.",

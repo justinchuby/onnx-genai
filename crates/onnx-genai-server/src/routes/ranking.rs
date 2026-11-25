@@ -106,16 +106,26 @@ pub(crate) async fn rerank(
                 ))
             })?;
     }
-    let mut media = crate::image_input::ImageRequest::new(
+    let mut media = crate::media_input::MediaRequest::new(
         state.config.max_rerank_media_bytes,
         "--max-rerank-media-bytes",
     );
-    let query_images = media.load(&query.images, "query.image").await?;
+    let query_images = media
+        .load(
+            onnx_genai_metadata::EncodedMediaKind::Image,
+            &query.images,
+            "query.image",
+        )
+        .await?;
     let mut document_images = Vec::with_capacity(documents.len());
     for (index, document) in documents.iter().enumerate() {
         document_images.push(
             media
-                .load(&document.images, &format!("documents[{index}].image"))
+                .load(
+                    onnx_genai_metadata::EncodedMediaKind::Image,
+                    &document.images,
+                    &format!("documents[{index}].image"),
+                )
                 .await?,
         );
     }

@@ -2226,4 +2226,18 @@ output-scope versions fail with a component/ABI/version diagnostic.
 This optional semantic extension uses existing core fields and needs no new
 core schema version. Its registry floor is v1; the fixture uses the current
 explicit publication contract. This is a prerequisite for state audio and spoken
-decision questions; the SystemOne HTTP audio contract remains to be implemented.
+decision questions; the SystemOne HTTP audio contract is declared by decision v3
+below.
+
+## Decision v3: explicit mixed media and spoken input (core v1.15)
+
+V3 declares ordered typed `media` bindings and a separate optional
+`spoken_instructions` encoded-audio endpoint. It omits v2 `images`; v1/v2 retain
+their exact contracts. All media endpoints share canonical opaque application
+uint8-vector admission, including reranking images. Duplicate endpoint ownership,
+missing required inputs, kind/order mismatches, forbidden spoken instructions,
+and missing actual-usage outputs fail before execution. Rendering receives counts
+and kind order, never encoded spoken bytes. Workflow metadata owns preprocessing
+and expansion accounting; transport supports PCM16 WAV and does not infer a model
+family or fetch remote decision media. Video requires executable support before
+its kind can be declared.
