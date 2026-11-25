@@ -481,7 +481,7 @@
           "description": "Element type of the emitted tensor."
         },
         "name": {
-          "description": "Workflow SSA value this output binds to.",
+          "description": "Workflow SSA value (audio-preprocess@1) or component output port (@2).",
           "examples": [
             "audio.input_features"
           ],
@@ -562,7 +562,7 @@
       "description": "Generic audio preprocessing program: an ordered transform pipeline plus the\nnamed workflow SSA tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata, mirroring `VisionPreprocessingProgram`. Transform operations are\ngeneric (decode, resample, downmix, rescale, normalize, pad, frame,\nspectrogram, log_mel). In workflow metadata, outputs are materialized by a\nmanifest-pinned preprocessing adapter invocation and bind processor-local\nvalues to typed SSA names. A package may name an output `input_values`,\n`input_features`, `attention_mask`, or anything else without introducing\nruntime model-family dispatch.\n\nOne program type covers every audio family. A CTC acoustic model declares\nresample/downmix/zero_mean_unit_variance over raw samples; an\nencoder-decoder speech model declares resample/pad/log_mel over a fixed\nwindow. The runtime reads the same fields either way.",
       "properties": {
         "outputs": {
-          "description": "Named tensor outputs the program emits, each bound to a workflow SSA value.",
+          "description": "Named tensor outputs; the adapter ABI selects workflow values or component-local ports.",
           "items": {
             "$ref": "#/$defs/AudioOutputBinding"
           },
@@ -5721,7 +5721,7 @@
       "description": "Generic pixel preprocessing program: an ordered transform pipeline plus the\nnamed workflow SSA tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata. Transform operations are generic (decode, resize, rescale, normalize,\ntile, patchify, pad, and for clips sample_frames and pad_frames). In workflow\nmetadata, outputs are materialized by a manifest-pinned preprocessing adapter\ninvocation and bind processor-local values to typed SSA names. A package may\nname an output `pixel_position_ids`, `image_grid_thw`, `video_grid_thw`, or\nanything else without introducing runtime model-family dispatch.\n\nOne program type covers stills and clips, the way one audio program covers\nevery audio family: a frame is an image, so a video program declares the\nsame spatial work plus the temporal operations that select and pad frames.",
       "properties": {
         "outputs": {
-          "description": "Named tensor outputs the program emits, each bound to a workflow SSA value.",
+          "description": "Named tensor outputs; the adapter ABI selects workflow values or component-local ports.",
           "items": {
             "$ref": "#/$defs/VisionOutputBinding"
           },

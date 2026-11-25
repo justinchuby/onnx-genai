@@ -202,3 +202,9 @@ GGUF decision-head import is not implemented by registering this HTTP route.
 The small native ONNX fixture proves actual input-dependent head execution,
 not compatibility with every upstream decision model. These remain part of the
 overall compatibility work; tool execution remains delegated to external harnesses.
+
+The native `audio-preprocess@2` adapter can now be invoked repeatedly with
+component-local outputs, so separate state and question clips can retain their
+own features and valid lengths. This prerequisite does not yet admit audio at
+`/v1/systemone`: ordered audio/spoken-question metadata, transport preparation
+and broader waveform/log-mel transform support remain required.

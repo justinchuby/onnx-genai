@@ -2211,3 +2211,19 @@ Both typed admission and parser gates require core v1.14. The shared encoded-ima
 endpoint resolver also serves reranking, with no model-name inference or
 backward aliases. Task-owned media does not become an ordinary chat Media role.
 See [SystemOne](../SYSTEMONE.md) for preparation, request order, limits and usage.
+
+### 10.8 Reusable audio preprocessing
+
+`onnx-genai.audio-preprocess@2` gives program output names component-local
+meaning, like image-preprocess@2. Each invocation explicitly maps those ports
+to independent workflow SSA values. Feature tensors and valid-length outputs
+therefore survive repeated clips with different encoded lengths and frame
+counts. The adapter uses the existing audio transform executor and its explicit
+format/algorithm limits; reuse does not imply new codec or transform support.
+ABI v1 retains its single-invocation, workflow-output-name contract. Unknown
+output-scope versions fail with a component/ABI/version diagnostic.
+
+This optional semantic extension uses existing core fields and needs no new
+core schema version. Its registry floor is v1; the fixture uses the current
+explicit publication contract. This is a prerequisite for state audio and spoken
+decision questions; the SystemOne HTTP audio contract remains to be implemented.

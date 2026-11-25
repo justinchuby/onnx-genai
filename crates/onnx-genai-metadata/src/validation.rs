@@ -1290,7 +1290,15 @@ fn validate_preprocessing_program(
             if component_abi != abi {
                 return None;
             }
-            let scope = PreprocessingOutputScope::for_version(version).ok()?;
+            let scope = match PreprocessingOutputScope::for_version(version) {
+                Ok(scope) => scope,
+                Err(error) => {
+                    errors.push(format!(
+                        "workflow preprocessing component '{name}' using {abi}: {error}"
+                    ));
+                    return None;
+                }
+            };
             Some((name, component, scope, version))
         })
         .collect::<Vec<_>>();

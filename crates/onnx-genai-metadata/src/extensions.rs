@@ -253,6 +253,7 @@ impl PreprocessingOutputScope {
 }
 pub const VIDEO_PREPROCESS_V1: ExtensionId = ExtensionId::new("onnx-genai.video-preprocess", "1");
 pub const AUDIO_PREPROCESS_V1: ExtensionId = ExtensionId::new("onnx-genai.audio-preprocess", "1");
+pub const AUDIO_PREPROCESS_V2: ExtensionId = ExtensionId::new("onnx-genai.audio-preprocess", "2");
 pub const TEXT_ASSEMBLY_V1: ExtensionId = ExtensionId::new("onnx-genai.text-assembly", "1");
 pub const ADAPTERS_V1: ExtensionId = ExtensionId::new("onnx-genai.adapters", "1");
 pub const ADAPTERS_JSON_V1: ExtensionId = ExtensionId::new("onnx-genai.adapters.json", "1");
@@ -394,6 +395,16 @@ pub const BUILTIN_EXTENSIONS: &[ExtensionDescriptor] = &[
         schema_floor: V1,
         declaration: "pipeline.workflow.components.<name>.implementation { kind: adapter }",
         normative_reference: "§10, §15",
+        admission_consumer: "onnx_genai_engine::pipeline::workflow",
+        fallback: FallbackClass::SemanticRequired,
+        status: SupportStatus::Implemented,
+    },
+    ExtensionDescriptor {
+        id: AUDIO_PREPROCESS_V2,
+        surface: ExtensionSurface::ComponentAdapter,
+        schema_floor: V1,
+        declaration: "pipeline.workflow.components.<name>.implementation { kind: adapter }",
+        normative_reference: "§10.8, §15",
         admission_consumer: "onnx_genai_engine::pipeline::workflow",
         fallback: FallbackClass::SemanticRequired,
         status: SupportStatus::Implemented,
