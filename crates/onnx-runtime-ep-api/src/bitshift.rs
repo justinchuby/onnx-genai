@@ -2,6 +2,8 @@
 
 use onnx_runtime_ir::DataType;
 
+use crate::OpKey;
+
 pub const SIGNED_SINCE: u64 = 28;
 const DTYPES: [DataType; 8] = [
     DataType::Uint8,
@@ -13,6 +15,13 @@ const DTYPES: [DataType; 8] = [
     DataType::Int32,
     DataType::Int64,
 ];
+
+/// ORT keeps the open-ended unsigned registration and does not advertise
+/// the standalone signed revision. Dtype admission, not a schema cutoff,
+/// keeps signed nodes out without losing unsigned nodes at newer opsets.
+pub fn standalone_only_registration(key: &OpKey) -> bool {
+    key.domain.is_empty() && key.op_type == "BitShift" && key.since_version >= SIGNED_SINCE
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BitShiftTypes {

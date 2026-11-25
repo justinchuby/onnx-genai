@@ -1062,7 +1062,7 @@ pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor
     (reg, descriptors)
 }
 
-/// Derive one [`CpuOpDescriptor`] per entry in `reg`.
+/// Derive one [`CpuOpDescriptor`] per plugin-visible entry in `reg`.
 ///
 /// Reads the registry itself rather than a list accumulated during
 /// registration. Those two had drifted: `register_cnn_ops` takes `&mut
@@ -1080,6 +1080,7 @@ pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor
 fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
     let mut descriptors: Vec<CpuOpDescriptor> = reg
         .keys()
+        .filter(|key| !onnx_runtime_ep_api::bitshift::standalone_only_registration(key))
         .map(|key| {
             let supports_raw_tensor_abi = input_dtype_constraints_for_op(&key.op_type, &key.domain)
                 .iter()
@@ -1095,8 +1096,7 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
                 since_version: key.since_version,
                 end_version: reg.explicit_end_version(key),
                 supported_dtypes: if key.op_type == "BitShift" && key.domain.is_empty() {
-                    onnx_runtime_ep_api::bitshift::BitShiftTypes::for_opset(key.since_version)
-                        .dtypes()
+                    onnx_runtime_ep_api::bitshift::BitShiftTypes::UnsignedOnly.dtypes()
                 } else {
                     supported_dtypes_for_op(&key.op_type, &key.domain)
                 },
@@ -2063,9 +2063,8 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(onehot::OneHotFactory),
     );
-    rec.register_through(
+    rec.register(
         OpKey::new("BitShift", "", 11),
-        onnx_runtime_ep_api::bitshift::SIGNED_SINCE - 1,
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(bitshift::BitShiftFactory(
             onnx_runtime_ep_api::bitshift::BitShiftTypes::UnsignedOnly,
@@ -3788,7 +3787,7 @@ mod tests {
 
     #[test]
     fn descriptors_derived_from_real_registry_not_hand_maintained() {
-        // Every registered op must have a descriptor -- not "close to", exactly.
+        // Every plugin-visible registration must have a descriptor.
         //
         // This used to allow a delta of up to 50 and documented CNN ops as the
         // expected difference. That tolerance was hiding a real bug: the plugin
@@ -3805,23 +3804,39 @@ mod tests {
             .iter()
             .map(|d| (d.op_type.as_str(), d.domain.as_str(), d.since_version))
             .collect();
-        let missing: Vec<String> = reg
+        let expected: std::collections::BTreeSet<_> = reg
             .keys()
-            .filter(|k| {
-                !described.contains(&(k.op_type.as_str(), k.domain.as_str(), k.since_version))
-            })
-            .map(|k| format!("{}::{}@{}", k.domain, k.op_type, k.since_version))
+            .filter(|key| !onnx_runtime_ep_api::bitshift::standalone_only_registration(key))
+            .map(|key| (key.op_type.as_str(), key.domain.as_str(), key.since_version))
             .collect();
-        assert!(
-            missing.is_empty(),
-            "{} registered ops have no descriptor, so the plugin would decline \
-             them to ORT's CPU EP: {missing:?}",
-            missing.len()
-        );
+        assert_eq!(described, expected);
         assert_eq!(
             descriptors.len(),
-            reg.len(),
-            "descriptor count must equal registry size exactly"
+            expected.len(),
+            "plugin descriptor inventory must not contain duplicates"
+        );
+    }
+
+    #[test]
+    fn bitshift_plugin_descriptor_keeps_open_ended_unsigned_coverage() {
+        let (_, descriptors) = shared_registry_with_descriptors();
+        let shifts: Vec<_> = descriptors
+            .iter()
+            .filter(|d| d.domain.is_empty() && d.op_type == "BitShift")
+            .collect();
+        assert_eq!(shifts.len(), 1);
+        assert_eq!(
+            (shifts[0].since_version, shifts[0].end_version),
+            (11, u64::MAX)
+        );
+        assert_eq!(
+            shifts[0].supported_dtypes,
+            &[
+                DataType::Uint8,
+                DataType::Uint16,
+                DataType::Uint32,
+                DataType::Uint64
+            ]
         );
     }
 

@@ -725,7 +725,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
 
 /// Derive plugin kernel-registry descriptors from the real CUDA [`OpRegistry`].
 ///
-/// One descriptor per registered `(op_type, domain, since_version)` key, with
+/// One descriptor per plugin-visible `(op_type, domain, since_version)` key, with
 /// the domain taken verbatim from the registry (so `com.microsoft` kernels are
 /// advertised in `com.microsoft`, not the default domain) and dtypes from
 /// [`cuda_supported_dtypes_for_op`]. Building the registry only constructs
@@ -735,13 +735,14 @@ pub fn build_cuda_registry_descriptors(runtime: Arc<CudaRuntime>) -> Vec<CudaOpD
     let registry = build_cuda_registry(runtime);
     let mut descriptors: Vec<CudaOpDescriptor> = registry
         .keys()
+        .filter(|key| !onnx_runtime_ep_api::bitshift::standalone_only_registration(key))
         .map(|key| CudaOpDescriptor {
             op_type: key.op_type.clone(),
             domain: key.domain.clone(),
             since_version: key.since_version,
             end_version: registry.explicit_end_version(key),
             supported_dtypes: if key.op_type == "BitShift" && key.domain.is_empty() {
-                onnx_runtime_ep_api::bitshift::BitShiftTypes::for_opset(key.since_version).dtypes()
+                onnx_runtime_ep_api::bitshift::BitShiftTypes::UnsignedOnly.dtypes()
             } else {
                 cuda_supported_dtypes_for_op(&key.op_type, &key.domain)
             },
@@ -2005,9 +2006,8 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
-    reg.register_through(
+    reg.register(
         OpKey::new("BitShift", "", 11),
-        onnx_runtime_ep_api::bitshift::SIGNED_SINCE - 1,
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(bitwise::BitShiftFactory {
             runtime: runtime.clone(),
@@ -2056,6 +2056,8 @@ pub fn build_cuda_registry_with_metrics(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+
+    use onnx_runtime_ir::DataType;
 
     use super::{
         CUDA_COVERED_OPS, CUDA_DFT_DTYPES, CUDA_FLOAT_DTYPES, CUDA_NMS_DTYPES, CUDA_STFT_DTYPES,
@@ -2264,6 +2266,24 @@ mod tests {
                 .expect("CUDA registry census requires a usable CUDA device 0"),
         );
         let descriptors = build_cuda_registry_descriptors(runtime);
+        let shifts: Vec<_> = descriptors
+            .iter()
+            .filter(|d| d.domain.is_empty() && d.op_type == "BitShift")
+            .collect();
+        assert_eq!(shifts.len(), 1);
+        assert_eq!(
+            (shifts[0].since_version, shifts[0].end_version),
+            (11, u64::MAX)
+        );
+        assert_eq!(
+            shifts[0].supported_dtypes,
+            &[
+                DataType::Uint8,
+                DataType::Uint16,
+                DataType::Uint32,
+                DataType::Uint64
+            ]
+        );
         let pairs: BTreeSet<(String, String)> = descriptors
             .into_iter()
             .map(|descriptor| (descriptor.domain, descriptor.op_type))
