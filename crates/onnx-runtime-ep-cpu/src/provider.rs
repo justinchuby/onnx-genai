@@ -38,6 +38,7 @@ use crate::optimizer::cpu_optimization_passes;
 /// registry is also exposed to the session (Track D) so placement and kernel
 /// instantiation share one source of truth.
 pub struct CpuExecutionProvider {
+    standalone: bool,
     device: DeviceId,
     initialized: bool,
     registry: OpRegistry,
@@ -131,14 +132,12 @@ impl CpuExecutionProvider {
         Self::shared_kernels(CpuMemoryResources::default(), false)
     }
 
-    fn shared_kernels(resources: CpuMemoryResources, native_linear_quantization: bool) -> Self {
+    fn shared_kernels(resources: CpuMemoryResources, standalone: bool) -> Self {
         Self {
+            standalone,
             device: DeviceId::cpu(),
             initialized: false,
-            registry: build_cpu_registry_with_resources(
-                resources.clone(),
-                native_linear_quantization,
-            ),
+            registry: build_cpu_registry_with_resources(resources.clone(), standalone),
             resources,
             local_workspace: std::sync::OnceLock::new(),
             memory: default_cpu_memory(),
@@ -520,7 +519,8 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
-        if op.op_type == "Mod"
+        if self.standalone
+            && op.op_type == "Mod"
             && onnx_runtime_ir::is_default_domain(&op.domain)
             && let Err(reason) = onnx_runtime_ir::modulo::ModMode::parse(op).and_then(|mode| {
                 input_dtypes

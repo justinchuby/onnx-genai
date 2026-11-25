@@ -19,7 +19,9 @@ pub(crate) fn unsupported_reason_at_opset(
     let result = match node.op_type.as_str() {
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
         "GatherND" => gather_nd(node, opset, input_dtypes),
-        "Mod" => mod_op(node, opset, input_dtypes),
+        "Mod" if matches!(conv_transpose_contract, super::conv_transpose::Contract::Standalone) => {
+            mod_op(node, opset, input_dtypes)
+        }
         "QuantizeLinear" | "DequantizeLinear" => {
             if matches!(
                 conv_transpose_contract,
@@ -87,6 +89,7 @@ pub(crate) fn unsupported_reason(
         | "ReduceLogSumExp" => reduce_float(node, input_dtypes),
         "Swish" | "ThresholdedRelu" => float_activation(node, input_dtypes),
         "Sum" | "Mean" => variadic_float(node, input_dtypes),
+        "Mod" => legacy_mod(node, input_dtypes),
         "QuantizeLinear" => quantize_linear(node, input_dtypes),
         "DequantizeLinear" => dequantize_linear(node, input_dtypes),
         "DequantizePacked" => {
@@ -906,6 +909,17 @@ fn mod_op(node: &Node, opset: u64, input_dtypes: &[DataType]) -> Result<(), Stri
     required_arity(node, input_dtypes, 2, 1, 1)?;
     require_dtype(input_dtypes, 1, input_dtypes[0], "B")?;
     super::mod_op::entry_for(input_dtypes[0], opset, ModMode::parse(node)?)?;
+    Ok(())
+}
+
+fn legacy_mod(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 2, 1, 1)?;
+    require_one_of(input_dtypes, 0, super::mod_op::LEGACY_DTYPES, "A")?;
+    require_dtype(input_dtypes, 1, input_dtypes[0], "B")?;
+    let mode = ModMode::parse(node).map_err(|_| "attribute 'fmod' must be 0 or 1")?;
+    if input_dtypes[0] == DataType::Float32 && mode == ModMode::Floor {
+        return Err("Float32 Mod requires fmod=1".into());
+    }
     Ok(())
 }
 
