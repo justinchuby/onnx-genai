@@ -154,13 +154,27 @@ fn deserialize_prediction_time<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<std::time::Duration>, D::Error> {
     let value = serde_json::Value::deserialize(deserializer)?;
+    let milliseconds = parse_llama_integer(&value, "t_max_predict_ms", i64::MAX)
+        .map_err(<D::Error as serde::de::Error>::custom)?;
+    Ok(milliseconds
+        .filter(|number| *number > 0)
+        .map(|number| std::time::Duration::from_millis(number as u64)))
+}
+
+/// Pinned field_num signed integer semantics, without unsafe overflow casts.
+/// A null field is absent; each caller retains its configured default.
+pub(crate) fn parse_llama_integer(
+    value: &serde_json::Value,
+    field: &str,
+    maximum: i64,
+) -> Result<Option<i64>, String> {
     if value.is_null() {
         return Ok(None);
     }
     // Match field_num<int64_t>: floating numbers truncate toward zero before
     // the inclusive lower bound is checked. Reject representations that cannot
     // be converted safely rather than relying on an out-of-range C++ cast.
-    let milliseconds = value
+    let number = value
         .as_i64()
         .or_else(|| {
             value.as_f64().filter(|number| {
@@ -169,13 +183,9 @@ fn deserialize_prediction_time<'de, D: serde::Deserializer<'de>>(
                     && number.trunc() < 9_223_372_036_854_775_808.0
             }).map(|number| number.trunc() as i64)
         })
-        .filter(|number| *number >= -1)
-        .ok_or_else(|| {
-            <D::Error as serde::de::Error>::custom(
-                "t_max_predict_ms must be numeric milliseconds convertible to int64 from -1 through 9223372036854775807; -1, 0 and null disable prediction time limits",
-            )
-        })?;
-    Ok((milliseconds > 0).then(|| std::time::Duration::from_millis(milliseconds as u64)))
+        .filter(|number| *number >= -1 && *number <= maximum)
+        .ok_or_else(|| format!("{field} must be numeric and truncate to an integer from -1 through {maximum}; use -1 or 0 to disable, or null to inherit the configured default"))?;
+    Ok(Some(number))
 }
 
 #[derive(Debug, Deserialize)]

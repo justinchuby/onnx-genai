@@ -261,7 +261,7 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
             // These opt into optional progress/control facilities, not a different decoding algorithm.
             "return_progress" | "timings_per_token" => value.is_boolean(),
             "sse_ping_interval" => {
-                crate::SsePingInterval::parse(value)?;
+                let _ = crate::SsePingInterval::parse(value)?;
                 true
             }
             "cache_prompt" | "ignore_eos" => value.is_boolean(),

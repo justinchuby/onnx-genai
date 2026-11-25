@@ -7905,8 +7905,22 @@ mod llama_compat {
                 json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":1}),
             ),
         ] {
-            for value in [json!(-1), json!(0), json!(1), json!(-2), json!(0.5)] {
-                let valid = value.as_i64().is_some_and(|n| n >= -1);
+            for (value, valid) in [
+                (json!(-1), true),
+                (json!(0), true),
+                (json!(1), true),
+                (json!(null), true),
+                (json!(0.5), true),
+                (json!(1.5), true),
+                (json!(-1.9), true),
+                (json!(2147483647.9), true),
+                (json!(-2), false),
+                (json!(-2.1), false),
+                (json!(2147483648u64), false),
+                (json!(true), false),
+                (json!("1"), false),
+                (json!(u64::MAX), false),
+            ] {
                 let mut body = body.clone();
                 body["sse_ping_interval"] = value;
                 body["stream"] = json!(true);
