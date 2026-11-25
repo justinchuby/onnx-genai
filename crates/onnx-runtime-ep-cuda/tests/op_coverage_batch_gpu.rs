@@ -917,6 +917,65 @@ fn mod_matches_cpu() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
+fn ort_mod_keeps_unbounded_legacy_metadata_and_routing() {
+    let ep = CudaExecutionProvider::new_for_ort_plugin()
+        .expect("legacy CUDA Mod test requires the CUDA driver and a physical device");
+    let descriptors = onnx_runtime_ep_cuda::build_cuda_registry_descriptors(ep.registry());
+    let mut entries = descriptors.iter().filter(|entry| entry.op_type == "Mod");
+    let entry = entries.next().unwrap();
+    assert!(entries.next().is_none());
+    let native_registry = onnx_runtime_ep_cuda::build_cuda_registry(ep.runtime().clone());
+    let native = onnx_runtime_ep_cuda::build_cuda_registry_descriptors(&native_registry);
+    assert_eq!(
+        native
+            .iter()
+            .filter(|entry| entry.op_type == "Mod")
+            .map(|entry| (entry.since_version, entry.end_version))
+            .collect::<Vec<_>>(),
+        [(10, 27), (28, u64::MAX)]
+    );
+    assert_eq!(
+        (
+            entry.domain.as_str(),
+            entry.since_version,
+            entry.end_version
+        ),
+        ("", 10, u64::MAX)
+    );
+    use DataType::*;
+    assert_eq!(
+        entry.supported_dtypes,
+        &[
+            Float32, Float16, BFloat16, Int8, Int16, Int32, Int64, Uint8, Uint16, Uint32, Uint64
+        ]
+    );
+
+    let inputs = [
+        input(Float32, &[1], &[-5.5_f32]),
+        input(Float32, &[1], &[3.0_f32]),
+    ];
+    let outputs = [(Float32, vec![1])];
+    let attrs = [("fmod", Attribute::Int(1))];
+    assert_eq!(
+        run_cuda(&ep, "Mod", 29, &inputs, &outputs, &attrs)[0],
+        raw(&[-2.5_f32])
+    );
+
+    let (graph, node) = build_graph("Mod", 29, &inputs, &outputs, &[]);
+    let shapes = [static_shape([1]), static_shape([1])];
+    let claim = ep.supports_op(graph.node(node), 29, &shapes, &[Float32; 2], &[]);
+    assert_eq!(claim.reason(), Some("Mod: Float32 Mod requires fmod=1"));
+
+    let (graph, node) = build_graph("Mod", 29, &inputs, &outputs, &attrs);
+    let claim = ep.supports_op(graph.node(node), 29, &shapes, &[Float16; 2], &[]);
+    assert!(!claim.is_supported(), "legacy CUDA Mod does not claim fp16");
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
 fn mod_28_matches_onnx_values() {
     let ep = require_cuda();
     let node = Node::new(

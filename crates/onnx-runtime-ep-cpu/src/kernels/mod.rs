@@ -1605,12 +1605,19 @@ pub(crate) fn build_cpu_registry_with_resources(
         Box::new(elementwise::DivFactory),
     );
     let mod_28 = onnx_runtime_ir::modulo::FLOAT_FLOOR_SINCE;
-    for (since_version, end_version) in [(10, mod_28 - 1), (mod_28, u64::MAX)] {
-        rec.register_through(
-            OpKey::new("Mod", "", since_version),
-            end_version,
+    rec.register_through(
+        OpKey::new("Mod", "", 10),
+        if standalone { mod_28 - 1 } else { u64::MAX },
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(elementwise::ModFactory { since_version: 10 }),
+    );
+    if standalone {
+        rec.register(
+            OpKey::new("Mod", "", mod_28),
             onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(elementwise::ModFactory { since_version }),
+            Box::new(elementwise::ModFactory {
+                since_version: mod_28,
+            }),
         );
     }
     rec.register(
@@ -3760,14 +3767,14 @@ mod tests {
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
         // Opset 29 adds the three indexing revisions; ScatterElements also
         // gets a distinct opset 18 registration for max/min.
-        // Opset-28 Cast adds one registration.
+        // Opset-28 Cast and standalone Mod each add one registration.
         // MeanVarianceNormalization-29 adds one registration.
         // Cast and CastLike each add FP8 registrations at opsets 19 and 24.
         // Standalone QLinearMatMul-21 adds one registration.
         assert_eq!(
             reg.len(),
             PHASE1_OPS.len()
-                + 135
+                + 136
                 + mlas_registrations
                 + onnx_runtime_ir::roi_align::VERSIONS.len()
         );

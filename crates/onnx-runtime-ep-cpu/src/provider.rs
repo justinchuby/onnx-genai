@@ -531,7 +531,8 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
-        if op.op_type == "Mod"
+        if self.standalone
+            && op.op_type == "Mod"
             && onnx_runtime_ir::is_default_domain(&op.domain)
             && let Err(reason) = onnx_runtime_ir::modulo::ModMode::parse(op).and_then(|mode| {
                 input_dtypes

@@ -159,7 +159,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 |----|--------|--------|---------|-------|
 | `Add`, `Sub`, `Mul`, `Div`, `Pow`, `Min`, `Max` | `` | ✅ | **NVRTC-custom** | f32/f16/bf16 with NumPy right-aligned broadcasting. Host-computed output shape plus zero-stride metadata drives one generic device index walk; half arithmetic computes in f32. |
 | `Sum`, `Mean` | `` | ✅ | **NVRTC-custom** | Variadic f32/f16/bf16 with NumPy right-aligned broadcasting (`nary.rs`); accumulates each input into an f32 scratch buffer, then `Mean` divides by the input count before narrowing once on store. |
-| `Mod` | `` | ✅ | **NVRTC-custom** | Before opset 28: f32 truncating remainder, i32/i64 floor or truncating remainder. From opset 28: both modes for all schema numeric types, with f16/bf16 computed in f32. Integer zero divisors yield `0` (nxrt convention); floating zero divisors yield NaN. |
+| `Mod` | `` | ✅ | **NVRTC-custom** | Before opset 28 (and on the ORT CUDA plugin at all opsets): f32 truncating remainder, i32/i64 floor or truncating remainder. Standalone nxrt at opset 28+: both modes for all schema numeric types, with f16/bf16 computed in f32. Integer zero divisors yield `0` (nxrt convention); floating zero divisors yield NaN. |
 
 ### Normalization & softmax
 

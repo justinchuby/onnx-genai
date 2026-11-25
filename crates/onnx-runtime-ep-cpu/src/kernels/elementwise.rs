@@ -1080,6 +1080,55 @@ mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
 
+    #[test]
+    fn ort_mod_keeps_legacy_claim_and_factory_past_opset_27() {
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_ir::{Attribute, NodeId, ValueId, static_shape};
+
+        let mut node = Node::new(
+            NodeId(0),
+            "Mod",
+            vec![Some(ValueId(0)), Some(ValueId(1))],
+            vec![ValueId(2)],
+        );
+        let ort = crate::CpuExecutionProvider::for_ort_plugin();
+        let native = crate::CpuExecutionProvider::new();
+        let shapes = [static_shape([1]), static_shape([1])];
+        let dtypes = [DataType::Float32; 2];
+        let a = Owned::f32(&[1], &[-5.5]);
+        let b = Owned::f32(&[1], &[3.0]);
+        let mut out = Owned::zeros_f32(&[1]);
+        let inputs = [a.view(), b.view()];
+        let concrete = [vec![1], vec![1]];
+        for opset in [13, 28, 29] {
+            assert!(
+                ort.supports_op(&node, opset, &shapes, &dtypes, &[])
+                    .is_supported()
+            );
+            assert!(
+                ort.get_kernel(&node, &concrete, opset)
+                    .unwrap()
+                    .execute(&inputs, &mut [out.view_mut()])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("fmod=0 requires an integer dtype")
+            );
+        }
+        native
+            .get_kernel(&node, &concrete, 28)
+            .unwrap()
+            .execute(&inputs, &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_f32(), vec![0.5]);
+
+        node.attributes.insert("fmod".into(), Attribute::Int(1));
+        ort.get_kernel(&node, &concrete, 29)
+            .unwrap()
+            .execute(&inputs, &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_f32(), vec![-2.5]);
+    }
+
     fn run_bin(f: BinOp, a: &Owned, b: &Owned, out: &mut Owned) {
         BinaryKernel { op: f, flops: None }
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
