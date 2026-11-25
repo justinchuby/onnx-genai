@@ -8694,6 +8694,60 @@ mod native_compat {
         assert_eq!(body["tokens_predicted"], 0);
         assert_eq!(body["tokens_evaluated"], 3);
         assert_eq!(body["stop"], true);
+        assert_eq!(
+            body["tokens_cached"], 3,
+            "cold evaluation still retains the evaluated prompt"
+        );
+        for streaming in [false, true] {
+            let response = request(
+                router.clone(),
+                "/completion",
+                json!({"prompt":[2,4,3],"n_predict":0,"stream":streaming}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = if streaming {
+                sse_json_events(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    .remove(0)
+            } else {
+                json_body(response).await
+            };
+            assert_eq!(value["tokens_cached"], 3, "{value}");
+            assert_eq!(value["tokens_predicted"], 0);
+            assert_eq!(value["content"], "");
+        }
+        let response = request(
+            router.clone(),
+            "/completion",
+            json!({"prompt":[2,4,3,5],"n_predict":0}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(value["tokens_cached"], 4, "{value}");
+        assert_eq!(value["tokens_evaluated"], 4);
+        let slots = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/slots")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(slots.status(), StatusCode::OK);
+        let slots = json_body(slots).await;
+        assert_eq!(slots[0]["n_past"], 4, "{slots}");
+        assert_eq!(slots[0]["is_processing"], false, "{slots}");
+        let response = request(
+            router.clone(),
+            "/completion",
+            json!({"prompt":[2,4,3,5],"n_predict":0,"cache_prompt":false}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["tokens_cached"], 4);
         let response = request(
             router.clone(),
             "/completion",
@@ -8714,7 +8768,7 @@ mod native_compat {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(json_body(response).await["tokens_cached"], 0);
+        assert_eq!(json_body(response).await["tokens_cached"], 3);
         for streaming in [false, true] {
             let response = request(
                 router.clone(),

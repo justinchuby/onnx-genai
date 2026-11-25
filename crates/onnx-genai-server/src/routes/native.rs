@@ -471,7 +471,7 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
                 .map_err(map_generate_submit_error)?;
             let value = json!({"content":"","tokens":[],"stop":true,"index":index,"model":handle.id,
                 "tokens_predicted":0,"tokens_evaluated":result.prompt_tokens,
-                "tokens_cached":result.prefix_cache_hit_len,"stop_type":"limit","truncated":false});
+                "tokens_cached":result.retained_cache_tokens,"stop_type":"limit","truncated":false});
             if !request.sampling.stream {
                 return Ok(NativeOutput::Buffered(value));
             }

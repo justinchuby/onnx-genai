@@ -2142,6 +2142,8 @@ pub struct PrefillRequest {
 pub struct PrefillResult {
     pub prompt_tokens: usize,
     pub prefix_cache_hit_len: usize,
+    /// Materialized cache retained after commit, independent of input reuse.
+    pub retained_cache_tokens: usize,
 }
 
 /// A single generation request.
