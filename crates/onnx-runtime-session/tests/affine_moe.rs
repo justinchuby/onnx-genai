@@ -323,16 +323,35 @@ fn fixture(t: usize) -> Fixture {
     }
 }
 
+fn unfused_reference(graph: &Graph, banks: [ValueId; 2]) -> Graph {
+    let mut reference = graph.clone();
+    for bank in banks {
+        let dq = reference.value(bank).producer.unwrap();
+        assert_eq!(reference.node(dq).op_type, "DequantizeLinear");
+        // Standalone Cast cannot write UINT4. The fixture's nibble unpack
+        // bounds both codes and zero points to 0..=15 before the Casts. Keeping
+        // both as UINT8 preserves the values and the blocked affine DQ math.
+        for index in [0, 2] {
+            let packed = reference.node(dq).inputs[index].unwrap();
+            let cast = reference.value(packed).producer.unwrap();
+            assert_eq!(reference.node(cast).op_type, "Cast");
+            let lanes = reference.node(cast).inputs[0].unwrap();
+            assert_eq!(reference.value(packed).dtype, D::Uint4);
+            assert_eq!(reference.value(lanes).dtype, D::Uint8);
+            reference.replace_input(dq, index, Some(lanes));
+            reference.remove_node(cast);
+        }
+        // Keep both separate DQ and standard GroupedMatMul on the oracle path.
+        reference.add_output(bank);
+    }
+    reference
+}
+
 #[test]
 fn affine_moe_cpu_executes_selected_fusion_against_standard_graph() {
     for t in [1, 4] {
         let Fixture { graph, banks, .. } = fixture(t);
-        let mut reference = graph.clone();
-        for bank in banks {
-            // Exposing the decoded banks prevents both the projection and full-region rewrites.
-            reference.add_output(bank);
-        }
-        let mut reference = InferenceSession::from_graph(reference).unwrap();
+        let mut reference = InferenceSession::from_graph(unfused_reference(&graph, banks)).unwrap();
         let mut fused = InferenceSession::from_graph(graph).unwrap();
         assert_eq!(
             fused
