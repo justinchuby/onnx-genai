@@ -188,8 +188,26 @@ pub(crate) fn parse_llama_integer(
     Ok(Some(number))
 }
 
+fn deserialize_minimum_indent<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<usize, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let minimum = parse_llama_integer(&value, "n_indent", i64::from(i32::MAX))
+        .map_err(|_| serde::de::Error::custom("n_indent must be numeric and truncate to an integer from 0 through 2147483647; use 0 or null to disable indentation stopping"))?
+        .unwrap_or(0);
+    usize::try_from(minimum).map_err(|_| serde::de::Error::custom(
+        "n_indent must truncate to an integer from 0 through 2147483647; use 0 or null to disable indentation stopping"
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
+    #[serde(
+        rename = "n_indent",
+        default,
+        deserialize_with = "deserialize_minimum_indent"
+    )]
+    pub minimum_indent: usize,
     #[serde(
         rename = "t_max_predict_ms",
         default,
@@ -278,6 +296,9 @@ pub struct ChatCompletionRequest {
     pub grammar_lazy: bool,
     #[serde(default)]
     pub grammar_triggers: Vec<GrammarTriggerRequest>,
+    /// nxrt extension: explicit classic-locale bracket collation.
+    #[serde(default, deserialize_with = "deserialize_grammar_collation")]
+    pub grammar_trigger_collation: Option<onnx_genai_engine::GrammarCollation>,
     #[serde(default)]
     pub preserved_tokens: Vec<String>,
     #[serde(default)]
@@ -468,6 +489,20 @@ impl ReasoningEffort {
     }
 }
 
+fn deserialize_grammar_collation<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<onnx_genai_engine::GrammarCollation>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if !value.is_null() && !value.is_string() {
+        return Err(D::Error::custom(
+            r#"grammar_trigger_collation must be null, "libcxx" or "libstdcxx"; use a string to select the classic-locale bracket profile"#,
+        ));
+    }
+    serde_json::from_value(value).map_err(|error| D::Error::custom(format!(
+        r#"grammar_trigger_collation must be null, "libcxx" or "libstdcxx"; select the C++ classic-locale bracket profile: {error}"#
+    )))
+}
+
 impl ChatCompletionRequest {
     pub(crate) fn grammar_activation(
         &self,
@@ -484,6 +519,7 @@ impl ChatCompletionRequest {
                 .iter()
                 .map(GrammarTriggerRequest::lower)
                 .collect(),
+            self.grammar_trigger_collation.unwrap_or_default(),
         )
         .map(Some)
     }

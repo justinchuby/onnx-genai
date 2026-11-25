@@ -407,6 +407,28 @@ sequences are inert. Pending decoder bytes are finalized before semantic commit,
 so an EOF text stop receives its actual stop reason, and a decoding or byte-bound
 failure leaves session state and callbacks uncommitted.
 
+`n_indent` requests a minimum number of space or tab characters after generated
+newlines. Each tab counts once. Omission, `null` and zero disable the control;
+numeric fractions truncate toward zero and the resulting value must fit
+0 through INT32_MAX. It requires a package tokenizer. The request is shared by
+native and OpenAI completion/chat, Responses and Anthropic generation.
+
+Indentation checks follow the pinned server's token-observation order: the first
+visible newline arms a later observation, and subsequent observations advance
+the newline scan. An insufficiently indented line stops generation normally;
+its leading whitespace remains in final text while its body is removed. EOS and
+prediction-time labels can take precedence without undoing that text clipping.
+The triggering token remains committed and counted. Native reports `limit`;
+OpenAI reports `length`. Generic workflows finish the current loop body
+atomically; specialized execution repairs the accepted prefix before commit.
+
+SSE publishes text whose indentation is already safe, withholding potentially
+retractable line content until the final boundary is known. A request that ends
+before the delayed indentation check releases any retained valid suffix. This
+avoids the pinned implementation's send-before-truncate ordering producing a
+streamed body that disagrees with final text. Token IDs and usage still account
+for every committed token.
+
 Ordinary runtime-owned decoder generation returns llama.cpp `timings` in native,
 OpenAI completion and chat buffered results and final SSE chunks. Setting
 `timings_per_token=true` adds cumulative token-boundary measurements to SSE,
@@ -780,8 +802,24 @@ answer (alongside the route's normal prompt/messages fields):
 As in the pinned upstream sampler, raw `%llguidance` Lark remains eager and
 ignores lazy token/pattern effects, while tokenizer-level word preservation is
 still validated. Lazy JSON `response_format` without a raw GBNF grammar is still
-unsupported and returns a pre-SSE error. Collating/equivalence bracket forms are
-also explicitly unsupported. Trigger source/input bytes, combined translated
+unsupported and returns a pre-SSE error. Collating symbols (`[[.a.]]`,
+`[[.space.]]`) and equivalence classes (`[[=a=]]`) have explicit classic-locale
+byte semantics. Because C++ libraries disagree, nxrt accepts the request extension
+`grammar_trigger_collation`: omission/null or `"libcxx"` preserves the existing
+libc++ contract; `"libstdcxx"` selects GNU collating names and ASCII-case primary
+equivalence. For example, `[[=a=]]` matches a in the former and a/A in the latter.
+There is no ambient-locale or host-compiler inference, or Unicode/accent folding.
+Model properties advertise both choices and the fixed default.
+
+Named punctuation, controls and digits follow the selected library; accepted
+names and legacy NUL behavior are covered by paired C++ reference fixtures.
+Unsupported names and malformed delimiters fail before SSE with profile and byte
+location. The default profile permits collating symbols at both range ends and
+independent equivalence/POSIX terms followed by a hyphen: `[[.a.]-[.c.]]` matches
+a through c, while `[[=a=]-c]` matches a, hyphen or c. GNU requires a literal
+right endpoint (`[[.a.]-c]`) and rejects a class as a range start. Its otherwise
+unmatched closing bracket is literal; the default profile rejects it.
+Trigger source/input bytes, combined translated
 program size, captures, nesting, repetitions, character-class items, history
 length and backtracking have declared bounds; exhaustion is an actionable error.
 Neutral `grammar_lazy=false`, `grammar_triggers=[]` and `preserved_tokens=[]`

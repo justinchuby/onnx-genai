@@ -188,6 +188,33 @@ mod gbnf_wire {
         }
     }
 
+    #[test]
+    fn grammar_collation_is_explicit_and_has_a_stable_default() {
+        for (value, expected) in [
+            (json!(null), onnx_genai_engine::GrammarCollation::Libcxx),
+            (json!("libcxx"), onnx_genai_engine::GrammarCollation::Libcxx),
+            (
+                json!("libstdcxx"),
+                onnx_genai_engine::GrammarCollation::Libstdcxx,
+            ),
+        ] {
+            let request:ChatCompletionRequest=serde_json::from_value(json!({"messages":[],"grammar_lazy":true,
+                "grammar_trigger_collation":value,"grammar_triggers":[{"type":2,"value":"[[=a=]]"}]})).unwrap();
+            assert_eq!(
+                request.grammar_activation().unwrap().unwrap().collation(),
+                expected
+            );
+        }
+        let request: ChatCompletionRequest =
+            serde_json::from_value(json!({"messages":[],"grammar_lazy":true,
+            "grammar_triggers":[{"type":2,"value":"[[=a=]]"}]}))
+            .unwrap();
+        assert_eq!(
+            request.grammar_activation().unwrap().unwrap().collation(),
+            onnx_genai_engine::GrammarCollation::Libcxx
+        );
+    }
+
     #[tokio::test]
     async fn gbnf_wire_ort_preserves_raw_framing_and_validates_before_sse() {
         run(onnx_genai_engine::EngineDecodeBackend::Ort).await;
@@ -245,6 +272,23 @@ mod gbnf_wire {
         )
         .unwrap();
         let router = app(state);
+        let properties = json_body(
+            router
+                .clone()
+                .oneshot(Request::get("/props").body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            properties["default_generation_settings"]["params"]["grammar_trigger_collation"],
+            "libcxx"
+        );
+        assert_eq!(
+            properties["nxrt_capabilities"]["grammar_trigger_collations"],
+            json!(["libcxx", "libstdcxx"])
+        );
+
         for path in ["/v1/chat/completions", "/v1/completions", "/completion"] {
             for raw_lark in [false, true] {
                 for stream in [false, true] {
@@ -329,89 +373,96 @@ mod gbnf_wire {
         // Exercise all native trigger tags through real generation and SSE.
         // A large bias selects the unconstrained trigger; grammar alone then
         // selects the different successor and permits only a completed EOS.
-        for path in [
-            "/completion",
-            "/completions",
-            "/v1/completions",
-            "/v1/chat/completions",
-            "/chat/completions",
-        ] {
-            let chat = path.ends_with("/chat/completions");
-            let id = if chat { 23 } else { 4 };
-            let word = if chat { "tok23" } else { "hello" };
-            for kind in 0..=3 {
-                for stream in [false, true] {
-                    let trigger = match kind {
-                        0 => json!({"type":0,"value":word,"token":id}),
-                        1 => json!({"type":1,"value":word}),
-                        2 => json!({"type":2,"value":if chat {"tok(23)"} else {"h(ello)"}}),
-                        _ => json!({"type":3,"value":word}),
-                    };
-                    let mut body = if chat {
-                        json!({"messages":[{"role":"user","content":"hello"}],"grammar":"root ::= <[23]> <[4]> <[5]>","reasoning_budget_tokens":0})
-                    } else {
-                        json!({"prompt":"hello","grammar":"root ::= <[4]> <[5]>"})
-                    };
-                    body["grammar_lazy"] = json!(true);
-                    body["grammar_triggers"] = json!([trigger]);
-                    body["preserved_tokens"] = json!([word]);
-                    body["logit_bias"] = json!({"4":100.0});
-                    body["max_tokens"] = json!(4);
-                    body["temperature"] = json!(0);
-                    body["stream"] = json!(stream);
-                    let response = router
-                        .clone()
-                        .oneshot(
-                            Request::post(path)
-                                .header(header::CONTENT_TYPE, "application/json")
-                                .body(Body::from(body.to_string()))
-                                .unwrap(),
-                        )
-                        .await
-                        .unwrap();
-                    let status = response.status();
-                    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-                    let text = String::from_utf8_lossy(&bytes);
-                    assert_eq!(
-                        status,
-                        StatusCode::OK,
-                        "{backend:?} {path} lazy kind={kind} stream={stream}: {text}"
-                    );
-                    let content = if stream {
-                        let events = sse_json_events(&bytes);
-                        assert!(
-                            !events.iter().any(|event| event.get("error").is_some()),
-                            "{text}"
-                        );
-                        events
-                            .iter()
-                            .filter_map(|event| {
-                                if matches!(path, "/completion" | "/completions") {
-                                    event["content"].as_str()
-                                } else if chat {
-                                    event["choices"][0]["delta"]["content"].as_str()
-                                } else {
-                                    event["choices"][0]["text"].as_str()
-                                }
-                            })
-                            .collect::<String>()
-                    } else {
-                        let value: Value = serde_json::from_slice(&bytes).unwrap();
-                        if matches!(path, "/completion" | "/completions") {
-                            value["content"].as_str()
-                        } else if chat {
-                            value["choices"][0]["message"]["content"].as_str()
+        for collation in ["libcxx", "libstdcxx"] {
+            for path in [
+                "/completion",
+                "/completions",
+                "/v1/completions",
+                "/v1/chat/completions",
+                "/chat/completions",
+            ] {
+                let chat = path.ends_with("/chat/completions");
+                let id = if chat { 23 } else { 4 };
+                let word = if chat { "tok23" } else { "hello" };
+                for kind in 0..=3 {
+                    for stream in [false, true] {
+                        let trigger = match kind {
+                            0 => json!({"type":0,"value":word,"token":id}),
+                            1 => json!({"type":1,"value":word}),
+                            2 => {
+                                json!({"type":2,"value":if chat { if collation=="libstdcxx" {"[[=T=]]ok([[.two.]][[=three=]])"} else {"tok([[.two.]][[=three=]])"} } else {if collation=="libstdcxx" {"[[.h.]]([[=E=]]llo)"} else {"[[.h.]]([[=e=]]llo)"}}})
+                            }
+                            _ => {
+                                json!({"type":3,"value":if chat {if collation=="libstdcxx" {"[[=T=]]ok[[.two.]][[.three.]]"} else {"[[=t=]]ok[[.two.]][[.three.]]"}} else {if collation=="libstdcxx" {"[[=H=]]ello"} else {"[[.h.]]ello"}}})
+                            }
+                        };
+                        let mut body = if chat {
+                            json!({"messages":[{"role":"user","content":"hello"}],"grammar":"root ::= <[23]> <[4]> <[5]>","reasoning_budget_tokens":0})
                         } else {
-                            value["choices"][0]["text"].as_str()
-                        }
-                        .unwrap()
-                        .to_owned()
-                    };
-                    assert_eq!(
-                        content.trim(),
-                        "helloworld",
-                        "{backend:?} {path} lazy kind={kind} stream={stream}: {text}"
-                    );
+                            json!({"prompt":"hello","grammar":"root ::= <[4]> <[5]>"})
+                        };
+                        body["grammar_lazy"] = json!(true);
+                        body["grammar_trigger_collation"] = json!(collation);
+                        body["grammar_triggers"] = json!([trigger]);
+                        body["preserved_tokens"] = json!([word]);
+                        body["logit_bias"] = json!({"4":100.0});
+                        body["max_tokens"] = json!(4);
+                        body["temperature"] = json!(0);
+                        body["stream"] = json!(stream);
+                        let response = router
+                            .clone()
+                            .oneshot(
+                                Request::post(path)
+                                    .header(header::CONTENT_TYPE, "application/json")
+                                    .body(Body::from(body.to_string()))
+                                    .unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        let status = response.status();
+                        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                        let text = String::from_utf8_lossy(&bytes);
+                        assert_eq!(
+                            status,
+                            StatusCode::OK,
+                            "{backend:?} {path} lazy kind={kind} stream={stream}: {text}"
+                        );
+                        let content = if stream {
+                            let events = sse_json_events(&bytes);
+                            assert!(
+                                !events.iter().any(|event| event.get("error").is_some()),
+                                "{text}"
+                            );
+                            events
+                                .iter()
+                                .filter_map(|event| {
+                                    if matches!(path, "/completion" | "/completions") {
+                                        event["content"].as_str()
+                                    } else if chat {
+                                        event["choices"][0]["delta"]["content"].as_str()
+                                    } else {
+                                        event["choices"][0]["text"].as_str()
+                                    }
+                                })
+                                .collect::<String>()
+                        } else {
+                            let value: Value = serde_json::from_slice(&bytes).unwrap();
+                            if matches!(path, "/completion" | "/completions") {
+                                value["content"].as_str()
+                            } else if chat {
+                                value["choices"][0]["message"]["content"].as_str()
+                            } else {
+                                value["choices"][0]["text"].as_str()
+                            }
+                            .unwrap()
+                            .to_owned()
+                        };
+                        assert_eq!(
+                            content.trim(),
+                            "helloworld",
+                            "{backend:?} {path} lazy kind={kind} stream={stream}: {text}"
+                        );
+                    }
                 }
             }
         }
@@ -675,6 +726,12 @@ mod gbnf_wire {
             json!({"grammar":"root ::= \"hello\"", "grammar_lazy":true,"grammar_triggers":[{"type":2,"value":"(?<=x)y"}]}),
             json!({"grammar":"root ::= \"hello\"", "grammar_triggers":[{"type":1,"value":"hello"}]}),
             json!({"grammar":"root ::= \"hello\"", "grammar_triggers":[{"type":4,"value":"hello"}]}),
+            json!({"grammar":"root ::= \"hello\"", "grammar_lazy":true,"grammar_triggers":[{"type":2,"value":"[[.missing.]]"}]}),
+            json!({"grammar":"root ::= \"hello\"", "grammar_lazy":true,"grammar_triggers":[{"type":2,"value":"[[=missing=]]"}]}),
+            json!({"grammar":"root ::= \"hello\"", "grammar_lazy":true,"grammar_triggers":[{"type":2,"value":"[[.a]]"}]}),
+            json!({"grammar_trigger_collation":"unknown"}),
+            json!({"grammar_trigger_collation":true}),
+            json!({"grammar_trigger_collation":{"libcxx":null}}),
             json!({"response_format":{"type":"json_object"},"grammar_lazy":true,"grammar_triggers":[{"type":2,"value":"[{]"}]}),
             json!({"grammar":"%llguidance {}\nstart: <[4]>", "grammar_lazy":true,"grammar_triggers":[{"type":1,"value":"hello"}]}),
             json!({"grammar":"root ::= \"hello\"", "ignore_eos":true}),
@@ -3367,7 +3424,7 @@ fn stop_boundary_buffer_holds_partial_stop_sequence() {
     assert_eq!(buffer.push("k"), "");
     assert_eq!(buffer.push("2"), "");
     assert_eq!(buffer.push("1"), "tok21");
-    assert_eq!(buffer.flush(), "");
+    assert_eq!(buffer.finish("tok21").unwrap(), "");
 }
 
 #[test]
@@ -3375,7 +3432,7 @@ fn stop_boundary_buffer_suppresses_matched_stop_sequence() {
     let mut buffer = StopBoundaryBuffer::new(vec!["tok20".to_string()]);
     assert_eq!(buffer.push("hello tok"), "hello ");
     assert_eq!(buffer.push("20"), "");
-    assert_eq!(buffer.flush(), "");
+    assert_eq!(buffer.finish("hello tok20").unwrap(), "");
 }
 
 #[tokio::test]
@@ -8369,6 +8426,190 @@ mod native_compat {
             .await
             .unwrap()
     }
+    #[tokio::test]
+    async fn indentation_stops_native_buffered_and_streamed_real_generation() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        copy_tree(&source, scratch.path());
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+        vocab.remove("tok22");
+        vocab.insert("head\n bad".into(), json!(22));
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let router = app(AppState::load(scratch.path(), Some("indent".into())).unwrap());
+        for stream in [false, true] {
+            for budget in [1, 8] {
+                let response=request(router.clone(),"/completion",json!({"prompt":[2,4,3],"n_predict":budget,
+                    "n_indent":2,"temperature":0,"ignore_eos":true,"logit_bias":{"22":100},"stream":stream})).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let expected = if budget == 1 { "head\n bad" } else { "head\n " };
+                let result = if stream {
+                    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                    let events = sse_json_events(&bytes);
+                    assert!(
+                        !std::str::from_utf8(&bytes)
+                            .unwrap()
+                            .contains("event: error"),
+                        "{}",
+                        String::from_utf8_lossy(&bytes)
+                    );
+                    let content = events
+                        .iter()
+                        .filter_map(|event| event["content"].as_str())
+                        .collect::<String>();
+                    assert_eq!(content, expected);
+                    events.last().unwrap().clone()
+                } else {
+                    let value = json_body(response).await;
+                    assert_eq!(value["content"], expected);
+                    value
+                };
+                assert_eq!(result["tokens_predicted"], if budget == 1 { 1 } else { 3 });
+                assert_eq!(result["stop_type"], "limit");
+                assert_eq!(result["generation_settings"]["n_indent"], 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn indentation_openai_streams_preserve_held_text_on_early_word_stops() {
+        let scratch = tempfile::tempdir().unwrap();
+        copy_tree(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm"),
+            scratch.path(),
+        );
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+        vocab.remove("tok22");
+        vocab.insert("title\n bad".into(), json!(22));
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        std::fs::write(
+            scratch.path().join("tokenizer_config.json"),
+            r#"{"chat_template":"."}"#,
+        )
+        .unwrap();
+        let router = app(AppState::load(scratch.path(), Some("indent".into())).unwrap());
+        for chat in [false, true] {
+            for stream in [false, true] {
+                for (budget, word, expected) in [
+                    (1, false, "title\n bad"),
+                    (8, false, "title\n "),
+                    (8, true, "title\n b"),
+                ] {
+                    let mut body = json!({"max_tokens":budget,"n_indent":2,"temperature":0,"ignore_eos":true,"logit_bias":{"22":100},"stream":stream});
+                    let path = if chat {
+                        body["messages"] = json!([{"role":"user","content":"hello"}]);
+                        "/v1/chat/completions"
+                    } else {
+                        body["prompt"] = json!([2, 4, 3]);
+                        "/v1/completions"
+                    };
+                    if word {
+                        body["stop"] = json!(["ad"]);
+                    }
+                    let response = request(router.clone(), path, body).await;
+                    if response.status() != StatusCode::OK {
+                        panic!(
+                            "{path} chat={chat} stream={stream}: {}",
+                            json_body(response).await
+                        );
+                    }
+                    let content = if stream {
+                        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                        assert!(
+                            !std::str::from_utf8(&bytes)
+                                .unwrap()
+                                .contains("event: error"),
+                            "{}",
+                            String::from_utf8_lossy(&bytes)
+                        );
+                        sse_json_events(&bytes)
+                            .iter()
+                            .filter_map(|event| {
+                                if chat {
+                                    event["choices"][0]["delta"]["content"].as_str()
+                                } else {
+                                    event["choices"][0]["text"].as_str()
+                                }
+                            })
+                            .collect::<String>()
+                    } else {
+                        let value = json_body(response).await;
+                        if chat {
+                            value["choices"][0]["message"]["content"]
+                                .as_str()
+                                .unwrap()
+                                .to_owned()
+                        } else {
+                            value["choices"][0]["text"].as_str().unwrap().to_owned()
+                        }
+                    };
+                    assert_eq!(
+                        content, expected,
+                        "chat={chat} stream={stream} word={word} budget={budget}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn indentation_wire_bounds_are_shared_across_generation_protocols() {
+        let router = app(tiny_state());
+        for (path, base) in [
+            ("/completion", json!({"prompt":"hello","n_predict":1})),
+            ("/v1/completions", json!({"prompt":"hello","max_tokens":1})),
+            (
+                "/v1/chat/completions",
+                json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":1}),
+            ),
+            (
+                "/v1/responses",
+                json!({"input":"hello","max_output_tokens":1}),
+            ),
+            (
+                "/v1/messages",
+                json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":1}),
+            ),
+        ] {
+            for (value, valid) in [
+                (json!(null), true),
+                (json!(0), true),
+                (json!(2.9), true),
+                (json!(-0.5), true),
+                (json!(i32::MAX), true),
+                (json!(-1), false),
+                (json!(2147483648_u64), false),
+                (json!(true), false),
+                (json!("2"), false),
+            ] {
+                let mut body = base.clone();
+                body["n_indent"] = value;
+                body["stream"] = json!(true);
+                let response = request(router.clone(), path, body).await;
+                assert_eq!(
+                    response.status(),
+                    if valid {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    },
+                    "{path}"
+                );
+                let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                if !valid {
+                    assert!(
+                        std::str::from_utf8(&bytes).unwrap().contains("n_indent"),
+                        "{path}"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn prediction_time_limit_wire_domain_is_shared_across_generation_protocols() {
         let router = app(tiny_state());

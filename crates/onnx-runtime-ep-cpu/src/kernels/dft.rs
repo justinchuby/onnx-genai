@@ -16,8 +16,10 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::{Node, dft::DftMode};
 
 use super::check_arity;
-use super::fourier_workspace::{FourierWorkspace, scalar_i64};
-use crate::dtype::{to_dense_f32_widen, validate_f32_widen_input, write_dense_f32_narrow};
+use super::float_workspace::FloatWorkspace;
+use crate::dtype::{
+    scalar_i64, to_dense_f32_widen, validate_f32_widen_input, write_dense_f32_narrow,
+};
 
 /// Dispatch counter for the vDSP Accelerate DFT fast path.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -145,8 +147,17 @@ struct DftGeometry {
 }
 
 impl DftGeometry {
-    fn workspace(&self) -> Result<FourierWorkspace> {
-        FourierWorkspace::new("DFT", self.n, self.batches != 0)
+    fn workspace(&self) -> Result<FloatWorkspace<4>> {
+        let len = if self.batches == 0 { 0 } else { self.n };
+        FloatWorkspace::new(
+            "DFT",
+            [
+                ("real input", len),
+                ("imaginary input", len),
+                ("real output", len),
+                ("imaginary output", len),
+            ],
+        )
     }
 }
 

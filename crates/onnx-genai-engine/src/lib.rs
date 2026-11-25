@@ -19,6 +19,7 @@ pub mod embedding;
 pub mod engine;
 pub mod fim;
 pub mod gbnf;
+pub mod indentation;
 mod json_prefix;
 pub(crate) mod kv_bridge;
 pub(crate) mod kv_sizing;
@@ -73,8 +74,8 @@ pub use engine::{
     EngineDecodeBackend, EngineGovernorError, EngineResourceGovernor, FinishReason,
     GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
     GenerateToken, GenerateTokenCallback, GenerationBudgetCap, GenerationTimings,
-    GrammarActivation, GrammarTrigger, KvConnectorBackend, KvConnectorConfig, LayerWeightBytes,
-    LimitParseError, LogprobSource, MemoryPolicyApplication, MemoryStrategy,
+    GrammarActivation, GrammarCollation, GrammarTrigger, KvConnectorBackend, KvConnectorConfig,
+    LayerWeightBytes, LimitParseError, LogprobSource, MemoryPolicyApplication, MemoryStrategy,
     MemoryStrategyDecision, MemoryStrategyPlan, MirostatConfig, MirostatVersion, MtpCacheScope,
     MtpConfig, MtpHiddenLayout, MtpWeightSource, OrtEngineWorkerFactory, OrtSessionWorkerLoadError,
     PackageExecutionError, PrefillRequest, PrefillResult, PrioritizedGenerateRequest,

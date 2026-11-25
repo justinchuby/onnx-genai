@@ -2623,7 +2623,7 @@ and per-batch DFT allocations still require their own workspace migration.
 
 DFT's real/imaginary input and output vectors now borrow four transform-length
 regions from the same StepScoped Host execution domain as STFT. A private
-FourierWorkspace descriptor centralizes checked partitioning and initialization;
+FloatWorkspace<4> descriptor centralizes checked partitioning and initialization;
 it owns neither backing nor quota. Both operators use its closure-scoped Host
 borrows. DFT constructs one existing DftPlan per execution and reuses it across
 all batches, instead of allocating vectors and DSP setup for each transform.
@@ -2709,3 +2709,82 @@ Input/scale widening and the general broadcast path's rank-sized stride vectors
 remain outside the staging requirement. These checks prove ownership and
 numerical behavior, not zero total allocations, inference latency, complete RSS
 accounting or CUDA execution.
+
+
+### One private initialized-float binding contract for CPU kernels
+
+DFT, STFT and both RMS schemas now use `FloatWorkspace<N>` instead of separate
+Fourier and RMS raw-pointer initialization code. A kernel supplies named f32
+region lengths, keeps its own geometry and declares the same existing
+StepScoped requirement. The descriptor uses fixed-size stack arrays and the
+existing `WorkspaceLayout`; lengths are derived from checked region byte sizes
+when binding rather than retained as a second source of truth. It owns no
+backing, quota, lock or pool. This is a CPU-private helper, not a new EP ABI.
+
+Complete capacity/alignment/address validation precedes all memory writes and
+the callback. Each region is initialized before its f32 slice exists, including
+fresh backing; empty regions use aligned dangling pointers. A higher-ranked
+closure and fixed return type keep scratch references within the synchronous
+borrow. Callers still prove Host accessibility, live exclusive ownership and
+disjointness from tensors. Their existing view, optional-output, overflow and
+empty-work guards remain in the kernels. The helper introduces no per-frame,
+row or expert admission. Scalar integer reads move to the dtype module,
+independent of workspace ownership, with invalid-view errors naming the op and
+control input.
+
+Exact source comparison preserves the DFT/STFT execution and tests and the RMS
+math core. The binding regressions retain fresh/poisoned four-buffer controls
+and cover unequal region lengths, optional empty holes, no regions,
+missing/short/misaligned/wrapping backing, no writes/callback on refusal and
+reuse after a consumer error. Scalar controls cover signed values, unaligned
+backing, byte offsets, invalid views and Host-accessible unified-memory metadata.
+Existing per-kernel and governed-lane tests, public sessions and fallback-disabled
+real ORT plugin tests remain the integration checks. Byte bounds, arithmetic,
+retention and grant/refund ownership are unchanged; no timing or CUDA-runtime
+claim is made.
+
+
+### LayerNorm and Skip share admitted output/statistics staging
+
+LayerNormalization (default and private fused domain) and SkipLayerNormalization
+now share one explicit schema-kind kernel, checked metadata geometry and
+`FloatWorkspace<4>`. The allocating `layer_norm_dense` return interface and
+Skip's residual-sum Vec are removed. The regions are Y, requested mean,
+requested inverse standard deviation, and Skip's full residual sum. Standard
+LayerNorm has no sum region; omitted statistics occupy zero bytes. Skip keeps
+its sum alongside Y because it is both the normalization input and an optional
+published output. No new EP protocol, kernel pool or per-row grant is introduced.
+
+The original f32 mean/variance/scale/beta arithmetic is preserved. Skip still
+computes `(X + skip) + bias_or_positive_zero` before normalization, including the
+final +0.0 when bias is omitted. Beta and bias remain independently optional.
+All live operands are consumed and every group computed before any output is
+published, preserving input, residual and parameter aliases. Skip Y/sum retain
+activation storage dtype, while each statistic independently supports Float32
+or activation dtype. Absent optional output holes are not validated or written.
+
+Preparation checks required slots, normalized width, group and stride products,
+parameter element counts, dtypes, complete output shapes and total layout
+capacity. Empty groups retain parameter/view/Host/output checks and need no
+scratch. Empty normalized width remains an error; axis==rank is now rejected in
+accordance with the [ONNX axis range](https://onnx.ai/onnx/operators/onnx__LayerNormalization.html).
+Standard LayerNorm's pre-existing full-normalized-parameter element-count rule
+is retained. **Follow-up remains open:** support the broader unidirectional
+Scale/B broadcasting described by that schema; this migration does not claim
+that capability or alter the accepted complete parameter layouts.
+
+Regression controls cover exact optional-region bounds, independent beta/bias
+holes, fresh and poisoned backing, prefix canaries, missing/short/misaligned
+scratch, view/shape/overflow refusal, operand/output aliases, signed zero,
+strided half input/output and existing bf16 literal goldens. A real governed
+lane alternates 48-byte standard and 80-byte Skip calls for 4,096 warm cycles
+without additional issuer callbacks (including zero-byte observer controls),
+refuses concurrent reuse and refunds physical capacity only after idle trim.
+An encoded two-node public session uses one 80-byte peak, refuses 79 bytes,
+reuses its managed identity and re-admits reclaimed storage. The shipping ORT
+plugin disables fallback, assigns both nodes to cpu_ep, changes shapes
+2x3/3x9/2x3 and checks all six published outputs against f64 references.
+
+Input widening remains outside these four staging regions. This is not complete
+RSS accounting, a zero-total-overhead or inference-speed measurement, or CUDA
+runtime validation.
