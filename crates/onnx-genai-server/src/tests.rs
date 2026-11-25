@@ -9603,6 +9603,226 @@ mod native_compat {
         }
     }
 
+    fn multimodal_ranking_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/reranking_multimodal")
+    }
+    fn ranking_image(name: &str) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode(std::fs::read(multimodal_ranking_root().join(name)).unwrap())
+    }
+    #[tokio::test]
+    async fn reranking_multimodal_aliases_execute_real_ordered_images() {
+        let router =
+            app(AppState::load(&multimodal_ranking_root(), Some("vision-ranker".into())).unwrap());
+        let props = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/props")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(props.status(), StatusCode::OK);
+        let props = json_body(props).await;
+        assert_eq!(
+            props["nxrt_capabilities"]["reranking_image_limits"],
+            json!({"query":1,"document":2})
+        );
+        assert_eq!(
+            props["modalities"]["vision"], false,
+            "reranking application inputs do not grant chat image ownership"
+        );
+        let white = ranking_image("white.png");
+        let black = format!("data:image/png;base64,{}", ranking_image("black.png"));
+        for path in ["/rerank", "/reranking", "/v1/rerank", "/v1/reranking"] {
+            let response = request(
+                router.clone(),
+                path,
+                json!({
+                    "query":{"text":"hello","image":white},
+                    "documents":[
+                        {"text":["hel","lo"],"image":[white,black]},
+                        {"text":"hello","image":[black,white]},
+                        {"text":"hello","image":[white,white]}
+                    ]
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            assert_eq!(
+                body["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["index"].as_u64().unwrap())
+                    .collect::<Vec<_>>(),
+                vec![2, 1, 0]
+            );
+            for (row, distance) in body["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip([0.0_f64, 1.0, 2.0])
+            {
+                assert!(
+                    (row["relevance_score"].as_f64().unwrap() - 1.0 / (1.0 + distance.exp())).abs()
+                        < 1e-5,
+                    "{body}"
+                );
+            }
+            assert_eq!(body["usage"]["prompt_tokens"], 15);
+        }
+        let response = request(
+            router.clone(),
+            "/rerank",
+            json!({
+                "query":{"image":white}, "texts":[{"image":[white,white]}], "return_text":true
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body[0]["text"], "");
+        assert!((body[0]["score"].as_f64().unwrap() - 0.5).abs() < 1e-6);
+    }
+    #[tokio::test]
+    async fn reranking_multimodal_admits_counts_before_fetch_and_enforces_media_budget() {
+        let root = multimodal_ranking_root();
+        let white = ranking_image("white.png");
+        let black = ranking_image("black.png");
+        let limit = std::fs::read(root.join("white.png")).unwrap().len();
+        let state = AppState::load_with_config(
+            &root,
+            Some("limited-vision-ranker".into()),
+            ServerConfig {
+                max_rerank_media_bytes: std::num::NonZeroUsize::new(limit).unwrap(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let router = app(state);
+        // Shared sources occupy one allocation even across query and multiple pairs.
+        let response=request(router.clone(),"/rerank",json!({"query":{"image":white},"documents":[{"image":[white,white]},{"image":[white,white]}]})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        for (body, expected) in [
+            (
+                json!({"query":{"image":white},"documents":[{"image":[white,black]}]}),
+                "--max-rerank-media-bytes",
+            ),
+            (
+                json!({"query":{"image":white},"documents":[{"image":["http://127.0.0.1:9/unreachable",white,white]}]}),
+                "declares 2",
+            ),
+            (
+                json!({"query":"hello","documents":[{"image":[white,white]}]}),
+                "query.image",
+            ),
+            (
+                json!({"query":{"image":"AAAA"},"documents":[{"image":[white,white]}]}),
+                "not a supported encoded image",
+            ),
+            (
+                json!({"query":{"image":[1]},"documents":[{"image":[white,white]}]}),
+                "query.image[0]",
+            ),
+            (
+                json!({"query":{"image":white,"video":"clip"},"documents":[{"image":[white,white]}]}),
+                "video/fps/max_frames",
+            ),
+        ] {
+            let response = request(router.clone(), "/rerank", body).await;
+            assert!(response.status().is_client_error());
+            let body = json_body(response).await;
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected),
+                "{body}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn reranking_multimodal_fetches_reused_http_images_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let bytes = std::fs::read(multimodal_ranking_root().join("white.png")).unwrap();
+        let upstream = axum::Router::new().route(
+            "/image.png",
+            axum::routing::get(move || {
+                let bytes = bytes.clone();
+                let count = Arc::clone(&count);
+                async move {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    ([(axum::http::header::CONTENT_TYPE, "image/png")], bytes)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let url = format!("http://{address}/image.png");
+        let router = app(AppState::load(
+            &multimodal_ranking_root(),
+            Some("http-vision-ranker".into()),
+        )
+        .unwrap());
+        let response = request(
+            router,
+            "/rerank",
+            json!({"query":{"image":url},"documents":[{"image":[url,url]},{"image":[url,url]}]}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn reranking_multimodal_validates_pixel_payload_before_submission() {
+        use base64::Engine as _;
+        let bytes = std::fs::read(multimodal_ranking_root().join("truncated_pixels.png")).unwrap();
+        assert_eq!(
+            image::ImageReader::new(Cursor::new(&bytes))
+                .with_guessed_format()
+                .unwrap()
+                .into_dimensions()
+                .unwrap(),
+            (1, 1),
+            "the fixture must pass header-only validation"
+        );
+        let truncated = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let white = ranking_image("white.png");
+        let router =
+            app(
+                AppState::load(&multimodal_ranking_root(), Some("truncated-media".into())).unwrap(),
+            );
+        let response = request(
+            router,
+            "/rerank",
+            json!({"query":{"image":truncated},"documents":[{"image":[white,white]}]}),
+        )
+        .await;
+        let status = response.status();
+        let body = json_body(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("query.image[0]"),
+            "{body}"
+        );
+    }
+
     fn ranking_state() -> AppState {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/onnx_genai_workflows/reranking");
@@ -9697,7 +9917,7 @@ mod native_compat {
             json_body(response).await["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("reranking v1 profile")
+                .contains("reranking profile")
         );
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/onnx_genai_workflows/reranking");

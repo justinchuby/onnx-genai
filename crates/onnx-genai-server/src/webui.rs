@@ -6,9 +6,16 @@ use axum::{
 };
 include!(concat!(env!("OUT_DIR"), "/llama_chat_assets.rs"));
 
+fn asset_path(path: &str) -> &str {
+    let path = path.strip_prefix('/').unwrap_or(path);
+    if path.is_empty() { "index.html" } else { path }
+}
+pub(crate) fn is_asset(path: &str) -> bool {
+    asset(asset_path(path)).is_some()
+}
+
 pub(crate) async fn serve(uri: Uri) -> Response {
-    let path = uri.path().strip_prefix('/').unwrap_or(uri.path());
-    let path = if path.is_empty() { "index.html" } else { path };
+    let path = asset_path(uri.path());
     let Some(body) = asset(path) else {
         return crate::routes::ApiError::not_found(format!(
             "path '{}' is not served; open / for Llama Chat or /v1/models for model discovery",

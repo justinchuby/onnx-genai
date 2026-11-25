@@ -363,6 +363,10 @@ fn workflow_adapter_registry()
                 WorkflowRuntime::run_image_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
+                ("onnx-genai.image-preprocess", "2"),
+                WorkflowRuntime::run_image_preprocess_adapter as WorkflowAdapterExecutor,
+            ),
+            (
                 ("onnx-genai.video-preprocess", "1"),
                 WorkflowRuntime::run_video_preprocess_adapter as WorkflowAdapterExecutor,
             ),
@@ -3880,6 +3884,14 @@ impl WorkflowRuntime {
         package_symbols: &HashMap<String, i64>,
         component_symbols: &mut HashMap<String, i64>,
     ) -> anyhow::Result<()> {
+        let ComponentImplementation::Adapter { version, .. } = &declaration.implementation else {
+            anyhow::bail!(
+                "image preprocessing component '{component}' must declare an adapter implementation"
+            );
+        };
+        let output_scope =
+            onnx_genai_metadata::extensions::PreprocessingOutputScope::for_version(version)
+                .map_err(anyhow::Error::msg)?;
         let program = self
             .plan
             .preprocessing
@@ -3946,11 +3958,9 @@ impl WorkflowRuntime {
             .map(|tensor| (tensor.name.clone(), tensor))
             .collect::<HashMap<_, _>>();
         for (port, value_ref) in outputs {
-            let tensor = tensors.remove(value_ref).with_context(|| {
-                format!(
-                    "image preprocessing adapter '{component}' did not produce declared SSA \
-                     output '{value_ref}'"
-                )
+            let output_name = output_scope.output_name(port, value_ref);
+            let tensor = tensors.remove(output_name).with_context(|| {
+                format!("image preprocessing adapter '{component}' did not produce output '{output_name}' for port '{port}' and workflow value '{value_ref}'; align preprocessing.image.outputs with the adapter output bindings")
             })?;
             let contract = declaration.ports.outputs.get(port).with_context(|| {
                 format!(

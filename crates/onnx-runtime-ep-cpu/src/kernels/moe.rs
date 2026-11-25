@@ -674,16 +674,21 @@ struct RoutingPlan {
 impl RoutingPlan {
     fn build(router: &[f32], rows: usize, experts: usize, k: usize, normalize: bool) -> Self {
         let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); experts];
+        let mut routing = RoutingScratch::default();
         for row in 0..rows {
-            for (expert, weight) in routing_weights(
-                &router[row * experts..(row + 1) * experts],
-                None,
-                k,
-                normalize,
-            ) {
+            for &(expert, weight) in routing
+                .weights(
+                    &router[row * experts..(row + 1) * experts],
+                    None,
+                    k,
+                    normalize,
+                )
+                .iter()
+            {
                 per_expert[expert].push((row as u32, weight));
             }
         }
+        drop(routing);
         let total = per_expert.iter().map(Vec::len).sum::<usize>();
         let mut slot_row = Vec::with_capacity(total);
         let mut slot_expert = Vec::with_capacity(total);
@@ -1669,7 +1674,69 @@ fn linear(
     output
 }
 
-pub(super) fn routing_weights(
+/// Dispatch-local routing metadata. Each call replaces all live entries while
+/// retaining capacity; callers must consume/copy the borrowed selection before
+/// routing the next row. Exactly min(k, logits.len()) entries are returned.
+#[derive(Default)]
+pub(super) struct RoutingScratch {
+    indices: Vec<usize>,
+    exponentials: Vec<f32>,
+    selected: Vec<(usize, f32)>,
+}
+
+impl RoutingScratch {
+    pub(super) fn weights(
+        &mut self,
+        logits: &[f32],
+        aggregation_weights: Option<&[f32]>,
+        k: usize,
+        normalize: bool,
+    ) -> &mut [(usize, f32)] {
+        self.indices.clear();
+        self.indices.extend(0..logits.len());
+        self.indices
+            .sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]).then_with(|| a.cmp(&b)));
+        self.indices.truncate(k);
+        self.selected.clear();
+        if let Some(weights) = aggregation_weights {
+            let denominator = if normalize {
+                self.indices.iter().map(|&i| weights[i]).sum()
+            } else {
+                1.0
+            };
+            self.selected.extend(self.indices.iter().map(|&i| {
+                let weight = if denominator == 0.0 {
+                    0.0
+                } else {
+                    weights[i] / denominator
+                };
+                (i, weight)
+            }));
+        } else {
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            self.exponentials.clear();
+            self.exponentials
+                .extend(logits.iter().map(|&v| (v - max).exp()));
+            let all_sum: f32 = self.exponentials.iter().sum();
+            let denominator = if normalize {
+                self.indices.iter().map(|&i| self.exponentials[i]).sum()
+            } else {
+                all_sum
+            };
+            self.selected.extend(
+                self.indices
+                    .iter()
+                    .map(|&i| (i, self.exponentials[i] / denominator)),
+            );
+        }
+        &mut self.selected
+    }
+}
+
+// Frozen pre-scratch algorithm: independent oracle for routing and the existing
+// full-kernel expected-value tests, never a production compatibility surface.
+#[cfg(test)]
+pub(super) fn reference_routing_weights(
     logits: &[f32],
     aggregation_weights: Option<&[f32]>,
     k: usize,
@@ -1709,6 +1776,142 @@ pub(super) fn routing_weights(
         .into_iter()
         .map(|i| (i, exponentials[i] / denominator))
         .collect()
+}
+
+#[cfg(test)]
+mod routing_scratch_tests {
+    use super::{RoutingScratch, reference_routing_weights};
+
+    fn assert_selection_bits(actual: &[(usize, f32)], expected: &[(usize, f32)]) {
+        assert_eq!(actual.len(), expected.len());
+        for (position, ((actual_expert, actual_weight), (expert, weight))) in
+            actual.iter().zip(expected).enumerate()
+        {
+            assert_eq!(actual_expert, expert, "selection {position}");
+            assert_eq!(
+                actual_weight.to_bits(),
+                weight.to_bits(),
+                "weight {position}"
+            );
+        }
+    }
+
+    #[test]
+    fn reused_routing_preserves_reference_bits_across_geometry_and_special_values() {
+        let mut scratch = RoutingScratch::default();
+        let patterns = [
+            vec![2., 2., -0., 0., -2., 1.],
+            vec![f32::INFINITY, f32::NEG_INFINITY, f32::MAX, -f32::MAX],
+            vec![
+                f32::from_bits(0x7fc0_0001),
+                0.,
+                f32::from_bits(0xffc0_0051),
+                -0.,
+            ],
+            vec![f32::NEG_INFINITY],
+            vec![f32::INFINITY],
+        ];
+        // Grow, shrink, regrow and switch aggregation modes on the same owner.
+        for width in [0usize, 1, 7, 65, 257, 2, 16, 0, 257, 1] {
+            for pattern in &patterns {
+                let logits: Vec<_> = (0..width).map(|i| pattern[i % pattern.len()]).collect();
+                let zeros = vec![0.; width];
+                let weights: Vec<_> = (0..width)
+                    .map(|i| [1., -1., 0., -0., f32::INFINITY, f32::from_bits(0x7fc0_0032)][i % 6])
+                    .collect();
+                for k in [0, 1, width / 2, width, width + 5, usize::MAX] {
+                    for normalize in [false, true] {
+                        for aggregation in [None, Some(zeros.as_slice()), Some(weights.as_slice())]
+                        {
+                            let expected =
+                                reference_routing_weights(&logits, aggregation, k, normalize);
+                            let selected = scratch.weights(&logits, aggregation, k, normalize);
+                            assert_eq!(selected.len(), k.min(width));
+                            assert_selection_bits(selected, &expected);
+                            // BlockQuantizedMoE consumes expert-sorted selections.
+                            // That mutation must not leak into the next score order.
+                            selected.sort_unstable_by_key(|&(expert, _)| expert);
+                            assert_selection_bits(
+                                scratch.weights(&logits, aggregation, k, normalize),
+                                &expected,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn routing_matches_sorted_reference_for_permuted_bits_and_selection_boundaries() {
+        let mut scratch = RoutingScratch::default();
+        let mut seed = 0x91e1_0da5u32;
+        for width in [0usize, 1, 2, 8, 17, 64, 257, 1024] {
+            let mut logits = Vec::with_capacity(width);
+            for _ in 0..width {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                logits.push(f32::from_bits(seed));
+            }
+            if width > 7 {
+                logits[..8].copy_from_slice(&[
+                    f32::from_bits(0x7fc0_0032),
+                    f32::from_bits(0xffc0_0021),
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                    0.,
+                    -0.,
+                    1.,
+                    1.,
+                ]);
+            }
+            let aggregation: Vec<_> = (0..width).map(|i| [1., -1., 0., 0.25][i % 4]).collect();
+            let ks: Vec<_> = if width < 18 {
+                (0..=width + 1).collect()
+            } else {
+                vec![0, 1, 2, width / 2, width - 1, width, width + 1]
+            };
+            for k in ks {
+                for normalize in [false, true] {
+                    for weights in [None, Some(aggregation.as_slice())] {
+                        let expected = reference_routing_weights(&logits, weights, k, normalize);
+                        assert_selection_bits(
+                            scratch.weights(&logits, weights, k, normalize),
+                            &expected,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn routing_keeps_total_order_ties_signed_zero_and_zero_denominator() {
+        let mut scratch = RoutingScratch::default();
+        let logits = [2., 2., -0., 0., f32::NEG_INFINITY];
+        let weights = [1., -1., 7., -7., 0.];
+        assert_selection_bits(
+            scratch.weights(&logits, Some(&weights), 5, false),
+            &[(0, 1.), (1, -1.), (3, -7.), (2, 7.), (4, 0.)],
+        );
+        assert_selection_bits(
+            scratch.weights(&logits, Some(&weights), 2, true),
+            &[(0, 0.), (1, 0.)],
+        );
+        let logits = [
+            f32::from_bits(0x7fc0_0001),
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(0xffc0_0001),
+            0.,
+            -0.,
+        ];
+        let ones = [1.; 6];
+        let selected = scratch.weights(&logits, Some(&ones), 6, false);
+        assert_eq!(
+            selected.iter().map(|&(i, _)| i).collect::<Vec<_>>(),
+            [0, 1, 4, 5, 2, 3]
+        );
+    }
 }
 
 fn activate(activation: Activation, value: f32) -> f32 {
@@ -2620,9 +2823,12 @@ mod tests {
         let attributes = MoeAttributes::from_node(graph.node(node)).unwrap();
         let mut dense = vec![0.0f32; ROWS * HIDDEN];
         for row in 0..ROWS {
-            for (expert, weight) in
-                routing_weights(&router[row * EXPERTS..(row + 1) * EXPERTS], None, 2, true)
-            {
+            for (expert, weight) in reference_routing_weights(
+                &router[row * EXPERTS..(row + 1) * EXPERTS],
+                None,
+                2,
+                true,
+            ) {
                 let expert_output = run_expert(
                     &input[row * HIDDEN..(row + 1) * HIDDEN],
                     &fc1[expert * INTER * HIDDEN..(expert + 1) * INTER * HIDDEN],
@@ -3078,7 +3284,7 @@ mod tests {
     ) -> Vec<f32> {
         let mut dense = vec![0.0f32; rows * hidden];
         for row in 0..rows {
-            for (expert, weight) in routing_weights(
+            for (expert, weight) in reference_routing_weights(
                 &router[row * experts..(row + 1) * experts],
                 None,
                 k,
@@ -3313,7 +3519,7 @@ mod tests {
         let mut output = vec![0.0f32; rows * hidden];
         let mut tasks = BTreeMap::<usize, Vec<(usize, f32)>>::new();
         for row in 0..rows {
-            for (expert, weight) in routing_weights(
+            for (expert, weight) in reference_routing_weights(
                 &router[row * experts..(row + 1) * experts],
                 None,
                 attributes.k,

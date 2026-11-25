@@ -34,6 +34,7 @@ pub mod pipeline_cache;
 pub(crate) mod platform_capacity;
 pub(crate) mod processors;
 pub mod ranking;
+pub mod realtime;
 pub mod reasoning;
 mod response_constraint;
 pub mod response_template;

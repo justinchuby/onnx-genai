@@ -435,6 +435,25 @@ impl DecodedProjectionPlan {
         ])
     }
 
+    /// Serial projections reuse one complete layout. Keep each projection's
+    /// internal offsets intact rather than taking separate region maxima.
+    pub(super) fn maximum_layout(
+        self,
+        rows: usize,
+        projections: impl IntoIterator<Item = (usize, usize)>,
+    ) -> Result<std::alloc::Layout> {
+        let mut bytes = 0;
+        let mut alignment = 1;
+        for (k, n) in projections {
+            let layout = self.layout(rows, k, n)?;
+            bytes = bytes.max(layout.bytes());
+            alignment = alignment.max(layout.alignment());
+        }
+        std::alloc::Layout::from_size_align(bytes, alignment).map_err(|_| {
+            EpError::KernelFailed("serial decoded projection workspace exceeds addressable capacity; reduce batch or projection dimensions".into())
+        })
+    }
+
     /// Partition only this projection's prefix, leaving the rest of a larger
     /// shared lane untouched. Safe slice borrowing enforces non-overlap.
     pub(super) fn split_scratch(
@@ -551,6 +570,26 @@ mod tests {
     use super::*;
     use onnx_runtime_ep_api::DevicePtrMut;
     use std::num::NonZeroUsize;
+
+    #[test]
+    fn serial_projection_layout_uses_maximum_complete_phase() {
+        let plan = DecodedProjectionPlan::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        );
+        let fc1 = plan.layout(3, 16, 32).unwrap();
+        let fc2 = plan.layout(3, 32, 16).unwrap();
+        assert_eq!(fc1.bytes(), (96 + 32) * 4);
+        assert_eq!(fc2.bytes(), (48 + 64) * 4);
+        let maximum = plan.maximum_layout(3, [(16, 32), (32, 16)]).unwrap();
+        assert_eq!(maximum.size(), 128 * 4);
+        assert_eq!(maximum.align(), 4);
+        assert_eq!(plan.maximum_layout(3, []).unwrap().size(), 0);
+        assert_eq!(
+            plan.maximum_layout(0, [(16, 32), (32, 16)]).unwrap().size(),
+            0
+        );
+    }
 
     #[test]
     fn composite_scratch_binds_disjoint_f32_regions_and_rejects_untyped_geometry() {

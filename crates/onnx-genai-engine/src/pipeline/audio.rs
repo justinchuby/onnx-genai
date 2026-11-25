@@ -160,25 +160,110 @@ pub fn resample_planar(
     if source_rate == target_rate {
         return Ok(input.to_vec());
     }
-    let target_samples = ((source_samples as u128 * target_rate as u128 + source_rate as u128 / 2)
-        / source_rate as u128) as usize;
-    let mut output = vec![0.0f32; channels * target_samples];
-    let ratio = source_rate as f64 / target_rate as f64;
-    let cutoff = (target_rate as f64 / source_rate as f64).min(1.0);
-
+    let mut output = Vec::new();
     for channel in 0..channels {
         let source = &input[channel * source_samples..(channel + 1) * source_samples];
-        let destination = &mut output[channel * target_samples..(channel + 1) * target_samples];
-        for (index, sample) in destination.iter_mut().enumerate() {
-            let position = index as f64 * ratio;
-            let center = position.floor() as isize;
+        let mut resampler = StreamingResampler::new(
+            std::num::NonZeroU32::new(source_rate).context("source rate must be positive")?,
+            std::num::NonZeroU32::new(target_rate).context("target rate must be positive")?,
+        );
+        output.extend(resampler.push(source)?);
+        output.extend(resampler.finish()?);
+    }
+    Ok(output)
+}
+
+/// A mono PCM stream resampler with a persistent rational sampling clock.
+///
+/// `push` retains only the filter's lookbehind/lookahead window after emitting
+/// ready samples. `finish` consumes the stream and emits its rounded-length
+/// tail. A new audio turn must use a new instance; message boundaries must not.
+/// Rates are supplied by the admitted audio contract, never a model identity.
+pub struct StreamingResampler {
+    source_rate: std::num::NonZeroU32,
+    target_rate: std::num::NonZeroU32,
+    samples: std::collections::VecDeque<f32>,
+    first_sample: usize,
+    received: usize,
+    emitted: usize,
+}
+
+impl StreamingResampler {
+    pub fn new(source_rate: std::num::NonZeroU32, target_rate: std::num::NonZeroU32) -> Self {
+        Self {
+            source_rate,
+            target_rate,
+            samples: std::collections::VecDeque::new(),
+            first_sample: 0,
+            received: 0,
+            emitted: 0,
+        }
+    }
+
+    /// Upper bound on output still owed after accepting additional source
+    /// samples, including filter lookahead. Callers can admit an expansion
+    /// budget before `push` or `finish` allocates an output chunk.
+    pub fn remaining_output_samples(&self, additional: usize) -> anyhow::Result<usize> {
+        let received = self
+            .received
+            .checked_add(additional)
+            .context("audio stream sample count overflow; start a new audio turn")?;
+        self.output_len(received)?
+            .checked_sub(self.emitted)
+            .context("audio resampling clock emitted beyond its admitted source length")
+    }
+
+    pub fn push(&mut self, samples: &[f32]) -> anyhow::Result<Vec<f32>> {
+        let received = self
+            .received
+            .checked_add(samples.len())
+            .context("audio stream sample count overflow; start a new audio turn")?;
+        // Validate the eventual output count before changing the stream.
+        self.output_len(received)?;
+        self.received = received;
+        if self.source_rate == self.target_rate {
+            self.emitted = received;
+            self.first_sample = received;
+            return Ok(samples.to_vec());
+        }
+        self.samples.extend(samples);
+        self.drain(false)
+    }
+
+    pub fn finish(mut self) -> anyhow::Result<Vec<f32>> {
+        self.drain(true)
+    }
+
+    fn output_len(&self, received: usize) -> anyhow::Result<usize> {
+        usize::try_from(
+            (received as u128 * u128::from(self.target_rate.get())
+                + u128::from(self.source_rate.get()) / 2)
+                / u128::from(self.source_rate.get()),
+        )
+        .context("resampled audio length exceeds host address space; use a shorter audio turn")
+    }
+
+    fn drain(&mut self, finishing: bool) -> anyhow::Result<Vec<f32>> {
+        let limit = self.output_len(self.received)?;
+        let cutoff =
+            (f64::from(self.target_rate.get()) / f64::from(self.source_rate.get())).min(1.0);
+        let mut output = Vec::new();
+        while self.emitted < limit {
+            let clock = self.emitted as u128 * u128::from(self.source_rate.get());
+            let center = clock / u128::from(self.target_rate.get());
+            if !finishing && center + RESAMPLE_RADIUS as u128 >= self.received as u128 {
+                break;
+            }
+            let center = i128::try_from(center).context("audio sampling clock overflow")?;
+            let fraction = (clock % u128::from(self.target_rate.get())) as f64
+                / f64::from(self.target_rate.get());
             let mut weighted = 0.0;
             let mut weight_sum = 0.0;
-            for source_index in center - RESAMPLE_RADIUS + 1..=center + RESAMPLE_RADIUS {
-                if source_index < 0 || source_index >= source_samples as isize {
+            for index in center - RESAMPLE_RADIUS as i128 + 1..=center + RESAMPLE_RADIUS as i128 {
+                if index < 0 || index >= self.received as i128 {
                     continue;
                 }
-                let distance = position - source_index as f64;
+                let distance = (center - index) as f64 + fraction;
                 let normalized = distance / RESAMPLE_RADIUS as f64;
                 if normalized.abs() >= 1.0 {
                     continue;
@@ -191,17 +276,39 @@ pub fn resample_planar(
                     (std::f64::consts::PI * argument).sin() / (std::f64::consts::PI * argument)
                 };
                 let weight = cutoff * sinc * window;
-                weighted += source[source_index as usize] as f64 * weight;
+                let offset = usize::try_from(index)
+                    .context("audio sample index overflow")?
+                    .checked_sub(self.first_sample)
+                    .context("audio resampling lookbehind was released before use")?;
+                let sample = self
+                    .samples
+                    .get(offset)
+                    .context("audio resampling window does not contain the required sample")?;
+                weighted += f64::from(*sample) * weight;
                 weight_sum += weight;
             }
-            *sample = if weight_sum.abs() > 1e-12 {
+            output.push(if weight_sum.abs() > 1e-12 {
                 (weighted / weight_sum) as f32
             } else {
                 0.0
-            };
+            });
+            self.emitted += 1;
         }
+        let next_center = self.emitted as u128 * u128::from(self.source_rate.get())
+            / u128::from(self.target_rate.get());
+        let keep_from = next_center
+            .saturating_sub(RESAMPLE_RADIUS as u128 - 1)
+            .min(self.received as u128) as usize;
+        let release = keep_from
+            .saturating_sub(self.first_sample)
+            .min(self.samples.len());
+        self.samples.drain(..release);
+        self.first_sample += release;
+        // A large network message must not leave its allocation resident for
+        // the lifetime of the connection after the filter window is drained.
+        self.samples.shrink_to(2 * RESAMPLE_RADIUS as usize);
+        Ok(output)
     }
-    Ok(output)
 }
 
 pub fn encode_pcm16_wav(
@@ -323,6 +430,74 @@ mod tests {
             .sum::<f64>()
             / values.len() as f64)
             .sqrt()
+    }
+
+    #[test]
+    fn streaming_resampling_is_independent_of_message_boundaries() {
+        for (source, target) in [
+            (44_100, 32_000),
+            (8_000, 48_000),
+            (48_000, 8_000),
+            (24_000, 24_000),
+        ] {
+            let input = sine(source, 751.0, 0.13);
+            let expected = resample_planar(&input, 1, input.len(), source, target).unwrap();
+            for chunk_size in [1, 7, 31, 257, 1024] {
+                let mut stream = StreamingResampler::new(
+                    std::num::NonZeroU32::new(source).unwrap(),
+                    std::num::NonZeroU32::new(target).unwrap(),
+                );
+                let mut actual = Vec::new();
+                for chunk in input.chunks(chunk_size) {
+                    actual.extend(stream.push(chunk).unwrap());
+                    assert!(stream.push(&[]).unwrap().is_empty());
+                    assert!(stream.samples.len() <= 2 * RESAMPLE_RADIUS as usize);
+                }
+                actual.extend(stream.finish().unwrap());
+                assert_eq!(
+                    actual, expected,
+                    "{source}->{target}, chunk size {chunk_size}"
+                );
+                assert_eq!(
+                    actual.len(),
+                    (input.len() * target as usize + source as usize / 2) / source as usize
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_resampling_emits_before_finish_and_preserves_constant_signal() {
+        let mut stream = StreamingResampler::new(
+            std::num::NonZeroU32::new(48_000).unwrap(),
+            std::num::NonZeroU32::new(44_100).unwrap(),
+        );
+        let ready = stream.push(&[0.25; 1024]).unwrap();
+        assert!(ready.len() > 900);
+        let tail = stream.finish().unwrap();
+        assert!(!tail.is_empty());
+        assert!(
+            ready
+                .iter()
+                .chain(&tail)
+                .all(|sample| (*sample - 0.25).abs() < 1e-6)
+        );
+        assert_eq!(ready.len() + tail.len(), 941);
+    }
+
+    #[test]
+    fn streaming_resampling_empty_and_sub_filter_turns_have_exact_lengths() {
+        for size in 0..32 {
+            for (source, target) in [(192_000, 8_000), (8_000, 192_000)] {
+                let input = vec![1.0; size];
+                let output = resample_planar(&input, 1, size, source, target).unwrap();
+                assert_eq!(
+                    output.len(),
+                    (size * target as usize + source as usize / 2) / source as usize
+                );
+                assert!(output.iter().all(|sample| (*sample - 1.0).abs() < 1e-6));
+            }
+        }
     }
 
     #[test]

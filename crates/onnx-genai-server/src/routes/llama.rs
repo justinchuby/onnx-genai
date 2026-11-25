@@ -107,7 +107,8 @@ pub(crate) async fn props(
             "lora_embeddings": handle.engine.adapters.as_ref().is_some_and(|state|state.capabilities.embeddings),
             "lora_sessions": handle.engine.adapters.as_ref().is_some_and(|state|state.capabilities.sessions),
             "decision": handle.engine.decision.is_some(),
-            "reranking": handle.engine.reranking.is_some()
+            "reranking": handle.engine.reranking.is_some(),
+            "reranking_image_limits": handle.engine.reranking.as_ref().map(|contract|json!({"query":contract.query_images().len(),"document":contract.document_images().len()}))
         }
     });
     let lora = match &handle.engine.adapters {
