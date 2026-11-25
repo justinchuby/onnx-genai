@@ -320,7 +320,10 @@ mod tests {
         assert!(pcm.next_frame()?.is_none());
         assert!(native.step(RealtimeInputOwned::Cancel).await?.done);
         assert_eq!(
-            response.finish(true).last().unwrap()["response"]["status"],
+            response
+                .finish(events::ResponseEnd::Cancelled)
+                .last()
+                .unwrap()["response"]["status"],
             "cancelled"
         );
         drop(native);

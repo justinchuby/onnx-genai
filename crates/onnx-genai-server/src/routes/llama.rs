@@ -107,6 +107,10 @@ pub(crate) async fn props(
             "lora_embeddings": handle.engine.adapters.as_ref().is_some_and(|state|state.capabilities.embeddings),
             "lora_sessions": handle.engine.adapters.as_ref().is_some_and(|state|state.capabilities.sessions),
             "decision": handle.engine.decision.is_some(),
+            "decision_image_limit": handle.engine.decision.as_ref().map(|contract| contract.media().iter().filter(|m| m.kind==onnx_genai_metadata::EncodedMediaKind::Image).count()),
+            "decision_media_order": handle.engine.decision.as_ref().map(|contract|contract.media().iter().map(|m|m.kind).collect::<Vec<_>>()),
+            "decision_audio_limit": handle.engine.decision.as_ref().map(|contract|contract.media().iter().filter(|m|m.kind==onnx_genai_metadata::EncodedMediaKind::Audio).count()),
+            "decision_spoken_instructions": handle.engine.decision.as_ref().is_some_and(|contract|contract.spoken_input().is_some()),
             "reranking": handle.engine.reranking.is_some(),
             "reranking_image_limits": handle.engine.reranking.as_ref().map(|contract|json!({"query":contract.query_images().len(),"document":contract.document_images().len()}))
         }

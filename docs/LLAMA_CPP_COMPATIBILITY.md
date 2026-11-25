@@ -454,10 +454,11 @@ This is a functional Llama Chat integration, not a claim of complete llama-serve
 parity. These upstream capabilities remain incomplete:
 
 - Realtime grammar forcing beyond declared turn-based tagged-json mask workflows,
-  full tool argument schema validation and
+  partial function-call fragment projection, broader pressure/overlap acceptance and
   device-backed wire acceptance; see [realtime](REALTIME.md) for the implemented
   WebSocket session modes, resource bounds and Native CPU evidence.
-- Multimodal/joint decision heads and shared generation/decision entry points.
+- Video decision inputs, broader audio codecs and waveform/normalization dataflow,
+  joint/packed decision heads and shared generation/decision entry points.
 - Device-state/multi-sequence slot persistence; arbitrary GGUF/PEFT LoRA imports and device-fused LoRA.
 - GGUF package import, quantization selectors and selective sidecar management.
   Hugging Face nxrt-package download, resume and deletion are supported.
@@ -465,8 +466,12 @@ parity. These upstream capabilities remain incomplete:
 `/v1/systemone` executes text/structured-state decision profiles, with explicit
 model-authored prompting, calibration outputs, variants and answer policies.
 Core schema v1.11 declares input defaults, instruction/payload rules, option
-ordering, score ranges and canonical legends. Multimodal/joint heads and shared
-generation/decision entry points remain open; see [SystemOne](SYSTEMONE.md). Route presence does not
+ordering, score ranges and canonical legends. Decision v2 in core schema v1.14 additionally executes ordered state images,
+including `files`/`images` and embedded chat image parts, with actual media-aware
+usage. Decision v3 in core schema v1.15 adds ordered mixed image/audio state and
+per-question spoken instructions using PCM16 WAV. Video, broader audio codecs,
+joint/packed heads and shared generation/decision
+entry points remain open; see [SystemOne](SYSTEMONE.md). Route presence does not
 claim every upstream decision-model format is admitted.
 
 Model download/delete require `--model-cache-dir`; operator-configured paths
@@ -651,3 +656,9 @@ the tokenizer; regex boundaries can declare individual registered spellings in
 tokenizer is not mutated, and buffered/SSE output uses the same policy, including
 logprob delivery and transactional publication. UTF-8 decoder lookbehind remains
 request-local. Raw grammar recognition continues to inspect model bytes and IDs.
+
+Audio preprocessing admits package-authored mel counts, sample rates, FFT/hop
+and Hann-window lengths through the executable log-mel program. Numerical
+acceptance includes an independent direct DFT and Native workflows using
+nonstandard geometry. Pure-waveform transform dataflow, additional window/mel
+conventions and audio codecs remain open; this does not imply full audio parity.
