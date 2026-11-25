@@ -768,7 +768,14 @@ fn convolution_gemm_execute(
         && strides.iter().all(|&s| s == 1)
         && dilations.iter().all(|&d| d == 1)
         && pads.iter().all(|&p| p == 0);
+    // This source is the production Conv without MLAS. With MLAS it is
+    // compiled only as conv_native for explicit same-binary research: force
+    // Generic here so an environment override cannot turn its GEMM into MLAS.
+    // BNNS and direct NEON remain independent native convolution routes.
+    #[cfg(not(feature = "mlas"))]
     let backend = crate::backend::CpuBackend::auto_detect();
+    #[cfg(feature = "mlas")]
+    let backend = crate::backend::CpuBackend::Generic;
     let mut output = vec![0.0f32; batch * oc * n];
     let mut col = if is_1x1 {
         Vec::new()
