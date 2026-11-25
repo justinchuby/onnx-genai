@@ -1937,3 +1937,22 @@ PCM16 WAV bytes enter authored reusable audio-preprocess@2 components. Actual
 workflow token usage includes media expansion and is bounded. Native fixture
 and HTTP acceptance cover independent spoken questions, byte-budget sharing,
 invalid media and capability discovery; see [SystemOne](SYSTEMONE.md).
+
+## Native prompt-only prefix reuse
+
+`n_predict=0` now retains and reuses actual Native prompt state, with exact full
+hits, suffix appends and permitted KV prefix rewinds. The physical owner and the
+package's `prefix_reusable` declarations decide reuse; a token-history match
+alone does not. Non-sliceable state resets for destructive prefix replacement.
+Cold requests force full evaluation. HTTP checks cover buffered/SSE zero-output
+responses, cache counts and the committed idle slot cursor. Engine tests compare
+content-dependent key/value tensors with a cold oracle across repeated, appended,
+diverged, shortened and complete-context prompts, pin no-reset behavior on a full
+hit, and preserve the existing cancellation/rollback checks.
+
+Prefill responses also distinguish input reuse from post-task retention:
+`PrefillResult.prefix_cache_hit_len` measures reused input, while
+`retained_cache_tokens` supplies native-wire `tokens_cached`. Cold evaluation
+still retains evaluated cache. ORT reference results inspect governed snapshots
+and cached pages rather than claiming token-history-only retention. The same
+wire correction for general generation remains required work.

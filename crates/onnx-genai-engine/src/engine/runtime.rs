@@ -1539,7 +1539,7 @@ impl Engine {
         }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
-            return self.prefill_native(&tokens, control.as_ref(), admitted);
+            return self.prefill_native(&tokens, request.cold_start, control.as_ref(), admitted);
         }
         let session = self.create_session()?;
         let result = (|| -> anyhow::Result<PrefillResult> {
@@ -1587,10 +1587,11 @@ impl Engine {
                         Ok(PrefillResult {
                             prompt_tokens: tokens.len(),
                             prefix_cache_hit_len,
+                            retained_cache_tokens: 0,
                         })
                     })();
                     match result {
-                        Ok(result) => {
+                        Ok(mut result) => {
                             turn.commit()?;
                             if let Some(control) = &control {
                                 control.finish_commit();
@@ -1600,6 +1601,12 @@ impl Engine {
                             {
                                 tracing::debug!(%error, "prefill committed but optional prefix publication failed");
                             }
+                            let snapshot = self
+                                .prefix_cache
+                                .lookup_snapshot::<OrtPrefixSnapshot>(&tokens)
+                                .map_or(0, |(length, _)| length);
+                            let (paged, _) = self.prefix_cache.lookup(&tokens);
+                            result.retained_cache_tokens = snapshot.max(paged);
                             Ok(result)
                         }
                         Err(error) => {
@@ -1636,6 +1643,7 @@ impl Engine {
     fn prefill_native(
         &mut self,
         tokens: &[TokenId],
+        cold_start: bool,
         control: Option<&crate::pipeline::GenerationControl>,
         mut admitted: Option<&mut dyn FnMut()>,
     ) -> anyhow::Result<PrefillResult> {
@@ -1652,23 +1660,53 @@ impl Engine {
                 if let Some(callback) = admitted.as_mut() {
                     callback();
                 }
+                let active_matches = self.native_active_session == Some(session);
+                let prefix_reusable = self.prefix_reuse_permitted();
+                let prefix = self
+                    .native_sessions
+                    .get(&session)
+                    .context("native prefill logical history disappeared before evaluation")?
+                    .tokens
+                    .as_slice();
+                let matched = common_prefix_len(prefix, tokens);
                 let native = self
                     .native_session
                     .as_mut()
                     .context("native prefill executor is unavailable")?;
-                let workspace = native.prepare_generation_workspace_preserving_state(tokens)?;
-                crate::native_decode::accept_eager_workspace_preparation(workspace);
-                native.reset()?;
-                native.bind_logical_state(identity)?;
-                self.native_active_session = Some(session);
-                native.prefill_prefix(tokens)?;
+                let mut reused = if active_matches && !cold_start && prefix_reusable {
+                    native.ensure_logical_state(identity)?;
+                    matched.min(native.current_len())
+                } else {
+                    0
+                };
+                // A complete carried prefix may be appended to. State without
+                // sliceable history cannot reconstruct a shorter prefix, so it
+                // must recompute instead of advertising a token-only cache hit.
+                if reused < native.current_len() && native.has_recurrent_state() {
+                    reused = 0;
+                }
+                if reused == 0 {
+                    native.reset()?;
+                    native.bind_logical_state(identity)?;
+                    self.native_active_session = Some(session);
+                } else if reused < native.current_len() {
+                    native.rewind(reused)?;
+                }
+                let pending = &tokens[reused..];
+                if !pending.is_empty() {
+                    let workspace =
+                        native.prepare_generation_workspace_preserving_state(pending)?;
+                    crate::native_decode::accept_eager_workspace_preparation(workspace);
+                    native.prefill_prefix(pending)?;
+                }
                 if let Some(control) = control {
                     control.check(crate::pipeline::GenerationBoundary::AfterDecoderForward)?;
                     control.require_commit()?;
                 }
                 Ok(PrefillResult {
                     prompt_tokens: tokens.len(),
-                    prefix_cache_hit_len: 0,
+                    prefix_cache_hit_len: reused,
+                    retained_cache_tokens: native.current_len(),
                 })
             })();
             match result {
@@ -5495,7 +5533,8 @@ mod tests {
             result,
             PrefillResult {
                 prompt_tokens: 3,
-                prefix_cache_hit_len: 0
+                prefix_cache_hit_len: 0,
+                retained_cache_tokens: 3,
             }
         );
         assert!(
@@ -5593,7 +5632,13 @@ mod tests {
         let metadata = std::fs::read_to_string(source.join("inference_metadata.yaml"))?
             .replace("prefix_reusable: true", "prefix_reusable: false");
         std::fs::write(directory.path().join("inference_metadata.yaml"), metadata)?;
-        let mut engine = Engine::from_dir(directory.path(), EngineConfig::default())?;
+        let mut engine = Engine::from_dir(
+            directory.path(),
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?;
         let prompt = [2, 4, 3];
         engine.prefill(prefill_request(&prompt))?;
         assert!(
@@ -5615,7 +5660,13 @@ mod tests {
     fn prompt_only_prefill_cache_restore_budget_shortfall_recomputes_honestly() -> anyhow::Result<()>
     {
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
-        let mut engine = Engine::from_dir(&source, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(
+            &source,
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?;
         let prompt = [2, 4, 3];
         engine.prefill(prefill_request(&prompt))?;
         let memory = engine.governor.memory();
@@ -5672,7 +5723,13 @@ mod tests {
     fn cancelled_prompt_only_prefill_restores_ort_and_does_not_publish_prefix() -> anyhow::Result<()>
     {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?;
         let prompt = [2, 4, 3];
         let authority = crate::GenerationControl::new();
         let cancel = authority.clone();
@@ -5706,6 +5763,156 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "native-backend")]
+    fn native_prefill_content_engine(directory: &Path, reusable: bool) -> anyhow::Result<Engine> {
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+        let metadata = std::fs::read_to_string(source.join("inference_metadata.yaml"))?;
+        let metadata = if reusable {
+            metadata
+        } else {
+            anyhow::ensure!(
+                metadata.contains("prefix_reusable: true"),
+                "fixture must declare its reuse policy"
+            );
+            metadata.replace("prefix_reusable: true", "prefix_reusable: false")
+        };
+        std::fs::write(directory.join("inference_metadata.yaml"), metadata)?;
+        std::fs::copy(
+            source.join("tokenizer.json"),
+            directory.join("tokenizer.json"),
+        )?;
+        std::fs::write(
+            directory.join("model.onnx.textproto"),
+            content_dependent_kv_fixture(&std::fs::read_to_string(
+                source.join("model.onnx.textproto"),
+            )?)?,
+        )?;
+        Engine::from_dir(
+            directory,
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                native_device: Some(crate::NativeDecodeDevice::Cpu),
+                ..Default::default()
+            },
+        )
+    }
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prompt_only_prefill_native_cache_reuses_real_kv_and_recomputes_changed_suffixes()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut engine = native_prefill_content_engine(directory.path(), true)?;
+        for (tokens, expected, cold) in [
+            (vec![4, 5, 6], 0, false),
+            (vec![4, 5, 6], 3, false),
+            (vec![4, 5, 6, 7, 8], 3, false),
+            (vec![4, 5, 9, 10], 2, false),
+            (vec![4, 5], 2, false),
+            (vec![11, 12, 13], 0, false),
+            (vec![11, 12, 13], 0, true),
+            (vec![14; 16], 0, false),
+            (vec![14; 16], 16, false),
+        ] {
+            let mut request = prefill_request(&tokens);
+            request.cold_start = cold;
+            let result = engine.prefill(request.clone())?;
+            assert_eq!(result.prompt_tokens, tokens.len());
+            assert_eq!(result.retained_cache_tokens, tokens.len());
+            assert_eq!(
+                result.prefix_cache_hit_len, expected,
+                "{tokens:?}, cold={cold}"
+            );
+            let mut oracle = Engine::from_dir(
+                directory.path(),
+                EngineConfig {
+                    decode_backend: EngineDecodeBackend::Native,
+                    native_device: Some(crate::NativeDecodeDevice::Cpu),
+                    ..Default::default()
+                },
+            )?;
+            request.cold_start = true;
+            oracle.prefill(request)?;
+            for port in ["past_key_values.0.key", "past_key_values.0.value"] {
+                let actual = engine
+                    .native_session
+                    .as_ref()
+                    .unwrap()
+                    .host_present_kv(port)
+                    .context("materialized native prefill KV")?;
+                let expected = oracle
+                    .native_session
+                    .as_ref()
+                    .unwrap()
+                    .host_present_kv(port)
+                    .context("cold prefill oracle KV")?;
+                assert_eq!(actual, expected, "physical KV {port} for {tokens:?}");
+            }
+            assert_eq!(
+                engine.native_session.as_ref().unwrap().current_len(),
+                tokens.len()
+            );
+            assert_eq!(engine.scheduler.running_count(), 0);
+        }
+        Ok(())
+    }
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prompt_only_prefill_native_cache_honors_policy_and_does_not_reset_a_full_hit()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut engine = native_prefill_content_engine(directory.path(), false)?;
+        for _ in 0..2 {
+            assert_eq!(
+                engine
+                    .prefill(prefill_request(&[4, 5, 6]))?
+                    .prefix_cache_hit_len,
+                0
+            );
+        }
+        let directory = tempfile::tempdir()?;
+        let mut engine = native_prefill_content_engine(directory.path(), true)?;
+        let request = prefill_request(&[4, 5, 6]);
+        engine.prefill(request.clone())?;
+        engine
+            .native_session
+            .as_mut()
+            .unwrap()
+            .fail_next_reset_for_test();
+        assert_eq!(engine.prefill(request.clone())?.prefix_cache_hit_len, 3);
+        let mut cold = request.clone();
+        cold.cold_start = true;
+        let error = engine.prefill(cold).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("injected native decoder reset failure"),
+            "{error:#}"
+        );
+        assert_eq!(engine.scheduler.running_count(), 0);
+        assert_eq!(engine.prefill(request)?.prefix_cache_hit_len, 0);
+        let other = engine.create_session()?;
+        let mut generation = GenerateRequest::new(GeneratePrompt::TokenIds(vec![4, 5, 6]));
+        generation.options.max_new_tokens = 1;
+        generation.options.temperature = 0.0;
+        generation.options.stop_on_eos = false;
+        engine.generate_in_session(other, generation)?;
+        let other_history = engine.native_sessions[&other].tokens.clone();
+        assert_eq!(engine.native_active_session, Some(other));
+        assert_eq!(
+            engine
+                .prefill(prefill_request(&[4, 5, 6]))?
+                .prefix_cache_hit_len,
+            0,
+            "matching logical tokens owned by another physical session cannot count as reuse"
+        );
+        assert_eq!(engine.native_sessions[&other].tokens, other_history);
+        assert_eq!(
+            engine
+                .prefill(prefill_request(&[4, 5, 6]))?
+                .prefix_cache_hit_len,
+            3
+        );
+        Ok(())
+    }
     #[cfg(feature = "native-backend")]
     #[test]
     fn prompt_only_prefill_retains_exact_native_prompt_and_cancellation_is_atomic()
