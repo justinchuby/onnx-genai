@@ -1,4 +1,4 @@
-//! Additional f32 reduction kernels: `ReduceSum`, `ReduceMax`, `ReduceMin`,
+//! Additional CPU reduction kernels: `ReduceSum`, `ReduceMax`, `ReduceMin`,
 //! `ReduceProd`, `ReduceSumSquare`, `ReduceL1`, `ReduceL2`, `ReduceLogSum`, and
 //! `ReduceLogSumExp` (`docs/architecture/ORT2.md` §4.4).
 //!
@@ -105,7 +105,7 @@ impl ReduceOp {
     }
 }
 
-/// f32 reduction kernel carrying the op, the attribute `axes` (opset < 13/18),
+/// Reduction kernel carrying the op, the attribute `axes` (opset < 13/18),
 /// `keepdims` and `noop_with_empty_axes`.
 pub struct ReduceKernel {
     op: ReduceOp,
