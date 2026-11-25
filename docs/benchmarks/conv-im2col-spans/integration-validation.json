@@ -1,0 +1,294 @@
+{
+  "source_sha256": "03c927d43acc16c7f1adc52de3df8476225d172a2ddd29f2bc5271ffcecd103f",
+  "results": [
+    {
+      "name": "list-native",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::conv::tests::",
+        "--",
+        "--list"
+      ],
+      "environment_overrides": {},
+      "exit": 0,
+      "log_sha256": "62af97a138ce6fb825a421e4db32cd8651587ba1db6f0472df07af6ff16c0a42"
+    },
+    {
+      "name": "conv-native",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::conv::tests::"
+      ],
+      "environment_overrides": {},
+      "exit": 0,
+      "log_sha256": "d144d5ed4d483f39fa3c3c7abd6a0c04af719386f63edee4b672c1d4bb3ded84",
+      "counts": [
+        [
+          "47",
+          "0",
+          "1"
+        ]
+      ]
+    },
+    {
+      "name": "gemm-generic",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::conv::tests::gemm_driver_matches_exact_scalar_values_across_groups_batches_and_empty_axes",
+        "--",
+        "--exact"
+      ],
+      "environment_overrides": {
+        "NXRT_CPU_GEMM_BACKEND": "generic"
+      },
+      "exit": 0,
+      "log_sha256": "0422a0fcb330b50d975f0e5c0537066ecc6df35298e7df1f7b4e053a0cbfed15",
+      "counts": [
+        [
+          "1",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "allocation",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--test",
+        "conv_im2col_allocation"
+      ],
+      "environment_overrides": {},
+      "exit": 0,
+      "log_sha256": "377d2b220a2fd2b33e81a0e13367fbacbc8d587e96a86e714c4838739c56ca32",
+      "counts": [
+        [
+          "1",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "pair-default",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--test",
+        "conv_same_binary"
+      ],
+      "environment_overrides": {},
+      "exit": 0,
+      "log_sha256": "988f586202a2986b6554c02ece265cca9815a82a9909572cf6786a1f6b634a0e",
+      "counts": [
+        [
+          "1",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "list-linked-native",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--features",
+        "mlas",
+        "--lib",
+        "kernels::conv_native::tests::",
+        "--",
+        "--list"
+      ],
+      "environment_overrides": {},
+      "exit": 0,
+      "log_sha256": "b86fa288f616ccafe1f8ed59ad0b046d2171d058a65791c6d5ef3d9b5763f9c3"
+    },
+    {
+      "name": "conv-linked-native",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--features",
+        "mlas",
+        "--lib",
+        "kernels::conv_native::tests::"
+      ],
+      "environment_overrides": {},
+      "exit": 0,
+      "log_sha256": "7331b91d7da2245a66c4cd5bd4fd760d4f2b2999bc18be8c356ed93df2099f31",
+      "counts": [
+        [
+          "47",
+          "0",
+          "1"
+        ]
+      ]
+    },
+    {
+      "name": "conv-reference",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--features",
+        "mlas",
+        "--lib",
+        "kernels::conv::tests::"
+      ],
+      "environment_overrides": {},
+      "exit": 0,
+      "log_sha256": "c335415234725f151946d0af9f860cade7cf0a69435c5527e52f8d84a8d21545",
+      "counts": [
+        [
+          "11",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "pair-linked",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--features",
+        "mlas",
+        "--test",
+        "conv_same_binary"
+      ],
+      "environment_overrides": {},
+      "exit": 0,
+      "log_sha256": "e21ab6ce717cdc3c2463e8ff87ffbca80eef62ed4712ae5cdff05c8bf8d366e7",
+      "counts": [
+        [
+          "1",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "environment_overrides": {},
+      "exit": 0,
+      "log_sha256": "f886043813dd12c912a187fa883083aff7c8f757debf9705bba4c89e0759ff8c"
+    },
+    {
+      "name": "clippy-linked",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--features",
+        "mlas",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "environment_overrides": {},
+      "exit": 0,
+      "log_sha256": "107465e3aa8947f2212147d20412cd7b449d0ab7a64ec08ad2f09022c1471da7"
+    },
+    {
+      "name": "constant-reject",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::constant::tests::constant_packed_tensor_rejects_mismatched_output_or_storage",
+        "--",
+        "--exact"
+      ],
+      "environment_overrides": {},
+      "exit": 0,
+      "log_sha256": "a3e1f0e57a17feadde8a0801fb88c0f69b2cf68b43158d3eb3c0da90bec7c5bf",
+      "counts": [
+        [
+          "1",
+          "0",
+          "0"
+        ]
+      ]
+    }
+  ],
+  "initial_failed_checks": [
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "environment_overrides": {},
+      "exit": 101,
+      "log_sha256": "df433974907489b38af409e98259758ee8df689efcf6f5d3f71d8909ab22fdfc"
+    }
+  ],
+  "validated_parent": "337b9be106e363d51ba5ff479fd411737ccaf8af",
+  "relevant_source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/constant.rs": "8a5c8bd89385b07b7e46dbaae426643a4d46a3f8c4e79f5b5be98f3bc08e8e57",
+    "crates/onnx-runtime-ep-api/src/kernel.rs": "0ddb6cf3f8f50cdc796aa1aed6be772eb17b409416779ed2b1b94520b58c793f",
+    "crates/onnx-runtime-ep-cpu/src/kernels/mod.rs": "8eed46aab4ec22c99d8f2be73fc0b3a50dbf0ffaa446690038cbffc59d919d87",
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs": "4f828718b37b8dca29f03bdca3ac9d315bb7d5affbc08b114c60757669871677",
+    "crates/onnx-runtime-ep-cpu/src/dtype.rs": "96e00e19c874ba8e4801b87829a963a72f99879cddcf1dee0055e83783f46dff",
+    "Cargo.toml": "d8af9a77dcec2723f18fa3bd64ff4e1e4104121ca4f850b4f5fbf1f12aead81a",
+    "Cargo.lock": "5706f4f4ac68cd1b16db2496ab6fe9954bc316d2bb945b5f3bbfd09c3ce4296d"
+  }
+}

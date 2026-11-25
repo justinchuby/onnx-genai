@@ -274,7 +274,8 @@ mod tests {
 
     #[test]
     fn constant_packed_tensor_rejects_mismatched_output_or_storage() {
-        let cases: &[(DataType, &[usize], &[i64], &[u8], &str)] = &[
+        type RejectedOutputCase<'a> = (DataType, &'a [usize], &'a [i64], &'a [u8], &'a str);
+        let cases: &[RejectedOutputCase<'_>] = &[
             (
                 DataType::Uint4,
                 &[3],

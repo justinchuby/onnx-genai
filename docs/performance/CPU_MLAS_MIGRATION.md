@@ -1884,3 +1884,21 @@ one, so this ARM64 reference uses fallback ConvPlan; NCHWc packed-filter reuse i
 not an explanation of these observations. Boundary/tail work and grouped im2col
 are candidates for separate profiling, not established causal attributions.
 No runtime policy, quota, cache, graduation verdict or whole-model claim changes.
+
+
+## im2col classifies contiguous sampling spans once
+
+The native Conv im2col helper now derives one valid horizontal output interval
+per kernel column and reuses it across rows. Horizontal stride one copies the
+valid input span directly, including dilated kernels; other strides sample the
+same interval. Padding is still +0 and every copied sample keeps its bits. No
+new retained workspace, allocation, quota, API or GEMM arithmetic is introduced.
+
+The [same-executable before/after study](../benchmarks/conv-im2col-spans/README.md)
+finds about 26% less complete-operator CPU for the dilated fixture and 14% less
+for the grouped fixture on M1 Max, with three controlled repetitions. Other
+qualified fixture ranges overlap; the depthwise cell fails A/A and is retained
+without inference. The independent 6912-case byte matrix, implementation mutants,
+existing Conv/allocation tests and strict lint pin correctness. These findings
+apply to the recorded small warm fixtures, not whole-model throughput or family
+graduation; the optional MLAS reference remains available.
