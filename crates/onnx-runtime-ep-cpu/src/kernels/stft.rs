@@ -4,16 +4,22 @@
 //! does not pad the signal. Power-of-two frame lengths share DFT's O(N log N)
 //! radix-2/vDSP path. Other lengths currently use the shared O(N²) scalar DFT.
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceExecutionPreparation, WorkspacePreparation, WorkspaceRequirement, WorkspaceView,
+};
 use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
 use super::dft::DftPlan;
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use super::float_workspace::FloatWorkspace;
+use crate::dtype::{
+    scalar_i64, to_dense_f32_widen, validate_f32_widen_input, write_dense_f32_narrow,
+};
 
 pub struct StftFactory;
 
-pub(crate) fn unsupported_dtype_reason(input_dtypes: &[DataType]) -> Option<String> {
+fn unsupported_dtype_reason(input_dtypes: &[DataType]) -> Option<String> {
     let signal = input_dtypes.first().copied().unwrap_or(DataType::Undefined);
     if !matches!(
         signal,
@@ -50,6 +56,16 @@ pub(crate) fn unsupported_dtype_reason(input_dtypes: &[DataType]) -> Option<Stri
 }
 
 impl KernelFactory for StftFactory {
+    fn unsupported_reason(
+        &self,
+        _node: &Node,
+        _opset: u64,
+        _shapes: &[onnx_runtime_ir::Shape],
+        input_dtypes: &[DataType],
+    ) -> Option<String> {
+        unsupported_dtype_reason(input_dtypes)
+    }
+
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let onesided = node.attr("onesided").and_then(|a| a.as_int()).unwrap_or(1);
         if !matches!(onesided, 0 | 1) {
@@ -67,10 +83,17 @@ struct StftKernel {
     onesided: bool,
 }
 
-impl Kernel for StftKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        check_arity("STFT", inputs, outputs, 2, 4, 1)?;
-
+impl StftKernel {
+    /// The window's declared length is a safe bound even before an explicit
+    /// frame-length scalar is readable. Scalar-only planning remains Deferred.
+    fn frame_length(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        views: Option<&[TensorView<'_>]>,
+    ) -> Result<Option<usize>> {
+        if !(2..=4).contains(&inputs.len()) || !inputs[0].present || !inputs[1].present {
+            return Err(EpError::KernelFailed("STFT workspace needs 2 to 4 input slots with present signal and frame_step; provide complete STFT inputs".into()));
+        }
         let signal = &inputs[0];
         require_compute_dtype("signal", signal.dtype)?;
         if signal.shape.len() != 3 {
@@ -93,9 +116,8 @@ impl Kernel for StftKernel {
             ));
         }
 
-        let frame_step = positive_scalar("frame_step", &inputs[1])?;
-        let window = inputs.get(2).filter(|input| !input.is_absent());
-        let frame_length_input = inputs.get(3).filter(|input| !input.is_absent());
+        let window = inputs.get(2).filter(|input| input.present);
+        let frame_length_input = inputs.get(3).filter(|input| input.present);
 
         let window_length = if let Some(window) = window {
             require_compute_dtype("window", window.dtype)?;
@@ -120,10 +142,13 @@ impl Kernel for StftKernel {
         } else {
             None
         };
-        let explicit_frame_length = frame_length_input
-            .map(|input| positive_scalar("frame_length", input))
-            .transpose()?;
-
+        let explicit_frame_length = if frame_length_input.is_some() {
+            views
+                .map(|views| views.get(3).ok_or_else(|| EpError::KernelFailed("STFT: frame_length metadata is present but its Host view is missing; bind the scalar before execution".into())).and_then(|view| positive_scalar("frame_length", view)))
+                .transpose()?
+        } else {
+            None
+        };
         let frame_length = match (window_length, explicit_frame_length) {
             (Some(window_length), Some(frame_length)) => {
                 if window_length != frame_length {
@@ -131,10 +156,11 @@ impl Kernel for StftKernel {
                         "STFT: `window` length {window_length} must equal `frame_length` {frame_length}"
                     )));
                 }
-                frame_length
+                Some(frame_length)
             }
-            (Some(window_length), None) => window_length,
-            (None, Some(frame_length)) => frame_length,
+            (Some(window_length), None) => Some(window_length),
+            (None, Some(frame_length)) => Some(frame_length),
+            (None, None) if frame_length_input.is_some() => None,
             (None, None) => {
                 return Err(EpError::KernelFailed(
                     "STFT: either optional `window` or `frame_length` must be provided".into(),
@@ -142,13 +168,106 @@ impl Kernel for StftKernel {
             }
         };
 
-        let signal_length = signal.shape[1];
-        if frame_length > signal_length {
+        if let Some(length) = frame_length
+            && length > signal.shape[1]
+        {
             return Err(EpError::KernelFailed(format!(
-                "STFT: frame length {frame_length} exceeds signal length {signal_length}; \
-                 STFT uses complete unpadded frames"
+                "STFT: frame length {length} exceeds signal length {}; STFT uses complete unpadded frames",
+                signal.shape[1]
             )));
         }
+        Ok(frame_length)
+    }
+
+    fn scratch_layout(frame_length: usize, batch: usize) -> Result<FloatWorkspace<4>> {
+        let len = if batch == 0 { 0 } else { frame_length };
+        FloatWorkspace::new(
+            "STFT",
+            [
+                ("frame real", len),
+                ("frame imaginary", len),
+                ("spectrum real", len),
+                ("spectrum imaginary", len),
+            ],
+        )
+    }
+
+    fn requirement(frame_length: usize, batch: usize) -> Result<WorkspaceRequirement> {
+        Ok(Self::scratch_layout(frame_length, batch)?.requirement())
+    }
+}
+
+impl Kernel for StftKernel {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        match self.frame_length(inputs, None)? {
+            Some(length) => Ok(WorkspacePreparation::Ready(Self::requirement(
+                length,
+                inputs[0].shape[0],
+            )?)),
+            None => Ok(WorkspacePreparation::Deferred),
+        }
+    }
+
+    fn workspace_requirement_for_execution(
+        &self,
+        inputs: &[TensorView],
+        _outputs: &[TensorMut],
+        metadata: &[TensorMetadata<'_>],
+        _output_metadata: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+        _cached: Option<WorkspacePreparation>,
+    ) -> Result<WorkspaceExecutionPreparation> {
+        if inputs.len() != metadata.len() {
+            return Err(EpError::KernelFailed("STFT: input views and metadata have different slot counts; bind every positional input before workspace preparation".into()));
+        }
+        let length = self.frame_length(metadata, Some(inputs))?.ok_or_else(|| EpError::KernelFailed(
+            "STFT: frame_length is not readable; bind the window or Host frame_length scalar before admission".into()
+        ))?;
+        Ok(WorkspaceExecutionPreparation::Ready(Self::requirement(
+            length,
+            metadata[0].shape[0],
+        )?))
+    }
+
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
+    }
+}
+
+impl StftKernel {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        check_arity("STFT", inputs, outputs, 2, 4, 1)?;
+        let metadata = std::array::from_fn::<_, 4, _>(|i| {
+            inputs.get(i).map_or(
+                TensorMetadata::new(DataType::Undefined, &[], false),
+                |input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()),
+            )
+        });
+        let frame_length = self
+            .frame_length(&metadata[..inputs.len()], Some(inputs))?
+            .ok_or_else(|| EpError::KernelFailed("STFT: frame_length is unresolved; bind window or frame_length before execution".into()))?;
+        let signal = &inputs[0];
+        let components = signal.shape[2];
+        let frame_step = positive_scalar("frame_step", &inputs[1])?;
+        let window = inputs.get(2).filter(|input| !input.is_absent());
+        let signal_length = signal.shape[1];
         let frames = (signal_length - frame_length) / frame_step + 1;
         let bins = if self.onesided {
             frame_length / 2 + 1
@@ -172,52 +291,63 @@ impl Kernel for StftKernel {
             )));
         }
 
-        let signal_data = to_dense_f32_widen("STFT signal", signal)?;
-        let window_data = window
-            .map(|window| to_dense_f32_widen("STFT window", window))
-            .transpose()?;
-        let mut output_data = vec![0.0f32; signal.shape[0] * frames * bins * 2];
-
-        // Four frame-sized buffers are allocated once and reused for every
-        // batch/frame pair. The materialized signal/window and final output are
-        // the only input/output-sized allocations.
-        let mut frame_real = vec![0.0f32; frame_length];
-        let mut frame_imag = vec![0.0f32; frame_length];
-        let mut spectrum_real = vec![0.0f32; frame_length];
-        let mut spectrum_imag = vec![0.0f32; frame_length];
-        let dft = DftPlan::new(frame_length, false);
-
-        for batch in 0..signal.shape[0] {
-            for frame in 0..frames {
-                let signal_start =
-                    batch * signal_length * components + frame * frame_step * components;
-                for sample in 0..frame_length {
-                    let weight = window_data.as_ref().map_or(1.0, |values| values[sample]);
-                    let input = signal_start + sample * components;
-                    frame_real[sample] = signal_data[input] * weight;
-                    frame_imag[sample] = if components == 2 {
-                        signal_data[input + 1] * weight
-                    } else {
-                        0.0
-                    };
-                }
-
-                dft.transform(
-                    &frame_real,
-                    &frame_imag,
-                    &mut spectrum_real,
-                    &mut spectrum_imag,
-                );
-
-                let output_start = (batch * frames + frame) * bins * 2;
-                for bin in 0..bins {
-                    output_data[output_start + bin * 2] = spectrum_real[bin];
-                    output_data[output_start + bin * 2 + 1] = spectrum_imag[bin];
-                }
-            }
+        let output_elements = expected_shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d))
+            .ok_or_else(|| EpError::KernelFailed(format!("STFT: output shape {expected_shape:?} overflows element count; reduce signal or batch size")))?;
+        // Even an empty batch must retain the original view/accessibility
+        // checks, without materializing data that execution will not read.
+        validate_f32_widen_input("STFT signal", signal)?;
+        if let Some(window) = window {
+            validate_f32_widen_input("STFT window", window)?;
         }
+        let plan = Self::scratch_layout(frame_length, signal.shape[0])?;
+        if output_elements == 0 {
+            return write_dense_f32_narrow("STFT", output, &[]);
+        }
+        // SAFETY: CPU execution owns exclusive live Host backing until this
+        // synchronous closure returns. The shared helper checks and initializes
+        // the four regions before forming f32 references.
+        unsafe {
+            plan.with_buffers(
+                workspace,
+                |[frame_real, frame_imag, spectrum_real, spectrum_imag]| {
+                    let signal_data = to_dense_f32_widen("STFT signal", signal)?;
+                    let window_data = window
+                        .map(|window| to_dense_f32_widen("STFT window", window))
+                        .transpose()?;
+                    let mut output_data = vec![0.0f32; output_elements];
 
-        write_dense_f32_narrow("STFT", output, &output_data)
+                    let dft = DftPlan::new(frame_length, false);
+
+                    for batch in 0..signal.shape[0] {
+                        for frame in 0..frames {
+                            let signal_start = batch * signal_length * components
+                                + frame * frame_step * components;
+                            for sample in 0..frame_length {
+                                let weight =
+                                    window_data.as_ref().map_or(1.0, |values| values[sample]);
+                                let input = signal_start + sample * components;
+                                frame_real[sample] = signal_data[input] * weight;
+                                frame_imag[sample] = if components == 2 {
+                                    signal_data[input + 1] * weight
+                                } else {
+                                    0.0
+                                };
+                            }
+
+                            dft.transform(frame_real, frame_imag, spectrum_real, spectrum_imag);
+
+                            let output_start = (batch * frames + frame) * bins * 2;
+                            for bin in 0..bins {
+                                output_data[output_start + bin * 2] = spectrum_real[bin];
+                                output_data[output_start + bin * 2 + 1] = spectrum_imag[bin];
+                            }
+                        }
+                    }
+
+                    write_dense_f32_narrow("STFT", output, &output_data)
+                },
+            )
+        }
     }
 }
 
@@ -236,18 +366,7 @@ fn require_compute_dtype(argument: &str, dtype: DataType) -> Result<()> {
 }
 
 fn positive_scalar(name: &str, input: &TensorView<'_>) -> Result<usize> {
-    if input.is_absent() {
-        return Err(EpError::KernelFailed(format!(
-            "STFT: required `{name}` input is absent"
-        )));
-    }
-    if !input.shape.is_empty() {
-        return Err(EpError::KernelFailed(format!(
-            "STFT: `{name}` must be a scalar, got shape {:?}",
-            input.shape
-        )));
-    }
-    let value = super::to_dense_i64(input)?[0];
+    let value = scalar_i64("STFT", name, input)?;
     if value <= 0 {
         return Err(EpError::KernelFailed(format!(
             "STFT: `{name}` must be greater than zero, got {value}"
@@ -264,7 +383,7 @@ fn positive_scalar(name: &str, input: &TensorView<'_>) -> Result<usize> {
 mod tests {
     use super::*;
     use crate::kernels::dft::dft_fast_path_hits_this_thread;
-    use crate::kernels::testutil::Owned;
+    use crate::kernels::testutil::{Owned, PreparedTestKernel};
     use onnx_runtime_ep_api::TensorView;
     use onnx_runtime_ir::{Attribute, NodeId};
 
@@ -339,11 +458,257 @@ mod tests {
         let absent_length = TensorView::absent(DataType::Int64);
         let window_view = window.map_or(absent_window, Owned::view);
         let length_view = length.map_or(absent_length, Owned::view);
-        StftFactory.create(&node(onesided), &[])?.execute(
+        StftFactory.create(&node(onesided), &[])?.execute_prepared(
             &[signal.view(), step.view(), window_view, length_view],
             &mut [output.view_mut()],
         )?;
         Ok(output)
+    }
+
+    #[test]
+    fn workspace_uses_window_bound_or_live_scalar_without_signal_sized_reservation() {
+        let kernel = StftKernel { onesided: false };
+        let signal = Owned::f32(&[1, 32, 1], &[1.; 32]);
+        let step = Owned::i64(&[], &[2]);
+        let window = Owned::f32(&[3], &[1.; 3]);
+        let length = Owned::i64(&[], &[3]);
+        let metadata = [
+            TensorMetadata::new(signal.dtype, &signal.shape, true),
+            TensorMetadata::new(step.dtype, &step.shape, true),
+            TensorMetadata::new(window.dtype, &window.shape, true),
+            TensorMetadata::new(length.dtype, &length.shape, true),
+        ];
+        let ready = kernel
+            .workspace_requirement(&metadata, &[])
+            .unwrap()
+            .require_ready()
+            .unwrap();
+        assert_eq!(ready.bytes, 4 * 3 * 4);
+        let mut scalar_only = metadata;
+        scalar_only[2].present = false;
+        assert_eq!(
+            kernel.workspace_requirement(&scalar_only, &[]).unwrap(),
+            WorkspacePreparation::Deferred
+        );
+        let views = [
+            signal.view(),
+            step.view(),
+            TensorView::absent(DataType::Float32),
+            length.view(),
+        ];
+        let ready = kernel
+            .workspace_requirement_for_execution(
+                &views,
+                &[],
+                &scalar_only,
+                &[],
+                Some(WorkspacePreparation::Deferred),
+            )
+            .unwrap()
+            .require_ready()
+            .unwrap();
+        assert_eq!(ready.bytes, 48);
+        assert!(StftKernel::scratch_layout(usize::MAX / 4, 1).is_err());
+        assert_eq!(StftKernel::requirement(3, 0).unwrap().bytes, 0);
+    }
+
+    #[test]
+    fn workspace_refills_poisoned_frames_and_rejects_bad_backing_before_output_writes() {
+        let kernel = StftKernel { onesided: false };
+        let signal = Owned::f32(&[1, 8, 1], &[1., 2., 3., 4., 5., 6., 7., 8.]);
+        let step = Owned::i64(&[], &[2]);
+        let mut length = Owned::i64(&[], &[4]);
+        let mut backing = [0x7fc0_1234u32; 18];
+        let storage = WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(unsafe { backing.as_mut_ptr().add(1).cast() }),
+            64,
+        );
+        let canary = backing[0];
+        for n in [4usize, 3, 4] {
+            length.bytes.copy_from_slice(&(n as i64).to_le_bytes());
+            let inputs = [
+                signal.view(),
+                step.view(),
+                TensorView::absent(DataType::Float32),
+                length.view(),
+            ];
+            let frames = (8 - n) / 2 + 1;
+            let mut output = Owned::f32(&[1, frames, n, 2], &vec![123.; frames * n * 2]);
+            for bad in [
+                None,
+                Some(WorkspaceView::new(storage.ptr(), 4 * n * 4 - 1)),
+                Some(WorkspaceView::new(
+                    onnx_runtime_ep_api::DevicePtrMut(unsafe {
+                        storage.ptr().0.cast::<u8>().add(1).cast()
+                    }),
+                    64,
+                )),
+            ] {
+                let error = kernel
+                    .execute_with_workspace(&inputs, &mut [output.view_mut()], bad)
+                    .unwrap_err();
+                assert!(error.to_string().contains("workspace needs"), "{error}");
+                assert!(output.to_f32().iter().all(|&value| value == 123.));
+            }
+            kernel
+                .execute_with_workspace(&inputs, &mut [output.view_mut()], Some(storage))
+                .unwrap();
+            let expected = reference(&[1., 2., 3., 4., 5., 6., 7., 8.], 1, 2, n, None, false);
+            assert_close(&output.to_f32(), &expected);
+            assert_eq!(backing[0], canary);
+            assert_eq!(backing[17], canary);
+            backing[1..17].fill(canary);
+        }
+    }
+
+    #[test]
+    fn empty_batch_validates_parameters_but_needs_no_workspace() {
+        let kernel = StftKernel { onesided: false };
+        let signal = Owned::f32(&[0, 8, 1], &[]);
+        let step = Owned::i64(&[], &[2]);
+        let length = Owned::i64(&[], &[4]);
+        let mut output = Owned::zeros_f32(&[0, 3, 4, 2]);
+        kernel
+            .execute(
+                &[
+                    signal.view(),
+                    step.view(),
+                    TensorView::absent(DataType::Float32),
+                    length.view(),
+                ],
+                &mut [output.view_mut()],
+            )
+            .unwrap();
+        let invalid = Owned::i64(&[], &[0]);
+        assert!(
+            kernel
+                .execute(
+                    &[
+                        signal.view(),
+                        invalid.view(),
+                        TensorView::absent(DataType::Float32),
+                        length.view()
+                    ],
+                    &mut [output.view_mut()]
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("frame_step")
+        );
+    }
+
+    #[test]
+    fn empty_batches_keep_view_guards_and_scalars_accept_host_accessible_storage() {
+        use onnx_runtime_ir::{DeviceId, DeviceType};
+        let kernel = StftKernel { onesided: false };
+        let signal = Owned::f32(&[0, 8, 1], &[]);
+        let step = Owned::i64(&[], &[2]);
+        let window = Owned::f32(&[4], &[1.; 4]);
+        let mut output = Owned::zeros_f32(&[0, 3, 4, 2]);
+        for index in [0, 2] {
+            for invalid_strides in [false, true] {
+                let mut inputs = [signal.view(), step.view(), window.view()];
+                if invalid_strides {
+                    inputs[index].strides = &[];
+                } else {
+                    inputs[index].device = DeviceId::cuda(0);
+                }
+                let error = kernel
+                    .execute(&inputs, &mut [output.view_mut()])
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains(if invalid_strides {
+                        "rank mismatch"
+                    } else {
+                        "explicitly transfer"
+                    }),
+                    "{error}"
+                );
+            }
+        }
+        let mut scalar = step.view();
+        scalar.device = DeviceId::new(DeviceType::Mlx, 0);
+        assert_eq!(positive_scalar("frame_step", &scalar).unwrap(), 2);
+        scalar.device = DeviceId::cuda(0);
+        assert!(
+            positive_scalar("frame_step", &scalar)
+                .unwrap_err()
+                .to_string()
+                .contains("Host scalar")
+        );
+    }
+
+    #[test]
+    fn governed_workspace_is_one_lane_with_zero_warm_issuer_callbacks() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{
+            HolderId, HostWorkspacePool, MemoryGovernor, ProcessMemoryManager,
+        };
+        use std::sync::Arc;
+        let books = Arc::new(RecordingGovernor::new_host(64));
+        let manager = ProcessMemoryManager::new().unwrap();
+        let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+        let resources = crate::CpuMemoryResources::new(
+            books.weight_memory(HolderId::new(13)),
+            Default::default(),
+        )
+        .unwrap()
+        .with_workspace_pool(pool.clone())
+        .unwrap();
+        let provider = crate::CpuExecutionProvider::initialized_with_resources(resources).unwrap();
+        let kernel = StftKernel { onesided: false };
+        let signal = Owned::f32(&[1, 4, 1], &[1., 2., 3., 4.]);
+        let step = Owned::i64(&[], &[4]);
+        let length = Owned::i64(&[], &[4]);
+        let inputs = [
+            signal.view(),
+            step.view(),
+            TensorView::absent(DataType::Float32),
+            length.view(),
+        ];
+        let mut output = Owned::zeros_f32(&[1, 1, 4, 2]);
+        let request = StftKernel::requirement(4, 1).unwrap();
+        let first = provider
+            .allocate_workspace(64, request.alignment, request.role())
+            .unwrap();
+        let identity = first.managed_owner().unwrap().identity();
+        provider.deallocate_workspace(first).unwrap();
+        let before = (books.claims(), books.releases());
+        drop(
+            books
+                .reserve(Tier::Host, 0, request.role(), HolderId::new(99))
+                .unwrap(),
+        );
+        books.probe_zero_release();
+        assert_eq!(
+            (books.claims(), books.releases()),
+            (before.0 + 1, before.1 + 1)
+        );
+        let calls = (books.claims(), books.releases());
+        for _ in 0..4096 {
+            let mut allocation = provider
+                .allocate_workspace(64, request.alignment, request.role())
+                .unwrap();
+            assert_eq!(allocation.managed_owner().unwrap().identity(), identity);
+            let workspace = WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(allocation.as_mut_ptr()),
+                allocation.len(),
+            );
+            kernel
+                .execute_with_workspace(&inputs, &mut [output.view_mut()], Some(workspace))
+                .unwrap();
+            provider.deallocate_workspace(allocation).unwrap();
+        }
+        assert_close(&output.to_f32(), &[10., 0., -2., 2., -2., 0., -2., -2.]);
+        assert_eq!((books.claims(), books.releases()), calls);
+        assert_eq!(books.used(Tier::Host), 64);
+        assert_eq!(manager.process_used(Tier::Host), 64);
+        pool.trim_idle(64).unwrap();
+        assert_eq!(books.used(Tier::Host), 0);
+        assert_eq!(manager.process_used(Tier::Host), 0);
     }
 
     #[test]
@@ -548,7 +913,7 @@ mod tests {
             StftFactory
                 .create(&node(1), &[])
                 .unwrap()
-                .execute(
+                .execute_prepared(
                     &[
                         signal.view(),
                         step.view(),
@@ -597,7 +962,7 @@ mod tests {
         StftFactory
             .create(&Node::new(NodeId(0), "STFT", vec![], vec![]), &[])
             .unwrap()
-            .execute(
+            .execute_prepared(
                 &[
                     signal.view(),
                     step.view(),

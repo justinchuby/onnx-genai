@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "prompt_template": "hello{% if language == 'zh' %} tok31{% endif %}{% if prompt %} {{ prompt }}{% endif %} dog",
+  "languages": {
+    "kind": "choices",
+    "values": [
+      "en",
+      "zh"
+    ]
+  },
+  "prompt_conditioning": true,
+  "response_template": {
+    "version": 1,
+    "start_anchor": "dog",
+    "fields": {
+      "content": {
+        "open": "tok16 ",
+        "close": " tok17",
+        "optional": false
+      }
+    },
+    "preserved_tokens": [
+      "tok16",
+      "tok17"
+    ]
+  }
+}

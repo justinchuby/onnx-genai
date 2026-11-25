@@ -9580,3 +9580,173 @@ fn report_probe(
         println!("# event {name},{:.3}/run", events[i] as f64 / per_run);
     }
 }
+
+/// Exercise the shipping plugin's Deferred -> live workspace refinement, not
+/// just a direct kernel or native executor. Runtime N changes at fixed input
+/// shapes, and the whole two-node graph must stay on our EP without fallback.
+#[test]
+fn fourier_workspace_refines_runtime_lengths_through_real_plugin() {
+    let _lock = lock_ort_ep();
+    for onesided in [0, 1] {
+        let components = if onesided == 1 { 1 } else { 2 };
+        let name = if onesided == 1 {
+            "fourier_workspace_irfft"
+        } else {
+            "fourier_workspace_full"
+        };
+        let model = r#"ir_version: 10
+opset_import: [{ version: 20 }]
+graph {
+  name: "fourier_workspace"
+  node: [
+    { input: ["X", "N"] output: ["F"] op_type: "DFT"
+      attribute: [{ name: "onesided" i: $ONESIDED type: INT }] },
+    { input: ["F", "N"] output: ["Y"] op_type: "DFT"
+      attribute: [{ name: "onesided" i: $ONESIDED type: INT }, { name: "inverse" i: 1 type: INT }] }
+  ]
+  input: [
+    { name: "X" type { tensor_type { elem_type: 1 shape { dim: [{ dim_value: 2 }, { dim_value: 8 }, { dim_value: 1 }] } } } },
+    { name: "N" type { tensor_type { elem_type: 7 shape {} } } }
+  ]
+  value_info: [{ name: "F" type { tensor_type { elem_type: 1 shape { dim: [{ dim_value: 2 }, { dim_param: "bins" }, { dim_value: 2 }] } } } }]
+  output: [{ name: "Y" type { tensor_type { elem_type: 1 shape { dim: [{ dim_value: 2 }, { dim_param: "samples" }, { dim_value: $COMPONENTS }] } } } }]
+}
+"#.replace("$ONESIDED", &onesided.to_string()).replace("$COMPONENTS", &components.to_string());
+        let path = write_generated_model(name, &model);
+        let (_library, api, env, options, session) = skip_if_missing!(
+            unsafe { conformance_setup(name, &path, true) },
+            "fourier workspace: ORT/plugin unavailable"
+        );
+        unsafe {
+            let assignment = query_ep_assignment(api, session);
+            assert_eq!(
+                assignment.ops_on_our_ep(),
+                ["DFT", "DFT"],
+                "{name}: {:?}",
+                assignment.assignments
+            );
+            assert!(assignment.ops_not_on_our_ep().is_empty());
+            for (iteration, n) in [8usize, 3, 9, 8].into_iter().enumerate() {
+                let values = (0..16)
+                    .map(|i| i as f32 * 0.125 - 0.75 + iteration as f32 * 0.25)
+                    .collect::<Vec<_>>();
+                let mut bytes = values
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>();
+                let mut length = (n as i64).to_le_bytes();
+                let signal = make_raw_tensor(api, &mut bytes, &[2, 8, 1], ELEM_F32);
+                let scalar = make_raw_tensor(
+                    api,
+                    &mut length,
+                    &[],
+                    ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+                );
+                let outputs =
+                    run_and_collect_f32(api, session, &["X", "N"], &[signal, scalar], &["Y"]);
+                ((*api).ReleaseValue.unwrap())(signal);
+                ((*api).ReleaseValue.unwrap())(scalar);
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(outputs[0].len(), 2 * n * components);
+                for batch in 0..2 {
+                    for t in 0..n {
+                        let index = (batch * n + t) * components;
+                        let expected = if t < 8 { values[batch * 8 + t] } else { 0. };
+                        assert!(
+                            (outputs[0][index] - expected).abs() < 1e-4,
+                            "{name}, n={n}, batch={batch}, t={t}: {} versus {expected}",
+                            outputs[0][index]
+                        );
+                        if components == 2 {
+                            assert!(outputs[0][index + 1].abs() < 1e-4);
+                        }
+                    }
+                }
+            }
+            eprintln!("[{name}] two DFT nodes assigned to cpu_ep; runtime lengths 8/3/9/8 passed");
+            conformance_teardown(api, env, options, session, name);
+        }
+    }
+}
+
+/// Both RMS schemas must keep their changing workspace geometry on the shipping
+/// EP, including the optional statistics output, without an ORT fallback.
+#[test]
+fn rms_workspace_tracks_dynamic_shapes_through_real_plugin() {
+    let _lock = lock_ort_ep();
+    let name = "rms_workspace";
+    let model = r#"ir_version: 10
+opset_import: [{ version: 23 }]
+graph {
+  name: "rms_workspace"
+  node: [
+    { input: ["X", "scale"] output: ["first"] op_type: "RMSNormalization" },
+    { input: ["first", "scale"] output: ["Y", "inv"] op_type: "SimplifiedLayerNormalization" }
+  ]
+  input: [
+    { name: "X" type { tensor_type { elem_type: 1 shape { dim: [{ dim_param: "rows" }, { dim_param: "width" }] } } } },
+    { name: "scale" type { tensor_type { elem_type: 1 shape { dim: [{ dim_param: "width" }] } } } }
+  ]
+  value_info: [{ name: "first" type { tensor_type { elem_type: 1 shape { dim: [{ dim_param: "rows" }, { dim_param: "width" }] } } } }]
+  output: [
+    { name: "Y" type { tensor_type { elem_type: 1 shape { dim: [{ dim_param: "rows" }, { dim_param: "width" }] } } } },
+    { name: "inv" type { tensor_type { elem_type: 1 shape { dim: [{ dim_param: "rows" }, { dim_value: 1 }] } } } }
+  ]
+}
+"#;
+    let path = write_generated_model(name, model);
+    let (_library, api, env, options, session) = skip_if_missing!(
+        unsafe { conformance_setup(name, &path, true) },
+        "RMS workspace: ORT/plugin unavailable"
+    );
+    unsafe {
+        let assignment = query_ep_assignment(api, session);
+        assert_eq!(
+            assignment.ops_on_our_ep(),
+            ["RMSNormalization", "SimplifiedLayerNormalization"],
+            "{:?}",
+            assignment.assignments
+        );
+        assert!(assignment.ops_not_on_our_ep().is_empty());
+        for (iteration, (rows, width)) in [(2usize, 3usize), (3, 9), (2, 3)].into_iter().enumerate()
+        {
+            let mut values = (0..rows * width)
+                .map(|i| (i as f32 * 0.175).cos() * 2. + iteration as f32 * 0.25)
+                .collect::<Vec<_>>();
+            let mut scales = (0..width)
+                .map(|i| 0.25 + i as f32 * 0.125)
+                .collect::<Vec<_>>();
+            let mut expected = values.iter().copied().map(f64::from).collect::<Vec<_>>();
+            let mut expected_inv = vec![0.; rows];
+            for _ in 0..2 {
+                for (g, row) in expected.chunks_exact_mut(width).enumerate() {
+                    let inv =
+                        1. / (row.iter().map(|x| x * x).sum::<f64>() / width as f64 + 1e-5).sqrt();
+                    expected_inv[g] = inv;
+                    for (value, scale) in row.iter_mut().zip(&scales) {
+                        *value = *value * inv * f64::from(*scale);
+                    }
+                }
+            }
+            let x = make_float_tensor(api, &mut values, &[rows as i64, width as i64]);
+            let scale = make_float_tensor(api, &mut scales, &[width as i64]);
+            let outputs =
+                run_and_collect_f32(api, session, &["X", "scale"], &[x, scale], &["Y", "inv"]);
+            ((*api).ReleaseValue.unwrap())(x);
+            ((*api).ReleaseValue.unwrap())(scale);
+            assert_eq!(outputs.len(), 2);
+            assert_eq!(outputs[0].len(), rows * width);
+            assert_eq!(outputs[1].len(), rows);
+            for (actual, expected) in outputs[0].iter().zip(expected) {
+                assert!((f64::from(*actual) - expected).abs() < 1e-5);
+            }
+            for (actual, expected) in outputs[1].iter().zip(expected_inv) {
+                assert!((f64::from(*actual) - expected).abs() < 1e-5);
+            }
+        }
+        eprintln!(
+            "[rms_workspace] both RMS schemas assigned to cpu_ep; shapes 2x3/3x9/2x3 and statistics passed"
+        );
+        conformance_teardown(api, env, options, session, name);
+    }
+}

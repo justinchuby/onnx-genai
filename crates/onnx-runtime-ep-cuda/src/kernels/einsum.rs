@@ -2202,7 +2202,7 @@ impl Kernel for EinsumKernel {
         Some(vec![view])
     }
 
-    fn may_produce_views(&self) -> bool {
+    fn may_produce_views(&self, _input_dtypes: &[DataType]) -> bool {
         matches!(
             self.plan.planning_classification(),
             EinsumPlanningClassification::ViewOnlyPermutation(_)

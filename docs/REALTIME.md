@@ -153,6 +153,21 @@ and parameter validation, and a natural model stop must satisfy required-tool
 postconditions. Raw partial function-call fragments are not yet projected onto
 wire call items; completed batches retain atomic admission.
 
+`response.cancel` is idempotent: without an active response it emits no error
+or acknowledgement, including before the first turn and after completion. An
+active response still executes native cancellation and publishes its terminal
+events. A repeated cancel cannot cancel a later response that has not started.
+
+Realtime error envelopes match the pinned llama-server classification: an empty
+`response.create` uses `error.type: conversation_empty`, and an empty audio
+commit uses `error.type: input_audio_buffer_commit_empty`. Other rejected client
+events use `invalid_request_error`; native failures use `server_error` and close
+the connection after flushing the error. `error.code` and `error.param` are null.
+Every envelope retains its actionable message and generated top-level event ID.
+The native text WebSocket regression checks both specialized errors, repeated
+idle cancellation before/after a response, ordinary invalid requests and a
+successful budgeted native response on the same connection.
+
 ## Remaining conformance work
 
 Turn-based tagged-json tool forcing is connected for workflows declaring
@@ -196,6 +211,24 @@ actual native transcription, with matching item IDs, deltas and terminal text.
 This proves rejection did not consume input quota or freeze conditioning. It
 does not establish oversized WebSocket frame closure, slow-reader backpressure,
 all rate epochs or device execution conformance.
+
+### Executed model isolation and reconnect
+
+`websocket_models_isolate_native_state_and_release_closed_worker` loads two
+independent Native CPU model entries from the same authored duplex fixture and
+opens both routed WebSocket sessions simultaneously. Each handshake identifies
+its selected model and a distinct session. An additional connection to the
+occupied first model receives HTTP 503 before upgrade; it cannot steal that
+worker or prevent the second model from executing.
+
+The fixture accumulates ingested audio in native state. Zero audio in the first
+model and nonzero audio in the second produce independent PCM output. Closing
+and reopening the first connection releases its worker and creates fresh native
+state, while the second connection preserves its previous accumulated state.
+The test checks complete native frame sizes and actual output bytes after
+reconnect. The close handshake and retry-on-busy cleanup wait are bounded. This
+establishes routed CPU state isolation and reconnect cleanup, rather than device
+isolation, arbitrary worker-pool sizing or recognition/synthesis quality.
 
 Tool execution belongs exclusively to the external harness. This transport
 accepts definitions/results and emits model calls; it provides no tool runtime.

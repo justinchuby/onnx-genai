@@ -95,6 +95,7 @@ pub mod log_softmax;
 pub mod marlin_gemm;
 pub mod matmul;
 pub mod matmul_nbits;
+mod mean_variance_normalization;
 mod metadata_workspace;
 pub mod mod_op;
 pub mod movement;
@@ -121,6 +122,7 @@ pub mod quantization;
 pub mod range;
 pub mod reduce;
 pub mod resize;
+mod roi_align;
 pub mod rotary_embedding;
 pub mod shape;
 pub mod size;
@@ -391,6 +393,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "LpNormalization",
     "InstanceNormalization",
     "GroupNormalization",
+    "MeanVarianceNormalization",
     "CenterCropPad",
     "Col2Im",
     "QLinearMatMul",
@@ -398,6 +401,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "ConvTranspose",
     "DeformConv",
     "GridSample",
+    "RoiAlign",
     "GatherBlockQuantized",
     "CausalConvWithState",
     "LinearAttention",
@@ -533,8 +537,8 @@ static CUDA_ATTENTION_DTYPES: &[DataType] = &[
     DataType::Int64,
 ];
 
-/// Bounded CUDA Unique consumes f32 and returns f32 Y plus i64 metadata.
-static CUDA_UNIQUE_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
+/// Bounded CUDA Unique preserves the input dtype and produces i64 metadata.
+static CUDA_UNIQUE_DTYPES: &[DataType] = &[DataType::Float32, DataType::BFloat16, DataType::Int64];
 static CUDA_NMS_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
 static CUDA_EINSUM_DTYPES: &[DataType] = &[
     DataType::Float16,
@@ -572,6 +576,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
         ("Einsum", "") => CUDA_EINSUM_DTYPES,
         ("DeformConv", "") => onnx_runtime_ir::deform_conv::DTYPES,
+        ("RoiAlign", "") => onnx_runtime_ir::roi_align::DTYPES,
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
         ("DequantizePackedGather", onnx_runtime_ir::RUNTIME_DOMAIN) => &[
             DataType::Uint8,
@@ -632,6 +637,8 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("DsaIndexSelect", _)
         | ("LinearAttention", _) => CUDA_ATTENTION_DTYPES,
 
+        ("Transpose", "") => onnx_runtime_ir::transpose::DTYPES,
+
         // Byte-mover / structural ops: dtype-agnostic (copy/select, no
         // arithmetic on the values). Must advertise the full set so an integer
         // `Cast`/`Gather`/`Shape` in a partition does not sink it.
@@ -644,7 +651,6 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("Concat", _)
         | ("Slice", _)
         | ("Split", _)
-        | ("Transpose", _)
         | ("Gather", _)
         | ("GatherElements", _)
         | ("GatherND", _)
@@ -669,6 +675,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("CastLike", _)
         | ("TopK", _)
         | ("EyeLike", _) => CUDA_ALL_DTYPES,
+        ("MeanVarianceNormalization", "") => onnx_runtime_ep_api::mean_variance_normalization::DTYPES,
         ("Range", "") => &[
             DataType::Float32, DataType::Float64, DataType::Float16, DataType::BFloat16,
             DataType::Int16, DataType::Int32, DataType::Int64,
@@ -725,7 +732,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
 
 /// Derive plugin kernel-registry descriptors from the real CUDA [`OpRegistry`].
 ///
-/// One descriptor per registered `(op_type, domain, since_version)` key, with
+/// One descriptor per plugin-eligible `(op_type, domain, since_version)` key, with
 /// the domain taken verbatim from the registry (so `com.microsoft` kernels are
 /// advertised in `com.microsoft`, not the default domain) and dtypes from
 /// [`cuda_supported_dtypes_for_op`]. Building the registry only constructs
@@ -735,6 +742,8 @@ pub fn build_cuda_registry_descriptors(runtime: Arc<CudaRuntime>) -> Vec<CudaOpD
     let registry = build_cuda_registry(runtime);
     let mut descriptors: Vec<CudaOpDescriptor> = registry
         .keys()
+        // RoiAlign is currently supported only in standalone nxrt.
+        .filter(|key| !(key.op_type == "RoiAlign" && key.domain.is_empty()))
         .map(|key| {
             let supported_dtypes = if key.op_type == "Conv"
                 && key.domain.is_empty()
@@ -1016,6 +1025,15 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
+    reg.register(
+        OpKey::new("MeanVarianceNormalization", "", 29),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(
+            mean_variance_normalization::MeanVarianceNormalizationFactory {
+                runtime: runtime.clone(),
+            },
+        ),
+    );
     for since_version in [18, 21] {
         reg.register(
             OpKey::new("GroupNormalization", "", since_version),
@@ -1163,12 +1181,20 @@ pub fn build_cuda_registry_with_metrics(
             }),
         );
     }
+    for version in onnx_runtime_ir::roi_align::VERSIONS {
+        reg.register(
+            OpKey::new("RoiAlign", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+            Box::new(roi_align::Factory(runtime.clone(), version)),
+        );
+    }
     for version in [13, 22] {
         reg.register(
             OpKey::new("Dropout", "", version),
             onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(dropout::DropoutFactory {
                 runtime: runtime.clone(),
+                opset: version,
             }),
         );
     }
@@ -2065,7 +2091,7 @@ mod tests {
 
     use super::{
         CUDA_COVERED_OPS, CUDA_DFT_DTYPES, CUDA_FLOAT_DTYPES, CUDA_NMS_DTYPES, CUDA_STFT_DTYPES,
-        build_cuda_registry_descriptors, cuda_supported_dtypes_for_op,
+        build_cuda_registry, build_cuda_registry_descriptors, cuda_supported_dtypes_for_op,
     };
 
     fn coverage_matrix(doc: &str) -> &str {
@@ -2208,7 +2234,7 @@ mod tests {
         );
     }
 
-    /// Every advertised CUDA name must appear in the current matrix, not only
+    /// Every standalone CUDA name must appear in the current matrix, not only
     /// in a historical wave note elsewhere in the document.
     #[test]
     fn every_cuda_covered_op_is_named_in_current_coverage_matrix() {
@@ -2269,10 +2295,10 @@ mod tests {
             crate::runtime::CudaRuntime::new(0)
                 .expect("CUDA registry census requires a usable CUDA device 0"),
         );
-        let descriptors = build_cuda_registry_descriptors(runtime);
-        let pairs: BTreeSet<(String, String)> = descriptors
-            .into_iter()
-            .map(|descriptor| (descriptor.domain, descriptor.op_type))
+        let registry = build_cuda_registry(runtime);
+        let pairs: BTreeSet<(String, String)> = registry
+            .keys()
+            .map(|key| (key.domain.clone(), key.op_type.clone()))
             .collect();
         assert!(
             !pairs.is_empty(),
@@ -2347,6 +2373,36 @@ mod tests {
             dual_domain.len(),
             dual_domain,
             cpu_only
+        );
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn cuda_plugin_descriptors_exclude_standalone_roi_align() {
+        let runtime = std::sync::Arc::new(
+            crate::runtime::CudaRuntime::new(0)
+                .expect("CUDA plugin descriptor test requires a usable CUDA device 0"),
+        );
+        assert!(
+            build_cuda_registry(runtime.clone()).keys().any(|key| {
+                key.op_type == "RoiAlign" && matches!(key.domain.as_str(), "" | "ai.onnx")
+            }),
+            "standalone CUDA registry must contain ONNX RoiAlign before testing plugin exclusion"
+        );
+        let descriptors = build_cuda_registry_descriptors(runtime);
+        assert!(
+            !descriptors.is_empty(),
+            "CUDA plugin descriptors unexpectedly empty; exclusion check would be vacuous"
+        );
+        assert!(
+            !descriptors.iter().any(|descriptor| {
+                descriptor.op_type == "RoiAlign"
+                    && matches!(descriptor.domain.as_str(), "" | "ai.onnx")
+            }),
+            "standalone-only ONNX RoiAlign must not be advertised by the CUDA ORT plugin"
         );
     }
 

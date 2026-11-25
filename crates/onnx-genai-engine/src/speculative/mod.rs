@@ -1793,7 +1793,7 @@ impl Engine {
                     FinishReason::MaxTokens,
                     prefix_cache_hit_len,
                     logprobs.as_deref(),
-                    &options.effective_preserved_tokens(),
+                    options,
                 )
             }
         }
@@ -2042,7 +2042,7 @@ impl Engine {
                 FinishReason::MaxTokens,
                 prefix_cache_hit_len,
                 generated_logprobs.as_deref(),
-                &options.effective_preserved_tokens(),
+                options,
             )?));
         }
         if reached_context_limit(token_count, max_context) {
@@ -2051,7 +2051,7 @@ impl Engine {
                 FinishReason::Length,
                 prefix_cache_hit_len,
                 generated_logprobs.as_deref(),
-                &options.effective_preserved_tokens(),
+                options,
             )?));
         }
         Ok(None)
@@ -2523,6 +2523,7 @@ impl Engine {
             self.scheduler.advance(session_id);
             let prompt_tokens = state.tokens[..base_len.min(state.tokens.len())].to_vec();
             let mut commit_state = DecodeLoopState {
+                clock: Default::default(),
                 generated_tokens: std::mem::take(generated_tokens),
                 generated_text: std::mem::take(generated_text),
                 text_decoder: std::mem::take(text_decoder),
@@ -2545,6 +2546,7 @@ impl Engine {
                 chain,
                 self.require_tokenizer()?,
                 callback.as_deref_mut(),
+                None,
             )?;
             *generated_tokens = commit_state.generated_tokens;
             *generated_text = commit_state.generated_text;
@@ -2570,7 +2572,7 @@ impl Engine {
                     finish_reason,
                     prefix_cache_hit_len,
                     generated_logprobs.as_deref(),
-                    &options.effective_preserved_tokens(),
+                    options,
                 )?));
             }
         }

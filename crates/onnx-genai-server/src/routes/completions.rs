@@ -264,6 +264,9 @@ fn index_completion_publications(
         .collect()
 }
 struct StartedCompletion {
+    minimum_indent: usize,
+    return_progress: bool,
+    timings_per_token: bool,
     _registration: crate::completion_control::Registration,
     events: mpsc::Receiver<DriverEvent>,
     prompt_tokens: usize,
@@ -334,6 +337,19 @@ async fn start_completion(
     await_driver_admission(generation.admission).await?;
     crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
     Ok(StartedCompletion {
+        minimum_indent: request.sampling.minimum_indent,
+        return_progress: request
+            .sampling
+            .extensions
+            .get("return_progress")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+        timings_per_token: request
+            .sampling
+            .extensions
+            .get("timings_per_token")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
         _registration: registration,
         events: generation.events,
         prompt_tokens,
@@ -364,6 +380,7 @@ async fn run_completion(
     let logprobs = completion_logprobs(&result, &handle.tokenizer, request.logprobs)
         .map_err(|error| ApiError::internal(format!("logprobs conversion failed: {error:#}")))?;
     Ok(CompletionResponse {
+        timings: result.timings.map(crate::timings::render),
         id,
         object: "text_completion",
         created,
@@ -397,12 +414,23 @@ async fn deliver_completion(
     is_batch: bool,
 ) -> anyhow::Result<CompletionDelivery> {
     let (id, created, model, index) = response;
-    let mut stop_buffer = StopBoundaryBuffer::new(stops.to_vec());
+    let mut stop_buffer =
+        StopBoundaryBuffer::new(stops.to_vec()).with_minimum_indent(started.minimum_indent);
     let mut emitted = false;
     let result = loop {
         match tokio::select! { _=tx.closed()=>return Ok(CompletionDelivery::Disconnected),event=started.events.recv()=>event }
         {
             Some(DriverEvent::Token(token)) => {
+                if started.timings_per_token
+                    && let Some(sample) = token.timings
+                {
+                    send_completion_stream_chunk(
+                        tx,
+                        completion_chunk(id, created, model, index, String::new(), None)
+                            .with_timings(Some(sample)),
+                    )
+                    .await?;
+                }
                 if logprobs.is_some() {
                     continue;
                 }
@@ -417,6 +445,16 @@ async fn deliver_completion(
                 }
                 if matches!(token.finish_reason, Some(FinishReason::StopSequence { .. })) {
                     stop_buffer.discard_pending();
+                }
+            }
+            Some(DriverEvent::PromptProgress(progress)) => {
+                if started.return_progress {
+                    send_completion_stream_chunk(
+                        tx,
+                        completion_chunk(id, created, model, index, String::new(), None)
+                            .with_prompt_progress(progress),
+                    )
+                    .await?;
                 }
             }
             Some(DriverEvent::WorkflowPublications(publications)) => {
@@ -447,8 +485,8 @@ async fn deliver_completion(
             )
             .await?;
         }
-    } else if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
-        let text = stop_buffer.flush();
+    } else {
+        let text = stop_buffer.finish(&result.text)?;
         if !text.is_empty() {
             send_completion_stream_chunk(
                 tx,
@@ -465,7 +503,8 @@ async fn deliver_completion(
             model,
             index,
             finish_reason_label(&result.finish_reason),
-        ),
+        )
+        .with_timings(result.timings),
     )
     .await?;
     let completion_tokens = result.token_ids.len();
@@ -490,9 +529,10 @@ async fn stream_completions(
     first: (CompletionRequest, PreparedCompletion),
     rest: Vec<(CompletionRequest, PreparedCompletion)>,
     client_session_id: Option<String>,
-) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
+) -> Result<Response, ApiError> {
     let is_batch = !rest.is_empty();
     let (request, prepared) = first;
+    let ping = crate::SsePingInterval::resolve(&request.sampling, state.config.sse_ping_interval)?;
     let id = text_completion_id()?;
     let started = start_completion(
         &state,
@@ -576,6 +616,7 @@ async fn stream_completions(
         }
         if include_usage && !failed {
             let usage = CompletionResponse {
+                timings: None,
                 id,
                 object: "text_completion",
                 created,
@@ -593,7 +634,7 @@ async fn stream_completions(
             .context("completion receiver closed")?;
         Ok::<(), anyhow::Error>(())
     });
-    Ok(Sse::new(ReceiverStream::new(rx)))
+    Ok(ping.response(ReceiverStream::new(rx)))
 }
 
 pub(crate) async fn chat_completions(
@@ -668,8 +709,8 @@ async fn prepare_chat_input(
         config.replay_buffer_bytes,
     )
     .map_err(|err| ApiError::invalid_request(format!("prompt preparation failed: {err:#}")))?;
-    if !input_audio.is_empty() {
-        prepared = prepare_audio_generate_request(request, &handle.tokenizer, output_budget)?;
+    if !input_audio.is_empty() && handle.chat_template.is_none() {
+        prepared = prepare_audio_generate_request(request, handle, config, output_budget)?;
     }
     crate::lora::apply_request(request, handle, &mut prepared.request.options, has_session)?;
     prepared.request.options.max_constraint_bytes = config.replay_buffer_bytes;
@@ -840,6 +881,7 @@ async fn run_chat_completion(
     let reasoning = Some(output.reasoning).filter(|thought| !thought.is_empty());
     let total_tokens = prompt_tokens + completion_tokens;
     Ok(ChatCompletionResponse {
+        timings: result.timings.map(crate::timings::render),
         id,
         object: "chat.completion",
         created,
@@ -874,7 +916,8 @@ async fn stream_chat_completion(
     handle: Arc<ModelHandle>,
     request: ChatCompletionRequest,
     client_session_id: Option<String>,
-) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
+) -> Result<Response, ApiError> {
+    let ping = crate::SsePingInterval::resolve(&request, state.config.sse_ping_interval)?;
     let id = completion_id()?;
     let created = now_unix();
     let model = request.model.clone();
@@ -966,6 +1009,16 @@ async fn stream_chat_completion(
                 &mut driver_rx,
                 prompt_tokens,
                 request.stream_options.include_usage,
+                request
+                    .extensions
+                    .get("timings_per_token")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true),
+                request
+                    .extensions
+                    .get("return_progress")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true),
             )
             .await;
         }
@@ -977,6 +1030,19 @@ async fn stream_chat_completion(
                 event = driver_rx.recv() => event,
             } {
                 Some(DriverEvent::Token(token)) => {
+                    if request
+                        .extensions
+                        .get("timings_per_token")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                        && let Some(sample) = token.timings
+                    {
+                        send_stream_chunk(
+                            &tx,
+                            crate::sse::timing_chunk(&id, created, &model, sample),
+                        )
+                        .await?;
+                    }
                     let revealed = match channel_gate.push_text(&token.text) {
                         Ok(delta) => delta,
                         Err(error) => break Err(StreamOutputFailure::Projection(error)),
@@ -992,6 +1058,21 @@ async fn stream_chat_completion(
                     if requested_top_logprobs.is_none() && !content.is_empty() {
                         send_stream_chunk(&tx, content_chunk(&id, created, &model, content, None))
                             .await?;
+                    }
+                }
+                Some(DriverEvent::PromptProgress(progress)) => {
+                    if request
+                        .extensions
+                        .get("return_progress")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    {
+                        send_stream_chunk(
+                            &tx,
+                            crate::sse::role_chunk(&id, created, &model, progress.total)
+                                .with_prompt_progress(progress),
+                        )
+                        .await?;
                     }
                 }
                 Some(DriverEvent::WorkflowPublications(publications)) => {
@@ -1033,7 +1114,8 @@ async fn stream_chat_completion(
                             &model,
                             &result.finish_reason,
                             &user_stop_sequences,
-                        ),
+                        )
+                        .with_timings(result.timings),
                     )
                     .await?;
                 } else {
@@ -1065,7 +1147,8 @@ async fn stream_chat_completion(
                             &model,
                             &result.finish_reason,
                             &user_stop_sequences,
-                        ),
+                        )
+                        .with_timings(result.timings),
                     )
                     .await?;
                 }
@@ -1105,7 +1188,7 @@ async fn stream_chat_completion(
         Ok::<(), anyhow::Error>(())
     });
 
-    Ok(Sse::new(ReceiverStream::new(rx)))
+    Ok(ping.response(ReceiverStream::new(rx)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1120,6 +1203,8 @@ async fn stream_declared_tool_chat_completion(
     driver_rx: &mut mpsc::Receiver<DriverEvent>,
     prompt_tokens: usize,
     include_usage: bool,
+    timings_per_token: bool,
+    return_progress: bool,
 ) -> anyhow::Result<()> {
     let (id, created, model) = response;
     let mut buffered_text = String::new();
@@ -1129,6 +1214,10 @@ async fn stream_declared_tool_chat_completion(
             event = driver_rx.recv() => event,
         } {
             Some(DriverEvent::Token(token)) => {
+                if timings_per_token && let Some(sample) = token.timings {
+                    send_stream_chunk(tx, crate::sse::timing_chunk(id, created, model, sample))
+                        .await?;
+                }
                 let revealed = match channel_gate.push_text(&token.text) {
                     Ok(delta) => delta,
                     Err(error) => break Err(StreamOutputFailure::Projection(error)),
@@ -1138,6 +1227,16 @@ async fn stream_declared_tool_chat_completion(
                         .await?;
                 }
                 buffered_text.push_str(&revealed.content);
+            }
+            Some(DriverEvent::PromptProgress(progress)) => {
+                if return_progress {
+                    send_stream_chunk(
+                        tx,
+                        crate::sse::role_chunk(id, created, model, progress.total)
+                            .with_prompt_progress(progress),
+                    )
+                    .await?;
+                }
             }
             Some(DriverEvent::WorkflowPublications(publications)) => {
                 if let Err(error) = send_workflow_publications(tx, &publications).await {
@@ -1196,7 +1295,8 @@ async fn stream_declared_tool_chat_completion(
                         model,
                         &result.finish_reason,
                         user_stop_sequences,
-                    ),
+                    )
+                    .with_timings(result.timings),
                 )
                 .await?;
             } else {
@@ -1212,7 +1312,8 @@ async fn stream_declared_tool_chat_completion(
                         model,
                         &result.finish_reason,
                         user_stop_sequences,
-                    ),
+                    )
+                    .with_timings(result.timings),
                 )
                 .await?;
             }
@@ -1370,6 +1471,7 @@ async fn collect_generation_with_publications(
     while let Some(event) = rx.recv().await {
         match event {
             DriverEvent::Token(_) => {}
+            DriverEvent::PromptProgress(_) => {}
             DriverEvent::WorkflowPublications(committed) => publications.extend(committed),
             DriverEvent::Finished(result) => {
                 return Ok(CollectedGeneration {
@@ -1390,7 +1492,7 @@ fn preprocess_chat_audio(
     handle: &ModelHandle,
 ) -> Result<MultimodalInput, ApiError> {
     let bytes = crate::audio_input::decode_chat_audio(input)
-        .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err}")))?;
+        .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err:#}")))?;
     let spec = handle
         .multimodal
         .as_ref()
@@ -1398,8 +1500,8 @@ fn preprocess_chat_audio(
         .ok_or_else(|| {
             ApiError::invalid_request("audio input requires a model with a declared audio input")
         })?;
-    MultimodalInput::from_wav(spec, &bytes)
-        .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err}")))
+    MultimodalInput::from_audio_bytes(spec, &bytes)
+        .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err:#}")))
 }
 
 async fn preprocess_chat_images(
@@ -1412,7 +1514,7 @@ async fn preprocess_chat_images(
     let max_prompt_tokens =
         crate::multimodal::expansion_token_budget(model_max_context, max_tokens)
             .map_err(|err| ApiError::invalid_request(format!("{err:#}")))?;
-    let images = crate::image_input::fetch_images(image_urls)
+    let images = crate::media_input::fetch_images(image_urls)
         .await
         .map_err(|err| ApiError::invalid_request(format!("invalid image input: {err:#}")))?;
     let GeneratePrompt::TokenIds(mut token_ids) = std::mem::replace(
@@ -1432,9 +1534,11 @@ async fn preprocess_chat_images(
 
 fn prepare_audio_generate_request(
     request: &ChatCompletionRequest,
-    tokenizer: &Tokenizer,
+    handle: &ModelHandle,
+    config: &ServerConfig,
     output_budget: usize,
 ) -> Result<PreparedGenerateRequest, ApiError> {
+    let tokenizer = &handle.tokenizer;
     let mut options = build_generate_options_with_tokenizer(request, tokenizer, output_budget)
         .map_err(|error| {
             ApiError::invalid_request(format!("invalid audio generation controls: {error:#}"))
@@ -1455,10 +1559,58 @@ fn prepare_audio_generate_request(
             ApiError::invalid_request(format!("invalid audio reasoning protocol: {error:#}"))
         })?;
     }
-    let token_ids = audio_decoder_prompt(tokenizer, None)?;
+    let contract = handle.multimodal.as_ref().and_then(|specs|specs.audio.as_ref())
+        .and_then(|audio|audio.transcription()).ok_or_else(||ApiError::invalid_request("audio-only generation requires transcription_config.json with a declared decoder prompt; author the package contract"))?;
+    let conditioning = request
+        .messages
+        .iter()
+        .filter_map(|message| message.content.as_ref())
+        .map(|content| content.text())
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>();
+    if !conditioning.is_empty()
+        && (request.messages.len() != 1 || request.messages[0].role != "user")
+    {
+        return Err(ApiError::invalid_request(
+            "audio-only transcription prompting cannot interpret multi-turn text/role history; declare a chat_template for multimodal conversation or use /v1/audio/transcriptions prompt conditioning",
+        ));
+    }
+    let rendered = contract
+        .render(
+            tokenizer,
+            None,
+            conditioning.first().map(String::as_str),
+            onnx_genai_engine::transcription::generative::PromptLimits {
+                max_input_tokens: config.max_transcription_input_tokens,
+                template: onnx_genai_ort::TemplateLimits {
+                    max_output_bytes: config.max_transcription_prompt_bytes,
+                    max_operations: config.max_transcription_template_operations,
+                },
+                max_text_bytes: config.max_transcription_text_bytes,
+            },
+        )
+        .map_err(|error| {
+            ApiError::invalid_request(format!("prepare audio decoder prompt: {error:#}"))
+        })?;
+    if let Some(template) = &handle.response_template {
+        options.response_projection = Some(
+            onnx_genai_engine::response_template::ResponseProjection::resolve(
+                template.clone(),
+                rendered.text.clone(),
+                config.replay_buffer_bytes,
+                Some(tokenizer),
+            )
+            .map_err(|error| {
+                ApiError::invalid_request(format!(
+                    "prepare audio chat response projection: {error:#}"
+                ))
+            })?,
+        );
+    }
+    let token_ids = rendered.token_ids;
     let prompt_tokens = token_ids.len();
     Ok(PreparedGenerateRequest {
-        response_prefix: None,
+        response_prefix: Some(rendered.text),
         request: GenerateRequest {
             prompt: GeneratePrompt::TokenIds(token_ids),
             options,
@@ -2247,6 +2399,8 @@ fn build_generate_options(
     // stochastic controls as an explicit request to sample.
     let stochastic_sampling_requested = requests_stochastic_sampling(request);
     let mut options = GenerateOptions {
+        max_prediction_time: request.prediction_time_limit,
+        minimum_indent: request.minimum_indent,
         max_new_tokens: output_budget,
         temperature: request.temperature.unwrap_or(NEUTRAL_SAMPLING),
         sampler_order: request.samplers.clone(),
@@ -2855,6 +3009,7 @@ fn committed_chat_tool_calls(result: &GenerateResult) -> Option<Vec<ChatMessageT
 /// A resolved declaration plus the exact prompt that was actually rendered.
 #[derive(Clone)]
 struct ChatProjection {
+    minimum_indent: usize,
     template: Option<Arc<response_template::ResponseTemplate>>,
     prefix: Arc<str>,
     prefix_output: response_template::PrefixOutput,
@@ -2874,6 +3029,7 @@ impl ChatProjection {
             ""
         };
         Ok(Self {
+            minimum_indent: request.minimum_indent,
             template: handle.response_template.clone(),
             prefix: Arc::from(prefix),
             prefix_output: if request.continue_final_message.is_enabled() {
@@ -2908,8 +3064,8 @@ impl ChatProjection {
                     )
                 })
                 .transpose()?,
-            stop_buffer: StopBoundaryBuffer::new(self.stop_sequences.clone()),
-            generated: String::new(),
+            stop_buffer: StopBoundaryBuffer::new(self.stop_sequences.clone())
+                .with_minimum_indent(self.minimum_indent),
         })
     }
     fn buffered(&self, result: &GenerateResult) -> anyhow::Result<ChannelDelta> {
@@ -2936,7 +3092,6 @@ impl ChatProjection {
 struct ChannelGate {
     stop_buffer: StopBoundaryBuffer,
     parser: Option<response_template::ResponseParser>,
-    generated: String,
 }
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ChannelDelta {
@@ -2945,7 +3100,6 @@ struct ChannelDelta {
 }
 impl ChannelGate {
     fn push_text(&mut self, text: &str) -> anyhow::Result<ChannelDelta> {
-        self.generated.push_str(text);
         let safe = self.stop_buffer.push(text);
         let Some(parser) = &mut self.parser else {
             return Ok(ChannelDelta {
@@ -2960,9 +3114,7 @@ impl ChannelGate {
         })
     }
     fn finish(mut self, final_text: &str) -> anyhow::Result<ChannelDelta> {
-        let tail=final_text.strip_prefix(&self.generated).context("committed response text does not extend its published token text; repair the tokenizer's incremental output contract")?;
-        let mut safe = self.stop_buffer.push(tail);
-        safe.push_str(&self.stop_buffer.flush());
+        let safe = self.stop_buffer.finish(final_text)?;
         let Some(mut parser) = self.parser.take() else {
             return Ok(ChannelDelta {
                 content: safe,
@@ -3225,7 +3377,10 @@ fn truncate_tokens_at_stop(tokens: &[String], stop_sequences: &[String]) -> Vec<
 
 fn finish_reason_label(reason: &FinishReason) -> &'static str {
     match reason {
-        FinishReason::MaxTokens | FinishReason::Length => "length",
+        FinishReason::MaxTokens
+        | FinishReason::Length
+        | FinishReason::IndentationLimit
+        | FinishReason::PredictionTimeLimit => "length",
         FinishReason::EosToken | FinishReason::StopSequence { .. } => "stop",
         FinishReason::ToolCalls => "tool_calls",
     }
@@ -3616,6 +3771,76 @@ mod sampling_resolution_tests {
     }
 
     #[test]
+    fn indentation_control_matches_pinned_numeric_bounds() {
+        for (value, expected) in [
+            (json!(null), 0),
+            (json!(0), 0),
+            (json!(-0.5), 0),
+            (json!(2.9), 2),
+            (json!(i32::MAX), i32::MAX as usize),
+        ] {
+            let request = chat_request(json!({"n_indent":value}));
+            assert_eq!(
+                build_generate_options(&request, 10).minimum_indent,
+                expected
+            );
+        }
+        for value in [
+            json!(-1),
+            json!(-2.0),
+            json!(2147483648_u64),
+            json!("2"),
+            json!(true),
+            json!([]),
+        ] {
+            let error = serde_json::from_value::<ChatCompletionRequest>(
+                json!({"messages":[],"n_indent":value}),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("n_indent"), "{error}");
+            assert!(
+                error.to_string().contains("0 through 2147483647"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn prediction_time_limit_maps_wire_milliseconds_without_counting_disabled_values() {
+        for milliseconds in [-1, 0, 1, i64::MAX] {
+            let request = chat_request(json!({"t_max_predict_ms":milliseconds}));
+            let expected =
+                (milliseconds > 0).then(|| std::time::Duration::from_millis(milliseconds as u64));
+            assert_eq!(
+                build_generate_options(&request, 4).max_prediction_time,
+                expected
+            );
+        }
+        for value in [json!(null), json!(0.5), json!(-1.9)] {
+            let request = chat_request(json!({"t_max_predict_ms":value}));
+            assert_eq!(
+                build_generate_options(&request, 4).max_prediction_time,
+                None
+            );
+        }
+        let request = chat_request(json!({"t_max_predict_ms":1.5}));
+        assert_eq!(
+            build_generate_options(&request, 4).max_prediction_time,
+            Some(std::time::Duration::from_millis(1))
+        );
+        for value in [
+            json!(-2),
+            json!(-2.1),
+            json!(true),
+            json!("1"),
+            json!(u64::MAX),
+        ] {
+            let body = json!({"messages":[],"t_max_predict_ms":value});
+            assert!(serde_json::from_value::<ChatCompletionRequest>(body).is_err());
+        }
+    }
+
+    #[test]
     fn dynamic_temperature_controls_request_sampling_at_zero_base_temperature() {
         let request = chat_request(json!({"dynatemp_range":0.4,"dynatemp_exponent":2.0}));
         let mut options = build_generate_options(&request, 4);
@@ -3940,6 +4165,7 @@ mod channel_gate_tests {
         }))
         .unwrap();
         let projection = ChatProjection {
+            minimum_indent: 0,
             template: Some(template),
             prefix: Arc::from("[a]<c>old"),
             prefix_output: response_template::PrefixOutput::Include,
@@ -3947,6 +4173,8 @@ mod channel_gate_tests {
             stop_sequences: Vec::new(),
         };
         let result = GenerateResult {
+            timings: None,
+            retained_cache_tokens: 0,
             preserved_tokens: Default::default(),
             text: "</c><c>".into(),
             token_ids: Vec::new(),
@@ -3965,6 +4193,7 @@ mod channel_gate_tests {
     #[test]
     fn undeclared_protocol_is_not_interpreted() {
         let projection = ChatProjection {
+            minimum_indent: 0,
             template: None,
             prefix: Arc::from(""),
             prefix_output: response_template::PrefixOutput::Include,
@@ -4052,6 +4281,9 @@ mod completion_delivery_tests {
                 &tx,
                 ("id", 1, "model", 3),
                 StartedCompletion {
+                    return_progress: false,
+                    timings_per_token: false,
+                    minimum_indent: 0,
                     _registration: controls
                         .register(
                             "id",
@@ -4100,6 +4332,9 @@ mod completion_delivery_tests {
             &tx,
             ("id", 1, "model", 0),
             StartedCompletion {
+                return_progress: false,
+                timings_per_token: false,
+                minimum_indent: 0,
                 _registration: controls
                     .register(
                         "id",

@@ -132,6 +132,40 @@ impl ReasoningBudget {
                 "reasoning {name} contains absent token ID {id}; repair the tokenizer protocol"
             );
         }
+        let bytes = ByteStreamContract::resolve(tokenizer, SpecialTokenHandling::Preserve)
+            .context("resolve reasoning-budget UTF-8 tokenizer contract")?;
+        if let Some(bytes) = bytes.as_ref().filter(|bytes| bytes.has_trailing_strip()) {
+            for (index, sequence) in spec.start_sequences.iter().enumerate() {
+                ensure!(
+                    bytes.marker_stable(sequence, &spec.prefix_tokens)?,
+                    "reasoning start sequence {index} is consumed or delayed by tokenizer.decoder trailing Strip composition; choose a stable marker or remove the conflicting Strip stage"
+                );
+            }
+            let contexts = if spec.initially_active {
+                vec![spec.prefix_tokens.clone()]
+            } else {
+                spec.start_sequences
+                    .iter()
+                    .map(|start| {
+                        let mut context = spec.prefix_tokens.clone();
+                        context.extend(start);
+                        context
+                    })
+                    .collect()
+            };
+            for context in contexts {
+                for (index, sequence) in spec.end_sequences.iter().enumerate() {
+                    ensure!(
+                        bytes.marker_stable(sequence, &context)?,
+                        "reasoning end sequence {index} is consumed or delayed by tokenizer.decoder trailing Strip composition; choose a stable marker or remove the conflicting Strip stage"
+                    );
+                }
+                ensure!(
+                    bytes.marker_stable(&spec.forced_tokens, &context)?,
+                    "reasoning forced_tokens are consumed or delayed by tokenizer.decoder trailing Strip composition; end the forced sequence with a stable declared closer"
+                );
+            }
+        }
         let budget = Self {
             contract: Arc::new(Contract {
                 start: Matcher::new(spec.start_sequences),
@@ -140,8 +174,7 @@ impl ReasoningBudget {
                 prefix: spec.prefix_tokens,
                 limit: spec.max_tokens,
                 initially_active: spec.initially_active,
-                bytes: ByteStreamContract::resolve(tokenizer, SpecialTokenHandling::Preserve)
-                    .context("resolve reasoning-budget UTF-8 tokenizer contract")?,
+                bytes,
             }),
             control: ReasoningControl::default(),
         };
@@ -626,6 +659,67 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         Tokenizer::from_file(path).unwrap()
     }
+    #[test]
+    fn reasoning_trailing_strip_requires_stable_protocol_markers() {
+        let base = tokenizer(false);
+        for character in ["x", "L"] {
+            let mut value: Value =
+                serde_json::from_str(&base.inner().to_string(false).unwrap()).unwrap();
+            value["decoder"] = json!({"type":"Sequence","decoders":[{"type":"ByteFallback"},{"type":"Fuse"},
+                {"type":"Strip","content":character,"start":0,"stop":1}]});
+            let scratch = tempfile::tempdir().unwrap();
+            let path = scratch.path().join("tokenizer.json");
+            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            let tokenizer = Tokenizer::from_file(path).unwrap();
+            let result = ReasoningBudget::resolve(&tokenizer, spec(Some(0)));
+            if character == "L" {
+                let message = format!("{:#}", result.unwrap_err());
+                assert!(
+                    message.contains("reasoning end sequence 0")
+                        && message.contains("trailing Strip"),
+                    "{message}"
+                );
+            } else {
+                let processor = result.unwrap().processor().unwrap();
+                forced(mask(&processor, &[]), 23);
+                forced(mask(&processor, &[23]), 24);
+                assert!(
+                    mask(&processor, &[23, 24])
+                        .iter()
+                        .all(|value| value.is_finite())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reasoning_trailing_composition_checks_initial_strip_in_actual_marker_context() {
+        let base = tokenizer(false);
+        let mut value: Value =
+            serde_json::from_str(&base.inner().to_string(false).unwrap()).unwrap();
+        value["decoder"] = json!({"type":"Sequence","decoders":[{"type":"ByteFallback"},{"type":"Fuse"},
+            {"type":"Strip","content":"E","start":1,"stop":1}]});
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("tokenizer.json");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let tokenizer = Tokenizer::from_file(path).unwrap();
+        for initially_active in [false, true] {
+            let mut declaration = spec(Some(0));
+            declaration.initially_active = initially_active;
+            declaration.prefix_tokens.clear();
+            declaration.end_sequences = vec![vec![23]];
+            let result = ReasoningBudget::resolve(&tokenizer, declaration);
+            if initially_active {
+                assert!(format!("{:#}", result.unwrap_err()).contains("reasoning end sequence 0"));
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "the actual OPEN marker completes initial stripping before END"
+                );
+            }
+        }
+    }
+
     fn spec(limit: Option<usize>) -> ReasoningBudgetSpec {
         ReasoningBudgetSpec {
             start_sequences: vec![vec![22]],

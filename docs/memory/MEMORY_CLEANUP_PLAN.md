@@ -2476,3 +2476,269 @@ individual noisy repetitions remain visible. The final single-row gated point
 change is +1.4%, so a small cost is not excluded; no universal zero-overhead or
 model-throughput conclusion is made. Host resource tests retain exact full-lane
 charges, zero warm issuer callbacks and trim-to-zero checks.
+
+
+### Initialize decoded workspace according to live projections
+
+The one admitted BlockMatMul/BlockMoE/QMoE decode lane now initializes only the
+prefix requested by the current projection. A monotone dispatch-local prefix
+replaces the full-lane bool: first use clears its live span, larger later phases
+clear only new elements, and smaller phases retain initialized storage. A fresh
+binding discards the prior dispatch's proof. Prepared helpers pass the owner to
+the canonical checked plan split rather than clearing a complete maximum lane.
+
+Capacity/overflow errors precede writes. Decoder failures preserve valid f32
+initialization without publishing partial tensor output. Dense hits still leave
+decoder scratch untouched. The maximum capacity, charge, logical shard plan and
+all grant/refund operations remain unchanged; no finer quota is introduced.
+The [state/resource checks and mutation control](../benchmarks/decoded-scratch-prefix/README.md)
+cover sparse actual expert groups and pool changes. No inference latency, RSS,
+CUDA runtime or complete-process memory conclusion follows from this change.
+
+
+### Idle workspace pressure uses queue operations
+
+Host workspace idle slots now use a deque. A pressure sweep pops the front
+without shifting every remaining owner after each physical release. Warm
+best-fit and growth selection still remove from the back by swapping, preserving
+the previous Vec's logical order and boxed ownership. Physical release stays
+outside the idle lock; an error stops the sweep with remaining slots intact.
+
+The real-ledger regression holds eight independently funded execution lanes,
+partially trims them, checks the remaining allocation identities, reuses the
+best-fit box without issuer callbacks, and verifies the existing swapped release
+order before settling to zero. Existing concurrent, borrowed/foreign return and
+incomplete-release guards remain. This changes neither allocation granularity,
+EP APIs nor quota operations. It removes repeated queue bookkeeping on pressure;
+no inference latency, RSS or universally zero pool-overhead claim is made.
+
+
+### Structural claim checks travel with their registered factory
+
+`KernelFactory::unsupported_reason` is a pure metadata capability query on the
+same versioned factory the CPU provider will use for construction. The seven
+migrated Attention/MoE parser gates now live with that factory rather than in a
+second operator-name synchronization table. The selected factory receives the effective opset, original
+node, shapes and dtypes. The query does not call factory `create`, prepare device
+storage, initialize a thread pool or obtain an allocation grant. Existing parsers
+may produce small typed attribute values; those are metadata, not execution
+preparation. Execution and its coarse workspace/weight ownership paths do not
+call the gate.
+
+Native and linked-reference Conv share one rank rule for claim and concrete
+construction. Claim treats empty shapes conservatively as unknown rank, matching
+the current IR's scalar/unknown ambiguity; nonempty symbolic shapes retain known
+rank. Concrete construction still rejects scalar or unsupported/mismatched ranks.
+This is a shared structural capability boundary, not a performance-based decline
+or a new dynamic-rank execution guarantee.
+
+Regression tests query different registered factory revisions, verify metadata
+forwarding and zero kernel construction, preserve existing parser declines, and
+cover Conv known/unknown rank behavior. The real ORT plugin regression retains
+three unsupported MoE/attention assignments on ORT's fallback provider while their
+sessions load successfully. No additional per-op quota or scheduler is introduced.
+
+
+### Complete the factory-owned metadata boundary
+
+The remaining fifteen kernel-specific CPU claim gates now travel with their
+registered factories, including sparse attention/MoE, indexing, Gemm and
+DeformConv. Shared ONNX schema gates stay in the provider. Registry resolution
+also makes the default domain spellings (`""` and `ai.onnx`) use the same kernel
+limits; versioned Scatter and DeformConv queries use the selected factory's
+schema revision, matching construction.
+
+CompressedSparseAttention shares a plain attribute parser between claim and
+construction. Claim no longer constructs and immediately drops a kernel just to
+validate attributes. A constructor observer with a positive control covers this
+boundary. No execution buffers, pools or resource grants are prepared by it.
+
+DeformConv's previously unreachable provider check is now a factory capability
+query. The shared IR attribute parser retains its required-input and three-to-five-slot
+arity checks, with errors now naming the missing slot or invalid count. Empty claim shapes defer rank validation
+because the current IR also uses them for unknown rank; known invalid ranks are
+still rejected, and concrete execution retains strict shape validation. Tests
+cover domain aliases, BF16 schema versions and partially unknown shapes. These
+are claim-time changes; they introduce no inference-path quota operations or
+performance, RSS or CUDA execution claim.
+
+
+### STFT frames borrow one execution workspace
+
+STFT's four frame-length f32 buffers now occupy disjoint checked regions in the
+existing StepScoped execution domain. One lane serves every frame and batch;
+there is no per-frame resource admission or node-owned scratch pool. Existing
+zero initialization and DFT/vDSP arithmetic remain unchanged. The provider's
+registered planning fact declares metadata preparation.
+
+A present window supplies the exact metadata bound. Without a window, a runtime
+frame_length scalar leaves metadata preparation Deferred; execution reads the
+Host-accessible scalar and admits precisely four frames before dispatch. No
+signal-length-sized reserve, scalar-value memo or new EP API is introduced.
+Scalar reads no longer allocate a dense one-element vector. Empty batches still
+validate scalar parameters, signal/window views and accessibility, but use no
+frame scratch. Missing/short/misaligned backing fails before output writes.
+
+Controls cover poisoned reuse across changing frame lengths, independent f64
+references, strided/half input, overflow, empty-batch guards and exact Host
+refunds. A real two-node executor prepares max(48,64)=64 bytes, reuses one
+managed identity, and separately exercises scalar-only deferred preparation and
+48-to-64-byte growth. The real governor observer includes live zero-byte claim
+and refund controls; 4,096 warm checkout/execute/return cycles make no further
+issuer callbacks. This is an accounting invariant, not zero total runtime cost.
+
+Signal/window materialization, the output staging Vec and Apple DSP setup's
+internal allocations remain outside these four admitted regions. This does not
+establish complete STFT/RSS accounting, inference latency or CUDA behavior.
+
+
+### DFT mode correctness before scratch migration
+
+Inspection of the remaining DFT allocations exposed a pre-existing semantic
+error: inverse+onesided used a real input, a complex inverse and truncated
+complex output instead of IRFFT. The resource migration is kept separate while
+this contract is corrected. The shared IR mode now determines accepted input
+components, implicit transform length, output length and real/complex width.
+CPU execution, symbolic shape inference and plugin runtime sizing consume it.
+The [ONNX schemas 17/20](https://onnx.ai/onnx/operators/onnx__DFT.html) and
+[official reference](https://github.com/onnx/onnx/blob/main/onnx/reference/ops/op_dft.py)
+define the same real-inverse contract.
+
+CPU IRFFT pads/truncates positive-frequency bins, ignores imaginary DC and even-
+length Nyquist components, reconstructs the conjugate half and uses the existing
+normalized inverse transform. Its default length is twice (input bins minus
+one); explicit odd lengths are preserved. Output has one real component.
+Complete output geometry is checked before writes. Forward and full inverse
+arithmetic retain their existing compute-in-f32 contract.
+
+The cuFFT adapter has no IRFFT pack/unpack implementation. Its factory and
+claim query now explicitly reject that mode with a CPU selection instruction;
+this is not a CUDA execution result. Independent f64 sums cover odd/even sizes,
+padding/truncation and batches; a real encoded model exercises RFFT/IRFFT
+roundtrips for both schemas. Existing scalar/control, widening, output staging
+and per-batch DFT allocations still require their own workspace migration.
+
+
+### DFT batches reuse the Fourier execution lane
+
+DFT's real/imaginary input and output vectors now borrow four transform-length
+regions from the same StepScoped Host execution domain as STFT. A private
+FloatWorkspace<4> descriptor centralizes checked partitioning and initialization;
+it owns neither backing nor quota. Both operators use its closure-scoped Host
+borrows. DFT constructs one existing DftPlan per execution and reuses it across
+all batches, instead of allocating vectors and DSP setup for each transform.
+Forward/full inverse/RFFT and the newly corrected IRFFT keep their algorithms.
+
+Metadata preparation is Ready only when axis and transform length follow shape
+facts. Present runtime controls remain Deferred; execution requires readable
+control views, permits metadata-only intermediate signals for sizing, and reads
+rank-zero Host integer controls
+without a one-element Vec. Planning and run share checked geometry. Actual
+control values are read again before binding, so stale smaller backing fails
+before DSP setup or output writes. Workspace is `4 * dft_length * sizeof(f32)` bytes, independent of signal
+length, output size, batch count or the sum of graph-node requirements.
+Empty batches retain view/control/output validation and skip scratch/DSP setup.
+
+Every scratch region starts with valid +0 f32 values before references form.
+Within one call the copied positive-frequency prefix is fixed; input padding is
+never modified by the transform, and IRFFT mirroring writes only negative bins.
+Thus padding stays zero across batches without another clear or admission.
+Separate calls initialize only their requested prefix of a retained larger lane.
+The existing ownership domain still handles concurrency, growth, pressure and
+physical release; no per-frame/expert grant or kernel-owned pool is added.
+
+Controls cover poisoned and fresh uninitialized backing, canaries, odd/even
+IRFFT, truncation/padding, scalar changes at the same address, unreadable logical
+controls, overflow, missing/short/misaligned backing, and unchanged outputs on
+refusal. A live constructor positive control distinguishes one DSP plan across
+three batches from a disconnected observer. The real governor control performs
+4,096 preparation/checkout/execute/return cycles with zero further issuer calls,
+including zero-byte callback controls; an active lane cannot fund another call.
+The encoded two-node RFFT/IRFFT session uses one 128-byte peak under an exact
+Host quota, refuses at 127 bytes, reuses its managed identity and re-admits after
+idle reclamation, then settles to zero.
+
+Only these four f32 buffers are funded by the declared requirement. Input
+materialization, output staging, small rank/index metadata and vendor DSP setup
+allocations remain separate. This is not complete RSS accounting, zero total
+runtime overhead, a latency/throughput measurement or CUDA execution evidence.
+
+
+The shipping ORT plugin test disables fallback and verifies that both DFT nodes
+are assigned to cpu_ep. Full-complex and real-inverse roundtrips change runtime
+length 8/3/9/8 at unchanged input shapes, with numerical truncation/padding
+checks on both batches. It exposed an existing dtype-descriptor omission:
+DFT advertised only floats despite integer controls. The exact edge union and
+per-slot floating signal/output, integer length, and int64 axis declarations
+now agree with the kernel. The cross-crate shape fixture also receives the
+explicit forward direction required by the shared DFT shape interface.
+
+
+### RMS schemas share admitted staging and one statistics pass
+
+Standard RMSNormalization and both registrations of SimplifiedLayerNormalization
+now use one kernel with an explicit schema kind. The allocating `rms_norm_dense`
+interface and the duplicate Simplified execution path are removed. The shared
+metadata geometry checks axis, normalization/group products, broadcastability,
+contiguous stride arithmetic, floating storage and complete output shapes before
+planning a two-region StepScoped Host layout. It contains `X.numel()` f32 values
+for Y and, only when requested, one f32 inverse RMS per group. An absent optional
+statistics slot consumes no storage. No kernel-owned pool or per-row grant is
+introduced; the existing execution owner admits the graph's maximum requirement.
+
+Both checked regions are initialized before f32 references form. All groups are
+computed into staging before either output is published, preserving X/output,
+scale/output and statistics/input aliases. The same inverse RMS supplies Y and
+the optional statistic; the old second sum-of-squares pass is removed. The
+existing SIMD exact-identity path and multiply order remain intact, while only
+the general broadcast path builds rank-sized index strides. Empty outer groups
+need no scratch but still validate Host accessibility, views and outputs; an
+empty normalized width remains an error.
+
+The regression set covers fresh and poisoned scratch, prefix canaries,
+missing/short/misaligned backing, optional holes, invalid shapes/dtypes,
+overflow, aliases, half/strided inputs and exact statistic bits. A real governed
+lane executes 4,096 warm preparation/checkout/compute/return cycles without
+further issuer callbacks, including zero-byte callback controls, and refunds
+physical capacity only after idle trimming. An encoded two-schema session shares
+one 40-byte peak, refuses a 39-byte Host quota and re-admits after reclamation.
+The shipping ORT plugin test disables fallback, requires both RMS schemas on
+cpu_ep, and changes shapes 2x3/3x9/2x3 while checking Y and inverse RMS values.
+
+Input/scale widening and the general broadcast path's rank-sized stride vectors
+remain outside the staging requirement. These checks prove ownership and
+numerical behavior, not zero total allocations, inference latency, complete RSS
+accounting or CUDA execution.
+
+
+### One private initialized-float binding contract for CPU kernels
+
+DFT, STFT and both RMS schemas now use `FloatWorkspace<N>` instead of separate
+Fourier and RMS raw-pointer initialization code. A kernel supplies named f32
+region lengths, keeps its own geometry and declares the same existing
+StepScoped requirement. The descriptor uses fixed-size stack arrays and the
+existing `WorkspaceLayout`; lengths are derived from checked region byte sizes
+when binding rather than retained as a second source of truth. It owns no
+backing, quota, lock or pool. This is a CPU-private helper, not a new EP ABI.
+
+Complete capacity/alignment/address validation precedes all memory writes and
+the callback. Each region is initialized before its f32 slice exists, including
+fresh backing; empty regions use aligned dangling pointers. A higher-ranked
+closure and fixed return type keep scratch references within the synchronous
+borrow. Callers still prove Host accessibility, live exclusive ownership and
+disjointness from tensors. Their existing view, optional-output, overflow and
+empty-work guards remain in the kernels. The helper introduces no per-frame,
+row or expert admission. Scalar integer reads move to the dtype module,
+independent of workspace ownership, with invalid-view errors naming the op and
+control input.
+
+Exact source comparison preserves the DFT/STFT execution and tests and the RMS
+math core. The binding regressions retain fresh/poisoned four-buffer controls
+and cover unequal region lengths, optional empty holes, no regions,
+missing/short/misaligned/wrapping backing, no writes/callback on refusal and
+reuse after a consumer error. Scalar controls cover signed values, unaligned
+backing, byte offsets, invalid views and Host-accessible unified-memory metadata.
+Existing per-kernel and governed-lane tests, public sessions and fallback-disabled
+real ORT plugin tests remain the integration checks. Byte bounds, arithmetic,
+retention and grant/refund ownership are unchanged; no timing or CUDA-runtime
+claim is made.

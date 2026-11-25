@@ -1,3 +1,7 @@
+#[path = "support/measurements.rs"]
+mod measurements;
+use measurements::{results_without_timings, without_timings};
+
 use onnx_genai_engine::{
     ContinuousBatchDiagnostic, ContinuousBatchEvent, Engine, EngineConfig, GenerateOptions,
     GeneratePrompt, GenerateRequest, GenerateResult,
@@ -45,7 +49,10 @@ fn shared_buffer_fixture() -> anyhow::Result<tempfile::TempDir> {
 fn cpu_engine(model_dir: &Path) -> anyhow::Result<Engine> {
     Engine::from_dir_with_session_options(
         model_dir,
-        EngineConfig::default(),
+        EngineConfig {
+            decode_backend: onnx_genai_engine::EngineDecodeBackend::Ort,
+            ..Default::default()
+        },
         SessionOptions::default().with_intra_op_threads(1),
     )
 }
@@ -77,7 +84,7 @@ fn isolated_results(
     requests
         .iter()
         .cloned()
-        .map(|request| cpu_engine(fixture)?.generate(request))
+        .map(|request| cpu_engine(fixture)?.generate(request).map(without_timings))
         .collect()
 }
 
@@ -126,9 +133,12 @@ fn static_shared_batch_matches_isolated_ragged_rows() -> anyhow::Result<()> {
         "fixture must exercise the production shared-forward path"
     );
 
-    assert_eq!(engine.generate_batched_static(requests.clone())?, expected);
     assert_eq!(
-        engine.generate_batched_static(requests)?,
+        results_without_timings(engine.generate_batched_static(requests.clone())?),
+        expected
+    );
+    assert_eq!(
+        results_without_timings(engine.generate_batched_static(requests)?),
         expected,
         "a second static batch on the same engine must not inherit row state, output, or residency"
     );
@@ -147,11 +157,11 @@ fn scheduled_shared_batch_matches_isolated_through_backfill_and_row_reuse() -> a
     );
 
     assert_eq!(
-        engine.run_continuous_batch_scheduled(requests.clone(), 2)?,
+        results_without_timings(engine.run_continuous_batch_scheduled(requests.clone(), 2)?),
         expected
     );
     assert_eq!(
-        engine.run_continuous_batch_scheduled(requests, 2)?,
+        results_without_timings(engine.run_continuous_batch_scheduled(requests, 2)?),
         expected,
         "two physical rows must retire unequal requests, backfill and reuse slots without \
          carrying prior output, RNG, completion, state ownership, or residency"
@@ -189,7 +199,7 @@ fn live_row_residency_journal_and_completion_ownership_survive_backfill() -> any
         for event in manager.poll() {
             if let ContinuousBatchEvent::Finished { handle, result } = event {
                 assert!(
-                    completed.insert(handle, result).is_none(),
+                    completed.insert(handle, without_timings(result)).is_none(),
                     "handle {handle:?} completed more than once"
                 );
             }
@@ -288,7 +298,7 @@ fn shared_row_abort_restores_only_that_row_and_retry_matches_isolated() -> anyho
         for event in manager.poll() {
             match event {
                 ContinuousBatchEvent::Finished { handle, result } => {
-                    completed.insert(handle, result);
+                    completed.insert(handle, without_timings(result));
                 }
                 ContinuousBatchEvent::Aborted { error, .. } => {
                     anyhow::bail!("retry unexpectedly aborted: {error}")

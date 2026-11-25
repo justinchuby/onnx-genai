@@ -1,0 +1,176 @@
+{
+  "generator": "nxrt original stereo tone; ffmpeg independent PCM oracle",
+  "cases": [
+    {
+      "file": "pcm-u8.wav",
+      "codec": "pcm_u8",
+      "sample_rate": 16000,
+      "reference": "pcm-u8.wav.f32le",
+      "frames": 1600,
+      "sha256": "2022e2c0c6f16382c6a2a9505175be12e91c7eb17f368a1adb5d8bd9142f78d3",
+      "reference_policy": "decoded_stream",
+      "max_error": 1e-07
+    },
+    {
+      "file": "pcm-s16.wav",
+      "codec": "pcm_s16le",
+      "sample_rate": 16000,
+      "reference": "pcm-s16.wav.f32le",
+      "frames": 1600,
+      "sha256": "e817d20300c8e1b9c6bd418f641c43905e538ccf2ff34abb998285821f594c8d",
+      "reference_policy": "decoded_stream",
+      "max_error": 1e-07
+    },
+    {
+      "file": "pcm-s24.wav",
+      "codec": "pcm_s24le",
+      "sample_rate": 16000,
+      "reference": "pcm-s24.wav.f32le",
+      "frames": 1600,
+      "sha256": "033bb5199227bbde17de713c150111c48dbaa0ef1a202b225db814a97617d76e",
+      "reference_policy": "decoded_stream",
+      "max_error": 1e-07
+    },
+    {
+      "file": "pcm-s32.wav",
+      "codec": "pcm_s32le",
+      "sample_rate": 16000,
+      "reference": "pcm-s32.wav.f32le",
+      "frames": 1600,
+      "sha256": "c43cada497054d2ede8792fd78fed35787f88b0fcf67d1bb5fd849bfa3aad4e4",
+      "reference_policy": "decoded_stream",
+      "max_error": 1e-07
+    },
+    {
+      "file": "pcm-f32.wav",
+      "codec": "pcm_f32le",
+      "sample_rate": 16000,
+      "reference": "pcm-f32.wav.f32le",
+      "frames": 1600,
+      "sha256": "58ea1f8023103a4e47bfad2dc4c555e306572664e8de3cd5d3075a8292fbdb5a",
+      "reference_policy": "decoded_stream",
+      "max_error": 1e-07
+    },
+    {
+      "file": "pcm-f64.wav",
+      "codec": "pcm_f64le",
+      "sample_rate": 16000,
+      "reference": "pcm-f64.wav.f32le",
+      "frames": 1600,
+      "sha256": "ba5118268c2fdb1bc3c26c80fd2f3a9e1142d36053fa1bf58801a0908679c245",
+      "reference_policy": "decoded_stream",
+      "max_error": 1e-07
+    },
+    {
+      "file": "ima-adpcm.wav",
+      "codec": "adpcm_ima_wav",
+      "sample_rate": 16000,
+      "reference": "ima-adpcm.wav.f32le",
+      "frames": 2034,
+      "sha256": "bb9573d691a6173796bbdf5a276108257c25f72a484d3ed3c6b2981643cc21e9",
+      "reference_policy": "decoded_stream",
+      "max_error": 0.001
+    },
+    {
+      "file": "tone.flac",
+      "codec": "flac",
+      "sample_rate": 16000,
+      "reference": "tone.flac.f32le",
+      "frames": 1600,
+      "sha256": "4e06b50f495f0495cd02acf10b300439146c55b39b5b9eb7f608d90707598efb",
+      "reference_policy": "decoded_stream",
+      "max_error": 1e-07
+    },
+    {
+      "file": "vorbis.ogg",
+      "codec": "vorbis",
+      "sample_rate": 16000,
+      "reference": "vorbis.ogg.f32le",
+      "frames": 1600,
+      "sha256": "62d2ea37cf0b3e4448dfeeaf0112fe01ba9936efcc5cfda7ab3f44a81da87a03",
+      "reference_policy": "vorbis_eos_granule_1600",
+      "max_error": 0.0002
+    },
+    {
+      "file": "aac.aac",
+      "codec": "aac",
+      "sample_rate": 16000,
+      "reference": "aac.aac.f32le",
+      "frames": 3072,
+      "sha256": "b2de4cd2efe0e98a2b0d95f8b3201df137ea835daaec75380dfed9f981a941a9",
+      "reference_policy": "decoded_stream",
+      "max_error": 0.0002
+    },
+    {
+      "file": "aac.m4a",
+      "codec": "aac",
+      "sample_rate": 16000,
+      "reference": "aac.m4a.f32le",
+      "frames": 2624,
+      "sha256": "ea5527d3635cf1eb99a23220228216a7d09abe10a0852014ce3efb815bb4c957",
+      "reference_policy": "media_samples_without_mp4_edits",
+      "max_error": 0.0002
+    },
+    {
+      "file": "alac.m4a",
+      "codec": "alac",
+      "sample_rate": 16000,
+      "reference": "alac.m4a.f32le",
+      "frames": 1600,
+      "sha256": "8ea7804dabe5631e04c45747e780c89624ad1fabcd47361f96c71a20db16277c",
+      "reference_policy": "media_samples_without_mp4_edits",
+      "max_error": 1e-07
+    },
+    {
+      "file": "pcm.aiff",
+      "codec": "pcm_s16be",
+      "sample_rate": 16000,
+      "reference": "pcm.aiff.f32le",
+      "frames": 1600,
+      "sha256": "6d0cb1822eedacbc761855ccc14d3f53b0b1cd1ac00c50f5572fe490d8e04dd7",
+      "reference_policy": "decoded_stream",
+      "max_error": 1e-07
+    },
+    {
+      "file": "pcm.caf",
+      "codec": "pcm_s16le",
+      "sample_rate": 16000,
+      "reference": "pcm.caf.f32le",
+      "frames": 1600,
+      "sha256": "ea35fd1b36e8cdbfe4125cf14f7d9c220c50e441457685593fa3a871e33ad356",
+      "reference_policy": "decoded_stream",
+      "max_error": 1e-07
+    },
+    {
+      "file": "flac.mka",
+      "codec": "flac",
+      "sample_rate": 16000,
+      "reference": "flac.mka.f32le",
+      "frames": 1600,
+      "sha256": "849280b742bb67ae8a49ec8814013cd6b82308a9577470c0847ec76781573816",
+      "reference_policy": "decoded_stream",
+      "max_error": 1e-07
+    },
+    {
+      "file": "flac.oga",
+      "codec": "flac",
+      "sample_rate": 16000,
+      "reference": "flac.oga.f32le",
+      "frames": 1600,
+      "sha256": "42505f788cd3472b0c920489cd2c6112ff3b8dc23480a5bb1cf350ed28b99563",
+      "reference_policy": "decoded_stream",
+      "max_error": 1e-07
+    },
+    {
+      "file": "mpeg2.mp2",
+      "codec": "mp2",
+      "sample_rate": 16000,
+      "reference": "mpeg2.mp2.f32le",
+      "frames": 2304,
+      "sha256": "7a89267e6267990c514de9cd31ab3655d9bbc9ae111bdfdb383cc332c7494cea",
+      "reference_policy": "decoded_stream",
+      "max_error": 0.0002
+    }
+  ],
+  "ffmpeg_version": "9.0.2"
+}

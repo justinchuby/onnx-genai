@@ -1114,9 +1114,39 @@ mod mtp_execution_tests {
                 ..Default::default()
             },
         };
-        let result = engine.generate(request.clone())?;
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = progress.clone();
+        let control = crate::GenerationControl::new().with_prompt_progress(move |update| {
+            sink.lock().unwrap().push(update);
+            Ok(())
+        });
+        let mut tokens = Vec::new();
+        let result = engine.generate_with_control_callbacks(
+            request.clone(),
+            control,
+            None,
+            Some(&mut |token| {
+                tokens.push(token);
+                Ok(())
+            }),
+        )?;
+        let timing = result.timings.context("Native MTP timing report")?;
+        assert_eq!(timing.prompt_tokens, 2);
+        assert_eq!(timing.cached_prompt_tokens, 0);
+        assert_eq!(timing.generated_tokens, 6);
+        assert!(!timing.prompt_elapsed.is_zero());
+        assert!(!timing.generation_elapsed.is_zero());
+        assert_eq!(tokens.last().unwrap().timings, result.timings);
+        for (index, token) in tokens.iter().enumerate() {
+            assert_eq!(token.timings.unwrap().generated_tokens, index + 1);
+        }
+        let progress = progress.lock().unwrap();
+        assert_eq!(progress.len(), 2);
+        assert_eq!(progress[0].processed, 0);
+        assert_eq!(progress[1].processed, 2);
+        assert_eq!(progress[1].elapsed, timing.prompt_elapsed);
         let mut baseline = crate::Engine::from_dir(&root, crate::EngineConfig::default())?;
-        let ordinary = baseline.generate(request)?;
+        let ordinary = baseline.generate(request.clone())?;
         anyhow::ensure!(
             result.token_ids == ordinary.token_ids,
             "Native MTP changed greedy target tokens: {:?} vs {:?}",
@@ -1128,10 +1158,56 @@ mod mtp_execution_tests {
             "Native MTP did not produce the requested token budget"
         );
         let stats = engine.last_speculative_stats();
+        assert_eq!(timing.speculative, Some(stats));
+        for token in &tokens {
+            let snapshot = token
+                .timings
+                .unwrap()
+                .speculative
+                .expect("Native MTP counter snapshot");
+            assert!(snapshot.proposed_tokens > 0);
+            assert!(snapshot.accepted_tokens <= snapshot.proposed_tokens);
+            assert!(snapshot.proposed_tokens <= stats.proposed_tokens);
+        }
         anyhow::ensure!(
             stats.proposed_tokens > 0 && stats.verification_steps > 0,
             "Native MTP did not actually propose and verify: {stats:?}"
         );
+        for boundary in [
+            crate::GenerationBoundary::AfterProposer,
+            crate::GenerationBoundary::AfterVerifier,
+        ] {
+            let authority = crate::GenerationControl::new();
+            let cancel = authority.clone();
+            let control = authority.with_checkpoint(move |observed| {
+                if observed == boundary {
+                    cancel.cancel();
+                }
+                Ok(())
+            });
+            let mut output = Vec::new();
+            let error = engine
+                .generate_with_control_callbacks(
+                    request.clone(),
+                    control,
+                    None,
+                    Some(&mut |token| {
+                        output.push(token);
+                        Ok(())
+                    }),
+                )
+                .unwrap_err();
+            assert!(
+                error.downcast_ref::<crate::GenerationCancelled>().is_some(),
+                "{error:#}"
+            );
+            assert!(output.is_empty());
+            assert_eq!(
+                engine.generate(request.clone())?.token_ids,
+                ordinary.token_ids,
+                "Native MTP retry after {boundary:?}"
+            );
+        }
         Ok(())
     }
 }

@@ -428,11 +428,17 @@ fn hex(bytes: &[u8]) -> String {
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    pub sse_ping_interval: crate::SsePingInterval,
     pub api_keys: crate::ApiKeys,
     /// Node-level identifier reported by `GET /v1/status` for the cluster router
     /// (§34.8). Independent of any model; defaults to the hostname or a generated id.
     pub node_id: String,
     pub max_output_tokens: usize,
+    pub max_transcription_input_tokens: std::num::NonZeroUsize,
+    pub max_transcription_prompt_bytes: std::num::NonZeroUsize,
+    pub max_transcription_template_operations: std::num::NonZeroU64,
+    pub max_transcription_frames: std::num::NonZeroUsize,
+    pub max_transcription_text_bytes: std::num::NonZeroUsize,
     pub realtime: crate::realtime::RealtimeLimits,
     /// Enable the upstream POST /props acknowledgement; no mutation schema exists upstream.
     pub endpoint_props: bool,
@@ -451,6 +457,8 @@ pub struct ServerConfig {
     pub max_rerank_documents: std::num::NonZeroUsize,
     /// Unique encoded image bytes retained by one reranking request.
     pub max_rerank_media_bytes: std::num::NonZeroUsize,
+    /// Unique encoded image bytes retained by one SystemOne request.
+    pub max_decision_media_bytes: std::num::NonZeroUsize,
     /// Maximum tokens per decision prompt variant.
     pub max_decision_input_tokens: std::num::NonZeroUsize,
     /// Maximum rendered prompt bytes before decision tokenization.
@@ -514,6 +522,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         let decision = onnx_genai_engine::decision::DecisionLimits::default();
         Self {
+            sse_ping_interval: crate::SsePingInterval::default(),
             api_keys: crate::ApiKeys::default(),
             node_id: default_node_id(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
@@ -531,6 +540,22 @@ impl Default for ServerConfig {
             max_rerank_documents: std::num::NonZeroUsize::new(128)
                 .expect("positive default reranking document budget"),
             max_rerank_media_bytes: std::num::NonZeroUsize::new(64 * 1024 * 1024).unwrap(),
+            max_decision_media_bytes: std::num::NonZeroUsize::new(64 * 1024 * 1024).unwrap(),
+            max_transcription_input_tokens:
+                onnx_genai_engine::transcription::generative::PromptLimits::default()
+                    .max_input_tokens,
+            max_transcription_prompt_bytes:
+                onnx_genai_engine::transcription::generative::PromptLimits::default()
+                    .template
+                    .max_output_bytes,
+            max_transcription_template_operations:
+                onnx_genai_engine::transcription::generative::PromptLimits::default()
+                    .template
+                    .max_operations,
+            max_transcription_frames:
+                onnx_genai_engine::transcription::TranscriptionLimits::default().max_frames,
+            max_transcription_text_bytes:
+                onnx_genai_engine::transcription::TranscriptionLimits::default().max_text_bytes,
             max_decision_input_tokens: decision.max_input_tokens,
             max_decision_prompt_bytes: decision.template.max_output_bytes,
             max_decision_template_operations: decision.template.max_operations,

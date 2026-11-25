@@ -513,6 +513,16 @@ impl Default for EinsumFactory {
 }
 
 impl KernelFactory for EinsumFactory {
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        opset: u64,
+        shapes: &[onnx_runtime_ir::Shape],
+        input_dtypes: &[DataType],
+    ) -> Option<String> {
+        unsupported_reason_for_opset(node, opset, shapes, input_dtypes)
+    }
+
     fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let equation = equation(node)?;
         let input_shape_refs: Vec<_> = input_shapes.iter().map(Vec::as_slice).collect();
@@ -721,7 +731,7 @@ impl Kernel for EinsumKernel {
         true
     }
 
-    fn may_produce_views(&self) -> bool {
+    fn may_produce_views(&self, _input_dtypes: &[DataType]) -> bool {
         self.mode == EinsumExecutionMode::Optimized
             && matches!(
                 self.plan.planning_classification(),
