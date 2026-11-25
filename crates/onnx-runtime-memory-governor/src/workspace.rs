@@ -5,6 +5,7 @@
 //! admission; pressure releases only idle slots, outside every pool lock.
 //! Device work with pending fences must keep its owner outside this Host pool.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::{
@@ -68,7 +69,7 @@ struct IdleSlot {
 }
 #[derive(Debug, Default)]
 struct IdleSlots {
-    slots: Mutex<Vec<IdleSlot>>,
+    slots: Mutex<VecDeque<IdleSlot>>,
 }
 impl IdleSlots {
     fn release(&self, want: u64) -> Result<u64, WorkspacePoolError> {
@@ -79,11 +80,9 @@ impl IdleSlots {
                     .slots
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if slots.is_empty() {
-                    None
-                } else {
-                    Some(slots.remove(0))
-                }
+                // Pop in the same logical order without shifting all remaining
+                // owners for every physical release in a pressure sweep.
+                slots.pop_front()
             };
             let Some(slot) = slot else { break };
             released = released.saturating_add(self.release_slot(slot)?);
@@ -320,7 +319,10 @@ impl HostWorkspacePool {
                 .min_by_key(|(_, slot)| slot.owner.len())
                 .map(|(index, _)| index)
             {
-                return Ok(slots.swap_remove(index).owner);
+                return Ok(slots
+                    .swap_remove_back(index)
+                    .expect("index came from the same locked idle queue")
+                    .owner);
             }
             // Replace an existing lane instead of accumulating an idle slot
             // for every shape. Within one role, simultaneous checkouts add lanes.
@@ -330,7 +332,11 @@ impl HostWorkspacePool {
                 .filter(|(_, slot)| slot.role == role)
                 .max_by_key(|(_, slot)| slot.owner.len())
                 .map(|(index, _)| index)
-                .map(|index| slots.swap_remove(index))
+                .map(|index| {
+                    slots
+                        .swap_remove_back(index)
+                        .expect("index came from the same locked idle queue")
+                })
         };
         if let Some(old) = replacement {
             bytes = bytes.max(old.owner.len());
@@ -341,7 +347,7 @@ impl HostWorkspacePool {
                     .slots
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(old);
+                    .push_back(old);
                 return Err(WorkspacePoolError::InvalidRequest {
                     bytes,
                     alignment,
@@ -410,7 +416,7 @@ impl HostWorkspacePool {
             .slots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(IdleSlot {
+            .push_back(IdleSlot {
                 owner: allocation,
                 role,
             });
@@ -589,6 +595,83 @@ mod tests {
             assert!(pool.checkout(bytes, alignment, role).is_err());
         }
         assert_eq!(books.callbacks(), before);
+    }
+
+    #[test]
+    fn partial_pressure_and_best_fit_reuse_preserve_idle_order_and_exact_charges() {
+        let (books, manager, _, pool) = fixture(576);
+        // Hold all lanes simultaneously so each has independent physical ownership.
+        let owners: Vec<_> = (1..=8)
+            .map(|n| pool.checkout(n * 16, 16, ROLE).unwrap())
+            .collect();
+        let identities: Vec<_> = owners.iter().map(|owner| owner.identity()).collect();
+        let wrappers: Vec<_> = owners
+            .iter()
+            .map(|owner| std::ptr::from_ref(owner.as_ref()))
+            .collect();
+        for owner in owners {
+            pool.recycle_completed(owner).unwrap();
+        }
+        let callbacks = books.callbacks();
+        assert_eq!(books.used(Tier::Host), 576);
+        // Release the first five slots, rounding to whole lane ownership.
+        assert_eq!(pool.trim_idle(239).unwrap(), 240);
+        assert_eq!(books.used(Tier::Host), 336);
+        assert_eq!(manager.process_used(Tier::Host), 336);
+        let remaining: Vec<_> = manager
+            .snapshot()
+            .unwrap()
+            .allocations
+            .iter()
+            .map(|allocation| allocation.identity)
+            .collect();
+        assert_eq!(remaining.len(), 3);
+        for identity in &identities[..5] {
+            assert!(!remaining.contains(identity));
+        }
+        for identity in &identities[5..] {
+            assert!(remaining.contains(identity));
+        }
+        let after_pressure = books.callbacks();
+        assert_eq!(after_pressure, (callbacks.0, callbacks.1 + 5));
+        let warm = pool.checkout(1, 16, ROLE).unwrap();
+        assert_eq!(
+            warm.identity(),
+            identities[5],
+            "best fit must reuse 96 bytes"
+        );
+        assert_eq!(std::ptr::from_ref(warm.as_ref()), wrappers[5]);
+        pool.recycle_completed(warm).unwrap();
+        assert_eq!(
+            books.callbacks(),
+            after_pressure,
+            "warm use must not contact the issuer"
+        );
+        // Best-fit swap removal preserves the existing logical idle order:
+        // [96,112,128] -> [128,112] -> [128,112,96].
+        assert_eq!(pool.trim_idle(1).unwrap(), 128);
+        assert_eq!(books.used(Tier::Host), 208);
+        let remaining = manager.snapshot().unwrap();
+        assert_eq!(remaining.allocations.len(), 2);
+        assert!(
+            !remaining
+                .allocations
+                .iter()
+                .any(|a| a.identity == identities[7])
+        );
+        let before_warm = books.callbacks();
+        for _ in 0..128 {
+            let warm = pool.checkout(1, 16, ROLE).unwrap();
+            assert_eq!(warm.identity(), identities[5]);
+            assert_eq!(std::ptr::from_ref(warm.as_ref()), wrappers[5]);
+            pool.recycle_completed(warm).unwrap();
+        }
+        assert_eq!(books.callbacks(), before_warm);
+        assert_eq!(pool.trim_idle(u64::MAX).unwrap(), 208);
+        assert_eq!(books.used(Tier::Host), 0);
+        assert_eq!(manager.process_used(Tier::Host), 0);
+        assert_eq!(books.callbacks(), (callbacks.0, callbacks.1 + 8));
+        assert!(manager.snapshot().unwrap().allocations.is_empty());
     }
 
     #[test]
