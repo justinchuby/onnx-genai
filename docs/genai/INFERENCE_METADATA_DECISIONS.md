@@ -2252,5 +2252,21 @@ errors. The established convenience recipe and Slaney filter reference values
 remain numerically unchanged. Centered reflection and terminal-frame discard
 remain explicit implementation conventions; other windows/scales fail closed.
 No new serialized field or adapter ABI is needed for this geometry change.
-This does not repair broader transform SSA/source execution or add pure-waveform
-programs; those remain required follow-up work.
+Transform SSA/source execution and pure-waveform programs follow the explicit
+semantics below.
+
+## Audio programs execute typed processor-local values
+
+Audio compilation resolves each transform's explicit input or preceding value
+to a typed value ID. Names have unique producers; output `source` binds the exact
+computed result. Output roles validate waveform/features/mask/sample-length/frame-
+length types rather than selecting a global final tensor. Branches, omitted
+inputs, population-variance waveform normalization, rescaling, left/right/batch
+padding, trimming and validity publication now execute directly. Raw log-mel and
+its separately declared normalization are distinct values; no implicit resample
+or normalization is applied by the program. `emit_valid_frames` requires a hop
+when reading waveform instead of borrowing an unrelated branch's analysis rate.
+Unsupported operations fail during compilation instead of silently doing nothing.
+These existing fields need no schema bump; pre-release metadata callers must
+author the transforms they need. Both admitted audio adapter ABIs execute these
+semantics. See [executable audio preprocessing](../AUDIO_PREPROCESSING.md).
