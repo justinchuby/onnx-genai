@@ -12,8 +12,10 @@ use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
 use super::dft::DftPlan;
-use super::fourier_workspace::{FourierWorkspace, scalar_i64};
-use crate::dtype::{to_dense_f32_widen, validate_f32_widen_input, write_dense_f32_narrow};
+use super::float_workspace::FloatWorkspace;
+use crate::dtype::{
+    scalar_i64, to_dense_f32_widen, validate_f32_widen_input, write_dense_f32_narrow,
+};
 
 pub struct StftFactory;
 
@@ -177,8 +179,17 @@ impl StftKernel {
         Ok(frame_length)
     }
 
-    fn scratch_layout(frame_length: usize, batch: usize) -> Result<FourierWorkspace> {
-        FourierWorkspace::new("STFT", frame_length, batch != 0)
+    fn scratch_layout(frame_length: usize, batch: usize) -> Result<FloatWorkspace<4>> {
+        let len = if batch == 0 { 0 } else { frame_length };
+        FloatWorkspace::new(
+            "STFT",
+            [
+                ("frame real", len),
+                ("frame imaginary", len),
+                ("spectrum real", len),
+                ("spectrum imaginary", len),
+            ],
+        )
     }
 
     fn requirement(frame_length: usize, batch: usize) -> Result<WorkspaceRequirement> {

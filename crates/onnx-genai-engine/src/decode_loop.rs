@@ -513,13 +513,13 @@ pub(crate) fn finish_result(
     finish_reason: FinishReason,
     prefix_cache_hit_len: usize,
     logprobs: Option<&[TokenLogprob]>,
-    preserved_tokens: &std::collections::BTreeSet<TokenId>,
+    options: &GenerateOptions,
 ) -> anyhow::Result<GenerateResult> {
     Ok(GenerateResult {
         timings: None,
         retained_cache_tokens: 0,
-        text: crate::tokenization::decode_output(tokenizer, generated_tokens, preserved_tokens)?,
-        preserved_tokens: preserved_tokens.clone(),
+        text: crate::tokenization::decode_generation_output(tokenizer, generated_tokens, options)?,
+        preserved_tokens: options.effective_preserved_tokens(),
         token_ids: generated_tokens.to_vec(),
         finish_reason,
         tool_calls: Vec::new(),
@@ -860,7 +860,7 @@ mod tests {
                         finish,
                         0,
                         None,
-                        &options.effective_preserved_tokens(),
+                        &options,
                     )?;
                     assert_eq!(result.token_ids, [3]);
                     assert_eq!(result.text, text);

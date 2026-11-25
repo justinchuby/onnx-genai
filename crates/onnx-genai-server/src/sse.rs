@@ -94,6 +94,10 @@ pub(crate) struct ChunkToolCallFunction {
 #[derive(Debug)]
 pub(crate) struct StopBoundaryBuffer {
     stop_sequences: Vec<String>,
+    minimum_indent: usize,
+    indent_prefix: Option<usize>,
+    indent_holding: bool,
+    published: String,
     state: StopBoundaryState,
 }
 
@@ -110,11 +114,66 @@ impl StopBoundaryBuffer {
                 .into_iter()
                 .filter(|sequence| !sequence.is_empty())
                 .collect(),
+            minimum_indent: 0,
+            indent_prefix: None,
+            indent_holding: false,
+            published: String::new(),
             state: StopBoundaryState::Holding(String::new()),
         }
     }
 
+    pub(crate) fn with_minimum_indent(mut self, minimum: usize) -> Self {
+        self.minimum_indent = minimum;
+        self
+    }
+
     pub(crate) fn push(&mut self, text: &str) -> String {
+        let safe = self.push_stops(text);
+        let end = if self.minimum_indent == 0 {
+            safe.len()
+        } else if self.indent_holding {
+            0
+        } else {
+            let mut end = safe.len();
+            for (offset, character) in safe.char_indices() {
+                if let Some(count) = self.indent_prefix {
+                    if matches!(character, ' ' | '\t') {
+                        self.indent_prefix = Some(count.saturating_add(1));
+                    } else if count < self.minimum_indent {
+                        // Future observations may invalidate this line, even
+                        // when its first bytes arrived inside an earlier token.
+                        self.indent_holding = true;
+                        end = offset;
+                        break;
+                    } else if character == '\n' {
+                        self.indent_prefix = Some(0);
+                    } else {
+                        self.indent_prefix = None;
+                    }
+                } else if character == '\n' {
+                    self.indent_prefix = Some(0);
+                }
+            }
+            end
+        };
+        let emitted = safe[..end].to_owned();
+        self.published.push_str(&emitted);
+        emitted
+    }
+
+    /// Resolve withheld text against the authoritative committed final output.
+    pub(crate) fn finish(&mut self, final_text: &str) -> anyhow::Result<String> {
+        let final_text = text_before_stop(final_text, &self.stop_sequences);
+        let tail = final_text.strip_prefix(&self.published).context(
+            "committed final text does not preserve its published stream prefix; repair incremental decoding/output-boundary consistency"
+        )?.to_owned();
+        self.published.push_str(&tail);
+        self.state = StopBoundaryState::Stopped;
+        self.indent_holding = true;
+        Ok(tail)
+    }
+
+    fn push_stops(&mut self, text: &str) -> String {
         let StopBoundaryState::Holding(pending) = &mut self.state else {
             return String::new();
         };
@@ -138,13 +197,6 @@ impl StopBoundaryBuffer {
         let safe = pending[..emit_len].to_owned();
         pending.drain(..emit_len);
         safe
-    }
-
-    pub(crate) fn flush(&mut self) -> String {
-        match &mut self.state {
-            StopBoundaryState::Holding(pending) => std::mem::take(pending),
-            StopBoundaryState::Stopped => String::new(),
-        }
     }
 
     pub(crate) fn discard_pending(&mut self) {
@@ -571,9 +623,10 @@ pub(crate) fn done_chunk_with_stop(
         created,
         model,
         match reason {
-            FinishReason::MaxTokens | FinishReason::Length | FinishReason::PredictionTimeLimit => {
-                "length"
-            }
+            FinishReason::MaxTokens
+            | FinishReason::Length
+            | FinishReason::IndentationLimit
+            | FinishReason::PredictionTimeLimit => "length",
             FinishReason::ToolCalls => "tool_calls",
             _ => "stop",
         },
@@ -818,6 +871,35 @@ mod reasoning_wire_tests {
 mod stop_boundary_tests {
     use super::*;
     #[test]
+    fn indentation_publication_holds_only_potentially_retracted_content() {
+        let mut buffer = StopBoundaryBuffer::new(vec![]).with_minimum_indent(2);
+        assert_eq!(buffer.push("α\n bad"), "α\n ");
+        assert_eq!(buffer.push("suffix"), "");
+        assert_eq!(buffer.finish("α\n ").unwrap(), "");
+        let mut buffer = StopBoundaryBuffer::new(vec![]).with_minimum_indent(2);
+        assert_eq!(buffer.push("head\n\t body\n"), "head\n\t body\n");
+        assert_eq!(buffer.push("\n"), "");
+        assert_eq!(buffer.finish("head\n\t body\n").unwrap(), "");
+        // Budget exhaustion before the delayed check retains the original line.
+        let mut buffer = StopBoundaryBuffer::new(vec![]).with_minimum_indent(2);
+        assert_eq!(buffer.push("head\n bad"), "head\n ");
+        assert_eq!(buffer.finish("head\n bad").unwrap(), "bad");
+    }
+
+    #[test]
+    fn final_projection_rejects_a_changed_already_published_prefix() {
+        let mut buffer = StopBoundaryBuffer::new(vec![]).with_minimum_indent(2);
+        assert_eq!(buffer.push("head\n "), "head\n ");
+        assert!(
+            buffer
+                .finish("other")
+                .unwrap_err()
+                .to_string()
+                .contains("published stream prefix")
+        );
+    }
+
+    #[test]
     fn stop_boundaries_are_terminal_and_preserve_every_unicode_split() {
         let text = "hello停住hidden";
         for (split, _) in text
@@ -828,12 +910,12 @@ mod stop_boundary_tests {
             let mut output = buffer.push(&text[..split]);
             output.push_str(&buffer.push(&text[split..]));
             output.push_str(&buffer.push("later bytes"));
-            output.push_str(&buffer.flush());
+            output.push_str(&buffer.finish(text).unwrap());
             assert_eq!(output, "hello", "split={split}");
         }
         let mut buffer = StopBoundaryBuffer::new(vec!["停住".into()]);
         assert_eq!(buffer.push("hello停"), "hello");
-        assert_eq!(buffer.flush(), "停");
+        assert_eq!(buffer.finish("hello停").unwrap(), "停");
     }
 }
 

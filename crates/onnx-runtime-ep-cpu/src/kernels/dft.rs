@@ -18,8 +18,10 @@ use onnx_runtime_ir::{
     dft::{self, DftMode},
 };
 
-use super::fourier_workspace::{FourierWorkspace, scalar_i64};
-use crate::dtype::{to_dense_f32_widen, validate_f32_widen_input, write_dense_f32_narrow};
+use super::float_workspace::FloatWorkspace;
+use crate::dtype::{
+    scalar_i64, to_dense_f32_widen, validate_f32_widen_input, write_dense_f32_narrow,
+};
 
 /// Dispatch counter for the vDSP Accelerate DFT fast path.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -141,8 +143,17 @@ struct DftGeometry {
 }
 
 impl DftGeometry {
-    fn workspace<T: Copy + Default>(&self) -> Result<FourierWorkspace<T>> {
-        FourierWorkspace::new("DFT", self.n, self.batches != 0)
+    fn workspace<T: Float>(&self) -> Result<FloatWorkspace<4, T>> {
+        let len = if self.batches == 0 { 0 } else { self.n };
+        FloatWorkspace::new(
+            "DFT",
+            [
+                ("real input", len),
+                ("imaginary input", len),
+                ("real output", len),
+                ("imaginary output", len),
+            ],
+        )
     }
 
     fn requirement(&self) -> Result<onnx_runtime_ep_api::WorkspaceRequirement> {
@@ -468,7 +479,7 @@ impl DftKernel {
         }
     }
 
-    fn transform_batches<T: Copy + Default + std::ops::Neg<Output = T>, D: AsRef<[T]>>(
+    fn transform_batches<T: Float, D: AsRef<[T]>>(
         &self,
         geometry: &DftGeometry,
         input: &TensorView<'_>,
@@ -496,7 +507,7 @@ impl DftKernel {
             plan.with_buffers(workspace, |[real_in, imag_in, real_out, imag_out]| {
                 let data = read()?;
                 let input_data = data.as_ref();
-                let mut output_data = vec![T::default(); geometry.output_elements];
+                let mut output_data = vec![T::zero(); geometry.output_elements];
                 let mut batch_indices = vec![0usize; batch_shape.len()];
                 let copied = geometry.signal_len.min(self.mode.input_length(geometry.n));
                 for _ in 0..geometry.batches {
@@ -519,9 +530,9 @@ impl DftKernel {
                     // The plan never mutates its input. Positive-frequency padding
                     // stays zero between batches; mirrors touch only negative bins.
                     if self.mode == DftMode::RealInverse {
-                        imag_in[0] = T::default();
+                        imag_in[0] = T::zero();
                         if geometry.n.is_multiple_of(2) {
-                            imag_in[geometry.n / 2] = T::default();
+                            imag_in[geometry.n / 2] = T::zero();
                         }
                         for i in 1..geometry.n.div_ceil(2) {
                             real_in[geometry.n - i] = real_in[i];

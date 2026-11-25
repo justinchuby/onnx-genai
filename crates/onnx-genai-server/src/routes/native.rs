@@ -188,6 +188,8 @@ struct PreparedNative {
 }
 
 struct NativeFinalMetadata {
+    tokenizer: Arc<onnx_genai_ort::Tokenizer>,
+    minimum_indent: usize,
     model: String,
     prompt: String,
     slot: Option<usize>,
@@ -223,7 +225,7 @@ impl NativeFinalMetadata {
             "repeat_last_n":options.penalty_window.map_or(json!(-1), |n| json!(n)),
             "presence_penalty":options.presence_penalty,"frequency_penalty":options.frequency_penalty,
             "adaptive_target":options.adaptive_p.target,"adaptive_decay":options.adaptive_p.decay,
-            "n_predict":budget,"max_tokens":budget,"ignore_eos":!options.stop_on_eos,
+            "n_predict":budget,"max_tokens":budget,"n_indent":options.minimum_indent,"ignore_eos":!options.stop_on_eos,
             "stream":request.sampling.stream,"stop":stops,"samplers":stages,
             "n_probs":options.top_logprobs.unwrap_or(0),"post_sampling_probs":request.probabilities.post,
             "cache_prompt":!options.cold_start,"preserved_tokens":options.effective_preserved_tokens(),
@@ -260,6 +262,7 @@ impl NativeFinalMetadata {
             settings["dry_sequence_breakers"] = json!(request.sampling.dry_sequence_breakers);
         }
         Ok(Self {
+            tokenizer:handle.tokenizer.clone(), minimum_indent:options.minimum_indent,
             model:handle.id.clone(),
             prompt:handle.tokenizer.decode_with_special_tokens(tokens).map_err(|error| ApiError::invalid_request(format!("native response prompt detokenization failed: {error}; repair the package tokenizer or send valid token IDs")))?,
             slot:handle.engine.native_slot.as_ref().map(|_| 0),
@@ -679,6 +682,7 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
             });
         }
     };
+    let minimum_indent = options.minimum_indent;
     let probabilities = ProbabilityOutput::new(request.probabilities, &handle.tokenizer)?;
     let prompt_tokens = tokens.len();
     let generation = if let Some(suffix) = &request.suffix {
@@ -745,7 +749,7 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
             return_tokens,
             false,
             index,
-        );
+        )?;
         probabilities.decorate_result(&mut value, &result, &handle.tokenizer, &stops)?;
         return Ok(NativeOutput::Buffered(response_fields.project(value)));
     }
@@ -753,7 +757,8 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(16);
     let (completed, outcome) = oneshot::channel();
     tokio::spawn(async move {
-        let mut stop_buffer = StopBoundaryBuffer::new(stops.clone());
+        let mut stop_buffer =
+            StopBoundaryBuffer::new(stops.clone()).with_minimum_indent(minimum_indent);
         let mut published = String::new();
         loop {
             let event = tokio::select! { _ = tx.closed() => break, event = source.recv() => event };
@@ -793,14 +798,22 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
                 }
                 Some(DriverEvent::WorkflowPublications(_)) => continue,
                 Some(DriverEvent::Finished(result)) => {
-                    let mut value = final_value(
+                    let mut value = match final_value(
                         &metadata,
                         prompt_tokens,
                         &result,
                         return_tokens,
                         true,
                         index,
-                    );
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            let _ = tx.send(Ok(Event::default().event("error").data(json!({
+                                "error":{"message":error.message,"type":error.kind,"code":500},"index":index
+                            }).to_string()))).await;
+                            break;
+                        }
+                    };
                     let Some(tail) =
                         text_before_stop(&result.text, &stops).strip_prefix(&published)
                     else {
@@ -856,13 +869,14 @@ fn final_value(
     return_tokens: bool,
     streaming: bool,
     index: usize,
-) -> Value {
+) -> Result<Value, ApiError> {
     let stops = &metadata.stops;
     let model = &metadata.model;
     let stop_type = match result.finish_reason {
-        FinishReason::MaxTokens | FinishReason::Length | FinishReason::PredictionTimeLimit => {
-            "limit"
-        }
+        FinishReason::MaxTokens
+        | FinishReason::Length
+        | FinishReason::IndentationLimit
+        | FinishReason::PredictionTimeLimit => "limit",
         FinishReason::StopSequence { .. } => "word",
         FinishReason::EosToken | FinishReason::ToolCalls => "eos",
     };
@@ -875,8 +889,13 @@ fn final_value(
     }
     let content = text_before_stop(&result.text, stops);
     // The upstream diagnostic survives a later time/EOS stop-type override.
+    let raw_text = (metadata.minimum_indent > 0).then(|| {
+        onnx_genai_engine::tokenization::decode_output(
+            &metadata.tokenizer, &result.token_ids, &result.preserved_tokens,
+        ).map_err(|error| ApiError::internal(format!("decode native stop-word diagnostic before indentation clipping: {error:#}; repair the package tokenizer")))
+    }).transpose()?;
     let stopping_word = onnx_genai_engine::logits::first_text_stop(
-        &result.text,
+        raw_text.as_deref().unwrap_or(&result.text),
         stops
             .iter()
             .enumerate()
@@ -887,7 +906,7 @@ fn final_value(
     .map(String::as_str)
     .unwrap_or("");
     metadata.decorate(&mut value, content.contains('\n'), stopping_word);
-    value
+    Ok(value)
 }
 
 fn utf8_prefix(bytes: &[u8]) -> &str {

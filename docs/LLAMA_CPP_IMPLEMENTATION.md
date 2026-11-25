@@ -2339,3 +2339,27 @@ ignores. Default engine/server all-target strict Clippy, no-default engine
 all-target strict Clippy, formatting and diff checks passed on macOS ARM64 CPU.
 The general goal remains incomplete; indentation stopping and unchecked
 acceptance rows remain required.
+
+
+## Indentation stopping
+
+`n_indent` is parsed with the pinned numeric domain, mapped
+into the shared output-observer chain and ordinary, batched, speculative and
+authored workflow result construction. Its stateful scan distinguishes full
+stop-word removal from partially held stop prefixes and handles repeated/EOF
+observations without advancing a selected token twice. Text clipping is replayed
+independently of the final stop label, preserving EOS/time priority. Native
+stopping-word diagnostics use raw token text before indentation clipping.
+
+SSE gates publish safe line prefixes and withhold potentially retracted bodies,
+then resolve against committed final text. This deliberately avoids the pinned
+server's partial-response send occurring before its indentation truncation.
+Validation on main b07048488: full DFlash 27, candidate-tree 33 and workflow
+policy 30 tests passed; engine library 1095 passed with one inherited ignore,
+and server library 599 passed with two inherited ignores. Default engine/server
+all-target strict Clippy, no-default engine all-target strict Clippy, GenAI Python
+all-target compilation, formatting and diff checks passed on macOS ARM64 CPU.
+Real Native ordinary/speculative and ORT reference prefixes, EOS override,
+tokenizer admission, HTTP numeric bounds and buffered/SSE equality are covered.
+There are no performance or GPU claims. Unchecked goal acceptance rows remain
+required; this increment does not complete the broader compatibility goal.
