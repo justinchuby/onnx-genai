@@ -274,7 +274,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `DequantizePacked` | `` | ✅ | **NVRTC block decode** | All 27 opset-29 GGUF profiles decode directly from device-resident UINT8 payloads into FLOAT, FLOAT16, BFLOAT16, or DOUBLE. |
 | `Dropout`, `NonZero` | `` | ✅ | **NVRTC-custom** | Inference Dropout and bounded dynamic-output coordinate extraction; dynamic metadata paths decline capture where host materialization is required. |
 | `Resize`, `GridSample` | `` | ✅ | **NVRTC-custom** | Implemented interpolation/sampling subsets; unsupported coordinate modes and sampling policies fail closed. |
-| `ConvTranspose` | `` | ✅ | **NVRTC-custom** | 1-D/2-D/3-D f16/f32/f64 and opset-22+ bf16; explicit pads, SAME_UPPER/SAME_LOWER, VALID, and explicit output shape. |
+| `ConvTranspose` | `` | ✅ | **NVRTC-custom** | Standalone: 1-D/2-D/3-D f16/f32/f64 and opset-22+ bf16; explicit pads, SAME_UPPER/SAME_LOWER, VALID, and explicit output shape. ORT plugin: existing v1 registration and 1-D/2-D f16/f32/bf16 subset. |
 | `DeformConv` | `` | ✅ | **NVRTC-custom** | Opsets 19 and 22; fused N-D interpolation and grouped accumulation, with a specialized 2-D kernel. Supports up to 32 spatial axes on contiguous tensors. |
 
 <!-- CUDA_COVERAGE_MATRIX_END -->

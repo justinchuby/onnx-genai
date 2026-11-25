@@ -12,6 +12,7 @@ pub(crate) fn unsupported_reason_at_opset(
     opset: u64,
     input_shapes: &[Shape],
     input_dtypes: &[DataType],
+    conv_transpose_contract: super::conv_transpose::Contract,
 ) -> Option<String> {
     let result = match node.op_type.as_str() {
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
@@ -24,7 +25,13 @@ pub(crate) fn unsupported_reason_at_opset(
                 .err()
                 .map(|error| error.to_string());
         }
-        "ConvTranspose" => conv_transpose(node, opset, input_shapes, input_dtypes),
+        "ConvTranspose" => conv_transpose(
+            node,
+            opset,
+            input_shapes,
+            input_dtypes,
+            conv_transpose_contract,
+        ),
         _ => return unsupported_reason(node, input_shapes, input_dtypes),
     };
     result
@@ -204,6 +211,7 @@ fn conv_transpose(
     opset: u64,
     input_shapes: &[Shape],
     input_dtypes: &[DataType],
+    contract: super::conv_transpose::Contract,
 ) -> Result<(), String> {
     if !(2..=3).contains(&node.inputs.len()) || node.outputs.len() != 1 {
         return Err("requires X, W, optional B, and one output".into());
@@ -212,7 +220,14 @@ fn conv_transpose(
     if node.inputs.iter().any(Option::is_none) {
         return Err("all declared inputs must be present".into());
     }
-    super::conv_transpose::storage(input_dtypes[0], opset)?;
+    match contract {
+        super::conv_transpose::Contract::Standalone => {
+            super::conv_transpose::storage(input_dtypes[0], opset)?;
+        }
+        super::conv_transpose::Contract::OrtPlugin => {
+            require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")?;
+        }
+    }
     if input_dtypes[1] != input_dtypes[0]
         || input_dtypes
             .get(2)
@@ -220,7 +235,16 @@ fn conv_transpose(
     {
         return Err("W and optional B must match X dtype".into());
     }
-    super::conv_transpose::validate_claim(node, input_shapes).map_err(|error| error.to_string())
+    match contract {
+        super::conv_transpose::Contract::Standalone => {
+            super::conv_transpose::validate_claim(node, input_shapes)
+                .map_err(|error| error.to_string())
+        }
+        super::conv_transpose::Contract::OrtPlugin => {
+            super::conv_transpose_ort::reject_deferred(node).map_err(|error| error.to_string())?;
+            require_input_rank(input_shapes, 0, &[3, 4], "X")
+        }
+    }
 }
 
 fn grid_sample(

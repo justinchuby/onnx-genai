@@ -120,6 +120,38 @@ pub struct ConvTransposeFactory {
 
 pub(super) const BFLOAT16_SINCE: u64 = 22;
 
+/// Selects both the admitted geometry and the kernel family at provider construction.
+#[derive(Clone, Copy)]
+pub(crate) enum Contract {
+    Standalone,
+    OrtPlugin,
+}
+
+impl Contract {
+    pub(super) fn versions(self) -> &'static [u64] {
+        match self {
+            Self::Standalone => &[1, BFLOAT16_SINCE],
+            Self::OrtPlugin => &[1],
+        }
+    }
+
+    pub(super) fn factory(
+        self,
+        runtime: Arc<CudaRuntime>,
+        since_version: u64,
+    ) -> Box<dyn KernelFactory> {
+        match self {
+            Self::Standalone => Box::new(ConvTransposeFactory {
+                runtime,
+                since_version,
+            }),
+            Self::OrtPlugin => {
+                Box::new(super::conv_transpose_ort::ConvTransposeFactory { runtime })
+            }
+        }
+    }
+}
+
 enum Padding {
     Explicit(Vec<i64>),
     Inferred {
@@ -528,7 +560,9 @@ mod tests {
     fn conv_transpose_claim_observes_dtype_and_rank_boundaries() {
         let op = node(&[]);
         let shapes = [static_shape([1, 1, 2, 2, 2]), static_shape([1, 1, 3, 2, 1])];
-        let claim = |opset, dtype| unsupported_reason_at_opset(&op, opset, &shapes, &[dtype; 2]);
+        let claim = |opset, dtype| {
+            unsupported_reason_at_opset(&op, opset, &shapes, &[dtype; 2], Contract::Standalone)
+        };
         assert!(
             claim(21, DataType::BFloat16)
                 .unwrap()
@@ -542,9 +576,14 @@ mod tests {
             [static_shape([1; 6]), static_shape([1; 6])],
             [static_shape([1; 5]), static_shape([1; 4])],
         ] {
-            let reason =
-                unsupported_reason_at_opset(&op, 22, &invalid_shapes, &[DataType::Float32; 2])
-                    .expect("CUDA must not claim unsupported or mismatched ranks");
+            let reason = unsupported_reason_at_opset(
+                &op,
+                22,
+                &invalid_shapes,
+                &[DataType::Float32; 2],
+                Contract::Standalone,
+            )
+            .expect("CUDA must not claim unsupported or mismatched ranks");
             assert!(reason.contains("matching ranks in 3..=5"), "{reason}");
         }
     }
@@ -563,9 +602,47 @@ mod tests {
                 22,
                 &shapes,
                 &[DataType::Float32; 2],
+                Contract::Standalone,
             )
             .expect("malformed ConvTranspose attributes must not be claimed");
             assert!(reason.contains(attr), "{reason}");
+        }
+    }
+
+    #[test]
+    fn conv_transpose_ort_claim_preserves_legacy_dtype_and_geometry() {
+        let shapes_2d = [static_shape([1, 1, 2, 2]), static_shape([1, 1, 2, 2])];
+        let shapes_3d = [static_shape([1, 1, 2, 2, 2]), static_shape([1, 1, 2, 2, 2])];
+        let claim = |op: &Node, shapes: &[onnx_runtime_ir::Shape], dtype| {
+            unsupported_reason_at_opset(op, 11, shapes, &[dtype; 2], Contract::OrtPlugin)
+        };
+        let op = node(&[]);
+        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            assert_eq!(claim(&op, &shapes_2d, dtype), None);
+        }
+        assert!(
+            claim(&op, &shapes_2d, DataType::Float64)
+                .unwrap()
+                .contains("Float64")
+        );
+        assert!(
+            claim(&op, &shapes_3d, DataType::Float32)
+                .unwrap()
+                .contains("rank 5 unsupported")
+        );
+        for attr in [
+            ("auto_pad", Attribute::String(b"SAME_UPPER".to_vec())),
+            ("auto_pad", Attribute::String(b"SAME_LOWER".to_vec())),
+            ("output_shape", Attribute::Ints(vec![3, 3])),
+        ] {
+            let name = attr.0;
+            let op = node(&[attr]);
+            assert!(
+                claim(&op, &shapes_2d, DataType::Float32)
+                    .unwrap()
+                    .contains(name)
+            );
+            assert!(super::super::conv_transpose_ort::reject_deferred(&op).is_err());
         }
     }
 
