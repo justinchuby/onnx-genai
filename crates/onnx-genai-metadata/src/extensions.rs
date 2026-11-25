@@ -524,6 +524,10 @@ pub const CORE_CONFORMANCE: &[(SchemaVersion, &str)] = &[
         crate::version::MULTIMODAL_RERANKING_SCHEMA_VERSION,
         "Reranking v2 profiles declare ordered query/document encoded-image inputs; reusable image preprocessing v2 names component-local output ports.",
     ),
+    (
+        crate::version::REALTIME_SCHEMA_VERSION,
+        "Realtime v1 profiles declare session-owned bounded audio/text quanta, native rates, frame bounds, control operations and actual per-quantum usage.",
+    ),
 ];
 
 /// Look up a built-in extension by its exact declared identity and version.

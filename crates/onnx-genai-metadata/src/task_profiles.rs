@@ -7,7 +7,7 @@ use crate::{
 /// Unsupported versions of an ignorable task contract have no semantic effect.
 pub(crate) fn skip_unsupported_version(profile: &crate::TaskProfile) -> bool {
     let supported = match profile.kind.as_str() {
-        "embedding" | "decision" => profile.version == "1",
+        "embedding" | "decision" | "realtime" => profile.version == "1",
         "reranking" => matches!(profile.version.as_str(), "1" | "2"),
         _ => return false,
     };

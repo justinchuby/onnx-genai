@@ -889,11 +889,15 @@ const KNOWN_PROFILE_KINDS: &[&str] = &[
     "classification",
     "reward",
     "transcription",
+    "realtime",
 ];
 
 /// A required profile must be executable by this reader; an ignorable profile
 /// may be skipped. Unknown core fields still fail through `deny_unknown_fields`.
 fn validate_profiles(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
+    if let Err(error) = crate::realtime::realtime_contract(metadata) {
+        errors.push(error);
+    }
     if let Err(error) = crate::decision::decision_contract(metadata) {
         errors.push(error.to_string());
     }

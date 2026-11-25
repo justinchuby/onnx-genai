@@ -25,6 +25,7 @@ use tracing::Instrument;
 const MEDIA_UPLOAD_BODY_LIMIT: usize = 25 * 1024 * 1024;
 
 mod audio_input;
+mod auth;
 mod cli;
 mod completion_control;
 mod driver;
@@ -38,6 +39,7 @@ mod model_hub;
 mod model_management;
 mod models_config;
 pub mod multimodal;
+mod realtime;
 mod reasoning_request;
 mod registry;
 mod replay;
@@ -80,10 +82,23 @@ pub use types::{
     ToolChoiceSpecific, Usage,
 };
 
+pub use auth::ApiKeys;
+pub use realtime::RealtimeLimits;
+
+/// Declare an HTTP-upgrade protocol separately from ordinary GET contracts.
+fn ws<H, T>(handler: H) -> axum::routing::MethodRouter<AppState>
+where
+    H: axum::handler::Handler<T, AppState>,
+    T: 'static,
+{
+    get(handler)
+}
+
 pub fn app(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/health", get(routes::health))
         .route("/v1/health", get(routes::health))
+        .route("/v1/realtime", ws(realtime::websocket::upgrade))
         .route("/v1/responses", post(routes::transports::responses))
         .route("/responses", post(routes::transports::responses))
         .route(
@@ -234,10 +249,12 @@ pub fn app(state: AppState) -> Router {
     #[cfg(feature = "metrics")]
     let router = router.route("/metrics", get(routes::prometheus_metrics));
     let replays = state.replays.clone();
+    let api_keys = state.config.api_keys.clone();
     router
         .fallback(webui::serve)
         .with_state(state)
         .layer(middleware::from_fn_with_state(replays, replay::intercept))
+        .layer(middleware::from_fn_with_state(api_keys, auth::enforce))
         .layer(middleware::from_fn(trace_request))
 }
 
@@ -267,9 +284,8 @@ async fn trace_request(request: Request, next: Next) -> Response {
 }
 
 pub async fn serve(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
-    // Security posture: the server has no built-in authentication. The CLI defaults
-    // to 127.0.0.1, enforces max_tokens/max_sessions caps, and issues CSPRNG session
-    // ids; binding a non-loopback --addr should be done only behind an auth proxy.
+    // Authentication is opt-in through ServerConfig.api_keys. The CLI defaults
+    // to loopback; operators choose keys or an authenticated reverse proxy.
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app(state)).await?;
     Ok(())
