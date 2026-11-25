@@ -999,13 +999,22 @@ fn chat_sampling_defaults_stay_greedy_while_seed_enables_sampling() {
 }
 
 #[test]
-fn transcription_json_response_has_openai_shape() {
-    let response = crate::types::AudioTranscriptionResponse {
-        text: "hello".to_string(),
+fn transcription_json_response_has_llama_usage_and_openai_text() {
+    let response = crate::types::TranscriptResponse::Done {
+        text: "hello".into(),
+        usage: crate::types::TranscriptTokenUsage {
+            input_tokens: 3,
+            output_tokens: 1,
+            total_tokens: 4,
+            input_tokens_details: crate::types::TranscriptInputTokenDetails {
+                cached_tokens: 0,
+                audio_frames: None,
+            },
+        },
     };
     assert_eq!(
         serde_json::to_value(response).unwrap(),
-        json!({"text": "hello"})
+        json!({"type":"transcript.text.done","text":"hello","usage":{"type":"tokens","input_tokens":3,"output_tokens":1,"total_tokens":4,"input_tokens_details":{"cached_tokens":0}}})
     );
 }
 
@@ -1686,9 +1695,9 @@ async fn embeddings_success_path_returns_openai_compatible_response() {
 }
 
 #[tokio::test]
-async fn transcription_multipart_against_non_audio_model_returns_400() {
+async fn transcription_multipart_against_non_audio_model_returns_501() {
     // Send the correct model name (tiny-llm) so routing succeeds, then the handler
-    // returns 400 because tiny-llm has no audio input spec.
+    // returns 501 because tiny-llm declares no transcription capability.
     let (boundary, body) = multipart_audio_body_for_model("tiny-llm", "json");
     let response = app(tiny_state())
         .oneshot(
@@ -1705,14 +1714,14 @@ async fn transcription_multipart_against_non_audio_model_returns_400() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body: Value = serde_json::from_slice(&body).unwrap();
     let message = body["error"]["message"].as_str().unwrap();
     assert!(message.contains("What:"), "message: {message}");
     assert!(message.contains("How:"), "message: {message}");
     assert!(
-        message.contains("input_features"),
+        message.contains("audio input"),
         "the missing contract must be named: {message}"
     );
 }
@@ -11677,5 +11686,301 @@ mod systemone_audio {
                 .contains("--max-decision-media-bytes"),
             "{result}"
         );
+    }
+}
+
+mod ctc_transcription {
+    use super::*;
+    fn root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/transcription_ctc")
+    }
+    fn wav(negate: bool) -> Vec<u8> {
+        let samples = [-0.5, -0.5, 0.125, -0.5, 0.0, 0.5, 0.5, 0.125, 0.5]
+            .map(|v| if negate { -v } else { v });
+        onnx_genai_preprocess::audio::encode_wav_pcm16(&samples, 8000, 1).unwrap()
+    }
+    fn router(config: ServerConfig) -> axum::Router {
+        app(AppState::load_with_config(&root(), Some("ctc".into()), config).unwrap())
+    }
+    async fn send(
+        router: axum::Router,
+        path: &str,
+        bytes: &[u8],
+        fields: &[(&str, &str)],
+    ) -> (StatusCode, String) {
+        let boundary = "nxrt-ctc-test";
+        let mut body = Vec::new();
+        for (field, value) in fields {
+            body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"\r\n\r\n{value}\r\n").as_bytes());
+        }
+        body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"clip.wav\"\r\nContent-Type: audio/wav\r\n\r\n").as_bytes());
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+    async fn post(
+        router: axum::Router,
+        path: &str,
+        bytes: &[u8],
+        format: &str,
+        extra: Option<(&str, &str)>,
+    ) -> (StatusCode, String) {
+        let mut fields = vec![("model", "ctc"), ("response_format", format)];
+        if let Some(extra) = extra {
+            fields.push(extra);
+        }
+        send(router, path, bytes, &fields).await
+    }
+    fn transcript_events(body: &str) -> Vec<Value> {
+        let values = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .collect::<Vec<_>>();
+        assert_eq!(values.last(), Some(&"[DONE]"), "{body}");
+        values[..values.len() - 1]
+            .iter()
+            .map(|value| serde_json::from_str(value).unwrap())
+            .collect()
+    }
+    #[tokio::test]
+    async fn ctc_http_transcription_is_native_audio_dependent_and_supports_both_aliases() {
+        let router = router(Default::default());
+        for path in ["/v1/audio/transcriptions", "/audio/transcriptions"] {
+            for (negate, expected) in [(false, "bb aa"), (true, "aa bb")] {
+                let (status, body) = post(router.clone(), path, &wav(negate), "json", None).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let value: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(value["type"], "transcript.text.done");
+                assert_eq!(value["text"], expected);
+                assert_eq!(
+                    value["usage"],
+                    json!({"type":"tokens","input_tokens":9,"output_tokens":5,"total_tokens":14,"input_tokens_details":{"cached_tokens":0,"audio_frames":9}})
+                );
+                let (status, text) = post(router.clone(), path, &wav(negate), "text", None).await;
+                assert_eq!(status, StatusCode::OK, "{text}");
+                assert_eq!(text, expected);
+            }
+        }
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/props")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let props = json_body(response).await;
+        assert_eq!(props["nxrt_capabilities"]["frame_transcription"], true);
+    }
+    #[tokio::test]
+    async fn ctc_http_rejects_bad_audio_conditioning_and_resource_limits_without_poisoning_model() {
+        let router = router(Default::default());
+        for (bytes, format, extra, diagnostic) in [
+            (vec![0, 1, 2], "json", None, "PCM16 WAV"),
+            (wav(false), "verbose_json", None, "response_format"),
+            (wav(false), "json", Some(("language", "en")), "conditioning"),
+            (
+                wav(false),
+                "json",
+                Some(("prompt", "names")),
+                "conditioning",
+            ),
+        ] {
+            let (status, body) = post(
+                router.clone(),
+                "/v1/audio/transcriptions",
+                &bytes,
+                format,
+                extra,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains(diagnostic), "{body}");
+        }
+        let (status, body) = post(
+            router,
+            "/v1/audio/transcriptions",
+            &wav(false),
+            "json",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for config in [
+            ServerConfig {
+                max_transcription_frames: std::num::NonZeroUsize::new(8).unwrap(),
+                ..Default::default()
+            },
+            ServerConfig {
+                max_transcription_text_bytes: std::num::NonZeroUsize::new(1).unwrap(),
+                ..Default::default()
+            },
+        ] {
+            let (status, body) = post(
+                self::router(config),
+                "/v1/audio/transcriptions",
+                &wav(false),
+                "json",
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("shorten the audio"), "{body}");
+        }
+    }
+    #[tokio::test]
+    async fn ctc_transcription_streams_typed_events_and_honors_per_request_output_limits() {
+        let router = router(Default::default());
+        for path in ["/v1/audio/transcriptions", "/audio/transcriptions"] {
+            for budget in [1, 8] {
+                let maximum = budget.to_string();
+                let (status, body) = send(
+                    router.clone(),
+                    path,
+                    &wav(false),
+                    &[
+                        ("model", "ctc"),
+                        ("stream", "true"),
+                        ("max_tokens", &maximum),
+                    ],
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let events = transcript_events(&body);
+                assert!(events.len() > 1, "{body}");
+                let final_event = events.last().unwrap();
+                assert_eq!(final_event["type"], "transcript.text.done");
+                let text = events[..events.len() - 1]
+                    .iter()
+                    .map(|event| {
+                        assert_eq!(event["type"], "transcript.text.delta");
+                        event["delta"].as_str().unwrap()
+                    })
+                    .collect::<String>();
+                assert_eq!(final_event["text"], text);
+                assert_eq!(text, if budget == 1 { "b" } else { "bb aa" });
+                assert_eq!(final_event["usage"]["input_tokens"], 9);
+                let count = final_event["usage"]["output_tokens"].as_u64().unwrap();
+                assert!(count > 0 && count <= budget);
+            }
+        }
+        let (status, body) = post(
+            self::router(ServerConfig {
+                max_output_tokens: 1,
+                ..Default::default()
+            }),
+            "/v1/audio/transcriptions",
+            &wav(false),
+            "json",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["text"], "b");
+        assert_eq!(value["usage"]["output_tokens"], 1);
+        for (field, value) in [
+            ("max_tokens", "0"),
+            ("max_tokens", "oops"),
+            ("max_tokens", "99999"),
+            ("stream", "oops"),
+        ] {
+            let (status, body) = post(
+                router.clone(),
+                "/v1/audio/transcriptions",
+                &wav(false),
+                "json",
+                Some((field, value)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains(field), "{body}");
+        }
+        let (status, body) = post(
+            router,
+            "/v1/audio/transcriptions",
+            &wav(false),
+            "text",
+            Some(("stream", "true")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    #[tokio::test]
+    async fn generative_transcription_uses_typed_buffered_and_live_stream_responses() {
+        let model = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/transcription_tokens");
+        let router = app(AppState::load(&model, Some("speech".into())).unwrap());
+        let (status, buffered) = send(
+            router.clone(),
+            "/v1/audio/transcriptions",
+            &wav(false),
+            &[("model", "speech"), ("max_tokens", "2")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{buffered}");
+        let buffered: Value = serde_json::from_str(&buffered).unwrap();
+        assert_eq!(buffered["type"], "transcript.text.done");
+        assert!(buffered["usage"]["input_tokens"].as_u64().unwrap() > 0);
+        assert!(buffered["usage"]["output_tokens"].as_u64().unwrap() <= 2);
+        assert_eq!(buffered["text"], "hello");
+        let silence = onnx_genai_preprocess::audio::encode_wav_pcm16(&[0.0; 9], 8000, 1).unwrap();
+        let (status, silent) = send(
+            router.clone(),
+            "/v1/audio/transcriptions",
+            &silence,
+            &[("model", "speech"), ("max_tokens", "2")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{silent}");
+        let silent: Value = serde_json::from_str(&silent).unwrap();
+        assert_eq!(silent["text"], "world");
+        let (status, rejected) = send(
+            router.clone(),
+            "/v1/audio/transcriptions",
+            &wav(false),
+            &[("model", "speech"), ("prompt", "names")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected}");
+        assert!(rejected.contains("prompt conditioning"), "{rejected}");
+        let (status, stream) = send(
+            router,
+            "/audio/transcriptions",
+            &wav(false),
+            &[("model", "speech"), ("max_tokens", "2"), ("stream", "true")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{stream}");
+        let events = transcript_events(&stream);
+        let final_event = events.last().unwrap();
+        assert_eq!(final_event["type"], "transcript.text.done");
+        assert_eq!(final_event["text"], buffered["text"]);
+        let text = events[..events.len() - 1]
+            .iter()
+            .map(|event| {
+                assert_eq!(event["type"], "transcript.text.delta");
+                event["delta"].as_str().unwrap()
+            })
+            .collect::<String>();
+        assert_eq!(final_event["text"], text);
     }
 }

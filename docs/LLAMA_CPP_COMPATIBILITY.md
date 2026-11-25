@@ -73,7 +73,7 @@ the configured key count; it does not contain credentials or their digests.
 | POST | `/v1/chat/completions/input_tokens`, `/chat/completions/input_tokens`, `/v1/responses/input_tokens`, `/responses/input_tokens`, `/v1/messages/count_tokens` | Input token counts from the shared inference preparation path |
 | GET, DELETE | `/v1/stream` | Byte-offset replay or explicit producer cancellation by `conv_id` |
 | POST | `/v1/streams/lookup` | Lookup only requested conversation IDs, including model-qualified IDs |
-| POST | `/v1/audio/transcriptions`, `/audio/transcriptions` | Existing multipart transcription contract |
+| POST | `/v1/audio/transcriptions`, `/audio/transcriptions` | Native frame-decoding and generative multipart transcription; typed JSON/SSE, budgets and usage; [contract](TRANSCRIPTION.md) |
 | POST | `/v1/audio/speech`, `/audio/speech`, `/tts` | Declared buffered speech workflow; native input/prompt and raw-prompt handling |
 | WS | `/v1/realtime` | Metadata-declared native streaming audio/text sessions; [contract and current limits](REALTIME.md) |
 | GET | `/models/sse` | Model status, actual per-file download progress, pause/failure and removal events |
@@ -664,3 +664,10 @@ nonstandard geometry. Pure-waveform normalization, named transform dataflow and 
 execute as described in [audio preprocessing](AUDIO_PREPROCESSING.md). Additional
 DSP operations, window/mel conventions and codecs remain open; this does not imply
 full audio parity.
+
+File transcription now executes declared one-pass CTC/greedy acoustic workflows
+as well as the existing generative speech path. Both aliases expose typed
+transcript done/delta events, usage, request output budgets and SSE termination.
+Native waveform-dependent HTTP acceptance is documented in
+[transcription](TRANSCRIPTION.md); MP3, general ASR prompt/response projection and
+richer generative media accounting remain open.

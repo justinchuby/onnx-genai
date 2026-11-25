@@ -46,6 +46,7 @@ pub mod speculative;
 mod task_inputs;
 mod text_projection;
 pub mod tokenization;
+pub mod transcription;
 
 #[cfg(feature = "native-backend")]
 pub use engine::{

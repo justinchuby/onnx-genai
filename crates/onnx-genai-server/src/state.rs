@@ -433,6 +433,8 @@ pub struct ServerConfig {
     /// (§34.8). Independent of any model; defaults to the hostname or a generated id.
     pub node_id: String,
     pub max_output_tokens: usize,
+    pub max_transcription_frames: std::num::NonZeroUsize,
+    pub max_transcription_text_bytes: std::num::NonZeroUsize,
     pub realtime: crate::realtime::RealtimeLimits,
     /// Enable the upstream POST /props acknowledgement; no mutation schema exists upstream.
     pub endpoint_props: bool,
@@ -534,6 +536,10 @@ impl Default for ServerConfig {
                 .expect("positive default reranking document budget"),
             max_rerank_media_bytes: std::num::NonZeroUsize::new(64 * 1024 * 1024).unwrap(),
             max_decision_media_bytes: std::num::NonZeroUsize::new(64 * 1024 * 1024).unwrap(),
+            max_transcription_frames:
+                onnx_genai_engine::transcription::TranscriptionLimits::default().max_frames,
+            max_transcription_text_bytes:
+                onnx_genai_engine::transcription::TranscriptionLimits::default().max_text_bytes,
             max_decision_input_tokens: decision.max_input_tokens,
             max_decision_prompt_bytes: decision.template.max_output_bytes,
             max_decision_template_operations: decision.template.max_operations,

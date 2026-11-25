@@ -3905,7 +3905,7 @@ fn describe_batch_layout(layout: &crate::schema::BatchLayout) -> String {
 /// axis. Stating that exactly is what lets a runtime index it without knowing
 /// what the value means.
 #[allow(clippy::too_many_arguments)]
-fn validate_valid_lengths_shape(
+pub(crate) fn validate_valid_lengths_shape(
     path: &str,
     contract: &crate::schema::TensorContract,
     dimension: &str,
