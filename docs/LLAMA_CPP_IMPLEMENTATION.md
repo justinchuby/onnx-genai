@@ -2196,3 +2196,21 @@ Wire tests cover idle reset, disablement and termination; HTTP tests cover
 request overrides and rejection across five generation protocols; a real replay
 middleware test checks offsets across comment and UTF-8 payload bytes. This
 increment does not check off unrelated remaining compatibility acceptance rows.
+
+
+## Native final-response field projection
+
+`response_fields` now projects actual native completion/infill terminal results,
+including buffered batches, SSE batches and prompt-only evaluation. An empty
+selector preserves the original response. The pinned source traverses object
+keys and retains the complete slash path as the output key; this differs from
+its README's leaf-renaming description. Missing paths are omitted, array indices
+and JSON Pointer escapes are not inferred. Intermediate token/progress events
+and errors keep their protocol contracts. Native batch completion remains tied
+to its owner outcome channel rather than projected JSON fields.
+
+Unit cases pin nested objects, empty segments, duplicate/missing paths, arrays
+and literal tildes. Real HTTP coverage exercises unchanged empty-selection
+results, nested timing selection, buffered/SSE batches without stop/index,
+prompt-only output, admitted infill, and invalid selector types. This remains an
+increment toward the original compatibility scope, not completion of its rows.

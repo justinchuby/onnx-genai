@@ -447,6 +447,18 @@ Complete compressed-state checkpoints restore saved record cursors and partial
 carries; they do not imply arbitrary token-prefix rewind or permission to ignore
 the package's prefix-reuse policy.
 
+Native completion/infill `response_fields` selects fields from the final result.
+An omitted or empty array returns the full result; otherwise missing paths are
+omitted. Paths traverse JSON object keys separated by `/`; arrays are not indexed
+and `~0`/`~1` are literal key text, not JSON Pointer escapes. The pinned
+`json_get_nested_values` implementation retains the entire path as the returned
+key, for example `"timings/prompt_n"`, rather than renaming it to its leaf as the
+README suggests. This also applies to each batch result and prompt-only result.
+SSE token/progress events and errors remain unchanged; only the terminal success
+object is projected, matching the pinned native task serializer. Batch stream
+completion is driven independently of whether `stop` or `index` was selected.
+Selection never fabricates a requested field that is absent from the result.
+
 Native generation accepts text, token IDs, mixed text/token rows and prompt
 batches, including text-only `prompt_string` objects. Only a first text segment
 receives inserted special tokens; explicit IDs are vocabulary-checked. Batches
