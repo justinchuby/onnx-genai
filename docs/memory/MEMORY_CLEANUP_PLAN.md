@@ -2768,10 +2768,9 @@ parameter element counts, dtypes, complete output shapes and total layout
 capacity. Empty groups retain parameter/view/Host/output checks and need no
 scratch. Empty normalized width remains an error; axis==rank is now rejected in
 accordance with the [ONNX axis range](https://onnx.ai/onnx/operators/onnx__LayerNormalization.html).
-Standard LayerNorm's pre-existing full-normalized-parameter element-count rule
-is retained. **Follow-up remains open:** support the broader unidirectional
-Scale/B broadcasting described by that schema; this migration does not claim
-that capability or alter the accepted complete parameter layouts.
+The initial migration retained the full-normalized-parameter element-count
+rule. The affine-broadcast follow-up below replaces that restriction for
+standard LayerNorm; Skip retains its complete-parameter contract.
 
 Regression controls cover exact optional-region bounds, independent beta/bias
 holes, fresh and poisoned backing, prefix canaries, missing/short/misaligned
@@ -2788,3 +2787,34 @@ plugin disables fallback, assigns both nodes to cpu_ep, changes shapes
 Input widening remains outside these four staging regions. This is not complete
 RSS accounting, a zero-total-overhead or inference-speed measurement, or CUDA
 runtime validation.
+
+
+### LayerNorm affine broadcasting without expanded coefficient storage
+
+Standard LayerNorm now validates Scale and B by right-aligned, unidirectional
+broadcast into X. Preparation classifies each operand as a complete normalized
+row, scalar, or general broadcast. The complete-row route preserves direct
+coefficient indexing; the general route derives indices from tensor geometry.
+No expanded coefficient tensor, new staging region, owner, or quota operation
+is introduced. Skip and the existing f32 normalization arithmetic are unchanged.
+
+CPU-scoped decomposition fusion accepts only affine shapes proven not to expand
+X: matching dimensions (including the same symbol) or literal singleton axes.
+Unrelated symbols decline. The complete reduced suffix must be provably
+nonempty, including positive lower bounds for symbolic widths. Immutable scalar
+coefficients and axes resolve through PassContext for inline and mapped weights
+in both matching and application; absent or malformed bytes and overridable
+initializer inputs decline. This also supplies the shared scalar reader used
+by GELU and attention fusion, without materializing mapped weights.
+
+Regression coverage includes 486 independent f64 coordinate cases, equal-size
+cross-group counterexamples, aliases, four float storage types, invalid geometry,
+and a 4,096-cycle governed workspace test spanning complete/scalar/group/Skip
+routes with no warm issuer calls. A public session changes affine shape classes
+while retaining one 112-byte allocation (111 bytes refused); an encoded nine-node
+decomposition fuses to one CPU node and uses 96 bytes (95 refused). Six real ORT
+plugin fixtures disable fallback and check Y and both statistics twice each.
+Mapped scalar/axes success and malformed/missing/overridable refusals have
+optimizer regressions. These checks establish correctness and allocation
+invariants, not measured inference speed or CUDA validation; f32 compute and
+existing stash-type behavior are outside this change.
