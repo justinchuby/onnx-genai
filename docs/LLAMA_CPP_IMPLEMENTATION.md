@@ -2180,3 +2180,19 @@ snapshot consistency and clean retries after progress/phase cancellation.
 Native MTP is exercised in a subprocess with the ORT library unavailable. The
 actual server driver checks the same counter snapshots after an aborted turn
 and successful retry. This increment does not close the broader acceptance rows.
+
+
+## SSE idle comment pings
+
+The previously accepted but ignored `sse_ping_interval` now configures actual
+idle comment pings for generation transports. A typed policy shares CLI,
+server-default, request validation and `/props` reporting. Default 30 seconds
+matches the pinned upstream; -1 and 0 disable pings. Data resets the idle timer
+and source EOF terminates it. Native completion/infill, OpenAI completion/chat,
+Responses and Anthropic adapters apply the same policy. Replay retains exact
+comment bytes rather than removing them and shifting reconnect offsets.
+
+Wire tests cover idle reset, disablement and termination; HTTP tests cover
+request overrides and rejection across five generation protocols; a real replay
+middleware test checks offsets across comment and UTF-8 payload bytes. This
+increment does not check off unrelated remaining compatibility acceptance rows.

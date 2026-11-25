@@ -145,13 +145,11 @@ enum NativeOutput {
         completed: oneshot::Receiver<()>,
     },
 }
-impl IntoResponse for NativeOutput {
-    fn into_response(self) -> Response {
+impl NativeOutput {
+    fn response(self, ping: crate::SsePingInterval) -> Response {
         match self {
             Self::Buffered(value) => Json(value).into_response(),
-            Self::Stream { receiver, .. } => {
-                Sse::new(ReceiverStream::new(receiver)).into_response()
-            }
+            Self::Stream { receiver, .. } => ping.response(ReceiverStream::new(receiver)),
         }
     }
 }
@@ -196,6 +194,7 @@ pub(crate) async fn completions(
         });
     }
     validate_native_request(&first, &state.config)?;
+    let ping = crate::SsePingInterval::resolve(&first.sampling, state.config.sse_ping_interval)?;
     // One batch retains one admitted package version across admin reloads.
     let handle = resolve_model(&state.registry, &first.sampling.model).await?;
     let mut prepared = Vec::with_capacity(requests.len() + 1);
@@ -253,7 +252,7 @@ pub(crate) async fn completions(
                 receiver: rx,
                 completed: outcome,
             }
-            .into_response())
+            .response(ping))
         }
     }
 }
@@ -315,10 +314,11 @@ pub(crate) async fn infill(
 ) -> Result<Response, ApiError> {
     let request = parse(body, true)?;
     validate_native_request(&request, &state.config)?;
+    let ping = crate::SsePingInterval::resolve(&request.sampling, state.config.sse_ping_interval)?;
     let handle = resolve_model(&state.registry, &request.sampling.model).await?;
     Ok(run(prepare(&state, request, handle)?, 0)
         .await?
-        .into_response())
+        .response(ping))
 }
 fn validate_native_request(request: &NativeRequest, config: &ServerConfig) -> Result<(), ApiError> {
     super::completions::validate_request(&request.sampling, config)?;
