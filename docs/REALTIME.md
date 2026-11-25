@@ -17,7 +17,7 @@ required opaque application inputs:
 
 | Input binding | Tensor | Meaning |
 | --- | --- | --- |
-| `inputs.output_token_budget` | int64 scalar | Remaining output tokens for this quantum, or -1 for unlimited |
+| `inputs.output_token_budget` | int64 scalar | Remaining response output-token allowance, or -1 for unlimited |
 | `inputs.operation` | int64 scalar | Control operation below |
 | `inputs.audio` | float32 symbolic vector | Mono normalized PCM, empty except audio operations |
 | `inputs.tokens` | int64 symbolic vector | Package-assembled prompt/text/tool-result IDs, empty when unused |
@@ -49,6 +49,13 @@ encoding saturates finite model peaks using llama-server's symmetric 32767 scale
 mean end of response. Duplex polling is not governed by ordinary generation's
 `max_new_tokens` default. Ordinary request-sourced/runtime inputs are rejected
 for this ABI so generation defaults cannot silently alter quantum execution.
+The remaining response allowance is passed unchanged to each invocation; it is
+not a per-quantum token cap. A constrained quantum still emits at most one text
+token, independently of that allowance. Reported output usage must cover every
+emitted text token so an underreported counter cannot evade the response limit.
+A model may finish an unfinished grammar when the actual response allowance is
+exhausted; premature natural completion remains a contract error.
+
 The workflow must obey `output_token_budget`; excess reported output is a
 contract violation that requires native reset or connection closure. The model workflow owns its codec, temporal/acoustic
 steps, delay buffers and response state. It must declare session-scoped state
@@ -135,6 +142,16 @@ state remains workflow-owned. An empty mask means unconstrained selection.
 Logical text constraints check the decoded text directly for completion. Raw
 token grammars require declared EOS IDs. After a text ending, an all-false mask
 permits codec-only quanta to finish without admitting further text.
+
+## Response termination
+
+A token-limited response ends with upstream-compatible `status: completed`;
+an explicit client cancellation uses `status: cancelled`. Both preserve the
+connection for later turns. An unfinished tool envelope at either intentional
+stop is not admitted as a completed tool call. Complete calls still pass name
+and parameter validation, and a natural model stop must satisfy required-tool
+postconditions. Raw partial function-call fragments are not yet projected onto
+wire call items; completed batches retain atomic admission.
 
 ## Remaining conformance work
 
