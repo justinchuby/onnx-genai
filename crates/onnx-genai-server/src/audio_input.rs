@@ -1,7 +1,7 @@
 use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use onnx_genai_preprocess::audio::{
-    LogMelExtractor, WHISPER_N_FRAMES, WHISPER_SAMPLE_RATE, decode_wav_pcm16, encode_wav_pcm16,
+    LogMelExtractor, WHISPER_N_FRAMES, WHISPER_SAMPLE_RATE, decode_audio, encode_wav_pcm16,
 };
 
 use crate::types::InputAudio;
@@ -85,22 +85,23 @@ pub struct AudioTensor {
 
 pub(crate) fn decode_chat_audio(input: &InputAudio) -> anyhow::Result<Vec<u8>> {
     match input.format.as_str() {
-        "wav" => STANDARD
+        "wav" | "mp3" => STANDARD
             .decode(&input.data)
             .context("input_audio.data must be valid base64"),
-        "mp3" => anyhow::bail!("MP3 audio is not supported yet; provide a PCM16 WAV file"),
-        format => anyhow::bail!("unsupported input_audio format '{format}'"),
+        format => anyhow::bail!(
+            "unsupported input_audio format '{format}'; use wav or mp3 with base64-encoded audio"
+        ),
     }
 }
 
-pub fn preprocess_wav(bytes: &[u8], spec: &AudioInputSpec) -> anyhow::Result<AudioTensor> {
-    let audio = decode_wav_pcm16(bytes)?;
+pub fn preprocess_audio(bytes: &[u8], spec: &AudioInputSpec) -> anyhow::Result<AudioTensor> {
+    let audio = decode_audio(bytes)?;
     preprocess_samples(&audio.samples, audio.sample_rate, spec)
 }
 
 /// Extract the model's declared audio features from raw `[-1, 1]` mono samples.
 ///
-/// The counterpart to [`preprocess_wav`] for callers that already hold samples
+/// The counterpart to [`preprocess_audio`] for callers that already hold samples
 /// — a live stream segment, for instance — so a waveform never has to be
 /// re-encoded into a WAV container just to be transcribed.
 pub fn preprocess_samples(

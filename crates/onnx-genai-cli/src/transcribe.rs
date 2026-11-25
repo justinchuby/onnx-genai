@@ -6,9 +6,7 @@ use anyhow::Context as _;
 use onnx_genai::Engine;
 use onnx_genai::engine::PipelineGenerateRequest;
 use onnx_genai::ort::Tokenizer;
-use onnx_genai::preprocess::audio::{
-    AudioSegment, SegmentConfig, StreamSegmenter, decode_wav_pcm16,
-};
+use onnx_genai::preprocess::audio::{AudioSegment, SegmentConfig, StreamSegmenter, decode_audio};
 use onnx_genai::{GenerateOptions, GeneratePrompt, GenerateRequest, GenerateToken};
 use onnx_genai_server::multimodal;
 
@@ -352,11 +350,11 @@ fn transcribe_file(
             path.display()
         )
     })?;
-    let audio = decode_wav_pcm16(&bytes).map_err(|error| {
+    let audio = decode_audio(&bytes).map_err(|error| {
         anyhow::anyhow!(
             "What: the audio file {} could not be decoded. \
              Why: {error}. \
-             How: provide a PCM16 WAV file (convert with `ffmpeg -i in.mp3 -ar 16000 -ac 1 out.wav`).",
+             How: provide a valid PCM16 WAV or MP3 file.",
             path.display()
         )
     })?;

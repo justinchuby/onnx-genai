@@ -1,8 +1,9 @@
 # File transcription
 
 Both `POST /v1/audio/transcriptions` and `/audio/transcriptions` accept multipart
-`file`, `model`, `response_format`, `max_tokens` and `stream` fields. PCM16 WAV is
-currently supported. The model is selected before execution; a package with no
+`file`, `model`, `response_format`, `max_tokens` and `stream` fields. PCM16 WAV and
+MP3 are supported by content, regardless of the upload filename. The model is
+selected before execution; a package with no
 admitted speech path returns `501 not_supported_error`.
 
 ```sh
@@ -118,7 +119,7 @@ HTTP aliases, JSON/text/SSE responses and incremental generative delivery.
 These are dataflow/protocol checks, not recognition-quality or GPU-performance
 claims.
 
-MP3 and broader codecs remain open. The existing generative convenience path rejects nonempty `prompt` conditioning
+Other compressed codecs remain open. The existing generative convenience path rejects nonempty `prompt` conditioning
 rather than dropping it, and still needs a general model-authored ASR prompt/response projection and richer
 media accounting; its legacy feature-input geometry and CLI transcription path
 also need further generalization. Realtime sessions use their separate declared

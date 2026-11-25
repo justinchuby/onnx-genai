@@ -469,7 +469,7 @@ Core schema v1.11 declares input defaults, instruction/payload rules, option
 ordering, score ranges and canonical legends. Decision v2 in core schema v1.14 additionally executes ordered state images,
 including `files`/`images` and embedded chat image parts, with actual media-aware
 usage. Decision v3 in core schema v1.15 adds ordered mixed image/audio state and
-per-question spoken instructions using PCM16 WAV. Video, broader audio codecs,
+per-question spoken instructions using PCM16 WAV or MP3. Video, broader audio codecs,
 joint/packed heads and shared generation/decision
 entry points remain open; see [SystemOne](SYSTEMONE.md). Route presence does not
 claim every upstream decision-model format is admitted.
@@ -669,5 +669,5 @@ File transcription now executes declared one-pass CTC/greedy acoustic workflows
 as well as the existing generative speech path. Both aliases expose typed
 transcript done/delta events, usage, request output budgets and SSE termination.
 Native waveform-dependent HTTP acceptance is documented in
-[transcription](TRANSCRIPTION.md); MP3, general ASR prompt/response projection and
+[transcription](TRANSCRIPTION.md); general ASR prompt/response projection and
 richer generative media accounting remain open.

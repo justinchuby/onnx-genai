@@ -44,9 +44,12 @@ The same executable program semantics apply to both.
 
 ## Waveforms and validity
 
-PCM16 WAV decoding currently mixes channels to mono. An explicit `downmix`
-therefore supports `channels: 1`; other channel layouts and codecs are not yet
-implemented. `resample` changes the rate at its declared position in the program.
+`decode` accepts PCM16 WAV and MP3 by content and averages channels to mono.
+MP3 decoding runs in portable Rust without external binaries, preserving the
+source sample rate and applying declared codec delay/padding metadata. Invalid
+packets and changing rate/channel layouts fail with context. An explicit
+`downmix` therefore supports `channels: 1`; multichannel waveform outputs and
+other codecs are not yet implemented. `resample` changes the rate at its declared position in the program.
 `rescale` multiplies samples by the declared finite scale.
 `zero_mean_unit_variance` (also selected by `normalize` with that mode) uses the
 valid samples' population variance plus a positive finite epsilon. Existing
