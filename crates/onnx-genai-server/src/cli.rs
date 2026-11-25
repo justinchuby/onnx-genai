@@ -153,6 +153,10 @@ pub struct ServeArgs {
     #[arg(long, env = "NXRT_PROPS")]
     pub props: bool,
 
+    /// Idle SSE comment interval in seconds; -1 or 0 disables pings.
+    #[arg(long, default_value = "30", allow_hyphen_values = true)]
+    pub sse_ping_interval: crate::SsePingInterval,
+
     /// Reasoning effort applied when a request omits `reasoning_effort`.
     ///
     /// Reasoning models pick their own default when the template receives no
@@ -287,6 +291,7 @@ fn server_config_from_args(args: &ServeArgs) -> anyhow::Result<ServerConfig> {
         max_decision_options: args.max_decision_options,
         max_replay_streams: args.max_replay_streams,
         replay_buffer_bytes: args.replay_buffer_bytes,
+        sse_ping_interval: args.sse_ping_interval,
         default_reasoning_effort: args.default_reasoning_effort,
         max_sessions: args.max_sessions,
         max_queue_depth: args.max_queue_depth,
@@ -360,6 +365,25 @@ mod tests {
     struct TestCli {
         #[command(flatten)]
         serve: ServeArgs,
+    }
+
+    #[test]
+    fn sse_ping_seconds_flow_from_cli_to_server_policy() {
+        for value in ["-1", "0", "1", "30"] {
+            let args =
+                TestCli::try_parse_from(["test", "model", "--sse-ping-interval", value]).unwrap();
+            assert_eq!(
+                server_config_from_args(&args.serve)
+                    .unwrap()
+                    .sse_ping_interval,
+                value.parse().unwrap()
+            );
+        }
+        for value in ["-2", "0.5", "2147483648"] {
+            assert!(
+                TestCli::try_parse_from(["test", "model", "--sse-ping-interval", value]).is_err()
+            );
+        }
     }
 
     #[test]

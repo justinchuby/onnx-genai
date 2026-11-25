@@ -526,9 +526,10 @@ async fn stream_completions(
     first: (CompletionRequest, PreparedCompletion),
     rest: Vec<(CompletionRequest, PreparedCompletion)>,
     client_session_id: Option<String>,
-) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
+) -> Result<Response, ApiError> {
     let is_batch = !rest.is_empty();
     let (request, prepared) = first;
+    let ping = crate::SsePingInterval::resolve(&request.sampling, state.config.sse_ping_interval)?;
     let id = text_completion_id()?;
     let started = start_completion(
         &state,
@@ -630,7 +631,7 @@ async fn stream_completions(
             .context("completion receiver closed")?;
         Ok::<(), anyhow::Error>(())
     });
-    Ok(Sse::new(ReceiverStream::new(rx)))
+    Ok(ping.response(ReceiverStream::new(rx)))
 }
 
 pub(crate) async fn chat_completions(
@@ -912,7 +913,8 @@ async fn stream_chat_completion(
     handle: Arc<ModelHandle>,
     request: ChatCompletionRequest,
     client_session_id: Option<String>,
-) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
+) -> Result<Response, ApiError> {
+    let ping = crate::SsePingInterval::resolve(&request, state.config.sse_ping_interval)?;
     let id = completion_id()?;
     let created = now_unix();
     let model = request.model.clone();
@@ -1183,7 +1185,7 @@ async fn stream_chat_completion(
         Ok::<(), anyhow::Error>(())
     });
 
-    Ok(Sse::new(ReceiverStream::new(rx)))
+    Ok(ping.response(ReceiverStream::new(rx)))
 }
 
 #[allow(clippy::too_many_arguments)]

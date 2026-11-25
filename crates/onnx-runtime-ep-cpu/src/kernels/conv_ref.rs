@@ -718,16 +718,32 @@ fn im2col(
         let co = ch * ih * iw;
         for kh_i in 0..kh {
             for kw_i in 0..kw {
+                // A sample is valid exactly when
+                // pl <= output_col * sw + kernel_col * dw < pl + iw.
+                // Classify that interval once, independently of dilation and
+                // row. Factory geometry validation bounds the padded extent.
+                let kernel_col = kw_i * dw;
+                let begin = pl.saturating_sub(kernel_col).div_ceil(sw).min(ow);
+                let end = (pl + iw).saturating_sub(kernel_col).div_ceil(sw).min(ow);
                 for o_h in 0..oh {
+                    let row = &mut col[idx..idx + ow];
+                    idx += ow;
                     let i_h = (o_h * sh + kh_i * dh).wrapping_sub(pt);
-                    for o_w in 0..ow {
-                        let i_w = (o_w * sw + kw_i * dw).wrapping_sub(pl);
-                        col[idx] = if i_h < ih && i_w < iw {
-                            input[co + i_h * iw + i_w]
-                        } else {
-                            0.0
-                        };
-                        idx += 1;
+                    if i_h >= ih || begin == end {
+                        row.fill(0.0);
+                        continue;
+                    }
+                    row[..begin].fill(0.0);
+                    row[end..].fill(0.0);
+                    let input_row = &input[co + i_h * iw..][..iw];
+                    let first = begin * sw + kernel_col - pl;
+                    let valid = &mut row[begin..end];
+                    if sw == 1 {
+                        valid.copy_from_slice(&input_row[first..first + valid.len()]);
+                    } else {
+                        for (offset, value) in valid.iter_mut().enumerate() {
+                            *value = input_row[first + offset * sw];
+                        }
                     }
                 }
             }
@@ -1249,6 +1265,112 @@ mod tests {
         }
         kernel.execute(&inputs, &mut [output.view_mut()]).unwrap();
         output.to_f32()
+    }
+
+    #[test]
+    fn im2col_spans_preserve_every_sample_bit_and_overwrite_padding() {
+        let mut cases = 0;
+        let bits = [
+            0,
+            0x8000_0000,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc0_1234,
+            0xffc0_5678,
+            1,
+            0x8080_0000,
+            0x3f80_0001,
+        ];
+        for c in [0, 1, 3] {
+            for (ih, iw) in [(0, 0), (0, 5), (3, 0), (1, 1), (2, 5), (5, 8)] {
+                for (kh, kw) in [(1, 1), (2, 3), (3, 2), (3, 3)] {
+                    for strides in [[1, 1], [1, 2], [2, 1], [3, 4]] {
+                        for dilations in [[1, 1], [1, 3], [2, 1], [2, 3]] {
+                            for pads in [
+                                [0, 0, 0, 0],
+                                [1, 1, 1, 1],
+                                [0, 4, 3, 0],
+                                [4, 0, 0, 5],
+                                [5, 7, 6, 8],
+                                [0, 0, 7, 9],
+                            ] {
+                                let (out, _) = output_geometry(
+                                    &[ih, iw],
+                                    &[kh, kw],
+                                    &dilations,
+                                    &strides,
+                                    pads.to_vec(),
+                                    AutoPad::NotSet,
+                                )
+                                .unwrap();
+                                let input: Vec<_> = (0..c * ih * iw)
+                                    .map(|i| f32::from_bits(bits[i % bits.len()]))
+                                    .collect();
+                                let len = c * kh * kw * out[0] * out[1];
+                                let poison = f32::from_bits(0x7fc0_dead);
+                                let mut actual = vec![poison; len + 2];
+                                im2col(
+                                    &input,
+                                    c,
+                                    ih,
+                                    iw,
+                                    kh,
+                                    kw,
+                                    &strides,
+                                    &dilations,
+                                    &pads,
+                                    out[0],
+                                    out[1],
+                                    &mut actual[1..len + 1],
+                                );
+                                // Independent signed-coordinate reference, including
+                                // nonfinite payloads and signed zero; no float arithmetic.
+                                let mut expected = Vec::with_capacity(len);
+                                for ch in 0..c {
+                                    for ky in 0..kh {
+                                        for kx in 0..kw {
+                                            for oy in 0..out[0] {
+                                                for ox in 0..out[1] {
+                                                    let y = (oy * strides[0] + ky * dilations[0])
+                                                        as i64
+                                                        - pads[0] as i64;
+                                                    let x = (ox * strides[1] + kx * dilations[1])
+                                                        as i64
+                                                        - pads[1] as i64;
+                                                    expected.push(
+                                                        if (0..ih as i64).contains(&y)
+                                                            && (0..iw as i64).contains(&x)
+                                                        {
+                                                            input[(ch * ih + y as usize) * iw
+                                                                + x as usize]
+                                                                .to_bits()
+                                                        } else {
+                                                            0
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                assert_eq!(actual[0].to_bits(), poison.to_bits());
+                                assert_eq!(actual[len + 1].to_bits(), poison.to_bits());
+                                assert_eq!(
+                                    actual[1..len + 1]
+                                        .iter()
+                                        .map(|v| v.to_bits())
+                                        .collect::<Vec<_>>(),
+                                    expected,
+                                    "c={c} input={ih}x{iw} kernel={kh}x{kw} stride={strides:?} dilation={dilations:?} pads={pads:?}"
+                                );
+                                cases += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 6912, "the span geometry matrix must execute");
     }
 
     #[test]

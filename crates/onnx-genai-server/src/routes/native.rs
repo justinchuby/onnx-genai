@@ -11,6 +11,28 @@ struct NativeRequest {
     return_tokens: bool,
     prefill_only: bool,
     probabilities: NativeProbabilities,
+    response_fields: Arc<ResponseFields>,
+}
+
+/// Pinned paths traverse objects and retain the entire path as the output key.
+#[derive(Default)]
+struct ResponseFields(Vec<String>);
+impl ResponseFields {
+    fn project(&self, value: Value) -> Value {
+        if self.0.is_empty() {
+            return value;
+        }
+        let mut output = Map::new();
+        for path in &self.0 {
+            let selected = path
+                .split('/')
+                .try_fold(&value, |current, key| current.as_object()?.get(key));
+            if let Some(selected) = selected {
+                output.insert(path.clone(), selected.clone());
+            }
+        }
+        Value::Object(output)
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -20,6 +42,10 @@ struct NativeProbabilities {
 }
 
 fn parse(mut body: Map<String, Value>, infill: bool) -> Result<NativeRequest, ApiError> {
+    let response_fields=Arc::new(ResponseFields(match body.remove("response_fields") {
+        None=>Vec::new(),
+        Some(value)=>serde_json::from_value::<Vec<String>>(value).map_err(|error| ApiError::invalid_request(format!("response_fields must be an array of string paths; use [] to return every field: {error}")))?,
+    }));
     let top = match body.remove("n_probs") {
         None => 0,
         Some(value) => value
@@ -135,6 +161,7 @@ fn parse(mut body: Map<String, Value>, infill: bool) -> Result<NativeRequest, Ap
         return_tokens,
         prefill_only,
         probabilities: NativeProbabilities { top, post },
+        response_fields,
     })
 }
 
@@ -145,13 +172,11 @@ enum NativeOutput {
         completed: oneshot::Receiver<()>,
     },
 }
-impl IntoResponse for NativeOutput {
-    fn into_response(self) -> Response {
+impl NativeOutput {
+    fn response(self, ping: crate::SsePingInterval) -> Response {
         match self {
             Self::Buffered(value) => Json(value).into_response(),
-            Self::Stream { receiver, .. } => {
-                Sse::new(ReceiverStream::new(receiver)).into_response()
-            }
+            Self::Stream { receiver, .. } => ping.response(ReceiverStream::new(receiver)),
         }
     }
 }
@@ -193,9 +218,11 @@ pub(crate) async fn completions(
             return_tokens: first.return_tokens,
             prefill_only: first.prefill_only,
             probabilities: first.probabilities,
+            response_fields: Arc::clone(&first.response_fields),
         });
     }
     validate_native_request(&first, &state.config)?;
+    let ping = crate::SsePingInterval::resolve(&first.sampling, state.config.sse_ping_interval)?;
     // One batch retains one admitted package version across admin reloads.
     let handle = resolve_model(&state.registry, &first.sampling.model).await?;
     let mut prepared = Vec::with_capacity(requests.len() + 1);
@@ -253,7 +280,7 @@ pub(crate) async fn completions(
                 receiver: rx,
                 completed: outcome,
             }
-            .into_response())
+            .response(ping))
         }
     }
 }
@@ -315,10 +342,11 @@ pub(crate) async fn infill(
 ) -> Result<Response, ApiError> {
     let request = parse(body, true)?;
     validate_native_request(&request, &state.config)?;
+    let ping = crate::SsePingInterval::resolve(&request.sampling, state.config.sse_ping_interval)?;
     let handle = resolve_model(&state.registry, &request.sampling.model).await?;
     Ok(run(prepare(&state, request, handle)?, 0)
         .await?
-        .into_response())
+        .response(ping))
 }
 fn validate_native_request(request: &NativeRequest, config: &ServerConfig) -> Result<(), ApiError> {
     super::completions::validate_request(&request.sampling, config)?;
@@ -468,6 +496,7 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
         handle,
         operation,
     } = prepared;
+    let response_fields = Arc::clone(&request.response_fields);
     let (tokens, options) = match operation {
         NativeOperation::Generate { tokens, options } => (tokens, *options),
         NativeOperation::Prefill(input) => {
@@ -493,7 +522,7 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
                         result = &mut prefill.result => {
                             let result = result.map_err(|_| ApiError::internal("prompt-only worker stopped before returning its committed result; inspect server logs and retry"))?
                                 .map_err(generation_failure)?;
-                            return Ok(NativeOutput::Buffered(prefill_value(&model, index, result)));
+                            return Ok(NativeOutput::Buffered(response_fields.project(prefill_value(&model, index, result))));
                         }
                     }
                 }
@@ -523,7 +552,7 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
                                 .and_then(|result| result.map_err(generation_failure));
                             match result {
                                 Ok(result) => {
-                                    let value = prefill_value(&model, index, result);
+                                    let value = response_fields.project(prefill_value(&model, index, result));
                                     if tx.send(Ok(Event::default().data(value.to_string()))).await.is_ok() {
                                         let _ = completed.send(());
                                     }
@@ -614,7 +643,7 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
             &stops,
         );
         probabilities.decorate_result(&mut value, &result, &handle.tokenizer, &stops)?;
-        return Ok(NativeOutput::Buffered(value));
+        return Ok(NativeOutput::Buffered(response_fields.project(value)));
     }
     let mut source = generation.events;
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(16);
@@ -678,6 +707,7 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
                         break;
                     };
                     value["content"] = json!(tail);
+                    let value = response_fields.project(value);
                     if tx
                         .send(Ok(Event::default().data(value.to_string())))
                         .await
@@ -1148,5 +1178,36 @@ mod batch_lifecycle_tests {
         assert!(rx.recv().await.is_some());
         assert!(rx.recv().await.is_some());
         assert!(rx.recv().await.is_none());
+    }
+}
+
+#[cfg(test)]
+mod response_field_tests {
+    use super::*;
+    #[test]
+    fn paths_match_pinned_object_traversal_and_full_path_keys() {
+        let source = json!({"a":{"b":{"c":1},"":2},"x":3,"list":[4],"":5,"tilde~1key":6});
+        let fields = ResponseFields(
+            vec![
+                "a/b/c",
+                "x",
+                "a/b",
+                "a/missing",
+                "x/y",
+                "list/0",
+                "a/",
+                "",
+                "tilde~1key",
+                "a/b/c",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        );
+        assert_eq!(
+            fields.project(source.clone()),
+            json!({"a/b/c":1,"x":3,"a/b":{"c":1},"a/":2,"":5,"tilde~1key":6})
+        );
+        assert_eq!(ResponseFields::default().project(source.clone()), source);
     }
 }

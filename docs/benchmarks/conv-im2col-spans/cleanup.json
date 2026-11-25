@@ -1,0 +1,8 @@
+{
+  "removed_private_probe_sha256": "27a359ad1b2e8b00fe269c2bb64ea4cca564a294882b8ee03c537f3dfe925bf7",
+  "bytes": 865264,
+  "matrix_completed": true,
+  "formal_processes": 216,
+  "all_child_receipts_exit_zero": true,
+  "cargo_caches_and_lock_preserved": true
+}
