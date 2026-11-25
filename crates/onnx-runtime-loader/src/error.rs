@@ -50,6 +50,18 @@ pub enum LoaderError {
     },
 
     #[error(
+        "illegal ai.onnx::Constant at node {node}: tensor attribute `value` has dtype {dtype:?} \
+         at opset {opset}, but it requires opset {minimum} or newer; re-export at a supported \
+         opset or change the value tensor's dtype"
+    )]
+    ConstantValueOpset {
+        node: String,
+        dtype: onnx_runtime_ir::DataType,
+        opset: u64,
+        minimum: u64,
+    },
+
+    #[error(
         "illegal ONNX Einsum at node {node}: {detail}. RULES #1: Einsum syntax, schema version, \
          homogeneous dtype, rank, diagonal, and broadcast constraints must be valid at model \
          load. Expected: fix the equation/input metadata or export with the applicable ai.onnx \

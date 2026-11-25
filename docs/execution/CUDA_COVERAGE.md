@@ -242,7 +242,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Split` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic byte copy; split input, legacy attribute, even split, negative axis, and opset-18 `num_outputs`. |
 | `Tile` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic repeated indexed copy across arbitrary axes. |
 | `Where` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic branch selection with right-aligned broadcasting across condition, x, and y. |
-| `Constant` | `` | ✅ | **host + H2D** | Uploads `value` tensors and numeric `value_*` attribute forms to the device. |
+| `Constant` | `` | ✅ | **host + H2D** | Uploads `value` tensors (including packed storage and FP8: E4M3/E5M2 variants from opset 19, E8M0 from opset 24) and numeric `value_*` attributes to the device. |
 | `BiasGelu` | `com.microsoft` | ✅ | **NVRTC-custom** | Exact (erf) GELU of `X + bias` with the bias broadcast over the last dimension; f32/f16/bf16, GELU evaluated in `double` and the `-inf → 0` guard matched to the CPU EP (`fused_gelu.rs`). |
 | `FastGelu` | `com.microsoft` | ✅ | **NVRTC-custom** | Tanh-approximation GELU of `X` plus an optional last-dim bias (1- or 2-input arity); f32/f16/bf16, matched to the CPU EP. |
 | `QuickGelu` | `com.microsoft` | ✅ | **NVRTC-custom** | `X · sigmoid(alpha · X)` with the `com.microsoft` default `alpha=1.702`; f32/f16/bf16, numerically stable sigmoid matched to the CPU EP. |
