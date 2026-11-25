@@ -3997,6 +3997,7 @@ mod channel_gate_tests {
             stop_sequences: Vec::new(),
         };
         let result = GenerateResult {
+            retained_cache_tokens: 0,
             preserved_tokens: Default::default(),
             text: "</c><c>".into(),
             token_ids: Vec::new(),

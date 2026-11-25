@@ -337,6 +337,7 @@ pub(crate) fn finish_result(
     preserved_tokens: &std::collections::BTreeSet<TokenId>,
 ) -> anyhow::Result<GenerateResult> {
     Ok(GenerateResult {
+        retained_cache_tokens: 0,
         text: crate::tokenization::decode_output(tokenizer, generated_tokens, preserved_tokens)?,
         preserved_tokens: preserved_tokens.clone(),
         token_ids: generated_tokens.to_vec(),

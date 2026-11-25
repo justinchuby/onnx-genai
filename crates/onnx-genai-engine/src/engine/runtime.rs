@@ -21,6 +21,15 @@ fn generate_uses_scheduler(_backend: EngineDecodeBackend) -> bool {
     true
 }
 
+/// Inspect owned cache payloads, never merely a remembered token history.
+fn retained_prefix_cache_tokens(cache: &mut PrefixCache, tokens: &[TokenId]) -> usize {
+    let snapshot = cache
+        .lookup_snapshot::<OrtPrefixSnapshot>(tokens)
+        .map_or(0, |(length, _)| length);
+    let (paged, _) = cache.lookup(tokens);
+    snapshot.max(paged)
+}
+
 /// Logical token length of an ORT-backed session, the single source of the
 /// "session not found" answer for the ORT arm of the shared session policy.
 fn ort_logical_len(engine: &Engine, id: SessionId) -> Option<usize> {
@@ -1068,12 +1077,9 @@ impl Engine {
             .is_none()
             .then(|| native_speculation_plan(&options, &chain))
             .flatten();
-        let retained = if options.cold_start {
-            None
-        } else {
-            Some(self.default_native_session()?)
-        };
-        let scheduler_session_id = retained.unwrap_or_else(|| self.next_native_session_id());
+        // Cold describes input reuse, not retirement of newly evaluated state.
+        let retained = self.default_native_session()?;
+        let scheduler_session_id = retained;
         let scheduled = self.admit_generate_request_with_scheduler(
             scheduler_session_id,
             prompt_tokens.len(),
@@ -1244,22 +1250,23 @@ impl Engine {
             EngineDecodeBackend::Native,
         );
         let result = match result {
-            Ok(result) => {
-                if let Some(id) = retained {
-                    let stamp = self.touch_native_session();
-                    let state = self
-                        .native_sessions
-                        .get_mut(&id)
-                        .expect("admitted default cache remains until commit");
-                    state.tokens.clone_from(&prompt_tokens);
-                    state.tokens.extend_from_slice(&result.token_ids);
-                    state.last_access = stamp;
-                }
+            Ok(mut result) => {
+                let stamp = self.touch_native_session();
+                let state = self
+                    .native_sessions
+                    .get_mut(&retained)
+                    .expect("admitted default cache remains until commit");
+                state.tokens.clone_from(&prompt_tokens);
+                state.tokens.extend_from_slice(&result.token_ids);
+                state.last_access = stamp;
                 let _outcome = turn.commit()?;
-                if let Some(id) = retained {
-                    self.native_active_session = Some(id);
-                    self.evict_native_sessions(id);
-                }
+                self.native_active_session = Some(retained);
+                self.evict_native_sessions(retained);
+                result.retained_cache_tokens = self
+                    .native_session
+                    .as_ref()
+                    .context("committed Native cache is absent")?
+                    .current_len();
                 if let Some(control) = control {
                     control.finish_commit();
                 }
@@ -1601,12 +1608,8 @@ impl Engine {
                             {
                                 tracing::debug!(%error, "prefill committed but optional prefix publication failed");
                             }
-                            let snapshot = self
-                                .prefix_cache
-                                .lookup_snapshot::<OrtPrefixSnapshot>(&tokens)
-                                .map_or(0, |(length, _)| length);
-                            let (paged, _) = self.prefix_cache.lookup(&tokens);
-                            result.retained_cache_tokens = snapshot.max(paged);
+                            result.retained_cache_tokens =
+                                retained_prefix_cache_tokens(&mut self.prefix_cache, &tokens);
                             Ok(result)
                         }
                         Err(error) => {
@@ -1768,7 +1771,11 @@ impl Engine {
             anyhow::bail!("custom samplers are not supported on the native single-session backend");
         }
         let session_id = self.create_session()?;
-        let result = self.generate_in_session_with_sampler(session_id, request, sampler);
+        let mut result = self.generate_in_session_with_sampler(session_id, request, sampler);
+        if let (Ok(result), Some(state)) = (&mut result, self.sessions.get(&session_id)) {
+            result.retained_cache_tokens =
+                retained_prefix_cache_tokens(&mut self.prefix_cache, &state.tokens);
+        }
         let close_result = self.close_session(session_id);
         match (result, close_result) {
             (Ok(result), Ok(())) => Ok(result),
@@ -2226,7 +2233,6 @@ impl Engine {
                 || request.options.num_speculative_tokens.is_some()
                 || self.mtp.is_some();
             if request.options.cold_start || native_spec_requested {
-                let retain_cache = !request.options.cold_start;
                 let result = self.generate_native_cold_with_callback(
                     request,
                     tool_call_policy,
@@ -2234,7 +2240,7 @@ impl Engine {
                     admission_callback,
                     token_callback,
                 );
-                if !retain_cache || result.is_err() {
+                if result.is_err() {
                     self.native_active_session = None;
                 }
                 return result;
@@ -2263,7 +2269,7 @@ impl Engine {
         }
 
         let session_id = self.create_session()?;
-        let result = self.generate_in_session_with_priority_and_callback(
+        let mut result = self.generate_in_session_with_priority_and_callback(
             session_id,
             request,
             Priority::Normal,
@@ -2273,6 +2279,10 @@ impl Engine {
             admission_callback,
             token_callback,
         );
+        if let (Ok(result), Some(state)) = (&mut result, self.sessions.get(&session_id)) {
+            result.retained_cache_tokens =
+                retained_prefix_cache_tokens(&mut self.prefix_cache, &state.tokens);
+        }
         let close_result = self.close_session(session_id);
         match (result, close_result) {
             (Ok(result), Ok(())) => Ok(result),
@@ -2542,8 +2552,15 @@ impl Engine {
             if let Some(control) = &control {
                 control.check(crate::pipeline::GenerationBoundary::BeforeWorkflowNode)?;
             }
-            let prefix_cache_hit_len =
-                self.prepare_session_prefix(session_id, &mut state, &prompt_tokens)?;
+            let prefix_cache_hit_len = if options.cold_start && state.tokens.is_empty() {
+                if self.connector.is_active() {
+                    self.connector.reset_stats();
+                }
+                state.tokens.extend_from_slice(&prompt_tokens);
+                0
+            } else {
+                self.prepare_session_prefix(session_id, &mut state, &prompt_tokens)?
+            };
             let mut loop_state =
                 DecodeLoopState::new(prefix_cache_hit_len, options.seed, options.top_logprobs);
             let has_custom_sampler = custom_sampler.is_some();
@@ -2617,6 +2634,11 @@ impl Engine {
                 self.ensure_session_kv_current(session_id, &mut state)?;
             }
             result.budget_cap = budget_cap;
+            result.retained_cache_tokens = if self.kv_model.is_some() {
+                state.kv_token_count
+            } else {
+                0
+            };
             if let Some(control) = &control {
                 control.require_commit()?;
             }
@@ -2816,9 +2838,9 @@ impl Engine {
                     }
                 };
                 generated_steps += 1;
-                if let Some(result) = step_result {
+                if let Some(mut result) = step_result {
                     let session_id = active_request.session_id;
-                    self.finish_active_generate(active_request)?;
+                    result.retained_cache_tokens = self.finish_active_generate(active_request)?;
                     results.push(PrioritizedGenerateResult { session_id, result });
                 } else {
                     active.insert(session_id, active_request);
@@ -3651,8 +3673,15 @@ impl Engine {
             }
         };
         let prepared = (|| -> anyhow::Result<_> {
-            let prefix_cache_hit_len =
-                self.prepare_session_prefix(request.session_id, &mut state, &prompt_tokens)?;
+            let prefix_cache_hit_len = if options.cold_start && state.tokens.is_empty() {
+                if self.connector.is_active() {
+                    self.connector.reset_stats();
+                }
+                state.tokens.extend_from_slice(&prompt_tokens);
+                0
+            } else {
+                self.prepare_session_prefix(request.session_id, &mut state, &prompt_tokens)?
+            };
             let mut loop_state =
                 DecodeLoopState::new(prefix_cache_hit_len, options.seed, options.top_logprobs);
             let (cursor, setup_finish) = {
@@ -3874,7 +3903,7 @@ impl Engine {
         Ok(None)
     }
 
-    fn finish_active_generate(&mut self, mut active: ActiveGenerate) -> anyhow::Result<()> {
+    fn finish_active_generate(&mut self, mut active: ActiveGenerate) -> anyhow::Result<usize> {
         let session_id = active.session_id;
         let result = (|| -> anyhow::Result<()> {
             // The workflow's own emit and the tokens this drive committed describe
@@ -3906,7 +3935,11 @@ impl Engine {
                         "committed prioritized turn could not publish optional prefix-cache state"
                     );
                 }
-                Ok(())
+                Ok(if self.kv_model.is_some() {
+                    active.state.kv_token_count
+                } else {
+                    0
+                })
             }
             Err(error) => match active.turn.abort(
                 self,
@@ -4122,6 +4155,7 @@ impl Engine {
         preserved_tokens: &std::collections::BTreeSet<TokenId>,
     ) -> anyhow::Result<GenerateResult> {
         Ok(GenerateResult {
+            retained_cache_tokens: 0,
             text: crate::tokenization::decode_output(
                 self.require_tokenizer()?,
                 generated_tokens,
@@ -4499,7 +4533,7 @@ impl Engine {
             Ok(result)
         });
         let result = match result {
-            Ok(result) => {
+            Ok(mut result) => {
                 // Staging validation and cancellation must finish before any
                 // durable history or retention policy changes. The exclusive
                 // engine borrow keeps this admitted session present until here.
@@ -4516,6 +4550,11 @@ impl Engine {
                     control.finish_commit();
                 }
                 self.evict_native_sessions(session_id);
+                result.retained_cache_tokens = self
+                    .native_session
+                    .as_ref()
+                    .context("committed Native cache is absent")?
+                    .current_len();
                 Ok(result)
             }
             Err(error) => {
@@ -5132,6 +5171,38 @@ mod tests {
 
     #[cfg(feature = "native-backend")]
     #[test]
+    fn generation_cache_reports_materialized_retention_after_cold_and_warm_turns()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut engine = native_prefill_content_engine(directory.path(), true)?;
+        let mut request = tiny_native_cold_request(false);
+        request.prompt = GeneratePrompt::TokenIds(vec![0, 1, 2]);
+        request.options.cold_start = true;
+        let first = engine.generate(request.clone())?;
+        assert_eq!(first.prefix_cache_hit_len, 0);
+        assert_eq!(
+            first.retained_cache_tokens,
+            engine.native_session.as_ref().unwrap().current_len()
+        );
+        assert!(first.retained_cache_tokens > 0);
+        let second = engine.generate(request.clone())?;
+        assert_eq!(second.prefix_cache_hit_len, 0);
+        assert_eq!(second.token_ids, first.token_ids);
+        assert_eq!(second.retained_cache_tokens, first.retained_cache_tokens);
+        assert!(engine.native_active_session.is_some());
+        request.options.cold_start = false;
+        let warm = engine.generate(request)?;
+        assert!(warm.prefix_cache_hit_len > 0);
+        assert_eq!(warm.token_ids, first.token_ids);
+        assert_eq!(
+            warm.retained_cache_tokens,
+            engine.native_session.as_ref().unwrap().current_len()
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
     fn request_cancellation_stops_cold_native_and_prompt_lookup_without_publication()
     -> anyhow::Result<()> {
         use crate::pipeline::{GenerationBoundary, GenerationCancelled, GenerationControl};
@@ -5518,6 +5589,39 @@ mod tests {
     }
 
     #[test]
+    fn generation_cache_prioritized_result_captures_committed_session_state() -> anyhow::Result<()>
+    {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let mut engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Ort,
+                ..Default::default()
+            },
+        )?;
+        let session_id = engine.create_session()?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
+        request.options.max_new_tokens = 2;
+        request.options.greedy = true;
+        request.options.stop_on_eos = false;
+        let results = engine.drive_prioritized_requests(vec![PrioritizedGenerateRequest {
+            session_id,
+            request,
+            priority: Priority::Normal,
+        }])?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].result.prefix_cache_hit_len, 0);
+        let state = &engine.sessions[&session_id];
+        assert!(state.kv_token_count >= 3);
+        assert_eq!(
+            results[0].result.retained_cache_tokens,
+            state.kv_token_count
+        );
+        engine.close_session(session_id)?;
+        Ok(())
+    }
+
+    #[test]
     fn prompt_only_prefill_publishes_real_ort_cache_without_output() -> anyhow::Result<()> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
         let mut engine = Engine::from_dir(
@@ -5609,6 +5713,14 @@ mod tests {
         request.options.stop_on_eos = false;
         let generated = engine.generate(request.clone())?;
         assert!(generated.prefix_cache_hit_len > 0);
+        assert!(generated.retained_cache_tokens >= prompt.len());
+        let mut cold = request.clone();
+        cold.options.cold_start = true;
+        let cold_result = engine.generate(cold)?;
+        assert_eq!(cold_result.prefix_cache_hit_len, 0);
+        assert!(cold_result.retained_cache_tokens >= prompt.len());
+        assert_eq!(cold_result.token_ids, generated.token_ids);
+        assert!(engine.generate(request.clone())?.prefix_cache_hit_len > 0);
         let oracle = Engine::from_dir(
             &fixture,
             EngineConfig {

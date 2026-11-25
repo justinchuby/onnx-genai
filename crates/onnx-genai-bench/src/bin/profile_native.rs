@@ -537,6 +537,7 @@ fn native_session_generate(
         };
     }
     Ok(GenerateResult {
+        retained_cache_tokens: 0,
         preserved_tokens: Default::default(),
         text: String::new(),
         token_ids,

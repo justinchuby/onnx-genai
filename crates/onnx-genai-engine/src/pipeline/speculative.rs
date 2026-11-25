@@ -500,6 +500,7 @@ fn finish_candidate_tree_without_generation(
         observer.commit_turn();
     }
     Ok(GenerateResult {
+        retained_cache_tokens: 0,
         preserved_tokens: preserved_tokens.clone(),
         text: String::new(),
         token_ids: Vec::new(),
@@ -1775,6 +1776,7 @@ impl WorkflowRuntime {
             }
         }
         Ok(GenerateResult {
+            retained_cache_tokens: 0,
             preserved_tokens: options.effective_preserved_tokens(),
             text: host.text,
             token_ids: published_tokens,
@@ -2352,6 +2354,7 @@ impl WorkflowRuntime {
                 observer.commit_turn();
             }
             return Ok(GenerateResult {
+                retained_cache_tokens: 0,
                 preserved_tokens: options.effective_preserved_tokens(),
                 text: String::new(),
                 token_ids: Vec::new(),
@@ -2694,6 +2697,7 @@ impl WorkflowRuntime {
             }
         }
         Ok(GenerateResult {
+            retained_cache_tokens: 0,
             preserved_tokens: options.effective_preserved_tokens(),
             text,
             token_ids: generated,

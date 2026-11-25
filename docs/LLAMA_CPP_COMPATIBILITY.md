@@ -409,7 +409,7 @@ and prompts filling the complete context. Declared standalone runtime-owned
 decoders support this operation; composite/authored workflows without an explicit
 prefill contract return an actionable 400 before execution. Portable ORT runner
 KV snapshots retain actual bytes under a host-memory lease and can warm later
-requests; `tokens_cached` counts materialized reuse, never a token-only match.
+requests; reuse counts require materialized state, never a token-only match.
 `cache_prompt=false` forces complete prompt evaluation. Other ORT runner modes can still evaluate but report zero cross-request
 reuse. Native prompt-only evaluation reuses the actual materialized prefix when
 its metadata permits reuse and the physical owner matches. A complete hit
@@ -417,13 +417,18 @@ executes no forward; appends evaluate only the suffix. Sliceable KV can rewind a
 diverged/shorter prefix; non-sliceable state recomputes instead of claiming a
 history-only hit. `cache_prompt=false` forces full Native evaluation too.
 Cancelled evaluations discard uncommitted stateless cache state and release
-admission capacity. For prompt-only responses, `tokens_cached` is the materialized
+admission capacity. For prompt-only and ordinary generation responses, `tokens_cached` is the materialized
 cache retained after the task, matching the pinned
 [upstream final-response assignment](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-context.cpp#L2185).
 It is distinct from the engine's `prefix_cache_hit_len`, which measures this
 request's input reuse. A cold evaluation can therefore retain a nonempty cache.
-The general generation response's retained-cache reporting still needs this same
-alignment; its current field reports input reuse.
+Ordinary Native generation also retains newly evaluated state after
+`cache_prompt=false`; the option prevents input reuse, rather than discarding
+that request's output cache. Retention is captured in the engine result at
+completion, so a later request cannot change an earlier response's count.
+The count comes from the materialized cursor, not prompt-plus-output token
+arithmetic: the final sampled token may not yet have been consumed by a forward.
+OpenAI cached-prompt usage continues to report input reuse separately.
 Native multimodal prompt objects and infill extra files still require further
 engine support. Native embedding normalization supports -1, 0 and positive integer p-norms; zero vectors
 remain zero. Token-counting routes use the same prompt renderer and declared media expansion

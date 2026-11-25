@@ -8678,6 +8678,52 @@ mod native_compat {
     }
 
     #[tokio::test]
+    async fn native_generation_reports_retained_cache_in_buffered_and_streamed_results() {
+        let router = app(tiny_state());
+        for streaming in [false, true] {
+            for cache_prompt in [false, true] {
+                let response = request(
+                    router.clone(),
+                    "/completion",
+                    json!({
+                        "prompt":[2,4,3], "n_predict":2, "temperature":0,
+                        "stream":streaming, "cache_prompt":cache_prompt
+                    }),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let value = if streaming {
+                    sse_json_events(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                        .into_iter()
+                        .find(|value| value["stop"] == true)
+                        .expect("final SSE result")
+                } else {
+                    json_body(response).await
+                };
+                let slots = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/slots")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(slots.status(), StatusCode::OK);
+                let slots = json_body(slots).await;
+                assert_eq!(
+                    value["tokens_cached"], slots[0]["n_past"],
+                    "{value}; {slots}"
+                );
+                assert!(value["tokens_cached"].as_u64().unwrap() >= 3, "{value}");
+                assert_eq!(slots[0]["is_processing"], false);
+                assert_eq!(value["tokens_predicted"], 2);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn native_prompt_only_prefill_returns_zero_output_and_real_cache_reuse() {
         let router = app(tiny_state());
         let response = request(
