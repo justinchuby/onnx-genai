@@ -720,6 +720,28 @@ mod tests {
     }
 
     #[test]
+    fn logarithmic_integer_kernel_behavior_is_unchanged() {
+        let x = Owned::i64(&[2], &[1, 3]);
+        for op in [ReduceOp::LogSum, ReduceOp::LogSumExp] {
+            let mut out = Owned::zeros(DataType::Int64, &[1]);
+            let error = ReduceKernel {
+                op,
+                axes_attr: Some(vec![0]),
+                keepdims: true,
+                noop_with_empty_axes: false,
+            }
+            .execute(&[x.view()], &mut [out.view_mut()])
+            .expect_err("the baseline kernel rejects integer logarithmic inputs");
+            let message = error.to_string();
+            assert!(
+                message.contains("unsupported element type Int64"),
+                "{message}"
+            );
+            assert!(message.contains("insert a `Cast`"), "{message}");
+        }
+    }
+
+    #[test]
     fn log_sum_exp_axes_attribute_keepdims() {
         let x = Owned::f32(&[2, 2], &[0., 1., 2., 3.]);
         let mut out = Owned::zeros_f32(&[2, 1]);
