@@ -1,0 +1,125 @@
+schema_version: v1.13
+package:
+  tokenizer:
+    algorithm: word_level
+    vocab_size: 32
+    artifacts: [{ location: tokenizer.json }]
+    special_tokens: { bos_token_id: 2, eos_token_id: [3] }
+profiles:
+  live:
+    kind: realtime
+    version: '1'
+    realtime:
+      default_mode: realtime
+      prompt_template: '{% if operation == "response_start" %}hello world{% else %}{{ text }}{% endif %}'
+      voices: {kind: choices, values: [alice, bob]}
+      languages: {kind: choices, values: [en, zh]}
+      modes: [realtime, transcription, duplex]
+      input_sample_rate_hz: 16000
+      input_frame_samples: 320
+      output_sample_rate_hz: 24000
+      inputs: { operation: request.operation, audio: request.audio, tokens: request.tokens, output_token_budget: request.output_token_budget }
+    outputs: { tokens: tokens, audio: audio, done: done, needs_input: needs_input, prompt_tokens: prompt_tokens, output_tokens: output_tokens }
+pipeline:
+  workflow:
+    publication_mode: commit_only
+    manifest: {}
+    inputs:
+      request.output_token_budget:
+        contract: { dtype: int64, shape: [] }
+        role: { kind: opaque }
+        source: { kind: application, name: output_token_budget }
+      request.operation:
+        contract: { dtype: int64, shape: [] }
+        role: { kind: opaque }
+        source: { kind: application, name: operation }
+      request.audio:
+        contract: { dtype: float32, shape: [input_samples] }
+        role: { kind: opaque }
+        source: { kind: application, name: audio }
+      request.tokens:
+        contract: { dtype: int64, shape: [input_tokens] }
+        role: { kind: opaque }
+        source: { kind: application, name: tokens }
+      seed:
+        contract: { dtype: float32, shape: [1], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: literal }
+        required: false
+        default: 0.0
+      mode_seed:
+        contract: { dtype: int64, shape: [1], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: literal }
+        required: false
+        default: -1
+      active:
+        contract: { dtype: bool, shape: [] }
+        role: { kind: opaque }
+        source: { kind: literal }
+        required: false
+        default: true
+      finished:
+        contract: { dtype: bool, shape: [] }
+        role: { kind: opaque }
+        source: { kind: literal }
+        required: false
+        default: false
+      accepted:
+        contract: { dtype: int64, shape: [1], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: literal }
+        required: false
+        default: 1
+    outputs:
+      tokens: { contract: { dtype: int64, shape: [text_samples] }, role: tensor, family: {kind: materialized}, stage: pre_adapter }
+      audio: { contract: { dtype: float32, shape: [audio_samples] }, role: tensor, family: {kind: materialized}, stage: pre_adapter }
+      done: { contract: { dtype: bool, shape: [] }, role: tensor, family: {kind: materialized}, stage: pre_adapter }
+      needs_input: { contract: { dtype: bool, shape: [] }, role: tensor, family: {kind: materialized}, stage: pre_adapter }
+      prompt_tokens: { contract: { dtype: int64, shape: [] }, role: tensor, family: {kind: materialized}, stage: pre_adapter }
+      output_tokens: { contract: { dtype: int64, shape: [] }, role: tensor, family: {kind: materialized}, stage: pre_adapter }
+    components:
+      quantum:
+        implementation: { kind: onnx, artifact: model.onnx.textproto }
+    state:
+      history:
+        contract: { dtype: float32, shape: [1], batch_layout: { kind: request_aligned, axis: 0 } }
+        scope: session
+        initializer: seed
+        recurrence: { kind: invariant }
+        management: runtime
+        release_boundary: session
+        service_group: memory
+      session_mode:
+        contract: { dtype: int64, shape: [1], batch_layout: { kind: request_aligned, axis: 0 } }
+        scope: session
+        initializer: mode_seed
+        recurrence: { kind: invariant }
+        management: runtime
+        release_boundary: session
+        service_group: memory
+    serving:
+      active: active
+      done: finished
+      accepted_len: accepted
+      state_service:
+        groups:
+          memory:
+            kind: recurrent
+            layout: scalar
+            update: { kind: replace }
+            ports:
+              quantum:
+                history: { input: previous, output: next }
+                session_mode: { input: previous_mode, output: next_mode }
+    steps:
+      - kind: invoke
+        component: quantum
+        inputs: { output_token_budget: request.output_token_budget, operation: request.operation, audio: request.audio, tokens: request.tokens, previous: seed, previous_mode: mode_seed }
+        outputs: { audio_out: chunk.audio, tokens_out: chunk.tokens, done: chunk.done, needs_input: chunk.needs_input, count: chunk.count, prompt_count: chunk.prompt_count, next: chunk.next, next_mode: chunk.next_mode }
+      - { kind: emit, value: chunk.audio, output: audio, mode: replace }
+      - { kind: emit, value: chunk.tokens, output: tokens, mode: replace }
+      - { kind: emit, value: chunk.done, output: done, mode: replace }
+      - { kind: emit, value: chunk.needs_input, output: needs_input, mode: replace }
+      - { kind: emit, value: chunk.prompt_count, output: prompt_tokens, mode: replace }
+      - { kind: emit, value: chunk.count, output: output_tokens, mode: replace }

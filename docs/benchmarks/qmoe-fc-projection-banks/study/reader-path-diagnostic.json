@@ -1,0 +1,8 @@
+{
+  "stage": "postprocessing, after 144 terminal processes",
+  "initial_default_directory": "/tmp/nxrt-block-banks-study",
+  "rejection": "case0 baseline workspace1280 != expected0",
+  "correct_directory": "/tmp/nxrt-qmoe-fc-banks-study",
+  "actual_case0_baseline_workspace_bytes": 0,
+  "correction": "reader default directory fixed; reread same frozen data; no measurements rerun"
+}

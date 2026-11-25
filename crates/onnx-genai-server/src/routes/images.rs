@@ -21,7 +21,7 @@ const IMAGE_RANGE_RELATIVE_EPSILON: f32 = 1.0e-5;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct OpenAiImageRequest {
+pub(crate) struct OpenAiMediaRequest {
     model: String,
     prompt: String,
     #[serde(default = "one")]
@@ -113,7 +113,7 @@ struct OpenAiImageData {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct A1111ImageRequest {
+pub(crate) struct A1111MediaRequest {
     #[serde(default)]
     prompt: String,
     #[serde(default)]
@@ -283,7 +283,7 @@ pub(crate) struct A1111Sampler {
 }
 
 #[derive(Debug, Clone)]
-struct NormalizedImageRequest {
+struct NormalizedMediaRequest {
     prompt: String,
     negative_prompt: String,
     seed: u64,
@@ -299,7 +299,7 @@ struct NormalizedImageRequest {
 
 pub(crate) async fn openai_images(
     State(state): State<AppState>,
-    ApiJson(request): ApiJson<OpenAiImageRequest>,
+    ApiJson(request): ApiJson<OpenAiMediaRequest>,
 ) -> Result<Json<OpenAiImageResponse>, ApiError> {
     validate_count(request.n)?;
     if request.quality.is_some() {
@@ -352,7 +352,7 @@ pub(crate) async fn openai_images(
     let base_seed = request_seed(spec);
     let mut data = Vec::with_capacity(request.n);
     for index in 0..request.n {
-        let normalized = NormalizedImageRequest {
+        let normalized = NormalizedMediaRequest {
             prompt: request.prompt.clone(),
             negative_prompt: String::new(),
             seed: base_seed.wrapping_add(index as u64),
@@ -378,7 +378,7 @@ pub(crate) async fn openai_images(
 
 pub(crate) async fn a1111_txt2img(
     State(state): State<AppState>,
-    ApiJson(request): ApiJson<A1111ImageRequest>,
+    ApiJson(request): ApiJson<A1111MediaRequest>,
 ) -> Result<Json<A1111ImageResponse>, ApiError> {
     if !request.init_images.is_empty() || request.denoising_strength.is_some() {
         return Err(ApiError::invalid_request(
@@ -390,14 +390,14 @@ pub(crate) async fn a1111_txt2img(
 
 pub(crate) async fn a1111_img2img(
     State(state): State<AppState>,
-    ApiJson(request): ApiJson<A1111ImageRequest>,
+    ApiJson(request): ApiJson<A1111MediaRequest>,
 ) -> Result<Json<A1111ImageResponse>, ApiError> {
     execute_a1111(state, request, true).await
 }
 
 async fn execute_a1111(
     state: AppState,
-    request: A1111ImageRequest,
+    request: A1111MediaRequest,
     img2img: bool,
 ) -> Result<Json<A1111ImageResponse>, ApiError> {
     reject_a1111_unsupported(&request)?;
@@ -440,7 +440,7 @@ async fn execute_a1111(
     let mut actual_height = height;
     for index in 0..count {
         let seed = first_seed.wrapping_add(index as u64);
-        let normalized = NormalizedImageRequest {
+        let normalized = NormalizedMediaRequest {
             prompt: request.prompt.clone(),
             negative_prompt: request.negative_prompt.clone(),
             seed,
@@ -499,7 +499,7 @@ async fn execute_a1111(
     }))
 }
 
-fn reject_a1111_unsupported(request: &A1111ImageRequest) -> Result<(), ApiError> {
+fn reject_a1111_unsupported(request: &A1111MediaRequest) -> Result<(), ApiError> {
     if request.save_images {
         return Err(ApiError::invalid_request(
             "`save_images: true` is unsupported because the server has no configured image asset store",
@@ -541,7 +541,7 @@ fn image_spec(
 async fn execute(
     handle: &crate::registry::ModelHandle,
     spec: &ImagePipelineSpec,
-    normalized: &NormalizedImageRequest,
+    normalized: &NormalizedMediaRequest,
 ) -> Result<Vec<u8>, ApiError> {
     let pipeline_request = lower(handle, spec, normalized)?;
     let image = handle
@@ -556,7 +556,7 @@ async fn execute(
 fn lower(
     handle: &crate::registry::ModelHandle,
     spec: &ImagePipelineSpec,
-    request: &NormalizedImageRequest,
+    request: &NormalizedMediaRequest,
 ) -> Result<ImageExecutionRequest, ApiError> {
     if let Some(sampler) = request.sampler.as_deref()
         && !spec.samplers.iter().any(|declared| declared == sampler)

@@ -1,0 +1,138 @@
+{
+  "shapes_rows_hidden_inter_execution_width_dense_gate_construction_width_matmul": [
+    [
+      1,
+      64,
+      128,
+      1,
+      0,
+      1,
+      1,
+      0
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      0,
+      1,
+      4,
+      0
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      1,
+      1,
+      4,
+      0
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      0,
+      1,
+      1,
+      0
+    ],
+    [
+      8,
+      128,
+      256,
+      1,
+      0,
+      1,
+      4,
+      0
+    ],
+    [
+      1,
+      64,
+      128,
+      1,
+      0,
+      0,
+      1,
+      1
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      0,
+      0,
+      4,
+      1
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      1,
+      0,
+      4,
+      1
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      0,
+      0,
+      1,
+      1
+    ],
+    [
+      8,
+      128,
+      256,
+      1,
+      0,
+      0,
+      4,
+      1
+    ]
+  ],
+  "arms": [
+    "baseline",
+    "candidate",
+    "null"
+  ],
+  "repetitions": 3,
+  "work_macs": 536870912,
+  "k": 2,
+  "fixed_warm_calls": 5,
+  "setup_only_calls": 0,
+  "double_multiplier": 2,
+  "quality": {
+    "aa": [
+      0.95,
+      1.05
+    ],
+    "setup_fraction_max": 0.25,
+    "setup_adjusted_double": [
+      1.7,
+      2.3
+    ],
+    "work_cpu_seconds_min": 0.05,
+    "physical_cpu_wall_factor": 11
+  },
+  "max_attempts": 1,
+  "quality_metrics": [
+    "cpu_s",
+    "wall_s"
+  ],
+  "context_scope": "construction pool builds and initially prepares; execution pool prepares, warms and runs; baseline remains constructor-frozen, candidate follows actual execution width; logical and retained physical peak recorded separately",
+  "tile": 4,
+  "no_speedup_claim_by_default": true,
+  "binary_scope": "two source-controlled optimized native builds; null runs baseline executable; this is not one-address-space A/B",
+  "cpu_scope": "terminal child user+system CPU seconds, includes setup/work/validation/output IO/retirement; not pure inference latency"
+}

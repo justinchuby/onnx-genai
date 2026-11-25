@@ -1,0 +1,54 @@
+ir_version: 11
+opset_import { domain: "" version: 24 }
+graph { name: "stateful_realtime_quantum"
+node { input: "audio" input: "previous" output: "audio_out" op_type: "Add" }
+node { input: "audio" output: "sum" op_type: "ReduceSum" attribute { name: "keepdims" i: 0 type: INT } }
+node { input: "sum" input: "previous" output: "next" op_type: "Add" }
+node { input: "previous_mode" input: "axis" output: "prior_mode" op_type: "Squeeze" }
+node { input: "operation" input: "three" output: "starting" op_type: "Less" }
+node { input: "starting" input: "operation" input: "prior_mode" output: "mode" op_type: "Where" }
+node { input: "mode" input: "axis" output: "next_mode" op_type: "Unsqueeze" }
+node { input: "mode" input: "one" output: "transcription" op_type: "Equal" }
+node { input: "operation" input: "commit" output: "committing" op_type: "Equal" }
+node { input: "transcription" input: "committing" output: "asr" op_type: "And" }
+node { input: "operation" input: "generate" output: "generating" op_type: "Equal" }
+node { input: "generating" input: "asr" output: "responding" op_type: "Or" }
+node { input: "responding" output: "needs_input" op_type: "Not" }
+node { input: "operation" input: "cancel" output: "cancelling" op_type: "Equal" }
+node { input: "responding" input: "cancelling" output: "done" op_type: "Or" }
+node { input: "asr" output: "candidate_tokens" op_type: "If"
+attribute { name: "then_branch" type: GRAPH g { name: "asr_tokens" node { input: "hello_world" output: "result" op_type: "Identity" } output { name: "result" type { tensor_type { elem_type: 7 shape { dim { dim_value: 2 } } } } } } }
+attribute { name: "else_branch" type: GRAPH g { name: "context_or_generation_tokens" node { input: "tokens" output: "result" op_type: "Identity" } output { name: "result" type { tensor_type { elem_type: 7 shape { dim { dim_param: "tokens" } } } } } } }
+}
+node { input: "candidate_tokens" output: "candidate_count" op_type: "Size" }
+node { input: "responding" input: "output_token_budget" input: "unlimited" output: "budget" op_type: "Where" }
+node { input: "budget" input: "zero" output: "is_unlimited" op_type: "Less" }
+node { input: "is_unlimited" input: "candidate_count" input: "budget" output: "end" op_type: "Where" }
+node { input: "end" input: "axis" output: "ends" op_type: "Unsqueeze" }
+node { input: "candidate_tokens" input: "axis" input: "ends" input: "axis" output: "tokens_out" op_type: "Slice" }
+node { input: "tokens_out" output: "count" op_type: "Size" }
+node { input: "tokens" output: "prompt_count" op_type: "Size" }
+initializer { name: "cancel" data_type: 7 int64_data: 8 }
+initializer { name: "generate" data_type: 7 int64_data: 6 }
+initializer { name: "commit" data_type: 7 int64_data: 4 }
+initializer { name: "three" data_type: 7 int64_data: 3 }
+initializer { name: "one" data_type: 7 int64_data: 1 }
+initializer { name: "zero" data_type: 7 int64_data: 0 }
+initializer { name: "unlimited" data_type: 7 int64_data: -1 }
+initializer { name: "axis" data_type: 7 dims: 1 int64_data: 0 }
+initializer { name: "hello_world" data_type: 7 dims: 2 int64_data: 4 int64_data: 5 }
+input { name: "output_token_budget" type { tensor_type { elem_type: 7 shape {} } } }
+input { name: "audio" type { tensor_type { elem_type: 1 shape { dim { dim_param: "samples" } } } } }
+input { name: "tokens" type { tensor_type { elem_type: 7 shape { dim { dim_param: "tokens" } } } } }
+input { name: "operation" type { tensor_type { elem_type: 7 shape {} } } }
+input { name: "previous" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } } } } }
+input { name: "previous_mode" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } } } } }
+output { name: "audio_out" type { tensor_type { elem_type: 1 shape { dim { dim_param: "samples" } } } } }
+output { name: "tokens_out" type { tensor_type { elem_type: 7 shape { dim { dim_param: "emitted_tokens" } } } } }
+output { name: "count" type { tensor_type { elem_type: 7 shape {} } } }
+output { name: "prompt_count" type { tensor_type { elem_type: 7 shape {} } } }
+output { name: "next" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } } } } }
+output { name: "next_mode" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } } } } }
+output { name: "needs_input" type { tensor_type { elem_type: 9 shape {} } } }
+output { name: "done" type { tensor_type { elem_type: 9 shape {} } } }
+}

@@ -30,7 +30,7 @@ The supported surface and explicit limitations are documented in
 - [ ] Responses and Anthropic Messages, including tools and streamed event contracts.
 - [ ] Generation controls/sampling and reporting needed by the upstream frontend.
 - [ ] Capability-backed ranking, adapter and slot/state operations; audit the engine boundary before introducing transport support.
-- [ ] Model catalogue/download semantics and audio transports; preserve explicit configuration and resource bounds.
+- [ ] Complete model catalogue/source-format semantics and audio transports; preserve explicit configuration and resource bounds. Native-package download, resume and deletion are implemented; GGUF import and sidecar selection remain open.
 - [ ] Full compatibility matrix and executable conformance tests.
 - [ ] Fresh full checks, adversarial self-review, PR description update and merge (CI is currently blocked; user authorized merging after local verification).
 
@@ -1883,3 +1883,57 @@ choice ordering, true-first boolean heads, canonical-null alias precedence,
 fixed tasks and one-/eleven-level dynamic score heads. HTTP tests cover authored
 limits, payload rejection and wire legends. These tests establish text decision
 behavior for the authored fixtures; they do not establish media or GGUF support.
+
+
+## Managed native-package downloads
+
+`--model-cache-dir` enables `/models` download/delete and cache-backed load/unload
+without enabling `/v1/admin/*`. A validated Hub plan pins one immutable commit;
+partial files, full quota reservations and publication manifests survive
+restart. Canonical registry entries own transfer or package state, and native
+worker lifetimes retain package ownership until their threads stop. Only
+server-owned cache entries can be removed.
+
+The SSE stream reports upstream model envelopes with actual per-file counters,
+bounded notification storage and consumer-side coalescing. Pause and retry
+retain the original plan and byte prefixes. Model revision changes require
+explicit deletion first. See [model management](MODEL_MANAGEMENT.md) for public
+requests, limits and unsupported GGUF/sidecar source selections.
+
+
+## Multimodal reranking
+
+Core schema v1.12 and reranking v2 declare ordered query/document encoded-image
+endpoints and authoritative workflow token usage. Prepared pairs carry their
+admitted contract and shared media ownership into the ordinary worker command.
+The HTTP layer admits all image positions before fetch, bounds the retained
+request media, and preserves Jina/TEI response semantics.
+
+Reusable image-preprocess@2 binds program output names to component-local ports;
+each invocation publishes its own SSA values. ABI v1 keeps its established
+workflow-scoped single-invocation contract. Chat media capabilities derive from
+runtime Media roles, independently of task-owned application inputs. See
+[reranking](RERANKING.md) for the public contract and native fixture.
+
+
+## Ordered image decisions
+
+Decision v2 uses core schema v1.14 to declare ordered image endpoints and a
+workflow-owned total prompt-token count. The HTTP transport preserves upstream
+files/images/chat-media ordering, strips only image parts from textual state,
+and bounds unique retained media through the image loader shared with reranking.
+Prepared decisions retain shared encoded images across questions and variants;
+native workflow steps perform vision preprocessing and calibrated probability
+inference. Negative/underreported usage is rejected, and a typed input-limit
+error reaches HTTP as a client error. See [SystemOne](SYSTEMONE.md) for the
+explicit contract and the remaining audio/video, joint/packed and shared-entry
+work. This increment does not close the overall compatibility acceptance rows.
+
+### SystemOne mixed audio contracts
+
+Decision v3 (core v1.15) binds ordered typed state media and a distinct spoken
+instruction endpoint. HTTP extraction preserves state structure and media order;
+PCM16 WAV bytes enter authored reusable audio-preprocess@2 components. Actual
+workflow token usage includes media expansion and is bounded. Native fixture
+and HTTP acceptance cover independent spoken questions, byte-budget sharing,
+invalid media and capability discovery; see [SystemOne](SYSTEMONE.md).

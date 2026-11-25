@@ -18846,3 +18846,6 @@ fn kernel_cache_and_prebinding_require_exact_cold_shape_facts() {
     assert_ne!(third, fourth);
     assert_eq!(cache.stats().misses, 4);
 }
+
+#[path = "workspace_context_tests.rs"]
+mod workspace_context_tests;
