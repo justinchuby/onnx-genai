@@ -23,6 +23,7 @@ mod graph_cardinality;
 pub mod identity;
 mod lowering;
 pub mod parser;
+pub mod realtime;
 pub mod schema;
 pub mod session_state;
 mod state_plan;

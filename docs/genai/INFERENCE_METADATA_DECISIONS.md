@@ -751,6 +751,24 @@ binds every declared program output and preserves its exact typed contract.
 Version 1 retains workflow-scoped names and its exactly-one-invocation rule.
 These are explicit adapter ABIs, not alternative inference of output names.
 
+### 10.6 Realtime session quanta (v1.13)
+
+The `realtime` v1 task ABI declares rates, frame bounds, supported modes and
+opaque application input bindings for operation, mono PCM, discrete text
+IDs and the remaining output-token budget. It declares a default mode and
+model-authored conditioning template with explicit voice/language policies.
+Its outputs are final PCM/token vectors, response completion and input-readiness
+bools, and actual per-quantum token counts. The exact operation and tensor contracts are
+specified in [Realtime audio](../REALTIME.md). These fields require v1.13 at
+both parser and typed admission boundaries, including unsupported ignorable
+versions; newer ignorable task ABIs are otherwise skipped.
+
+The workflow owns all codec/conversation state and numerical computation.
+State persists under an exclusively owned native session, while every bounded
+invocation commits independently. No model identity, codec rate, frame geometry
+or silence/end-of-turn rule is inferred by the runtime. Transport cancellation
+and empty publications cannot silently close or reset model state.
+
 ## 11. Cache correctness dependencies
 
 ### 11.1 Derived, not declared

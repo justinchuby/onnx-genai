@@ -81,6 +81,14 @@ const MATRIX: &[Row] = &[
         false,
         None,
     ),
+    row(
+        "tests/fixtures/onnx_genai_workflows/realtime/inference_metadata.yaml",
+        1,
+        SingleGraph,
+        None,
+        false,
+        None,
+    ),
     // The adapter and ONNX classifier are two executable components, even
     // though one adapter is invoked three times. Neither is a decoder.
     row(
