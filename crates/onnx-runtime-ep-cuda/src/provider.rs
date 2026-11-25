@@ -4307,6 +4307,11 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if let Some(reason) =
+            onnx_runtime_ep_api::standard_activation::unsupported_reason(op, opset, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if let Some(reason) = onnx_runtime_ep_api::mean_variance_normalization::unsupported_reason(
             op,
             shapes,

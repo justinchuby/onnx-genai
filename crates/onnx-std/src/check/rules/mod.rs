@@ -873,6 +873,41 @@ mod tests {
     }
 
     #[test]
+    fn opset_22_activation_bf16_boundary_is_enforced_at_model_entry() {
+        let rule = TypeConstraintSatisfiedRule;
+        for op_type in ["Elu", "HardSigmoid", "Selu", "Softplus", "Softsign"] {
+            let model = |opset| {
+                let mut graph = Graph::new();
+                graph.opset_imports.insert(String::new(), opset);
+                let input = graph.create_named_value("X", DataType::BFloat16, static_shape([2]));
+                let output = graph.create_named_value("Y", DataType::BFloat16, static_shape([2]));
+                graph.add_input(input);
+                graph.insert_node(Node::new(
+                    NodeId(0),
+                    op_type,
+                    vec![Some(input)],
+                    vec![output],
+                ));
+                graph.add_output(output);
+                Model::new(graph)
+            };
+
+            let rejected = rule.check(&model(21), &ValidationContext::default());
+            assert_eq!(rejected.len(), 2, "{op_type}: {rejected:?}");
+            assert!(
+                rejected
+                    .iter()
+                    .all(|violation| { violation.message.contains("does not allow BFloat16") })
+            );
+            assert!(
+                rule.check(&model(22), &ValidationContext::default())
+                    .is_empty(),
+                "{op_type}"
+            );
+        }
+    }
+
+    #[test]
     fn matching_initializer_type_passes() {
         let rule = InitializerTypeMatchesDeclaredRule;
         let mut graph = Graph::new();
