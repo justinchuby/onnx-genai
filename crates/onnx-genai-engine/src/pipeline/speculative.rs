@@ -500,6 +500,8 @@ fn finish_candidate_tree_without_generation(
         observer.commit_turn();
     }
     Ok(GenerateResult {
+        timings: None,
+        retained_cache_tokens: 0,
         preserved_tokens: preserved_tokens.clone(),
         text: String::new(),
         token_ids: Vec::new(),
@@ -1761,6 +1763,7 @@ impl WorkflowRuntime {
         if let Some(callback) = callback.as_mut() {
             for (index, token) in published_tokens.iter().copied().enumerate() {
                 if let Err(error) = callback(crate::config::GenerateToken {
+                    timings: None,
                     logprob: None,
                     token_id: token,
                     text: host.token_text[index].clone(),
@@ -1775,6 +1778,8 @@ impl WorkflowRuntime {
             }
         }
         Ok(GenerateResult {
+            timings: None,
+            retained_cache_tokens: 0,
             preserved_tokens: options.effective_preserved_tokens(),
             text: host.text,
             token_ids: published_tokens,
@@ -2352,6 +2357,8 @@ impl WorkflowRuntime {
                 observer.commit_turn();
             }
             return Ok(GenerateResult {
+                timings: None,
+                retained_cache_tokens: 0,
                 preserved_tokens: options.effective_preserved_tokens(),
                 text: String::new(),
                 token_ids: Vec::new(),
@@ -2679,6 +2686,7 @@ impl WorkflowRuntime {
             )?;
             for (index, (token, text)) in generated.iter().copied().zip(pieces).enumerate() {
                 callback(crate::config::GenerateToken {
+                    timings: None,
                     logprob: None,
                     token_id: token,
                     text,
@@ -2694,6 +2702,8 @@ impl WorkflowRuntime {
             }
         }
         Ok(GenerateResult {
+            timings: None,
+            retained_cache_tokens: 0,
             preserved_tokens: options.effective_preserved_tokens(),
             text,
             token_ids: generated,
