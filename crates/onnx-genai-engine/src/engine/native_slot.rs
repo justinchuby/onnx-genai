@@ -258,7 +258,9 @@ mod tests {
     fn native_slot_cold_start_skips_reuse_but_retains_committed_speculative_cache()
     -> anyhow::Result<()> {
         let mut e = engine("tiny-mtp-full")?;
-        let warm = e.generate(request())?;
+        let mut cacheable = request();
+        cacheable.prompt = GeneratePrompt::TokenIds(vec![0, 1]);
+        let warm = e.generate(cacheable.clone())?;
         assert_eq!(warm.prefix_cache_hit_len, 0);
         assert!(warm.retained_cache_tokens > 0);
         assert_eq!(
@@ -267,12 +269,11 @@ mod tests {
         );
         let mut file = Vec::new();
         let saved = e.write_native_slot_state(&mut file, Default::default())?;
-        let reused = e.generate(request())?;
+        let reused = e.generate(cacheable.clone())?;
         assert!(reused.prefix_cache_hit_len > 0);
         assert_eq!(reused.token_ids, warm.token_ids);
-        let mut r = request();
-        r.options.cold_start = true;
-        let cold = e.generate(r)?;
+        cacheable.options.cold_start = true;
+        let cold = e.generate(cacheable.clone())?;
         assert_eq!(cold.prefix_cache_hit_len, 0);
         assert_eq!(cold.token_ids, warm.token_ids);
         assert!(cold.retained_cache_tokens > 0);
@@ -287,7 +288,8 @@ mod tests {
             e.native_slot_state().unwrap().materialized_tokens,
             saved.materialized_tokens
         );
-        let restored = e.generate(request())?;
+        cacheable.options.cold_start = false;
+        let restored = e.generate(cacheable)?;
         assert!(restored.prefix_cache_hit_len > 0);
         assert_eq!(restored.token_ids, warm.token_ids);
         Ok(())
