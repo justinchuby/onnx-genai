@@ -401,12 +401,12 @@ pub(super) fn build_pipeline_request(
             .audio
             .as_ref()
             .expect("audio support checked before building the request");
-        let input = MultimodalInput::from_wav(spec, &read_attachment(path, "audio")?)
+        let input = MultimodalInput::from_audio_bytes(spec, &read_attachment(path, "audio")?)
             .with_context(|| {
                 format!(
                     "What: the audio file {} could not be preprocessed. \
                      Why: it is not usable as this model's declared audio input. \
-                     How: provide a PCM16 WAV file.",
+                     How: provide a valid PCM16 WAV or MP3 file.",
                     path.display()
                 )
             })?;

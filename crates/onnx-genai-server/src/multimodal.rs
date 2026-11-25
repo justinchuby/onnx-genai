@@ -7,7 +7,7 @@ use onnx_genai_engine::PipelineGenerateRequest;
 use onnx_genai_metadata::{RuntimeInputRole, SemanticInputRole, TensorDimension};
 use onnx_genai_ort::{DataType, PipelineModelDirectory, PipelineModels, Tokenizer, Value};
 
-pub use crate::audio_input::{AudioInputSpec, AudioTensor, preprocess_samples, preprocess_wav};
+pub use crate::audio_input::{AudioInputSpec, AudioTensor, preprocess_audio, preprocess_samples};
 pub use crate::media_input::MAX_EXPANDED_PROMPT_TOKENS;
 
 #[derive(Debug, Clone)]
@@ -128,8 +128,10 @@ impl MultimodalInput {
         })
     }
 
-    pub fn from_wav(spec: &AudioInputSpec, bytes: &[u8]) -> anyhow::Result<Self> {
+    pub fn from_audio_bytes(spec: &AudioInputSpec, bytes: &[u8]) -> anyhow::Result<Self> {
         if spec.encoded {
+            onnx_genai_preprocess::audio::decode_audio(bytes)
+                .context("validate encoded audio input before workflow admission")?;
             return Ok(Self {
                 tensors: vec![PreparedTensor::EncodedAudio {
                     name: spec.endpoint.clone(),
@@ -137,7 +139,7 @@ impl MultimodalInput {
                 }],
             });
         }
-        let tensor = preprocess_wav(bytes, spec)?;
+        let tensor = preprocess_audio(bytes, spec)?;
         Ok(Self {
             tensors: vec![PreparedTensor::Audio {
                 name: tensor.endpoint,

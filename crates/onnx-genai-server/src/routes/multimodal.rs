@@ -6,7 +6,6 @@ pub(crate) async fn audio_transcriptions(
     mut multipart: Multipart,
 ) -> Result<Response, ApiError> {
     let mut file = None;
-    let mut filename = None;
     let mut language = None;
     let mut prompt = None;
     let mut response_format = "json".to_string();
@@ -22,7 +21,6 @@ pub(crate) async fn audio_transcriptions(
         let name = field.name().unwrap_or_default().to_string();
         match name.as_str() {
             "file" => {
-                filename = field.file_name().map(ToString::to_string);
                 file = Some(
                     field
                         .bytes()
@@ -96,14 +94,6 @@ pub(crate) async fn audio_transcriptions(
                     state.config.max_output_tokens
                 ))
             })?;
-    if filename
-        .as_deref()
-        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".mp3"))
-    {
-        return Err(ApiError::invalid_request(
-            "MP3 audio is not supported yet; provide a PCM16 WAV file",
-        ));
-    }
     if let Some(contract) = &handle.engine.transcription {
         if language.as_ref().is_some_and(|value| !value.is_empty())
             || prompt.as_ref().is_some_and(|value| !value.is_empty())
@@ -112,9 +102,9 @@ pub(crate) async fn audio_transcriptions(
                 "this frame-decoding transcription profile declares no language/prompt conditioning; omit those fields or select a conditioned speech package",
             ));
         }
-        let bytes=tokio::task::spawn_blocking(move ||onnx_genai_preprocess::audio::decode_wav_pcm16(&bytes).map(|_|bytes)).await
+        let bytes=tokio::task::spawn_blocking(move ||onnx_genai_preprocess::audio::decode_audio(&bytes).map(|_|bytes)).await
             .map_err(|error|ApiError::internal(format!("validate transcription file: decoding task stopped: {error}; retry or inspect server logs")))?
-            .map_err(|error|ApiError::invalid_request(format!("file is not valid PCM16 WAV audio: {error}; provide a supported WAV recording")))?;
+            .map_err(|error|ApiError::invalid_request(format!("file is not supported audio: {error}; provide a PCM16 WAV or MP3 recording")))?;
         let limits=onnx_genai_engine::transcription::TranscriptionLimits {
             max_frames:state.config.max_transcription_frames,
             max_tokens:std::num::NonZeroUsize::new(state.config.max_output_tokens).ok_or_else(||ApiError::internal("max_output_tokens is zero; configure a positive transcription output token allowance"))?,
@@ -155,8 +145,8 @@ pub(crate) async fn audio_transcriptions(
             ApiError {status:StatusCode::NOT_IMPLEMENTED,kind:"not_supported_error",retry_after_secs:None,message:format!(
                 "What: audio transcription was rejected for model '{}'. Why: its package declares neither a frame-transcription profile nor a generative audio input. How: serve a speech package with an explicit audio input contract.",handle.id)}
         })?;
-    let input = MultimodalInput::from_wav(spec, &bytes)
-        .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err}")))?;
+    let input = MultimodalInput::from_audio_bytes(spec, &bytes)
+        .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err:#}")))?;
     let max_tokens = spec
         .max_tokens
         .unwrap_or(output_limit.get())

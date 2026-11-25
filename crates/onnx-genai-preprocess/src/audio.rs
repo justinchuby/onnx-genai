@@ -26,6 +26,7 @@ pub enum AudioPreprocessError {
     InvalidSampleRate,
     UnsupportedWav(String),
     Wav(hound::Error),
+    Encoded(String),
 }
 
 impl fmt::Display for AudioPreprocessError {
@@ -35,6 +36,10 @@ impl fmt::Display for AudioPreprocessError {
             Self::InvalidSampleRate => write!(f, "sample rate must be greater than zero"),
             Self::UnsupportedWav(message) => write!(f, "unsupported WAV input: {message}"),
             Self::Wav(error) => write!(f, "failed to decode WAV: {error}"),
+            Self::Encoded(error) => write!(
+                f,
+                "encoded audio decoding: {error}; provide valid PCM16 WAV or MP3 audio with a consistent sample rate and channel layout"
+            ),
         }
     }
 }
@@ -61,7 +66,7 @@ impl LogMelFeatures {
     }
 }
 
-/// Mono PCM decoded from a WAV file.
+/// Mono PCM decoded from an encoded audio file.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecodedAudio {
     pub samples: Vec<f32>,
@@ -259,6 +264,111 @@ fn normalize_log_mel(features: &mut [f32]) {
             *value = (value.max(floor) + 4.0) / 4.0;
         }
     }
+}
+
+/// Decode supported audio bytes by content, independent of filename/MIME hints.
+/// WAV retains its explicit PCM16 contract; MP3 uses a portable Rust decoder.
+/// Channels are averaged to mono without resampling. Codec delay/padding is
+/// removed when the MP3 stream supplies gapless metadata.
+pub fn decode_audio(bytes: &[u8]) -> Result<DecodedAudio, AudioPreprocessError> {
+    if bytes.starts_with(b"RIFF") {
+        return decode_wav_pcm16(bytes);
+    }
+    decode_mp3(bytes)
+}
+fn decode_mp3(bytes: &[u8]) -> Result<DecodedAudio, AudioPreprocessError> {
+    use symphonia::core::{
+        codecs::audio::AudioDecoderOptions,
+        formats::{FormatOptions, TrackType, probe::Hint},
+        io::MediaSourceStream,
+        meta::MetadataOptions,
+    };
+    let invalid = AudioPreprocessError::Encoded;
+    let stream = MediaSourceStream::new(Box::new(Cursor::new(bytes)), Default::default());
+    let mut format = symphonia::default::get_probe()
+        .probe(
+            &Hint::new(),
+            stream,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|e| invalid(format!("cannot identify MP3 stream: {e}")))?;
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or_else(|| invalid("MP3 stream has no supported audio track".into()))?;
+    let params = track
+        .codec_params
+        .as_ref()
+        .and_then(|params| params.audio())
+        .ok_or_else(|| invalid("MP3 audio track has no audio codec parameters".into()))?;
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(params, &AudioDecoderOptions::default())
+        .map_err(|e| invalid(format!("cannot initialize MP3 decoder: {e}")))?;
+    let track_id = track.id;
+    let mut specification = None;
+    let mut samples = Vec::new();
+    let mut interleaved = Vec::<f32>::new();
+    while let Some(packet) = format
+        .next_packet()
+        .map_err(|e| invalid(format!("cannot read MP3 packet: {e}")))?
+    {
+        if packet.track_id != track_id {
+            continue;
+        }
+        let decoded = decoder
+            .decode(&packet)
+            .map_err(|e| invalid(format!("cannot decode MP3 packet: {e}")))?;
+        let spec = decoded.spec();
+        let channels = spec.channels().count();
+        if spec.rate() == 0 || channels == 0 {
+            return Err(invalid(
+                "MP3 packet declares zero sample rate or channels".into(),
+            ));
+        }
+        if specification
+            .as_ref()
+            .is_some_and(|previous| previous != spec)
+        {
+            return Err(invalid("MP3 sample rate/channel layout changes within one clip; split or normalize the recording".into()));
+        }
+        specification.get_or_insert_with(|| spec.clone());
+        let count = decoded.samples_interleaved();
+        interleaved
+            .try_reserve(count.saturating_sub(interleaved.len()))
+            .map_err(|e| {
+                invalid(format!(
+                    "cannot allocate MP3 packet sample buffer: {e}; shorten the recording"
+                ))
+            })?;
+        interleaved.resize(count, 0.0);
+        decoded.copy_to_slice_interleaved(&mut interleaved);
+        if !interleaved.len().is_multiple_of(channels)
+            || interleaved.iter().any(|sample| !sample.is_finite())
+        {
+            return Err(invalid(
+                "MP3 decoder produced partial-channel frames or nonfinite samples".into(),
+            ));
+        }
+        samples
+            .try_reserve(interleaved.len() / channels)
+            .map_err(|e| {
+                invalid(format!(
+                    "cannot grow decoded MP3 waveform: {e}; shorten the recording"
+                ))
+            })?;
+        for frame in interleaved.chunks_exact(channels) {
+            samples.push(
+                (frame.iter().map(|sample| f64::from(*sample)).sum::<f64>() / channels as f64)
+                    as f32,
+            );
+        }
+    }
+    let spec = specification
+        .ok_or_else(|| invalid("MP3 stream contains no decodable audio packets".into()))?;
+    Ok(DecodedAudio {
+        samples,
+        sample_rate: spec.rate(),
+    })
 }
 
 /// Decodes integer 16-bit PCM WAV bytes and mixes all channels to mono.

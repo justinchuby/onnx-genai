@@ -197,7 +197,7 @@ State media order is `files`, then `images`, then chat-state parts. Top-level
 entries accept image/audio base64 data URIs. Embedded `input_audio` parts and
 spoken instructions accept `{data: base64_or_audio_data_uri}` or
 `{url: base64_or_audio_data_uri}` inside `input_audio`; `data` takes precedence.
-Audio currently requires PCM16 WAV. HTTP/file URLs, video and other codecs fail
+Audio accepts PCM16 WAV and MP3 by content. HTTP/file URLs, video and other codecs fail
 with field-specific errors before inference. For example, with an image/audio
 state contract and a spoken endpoint:
 

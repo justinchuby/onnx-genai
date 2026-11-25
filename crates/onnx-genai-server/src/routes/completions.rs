@@ -1390,7 +1390,7 @@ fn preprocess_chat_audio(
     handle: &ModelHandle,
 ) -> Result<MultimodalInput, ApiError> {
     let bytes = crate::audio_input::decode_chat_audio(input)
-        .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err}")))?;
+        .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err:#}")))?;
     let spec = handle
         .multimodal
         .as_ref()
@@ -1398,8 +1398,8 @@ fn preprocess_chat_audio(
         .ok_or_else(|| {
             ApiError::invalid_request("audio input requires a model with a declared audio input")
         })?;
-    MultimodalInput::from_wav(spec, &bytes)
-        .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err}")))
+    MultimodalInput::from_audio_bytes(spec, &bytes)
+        .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err:#}")))
 }
 
 async fn preprocess_chat_images(

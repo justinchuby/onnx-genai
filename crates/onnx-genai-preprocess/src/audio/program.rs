@@ -380,7 +380,7 @@ fn execute(op: &Op, input: Option<&Data>, encoded: &[&[u8]]) -> Result<Data, Aud
         return encoded
             .iter()
             .map(|bytes| {
-                let audio = decode_wav_pcm16(bytes)?;
+                let audio = decode_audio(bytes)?;
                 let len = audio.samples.len();
                 Ok(Wave {
                     samples: audio.samples,
@@ -499,7 +499,7 @@ fn execute(op: &Op, input: Option<&Data>, encoded: &[&[u8]]) -> Result<Data, Aud
         Op::Mel(extractor) => {
             let rows = input.waves()?.iter().map(|row| {
                 if row.rate != extractor.sample_rate {
-                    return Err(invalid(format!("log_mel analysis rate {} does not match input WAV rate {}; declare resample before this transform", extractor.sample_rate, row.rate)));
+                    return Err(invalid(format!("log_mel analysis rate {} does not match input audio rate {}; declare resample before this transform", extractor.sample_rate, row.rate)));
                 }
                 let features = extractor.extract_log_resampled(&row.samples)?;
                 let valid = frame_range(&row.valid, features.n_frames, extractor.hop_length);
