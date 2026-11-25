@@ -157,6 +157,7 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         | E::ShapeOverflow { .. }
         | E::OutputShapeCountMismatch { .. }
         | E::SequenceOp { .. }
+        | E::OptionalOp { .. }
         | E::ControlFlow { .. }
         | E::HeterogeneousPlacementRequired { .. }
         | E::HeterogeneousExecutionUnsupported { .. } => OrtErrorCode::Fail,
@@ -921,6 +922,23 @@ mod tests {
 
         assert_eq!(code, OrtErrorCode::EpFail);
         assert!(message.contains(reason), "{message}");
+    }
+
+    #[test]
+    fn optional_operator_failure_preserves_actionable_status() {
+        let op = "OptionalGetElement";
+        let reason =
+            "input value #7 is absent; check OptionalHasElement before extracting its payload";
+        let (code, message) = session_err(SessionError::OptionalOp {
+            op: op.into(),
+            reason: reason.into(),
+        });
+
+        assert_eq!(code, OrtErrorCode::Fail);
+        assert!(
+            message.contains(op) && message.contains(reason),
+            "{message}"
+        );
     }
 
     #[test]
