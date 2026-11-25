@@ -545,6 +545,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
         if accepted >= 2 {
             stats.multi_token_accepts += 1;
         }
+        state.clock.record_speculative(*stats);
 
         // Roll the device KV back to the committed length: accepted draft
         // columns stay resident, unaccepted columns are dropped, and the bonus

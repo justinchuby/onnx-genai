@@ -1158,6 +1158,17 @@ mod mtp_execution_tests {
             "Native MTP did not produce the requested token budget"
         );
         let stats = engine.last_speculative_stats();
+        assert_eq!(timing.speculative, Some(stats));
+        for token in &tokens {
+            let snapshot = token
+                .timings
+                .unwrap()
+                .speculative
+                .expect("Native MTP counter snapshot");
+            assert!(snapshot.proposed_tokens > 0);
+            assert!(snapshot.accepted_tokens <= snapshot.proposed_tokens);
+            assert!(snapshot.proposed_tokens <= stats.proposed_tokens);
+        }
         anyhow::ensure!(
             stats.proposed_tokens > 0 && stats.verification_steps > 0,
             "Native MTP did not actually propose and verify: {stats:?}"

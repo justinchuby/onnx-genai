@@ -3857,6 +3857,25 @@ mod admission_tests {
                 vec![1, 2, 3]
             );
             assert_eq!(finished.timings, samples.last().copied());
+            let timing = finished.timings.unwrap();
+            let wire = crate::timings::render(timing);
+            if speculative {
+                let stats = timing.speculative.expect("verified prompt-lookup counters");
+                assert_eq!(stats, engine.last_speculative_stats());
+                assert!(stats.proposed_tokens > 0);
+                assert_eq!(wire["draft_n"], stats.proposed_tokens);
+                assert_eq!(wire["draft_n_accepted"], stats.accepted_tokens);
+                assert!(
+                    samples
+                        .iter()
+                        .filter_map(|sample| sample.speculative)
+                        .all(|sample| sample.proposed_tokens <= stats.proposed_tokens)
+                );
+            } else {
+                assert!(timing.speculative.is_none());
+                assert!(wire.get("draft_n").is_none());
+                assert!(wire.get("draft_n_accepted").is_none());
+            }
             assert_eq!(
                 finished.timings.unwrap().prompt_elapsed,
                 progress[1].elapsed

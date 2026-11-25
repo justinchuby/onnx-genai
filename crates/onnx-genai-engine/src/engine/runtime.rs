@@ -1612,6 +1612,7 @@ impl Engine {
                         }
                         Ok(PrefillResult {
                             timings: crate::GenerationTimings {
+                                speculative: None,
                                 prompt_tokens: tokens.len() - prefix_cache_hit_len,
                                 cached_prompt_tokens: prefix_cache_hit_len,
                                 generated_tokens: 0,
@@ -1752,6 +1753,7 @@ impl Engine {
                 }
                 Ok(PrefillResult {
                     timings: crate::GenerationTimings {
+                        speculative: None,
                         prompt_tokens: tokens.len() - reused,
                         cached_prompt_tokens: reused,
                         generated_tokens: 0,
@@ -5859,12 +5861,24 @@ mod tests {
         assert_eq!(timing.prompt_tokens, 5);
         assert_eq!(timing.cached_prompt_tokens, 0);
         assert_eq!(timing.generated_tokens, 8);
+        assert_eq!(timing.speculative, Some(engine.last_speculative_stats()));
+        assert!(timing.speculative.unwrap().proposed_tokens > 0);
         assert_eq!(timing.prompt_elapsed, updates[1].elapsed);
         assert!(!timing.prompt_elapsed.is_zero());
         assert!(!timing.generation_elapsed.is_zero());
         for (index, token) in tokens.iter().enumerate() {
             let sample = token.timings.context("native speculative token timing")?;
             assert_eq!(sample.generated_tokens, index + 1);
+            let stats = sample
+                .speculative
+                .context("committed speculative counters")?;
+            assert!(stats.proposed_tokens >= stats.accepted_tokens);
+            assert!(stats.proposed_tokens <= timing.speculative.unwrap().proposed_tokens);
+            if index > 0 {
+                let previous = tokens[index - 1].timings.unwrap().speculative.unwrap();
+                assert!(stats.proposed_tokens >= previous.proposed_tokens);
+                assert!(stats.accepted_tokens >= previous.accepted_tokens);
+            }
             assert_eq!(sample.prompt_elapsed, timing.prompt_elapsed);
             if index > 0 {
                 assert!(
@@ -5920,9 +5934,12 @@ mod tests {
                 } else {
                     assert!(format!("{error:#}").contains("injected speculative progress failure"));
                 }
+                let retry = engine.generate(request.clone())?;
+                let clean = tiny_native_cold_engine()?.generate(request)?;
+                assert_eq!(retry.token_ids, clean.token_ids);
                 assert_eq!(
-                    engine.generate(request.clone())?.token_ids,
-                    tiny_native_cold_engine()?.generate(request)?.token_ids
+                    retry.timings.unwrap().speculative,
+                    clean.timings.unwrap().speculative
                 );
             }
         }
@@ -5959,9 +5976,12 @@ mod tests {
             );
             assert!(output.is_empty());
             assert_eq!(engine.scheduler.running_count(), 0);
+            let retry = engine.generate(request.clone())?;
+            let clean = tiny_native_cold_engine()?.generate(request)?;
+            assert_eq!(retry.token_ids, clean.token_ids);
             assert_eq!(
-                engine.generate(request.clone())?.token_ids,
-                tiny_native_cold_engine()?.generate(request)?.token_ids
+                retry.timings.unwrap().speculative,
+                clean.timings.unwrap().speculative
             );
         }
         Ok(())
