@@ -1086,6 +1086,7 @@ fn ensure_user_role(item: &Value) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
     use tokio::net::{TcpListener, TcpStream};
     #[test]
     fn tool_batch_admission_rejects_a_late_undeclared_call_before_publication() {
@@ -1137,7 +1138,19 @@ mod tests {
     async fn server_for_package(
         root: &std::path::Path,
     ) -> (AppState, std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-        let state = AppState::load(root, Some("native-realtime".into())).unwrap();
+        server_for_package_with_config(root, crate::ServerConfig::default()).await
+    }
+    async fn server_for_package_with_config(
+        root: &std::path::Path,
+        config: crate::ServerConfig,
+    ) -> (AppState, std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let state =
+            AppState::load_with_config(root, Some("native-realtime".into()), config).unwrap();
+        server_for_state(state).await
+    }
+    async fn server_for_state(
+        state: AppState,
+    ) -> (AppState, std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let router = crate::app(state.clone());
@@ -1147,14 +1160,233 @@ mod tests {
         (state, address, task)
     }
     async fn connect(address: std::net::SocketAddr) -> Client {
-        let stream = TcpStream::connect(address).await.unwrap();
-        tokio_tungstenite::client_async(
-            format!("ws://{address}/v1/realtime?model=native-realtime"),
-            stream,
-        )
+        connect_model(address, "native-realtime").await.unwrap()
+    }
+    async fn connect_model(
+        address: std::net::SocketAddr,
+        model: &str,
+    ) -> Result<Client, tokio_tungstenite::tungstenite::Error> {
+        let stream = TcpStream::connect(address).await?;
+        tokio_tungstenite::client_async(format!("ws://{address}/v1/realtime?model={model}"), stream)
+            .await
+            .map(|(client, _)| client)
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_models_isolate_native_state_and_release_closed_worker() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/realtime");
+        let package = tempfile::tempdir().unwrap();
+        for file in ["model.onnx.textproto", "tokenizer.json"] {
+            std::fs::copy(root.join(file), package.path().join(file)).unwrap();
+        }
+        let metadata = std::fs::read_to_string(root.join("inference_metadata.yaml"))
+            .unwrap()
+            .replacen("default_mode: realtime", "default_mode: duplex", 1);
+        std::fs::write(package.path().join("inference_metadata.yaml"), metadata).unwrap();
+        let specs = ["alpha", "beta"]
+            .into_iter()
+            .map(|id| crate::models_config::ModelSpec {
+                id: id.into(),
+                path: package.path().to_owned(),
+                eager: true,
+                warmup: false,
+            })
+            .collect();
+        let state = AppState::load_from_specs(specs, crate::ServerConfig::default()).unwrap();
+        let (state, address, task) = server_for_state(state).await;
+        let mut alpha = connect_model(address, "alpha").await.unwrap();
+        let alpha_created = event(&mut alpha).await;
+        assert_eq!(alpha_created["session"]["model"], "alpha");
+        let mut beta = connect_model(address, "beta").await.unwrap();
+        let beta_created = event(&mut beta).await;
+        assert_eq!(beta_created["session"]["model"], "beta");
+        assert_ne!(
+            alpha_created["session"]["id"],
+            beta_created["session"]["id"]
+        );
+        match connect_model(address, "alpha").await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                let body: Value =
+                    serde_json::from_slice(response.body().as_ref().unwrap()).unwrap();
+                assert!(
+                    body["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("realtime"),
+                    "{body}"
+                );
+            }
+            other => {
+                panic!("an occupied model must reject a second realtime connection: {other:?}")
+            }
+        }
+        async fn audio(client: &mut Client, sample: i16) -> Vec<u8> {
+            let bytes: Vec<_> = (0..320).flat_map(|_| sample.to_le_bytes()).collect();
+            send(
+                client,
+                json!({"type":"input_audio_buffer.append","audio":STANDARD.encode(bytes)}),
+            )
+            .await;
+            loop {
+                let output = event(client).await;
+                assert_ne!(output["type"], "error", "{output}");
+                if output["type"] == "response.output_audio.delta" {
+                    let bytes = STANDARD.decode(output["delta"].as_str().unwrap()).unwrap();
+                    assert_eq!(
+                        bytes.len(),
+                        640,
+                        "one native frame must contain 320 PCM16 samples"
+                    );
+                    return bytes;
+                }
+            }
+        }
+        assert!(audio(&mut alpha, 0).await.iter().all(|b| *b == 0));
+        assert!(audio(&mut beta, 100).await.iter().any(|b| *b != 0));
+        alpha.close(None).await.unwrap();
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), alpha.next())
+            .await
+            .expect("alpha close handshake timed out")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(closed, Message::Close(_)));
+        drop(alpha);
+        // The close ACK can precede native cleanup. Retry only transient busy
+        // admission within a bounded deadline; other handshake failures fail.
+        let mut alpha = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match connect_model(address, "alpha").await {
+                    Ok(client) => break client,
+                    Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                        if response.status() == StatusCode::SERVICE_UNAVAILABLE =>
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("reopen alpha after native cleanup: {error}"),
+                }
+            }
+        })
         .await
-        .unwrap()
-        .0
+        .expect("closed model worker was not released");
+        let reopened = event(&mut alpha).await;
+        assert_ne!(reopened["session"]["id"], alpha_created["session"]["id"]);
+        assert_eq!(reopened["session"]["model"], "alpha");
+        assert!(audio(&mut alpha, 0).await.iter().all(|b| *b == 0));
+        // Beta keeps its own accumulated native audio state across Alpha's
+        // disconnect/reset/reopen. A zero frame therefore still produces audio.
+        assert!(audio(&mut beta, 0).await.iter().any(|b| *b != 0));
+        alpha.close(None).await.unwrap();
+        beta.close(None).await.unwrap();
+        drop((alpha, beta));
+        for id in ["alpha", "beta"] {
+            let model = state.registry.resolve(id).unwrap().unwrap();
+            tokio::task::spawn_blocking(move || model.engine.shutdown())
+                .await
+                .unwrap();
+        }
+        task.abort();
+        let _ = task.await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_rejected_frames_and_pcm_pressure_preserve_native_transcription() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/realtime");
+        let mut config = crate::ServerConfig::default();
+        config.realtime.source_bytes = NonZeroUsize::new(640).unwrap();
+        let (state, address, task) = server_for_package_with_config(&root, config).await;
+        let mut client = connect(address).await;
+        assert_eq!(event(&mut client).await["type"], "session.created");
+        let rejected = [
+            (Message::Text("{".into()), "valid JSON"),
+            (Message::Binary(vec![0, 1].into()), "JSON text frames"),
+            (Message::Text("null".into()), "type must be a string"),
+            (
+                Message::Text(json!({"type":"unknown"}).to_string().into()),
+                "unknown realtime event",
+            ),
+            (
+                Message::Text(
+                    json!({"type":"input_audio_buffer.append","audio":"!!!"})
+                        .to_string()
+                        .into(),
+                ),
+                "valid base64",
+            ),
+            (
+                Message::Text(
+                    json!({"type":"input_audio_buffer.append","audio":STANDARD.encode([0])})
+                        .to_string()
+                        .into(),
+                ),
+                "even byte count",
+            ),
+            (
+                Message::Text(
+                    json!({"type":"input_audio_buffer.append","audio":STANDARD.encode([0;642])})
+                        .to_string()
+                        .into(),
+                ),
+                "640-byte PCM queue budget",
+            ),
+        ];
+        let mut ids = BTreeSet::new();
+        for (frame, diagnostic) in rejected {
+            client.send(frame).await.unwrap();
+            let failure = event(&mut client).await;
+            assert_eq!(failure["type"], "error", "{failure}");
+            assert_eq!(failure["error"]["type"], "invalid_request_error");
+            assert!(
+                failure["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(diagnostic),
+                "{failure}"
+            );
+            assert!(ids.insert(failure["event_id"].as_str().unwrap().to_owned()));
+        }
+        // Rejected audio must neither freeze session conditioning nor consume
+        // input quota/state. A full-budget valid frame still starts an ASR turn.
+        send(
+            &mut client,
+            json!({"type":"session.update","session":{"type":"transcription"}}),
+        )
+        .await;
+        assert_eq!(event(&mut client).await["type"], "session.updated");
+        send(
+            &mut client,
+            json!({"type":"input_audio_buffer.append","audio":STANDARD.encode([0;640])}),
+        )
+        .await;
+        send(&mut client, json!({"type":"input_audio_buffer.commit"})).await;
+        let committed = event(&mut client).await;
+        assert_eq!(committed["type"], "input_audio_buffer.committed");
+        let item = committed["item_id"].clone();
+        let mut transcript = String::new();
+        loop {
+            let output = event(&mut client).await;
+            assert_ne!(output["type"], "error", "{output}");
+            if output["type"] == "conversation.item.input_audio_transcription.delta" {
+                assert_eq!(output["item_id"], item);
+                transcript.push_str(output["delta"].as_str().unwrap());
+            }
+            if output["type"] == "conversation.item.input_audio_transcription.completed" {
+                assert_eq!(output["item_id"], item);
+                assert_eq!(output["transcript"], "hello world");
+                break;
+            }
+        }
+        assert_eq!(transcript, "hello world");
+        client.close(None).await.unwrap();
+        drop(client);
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
     }
     fn tool_package(envelope: &str) -> tempfile::TempDir {
         tool_package_from("realtime", envelope)

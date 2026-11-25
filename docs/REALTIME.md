@@ -173,6 +173,48 @@ next-turn PCM; retry after its completed event. Duplex cancellation discards
 old queued audio and resets native conditioning before the next response,
 matching the upstream stream/KV lifecycle.
 
+### Executed malformed-input recovery
+
+`websocket_rejected_frames_and_pcm_pressure_preserve_native_transcription`
+opens a real TCP WebSocket against a Native CPU ONNX workflow. Each case below
+must return a distinct `error` event with `invalid_request_error`, after which
+the same connection remains usable:
+
+| Rejected input | Required diagnostic |
+| --- | --- |
+| Truncated JSON text | Valid JSON required |
+| Binary WebSocket frame | JSON text frames required |
+| JSON null without an event type | String `type` required |
+| Unknown event type | Recognized realtime event required |
+| Invalid audio base64 | Valid base64 PCM16 required |
+| One decoded audio byte | Even PCM16 byte count required |
+| 642 decoded bytes with a 640-byte queue budget | Remaining PCM queue budget exceeded |
+
+After all rejections, changing the session to transcription must still succeed.
+A valid 640-byte PCM message then fills the configured budget and commits to an
+actual native transcription, with matching item IDs, deltas and terminal text.
+This proves rejection did not consume input quota or freeze conditioning. It
+does not establish oversized WebSocket frame closure, slow-reader backpressure,
+all rate epochs or device execution conformance.
+
+### Executed model isolation and reconnect
+
+`websocket_models_isolate_native_state_and_release_closed_worker` loads two
+independent Native CPU model entries from the same authored duplex fixture and
+opens both routed WebSocket sessions simultaneously. Each handshake identifies
+its selected model and a distinct session. An additional connection to the
+occupied first model receives HTTP 503 before upgrade; it cannot steal that
+worker or prevent the second model from executing.
+
+The fixture accumulates ingested audio in native state. Zero audio in the first
+model and nonzero audio in the second produce independent PCM output. Closing
+and reopening the first connection releases its worker and creates fresh native
+state, while the second connection preserves its previous accumulated state.
+The test checks complete native frame sizes and actual output bytes after
+reconnect. The close handshake and retry-on-busy cleanup wait are bounded. This
+establishes routed CPU state isolation and reconnect cleanup, rather than device
+isolation, arbitrary worker-pool sizing or recognition/synthesis quality.
+
 Tool execution belongs exclusively to the external harness. This transport
 accepts definitions/results and emits model calls; it provides no tool runtime.
 A Native CPU WebSocket regression covers two tool-call rounds with an external
