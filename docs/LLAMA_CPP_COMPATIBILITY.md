@@ -31,6 +31,24 @@ Node/npm and network access are not needed to build the Rust server or use its U
 The removed `run` REPL has no alias or migration shim. `generate`, `transcribe`,
 model inspection, profiling and command-line streaming remain available.
 
+## API keys
+
+Authentication is optional. Start with `nxrt serve MODEL --api-key-file keys.txt`;
+the UTF-8 file contains one key per line, with blank lines and lines starting
+with `#` ignored. `--api-key` accepts comma-separated CSV and may be repeated.
+The upstream environment variables `LLAMA_API_KEY` and `LLAMA_ARG_API_KEY_FILE`
+are also accepted. Keys from both sources are combined.
+
+Send `Authorization: Bearer YOUR_KEY`, a raw `Authorization: YOUR_KEY`, or
+`X-Api-Key: YOUR_KEY`. A nonempty Authorization header takes precedence over
+X-Api-Key. Missing or incorrect credentials return HTTP 401 with
+`error.type: authentication_error` and `error.code: 401`.
+Health endpoints and exact embedded UI assets remain public. All other API
+requests, including replay, management and realtime upgrade requests, pass
+through key admission before routing. With no configured keys, requests keep
+the existing open behavior. Server configuration Debug output exposes only
+the configured key count; it does not contain credentials or their digests.
+
 ## Implemented surface
 
 | Method | Paths | Contract |
