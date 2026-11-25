@@ -248,12 +248,20 @@ pub struct ActivationFactory {
     pub runtime: Arc<CudaRuntime>,
 }
 
-pub struct Celu28Factory {
+pub struct NativeCeluFactory {
     pub runtime: Arc<CudaRuntime>,
+    pub typed: bool,
 }
 
-impl KernelFactory for Celu28Factory {
+impl KernelFactory for NativeCeluFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        if !self.typed {
+            return Ok(Box::new(ActivationKernel {
+                op: activation_from_node("Celu", node)?,
+                runtime: self.runtime.clone(),
+                strict_celu12: true,
+            }));
+        }
         let alpha = match node.attr("alpha") {
             None => 1.0,
             Some(attr) => attr.as_float().ok_or_else(|| {
@@ -265,6 +273,7 @@ impl KernelFactory for Celu28Factory {
         Ok(Box::new(ActivationKernel {
             op: ActivationOp::Celu28 { alpha },
             runtime: self.runtime.clone(),
+            strict_celu12: false,
         }))
     }
 }
@@ -275,6 +284,7 @@ impl KernelFactory for ActivationFactory {
         Ok(Box::new(ActivationKernel {
             op,
             runtime: self.runtime.clone(),
+            strict_celu12: false,
         }))
     }
 }
@@ -336,6 +346,7 @@ fn activation_from_node(name: &str, node: &Node) -> Result<ActivationOp> {
 struct ActivationKernel {
     op: ActivationOp,
     runtime: Arc<CudaRuntime>,
+    strict_celu12: bool,
 }
 
 impl ActivationKernel {
@@ -496,7 +507,9 @@ impl ActivationKernel {
         let x = &inputs[0];
         let dtype = match (self.op, x.dtype) {
             (ActivationOp::Celu28 { .. }, DataType::Float64) => FloatDtype::F64,
-            (ActivationOp::Celu { .. }, dtype) if dtype != DataType::Float32 => {
+            (ActivationOp::Celu { .. }, dtype)
+                if self.strict_celu12 && dtype != DataType::Float32 =>
+            {
                 return Err(not_implemented(format!(
                     "Celu-12 with X dtype {dtype:?}; use Float32"
                 )));

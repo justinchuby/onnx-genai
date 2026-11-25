@@ -20,7 +20,7 @@ enum Activation {
     ThresholdedRelu { alpha: f32 },
     Swish { alpha: f32 },
     Silu,
-    Celu { alpha: f32 },
+    Celu { alpha: f32, f32_only: bool },
     Mish,
 }
 
@@ -78,7 +78,7 @@ impl Activation {
             // Shared with the slice path rather than transcribed again: the
             // literal ONNX formula loses NaN through `f32::max`/`min`, and one
             // copy of that guard is easier to keep true than two.
-            Self::Celu { alpha } => crate::kernels::simd_activations::celu_scalar(x, alpha),
+            Self::Celu { alpha, .. } => crate::kernels::simd_activations::celu_scalar(x, alpha),
             // Mish(x) = x * tanh(softplus(x)), with softplus in its stable
             // form so large `x` neither overflows nor loses the identity.
             Self::Mish => x * (x.max(0.0) + (-x.abs()).exp().ln_1p()).tanh(),
@@ -134,7 +134,7 @@ impl Activation {
                 x * s
             }
             Self::Silu => silu_f64(x),
-            Self::Celu { alpha } => {
+            Self::Celu { alpha, .. } => {
                 // See `simd_activations::celu_scalar`: `max`/`min` return the
                 // other operand for NaN, so without this the f64 path -- which
                 // every `Float64` tensor takes -- would answer `0.0` where ORT
@@ -195,7 +195,9 @@ pub struct SeluFactory;
 pub struct ThresholdedReluFactory;
 pub struct SwishFactory;
 pub struct SiluFactory;
-pub struct CeluFactory;
+pub struct CeluFactory {
+    pub f32_only: bool,
+}
 pub struct Celu28Factory;
 pub struct MishFactory;
 
@@ -282,7 +284,10 @@ impl KernelFactory for CeluFactory {
         // fall back to the documented default rather than produce Inf/NaN.
         let alpha = if alpha == 0.0 { 1.0 } else { alpha };
         Ok(Box::new(ActivationKernel {
-            activation: Activation::Celu { alpha },
+            activation: Activation::Celu {
+                alpha,
+                f32_only: self.f32_only,
+            },
         }))
     }
 }
@@ -384,7 +389,7 @@ impl KernelFactory for SiluFactory {
 impl Kernel for ActivationKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity(self.activation.name(), inputs, outputs, 1, 1, 1)?;
-        if matches!(self.activation, Activation::Celu { .. })
+        if matches!(self.activation, Activation::Celu { f32_only: true, .. })
             && (inputs[0].dtype != DataType::Float32 || outputs[0].dtype != DataType::Float32)
         {
             return Err(EpError::KernelFailed(format!(
@@ -399,9 +404,11 @@ impl Kernel for ActivationKernel {
         // and 2n words of memory traffic that buy nothing.
         let ran = match self.activation {
             Activation::Silu => contiguous_f32(&inputs[0], &mut outputs[0], silu_f32_slice),
-            Activation::Celu { alpha } => contiguous_f32(&inputs[0], &mut outputs[0], |i, o| {
-                crate::kernels::simd_activations::celu_f32_slice(i, o, alpha);
-            }),
+            Activation::Celu { alpha, .. } => {
+                contiguous_f32(&inputs[0], &mut outputs[0], |i, o| {
+                    crate::kernels::simd_activations::celu_f32_slice(i, o, alpha);
+                })
+            }
             Activation::Mish => contiguous_f32(
                 &inputs[0],
                 &mut outputs[0],
@@ -449,7 +456,7 @@ impl Kernel for ActivationKernel {
             let mut output = vec![0.0; input.len()];
             silu_f32_slice(&input, &mut output);
             output
-        } else if let Activation::Celu { alpha } = self.activation {
+        } else if let Activation::Celu { alpha, .. } = self.activation {
             let mut output = vec![0.0; input.len()];
             crate::kernels::simd_activations::celu_f32_slice(&input, &mut output, alpha);
             output
@@ -757,6 +764,52 @@ mod tests {
     use onnx_runtime_ir::{Attribute, NodeId, ValueId, static_shape};
 
     #[test]
+    fn celu_ort_cpu_preserves_legacy_registration_and_routing() {
+        let (_, descriptors) = crate::build_cpu_registry_with_descriptors();
+        let entries: Vec<_> = descriptors
+            .iter()
+            .filter(|entry| entry.domain.is_empty() && entry.op_type == "Celu")
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let [entry] = entries.as_slice() else {
+            unreachable!()
+        };
+        assert_eq!((entry.since_version, entry.end_version), (12, u64::MAX));
+        assert_eq!(
+            entry.supported_dtypes,
+            &[
+                DataType::Float32,
+                DataType::Float16,
+                DataType::BFloat16,
+                DataType::Float64
+            ]
+        );
+        assert!(entry.supports_raw_tensor_abi);
+
+        let ep = crate::CpuExecutionProvider::new_for_ort();
+        let node = Node::new(NodeId(0), "Celu", vec![Some(ValueId(0))], vec![ValueId(1)]);
+        let x = Owned::f64(&[2], &[-2.0, -0.0]);
+        for opset in [12, 27, 28, 29] {
+            assert!(
+                ep.supports_op(&node, opset, &[static_shape([2])], &[x.dtype], &[])
+                    .is_supported()
+            );
+            let mut y = Owned::zeros(x.dtype, &[2]);
+            ep.get_kernel(&node, &[vec![2]], opset)
+                .unwrap()
+                .execute(&[x.view()], &mut [y.view_mut()])
+                .unwrap();
+            let y = y.to_f64();
+            assert!((y[0] - (-0.864_664_716_763_387_3)).abs() < 1e-14);
+            assert_eq!(
+                y[1].to_bits(),
+                0,
+                "ORT uses legacy Celu even at opset {opset}"
+            );
+        }
+    }
+
+    #[test]
     fn celu28_native_cpu_matches_typed_schema() {
         let ep = crate::CpuExecutionProvider::new();
         let mut node = Node::new(NodeId(0), "Celu", vec![Some(ValueId(0))], vec![ValueId(1)]);
@@ -896,7 +949,10 @@ mod tests {
     #[test]
     fn celu_and_mish_propagate_nan_on_every_path() {
         for alpha in [0.5f32, 1.0, 3.0] {
-            let act = Activation::Celu { alpha };
+            let act = Activation::Celu {
+                alpha,
+                f32_only: false,
+            };
             assert!(act.apply(f32::NAN).is_nan(), "f32 Celu(NaN), alpha={alpha}");
             assert!(
                 act.apply_f64(f64::NAN).is_nan(),

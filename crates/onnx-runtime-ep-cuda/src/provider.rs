@@ -69,7 +69,7 @@ use crate::deferred_release::{
     CudaDeferredReleaseQueue, CudaStreamFences, DEFAULT_DEFERRED_RELEASE_CAPACITY,
     DeferredActionOutcome, DeferredReleaseAction, ReleaseObserver, StreamOrderedKeepAlive,
 };
-use crate::kernels::build_cuda_registry_with_metrics;
+use crate::kernels::build_cuda_registry_with_celu_mode;
 use crate::kernels::csa_checkpoint::CsaMetrics;
 use crate::optimizer::cuda_optimization_passes;
 use crate::route_residency::{
@@ -1734,6 +1734,7 @@ pub struct CudaExecutionProvider {
     memory_cleanup_armed: AtomicBool,
     workspace_release_barrier: WorkspaceReleaseBarrier,
     registry: OpRegistry,
+    standalone_celu: bool,
     csa_metrics: Arc<CsaMetrics>,
     /// Device weight-offload policy resolved from the environment. When enabled,
     /// the EP advertises the `nxrt` weight-paging capability and pages lazy
@@ -1932,7 +1933,15 @@ impl CudaExecutionProvider {
         ordinal: u32,
         offload_policy: DeviceOffloadPolicy,
     ) -> Result<Self> {
-        Self::from_config(
+        Self::with_celu_mode(ordinal, offload_policy, true)
+    }
+
+    fn with_celu_mode(
+        ordinal: u32,
+        offload_policy: DeviceOffloadPolicy,
+        standalone_celu: bool,
+    ) -> Result<Self> {
+        Self::from_config_with_celu_mode(
             ordinal,
             CudaProviderConfig {
                 offload_policy,
@@ -1941,6 +1950,7 @@ impl CudaExecutionProvider {
                 route_residency_config: Self::route_residency_config_from_env(),
                 memory: None,
             },
+            standalone_celu,
         )
     }
 
@@ -2016,6 +2026,14 @@ impl CudaExecutionProvider {
     /// Construct with allocator selection complete before any runtime is exposed.
     /// An injected allocator is authoritative: the built-in VMM is never created.
     pub fn from_config(ordinal: u32, config: CudaProviderConfig) -> Result<Self> {
+        Self::from_config_with_celu_mode(ordinal, config, true)
+    }
+
+    fn from_config_with_celu_mode(
+        ordinal: u32,
+        config: CudaProviderConfig,
+        standalone_celu: bool,
+    ) -> Result<Self> {
         let CudaProviderConfig {
             offload_policy,
             governor,
@@ -2037,10 +2055,11 @@ impl CudaExecutionProvider {
         let route_telemetry_registry = Arc::new(
             crate::kernels::qmoe::RouteTelemetrySourceRegistry::new(route_residency_config),
         );
-        let registry = build_cuda_registry_with_metrics(
+        let registry = build_cuda_registry_with_celu_mode(
             runtime.clone(),
             csa_metrics.clone(),
             Arc::clone(&route_telemetry_registry),
+            standalone_celu,
         );
         let auto_dynamic_lending = auto_dynamic_lending_for(
             governor.is_some(),
@@ -2201,6 +2220,7 @@ impl CudaExecutionProvider {
             memory_cleanup_armed: AtomicBool::new(false),
             workspace_release_barrier: WorkspaceReleaseBarrier::default(),
             registry,
+            standalone_celu,
             csa_metrics,
             offload_policy,
             residency,
@@ -2700,6 +2720,11 @@ impl CudaExecutionProvider {
     /// Construct a CUDA EP on the default device (`CUDA:0`).
     pub fn new_default() -> Result<Self> {
         Self::new(0)
+    }
+
+    /// Construct the default CUDA EP used by ORT, retaining legacy Celu routing.
+    pub fn new_default_for_ort() -> Result<Self> {
+        Self::with_celu_mode(0, DeviceOffloadPolicy::from_env(), false)
     }
 
     /// Return whether a fully initialized CUDA EP can be constructed for this
@@ -4486,6 +4511,14 @@ impl ExecutionProvider for CudaExecutionProvider {
             && (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(reason) =
                 crate::kernels::deform_conv::unsupported_reason(op, opset, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if self.standalone_celu
+            && op.op_type == "Celu"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && let Some(reason) =
+                crate::kernels::standard_claims::standalone_celu_reason(op, opset, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }

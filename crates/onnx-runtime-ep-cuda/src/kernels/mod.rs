@@ -577,7 +577,6 @@ static CUDA_EINSUM_DTYPES: &[DataType] = &[
 /// kernels. Fail closed to the float compute set for unrecognised ops.
 pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataType] {
     match (op_type, domain) {
-        ("Celu", "") => CELU28_DTYPES,
         ("Gemm", "" | "ai.onnx") => gemm::DTYPES,
         ("BitCast", "") => BIT_CAST_TYPES,
         ("CumProd", "") => CUM_PROD_TYPES,
@@ -747,7 +746,12 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
 /// factory structs holding `Arc` clones of `runtime` — no cuBLASLt/NVRTC work —
 /// so this is cheap to call once at factory construction.
 pub fn build_cuda_registry_descriptors(runtime: Arc<CudaRuntime>) -> Vec<CudaOpDescriptor> {
-    let registry = build_cuda_registry(runtime);
+    let registry = build_cuda_registry_with_celu_mode(
+        runtime,
+        Arc::new(csa_checkpoint::CsaMetrics::default()),
+        Arc::new(qmoe::RouteTelemetrySourceRegistry::default()),
+        false,
+    );
     let mut descriptors: Vec<CudaOpDescriptor> = registry
         .keys()
         .map(|key| CudaOpDescriptor {
@@ -755,11 +759,7 @@ pub fn build_cuda_registry_descriptors(runtime: Arc<CudaRuntime>) -> Vec<CudaOpD
             domain: key.domain.clone(),
             since_version: key.since_version,
             end_version: registry.explicit_end_version(key),
-            supported_dtypes: if key.domain.is_empty() && key.op_type == "Celu" {
-                celu_dtypes(key.since_version)
-            } else {
-                cuda_supported_dtypes_for_op(&key.op_type, &key.domain)
-            },
+            supported_dtypes: cuda_supported_dtypes_for_op(&key.op_type, &key.domain),
         })
         .collect();
     // Deterministic order so the advertisement is stable across runs.
@@ -797,6 +797,15 @@ pub fn build_cuda_registry_with_metrics(
     runtime: Arc<CudaRuntime>,
     csa_metrics: Arc<csa_checkpoint::CsaMetrics>,
     telemetry_registry: Arc<qmoe::RouteTelemetrySourceRegistry>,
+) -> OpRegistry {
+    build_cuda_registry_with_celu_mode(runtime, csa_metrics, telemetry_registry, true)
+}
+
+pub(crate) fn build_cuda_registry_with_celu_mode(
+    runtime: Arc<CudaRuntime>,
+    csa_metrics: Arc<csa_checkpoint::CsaMetrics>,
+    telemetry_registry: Arc<qmoe::RouteTelemetrySourceRegistry>,
+    standalone_celu: bool,
 ) -> OpRegistry {
     let mut reg = OpRegistry::new();
     reg.register(
@@ -1613,22 +1622,35 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
-    reg.register_through(
-        OpKey::new("Celu", "", 12),
-        27,
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(ActivationFactory {
-            name: "Celu",
-            runtime: runtime.clone(),
-        }),
-    );
-    reg.register(
-        OpKey::new("Celu", "", 28),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(activations::Celu28Factory {
-            runtime: runtime.clone(),
-        }),
-    );
+    let celu12 = OpKey::new("Celu", "", 12);
+    if standalone_celu {
+        reg.register_through(
+            celu12,
+            27,
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(activations::NativeCeluFactory {
+                runtime: runtime.clone(),
+                typed: false,
+            }),
+        );
+        reg.register(
+            OpKey::new("Celu", "", 28),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(activations::NativeCeluFactory {
+                runtime: runtime.clone(),
+                typed: true,
+            }),
+        );
+    } else {
+        reg.register(
+            celu12,
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(ActivationFactory {
+                name: "Celu",
+                runtime: runtime.clone(),
+            }),
+        );
+    }
     reg.register(
         OpKey::new("Swish", "", 24),
         onnx_runtime_ep_api::WorkspacePlanning::None,

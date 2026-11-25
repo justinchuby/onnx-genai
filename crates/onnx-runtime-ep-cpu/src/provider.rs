@@ -41,6 +41,7 @@ pub struct CpuExecutionProvider {
     device: DeviceId,
     initialized: bool,
     registry: OpRegistry,
+    standalone_celu: bool,
     resources: CpuMemoryResources,
     local_workspace: std::sync::OnceLock<
         std::result::Result<
@@ -113,10 +114,20 @@ impl CpuExecutionProvider {
 
     /// Construct all CPU factories with the same immutable session resources.
     pub fn with_resources(resources: CpuMemoryResources) -> Self {
+        Self::with_celu_mode(resources, true)
+    }
+
+    /// Construct the CPU EP used by the ORT plugin, retaining legacy Celu routing.
+    pub fn new_for_ort() -> Self {
+        Self::with_celu_mode(CpuMemoryResources::default(), false)
+    }
+
+    fn with_celu_mode(resources: CpuMemoryResources, standalone_celu: bool) -> Self {
         Self {
             device: DeviceId::cpu(),
             initialized: false,
-            registry: build_cpu_registry_with_resources(resources.clone()),
+            registry: build_cpu_registry_with_resources(resources.clone(), standalone_celu),
+            standalone_celu,
             resources,
             local_workspace: std::sync::OnceLock::new(),
             memory: default_cpu_memory(),
@@ -486,7 +497,8 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
-        if op.op_type == "Celu"
+        if self.standalone_celu
+            && op.op_type == "Celu"
             && onnx_runtime_ir::is_default_domain(&op.domain)
             && let Some(&dtype) = input_dtypes.first()
         {

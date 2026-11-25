@@ -98,7 +98,8 @@ focused `celu28_native_cpu_matches_typed_schema` and
 `celu28_native_cuda_matches_typed_schema` tests compare against golden results
 from the [pinned ONNX function](https://github.com/onnx/onnx/blob/622adf94d4e720142950aa8178f7357d52e63db0/onnx/defs/math/defs.cc#L398-L422).
 The CUDA test requires `gpu-tests` and CUDA device execution; it cannot pass
-via CPU fallback.
+via CPU fallback. ORT plugins retain their pre-existing Celu-12 advertisement
+and routing; the typed Celu-28 path is standalone-only.
 
 ## Diagnostic finding
 

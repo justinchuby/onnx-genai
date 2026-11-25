@@ -3319,6 +3319,48 @@ fn opset26_native_cuda_conformance() {
 
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
 #[test]
+fn celu_ort_cuda_preserves_legacy_registration_and_routing() {
+    let ep = CudaExecutionProvider::new_default_for_ort()
+        .expect("CUDA ORT provider must initialize for legacy Celu conformance");
+    let descriptors = onnx_runtime_ep_cuda::build_cuda_registry_descriptors(ep.runtime().clone());
+    let entries: Vec<_> = descriptors
+        .iter()
+        .filter(|entry| entry.domain.is_empty() && entry.op_type == "Celu")
+        .collect();
+    assert_eq!(entries.len(), 1);
+    let [entry] = entries.as_slice() else {
+        unreachable!()
+    };
+    assert_eq!((entry.since_version, entry.end_version), (12, u64::MAX));
+    assert_eq!(
+        entry.supported_dtypes,
+        &[DataType::Float32, DataType::Float16, DataType::BFloat16]
+    );
+
+    for dtype in [DataType::Float16, DataType::BFloat16] {
+        for opset in [12, 27, 28, 29] {
+            let y = run_cuda(
+                &ep,
+                "Celu",
+                "",
+                opset,
+                &[float_input(dtype, &[2], &[-2.0, -0.0])],
+                &[(dtype, vec![2])],
+                &[],
+            );
+            let y = decode_floats(&y[0], dtype);
+            assert!((y[0] - (-0.864_664_73)).abs() < 0.003);
+            assert_eq!(
+                y[1].to_bits(),
+                0,
+                "ORT uses legacy Celu even at opset {opset}"
+            );
+        }
+    }
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
 fn celu28_native_cuda_matches_typed_schema() {
     let ep = require_cuda();
     let run = |opset, x: Tensor, alpha: Option<f32>| {

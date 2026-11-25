@@ -1059,14 +1059,12 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
 /// `lookup` picks the highest applicable version, so future opset-specialized
 /// kernels can be added alongside these.
 pub fn build_cpu_registry() -> OpRegistry {
-    build_cpu_registry_with_resources(crate::CpuMemoryResources::default())
+    build_cpu_registry_with_resources(crate::CpuMemoryResources::default(), true)
 }
 
-/// Build the CPU registry AND return all registered op keys (for kernel-registry
-/// type-constraint advertisement). The keys are derived from the exact same
-/// registration calls — not hand-maintained.
+/// Build the ORT CPU registry and derive its type-constraint advertisement.
 pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor>) {
-    let reg = build_cpu_registry();
+    let reg = build_cpu_registry_with_resources(crate::CpuMemoryResources::default(), false);
     let descriptors = descriptors_from_registry(&reg);
     (reg, descriptors)
 }
@@ -1103,11 +1101,7 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
                 domain: key.domain.clone(),
                 since_version: key.since_version,
                 end_version: reg.explicit_end_version(key),
-                supported_dtypes: if key.domain.is_empty() && key.op_type == "Celu" {
-                    celu_dtypes(key.since_version)
-                } else {
-                    supported_dtypes_for_op(&key.op_type, &key.domain)
-                },
+                supported_dtypes: supported_dtypes_for_op(&key.op_type, &key.domain),
                 supports_raw_tensor_abi,
             }
         })
@@ -1124,6 +1118,7 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
 /// Build all factories against one immutable set of session memory resources.
 pub(crate) fn build_cpu_registry_with_resources(
     resources: crate::CpuMemoryResources,
+    standalone_celu: bool,
 ) -> OpRegistry {
     let host_cache = resources.expert_cache().clone();
     let derived_weights = resources.weight_memory().clone();
@@ -1869,17 +1864,25 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     // Celu is opset 12, Mish opset 18 -- registering at their introducing
     // opset keeps older models routing to whatever handled them before.
-    rec.register_through(
-        OpKey::new("Celu", "", 12),
-        27,
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(activations::CeluFactory),
-    );
-    rec.register(
-        OpKey::new("Celu", "", 28),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(activations::Celu28Factory),
-    );
+    let celu12 = OpKey::new("Celu", "", 12);
+    let legacy = Box::new(activations::CeluFactory {
+        f32_only: standalone_celu,
+    });
+    if standalone_celu {
+        rec.register_through(
+            celu12,
+            27,
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            legacy,
+        );
+        rec.register(
+            OpKey::new("Celu", "", 28),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(activations::Celu28Factory),
+        );
+    } else {
+        rec.register(celu12, onnx_runtime_ep_api::WorkspacePlanning::None, legacy);
+    }
     rec.register(
         OpKey::new("Mish", "", 18),
         onnx_runtime_ep_api::WorkspacePlanning::None,

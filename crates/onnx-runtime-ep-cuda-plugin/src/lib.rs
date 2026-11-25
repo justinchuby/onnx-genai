@@ -292,7 +292,7 @@ mod cuda_impl {
     /// EP's real registry so the caller advertises each kernel under its true
     /// domain.
     pub(crate) fn construct_ep_with_stream() -> Result<ConstructedEp, String> {
-        let ep = CudaExecutionProvider::new_default().map_err(|e| {
+        let ep = CudaExecutionProvider::new_default_for_ort().map_err(|e| {
             format!("CUDA EP construction failed (no GPU or driver unavailable): {e}")
         })?;
         let stream_handle = ep.runtime().stream_ptr() as *mut std::os::raw::c_void;
