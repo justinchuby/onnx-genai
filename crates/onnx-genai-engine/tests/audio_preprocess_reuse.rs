@@ -155,3 +155,80 @@ fn native_audio_v1_keeps_its_workflow_scoped_single_invocation_contract() {
         [1600]
     );
 }
+
+#[test]
+fn native_audio_program_executes_package_authored_nonstandard_geometry() {
+    let package = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        root().join("tokenizer.json"),
+        package.path().join("tokenizer.json"),
+    )
+    .unwrap();
+    let graph = std::fs::read_to_string(root().join("model.onnx.textproto"))
+        .unwrap()
+        .replace("dim_value: 80", "dim_value: 7");
+    std::fs::write(package.path().join("model.onnx.textproto"), graph).unwrap();
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root().join("inference_metadata.yaml")).unwrap())
+            .unwrap();
+    fn replace_feature_dimension(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Number(n) if n.as_u64() == Some(80) => *value = serde_json::json!(7),
+            serde_json::Value::Array(values) => {
+                values.iter_mut().for_each(replace_feature_dimension)
+            }
+            serde_json::Value::Object(values) => {
+                values.values_mut().for_each(replace_feature_dimension)
+            }
+            _ => {}
+        }
+    }
+    replace_feature_dimension(&mut metadata);
+    for transform in metadata["preprocessing"]["audio"]["transforms"]
+        .as_array_mut()
+        .unwrap()
+    {
+        match transform["op"].as_str().unwrap() {
+            "resample" => transform["sample_rate"] = serde_json::json!(8000),
+            "log_mel" => {
+                transform["sample_rate"] = serde_json::json!(8000);
+                transform["n_fft"] = serde_json::json!(128);
+                transform["hop_length"] = serde_json::json!(64);
+                transform["win_length"] = serde_json::json!(96);
+            }
+            _ => {}
+        }
+    }
+    std::fs::write(
+        package.path().join("inference_metadata.yaml"),
+        serde_json::to_vec_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+    let mut engine = Engine::from_dir(package.path(), EngineConfig::default()).unwrap();
+    let outputs = engine
+        .run_pipeline_outputs(request(wav(1600, false), wav(3200, true)))
+        .unwrap();
+    for (prefix, samples) in [("first", 800), ("second", 1600)] {
+        let features = outputs.aggregate(&format!("{prefix}.features")).unwrap();
+        assert_eq!(features.shape(), [1, 7, samples / 64]);
+        assert_eq!(
+            outputs
+                .aggregate(&format!("{prefix}.length"))
+                .unwrap()
+                .to_vec_i64()
+                .unwrap(),
+            [samples]
+        );
+        let values = features.to_vec_f32().unwrap();
+        let expected = values.iter().sum::<f32>() / values.len() as f32;
+        let score = outputs
+            .aggregate(&format!("{prefix}.score"))
+            .unwrap()
+            .to_vec_f32()
+            .unwrap()[0];
+        assert!(
+            (score - expected).abs() < 1e-5,
+            "{prefix}: {score} != {expected}"
+        );
+    }
+}

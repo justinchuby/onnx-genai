@@ -68,7 +68,17 @@ pub struct DecodedAudio {
     pub sample_rate: u32,
 }
 
-/// Reusable Whisper log-mel extractor.
+/// Inspectable periodic-Hann / Slaney analysis geometry, supplied by a package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogMelConfig {
+    pub n_mels: usize,
+    pub sample_rate: u32,
+    pub n_fft: usize,
+    pub hop_length: usize,
+    pub win_length: usize,
+}
+
+/// Reusable configurable log-mel extractor.
 ///
 /// The extractor uses a periodic Hann window, centered/reflected STFT,
 /// Slaney-normalized mel filters, power spectra, and Whisper's dynamic-range
@@ -76,6 +86,8 @@ pub struct DecodedAudio {
 pub struct LogMelExtractor {
     n_mels: usize,
     sample_rate: u32,
+    n_fft: usize,
+    hop_length: usize,
     window: Vec<f32>,
     mel_filters: Vec<f32>,
     fft: Arc<dyn Fft<f32>>,
@@ -86,33 +98,65 @@ impl fmt::Debug for LogMelExtractor {
         f.debug_struct("LogMelExtractor")
             .field("n_mels", &self.n_mels)
             .field("sample_rate", &self.sample_rate)
+            .field("n_fft", &self.n_fft)
+            .field("hop_length", &self.hop_length)
             .finish_non_exhaustive()
     }
 }
 
 impl LogMelExtractor {
-    /// Creates an extractor. Whisper models use 80 or 128 mel bins and 16 kHz.
+    /// Creates an extractor using the standard 400-point / 160-hop Hann recipe.
+    /// Mel bins and target sample rate remain caller supplied.
     pub fn new(n_mels: usize, sample_rate: u32) -> Result<Self, AudioPreprocessError> {
-        if !matches!(n_mels, 80 | 128) {
+        Self::from_config(LogMelConfig {
+            n_mels,
+            sample_rate,
+            n_fft: WHISPER_N_FFT,
+            hop_length: WHISPER_HOP_LENGTH,
+            win_length: WHISPER_N_FFT,
+        })
+    }
+
+    /// Creates an extractor with explicit analysis geometry.
+    pub fn from_config(config: LogMelConfig) -> Result<Self, AudioPreprocessError> {
+        let LogMelConfig {
+            n_mels,
+            sample_rate,
+            n_fft,
+            hop_length,
+            win_length,
+        } = config;
+        if n_mels == 0
+            || sample_rate == 0
+            || n_fft < 2
+            || hop_length == 0
+            || win_length == 0
+            || win_length > n_fft
+            || n_fft > isize::MAX as usize
+        {
             return Err(AudioPreprocessError::InvalidConfig(format!(
-                "Whisper supports 80 or 128 mel bins, got {n_mels}"
+                "log-mel requires positive mel bins/sample rate/hop and 1 <= win_length <= n_fft (n_fft >= 2); got bins={n_mels}, sample_rate={sample_rate}, n_fft={n_fft}, hop_length={hop_length}, win_length={win_length}; correct the declared analysis geometry"
             )));
         }
-        if sample_rate != WHISPER_SAMPLE_RATE {
-            return Err(AudioPreprocessError::InvalidConfig(format!(
-                "Whisper requires a {WHISPER_SAMPLE_RATE} Hz target sample rate"
-            )));
+        let mut window = Vec::new();
+        window.try_reserve_exact(n_fft).map_err(|error| {
+            AudioPreprocessError::InvalidConfig(format!(
+                "allocate {n_fft}-point analysis window: {error}; reduce n_fft or free host memory"
+            ))
+        })?;
+        window.resize(n_fft, 0.0);
+        let offset = (n_fft - win_length) / 2;
+        for index in 0..win_length {
+            window[offset + index] =
+                0.5 - 0.5 * (2.0 * PI * index as f32 / win_length as f32).cos();
         }
-
-        let window = (0..WHISPER_N_FFT)
-            .map(|index| 0.5 - 0.5 * (2.0 * PI * index as f32 / WHISPER_N_FFT as f32).cos())
-            .collect();
-        let mel_filters = create_mel_filterbank(n_mels, sample_rate);
-        let fft = FftPlanner::<f32>::new().plan_fft_forward(WHISPER_N_FFT);
-
+        let mel_filters = create_mel_filterbank(n_mels, sample_rate, n_fft)?;
+        let fft = FftPlanner::<f32>::new().plan_fft_forward(n_fft);
         Ok(Self {
             n_mels,
             sample_rate,
+            n_fft,
+            hop_length,
             window,
             mel_filters,
             fft,
@@ -121,41 +165,54 @@ impl LogMelExtractor {
 
     /// Extracts a dynamically sized `[1, n_mels, n_frames]` tensor.
     ///
-    /// Frame count is `floor(resampled_samples / 160)`, matching Whisper's
-    /// centered STFT after its final frame is discarded.
+    /// Frame count is `floor(resampled_samples / hop_length)`, using centered
+    /// reflected windows centered at each `frame * hop_length`.
     pub fn extract(
         &self,
         samples: &[f32],
         input_sample_rate: u32,
     ) -> Result<LogMelFeatures, AudioPreprocessError> {
         let resampled = resample(samples, input_sample_rate, self.sample_rate)?;
-        Ok(self.extract_resampled(&resampled))
+        self.extract_resampled(&resampled)
     }
 
-    /// Pads with silence or truncates to 30 seconds before producing the fixed
-    /// `[1, n_mels, 3000]` Whisper encoder input.
+    /// Pads with silence or truncates to 30 seconds at the configured rate.
+    /// The standard 16 kHz / 160-hop recipe produces 3000 frames.
     pub fn extract_padded(
         &self,
         samples: &[f32],
         input_sample_rate: u32,
     ) -> Result<LogMelFeatures, AudioPreprocessError> {
         let mut resampled = resample(samples, input_sample_rate, self.sample_rate)?;
-        resampled.resize(WHISPER_N_SAMPLES, 0.0);
-        resampled.truncate(WHISPER_N_SAMPLES);
-        Ok(self.extract_resampled(&resampled))
+        let target = usize::try_from(self.sample_rate)?
+            .checked_mul(30)
+            .ok_or_else(|| {
+                AudioPreprocessError::InvalidConfig(
+                    "30-second sample count overflows; reduce sample_rate".into(),
+                )
+            })?;
+        resampled.resize(target, 0.0);
+        self.extract_resampled(&resampled)
     }
 
-    fn extract_resampled(&self, samples: &[f32]) -> LogMelFeatures {
-        let n_frames = samples.len() / WHISPER_HOP_LENGTH;
-        let mut features = vec![0.0; self.n_mels * n_frames];
-        let mut fft_buffer = vec![Complex32::default(); WHISPER_N_FFT];
-        let mut power = vec![0.0; WHISPER_N_FFT / 2 + 1];
+    fn extract_resampled(&self, samples: &[f32]) -> Result<LogMelFeatures, AudioPreprocessError> {
+        let n_frames = samples.len() / self.hop_length;
+        let count = self.n_mels.checked_mul(n_frames).ok_or_else(|| {
+            AudioPreprocessError::InvalidConfig(
+                "log-mel feature dimensions overflow; shorten audio or reduce num_mel_bins".into(),
+            )
+        })?;
+        let mut features = Vec::new();
+        features.try_reserve_exact(count).map_err(|error|AudioPreprocessError::InvalidConfig(format!("allocate {count} log-mel feature values: {error}; shorten audio or free host memory")))?;
+        features.resize(count, 0.0);
+        let mut fft_buffer = vec![Complex32::default(); self.n_fft];
+        let mut power = vec![0.0; self.n_fft / 2 + 1];
 
         for frame in 0..n_frames {
-            let frame_start = frame * WHISPER_HOP_LENGTH;
+            let frame_start = frame * self.hop_length;
             for (index, value) in fft_buffer.iter_mut().enumerate() {
                 let sample_index =
-                    frame_start as isize + index as isize - (WHISPER_N_FFT / 2) as isize;
+                    frame_start as isize + index as isize - (self.n_fft / 2) as isize;
                 value.re = reflected_sample(samples, sample_index) * self.window[index];
                 value.im = 0.0;
             }
@@ -183,11 +240,11 @@ impl LogMelExtractor {
             }
         }
 
-        LogMelFeatures {
+        Ok(LogMelFeatures {
             data: features,
             n_mels: self.n_mels,
             n_frames,
-        }
+        })
     }
 }
 
@@ -489,20 +546,36 @@ fn reflected_sample(samples: &[f32], index: isize) -> f32 {
     }
 }
 
-fn create_mel_filterbank(n_mels: usize, sample_rate: u32) -> Vec<f32> {
-    let n_freqs = WHISPER_N_FFT / 2 + 1;
+fn create_mel_filterbank(
+    n_mels: usize,
+    sample_rate: u32,
+    n_fft: usize,
+) -> Result<Vec<f32>, AudioPreprocessError> {
+    let n_freqs = n_fft / 2 + 1;
+    let filter_count = n_mels.checked_mul(n_freqs).ok_or_else(|| {
+        AudioPreprocessError::InvalidConfig(
+            "log-mel filter dimensions overflow; reduce num_mel_bins or n_fft".into(),
+        )
+    })?;
+    let point_count = n_mels.checked_add(2).ok_or_else(|| {
+        AudioPreprocessError::InvalidConfig(
+            "log-mel point count overflows; reduce num_mel_bins".into(),
+        )
+    })?;
+    let mut filters = Vec::new();
+    filters.try_reserve_exact(filter_count).map_err(|error|AudioPreprocessError::InvalidConfig(format!("allocate {filter_count} log-mel filter values: {error}; reduce analysis geometry or free host memory")))?;
+    filters.resize(filter_count, 0.0);
     let min_mel = hz_to_mel(0.0);
     let max_mel = hz_to_mel(f64::from(sample_rate) / 2.0);
-    let mel_points = (0..n_mels + 2)
+    let mel_points = (0..point_count)
         .map(|index| {
             let mel = min_mel + (max_mel - min_mel) * index as f64 / (n_mels + 1) as f64;
             mel_to_hz(mel)
         })
         .collect::<Vec<_>>();
     let fft_frequencies = (0..n_freqs)
-        .map(|bin| bin as f64 * f64::from(sample_rate) / WHISPER_N_FFT as f64)
+        .map(|bin| bin as f64 * f64::from(sample_rate) / n_fft as f64)
         .collect::<Vec<_>>();
-    let mut filters = vec![0.0; n_mels * n_freqs];
 
     for mel in 0..n_mels {
         let lower = mel_points[mel];
@@ -516,7 +589,7 @@ fn create_mel_filterbank(n_mels: usize, sample_rate: u32) -> Vec<f32> {
                 (lower_slope.min(upper_slope).max(0.0) * normalization) as f32;
         }
     }
-    filters
+    Ok(filters)
 }
 
 fn hz_to_mel(frequency: f64) -> f64 {
@@ -579,7 +652,7 @@ mod tests {
 
     #[test]
     fn slaney_mel_filterbank_matches_reference_spots() {
-        let filters = create_mel_filterbank(80, WHISPER_SAMPLE_RATE);
+        let filters = create_mel_filterbank(80, WHISPER_SAMPLE_RATE, WHISPER_N_FFT).unwrap();
         let n_freqs = WHISPER_N_FFT / 2 + 1;
 
         assert!((filters[1] - 0.024_862_594).abs() < 1e-7);
@@ -836,6 +909,8 @@ impl AudioProgram {
         let mut target_length: Option<usize> = None;
         let mut num_mel_bins: Option<usize> = None;
         let mut hop_length = WHISPER_HOP_LENGTH;
+        let mut n_fft = WHISPER_N_FFT;
+        let mut win_length = WHISPER_N_FFT;
         let mut produced: Vec<String> = Vec::new();
         let mut decoded = false;
         let mut mel_produced = false;
@@ -869,19 +944,9 @@ impl AudioProgram {
                                 .to_owned(),
                         ));
                     }
-                    let n_fft = transform.n_fft.unwrap_or(WHISPER_N_FFT);
-                    if n_fft != WHISPER_N_FFT {
-                        return Err(AudioPreprocessError::InvalidConfig(format!(
-                            "unsupported log-mel n_fft {n_fft}; this runtime implements {WHISPER_N_FFT}"
-                        )));
-                    }
+                    n_fft = transform.n_fft.unwrap_or(WHISPER_N_FFT);
                     hop_length = transform.hop_length.unwrap_or(WHISPER_HOP_LENGTH);
-                    if hop_length != WHISPER_HOP_LENGTH {
-                        return Err(AudioPreprocessError::InvalidConfig(format!(
-                            "unsupported log-mel hop_length {hop_length}; this runtime \
-                             implements {WHISPER_HOP_LENGTH}"
-                        )));
-                    }
+                    win_length = transform.win_length.unwrap_or(n_fft);
                     if let Some(window) = &transform.window
                         && window != "hann"
                     {
@@ -958,7 +1023,13 @@ impl AudioProgram {
             sample_rate,
             target_length,
             hop_length,
-            extractor: LogMelExtractor::new(num_mel_bins, sample_rate)?,
+            extractor: LogMelExtractor::from_config(LogMelConfig {
+                n_mels: num_mel_bins,
+                sample_rate,
+                n_fft,
+                hop_length,
+                win_length,
+            })?,
             outputs,
         })
     }
@@ -1005,7 +1076,7 @@ impl AudioProgram {
         let mut valid_frames = Vec::with_capacity(decoded.len());
         let mut waveform = Vec::new();
         for (samples, valid_samples) in &decoded {
-            let mel = self.extractor.extract_resampled(samples);
+            let mel = self.extractor.extract_resampled(samples)?;
             features.extend_from_slice(&mel.data);
             valid_frames.push(i64::try_from(
                 (valid_samples.div_ceil(self.hop_length)).min(frames),
@@ -1210,8 +1281,8 @@ outputs:
     }
 
     #[test]
-    fn an_unsupported_hop_length_is_rejected() {
-        let text = PROGRAM.replace("hop_length: 160", "hop_length: 128");
+    fn a_zero_hop_length_is_rejected() {
+        let text = PROGRAM.replace("hop_length: 160", "hop_length: 0");
 
         let error = program(&text).expect_err("the runtime must not silently retune the STFT");
 
@@ -1253,5 +1324,160 @@ outputs:
             .expect_err("an empty submission has no rows to align");
 
         assert!(error.to_string().contains("at least one clip"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+    #[test]
+    fn declared_geometry_matches_independent_direct_dft() {
+        // Odd/even FFTs, shortened/full windows, nonstandard rates/mel counts.
+        for (fft, hop, window, rate, mels) in [
+            (16, 3, 10, 8000, 7),
+            (15, 4, 15, 22050, 5),
+            (32, 7, 17, 44100, 9),
+        ] {
+            let extractor = LogMelExtractor::from_config(LogMelConfig {
+                n_mels: mels,
+                sample_rate: rate,
+                n_fft: fft,
+                hop_length: hop,
+                win_length: window,
+            })
+            .unwrap();
+            let samples = (0..91)
+                .map(|i| (i as f32 * 0.31).sin() * 0.3)
+                .collect::<Vec<_>>();
+            let actual = extractor.extract(&samples, rate).unwrap();
+            assert_eq!(actual.shape(), [1, mels, samples.len() / hop]);
+            let bins = fft / 2 + 1;
+            let filters = create_mel_filterbank(mels, rate, fft).unwrap();
+            let frames = samples.len() / hop;
+            let mut expected = vec![0.0f64; mels * frames];
+            for frame in 0..frames {
+                let mut power = vec![0.0f64; bins];
+                for (bin, power) in power.iter_mut().enumerate() {
+                    let (mut re, mut im) = (0.0, 0.0);
+                    for j in 0..window {
+                        let offset = (fft - window) / 2 + j;
+                        let index =
+                            frame as isize * hop as isize + offset as isize - (fft / 2) as isize;
+                        let x = f64::from(reflected_sample(&samples, index))
+                            * (0.5
+                                - 0.5
+                                    * (2.0 * std::f64::consts::PI * j as f64 / window as f64)
+                                        .cos());
+                        let phase =
+                            2.0 * std::f64::consts::PI * bin as f64 * offset as f64 / fft as f64;
+                        re += x * phase.cos();
+                        im -= x * phase.sin();
+                    }
+                    *power = re * re + im * im;
+                }
+                for mel in 0..mels {
+                    expected[mel * frames + frame] = filters[mel * bins..(mel + 1) * bins]
+                        .iter()
+                        .zip(&power)
+                        .map(|(w, p)| f64::from(*w) * p)
+                        .sum::<f64>()
+                        .max(1e-10)
+                        .log10();
+                }
+            }
+            let maximum = expected.iter().copied().reduce(f64::max).unwrap();
+            for (actual, expected) in actual.data.iter().zip(expected) {
+                let expected = (expected.max(maximum - 8.0) + 4.0) / 4.0;
+                assert!(
+                    (f64::from(*actual) - expected).abs() < 2e-5,
+                    "geometry {fft}/{hop}/{window}/{rate}/{mels}: {actual} != {expected}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn invalid_geometry_fails_with_parameters_and_recovery() {
+        for (mels, rate, fft, hop, window) in [
+            (0, 8000, 16, 4, 16),
+            (4, 0, 16, 4, 16),
+            (4, 8000, 1, 4, 1),
+            (4, 8000, 16, 0, 16),
+            (4, 8000, 16, 4, 17),
+            (4, 8000, 16, 4, 0),
+        ] {
+            let error = LogMelExtractor::from_config(LogMelConfig {
+                n_mels: mels,
+                sample_rate: rate,
+                n_fft: fft,
+                hop_length: hop,
+                win_length: window,
+            })
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("correct the declared analysis geometry"),
+                "{error}"
+            );
+        }
+    }
+    #[test]
+    fn excessive_mel_dimensions_fail_without_allocation_or_panic() {
+        let error = LogMelExtractor::from_config(LogMelConfig {
+            n_mels: usize::MAX,
+            sample_rate: 8000,
+            n_fft: 16,
+            hop_length: 4,
+            win_length: 16,
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("filter dimensions overflow"),
+            "{error}"
+        );
+    }
+    #[test]
+    fn thirty_second_padding_uses_the_declared_target_rate() {
+        let extractor = LogMelExtractor::from_config(LogMelConfig {
+            n_mels: 4,
+            sample_rate: 8000,
+            n_fft: 128,
+            hop_length: 1024,
+            win_length: 96,
+        })
+        .unwrap();
+        let features = extractor.extract_padded(&[], 8000).unwrap();
+        assert_eq!(features.shape(), [1, 4, 240000 / 1024]);
+        assert!(features.data.iter().all(|x| (*x + 1.5).abs() < 1e-6));
+    }
+    #[test]
+    fn audio_program_uses_authored_geometry_and_frame_usage() {
+        let declared: onnx_genai_metadata::AudioPreprocessingProgram = serde_yaml::from_str(
+            r#"
+transforms:
+  - op: decode
+    outputs: [samples]
+  - op: log_mel
+    inputs: [samples]
+    outputs: [features]
+    sample_rate: 8000
+    num_mel_bins: 7
+    n_fft: 128
+    hop_length: 64
+    win_length: 96
+  - op: emit_valid_frames
+    inputs: [samples]
+    outputs: [frames]
+outputs:
+  - {source: features, name: features, content: audio_features, dtype: float32}
+  - {source: frames, name: frames, content: valid_frames, dtype: int64}
+"#,
+        )
+        .unwrap();
+        let program = AudioProgram::from_program(&declared).unwrap();
+        let wav = encode_wav_pcm16(&vec![0.0; 1600], 16000, 1).unwrap();
+        let tensors = program.run(&[&wav]).unwrap();
+        assert_eq!(tensors[0].shape, [1, 7, 12]);
+        assert_eq!(tensors[1].data, AudioTensorData::Int64(vec![12]));
     }
 }
