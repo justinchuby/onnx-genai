@@ -347,6 +347,7 @@ mod tests {
         let mut body = response.into_body().into_data_stream();
         driver
             .send(DriverEvent::Token(onnx_genai_engine::GenerateToken {
+                timings: None,
                 token_id: 1,
                 text: "first".into(),
                 finish_reason: None,

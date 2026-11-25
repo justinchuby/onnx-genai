@@ -51,6 +51,7 @@ mod slots;
 mod speech;
 mod sse;
 mod state;
+mod timings;
 mod tool_protocol;
 mod types;
 mod webui;

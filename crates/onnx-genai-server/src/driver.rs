@@ -4140,6 +4140,7 @@ mod driver_delivery_tests {
 
     fn token(id: u32) -> GenerateToken {
         GenerateToken {
+            timings: None,
             logprob: None,
             token_id: id,
             text: format!("t{id}"),
@@ -4149,6 +4150,7 @@ mod driver_delivery_tests {
 
     fn result(tokens: usize) -> GenerateResult {
         GenerateResult {
+            timings: None,
             retained_cache_tokens: 0,
             preserved_tokens: Default::default(),
             text: "done".to_string(),

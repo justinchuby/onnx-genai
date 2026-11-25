@@ -264,6 +264,7 @@ fn index_completion_publications(
         .collect()
 }
 struct StartedCompletion {
+    timings_per_token: bool,
     _registration: crate::completion_control::Registration,
     events: mpsc::Receiver<DriverEvent>,
     prompt_tokens: usize,
@@ -334,6 +335,12 @@ async fn start_completion(
     await_driver_admission(generation.admission).await?;
     crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
     Ok(StartedCompletion {
+        timings_per_token: request
+            .sampling
+            .extensions
+            .get("timings_per_token")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
         _registration: registration,
         events: generation.events,
         prompt_tokens,
@@ -364,6 +371,7 @@ async fn run_completion(
     let logprobs = completion_logprobs(&result, &handle.tokenizer, request.logprobs)
         .map_err(|error| ApiError::internal(format!("logprobs conversion failed: {error:#}")))?;
     Ok(CompletionResponse {
+        timings: result.timings.map(crate::timings::render),
         id,
         object: "text_completion",
         created,
@@ -403,6 +411,16 @@ async fn deliver_completion(
         match tokio::select! { _=tx.closed()=>return Ok(CompletionDelivery::Disconnected),event=started.events.recv()=>event }
         {
             Some(DriverEvent::Token(token)) => {
+                if started.timings_per_token
+                    && let Some(sample) = token.timings
+                {
+                    send_completion_stream_chunk(
+                        tx,
+                        completion_chunk(id, created, model, index, String::new(), None)
+                            .with_timings(Some(sample)),
+                    )
+                    .await?;
+                }
                 if logprobs.is_some() {
                     continue;
                 }
@@ -465,7 +483,8 @@ async fn deliver_completion(
             model,
             index,
             finish_reason_label(&result.finish_reason),
-        ),
+        )
+        .with_timings(result.timings),
     )
     .await?;
     let completion_tokens = result.token_ids.len();
@@ -576,6 +595,7 @@ async fn stream_completions(
         }
         if include_usage && !failed {
             let usage = CompletionResponse {
+                timings: None,
                 id,
                 object: "text_completion",
                 created,
@@ -840,6 +860,7 @@ async fn run_chat_completion(
     let reasoning = Some(output.reasoning).filter(|thought| !thought.is_empty());
     let total_tokens = prompt_tokens + completion_tokens;
     Ok(ChatCompletionResponse {
+        timings: result.timings.map(crate::timings::render),
         id,
         object: "chat.completion",
         created,
@@ -966,6 +987,11 @@ async fn stream_chat_completion(
                 &mut driver_rx,
                 prompt_tokens,
                 request.stream_options.include_usage,
+                request
+                    .extensions
+                    .get("timings_per_token")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true),
             )
             .await;
         }
@@ -977,6 +1003,19 @@ async fn stream_chat_completion(
                 event = driver_rx.recv() => event,
             } {
                 Some(DriverEvent::Token(token)) => {
+                    if request
+                        .extensions
+                        .get("timings_per_token")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                        && let Some(sample) = token.timings
+                    {
+                        send_stream_chunk(
+                            &tx,
+                            crate::sse::timing_chunk(&id, created, &model, sample),
+                        )
+                        .await?;
+                    }
                     let revealed = match channel_gate.push_text(&token.text) {
                         Ok(delta) => delta,
                         Err(error) => break Err(StreamOutputFailure::Projection(error)),
@@ -1033,7 +1072,8 @@ async fn stream_chat_completion(
                             &model,
                             &result.finish_reason,
                             &user_stop_sequences,
-                        ),
+                        )
+                        .with_timings(result.timings),
                     )
                     .await?;
                 } else {
@@ -1065,7 +1105,8 @@ async fn stream_chat_completion(
                             &model,
                             &result.finish_reason,
                             &user_stop_sequences,
-                        ),
+                        )
+                        .with_timings(result.timings),
                     )
                     .await?;
                 }
@@ -1120,6 +1161,7 @@ async fn stream_declared_tool_chat_completion(
     driver_rx: &mut mpsc::Receiver<DriverEvent>,
     prompt_tokens: usize,
     include_usage: bool,
+    timings_per_token: bool,
 ) -> anyhow::Result<()> {
     let (id, created, model) = response;
     let mut buffered_text = String::new();
@@ -1129,6 +1171,10 @@ async fn stream_declared_tool_chat_completion(
             event = driver_rx.recv() => event,
         } {
             Some(DriverEvent::Token(token)) => {
+                if timings_per_token && let Some(sample) = token.timings {
+                    send_stream_chunk(tx, crate::sse::timing_chunk(id, created, model, sample))
+                        .await?;
+                }
                 let revealed = match channel_gate.push_text(&token.text) {
                     Ok(delta) => delta,
                     Err(error) => break Err(StreamOutputFailure::Projection(error)),
@@ -1196,7 +1242,8 @@ async fn stream_declared_tool_chat_completion(
                         model,
                         &result.finish_reason,
                         user_stop_sequences,
-                    ),
+                    )
+                    .with_timings(result.timings),
                 )
                 .await?;
             } else {
@@ -1212,7 +1259,8 @@ async fn stream_declared_tool_chat_completion(
                         model,
                         &result.finish_reason,
                         user_stop_sequences,
-                    ),
+                    )
+                    .with_timings(result.timings),
                 )
                 .await?;
             }
@@ -3997,6 +4045,7 @@ mod channel_gate_tests {
             stop_sequences: Vec::new(),
         };
         let result = GenerateResult {
+            timings: None,
             retained_cache_tokens: 0,
             preserved_tokens: Default::default(),
             text: "</c><c>".into(),
@@ -4103,6 +4152,7 @@ mod completion_delivery_tests {
                 &tx,
                 ("id", 1, "model", 3),
                 StartedCompletion {
+                    timings_per_token: false,
                     _registration: controls
                         .register(
                             "id",
@@ -4151,6 +4201,7 @@ mod completion_delivery_tests {
             &tx,
             ("id", 1, "model", 0),
             StartedCompletion {
+                timings_per_token: false,
                 _registration: controls
                     .register(
                         "id",

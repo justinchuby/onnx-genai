@@ -359,9 +359,20 @@ are canonicalized only for schema recognition; prompt bytes retain the original
 spelling. Literal escaped backslashes keep their meaning. Grammar-only byte chunks
 may still split UTF-8 scalars. Invalid schema prefixes return a typed 400 error. Tokenizers without an interpretable
 lossless byte codec fail explicitly rather than using lossy token decoding.
-Optional progress/control subscription fields from Llama Chat are accepted, but
+Ordinary runtime-owned decoder generation returns llama.cpp `timings` in native,
+OpenAI completion and chat buffered results and final SSE chunks. Setting
+`timings_per_token=true` adds cumulative token-boundary measurements to SSE,
+including through the chat reasoning/tool-channel projection. Native/ORT clocks
+measure actual forward and selection work before commit-only publication;
+network delivery, callback delays and scheduler suspension are excluded. The
+first generated token comes from prompt logits, so predicted throughput uses
+`predicted_n - 1` generation steps. Prompt timing counts fresh tokens and reports
+input reuse separately as `cache_n`; it is unrelated to retained `tokens_cached`.
+Executors without this timing contract (including speculative/composite paths
+and standalone prompt-only evaluation) omit the measurements. Optional
+`return_progress` is accepted, but prompt progress events remain open work.
 `/props.nxrt_capabilities` advertises resumable streams and the live reasoning
-control endpoint. Per-token timing/progress events are not promised.
+control endpoint.
 An SSE request with `X-Conversation-Id` retains generation independently of its
 HTTP reader. Reconnect with `/v1/stream?conv_id=ID&from=BYTE_OFFSET`; DELETE cancels
 the producer. Retention defaults to 16 streams and 4 MiB per stream, with completed
