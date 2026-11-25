@@ -525,18 +525,24 @@ impl ChatCompletionRequest {
     }
     pub(crate) fn validate_grammar(&self) -> anyhow::Result<()> {
         self.grammar_activation()?;
-        anyhow::ensure!(
-            !self.grammar_lazy
-                || self
-                    .grammar
-                    .as_deref()
-                    .is_some_and(|grammar| !grammar.is_empty())
-                || self
-                    .response_format
-                    .as_ref()
-                    .is_none_or(|format| matches!(format, ResponseFormat::Text)),
-            "grammar_lazy with a JSON response_format is not implemented yet; provide a raw GBNF grammar or disable lazy activation"
-        );
+        if self.grammar_lazy
+            && self
+                .response_format
+                .as_ref()
+                .is_some_and(|format| !matches!(format, ResponseFormat::Text))
+        {
+            anyhow::ensure!(
+                !matches!(
+                    self.tool_choice,
+                    Some(ToolChoice::Mode(ToolChoiceMode::Required) | ToolChoice::Specific(_))
+                ),
+                "grammar_lazy JSON response_format conflicts with forced tool_choice; use tool_choice auto/none or disable lazy JSON"
+            );
+            anyhow::ensure!(
+                self.extensions.get("ignore_eos") != Some(&serde_json::Value::Bool(true)),
+                "grammar_lazy JSON response_format cannot be combined with ignore_eos=true; allow JSON completion to terminate generation"
+            );
+        }
         let Some(grammar) = self
             .grammar
             .as_deref()
@@ -629,7 +635,7 @@ impl ChatCompletionRequest {
                         .is_some_and(|content| !content.text().trim().is_empty()),
                     "continue_final_message content requires nonempty final assistant content; provide the answer prefix to resume"
                 );
-                if self.wants_constrained_json() {
+                if self.consumes_json_prefill() {
                     let prefix = last
                         .content
                         .as_ref()
@@ -680,11 +686,12 @@ impl ChatCompletionRequest {
             .or_else(|| self.max_tokens.map(|budget| ("max_tokens", budget)))
     }
 
-    pub(crate) fn wants_constrained_json(&self) -> bool {
-        matches!(
-            self.response_format.as_ref(),
-            Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
-        )
+    pub(crate) fn consumes_json_prefill(&self) -> bool {
+        !self.grammar_lazy
+            && matches!(
+                self.response_format.as_ref(),
+                Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+            )
     }
 
     pub(crate) fn has_tool_context(&self) -> bool {

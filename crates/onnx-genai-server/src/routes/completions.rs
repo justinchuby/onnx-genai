@@ -2675,6 +2675,24 @@ pub(super) fn build_generate_options_with_tokenizer(
         }
     }
     if let Some(activation) = request.grammar_activation()? {
+        if request.grammar_lazy {
+            let schema = match &options.constraint {
+                Some(GenerateConstraint::Json { .. }) => Some("true".to_owned()),
+                Some(GenerateConstraint::JsonSchema { schema, .. }) => Some(schema.clone()),
+                _ => None,
+            };
+            if let Some(schema) = schema {
+                activation.validate_with_tokenizer(
+                    tokenizer,
+                    options.max_constraint_bytes,
+                    &options.effective_preserved_tokens(),
+                )?;
+                options.constraint = Some(GenerateConstraint::LazyJsonSchema {
+                    schema,
+                    activation: activation.clone(),
+                });
+            }
+        }
         if matches!(options.constraint, Some(GenerateConstraint::Gbnf { .. })) {
             activation.validate_with_tokenizer(
                 tokenizer,

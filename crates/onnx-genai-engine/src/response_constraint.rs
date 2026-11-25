@@ -260,6 +260,58 @@ impl ContentConstraint {
         Ok(())
     }
 
+    /// Restart a raw lazy JSON value at a captured byte offset, which can fall
+    /// inside a model token or an unfinished UTF-8 scalar. The caller has
+    /// already proved an identity byte decoder and serializes activation.
+    pub(crate) fn seed_raw_bytes(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lazy JSON state is poisoned; restart this completion"))?;
+        self.reset(&mut state)?;
+        let result = (|| {
+            ensure!(
+                state.decoder.is_identity()
+                    && matches!(self.projection_kind, ProjectionKind::Plain),
+                "lazy JSON raw replay requires a plain identity byte decoder; use a supported raw tokenizer contract"
+            );
+            let State {
+                projection,
+                json,
+                raw,
+                normalized,
+                ..
+            } = &mut *state;
+            ensure!(
+                Self::admit_preview(projection.with_preview(bytes, false, |view| {
+                    Self::inspect_grammar(
+                        view,
+                        json,
+                        raw,
+                        normalized.canonical(),
+                        false,
+                        self.normalization,
+                    )
+                }))?,
+                "lazy JSON trigger replay is not a viable JSON Schema prefix; include the captured trigger and its suffix in the schema value"
+            );
+            self.advance_bytes(&mut state, bytes, false)
+        })();
+        match result {
+            Err(operation) => {
+                if let Err(recovery) = self.reset(&mut state) {
+                    return Err(ResponseConstraintRecovery {
+                        operation,
+                        recovery,
+                    }
+                    .into());
+                }
+                Err(operation)
+            }
+            result => result,
+        }
+    }
+
     fn inspect_grammar(
         view: TextView<'_>,
         json: &mut GrammarByteCursor,
@@ -538,6 +590,13 @@ impl ContentConstraint {
 
     fn advance(&self, state: &mut State, id: TokenId) -> anyhow::Result<()> {
         let bytes = self.decode(&mut state.decoder, id, self.endings.contains(&id), false)?;
+        self.advance_bytes(state, &bytes, self.endings.contains(&id))?;
+        state.history.push(id);
+        state.ended = self.endings.contains(&id);
+        Ok(())
+    }
+
+    fn advance_bytes(&self, state: &mut State, bytes: &[u8], terminal: bool) -> anyhow::Result<()> {
         let retained = match &state.decoder {
             DecoderState::Bytes(decoder) => decoder.retained_bytes(),
             _ => 0,
@@ -554,14 +613,13 @@ impl ContentConstraint {
             }
             .into());
         }
-        state.projection.commit(&bytes)?;
-        let raw = if self.endings.contains(&id) {
+        state.projection.commit(bytes)?;
+        let raw = if terminal {
             state.projection.content(true)?
         } else {
             state.projection.content(false)?
         };
-        if projection_extension(&raw, &state.raw, self.endings.contains(&id), "content")?.is_some()
-        {
+        if projection_extension(&raw, &state.raw, terminal, "content")?.is_some() {
             let normalized = self.normalization.parse(&raw)?;
             if let Some(suffix) = normalized
                 .canonical()
@@ -576,8 +634,6 @@ impl ContentConstraint {
             state.raw = raw;
             state.normalized = normalized;
         }
-        state.history.push(id);
-        state.ended = self.endings.contains(&id);
         Ok(())
     }
 }
@@ -604,6 +660,9 @@ impl Constraint for ContentConstraint {
             }
             if state.ended {
                 return Ok(vec![false; candidates.len()]);
+            }
+            if candidates.is_empty() {
+                return Ok(Vec::new());
             }
             if let (Some(vocabulary), Codec::Bytes(contract)) =
                 (&self.plain_vocabulary, &self.codec)
@@ -721,6 +780,48 @@ mod tests {
         let path = scratch.path().join("tokenizer.json");
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         Tokenizer::from_file(path).unwrap()
+    }
+
+    #[test]
+    fn raw_json_seed_handles_partial_utf8_rejection_and_reactivation() {
+        let tokenizer = tokenizer(true);
+        let preserved = tokenizer
+            .inner()
+            .get_vocab(true)
+            .values()
+            .copied()
+            .collect();
+        let constraint = ContentConstraint::json_schema(
+            &tokenizer,
+            &json!({"const":"é"}),
+            ProjectionKind::Plain,
+            "",
+            128,
+            vec![],
+            &preserved,
+        )
+        .unwrap();
+        constraint.seed_raw_bytes(b"\"\xc3").unwrap();
+        assert!(!constraint.can_finish(&ProcessorContext::default()).unwrap());
+        let candidate = TokenCandidate {
+            token_id: 5,
+            text: String::new(),
+            is_eos: false,
+        };
+        assert_eq!(
+            constraint
+                .allowed_next_tokens(&ProcessorContext::default(), &[candidate])
+                .unwrap(),
+            [true]
+        );
+        assert!(constraint.seed_raw_bytes(b"\"wrong\"").is_err());
+        constraint.seed_raw_bytes("\"é\"".as_bytes()).unwrap();
+        assert!(constraint.can_finish(&ProcessorContext::default()).unwrap());
+        constraint.seed_raw_bytes(b"\"\\u00e9\"").unwrap();
+        assert!(constraint.can_finish(&ProcessorContext::default()).unwrap());
+        assert!(constraint.seed_raw_bytes(&[b' '; 129]).is_err());
+        constraint.seed_raw_bytes("\"é\"".as_bytes()).unwrap();
+        assert!(constraint.can_finish(&ProcessorContext::default()).unwrap());
     }
 
     #[test]
