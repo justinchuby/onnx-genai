@@ -6,7 +6,7 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
-use super::layernorm::layer_norm_dense;
+use super::layernorm::LayerNormKernel;
 use super::rmsnorm::RmsNormKernel;
 use super::simd_activations;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
@@ -30,52 +30,6 @@ fn require_fused_float_dtype(op: &str, inputs: &[TensorView], outputs: &[TensorM
             "{op}: input and output dtypes must all match (got input {dtype:?}, output {:?})",
             outputs[0].dtype
         )));
-    }
-    Ok(())
-}
-
-fn require_skip_layer_norm_dtype(inputs: &[TensorView], outputs: &[TensorMut]) -> Result<()> {
-    let dtype = inputs[0].dtype;
-    if !matches!(
-        dtype,
-        DataType::Float16 | DataType::BFloat16 | DataType::Float32
-    ) {
-        return Err(EpError::KernelFailed(format!(
-            "SkipLayerNormalization: unsupported dtype {dtype:?}; expected Float16, BFloat16, or Float32"
-        )));
-    }
-    if inputs
-        .iter()
-        .any(|input| !input.is_absent() && input.dtype != dtype)
-    {
-        return Err(EpError::KernelFailed(format!(
-            "SkipLayerNormalization: input dtypes must all match (got input {dtype:?})"
-        )));
-    }
-    for (index, output) in outputs.iter().enumerate() {
-        if output.is_absent() {
-            continue;
-        }
-        if matches!(index, 1 | 2) {
-            // `mean`/`inv_std_var` are training-only stats that inference
-            // graphs leave dangling. ORT's schema types them `float`, but
-            // exporters routinely emit them in the activation dtype instead
-            // (the bf16 skip-RMSNorm path documents the same allowance), and
-            // the write below narrows to whichever was declared.
-            if output.dtype != DataType::Float32 && output.dtype != dtype {
-                return Err(EpError::KernelFailed(format!(
-                    "SkipLayerNormalization: output {index} must have dtype Float32 or {dtype:?}, got {:?}",
-                    output.dtype
-                )));
-            }
-            continue;
-        }
-        if output.dtype != dtype {
-            return Err(EpError::KernelFailed(format!(
-                "SkipLayerNormalization: output {index} must have dtype {dtype:?}, got {:?}",
-                output.dtype
-            )));
-        }
     }
     Ok(())
 }
@@ -215,86 +169,14 @@ impl Kernel for QuickGeluKernel {
     }
 }
 
-pub struct SkipLayerNormKernel {
-    epsilon: f32,
-}
-
 pub struct SkipLayerNormFactory;
-
 impl KernelFactory for SkipLayerNormFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(SkipLayerNormKernel {
-            epsilon: node
-                .attr("epsilon")
+        Ok(Box::new(LayerNormKernel::skip(
+            node.attr("epsilon")
                 .and_then(|a| a.as_float())
                 .unwrap_or(1e-12),
-        }))
-    }
-}
-
-impl Kernel for SkipLayerNormKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        // ORT SkipLayerNormalization: `output` (0, required) plus optional
-        // `mean` (1), `inv_std_var` (2), and `input_skip_bias_sum` (3). A valid
-        // node may request as few as one output, so only require output 0.
-        check_arity("SkipLayerNormalization", inputs, outputs, 3, 5, 1)?;
-        require_skip_layer_norm_dtype(inputs, outputs)?;
-        let x = to_dense_f32_widen("SkipLayerNormalization", &inputs[0])?;
-        let skip = to_dense_f32_widen("SkipLayerNormalization", &inputs[1])?;
-        if inputs[0].shape != inputs[1].shape || x.len() != skip.len() {
-            return Err(EpError::KernelFailed(
-                "SkipLayerNormalization: skip must have the same shape as X".into(),
-            ));
-        }
-        let gamma = to_dense_f32_widen("SkipLayerNormalization", &inputs[2])?;
-        // `beta` (slot 3) and `bias` (slot 4) are independently optional: the
-        // executor may pass an absent placeholder for either while the other is
-        // present, so guard each slot separately instead of by input count.
-        let beta = if inputs.len() >= 4 && !inputs[3].is_absent() {
-            Some(to_dense_f32_widen("SkipLayerNormalization", &inputs[3])?)
-        } else {
-            None
-        };
-        let bias = if inputs.len() >= 5 && !inputs[4].is_absent() {
-            Some(to_dense_f32_widen("SkipLayerNormalization", &inputs[4])?)
-        } else {
-            None
-        };
-        let width = bias
-            .as_deref()
-            .map(|b| last_dim_bias(inputs[0].shape, b, "SkipLayerNormalization"))
-            .transpose()?;
-        // sum = X + skip + bias (bias broadcasts over the last dimension).
-        let sum = x
-            .iter()
-            .zip(skip.iter())
-            .enumerate()
-            .map(|(i, (&a, &b))| a + b + bias.as_ref().map_or(0.0, |v| v[i % width.unwrap()]))
-            .collect::<Vec<_>>();
-        let (y, means, inv_stds) = layer_norm_dense(
-            &sum,
-            inputs[0].shape,
-            &gamma,
-            beta.as_deref(),
-            -1,
-            self.epsilon,
-        )?;
-        write_dense_f32_narrow("SkipLayerNormalization", &mut outputs[0], &y)?;
-        if outputs.len() > 1 {
-            write_dense_f32_narrow("SkipLayerNormalization", &mut outputs[1], &means)?;
-        }
-        if outputs.len() > 2 {
-            write_dense_f32_narrow("SkipLayerNormalization", &mut outputs[2], &inv_stds)?;
-        }
-        // Output 3 (`input_skip_bias_sum`) is the pre-normalization X-shaped sum.
-        if outputs.len() > 3 {
-            write_dense_f32_narrow("SkipLayerNormalization", &mut outputs[3], &sum)?;
-        }
-        Ok(())
-    }
-
-    fn supports_strided_input(&self, _input_idx: usize) -> bool {
-        true
+        )))
     }
 }
 
@@ -451,8 +333,8 @@ mod tests {
         let mut y = Owned::zeros_f32(&[2, 4]);
         let mut mean = Owned::zeros_f32(&[2, 1]);
         let mut inv_std = Owned::zeros_f32(&[2, 1]);
-        SkipLayerNormKernel { epsilon: 1e-5 }
-            .execute(
+        LayerNormKernel::skip(1e-5)
+            .execute_prepared(
                 &[
                     x.view(),
                     skip.view(),
@@ -496,8 +378,8 @@ mod tests {
         let mut inv_std = Owned::zeros_f32(&[1, 1]);
         let mut sum = Owned::zeros(DataType::BFloat16, &[1, 4]);
 
-        SkipLayerNormKernel { epsilon: 1e-5 }
-            .execute(
+        LayerNormKernel::skip(1e-5)
+            .execute_prepared(
                 &[
                     x.view(),
                     skip.view(),
@@ -529,8 +411,8 @@ mod tests {
         let mut mean = Owned::zeros_f32(&[1, 1]);
         let mut inv_std = Owned::zeros_f32(&[1, 1]);
 
-        SkipLayerNormKernel { epsilon: 1e-5 }
-            .execute(
+        LayerNormKernel::skip(1e-5)
+            .execute_prepared(
                 &[x.view(), skip.view(), gamma.view()],
                 &mut [y.view_mut(), mean.view_mut(), inv_std.view_mut()],
             )
@@ -740,8 +622,8 @@ mod tests {
         let gamma = Owned::f32(&[4], &[1., 2., 0.5, 1.5]);
         let beta = Owned::f32(&[4], &[0., 1., -1., 0.5]);
         let mut y = Owned::zeros_f32(&[2, 4]);
-        SkipLayerNormKernel { epsilon: 1e-5 }
-            .execute(
+        LayerNormKernel::skip(1e-5)
+            .execute_prepared(
                 &[x.view(), skip.view(), gamma.view(), beta.view()],
                 &mut [y.view_mut()],
             )
@@ -771,8 +653,8 @@ mod tests {
         let mut y = Owned::zeros(DataType::BFloat16, &[2, 4]);
         let mut mean = Owned::zeros(DataType::BFloat16, &[2, 1]);
         let mut inv_std = Owned::zeros(DataType::BFloat16, &[2, 1]);
-        SkipLayerNormKernel { epsilon: 1e-5 }
-            .execute(
+        LayerNormKernel::skip(1e-5)
+            .execute_prepared(
                 &[x.view(), skip.view(), gamma.view()],
                 &mut [y.view_mut(), mean.view_mut(), inv_std.view_mut()],
             )
@@ -798,8 +680,8 @@ mod tests {
         let mut y = Owned::zeros(DataType::BFloat16, &[2, 4]);
         let mut mean = Owned::zeros_f32(&[2, 1]);
         let mut inv_std = Owned::zeros_f32(&[2, 1]);
-        SkipLayerNormKernel { epsilon: 1e-5 }
-            .execute(
+        LayerNormKernel::skip(1e-5)
+            .execute_prepared(
                 &[x.view(), skip.view(), gamma.view()],
                 &mut [y.view_mut(), mean.view_mut(), inv_std.view_mut()],
             )
@@ -817,8 +699,8 @@ mod tests {
         let gamma = Owned::bf16(&[4], &[1., 2., 0.5, 1.5]);
         let mut y = Owned::zeros(DataType::BFloat16, &[2, 4]);
         let mut mean = Owned::zeros(DataType::Float16, &[2, 1]);
-        let error = SkipLayerNormKernel { epsilon: 1e-5 }
-            .execute(
+        let error = LayerNormKernel::skip(1e-5)
+            .execute_prepared(
                 &[x.view(), skip.view(), gamma.view()],
                 &mut [y.view_mut(), mean.view_mut()],
             )
@@ -842,8 +724,8 @@ mod tests {
         let mut mean = Owned::zeros_f32(&[2, 1]);
         let mut inv_std = Owned::zeros_f32(&[2, 1]);
         let mut skip_sum = Owned::zeros_f32(&[2, 4]);
-        SkipLayerNormKernel { epsilon: 1e-5 }
-            .execute(
+        LayerNormKernel::skip(1e-5)
+            .execute_prepared(
                 &[
                     x.view(),
                     skip.view(),
@@ -888,8 +770,8 @@ mod tests {
         let gamma = Owned::f32(&[4], &[1., 2., 0.5, 1.5]);
         let bias = Owned::f32(&[4], &[0.25, 0., -0.5, 1.]);
         let mut y = Owned::zeros_f32(&[2, 4]);
-        SkipLayerNormKernel { epsilon: 1e-5 }
-            .execute(
+        LayerNormKernel::skip(1e-5)
+            .execute_prepared(
                 &[
                     x.view(),
                     skip.view(),
@@ -920,8 +802,8 @@ mod tests {
         let gamma = Owned::f32(&[4], &[1., 2., 0.5, 1.5]);
         let beta = Owned::f32(&[4], &[0., 1., -1., 0.5]);
         let mut y = Owned::zeros_f32(&[2, 4]);
-        SkipLayerNormKernel { epsilon: 1e-5 }
-            .execute(
+        LayerNormKernel::skip(1e-5)
+            .execute_prepared(
                 &[
                     x.view(),
                     skip.view(),
