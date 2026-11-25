@@ -175,6 +175,13 @@ pub struct OperatorExclusion {
 
 pub type OperatorExclusions = &'static [OperatorExclusion];
 
+/// Tensor-state convolution with dilated history is currently standalone only.
+pub const STANDALONE_CAUSAL_CONV: OperatorExclusions = &[OperatorExclusion {
+    domain: "",
+    op_type: "CausalConvWithState",
+    since_version: 29,
+}];
+
 pub(crate) fn first_excluded_revision(
     exclusions: OperatorExclusions,
     domain: &str,
@@ -190,6 +197,17 @@ pub(crate) fn first_excluded_revision(
         .min()
 }
 
+pub(crate) fn excludes_schema_revision(
+    exclusions: OperatorExclusions,
+    node: &onnx_runtime_ir::Node,
+) -> bool {
+    first_excluded_revision(exclusions, &node.domain, &node.op_type).is_some_and(|since| {
+        // ORT's Node_GetSinceVersion is authoritative, not the graph import.
+        node.version
+            .is_none_or(|version| version <= 0 || version >= i64::from(since))
+    })
+}
+
 pub(crate) fn query_plugin_capabilities(
     view: &onnx_runtime_ir::GraphView<'_>,
     ep: &dyn ExecutionProvider,
@@ -202,14 +220,7 @@ pub(crate) fn query_plugin_capabilities(
             let node = view.node(index);
             // Exclude before partitioning so an unsupported node cannot take
             // supported neighbors out with it in the later registry filter.
-            let excluded = first_excluded_revision(exclusions, &node.domain, &node.op_type)
-                .is_some_and(|since| {
-                    // This is the schema revision from ORT's Node_GetSinceVersion.
-                    // A graph import cannot establish that an unknown revision is eligible.
-                    node.version
-                        .is_none_or(|version| version <= 0 || version >= i64::from(since))
-                });
-            !excluded && node_admissible(index, graph_kernel)
+            !excludes_schema_revision(exclusions, node) && node_admissible(index, graph_kernel)
         },
     )
 }
@@ -951,6 +962,21 @@ fn ep_compile_inner(
             }
         };
         let view = onnx_runtime_ir::GraphView::new(ir_graph, &cache);
+
+        if let Some(node) = view
+            .nodes()
+            .map(|index| view.node(index))
+            .find(|node| excludes_schema_revision(exported.operator_exclusions, node))
+        {
+            cleanup_partial_infos(out_infos, i);
+            return fail_status(&format!(
+                "Compile: the ORT plugin cannot run {}::{} node '{}' at schema revision {:?}; use standalone nxrt or a plugin supporting that revision",
+                onnx_runtime_ir::normalize_domain(&node.domain),
+                node.op_type,
+                node.name,
+                node.version,
+            ));
+        }
 
         let graph_claims = match exported
             .ep
@@ -2251,6 +2277,108 @@ mod tests {
         node.domain = domain.to_string();
         let nid = g.insert_node(node);
         (g, nid)
+    }
+
+    #[test]
+    fn causal_conv_plugin_claims_legacy_schema_not_graph_import() {
+        use onnx_runtime_ep_cpu::CpuExecutionProvider;
+        use onnx_runtime_ir::{Graph, GraphView, GraphViewCache, Node, NodeId, static_shape};
+
+        let mut provider = CpuExecutionProvider::new();
+        provider
+            .initialize(&onnx_runtime_ep_api::EpConfig::default())
+            .unwrap();
+        for (domain, revision, allowed) in [
+            ("", Some(27), true),
+            ("ai.onnx", Some(28), true),
+            ("com.microsoft", Some(1), true),
+            ("", Some(29), false),
+            ("ai.onnx", Some(29), false),
+            ("", None, false),
+            ("", Some(0), false),
+        ] {
+            let mut graph = Graph::new();
+            graph.opset_imports.insert(
+                domain.into(),
+                if domain == "com.microsoft" { 1 } else { 29 },
+            );
+            let x = graph.create_named_value("x", DataType::Float32, static_shape([1, 2, 4]));
+            let w = graph.create_named_value("w", DataType::Float32, static_shape([2, 1, 3]));
+            let y = graph.create_named_value("y", DataType::Float32, static_shape([1, 2, 4]));
+            let state =
+                graph.create_named_value("state", DataType::Float32, static_shape([1, 2, 2]));
+            graph.add_input(x);
+            graph.add_input(w);
+            graph.add_output(y);
+            graph.add_output(state);
+            let mut node = Node::new(
+                NodeId(0),
+                "CausalConvWithState",
+                vec![Some(x), Some(w)],
+                vec![y, state],
+            );
+            node.domain = domain.into();
+            node.version = revision;
+            let id = graph.insert_node(node);
+            let cache = GraphViewCache::build(&graph).unwrap();
+            let view = GraphView::new(&graph, &cache);
+
+            let standalone =
+                super::query_plugin_capabilities(&view, &provider, &[], |_, _| true).unwrap();
+            assert_eq!(standalone[0].node_ids, [id], "{domain:?} {revision:?}");
+            let claims = super::query_plugin_capabilities(
+                &view,
+                &provider,
+                super::STANDALONE_CAUSAL_CONV,
+                |_, _| {
+                    assert!(allowed, "{domain:?} {revision:?} reached plugin admission");
+                    true
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                claims.len(),
+                usize::from(allowed),
+                "{domain:?} {revision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn causal_conv_plugin_shapes_decline_standalone_schema() {
+        use crate::compute::ShapeInference;
+        use onnx_runtime_ir::{Node, NodeId};
+
+        for (domain, revision, allowed) in [
+            ("", 27, true),
+            ("ai.onnx", 28, true),
+            ("com.microsoft", 1, true),
+            ("", 29, false),
+            ("ai.onnx", 29, false),
+        ] {
+            let mut node = Node::new(NodeId(0), "CausalConvWithState", vec![], vec![]);
+            node.domain = domain.into();
+            node.version = Some(revision);
+            let strategy = ShapeInference::for_node(
+                &node,
+                &[
+                    vec![Some(1), Some(2), Some(4)],
+                    vec![Some(2), Some(1), Some(3)],
+                ],
+                2,
+            );
+            assert_eq!(
+                matches!(
+                    strategy,
+                    ShapeInference::NativeRegistry { .. } | ShapeInference::CausalConvWithState
+                ),
+                allowed,
+                "{domain:?} {revision}"
+            );
+            if !allowed {
+                assert!(matches!(strategy, ShapeInference::Declined { .. }));
+            }
+        }
     }
 
     /// f32 node with matching registry entry is claimed.

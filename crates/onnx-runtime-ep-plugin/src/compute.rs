@@ -355,6 +355,15 @@ impl ShapeInference {
         }
         let op = node.op_type.as_str();
         let domain = node.domain.as_str();
+        if crate::ep::excludes_schema_revision(crate::ep::STANDALONE_CAUSAL_CONV, node) {
+            return Self::Declined {
+                op_type: op.into(),
+                domain: domain.into(),
+                reason: DeclineReason::NodeNotShapeable(
+                    "the ORT plugin needs the opset-27 CausalConvWithState schema; use standalone nxrt for opset-29 dilation",
+                ),
+            };
+        }
         let opset = node.version.unwrap_or(0);
 
         if kernel_sized_output_strategy(domain, op) {
