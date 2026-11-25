@@ -317,6 +317,8 @@ fn build_from_bytes_with_weights(
     validate_loaded_model(&graph)?;
     prepare_graph_for_execution(&mut graph)?;
     infer_shapes(&mut graph)?;
+    // Serialized graphs can omit intermediate value types until inference.
+    validate_shape_only_types(&graph, graph.opset_imports.get("").copied())?;
 
     Ok((graph, Arc::new(store)))
 }
@@ -559,12 +561,9 @@ fn validate_ir(graph: &Graph) -> Result<(), LoaderError> {
 }
 
 fn validate_loaded_model(graph: &Graph) -> Result<(), LoaderError> {
-    // Full fail-fast validation once initializers are attached (so
-    // initializer-backed values are recognized as sourced). Rejects
-    // statically-knowable unsupported/illegal constructs before shape
-    // inference or execution — see [`validate_model`].
+    // Check structure before inference, once initializer-backed values are sourced.
     let mut span = trace_span("load.validate_model", "load");
-    validate_model(graph)?;
+    validate_model_structure(graph)?;
     if let Some(span) = span.as_mut() {
         span.set_args(Args::new().with("nodes", graph.num_nodes() as u64));
     }
@@ -630,11 +629,73 @@ fn infer_shapes(graph: &mut Graph) -> Result<(), LoaderError> {
 /// dependency cycles — are intentionally *not* re-checked here to avoid drift;
 /// this function adds the checks that path does not cover.
 pub fn validate_model(graph: &Graph) -> Result<(), LoaderError> {
+    validate_model_structure(graph)?;
+    validate_shape_only_types(graph, graph.opset_imports.get("").copied())
+}
+
+fn validate_model_structure(graph: &Graph) -> Result<(), LoaderError> {
     validate_opset_imports(graph)?;
     validate_einsum_nodes(graph)?;
     validate_no_control_flow(graph)?;
     validate_no_dangling_refs(graph)?;
     validate_no_initializer_producer(graph)?;
+    Ok(())
+}
+
+fn validate_shape_only_types(
+    graph: &Graph,
+    imported_opset: Option<u64>,
+) -> Result<(), LoaderError> {
+    use onnx_runtime_ir::DataType;
+
+    for node in graph.nodes.values().filter(|node| node.is_default_domain()) {
+        // Pinned ONNX 622adf94: only Reshape has a separate IR9 schema.
+        let ir9_since = match node.op_type.as_str() {
+            "Reshape" => 19,
+            "Flatten" | "Squeeze" | "Unsqueeze" => 21,
+            _ => continue,
+        };
+        let Some(opset) = node.local_opset().or(imported_opset) else {
+            continue; // Structural admission reports missing imports.
+        };
+        // Both data input and output bind schema type T. Check either side
+        // even if the other lacks type metadata; the shape/axes input is not T.
+        for (slot, id) in [
+            ("input", node.inputs.first().copied().flatten()),
+            ("output", node.outputs.first().copied().flatten()),
+        ] {
+            let Some(dtype) = id
+                .and_then(|id| graph.try_value(id))
+                .and_then(|v| v.tensor_dtype())
+            else {
+                continue;
+            };
+            let since = match dtype {
+                DataType::Float8E4M3FN
+                | DataType::Float8E4M3FNUZ
+                | DataType::Float8E5M2
+                | DataType::Float8E5M2FNUZ => ir9_since,
+                DataType::Int4 | DataType::Uint4 => 21,
+                DataType::Float4E2M1 => 23,
+                DataType::Float8E8M0 => 24,
+                DataType::Int2 | DataType::Uint2 => 25,
+                _ => continue,
+            };
+            if opset < since {
+                return Err(LoaderError::InvalidShapeOnlyDtype {
+                    node: node_label(node),
+                    op: node.op_type.clone(),
+                    slot,
+                    dtype,
+                    opset,
+                    since,
+                });
+            }
+        }
+    }
+    for subgraph in graph.subgraphs.values() {
+        validate_shape_only_types(subgraph, imported_opset)?;
+    }
     Ok(())
 }
 

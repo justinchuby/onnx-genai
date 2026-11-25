@@ -58,6 +58,19 @@ pub enum LoaderError {
     InvalidEinsum { node: String, detail: String },
 
     #[error(
+        "illegal ONNX {op} at node {node}: {slot} dtype {dtype:?} is not valid at opset \
+         {opset}; use opset {since} or newer"
+    )]
+    InvalidShapeOnlyDtype {
+        node: String,
+        op: String,
+        slot: &'static str,
+        dtype: onnx_runtime_ir::DataType,
+        opset: u64,
+        since: u64,
+    },
+
+    #[error(
         "unsupported ONNX model: operator {domain}::{op_type} at node {node} carries a \
          subgraph attribute '{attr}' (control-flow / nested-graph op) that this runtime cannot \
          execute. RULES #1: ep-cpu recursively executes the standard control-flow ops \
