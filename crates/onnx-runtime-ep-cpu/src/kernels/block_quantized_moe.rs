@@ -242,12 +242,20 @@ impl Kernel for BlockQuantizedMoEKernel {
         _outputs: &[TensorMut],
         metadata: &[TensorMetadata<'_>],
         _output_metadata: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-        _cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
+        cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
     ) -> Result<onnx_runtime_ep_api::WorkspaceExecutionPreparation> {
         // Exclusive kernel ownership spans refinement, admission and launch.
         // A rejected preparation must never revive an earlier execution plan.
         self.prepared_projection.set(None);
-        let (plan, requirement) = self.plan_workspace(metadata)?;
+        // The caller already matched this kernel, tensor metadata and provider
+        // context. A Ready hit needs a new execution plan, not another metadata
+        // query. Deferred/uncached requests still take the checked planner.
+        let (plan, requirement) = match cached {
+            Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(requirement)) => {
+                (projection_plan(), requirement)
+            }
+            _ => self.plan_workspace(metadata)?,
+        };
         self.prepared_projection.set(Some(plan));
         Ok(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready(
             requirement,
@@ -280,6 +288,8 @@ impl BlockQuantizedMoEKernel {
         super::decoded_projection::DecodedProjectionPlan,
         WorkspaceRequirement,
     )> {
+        #[cfg(test)]
+        WORKSPACE_METADATA_QUERIES.with(|queries| queries.set(queries.get() + 1));
         let dims = validate_runtime_shapes(inputs, None, &self.attributes, self.formats)?;
         let plan = projection_plan();
         let layout = self.execution_workspace_layout(dims, plan)?;
@@ -1436,6 +1446,13 @@ fn error(message: impl Into<String>) -> EpError {
     EpError::KernelFailed(format!("{OP}: {}", message.into()))
 }
 
+// Test-only observation of actual metadata planning, scoped to the calling
+// thread so unrelated parallel tests cannot turn a warm-cache check into noise.
+#[cfg(test)]
+thread_local! {
+    static WORKSPACE_METADATA_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1733,7 +1750,12 @@ mod tests {
                 let mut scratch = vec![f32::NAN; expected / 4 + 7];
                 scratch[expected / 4..].fill(83.);
                 let view = WorkspaceView::new(DevicePtrMut(scratch.as_mut_ptr().cast()), expected);
-                for _ in 0..2 {
+                for preparation in [
+                    Some(cached),
+                    Some(onnx_runtime_ep_api::WorkspacePreparation::Deferred),
+                    None,
+                ] {
+                    let queries_before = WORKSPACE_METADATA_QUERIES.with(std::cell::Cell::get);
                     assert_eq!(
                         kernel
                             .workspace_requirement_for_execution(
@@ -1741,12 +1763,20 @@ mod tests {
                                 &[y.view_mut()],
                                 &metadata,
                                 &[],
-                                Some(cached)
+                                preparation
                             )
                             .unwrap()
                             .require_ready()
                             .unwrap(),
                         req
+                    );
+                    assert_eq!(
+                        WORKSPACE_METADATA_QUERIES.with(std::cell::Cell::get) - queries_before,
+                        usize::from(!matches!(
+                            preparation,
+                            Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(_))
+                        )),
+                        "Ready reuses metadata, while Deferred/None must run the checked planner"
                     );
                     kernel
                         .execute_with_workspace(&inputs, &mut [y.view_mut()], Some(view))
@@ -1779,7 +1809,7 @@ mod tests {
                                 &[y.view_mut()],
                                 &invalid,
                                 &[],
-                                Some(cached)
+                                None
                             )
                             .is_err()
                     );
