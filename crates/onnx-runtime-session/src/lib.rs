@@ -343,6 +343,8 @@ mod error {
 
         #[error("Sequence op {op}: {reason}")]
         SequenceOp { op: String, reason: String },
+        #[error("ONNX Optional operator {op}: {reason}")]
+        OptionalOp { op: String, reason: String },
 
         #[error("control-flow op {op}: {reason}")]
         ControlFlow { op: String, reason: String },
