@@ -14,7 +14,8 @@
 use std::path::{Path, PathBuf};
 
 use onnx_genai_engine::{
-    Engine, EngineConfig, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
+    Engine, EngineConfig, EngineDecodeBackend, FinishReason, GenerateOptions, GeneratePrompt,
+    GenerateRequest,
 };
 
 fn decoder_package() -> PathBuf {
@@ -73,10 +74,16 @@ fn a_single_decoder_is_an_authored_workflow() -> anyhow::Result<()> {
 }
 
 /// Prefill and cached decode both run through the canonical loop, and a second
-/// turn on the same session reuses the first turn's KV.
+/// turn on the same ORT session appends to the first turn's KV.
 #[test]
 fn prefill_and_cached_decode_run_through_the_canonical_loop() -> anyhow::Result<()> {
-    let mut engine = engine()?;
+    let mut engine = Engine::from_dir(
+        &decoder_package(),
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Ort,
+            ..EngineConfig::default()
+        },
+    )?;
     let session = engine.create_session()?;
 
     let first = engine.generate_in_session(session, greedy(6))?;

@@ -1,0 +1,61 @@
+{
+  "synthetic_qualified": true,
+  "controls": [
+    {
+      "name": "missing process",
+      "rejected": true
+    },
+    {
+      "name": "missing window",
+      "rejected": true
+    },
+    {
+      "name": "duplicate window",
+      "rejected": true
+    },
+    {
+      "name": "different workspace owner",
+      "rejected": true
+    },
+    {
+      "name": "different input owner",
+      "rejected": true
+    },
+    {
+      "name": "wrong logical demand",
+      "rejected": true
+    },
+    {
+      "name": "wrong physical demand",
+      "rejected": true
+    },
+    {
+      "name": "zero timed work",
+      "rejected": true
+    },
+    {
+      "name": "negative empty timer",
+      "rejected": true
+    },
+    {
+      "name": "wrong fixed calls",
+      "rejected": true
+    },
+    {
+      "name": "bad final output",
+      "rejected": true
+    }
+  ],
+  "quality_controls": [
+    {
+      "frozen": true,
+      "failed_aa_preserved": true
+    },
+    {
+      "frozen": false,
+      "failed_aa_preserved": true
+    }
+  ],
+  "reader_sha256": "fb0d8463febc658056d15332ae61488543ef9155b3e85aacc166dfecae467b89",
+  "zero_empty_only": true
+}

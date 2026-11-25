@@ -4290,14 +4290,38 @@ impl ExecutionProvider for CudaExecutionProvider {
                 opset
             );
         }
+        if op.is_default_domain()
+            && op.op_type == "Transpose"
+            && let Some(&dtype) = input_dtypes.first()
+            && let Err(reason) = onnx_runtime_ir::transpose::validate_dtype(dtype, opset)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if let Some(reason) =
             onnx_runtime_ep_api::packed_routed::unsupported_reason(op, shapes, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }
+        if let Some(reason) = input_dtypes.first().and_then(|&dtype| {
+            onnx_runtime_ir::trig::bf16_unsupported_reason(&op.op_type, &op.domain, opset, dtype)
+        }) {
+            return KernelMatch::unsupported(reason);
+        }
         if let Some(reason) =
             onnx_runtime_ep_api::standard_math::unsupported_reason(op, shapes, input_dtypes)
         {
+            return KernelMatch::unsupported(reason);
+        }
+        if let Some(reason) =
+            onnx_runtime_ep_api::standard_activation::unsupported_reason(op, opset, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if let Some(reason) = onnx_runtime_ep_api::mean_variance_normalization::unsupported_reason(
+            op,
+            shapes,
+            input_dtypes,
+        ) {
             return KernelMatch::unsupported(reason);
         }
         if let Some(reason) =
@@ -4350,6 +4374,7 @@ impl ExecutionProvider for CudaExecutionProvider {
             && (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(reason) = crate::kernels::unique::unsupported_reason(
                 op,
+                opset,
                 shapes,
                 input_dtypes,
                 layouts,
@@ -4568,7 +4593,9 @@ impl ExecutionProvider for CudaExecutionProvider {
                 .workspace_planning(&op.op_type, &op.domain, opset)
                 .expect("supported kernel has a versioned registration"),
             cost,
-            required_input_layouts: None,
+            required_input_layouts: (op.op_type
+                == onnx_runtime_ep_api::mean_variance_normalization::OP)
+                .then(|| vec![TensorLayout::contiguous()]),
             output_layouts,
         }
     }

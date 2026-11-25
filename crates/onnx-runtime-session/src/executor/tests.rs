@@ -953,7 +953,7 @@ fn readiness_exhaustion_rejects_before_kernel_publication_and_stays_exhausted() 
             &[false],
             &[None],
             17,
-            false,
+            KernelShapeFacts::default(),
             config,
             &mut readiness,
             &ep,
@@ -2334,7 +2334,7 @@ impl Kernel for CaptureDecliningKernel {
 
 // Mirrors the bypass kernels Harry flagged (`UnaryMathKernel`, `NotKernel`,
 // `BitwiseNotKernel`): returns `CaptureSupport::Supported` unconditionally and
-// deliberately does NOT override `set_capture_seq_independent`, so the kernel
+// deliberately does NOT override `configure_shape_facts`, so the kernel
 // alone would happily admit a classifier-disqualified growing node into capture.
 struct UnconditionalCaptureKernel;
 
@@ -2403,8 +2403,10 @@ fn build_identity_capture_fixture() -> (Executor, Vec<KernelKey>, HashMap<ValueI
     let keys = executor
         .plan
         .iter()
-        .map(|plan| KernelKey {
+        .enumerate()
+        .map(|(pi, plan)| KernelKey {
             node: plan.node_id.0,
+            shape_facts: executor.kernel_shape_facts[pi],
             shapes: plan
                 .inputs
                 .iter()
@@ -2448,7 +2450,7 @@ fn classifier_disqualified_node_is_vetoed_despite_supported_kernel() {
         .insert(keys[0].clone(), Box::new(UnconditionalCaptureKernel));
 
     let decline = executor
-        .node_capture_reason(&executor.plan[0], &resolved)
+        .node_capture_reason(0, &resolved)
         .expect("classifier-disqualified node must be declined for capture");
     assert_eq!(
         decline.seam_reason,
@@ -2472,9 +2474,7 @@ fn classifier_qualified_node_with_supported_kernel_is_admitted() {
         .insert(keys[0].clone(), Box::new(UnconditionalCaptureKernel));
 
     assert!(
-        executor
-            .node_capture_reason(&executor.plan[0], &resolved)
-            .is_none(),
+        executor.node_capture_reason(0, &resolved).is_none(),
         "a sequence-independent node with a Supported kernel must remain capture-eligible"
     );
 }
@@ -2527,7 +2527,7 @@ fn disqualified_control_flow_node_reports_host_seam_not_device_seam() {
         .insert(keys[0].clone(), Box::new(UnconditionalCaptureKernel));
 
     let decline = executor
-        .node_capture_reason(&executor.plan[0], &resolved)
+        .node_capture_reason(0, &resolved)
         .expect("control-flow node must be declined for capture");
     assert_eq!(
         decline.seam_reason,
@@ -2615,9 +2615,10 @@ fn ep_structural_plan_plus_executor_kernel_checks_matches_legacy_declines() {
 
     fn legacy_node_capture_reason(
         executor: &Executor,
-        plan: &NodePlan,
+        pi: usize,
         resolved: &HashMap<ValueId, Vec<usize>>,
     ) -> Option<CaptureDecline> {
+        let plan = &executor.plan[pi];
         let node = executor.graph.node(plan.node_id);
         if is_control_flow_op(&node.op_type, &node.domain)
             || is_sequence_op(&node.op_type, &node.domain)
@@ -2660,6 +2661,7 @@ fn ep_structural_plan_plus_executor_kernel_checks_matches_legacy_declines() {
         };
         let key = KernelKey {
             node: plan.node_id.0,
+            shape_facts: executor.kernel_shape_facts[pi],
             shapes: input_shapes,
         };
         let Some(kernel) = executor.cache.entries.get(&key) else {
@@ -2716,8 +2718,10 @@ fn ep_structural_plan_plus_executor_kernel_checks_matches_legacy_declines() {
     let keys = executor
         .plan
         .iter()
-        .map(|plan| KernelKey {
+        .enumerate()
+        .map(|(pi, plan)| KernelKey {
             node: plan.node_id.0,
+            shape_facts: executor.kernel_shape_facts[pi],
             shapes: plan
                 .inputs
                 .iter()
@@ -2745,12 +2749,14 @@ fn ep_structural_plan_plus_executor_kernel_checks_matches_legacy_declines() {
     let legacy = executor
         .plan
         .iter()
-        .map(|plan| legacy_node_capture_reason(&executor, plan, &resolved))
+        .enumerate()
+        .map(|(pi, _)| legacy_node_capture_reason(&executor, pi, &resolved))
         .collect::<Vec<_>>();
     let refactored = executor
         .plan
         .iter()
-        .map(|plan| executor.node_capture_reason(plan, &resolved))
+        .enumerate()
+        .map(|(pi, _)| executor.node_capture_reason(pi, &resolved))
         .collect::<Vec<_>>();
 
     assert_eq!(refactored, legacy);
@@ -7127,6 +7133,76 @@ fn sealed_bqmoe_cuda_session_fixture() -> (
 
 #[cfg(feature = "gpu-tests")]
 #[test]
+fn unique_28_bfloat16_executes_in_strict_cuda_session() {
+    use onnx_runtime_ep_cuda::{
+        CudaExecutionProvider, reset_unique_execution_stats, unique_execution_stats,
+    };
+
+    // Pinned ONNX 622adf94d4e720142950aa8178f7357d52e63db0:
+    // test_unique_bfloat16_sorted_without_axis, with concrete fixture output
+    // extents because the standalone executor preallocates leaf outputs.
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 28);
+    let input_id = graph.create_named_value("x", DataType::BFloat16, static_shape([6]));
+    graph.add_input(input_id);
+    let outputs = [
+        ("y", DataType::BFloat16, 4),
+        ("indices", DataType::Int64, 4),
+        ("inverse_indices", DataType::Int64, 6),
+        ("counts", DataType::Int64, 4),
+    ]
+    .map(|(name, dtype, len)| graph.create_named_value(name, dtype, static_shape([len])));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Unique",
+        vec![Some(input_id)],
+        outputs.to_vec(),
+    ));
+    for output in outputs {
+        graph.add_output(output);
+    }
+
+    let mut cuda = CudaExecutionProvider::new(0).expect("CUDA device 0");
+    cuda.initialize(&onnx_runtime_ep_api::EpConfig::default())
+        .expect("initialize CUDA");
+    let mut executor = Executor::build_with_cuda_requirement(
+        graph,
+        Arc::new(WeightStore::new()),
+        Arc::new(cuda),
+        true,
+    )
+    .expect("strict CUDA must place Unique-28 without CPU fallback");
+    let bytes =
+        |values: &[u16]| -> Vec<u8> { values.iter().flat_map(|bits| bits.to_le_bytes()).collect() };
+    let x = Tensor::from_raw(
+        DataType::BFloat16,
+        vec![6],
+        &bytes(&[0x4000, 0x3f80, 0x3f80, 0x4040, 0x4080, 0x4040]),
+    )
+    .unwrap();
+    reset_unique_execution_stats();
+    let y = executor.run(&[("x", &x)]).expect("native CUDA Unique-28");
+    assert_eq!(y.len(), 4);
+    assert_eq!(y[0].dtype, DataType::BFloat16);
+    assert_eq!(y[0].shape, [4]);
+    assert_eq!(y[0].as_bytes(), bytes(&[0x3f80, 0x4000, 0x4040, 0x4080]));
+    for (output, expected) in y[1..].iter().zip([
+        &[1, 0, 3, 4][..],
+        &[1, 0, 0, 2, 3, 2][..],
+        &[2, 1, 2, 1][..],
+    ]) {
+        assert_eq!(output.dtype, DataType::Int64);
+        assert_eq!(output.shape, [expected.len()]);
+        assert_eq!(output.to_vec_i64(), expected);
+    }
+    let stats = unique_execution_stats();
+    assert_eq!(stats.metadata_launches, 1);
+    assert_eq!(stats.materialize_launches, 1);
+    assert_eq!(stats.d2h_bytes, 8);
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
 fn sealed_bqmoe_executes_through_production_session_path() {
     use onnx_runtime_ep_cpu::kernels::block_quantized_moe::BLOCK_QUANT_MOE_DENSE_EXPANSIONS;
     use onnx_runtime_ep_cuda::CudaExecutionProvider;
@@ -9094,6 +9170,7 @@ fn coverage_collector_surfaces_ep_decline_reason() {
         "graph",
         &mut issues,
         false,
+        false,
     )
     .unwrap();
 
@@ -9162,7 +9239,7 @@ fn cuda_coverage_report_groups_all_distinct_failure_classes_deterministically() 
     )
     .unwrap();
     let report = || {
-        cuda_fallback_report(&graph, &ep, artifact_config, false)
+        cuda_fallback_report(&graph, &ep, artifact_config, false, false)
             .unwrap()
             .expect("CUDA declines must produce a fallback report")
             .to_string()
@@ -10585,11 +10662,12 @@ fn strict_cuda_partial_multinode_admission_rolls_back_once() {
         Ok(_) => panic!("strict CUDA must reject partial multi-node admission"),
         Err(error) => error,
     };
-    assert!(
-        error
-            .to_string()
-            .contains("injected kernel admission failure at decline_after_two_publications")
-    );
+    let SessionError::CudaKernelCreationFailed { node, source, .. } = error else {
+        panic!("expected a kernel creation failure, not a provider decline: {error}");
+    };
+    assert!(node.contains("decline_after_two_publications"), "{node}");
+    assert!(matches!(source, EpError::KernelFailed(message)
+        if message.contains("injected kernel admission failure at decline_after_two_publications")));
     assert_probe_rolled_back_once(&ep, 3);
 }
 
@@ -11964,7 +12042,7 @@ fn warm_decode_seeding_admits_previously_unresolved_capture_safe_node() {
         "Range's runtime-length output (and its Cast) must be data-dependent (unresolved)"
     );
     let pre_seam = exec
-        .node_capture_reason(&exec.plan[cast_pi], &pre)
+        .node_capture_reason(cast_pi, &pre)
         .and_then(|decline| decline.seam_reason);
     assert!(
         matches!(
@@ -11999,7 +12077,7 @@ fn warm_decode_seeding_admits_previously_unresolved_capture_safe_node() {
     // shape gate (any remaining decline is a kernel-capability decision, not
     // a missing-shape rejection).
     let post_seam = exec
-        .node_capture_reason(&exec.plan[cast_pi], &post)
+        .node_capture_reason(cast_pi, &post)
         .and_then(|decline| decline.seam_reason);
     assert!(
         !matches!(
@@ -12090,7 +12168,7 @@ fn quarantined_op_type_is_forced_to_a_capture_recording_failed_seam() {
         .unwrap();
     let resolved = exec.resolve_soft(&bindings);
     let pre_seam = exec
-        .node_capture_reason(&exec.plan[cast_pi], &resolved)
+        .node_capture_reason(cast_pi, &resolved)
         .and_then(|decline| decline.seam_reason);
     assert!(
         !matches!(pre_seam, Some(SeamReason::CaptureRecordingFailed)),
@@ -12104,7 +12182,7 @@ fn quarantined_op_type_is_forced_to_a_capture_recording_failed_seam() {
     exec.cap_mut()
         .capture_quarantine_ops
         .insert(("ai.onnx".to_string(), "Cast".to_string()));
-    let post = exec.node_capture_reason(&exec.plan[cast_pi], &resolved);
+    let post = exec.node_capture_reason(cast_pi, &resolved);
     assert_eq!(
         post.and_then(|decline| decline.seam_reason),
         Some(SeamReason::CaptureRecordingFailed),
@@ -13981,6 +14059,15 @@ fn executor_pin_fixed_capacity_kv_admits_gqa() {
         .insert("kv_num_heads".into(), Attribute::Int(2));
     let gqa_node_id = gqa.id;
     graph.insert_node(gqa);
+    let shape_out = graph.create_named_value("past_shape", DataType::Int64, vec![st(4)]);
+    graph.add_output(shape_out);
+    let shape_id = NodeId(1);
+    graph.insert_node(Node::new(
+        shape_id,
+        "Shape",
+        vec![Some(past_key)],
+        vec![shape_out],
+    ));
 
     let mut exec = Executor::build(
         graph,
@@ -14000,7 +14087,49 @@ fn executor_pin_fixed_capacity_kv_admits_gqa() {
         "before the pin the GQA node must be classifier-vetoed"
     );
 
+    let shape_pi = exec
+        .plan
+        .iter()
+        .position(|entry| entry.node_id == shape_id)
+        .unwrap();
+    fn specialize(exec: &mut Executor, pi: usize) -> KernelKey {
+        let node = exec.graph.node(exec.plan[pi].node_id).clone();
+        let (_, key) = exec
+            .cache
+            .get_or_create(
+                node.id,
+                &node,
+                &[vec![1, 2, 16, 128]],
+                &[DataType::Float32],
+                &[false],
+                &[None],
+                17,
+                exec.kernel_shape_facts[pi],
+                exec.artifact_config,
+                &mut exec.provider_artifact_readiness,
+                exec.ep.as_ref(),
+                [None; DeviceGraphSlot::COUNT],
+                None,
+            )
+            .unwrap();
+        exec.kernel_bindings[pi] = Some(key.clone());
+        key
+    }
+    let old_key = specialize(&mut exec, shape_pi);
+    assert_eq!(old_key.shape_facts.evolution, ShapeEvolution::Growing);
+    let misses_before_pin = exec.cache.stats().misses;
     let pinned = exec.pin_fixed_capacity_kv_capture_symbols();
+    assert_ne!(old_key.shape_facts, exec.kernel_shape_facts[shape_pi]);
+    assert!(!exec.cache.has_prebound(
+        &old_key,
+        &[vec![1, 2, 16, 128]],
+        exec.kernel_shape_facts[shape_pi]
+    ));
+    let new_key = specialize(&mut exec, shape_pi);
+    assert_eq!(new_key.shapes, old_key.shapes);
+    assert_ne!(new_key, old_key);
+    assert_eq!(new_key.shape_facts, exec.kernel_shape_facts[shape_pi]);
+    assert_eq!(exec.cache.stats().misses, misses_before_pin + 1);
     assert!(
         pinned >= 1,
         "at least the GQA KV seq symbol must be pinned, got {pinned}"
@@ -18608,3 +18737,187 @@ mod workspace_completion_tests;
 
 #[path = "workspace_lane_tests.rs"]
 mod workspace_lane_tests;
+
+#[test]
+fn shape_evolution_separates_positive_growth_from_unknown_capture_policy() {
+    let mut graph = Graph::new();
+    let growing = graph.create_symbol(None);
+    let declared = graph.create_symbol(None);
+    graph.inference_symbol_floor = Some(2);
+    let opaque = graph.create_symbol(None);
+    graph.symbol_opaque.push(opaque);
+    let untraced = graph.create_symbol(None);
+    let derived = graph.create_symbol(None);
+    graph.symbol_derivations.push((derived, growing));
+    let alias = graph.create_symbol(None);
+    graph.symbol_unifications.push((alias, derived));
+    let past = graph.create_named_value(
+        "past_key",
+        DataType::Float32,
+        vec![
+            Dim::Static(1),
+            Dim::Static(1),
+            Dim::Symbolic(growing),
+            Dim::Static(8),
+        ],
+    );
+    graph.add_input(past);
+    let input = graph.create_named_value("x", DataType::Float32, vec![Dim::Static(1)]);
+    let output = graph.create_named_value("y", DataType::Float32, vec![Dim::Static(1)]);
+    let node = Node::new(NodeId(0), "Relu", vec![Some(input)], vec![output]);
+    let classifier = ShapeEvolutionClassifier::new(&graph, &HashSet::new());
+    let denylist = compute_capture_growing_symbols(&graph);
+    let failsafe = compute_not_pinned_symbols(&graph);
+    assert_eq!(
+        classifier.facts(&graph, &node, &failsafe).evolution,
+        ShapeEvolution::Stable
+    );
+    for symbol in [growing, derived, alias] {
+        graph.value_mut(input).shape = vec![Dim::Symbolic(symbol)];
+        assert_eq!(
+            classifier.facts(&graph, &node, &denylist).evolution,
+            ShapeEvolution::Growing
+        );
+        graph.value_mut(input).shape = vec![Dim::Static(1)];
+        graph.value_mut(output).shape = vec![Dim::Symbolic(symbol)];
+        assert_eq!(
+            classifier.facts(&graph, &node, &failsafe).evolution,
+            ShapeEvolution::Growing
+        );
+        graph.value_mut(output).shape = vec![Dim::Static(1)];
+    }
+    for symbol in [opaque, untraced] {
+        graph.value_mut(input).shape = vec![Dim::Symbolic(symbol)];
+        assert_eq!(
+            classifier.facts(&graph, &node, &denylist).evolution,
+            ShapeEvolution::Unknown
+        );
+        assert!(!classifier.facts(&graph, &node, &failsafe).capture_eligible);
+    }
+    graph.value_mut(input).shape = vec![Dim::Symbolic(untraced)];
+    assert!(
+        classifier.facts(&graph, &node, &denylist).capture_eligible,
+        "Denylist capture policy must not become a positive growth proof"
+    );
+    graph.value_mut(input).shape = vec![Dim::Symbolic(declared)];
+    assert_eq!(
+        classifier.facts(&graph, &node, &failsafe).evolution,
+        ShapeEvolution::Stable
+    );
+    graph.mark_value_shape_unknown(input);
+    assert_eq!(
+        classifier.facts(&graph, &node, &denylist).evolution,
+        ShapeEvolution::Unknown
+    );
+}
+
+#[test]
+fn capacity_pinning_changes_shape_facts_without_changing_concrete_shapes() {
+    let mut graph = Graph::new();
+    let growing = graph.create_symbol(None);
+    let past = graph.create_named_value(
+        "past_key",
+        DataType::Float32,
+        vec![
+            Dim::Static(1),
+            Dim::Static(1),
+            Dim::Symbolic(growing),
+            Dim::Static(8),
+        ],
+    );
+    graph.add_input(past);
+    let output = graph.create_named_value("y", DataType::Float32, vec![Dim::Static(1)]);
+    let node = Node::new(NodeId(0), "Shape", vec![Some(past)], vec![output]);
+    let before = ShapeEvolutionClassifier::new(&graph, &HashSet::new()).facts(
+        &graph,
+        &node,
+        &compute_not_pinned_symbols(&graph),
+    );
+    assert_eq!(before.evolution, ShapeEvolution::Growing);
+    assert!(!before.capture_eligible);
+    let pinned = HashSet::from([growing]);
+    let after = ShapeEvolutionClassifier::new(&graph, &pinned).facts(
+        &graph,
+        &node,
+        &compute_not_pinned_symbols_excluding(&graph, &pinned),
+    );
+    assert_eq!(after.evolution, ShapeEvolution::Stable);
+    assert!(after.capture_eligible);
+    let shape = vec![vec![1, 1, 16, 8]];
+    let before_key = KernelKey {
+        node: 0,
+        shapes: shape.clone(),
+        shape_facts: before,
+    };
+    let after_key = KernelKey {
+        node: 0,
+        shapes: shape,
+        shape_facts: after,
+    };
+    assert_ne!(before_key, after_key);
+}
+
+#[test]
+fn kernel_cache_and_prebinding_require_exact_cold_shape_facts() {
+    let ep = CpuExecutionProvider::new();
+    let config = ExecutorArtifactConfig::issue(
+        ep.executor_artifact_policy().unwrap(),
+        issue_executor_instance_id().unwrap(),
+    )
+    .unwrap();
+    let mut readiness = ProviderArtifactReadiness::at_epoch_for_test(0);
+    let mut cache = KernelCache::default();
+    let node = Node::new(NodeId(0), "Relu", vec![Some(ValueId(0))], vec![ValueId(1)]);
+    let shapes = [vec![1]];
+    let compile = |cache: &mut KernelCache, readiness: &mut ProviderArtifactReadiness, facts| {
+        cache
+            .get_or_create(
+                NodeId(0),
+                &node,
+                &shapes,
+                &[DataType::Float32],
+                &[false],
+                &[None],
+                17,
+                facts,
+                config,
+                readiness,
+                &ep,
+                [None; DeviceGraphSlot::COUNT],
+                None,
+            )
+            .unwrap()
+            .1
+    };
+    let stable = KernelShapeFacts {
+        evolution: ShapeEvolution::Stable,
+        capture_eligible: true,
+    };
+    let growing = KernelShapeFacts {
+        evolution: ShapeEvolution::Growing,
+        capture_eligible: false,
+    };
+    let first = compile(&mut cache, &mut readiness, stable);
+    assert!(cache.get_prebound(&first, &shapes, stable).is_some());
+    assert!(!cache.has_prebound(&first, &shapes, growing));
+    assert!(cache.get_prebound(&first, &shapes, growing).is_none());
+    let second = compile(&mut cache, &mut readiness, growing);
+    assert_ne!(first, second);
+    assert!(cache.has_prebound(&second, &shapes, growing));
+    let unknown = KernelShapeFacts::default();
+    assert!(!cache.has_prebound(&second, &shapes, unknown));
+    let third = compile(&mut cache, &mut readiness, unknown);
+    assert_ne!(second, third);
+    assert!(cache.get_prebound(&third, &shapes, unknown).is_some());
+    let changed_policy = KernelShapeFacts {
+        capture_eligible: true,
+        ..unknown
+    };
+    assert!(!cache.has_prebound(&third, &shapes, changed_policy));
+    let fourth = compile(&mut cache, &mut readiness, changed_policy);
+    assert_ne!(third, fourth);
+    assert_eq!(cache.stats().misses, 4);
+}
+
+#[path = "workspace_context_tests.rs"]
+mod workspace_context_tests;

@@ -1,0 +1,129 @@
+{
+  "decode": {
+    "baseline_instructions": 81,
+    "candidate_instructions": 81,
+    "differences": [
+      {
+        "instruction": 24,
+        "baseline": "adrp\tx13, <absolute> <_anon.3ea6753b9c9dbe2e759668c2822d19e2.431+OFFSET>",
+        "candidate": "adrp\tx13, <absolute> <_anon.1dc4c1243e6292eeac6ae69d27196f4c.445+OFFSET>"
+      },
+      {
+        "instruction": 25,
+        "baseline": "add\tx13, x13, #0x8b0",
+        "candidate": "add\tx13, x13, #0xd50"
+      },
+      {
+        "instruction": 64,
+        "baseline": "adrp\tx2, <absolute> <_anon.3ea6753b9c9dbe2e759668c2822d19e2.247+OFFSET>",
+        "candidate": "adrp\tx2, <absolute> <_anon.1dc4c1243e6292eeac6ae69d27196f4c.446+OFFSET>"
+      },
+      {
+        "instruction": 65,
+        "baseline": "add\tx2, x2, #0xeb8",
+        "candidate": "add\tx2, x2, #0x698"
+      },
+      {
+        "instruction": 69,
+        "baseline": "adrp\tx2, <absolute> <_anon.3ea6753b9c9dbe2e759668c2822d19e2.247+OFFSET>",
+        "candidate": "adrp\tx2, <absolute> <_anon.1dc4c1243e6292eeac6ae69d27196f4c.446+OFFSET>"
+      },
+      {
+        "instruction": 70,
+        "baseline": "add\tx2, x2, #0xe88",
+        "candidate": "add\tx2, x2, #0x668"
+      },
+      {
+        "instruction": 72,
+        "baseline": "adrp\tx2, <absolute> <_anon.3ea6753b9c9dbe2e759668c2822d19e2.247+OFFSET>",
+        "candidate": "adrp\tx2, <absolute> <_anon.1dc4c1243e6292eeac6ae69d27196f4c.446+OFFSET>"
+      },
+      {
+        "instruction": 73,
+        "baseline": "add\tx2, x2, #0xea0",
+        "candidate": "add\tx2, x2, #0x680"
+      },
+      {
+        "instruction": 77,
+        "baseline": "adrp\tx2, <absolute> <_anon.3ea6753b9c9dbe2e759668c2822d19e2.247+OFFSET>",
+        "candidate": "adrp\tx2, <absolute> <_anon.1dc4c1243e6292eeac6ae69d27196f4c.446+OFFSET>"
+      },
+      {
+        "instruction": 78,
+        "baseline": "add\tx2, x2, #0xe70",
+        "candidate": "add\tx2, x2, #0x650"
+      }
+    ]
+  },
+  "project": {
+    "baseline_instructions": 273,
+    "candidate_instructions": 273,
+    "differences": [
+      {
+        "instruction": 86,
+        "baseline": "adrp\tx8, <absolute> <__RNvXs_NtNtCslWxY2MhVcag_4core3fmt3numnNtB6_7Display3fmt+OFFSET>",
+        "candidate": "adrp\tx8, <absolute> <__RNvXs_NtNtCslWxY2MhVcag_4core3str5errorNtB4_9Utf8ErrorNtNtB8_3fmt7Display3fmt+OFFSET>"
+      },
+      {
+        "instruction": 87,
+        "baseline": "add\tx8, x8, #0x32c",
+        "candidate": "add\tx8, x8, #0x1b4"
+      },
+      {
+        "instruction": 97,
+        "baseline": "add\tx0, x0, #0xf61",
+        "candidate": "add\tx0, x0, #0xae1"
+      },
+      {
+        "instruction": 224,
+        "baseline": "adrp\tx8, <absolute> <__RNvXs_NtNtCslWxY2MhVcag_4core3fmt3numnNtB6_7Display3fmt+OFFSET>",
+        "candidate": "adrp\tx8, <absolute> <__RNvXs_NtNtCslWxY2MhVcag_4core3str5errorNtB4_9Utf8ErrorNtNtB8_3fmt7Display3fmt+OFFSET>"
+      },
+      {
+        "instruction": 225,
+        "baseline": "add\tx8, x8, #0x32c",
+        "candidate": "add\tx8, x8, #0x1b4"
+      },
+      {
+        "instruction": 231,
+        "baseline": "adrp\tx0, <absolute> <_anon.a08b98e357d9c30c0ee8e1a8378508b3.44+OFFSET>",
+        "candidate": "adrp\tx0, <absolute> <_anon.06b6bc08fc3403f3a3355b160600f94f.83+OFFSET>"
+      },
+      {
+        "instruction": 232,
+        "baseline": "add\tx0, x0, #0x869",
+        "candidate": "add\tx0, x0, #0x3e9"
+      },
+      {
+        "instruction": 248,
+        "baseline": "adrp\tx0, <absolute> <_anon.326378dd3487de1d34c474a3ac950bdf.218+OFFSET>",
+        "candidate": "adrp\tx0, <absolute> <_anon.1dc4c1243e6292eeac6ae69d27196f4c.803+OFFSET>"
+      },
+      {
+        "instruction": 249,
+        "baseline": "add\tx0, x0, #0x6c7",
+        "candidate": "add\tx0, x0, #0x9f"
+      },
+      {
+        "instruction": 254,
+        "baseline": "adrp\tx0, <absolute> <_anon.326378dd3487de1d34c474a3ac950bdf.218+OFFSET>",
+        "candidate": "adrp\tx0, <absolute> <_anon.1dc4c1243e6292eeac6ae69d27196f4c.803+OFFSET>"
+      },
+      {
+        "instruction": 255,
+        "baseline": "add\tx0, x0, #0x6c7",
+        "candidate": "add\tx0, x0, #0x9f"
+      },
+      {
+        "instruction": 260,
+        "baseline": "adrp\tx0, <absolute> <_anon.d2af6fe06533fb757835afa17425b9a1.0+OFFSET>",
+        "candidate": "adrp\tx0, <absolute> <_anon.a08b98e357d9c30c0ee8e1a8378508b3.46+OFFSET>"
+      },
+      {
+        "instruction": 261,
+        "baseline": "add\tx0, x0, #0x66e",
+        "candidate": "add\tx0, x0, #0x12e"
+      }
+    ]
+  }
+}

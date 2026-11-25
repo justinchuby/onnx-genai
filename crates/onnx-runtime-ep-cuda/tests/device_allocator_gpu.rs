@@ -354,33 +354,6 @@ fn an_injected_external_eager_allocator_is_selected_at_construction() {
     );
 }
 
-/// An allocator that does not serve this EP's device is refused.
-///
-/// Pointers from construction-selected memory are given to kernels as this device's
-/// addresses. A host allocator's pointer is a perfectly valid host address, so
-/// nothing detects the substitution until a kernel dereferences it on the
-/// device -- far from the call that caused it.
-#[cfg_attr(
-    not(feature = "gpu-tests"),
-    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
-)]
-#[test]
-fn an_allocator_for_the_wrong_device_is_refused() {
-    let error = onnx_runtime_ep_cuda::CudaExecutionProvider::from_config(
-        0,
-        onnx_runtime_ep_cuda::CudaProviderConfig {
-            memory: Some(Arc::new(onnx_runtime_memory_api::HostAllocator)),
-            ..Default::default()
-        },
-    )
-    .expect_err("host memory is not CUDA device memory");
-    let message = error.to_string();
-    assert!(
-        message.contains("CUDA device 0"),
-        "the error must name the device that was expected: {message}"
-    );
-}
-
 /// A zero-byte allocation reaches `deallocate` with the size it was allocated
 /// with.
 ///

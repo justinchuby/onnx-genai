@@ -70,7 +70,7 @@ pub struct VisionPreprocessingProgram {
     #[serde(default)]
     pub transforms: Vec<VisionTransform>,
 
-    /// Named tensor outputs the program emits, each bound to a workflow SSA value.
+    /// Named tensor outputs; the adapter ABI selects workflow values or component-local ports.
     #[schemars(length(min = 1))]
     pub outputs: Vec<VisionOutputBinding>,
 }
@@ -282,7 +282,9 @@ pub struct VisionOutputBinding {
     #[schemars(length(min = 1))]
     pub source: String,
 
-    /// Workflow SSA value produced by the preprocessing adapter invocation.
+    /// Output name: a workflow SSA value under preprocessing ABI v1, or a
+    /// component-local output port under image-preprocess ABI v2. The latter
+    /// allows repeated invocations to bind independent workflow SSA values.
     #[schemars(length(min = 1), example = &"image.pixel_values")]
     pub name: String,
 
@@ -331,7 +333,7 @@ pub struct AudioPreprocessingProgram {
     #[serde(default)]
     pub transforms: Vec<AudioTransform>,
 
-    /// Named tensor outputs the program emits, each bound to a workflow SSA value.
+    /// Named tensor outputs; the adapter ABI selects workflow values or component-local ports.
     #[schemars(length(min = 1))]
     pub outputs: Vec<AudioOutputBinding>,
 }
@@ -437,7 +439,7 @@ pub struct AudioTransform {
 /// Neither the name nor the content role is inferred from a model identity.
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
 pub struct AudioOutputBinding {
-    /// Workflow SSA value this output binds to.
+    /// Workflow SSA value (audio-preprocess@1) or component output port (@2).
     #[schemars(length(min = 1), example = &"audio.input_features")]
     pub name: String,
 

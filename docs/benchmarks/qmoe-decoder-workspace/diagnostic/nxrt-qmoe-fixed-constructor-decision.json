@@ -1,0 +1,5 @@
+{
+  "status": "not adopted",
+  "reason": "constructor1->execution4 stores only one logical shard although legacy dynamic dispatcher can schedule four; same-pool CPU matrix cannot establish preserved cross-pool latency",
+  "focused_validation": "62 passed /1 ignored after test-only Send/pointer fixes; no performance run or wall-cost claim for this initial design"
+}

@@ -10,8 +10,7 @@
 
 #![forbid(unsafe_code)]
 
-use anyhow::Context as _;
-use std::{net::SocketAddr, sync::Arc, time::Instant};
+use std::{net::SocketAddr, time::Instant};
 
 use axum::{
     Router,
@@ -26,16 +25,23 @@ use tracing::Instrument;
 const MEDIA_UPLOAD_BODY_LIMIT: usize = 25 * 1024 * 1024;
 
 mod audio_input;
+mod auth;
 mod cli;
 mod completion_control;
 mod driver;
 mod image_generation;
-mod image_input;
 mod lease;
 mod lora;
+mod media_input;
 mod metrics;
+mod model_cache;
+mod model_hub;
+mod model_management;
 mod models_config;
 pub mod multimodal;
+mod ping;
+pub use ping::SsePingInterval;
+mod realtime;
 mod reasoning_request;
 mod registry;
 mod replay;
@@ -47,9 +53,8 @@ mod slots;
 mod speech;
 mod sse;
 mod state;
+mod timings;
 mod tool_protocol;
-mod tools;
-pub use tools::{BuiltinTool, McpSources, ToolsConfig};
 mod types;
 mod webui;
 mod worker;
@@ -66,45 +71,37 @@ pub use runtime_args::{
 #[cfg(feature = "native-backend")]
 pub use state::parse_native_device;
 pub use state::{
-    AppState, McpProxyPolicy, OrtSessionWorkerCount, ServerConfig, default_node_id,
-    parse_kv_cache_dtype,
+    AppState, OrtSessionWorkerCount, ServerConfig, default_node_id, parse_kv_cache_dtype,
 };
 pub use tool_protocol::{ToolProtocol, ToolProtocolError};
 pub use types::{
-    AudioSpeechRequest, AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest,
-    ChatCompletionResponse, ChatContinuation, ChatLogprobs, ChatMessage, ChatMessageContent,
-    ChatMessageContentPart, ChatMessageToolCall, ChatMessageToolCallFunction, ChatTokenLogprob,
-    ChatTool, ChatToolFunction, ChatTopLogprob, CompletionChoice, CompletionLogprobs,
-    CompletionRequest, CompletionResponse, EmbeddingData, EmbeddingEncodingFormat, EmbeddingInput,
-    EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, ImageUrl, InputAudio,
-    JsonSchemaSpec, ResponseFormat, StopInput, ToolChoice, ToolChoiceFunction, ToolChoiceMode,
-    ToolChoiceSpecific, Usage,
+    AudioSpeechRequest, ChatChoice, ChatCompletionRequest, ChatCompletionResponse,
+    ChatContinuation, ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageContentPart,
+    ChatMessageToolCall, ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatToolFunction,
+    ChatTopLogprob, CompletionChoice, CompletionLogprobs, CompletionRequest, CompletionResponse,
+    EmbeddingData, EmbeddingEncodingFormat, EmbeddingInput, EmbeddingRequest, EmbeddingResponse,
+    EmbeddingUsage, EmbeddingVector, ImageUrl, InputAudio, JsonSchemaSpec, ResponseFormat,
+    StopInput, ToolChoice, ToolChoiceFunction, ToolChoiceMode, ToolChoiceSpecific,
+    TranscriptInputTokenDetails, TranscriptResponse, TranscriptTokenUsage, Usage,
 };
 
+pub use auth::ApiKeys;
+pub use realtime::RealtimeLimits;
+
+/// Declare an HTTP-upgrade protocol separately from ordinary GET contracts.
+fn ws<H, T>(handler: H) -> axum::routing::MethodRouter<AppState>
+where
+    H: axum::handler::Handler<T, AppState>,
+    T: 'static,
+{
+    get(handler)
+}
+
 pub fn app(state: AppState) -> Router {
-    let tools_origin = state.tools.clone();
-    let tools_cors = tower_http::cors::CorsLayer::new()
-        .allow_origin(tower_http::cors::AllowOrigin::predicate(
-            move |origin, _| {
-                origin.to_str().is_ok_and(|origin| {
-                    tools_origin
-                        .as_ref()
-                        .is_some_and(|tools| tools.origin_allowed(origin))
-                })
-            },
-        ))
-        .allow_credentials(true)
-        .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
-        .allow_headers([
-            axum::http::header::CONTENT_TYPE,
-            axum::http::header::AUTHORIZATION,
-            axum::http::HeaderName::from_static("x-tool-cwd"),
-            axum::http::HeaderName::from_static("x-tool-runtime"),
-            axum::http::HeaderName::from_static("x-resp-type"),
-        ]);
     let mut router = Router::new()
         .route("/health", get(routes::health))
         .route("/v1/health", get(routes::health))
+        .route("/v1/realtime", ws(realtime::websocket::upgrade))
         .route("/v1/responses", post(routes::transports::responses))
         .route("/responses", post(routes::transports::responses))
         .route(
@@ -132,8 +129,8 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/models",
             get(routes::models)
-                .post(routes::llama::disabled_feature)
-                .delete(routes::llama::disabled_feature),
+                .post(routes::model_management::download)
+                .delete(routes::model_management::delete),
         )
         .route("/models/sse", get(routes::llama::model_events))
         .route(
@@ -162,10 +159,23 @@ pub fn app(state: AppState) -> Router {
         .route("/completions", post(routes::native::completions))
         .route("/infill", post(routes::native::infill))
         .route("/tts", post(routes::native::tts))
-        .route("/reranking", post(routes::ranking::rerank))
-        .route("/rerank", post(routes::ranking::rerank))
-        .route("/v1/rerank", post(routes::ranking::rerank))
-        .route("/v1/reranking", post(routes::ranking::rerank))
+        .route(
+            "/reranking",
+            post(routes::ranking::rerank).layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
+        )
+        .route(
+            "/rerank",
+            post(routes::ranking::rerank).layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
+        )
+        .route("/v1/systemone", post(routes::decision::decide))
+        .route(
+            "/v1/rerank",
+            post(routes::ranking::rerank).layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
+        )
+        .route(
+            "/v1/reranking",
+            post(routes::ranking::rerank).layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
+        )
         .route("/embedding", post(routes::native::embeddings))
         .route("/embeddings", post(routes::native::embeddings))
         .route(
@@ -177,16 +187,6 @@ pub fn app(state: AppState) -> Router {
         .route("/tokenize", post(routes::llama::tokenize))
         .route("/detokenize", post(routes::llama::detokenize))
         .route("/apply-template", post(routes::llama::apply_template))
-        .route(
-            "/tools",
-            get(routes::tools::list)
-                .post(routes::tools::invoke)
-                .layer(tools_cors),
-        )
-        .route(
-            "/cors-proxy",
-            get(routes::proxy::forward).post(routes::proxy::forward),
-        )
         .route("/chat/completions", post(routes::chat_completions))
         .route("/v1/models", get(routes::models))
         .route("/v1/status", get(routes::status))
@@ -230,10 +230,13 @@ pub fn app(state: AppState) -> Router {
                 get(routes::debug_trace_perfetto),
             );
     }
-    if state.config.enable_admin_endpoints {
+    if state.config.enable_admin_endpoints || state.model_manager.is_some() {
         router = router
             .route("/models/load", post(routes::llama::load_model))
-            .route("/models/unload", post(routes::llama::unload_model))
+            .route("/models/unload", post(routes::llama::unload_model));
+    }
+    if state.config.enable_admin_endpoints {
+        router = router
             .route("/v1/admin/models", get(routes::admin_list_models))
             .route("/v1/admin/models/{id}/load", post(routes::admin_load_model))
             .route(
@@ -249,10 +252,12 @@ pub fn app(state: AppState) -> Router {
     #[cfg(feature = "metrics")]
     let router = router.route("/metrics", get(routes::prometheus_metrics));
     let replays = state.replays.clone();
+    let api_keys = state.config.api_keys.clone();
     router
         .fallback(webui::serve)
         .with_state(state)
         .layer(middleware::from_fn_with_state(replays, replay::intercept))
+        .layer(middleware::from_fn_with_state(api_keys, auth::enforce))
         .layer(middleware::from_fn(trace_request))
 }
 
@@ -282,16 +287,8 @@ async fn trace_request(request: Request, next: Next) -> Response {
 }
 
 pub async fn serve(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
-    // Security posture: the server has no built-in authentication. The CLI defaults
-    // to 127.0.0.1, enforces max_tokens/max_sessions caps, and issues CSPRNG session
-    // ids; binding a non-loopback --addr should be done only behind an auth proxy.
-    if let Some(tools) = &state.tools {
-        let job = Arc::new(tools.admit(0).context("admit MCP startup discovery")?);
-        tools
-            .catalog(job)
-            .await
-            .context("discover configured MCP tools before accepting HTTP requests")?;
-    }
+    // Authentication is opt-in through ServerConfig.api_keys. The CLI defaults
+    // to loopback; operators choose keys or an authenticated reverse proxy.
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app(state)).await?;
     Ok(())

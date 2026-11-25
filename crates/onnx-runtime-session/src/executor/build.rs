@@ -387,7 +387,7 @@ fn check_operator_coverage(
         if graph_claims.contains(node_id)
             || onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
             || is_control_flow_op(&node.op_type, &node.domain)
-            || is_sequence_op(&node.op_type, &node.domain)
+            || is_container_op(&node.op_type, &node.domain)
         {
             continue;
         }
@@ -466,6 +466,7 @@ pub(super) fn cuda_fallback_report(
     ep: &dyn ExecutionProvider,
     artifact_config: ExecutorArtifactConfig,
     ordered_probe: bool,
+    require_cuda: bool,
 ) -> Result<Option<ExecutionProviderFallbackReport>> {
     if ep.device_type() != DeviceType::Cuda {
         return Ok(None);
@@ -480,6 +481,7 @@ pub(super) fn cuda_fallback_report(
         "graph",
         &mut issues,
         ordered_probe,
+        require_cuda,
     )?;
     if issues.is_empty() {
         return Ok(None);
@@ -540,6 +542,7 @@ pub(super) fn format_cuda_coverage_issues(issues: &[ExecutionProviderDecline]) -
         .join("; ")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn collect_cuda_coverage_issues(
     graph: &Graph,
     opset_graph: &Graph,
@@ -548,6 +551,7 @@ pub(super) fn collect_cuda_coverage_issues(
     scope: &str,
     issues: &mut Vec<ExecutionProviderDecline>,
     ordered_probe: bool,
+    require_cuda: bool,
 ) -> Result<()> {
     let graph_claims = onnx_runtime_ep_api::GraphKernelClaims::query(ep, graph)?;
     for (node_id, node) in graph.nodes.iter() {
@@ -563,7 +567,7 @@ pub(super) fn collect_cuda_coverage_issues(
         if graph_claims.contains(node_id)
             || onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
             || is_control_flow_op(&node.op_type, &node.domain)
-            || is_sequence_op(&node.op_type, &node.domain)
+            || is_container_op(&node.op_type, &node.domain)
         {
             continue;
         }
@@ -624,6 +628,14 @@ pub(super) fn collect_cuda_coverage_issues(
             &concrete_shapes,
             opset,
         ) {
+            if require_cuda {
+                return Err(SessionError::CudaKernelCreationFailed {
+                    node: format_node_identity(scope, node_id, node),
+                    op_type: node.op_type.clone(),
+                    opset: opset.into(),
+                    source: error,
+                });
+            }
             if ordered_probe && !matches!(error, onnx_runtime_ep_api::EpError::NoEpForOp { .. }) {
                 return Err(SessionError::unsupported_op(
                     node,
@@ -655,6 +667,7 @@ pub(super) fn collect_cuda_coverage_issues(
             &sub_scope,
             issues,
             ordered_probe,
+            require_cuda,
         )?;
     }
     for value_id in super::host_strings::producerless_string_outputs(graph) {
@@ -1387,8 +1400,10 @@ impl Executor {
         let has_symbols =
             Self::collect_value_metadata(&graph, &order, &mut value_shapes, &mut value_dtypes);
 
-        let (sequence_values, control_flow_output_values) =
+        let (mut sequence_values, control_flow_output_values) =
             Self::classify_special_values(&graph, &order);
+        let optional_values =
+            optional_ops::classify_optional_values(&graph, &order, &mut sequence_values)?;
         let all_value_ids = value_shapes.keys().copied().collect();
 
         // 3) Build the structural per-node plan.
@@ -1409,6 +1424,13 @@ impl Executor {
             super::bindings::collect_workspace_node_locations(ep.as_ref(), &graph, &plan)?;
         let plan_len = plan.len();
         let capture_growing_symbols = compute_capture_disqualifying_symbols(&graph);
+        let classifier = ShapeEvolutionClassifier::new(&graph, &HashSet::new());
+        let kernel_shape_facts = plan
+            .iter()
+            .map(|entry| {
+                classifier.facts(&graph, graph.node(entry.node_id), &capture_growing_symbols)
+            })
+            .collect();
         let mut exec = Self {
             instance_id,
             artifact_config: artifact_transaction.config(),
@@ -1432,7 +1454,11 @@ impl Executor {
             string_initializers,
             string_values: HashMap::new(),
             buffer_shapes,
-            has_unknown_rank: value_shapes.values().any(Option::is_none),
+            has_unknown_rank: value_shapes.iter().any(|(vid, shape)| {
+                shape.is_none()
+                    && !sequence_values.contains(vid)
+                    && !optional_values.contains_key(vid)
+            }),
             value_shapes,
             value_dtypes,
             plan,
@@ -1447,11 +1473,14 @@ impl Executor {
             slot_capture: std::array::from_fn(|_| SlotCaptureState::default()),
             control_flow_output_values,
             capture_growing_symbols,
+            kernel_shape_facts,
             capacity_pinned_kv_symbols: HashSet::new(),
             last_capture_failed_node: None,
             views: HashMap::new(),
             pinned: HashSet::new(),
             sequence_values,
+            optional_values,
+            optionals: HashMap::new(),
             activation_memory_plan: None,
             shared_buffers: HashMap::new(),
             parked_input_buffers: Vec::new(),
@@ -1731,7 +1760,9 @@ impl Executor {
         // (a wrapped `CycleDetected`, or an opset-import invariant instead of the
         // unsupported-operator error) with a structural error. Mirrors the
         // control-flow signature check above.
-        graph.topological_order()?;
+        let order = graph.topological_order()?;
+        let (mut sequences, _) = Self::classify_special_values(graph, &order);
+        optional_ops::classify_optional_values(graph, &order, &mut sequences)?;
         reject_unsupported_operators(graph, ep.as_ref(), ordered_probe)?;
         let graph_before_ep_passes = graph.clone();
         let ep_pass_nodes_before = graph.num_nodes();
@@ -1743,6 +1774,7 @@ impl Executor {
             ep.as_ref(),
             artifact_transaction.config(),
             ordered_probe,
+            require_cuda,
         )?;
         let fallback_declines = execution_provider_fallback_report
             .as_ref()
@@ -2249,7 +2281,7 @@ impl Executor {
             // Sequence-typed values have no meaningful tensor shape and are
             // never buffer-sized; skip them so a static graph does not trip the
             // unresolved-shape check on a sequence value.
-            if self.sequence_values.contains(&vid) {
+            if self.is_container_value(vid) {
                 continue;
             }
             match shape.as_ref().and_then(|shape| substitute(shape, bindings)) {
@@ -2719,7 +2751,7 @@ impl Executor {
             }
             // Sequence-typed values own no tensor buffer (their list lives in
             // `sequences` at run time), so never size one for them.
-            if self.sequence_values.contains(&vid) {
+            if self.is_container_value(vid) {
                 continue;
             }
             let dtype = self.value_dtypes[&vid];
@@ -2798,7 +2830,7 @@ impl Executor {
             // Sequence ops are executor-handled (they operate on sequence-of-
             // tensor values, not tensor views) — they have no EP kernel and must
             // not be compiled here, exactly like control-flow ops.
-            if is_sequence_op(&node.op_type, &node.domain) {
+            if is_container_op(&node.op_type, &node.domain) {
                 if span.is_some() {
                     skipped_sequence += 1;
                 }
@@ -2816,6 +2848,7 @@ impl Executor {
             }
             if self.kernel_bindings[i].as_ref().is_some_and(|binding| {
                 self.cache.contains(binding)
+                    && binding.shape_facts == self.kernel_shape_facts[i]
                     && binding.shapes.len() == self.plan[i].inputs.len()
                     && binding.shapes.iter().zip(&self.plan[i].inputs).all(
                         |(bound_shape, input)| match input {
@@ -2846,8 +2879,7 @@ impl Executor {
             )?;
             let node = self.graph.node(node_id);
             let opset = effective_opset(&self.graph, node);
-            let seq_independent =
-                node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols);
+            let shape_facts = self.kernel_shape_facts[i];
             let graph_tokens = self.captured_graph_tokens_for_plan_index(i);
             let (_, key) = self.cache.get_or_create(
                 node_id,
@@ -2857,7 +2889,7 @@ impl Executor {
                 &constant_inputs,
                 &constant_values,
                 opset,
-                seq_independent,
+                shape_facts,
                 self.artifact_config,
                 &mut self.provider_artifact_readiness,
                 self.ep.as_ref(),
@@ -3252,6 +3284,16 @@ impl Executor {
     /// context-cache model with compiled partitions spliced out.
     pub(crate) fn graph(&self) -> &Graph {
         &self.graph
+    }
+
+    pub(crate) fn host_graph_op(&self) -> Option<&Node> {
+        self.plan.iter().find_map(|planned| {
+            let node = self.graph.node(planned.node_id);
+            (planned.managed_strings
+                || is_sequence_op(&node.op_type, &node.domain)
+                || (!planned.graph_kernel && is_control_flow_op(&node.op_type, &node.domain)))
+            .then_some(node)
+        })
     }
 
     pub(crate) fn execution_provider_fallback_report(

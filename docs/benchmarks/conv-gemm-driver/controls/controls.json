@@ -1,0 +1,78 @@
+[
+  {
+    "name": "historical-allocation",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "-p",
+      "onnx-runtime-ep-cpu",
+      "--test",
+      "conv_im2col_allocation",
+      "--",
+      "--nocapture"
+    ],
+    "extra_env": {},
+    "exit": 101,
+    "source_sha256": "8dac08a569239c271731345de361061e002ee428b1c257cd19417e97fd44de51",
+    "log_sha256": "75aa84baae20d75e39295c01f22164ce460a8dc1e4c495fab9217bb4951f2643"
+  },
+  {
+    "name": "eager-col",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "-p",
+      "onnx-runtime-ep-cpu",
+      "--test",
+      "conv_im2col_allocation",
+      "--",
+      "--nocapture"
+    ],
+    "extra_env": {},
+    "exit": 101,
+    "source_sha256": "f075ca8e6702e9f3d528d4de56fc84595cbad6f9e7099d568d3376a88783a3eb",
+    "log_sha256": "762429f15dcb3167cc8f93d61309b681f41494443044d62abceeec057f77c6b0"
+  },
+  {
+    "name": "same-image",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "-p",
+      "onnx-runtime-ep-cpu",
+      "--lib",
+      "kernels::conv::historical_conv_driver_probe::single_image_driver_bits_match_historical_implementations",
+      "--",
+      "--exact",
+      "--nocapture"
+    ],
+    "extra_env": {},
+    "exit": 0,
+    "source_sha256": "04edbe2a816a0cf3d319169d7c6447445eb6e91c4d20698662a4a5310b2363f1",
+    "log_sha256": "f4201fc4c8cb1e06748c3c680e88863747fc9703cc52beb25cd505fc8f3ab33c"
+  },
+  {
+    "name": "same-image-generic",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "-p",
+      "onnx-runtime-ep-cpu",
+      "--lib",
+      "kernels::conv::historical_conv_driver_probe::single_image_driver_bits_match_historical_implementations",
+      "--",
+      "--exact",
+      "--nocapture"
+    ],
+    "extra_env": {
+      "NXRT_CPU_GEMM_BACKEND": "generic"
+    },
+    "exit": 0,
+    "source_sha256": "04edbe2a816a0cf3d319169d7c6447445eb6e91c4d20698662a4a5310b2363f1",
+    "log_sha256": "ba4544457ec0c9127cfbb3743a2469f745bd21e4757c0ee019d15d2b5820d7ea"
+  }
+]

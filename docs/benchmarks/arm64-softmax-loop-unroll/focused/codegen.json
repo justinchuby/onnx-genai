@@ -1,0 +1,96 @@
+{
+  "binary_sha256": "f5b3b4b946617ca6a2f573a6619f0e6b1909029b33ef3f4270af6f3b05b8edc3",
+  "llvm": "Homebrew LLVM version 23.1.5",
+  "records": [
+    {
+      "symbol": "__RINvNtNtNtNtCs9Xuh1DSS2Xc_19onnx_runtime_ep_cpu7kernels7softmax12softmax_neon12unroll_tests13original_rowsKb0_EBa_",
+      "start": 4296186956,
+      "stop": 4296188636,
+      "bytes": 1680,
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/llvm-objdump",
+        "-d",
+        "--start-address=4296186956",
+        "--stop-address=4296188636",
+        "/tmp/nxrt-neon-unroll-process-focus/measured.binary"
+      ],
+      "raw_sha256": "7eba72eae6019f45bf87ee037f0f785fccfcbb3965ae1603f542b785ad825066",
+      "artifact": "original-rows.disasm.gz"
+    },
+    {
+      "symbol": "__RINvNtNtNtNtCs9Xuh1DSS2Xc_19onnx_runtime_ep_cpu7kernels7softmax12softmax_neon12unroll_tests13original_rowsKb1_EBa_",
+      "start": 4296188636,
+      "stop": 4296189576,
+      "bytes": 940,
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/llvm-objdump",
+        "-d",
+        "--start-address=4296188636",
+        "--stop-address=4296189576",
+        "/tmp/nxrt-neon-unroll-process-focus/measured.binary"
+      ],
+      "raw_sha256": "11a943bef148cab5cd023a34e340bcab67e8f35e50bfa89a7b1a50382a2e0705",
+      "artifact": "original-rows-10012a2dc.disasm.gz"
+    },
+    {
+      "symbol": "__RNvNtNtCs9Xuh1DSS2Xc_19onnx_runtime_ep_cpu7kernels7softmax30softmax_rows_serial_out_native",
+      "start": 4298119600,
+      "stop": 4298120540,
+      "bytes": 940,
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/llvm-objdump",
+        "-d",
+        "--start-address=4298119600",
+        "--stop-address=4298120540",
+        "/tmp/nxrt-neon-unroll-process-focus/measured.binary"
+      ],
+      "raw_sha256": "f2c7ddf01db2a3f4f9feaa196d8e5fb8b88953a01416e52aa3deb74e40dbc4eb",
+      "artifact": "native.disasm.gz"
+    },
+    {
+      "symbol": "__RNvNtNtNtCs9Xuh1DSS2Xc_19onnx_runtime_ep_cpu7kernels7softmax12softmax_neon11softmax_row",
+      "start": 4299056484,
+      "stop": 4299058296,
+      "bytes": 1812,
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/llvm-objdump",
+        "-d",
+        "--start-address=4299056484",
+        "--stop-address=4299058296",
+        "/tmp/nxrt-neon-unroll-process-focus/measured.binary"
+      ],
+      "raw_sha256": "954848d2d31e40b9327b754d620112f0a3c382241aef4f1f6a86c5a93886f647",
+      "artifact": "native-row.disasm.gz"
+    },
+    {
+      "symbol": "__RNvNtNtNtNtCs9Xuh1DSS2Xc_19onnx_runtime_ep_cpu7kernels7softmax12softmax_neon12unroll_tests21original_row_outlined",
+      "start": 4299118532,
+      "stop": 4299119660,
+      "bytes": 1128,
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/llvm-objdump",
+        "-d",
+        "--start-address=4299118532",
+        "--stop-address=4299119660",
+        "/tmp/nxrt-neon-unroll-process-focus/measured.binary"
+      ],
+      "raw_sha256": "cc7d212897a319ea9dc4b72bc71dbe1e353e277c0c1778bf8055ab24d4117913",
+      "artifact": "original-row-outlined.disasm.gz"
+    },
+    {
+      "symbol": "__RNvNtNtNtNtCs9Xuh1DSS2Xc_19onnx_runtime_ep_cpu7kernels7softmax12softmax_neon12unroll_tests8original",
+      "start": 4299119660,
+      "stop": 4299119820,
+      "bytes": 160,
+      "command": [
+        "/opt/homebrew/opt/llvm/bin/llvm-objdump",
+        "-d",
+        "--start-address=4299119660",
+        "--stop-address=4299119820",
+        "/tmp/nxrt-neon-unroll-process-focus/measured.binary"
+      ],
+      "raw_sha256": "83039a5d887e87abe3eb4b3f68b03c516d0953cd427c706f8c1a7d76812df2f1",
+      "artifact": "original-wrapper.disasm.gz"
+    }
+  ]
+}
