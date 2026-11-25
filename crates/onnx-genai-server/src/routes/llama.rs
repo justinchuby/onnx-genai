@@ -71,6 +71,7 @@ pub(crate) async fn props(
             "params": {
                 "n_predict": state.config.max_output_tokens,
                 "t_max_predict_ms": -1,
+                "n_indent": options.minimum_indent,
                 "seed": -1,
                 "temperature": if options.greedy { 0.0 } else { options.temperature },
                 "top_k": options.top_k, "top_p": options.top_p, "min_p": options.min_p,

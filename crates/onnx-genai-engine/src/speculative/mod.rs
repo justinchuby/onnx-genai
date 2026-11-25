@@ -1793,7 +1793,7 @@ impl Engine {
                     FinishReason::MaxTokens,
                     prefix_cache_hit_len,
                     logprobs.as_deref(),
-                    &options.effective_preserved_tokens(),
+                    options,
                 )
             }
         }
@@ -2042,7 +2042,7 @@ impl Engine {
                 FinishReason::MaxTokens,
                 prefix_cache_hit_len,
                 generated_logprobs.as_deref(),
-                &options.effective_preserved_tokens(),
+                options,
             )?));
         }
         if reached_context_limit(token_count, max_context) {
@@ -2051,7 +2051,7 @@ impl Engine {
                 FinishReason::Length,
                 prefix_cache_hit_len,
                 generated_logprobs.as_deref(),
-                &options.effective_preserved_tokens(),
+                options,
             )?));
         }
         Ok(None)
@@ -2572,7 +2572,7 @@ impl Engine {
                     finish_reason,
                     prefix_cache_hit_len,
                     generated_logprobs.as_deref(),
-                    &options.effective_preserved_tokens(),
+                    options,
                 )?));
             }
         }

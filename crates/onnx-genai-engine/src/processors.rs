@@ -24,6 +24,12 @@ pub(crate) fn append_output_observers(chain: &mut ProcessorChain, options: &Gene
             options.stop_sequences.clone(),
         )));
     }
+    if options.minimum_indent > 0 {
+        chain.add(Box::new(crate::indentation::IndentationLimit::new(
+            options.minimum_indent,
+            options.stop_sequences.clone(),
+        )));
+    }
     if !options.stop_sequences.is_empty() {
         chain.add(Box::new(StopSequenceProcessor::new(
             options.stop_sequences.clone(),
@@ -41,6 +47,10 @@ pub(crate) fn build_processor_chain(
     tokenizer: Option<&Tokenizer>,
     has_custom_sampler: bool,
 ) -> anyhow::Result<ProcessorChain> {
+    anyhow::ensure!(
+        options.minimum_indent == 0 || tokenizer.is_some(),
+        "minimum_indent requires the model tokenizer; declare a tokenizer before requesting indentation stopping"
+    );
     let mut chain = ProcessorChain::new();
     // A temperature-zero stage still runs at its requested position. Only an
     // explicit greedy policy bypasses stochastic warpers before terminal selection.
@@ -663,13 +673,15 @@ pub(crate) fn finish_reason_after_token(
     chain: &ProcessorChain,
     context: &ProcessorContext,
 ) -> Option<FinishReason> {
+    let signal = chain.signal(context);
     if options.terminates(token_id) {
         return Some(FinishReason::EosToken);
     }
 
-    chain.signal(context).map(|signal| match signal {
+    signal.map(|signal| match signal {
         ProcessorSignal::StopSequence { index } => FinishReason::StopSequence { index },
         ProcessorSignal::PredictionTimeLimit => FinishReason::PredictionTimeLimit,
+        ProcessorSignal::IndentationLimit { .. } => FinishReason::IndentationLimit,
     })
 }
 

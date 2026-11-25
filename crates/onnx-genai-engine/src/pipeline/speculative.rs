@@ -1043,10 +1043,10 @@ impl super::workflow::WorkflowNodeHost for CandidateTreeWorkflowHost<'_> {
         self.text = self
             .tokenizer
             .map(|tokenizer| {
-                crate::tokenization::decode_output(
+                crate::tokenization::decode_generation_output(
                     tokenizer,
                     &self.authoritative_tokens,
-                    &self.options.effective_preserved_tokens(),
+                    self.options,
                 )
             })
             .transpose()
@@ -2683,6 +2683,7 @@ impl WorkflowRuntime {
             if matches!(
                 finish_reason,
                 FinishReason::EosToken
+                    | FinishReason::IndentationLimit
                     | FinishReason::PredictionTimeLimit
                     | FinishReason::StopSequence { .. }
             ) {
@@ -2707,11 +2708,7 @@ impl WorkflowRuntime {
         }
         let text = tokenizer
             .map(|tokenizer| {
-                crate::tokenization::decode_output(
-                    tokenizer,
-                    &generated,
-                    &options.effective_preserved_tokens(),
-                )
+                crate::tokenization::decode_generation_output(tokenizer, &generated, options)
             })
             .transpose()?
             .unwrap_or_default();

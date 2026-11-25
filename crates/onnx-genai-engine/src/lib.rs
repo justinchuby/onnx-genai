@@ -19,6 +19,7 @@ pub mod embedding;
 pub mod engine;
 pub mod fim;
 pub mod gbnf;
+pub mod indentation;
 mod json_prefix;
 pub(crate) mod kv_bridge;
 pub(crate) mod kv_sizing;
