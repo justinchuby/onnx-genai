@@ -58,6 +58,10 @@ pub(super) enum OutputBudget {
     Tokens(NonZeroU32),
 }
 impl OutputBudget {
+    pub(super) fn exhausted(self, used: u64) -> bool {
+        matches!(self,Self::Tokens(limit) if used >= u64::from(limit.get()))
+    }
+
     fn parse(value: &Value) -> anyhow::Result<Self> {
         if value == "inf" {
             return Ok(Self::Unlimited);
