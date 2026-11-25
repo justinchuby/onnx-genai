@@ -535,7 +535,6 @@ impl Kernel for QMoEKernel {
             plan: projection_plan,
         };
         let mut routing = RoutingScratch::default();
-        let mut token_counts = BTreeMap::new();
         let mut tasks = BTreeMap::<usize, Vec<(usize, usize, f32)>>::new();
         let mut route_slots = 0usize;
         for row in 0..rows {
@@ -574,7 +573,6 @@ impl Kernel for QMoEKernel {
                 );
             }
             for &(expert, route_weight) in route.iter() {
-                *token_counts.entry(expert).or_insert(0usize) += 1;
                 tasks
                     .entry(expert)
                     .or_default()
@@ -607,7 +605,7 @@ impl Kernel for QMoEKernel {
             metrics()
                 .record_mapped_regions(&mapped_regions)
                 .map_err(error)?;
-            metrics().record_routes(self.layer_id, &token_counts);
+            metrics().record_routes(self.layer_id, &tasks);
 
             let expanded_bytes = DequantizedExpert::expanded_bytes(&fc1, &fc2, fc3.as_ref())?;
             let ordered: Vec<RoutedExpert> = tasks.into_iter().collect();
