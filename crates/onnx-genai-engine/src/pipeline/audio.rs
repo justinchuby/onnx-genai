@@ -47,10 +47,34 @@ pub fn buffered_pcm16_wav_output_names(workflow: &WorkflowSpec) -> Vec<String> {
         .collect()
 }
 
+/// Transport encoding of the selected declared audio output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioOutputFormat {
+    Wav,
+    PcmS16Le,
+    PcmF32Le,
+}
+impl AudioOutputFormat {
+    fn content_type(self, sample_rate: u32, channels: u16) -> String {
+        if self == Self::Wav {
+            return "audio/wav".into();
+        }
+        let mut content = format!("audio/pcm;rate={sample_rate}");
+        if channels > 1 {
+            content.push_str(&format!(";channels={channels}"));
+        }
+        content.push_str(match self {
+            Self::PcmF32Le => ";encoding=float;bits=32",
+            _ => ";encoding=signed-int;bits=16",
+        });
+        content
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedAudio {
     pub bytes: Vec<u8>,
-    pub content_type: &'static str,
+    pub content_type: String,
     pub sample_rate_hz: u32,
     pub channels: u16,
 }
@@ -67,6 +91,7 @@ impl WorkflowRuntime {
         &self,
         outputs: &PipelineOutputs,
         output_name: &str,
+        format: AudioOutputFormat,
     ) -> anyhow::Result<EncodedAudio> {
         let declaration = self
             .plan
@@ -90,16 +115,25 @@ impl WorkflowRuntime {
             .sample_rate_hz
             .context("audio output has no sample_rate_hz")?;
         let channels = media.channels.context("audio output has no channels")?;
+        anyhow::ensure!(
+            target_rate > 0 && channels > 0,
+            "audio output '{output_name}' must declare positive sample_rate_hz and channels"
+        );
         let value = self
             .structured_output_for_name(outputs, output_name)
             .with_context(|| format!("workflow did not emit audio output '{output_name}'"))?;
 
         if declaration.stage == OutputStage::PostAdapter {
             let bytes = value.to_raw_bytes()?;
-            validate_wav_header(&bytes, target_rate, channels)?;
+            let source = validate_wav_header(&bytes, target_rate, channels)?;
+            let encoded = match format {
+                AudioOutputFormat::Wav => bytes,
+                AudioOutputFormat::PcmS16Le => source.payload.to_vec(),
+                AudioOutputFormat::PcmF32Le => source.float_pcm()?,
+            };
             return Ok(EncodedAudio {
-                bytes,
-                content_type: "audio/wav",
+                bytes: encoded,
+                content_type: format.content_type(target_rate, channels),
                 sample_rate_hz: target_rate,
                 channels,
             });
@@ -122,10 +156,16 @@ impl WorkflowRuntime {
             source_rate,
             target_rate,
         )?;
-        let bytes = encode_pcm16_wav(&resampled, usize::from(channels), target_rate)?;
+        let bytes = match format {
+            AudioOutputFormat::Wav => {
+                encode_pcm16_wav(&resampled, usize::from(channels), target_rate)
+            }
+            _ => encode_planar_pcm(&resampled, usize::from(channels), format),
+        }
+        .with_context(|| format!("encode workflow audio output '{output_name}' as {format:?}"))?;
         Ok(EncodedAudio {
             bytes,
-            content_type: "audio/wav",
+            content_type: format.content_type(target_rate, channels),
             sample_rate_hz: target_rate,
             channels,
         })
@@ -311,6 +351,59 @@ impl StreamingResampler {
     }
 }
 
+fn encode_planar_pcm(
+    planar: &[f32],
+    channels: usize,
+    format: AudioOutputFormat,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        channels > 0 && channels <= u16::MAX as usize,
+        "PCM channel count must be between 1 and {}",
+        u16::MAX
+    );
+    anyhow::ensure!(
+        planar.len().is_multiple_of(channels),
+        "planar audio length {} is not divisible by channel count {channels}",
+        planar.len()
+    );
+    if let Some((index, value)) = planar
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        bail!(
+            "audio sample {index} is not finite ({value}); repair the workflow waveform output before encoding"
+        );
+    }
+    let width = if format == AudioOutputFormat::PcmF32Le {
+        4
+    } else {
+        2
+    };
+    let length = planar
+        .len()
+        .checked_mul(width)
+        .context("PCM output byte length overflows")?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .context("reserve interleaved PCM output bytes")?;
+    let samples = planar.len() / channels;
+    for sample in 0..samples {
+        for channel in 0..channels {
+            let value = planar[channel * samples + sample];
+            if format == AudioOutputFormat::PcmF32Le {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            } else {
+                // Match llama-server's rounded symmetric PCM16 conversion.
+                let value = (value.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+    Ok(bytes)
+}
+
 pub fn encode_pcm16_wav(
     planar: &[f32],
     channels: usize,
@@ -341,7 +434,10 @@ pub fn encode_pcm16_wav(
         .checked_mul(2)
         .context("WAV block align overflow")?;
 
-    let mut wav = Vec::with_capacity(44 + data_len);
+    let pcm = encode_planar_pcm(planar, channels, AudioOutputFormat::PcmS16Le)?;
+    let mut wav = Vec::new();
+    wav.try_reserve_exact(44 + data_len)
+        .context("reserve PCM16 WAV output bytes")?;
     wav.extend_from_slice(b"RIFF");
     wav.extend_from_slice(&riff_len_u32.to_le_bytes());
     wav.extend_from_slice(b"WAVEfmt ");
@@ -354,21 +450,40 @@ pub fn encode_pcm16_wav(
     wav.extend_from_slice(&16u16.to_le_bytes());
     wav.extend_from_slice(b"data");
     wav.extend_from_slice(&data_len_u32.to_le_bytes());
-    for sample in 0..samples {
-        for channel in 0..channels {
-            let value = planar[channel * samples + sample].clamp(-1.0, 1.0);
-            let pcm = if value <= -1.0 {
-                i16::MIN
-            } else {
-                (value * i16::MAX as f32).round() as i16
-            };
-            wav.extend_from_slice(&pcm.to_le_bytes());
-        }
-    }
+    wav.extend(pcm);
     Ok(wav)
 }
 
-fn validate_wav_header(bytes: &[u8], sample_rate: u32, channels: u16) -> anyhow::Result<()> {
+struct ValidatedPcm16Wav<'a> {
+    payload: &'a [u8],
+}
+impl ValidatedPcm16Wav<'_> {
+    fn float_pcm(&self) -> anyhow::Result<Vec<u8>> {
+        let length = self
+            .payload
+            .len()
+            .checked_mul(2)
+            .context("float PCM output byte length overflows")?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(length)
+            .context("reserve float PCM bytes from the validated PCM16 audio output")?;
+        for sample in self.payload.chunks_exact(2) {
+            let sample = f32::from(i16::from_le_bytes([sample[0], sample[1]])) / 32768.0;
+            output.extend_from_slice(&sample.to_le_bytes());
+        }
+        Ok(output)
+    }
+}
+fn validate_wav_header(
+    bytes: &[u8],
+    sample_rate: u32,
+    channels: u16,
+) -> anyhow::Result<ValidatedPcm16Wav<'_>> {
+    anyhow::ensure!(
+        channels > 0 && sample_rate > 0,
+        "declared PCM16 WAV sample rate and channels must be positive"
+    );
     if bytes.len() < 44
         || &bytes[0..4] != b"RIFF"
         || &bytes[8..12] != b"WAVE"
@@ -399,6 +514,7 @@ fn validate_wav_header(bytes: &[u8], sample_rate: u32, channels: u16) -> anyhow:
         || byte_rate != expected_byte_rate
         || usize::try_from(riff_size).ok() != bytes.len().checked_sub(8)
         || usize::try_from(data_size).ok() != bytes.len().checked_sub(44)
+        || !data_size.is_multiple_of(u32::from(expected_block_align))
     {
         bail!("post-adapter WAV must contain canonical PCM16 fmt and data chunks");
     }
@@ -407,7 +523,9 @@ fn validate_wav_header(bytes: &[u8], sample_rate: u32, channels: u16) -> anyhow:
             "WAV header declares {actual_channels} channels at {actual_rate} Hz; metadata declares {channels} channels at {sample_rate} Hz"
         );
     }
-    Ok(())
+    Ok(ValidatedPcm16Wav {
+        payload: &bytes[44..],
+    })
 }
 
 #[cfg(test)]
@@ -535,10 +653,79 @@ mod tests {
         assert_eq!(
             &wav[44..],
             &[
-                0, 0, 0, 128, // L0=0, R0=-1
+                0, 0, 1, 128, // L0=0, R0=-1 (symmetric PCM16)
                 255, 127, 0, 64, // L1=1, R1=0.5
             ]
         );
+    }
+
+    #[test]
+    fn raw_pcm_preserves_float_precision_and_interleaves_channels() {
+        let planar = [0.1234567, -1.25, 0.75, 1.5];
+        let bytes = encode_planar_pcm(&planar, 2, AudioOutputFormat::PcmF32Le).unwrap();
+        let actual: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        assert_eq!(actual, [0.1234567, 0.75, -1.25, 1.5]);
+        let bytes = encode_planar_pcm(&planar, 2, AudioOutputFormat::PcmS16Le).unwrap();
+        let actual: Vec<i16> = bytes
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        assert_eq!(actual, [4045, 24575, -32767, 32767]);
+        assert_eq!(
+            AudioOutputFormat::PcmF32Le.content_type(24000, 2),
+            "audio/pcm;rate=24000;channels=2;encoding=float;bits=32"
+        );
+        assert_eq!(
+            AudioOutputFormat::PcmS16Le.content_type(44100, 1),
+            "audio/pcm;rate=44100;encoding=signed-int;bits=16"
+        );
+    }
+
+    #[test]
+    fn raw_pcm_rejects_invalid_shapes_and_nonfinite_samples() {
+        for format in [AudioOutputFormat::PcmS16Le, AudioOutputFormat::PcmF32Le] {
+            assert!(encode_planar_pcm(&[], 0, format).is_err());
+            assert!(encode_planar_pcm(&[0.0], 2, format).is_err());
+            assert!(encode_planar_pcm(&[], 2, format).unwrap().is_empty());
+            for sample in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let error = encode_planar_pcm(&[0.0, sample], 1, format)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains("sample 1") && error.contains("not finite"),
+                    "{error}"
+                );
+            }
+        }
+        assert!(encode_pcm16_wav(&[f32::NAN], 1, 24000).is_err());
+    }
+
+    #[test]
+    fn validated_post_adapter_pcm_preserves_full_signed_range_and_rejects_partial_frames() {
+        let mut wav = encode_pcm16_wav(&[0.0, 0.0, 0.0, 0.0], 2, 24000).unwrap();
+        let source: Vec<u8> = [i16::MIN, -1, 0, i16::MAX]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        wav[44..].copy_from_slice(&source);
+        let validated = validate_wav_header(&wav, 24000, 2).unwrap();
+        assert_eq!(validated.payload, source);
+        let floats: Vec<f32> = validated
+            .float_pcm()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        assert_eq!(floats, [-1.0, -1.0 / 32768.0, 0.0, 32767.0 / 32768.0]);
+        wav.pop();
+        let riff_size = u32::try_from(wav.len() - 8).unwrap();
+        let data_size = u32::try_from(wav.len() - 44).unwrap();
+        wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        wav[40..44].copy_from_slice(&data_size.to_le_bytes());
+        assert!(validate_wav_header(&wav, 24000, 2).is_err());
     }
 
     #[test]

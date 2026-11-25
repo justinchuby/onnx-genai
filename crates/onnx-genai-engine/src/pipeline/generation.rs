@@ -384,6 +384,7 @@ pub(crate) trait GenerationCore: WorkflowNodeHost {
     fn prefix_cache_hit_len(&self) -> usize;
     /// Per-token logprobs, when the request asked for them.
     fn logprobs(&self) -> Option<Vec<crate::config::TokenLogprob>>;
+    fn timings(&self) -> Option<crate::config::GenerationTimings>;
     /// The tokens this core committed, cross-checked against the emitted stream.
     fn committed_tokens(&self) -> Vec<crate::TokenId>;
     /// Whether this core already delivered each token to the request callback.
@@ -479,6 +480,14 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
             "the generation loop ran two decoder forward passes without applying its token \
              policy between them; the second pass's scores would replace the first's unread"
         );
+        let first_forward = !self.state.clock.has_finished_prompt();
+        if first_forward && let Some(control) = self.control {
+            control.report_prompt_progress(
+                self.state
+                    .clock
+                    .initial_progress(self.backend.context_len(), self.state.prefix_cache_hit_len),
+            )?;
+        }
         self.pending_forward = Some(forward_step(
             self.backend,
             self.state,
@@ -487,6 +496,15 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
         )?);
         if let Some(control) = self.control {
             control.check(super::GenerationBoundary::AfterDecoderForward)?;
+            if first_forward && let Some(sample) = self.state.clock.snapshot() {
+                let total = sample.prompt_tokens + sample.cached_prompt_tokens;
+                control.report_prompt_progress(super::PromptProgress {
+                    total,
+                    cache: sample.cached_prompt_tokens,
+                    processed: total,
+                    elapsed: sample.prompt_elapsed,
+                })?;
+            }
         }
         Ok(())
     }
@@ -681,6 +699,9 @@ impl<B: DecodeLoopBackend + ?Sized> GenerationCore for GenerationNodeHost<'_, '_
 
     fn committed_tokens(&self) -> Vec<crate::TokenId> {
         self.state.generated_tokens.clone()
+    }
+    fn timings(&self) -> Option<crate::config::GenerationTimings> {
+        self.state.clock.snapshot()
     }
 
     fn streams_tokens(&self) -> bool {
@@ -931,6 +952,7 @@ pub(crate) fn run_declared_generation(
         let pieces = crate::tokenization::token_texts(tokenizer, &token_ids, &preserved_tokens)?;
         for (index, (token_id, token_text)) in token_ids.iter().copied().zip(pieces).enumerate() {
             callback(crate::config::GenerateToken {
+                timings: None,
                 logprob: logprobs
                     .as_ref()
                     .and_then(|values| values.get(index))
@@ -943,6 +965,8 @@ pub(crate) fn run_declared_generation(
     }
 
     Ok(GenerateResult {
+        timings: core.as_deref().and_then(GenerationCore::timings),
+        retained_cache_tokens: 0,
         text,
         preserved_tokens,
         token_ids,

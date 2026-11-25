@@ -2270,3 +2270,18 @@ Unsupported operations fail during compilation instead of silently doing nothing
 These existing fields need no schema bump; pre-release metadata callers must
 author the transforms they need. Both admitted audio adapter ABIs execute these
 semantics. See [executable audio preprocessing](../AUDIO_PREPROCESSING.md).
+
+## Executable frame transcription profiles
+
+The existing transcription profile v1.0 is admitted as a non-generative task: one
+request-authorized encoded media input, explicit time/class axes and vocabulary,
+and authoritative valid-frame prefixes. Core metadata may describe broader
+sequence/batch contracts; the file executor admits one audio row and rejects
+undeclared conditioning rather than inferring inputs. Encoded byte-vector shape
+proof is shared with decision/reranking, while each task separately admits its
+input authority. The executing package resolves tokenizer class names itself.
+CTC repeat/blank order, ignored classes, delimiter rendering and per-request
+output budgets execute independently of any autoregressive generation path.
+The existing serialized fields require no schema or adapter ABI bump. See
+[file transcription](../TRANSCRIPTION.md) for the wire protocol, usage units,
+resource bounds and remaining generative-audio work.

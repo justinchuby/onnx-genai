@@ -1035,9 +1035,20 @@ pub struct BlockQuantizedMoeTraffic {
 }
 
 /// A borrowed, dense host string tensor. It has no byte or device representation.
+#[derive(Clone, Copy)]
 pub struct HostStringInput<'a> {
     pub shape: &'a [usize],
     pub values: &'a [String],
+}
+
+/// Borrowed dense operands for native host kernels on managed-string nodes.
+pub enum HostKernelInput<'a> {
+    Strings(HostStringInput<'a>),
+    /// One byte per BOOL element, interpreted as false for zero and true otherwise.
+    Bool {
+        shape: &'a [usize],
+        bytes: &'a [u8],
+    },
 }
 
 /// An owned output whose shape may be determined by the string kernel.
@@ -1054,10 +1065,10 @@ pub enum HostKernelData {
 
 /// A kernel ready to execute a specific op with specific shapes (§4.2).
 pub trait Kernel: Send + KernelType {
-    /// Execute on borrowed host strings without a raw-byte tensor ABI.
-    fn execute_host_strings(
+    /// Execute a managed-string node using borrowed host operands.
+    fn execute_managed_host(
         &self,
-        _inputs: &[HostStringInput<'_>],
+        _inputs: &[HostKernelInput<'_>],
     ) -> Result<Vec<HostKernelOutput>> {
         Err(crate::EpError::KernelFailed(
             "kernel does not support native host string tensors; use a string-aware host kernel"
@@ -1384,7 +1395,7 @@ pub trait Kernel: Send + KernelType {
     /// Heterogeneous execution uses independently owned boundary buffers. Its
     /// first slice rejects view-producing kernels before execution rather than
     /// discovering an alias after an upstream partition has already run.
-    fn may_produce_views(&self) -> bool {
+    fn may_produce_views(&self, _input_dtypes: &[DataType]) -> bool {
         false
     }
 

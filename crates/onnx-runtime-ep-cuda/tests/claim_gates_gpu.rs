@@ -140,6 +140,7 @@ fn glm_standard_claim_gates_reject_runtime_unsupported_input_dtypes() {
             "TopK must claim {dtype:?} router values"
         );
     }
+
     assert_rejected(&ep, "CumSum", 24, &[DataType::Float32, DataType::Int32], 1);
     assert_rejected(
         &ep,
@@ -173,6 +174,19 @@ fn glm_standard_claim_gates_reject_runtime_unsupported_input_dtypes() {
         1,
     );
     assert_rejected(&ep, "Expand", 24, &[DataType::Float32, DataType::Int32], 1);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn activation_bf16_claims_start_at_opset_22() {
+    let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
+    for op_type in ["Elu", "HardSigmoid", "Selu", "Softplus", "Softsign"] {
+        assert_rejected(&ep, op_type, 21, &[DataType::BFloat16], 1);
+        assert_supported(&ep, op_type, 22, &[DataType::BFloat16], 1);
+    }
 }
 
 #[cfg_attr(

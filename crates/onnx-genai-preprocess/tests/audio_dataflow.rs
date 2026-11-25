@@ -129,7 +129,7 @@ fn raw_log_mel_and_explicit_normalization_publish_different_sources() {
     let encoded = wav(&samples);
     let tensors = p.run(&[&encoded]).unwrap();
     assert_ne!(floats(&tensors[0]), floats(&tensors[1]));
-    let decoded = onnx_genai_preprocess::audio::decode_wav_pcm16(&encoded).unwrap();
+    let decoded = onnx_genai_preprocess::audio::decode_audio(&encoded).unwrap();
     let expected = LogMelExtractor::from_config(LogMelConfig {
         n_mels: 4,
         sample_rate: 8000,
@@ -257,6 +257,6 @@ fn empty_output_names_and_zero_rate_wav_are_rejected() {
     // PCM WAV fmt chunk: zero sample and byte rates are malformed metadata.
     encoded[24..28].copy_from_slice(&0u32.to_le_bytes());
     encoded[28..32].copy_from_slice(&0u32.to_le_bytes());
-    let error = onnx_genai_preprocess::audio::decode_wav_pcm16(&encoded).unwrap_err();
+    let error = onnx_genai_preprocess::audio::decode_audio(&encoded).unwrap_err();
     assert!(error.to_string().contains("sample rate"), "{error}");
 }

@@ -24,8 +24,12 @@ pub const WHISPER_N_FRAMES: usize = 3_000;
 pub enum AudioPreprocessError {
     InvalidConfig(String),
     InvalidSampleRate,
-    UnsupportedWav(String),
-    Wav(hound::Error),
+    WavEncoding(hound::Error),
+    Encoded(String),
+    Codec {
+        context: String,
+        source: symphonia::core::errors::Error,
+    },
 }
 
 impl fmt::Display for AudioPreprocessError {
@@ -33,17 +37,35 @@ impl fmt::Display for AudioPreprocessError {
         match self {
             Self::InvalidConfig(message) => write!(f, "invalid audio configuration: {message}"),
             Self::InvalidSampleRate => write!(f, "sample rate must be greater than zero"),
-            Self::UnsupportedWav(message) => write!(f, "unsupported WAV input: {message}"),
-            Self::Wav(error) => write!(f, "failed to decode WAV: {error}"),
+            Self::WavEncoding(error) => write!(
+                f,
+                "WAV encoding failed: {error}; check the output sample rate, channels and sample data"
+            ),
+            Self::Codec { context, source } => write!(
+                f,
+                "encoded audio decoding: {context}: {source}; provide a valid supported audio file or convert to WAV/FLAC; unsupported codecs require a decoder supported by this build"
+            ),
+            Self::Encoded(error) => write!(
+                f,
+                "encoded audio decoding: {error}; provide valid supported audio (e.g. WAV, FLAC, MP3, AAC/M4A or OGG/Vorbis) with a consistent sample rate and channel layout"
+            ),
         }
     }
 }
 
-impl std::error::Error for AudioPreprocessError {}
+impl std::error::Error for AudioPreprocessError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::WavEncoding(source) => Some(source),
+            Self::Codec { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 impl From<hound::Error> for AudioPreprocessError {
     fn from(value: hound::Error) -> Self {
-        Self::Wav(value)
+        Self::WavEncoding(value)
     }
 }
 
@@ -61,7 +83,7 @@ impl LogMelFeatures {
     }
 }
 
-/// Mono PCM decoded from a WAV file.
+/// Mono PCM decoded from an encoded audio file.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecodedAudio {
     pub samples: Vec<f32>,
@@ -163,6 +185,10 @@ impl LogMelExtractor {
         })
     }
 
+    pub fn n_mels(&self) -> usize {
+        self.n_mels
+    }
+
     /// Extracts a dynamically sized `[1, n_mels, n_frames]` tensor.
     ///
     /// Frame count is `floor(resampled_samples / hop_length)`, using centered
@@ -183,14 +209,59 @@ impl LogMelExtractor {
         samples: &[f32],
         input_sample_rate: u32,
     ) -> Result<LogMelFeatures, AudioPreprocessError> {
-        let mut resampled = resample(samples, input_sample_rate, self.sample_rate)?;
         let target = usize::try_from(self.sample_rate)?
             .checked_mul(30)
+            .and_then(std::num::NonZeroUsize::new)
             .ok_or_else(|| {
                 AudioPreprocessError::InvalidConfig(
-                    "30-second sample count overflows; reduce sample_rate".into(),
+                    "30-second sample window overflows; reduce sample_rate".into(),
                 )
             })?;
+        self.extract_sample_window(samples, input_sample_rate, target)
+    }
+    /// Pad/truncate the waveform at this extractor's analysis rate so its
+    /// actual hop produces exactly the requested number of normalized frames.
+    pub fn extract_fixed_frames(
+        &self,
+        samples: &[f32],
+        input_sample_rate: u32,
+        frames: std::num::NonZeroUsize,
+    ) -> Result<LogMelFeatures, AudioPreprocessError> {
+        self.extract_sample_window(
+            samples,
+            input_sample_rate,
+            self.sample_window_for_frames(frames)?,
+        )
+    }
+    fn sample_window_for_frames(
+        &self,
+        frames: std::num::NonZeroUsize,
+    ) -> Result<std::num::NonZeroUsize, AudioPreprocessError> {
+        frames.get().checked_mul(self.hop_length).and_then(std::num::NonZeroUsize::new)
+            .ok_or_else(|| AudioPreprocessError::InvalidConfig("requested frames times analysis hop overflows the waveform window; reduce the frame count or hop".into()))
+    }
+    /// Exact source clip bound for fixed-frame extraction, through the same
+    /// compiled waveform-window admission used by authored audio programs.
+    pub fn maximum_input_samples_for_frames(
+        &self,
+        source_rate: u32,
+        frames: std::num::NonZeroUsize,
+    ) -> Result<std::num::NonZeroUsize, AudioPreprocessError> {
+        AudioProgram::fixed_waveform_window(self.sample_rate, self.sample_window_for_frames(frames)?)
+            .maximum_input_samples(source_rate)?
+            .ok_or_else(|| AudioPreprocessError::InvalidConfig("fixed analysis window lost its clipping bound; report this runtime invariant failure".into()))
+    }
+    fn extract_sample_window(
+        &self,
+        samples: &[f32],
+        input_sample_rate: u32,
+        target: std::num::NonZeroUsize,
+    ) -> Result<LogMelFeatures, AudioPreprocessError> {
+        let mut resampled = resample(samples, input_sample_rate, self.sample_rate)?;
+        let target = target.get();
+        if target > resampled.len() {
+            resampled.try_reserve_exact(target-resampled.len()).map_err(|e|AudioPreprocessError::InvalidConfig(format!("allocate {target}-sample analysis window: {e}; reduce the target frame count or free host memory")))?;
+        }
         resampled.resize(target, 0.0);
         self.extract_resampled(&resampled)
     }
@@ -261,37 +332,183 @@ fn normalize_log_mel(features: &mut [f32]) {
     }
 }
 
-/// Decodes integer 16-bit PCM WAV bytes and mixes all channels to mono.
-pub fn decode_wav_pcm16(bytes: &[u8]) -> Result<DecodedAudio, AudioPreprocessError> {
-    let mut reader = hound::WavReader::new(Cursor::new(bytes))?;
-    let spec = reader.spec();
-    if spec.sample_rate == 0 {
+/// Decode encoded audio through Symphonia's registered demuxers and codecs.
+/// Content determines the format, including WAV integer/float PCM and ADPCM.
+/// Channels are averaged to mono without resampling; codec delay/padding is
+/// removed when the stream supplies gapless metadata. hound is encoding-only.
+pub fn decode_audio(bytes: &[u8]) -> Result<DecodedAudio, AudioPreprocessError> {
+    use symphonia::core::{
+        codecs::audio::AudioDecoderOptions,
+        formats::{FormatOptions, TrackType, probe::Hint},
+        io::MediaSourceStream,
+        meta::MetadataOptions,
+    };
+    let invalid = AudioPreprocessError::Encoded;
+    let stream = MediaSourceStream::new(Box::new(Cursor::new(bytes)), Default::default());
+    let mut format = symphonia::default::get_probe()
+        .probe(
+            &Hint::new(),
+            stream,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|e| AudioPreprocessError::Codec {
+            context: "cannot identify a supported audio container".into(),
+            source: e,
+        })?;
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or_else(|| invalid("container has no decodable audio track; supply an audio recording or a container with an audio track".into()))?;
+    let params = track
+        .codec_params
+        .as_ref()
+        .and_then(|params| params.audio())
+        .ok_or_else(|| {
+            invalid(
+                "audio track has no codec parameters; supply a valid encoded audio track".into(),
+            )
+        })?;
+    if params.sample_rate == Some(0) {
         return Err(AudioPreprocessError::InvalidSampleRate);
     }
-    if spec.sample_format != hound::SampleFormat::Int || spec.bits_per_sample != 16 {
-        return Err(AudioPreprocessError::UnsupportedWav(format!(
-            "expected 16-bit integer PCM, got {:?} with {} bits",
-            spec.sample_format, spec.bits_per_sample
-        )));
+    if params
+        .channels
+        .as_ref()
+        .is_some_and(|channels| channels.count() == 0)
+    {
+        return Err(invalid("audio track declares zero channels".into()));
     }
-    if spec.channels == 0 {
-        return Err(AudioPreprocessError::UnsupportedWav(
-            "channel count is zero".to_owned(),
-        ));
+    let empty_spec = params
+        .sample_rate
+        .filter(|rate| *rate > 0)
+        .zip(params.channels.clone())
+        .map(|(rate, channels)| symphonia::core::audio::AudioSpec::new(rate, channels));
+    let declared_frames = track.num_frames;
+    let time_base = track.time_base;
+    let track_id = track.id;
+    let container = format.format_info().short_name;
+    let codec = format!("{:?}", params.codec);
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(params, &AudioDecoderOptions::default())
+        .map_err(|e| AudioPreprocessError::Codec {
+            context: format!(
+                "cannot initialize {container} audio track {track_id} decoder for codec {codec}"
+            ),
+            source: e,
+        })?;
+    let mut specification = None;
+    let mut samples = Vec::new();
+    let mut interleaved = Vec::<f32>::new();
+    let mut packet_index = 0usize;
+    while let Some(packet) = format
+        .next_packet()
+        .map_err(|e| AudioPreprocessError::Codec {
+            context: format!("cannot read {container} audio packet"),
+            source: e,
+        })?
+    {
+        if packet.track_id != track_id {
+            continue;
+        }
+        packet_index += 1;
+        let decoded = decoder
+            .decode(&packet)
+            .map_err(|e| AudioPreprocessError::Codec {context:format!("cannot decode {container} audio track {track_id} packet {packet_index} ({codec})"),source:e})?;
+        let spec = decoded.spec();
+        let channels = spec.channels().count();
+        if spec.rate() == 0 || channels == 0 {
+            return Err(invalid(
+                "decoded audio packet declares zero sample rate or channels".into(),
+            ));
+        }
+        if specification
+            .as_ref()
+            .is_some_and(|previous| previous != spec)
+        {
+            return Err(invalid("audio sample rate/channel layout changes within one clip; split or normalize the recording".into()));
+        }
+        specification.get_or_insert_with(|| spec.clone());
+        let count = decoded.samples_interleaved();
+        interleaved
+            .try_reserve(count.saturating_sub(interleaved.len()))
+            .map_err(|e| {
+                invalid(format!(
+                    "cannot allocate audio packet sample buffer: {e}; shorten the recording"
+                ))
+            })?;
+        interleaved.resize(count, 0.0);
+        decoded.copy_to_slice_interleaved(&mut interleaved);
+        if !interleaved.len().is_multiple_of(channels)
+            || interleaved.iter().any(|sample| !sample.is_finite())
+        {
+            return Err(invalid(
+                "audio decoder produced partial-channel frames or nonfinite samples".into(),
+            ));
+        }
+        let presented = presented_frames(&packet, time_base, spec.rate(), decoded.frames())?;
+        let start=presented.start.checked_mul(channels).ok_or_else(||invalid("audio presentation start exceeds the packet buffer; provide consistent frame/channel metadata".into()))?;
+        let end=presented.end.checked_mul(channels).ok_or_else(||invalid("audio presentation end exceeds the packet buffer; provide consistent frame/channel metadata".into()))?;
+        let interleaved = &interleaved[start..end];
+        samples
+            .try_reserve(interleaved.len() / channels)
+            .map_err(|e| {
+                invalid(format!(
+                    "cannot grow decoded audio waveform: {e}; shorten the recording"
+                ))
+            })?;
+        for frame in interleaved.chunks_exact(channels) {
+            samples.push(
+                (frame.iter().map(|sample| f64::from(*sample)).sum::<f64>() / channels as f64)
+                    as f32,
+            );
+        }
     }
-
-    let channels = usize::from(spec.channels);
-    let interleaved = reader.samples::<i16>().collect::<Result<Vec<_>, _>>()?;
-    let mut samples = Vec::with_capacity(interleaved.len() / channels);
-    for frame in interleaved.chunks_exact(channels) {
-        let sum = frame.iter().map(|&sample| f32::from(sample)).sum::<f32>();
-        samples.push(sum / channels as f32 / 32768.0);
-    }
-
+    let spec = specification.or_else(|| if declared_frames == Some(0) {empty_spec} else {None})
+        .ok_or_else(|| invalid(format!("{container} audio track {track_id} contains no decoded audio packets (declared frames {declared_frames:?}); supply a complete recording")))?;
     Ok(DecodedAudio {
         samples,
-        sample_rate: spec.sample_rate,
+        sample_rate: spec.rate(),
     })
+}
+
+/// Use exact packet timing only. Decoders may already apply gapless trimming;
+/// preserve those buffers and bound untrimmed buffers by declared valid frames.
+/// Coarse/non-integral clocks and unknown durations never invent a sample cut.
+fn presented_frames(
+    packet: &symphonia::core::packet::Packet,
+    time_base: Option<symphonia::core::units::TimeBase>,
+    sample_rate: u32,
+    decoded: usize,
+) -> Result<std::ops::Range<usize>, AudioPreprocessError> {
+    let Some(time_base) = time_base else {
+        return Ok(0..decoded);
+    };
+    let frames=|duration:symphonia::core::units::Duration|->Result<Option<usize>,AudioPreprocessError>{
+        let numerator=u128::from(duration.get())*u128::from(time_base.numer.get())*u128::from(sample_rate);
+        let denominator=u128::from(time_base.denom.get());
+        if !numerator.is_multiple_of(denominator){return Ok(None);}
+        usize::try_from(numerator/denominator).map(Some).map_err(|_|AudioPreprocessError::Encoded("audio packet timing exceeds the host sample-count range; shorten the recording or correct its time base".into()))
+    };
+    let (Some(valid), Some(start), Some(end)) = (
+        frames(packet.dur)?,
+        frames(packet.trim_start)?,
+        frames(packet.trim_end)?,
+    ) else {
+        return Ok(0..decoded);
+    };
+    if decoded <= valid {
+        return Ok(0..decoded);
+    }
+    let total=valid.checked_add(start).and_then(|n|n.checked_add(end)).ok_or_else(||AudioPreprocessError::Encoded("audio packet duration and trim lengths overflow; correct the stream's timing metadata".into()))?;
+    if total == 0 {
+        return Ok(0..decoded);
+    }
+    if decoded < total {
+        return Err(AudioPreprocessError::Encoded(format!(
+            "decoded audio packet has {decoded} frames but declares {valid} valid + {start}/{end} trim frames; partial decoder trimming is ambiguous, so convert this recording to WAV/FLAC"
+        )));
+    }
+    Ok(start..start + valid)
 }
 
 /// How a waveform is cut into transcribable segments.
@@ -454,44 +671,105 @@ impl StreamSegmenter {
     }
 }
 
-/// Encodes `[-1, 1]` float samples as 16-bit integer PCM WAV bytes.
-///
-/// The inverse of [`decode_wav_pcm16`], for handing a synthesized waveform back
-/// to a caller. `channels` interleaved frames are written as-is; values outside
-/// `[-1, 1]` are clamped rather than allowed to wrap.
+/// Encode integer PCM16 WAV output; finite amplitudes outside [-1,1] are clipped.
 pub fn encode_wav_pcm16(
     samples: &[f32],
     sample_rate: u32,
     channels: u16,
 ) -> Result<Vec<u8>, AudioPreprocessError> {
-    if channels == 0 {
-        return Err(AudioPreprocessError::UnsupportedWav(
-            "channel count is zero".to_owned(),
-        ));
+    encode_wav(samples, sample_rate, channels, WavEncoding::Pcm16)
+}
+/// Preserve finite float32 waveform samples exactly in an encoded input container.
+/// This avoids quantizing file/live segments before the workflow decodes them.
+pub fn encode_wav_f32(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+) -> Result<Vec<u8>, AudioPreprocessError> {
+    encode_wav(samples, sample_rate, channels, WavEncoding::Float32)
+}
+enum WavEncoding {
+    Pcm16,
+    Float32,
+}
+fn encode_wav(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+    encoding: WavEncoding,
+) -> Result<Vec<u8>, AudioPreprocessError> {
+    if channels == 0 || !samples.len().is_multiple_of(usize::from(channels)) {
+        return Err(AudioPreprocessError::InvalidConfig(format!(
+            "WAV encoder has {channels} channels for {} interleaved samples; use positive channels and complete channel frames",
+            samples.len()
+        )));
     }
     if sample_rate == 0 {
-        return Err(AudioPreprocessError::UnsupportedWav(
-            "sample rate is zero".to_owned(),
+        return Err(AudioPreprocessError::InvalidSampleRate);
+    }
+    if samples.iter().any(|sample| !sample.is_finite()) {
+        return Err(AudioPreprocessError::InvalidConfig(
+            "WAV encoder received nonfinite samples; supply a finite waveform before encoding"
+                .into(),
         ));
     }
+    let (bits_per_sample, sample_format) = match encoding {
+        WavEncoding::Pcm16 => (16, hound::SampleFormat::Int),
+        WavEncoding::Float32 => (32, hound::SampleFormat::Float),
+    };
     let spec = hound::WavSpec {
         channels,
         sample_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
+        bits_per_sample,
+        sample_format,
     };
     let mut buffer = Cursor::new(Vec::new());
     {
         let mut writer = hound::WavWriter::new(&mut buffer, spec)?;
-        for &sample in samples {
-            // i16::MIN..=i16::MAX is asymmetric, so scale by 32767 and clamp;
-            // scaling by 32768 would wrap a full-scale -1.0..1.0 signal.
-            let scaled = (sample.clamp(-1.0, 1.0) * 32767.0).round();
-            writer.write_sample(scaled as i16)?;
+        match encoding {
+            WavEncoding::Pcm16 => {
+                for sample in samples {
+                    writer.write_sample((sample.clamp(-1.0, 1.0) * 32767.0).round() as i16)?;
+                }
+            }
+            WavEncoding::Float32 => {
+                for sample in samples {
+                    writer.write_sample(*sample)?;
+                }
+            }
         }
         writer.finalize()?;
     }
     Ok(buffer.into_inner())
+}
+
+fn resampled_length(
+    samples: usize,
+    input_rate: u32,
+    output_rate: u32,
+) -> Result<usize, AudioPreprocessError> {
+    if input_rate == 0 || output_rate == 0 {
+        return Err(AudioPreprocessError::InvalidSampleRate);
+    }
+    usize::try_from((samples as u128 * u128::from(output_rate) + u128::from(input_rate) / 2) / u128::from(input_rate))
+        .map_err(|_| AudioPreprocessError::InvalidConfig("resampled waveform length exceeds this host's address range; shorten the clip or reduce the target sample rate".into()))
+}
+fn resampled_valid_range(
+    valid: &std::ops::Range<usize>,
+    input_rate: u32,
+    output_rate: u32,
+    output_samples: usize,
+) -> std::ops::Range<usize> {
+    let start = (valid.start as u128 * u128::from(output_rate) / u128::from(input_rate))
+        .min(output_samples as u128) as usize;
+    let end = if valid.is_empty() {
+        start
+    } else {
+        (valid.end as u128 * u128::from(output_rate))
+            .div_ceil(u128::from(input_rate))
+            .min(output_samples as u128) as usize
+    };
+    start..end
 }
 
 fn resample(
@@ -506,8 +784,7 @@ fn resample(
         return Ok(samples.to_vec());
     }
 
-    let output_len =
-        (samples.len() as f64 * f64::from(output_rate) / f64::from(input_rate)).round() as usize;
+    let output_len = resampled_length(samples.len(), input_rate, output_rate)?;
     let ratio = f64::from(input_rate) / f64::from(output_rate);
     let cutoff = (f64::from(output_rate) / f64::from(input_rate)).min(1.0);
     const RADIUS: isize = 16;
@@ -696,7 +973,7 @@ mod tests {
             writer.finalize().unwrap();
         }
 
-        let decoded = decode_wav_pcm16(&bytes).unwrap();
+        let decoded = decode_audio(&bytes).unwrap();
 
         assert_eq!(decoded.sample_rate, 8_000);
         assert_eq!(decoded.samples.len(), expected.len());
@@ -1259,5 +1536,54 @@ outputs:
         let tensors = program.run(&[&wav]).unwrap();
         assert_eq!(tensors[0].shape, [1, 7, 12]);
         assert_eq!(tensors[1].data, AudioTensorData::Int64(vec![12]));
+    }
+}
+
+#[cfg(test)]
+mod audio_presentation_tests {
+    use super::*;
+    use std::num::NonZeroU32;
+    use symphonia::core::{
+        packet::Packet,
+        units::{Duration, TimeBase, Timestamp},
+    };
+    #[test]
+    fn packet_presentation_handles_trimmed_raw_partial_and_coarse_clocks_explicitly() {
+        let rate = 16000;
+        let clock = Some(TimeBase::new(
+            NonZeroU32::new(1).unwrap(),
+            NonZeroU32::new(rate).unwrap(),
+        ));
+        let mut packet = Packet::new(0, Timestamp::ZERO, Duration::new(576), Vec::<u8>::new());
+        assert_eq!(
+            presented_frames(&packet, clock, rate, 1024).unwrap(),
+            0..576
+        );
+        packet.trim_start = Duration::new(100);
+        packet.trim_end = Duration::new(24);
+        assert_eq!(
+            presented_frames(&packet, clock, rate, 700).unwrap(),
+            100..676
+        );
+        assert_eq!(presented_frames(&packet, clock, rate, 576).unwrap(), 0..576);
+        assert!(
+            presented_frames(&packet, clock, rate, 600)
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+        assert_eq!(presented_frames(&packet, None, rate, 700).unwrap(), 0..700);
+        let coarse = Some(TimeBase::new(
+            NonZeroU32::new(1).unwrap(),
+            NonZeroU32::new(1001).unwrap(),
+        ));
+        assert_eq!(
+            presented_frames(&packet, coarse, rate, 700).unwrap(),
+            0..700
+        );
+        packet.dur = Duration::ZERO;
+        packet.trim_start = Duration::ZERO;
+        packet.trim_end = Duration::ZERO;
+        assert_eq!(presented_frames(&packet, clock, rate, 700).unwrap(), 0..700);
     }
 }

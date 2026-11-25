@@ -1,0 +1,36 @@
+[
+  {
+    "name": "wrong-id",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "-p",
+      "onnx-runtime-ep-cpu",
+      "--lib",
+      "kernels::qmoe::tests::prefetch_group_driver_preserves_sparse_ids_and_two_live_payload_bound",
+      "--",
+      "--exact",
+      "--nocapture"
+    ],
+    "exit": 101,
+    "mutated_source_sha256": "3ef23504a0d05ce7b86ca1897fcd744dcac94419e9670ee5e35f20a91d20c2e4"
+  },
+  {
+    "name": "spawn-failure",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "-p",
+      "onnx-runtime-ep-cpu",
+      "--lib",
+      "kernels::qmoe::prefetch_spawn_failure_probe::returns_actionable_error_before_callbacks",
+      "--",
+      "--exact",
+      "--nocapture"
+    ],
+    "exit": 0,
+    "mutated_source_sha256": "7711aa016768a143d12ffe501e26380cca77e40d8acad7c7dd9d437237f07f87"
+  }
+]
