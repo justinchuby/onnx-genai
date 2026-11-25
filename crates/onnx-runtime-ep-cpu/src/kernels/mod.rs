@@ -1673,16 +1673,13 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(unique::UniqueFactory),
     );
-    rec.register(
-        OpKey::new("Dropout", "", 13),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(dropout::DropoutFactory),
-    );
-    rec.register(
-        OpKey::new("Dropout", "", 22),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(dropout::DropoutFactory),
-    );
+    for version in [13, 22] {
+        rec.register(
+            OpKey::new("Dropout", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(dropout::DropoutFactory { opset: version }),
+        );
+    }
     rec.register(
         OpKey::new("Pad", "", 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,

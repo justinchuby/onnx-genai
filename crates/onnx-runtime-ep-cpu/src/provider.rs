@@ -509,6 +509,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             deny!("DequantizePacked: {reason}");
         }
+        if op.op_type == "Dropout"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && let Err(reason) =
+                onnx_runtime_ir::dropout::validate_claim(op, opset, shapes, input_dtypes)
+        {
+            deny!("Dropout: {reason}");
+        }
         if op.op_type == "CompressedSparseAttention"
             && op.domain == "pkg.nxrt"
             && let Some(reason) = crate::kernels::compressed_sparse_attention::unsupported_reason(

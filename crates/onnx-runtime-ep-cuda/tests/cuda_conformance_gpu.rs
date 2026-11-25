@@ -55,8 +55,10 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use common::{
-    Tensor, assert_close, decode_floats, float_input, input, require_cuda, run_cpu, run_cuda,
+    Tensor, absent_input, assert_close, build_graph, decode_floats, float_input, input,
+    require_cuda, run_cpu, run_cuda, try_run_cuda,
 };
+use onnx_runtime_ep_api::ExecutionProvider;
 use onnx_runtime_ep_cuda::{CUDA_COVERED_OPS, CudaExecutionProvider};
 use onnx_runtime_ir::{Attribute, DataType};
 
@@ -680,16 +682,80 @@ fn dropout_cases() -> Vec<Case> {
             compare: Compare::ExactBytes,
         },
         Case {
-            label: "Dropout[i32,inference]".into(),
+            label: "Dropout[bf16,inference]".into(),
             op: "Dropout",
             domain: "",
             opset: 13,
-            inputs: vec![input(DataType::Int32, &[4], &[-7i32, 0, 3, 99])],
-            outputs: vec![(DataType::Int32, vec![4])],
+            inputs: vec![input(
+                DataType::BFloat16,
+                &[4],
+                &[0xbfe0u16, 0, 0x8000, 0x7fc1],
+            )],
+            outputs: vec![(DataType::BFloat16, vec![4])],
             attrs: vec![],
             compare: Compare::ExactBytes,
         },
     ]
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn dropout_22_inference_inputs_on_physical_cuda() {
+    let ep = require_cuda();
+    use DataType::*;
+    // Independent byte oracle: include signed zero and NaN payload encodings.
+    let x = input(Float8E4M3FN, &[4], &[0x38u8, 0x80, 0x7f, 0xb8]);
+    let ratio = input(Float8E5M2, &[], &[0x38u8]);
+    let no_ratio = absent_input(Undefined);
+    let evaluation = input(Bool, &[], &[0u8]);
+    let training = input(Bool, &[], &[1u8]);
+    let y = (Float8E4M3FN, vec![4]);
+    let mask = (Bool, vec![4]);
+
+    for (inputs, outputs, capture, expected) in [
+        (
+            vec![x.clone(), ratio.clone()],
+            vec![y.clone(), mask.clone()],
+            true,
+            vec![x.bytes.clone(), vec![1; 4]],
+        ),
+        (
+            vec![x.clone(), no_ratio.clone(), evaluation.clone()],
+            vec![y.clone()],
+            false,
+            vec![x.bytes.clone()],
+        ),
+        (
+            vec![x.clone(), ratio, evaluation],
+            vec![y.clone(), mask],
+            false,
+            vec![x.bytes.clone(), vec![1; 4]],
+        ),
+    ] {
+        let (graph, id) = build_graph("Dropout", "", 22, &inputs, &outputs, &[]);
+        let kernel = ep.get_kernel(graph.node(id), &[], 22).unwrap();
+        assert_eq!(
+            kernel.capture_support(),
+            if capture {
+                onnx_runtime_ep_api::CaptureSupport::Supported
+            } else {
+                onnx_runtime_ep_api::CaptureSupport::unsupported(
+                    "Dropout reads training_mode on the host; omit training_mode to capture inference",
+                )
+            }
+        );
+        assert_eq!(
+            run_cuda(&ep, "Dropout", "", 22, &inputs, &outputs, &[]),
+            expected
+        );
+    }
+
+    let error =
+        try_run_cuda(&ep, "Dropout", "", 22, &[x, no_ratio, training], &[y], &[]).unwrap_err();
+    assert!(error.to_string().contains("training_mode=true"), "{error}");
 }
 
 fn instance_normalization_cases() -> Vec<Case> {
