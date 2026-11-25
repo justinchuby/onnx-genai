@@ -2537,3 +2537,27 @@ forwarding and zero kernel construction, preserve existing parser declines, and
 cover Conv known/unknown rank behavior. The real ORT plugin regression retains
 three unsupported MoE/attention assignments on ORT's fallback provider while their
 sessions load successfully. No additional per-op quota or scheduler is introduced.
+
+
+### Complete the factory-owned metadata boundary
+
+The remaining fifteen kernel-specific CPU claim gates now travel with their
+registered factories, including sparse attention/MoE, indexing, Gemm and
+DeformConv. Shared ONNX schema gates stay in the provider. Registry resolution
+also makes the default domain spellings (`""` and `ai.onnx`) use the same kernel
+limits; versioned Scatter and DeformConv queries use the selected factory's
+schema revision, matching construction.
+
+CompressedSparseAttention shares a plain attribute parser between claim and
+construction. Claim no longer constructs and immediately drops a kernel just to
+validate attributes. A constructor observer with a positive control covers this
+boundary. No execution buffers, pools or resource grants are prepared by it.
+
+DeformConv's previously unreachable provider check is now a factory capability
+query. The shared IR attribute parser retains its required-input and three-to-five-slot
+arity checks, with errors now naming the missing slot or invalid count. Empty claim shapes defer rank validation
+because the current IR also uses them for unknown rank; known invalid ranks are
+still rejected, and concrete execution retains strict shape validation. Tests
+cover domain aliases, BF16 schema versions and partially unknown shapes. These
+are claim-time changes; they introduce no inference-path quota operations or
+performance, RSS or CUDA execution claim.
