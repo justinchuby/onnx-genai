@@ -11830,6 +11830,51 @@ mod ctc_transcription {
             .collect()
     }
     #[tokio::test]
+    async fn authored_feature_transcription_matches_encoded_native_workflow() {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows");
+        let encoded = app(AppState::load(
+            &fixtures.join("transcription_tokens"),
+            Some("speech".into()),
+        )
+        .unwrap());
+        let features = app(AppState::load(
+            &fixtures.join("transcription_features"),
+            Some("speech".into()),
+        )
+        .unwrap());
+        for (amplitude, expected_text) in [(0.0, "world"), (0.5, "hello")] {
+            let values = (0..512)
+                .map(|i| amplitude * (i as f32 * 0.23).sin())
+                .collect::<Vec<_>>();
+            let bytes = onnx_genai_preprocess::audio::encode_wav_f32(&values, 16000, 1).unwrap();
+            let mut results = Vec::new();
+            for router in [&encoded, &features] {
+                let (status, body) = send(
+                    router.clone(),
+                    "/v1/audio/transcriptions",
+                    &bytes,
+                    &[("model", "speech")],
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let result: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(result["text"], expected_text);
+                let (status, body) = send(
+                    router.clone(),
+                    "/v1/audio/transcriptions",
+                    &bytes,
+                    &[("model", "speech"), ("stream", "true")],
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(transcript_events(&body).last().unwrap(), &result);
+                results.push(result);
+            }
+            assert_eq!(results[0], results[1]);
+        }
+    }
+    #[tokio::test]
     async fn generative_waveform_transcription_executes_without_a_mel_output_contract() {
         let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/onnx_genai_workflows/transcription_tokens");
