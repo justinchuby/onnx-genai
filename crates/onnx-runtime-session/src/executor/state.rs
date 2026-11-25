@@ -782,10 +782,12 @@ pub(crate) struct Executor {
 }
 
 /// One successful metadata-only plan, scoped to this immutable executor graph.
-/// Shapes are derived solely from graph/weight metadata and these symbols;
+/// Bounds also depend on the provider execution context. Shapes are derived
+/// from graph/weight metadata and these symbols;
 /// growing-symbol classification supplies the remaining capacity-bound input.
 /// Store peaks, never borrowed addresses or admission/ownership proofs.
 pub(super) struct WorkspacePreparationMemo {
+    pub(super) context: onnx_runtime_ep_api::WorkspaceContextKey,
     pub(super) output_bindings: WorkspaceOutputBindings,
     pub(super) symbols: HashMap<SymbolId, usize>,
     pub(super) growing_symbols: HashSet<SymbolId>,

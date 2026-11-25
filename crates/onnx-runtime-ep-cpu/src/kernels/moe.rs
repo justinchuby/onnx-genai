@@ -278,25 +278,8 @@ impl MoEKernel {
         } else {
             rows
         };
-        let separate_gate = self.attributes.uses_separate_gate(has_fc3);
-        let widths = if self.attributes.is_gated(has_fc3) {
-            // A: gather -> activated; B: FC1+FC3 -> expert output.
-            [
-                hidden.max(inter),
-                fc1.checked_add(if separate_gate { inter } else { 0 })
-                    .ok_or_else(invalid)?
-                    .max(hidden),
-            ]
-        } else {
-            // A: gather -> expert output; B: FC1 -> in-place activation.
-            [hidden, inter]
-        };
-        let regions = widths.map(|width| {
-            let elements = bound.checked_mul(width).ok_or_else(invalid)?;
-            std::alloc::Layout::array::<f32>(elements).map_err(|_| invalid())
-        });
-        let [a, b] = regions;
-        WorkspaceLayout::new([a?, b?, accumulator])
+        let [a, b] = MoeWorkspace::bank_layouts(bound, hidden, inter, &self.attributes, has_fc3)?;
+        WorkspaceLayout::new([a, b, accumulator])
     }
 }
 
@@ -691,16 +674,21 @@ struct RoutingPlan {
 impl RoutingPlan {
     fn build(router: &[f32], rows: usize, experts: usize, k: usize, normalize: bool) -> Self {
         let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); experts];
+        let mut routing = RoutingScratch::default();
         for row in 0..rows {
-            for (expert, weight) in routing_weights(
-                &router[row * experts..(row + 1) * experts],
-                None,
-                k,
-                normalize,
-            ) {
+            for &(expert, weight) in routing
+                .weights(
+                    &router[row * experts..(row + 1) * experts],
+                    None,
+                    k,
+                    normalize,
+                )
+                .iter()
+            {
                 per_expert[expert].push((row as u32, weight));
             }
         }
+        drop(routing);
         let total = per_expert.iter().map(Vec::len).sum::<usize>();
         let mut slot_row = Vec::with_capacity(total);
         let mut slot_expert = Vec::with_capacity(total);
@@ -930,7 +918,7 @@ fn run_moe_per_expert<'out>(
         let slots = group.start..group.start + group.len;
         let expert_out = scratch.run_dense_expert(
             x,
-            &plan.slot_row[slots.clone()],
+            plan.slot_row[slots.clone()].iter().map(|&row| row as usize),
             DenseExpertWeights {
                 fc1: &fc1_weights[expert * fc1_size * hidden..(expert + 1) * fc1_size * hidden],
                 fc1_bias: fc1_bias.map(|b| &b[expert * fc1_size..(expert + 1) * fc1_size]),
@@ -1123,6 +1111,7 @@ impl ActivationBias for PendingActivationBias<'_> {
     }
 }
 
+#[inline]
 fn gated_activation_row(
     output: &mut [f32],
     fc1: &[f32],
@@ -1174,67 +1163,157 @@ fn apply_gated_activation(
 }
 
 /// Two exclusive banks, reused only after the previous phase's final read.
-struct MoeWorkspace<'a> {
-    input: ProjectionScratch<'a>,
-    projection: ProjectionScratch<'a>,
+pub(super) struct MoeWorkspace<'a> {
+    pub(super) input: ProjectionScratch<'a>,
+    pub(super) projection: ProjectionScratch<'a>,
 }
-struct DenseExpertWeights<'a> {
-    fc1: &'a [f32],
-    fc1_bias: Option<&'a [f32]>,
-    fc2: &'a [f32],
-    fc2_bias: Option<&'a [f32]>,
-    fc3: Option<&'a [f32]>,
-    fc3_bias: Option<&'a [f32]>,
+pub(super) struct DenseExpertWeights<'a> {
+    pub(super) fc1: &'a [f32],
+    pub(super) fc1_bias: Option<&'a [f32]>,
+    pub(super) fc2: &'a [f32],
+    pub(super) fc2_bias: Option<&'a [f32]>,
+    pub(super) fc3: Option<&'a [f32]>,
+    pub(super) fc3_bias: Option<&'a [f32]>,
 }
 impl MoeWorkspace<'_> {
+    /// One bank layout shared by dense and compressed expert execution.
+    /// The bound is routed rows; only whole-operator batching may multiply it.
+    pub(super) fn bank_layouts(
+        rows: usize,
+        hidden: usize,
+        inter: usize,
+        attributes: &MoeAttributes,
+        has_fc3: bool,
+    ) -> Result<[std::alloc::Layout; 2]> {
+        let invalid = || {
+            EpError::KernelFailed(format!(
+                "MoE expert workspace overflows for rows={rows}, hidden={hidden}, inter={inter}; reduce batch or projection dimensions"
+            ))
+        };
+        let fc1 = attributes.checked_fc1_size(inter, "MoE expert workspace")?;
+        let widths = if attributes.is_gated(has_fc3) {
+            [
+                hidden.max(inter),
+                fc1.checked_add(if attributes.uses_separate_gate(has_fc3) {
+                    inter
+                } else {
+                    0
+                })
+                .ok_or_else(invalid)?
+                .max(hidden),
+            ]
+        } else {
+            [hidden, inter]
+        };
+        let [a, b] = widths.map(|width| {
+            std::alloc::Layout::array::<f32>(rows.checked_mul(width).ok_or_else(invalid)?)
+                .map_err(|_| invalid())
+        });
+        Ok([a?, b?])
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn run_dense_expert(
+    pub(super) fn run_dense_expert(
         &mut self,
         x: &[f32],
-        row_indices: &[u32],
+        row_indices: impl ExactSizeIterator<Item = usize>,
         weights: DenseExpertWeights<'_>,
         fc1_size: usize,
         hidden: usize,
         inter: usize,
         attributes: &MoeAttributes,
     ) -> Result<&[f32]> {
+        let fc1 = DenseExpertProjection {
+            weights: weights.fc1,
+            out_features: fc1_size,
+            in_features: hidden,
+        };
+        let fc2 = DenseExpertProjection {
+            weights: weights.fc2,
+            out_features: hidden,
+            in_features: inter,
+        };
+        let fc3 = weights.fc3.map(|weights| DenseExpertProjection {
+            weights,
+            out_features: inter,
+            in_features: hidden,
+        });
+        self.run_expert_projections(
+            x,
+            row_indices,
+            &fc1,
+            weights.fc1_bias,
+            &fc2,
+            weights.fc2_bias,
+            fc3.as_ref(),
+            weights.fc3_bias,
+            attributes,
+            |projection, input, rows, bias, output| {
+                linear_grouped_into(
+                    input,
+                    rows,
+                    projection.weights,
+                    bias,
+                    projection.out_features,
+                    projection.in_features,
+                    output,
+                )
+            },
+        )
+    }
+
+    /// Each projection fills a caller bank; one exclusive decode lane may be
+    /// reused by the callback. Returned expert output borrows only these banks.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_expert_projections<P: ExpertProjection>(
+        &mut self,
+        x: &[f32],
+        mut row_indices: impl ExactSizeIterator<Item = usize>,
+        fc1_projection: &P,
+        fc1_bias: Option<&[f32]>,
+        fc2: &P,
+        fc2_bias: Option<&[f32]>,
+        fc3: Option<&P>,
+        fc3_bias: Option<&[f32]>,
+        attributes: &MoeAttributes,
+        mut apply: impl FnMut(&P, &[f32], usize, Option<&[f32]>, &mut [f32]) -> Result<()>,
+    ) -> Result<&[f32]> {
+        let hidden = fc1_projection.in_features();
+        let inter = fc2.in_features();
+        let fc1_size = fc1_projection.out_features();
+        let has_fc3 = fc3.is_some();
         let rows = row_indices.len();
         let input = if rows == 1 {
-            let start = row_indices[0] as usize * hidden;
-            &x[start..start + hidden]
+            let row = row_indices.next().expect("one routed row");
+            let input = row
+                .checked_mul(hidden)
+                .and_then(|start| x.get(start..))
+                .and_then(|tail| tail.get(..hidden));
+            input.ok_or_else(|| EpError::KernelFailed(format!(
+                "MoE expert input row {row} with hidden width {hidden} exceeds {} input values; validate routed row indices", x.len()
+            )))?
         } else {
-            self.input
-                .gather_rows(x, hidden, row_indices.iter().map(|&row| row as usize))?
+            self.input.gather_rows(x, hidden, row_indices)?
         };
-        let separate = attributes.uses_separate_gate(weights.fc3.is_some());
+        let separate = attributes.uses_separate_gate(fc3.is_some());
         let projections = self
             .projection
             .zeroed_prefix(rows * (fc1_size + if separate { inter } else { 0 }))?;
-        let (fc1, fc3) = projections.split_at_mut(rows * fc1_size);
-        linear_grouped_into(
-            input,
-            rows,
-            weights.fc1,
-            weights.fc1_bias,
-            fc1_size,
-            hidden,
-            fc1,
-        )?;
+        let (fc1, fc3_output) = projections.split_at_mut(rows * fc1_size);
+        apply(fc1_projection, input, rows, fc1_bias, fc1)?;
         let fc3 = if separate {
-            linear_grouped_into(
+            apply(
+                fc3.expect("validated separate FC3"),
                 input,
                 rows,
-                weights.fc3.expect("validated separate FC3"),
-                weights.fc3_bias,
-                inter,
-                hidden,
-                fc3,
+                fc3_bias,
+                fc3_output,
             )?;
-            Some(&*fc3)
+            Some(&*fc3_output)
         } else {
             None
         };
-        if attributes.is_gated(weights.fc3.is_some()) {
+        if attributes.is_gated(has_fc3) {
             let activated = self.input.zeroed_prefix(rows * inter)?;
             // Keep the per-expert activation serial, as before.
             if inter != 0 {
@@ -1250,30 +1329,14 @@ impl MoeWorkspace<'_> {
                 }
             }
             let output = self.projection.zeroed_prefix(rows * hidden)?;
-            linear_grouped_into(
-                activated,
-                rows,
-                weights.fc2,
-                weights.fc2_bias,
-                hidden,
-                inter,
-                output,
-            )?;
+            apply(fc2, activated, rows, fc2_bias, output)?;
             Ok(output)
         } else {
             for value in fc1.iter_mut() {
                 *value = activate(attributes.activation, *value);
             }
             let output = self.input.zeroed_prefix(rows * hidden)?;
-            linear_grouped_into(
-                fc1,
-                rows,
-                weights.fc2,
-                weights.fc2_bias,
-                hidden,
-                inter,
-                output,
-            )?;
+            apply(fc2, fc1, rows, fc2_bias, output)?;
             Ok(output)
         }
     }
@@ -1353,6 +1416,7 @@ pub(super) fn run_expert(
     linear(&activated, fc2_weights, fc2_bias, hidden, inter)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_expert_grouped(
     input: &[f32],
@@ -1417,6 +1481,7 @@ impl ExpertProjection for DenseExpertProjection<'_> {
         self.in_features
     }
 }
+#[cfg(test)]
 impl DenseExpertProjection<'_> {
     fn apply(&self, input: &[f32], rows: usize, bias: Option<&[f32]>) -> Result<Vec<f32>> {
         linear_grouped(
@@ -1430,6 +1495,7 @@ impl DenseExpertProjection<'_> {
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_expert_projections<P: ExpertProjection>(
     input: &[f32],
@@ -1464,15 +1530,20 @@ pub(super) fn run_expert_projections<P: ExpertProjection>(
             } else {
                 let mut gate = Vec::with_capacity(rows * inter);
                 let mut linear = Vec::with_capacity(rows * inter);
-                for row in fc1_out.chunks_exact(fc1_size) {
-                    if attributes.swiglu_fusion == 1 {
-                        for pair in row.as_chunks::<2>().0 {
-                            gate.push(pair[0]);
-                            linear.push(pair[1]);
+                // A zero-width projection has no gate/linear values. Avoid
+                // constructing a zero-sized chunk iterator; FC2 still runs for
+                // every routed row and supplies its zero-K bias result.
+                if fc1_size != 0 {
+                    for row in fc1_out.chunks_exact(fc1_size) {
+                        if attributes.swiglu_fusion == 1 {
+                            for pair in row.as_chunks::<2>().0 {
+                                gate.push(pair[0]);
+                                linear.push(pair[1]);
+                            }
+                        } else {
+                            gate.extend_from_slice(&row[..inter]);
+                            linear.extend_from_slice(&row[inter..]);
                         }
-                    } else {
-                        gate.extend_from_slice(&row[..inter]);
-                        linear.extend_from_slice(&row[inter..]);
                     }
                 }
                 (gate, linear)
@@ -1515,6 +1586,7 @@ pub(super) fn run_expert_projections<P: ExpertProjection>(
 /// for both operands. Neither materializes the `[in_features, out_features]`
 /// copy the old portable path built - a 29 MiB strided scatter per call for a
 /// Mixtral-sized expert, previously the single largest term in the operator.
+#[cfg(test)]
 fn linear_grouped(
     input: &[f32],
     rows: usize,
@@ -1602,7 +1674,69 @@ fn linear(
     output
 }
 
-pub(super) fn routing_weights(
+/// Dispatch-local routing metadata. Each call replaces all live entries while
+/// retaining capacity; callers must consume/copy the borrowed selection before
+/// routing the next row. Exactly min(k, logits.len()) entries are returned.
+#[derive(Default)]
+pub(super) struct RoutingScratch {
+    indices: Vec<usize>,
+    exponentials: Vec<f32>,
+    selected: Vec<(usize, f32)>,
+}
+
+impl RoutingScratch {
+    pub(super) fn weights(
+        &mut self,
+        logits: &[f32],
+        aggregation_weights: Option<&[f32]>,
+        k: usize,
+        normalize: bool,
+    ) -> &mut [(usize, f32)] {
+        self.indices.clear();
+        self.indices.extend(0..logits.len());
+        self.indices
+            .sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]).then_with(|| a.cmp(&b)));
+        self.indices.truncate(k);
+        self.selected.clear();
+        if let Some(weights) = aggregation_weights {
+            let denominator = if normalize {
+                self.indices.iter().map(|&i| weights[i]).sum()
+            } else {
+                1.0
+            };
+            self.selected.extend(self.indices.iter().map(|&i| {
+                let weight = if denominator == 0.0 {
+                    0.0
+                } else {
+                    weights[i] / denominator
+                };
+                (i, weight)
+            }));
+        } else {
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            self.exponentials.clear();
+            self.exponentials
+                .extend(logits.iter().map(|&v| (v - max).exp()));
+            let all_sum: f32 = self.exponentials.iter().sum();
+            let denominator = if normalize {
+                self.indices.iter().map(|&i| self.exponentials[i]).sum()
+            } else {
+                all_sum
+            };
+            self.selected.extend(
+                self.indices
+                    .iter()
+                    .map(|&i| (i, self.exponentials[i] / denominator)),
+            );
+        }
+        &mut self.selected
+    }
+}
+
+// Frozen pre-scratch algorithm: independent oracle for routing and the existing
+// full-kernel expected-value tests, never a production compatibility surface.
+#[cfg(test)]
+pub(super) fn reference_routing_weights(
     logits: &[f32],
     aggregation_weights: Option<&[f32]>,
     k: usize,
@@ -1642,6 +1776,142 @@ pub(super) fn routing_weights(
         .into_iter()
         .map(|i| (i, exponentials[i] / denominator))
         .collect()
+}
+
+#[cfg(test)]
+mod routing_scratch_tests {
+    use super::{RoutingScratch, reference_routing_weights};
+
+    fn assert_selection_bits(actual: &[(usize, f32)], expected: &[(usize, f32)]) {
+        assert_eq!(actual.len(), expected.len());
+        for (position, ((actual_expert, actual_weight), (expert, weight))) in
+            actual.iter().zip(expected).enumerate()
+        {
+            assert_eq!(actual_expert, expert, "selection {position}");
+            assert_eq!(
+                actual_weight.to_bits(),
+                weight.to_bits(),
+                "weight {position}"
+            );
+        }
+    }
+
+    #[test]
+    fn reused_routing_preserves_reference_bits_across_geometry_and_special_values() {
+        let mut scratch = RoutingScratch::default();
+        let patterns = [
+            vec![2., 2., -0., 0., -2., 1.],
+            vec![f32::INFINITY, f32::NEG_INFINITY, f32::MAX, -f32::MAX],
+            vec![
+                f32::from_bits(0x7fc0_0001),
+                0.,
+                f32::from_bits(0xffc0_0051),
+                -0.,
+            ],
+            vec![f32::NEG_INFINITY],
+            vec![f32::INFINITY],
+        ];
+        // Grow, shrink, regrow and switch aggregation modes on the same owner.
+        for width in [0usize, 1, 7, 65, 257, 2, 16, 0, 257, 1] {
+            for pattern in &patterns {
+                let logits: Vec<_> = (0..width).map(|i| pattern[i % pattern.len()]).collect();
+                let zeros = vec![0.; width];
+                let weights: Vec<_> = (0..width)
+                    .map(|i| [1., -1., 0., -0., f32::INFINITY, f32::from_bits(0x7fc0_0032)][i % 6])
+                    .collect();
+                for k in [0, 1, width / 2, width, width + 5, usize::MAX] {
+                    for normalize in [false, true] {
+                        for aggregation in [None, Some(zeros.as_slice()), Some(weights.as_slice())]
+                        {
+                            let expected =
+                                reference_routing_weights(&logits, aggregation, k, normalize);
+                            let selected = scratch.weights(&logits, aggregation, k, normalize);
+                            assert_eq!(selected.len(), k.min(width));
+                            assert_selection_bits(selected, &expected);
+                            // BlockQuantizedMoE consumes expert-sorted selections.
+                            // That mutation must not leak into the next score order.
+                            selected.sort_unstable_by_key(|&(expert, _)| expert);
+                            assert_selection_bits(
+                                scratch.weights(&logits, aggregation, k, normalize),
+                                &expected,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn routing_matches_sorted_reference_for_permuted_bits_and_selection_boundaries() {
+        let mut scratch = RoutingScratch::default();
+        let mut seed = 0x91e1_0da5u32;
+        for width in [0usize, 1, 2, 8, 17, 64, 257, 1024] {
+            let mut logits = Vec::with_capacity(width);
+            for _ in 0..width {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                logits.push(f32::from_bits(seed));
+            }
+            if width > 7 {
+                logits[..8].copy_from_slice(&[
+                    f32::from_bits(0x7fc0_0032),
+                    f32::from_bits(0xffc0_0021),
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                    0.,
+                    -0.,
+                    1.,
+                    1.,
+                ]);
+            }
+            let aggregation: Vec<_> = (0..width).map(|i| [1., -1., 0., 0.25][i % 4]).collect();
+            let ks: Vec<_> = if width < 18 {
+                (0..=width + 1).collect()
+            } else {
+                vec![0, 1, 2, width / 2, width - 1, width, width + 1]
+            };
+            for k in ks {
+                for normalize in [false, true] {
+                    for weights in [None, Some(aggregation.as_slice())] {
+                        let expected = reference_routing_weights(&logits, weights, k, normalize);
+                        assert_selection_bits(
+                            scratch.weights(&logits, weights, k, normalize),
+                            &expected,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn routing_keeps_total_order_ties_signed_zero_and_zero_denominator() {
+        let mut scratch = RoutingScratch::default();
+        let logits = [2., 2., -0., 0., f32::NEG_INFINITY];
+        let weights = [1., -1., 7., -7., 0.];
+        assert_selection_bits(
+            scratch.weights(&logits, Some(&weights), 5, false),
+            &[(0, 1.), (1, -1.), (3, -7.), (2, 7.), (4, 0.)],
+        );
+        assert_selection_bits(
+            scratch.weights(&logits, Some(&weights), 2, true),
+            &[(0, 0.), (1, 0.)],
+        );
+        let logits = [
+            f32::from_bits(0x7fc0_0001),
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(0xffc0_0001),
+            0.,
+            -0.,
+        ];
+        let ones = [1.; 6];
+        let selected = scratch.weights(&logits, Some(&ones), 6, false);
+        assert_eq!(
+            selected.iter().map(|&(i, _)| i).collect::<Vec<_>>(),
+            [0, 1, 4, 5, 2, 3]
+        );
+    }
 }
 
 fn activate(activation: Activation, value: f32) -> f32 {
@@ -1795,10 +2065,26 @@ mod tests {
 
     #[test]
     fn gated_row_bias_states_preserve_layouts_and_signed_zero() {
-        let gate = [-0.0, -2.0, 3.0];
-        let linear = [1.0, 2.0, -3.0];
-        let gate_bias = [0.0, 0.25, -0.5];
-        let linear_bias = [0.0, -0.5, 0.75];
+        let gate = black_box([-0.0, -2.0, 3.0]);
+        let linear = black_box([1.0, 2.0, -3.0]);
+        let gate_bias = black_box([0.0, 0.25, -0.5]);
+        let linear_bias = black_box([0.0, -0.5, 0.75]);
+        // Observe rounding at the bias boundary itself. Once inlined through
+        // min/clamp, optimized activation code can fold zero expressions
+        // differently from a compile-time-constant scalar oracle.
+        let zero = black_box(-0.0_f32);
+        assert_eq!(
+            AppliedActivationBias.value(false, 0, zero).to_bits(),
+            (-0.0_f32).to_bits()
+        );
+        for fc1 in [None, Some(&gate_bias[..])] {
+            assert_eq!(
+                PendingActivationBias { fc1, linear: None }
+                    .value(false, 0, zero)
+                    .to_bits(),
+                0.0_f32.to_bits()
+            );
+        }
         for fusion in 0..=2 {
             let attributes = MoeAttributes {
                 k: 1,
@@ -1825,8 +2111,9 @@ mod tests {
                 &attributes,
                 AppliedActivationBias,
             );
-            let expected =
-                std::array::from_fn::<_, 3, _>(|i| attributes.swiglu(gate[i], linear[i]));
+            let expected = std::array::from_fn::<_, 3, _>(|i| {
+                attributes.swiglu(black_box(gate[i]), black_box(linear[i]))
+            });
             assert_eq!(applied.map(f32::to_bits), expected.map(f32::to_bits));
             assert_eq!(applied[0].to_bits(), (-0.0f32).to_bits());
             for biased in [false, true] {
@@ -1849,12 +2136,17 @@ mod tests {
                 );
                 let expected = std::array::from_fn::<_, 3, _>(|i| {
                     attributes.swiglu(
-                        gate[i] + if biased { gate_bias[i] } else { 0.0 },
-                        linear[i] + if biased { linear_bias[i] } else { 0.0 },
+                        black_box(gate[i]) + if biased { black_box(gate_bias[i]) } else { 0.0 },
+                        black_box(linear[i])
+                            + if biased {
+                                black_box(linear_bias[i])
+                            } else {
+                                0.0
+                            },
                     )
                 });
                 assert_eq!(pending.map(f32::to_bits), expected.map(f32::to_bits));
-                assert_eq!(pending[0].to_bits(), 0.0f32.to_bits());
+                assert_eq!(pending[0], 0.0);
             }
         }
     }
@@ -2531,9 +2823,12 @@ mod tests {
         let attributes = MoeAttributes::from_node(graph.node(node)).unwrap();
         let mut dense = vec![0.0f32; ROWS * HIDDEN];
         for row in 0..ROWS {
-            for (expert, weight) in
-                routing_weights(&router[row * EXPERTS..(row + 1) * EXPERTS], None, 2, true)
-            {
+            for (expert, weight) in reference_routing_weights(
+                &router[row * EXPERTS..(row + 1) * EXPERTS],
+                None,
+                2,
+                true,
+            ) {
                 let expert_output = run_expert(
                     &input[row * HIDDEN..(row + 1) * HIDDEN],
                     &fc1[expert * INTER * HIDDEN..(expert + 1) * INTER * HIDDEN],
@@ -2989,7 +3284,7 @@ mod tests {
     ) -> Vec<f32> {
         let mut dense = vec![0.0f32; rows * hidden];
         for row in 0..rows {
-            for (expert, weight) in routing_weights(
+            for (expert, weight) in reference_routing_weights(
                 &router[row * experts..(row + 1) * experts],
                 None,
                 k,
@@ -3224,7 +3519,7 @@ mod tests {
         let mut output = vec![0.0f32; rows * hidden];
         let mut tasks = BTreeMap::<usize, Vec<(usize, f32)>>::new();
         for row in 0..rows {
-            for (expert, weight) in routing_weights(
+            for (expert, weight) in reference_routing_weights(
                 &router[row * experts..(row + 1) * experts],
                 None,
                 attributes.k,

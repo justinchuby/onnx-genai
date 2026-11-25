@@ -30,7 +30,7 @@ The supported surface and explicit limitations are documented in
 - [ ] Responses and Anthropic Messages, including tools and streamed event contracts.
 - [ ] Generation controls/sampling and reporting needed by the upstream frontend.
 - [ ] Capability-backed ranking, adapter and slot/state operations; audit the engine boundary before introducing transport support.
-- [ ] Model catalogue/download semantics and audio transports; preserve explicit configuration and resource bounds.
+- [ ] Complete model catalogue/source-format semantics and audio transports; preserve explicit configuration and resource bounds. Native-package download, resume and deletion are implemented; GGUF import and sidecar selection remain open.
 - [ ] Full compatibility matrix and executable conformance tests.
 - [ ] Fresh full checks, adversarial self-review, PR description update and merge (CI is currently blocked; user authorized merging after local verification).
 
@@ -1862,6 +1862,55 @@ converted probabilities through engine-result ownership. A native ONNX fixture
 changes its decisions with the input; it does not simulate a chat answer.
 
 This increment does not establish all upstream decision-model conformance.
-Multimodal inputs, per-model request defaults, joint/packed heads and shared
-workflow entry points remain required; [SystemOne](SYSTEMONE.md) records the
+Multimodal inputs, joint/packed heads and shared workflow entry points remain
+required; [SystemOne](SYSTEMONE.md) records the
 current executable contract and explicit gaps. Server tools remain out of scope.
+
+
+### Declared SystemOne input contracts
+
+Core schema v1.11 requires explicit `decision.input_policy`. A single engine
+question factory admits defaults, required/optional/forbidden instructions,
+payload types, enabled question kinds, dynamic/fixed choices, request/lexical
+order, declared score ranges, boolean alias/order rules and legend formatting.
+The HTTP transport supplies its operator limits; it does not duplicate question
+interpretation. Immutable questions/results retain their admitted contract, with
+fixed options and default instructions borrowed from that owner. No model-name
+branch selects request semantics. Schema v1.10 keeps its published contract.
+
+Native inference tests exercise missing/null/non-string default types, changed
+choice ordering, true-first boolean heads, canonical-null alias precedence,
+fixed tasks and one-/eleven-level dynamic score heads. HTTP tests cover authored
+limits, payload rejection and wire legends. These tests establish text decision
+behavior for the authored fixtures; they do not establish media or GGUF support.
+
+
+## Managed native-package downloads
+
+`--model-cache-dir` enables `/models` download/delete and cache-backed load/unload
+without enabling `/v1/admin/*`. A validated Hub plan pins one immutable commit;
+partial files, full quota reservations and publication manifests survive
+restart. Canonical registry entries own transfer or package state, and native
+worker lifetimes retain package ownership until their threads stop. Only
+server-owned cache entries can be removed.
+
+The SSE stream reports upstream model envelopes with actual per-file counters,
+bounded notification storage and consumer-side coalescing. Pause and retry
+retain the original plan and byte prefixes. Model revision changes require
+explicit deletion first. See [model management](MODEL_MANAGEMENT.md) for public
+requests, limits and unsupported GGUF/sidecar source selections.
+
+
+## Multimodal reranking
+
+Core schema v1.12 and reranking v2 declare ordered query/document encoded-image
+endpoints and authoritative workflow token usage. Prepared pairs carry their
+admitted contract and shared media ownership into the ordinary worker command.
+The HTTP layer admits all image positions before fetch, bounds the retained
+request media, and preserves Jina/TEI response semantics.
+
+Reusable image-preprocess@2 binds program output names to component-local ports;
+each invocation publishes its own SSA values. ABI v1 keeps its established
+workflow-scoped single-invocation contract. Chat media capabilities derive from
+runtime Media roles, independently of task-owned application inputs. See
+[reranking](RERANKING.md) for the public contract and native fixture.
