@@ -1843,6 +1843,48 @@ mod routing_scratch_tests {
     }
 
     #[test]
+    fn routing_matches_sorted_reference_for_permuted_bits_and_selection_boundaries() {
+        let mut scratch = RoutingScratch::default();
+        let mut seed = 0x91e1_0da5u32;
+        for width in [0usize, 1, 2, 8, 17, 64, 257, 1024] {
+            let mut logits = Vec::with_capacity(width);
+            for _ in 0..width {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                logits.push(f32::from_bits(seed));
+            }
+            if width > 7 {
+                logits[..8].copy_from_slice(&[
+                    f32::from_bits(0x7fc0_0032),
+                    f32::from_bits(0xffc0_0021),
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                    0.,
+                    -0.,
+                    1.,
+                    1.,
+                ]);
+            }
+            let aggregation: Vec<_> = (0..width).map(|i| [1., -1., 0., 0.25][i % 4]).collect();
+            let ks: Vec<_> = if width < 18 {
+                (0..=width + 1).collect()
+            } else {
+                vec![0, 1, 2, width / 2, width - 1, width, width + 1]
+            };
+            for k in ks {
+                for normalize in [false, true] {
+                    for weights in [None, Some(aggregation.as_slice())] {
+                        let expected = reference_routing_weights(&logits, weights, k, normalize);
+                        assert_selection_bits(
+                            scratch.weights(&logits, weights, k, normalize),
+                            &expected,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn routing_keeps_total_order_ties_signed_zero_and_zero_denominator() {
         let mut scratch = RoutingScratch::default();
         let logits = [2., 2., -0., 0., f32::NEG_INFINITY];
