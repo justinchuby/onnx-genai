@@ -736,7 +736,10 @@ fn binary_static_shape_metadata_captures_replays_and_tracks_signatures() {
     let mut kernel = ep
         .get_kernel(&Node::new(NodeId(0), "Add", vec![], vec![]), &[], 17)
         .unwrap();
-    kernel.set_capture_seq_independent(true);
+    kernel.configure_shape_facts(onnx_runtime_ep_api::KernelShapeFacts {
+        capture_eligible: true,
+        ..Default::default()
+    });
     assert!(!kernel.cuda_graph_compatible());
 
     let output = TensorMut::new(
@@ -896,6 +899,7 @@ fn binary_static_shape_metadata_captures_replays_and_tracks_signatures() {
         &prefill_strides,
         device,
     );
+    ep.wait_for_deferred_releases().unwrap();
     let before_shape_change = runtime.allocation_counts();
     kernel
         .execute(&prefill_inputs, &mut [prefill_output])
@@ -935,7 +939,7 @@ fn binary_static_shape_metadata_captures_replays_and_tracks_signatures() {
 /// collapse to 1 — e.g. a head-major `[heads=32, feat=128]` decode tensor — is
 /// rejected by the runtime-extent heuristic (`is_fixed_decode_shape`) but must be
 /// admitted to capture once the executor reports the node's IR output shape is
-/// fully static via `set_capture_seq_independent(true)`. The same shape with the
+/// fully static via `configure_shape_facts` with capture permission. The same shape with the
 /// flag left `false` (as the executor does for a symbolic/growing seq axis) must
 /// stay eager. This is the metadata-driven gate that distinguishes
 /// `[heads=32, feat=128]` (capturable) from `[tokens=32, feat=128]` (unsafe),
@@ -1014,7 +1018,10 @@ fn seq_independent_static_shape_is_capture_eligible_via_metadata_flag() {
     let mut capture_kernel = ep
         .get_kernel(&Node::new(NodeId(0), "Add", vec![], vec![]), &[], 17)
         .unwrap();
-    capture_kernel.set_capture_seq_independent(true);
+    capture_kernel.configure_shape_facts(onnx_runtime_ep_api::KernelShapeFacts {
+        capture_eligible: true,
+        ..Default::default()
+    });
     let output = TensorMut::new(
         DevicePtrMut(y_buf.as_mut_ptr()),
         DataType::Float32,
@@ -1116,7 +1123,7 @@ fn execute_broadcast(
     b_shape: &[usize],
     output: &mut DeviceBuffer,
     output_shape: &[usize],
-) {
+) -> onnx_runtime_ep_api::Result<()> {
     let a_strides = compute_contiguous_strides(a_shape);
     let b_strides = compute_contiguous_strides(b_shape);
     let output_strides = compute_contiguous_strides(output_shape);
@@ -1143,7 +1150,7 @@ fn execute_broadcast(
         &output_strides,
         ep.device_id(),
     );
-    kernel.execute(&inputs, &mut [output]).unwrap();
+    kernel.execute(&inputs, &mut [output])
 }
 
 fn exercise_broadcast_capture_owner(ep: &CudaExecutionProvider, case: BroadcastCaptureCase) {
@@ -1156,31 +1163,26 @@ fn exercise_broadcast_capture_owner(ep: &CudaExecutionProvider, case: BroadcastC
     let a = upload(ep, &case.a_values);
     let b = upload(ep, &case.b_values);
     let mut output = ep.allocate(case.expected.len(), 256).unwrap();
-    let mut kernel = ep
-        .get_kernel(
-            &Node::new(NodeId(0), case.op, vec![], vec![]),
-            &[],
-            case.opset,
-        )
-        .unwrap();
-    kernel.set_capture_seq_independent(true);
+    let mut node = Node::new(NodeId(0), case.op, vec![], vec![]);
+    if case.op == "BitShift" {
+        node.attributes
+            .insert("direction".into(), Attribute::String("LEFT".into()));
+    }
+    let mut kernel = ep.get_kernel(&node, &[], case.opset).unwrap();
+    kernel.configure_shape_facts(onnx_runtime_ep_api::KernelShapeFacts {
+        capture_eligible: true,
+        ..Default::default()
+    });
     assert!(
         !kernel.cuda_graph_compatible(),
-        "{} must remain capture-unsupported until its metadata is warmed",
+        "{} must be warmed",
         case.op
     );
-    assert!(
-        kernel.device_graph_resources().is_empty(),
-        "{} must not publish a metadata owner before warmup",
-        case.op
-    );
-    let error = runtime
-        .begin_graph_capture(&[kernel.as_ref()])
-        .expect_err("an unwarmed broadcast kernel must be rejected before CUDA capture");
+    assert!(kernel.device_graph_resources().is_empty());
+    let error = runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap_err();
     assert!(
         error.to_string().contains("rejected before begin_capture"),
-        "{} returned an unactionable unwarmed-capture error: {error}",
-        case.op
+        "{error}"
     );
     assert!(!runtime.is_capturing().unwrap());
 
@@ -1195,29 +1197,49 @@ fn exercise_broadcast_capture_owner(ep: &CudaExecutionProvider, case: BroadcastC
         &a_b_shape,
         &mut output,
         &a_shape,
-    );
+    )
+    .unwrap();
     assert_eq!(
         download(ep, &output, case.expected.len()),
         case.expected,
-        "{} warm output is incorrect",
+        "{} warm",
         case.op
     );
-    assert!(
-        kernel.cuda_graph_compatible(),
-        "{} must advertise capture only after a successful warm",
-        case.op
-    );
-    let resource = kernel.device_graph_resources();
+    assert!(kernel.cuda_graph_compatible());
+    let captured_resource = kernel.device_graph_resources()[0].identity();
+    let counters = || {
+        (
+            runtime.allocation_counts(),
+            runtime.transfer_counts(),
+            runtime.forced_synchronization_count(),
+        )
+    };
+    let warm_counts = counters();
+    for _ in 0..8 {
+        execute_broadcast(
+            ep,
+            kernel.as_ref(),
+            case.input_dtype,
+            case.output_dtype,
+            &a,
+            &a_shape,
+            &b,
+            &a_b_shape,
+            &mut output,
+            &a_shape,
+        )
+        .unwrap();
+    }
     assert_eq!(
-        resource.len(),
-        1,
-        "{} must publish its BroadcastMetadataCache owner",
+        counters(),
+        warm_counts,
+        "{} warm A must not allocate/upload/sync",
         case.op
     );
-    let captured_resource = resource[0].identity();
-    drop(resource);
 
     let graph_counts = runtime.graph_execution_counts();
+    let verify_counts =
+        runtime.graph_execution_counts_in(onnx_runtime_ep_api::DeviceGraphSlot::Verify);
     runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
     execute_broadcast(
         ep,
@@ -1230,51 +1252,79 @@ fn exercise_broadcast_capture_owner(ep: &CudaExecutionProvider, case: BroadcastC
         &a_b_shape,
         &mut output,
         &a_shape,
-    );
+    )
+    .unwrap();
     runtime.end_graph_capture().unwrap();
-    assert_eq!(
-        runtime.graph_segment_count().unwrap(),
-        1,
-        "{} capture must install one non-vacuous graph segment",
-        case.op
-    );
-    assert_eq!(
-        runtime.graph_execution_counts().captures,
-        graph_counts.captures + 1,
-        "{} capture was not installed",
-        case.op
-    );
-
-    let frees_before_drop = runtime.allocation_counts().frees;
-    let pooled_before_drop = runtime.raw_pool_retained_bytes();
-    drop(kernel);
-    assert_eq!(
-        runtime.allocation_counts().frees,
-        frees_before_drop,
-        "{} kernel drop freed metadata still retained by the graph",
-        case.op
-    );
-    assert_eq!(
-        runtime.raw_pool_retained_bytes(),
-        pooled_before_drop,
-        "{} kernel drop returned graph-retained metadata to the raw pool",
-        case.op
-    );
+    assert_eq!(runtime.graph_segment_count().unwrap(), 1);
 
     let rewarm_a = upload(ep, &case.rewarm_a_values);
     let rewarm_b = upload(ep, &case.rewarm_b_values);
     let mut rewarm_output = ep.allocate(case.rewarm_expected.len(), 256).unwrap();
-    let mut rewarm_kernel = ep
-        .get_kernel(
-            &Node::new(NodeId(1), case.op, vec![], vec![]),
-            &[],
-            case.opset,
+    #[cfg(feature = "gpu-tests")]
+    {
+        runtime.fail_warm_transaction_at_for_test(1);
+        let error = execute_broadcast(
+            ep,
+            kernel.as_ref(),
+            case.input_dtype,
+            case.output_dtype,
+            &rewarm_a,
+            &rewarm_shape,
+            &rewarm_b,
+            &rewarm_b_shape,
+            &mut rewarm_output,
+            &rewarm_shape,
         )
-        .unwrap();
-    rewarm_kernel.set_capture_seq_independent(true);
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("injected staged warm-cache failure"),
+            "{}: {error}",
+            case.op
+        );
+        assert_eq!(
+            kernel.device_graph_resources()[0].identity(),
+            captured_resource
+        );
+        assert!(
+            kernel.cuda_graph_compatible(),
+            "{} failure must preserve A proof",
+            case.op
+        );
+    }
+    // A failed candidate can retire asynchronously. Isolate the next counter window.
+    ep.wait_for_deferred_releases().unwrap();
+    let warm_counts = counters();
     execute_broadcast(
         ep,
-        rewarm_kernel.as_ref(),
+        kernel.as_ref(),
+        case.input_dtype,
+        case.output_dtype,
+        &a,
+        &a_shape,
+        &b,
+        &a_b_shape,
+        &mut output,
+        &a_shape,
+    )
+    .unwrap();
+    assert_eq!(
+        counters(),
+        warm_counts,
+        "{} failed rewarm must retain warm A",
+        case.op
+    );
+
+    runtime
+        .begin_graph_capture_in(
+            onnx_runtime_ep_api::DeviceGraphSlot::Verify,
+            &[kernel.as_ref()],
+        )
+        .unwrap();
+    let mismatch_counts = counters();
+    let error = execute_broadcast(
+        ep,
+        kernel.as_ref(),
         case.input_dtype,
         case.output_dtype,
         &rewarm_a,
@@ -1283,63 +1333,196 @@ fn exercise_broadcast_capture_owner(ep: &CudaExecutionProvider, case: BroadcastC
         &rewarm_b_shape,
         &mut rewarm_output,
         &rewarm_shape,
+    )
+    .unwrap_err()
+    .to_string();
+    runtime
+        .abort_graph_capture_in(onnx_runtime_ep_api::DeviceGraphSlot::Verify)
+        .unwrap();
+    assert!(
+        error.contains("dtype or shape changed"),
+        "{}: {error}",
+        case.op
+    );
+    assert_eq!(
+        counters(),
+        mismatch_counts,
+        "{} must refuse before device mutation",
+        case.op
+    );
+    assert_eq!(
+        kernel.device_graph_resources()[0].identity(),
+        captured_resource
+    );
+
+    execute_broadcast(
+        ep,
+        kernel.as_ref(),
+        case.input_dtype,
+        case.output_dtype,
+        &rewarm_a,
+        &rewarm_shape,
+        &rewarm_b,
+        &rewarm_b_shape,
+        &mut rewarm_output,
+        &rewarm_shape,
+    )
+    .unwrap();
+    assert_eq!(
+        download(ep, &rewarm_output, case.rewarm_expected.len()),
+        case.rewarm_expected,
+        "{} rewarm",
+        case.op
+    );
+    assert!(kernel.cuda_graph_compatible());
+    assert_ne!(
+        kernel.device_graph_resources()[0].identity(),
+        captured_resource
+    );
+    let warm_counts = counters();
+    for _ in 0..8 {
+        execute_broadcast(
+            ep,
+            kernel.as_ref(),
+            case.input_dtype,
+            case.output_dtype,
+            &rewarm_a,
+            &rewarm_shape,
+            &rewarm_b,
+            &rewarm_b_shape,
+            &mut rewarm_output,
+            &rewarm_shape,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        counters(),
+        warm_counts,
+        "{} warm B must not allocate/upload/sync",
+        case.op
+    );
+    runtime
+        .begin_graph_capture_in(
+            onnx_runtime_ep_api::DeviceGraphSlot::Verify,
+            &[kernel.as_ref()],
+        )
+        .unwrap();
+    execute_broadcast(
+        ep,
+        kernel.as_ref(),
+        case.input_dtype,
+        case.output_dtype,
+        &rewarm_a,
+        &rewarm_shape,
+        &rewarm_b,
+        &rewarm_b_shape,
+        &mut rewarm_output,
+        &rewarm_shape,
+    )
+    .unwrap();
+    runtime
+        .end_graph_capture_in(onnx_runtime_ep_api::DeviceGraphSlot::Verify)
+        .unwrap();
+    assert_eq!(
+        runtime.graph_execution_counts().captures,
+        graph_counts.captures + 1
+    );
+
+    assert_eq!(
+        runtime
+            .graph_execution_counts_in(onnx_runtime_ep_api::DeviceGraphSlot::Verify)
+            .captures,
+        verify_counts.captures + 1
+    );
+    ep.wait_for_deferred_releases().unwrap();
+    let before_drop = runtime.allocation_counts();
+    drop(kernel);
+    ep.wait_for_deferred_releases().unwrap();
+    assert_eq!(
+        runtime.allocation_counts(),
+        before_drop,
+        "{} graph owners must outlive kernel",
+        case.op
+    );
+    // SAFETY: the live output allocations cover the full poison uploads.
+    unsafe {
+        runtime
+            .htod(&vec![0xa5; case.expected.len()], cuptr(output.as_mut_ptr()))
+            .unwrap();
+        runtime
+            .htod(
+                &vec![0xa5; case.rewarm_expected.len()],
+                cuptr(rewarm_output.as_mut_ptr()),
+            )
+            .unwrap();
+    }
+    runtime.replay_graph().unwrap();
+    runtime
+        .replay_graph_in(onnx_runtime_ep_api::DeviceGraphSlot::Verify)
+        .unwrap();
+    assert_eq!(
+        download(ep, &output, case.expected.len()),
+        case.expected,
+        "{} old A graph",
+        case.op
     );
     assert_eq!(
         download(ep, &rewarm_output, case.rewarm_expected.len()),
         case.rewarm_expected,
-        "{} rewarm output is incorrect",
-        case.op
-    );
-    let rewarm_resources = rewarm_kernel.device_graph_resources();
-    assert_eq!(rewarm_resources.len(), 1);
-    assert_ne!(
-        rewarm_resources[0].identity(),
-        captured_resource,
-        "{} rewarm must not replace the owner retained by the installed graph",
-        case.op
-    );
-    drop(rewarm_resources);
-
-    let counts_before_rewarm_drop = runtime.allocation_counts();
-    let pooled_before_rewarm_drop = runtime.raw_pool_retained_bytes();
-    drop(rewarm_kernel);
-    assert!(
-        runtime.allocation_counts().frees > counts_before_rewarm_drop.frees
-            || runtime.raw_pool_retained_bytes() > pooled_before_rewarm_drop,
-        "{} dropping the uncaptured rewarm kernel must release its metadata owner",
-        case.op
-    );
-
-    unsafe {
-        runtime
-            .htod(&vec![0xa5; case.expected.len()], cuptr(output.as_mut_ptr()))
-            .unwrap()
-    };
-    runtime.replay_graph().unwrap();
-    assert_eq!(
-        download(ep, &output, case.expected.len()),
-        case.expected,
-        "{} replay used stale or recycled broadcast metadata after kernel drop/rewarm",
+        "{} new B graph",
         case.op
     );
     assert_eq!(runtime.check_capture_error().unwrap(), 0);
     assert_eq!(
         runtime.graph_execution_counts().replays,
-        graph_counts.replays + 1,
-        "{} installed graph was not replayed",
-        case.op
+        graph_counts.replays + 1
     );
 
-    let counts_before_reset = runtime.allocation_counts();
-    let pooled_before_reset = runtime.raw_pool_retained_bytes();
+    assert_eq!(
+        runtime
+            .graph_execution_counts_in(onnx_runtime_ep_api::DeviceGraphSlot::Verify)
+            .replays,
+        verify_counts.replays + 1
+    );
+
+    ep.wait_for_deferred_releases().unwrap();
+    let before_reset = runtime.allocation_counts();
     assert!(runtime.reset_graph().unwrap());
+    ep.wait_for_deferred_releases().unwrap();
     assert!(
-        runtime.allocation_counts().frees > counts_before_reset.frees
-            || runtime.raw_pool_retained_bytes() > pooled_before_reset,
-        "{} graph reset must release its retained metadata owner",
+        runtime.allocation_counts().frees > before_reset.frees,
+        "{} A graph must release owner",
         case.op
     );
-
+    // Resetting the old A graph must not retire B's independently pinned owner.
+    // SAFETY: the live B output covers this complete poison upload.
+    unsafe {
+        runtime
+            .htod(
+                &vec![0xa5; case.rewarm_expected.len()],
+                cuptr(rewarm_output.as_mut_ptr()),
+            )
+            .unwrap();
+    }
+    runtime
+        .replay_graph_in(onnx_runtime_ep_api::DeviceGraphSlot::Verify)
+        .unwrap();
+    assert_eq!(
+        download(ep, &rewarm_output, case.rewarm_expected.len()),
+        case.rewarm_expected
+    );
+    let before_reset = runtime.allocation_counts();
+    assert!(
+        runtime
+            .reset_graph_in(onnx_runtime_ep_api::DeviceGraphSlot::Verify)
+            .unwrap()
+    );
+    ep.wait_for_deferred_releases().unwrap();
+    assert!(
+        runtime.allocation_counts().frees > before_reset.frees,
+        "{} B graph must release owner",
+        case.op
+    );
     for buffer in [a, b, output, rewarm_a, rewarm_b, rewarm_output] {
         ep.deallocate(buffer).unwrap();
     }
@@ -1353,6 +1536,30 @@ fn exercise_broadcast_capture_owner(ep: &CudaExecutionProvider, case: BroadcastC
 fn capture_capable_broadcast_families_register_and_retain_metadata_owners() {
     let ep = require_cuda();
     let cases = [
+        BroadcastCaptureCase {
+            op: "And",
+            opset: 17,
+            input_dtype: DataType::Bool,
+            output_dtype: DataType::Bool,
+            a_values: vec![0, 1, 1, 1, 0, 1],
+            b_values: vec![1, 1, 0],
+            expected: vec![0, 1, 0, 1, 0, 0],
+            rewarm_a_values: vec![0, 1, 1, 1, 0, 1],
+            rewarm_b_values: vec![1, 0],
+            rewarm_expected: vec![0, 1, 1, 0, 0, 0],
+        },
+        BroadcastCaptureCase {
+            op: "BitShift",
+            opset: 18,
+            input_dtype: DataType::Uint32,
+            output_dtype: DataType::Uint32,
+            a_values: owned_bytes(&[1_u32, 2, 3, 4, 5, 6]),
+            b_values: owned_bytes(&[0_u32, 1, 2]),
+            expected: owned_bytes(&[1_u32, 4, 12, 4, 10, 24]),
+            rewarm_a_values: owned_bytes(&[1_u32, 2, 3, 4, 5, 6]),
+            rewarm_b_values: owned_bytes(&[1_u32, 2]),
+            rewarm_expected: owned_bytes(&[2_u32, 4, 6, 16, 20, 24]),
+        },
         BroadcastCaptureCase {
             op: "Add",
             opset: 17,

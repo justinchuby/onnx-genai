@@ -1,0 +1,36 @@
+{
+  "baseline": {
+    "decode": {
+      "present": true,
+      "instructions": 81,
+      "symbol": "__RNvNtNtCs42teQl6N5qM_19onnx_runtime_ep_cpu7kernels22block_quantized_matmul18decode_mxfp4_block",
+      "sha256": "3e5fc8c38c3fd1b783f1b1f937e846e13f6d6e73300232ceb9746f70de526d37"
+    },
+    "project": {
+      "present": true,
+      "instructions": 273,
+      "symbol": "__RINvMs_NtNtCs42teQl6N5qM_19onnx_runtime_ep_cpu7kernels18decoded_projectionNtB5_21DecodedProjectionPlan7projectKj4_NCNvMs7_NtB7_22block_quantized_matmulNtB1W_20PackedProjectionRows7decoder0NCINvB1W_28linear_packed_prepared_tiledKB1L_E0INvB1W_19project_packed_tileKB1L_EEB9_",
+      "sha256": "52ececcd29ca2a92d306db11515f827735e9c911aef41d7699b5b750cd720db0"
+    },
+    "workspace": {
+      "present": false
+    }
+  },
+  "candidate": {
+    "decode": {
+      "present": true,
+      "instructions": 81,
+      "symbol": "__RNvNtNtCs42teQl6N5qM_19onnx_runtime_ep_cpu7kernels22block_quantized_matmul18decode_mxfp4_block",
+      "sha256": "9f4edc5a733f58938ebcf8c4ccf67e54995291dcb3695f451a6a8d958eaf77a1"
+    },
+    "project": {
+      "present": true,
+      "instructions": 273,
+      "symbol": "__RINvMs_NtNtCs42teQl6N5qM_19onnx_runtime_ep_cpu7kernels18decoded_projectionNtB5_21DecodedProjectionPlan7projectKj4_NCNvMs7_NtB7_22block_quantized_matmulNtB1W_20PackedProjectionRows7decoder0NCINvB1W_28linear_packed_prepared_tiledKB1L_E0INvB1W_19project_packed_tileKB1L_EEB9_",
+      "sha256": "29bfcec0be1b38c0b03cd7b4501328027c4ab507d67e2b28761538d3266cfc41"
+    },
+    "workspace": {
+      "present": false
+    }
+  }
+}

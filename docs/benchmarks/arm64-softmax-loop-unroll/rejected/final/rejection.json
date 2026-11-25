@@ -1,0 +1,4 @@
+{
+  "rejected_for_cpu_claims": true,
+  "reason": "getrusage short-window process accounting exceeds 11 CPU-seconds per wall second on a 10 logical CPU host; A/A alone is insufficient. All raw samples retained. New experiment uses CLOCK_PROCESS_CPUTIME_ID plus a physical bound hard guard."
+}

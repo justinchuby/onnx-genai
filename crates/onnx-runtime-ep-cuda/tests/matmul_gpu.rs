@@ -568,10 +568,14 @@ fn matmul_dense_plans_borrow_one_caller_workspace_gpu() {
     let injected = Arc::new(common::ExternalEagerAllocator::new(
         common::require_context("MatMul workspace-authority test"),
     ));
-    let ep = CudaExecutionProvider::new_default()
-        .expect("construct CUDA EP")
-        .with_memory(Arc::clone(&injected) as Arc<dyn DeviceAllocator>)
-        .expect("install constrained test allocator");
+    let ep = CudaExecutionProvider::from_config(
+        0,
+        onnx_runtime_ep_cuda::CudaProviderConfig {
+            memory: Some(Arc::clone(&injected) as Arc<dyn DeviceAllocator>),
+            ..Default::default()
+        },
+    )
+    .expect("install constrained test allocator");
     let runtime = ep.runtime();
     let device = ep.device_id();
 

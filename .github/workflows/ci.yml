@@ -669,7 +669,7 @@ jobs:
       - name: Install the aarch64 cross toolchain for the cross-arch pass
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross
       # The gate's submodule precondition, tested against fixture repository
       # roots with cargo/rustup shimmed -- about a second, and it is the only
       # thing that proves the check refuses BEFORE spending a clippy run rather

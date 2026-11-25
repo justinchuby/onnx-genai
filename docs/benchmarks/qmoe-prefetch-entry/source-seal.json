@@ -1,0 +1,7 @@
+{
+  "base": "4e3d4d5b6d2d11276dcf1f371a7ecad830c3993a",
+  "source_path": "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs",
+  "final_sha256": "f6593d1753c0b3a6efa5a60e651882db668d2acfde422832e84365af9743f4e7",
+  "runtime_change": "move existing eligibility check from caller to prefetch funding entry",
+  "negative_restored": true
+}

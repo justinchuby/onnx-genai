@@ -82,14 +82,21 @@ serde_json = { workspace = true }
 serde_path_to_error = { workspace = true }
 serde_yaml = { workspace = true }
 regex = "1.12"
+tempfile = "3"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 tokio-stream = { workspace = true }
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 getrandom = "0.3"
 base64 = "0.22"
+sha2 = { workspace = true }
+subtle = "2.6"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 image = { workspace = true, features = ["png"] }
@@ -101,7 +108,6 @@ libc = "0.2"
 onnx-genai-engine = { path = "../onnx-genai-engine", version = "=0.1.0-dev.6", default-features = false, features = ["test-output-staging"] }
 onnx-runtime-virtual-memory = { workspace = true }
 tower = { workspace = true }
-tempfile = "3"
 
 [dev-dependencies.cudarc]
 version = "0.19"

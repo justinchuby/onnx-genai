@@ -1,5 +1,9 @@
 # llama.cpp protocol compatibility
 
+The [generated endpoint registration matrix](LLAMA_CPP_ENDPOINT_MATRIX.md) inventories
+all 55 static upstream method/path contracts, including aliases and conditional routes.
+Its route-presence results are separate from the behavioral evidence below.
+
 Native execution is enabled and selected by default in the engine, facade, CLI
 and server. ORT is an explicitly selected reference backend for tests and
 comparisons: use `--backend ort` or `EngineDecodeBackend::Ort`. Native failures
@@ -27,6 +31,24 @@ Node/npm and network access are not needed to build the Rust server or use its U
 The removed `run` REPL has no alias or migration shim. `generate`, `transcribe`,
 model inspection, profiling and command-line streaming remain available.
 
+## API keys
+
+Authentication is optional. Start with `nxrt serve MODEL --api-key-file keys.txt`;
+the UTF-8 file contains one key per line, with blank lines and lines starting
+with `#` ignored. `--api-key` accepts comma-separated CSV and may be repeated.
+The upstream environment variables `LLAMA_API_KEY` and `LLAMA_ARG_API_KEY_FILE`
+are also accepted. Keys from both sources are combined.
+
+Send `Authorization: Bearer YOUR_KEY`, a raw `Authorization: YOUR_KEY`, or
+`X-Api-Key: YOUR_KEY`. A nonempty Authorization header takes precedence over
+X-Api-Key. Missing or incorrect credentials return HTTP 401 with
+`error.type: authentication_error` and `error.code: 401`.
+Health endpoints and exact embedded UI assets remain public. All other API
+requests, including replay, management and realtime upgrade requests, pass
+through key admission before routing. With no configured keys, requests keep
+the existing open behavior. Server configuration Debug output exposes only
+the configured key count; it does not contain credentials or their digests.
+
 ## Implemented surface
 
 | Method | Paths | Contract |
@@ -39,12 +61,13 @@ model inspection, profiling and command-line streaming remain available.
 | POST | `/detokenize` | `tokens`, optional `model`; preserves special tokens, rejects absent vocabulary IDs |
 | POST | `/apply-template` | Chat request fields; same prompt renderer as chat inference |
 | POST | `/v1/chat/completions`, `/chat/completions` | Buffered/streaming text, tools, reasoning, declared image/audio inputs |
+| POST | `/v1/systemone` | Declared non-generative decision workflows: choice, score and noul; see [contract and limits](SYSTEMONE.md) |
 | POST | `/v1/chat/completions/control` | End the current reasoning block of an armed live chat/legacy completion |
 | POST | `/v1/completions` | OpenAI text/token/mixed prompt batches, shared controls, declared text FIM and optional stream usage |
 | POST | `/v1/embeddings` | Existing OpenAI embedding contract |
 | POST | `/completion`, `/completions`, `/infill` | Native buffered/streaming completion, bounded text/token/mixed batches, declared FIM metadata |
 | POST | `/embedding`, `/embeddings` | Native pooled embeddings with requested normalization |
-| POST | `/rerank`, `/reranking`, `/v1/rerank`, `/v1/reranking` | Declared token-pair scoring workflow with Jina/TEI response shapes |
+| POST | `/rerank`, `/reranking`, `/v1/rerank`, `/v1/reranking` | Declared text/image-pair scoring workflow with Jina/TEI response shapes |
 | POST | `/v1/responses`, `/responses` | Responses wire adapter over admitted chat generation |
 | POST | `/v1/messages` | Anthropic Messages wire adapter over admitted chat generation |
 | POST | `/v1/chat/completions/input_tokens`, `/chat/completions/input_tokens`, `/v1/responses/input_tokens`, `/responses/input_tokens`, `/v1/messages/count_tokens` | Input token counts from the shared inference preparation path |
@@ -52,9 +75,11 @@ model inspection, profiling and command-line streaming remain available.
 | POST | `/v1/streams/lookup` | Lookup only requested conversation IDs, including model-qualified IDs |
 | POST | `/v1/audio/transcriptions`, `/audio/transcriptions` | Existing multipart transcription contract |
 | POST | `/v1/audio/speech`, `/audio/speech`, `/tts` | Declared buffered speech workflow; native input/prompt and raw-prompt handling |
-| GET | `/models/sse` | Initial state and changes to committed model load status; one-second polling, no invented progress |
-| POST | `/models/load`, `/models/unload` | Configured model IDs; requires `--enable-admin-endpoints` |
-| GET, POST | `/cors-proxy` | Optional HTTP(S) MCP transport; explicit forwarding headers, checked and pinned target addresses, bounded streaming |
+| WS | `/v1/realtime` | Metadata-declared native streaming audio/text sessions; [contract and current limits](REALTIME.md) |
+| GET | `/models/sse` | Model status, actual per-file download progress, pause/failure and removal events |
+| POST | `/models/load`, `/models/unload` | Configured and cached model IDs; cache mode also supports pausing downloads |
+| POST, DELETE | `/models` | Opt-in bounded Hugging Face nxrt-package download, resume and deletion |
+| GET, POST | `/tools`, `/cors-proxy` | Outside scope: execution and MCP transport belong to an external harness |
 | GET, POST | `/lora-adapters` | Model-bound declared catalog and atomic default scale replacement; request `lora` overrides execute actual adapter weights |
 | GET | `/slots` | Actual serial Native slot status; model/autoload selection and fail-on-busy polling |
 | POST | `/slots/{id_slot}?action=save\|restore\|erase` | Owner-thread state actions under opt-in bounded `--slot-save-path`; nxrt state file encoding |
@@ -64,9 +89,12 @@ model inspection, profiling and command-line streaming remain available.
 `autoload=true`. The UI uses `autoload=false` for discovery. Unknown/unloaded
 models are reported explicitly. Model load/unload requests complete when the
 operation completes; clients can inspect the committed status afterward.
-Models are configured with `--models-dir` or `--models-config`; this does not
-implement llama.cpp's Hugging Face/GGUF download manager. Load `extra_args` are
-rejected because these models execute in-process with explicit nxrt settings.
+Models are configured with `--models-dir` or `--models-config`. Opt-in
+`--model-cache-dir` also admits managed Hugging Face nxrt packages, with durable
+pause/resume and deletion; see [model management](MODEL_MANAGEMENT.md).
+Load/unload requires this cache option or `--enable-admin-endpoints`.
+Load `extra_args` are rejected because these models execute in-process with
+explicit nxrt settings.
 
 ## Request compatibility
 
@@ -416,37 +444,58 @@ Declared host LoRA serving supports global defaults, per-request overrides,
 model isolation and replayed conversation history. See [LoRA serving](LORA_SERVING.md)
 for package contracts, memory admission and remaining source/device limitations.
 
+Reranking accepts ordered query/document images through an explicit v2 profile,
+including actual native image preprocessing and model-owned token usage. See
+[reranking](RERANKING.md) for the package ABI, request shapes and resource bounds.
+
 ## Remaining differences
 
 This is a functional Llama Chat integration, not a claim of complete llama-server
-parity. These upstream protocols are still unimplemented:
+parity. These upstream capabilities remain incomplete:
 
-- Multimodal reranking, realtime audio/WebSocket inference and `/v1/systemone`.
+- Realtime grammar forcing beyond declared turn-based tagged-json mask workflows,
+  partial function-call fragment projection, broader pressure/overlap acceptance and
+  device-backed wire acceptance; see [realtime](REALTIME.md) for the implemented
+  WebSocket session modes, resource bounds and Native CPU evidence.
+- Video decision inputs, broader audio codecs and additional DSP operations/conventions,
+  joint/packed decision heads and shared generation/decision entry points.
 - Device-state/multi-sequence slot persistence; arbitrary GGUF/PEFT LoRA imports and device-fused LoRA.
-- GGUF/Hugging Face model downloads and deletion.
+- GGUF package import, quantization selectors and selective sidecar management.
+  Hugging Face nxrt-package download, resume and deletion are supported.
 
-`/tools`, model download/delete and mutable `/props` remain disabled. The MCP
-HTTP proxy is separately opt-in with `--ui-mcp-proxy`; `/props` reports
-`cors_proxy_enabled` from that setting. `GET` and `POST /cors-proxy?url=...`
-forward only headers explicitly prefixed with `x-llama-server-proxy-header-`.
-Ambient server credentials and cookies are never forwarded. HTTP(S) targets
-must resolve entirely to public addresses unless the operator also supplies
-`--ui-mcp-proxy-allow-private-urls`. Connections use those checked DNS results;
-environment proxies cannot override the chosen destination. Redirects return
-through `/cors-proxy` for fresh admission, with credential and arbitrary forwarding headers
-removed when the target origin changes; only explicit `Accept`, `Content-Type`
-and `Content-Encoding` representation headers survive that redirect. Remote cookies and hop-by-hop headers
-are removed from responses; proxied documents receive a sandbox CSP.
+`/v1/systemone` executes text/structured-state decision profiles, with explicit
+model-authored prompting, calibration outputs, variants and answer policies.
+Core schema v1.11 declares input defaults, instruction/payload rules, option
+ordering, score ranges and canonical legends. Decision v2 in core schema v1.14 additionally executes ordered state images,
+including `files`/`images` and embedded chat image parts, with actual media-aware
+usage. Decision v3 in core schema v1.15 adds ordered mixed image/audio state and
+per-question spoken instructions using PCM16 WAV. Video, broader audio codecs,
+joint/packed heads and shared generation/decision
+entry points remain open; see [SystemOne](SYSTEMONE.md). Route presence does not
+claim every upstream decision-model format is admitted.
 
-Transfers stream through a bounded queue and stop on consumer disconnect. At most
-16 outbound transfers run concurrently (`--ui-mcp-proxy-max-connections`); excess
-requests receive `503` with `Retry-After`, and disconnect/timeout releases the slot. The
-request and response byte limit defaults to 64 MiB (`--ui-mcp-proxy-max-bytes`),
-and the idle transfer timeout defaults to 600 seconds
-(`--ui-mcp-proxy-timeout-secs`). Progress resets that timeout, so active SSE
-sessions can outlive it. Streaming failures surface as body errors;
-pre-response failures return actionable HTTP errors. The proxy does not execute
-local tools or shell commands.
+Model download/delete require `--model-cache-dir`; operator-configured paths
+cannot be deleted. `--props` enables `POST /props`, matching
+upstream's current acknowledgement-only contract: it returns `{"success":true}`
+and does not read or change generation settings. `GET /props` advertises the
+configured `endpoint_props` value in router and model modes. When disabled, POST
+returns upstream-compatible `501 not_supported_error`. This is not an API
+for changing generation defaults.
+Tool execution belongs to an external harness. nxrt does not register `/tools`
+or `/cors-proxy`, launch MCP children, execute filesystem/shell tools, or provide
+Docker/Podman/SSH tool runtimes. These are deliberate scope exclusions, not
+pending compatibility work. `/props` reports `server_tools: false` in
+`nxrt_capabilities` and `cors_proxy_enabled: false` in both router and model modes.
+The former tool/MCP/proxy CLI options and library configuration types are removed.
+
+Chat tool calling remains supported: clients send `tools`/`tool_choice`, consume
+assistant `tool_calls` (including streaming deltas), execute those calls in their
+harness, and return `role: "tool"` messages with the matching `tool_call_id`.
+Model metadata still determines which tool protocol is admitted. For example, a
+harness can submit `{"role":"tool","tool_call_id":"call_1","content":"result"}`
+as part of the next `/v1/chat/completions` request. The server never executes the
+function named by a generated call.
+
 Other unknown paths return JSON 404 errors rather than the HTML app.
 Existing nxrt sessions/admin/debug/image APIs remain available with their own
 contracts. Capability flags are derived from admitted package metadata; ONNX
@@ -489,6 +538,14 @@ Temporary fixtures, proxy, Chrome and server processes are cleaned up, with
 bounded startup/observer waits. Append an optional screenshot path after the
 Playwright module path to save an image of the baseline chat. Coordinate this
 inference workload with other sessions using the shared host lock.
+
+For API-key onboarding, run
+`node scripts/test_llama_chat_auth.mjs /absolute/path/to/playwright/index.mjs /absolute/path/to/onnx-genai-server`
+under the same lock. This uses real Chrome and Native CPU inference to enter an
+incorrect key, retry a correct key through the UI, chat, reload the persisted
+login, and check private byte-exact replay. A fresh browser context must still
+require a key. The script uses an ephemeral loopback port and removes its
+synthetic key file, browser and server on exit.
 
 
 ## Raw GBNF and llguidance constraints
@@ -599,3 +656,11 @@ the tokenizer; regex boundaries can declare individual registered spellings in
 tokenizer is not mutated, and buffered/SSE output uses the same policy, including
 logprob delivery and transactional publication. UTF-8 decoder lookbehind remains
 request-local. Raw grammar recognition continues to inspect model bytes and IDs.
+
+Audio preprocessing admits package-authored mel counts, sample rates, FFT/hop
+and Hann-window lengths through the executable log-mel program. Numerical
+acceptance includes an independent direct DFT and Native workflows using
+nonstandard geometry. Pure-waveform normalization, named transform dataflow and validity publication
+execute as described in [audio preprocessing](AUDIO_PREPROCESSING.md). Additional
+DSP operations, window/mel conventions and codecs remain open; this does not imply
+full audio parity.

@@ -48,7 +48,7 @@ development box is not evidence at all — identical configurations have ranged
 
 The current built-in CUDA allocator is `CudaVmmAllocator`. Disabling dynamic
 KV/weight lending changes policy; it does not select the removed eager allocator.
-A caller can supply another mechanism through `CudaExecutionProvider::with_memory`.
+A caller can supply another mechanism through `CudaProviderConfig::memory`.
 Historical measurements below retain their original configurations and do not
 establish that those configurations remain available today.
 
@@ -79,6 +79,65 @@ and host tests do not validate CUDA mapping, stream ordering, capture/replay or
 throughput. Adoption, pooling, lending and release behavior remain unchanged in
 this cleanup.
 
+### Shape evidence and metadata ownership
+
+`KernelShapeFacts` separates positive graph evidence (`Stable`, `Growing`,
+`Unknown`) from capture eligibility. A capture denylist can permit an unproven
+symbol; that permission does not prove stability. Conversely, `Growing` means
+an input or output depends on a growing symbol, not that every call changes its
+concrete shape. Session computes these facts during construction and capacity
+pinning, and includes them in kernel specialization and prebinding identity.
+Changing facts cannot reuse a kernel prepared under the old configuration even
+when concrete input shapes match.
+
+Binary broadcast descriptors keep immutable native ownership. Repeated shapes
+reuse the published descriptor without a new upload or quota admission; captured
+graphs pin the actual owner. A shared workspace lane has unspecified contents
+between dispatches, so using it for these descriptors would require uploading on
+every call, including repeated growing shapes. Positive growth evidence alone
+therefore does not select mutable metadata storage. Such a policy needs device
+measurements of both changing and repeated shapes before changing the default.
+
+Broadcast arithmetic, comparison/logical, integer bitwise/shift, PRelu and
+TensorScatter kernels publish immutable metadata and the successful launch signature together.
+Preparation and GPU submission use a private snapshot outside the shared state
+lock; only successful submission replaces the published pair. A failed candidate
+preserves the previous proof and owner. Replacement retirement happens after
+unlocking, while captured graphs retain their own pins. This publication rule
+does not provide concurrent execution lanes or change descriptor storage policy.
+
+Gemm's N-D bias epilogue likewise prepares a private immutable descriptor and
+publishes it only after successful submission, without holding its cache lock
+over preparation or GPU work. An inactive bias (absent C or beta=0) does not
+consult that cache, including on the K=0 empty-product path. Existing Gemm
+synchronization and eager-only capture policy remain in place; this transaction
+does not establish a cuBLASLt/bias capture contract.
+
+TensorScatter uses this same one-record publication rule for its persistent
+stride descriptor and exact dtype/cache/update/optional-index signature. It
+snapshots only after ordinary input validation, checking the old proof and
+cloning its immutable metadata owner under the same lock. The already-built
+invocation signature moves into the private candidate, avoiding deep copies of
+the old signature vectors. Both metadata staging and the
+launch run outside the state lock, and successful eager submission publishes
+one pair; capture only consumes its validated snapshot. A zero-update copy
+publishes after the copy submission succeeds, while empty output publishes
+without device work. These paths may retain an unused old descriptor but never
+consume it under the new empty signature. Nonempty capture still validates the
+actual graph-held allocation owner as well as the exact signature. Existing
+exclusive kernel execution/capture contracts remain required; this is not a
+new execution-concurrency authority.
+
+The TensorScatter device regression covers linear/circular updates, optional
+indices, A→failed B→A→B, stable warm allocation/transfer/drain counters, missing
+capture-owner refusal, capture-signature mismatch, and independent A/B graph
+replay after kernel destruction and old-graph reset. It also covers zero-update
+copy and empty-output publication. On the CPU-only development host this test
+is compiled/listed and default-ignored, not executed. No CUDA numerical,
+lifetime or performance result is claimed from those checks. The CUDA source,
+metadata format, physical owner, quota authority and allocation policy are
+unchanged.
+
 ### Resource allocation granularity
 
 Admission follows physical ownership and independent reclamation, not each
@@ -102,6 +161,30 @@ preserves the charge at its retained physical capacity; a smaller logical view
 does not refund those bytes. Idle capacity can be reclaimed under pressure.
 Pending asynchronous work, active readers and capture pins prevent reuse, and
 quarantined backing retains its charge until physical release is settled.
+
+CPU derived-weight payloads also treat zero bytes as an explicit empty grant.
+An empty grant cannot split off positive bytes; a zero-byte split of any grant
+produces another empty value without cloning an accountant lease. Positive
+governed payloads still claim and retain their exact physical capacity, and
+partially split owners return only their own bytes. This removes empty
+projection-group admission callbacks without relabeling zero capacity as the
+unbounded local/ungoverned mode. The configured source's one-time zero-byte
+authority anchor remains validated at construction; it is not a payload claim.
+QMoE uses the same empty-owner conversion for on-demand and transient experts.
+Direct issuer-counter tests cover empty groups, full-capacity pressure, mixed
+zero/nonzero groups, positive construction peaks for empty final payloads,
+positive splitting/retirement and zero-capacity rejection.
+This establishes callback behavior, not a measured inference speedup.
+
+CPU derived-weight group control metadata uses inline storage for the common
+one-to-three projection set. Larger groups spill normally; inline capacity is
+not an eligibility or budget limit. Block-format MoE uses the same storage for
+its short projection/source/key/size/spec lists. Payload buffers remain separate,
+exactly charged owners; whole-group missing-build peaks are still preflighted
+once, and cache entries are published only after every builder succeeds. The
+[allocation diagnostic](../benchmarks/weight-group-metadata/README.md) scopes
+its result to private warm cache-hit metadata, not routing, numerical compute,
+whole-kernel allocations or inference throughput.
 
 Cold replacement borrows the caller's `Option<WorkspaceAllocation>`. The option
 retains the original owner until the provider actually takes it for retirement.
@@ -564,10 +647,36 @@ refiner before admission. Output storage is uninitialized: only layout and
 pointer origins may be inspected. Kernel-sized output paths explicitly have no
 final output storage yet. The caller retains exclusive execution ownership from
 refinement through admission and launch. Most kernels implement only the metadata
-hook; only address/value-dependent kernels need an execution refiner. ORT caches
-metadata preparations, including `Deferred`, and refines on each Compute; exact
+hook; only address/value/context-dependent kernels need an execution refiner.
+ORT caches metadata preparations, including `Deferred`, and refines on each Compute; exact
 address/value-dependent bytes never enter that geometry cache. Cached ready
 preparations avoid repeating the metadata query.
+
+Metadata workspace caches also include a provider-scoped execution-context key.
+The key describes ambient facts that can change a fixed kernel's bound; it is
+neither a memory owner nor an admission token. Providers with context-independent
+bounds use the default stable reader. CPU uses the selected Rayon width inside
+workers and a separate stable class for external callers of the immutable global
+pool. Reading the key does not initialize that pool. Same-width pools are
+capacity-equivalent; switching between an external caller and a global worker
+may conservatively miss. Native complete-preparation memos and both ORT hot and
+bounded metadata caches compare this key before serving a bound. Delegators
+forward the originating provider's reader. ORT captures it once while retaining
+the origin, so warm Compute adds no Shared-provider lock, allocation or quota
+operation. The Copy callback reader itself does not keep its module alive.
+
+Integer QMoE's execution refiner selects the actual decode plan before admission,
+clears any previous plan on failure and publishes only a successful selection.
+Launch consumes that exact plan under the existing exclusive kernel boundary;
+it never recomputes a different shard count from the thread pool. Cached metadata
+does not skip this selection. A Ready bound from the same kernel, tensor metadata
+and provider context is reused without repeating metadata planning; None/Deferred
+still run the checked planner. This preserves the default refiner's warm-cache
+contract while fixing the dispatch plan. Actual-view/layout validation remains
+in execution, and failed uncached preparation clears any earlier selection.
+Shape preparation can remain complete while a changed execution context takes
+the normal cold reprepare/growth path; existing
+capture guards still reject replacing pinned backing.
 
 ActualAddress workspace sizes across alignment classes need not be monotonic.
 The selected host plan, rather than a second heuristic query, is the authority
@@ -645,30 +754,80 @@ do not validate device arithmetic, asynchronous failure ordering or throughput.
 ### BF16 converted constants are immutable per signature
 
 MatMulNBits keeps one prepared record containing the source signature, checked
-composite layout and actual optional `GraphDeviceAllocation` owner. Capacity is
-derived from that owner. Warm hits perform signature comparison, layout binding
-and capture ownership validation; they do not allocate, convert or synchronize.
-Zero-element constants require no device backing.
+composite layout and actual optional `NativeDeviceAllocation` owner. Capacity is
+derived from that owner. Warm BF16 hits borrow an ArcSwap guard and bind the
+existing immutable composite, without a signature Vec, owner clone, cache mutex,
+conversion, allocation or quota request/return. Zero-element constants require
+no device backing. Non-BF16 execution does not touch this cache: no per-call
+`used` flag or `begin_call` initialization is needed. Resource collection may
+conservatively pin the one retained record even if the most recent route did
+not consume it, rather than maintaining a second last-call ownership state.
 
 A changed signature validates every source extent and cast limit, refuses real
 stream capture, and prepares a new complete composite. It never overwrites the
-previous allocation merely because its capacity fits. Prior compute readers are
-drained at this cold boundary even with eager synchronization deferred. Only
-successful conversion submissions and the preparation checkpoint publish the
-replacement. Errors leave the previous record intact; outer execution still
-clears capture readiness on failure. An already captured graph retains its old
-owner and converted contents until graph retirement. This is resource reuse by
-signature and lifetime, without per-operand quota tickets or a new EP protocol.
+previous allocation merely because its capacity fits. Successful conversion
+submissions and the preparation checkpoint publish the replacement; errors leave
+the previous record intact and outer execution clears capture readiness. The
+caller keeps its exact borrowed record through every GEMV/GEMM and output cast,
+including partial submission failure. Cold publication returns the candidate
+it prepared rather than reloading a potentially different signature.
 
-Registered capture hits must pin the real artifact owner. Raw/unregistered
-capture cannot embed a warm private pointer, and a capture miss rejects before
-allocation or conversion. Host tests exercise operand count, empty layouts,
-regions, source address overflow and int32 conversion limits. A GPU fixture
-covers warm no-work counters, failed replacement, same-size replacement after
-capture, old graph replay and raw-capture refusal. It is compiled/listed on this
-Host, not executed; device arithmetic, lifetime behavior and performance remain
-unmeasured. The underlying retained-artifact owner still uses the runtime raw
-allocation path; this change does not claim native quota coverage for artifacts.
+Old readers and captured graphs keep their independent native owners. Final
+retirement uses the existing stream-ordered queue instead of globally draining
+compute/copy before replacing immutable data. This removes an explicit cold
+synchronization, without adding a pool, ledger or per-operand ticket. Kernel
+execution, resource enumeration and capture retain their existing exclusive
+execution contract; guard lifetime alone does not authorize concurrent capture.
+
+BF16 staging shares one actual stream-capture observation between workspace
+and constant ownership validation. Registered capture hits must pin the real
+artifact owner; raw/unregistered capture cannot embed a warm private pointer.
+A capture miss rejects before allocation or conversion. Native owner identity
+is derived directly without temporarily constructing another resource pin.
+
+Host tests exercise empty-layout real publication/read guards, warm preparation
+counts, cache replacement/destruction with outstanding reads, failed candidate
+preservation and capture refusal/validation ordering, alongside existing operand
+and layout checks. The GPU fixture additionally covers no-drain replacement,
+submitted failure, old graph replay, missing pins and a borrowed nonempty record
+surviving cache replacement and destruction. It is compiled/listed on this host,
+not executed. Device arithmetic, asynchronous lifetime and throughput remain
+unmeasured; fewer locks and explicit drains do not establish a speedup.
+
+### Immutable int4 interleave ownership
+
+Interleave conversion requires explicit constant-input metadata for packed B.
+Dynamic packed weights use the ordinary GEMV, including in-place updates at an
+address already present in the conversion cache. Paged weights also bypass the
+optimization because their source retirement does not invalidate this cache.
+
+Each runtime cache entry owns a native allocation with role Weights, admitted
+through the provider's selected domain. Removing a source key marks its entry
+invalid before unlocking, then drops the cache's owner outside the lock. This
+also handles offset views and multiple lengths of one source allocation.
+Last-owner retirement uses the existing compute/copy completion queue; there
+is no cache-specific raw free, global drain, or retired-pointer collection.
+Failed conversions and racing duplicate conversions follow that same path.
+
+A kernel retains one prepared entry. Warm execution borrows its ArcSwap guard
+and checks source signature, runtime identity and validity, without a shared
+cache lookup or quota request/return. A changed entry publishes only after
+successful GEMV submission. Graph resources pin the owning entry, so source
+invalidation and a later kernel binding cannot overwrite an old graph's bytes.
+A kernel can retain an invalid entry until rebinding or destruction; graphs can
+retain it until retirement. Source invalidation therefore revokes cache reuse,
+not necessarily physical residency immediately. No cross-kernel invalidation
+registry or second accounting ledger is introduced.
+
+Actual stream-capture observation requires the precise registered entry owner;
+a missing pin, capture-time preparation or failed submission propagates an
+error and clears capture readiness. The new capture-status query and ArcSwap
+read cost have not been measured. Deterministic Host tests cover recycled
+addresses, old graph pins, recursive retirement outside cache locks and failed
+submitted conversion. The GPU fixture covers native wiring, dynamic in-place
+updates, warm allocation counters, missing pins and independent graph replay;
+it is compiled/listed here, not executed on this CPU-only host. CUDA arithmetic,
+asynchronous execution and throughput still require a device runner.
 
 ### CUDA quantized MatMul accuracy-4 decode activation scratch
 
@@ -749,8 +908,8 @@ workspace retirement, and partial submission errors retain the original
 provider's deferred-release/settlement contract. BF16_DIRECT_OUT restoration
 remains before error propagation.
 
-The immutable conversion cache and Marlin caches still require separate
-governed-ownership work. This migration adds no pool,
+Immutable conversion and Marlin artifacts use the native allocation domain;
+interleave ownership is described above. Workspace migration adds no pool,
 quota protocol or public EP trait hook. The generic ORT adapter now serves
 nonzero SessionPersistent requests through its registered state-owned lane;
 see the [adapter contract](#ort-persistent-workspace-adapter). Native sessions
@@ -779,6 +938,25 @@ explicitly unsupported until metadata preparation has a capture-safe contract.
 No new pool, quota interface or issuer callback is introduced in execution.
 CUDA numerical, asynchronous-failure and throughput validation require a device.
 
+### CPU expert routing metadata
+
+CPU MoE, QMoE and BlockQuantizedMoE share one dispatch-local routing scratch.
+The index, exponential and selected-pair vectors retain capacity across rows;
+borrowed selections are consumed before the next row, and the scratch retires
+before expert weight admission, computation or prefetch. QMoE consumes its final
+contribution slots using the already validated row/k geometry instead of keeping
+a second copy of every selected route just to recover each row's count. Sorting,
+normalization and contribution addition order are preserved. This metadata is
+still outside the governed projection lane; cold setup, growth and grouping
+allocations remain. See the [routing evidence and limits](../benchmarks/cpu-routing-scratch/README.md).
+
+QMoE route-first statistics also borrow their per-expert counts directly from
+the existing task-group lengths. They do not maintain another per-dispatch
+count map, including when offload is disabled. Process/per-layer accumulated
+statistics and their lock order remain unchanged. The [route-count evidence](../benchmarks/qmoe-route-counts/README.md)
+separates this removed diagnostic index from persistent metrics and governed
+payloads.
+
 ### CPU compressed-projection scratch
 
 CPU `BlockQuantizedMatMul` and `BlockQuantizedMoE` declare metadata-planned,
@@ -793,23 +971,138 @@ expert IDs. Each expert therefore receives at most the total input row count.
 The node declares the maximum **complete** projection layout across FC1, FC2,
 and optional FC3 at that row count, rather than their sum or a multiple of
 expert count/top-k. Each projection layout includes column staging plus decoded
-tiles. The logical shard count is fixed when the kernel is created and is used
-by both planning and execution, even when a different Rayon pool runs it.
-Dense-cache admission may decline, so the bound always covers streamed fallback.
+tiles. Metadata planning follows the selected execution context. Before admission,
+the execution refiner selects a logical shard plan from that actual Rayon pool;
+launch consumes the same plan once for both layout binding and compute. Kernel
+construction no longer fixes the pool width or initializes Rayon. A failed
+refinement clears any earlier selection; a nonempty launch without a selected
+plan fails before weight admission. Existing validated-empty MoE execution still
+clears old state and returns only after its original shape validation. Dense-cache
+admission may decline, so the bound always covers streamed fallback. The same
+provider context key used by integer QMoE guards native/ORT preparation caches;
+no new public API, allocator, per-shard quota or provider lock is introduced.
+The existing architecture-dependent tile and serial arithmetic are unchanged.
+The [adoption record and matched-owner diagnostic](../benchmarks/block-projection-paired-owner/README.md)
+retain the earlier noisy results and distinguish measured warm wall time from
+unresolved per-arm CPU cost.
 
-One exclusive scratch lane is borrowed by sequential projection calls, which
-return owned results. A private dispatch-local owner lazily initializes the
-required f32 prefix at the first streamed apply; later applies receive short,
-exclusive initialized slices and partition their own prefixes safely. Dense
-resident hits leave the streamed-projection regions untouched, and unused
-capacity in a larger pool slot is not initialized. The initialization proof ends with the dispatch and
-is never cached across pool borrowers. FC1/FC3 results survive subsequent
-scratch overwrites for gating. BlockQuantizedMoE grouped inputs also borrow an
-input-sized region in that admitted layout; singleton groups can borrow their
-original row. Routing, activation/output staging and owned intermediate results
-remain separate allocations, so this is not a complete process-memory bound. Dense resident-set admission remains a
-separate existing weight-cache operation. No new public EP API is required.
+The decode region is borrowed by sequential projection calls. A private
+dispatch-local owner lazily initializes its required f32 span at the first
+streamed apply; later applies reuse initialized prefixes. Dense resident hits
+leave it untouched, and a larger pool slot's unused capacity is not initialized.
+The proof ends with the dispatch, never surviving across pool borrowers.
 
+BlockQuantizedMoE now composes four regions in that one admission: maximum
+decode scratch, two FC banks, and an input-sized accumulator. The FC banks share
+the float MoE's private expert driver and checked width rules. For rows R,
+hidden H and intermediate I, nongated banks are R*H and R*I f32 values; gated
+banks are R*max(H,I) and R*max(FC1+separate_FC3,H). Experts remain serial, so
+these banks have no expert-count or top-k multiplier. Singleton groups borrow
+the original input row; other groups gather into bank A. All FC1/optional FC3
+reads finish before A becomes activation storage; gated FC2 then overwrites B.
+Nongated FC1 activates in B before FC2 overwrites A. The accumulator remains
+disjoint across all experts. Destination prefixes are initialized before each
+projection, including zero-K bias results, and final tensor publication still
+occurs only after every expert succeeds.
+
+This deliberately charges retained FC capacity that the former owned Vec path
+allocated outside the lane. The conservative physical bound can be larger than
+the previous declared workspace; it is not an RSS-saving claim. Admission may
+refuse a cap that previously omitted those intermediates. Routing, tensor
+widening, strided compressed copies, final tensor storage and GEMM internals
+remain separate; this is not a process-memory cap. Standalone MatMul retains
+its caller-owned output staging. Dense weight residency keeps its existing
+weight-cache authority. No allocator, pool or public EP API is added.
+
+[Public-session evidence](../benchmarks/block-moe-projection-banks/README.md)
+retains the initial measured gated regression and the inline-hint refinement,
+with complete output identity, actual funding, setup/doubled-work and A/A
+controls. Host resource tests count zero warm issuer requests/returns, including
+zero-byte calls; physical backing remains charged through idle retention and
+returns to zero only after trim. CPU fixture results do not establish model
+throughput, CUDA correctness or universal zero overhead.
+
+
+### Caller-owned row-decoded destinations
+
+The shared dynamic row-decoded projection core writes an initialized caller
+destination instead of returning an owned Vec. Complete input/bias/output
+geometry is checked before any dispatch or write. Unit axes let the column
+producer write that destination directly; multirow/multicolumn execution keeps
+its temporary column-major buffer and transposes only after successful work.
+Later decoder/dispatch errors may modify staging, so staging is not permission
+to publish a partial tensor.
+
+QMoE streams projections directly into its expert banks; the block-format
+owned test oracle allocates its reference staging at the ownership edge.
+MatMulNBits deliberately retains independent staging and copies into its
+possibly direct Float32 tensor output only after success. Decoder state,
+bounded tile allocation, scheduling, K reduction and bias order remain.
+No old returned-Vec alias or public EP interface is retained/added.
+
+### CPU integer QMoE projection banks
+
+Integer QMoE reuses the same private two-bank driver as float MoE and
+BlockQuantizedMoE. One StepScoped composite covers grouped input, FC1/optional FC3,
+activation, expert output, route-ordered contributions and one serial decode
+lane. FC banks are reused
+serially across expert groups. Nongated banks are R*H and R*I f32 values; gated banks are R*max(H,I) and
+R*max(FC1+separate_FC3,H), for total input rows R. There is no expert-count or
+top-k multiplier for the FC banks. Contributions additionally retain R*k*H
+f32 values in their original route slots. Once all experts and the prefetch
+scope finish, bank A is dead; its R*H prefix is zeroed to +0 and reused for the
+final accumulator, preserving row/route-slot += order before publication. No
+separate accumulator region is added. A singleton still borrows its contiguous
+original input row and declares FC and contribution capacity.
+
+Preparation and execution share checked geometry: inter is FC2's packed input
+axis times 8/bits, never inferred backward from FC1. FC2 metadata is therefore
+required during preparation. Zero rows have zero banks; zero hidden retains
+input/weight/routing validation and can still need nonempty FC1 storage.
+QMoE's prefetch-scope preparation owns the shared-bank eligibility check as
+well as funding. It refuses ineligible operations before inspecting selected
+experts, locking payloads, pinning readers or requesting capacity, including
+for local/ungoverned sources. Callers retain only enabled/group-count scheduling
+checks; a scope carries the existing capacity proof and mode-specific funding
+contract (local sources remain on demand). Its borrow keeps the operation and
+registry proof alive.
+Streaming still avoids registry locking; governed streaming uses one two-slot
+window, while local streaming remains on demand. Warm retained hits pin existing
+owners without new issuer callbacks. See the
+[prefetch-entry resource tests and negative control](../benchmarks/qmoe-prefetch-entry/README.md).
+
+The prefetch worker owns weights independently. The main compute dispatch owns
+the lane; joined projection tasks borrow disjoint decode slices. Weight
+request/read/join order and final contribution
+accumulation/publication order remain unchanged.
+
+This accounts retained FC and contribution capacity previously allocated as
+per-expert or per-dispatch Vecs;
+it does not establish RSS savings or a process-memory cap. Tensor widening,
+and routing remain outside this lane. Decoded rows and column-major staging now
+share a fourth region in the same composite. Its capacity is the maximum complete
+FC1/FC2/effective separate-FC3 projection layout, because these phases execute
+serially, rather than the sum of independently maximal row and column parts.
+The execution-selected plan retains tile1 and the original serial GEMM arithmetic;
+shards receive disjoint row scratch. Dense expert paths never initialize the
+decode region; the first streamed projection initializes it once per dispatch.
+No per-row, per-tile or per-expert workspace admission is introduced.
+Transient/retained weight grants retain their existing authority. Warm workspace checkout/return does not call its
+issuer; this is distinct from unchanged positive transient weight admissions.
+
+The [decode-workspace study](../benchmarks/qmoe-decoder-workspace/README.md)
+retains192 complete terminal-process CPU/wall receipts, including both cross-pool
+directions. CPU qualification passes7/8 cells and wall8/8; dense4-thread CPU
+A/A noise remains explicitly inconclusive. No speedup or universal zero-overhead
+claim is made.
+
+The earlier [FC-bank public-session study](../benchmarks/qmoe-fc-projection-banks/README.md)
+retains144 terminal-process CPU receipts, complete outputs and actual path
+traces, plus setup/doubled-work/A/A controls. All six aggregate cells qualify;
+small single-row CPU costs are not excluded. This is not CUDA, mmap-prefetch
+performance or full-model throughput evidence. The subsequent
+[contribution/bank-A reuse study](../benchmarks/qmoe-routed-bank-reuse/README.md)
+compares the full three-region composite against that merged FC-bank baseline.
 
 ### CPU float MoE projection banks
 
@@ -859,7 +1152,7 @@ when in fact it is 1955 lines.
 | Memory mechanism contracts | #1186 Phases 1-2 | **implemented** | low-dependency `crates/onnx-runtime-memory-api`; existing governor paths re-export the moved types and traits |
 | Process memory manager | #1186 Phase 5 | **implemented for registration plus session workspace transactions** | `ProcessMemoryManager` in `onnx-runtime-memory-governor`; native CUDA and `onnx-runtime-session` workspace preparation use manager-issued scoped bindings, while remaining generic allocation adapters are reported as compatibility/unattributed |
 | Allocator capabilities | §1.2, §1.3, §1.5 | **implemented on all three backends** | minimal `DeviceAllocator` plus optional `VirtualBacking` and independent `SharedMapping`; CPU/eager implements only the minimum, while CUDA VMM discovers capabilities from its selected allocator |
-| Virtual contiguity | §1.6 | **implemented; managed no-spill VMM is the default for native CUDA (#755)** | `crates/onnx-runtime-virtual-memory`; `CudaVmmAllocator` in `onnx-runtime-cuda-memory` reserves one range and maps 2 MiB granules on demand, leasing each before it maps it. On native CUDA the authority-governed VMM/pool path is now selected **by default, without a flag** (#755): memory-strategy inference runs unconditionally (#752) and drives policy, so a plain `serve` gets managed **no-spill** mode and does not rely on WDDM shared-memory fallback. An explicit `serve --vram-limit <bytes>` now **overrides the inferred device budget** rather than being the trigger. When the resolved budget cannot hold the package weights the runtime **automatically enables weight streaming/offload** instead of failing, so being larger than the budget is a supported configuration; a model that fits stays `FullResident` and does **not** page. **Exception (#864): on Windows/WDDM the OS shared-memory fallback pages over-budget weights from host RAM over PCIe ~30× faster than managed streaming for the single-touch decode access pattern, so managed weight streaming is *not* auto-enabled there — the effective strategy becomes `Compatibility` (`weight_offload_enabled=false`, `managed_no_spill=false`).** This affects only the *inferred* default: an explicit `ONNX_GENAI_WEIGHT_OFFLOAD=1`, `--vram-limit`, or device-budget override still selects managed streaming, and `ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1` forces it. On Linux there is no shared-memory fallback, so the managed path is unchanged (#783). Failure to construct the VMM arena/pool is fatal at provider construction and names the device, the driver error, the support boundary and any requested limit; it never silently falls back to ungoverned `cuMemAlloc`. **Since #1186 Phase 7 there is no built-in eager allocator to fall back to at all** — `ONNX_GENAI_LEGACY_ALLOCATOR=1` and `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0` still select the non-lending arena configuration, but they no longer select a different *mechanism*. A caller who needs eager `cuMemAlloc` implements `DeviceAllocator` and injects it through `CudaExecutionProvider::with_memory`, which is authoritative. The resolved budget, chosen strategy and offload state are printed at startup and exposed in `/v1/resources` (`memory_strategy`). |
+| Virtual contiguity | §1.6 | **implemented; managed no-spill VMM is the default for native CUDA (#755)** | `crates/onnx-runtime-virtual-memory`; `CudaVmmAllocator` in `onnx-runtime-cuda-memory` reserves one range and maps 2 MiB granules on demand, leasing each before it maps it. On native CUDA the authority-governed VMM/pool path is now selected **by default, without a flag** (#755): memory-strategy inference runs unconditionally (#752) and drives policy, so a plain `serve` gets managed **no-spill** mode and does not rely on WDDM shared-memory fallback. An explicit `serve --vram-limit <bytes>` now **overrides the inferred device budget** rather than being the trigger. When the resolved budget cannot hold the package weights the runtime **automatically enables weight streaming/offload** instead of failing, so being larger than the budget is a supported configuration; a model that fits stays `FullResident` and does **not** page. **Exception (#864): on Windows/WDDM the OS shared-memory fallback pages over-budget weights from host RAM over PCIe ~30× faster than managed streaming for the single-touch decode access pattern, so managed weight streaming is *not* auto-enabled there — the effective strategy becomes `Compatibility` (`weight_offload_enabled=false`, `managed_no_spill=false`).** This affects only the *inferred* default: an explicit `ONNX_GENAI_WEIGHT_OFFLOAD=1`, `--vram-limit`, or device-budget override still selects managed streaming, and `ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1` forces it. On Linux there is no shared-memory fallback, so the managed path is unchanged (#783). Failure to construct the VMM arena/pool is fatal at provider construction and names the device, the driver error, the support boundary and any requested limit; it never silently falls back to ungoverned `cuMemAlloc`. **Since #1186 Phase 7 there is no built-in eager allocator to fall back to at all** — `ONNX_GENAI_LEGACY_ALLOCATOR=1` and `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0` still select the non-lending arena configuration, but they no longer select a different *mechanism*. A caller who needs eager `cuMemAlloc` implements `DeviceAllocator` and injects it through `CudaProviderConfig::memory`, which is authoritative. The resolved budget, chosen strategy and offload state are printed at startup and exposed in `/v1/resources` (`memory_strategy`). |
 | Composability of the memory paths | — | **authority-governed native path implemented** | The historical independent VMM and weight-offload toggles did not compose (#704). On native CUDA — by default under #755, or under an explicit byte limit — native CUDA constructs one authority before the allocator, charges the physical-handle pool once, registers reloadable weight residency explicitly, and admits KV/workspace growth transactionally. The legacy-allocator opt-out changes lending policy while retaining the built-in VMM mechanism; a different allocator must be explicitly injected. Performance parity with WDDM remains separate work. |
 | Weight offload vs the OS | — | **fixed 2026-08-12: WDDM shared memory is now the default on Windows for inferred-over-budget models (#874)** | Measured directly on `qwen14b-zp` (8.33 GB weights vs a 7.73 GB budget), same binary, same prompt, byte-identical output, solo with `nvidia-smi` verified empty before every run: **WDDM 8.09/7.78 tok/s with `htod_bytes_per_token = 0`** (true zero-copy — the kernel reads weights in place from host RAM over PCIe) against **managed streaming 0.11 tok/s**. On `main` immediately prior the managed default measured 0.05–0.08 tok/s, so the end-to-end effect on this box is ~100×. **The cause is structural, not a tuning gap:** each weight is read *exactly once per decode step* (922 initializers, ~867 lookups/step, `SequentialDense`), so both paths move the same bytes over the same link, but ours adds a CPU memcpy into pinned staging, a VRAM allocation, a `cuMemMap`, an eviction and a synchronize — to buy VRAM residency that is discarded before it is ever re-read. **Copying to VRAM only pays off when the data is re-read from VRAM before eviction, and there is no intra-step reuse.** #874 therefore stops auto-enabling managed streaming on Windows when the OS fallback is available; explicit requests (`ONNX_GENAI_WEIGHT_OFFLOAD=1`, `--vram-limit`, a device-budget override) are still honoured, and `ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1` forces the managed path back (parsed so an *unrecognized* value keeps the fast default — the inverse of the `ASYNC_PAGEIN` trap). Linux is unchanged and must stay so: with no shared-memory fallback an over-budget model simply fails there, so managed streaming competes with "does not run", not with something faster (#783's lesson about not inheriting a platform-specific conclusion). Trade stated plainly: the `Compatibility` arm has **no device budget** (`managed_limit_bytes=None`), so on a host short of RAM an over-budget model can thrash, and the governor cannot see system-wide pressure (#863). Keeping the no-spill arena while merely disabling offload is **not** an option — the physical-handle pool is a hard cap and `cuMemCreate` cannot spill, so with nothing paging the remainder the load fails outright. The durable fix remains the hybrid in #864: a resident hot set **plus zero-copy cold reads**, which is what would beat the OS rather than merely stop losing to it — **and which has since been built and measured to fail here; see the CLOSED NEGATIVE note at the end of this row.** **Feasibility is measured** (`scripts/zero_copy_host_map_probe.py`, #877; real-kernel follow-up #880): `cuMemHostRegister(READ_ONLY|DEVICEMAP)` on a read-only weight mapping succeeds and costs 3.1 ms per GiB, and **CUDA graph capture with a host-mapped weight pointer is supported, replaying bit-identically to eager** (#880) — so the cold path does not forfeit the `captures > 0` / `fallbacks == 0` gates. On bandwidth, **the sequential-proxy figure was optimistic by ~2× and is superseded**: #877 measured 11.41 GB/s with a `cuMemcpyDtoD` *from* mapped host memory, but #880 ran the **real strided int4 GEMV** — the exact kernel and launch config the engine selects — with only the weight pointer differing, and measured **~5.6 GB/s steady-state** from host-mapped memory against **~100–133 GB/s** resident, outputs bit-identical at every size. **Use 5.6 GB/s, not 11.4, when sizing the hybrid's cold path.** The correction is corroborated independently: WDDM reaches ~8 tok/s on qwen14b-zp by keeping ~7.7 GB resident and reading the ~0.6 GB remainder from host each step ≈ 4.8 GB/s of PCIe traffic — the same order, and impossible if zero-copy were ~1 GB/s. Sweeping the packed size mattered: the realistic ~12 MiB per-tensor read fits this GPU's L2, so a single-point measurement there compares a cached read against a PCIe read; the ≥64 MiB points are the honest ones, since the real 8.33 GB layer walk reads each weight once and vastly exceeds L2. Two consequences, the second of which **reverses the priority order originally assumed on #864**: zero-copy is **not** a bandwidth win (1.01× against an explicit copy) — it removes the copy's *second* pass and its machinery (staging fill, VRAM alloc, `cuMemMap`, eviction, synchronize), which subsumes #837 items 1–2 rather than competing with them; and **the resident hot set is worth ~9.7× at the realistic per-op shape, rising to ~15–24× at large N**, so maximising residency comes first and de-copying the remainder second. Registering all 8.33 GB of referenced weights also page-locks that much host RAM, which needs a policy on smaller hosts. **CLOSED NEGATIVE 2026-08-13 (#912): the hybrid was built end-to-end on this reasoning and it does not beat the OS here.** Both feasibility findings above held — real strided GEMV at ~5.6 GB/s, capture bit-identical with host-mapped pointers — so what defeated it was a limit neither probe looked for: **aggregate distinct host-mapped bytes read per decode step above ~0.44–0.65 GB silently return stale data** (48 cold weights collapsed generation 16 → 3 tokens; a single read stays bit-identical at 1/8/16/32, and a copy-instead A/B places the fault on the read), and capped at a provably safe 256 MiB the arm measured **0.73 tok/s against WDDM's 7.84** in the same session. The safe aperture (0.26 GB/step) is smaller than the traffic it must displace (~0.6 GB/step), so the lever is short by construction. It ships default-OFF behind `ONNX_GENAI_ZERO_COPY_HYBRID` with the conservative budget, as instrumentation for parts with larger host apertures — **re-measure there rather than inheriting this result in either direction.** **The closure is WDDM-scoped, and the Linux question is now answered (#925, default raised in #936).** On Linux there is no shared-memory fallback, so the 7.84 tok/s comparison arm does not exist: the hybrid's competitor is managed streaming or outright failure — and it wins by **~8×, 67 tok/s against ~8.5 median**. The aperture ceiling is a VidMm behaviour, as #863 suggested (it measured WDDM demoting our own VMM granules; a host registration being silently remapped is the same family), and it is **measured absent** on H200 (driver 580.105.08, CUDA 13, kernel 6.6): byte-identical to baseline with `fallbacks=0` up to **6.795 GB** of distinct host-mapped weights bound and re-read per decode step (704 `cuMemHostRegister` binds, n=3, all byte-identical) — ~15× the WDDM ~0.44 GB onset. The default budget is now platform-conditional: 256 MiB on Windows, 2 GiB elsewhere, deliberately bounded at >3× under the measured-safe figure because only one GPU class was tested. #783's lesson applied in both directions — the WDDM negative was not inherited onto Linux, and the Linux positive is not extrapolated past its hardware. With the hybrid closed on WDDM, the remaining levers on this row are **batching** (which creates the intra-step reuse that makes residency pay at all, #884/#891) and the **admission** side of the residency gap (~90% of it, #901). Historical figures this row previously carried (6.01 tok/s WDDM, 27× behind, `h2d_copy` 18.8% / `staging_fill` 9.0% / `vram_free` 9.0% / `vram_alloc` 2.3%, capture disabled under offload) are superseded: capture now runs under offload (#796) and the eviction-policy defect was fixed (#723). #705, #864, #874, #877, #880, #912, #925 |
 | `--vram-limit` | — | **override, not trigger; managed no-spill is the default (#755)** | Under #755 memory-strategy inference runs on every native CUDA load and selects managed no-spill by default; `--vram-limit` now **overrides** the inferred device budget rather than being what turns the managed path on. If package weights exceed the resolved budget, weight offload is enabled automatically and its allowance is derived as `budget − governed device state`; the same authority owns physical VMM handles, mapped weights, KV, and workspace. A 6 GiB qwen2.5-14b int4 live run loaded, generated the expected `Paris`, stayed at 5,534,384,128 owned bytes, rejected an 8K request pre-header with 429, and completed four queued short requests without overlap-only rejection. Crossing the first physical KV-growth boundary transferred 201,326,592 bytes through one grant and reported 201,326,592 mapped KV bytes; later governed capacity exhaustion returned 429 rather than 500/OOM. Managed initialization failure is an early arithmetic/provider error, while `ONNX_GENAI_LEGACY_ALLOCATOR=1` or `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0` disables dynamic lending while retaining the VMM arena; neither restores an eager allocator. Limitation: the native server's FIFO per-request engine queue verified ordering and absence of overlap-only rejection, but did not demonstrate simultaneous live KV accumulation. Caveat carried, not closed: `activations_bytes=unknown` and `runtime_overhead_bytes=unknown` are not subtracted (#514). PRs #717, #736. |
@@ -1226,18 +1519,13 @@ adding grants, a pool or a new EP lifecycle. Warm calls retain the existing zero
 metadata-upload/device-allocation behavior. One cold upload replaces three
 synchronous uploads, but GPU latency/throughput effects are unmeasured.
 
-Retained `GraphDeviceAllocation` owners use checked 512-byte capacity classes in
-the existing raw pool; ordinary transient `alloc_raw` keeps its wider reuse
-classes. The same allocation core, capacity tracking, retention cap and retirement
-path serve both. This prevents a combined payload just beyond a power-of-two or
-MiB boundary from nearly doubling its live requested capacity: 32,784 bytes now
-requests 33,280 rather than 65,536 (the original three blocks requested 33,792).
-It introduces more possible classes and may reduce cold reuse across different
-sizes. Empty pool buckets retain Host metadata until the existing drain path;
-the device-byte cap does not bound that metadata under repeated shape changes.
-Fitting warm owners perform no class lookup or allocation. This policy
-does not add managed-workspace quota accounting to raw artifacts, and driver
-memory use and cold-path performance still need device measurements.
+Retained `NativeDeviceAllocation` owners now use the provider's native domain
+with exact requested bytes (logical zero retains one real backing byte). The
+selected allocator determines mapping/physical granularity; artifacts no longer
+use the raw pool's size classes or a synchronous free fallback. Coalesced tables
+still own one payload per shared lifetime. The existing raw pool remains for
+explicit runtime raw callers, with its existing retention policy. No reduction
+in physical GPU footprint or cold latency is claimed without device measurements.
 
 Host tests verify table order and signed/native-endian contents, aligned region
 origins, initialized empty slots, complete-span refusal and overflow before
@@ -1258,10 +1546,12 @@ encodes a new key and payload. Kernels still define their table ABI and scalar
 sentinels; the helper owns allocation/upload, capture-registration checks and
 the existing staged-mutation checkpoint.
 
-A capture miss refuses before encoding, draining or uploading. On an eager
-miss with a previous entry, the common path uses `drain_for_unmap`, including
-`Where` when optional per-op synchronization is deferred. Only successful
-allocation/upload/checkpoint installs the candidate record, and each kernel
+A capture miss refuses before encoding or uploading. Eager misses prepare a
+new immutable native owner; they do not explicitly drain old readers before
+encoding or replacing metadata. Encoding refusal performs no admission, copy
+or drain. Synchronous H2D upload still waits for stream completion; this change
+does not make uploads asynchronous. Only successful allocation/upload/checkpoint
+installs the candidate record, and each kernel
 still publishes that candidate and its capture signature after successful
 launch. Installed graphs independently pin old allocation owners across rewarm
 and kernel drop. No new lock, pool, budget, quota callback or device owner is
@@ -1272,10 +1562,40 @@ key construction on `Where` hits, and both caches' candidate key deep copies.
 Capture-signature and broadcast-output shape handling still allocate Host
 vectors, so this is not an allocation-free whole-call claim. Cold preparation
 materializes a byte payload for the shared upload interface. Device fixtures
-cover lazy hits, mandatory replacement drains under eager deferral, staged
+cover lazy hits, no explicit drain on replacement under eager deferral, staged
 failure retention, capture miss rejection and replay after owner replacement
 and kernel drop. Host/type checks and GPU-feature compilation can verify the
 interfaces here; device execution and performance need CUDA hardware.
+
+Binary elementwise and `Where` now keep metadata and their most recent
+successful dtype/shape signature in one `WarmMetadata` record under one mutex.
+Execution briefly clones the complete record, releases the lock, and performs
+validation, lazy preparation, NVRTC resolution and device launches against that
+local candidate. A successful call publishes the metadata/signature pair through
+one short replace; old owners retire after unlocking. Poisoned publication
+refuses the candidate without changing the published pair. Failed execution
+preserves the previous successful A signature and owner, matching the existing
+broadcast capture contract rather than SkipNorm's last-call readiness policy.
+
+Capture validates the signature from that same snapshot and the real native
+owner consumed by the candidate. It does not combine independently re-read
+metadata/signature states or perform a separate post-launch capture query just
+to publish. Empty `Where` keeps its no-allocation path, updates the empty
+signature and may retain one previously prepared owner without consuming it;
+a later nonempty capture still must match the new exact signature. Resource
+collection and capture eligibility inspect the same published record. This does
+not authorize concurrent warm/configuration/capture on one kernel: existing
+exclusive execution contracts remain required.
+
+The one-record clone retains the existing Host signature-vector work. No new
+physical allocation, per-region ticket, grant or refund is added on warm reuse.
+Host publication tests exercise metadata/proof pairing and reentrant retirement
+after unlocking, including poison refusal. Device fixtures cover A success,
+B post-upload failure preserving A, successful B publication, independent A/B
+graph replay after kernel destruction, and empty/nonempty signature transitions.
+They are compiled/listed on this CPU-only host; device lifetime and performance
+are unmeasured. SiluMul and other paths without broadcast metadata retain their
+existing state handling.
 
 The same cache now backs `ScatterElements`, `GatherElements` and the shared
 `PersistentMetadata` adapter used by movement, Einsum views, ScatterND,
@@ -1288,15 +1608,14 @@ extent and graph resource derive from that record through a borrowed allocation
 accessor. Empty metadata retains the initialized u64 sentinel, including exact
 signed-stride bit patterns in nonempty payloads.
 
-For this adapter, a content miss now adds the common explicit
-`drain_for_unmap` before replacement, independent of deferred per-op eager sync;
-its fitting warm path adds no drain or upload. Cold preparation materializes
-an owned byte payload. Existing kernel-specific signature checks, dynamic
+For this adapter, content misses use native retirement for the prior owner;
+fitting warm reuse adds no drain or upload. Cold preparation materializes an
+owned byte payload and retains its synchronous H2D completion. Existing kernel-specific signature checks, dynamic
 control readbacks, identity/empty paths and launch-success publication remain
 in their callers. The artifact labels passed to staging are borrowed, avoiding
 new warm formatting. Host regressions pin table ABI and sentinel/signed-bit
 encoding; the Transpose device fixture additionally checks warm allocation/
-transfer/drain stability and mandatory drains for failed and successful rewarm,
+transfer/drain stability and no explicit drain for failed or successful rewarm,
 while retaining its old-graph replay after rewarm and kernel drop.
 
 ### Slice metadata shares one physical lifetime
@@ -1317,8 +1636,10 @@ Eager calls still read dynamic starts/ends/axes/steps; capture reuses the warmed
 fixed plan. Empty-output and scalar-copy paths remain unchanged. Warm eager
 calls therefore still incur control D2H and Host shape/plan construction; the
 metadata hit introduces no additional upload or retirement drain. A content
-miss uses one mandatory retirement drain rather than independently replacing
-two tables. This adds no quota protocol or new allocator.
+miss prepares one complete immutable replacement and retires prior ownership
+through the existing native queue. Its four dynamic control D2H completion
+barriers remain; there is no added metadata retirement drain, quota protocol or
+new allocator.
 
 Host regressions cover table order, signed encoding, aligned origins,
 initialized sentinels, complete-span refusal, rank mismatch and layout overflow.
@@ -1334,12 +1655,27 @@ actual driver memory use and latency/throughput remain unmeasured here.
 
 `SkipSimplifiedLayerNormalization` now delegates its two-table broadcast cache
 to `DeviceMetadataCache`, with input/skip shapes in one non-Clone typed key and
-the owner in the same immutable record. The outer warm rollback snapshot shares
-the Arc instead of copying shape vectors. Table encoding, allocation/upload
-checkpoint and BF16 caller-workspace pins remain separate kernel contracts.
-Preparation failures restore the old owner and revoke capture readiness; a
-successful launch keeps the replacement. Cold content replacement uses the
-common mandatory drain in place of the old trailing optional synchronization.
+the owner in the same immutable record. Each invocation briefly locks shared
+state to clone a candidate, sharing the Arc rather than copying shape vectors.
+Direct, native BF16 and BF16-through-F32 paths all consume that local candidate
+through the final output conversion. No shared metadata lock is held over
+encoding, upload, NVRTC resolution or kernel launches. Only successful complete
+consumption publishes the candidate with a short replace; the old value retires
+after unlocking. Failed calls never mutate published metadata and retain the
+old graph's owner, with readiness false from entry. The Drop rollback object,
+ignored failure drain and restore-under-lock path are removed.
+
+Branches return their capture eligibility as an ordinary result. The outer call
+publishes that eligibility only after metadata commit succeeds, so failed casts
+and poisoned publication cannot advertise ready state. Table encoding,
+allocation/upload checkpoint and actual BF16 workspace pins remain enforced.
+Host tests exercise reentrant candidate retirement outside the publication lock,
+including refusal with poisoned state. Device fixtures distinguish required
+H2D upload counters from explicit force/drain counters, and check no work on
+invalid input, failed replacement preservation, successful rewarm and old graph
+replay after kernel destruction. These fixtures are compiled/listed, not run on
+this CPU-only host. Synchronous H2D behavior is unchanged, and no latency or
+throughput improvement is claimed.
 
 The shared metadata hit path already queries the driver's capture status. It
 now uses a strict captured-owner check: an actual capture must have a registered
@@ -1497,7 +1833,7 @@ allowlist and transitive synchronization checks remain enforced.
 
 The immutable allocation scope of an armed route record now covers its six-word
 header and expert bitmap together. `ArmedTelemetry` keeps one
-`GraphDeviceAllocation`; QMoE publishes/validates one capture resource, while
+`NativeDeviceAllocation`; QMoE publishes/validates one capture resource, while
 BlockQuantizedMoE continues to pin its existing outer telemetry owner. Header
 injection remains bounded to its six words. Kernel sources and two-pointer ABI
 are unchanged: header is at the owner base and bitmap at byte offset 512.
@@ -1525,6 +1861,43 @@ owner surviving handle drop until graph reset. Existing QMoE and
 BlockQuantizedMoE route/capture suites are compiled for integration coverage.
 Device execution, atomic-contention impact and throughput remain unmeasured;
 512B separation is a conservative layout choice, not proof of equal performance.
+
+QMoE retains one window-state mutex because reset writes the same record in
+place. Route submission now borrows that locked state from pointer selection
+through the route launch, so reset cannot pass between those steps. NVRTC
+function resolution occurs before taking the mutex; the borrowed state is
+released before subsequent allocations, synchronization or release-queue work.
+Snapshot/reset enter global capture exclusion before locking state, preserving
+the capture/queue-to-state lock order. Reset still drains completed compute and
+copy work before zeroing the record; snapshot remains a coarse ordered read.
+
+Arm publishes a complete candidate with a short ownership handoff, then drops
+the prior record outside the mutex. Disarm and poisoned-state cleanup use that
+same retirement handoff after unlocking. Native queue completion and graph pins own
+retirement, so arm/disarm/final destruction no longer perform an ignored global
+drain. Provider cleanup after its existing stream fences invokes this same
+disarm path; there is no second retirement API or new quota protocol. Failed
+state publication returns an actionable typed poison error and preserves the
+previous record.
+
+The early capture signature retains the exact selected native owner pin until
+successful publication. Submission compares the currently selected owner with
+that signature while holding the window mutex, refusing administrative
+reconfiguration instead of recording a different pointer. This also prevents
+host owner-address reuse during preparation. Successful capture readiness stores
+the exact same pin, without re-reading mutable telemetry state. The shared
+last-call-used flag is removed; warm execution adds no grant, refund, reset,
+extra resource allocation or owner clone compared with the prior path.
+
+Host tests exercise exact owner matching and reentrant retirement outside the
+state lock, including candidate refusal and cleanup after poison. CUDA fixtures
+compile/list assertions for submission serialization, no retirement drain,
+retained old ownership and exact native settlement. Their counter assertions
+track required synchronous H2D through `host_to_device` separately from
+`forced_synchronization_count`, which records explicit force/drain calls. Existing QMoE graph/window
+integration tests retain reset, accumulation and request-isolation coverage.
+These source/Host checks do not prove device ordering or throughput; the longer
+route-submission mutex interval still needs device validation.
 
 ### Variable-length attention borrows one exact caller composite
 
@@ -1651,8 +2024,7 @@ retry that owner or refund retained bytes.
 
 No runtime, new registry, quota authority, pool or per-region lease is stored in
 this core. It introduces no hot execution path. This is the shared retirement
-boundary for the next native allocation-domain extraction; runtime-private raw
-artifacts have not yet migrated.
+boundary used by the native allocation domain and its retained graph artifacts.
 
 Host regressions drive this production function with real binding/managed Host
 owners and independently controlled compute/copy fences. They verify pending
@@ -1661,6 +2033,147 @@ refusal with retained charges, typed outstanding-view failure without enqueue,
 and the binding-only branch. Existing workspace-barrier tests now also use this
 core instead of a test-specific settlement observer. GPU fixtures compile
 against both callers; no CUDA execution or performance measurement was available.
+
+### Allocator selection precedes provider publication
+
+`CudaExecutionProvider::from_config(ordinal, CudaProviderConfig)` selects an
+optional external allocator before initializing CUDA. A mismatched device is
+rejected at this public boundary with the expected CUDA ordinal and offered
+device. When external memory is selected, construction never creates a spare
+built-in VMM arena or registration. Otherwise the same mandatory built-in VMM
+construction and actionable failure behavior apply.
+
+The completed provider has one selected mechanism for its lifetime. The former
+consuming `with_memory` operation, its late-replacement guards, retired mechanism
+list and allocator-teardown list are removed. This prevents a cloned runtime and
+future artifact admission from racing an allocator swap. It does not require a
+freeze flag, configuration lock, Arc reference-count check or per-dispatch guard.
+Shutdown still pins that mechanism until its queued ownership and allocator
+teardown have settled. Governor adoption preserves authority identity checks;
+external immutable-weight admission remains explicitly refused.
+
+For example, use `CudaProviderConfig { memory: Some(allocator), ..Default::default() }`
+as the construction input. Defaults still resolve offload/route policy from the
+environment; explicit policy/governor/manager fields can be supplied together.
+Host tests exercise the actual mismatched-device constructor before CUDA loading.
+GPU fixtures cover authoritative injection, allocation/free size agreement,
+workspace reuse/capture and external sealed-admission refusal; they are compiled
+without claiming CUDA execution on a Host-only machine.
+
+### The provider owns one native allocation domain
+
+The private `CudaAllocationDomain` owns the selected allocator, process-manager
+binding, governor, mapped attribution, allocation/free counters, admission-closed
+state and deferred-release queue. Provider and retained artifacts share one Arc
+domain; there is no parallel mutable configuration. Native admission, mapped
+growth and release accounting read that same state. The runtime installs one
+Weak domain after complete construction and is borrowed for capture checks;
+the domain never retains it. Runtime also retains the existing two counter Arcs,
+which contain only atomics, so cumulative native counts survive domain teardown.
+No configuration lock, per-region ticket or allocation tier is added.
+
+Allocator selection is construction-only through `CudaProviderConfig::memory`.
+The selected mechanism is registered once before the provider/runtime can escape;
+there is no live allocator replacement. Governor adoption still checks the same
+authority and physical pool. The construction queue guard remains armed
+through fallible residency installation. Field teardown releases mapped reclaim
+registration before the domain, then the selected allocator before its binding,
+with the domain queue last. No second cleanup owner or Domain Drop is introduced.
+
+The EP continues to coordinate workspace release barriers, executor/graph state,
+shutdown and the terminal runtime keepalive. Existing provider trait methods
+forward allocation work to the domain; retained warm workspace paths do not gain
+quota calls. A retained graph artifact consumes a real binding/managed owner
+through this domain. Missing or expired runtime installation refuses admission
+explicitly, including standalone runtimes; there is no silent raw fallback.
+Existing raw runtime APIs and their transient consumers remain a separate scope.
+
+Host allocator/retirement regressions pass; GPU admission and deferred-release
+fixtures compile and are listed, and default/GPU-feature all-target Clippy covers
+the EP, plugin and session callers. No CUDA execution or performance was measured.
+
+### Retained graph artifacts use native ownership and settlement
+
+`NativeDeviceAllocation` admits one whole artifact or metadata composite through
+`allocate_governed`, using Weights for converted/repacked constants and persistent
+Workspace for metadata/telemetry. Its buffer retains the real owner and its
+allocation domain. Graph resources pin the same artifact Arc, never duplicate
+its allocation or charge. Final retirement validates the selected binding and
+uses the common consuming release core after both stream tails. Keeping an
+artifact beyond provider shutdown keeps its retirement domain/queue available;
+it cannot reopen admission. The domain has no strong runtime back-edge.
+
+Runtime allocation counts now combine raw driver calls with native logical
+admissions and settled releases; they are not all driver malloc/free counts.
+The provider forwards these totals without adding the same domain twice.
+Native frees increase only on complete settlement, not enqueue. GPU lifecycle
+fixtures wait for settlement before asserting release; raw-pool growth and the
+old 512-byte retained class are no longer evidence of native retirement.
+
+LinearAttention's large runtime head-size state was a per-execution temporary,
+so it does not become a graph-artifact admission. Both registry entries declare
+metadata workspace planning. One checked geometry helper determines an FP32
+state span (`batch * kv_heads * d_k * d_v * sizeof(f32)`) independent of storage
+dtype, optional past and sequence length. Sizes within local-column capacity
+need no scratch; larger sizes borrow a persistent caller lane, including zero
+sequence with nonempty state. Warm fitting execution performs no internal
+allocation or quota request. Missing/misaligned/short backing is refused, and
+capture requires a real registered pin covering the used state span.
+
+Host regressions exercise the real graph owner, manager/domain and native
+retirement with controlled fences: last-pin lifetime, retained domain, pending
+charges, settlement and no retry/refund on refusal. Geometry/layout checks cover
+thresholds, zero extents/sequence, overflow and malformed backing. GPU fixtures
+compile numerical parity across state sizes/dtypes, pinned recurrent capture,
+missing-domain refusal and monotonic/nonduplicated counters; CUDA execution and
+throughput remain unmeasured. Migrating raw pool allocation to selected native
+backing changes physical granularity and cold behavior, so no memory/performance
+improvement is inferred from Host tests.
+
+### Prefill staging keeps two exclusive native slot owners
+
+The whole-layer prefill double buffer reserves two independent
+`NativeDeviceAllocation` owners through its runtime's existing provider domain.
+The former graph-specific owner name is removed; graph pins use its shared
+constructor, while prefill holds exclusive values. One cold admission per stable
+slot keeps failure isolation without per-layer, per-row or per-tile tickets.
+There is no second residency budget or accounting ledger. Content is Weights;
+selected allocator, capture checks and native mapped accounting remain canonical.
+
+Reservation validates the per-slot layout and two-slot peak before casts, then
+prepares both native owners and both pinned sources before publishing either
+slot. A second-slot refusal retires the unpublished first owner through the same
+queue, so its charge is released only after settlement. Slot pointers and
+capacities come from the owner, instead of separately maintained raw fields.
+Repeated fill/wait/release changes data and existing fences, never slot backing
+or quota. Replacing an already reserved transfer is explicitly refused.
+
+Pinned source reads have three states: Idle, Unproven and Fenced. The transfer
+sets Unproven before attempting H2D submission and publishes a reuse fence only
+after recording succeeds. An enqueue or fence failure cannot later use fence
+zero as a fake completion proof. Actual completion (including an authoritative
+fallback sync witness) permits pinned reuse; absence of submission is safe to
+drop but does not forge a pool-return witness. Unknown completion retains the
+source and explicitly quarantines its native destination with
+`QuarantineReason::CompletionUnknown`. The healthy sibling can still retire.
+
+Normal teardown and defensive Drop share this path. Device ownership goes to
+the existing two-stream deferred queue; it no longer ignores a failed global
+compute drain and raw-frees the destination. Final per-slot fences are handled
+without claiming enqueue is refund. Pinned retention remains a separate safety
+condition: only a real copy-completion witness returns pages to the pool.
+Quarantined native charges stay visible in the manager rather than disappearing
+inside a forgotten raw-pointer bundle. Typed binding/transaction errors remain
+in the source chain through native, prefill transfer and rejection boundaries.
+Capture admission remains unchanged; this does not enable pipeline capture.
+
+Host checks cover the actual native quarantine/charge path, typed capacity
+refusal, failed read proofs, address/peak overflow and typed prefill causes,
+alongside the existing generic pipeline state machine. GPU fixtures compile
+second-slot refusal, direct Drop, single-slot quarantine and normal multi-layer
+reuse/settlement. They are not CUDA execution or performance measurements. The
+native allocator can change physical granularity and cold reservation behavior;
+no footprint or throughput improvement is inferred from these Host checks.
 
 ### Sealed weights and workspace share cold native admission
 
@@ -1698,8 +2211,8 @@ raw-capture entry points, role/charge-mode/process-reservation records, copied
 bytes, allocation failure, post-upload rejection and deferred release. CUDA
 execution and performance were unavailable. No new warm inference allocation or
 quota callback was added; this does not establish a universal zero-callback
-contract for arbitrary existing StepScoped callers. Runtime-private raw artifacts
-still require the subsequent native-domain migration.
+contract for arbitrary existing StepScoped callers. Retained graph artifacts now
+use the same domain; other explicit raw runtime consumers remain separate.
 
 ### Physical release pins are independent of the runtime graph registry
 
@@ -1837,7 +2350,7 @@ call; it owns the governed workspace preparation path
 | `kernels/einsum/plan.rs` | immutable final-address launch metadata | exact encoded generic-step program | complete I/O identity and final used-span binding | independently pinned immutable device artifact | fresh candidate published only after successful execution; installed graphs retain older metadata |
 | `kernels/index_transform.rs` | CenterCropPad/Col2Im descriptors | respectively `4 * rank * 8` and `6 * control_elements * 8` | input rank / checked image-shape control length | SessionPersistent caller peak | complete bind before existing D2H; exact borrowed upload |
 | `kernels/indexing.rs` | ScatterElements/ScatterND mean accumulator state | `data_numel * (16 or 24)` | output shape/dtype dependent | session-persistent shared caller peak | governed metadata requirement; real used-span capture pin; no private scratch owner |
-| `kernels/indexing.rs` metadata caches | shape/indexing descriptors | `bytes.len().max(1)` | op/rank/shape dependent | shape-keyed persistent metadata artifact | existing raw artifact owner and capture pin; separate from disposable mean state |
+| `kernels/indexing.rs` metadata caches | shape/indexing descriptors | `bytes.len().max(1)` | op/rank/shape dependent | shape-keyed persistent metadata artifact | native allocation-domain owner and capture pin; separate from disposable mean state |
 | `kernels/matmul.rs` | dense MatMul cuBLASLt workspace, including F32/F16 single-row paths | exact cached ActualAddress plan `workspaceSize` | shape/dtype/alignment/algorithm dependent | session-persistent caller lane peak | metadata Deferred, execution refiner fixes the plan before admission; no private device scratch |
 | `kernels/matmul.rs` | batched/broadcast MatMul cuBLASLt workspace | metadata planner heuristic `workspaceSize` | shape/dtype/algorithm dependent | session-persistent shared peak | existing governed metadata bound; non-capturable |
 | `kernels/matmul_nbits.rs:3599` | `MatMulNBits` accuracy-4 decode activation quantization | `padded_k + (padded_k / block_size) * sizeof(f32)` | model config (`K`, `block_size`) | model-lifetime fixed scratch | raw bypass |

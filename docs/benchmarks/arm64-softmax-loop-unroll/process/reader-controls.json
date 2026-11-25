@@ -1,0 +1,44 @@
+{
+  "scope": "synthetic controls, not performance measurements",
+  "accepted_complete_matrix": true,
+  "processes": 528,
+  "controls": [
+    {
+      "name": "vacuity_only_setup_processes",
+      "rejected": true
+    },
+    {
+      "name": "missing_process",
+      "rejected": true
+    },
+    {
+      "name": "duplicate_process_identity",
+      "rejected": true
+    },
+    {
+      "name": "work_labeled_with_zero_calls",
+      "rejected": true
+    },
+    {
+      "name": "no_native_work_witness",
+      "rejected": true
+    },
+    {
+      "name": "impossible_cpu_capacity",
+      "rejected": true
+    },
+    {
+      "name": "unstable_full_output_digest",
+      "rejected": true
+    },
+    {
+      "name": "missing_validation_bound",
+      "rejected": true
+    },
+    {
+      "name": "missing_parallel_worker",
+      "rejected": true
+    }
+  ],
+  "reader_sha256": "5bfcc88e80f55ef74395b38b8a746bcbf689f23863b02859717514c415d46821"
+}

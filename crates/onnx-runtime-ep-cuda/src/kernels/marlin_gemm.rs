@@ -70,7 +70,7 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{DeviceGraphResource, EpError, Result};
 
 use crate::error::driver_err;
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
+use crate::runtime::{CudaRuntime, NativeDeviceAllocation, cuptr};
 
 /// NVRTC module + entry names for the Marlin int4 tensor-core GEMM.
 pub const MARLIN_MODULE: &str = "matmul_nbits_marlin_gemm";
@@ -175,13 +175,13 @@ pub fn marlin_splitk_enabled() -> bool {
 /// the repack, including captured CUDA-graph replays.
 #[derive(Debug)]
 struct RepackEntry {
-    allocation: Arc<GraphDeviceAllocation>,
+    allocation: Arc<NativeDeviceAllocation>,
 }
 
 pub(super) struct RepackCache {
     runtime: Arc<CudaRuntime>,
     map: Mutex<HashMap<(usize, usize, usize, usize), RepackEntry>>,
-    last_used: Mutex<Vec<Arc<GraphDeviceAllocation>>>,
+    last_used: Mutex<Vec<Arc<NativeDeviceAllocation>>>,
     /// Device bytes held by `map`. These are raw `cuMemAlloc`s, invisible to
     /// the VMM arena, so without a counter this memory cannot be reported at
     /// all — it shows up only as an unexplained gap against `nvidia-smi`.
@@ -243,13 +243,13 @@ impl RepackCache {
             .map(|allocations| {
                 allocations
                     .iter()
-                    .map(GraphDeviceAllocation::device_graph_resource)
+                    .map(NativeDeviceAllocation::device_graph_resource)
                     .collect()
             })
             .unwrap_or_default()
     }
 
-    fn record_use(&self, allocation: &Arc<GraphDeviceAllocation>) {
+    fn record_use(&self, allocation: &Arc<NativeDeviceAllocation>) {
         let mut last_used = self
             .last_used
             .lock()
@@ -293,7 +293,11 @@ impl RepackCache {
             ));
         }
         let bytes = repacked_bytes(n, k);
-        let allocation = GraphDeviceAllocation::allocate(&self.runtime, bytes)?;
+        let allocation = NativeDeviceAllocation::allocate_shared(
+            &self.runtime,
+            bytes,
+            onnx_runtime_memory_api::MemoryRole::Weights,
+        )?;
         let out = allocation.ptr();
         launch_marlin_repack(&self.runtime, packed, out, n, k, group_size)?;
         let mut cache = self.map.lock().expect("marlin repack cache poisoned");
@@ -1103,8 +1107,8 @@ mod tests {
 
     use crate::runtime::CudaRuntime;
 
-    fn runtime() -> Option<Arc<CudaRuntime>> {
-        crate::test_support::maybe_runtime()
+    fn runtime() -> Option<crate::test_support::NativeRuntimeFixture> {
+        crate::test_support::maybe_native_runtime()
     }
 
     fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
@@ -1349,7 +1353,7 @@ mod tests {
     #[test]
     #[ignore = "requires a live CUDA device (SM80+)"]
     fn marlin_parity_vs_f64_oracle() {
-        let Some(rt) = runtime() else {
+        let Some((_provider, rt)) = runtime() else {
             eprintln!("skipping: CUDA runtime unavailable");
             return;
         };
@@ -1409,7 +1413,7 @@ mod tests {
     #[test]
     #[ignore = "requires a live CUDA device (SM80+)"]
     fn marlin_splitk_parity_vs_f64_oracle() {
-        let Some(rt) = runtime() else {
+        let Some((_provider, rt)) = runtime() else {
             eprintln!("skipping: CUDA runtime unavailable");
             return;
         };
@@ -1460,7 +1464,7 @@ mod tests {
     #[test]
     #[ignore = "requires a live CUDA device (SM80+)"]
     fn marlin_splitk_is_deterministic() {
-        let Some(rt) = runtime() else {
+        let Some((_provider, rt)) = runtime() else {
             eprintln!("skipping: CUDA runtime unavailable");
             return;
         };
@@ -1483,7 +1487,7 @@ mod tests {
     fn marlin_bandwidth_microbench() {
         use half::f16;
 
-        let Some(rt) = runtime() else {
+        let Some((_provider, rt)) = runtime() else {
             eprintln!("skipping: CUDA runtime unavailable");
             return;
         };
@@ -1633,7 +1637,7 @@ mod tests {
     #[test]
     #[ignore = "requires a live CUDA device"]
     fn device_repack_matches_host() {
-        let Some(rt) = runtime() else {
+        let Some((_provider, rt)) = runtime() else {
             eprintln!("skipping: CUDA runtime unavailable");
             return;
         };
@@ -1681,7 +1685,7 @@ mod tests {
     #[test]
     #[ignore = "requires a live CUDA device"]
     fn repack_cache_address_reuse_is_scoped_to_kernel_owner() {
-        let Some(rt) = runtime() else {
+        let Some((_provider, rt)) = runtime() else {
             eprintln!("skipping: CUDA runtime unavailable");
             return;
         };
