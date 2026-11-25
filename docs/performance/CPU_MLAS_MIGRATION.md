@@ -1833,3 +1833,18 @@ retains all 160 cases and both candidate/final validation. No latency or LLM
 throughput was measured. Keep the existing default and add no heuristic; the
 permuted-bit/selection-boundary regression test remains as a guard for future
 native optimization. No resource, quota or public EP API changes are introduced.
+
+
+## Native Conv shares one group GEMM driver
+
+The default native Conv implementation now uses one group-indexed GEMM driver
+for ordinary and grouped convolution. Non-pointwise geometry reuses one im2col
+buffer across batches/groups; pointwise geometry borrows input without a col
+allocation. Empty batches skip unused scratch. Existing BNNS/NEON/native-backend
+selection, arithmetic order and output staging remain. No new resource, cache or
+EP interface is introduced; the col buffer remains call-owned scratch.
+
+The [allocation and equivalence checks](../benchmarks/conv-gemm-driver/README.md)
+cover actual native execute calls and old/new same-image drivers. This removes
+redundant ownership and decisions; it does not claim inference latency, full
+memory accounting, Convolution graduation or removal of its MLAS reference.
