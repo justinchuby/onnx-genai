@@ -1,0 +1,74 @@
+{
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/moe.rs": "094a9f26ea3bd6f09ebc53c14807c3e9151417f9f239219764a8ffa7ac3bee58",
+    "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs": "198ec86e0c862066264eabc95c87dfa4f280e5139f44bc8b9627f6193e527cc8"
+  },
+  "checks": [
+    {
+      "name": "full",
+      "sha256": "701b2ec2df3438878177a7eec209856709415f75274e564d89ff6963c8044409",
+      "counts": [
+        [
+          "ok",
+          "2059",
+          "0",
+          "21"
+        ],
+        [
+          "ok",
+          "2101",
+          "0",
+          "37"
+        ],
+        [
+          "ok",
+          "14",
+          "0",
+          "0"
+        ],
+        [
+          "ok",
+          "373",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "oracle",
+      "sha256": "d97086e338105119736652db4e70d161d767ae7aebb21bfd0187d6956b2e8a0c",
+      "counts": [
+        [
+          "ok",
+          "1",
+          "0",
+          "0"
+        ],
+        [
+          "ok",
+          "14",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "focused-initial",
+      "sha256": "9e6f087818f65a52d1a513239d85455db4f86189ac60a97d92d0b2c70d7f39f1",
+      "counts": [
+        [
+          "FAILED",
+          "54",
+          "3",
+          "1"
+        ],
+        [
+          "ok",
+          "57",
+          "0",
+          "1"
+        ]
+      ]
+    }
+  ]
+}

@@ -616,11 +616,11 @@ impl Executor {
         // `cache` and `kernel_bindings` are kept as separate locals because the
         // resolved kernel reference borrows `cache` for the rest of the dispatch.
         let workspace_replacement = self.workspace_replacement();
+        let shape_facts = self.kernel_shape_facts[pi];
         let cache = &mut self.cache;
         let kernel_bindings = &mut self.kernel_bindings;
         let provider_artifact_readiness = &mut self.provider_artifact_readiness;
         let finalized_expert_banks = &self.finalized_expert_banks;
-        let capture_growing = &self.capture_growing_symbols;
         let weights = &self.weights;
         let workspace_owners = self.workspaces.active_mut();
         let mut ctx = KernelDispatchContext {
@@ -672,7 +672,7 @@ impl Executor {
             // hits here. The binding is populated on miss (below) or at build.
             let prebound = kernel_bindings[pi]
                 .as_ref()
-                .is_some_and(|binding| cache.has_prebound(binding, input_shapes));
+                .is_some_and(|binding| cache.has_prebound(binding, input_shapes, shape_facts));
             if !prebound {
                 // No binding yet (first dispatch of this node for a symbolic
                 // graph), or the shape changed. Compute constants and go through
@@ -698,7 +698,7 @@ impl Executor {
                     &constant_inputs,
                     &constant_values,
                     opset,
-                    node_capture_seq_independent(ctx.graph, node, capture_growing),
+                    shape_facts,
                     artifact_config,
                     provider_artifact_readiness,
                     ep.as_ref(),
@@ -723,6 +723,7 @@ impl Executor {
                         .as_ref()
                         .expect("kernel binding installed before lookup"),
                     input_shapes,
+                    shape_facts,
                 )
                 .expect("kernel binding resolved immediately before lookup")
         };

@@ -1,0 +1,14 @@
+{
+  "observation": "baseline has no AppliedActivationBias gated_activation_row outline; candidate has an outlined generic row helper. This motivates an inline-hint ablation; it does not prove CPU causality.",
+  "records": [
+    {
+      "start": 4297165336,
+      "stop": 4297165808,
+      "bytes": 472,
+      "symbol": "__RINvNtNtCs42teQl6N5qM_19onnx_runtime_ep_cpu7kernels3moe20gated_activation_rowNtB2_21AppliedActivationBiasEB6_"
+    }
+  ],
+  "binary_sha256": "afcfd128f91ab89a6b21686498d47772d57e7c9a8578ad02bd6691204fc3eea9",
+  "disassembly_raw_sha256": "b2ae87ba15b9f44a1ff660f02ecd7e407ddc4f353e937e85168e5ad777f3d487",
+  "collection": "llvm-nm --numeric-sort, then llvm-objdump -d over [start,stop) for the recorded candidate.binary"
+}

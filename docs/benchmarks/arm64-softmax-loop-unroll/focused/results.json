@@ -1,0 +1,60 @@
+{
+  "schema": 1,
+  "processes": 36,
+  "cells": [
+    {
+      "width": 8,
+      "case": 5,
+      "shape": [
+        32,
+        1024
+      ],
+      "setup_cpu_s": {
+        "0": 0.008211,
+        "1": 0.008056,
+        "2": 0.00756,
+        "3": 0.007023,
+        "4": 0.007854
+      },
+      "work_cpu_s": {
+        "0": 0.379383,
+        "1": 0.28336,
+        "2": 0.28396499999999997,
+        "3": 0.186575,
+        "4": 0.365143
+      },
+      "candidate_aa": 0.9978694557427853,
+      "fixed_fractions": {
+        "0": 0.021643036192976486,
+        "1": 0.02843026538678713,
+        "2": 0.026622999313295655,
+        "3": 0.03764169904863996,
+        "4": 0.02150938125611062
+      },
+      "scaling": {
+        "0": {
+          "double_cpu_s": 0.7437579999999999,
+          "raw_double_over_work": 1.9604410318859828,
+          "setup_adjusted_work_scale": 1.9816877350662225
+        },
+        "1": {
+          "double_cpu_s": 0.558859,
+          "raw_double_over_work": 1.97225790513834,
+          "setup_adjusted_work_scale": 2.000708307906896
+        }
+      },
+      "qualified": true,
+      "reasons": [],
+      "original_over_candidate_ratio": 1.3388728119706381,
+      "paired_ratios": [
+        1.4117482536109798,
+        1.3388728119706381,
+        1.3172382113390222
+      ],
+      "original_over_outline": 1.0389984197971753,
+      "outline_over_candidate": 1.2886187182382833,
+      "mlas_over_candidate": 0.6584380293619424
+    }
+  ],
+  "all_native_full_output_hashes_match": true
+}
