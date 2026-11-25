@@ -585,6 +585,20 @@ impl ExecutionProvider for CpuExecutionProvider {
                 op.op_type
             );
         }
+        if opset >= 28
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && matches!(op.op_type.as_str(), "ReduceLogSum" | "ReduceLogSumExp")
+            && let Some(&dtype) = input_dtypes.first()
+            && !matches!(
+                dtype,
+                DataType::Float16 | DataType::BFloat16 | DataType::Float32 | DataType::Float64
+            )
+        {
+            deny!(
+                "{} does not accept {dtype:?} data at opset {opset}; the opset-28 schema is float-only, so cast the data input to Float16, BFloat16, Float32, or Float64",
+                op.op_type
+            );
+        }
         if op.op_type == "DeformConv"
             && domain.is_empty()
             && let Err(reason) =
@@ -1109,6 +1123,42 @@ mod host_copy_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logarithmic_reductions_apply_opset_28_float_boundary_at_admission() {
+        let ep = CpuExecutionProvider::new();
+        for op_type in ["ReduceLogSum", "ReduceLogSumExp"] {
+            let node = Node::new(NodeId(0), op_type, vec![], vec![]);
+            assert!(
+                ep.supports_op(&node, 27, &[], &[DataType::Int64], &[])
+                    .is_supported(),
+                "{op_type} opset 27 must preserve the legacy integer admission contract"
+            );
+
+            let current = ep.supports_op(&node, 28, &[], &[DataType::Int64], &[]);
+            assert!(
+                !current.is_supported(),
+                "{op_type} opset 28 must reject Int64"
+            );
+            let current_reason = current
+                .reason()
+                .expect("opset-28 rejection must explain the boundary");
+            assert!(
+                current_reason.contains("does not accept Int64 data at opset 28"),
+                "{current_reason}"
+            );
+            assert!(
+                current_reason.contains("opset-28 schema is float-only"),
+                "{current_reason}"
+            );
+            assert!(
+                ep.supports_op(&node, 28, &[], &[DataType::Float64], &[])
+                    .is_supported(),
+                "{op_type} opset 28 accepts Float64"
+            );
+        }
+    }
+
     #[test]
     fn workspace_context_is_lazy_and_distinguishes_selected_pool_widths() {
         const CHILD: &str = "NXRT_WORKSPACE_CONTEXT_CHILD";
