@@ -45,7 +45,7 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ir::{DataType, Node};
 
-use crate::device_metadata::DeviceMetadataCache;
+use crate::device_metadata::{DeviceMetadataCache, publish_metadata_candidate};
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr, raw_ptr};
 
@@ -2264,57 +2264,6 @@ fn skip_stat_bf16_mask(outputs: &[TensorMut]) -> i32 {
         })
 }
 
-struct SkipNormWarmRollback<'a> {
-    kernel: &'a SkipSimplifiedLayerNormKernel,
-    metadata: Option<SkipBroadcastMetadataCache>,
-    committed: bool,
-}
-
-impl<'a> SkipNormWarmRollback<'a> {
-    fn new(kernel: &'a SkipSimplifiedLayerNormKernel) -> Result<Self> {
-        Ok(Self {
-            metadata: Some(
-                kernel
-                    .metadata
-                    .lock()
-                    .map_err(|_| {
-                        EpError::KernelFailed(
-                            "cuda_ep SkipSimplifiedLayerNormalization: metadata lock poisoned"
-                                .into(),
-                        )
-                    })?
-                    .clone(),
-            ),
-            kernel,
-            committed: false,
-        })
-    }
-
-    fn finish(mut self, result: Result<()>) -> Result<()> {
-        self.committed = result.is_ok();
-        result
-    }
-}
-
-impl Drop for SkipNormWarmRollback<'_> {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        if !self.kernel.runtime.is_capturing().unwrap_or(true) {
-            let _ = self.kernel.runtime.drain_for_unmap();
-        }
-        if let Some(metadata) = self.metadata.take()
-            && let Ok(mut current) = self.kernel.metadata.lock()
-        {
-            *current = metadata;
-        }
-        self.kernel
-            .last_call_capture_safe
-            .store(false, Ordering::Relaxed);
-    }
-}
-
 #[derive(Debug)]
 struct SkipBroadcastMetadataKey {
     input_shape: Vec<usize>,
@@ -2364,7 +2313,8 @@ impl SkipSimplifiedLayerNormKernel {
         outputs: &mut [TensorMut],
         layout: WorkspaceLayout<8>,
         workspace: Option<WorkspaceView>,
-    ) -> Result<()> {
+        metadata: &mut SkipBroadcastMetadataCache,
+    ) -> Result<bool> {
         let regions = layout.bind(workspace).map_err(|source| EpError::Backend {
             operation: "bind complete caller workspace for SkipSimplifiedLayerNormalization BF16 staging",
             source: Box::new(source),
@@ -2431,7 +2381,7 @@ impl SkipSimplifiedLayerNormKernel {
                 }
             })
             .collect::<Vec<_>>();
-        self.run_direct(&f32_inputs, &mut f32_outputs)?;
+        let capture_safe = self.run_direct(&f32_inputs, &mut f32_outputs, metadata)?;
         for (index, output) in outputs.iter_mut().enumerate() {
             if !output.is_absent() && output.numel() != 0 {
                 super::cast::launch_cast_raw(
@@ -2444,7 +2394,7 @@ impl SkipSimplifiedLayerNormKernel {
                 )?;
             }
         }
-        Ok(())
+        Ok(capture_safe)
     }
 
     /// Native byte-exact bf16 fused Skip-RMSNorm. Preconditions (checked by the
@@ -2453,8 +2403,12 @@ impl SkipSimplifiedLayerNormKernel {
     /// validation but launches `skip_rmsnorm_bf16` with the same block-tree
     /// reduction config as `rmsnorm_bf16`, so a folded `Add → RMSNorm` seam is
     /// bit-identical to running the standalone `Add(bf16)` + `rmsnorm_bf16`.
-    fn run_bf16_native(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.last_call_capture_safe.store(false, Ordering::Relaxed);
+    fn run_bf16_native(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        metadata: &mut SkipBroadcastMetadataCache,
+    ) -> Result<bool> {
         let op = "SkipSimplifiedLayerNormalization";
         let input = &inputs[0];
         let skip = &inputs[1];
@@ -2512,7 +2466,7 @@ impl SkipSimplifiedLayerNormKernel {
             )));
         }
         if num_groups == 0 {
-            return Ok(());
+            return Ok(false);
         }
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             let elements = input.numel() as u64;
@@ -2554,10 +2508,6 @@ impl SkipSimplifiedLayerNormKernel {
         let skip_ptr = cuptr(skip.data_ptr::<u8>() as *const c_void);
         let gamma_ptr = cuptr(gamma.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-        let mut metadata = self
-            .metadata
-            .lock()
-            .expect("cuda_ep skip normalization metadata cache poisoned");
         let metadata_ptr = metadata.reserve(input.shape, skip.shape)?;
         let dense_skip = i32::from(skip.numel() == input.numel());
         let bias_ptr = 0u64;
@@ -2614,9 +2564,7 @@ impl SkipSimplifiedLayerNormKernel {
         // SAFETY: all pointers reference validated device buffers; metadata holds
         // two rank-length u64 arrays (output shape and skip strides).
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err("launch skip_rmsnorm_bf16", e))?;
-        self.last_call_capture_safe
-            .store(num_groups == 1, Ordering::Relaxed);
-        Ok(())
+        Ok(num_groups == 1)
     }
 
     fn run(
@@ -2626,7 +2574,27 @@ impl SkipSimplifiedLayerNormKernel {
         workspace: Option<WorkspaceView>,
     ) -> Result<()> {
         self.last_call_capture_safe.store(false, Ordering::Relaxed);
-        let rollback = SkipNormWarmRollback::new(self)?;
+        let mut candidate = self.metadata.lock().map_err(|_| EpError::KernelFailed(
+            "cuda_ep SkipSimplifiedLayerNormalization metadata state is poisoned; rebuild the provider before warming again".into(),
+        ))?.clone();
+        let capture_safe = self.run_candidate(inputs, outputs, workspace, &mut candidate)?;
+        publish_metadata_candidate(
+            &self.metadata,
+            candidate,
+            "SkipSimplifiedLayerNormalization",
+        )?;
+        self.last_call_capture_safe
+            .store(capture_safe, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn run_candidate(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+        metadata: &mut SkipBroadcastMetadataCache,
+    ) -> Result<bool> {
         let op = "SkipSimplifiedLayerNormalization";
         if !(3..=4).contains(&inputs.len()) || outputs.is_empty() || outputs.len() > 4 {
             return Err(EpError::KernelFailed(format!(
@@ -2635,8 +2603,8 @@ impl SkipSimplifiedLayerNormKernel {
                 outputs.len()
             )));
         }
-        let result = if inputs[0].dtype == DataType::BFloat16 {
-            let metadata: [_; 4] = std::array::from_fn(|index| {
+        if inputs[0].dtype == DataType::BFloat16 {
+            let input_metadata: [_; 4] = std::array::from_fn(|index| {
                 inputs.get(index).map_or(
                     TensorMetadata::new(DataType::Float32, &[], false),
                     |input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()),
@@ -2648,7 +2616,7 @@ impl SkipSimplifiedLayerNormKernel {
                     .map_or(OutputMetadata::Absent, OutputMetadata::from_view)
             });
             let route = skip_norm_route(
-                &metadata[..inputs.len()],
+                &input_metadata[..inputs.len()],
                 &output_metadata[..outputs.len()],
                 self.native_bf16_available,
             )?;
@@ -2675,19 +2643,23 @@ impl SkipSimplifiedLayerNormKernel {
                 )?;
             }
             match route {
-                SkipNormRoute::Bf16Native => self.run_bf16_native(inputs, outputs),
+                SkipNormRoute::Bf16Native => self.run_bf16_native(inputs, outputs, metadata),
                 SkipNormRoute::Bf16Staged(layout) => {
-                    self.run_bf16_via_f32(inputs, outputs, layout, workspace)
+                    self.run_bf16_via_f32(inputs, outputs, layout, workspace, metadata)
                 }
                 SkipNormRoute::Direct => unreachable!("BF16 route classified above"),
             }
         } else {
-            self.run_direct(inputs, outputs)
-        };
-        rollback.finish(result)
+            self.run_direct(inputs, outputs, metadata)
+        }
     }
 
-    fn run_direct(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+    fn run_direct(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        metadata: &mut SkipBroadcastMetadataCache,
+    ) -> Result<bool> {
         let op = "SkipSimplifiedLayerNormalization";
         let input = &inputs[0];
         let skip = &inputs[1];
@@ -2755,7 +2727,7 @@ impl SkipSimplifiedLayerNormKernel {
             )));
         }
         if num_groups == 0 {
-            return Ok(());
+            return Ok(false);
         }
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             let elements = input.numel() as u64;
@@ -2813,10 +2785,6 @@ impl SkipSimplifiedLayerNormKernel {
         let skip_ptr = cuptr(skip.data_ptr::<u8>() as *const c_void);
         let gamma_ptr = cuptr(gamma.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-        let mut metadata = self
-            .metadata
-            .lock()
-            .expect("cuda_ep skip normalization metadata cache poisoned");
         let metadata_ptr = metadata.reserve(input.shape, skip.shape)?;
         let dense_skip = i32::from(skip.numel() == input.numel());
         let selection = select_skip_rmsnorm_variant(
@@ -2936,8 +2904,7 @@ impl SkipSimplifiedLayerNormKernel {
         // real capture hazard, and kept every batched (speculative-verify /
         // prefill) node declaring KernelCaptureUnsupported. BF16 staging binds
         // the admitted caller lane and verifies its real capture pin.
-        self.last_call_capture_safe.store(true, Ordering::Relaxed);
-        Ok(())
+        Ok(true)
     }
 }
 

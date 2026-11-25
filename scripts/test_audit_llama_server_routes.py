@@ -58,12 +58,31 @@ ctx_http.get("/real", handler); // end
     def test_duplicate_upstream_gates_count_as_one_contract(self):
         fixture = {
             "registrations": [
-                {"method": "GET", "path": "/tools", "source_line": n} for n in [1, 2]
+                {"method": "GET", "path": "/health", "source_line": n} for n in [1, 2]
             ]
         }
-        rows = audit.contracts(fixture, 'router.route("/tools", get(discovery))')
+        rows = audit.contracts(fixture, 'router.route("/health", get(discovery))')
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["source_line"], 1)
+
+    def test_external_harness_contracts_are_visible_but_not_missing(self):
+        fixture = {"registrations": [
+            {"method": method, "path": path, "source_line": 1}
+            for method, path in sorted(audit.EXTERNAL_HARNESS)
+        ]}
+        rows = audit.contracts(fixture, 'router.route("/health", get(health))')
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(row["status"] == "external harness" for row in rows))
+        with self.assertRaisesRegex(ValueError, "must not execute"):
+            audit.contracts(fixture, 'router.route("/tools", post(exec_tools))')
+
+    def test_explicit_websocket_registration_is_distinct_from_plain_get(self):
+        fixture = {"registrations": [{"method": "WS", "path": "/v1/realtime", "source_line": 1}]}
+        plain = audit.contracts(fixture, 'router.route("/v1/realtime", get(normal_http))')
+        self.assertEqual(plain[0]["status"], "missing")
+        upgraded = audit.contracts(fixture, 'router.route("/v1/realtime", ws(realtime::websocket::upgrade))')
+        self.assertEqual(upgraded[0]["status"], "present")
+        self.assertEqual(upgraded[0]["handler"], "realtime::websocket::upgrade")
 
     def test_local_ambiguity_and_unsupported_grammar_fail_closed(self):
         for source in [

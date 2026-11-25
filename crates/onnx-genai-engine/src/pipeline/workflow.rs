@@ -352,6 +352,19 @@ type WorkflowAdapterExecutor = fn(
     &mut HashMap<String, i64>,
 ) -> anyhow::Result<()>;
 
+fn preprocessing_output_scope(
+    component: &str,
+    declaration: &onnx_genai_metadata::WorkflowComponent,
+) -> anyhow::Result<onnx_genai_metadata::extensions::PreprocessingOutputScope> {
+    let ComponentImplementation::Adapter { version, .. } = &declaration.implementation else {
+        anyhow::bail!(
+            "preprocessing component '{component}' must declare an adapter implementation"
+        );
+    };
+    onnx_genai_metadata::extensions::PreprocessingOutputScope::for_version(version)
+        .map_err(anyhow::Error::msg)
+}
+
 fn workflow_adapter_registry()
 -> &'static HashMap<(&'static str, &'static str), WorkflowAdapterExecutor> {
     static REGISTRY: std::sync::LazyLock<
@@ -363,11 +376,19 @@ fn workflow_adapter_registry()
                 WorkflowRuntime::run_image_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
+                ("onnx-genai.image-preprocess", "2"),
+                WorkflowRuntime::run_image_preprocess_adapter as WorkflowAdapterExecutor,
+            ),
+            (
                 ("onnx-genai.video-preprocess", "1"),
                 WorkflowRuntime::run_video_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
                 ("onnx-genai.audio-preprocess", "1"),
+                WorkflowRuntime::run_audio_preprocess_adapter as WorkflowAdapterExecutor,
+            ),
+            (
+                ("onnx-genai.audio-preprocess", "2"),
                 WorkflowRuntime::run_audio_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
@@ -3880,6 +3901,7 @@ impl WorkflowRuntime {
         package_symbols: &HashMap<String, i64>,
         component_symbols: &mut HashMap<String, i64>,
     ) -> anyhow::Result<()> {
+        let output_scope = preprocessing_output_scope(component, declaration)?;
         let program = self
             .plan
             .preprocessing
@@ -3946,11 +3968,9 @@ impl WorkflowRuntime {
             .map(|tensor| (tensor.name.clone(), tensor))
             .collect::<HashMap<_, _>>();
         for (port, value_ref) in outputs {
-            let tensor = tensors.remove(value_ref).with_context(|| {
-                format!(
-                    "image preprocessing adapter '{component}' did not produce declared SSA \
-                     output '{value_ref}'"
-                )
+            let output_name = output_scope.output_name(port, value_ref);
+            let tensor = tensors.remove(output_name).with_context(|| {
+                format!("image preprocessing adapter '{component}' did not produce output '{output_name}' for port '{port}' and workflow value '{value_ref}'; align preprocessing.image.outputs with the adapter output bindings")
             })?;
             let contract = declaration.ports.outputs.get(port).with_context(|| {
                 format!(
@@ -4054,6 +4074,7 @@ impl WorkflowRuntime {
         _package_symbols: &HashMap<String, i64>,
         component_symbols: &mut HashMap<String, i64>,
     ) -> anyhow::Result<()> {
+        let output_scope = preprocessing_output_scope(component, declaration)?;
         let program = self
             .plan
             .preprocessing
@@ -4091,19 +4112,21 @@ impl WorkflowRuntime {
                  uint8 rank 1"
             );
         }
-        let executable = onnx_genai_preprocess::audio::AudioProgram::from_program(program)?;
-        let encoded_bytes = encoded.as_raw_bytes()?;
+        let executable = onnx_genai_preprocess::audio::AudioProgram::from_program(program)
+            .with_context(|| format!("compile preprocessing.audio for component '{component}'; repair the declared audio transform parameters"))?;
+        let encoded_bytes = encoded.as_raw_bytes().with_context(|| format!(
+            "read audio component '{component}' input 'encoded' from workflow value '{encoded_ref}'; provide host-readable encoded audio bytes"
+        ))?;
         let mut tensors = executable
-            .run(&[encoded_bytes])?
+            .run(&[encoded_bytes])
+            .with_context(|| format!("preprocess audio component '{component}' input 'encoded' from workflow value '{encoded_ref}'; provide a valid PCM16 WAV clip supported by the declared audio program"))?
             .into_iter()
             .map(|tensor| (tensor.name.clone(), tensor))
             .collect::<HashMap<_, _>>();
         for (port, value_ref) in outputs {
-            let tensor = tensors.remove(value_ref).with_context(|| {
-                format!(
-                    "audio preprocessing adapter '{component}' did not produce declared SSA \
-                     output '{value_ref}'"
-                )
+            let output_name = output_scope.output_name(port, value_ref);
+            let tensor = tensors.remove(output_name).with_context(|| {
+                format!("audio preprocessing adapter '{component}' did not produce output '{output_name}' for port '{port}' and workflow value '{value_ref}'; align preprocessing.audio.outputs with the adapter output bindings")
             })?;
             let contract = declaration.ports.outputs.get(port).with_context(|| {
                 format!(

@@ -1,0 +1,6 @@
+{
+  "initial_reader": "analyze-initial.py",
+  "initial_issue": "asserted positive elapsed time for zero-call empty windows; some are below one Instant tick and return zero",
+  "correction": "allow zero only for empty windows; negative empty and zero timed work remain rejected; no sample rerun, unchanged 50ms work floor and all qualification thresholds",
+  "timing_attempts": 1
+}

@@ -70,7 +70,7 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{DeviceGraphResource, EpError, Result};
 
 use crate::error::driver_err;
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
+use crate::runtime::{CudaRuntime, NativeDeviceAllocation, cuptr};
 
 /// NVRTC module + entry names for the Marlin int4 tensor-core GEMM.
 pub const MARLIN_MODULE: &str = "matmul_nbits_marlin_gemm";
@@ -175,13 +175,13 @@ pub fn marlin_splitk_enabled() -> bool {
 /// the repack, including captured CUDA-graph replays.
 #[derive(Debug)]
 struct RepackEntry {
-    allocation: Arc<GraphDeviceAllocation>,
+    allocation: Arc<NativeDeviceAllocation>,
 }
 
 pub(super) struct RepackCache {
     runtime: Arc<CudaRuntime>,
     map: Mutex<HashMap<(usize, usize, usize, usize), RepackEntry>>,
-    last_used: Mutex<Vec<Arc<GraphDeviceAllocation>>>,
+    last_used: Mutex<Vec<Arc<NativeDeviceAllocation>>>,
     /// Device bytes held by `map`. These are raw `cuMemAlloc`s, invisible to
     /// the VMM arena, so without a counter this memory cannot be reported at
     /// all — it shows up only as an unexplained gap against `nvidia-smi`.
@@ -243,13 +243,13 @@ impl RepackCache {
             .map(|allocations| {
                 allocations
                     .iter()
-                    .map(GraphDeviceAllocation::device_graph_resource)
+                    .map(NativeDeviceAllocation::device_graph_resource)
                     .collect()
             })
             .unwrap_or_default()
     }
 
-    fn record_use(&self, allocation: &Arc<GraphDeviceAllocation>) {
+    fn record_use(&self, allocation: &Arc<NativeDeviceAllocation>) {
         let mut last_used = self
             .last_used
             .lock()
@@ -293,7 +293,7 @@ impl RepackCache {
             ));
         }
         let bytes = repacked_bytes(n, k);
-        let allocation = GraphDeviceAllocation::allocate(
+        let allocation = NativeDeviceAllocation::allocate_shared(
             &self.runtime,
             bytes,
             onnx_runtime_memory_api::MemoryRole::Weights,

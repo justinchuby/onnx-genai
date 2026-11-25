@@ -1,0 +1,85 @@
+{
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/moe.rs": "b1eea36be5353360721a03de4f0dc0b5cc309f17913209fb5789a6c18481768d"
+  },
+  "results": [
+    {
+      "name": "routing",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "routing_scratch_tests::"
+      ],
+      "exit": 0,
+      "log_sha256": "a91ddce8f0d3fa75e9724d0f65858535eae477646b154cc1c9d3f9e672fb3085",
+      "counts": [
+        [
+          "3",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "routing-mlas",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "--features",
+        "mlas",
+        "routing_scratch_tests::"
+      ],
+      "exit": 0,
+      "log_sha256": "9aa8b38dcbae2e087f1c746ac9a2772b32b4a67325d6c3eb899d24ec492a74f9",
+      "counts": [
+        [
+          "3",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit": 0,
+      "log_sha256": "7b9201528a41e9094973572fff7a5443b614174f9cc5ad337ab0d206cda6a522"
+    },
+    {
+      "name": "clippy-mlas",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--all-targets",
+        "--features",
+        "mlas",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit": 0,
+      "log_sha256": "aa6ad75e5380e0d764201e949396dac2f8f504b1c3f90b03525f81d5ec611810"
+    }
+  ]
+}

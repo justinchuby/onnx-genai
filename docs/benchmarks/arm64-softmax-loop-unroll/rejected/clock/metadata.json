@@ -1,0 +1,59 @@
+{
+  "schema": 2,
+  "protocol_phase": "clock-process-cpu-and-physical-bound",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/softmax_neon.rs": "a03ec3cdfa7f7df5fae4a48328593adc6eb5283b62dc4ed828fedf6524565da8",
+    "crates/onnx-runtime-ep-cpu/src/kernels/softmax_neon_unroll_tests.rs": "f89e44d76c69e83c27b2e39877b2ed089d70d0e2587be64504d39aad36069785"
+  },
+  "parent": "4aae0c84dbfc056754b3f467dddfc23902132fbc",
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "lock_inode": 339651569,
+  "lock_parent_pid": 58169,
+  "lock_busy_control": true,
+  "load_before": [
+    4.1279296875,
+    3.84521484375,
+    2.97802734375
+  ],
+  "foreign_cpu_instrument": "unavailable on Darwin; no claim of foreign CPU absence",
+  "receipts": [
+    {
+      "sweep": 0,
+      "width": 1,
+      "pid": 58921,
+      "exit": 0,
+      "wall_s": 0.7649207080248743,
+      "cpu_s": 0.7620899999999999,
+      "maxrss_bytes": 33964032,
+      "load_after": [
+        2.6142578125,
+        3.0,
+        2.78564453125
+      ],
+      "cpus": 10,
+      "fpcr_start": 0,
+      "fpcr_end_equality_assertion_passed": true
+    }
+  ],
+  "arms": {
+    "0": "original_same_arithmetic",
+    "1": "unrolled_native",
+    "2": "unrolled_native_aa",
+    "3": "mlas",
+    "4": "original_outlined"
+  },
+  "cpu_unit": "ns; CLOCK_PROCESS_CPUTIME_ID, all threads",
+  "repetitions": 15,
+  "sweeps": 3,
+  "machdep.cpu.brand_string": "Apple M1 Max",
+  "hw.memsize": "34359738368",
+  "hw.logicalcpu": "10",
+  "hardware_read_command": "/usr/sbin/sysctl -n machdep.cpu.brand_string hw.memsize hw.logicalcpu",
+  "hardware_read_exit": 0,
+  "hardware_read_authority": "separate escalated read-only command; sandbox sysctl was denied before any build or timing",
+  "hardware_read_time_utc": "2026-11-24T19:43:28.315736+00:00",
+  "binary": "/tmp/nxrt-erf-nan-target/release/deps/onnx_runtime_ep_cpu-6ee16d18d97c5fef",
+  "binary_sha256": "98f69e8af1025c40a2204984d6b569bfede5f9c3d2c96b62dfbdf00c6946a430"
+}
