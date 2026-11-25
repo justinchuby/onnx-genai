@@ -9580,3 +9580,91 @@ fn report_probe(
         println!("# event {name},{:.3}/run", events[i] as f64 / per_run);
     }
 }
+
+/// Exercise the shipping plugin's Deferred -> live workspace refinement, not
+/// just a direct kernel or native executor. Runtime N changes at fixed input
+/// shapes, and the whole two-node graph must stay on our EP without fallback.
+#[test]
+fn fourier_workspace_refines_runtime_lengths_through_real_plugin() {
+    let _lock = lock_ort_ep();
+    for onesided in [0, 1] {
+        let components = if onesided == 1 { 1 } else { 2 };
+        let name = if onesided == 1 {
+            "fourier_workspace_irfft"
+        } else {
+            "fourier_workspace_full"
+        };
+        let model = r#"ir_version: 10
+opset_import: [{ version: 20 }]
+graph {
+  name: "fourier_workspace"
+  node: [
+    { input: ["X", "N"] output: ["F"] op_type: "DFT"
+      attribute: [{ name: "onesided" i: $ONESIDED type: INT }] },
+    { input: ["F", "N"] output: ["Y"] op_type: "DFT"
+      attribute: [{ name: "onesided" i: $ONESIDED type: INT }, { name: "inverse" i: 1 type: INT }] }
+  ]
+  input: [
+    { name: "X" type { tensor_type { elem_type: 1 shape { dim: [{ dim_value: 2 }, { dim_value: 8 }, { dim_value: 1 }] } } } },
+    { name: "N" type { tensor_type { elem_type: 7 shape {} } } }
+  ]
+  value_info: [{ name: "F" type { tensor_type { elem_type: 1 shape { dim: [{ dim_value: 2 }, { dim_param: "bins" }, { dim_value: 2 }] } } } }]
+  output: [{ name: "Y" type { tensor_type { elem_type: 1 shape { dim: [{ dim_value: 2 }, { dim_param: "samples" }, { dim_value: $COMPONENTS }] } } } }]
+}
+"#.replace("$ONESIDED", &onesided.to_string()).replace("$COMPONENTS", &components.to_string());
+        let path = write_generated_model(name, &model);
+        let (_library, api, env, options, session) = skip_if_missing!(
+            unsafe { conformance_setup(name, &path, true) },
+            "fourier workspace: ORT/plugin unavailable"
+        );
+        unsafe {
+            let assignment = query_ep_assignment(api, session);
+            assert_eq!(
+                assignment.ops_on_our_ep(),
+                ["DFT", "DFT"],
+                "{name}: {:?}",
+                assignment.assignments
+            );
+            assert!(assignment.ops_not_on_our_ep().is_empty());
+            for (iteration, n) in [8usize, 3, 9, 8].into_iter().enumerate() {
+                let values = (0..16)
+                    .map(|i| i as f32 * 0.125 - 0.75 + iteration as f32 * 0.25)
+                    .collect::<Vec<_>>();
+                let mut bytes = values
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>();
+                let mut length = (n as i64).to_le_bytes();
+                let signal = make_raw_tensor(api, &mut bytes, &[2, 8, 1], ELEM_F32);
+                let scalar = make_raw_tensor(
+                    api,
+                    &mut length,
+                    &[],
+                    ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+                );
+                let outputs =
+                    run_and_collect_f32(api, session, &["X", "N"], &[signal, scalar], &["Y"]);
+                ((*api).ReleaseValue.unwrap())(signal);
+                ((*api).ReleaseValue.unwrap())(scalar);
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(outputs[0].len(), 2 * n * components);
+                for batch in 0..2 {
+                    for t in 0..n {
+                        let index = (batch * n + t) * components;
+                        let expected = if t < 8 { values[batch * 8 + t] } else { 0. };
+                        assert!(
+                            (outputs[0][index] - expected).abs() < 1e-4,
+                            "{name}, n={n}, batch={batch}, t={t}: {} versus {expected}",
+                            outputs[0][index]
+                        );
+                        if components == 2 {
+                            assert!(outputs[0][index + 1].abs() < 1e-4);
+                        }
+                    }
+                }
+            }
+            eprintln!("[{name}] two DFT nodes assigned to cpu_ep; runtime lengths 8/3/9/8 passed");
+            conformance_teardown(api, env, options, session, name);
+        }
+    }
+}

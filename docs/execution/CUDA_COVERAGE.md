@@ -467,6 +467,10 @@ optional controls omitted. This common
 packed-batch/plan-cache seam is reused by STFT, whose fused pack kernel extracts
 complete frames and applies the optional window before one batched cuFFT call.
 
+The CPU EP uses governed scratch for one transform at a time, reusing it
+across batches. Float64 DFT stays in double precision; it uses radix-2 FFT
+for power-of-two lengths and a direct transform for other lengths.
+
 | Backend | CPU-covered gaps mapped here | Rationale |
 |---------|------------------------------|-----------|
 | **CUTLASS / cuDNN SDPA** | `FusedAttention` | Flash/SDPA implementation avoids materialising the O(S²) score tensor. |
