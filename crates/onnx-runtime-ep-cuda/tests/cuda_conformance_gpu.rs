@@ -2611,11 +2611,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     ));
     p.push(sweep(
         "Sin",
-        unary_float("Sin", 13, &[-3.0, -1.0, 0.0, 1.0, 3.0]),
+        unary_float("Sin", 22, &[-3.0, -1.0, 0.0, 1.0, 3.0]),
     ));
     p.push(sweep(
         "Cos",
-        unary_float("Cos", 13, &[-3.0, -1.0, 0.0, 1.0, 3.0]),
+        unary_float("Cos", 22, &[-3.0, -1.0, 0.0, 1.0, 3.0]),
     ));
     p.push(sweep(
         "Softplus",
