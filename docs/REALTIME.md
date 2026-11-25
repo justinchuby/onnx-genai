@@ -173,6 +173,30 @@ next-turn PCM; retry after its completed event. Duplex cancellation discards
 old queued audio and resets native conditioning before the next response,
 matching the upstream stream/KV lifecycle.
 
+### Executed malformed-input recovery
+
+`websocket_rejected_frames_and_pcm_pressure_preserve_native_transcription`
+opens a real TCP WebSocket against a Native CPU ONNX workflow. Each case below
+must return a distinct `error` event with `invalid_request_error`, after which
+the same connection remains usable:
+
+| Rejected input | Required diagnostic |
+| --- | --- |
+| Truncated JSON text | Valid JSON required |
+| Binary WebSocket frame | JSON text frames required |
+| JSON null without an event type | String `type` required |
+| Unknown event type | Recognized realtime event required |
+| Invalid audio base64 | Valid base64 PCM16 required |
+| One decoded audio byte | Even PCM16 byte count required |
+| 642 decoded bytes with a 640-byte queue budget | Remaining PCM queue budget exceeded |
+
+After all rejections, changing the session to transcription must still succeed.
+A valid 640-byte PCM message then fills the configured budget and commits to an
+actual native transcription, with matching item IDs, deltas and terminal text.
+This proves rejection did not consume input quota or freeze conditioning. It
+does not establish oversized WebSocket frame closure, slow-reader backpressure,
+all rate epochs or device execution conformance.
+
 Tool execution belongs exclusively to the external harness. This transport
 accepts definitions/results and emits model calls; it provides no tool runtime.
 A Native CPU WebSocket regression covers two tool-call rounds with an external
