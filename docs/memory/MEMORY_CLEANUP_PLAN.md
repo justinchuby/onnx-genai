@@ -2818,3 +2818,34 @@ Mapped scalar/axes success and malformed/missing/overridable refusals have
 optimizer regressions. These checks establish correctness and allocation
 invariants, not measured inference speed or CUDA validation; f32 compute and
 existing stash-type behavior are outside this change.
+
+
+### LogSoftmax uses one admitted output-staging region
+
+Both legacy (opsets 1–12, flattened suffix) and modern (opset 13+, one selected
+axis) LogSoftmax factories now declare metadata workspace planning. The kernel
+replaces its per-execution full-output Vec with FloatWorkspace<1> on the existing
+StepScoped lane. Its bound is exactly four bytes per X element, zero for empty
+input. Unresolved Y metadata derives the same bound from X; resolved Y must
+match the complete input shape. No kernel pool, extra owner or per-slice grant
+is introduced. Input widening remains outside this output-staging region.
+
+Geometry validates arity, floating dtypes, required presence, axis, complete Y
+shape, dense suffix products and addressable f32 layout capacity. Execution
+validates both views and Host accessibility before binding scratch. Missing,
+short or misaligned backing refuses before writes. Empty work still validates
+views and requires no allocation. All X reads complete before publishing Y,
+including overlapping input/output and strided half storage. The f32
+log_softmax_slices function is byte-for-byte unchanged, preserving reduction
+order and both opset semantics.
+
+Regression coverage includes independent f64 coordinates for every positive and
+negative axis under both semantics, all four float storage types, invalid views,
+fresh/poisoned scratch, prefix canaries, geometry overflow, and 4,096 warm pool
+cycles without issuer callbacks (including positive zero-byte observer controls).
+Encoded public sessions cover two nodes sharing one 96-byte peak (95 bytes
+refused), dynamic 2x3x4/1x2x5/2x3x4 shapes, identity reuse, idle trim and
+re-admission for opsets 11 and 13. Real ORT plugin fixtures disable fallback,
+require LogSoftmax assignment to cpu_ep and check both versions numerically
+across those changing shapes. These are correctness and allocation invariants,
+not inference-speed or CUDA-runtime measurements.
