@@ -118,6 +118,15 @@ impl EagerContext {
         let input_shapes: Vec<Vec<usize>> = inputs.iter().map(|t| t.shape().to_vec()).collect();
 
         let node = ephemeral_node(op_type, domain, attrs, inputs.len(), output_count);
+        if let Some(input) = inputs.first() {
+            onnx_runtime_ir::topk::validate_bfloat16_opset(&node, opset, input.dtype()).map_err(
+                |reason| EagerError::ShapeInference {
+                    op_type: op_type.to_string(),
+                    domain: domain.to_string(),
+                    reason,
+                },
+            )?;
+        }
 
         // 3 + 4. Cache key, then get-or-compile the kernel through the EP.
         let cache_key = KernelCacheKey {

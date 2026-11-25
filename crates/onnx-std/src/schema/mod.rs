@@ -365,6 +365,7 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/transpose_v13.yaml"),
     include_str!("../../schemas/standard/transpose_v21.yaml"),
     include_str!("../../schemas/standard/transpose_v23.yaml"),
+    include_str!("../../schemas/standard/transpose_v24.yaml"),
     include_str!("../../schemas/standard/transpose.yaml"),
     include_str!("../../schemas/standard/concat.yaml"),
     include_str!("../../schemas/standard/slice.yaml"),
@@ -1311,7 +1312,7 @@ type_constraints:
     }
 
     #[test]
-    fn transpose_schema_matches_opset_24() {
+    fn transpose_schema_admits_low_precision_dtypes_at_their_onnx_revision() {
         let registry = SchemaRegistry::builtins();
         assert_eq!(
             registry.lookup("Transpose", "", 20).unwrap().since_version,
@@ -1335,6 +1336,31 @@ type_constraints:
             (24, 1, 1)
         );
         assert_eq!(schema.attributes[0].attr_type, AttributeType::Ints);
+        assert_eq!(
+            registry.lookup("Transpose", "", 25).unwrap().since_version,
+            25
+        );
+        for (dtype, since) in [
+            (DataType::Uint4, 21),
+            (DataType::Int4, 21),
+            (DataType::Float4E2M1, 23),
+            (DataType::Float8E8M0, 24),
+            (DataType::Uint2, 25),
+            (DataType::Int2, 25),
+        ] {
+            let allowed = |opset| {
+                registry
+                    .lookup("Transpose", "", opset)
+                    .unwrap()
+                    .type_constraints[0]
+                    .allowed
+                    .contains(&dtype)
+            };
+            assert!(!allowed(since - 1), "{dtype:?} was admitted too early");
+            for opset in since..=25 {
+                assert!(allowed(opset), "{dtype:?} was rejected at opset {opset}");
+            }
+        }
     }
 
     #[test]

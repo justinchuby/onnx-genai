@@ -279,13 +279,20 @@ same projection for buffered, SSE and logprob output. Capabilities are checked
 before generation/SSE admission. Supported combinations currently use literal
 boundaries or regex boundaries with a resolved byte DFA, plus
 ByteLevel/ByteFallback or canonical non-byte decoders. Byte decoder sequences
-also support token-local Replace/Strip before one byte stage, Fuse, and initial
-Strip after fusion. These capabilities follow decoder metadata and preserve
+also support token-local Replace/Strip before one byte stage, Fuse, and finite
+initial/trailing Strip after fusion. These capabilities follow decoder metadata and preserve
 generated-stream boundaries, including split Unicode and special-token policy. Pending Unicode bytes,
 regex priority, greedy/lazy continuations and EOF assertions share the publication
 parser's boundary rules. Regexes requiring unsupported DFA look assertions
-and other contextual byte-decoder stages (including trailing stripping) remain
-open compatibility work; errors identify the unsupported decoder path.
+and other unresolved contextual byte-decoder stages remain open compatibility
+work; errors identify the unsupported decoder path. Trailing stripping retains
+bounded UTF-8 suffixes and checks actual reachable endings before admitting a
+candidate; a withheld tail cannot hide a schema violation inside an incomplete
+value. Combined published/retained bytes share the request response budget, and
+composed Strip retention is capped at 4 MiB. Ambiguous suffix viability has an
+explicit 4096-state, bounded retained-state analysis budget and fails actionably
+when exceeded. Reasoning token-ID boundaries must be stable after their final
+token; markers delayed by trailing stripping are rejected before execution.
 Projected JSON accepts split Unicode escapes and surrogate pairs, including
 string constants, known property names, string patterns and scalar length limits.
 An unfinished escape must have a schema-valid scalar completion and never permits
@@ -485,6 +492,24 @@ bounded WAV workflow. `raw_prompt=true` bypasses text assembly and requires empt
 undeclared voices/languages, and active synthesis controls are rejected rather
 than ignored. The OpenAI speech request also rejects unknown controls.
 
+Buffered speech supports native `/tts` `response_format=wav` (default), `pcm`
+(float32 little-endian), and `pcm16` (signed 16-bit little-endian). OpenAI
+`/v1/audio/speech` and `/audio/speech` accept `wav` and map `pcm` to signed
+16-bit samples. Raw PCM responses declare the package's output sample rate,
+channel count (when greater than one), encoding and bit depth in `Content-Type`.
+The declared output rate and channels are preserved; no implicit mono conversion
+or 24 kHz override is applied. Float waveform outputs retain their precision
+until transport encoding. An already encoded post-adapter PCM16 WAV can only
+provide its existing quantized samples, scaled by 32768 for float transport.
+PCM16 waveform encoding rounds `clamp(sample, -1, 1) * 32767`, including WAV;
+nonfinite waveform samples fail with their sample index. Streaming speech
+remains unsupported for these buffered workflow contracts.
+
+For example, `curl http://localhost:8080/tts -H 'Content-Type: application/json'
+-d '{"input":"hello","response_format":"pcm"}' --output speech.f32` returns
+interleaved float32 samples at the rate and channels named in the response header.
+
+
 Explicit API failures carry numeric HTTP `code`, `message` and protocol `type`.
 Invalid JSON/parameters use `invalid_request_error`; absent models/routes use
 `not_found_error`, and permission refusals use `permission_error`. Internal faults
@@ -632,7 +657,7 @@ repetitions above 2,000 are refused and larger upper bounds become unbounded.
 The model must declare a dense, resolved, token-local byte vocabulary. Actual
 raw pieces include special-token spellings; only explicitly declared ending IDs
 receive terminal semantics. Token names and angle brackets do not guess roles.
-Non-byte contextual decoders and stream-initial stripping currently return an
+Non-byte contextual decoders and stream-initial/trailing stripping currently return an
 actionable capability error before SSE.
 
 Both raw grammar forms conflict with JSON `response_format`, forced `tool_choice`, and

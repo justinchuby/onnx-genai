@@ -962,7 +962,18 @@ pub(crate) async fn tts(
         }
     }
     let request = serde_json::from_value(Value::Object(body)).map_err(|err| ApiError::invalid_request(format!("invalid native speech request: {err}; send input/prompt and optional model; voice cloning and undeclared synthesis controls require a capable package contract")))?;
-    super::audio_speech(State(state), ApiJson(request)).await
+    let request: crate::types::AudioSpeechRequest = request;
+    let format = match request.response_format.to_ascii_lowercase().as_str() {
+        "wav" => onnx_genai_engine::AudioOutputFormat::Wav,
+        "pcm" => onnx_genai_engine::AudioOutputFormat::PcmF32Le,
+        "pcm16" => onnx_genai_engine::AudioOutputFormat::PcmS16Le,
+        _ => {
+            return Err(ApiError::invalid_request(
+                "/tts response_format must be wav, pcm (float32 little-endian), or pcm16 (signed 16-bit little-endian)",
+            ));
+        }
+    };
+    super::speech::synthesize(state, request, format).await
 }
 
 #[cfg(test)]

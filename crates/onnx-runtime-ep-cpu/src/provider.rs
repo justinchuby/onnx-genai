@@ -476,6 +476,13 @@ impl ExecutionProvider for CpuExecutionProvider {
                 opset
             );
         }
+        if op.is_default_domain()
+            && op.op_type == "Transpose"
+            && let Some(&dtype) = input_dtypes.first()
+            && let Err(reason) = onnx_runtime_ir::transpose::validate_dtype(dtype, opset)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if let Some(reason) =
             onnx_runtime_ep_api::packed_routed::unsupported_reason(op, shapes, input_dtypes)
         {
@@ -484,6 +491,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         if let Some(reason) =
             onnx_runtime_ep_api::standard_math::unsupported_reason(op, shapes, input_dtypes)
         {
+            return KernelMatch::unsupported(reason);
+        }
+        if let Some(reason) = onnx_runtime_ep_api::mean_variance_normalization::unsupported_reason(
+            op,
+            shapes,
+            input_dtypes,
+        ) {
             return KernelMatch::unsupported(reason);
         }
         if let Some(reason) = onnx_runtime_ep_api::gemm::unsupported_reason(
@@ -501,6 +515,13 @@ impl ExecutionProvider for CpuExecutionProvider {
                 onnx_runtime_ir::dequantize_packed::validate_claim(op, shapes, input_dtypes)
         {
             deny!("DequantizePacked: {reason}");
+        }
+        if op.op_type == "Dropout"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && let Err(reason) =
+                onnx_runtime_ir::dropout::validate_claim(op, opset, shapes, input_dtypes)
+        {
+            deny!("Dropout: {reason}");
         }
         if op.op_type == "CompressedSparseAttention"
             && op.domain == "pkg.nxrt"
@@ -574,6 +595,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "Unique"
+            && op.is_default_domain()
+            && let Some(&dtype) = input_dtypes.first()
+            && let Some(reason) = crate::kernels::unique::unsupported_dtype_for_opset(dtype, opset)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         // The numeric extrema kernel predates BOOL, which entered both schemas in opset 20.
         if opset < 20
             && onnx_runtime_ir::is_default_domain(&op.domain)
@@ -582,6 +610,20 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             deny!(
                 "{} does not accept BOOL data at opset {opset}; export at opset 20 or later, or supply a numeric tensor",
+                op.op_type
+            );
+        }
+        if opset >= 28
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && matches!(op.op_type.as_str(), "ReduceLogSum" | "ReduceLogSumExp")
+            && let Some(&dtype) = input_dtypes.first()
+            && !matches!(
+                dtype,
+                DataType::Float16 | DataType::BFloat16 | DataType::Float32 | DataType::Float64
+            )
+        {
+            deny!(
+                "{} does not accept {dtype:?} data at opset {opset}; the opset-28 schema is float-only, so cast the data input to Float16, BFloat16, Float32, or Float64",
                 op.op_type
             );
         }
@@ -1109,6 +1151,42 @@ mod host_copy_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logarithmic_reductions_apply_opset_28_float_boundary_at_admission() {
+        let ep = CpuExecutionProvider::new();
+        for op_type in ["ReduceLogSum", "ReduceLogSumExp"] {
+            let node = Node::new(NodeId(0), op_type, vec![], vec![]);
+            assert!(
+                ep.supports_op(&node, 27, &[], &[DataType::Int64], &[])
+                    .is_supported(),
+                "{op_type} opset 27 must preserve the legacy integer admission contract"
+            );
+
+            let current = ep.supports_op(&node, 28, &[], &[DataType::Int64], &[]);
+            assert!(
+                !current.is_supported(),
+                "{op_type} opset 28 must reject Int64"
+            );
+            let current_reason = current
+                .reason()
+                .expect("opset-28 rejection must explain the boundary");
+            assert!(
+                current_reason.contains("does not accept Int64 data at opset 28"),
+                "{current_reason}"
+            );
+            assert!(
+                current_reason.contains("opset-28 schema is float-only"),
+                "{current_reason}"
+            );
+            assert!(
+                ep.supports_op(&node, 28, &[], &[DataType::Float64], &[])
+                    .is_supported(),
+                "{op_type} opset 28 accepts Float64"
+            );
+        }
+    }
+
     #[test]
     #[cfg_attr(miri, ignore = "Miri cannot spawn the child process this needs")]
     fn workspace_context_is_lazy_and_distinguishes_selected_pool_widths() {
@@ -1756,6 +1834,29 @@ mod tests {
             ep.supports_op(&conv, 17, &[], &[], &[]).is_supported(),
             cfg!(feature = "ops-cnn")
         );
+    }
+
+    #[test]
+    fn transpose_packed_cpu_claim_respects_onnx_type_versions() {
+        let ep = CpuExecutionProvider::new();
+        let node = Node::new(onnx_runtime_ir::NodeId(0), "Transpose", vec![], vec![]);
+        let shapes = [onnx_runtime_ir::static_shape([3, 5])];
+        for (dtype, since) in [
+            (DataType::Int4, 21),
+            (DataType::Uint4, 21),
+            (DataType::Float4E2M1, 23),
+            (DataType::Float8E8M0, 24),
+            (DataType::Int2, 25),
+            (DataType::Uint2, 25),
+        ] {
+            let rejected = ep.supports_op(&node, since - 1, &shapes, &[dtype], &[]);
+            let reason = rejected.reason().expect("older opset must be declined");
+            assert!(reason.contains(&format!("use opset {since}")), "{reason}");
+            assert!(
+                ep.supports_op(&node, since, &shapes, &[dtype], &[])
+                    .is_supported()
+            );
+        }
     }
 
     #[test]

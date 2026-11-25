@@ -1395,7 +1395,7 @@ pub trait Kernel: Send + KernelType {
     /// Heterogeneous execution uses independently owned boundary buffers. Its
     /// first slice rejects view-producing kernels before execution rather than
     /// discovering an alias after an upstream partition has already run.
-    fn may_produce_views(&self) -> bool {
+    fn may_produce_views(&self, _input_dtypes: &[DataType]) -> bool {
         false
     }
 

@@ -2112,3 +2112,54 @@ and points its ORT library at a nonexistent path. It validates real proposal and
 verification, prompt/final/per-token timing reports, and cancellation/retry after
 both head proposal and target verification. This proves the same reporting and
 abort contracts on the actual Native head path rather than only prompt lookup.
+
+
+### Contextual fused trailing Strip decoding
+
+The shared byte-stream contract now resolves finite trailing Strip after fusion
+(ByteLevel is already fused). Ordered initial/trailing stages retain only their
+bounded suffixes, preserve split UTF-8 and never retract published bytes. Terminal
+flushing removes only complete matching characters; incomplete scalars remain
+visible to strict terminal validation. Token-local stages before the byte stage
+keep their existing semantics. Chunk-local post-ByteFallback Strip still needs
+an explicit Fuse, and other unresolved contextual transforms remain rejected.
+
+Content constraints inspect both the provisional retained suffix and actual
+reachable terminal outputs. When multiple characters are withheld, a bounded
+state search releases only prefixes that a real continuation of the composed
+decoder can expose. It includes split-scalar completions and skips unchanged
+window-filling runs. This accepts a partially released valid ending without
+inventing an ending between composed stages. Published plus retained bytes share
+the response limit; per-chain retention and search work have explicit guards.
+Literal-byte vocabulary masks remain unchanged for context-free decoders.
+
+Reasoning-budget token markers are admitted only when the trailing decoder leaves
+them visible at the declared token boundary. Tool observation uses the same
+ordered decoder and includes retained bytes in its response budget. Its deferred
+contextual-decoder regression now uses an unresolved Replace stage, preserving
+that fallback coverage after fused trailing Strip became supported. Existing
+panic fences still preserve dependency decoder failures and their causes.
+
+Conformance covers ASCII/multibyte tails and every chunk width, ordered composed
+stages, bounded retention, partial-scalar EOF refusal, large finite windows,
+semantic candidate masks, and stable reasoning markers. A real Native HTTP
+fixture competes a higher-biased schema-invalid token against a valid token whose
+encoded suffix is stripped, through buffered/SSE and ordinary/logprob output.
+
+
+## Buffered speech PCM transport
+
+Native `/tts` now supports default WAV, float32 little-endian `pcm`, and signed
+16-bit `pcm16`; OpenAI speech aliases map `pcm` to signed 16-bit samples. Typed
+transport selection reaches the declared audio output through the owner driver.
+Package rates and channel layouts are retained and described in raw PCM MIME
+parameters. Float waveform encoding precedes quantization; validated post-adapter
+PCM16 WAV conversion preserves the already quantized source. Nonfinite samples
+and incomplete post-adapter frames fail explicitly. Streaming speech remains open.
+
+Validation on Native CPU: 14 audio unit tests, both ONNX-owned audio workflow
+tests, and the complete server library (580 passed, 2 inherited ignores) pass.
+Byte checks include stereo interleaving, float precision, symmetric PCM16
+rounding, full signed-range post-adapter conversion, and both HTTP PCM mappings.
+This checkpoint does not establish audio quality or GPU behavior and does not
+complete the remaining compatibility acceptance rows above.
