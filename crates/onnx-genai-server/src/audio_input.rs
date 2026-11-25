@@ -1,78 +1,97 @@
 use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use onnx_genai_preprocess::audio::{
-    LogMelExtractor, WHISPER_N_FRAMES, WHISPER_SAMPLE_RATE, decode_wav_pcm16, encode_wav_pcm16,
-};
+use onnx_genai_preprocess::audio::{AudioProgram, AudioTensorData, encode_wav_f32};
 
 use crate::types::InputAudio;
 
 #[derive(Clone, Debug)]
 pub struct AudioInputSpec {
     pub endpoint: String,
-    pub n_mels: usize,
-    pub n_frames: usize,
-    pub max_tokens: Option<usize>,
-    /// Whether the endpoint takes the encoded container rather than features.
-    ///
-    /// A package that declares `preprocessing.audio` owns feature extraction
-    /// itself, so the server must hand it the bytes and stay out of the way.
-    pub encoded: bool,
+    binding: AudioInputBinding,
+    pub(crate) transcription: Option<
+        std::sync::Arc<onnx_genai_engine::transcription::generative::GenerativeTranscription>,
+    >,
 }
-
+#[derive(Clone, Debug)]
+enum AudioInputBinding {
+    Encoded(std::sync::Arc<onnx_genai_preprocess::audio::AudioProgram>),
+    Features {
+        program: std::sync::Arc<AudioProgram>,
+        shape: [usize; 3],
+    },
+}
 impl AudioInputSpec {
+    pub fn transcription(
+        &self,
+    ) -> Option<&onnx_genai_engine::transcription::generative::GenerativeTranscription> {
+        self.transcription.as_deref()
+    }
     pub fn from_input(
         endpoint: String,
         shape: &[i64],
-        max_tokens: Option<usize>,
+        declaration: &onnx_genai_metadata::AudioPreprocessingProgram,
     ) -> anyhow::Result<Self> {
-        if shape.len() != 3 {
-            anyhow::bail!(
-                "audio input '{endpoint}' must have rank 3 [batch, mel, frames], got {shape:?}"
-            );
-        }
-        if !matches!(shape[0], -1 | 1) {
-            anyhow::bail!("audio input '{endpoint}' must have batch dimension 1 or dynamic");
-        }
-        let n_mels = usize::try_from(shape[1])
-            .ok()
-            .filter(|value| matches!(value, 80 | 128))
-            .with_context(|| {
-                format!(
-                    "audio input '{endpoint}' must declare 80 or 128 mel bins, got {}",
-                    shape[1]
-                )
-            })?;
-        let n_frames = usize::try_from(shape[2])
-            .ok()
-            .filter(|value| *value > 0)
-            .unwrap_or(WHISPER_N_FRAMES);
+        anyhow::ensure!(
+            shape.len() == 3 && matches!(shape[0], -1 | 1),
+            "audio input '{endpoint}' must declare [1 or dynamic, mel_bins, frames], got {shape:?}; publish explicit positive feature dimensions"
+        );
+        let positive = |axis: usize| {
+            usize::try_from(shape[axis]).ok().and_then(std::num::NonZeroUsize::new).with_context(||format!("audio input '{endpoint}' axis {axis} must declare a positive concrete feature dimension, got {}; author the mel/frame count instead of guessing it",shape[axis]))
+        };
+        let n_mels = positive(1)?;
+        let n_frames = positive(2)?;
+        n_mels.get().checked_mul(n_frames.get()).context("audio feature tensor size exceeds this host's address range; reduce the declared mel/frame geometry")?;
+        let mut selected = declaration.clone();
+        let output = declaration.outputs.iter().find(|output| output.name == endpoint)
+            .with_context(||format!("audio feature input '{endpoint}' needs preprocessing.audio.outputs with the same name; declare its exact waveform/analysis program and binding"))?;
+        anyhow::ensure!(
+            output.content == "audio_features" && output.dtype == "float32",
+            "audio feature input '{endpoint}' requires its preprocessing output to declare content audio_features and dtype float32; correct the named output"
+        );
+        selected.outputs = vec![output.clone()];
+        let program = AudioProgram::from_program(&selected).with_context(|| {
+            format!("compile preprocessing for audio feature input '{endpoint}'")
+        })?;
         Ok(Self {
             endpoint,
-            n_mels,
-            n_frames,
-            max_tokens,
-            encoded: false,
+            transcription: None,
+            binding: AudioInputBinding::Features {
+                program: std::sync::Arc::new(program),
+                shape: [1, n_mels.get(), n_frames.get()],
+            },
         })
     }
-
-    /// Builds a spec for an endpoint that consumes the encoded audio container.
-    ///
-    /// The declared preprocessing program is what turns those bytes into the
-    /// encoder's feature tensor, so the mel geometry here is only used to bound
-    /// the transcribable window reported to callers.
     pub fn from_encoded_input(
         endpoint: String,
-        n_mels: usize,
-        n_frames: usize,
-        max_tokens: Option<usize>,
-    ) -> Self {
-        Self {
+        program: &onnx_genai_metadata::AudioPreprocessingProgram,
+    ) -> anyhow::Result<Self> {
+        let program = onnx_genai_preprocess::audio::AudioProgram::from_program(program)
+            .context("compile declared encoded-audio preprocessing for serving")?;
+        Ok(Self {
             endpoint,
-            n_mels,
-            n_frames,
-            max_tokens,
-            encoded: true,
+            transcription: None,
+            binding: AudioInputBinding::Encoded(std::sync::Arc::new(program)),
+        })
+    }
+    pub fn is_encoded(&self) -> bool {
+        matches!(self.binding, AudioInputBinding::Encoded(_))
+    }
+    pub fn feature_shape(&self) -> Option<[usize; 3]> {
+        match &self.binding {
+            AudioInputBinding::Features { shape, .. } => Some(*shape),
+            AudioInputBinding::Encoded(_) => None,
         }
+    }
+    pub fn maximum_input_samples(
+        &self,
+        source_rate: u32,
+    ) -> anyhow::Result<Option<std::num::NonZeroUsize>> {
+        let program = match &self.binding {
+            AudioInputBinding::Encoded(program) | AudioInputBinding::Features { program, .. } => {
+                program
+            }
+        };
+        Ok(program.maximum_input_samples(source_rate)?)
     }
 }
 
@@ -84,73 +103,58 @@ pub struct AudioTensor {
 }
 
 pub(crate) fn decode_chat_audio(input: &InputAudio) -> anyhow::Result<Vec<u8>> {
-    match input.format.as_str() {
-        "wav" => STANDARD
-            .decode(&input.data)
-            .context("input_audio.data must be valid base64"),
-        "mp3" => anyhow::bail!("MP3 audio is not supported yet; provide a PCM16 WAV file"),
-        format => anyhow::bail!("unsupported input_audio format '{format}'"),
-    }
+    anyhow::ensure!(
+        !input.format.trim().is_empty(),
+        "input_audio.format must be a nonempty audio format label (e.g. wav, flac, mp3); encoded content determines the decoder"
+    );
+    STANDARD
+        .decode(&input.data)
+        .context("input_audio.data must contain valid base64 encoded audio")
 }
 
-pub fn preprocess_wav(bytes: &[u8], spec: &AudioInputSpec) -> anyhow::Result<AudioTensor> {
-    let audio = decode_wav_pcm16(bytes)?;
-    preprocess_samples(&audio.samples, audio.sample_rate, spec)
+/// Execute the package's selected feature output, retaining authored analysis semantics.
+pub fn preprocess_audio(bytes: &[u8], spec: &AudioInputSpec) -> anyhow::Result<AudioTensor> {
+    let AudioInputBinding::Features { program, shape } = &spec.binding else {
+        anyhow::bail!(
+            "encoded audio preprocessing belongs to the workflow; bind encoded bytes with MultimodalInput instead of extracting features"
+        );
+    };
+    let tensor = program.run(&[bytes])?.into_iter().next().context(
+        "selected audio preprocessing output is absent; repair the package's output binding",
+    )?;
+    anyhow::ensure!(
+        tensor.shape == shape.map(|value| value as i64),
+        "audio preprocessing output '{}' has shape {:?}, expected {:?}; correct the authored padding/analysis geometry",
+        spec.endpoint,
+        tensor.shape,
+        shape
+    );
+    let AudioTensorData::Fp32(data) = tensor.data else {
+        anyhow::bail!(
+            "audio preprocessing output '{}' is not float32; correct its declared transform/output dtype",
+            spec.endpoint
+        );
+    };
+    Ok(AudioTensor {
+        endpoint: spec.endpoint.clone(),
+        data,
+        shape: tensor.shape,
+    })
 }
 
-/// Extract the model's declared audio features from raw `[-1, 1]` mono samples.
-///
-/// The counterpart to [`preprocess_wav`] for callers that already hold samples
-/// — a live stream segment, for instance — so a waveform never has to be
-/// re-encoded into a WAV container just to be transcribed.
+/// Wrap finite mono samples without quantization, then run the same declared program.
 pub fn preprocess_samples(
     samples: &[f32],
     sample_rate: u32,
     spec: &AudioInputSpec,
 ) -> anyhow::Result<AudioTensor> {
-    let extractor = LogMelExtractor::new(spec.n_mels, WHISPER_SAMPLE_RATE)?;
-    let features = if spec.n_frames == WHISPER_N_FRAMES {
-        extractor.extract_padded(samples, sample_rate)?
-    } else {
-        extractor.extract(samples, sample_rate)?
-    };
-    let data = resize_feature_frames(
-        &features.data,
-        spec.n_mels,
-        features.n_frames,
-        spec.n_frames,
-    );
-    Ok(AudioTensor {
-        endpoint: spec.endpoint.clone(),
-        data,
-        shape: vec![1, spec.n_mels as i64, spec.n_frames as i64],
-    })
+    preprocess_audio(&encode_wav_f32(samples, sample_rate, 1)?, spec)
 }
 
-fn resize_feature_frames(
-    source: &[f32],
-    n_mels: usize,
-    source_frames: usize,
-    target_frames: usize,
-) -> Vec<f32> {
-    if source_frames == target_frames {
-        return source.to_vec();
-    }
-    let copy_frames = source_frames.min(target_frames);
-    let mut output = vec![-1.5; n_mels * target_frames];
-    for mel in 0..n_mels {
-        let source_start = mel * source_frames;
-        let target_start = mel * target_frames;
-        output[target_start..target_start + copy_frames]
-            .copy_from_slice(&source[source_start..source_start + copy_frames]);
-    }
-    output
-}
-
-/// Re-encodes `[-1, 1]` mono samples into a PCM16 WAV container.
+/// Re-encodes finite mono samples into a float32 WAV container.
 ///
 /// A package whose preprocessing program starts at `decode` accepts a container,
 /// not bare samples, so a stream segment has to be wrapped before it is bound.
 pub fn encode_samples_wav(samples: &[f32], sample_rate: u32) -> anyhow::Result<Vec<u8>> {
-    Ok(encode_wav_pcm16(samples, sample_rate, 1)?)
+    Ok(encode_wav_f32(samples, sample_rate, 1)?)
 }

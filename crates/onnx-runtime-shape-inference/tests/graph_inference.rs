@@ -407,6 +407,237 @@ fn if_branch_element_type_mismatch_is_an_error() {
     ));
 }
 
+fn dtype_boundary_graph(op: &str, opset: u64, dtype: DataType) -> (Graph, ValueId) {
+    match op {
+        "If" => {
+            let (mut graph, output) = if_graph(
+                identity_branch_with_element_type(dtype, vec![Dim::Static(2)]),
+                identity_branch_with_element_type(dtype, vec![Dim::Static(2)]),
+            );
+            graph.opset_imports.insert(String::new(), opset);
+            (graph, output)
+        }
+        "Loop" => {
+            let mut graph = Graph::new();
+            let trip_count = graph.create_named_value("M", DataType::Int64, Shape::new());
+            graph.add_input(trip_count);
+            let condition = graph.create_named_value("cond", DataType::Bool, Shape::new());
+            graph.add_input(condition);
+            let carried = graph.create_named_value("carried", dtype, vec![Dim::Static(2)]);
+            graph.add_input(carried);
+            let output = graph.create_named_value("output", DataType::Undefined, Shape::new());
+            graph.mark_value_type_unknown(output);
+            graph.mark_value_shape_unknown(output);
+
+            let mut body = Graph::new();
+            let iter = body.create_named_value("iter", DataType::Int64, Shape::new());
+            body.add_input(iter);
+            let cond_in = body.create_named_value("cond_in", DataType::Bool, Shape::new());
+            body.add_input(cond_in);
+            let carried_in =
+                body.create_named_value("carried_in", DataType::Undefined, Shape::new());
+            body.mark_value_type_unknown(carried_in);
+            body.mark_value_shape_unknown(carried_in);
+            body.add_input(carried_in);
+            let cond_out = body.create_named_value("cond_out", DataType::Bool, Shape::new());
+            body.insert_node(node(0, "Identity", vec![Some(cond_in)], vec![cond_out]));
+            let carried_out =
+                body.create_named_value("carried_out", DataType::Undefined, Shape::new());
+            body.mark_value_type_unknown(carried_out);
+            body.mark_value_shape_unknown(carried_out);
+            body.insert_node(node(
+                1,
+                "Identity",
+                vec![Some(carried_in)],
+                vec![carried_out],
+            ));
+            body.add_output(cond_out);
+            body.add_output(carried_out);
+
+            let loop_id = graph.insert_node(node(
+                0,
+                "Loop",
+                vec![Some(trip_count), Some(condition), Some(carried)],
+                vec![output],
+            ));
+            graph.subgraphs.insert((loop_id, "body".into()), body);
+            graph.add_output(output);
+            graph.opset_imports.insert(String::new(), opset);
+            (graph, output)
+        }
+        "Scan" => {
+            let mut graph = Graph::new();
+            let state = graph.create_named_value("state", dtype, vec![Dim::Static(2)]);
+            graph.add_input(state);
+            let scan_input =
+                graph.create_named_value("scan_input", dtype, vec![Dim::Static(3), Dim::Static(2)]);
+            graph.add_input(scan_input);
+            let state_output =
+                graph.create_named_value("state_output", DataType::Undefined, Shape::new());
+            graph.mark_value_type_unknown(state_output);
+            graph.mark_value_shape_unknown(state_output);
+            let scan_output =
+                graph.create_named_value("scan_output", DataType::Undefined, Shape::new());
+            graph.mark_value_type_unknown(scan_output);
+            graph.mark_value_shape_unknown(scan_output);
+
+            let mut body = Graph::new();
+            let state_in = body.create_named_value("state_in", DataType::Undefined, Shape::new());
+            body.mark_value_type_unknown(state_in);
+            body.mark_value_shape_unknown(state_in);
+            body.add_input(state_in);
+            let slice_in = body.create_named_value("slice_in", DataType::Undefined, Shape::new());
+            body.mark_value_type_unknown(slice_in);
+            body.mark_value_shape_unknown(slice_in);
+            body.add_input(slice_in);
+            let state_out = body.create_named_value("state_out", DataType::Undefined, Shape::new());
+            body.mark_value_type_unknown(state_out);
+            body.mark_value_shape_unknown(state_out);
+            body.insert_node(node(0, "Identity", vec![Some(state_in)], vec![state_out]));
+            let slice_out = body.create_named_value("slice_out", DataType::Undefined, Shape::new());
+            body.mark_value_type_unknown(slice_out);
+            body.mark_value_shape_unknown(slice_out);
+            body.insert_node(node(1, "Identity", vec![Some(slice_in)], vec![slice_out]));
+            body.add_output(state_out);
+            body.add_output(slice_out);
+
+            let mut scan = node(
+                0,
+                "Scan",
+                vec![Some(state), Some(scan_input)],
+                vec![state_output, scan_output],
+            );
+            scan.attributes
+                .insert("num_scan_inputs".into(), Attribute::Int(1));
+            let scan_id = graph.insert_node(scan);
+            graph.subgraphs.insert((scan_id, "body".into()), body);
+            graph.add_output(state_output);
+            graph.add_output(scan_output);
+            graph.opset_imports.insert(String::new(), opset);
+            (graph, state_output)
+        }
+        _ => unreachable!("unsupported control-flow op"),
+    }
+}
+
+#[test]
+fn control_flow_dtype_boundaries_match_onnx_ir_revisions() {
+    let boundaries = [
+        (DataType::Float8E4M3FN, 19),
+        (DataType::Float8E4M3FNUZ, 19),
+        (DataType::Float8E5M2, 19),
+        (DataType::Float8E5M2FNUZ, 19),
+        (DataType::Uint4, 21),
+        (DataType::Int4, 21),
+        (DataType::Float4E2M1, 23),
+        (DataType::Float8E8M0, 24),
+        (DataType::Uint2, 25),
+        (DataType::Int2, 25),
+    ];
+    let registry = InferenceRegistry::default_registry();
+
+    for op in ["If", "Loop", "Scan"] {
+        for (dtype, first_opset) in boundaries {
+            let (mut prior, _) = dtype_boundary_graph(op, first_opset - 1, dtype);
+            let imports = prior.opset_imports.clone();
+            let error = registry
+                .infer_graph(&mut prior, &imports, MergePolicy::Permissive)
+                .expect_err("the prior opset must reject the newly introduced dtype");
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("opset {}", first_opset - 1))
+                    && message.contains(&format!("first admitted at opset {first_opset}")),
+                "{op} {dtype:?} rejection must explain the exact boundary: {message}"
+            );
+
+            let (mut legal, output) = dtype_boundary_graph(op, first_opset, dtype);
+            let imports = legal.opset_imports.clone();
+            registry
+                .infer_graph(&mut legal, &imports, MergePolicy::Permissive)
+                .unwrap_or_else(|error| {
+                    panic!("{op} {dtype:?} must be legal at opset {first_opset}: {error}")
+                });
+            assert_eq!(legal.value(output).dtype, dtype);
+        }
+    }
+}
+
+#[test]
+fn control_flow_dtype_gate_uses_node_local_opset() {
+    let (mut graph, output) = dtype_boundary_graph("If", 18, DataType::Float8E4M3FN);
+    graph.node_mut(NodeId(0)).version = Some(19);
+    let imports = graph.opset_imports.clone();
+    InferenceRegistry::default_registry()
+        .infer_graph(&mut graph, &imports, MergePolicy::Permissive)
+        .expect("the containing If node's local opset admits float8");
+    assert_eq!(graph.value(output).dtype, DataType::Float8E4M3FN);
+}
+
+#[test]
+fn unresolved_if_branch_outputs_remain_deferred() {
+    fn unresolved_branch() -> Graph {
+        let mut branch = Graph::new();
+        let input = branch.create_named_value("input", DataType::Undefined, Shape::new());
+        branch.mark_value_type_unknown(input);
+        branch.mark_value_shape_unknown(input);
+        branch.add_input(input);
+        let output = branch.create_named_value("output", DataType::Undefined, Shape::new());
+        branch.mark_value_type_unknown(output);
+        branch.mark_value_shape_unknown(output);
+        branch.insert_node(node(0, "UnknownProducer", vec![Some(input)], vec![output]));
+        branch.add_output(output);
+        branch
+    }
+
+    let (mut graph, output) = if_graph(unresolved_branch(), unresolved_branch());
+    graph.opset_imports.insert(String::new(), 18);
+    let imports = graph.opset_imports.clone();
+    let report = InferenceRegistry::default_registry()
+        .infer_graph(&mut graph, &imports, MergePolicy::Permissive)
+        .expect("unknown branch output types must remain deferred");
+    assert!(report.unresolved.contains(&output));
+}
+
+#[test]
+fn unresolved_if_output_still_checks_a_known_declared_dtype() {
+    fn unresolved_branch() -> Graph {
+        let mut branch = Graph::new();
+        let output = branch.create_named_value(
+            "unresolved_branch_output",
+            DataType::Undefined,
+            Shape::new(),
+        );
+        branch.mark_value_type_unknown(output);
+        branch.mark_value_shape_unknown(output);
+        branch.add_output(output);
+        branch
+    }
+
+    let mut graph = Graph::new();
+    let condition = graph.create_named_value("condition", DataType::Bool, Shape::new());
+    graph.add_input(condition);
+    let output = graph.create_named_value("output", DataType::Float8E4M3FN, vec![Dim::Static(2)]);
+    let if_id = graph.insert_node(node(0, "If", vec![Some(condition)], vec![output]));
+    graph
+        .subgraphs
+        .insert((if_id, "then_branch".into()), unresolved_branch());
+    graph
+        .subgraphs
+        .insert((if_id, "else_branch".into()), unresolved_branch());
+    graph.add_output(output);
+    graph.opset_imports.insert(String::new(), 18);
+
+    let imports = graph.opset_imports.clone();
+    let message = InferenceRegistry::default_registry()
+        .infer_graph(&mut graph, &imports, MergePolicy::Permissive)
+        .expect_err("a known parent output dtype must be checked even when branches are unresolved")
+        .to_string();
+    assert!(
+        message.contains("output #0") && message.contains("first admitted at opset 19"),
+        "the declared output rejection must identify the boundary: {message}"
+    );
+}
+
 /// Build a small graph exercising symbolic-batch propagation through
 /// MatMul → Add → Reshape, and assert the named batch dim `N` survives.
 #[test]
@@ -1564,6 +1795,38 @@ fn if_unifies_matching_sequence_branch_outputs() {
 }
 
 #[test]
+fn if_sequence_dtype_uses_the_same_opset_boundary_as_tensor_values() {
+    for (opset, accepted) in [(20, false), (21, true)] {
+        let (mut graph, output) = if_graph(
+            sequence_construct_branch(DataType::Int4, vec![Dim::Static(8)]),
+            sequence_construct_branch(DataType::Int4, vec![Dim::Static(8)]),
+        );
+        graph.opset_imports.insert(String::new(), opset);
+        let imports = graph.opset_imports.clone();
+        let result = InferenceRegistry::default_registry().infer_graph(
+            &mut graph,
+            &imports,
+            MergePolicy::Permissive,
+        );
+        if accepted {
+            let report = result.expect("If-21 must admit Sequence<Tensor<int4>>");
+            assert_eq!(
+                sequence_tensor(report.containers.get(&output).expect("sequence output")).dtype,
+                DataType::Int4
+            );
+        } else {
+            let message = result
+                .expect_err("If-20 must reject Sequence<Tensor<int4>>")
+                .to_string();
+            assert!(
+                message.contains("first admitted at opset 21"),
+                "rejection must name the first legal opset: {message}"
+            );
+        }
+    }
+}
+
+#[test]
 fn if_sequence_branch_extent_disagreement_degrades_to_symbol() {
     let (_graph, output, report) = run_if(
         sequence_construct_branch(DataType::Float32, vec![Dim::Static(2), Dim::Static(3)]),
@@ -1619,6 +1882,26 @@ fn if_container_versus_tensor_branch_disagreement_errors() {
         message.contains("container"),
         "error must explain the container/tensor mismatch, got {message}"
     );
+}
+
+#[test]
+fn if_known_sequence_and_unknown_branch_output_remain_deferred() {
+    let mut unknown = Graph::new();
+    let output = unknown.create_named_value("unknown", DataType::Undefined, Shape::new());
+    unknown.mark_value_type_unknown(output);
+    unknown.mark_value_shape_unknown(output);
+    unknown.add_output(output);
+
+    let (mut graph, output) = if_graph(
+        sequence_construct_branch(DataType::Float32, vec![Dim::Static(2)]),
+        unknown,
+    );
+    let imports = graph.opset_imports.clone();
+    let report = InferenceRegistry::default_registry()
+        .infer_graph(&mut graph, &imports, MergePolicy::Permissive)
+        .expect("an unknown branch must not be treated as a tensor branch");
+    assert!(report.unresolved.contains(&output));
+    assert!(!report.containers.contains_key(&output));
 }
 
 /// A `Loop` body that accumulates into its carried sequence: `SequenceInsert`
@@ -1888,6 +2171,56 @@ fn sequence_map_identity_preserves_element_type() {
 }
 
 #[test]
+fn sequence_map_is_not_subject_to_if_loop_scan_dtype_boundaries() {
+    let mut graph = Graph::new();
+    let elem = graph.create_named_value("elem", DataType::Float8E4M3FN, vec![Dim::Static(2)]);
+    graph.add_input(elem);
+    let seq = graph.create_named_value("seq", DataType::Undefined, Shape::new());
+    graph.mark_value_type_unknown(seq);
+    graph.mark_value_shape_unknown(seq);
+    graph.insert_node(node(0, "SequenceConstruct", vec![Some(elem)], vec![seq]));
+
+    let mut body = Graph::new();
+    let body_input = body.create_named_value("body_input", DataType::Undefined, Shape::new());
+    body.mark_value_type_unknown(body_input);
+    body.mark_value_shape_unknown(body_input);
+    body.add_input(body_input);
+    let body_output = body.create_named_value("body_output", DataType::Undefined, Shape::new());
+    body.mark_value_type_unknown(body_output);
+    body.mark_value_shape_unknown(body_output);
+    body.insert_node(node(
+        0,
+        "Identity",
+        vec![Some(body_input)],
+        vec![body_output],
+    ));
+    body.add_output(body_output);
+
+    let map_output = graph.create_named_value("map_output", DataType::Undefined, Shape::new());
+    graph.mark_value_type_unknown(map_output);
+    graph.mark_value_shape_unknown(map_output);
+    let map_id = graph.insert_node(node(1, "SequenceMap", vec![Some(seq)], vec![map_output]));
+    graph.subgraphs.insert((map_id, "body".into()), body);
+    graph.add_output(map_output);
+    graph.opset_imports.insert(String::new(), 17);
+
+    let imports = graph.opset_imports.clone();
+    let report = InferenceRegistry::default_registry()
+        .infer_graph(&mut graph, &imports, MergePolicy::Permissive)
+        .expect("SequenceMap-17 has its own schema and must not use If/Loop/Scan dtype gates");
+    assert_eq!(
+        sequence_tensor(
+            report
+                .containers
+                .get(&map_output)
+                .expect("SequenceMap output")
+        )
+        .dtype,
+        DataType::Float8E4M3FN
+    );
+}
+
+#[test]
 fn sequence_map_body_transforms_element_type() {
     // `Shape` turns each [2,3] element into an int64 [2] vector; the OUTPUT
     // sequence element type must reflect that transform, proving the body was
@@ -2091,10 +2424,10 @@ fn if_branches_capture_outer_scope_sequence() {
 }
 
 #[test]
-fn scan_carries_sequence_state_variable() {
-    // A Scan with one container state var and one scan input. The body erases
-    // from the carried sequence (state) and passes a scan slice through. The
-    // final state output must be a sequence with the element type preserved.
+fn scan_rejects_sequence_state_variable() {
+    // Scan's schema is tensor-only even though Loop and If admit sequence and
+    // optional values. The body inference may discover the container state, but
+    // the containing Scan must reject it at its schema boundary.
     let mut graph = Graph::new();
     let elem = graph.create_named_value(
         "elem",
@@ -2161,26 +2494,13 @@ fn scan_carries_sequence_state_variable() {
 
     let registry = InferenceRegistry::default_registry();
     let opsets = graph.opset_imports.clone();
-    let report = registry
+    let error = registry
         .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
-        .expect("infer Scan with a sequence state var");
-
-    let tensor = sequence_tensor(
-        report
-            .containers
-            .get(&final_state)
-            .expect("state is a sequence"),
-    );
-    assert_eq!(tensor.dtype, DataType::Float32);
-    assert_eq!(
-        tensor.shape,
-        Some(vec![DimExpr::constant(2), DimExpr::constant(3)]),
-        "the sequence state element type is preserved across the Scan"
-    );
-    // The scan output stays a plain stacked tensor (not a container).
+        .expect_err("Scan must reject a sequence state variable");
+    let message = error.to_string();
     assert!(
-        !report.containers.contains_key(&scan_result),
-        "a scan output stacks tensors and is never a container"
+        message.contains("input #0") && message.contains("tensor-only"),
+        "the rejection must identify the tensor-only Scan input: {message}"
     );
 }
 

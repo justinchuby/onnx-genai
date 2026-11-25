@@ -44,9 +44,12 @@ The same executable program semantics apply to both.
 
 ## Waveforms and validity
 
-PCM16 WAV decoding currently mixes channels to mono. An explicit `downmix`
-therefore supports `channels: 1`; other channel layouts and codecs are not yet
-implemented. `resample` changes the rate at its declared position in the program.
+`decode` accepts [supported encoded audio](#encoded-audio-formats) by content and averages channels to mono.
+Decoding runs in portable Rust without external binaries, preserving the
+source sample rate and applying declared codec delay/padding metadata. Invalid
+packets and changing rate/channel layouts fail with context. An explicit
+`downmix` therefore supports `channels: 1`; multichannel waveform outputs and
+other codecs are not yet implemented. `resample` changes the rate at its declared position in the program.
 `rescale` multiplies samples by the declared finite scale.
 `zero_mean_unit_variance` (also selected by `normalize` with that mode) uses the
 valid samples' population variance plus a positive finite epsilon. Existing
@@ -60,6 +63,21 @@ Sample validity follows these operations. `emit_valid_samples` and
 `emit_sample_lengths` publish the surviving real sample count, and
 `emit_validity_mask` publishes a batch-aligned int64 mask. Ragged published
 waveform/feature/mask rows fail with padding guidance.
+
+## Input windows
+
+`AudioProgram::maximum_input_samples(source_rate)` derives the largest source
+clip whose valid samples survive every published path's `trim`/`fixed_window`.
+It uses execution's integer resampling lengths and valid intervals, including
+multiple resamplers and left/right padding. Trimming padding does not count as
+losing real audio. An unpublished branch does not constrain the window. `None`
+means no live clipping bound was declared; a caller must choose its own segment
+allowance instead of assuming a model-specific duration. Zero source rate and
+windows too small to preserve one source sample fail with guidance.
+
+The CLI uses this proof for both file and live transcription after resolving the
+recording's actual source rate. Serving encoded audio binds the compiled program,
+not a guessed rank-3 mel output or a fixed hop/rate formula.
 
 ## Log-mel and normalization
 
@@ -84,9 +102,42 @@ the executable program applies only the transforms it actually declares.
 Unsupported operations such as standalone `spectrogram` fail explicitly instead
 of being accepted as no-ops. More DSP operations, windows/scales, codecs and the
 server's remaining legacy feature-input path still require compatibility work.
+Declared pure-waveform CTC/greedy packages execute through the
+[file transcription API](TRANSCRIPTION.md).
 
 The maintained `audio_waveform` fixture executes actual Native CPU preprocessing
 and an ONNX head, checking independently normalized/rescaled branches, padding,
 masks and lengths. Direct processor tests cover branching, batching, explicit
 rates and failure cases. These establish dataflow and numerical behavior, not
 speech-recognition quality or device performance.
+
+### Encoded audio formats
+
+Audio inputs use one content-probed Symphonia decoder, including WAV (integer
+and floating point), MP3/MP2, FLAC, Vorbis/Ogg, AAC (ADTS/MP4), ALAC, AIFF, CAF
+and supported audio tracks in Matroska. The codec inside the container must also
+be supported. Chat `input_audio.format` is a nonempty descriptive label; bytes
+determine the actual format. Decoding preserves the source sample rate and uses
+the arithmetic channel mean; internal WAV transport uses float32.
+
+Opus is unsupported in Symphonia 0.6.1. MP4 edit lists are not applied, so priming
+that depends on an edit list remains audible to preprocessing. Midstream rate or
+channel changes are rejected. Convert such inputs to a supported WAV file first.
+Live stdin framing continues to use its documented WAV/PCM16 protocol.
+
+## Feature tensor inputs
+
+Schema v1.16 admits externally executed audio feature programs.
+A rank-3 float32 runtime media input also requires `preprocessing.audio`.
+The program output whose `name` exactly matches that workflow input must declare
+`content: audio_features` and `dtype: float32`. Serving executes that output's
+program before binding the tensor and verifies the result against the workflow
+shape. The same program determines source-rate clip limits for CLI segmentation.
+There is no implicit sample rate, FFT, hop, window or normalization recipe.
+Other program outputs do not impose a clip limit on the selected feature branch.
+
+For example, `transcription_features` binds `request.features` after its authored
+8 kHz / 128 FFT / 64 hop / 7 mel / 4 frame program. Its Native head and the
+encoded-input `transcription_tokens` package produce matching buffered/SSE
+transcripts and usage from the same waveform. Missing programs, output-name or
+dtype mismatches, and actual feature-shape mismatches fail with repair guidance.

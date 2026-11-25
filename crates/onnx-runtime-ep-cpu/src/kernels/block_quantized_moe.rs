@@ -570,7 +570,7 @@ impl BlockQuantizedMoEKernel {
                             projection.out_features,
                             bias,
                             plan,
-                            scratch.initialized(),
+                            &mut scratch,
                             output,
                         )
                     },
@@ -3868,7 +3868,7 @@ mod tests {
                                     p.out_features,
                                     bias,
                                     plan,
-                                    &mut old_decode,
+                                    &mut ProjectionScratch::test_binding(&mut old_decode),
                                     &mut output,
                                 )?;
                                 Ok(output)
@@ -3927,7 +3927,7 @@ mod tests {
                                             p.out_features,
                                             bias,
                                             plan,
-                                            decode.initialized(),
+                                            &mut decode,
                                             output,
                                         )
                                     },
