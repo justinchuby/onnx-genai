@@ -242,33 +242,42 @@ fn string<'a>(object: &'a Value, key: &str) -> anyhow::Result<&'a str> {
         .and_then(Value::as_str)
         .with_context(|| format!("realtime field {key} must be a string"))
 }
+enum FailureKind {
+    Protocol(super::conversation::ProtocolErrorKind),
+    Native,
+}
 struct Failure {
     message: String,
-    code: Option<&'static str>,
-    fatal: bool,
+    kind: FailureKind,
 }
 impl Failure {
+    fn fatal(&self) -> bool {
+        matches!(self.kind, FailureKind::Native)
+    }
+    fn error_type(&self) -> &'static str {
+        match self.kind {
+            FailureKind::Protocol(kind) => kind.error_type(),
+            FailureKind::Native => "server_error",
+        }
+    }
     fn invalid(error: impl std::fmt::Display) -> Self {
         Self {
             message: error.to_string(),
-            code: None,
-            fatal: false,
+            kind: FailureKind::Protocol(super::conversation::ProtocolErrorKind::InvalidRequest),
         }
     }
     fn native(error: anyhow::Error) -> Self {
         Self {
             message: format!("{error:#}"),
-            code: None,
-            fatal: true,
+            kind: FailureKind::Native,
         }
     }
 }
 impl From<super::conversation::ProtocolError> for Failure {
     fn from(error: super::conversation::ProtocolError) -> Self {
         Self {
-            code: error.code,
+            kind: FailureKind::Protocol(error.kind),
             message: error.to_string(),
-            fatal: false,
         }
     }
 }
@@ -318,8 +327,8 @@ impl Runner {
         .context("realtime output writer closed")
     }
     async fn error(&self, out: &mpsc::Sender<Outgoing>, failure: &Failure) -> anyhow::Result<()> {
-        let value = json!({"type":"error","error":{"type":if failure.fatal {"server_error"} else {"invalid_request_error"},"code":failure.code,"message":failure.message,"param":null}});
-        if failure.fatal {
+        let value = json!({"type":"error","error":{"type":failure.error_type(),"code":null,"message":failure.message,"param":null}});
+        if failure.fatal() {
             let (flushed, reply) = oneshot::channel();
             out.send(Outgoing {
                 value: WireOutput::Event(value),
@@ -359,7 +368,7 @@ impl Runner {
                 Ok(false) => {}
                 Err(failure) => {
                     self.error(out, &failure).await?;
-                    if failure.fatal {
+                    if failure.fatal() {
                         return Ok(());
                     }
                 }
@@ -424,7 +433,7 @@ impl Runner {
         };
         if let Err(failure) = result {
             self.error(out, &failure).await?;
-            return Ok(!failure.fatal);
+            return Ok(!failure.fatal());
         }
         Ok(true)
     }
@@ -851,12 +860,11 @@ impl Runner {
                 .await?;
             }
             "response.cancel" => {
-                if self.active.is_none() {
-                    return Err(Failure::invalid(
-                        "response.cancel requires an active response",
-                    ));
+                // Upstream cancellation is idempotent: an idle response has
+                // nothing to cancel and emits no acknowledgement or error.
+                if self.active.is_some() {
+                    self.quantum(RealtimeInputOwned::Cancel, true, out).await?;
                 }
-                self.quantum(RealtimeInputOwned::Cancel, true, out).await?;
             }
             _ => {
                 return Err(Failure::invalid(format!(
@@ -1686,9 +1694,18 @@ node { input: "starting" input: "operation""#);
             created["session"]["audio"]["input"]["format"]["rate"],
             16000
         );
+        // Idle/repeated cancellation is silent, including before the first turn.
+        send(&mut client, json!({"type":"response.cancel"})).await;
+        send(&mut client, json!({"type":"response.cancel"})).await;
+        send(&mut client, json!({"type":"response.create"})).await;
+        let empty = event(&mut client).await;
+        assert_eq!(empty["type"], "error");
+        assert_eq!(empty["error"]["type"], "conversation_empty");
+        assert!(empty["error"]["code"].is_null());
         send(&mut client, json!({"type":"input_audio_buffer.commit"})).await;
         let error = event(&mut client).await;
-        assert_eq!(error["error"]["code"], "input_audio_buffer_commit_empty");
+        assert_eq!(error["error"]["type"], "input_audio_buffer_commit_empty");
+        assert!(error["error"]["code"].is_null());
         send(&mut client,json!({"type":"session.update","session":{"instructions":"hello","output_modalities":["text"],"max_output_tokens":1}})).await;
         assert_eq!(event(&mut client).await["type"], "session.updated");
         send(&mut client,json!({"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"world"}]}})).await;
@@ -1708,12 +1725,23 @@ node { input: "starting" input: "operation""#);
             }
         }
         assert_eq!(text, "hello");
+        send(&mut client, json!({"type":"response.cancel"})).await;
+        send(&mut client, json!({"type":"response.cancel"})).await;
+        send(
+            &mut client,
+            json!({"type":"session.update","session":{"max_output_tokens":2}}),
+        )
+        .await;
+        assert_eq!(event(&mut client).await["type"], "session.updated");
         send(
             &mut client,
             json!({"type":"session.update","session":{"instructions":"changed"}}),
         )
         .await;
-        assert_eq!(event(&mut client).await["type"], "error");
+        let invalid = event(&mut client).await;
+        assert_eq!(invalid["type"], "error");
+        assert_eq!(invalid["error"]["type"], "invalid_request_error");
+        assert!(invalid["error"]["code"].is_null());
         client.close(None).await.unwrap();
         drop(client);
         let model = state.registry.resolve("native-realtime").unwrap().unwrap();
