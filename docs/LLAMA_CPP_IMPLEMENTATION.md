@@ -2145,3 +2145,21 @@ stages, bounded retention, partial-scalar EOF refusal, large finite windows,
 semantic candidate masks, and stable reasoning markers. A real Native HTTP
 fixture competes a higher-biased schema-invalid token against a valid token whose
 encoded suffix is stripped, through buffered/SSE and ordinary/logprob output.
+
+
+## Buffered speech PCM transport
+
+Native `/tts` now supports default WAV, float32 little-endian `pcm`, and signed
+16-bit `pcm16`; OpenAI speech aliases map `pcm` to signed 16-bit samples. Typed
+transport selection reaches the declared audio output through the owner driver.
+Package rates and channel layouts are retained and described in raw PCM MIME
+parameters. Float waveform encoding precedes quantization; validated post-adapter
+PCM16 WAV conversion preserves the already quantized source. Nonfinite samples
+and incomplete post-adapter frames fail explicitly. Streaming speech remains open.
+
+Validation on Native CPU: 14 audio unit tests, both ONNX-owned audio workflow
+tests, and the complete server library (580 passed, 2 inherited ignores) pass.
+Byte checks include stereo interleaving, float precision, symmetric PCM16
+rounding, full signed-range post-adapter conversion, and both HTTP PCM mappings.
+This checkpoint does not establish audio quality or GPU behavior and does not
+complete the remaining compatibility acceptance rows above.
