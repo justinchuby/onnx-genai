@@ -5,6 +5,8 @@
 //!   values to the target integer's bounds (ONNX Cast semantics; NaN → 0),
 //!   converting straight to the target type so narrow targets clamp rather than
 //!   wrap;
+//! * float → packed integer truncates and wraps modulo the packed width,
+//!   matching ONNX's `ml_dtypes` reference conversion (NaN/inf → 0);
 //! * any numeric → `bool` is `x != 0` (NaN casts to `true`);
 //! * integer → integer is a width-narrowing/widening reinterpret (`as`);
 //! * float ↔ float rounds to the nearest representable value.
@@ -14,7 +16,10 @@
 //! model-agnostic.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_ir::{
+    DataType, Node, Shape,
+    packed_integer::{PackedInteger, cast_unsupported_reason, packed_integer},
+};
 
 use super::{check_arity, elem_size};
 use crate::strided::{next_index, numel};
@@ -101,14 +106,30 @@ num_to_int!(to_u64, u64);
 pub struct CastKernel {
     to: Option<DataType>,
     float6: bool,
+    opset: u64,
 }
 
 /// Factory reading the ONNX `to` attribute (a `TensorProto.DataType` integer).
 pub struct CastFactory {
     pub float6: bool,
+    pub opset: u64,
 }
 
 impl KernelFactory for CastFactory {
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        opset: u64,
+        _input_shapes: &[Shape],
+        input_dtypes: &[DataType],
+    ) -> Option<String> {
+        let target = node
+            .attr("to")
+            .and_then(|a| a.as_int())
+            .and_then(|raw| DataType::from_onnx(raw as i32));
+        cast_unsupported_reason("Cast", opset, input_dtypes.first().copied(), target)
+    }
+
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let to = node
             .attr("to")
@@ -117,20 +138,45 @@ impl KernelFactory for CastFactory {
         Ok(Box::new(CastKernel {
             to,
             float6: self.float6,
+            opset: self.opset,
         }))
     }
 }
 
 /// `CastLike` kernel. Its target dtype is supplied by input 1 rather than an
 /// attribute, but conversion itself is exactly the `Cast` conversion table.
-pub struct CastLikeKernel;
+pub struct CastLikeKernel {
+    opset: u64,
+}
 
 /// Factory for `CastLike`.
-pub struct CastLikeFactory;
+pub struct CastLikeFactory {
+    pub opset: u64,
+}
 
 impl KernelFactory for CastLikeFactory {
+    fn unsupported_reason(
+        &self,
+        _node: &Node,
+        opset: u64,
+        _input_shapes: &[Shape],
+        input_dtypes: &[DataType],
+    ) -> Option<String> {
+        if opset < 15 {
+            return Some(format!(
+                "CastLike requires opset 15 or newer, got opset {opset}; export the model with a supported CastLike revision"
+            ));
+        }
+        cast_unsupported_reason(
+            "CastLike",
+            opset,
+            input_dtypes.first().copied(),
+            input_dtypes.get(1).copied(),
+        )
+    }
+
     fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(CastLikeKernel))
+        Ok(Box::new(CastLikeKernel { opset: self.opset }))
     }
 }
 
@@ -140,7 +186,14 @@ impl Kernel for CastKernel {
         let to = self.to.ok_or_else(|| {
             EpError::KernelFailed("Cast: missing or unsupported `to` attribute".into())
         })?;
-        cast_to("Cast", &inputs[0], &mut outputs[0], to, self.float6)
+        cast_to(
+            "Cast",
+            &inputs[0],
+            &mut outputs[0],
+            to,
+            self.float6,
+            self.opset,
+        )
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -158,6 +211,7 @@ impl Kernel for CastLikeKernel {
             &mut outputs[0],
             inputs[1].dtype,
             false,
+            self.opset,
         )
     }
 
@@ -172,6 +226,7 @@ fn cast_to(
     output: &mut TensorMut,
     to: DataType,
     float6: bool,
+    opset: u64,
 ) -> Result<()> {
     // Cast to/from STRING is a real ONNX feature, but the ep-cpu stores
     // string tensors out-of-band (String has no fixed-width raw byte
@@ -193,6 +248,12 @@ fn cast_to(
             "{op}: output dtype {:?} does not match target dtype {to:?}",
             output.dtype
         )));
+    }
+    if packed_integer(input.dtype).is_some() || packed_integer(to).is_some() {
+        if let Some(reason) = cast_unsupported_reason(op, opset, Some(input.dtype), Some(to)) {
+            return Err(EpError::KernelFailed(reason));
+        }
+        return cast_packed_integer(input, output, to);
     }
     if input.dtype.is_float6() {
         if !float6 {
@@ -220,6 +281,132 @@ fn cast_to(
         write_num(&mut bytes, n, to)?;
     }
     super::write_dense_bytes(output, &bytes)
+}
+
+fn cast_packed_integer(input: &TensorView, output: &mut TensorMut, to: DataType) -> Result<()> {
+    input.validate()?;
+    output.validate()?;
+    if input.shape != output.shape {
+        return Err(EpError::KernelFailed(format!(
+            "Cast from {:?} to {to:?} requires matching input and output shapes, got {:?} and {:?}",
+            input.dtype, input.shape, output.shape
+        )));
+    }
+    let values = if packed_integer(input.dtype).is_some() {
+        read_packed_integer(input)?
+    } else {
+        read_src(input)?
+    };
+    if let Some(target) = packed_integer(to) {
+        write_packed_integer(output, &values, target)
+    } else {
+        let out_esize = elem_size(to)?;
+        let mut bytes = Vec::with_capacity(values.len() * out_esize);
+        for value in values {
+            write_num(&mut bytes, value, to)?;
+        }
+        super::write_dense_bytes(output, &bytes)
+    }
+}
+
+fn read_packed_integer(view: &TensorView) -> Result<Vec<Num>> {
+    view.validate()?;
+    let packed = packed_integer(view.dtype).ok_or_else(|| {
+        EpError::KernelFailed(format!(
+            "Cast: {:?} is not a supported packed integer source",
+            view.dtype
+        ))
+    })?;
+    let n = numel(view.shape);
+    let mut values = Vec::with_capacity(n);
+    if n == 0 {
+        return Ok(values);
+    }
+    let origin = view.data_ptr::<u8>();
+    let mut index = vec![0; view.shape.len()];
+    loop {
+        let element = crate::strided::elem_offset(view.strides, &index);
+        let bit = element * isize::from(packed.bits());
+        let byte_offset = bit.div_euclid(8);
+        let shift = bit.rem_euclid(8) as u8;
+        // SAFETY: the validated view's owner proved every addressed logical
+        // element is within the backing extent. Packed lanes never cross bytes.
+        let byte = unsafe { *origin.offset(byte_offset) };
+        let code = byte >> shift & packed.mask();
+        values.push(Num::I(packed.decode(code)));
+        if !next_index(view.shape, &mut index) {
+            break;
+        }
+    }
+    Ok(values)
+}
+
+fn packed_code(value: Num, packed: PackedInteger) -> u8 {
+    match value {
+        Num::F(value) => {
+            if !value.is_finite() {
+                return 0;
+            }
+            let modulus = f64::from(1_u32 << packed.bits());
+            packed.encode_wrapping_u64(value.trunc().rem_euclid(modulus) as u64)
+        }
+        Num::I(value) => packed.encode_wrapping_i64(value),
+        Num::U(value) => packed.encode_wrapping_u64(value),
+    }
+}
+
+fn write_packed_integer(
+    output: &mut TensorMut,
+    values: &[Num],
+    packed: PackedInteger,
+) -> Result<()> {
+    let n = numel(output.shape);
+    if values.len() != n {
+        return Err(EpError::KernelFailed(format!(
+            "Cast: packed output {:?} needs {n} elements, got {} converted values",
+            output.dtype,
+            values.len()
+        )));
+    }
+    if n == 0 {
+        return Ok(());
+    }
+    let origin = output.data_ptr_mut::<u8>();
+    if output.is_contiguous() {
+        let mut bytes = vec![0_u8; output.dtype.storage_bytes(n)];
+        for (element, &value) in values.iter().enumerate() {
+            let bit = element * packed.bits() as usize;
+            bytes[bit / 8] |= packed_code(value, packed) << (bit % 8);
+        }
+        // SAFETY: the validated contiguous packed output owns exactly
+        // `storage_bytes(n)` bytes. The zero-filled staging buffer also makes
+        // every unused high tail bit deterministic.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), origin, bytes.len());
+        }
+        return Ok(());
+    }
+
+    let mut index = vec![0; output.shape.len()];
+    let mut logical = 0;
+    loop {
+        let element = crate::strided::elem_offset(output.strides, &index);
+        let bit = element * isize::from(packed.bits());
+        let byte_offset = bit.div_euclid(8);
+        let shift = bit.rem_euclid(8) as u8;
+        let lane_mask = packed.mask() << shift;
+        // SAFETY: as in `read_packed_integer`, each addressed packed lane is
+        // within the validated output extent. Preserve unrelated lanes.
+        unsafe {
+            let byte = origin.offset(byte_offset);
+            *byte = (*byte & !lane_mask) | (packed_code(values[logical], packed) << shift);
+        }
+        logical += 1;
+        if !next_index(output.shape, &mut index) {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn widen_float6(input: &TensorView, output: &mut TensorMut) -> Result<()> {
@@ -824,6 +1011,8 @@ fn write_num(out: &mut Vec<u8>, n: Num, dtype: DataType) -> Result<()> {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+    use onnx_runtime_ep_api::ExecutionProvider;
+    use onnx_runtime_ir::{Attribute, NodeId, static_shape};
 
     fn bytes_to_u64(bytes: &[u8]) -> Vec<u64> {
         bytes
@@ -838,6 +1027,7 @@ mod tests {
         CastKernel {
             to: Some(to),
             float6: true,
+            opset: 28,
         }
         .execute(&[input.view()], &mut [out.view_mut()])
         .unwrap();
@@ -855,6 +1045,7 @@ mod tests {
         let legacy = CastKernel {
             to: Some(DataType::Float32),
             float6: false,
+            opset: 1,
         };
         let error = legacy
             .execute(&[packed.view()], &mut [out.view_mut()])
@@ -989,19 +1180,134 @@ mod tests {
         let input = Owned::f32(&[2], &[1.9, -2.5]);
         let target_i32 = Owned::i32(&[], &[0]);
         let mut i32out = Owned::zeros(DataType::Int32, &[2]);
-        CastLikeKernel
+        CastLikeKernel { opset: 25 }
             .execute(&[input.view(), target_i32.view()], &mut [i32out.view_mut()])
             .unwrap();
         assert_eq!(i32out.to_i32(), vec![1, -2]);
 
         let target_f16 = Owned::f16(&[], &[0.]);
         let mut f16out = Owned::zeros(DataType::Float16, &[2]);
-        CastLikeKernel
+        CastLikeKernel { opset: 25 }
             .execute(&[input.view(), target_f16.view()], &mut [f16out.view_mut()])
             .unwrap();
         assert_eq!(f16out.dtype, DataType::Float16);
         assert!((f16out.to_f16_as_f32()[0] - 1.9).abs() < 1e-3);
         assert_eq!(f16out.to_f16_as_f32()[1], -2.5);
+    }
+
+    #[test]
+    fn uint8_to_uint4_packs_codes_and_zero_points_low_nibble_first() {
+        let input = Owned::u8(&[7], &[0, 1, 7, 8, 15, 16, 255]);
+        let mut output = Owned::zeros(DataType::Uint4, &[7]);
+        CastKernel {
+            to: Some(DataType::Uint4),
+            float6: false,
+            opset: 21,
+        }
+        .execute(&[input.view()], &mut [output.view_mut()])
+        .unwrap();
+        assert_eq!(output.bytes, vec![0x10, 0x87, 0x0f, 0x0f]);
+    }
+
+    #[test]
+    fn packed_cast_claims_follow_schema_revision_boundaries() {
+        let provider = crate::CpuExecutionProvider::new();
+        let mut node = Node::new(NodeId(0), "Cast", vec![], vec![]);
+        node.attributes
+            .insert("to".into(), Attribute::Int(DataType::Uint4 as i64));
+        let shape = static_shape([7]);
+        let rejected = provider.supports_op(&node, 20, &[shape.clone()], &[DataType::Uint8], &[]);
+        assert!(
+            rejected
+                .reason()
+                .is_some_and(|reason| reason.contains("opset 21")),
+            "unexpected pre-opset-21 claim result: {:?}",
+            rejected.reason()
+        );
+        assert!(
+            provider
+                .supports_op(&node, 21, &[shape], &[DataType::Uint8], &[])
+                .is_supported()
+        );
+
+        node.attributes
+            .insert("to".into(), Attribute::Int(DataType::Float8E4M3FN as i64));
+        assert!(
+            provider
+                .supports_op(&node, 25, &[static_shape([7])], &[DataType::Uint4], &[],)
+                .reason()
+                .is_some_and(|reason| reason.contains("does not support target dtype"))
+        );
+        node.attributes
+            .insert("to".into(), Attribute::Int(DataType::Uint4 as i64));
+        assert!(
+            provider
+                .supports_op(
+                    &node,
+                    25,
+                    &[static_shape([7])],
+                    &[DataType::Float8E4M3FN],
+                    &[],
+                )
+                .reason()
+                .is_some_and(|reason| reason.contains("does not support source dtype"))
+        );
+    }
+
+    #[test]
+    fn packed_integer_casts_cover_signed_widths_strides_and_zero_tail_bits() {
+        let input = Owned {
+            bytes: vec![0x10, 0x87, 0xff],
+            shape: vec![5],
+            strides: vec![1],
+            dtype: DataType::Uint4,
+        };
+        let mut int2 = Owned::zeros(DataType::Int2, &[5]);
+        CastKernel {
+            to: Some(DataType::Int2),
+            float6: false,
+            opset: 25,
+        }
+        .execute(&[input.view()], &mut [int2.view_mut()])
+        .unwrap();
+        assert_eq!(int2.bytes, vec![0x34, 0x03]);
+        assert_eq!(int2.bytes[1] & 0xfc, 0, "unused tail bits must be zero");
+
+        let strided = input.with_view(&[3], &[2]);
+        let mut unpacked = Owned::zeros(DataType::Int8, &[3]);
+        CastKernel {
+            to: Some(DataType::Int8),
+            float6: false,
+            opset: 21,
+        }
+        .execute(&[strided.view()], &mut [unpacked.view_mut()])
+        .unwrap();
+        assert_eq!(unpacked.bytes, vec![0, 7, 15]);
+    }
+
+    #[test]
+    fn float_to_int4_matches_onnx_wrapping_reference_semantics() {
+        let input = Owned::f32(&[6], &[-20.0, -8.9, -7.9, 7.9, 8.0, f32::NAN]);
+        let mut output = Owned::zeros(DataType::Int4, &[6]);
+        CastKernel {
+            to: Some(DataType::Int4),
+            float6: false,
+            opset: 21,
+        }
+        .execute(&[input.view()], &mut [output.view_mut()])
+        .unwrap();
+        assert_eq!(output.bytes, vec![0x8c, 0x79, 0x08]);
+    }
+
+    #[test]
+    fn cast_like_25_uses_packed_target_dtype() {
+        let input = Owned::u8(&[5], &[0, 1, 2, 3, 4]);
+        let target = Owned::zeros(DataType::Uint2, &[]);
+        let mut output = Owned::zeros(DataType::Uint2, &[5]);
+        CastLikeKernel { opset: 25 }
+            .execute(&[input.view(), target.view()], &mut [output.view_mut()])
+            .unwrap();
+        assert_eq!(output.bytes, vec![0xe4, 0x00]);
     }
 
     #[test]
@@ -1047,6 +1353,7 @@ mod tests {
         let err = CastKernel {
             to: None,
             float6: false,
+            opset: 13,
         }
         .execute(&[a.view()], &mut [out.view_mut()]);
         assert!(err.is_err());
@@ -1061,6 +1368,7 @@ mod tests {
         let err = CastKernel {
             to: Some(DataType::String),
             float6: false,
+            opset: 13,
         }
         .execute(&[a.view()], &mut [out.view_mut()]);
         let msg = format!("{}", err.unwrap_err());
@@ -1076,6 +1384,7 @@ mod tests {
         let err = CastKernel {
             to: Some(DataType::Float32),
             float6: false,
+            opset: 13,
         }
         .execute(&[a.view()], &mut [out.view_mut()]);
         let msg = format!("{}", err.unwrap_err());
@@ -1116,6 +1425,7 @@ mod contiguous_fast_path_tests {
         CastKernel {
             to: Some(to),
             float6: false,
+            opset: 13,
         }
         .execute(&[input.view()], &mut [output.view_mut()])
         .unwrap();
@@ -1345,6 +1655,7 @@ mod contiguous_fast_path_tests {
         CastKernel {
             to: Some(DataType::Float32),
             float6: false,
+            opset: 13,
         }
         .execute(&[input.view()], &mut [output.view_mut()])
         .unwrap();

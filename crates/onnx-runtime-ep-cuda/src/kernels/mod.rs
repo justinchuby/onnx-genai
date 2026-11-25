@@ -732,16 +732,17 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
 
 /// Derive plugin kernel-registry descriptors from the real CUDA [`OpRegistry`].
 ///
-/// One descriptor per plugin-eligible `(op_type, domain, since_version)` key, with
-/// the domain taken verbatim from the registry (so `com.microsoft` kernels are
-/// advertised in `com.microsoft`, not the default domain) and dtypes from
-/// [`cuda_supported_dtypes_for_op`]. Building the registry only constructs
-/// factory structs holding `Arc` clones of `runtime` — no cuBLASLt/NVRTC work —
-/// so this is cheap to call once at factory construction.
+/// One descriptor per plugin-visible `(op_type, domain, since_version)` key,
+/// with the domain taken verbatim from the registry (so `com.microsoft` kernels
+/// are advertised in `com.microsoft`, not the default domain) and dtypes from
+/// [`cuda_supported_dtypes_for_op`]. Native-only revisions stay dispatchable
+/// without widening the shipped ORT plugin ABI. Building the registry only
+/// constructs factory structs holding `Arc` clones of `runtime` — no
+/// cuBLASLt/NVRTC work — so this is cheap to call once at factory construction.
 pub fn build_cuda_registry_descriptors(runtime: Arc<CudaRuntime>) -> Vec<CudaOpDescriptor> {
     let registry = build_cuda_registry(runtime);
     let mut descriptors: Vec<CudaOpDescriptor> = registry
-        .keys()
+        .plugin_keys()
         // RoiAlign is currently supported only in standalone nxrt.
         .filter(|key| !(key.op_type == "RoiAlign" && key.domain.is_empty()))
         .map(|key| CudaOpDescriptor {
@@ -1777,15 +1778,33 @@ pub fn build_cuda_registry_with_metrics(
     );
 
     // Cast / CastLike (NVRTC element-wise dtype conversion).
-    for (op_type, version) in [("Cast", 1), ("CastLike", 1), ("Cast", 28)] {
+    for (op_type, version, opset, float6) in [
+        ("Cast", 1, 1, false),
+        ("CastLike", 1, 15, false),
+        ("Cast", 28, 28, true),
+    ] {
         reg.register(
             OpKey::new(op_type, "", version),
             onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(cast::CastFactory {
                 runtime: runtime.clone(),
-                float6: version >= 28,
+                float6,
+                opset,
             }),
         );
+    }
+    for opset in [21, 25] {
+        for op_type in ["Cast", "CastLike"] {
+            reg.register_native_only(
+                OpKey::new(op_type, "", opset),
+                onnx_runtime_ep_api::WorkspacePlanning::None,
+                Box::new(cast::CastFactory {
+                    runtime: runtime.clone(),
+                    float6: false,
+                    opset,
+                }),
+            );
+        }
     }
 
     // Reductions (sum/mean cuDNN with f32 NVRTC fallback; max/min NVRTC).
@@ -2386,6 +2405,43 @@ mod tests {
             }),
             "standalone-only ONNX RoiAlign must not be advertised by the CUDA ORT plugin"
         );
+        let cast_versions = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.op_type == "Cast")
+            .map(|descriptor| descriptor.since_version)
+            .collect::<Vec<_>>();
+        let cast_like_versions = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.op_type == "CastLike")
+            .map(|descriptor| descriptor.since_version)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cast_versions,
+            vec![1, 28],
+            "native packed Cast revisions must not change CUDA ORT plugin admission"
+        );
+        assert_eq!(
+            cast_like_versions,
+            vec![1],
+            "native packed CastLike revisions must not change CUDA ORT plugin admission"
+        );
+        for descriptor in descriptors
+            .iter()
+            .filter(|descriptor| matches!(descriptor.op_type.as_str(), "Cast" | "CastLike"))
+        {
+            for packed in [
+                DataType::Uint4,
+                DataType::Int4,
+                DataType::Uint2,
+                DataType::Int2,
+            ] {
+                assert!(
+                    !descriptor.supported_dtypes.contains(&packed),
+                    "CUDA ORT plugin descriptor {:?} must keep rejecting packed dtype {packed:?}",
+                    descriptor.op_type
+                );
+            }
+        }
     }
 
     #[test]

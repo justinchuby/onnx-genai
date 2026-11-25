@@ -4264,7 +4264,7 @@ impl ExecutionProvider for CudaExecutionProvider {
     ) -> KernelMatch {
         // Keyed on (op_type, domain, opset) via the registry, the same single
         // source of truth the CPU EP uses.
-        if !self.registry.supports(&op.op_type, &op.domain, opset) {
+        let Some(factory) = self.registry.lookup(&op.op_type, &op.domain, opset) else {
             let domain = if op.domain.is_empty() {
                 "ai.onnx"
             } else {
@@ -4289,6 +4289,9 @@ impl ExecutionProvider for CudaExecutionProvider {
                 op.op_type,
                 opset
             );
+        };
+        if let Some(reason) = factory.unsupported_reason(op, opset, shapes, input_dtypes) {
+            return KernelMatch::unsupported(reason);
         }
         if op.is_default_domain()
             && op.op_type == "Transpose"

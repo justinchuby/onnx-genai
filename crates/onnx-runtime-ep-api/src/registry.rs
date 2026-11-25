@@ -64,6 +64,7 @@ pub trait KernelFactory: Send + Sync {
 pub struct OpRegistry {
     entries: HashMap<OpKey, (WorkspacePlanning, Box<dyn KernelFactory>)>,
     end_versions: HashMap<OpKey, u64>,
+    native_only: std::collections::HashSet<OpKey>,
     /// Normalized domain → op type → sorted registered `since_version`s.
     by_op: HashMap<String, HashMap<String, Vec<u64>>>,
 }
@@ -80,6 +81,19 @@ impl OpRegistry {
         planning: WorkspacePlanning,
         factory: Box<dyn KernelFactory>,
     ) {
+        self.register_through(key, u64::MAX, planning, factory);
+    }
+
+    /// Register a native-only schema revision that must not be advertised
+    /// through the shipped ORT kernel-registry ABI.
+    pub fn register_native_only(
+        &mut self,
+        mut key: OpKey,
+        planning: WorkspacePlanning,
+        factory: Box<dyn KernelFactory>,
+    ) {
+        key.domain = norm_domain(&key.domain).to_owned();
+        self.native_only.insert(key.clone());
         self.register_through(key, u64::MAX, planning, factory);
     }
 
@@ -169,6 +183,13 @@ impl OpRegistry {
     /// the real registry rather than a hand-maintained parallel list.
     pub fn keys(&self) -> impl Iterator<Item = &OpKey> {
         self.entries.keys()
+    }
+
+    /// Registrations eligible for the shipped ORT plugin ABI.
+    pub fn plugin_keys(&self) -> impl Iterator<Item = &OpKey> {
+        self.entries
+            .keys()
+            .filter(|key| !self.native_only.contains(*key))
     }
 
     /// Number of registered entries.
@@ -311,6 +332,37 @@ mod tests {
         assert_eq!(
             registry.workspace_planning("DsaIndexSelect", "pkg.nxrt", 3),
             Some(WorkspacePlanning::Metadata)
+        );
+    }
+
+    #[test]
+    fn native_only_revisions_dispatch_without_entering_plugin_advertisement() {
+        let mut registry = OpRegistry::new();
+        registry.register(
+            OpKey::new("Cast", "ai.onnx", 1),
+            WorkspacePlanning::None,
+            Box::new(DummyFactory(1)),
+        );
+        registry.register_native_only(
+            OpKey::new("Cast", "ai.onnx", 21),
+            WorkspacePlanning::None,
+            Box::new(DummyFactory(21)),
+        );
+
+        assert!(registry.supports("Cast", "", 21));
+        assert_eq!(
+            registry
+                .keys()
+                .map(|key| key.since_version)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [1, 21].into_iter().collect()
+        );
+        assert_eq!(
+            registry
+                .plugin_keys()
+                .map(|key| key.since_version)
+                .collect::<Vec<_>>(),
+            vec![1]
         );
     }
 }

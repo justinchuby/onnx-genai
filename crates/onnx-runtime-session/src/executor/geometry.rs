@@ -1,9 +1,9 @@
 use super::*;
 
 /// The `[shape, strides, byte_offset]` storage-bounds gate (Holden's
-/// precondition). Uses [`view_in_bounds`] for fixed-width dtypes and a
-/// `storage_bytes` check for sub-byte packed dtypes (which have no integral
-/// per-element byte size).
+/// precondition). Uses [`view_in_bounds`] for fixed-width dtypes and bit-range
+/// arithmetic for sub-byte dtypes (which have no integral per-element byte
+/// size).
 pub(super) fn view_bounds(
     shape: &[usize],
     strides: &[i64],
@@ -12,31 +12,76 @@ pub(super) fn view_bounds(
     buffer_len: usize,
 ) -> Result<()> {
     let esize = dtype.byte_size();
-    if esize == 0 {
-        // Sub-byte (int4/uint4) or variable-width: size via `storage_bytes`.
-        let storage_bytes =
-            onnx_runtime_ir::checked_expected_bytes(dtype, shape).ok_or_else(|| {
-                SessionError::ShapeOverflow {
-                    value: "sub-byte tensor view".to_string(),
-                    dims: shape.to_vec(),
-                }
-            })?;
-        let need =
-            byte_offset
-                .checked_add(storage_bytes)
-                .ok_or_else(|| SessionError::ShapeOverflow {
-                    value: "sub-byte tensor view byte offset".to_string(),
-                    dims: shape.to_vec(),
-                })?;
-        if need > buffer_len {
+    if dtype.is_sub_byte() {
+        if shape.len() != strides.len() {
             return Err(SessionError::from(
                 onnx_runtime_ep_api::EpError::InvalidTensorView {
                     reason: format!(
-                        "sub-byte view needs {need} bytes but backing allocation is {buffer_len}"
+                        "rank mismatch: shape {} dims, strides {}",
+                        shape.len(),
+                        strides.len()
                     ),
                 },
             ));
         }
+        if shape.contains(&0) {
+            return Ok(());
+        }
+        let mut min_element = 0_i128;
+        let mut max_element = 0_i128;
+        for (&dim, &stride) in shape.iter().zip(strides) {
+            let extent = ((dim - 1) as i128).checked_mul(stride as i128);
+            let Some(extent) = extent else {
+                return Err(SessionError::ShapeOverflow {
+                    value: "sub-byte tensor view element range".to_string(),
+                    dims: shape.to_vec(),
+                });
+            };
+            let bound = if extent < 0 {
+                &mut min_element
+            } else {
+                &mut max_element
+            };
+            let Some(next) = bound.checked_add(extent) else {
+                return Err(SessionError::ShapeOverflow {
+                    value: "sub-byte tensor view element range".to_string(),
+                    dims: shape.to_vec(),
+                });
+            };
+            *bound = next;
+        }
+        let bits = dtype.bit_size() as i128;
+        let origin = (byte_offset as i128).checked_mul(8);
+        let lo = origin.and_then(|origin| {
+            min_element
+                .checked_mul(bits)
+                .and_then(|offset| origin.checked_add(offset))
+        });
+        let hi = origin.and_then(|origin| {
+            max_element
+                .checked_mul(bits)
+                .and_then(|offset| origin.checked_add(offset))
+                .and_then(|start| start.checked_add(bits))
+        });
+        let capacity = (buffer_len as i128).checked_mul(8);
+        let (Some(lo), Some(hi), Some(capacity)) = (lo, hi, capacity) else {
+            return Err(SessionError::ShapeOverflow {
+                value: "sub-byte tensor view bit range".to_string(),
+                dims: shape.to_vec(),
+            });
+        };
+        if lo < 0 || hi > capacity {
+            return Err(SessionError::from(
+                onnx_runtime_ep_api::EpError::InvalidTensorView {
+                    reason: format!(
+                        "sub-byte view addresses bits [{lo}, {hi}) outside backing allocation [0, {capacity})"
+                    ),
+                },
+            ));
+        }
+        return Ok(());
+    }
+    if esize == 0 {
         return Ok(());
     }
     view_in_bounds(shape, strides, byte_offset, esize, buffer_len)?;
@@ -1215,6 +1260,19 @@ fn describe_node(node: &Node) -> String {
 #[cfg(test)]
 mod gather_tests {
     use super::*;
+
+    #[test]
+    fn packed_view_bounds_account_for_sparse_and_negative_strides() {
+        assert!(view_bounds(&[3], &[2], 0, DataType::Uint4, 3).is_ok());
+        assert!(view_bounds(&[3], &[2], 0, DataType::Uint4, 2).is_err());
+        assert!(view_bounds(&[3], &[-2], 2, DataType::Uint4, 3).is_ok());
+        assert!(view_bounds(&[3], &[-2], 1, DataType::Uint4, 3).is_err());
+    }
+
+    #[test]
+    fn packed_view_bounds_accept_empty_tensors_without_a_valid_origin() {
+        assert!(view_bounds(&[0, 5], &[5, 1], usize::MAX, DataType::Int2, 0).is_ok());
+    }
     use onnx_runtime_ir::static_shape;
 
     #[test]

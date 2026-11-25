@@ -111,6 +111,148 @@ fn transpose_packed_cuda_matches_reference_bytes() {
         );
         assert_eq!(outputs[0], expected, "{dtype:?} at opset {opset}");
     }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable gpu-tests"
+    )]
+    fn packed_integer_cast_cuda_matches_strict_reference_bytes() {
+        let ep = require_cuda();
+        let shape = static_shape([7]);
+        let mut node = Node::new(NodeId(0), "Cast", vec![], vec![]);
+        node.attributes
+            .insert("to".into(), Attribute::Int(DataType::Uint4 as i64));
+        let rejected = ep.supports_op(&node, 20, &[shape.clone()], &[DataType::Uint8], &[]);
+        assert!(
+            rejected
+                .reason()
+                .is_some_and(|reason| reason.contains("opset 21")),
+            "UINT4 Cast must be rejected before opset 21: {:?}",
+            rejected.reason()
+        );
+        assert!(
+            ep.supports_op(&node, 21, &[shape], &[DataType::Uint8], &[])
+                .is_supported()
+        );
+        node.attributes
+            .insert("to".into(), Attribute::Int(DataType::Float8E4M3FN as i64));
+        assert!(
+            ep.supports_op(&node, 25, &[static_shape([7])], &[DataType::Uint4], &[],)
+                .reason()
+                .is_some_and(|reason| reason.contains("does not support target dtype"))
+        );
+        node.attributes
+            .insert("to".into(), Attribute::Int(DataType::Uint4 as i64));
+        assert!(
+            ep.supports_op(
+                &node,
+                25,
+                &[static_shape([7])],
+                &[DataType::Float8E4M3FN],
+                &[],
+            )
+            .reason()
+            .is_some_and(|reason| reason.contains("does not support source dtype"))
+        );
+
+        let cases = [
+            (
+                "uint8-to-uint4-codes-and-zero-points",
+                21,
+                input(DataType::Uint8, &[7], &[0, 1, 7, 8, 15, 16, 255]),
+                DataType::Uint4,
+                vec![0x10, 0x87, 0x0f, 0x0f],
+            ),
+            (
+                "uint4-to-int2-between-packed-types",
+                25,
+                input(DataType::Uint4, &[5], &[0x10, 0x87, 0xff]),
+                DataType::Int2,
+                vec![0x34, 0x03],
+            ),
+            (
+                "int2-to-int4-sign-extension",
+                25,
+                input(DataType::Int2, &[5], &[0x34, 0x03]),
+                DataType::Int4,
+                vec![0x10, 0x0f, 0x0f],
+            ),
+        ];
+        for (label, opset, source, target, expected) in cases {
+            let attrs = [("to", Attribute::Int(target as i64))];
+            let outputs = [(target, source.shape.clone())];
+            assert_eq!(
+                run_cpu(
+                    "Cast",
+                    "",
+                    opset,
+                    std::slice::from_ref(&source),
+                    &outputs,
+                    &attrs
+                )[0],
+                expected,
+                "{label}: CPU reference"
+            );
+            assert_eq!(
+                run_cuda(
+                    &ep,
+                    "Cast",
+                    "",
+                    opset,
+                    std::slice::from_ref(&source),
+                    &outputs,
+                    &attrs,
+                )[0],
+                expected,
+                "{label}: CUDA"
+            );
+        }
+
+        let floats = float_input(
+            DataType::Float32,
+            &[6],
+            &[-20.0, -8.9, -7.9, 7.9, 8.0, f32::NAN],
+        );
+        let attrs = [("to", Attribute::Int(DataType::Int4 as i64))];
+        let outputs = [(DataType::Int4, vec![6])];
+        let expected = vec![0x8c, 0x79, 0x08];
+        assert_eq!(
+            run_cpu(
+                "Cast",
+                "",
+                21,
+                std::slice::from_ref(&floats),
+                &outputs,
+                &attrs
+            )[0],
+            expected
+        );
+        assert_eq!(
+            run_cuda(&ep, "Cast", "", 21, &[floats], &outputs, &attrs)[0],
+            expected
+        );
+
+        let source = input(DataType::Uint8, &[5], &[0, 1, 2, 3, 4]);
+        let target = input(DataType::Uint2, &[1], &[0]);
+        let outputs = [(DataType::Uint2, vec![5])];
+        let expected = vec![0xe4, 0x00];
+        assert_eq!(
+            run_cpu(
+                "CastLike",
+                "",
+                25,
+                &[source.clone(), target.clone()],
+                &outputs,
+                &[],
+            )[0],
+            expected
+        );
+        assert_eq!(
+            run_cuda(&ep, "CastLike", "", 25, &[source, target], &outputs, &[])[0],
+            expected
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
