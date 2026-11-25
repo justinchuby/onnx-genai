@@ -953,6 +953,9 @@ admission may decline, so the bound always covers streamed fallback. The same
 provider context key used by integer QMoE guards native/ORT preparation caches;
 no new public API, allocator, per-shard quota or provider lock is introduced.
 The existing architecture-dependent tile and serial arithmetic are unchanged.
+The [adoption record and matched-owner diagnostic](../benchmarks/block-projection-paired-owner/README.md)
+retain the earlier noisy results and distinguish measured warm wall time from
+unresolved per-arm CPU cost.
 
 The decode region is borrowed by sequential projection calls. A private
 dispatch-local owner lazily initializes its required f32 span at the first
