@@ -176,6 +176,16 @@ zero/nonzero groups, positive construction peaks for empty final payloads,
 positive splitting/retirement and zero-capacity rejection.
 This establishes callback behavior, not a measured inference speedup.
 
+CPU derived-weight group control metadata uses inline storage for the common
+one-to-three projection set. Larger groups spill normally; inline capacity is
+not an eligibility or budget limit. Block-format MoE uses the same storage for
+its short projection/source/key/size/spec lists. Payload buffers remain separate,
+exactly charged owners; whole-group missing-build peaks are still preflighted
+once, and cache entries are published only after every builder succeeds. The
+[allocation diagnostic](../benchmarks/weight-group-metadata/README.md) scopes
+its result to private warm cache-hit metadata, not routing, numerical compute,
+whole-kernel allocations or inference throughput.
+
 Cold replacement borrows the caller's `Option<WorkspaceAllocation>`. The option
 retains the original owner until the provider actually takes it for retirement.
 CUDA rejects real stream capture before release-barrier waiting, growth grants,
