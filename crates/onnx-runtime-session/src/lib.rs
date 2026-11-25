@@ -113,6 +113,16 @@ pub enum OpsetVersion {
     Undeclared,
 }
 
+impl From<u64> for OpsetVersion {
+    fn from(version: u64) -> Self {
+        if version == u64::MAX {
+            Self::Undeclared
+        } else {
+            Self::Known(version)
+        }
+    }
+}
+
 impl std::fmt::Display for OpsetVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -190,6 +200,14 @@ mod error {
              {unsupported_nodes}"
         )]
         HeterogeneousPlacementRequired { unsupported_nodes: String },
+
+        #[error("CUDA kernel creation failed for {op_type} at {node}, opset {opset}: {source}")]
+        CudaKernelCreationFailed {
+            node: String,
+            op_type: String,
+            opset: OpsetVersion,
+            source: onnx_runtime_ep_api::EpError,
+        },
 
         #[error("the ordered provider cannot cover the whole graph: {reason}")]
         OrderedProviderDeclined { reason: String },
@@ -391,11 +409,7 @@ mod error {
             } else {
                 format!("{:?}", node.name)
             };
-            let opset = if opset == u64::MAX {
-                OpsetVersion::Undeclared
-            } else {
-                OpsetVersion::Known(opset)
-            };
+            let opset = OpsetVersion::from(opset);
             Self::UnsupportedOp {
                 op_type: node.op_type.clone(),
                 domain,
@@ -2037,6 +2051,13 @@ impl InferenceSession {
     /// heterogeneous session. `None` for the single-EP path.
     pub fn heterogeneous_placement_report(&self) -> Option<&str> {
         self.exec.heterogeneous_placement_report()
+    }
+
+    /// The first graph operation dispatched by the session's host executor
+    /// rather than through an EP kernel, if any. Host-side tensor transfers
+    /// are not graph operations.
+    pub fn host_graph_op(&self) -> Option<&onnx_runtime_ir::Node> {
+        self.exec.host_graph_op()
     }
 
     /// Input metadata.
