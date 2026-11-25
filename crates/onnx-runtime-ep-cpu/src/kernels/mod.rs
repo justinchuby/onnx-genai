@@ -2164,13 +2164,12 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(tensor_scatter::TensorScatterFactory),
     );
-    for version in [11, 28] {
-        rec.register(
-            OpKey::new("OneHot", "", version),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(onehot::OneHotFactory),
-        );
-    }
+    // OneHot-28 reuses this factory through version-floor lookup.
+    rec.register(
+        OpKey::new("OneHot", "", 11),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(onehot::OneHotFactory),
+    );
     rec.register(
         OpKey::new("BitShift", "", 11),
         onnx_runtime_ep_api::WorkspacePlanning::None,

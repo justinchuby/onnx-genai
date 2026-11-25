@@ -86,7 +86,7 @@ plugin EPs (via C ABI bridge) handle them.
 | CumSum | 11 | Position computation. |
 | NonZero | 9 | Sparse operations. |
 | ScatterElements | 11 | Native CPU/CUDA; opset 29 adds mean reduction. |
-| OneHot | 9, 11, 28 | Native CPU/CUDA; v11 enables negative-index wrapping, v28 adds BF16 values/output. |
+| OneHot | 9, 11, 28 | Native CPU/CUDA; v11 enables negative-index wrapping. v28 adds BF16 values/output and is standalone nxrt only. |
 | Trilu | 14 | CPU implemented; causal mask generation, optional int64 `k` input. |
 | RotaryEmbedding | 22 | Added in opset 22 (ONNX standard). |
 
