@@ -1,0 +1,69 @@
+{
+  "accepted_complete_matrix": true,
+  "reader_sha256": "45757195f14efe08772538d6ded1a195d86af7e50a68aa31b2883cefea216db2",
+  "controls": [
+    {
+      "name": "empty",
+      "rejected": true
+    },
+    {
+      "name": "missing process",
+      "rejected": true
+    },
+    {
+      "name": "duplicate process",
+      "rejected": true
+    },
+    {
+      "name": "wrong execution width",
+      "rejected": true
+    },
+    {
+      "name": "wrong construction width",
+      "rejected": true
+    },
+    {
+      "name": "wrong logical demand",
+      "rejected": true
+    },
+    {
+      "name": "wrong construction demand",
+      "rejected": true
+    },
+    {
+      "name": "wrong physical peak",
+      "rejected": true
+    },
+    {
+      "name": "missing retained refund",
+      "rejected": true
+    },
+    {
+      "name": "physical CPU impossibility",
+      "rejected": true
+    },
+    {
+      "name": "nonfinite wall",
+      "rejected": true
+    },
+    {
+      "name": "wrong fixed work",
+      "rejected": true
+    },
+    {
+      "name": "bad output",
+      "rejected": true
+    }
+  ],
+  "synthetic_all_qualified": true,
+  "quality_controls": [
+    {
+      "metric": "cpu_s",
+      "failed_aa_remains_unqualified": true
+    },
+    {
+      "metric": "wall_s",
+      "failed_aa_remains_unqualified": true
+    }
+  ]
+}

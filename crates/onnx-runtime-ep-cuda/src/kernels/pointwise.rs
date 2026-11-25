@@ -44,6 +44,7 @@ use super::elementwise::{
     BroadcastMetadataCache, BroadcastMetadataKey, capture_shape_eligible,
     require_matching_capture_signature,
 };
+use crate::device_metadata::{WarmMetadata, publish_metadata_candidate};
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
@@ -723,8 +724,9 @@ impl KernelFactory for CmpFactory {
             src: CMP_SRC,
             kind: BinaryKind::Compare(self.op),
             runtime: self.runtime.clone(),
-            metadata: Mutex::new(BroadcastMetadataCache::new(self.runtime.clone())),
-            last_capture_safe_signature: Mutex::new(None),
+            warm: Mutex::new(WarmMetadata::new(BroadcastMetadataCache::new(
+                self.runtime.clone(),
+            ))),
             capture_seq_independent: false,
         }))
     }
@@ -745,8 +747,9 @@ impl KernelFactory for LogicalFactory {
             src: LOGICAL_SRC,
             kind: BinaryKind::LogicalBool,
             runtime: self.runtime.clone(),
-            metadata: Mutex::new(BroadcastMetadataCache::new(self.runtime.clone())),
-            last_capture_safe_signature: Mutex::new(None),
+            warm: Mutex::new(WarmMetadata::new(BroadcastMetadataCache::new(
+                self.runtime.clone(),
+            ))),
             capture_seq_independent: false,
         }))
     }
@@ -764,12 +767,8 @@ pub struct BinaryPredKernel {
     src: &'static str,
     kind: BinaryKind,
     runtime: Arc<CudaRuntime>,
-    /// Persistent broadcast metadata so a captured launch performs no per-step
-    /// host allocation/upload/free/synchronize (the seam Marsten identified).
-    metadata: Mutex<BroadcastMetadataCache>,
-    /// The exact dtype/shape signature recorded by the most recent successful
-    /// fixed-decode call. `Some` iff the op is currently capture-safe.
-    last_capture_safe_signature: Mutex<Option<PredCaptureSignature>>,
+    /// Immutable metadata and the successful launch proof are one publication.
+    warm: Mutex<WarmMetadata<BroadcastMetadataCache, PredCaptureSignature>>,
     /// Metadata-derived seq-independence: `true` iff all IR output dims are
     /// statically known (no growing seq axis), making the op capture-eligible
     /// regardless of the runtime row count.
@@ -786,12 +785,9 @@ struct PredCaptureSignature {
 
 impl BinaryPredKernel {
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        let mut last_signature = self.last_capture_safe_signature.lock().map_err(|_| {
-            EpError::KernelFailed(
-                "cuda_ep binary predicate capture signature lock was poisoned".into(),
-            )
-        })?;
-        let warmed_signature = last_signature.clone();
+        let mut candidate = self.warm.lock().map_err(|_| EpError::KernelFailed(
+            "cuda_ep binary predicate metadata/signature state is poisoned; rebuild the provider before warming again".into(),
+        ))?.clone();
         let op = self.op_name;
         if inputs.len() != 2 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
@@ -859,16 +855,12 @@ impl BinaryPredKernel {
         require_matching_capture_signature(
             &self.runtime,
             op,
-            warmed_signature.as_ref(),
+            candidate.signature.as_ref(),
             current_signature.as_ref(),
         )?;
 
         let func = self.runtime.nvrtc_function(self.module, self.src, entry)?;
-        let mut metadata = self.metadata.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep binary predicate metadata lock was poisoned".into())
-        })?;
-        let mut metadata_candidate = metadata.clone();
-        let metadata_ptr = metadata_candidate.prepare(a.shape, b.shape, &out_shape)?;
+        let metadata_ptr = candidate.metadata.prepare(a.shape, b.shape, &out_shape)?;
         let rank = i32::try_from(out_shape.len())
             .map_err(|_| EpError::KernelFailed(format!("cuda_ep {op}: rank exceeds i32")))?;
         let cfg = LaunchConfig {
@@ -891,11 +883,8 @@ impl BinaryPredKernel {
         // respective allocations, with matching rank/count and indexing. The
         // metadata pointer is the persistent cache buffer, valid across replays.
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
-        if !self.runtime.is_capturing()? {
-            *metadata = metadata_candidate;
-        }
-        *last_signature = current_signature;
-        Ok(())
+        candidate.signature = current_signature;
+        publish_metadata_candidate(&self.warm, candidate, op)
     }
 }
 
@@ -909,10 +898,10 @@ impl Kernel for BinaryPredKernel {
     }
 
     fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
-        self.metadata
+        self.warm
             .lock()
             .ok()
-            .and_then(|metadata| metadata.device_graph_resource())
+            .and_then(|state| state.metadata.device_graph_resource())
             .into_iter()
             .collect()
     }
@@ -921,8 +910,10 @@ impl Kernel for BinaryPredKernel {
         // Only the exact fixed-row signature recorded by the most recent
         // successful call may enter capture; the persistent metadata cache means
         // the launch itself performs no per-step host alloc/upload/free/sync.
-        match self.last_capture_safe_signature.lock() {
-            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+        match self.warm.lock() {
+            Ok(state) if state.signature.is_some() => {
+                onnx_runtime_ep_api::CaptureSupport::Supported
+            }
             Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(format!(
                 "{} broadcast shape/dtype signature does not match the warmed capture signature",
                 self.op_name
@@ -934,8 +925,14 @@ impl Kernel for BinaryPredKernel {
         }
     }
 
-    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
-        self.capture_seq_independent = seq_independent;
+    fn configure_shape_facts(&mut self, facts: onnx_runtime_ep_api::KernelShapeFacts) {
+        if self.capture_seq_independent != facts.capture_eligible {
+            self.warm
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .signature = None;
+        }
+        self.capture_seq_independent = facts.capture_eligible;
     }
 }
 

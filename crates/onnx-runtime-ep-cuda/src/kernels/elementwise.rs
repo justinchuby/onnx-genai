@@ -670,8 +670,14 @@ impl Kernel for UnaryKernel {
         }
     }
 
-    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
-        self.capture_seq_independent = seq_independent;
+    fn configure_shape_facts(&mut self, facts: onnx_runtime_ep_api::KernelShapeFacts) {
+        if self.capture_seq_independent != facts.capture_eligible {
+            *self
+                .last_capture_safe_signature
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+        self.capture_seq_independent = facts.capture_eligible;
     }
 }
 
@@ -939,8 +945,14 @@ impl Kernel for BinaryKernel {
         }
     }
 
-    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
-        self.capture_seq_independent = seq_independent;
+    fn configure_shape_facts(&mut self, facts: onnx_runtime_ep_api::KernelShapeFacts) {
+        if self.capture_seq_independent != facts.capture_eligible {
+            self.warm
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .signature = None;
+        }
+        self.capture_seq_independent = facts.capture_eligible;
     }
 }
 
@@ -1066,8 +1078,14 @@ impl Kernel for SiluMulKernel {
         }
     }
 
-    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
-        self.capture_seq_independent = seq_independent;
+    fn configure_shape_facts(&mut self, facts: onnx_runtime_ep_api::KernelShapeFacts) {
+        if self.capture_seq_independent != facts.capture_eligible {
+            *self
+                .last_capture_safe_signature
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+        self.capture_seq_independent = facts.capture_eligible;
     }
 }
 
@@ -1089,7 +1107,7 @@ pub(crate) fn require_matching_capture_signature<T: PartialEq>(
 ///
 /// The build-time growing-symbol classifier
 /// (`compute_capture_disqualifying_symbols` →
-/// `node_capture_seq_independent` → `set_capture_seq_independent`) is the sole,
+/// `node_capture_seq_independent` → `configure_shape_facts`) is the sole,
 /// authoritative authority here: `seq_independent == true` means every symbol on
 /// this node's output shape is *provably* pinned (fail-safe classifier) / not
 /// proven growing (denylist classifier), so the captured launch geometry stays

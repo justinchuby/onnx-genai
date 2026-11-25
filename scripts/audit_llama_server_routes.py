@@ -87,7 +87,7 @@ def local_routes(source: str) -> dict[tuple[str, str], str]:
         # Only top-level method-router calls count: a layer or handler may itself
         # contain get()/post() calls unrelated to route registration.
         while i < len(body):
-            call = re.match(r"(get|post|delete|put|patch|head|options)\s*\(", body[i:])
+            call = re.match(r"(get|post|delete|put|patch|head|options|ws)\s*\(", body[i:])
             if call and (i == 0 or not (body[i - 1].isalnum() or body[i - 1] == "_")):
                 paren = body.index("(", i)
                 end = close_paren(body, paren)
@@ -200,9 +200,9 @@ def render(fixture: dict, rows: list[dict]) -> str:
         "satisfy these cases. Cross-model and backend-specific behavior must use declared",
         "capabilities; a passing narrow fixture does not establish general parity.",
         "",
-        "The missing realtime/SystemOne protocols and disabled model download/deletion",
-        "remain implementation work. Existing handlers also retain the explicit source,",
-        "device-state and multimodal gaps documented in the compatibility ledger.",
+        "Realtime task admission, model-cache gates and the remaining source, device-state",
+        "and multimodal differences require the behavioral checks documented in the",
+        "compatibility ledger; a present registration does not close those gaps.",
         "",
     ]
     return "\n".join(lines)
