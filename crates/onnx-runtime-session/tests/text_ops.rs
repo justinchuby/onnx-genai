@@ -125,12 +125,13 @@ fn string_compress_requires_a_rank_one_bool_condition() {
     let x = strings(&[2, 3], &["a", "b", "c", "d", "e", "f"]);
     // In-memory graphs may reach the kernel without the loader's shape inference.
     let rank_two = Tensor::from_raw(DataType::Bool, vec![1, 2], &[0, 1]).unwrap();
-    let result = InferenceSession::from_graph(graph)
-        .and_then(|mut session| session.run(&[("X", &x), ("condition", &rank_two)]));
-    let detail = result.unwrap_err().to_string();
+    let mut session = InferenceSession::from_graph(graph).unwrap();
+    let detail = session
+        .run(&[("X", &x), ("condition", &rank_two)])
+        .unwrap_err()
+        .to_string();
     assert!(
-        detail.contains("Compress")
-            && (detail.contains("one-dimensional") || detail.contains("rank 1")),
+        detail.contains("Compress: condition must be a one-dimensional Bool tensor"),
         "{detail}"
     );
 
