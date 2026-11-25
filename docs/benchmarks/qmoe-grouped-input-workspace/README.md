@@ -1,5 +1,18 @@
 # QMoE reuses one grouped-input workspace
 
+Historical gather-only artifact. The current [QMoE FC bank contract and
+terminal-wait4 study](../qmoe-fc-projection-banks/README.md) supersede the
+single-row zero-workspace requirement described below.
+
+The timing tables below use short-window RUSAGE_SELF CPU deltas. Their
+historical duration/A/A checks do not independently validate that instrument
+against terminal process accounting; they are preserved, not reused as
+performance evidence for the FC-bank change. The new study measures terminal
+child CPU and asserts physical closure. Also, this old probe's dense-cache
+retention knob does not force QMoE row streaming; the new probe constrains the
+actual shared authority and witnesses its execution branch. Original raw data
+and probe sources remain unchanged.
+
 The integer CPU QMoE kernel now declares one StepScoped rows*hidden*f32 gather
 region and reuses it across serial expert groups. Singleton groups borrow their
 already contiguous input row; a batch with zero or one row declares zero scratch.

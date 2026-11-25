@@ -7407,6 +7407,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Cast", 1),
     ("", "CastLike", 1),
     ("", "CausalConvWithState", 27),
+    ("", "CausalConvWithState", 29),
     ("", "Ceil", 1),
     ("", "Celu", 12),
     ("", "CenterCropPad", 18),

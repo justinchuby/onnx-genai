@@ -90,6 +90,8 @@ pub(crate) enum WorkerUnavailable {
     /// The worker thread panicked or otherwise failed after startup. Sessions
     /// owned by this worker are lost and are never migrated implicitly.
     Failed(WorkerId),
+    /// A live realtime connection exclusively owns this worker.
+    Busy(WorkerId),
 }
 
 impl fmt::Display for WorkerUnavailable {
@@ -103,6 +105,10 @@ impl fmt::Display for WorkerUnavailable {
             // closed command channel: a stopped worker is a stopped driver as
             // far as a request is concerned.
             Self::Stopped(_) => formatter.write_str("engine driver stopped"),
+            Self::Busy(worker) => write!(
+                formatter,
+                "engine worker {worker} is reserved or has active sessions/turns; retry after a realtime connection closes or configure more workers"
+            ),
             Self::Failed(worker) => write!(
                 formatter,
                 "engine worker {worker} failed; sessions placed on this worker are unavailable \
@@ -180,6 +186,7 @@ pub(crate) struct WorkerHandle {
 
 struct WorkerState {
     lifecycle: Mutex<WorkerLifecycle>,
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 struct WorkerLifecycle {
@@ -187,6 +194,9 @@ struct WorkerLifecycle {
     live_sessions: usize,
     pending_sessions: usize,
     active_turns: usize,
+    realtime_reserved: bool,
+    /// Held by the actual owner thread, including when its handle is detached.
+    package: Option<Arc<crate::model_cache::PublishedPackage>>,
 }
 
 impl WorkerState {
@@ -197,7 +207,10 @@ impl WorkerState {
                 live_sessions: 0,
                 pending_sessions: 0,
                 active_turns: 0,
+                realtime_reserved: false,
+                package: None,
             }),
+            shutdown: tokio::sync::watch::channel(false).0,
         }
     }
 
@@ -217,6 +230,7 @@ impl WorkerState {
         lifecycle.live_sessions = 0;
         lifecycle.pending_sessions = 0;
         lifecycle.active_turns = 0;
+        lifecycle.package = None;
     }
 
     fn mark_failed(&self) {
@@ -224,6 +238,7 @@ impl WorkerState {
         lifecycle.health = WorkerHealth::Failed;
         lifecycle.live_sessions = 0;
         lifecycle.active_turns = 0;
+        lifecycle.package = None;
     }
 
     fn placement_load(&self) -> Option<usize> {
@@ -242,6 +257,9 @@ impl WorkerState {
         let mut lifecycle = lock(&self.lifecycle);
         match lifecycle.health {
             WorkerHealth::Healthy => {
+                if lifecycle.realtime_reserved {
+                    return Err(WorkerUnavailable::Busy(worker));
+                }
                 lifecycle.pending_sessions += 1;
                 Ok(SessionPlacementReservation {
                     worker,
@@ -293,6 +311,9 @@ impl WorkerState {
         let mut lifecycle = lock(&self.lifecycle);
         match lifecycle.health {
             WorkerHealth::Healthy => {
+                if lifecycle.realtime_reserved {
+                    return Err(WorkerUnavailable::Busy(worker));
+                }
                 lifecycle.active_turns += 1;
                 Ok(WorkerTurnGuard {
                     worker,
@@ -304,6 +325,38 @@ impl WorkerState {
                 Err(WorkerUnavailable::Stopped(worker))
             }
         }
+    }
+
+    fn accepts_turns(&self) -> bool {
+        let lifecycle = lock(&self.lifecycle);
+        lifecycle.health == WorkerHealth::Healthy && !lifecycle.realtime_reserved
+    }
+
+    fn reserve_realtime(
+        self: &Arc<Self>,
+        worker: WorkerId,
+    ) -> Result<WorkerRealtimeGuard, WorkerUnavailable> {
+        let mut lifecycle = lock(&self.lifecycle);
+        match lifecycle.health {
+            WorkerHealth::Failed => return Err(WorkerUnavailable::Failed(worker)),
+            WorkerHealth::Starting | WorkerHealth::Stopped => {
+                return Err(WorkerUnavailable::Stopped(worker));
+            }
+            WorkerHealth::Healthy => {}
+        }
+        if lifecycle.realtime_reserved
+            || lifecycle.active_turns != 0
+            || lifecycle.live_sessions != 0
+            || lifecycle.pending_sessions != 0
+        {
+            return Err(WorkerUnavailable::Busy(worker));
+        }
+        lifecycle.realtime_reserved = true;
+        lifecycle.active_turns = 1;
+        Ok(WorkerRealtimeGuard {
+            worker,
+            state: Arc::clone(self),
+        })
     }
 
     fn release_turn(&self, worker: WorkerId) {
@@ -391,6 +444,29 @@ impl Drop for WorkerTurnGuard {
 impl fmt::Debug for WorkerTurnGuard {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("WorkerTurnGuard")
+    }
+}
+
+/// Exclusive ownership of one otherwise idle native worker. The command owns
+/// this guard, so cancelling an async caller cannot release a running engine.
+pub(crate) struct WorkerRealtimeGuard {
+    worker: WorkerId,
+    state: Arc<WorkerState>,
+}
+impl WorkerRealtimeGuard {
+    #[cfg(test)]
+    pub(crate) fn worker(&self) -> WorkerId {
+        self.worker
+    }
+    pub(crate) fn shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.state.shutdown.subscribe()
+    }
+}
+impl Drop for WorkerRealtimeGuard {
+    fn drop(&mut self) {
+        let mut lifecycle = lock(&self.state.lifecycle);
+        lifecycle.realtime_reserved = false;
+        checked_decrement(&mut lifecycle.active_turns, self.worker, "realtime-turn");
     }
 }
 
@@ -548,7 +624,10 @@ impl WorkerHandle {
                     live_sessions: 0,
                     pending_sessions: 0,
                     active_turns: 0,
+                    realtime_reserved: false,
+                    package: None,
                 }),
+                shutdown: tokio::sync::watch::channel(false).0,
             }),
         })
     }
@@ -566,6 +645,9 @@ impl WorkerHandle {
             WorkerHealth::Failed => return Err(WorkerUnavailable::Failed(self.id)),
             WorkerHealth::Stopped => return Err(WorkerUnavailable::Stopped(self.id)),
             WorkerHealth::Starting | WorkerHealth::Healthy => {}
+        }
+        if lock(&self.state.lifecycle).realtime_reserved {
+            return Err(WorkerUnavailable::Busy(self.id));
         }
         lock(&self.commands)
             .clone()
@@ -589,6 +671,7 @@ impl WorkerHandle {
     /// `spawn_blocking`: it waits for the worker to finish the command it is
     /// running, which may be a full generation.
     pub(crate) fn shutdown(&self) {
+        self.state.shutdown.send_replace(true);
         let closed = lock(&self.commands).take().is_some();
         let mut join = lock(&self.join);
         if let Some(handle) = join.take() {
@@ -647,6 +730,7 @@ impl Drop for WorkerHandle {
     /// continue — model unload, registry teardown — call
     /// [`shutdown`](Self::shutdown) explicitly.
     fn drop(&mut self) {
+        self.state.shutdown.send_replace(true);
         if lock(&self.commands).take().is_some() {
             tracing::debug!(
                 worker = %self.id,
@@ -677,6 +761,35 @@ pub(crate) struct WorkerPool {
 }
 
 impl WorkerPool {
+    pub(crate) fn bind_cached_package(
+        &self,
+        package: &Arc<crate::model_cache::PublishedPackage>,
+    ) -> anyhow::Result<()> {
+        let mut failure = None;
+        // Bind every unbound owner before returning an error. Dropping a
+        // partially initialized pool detaches its threads; they still need
+        // their file capability until engine destruction finishes.
+        for worker in self.workers.iter() {
+            let mut state = lock(&worker.state.lifecycle);
+            let health = state.health;
+            if state.package.is_some() {
+                failure.get_or_insert((worker.id, health));
+                continue;
+            }
+            state.package = Some(Arc::clone(package));
+            if health != WorkerHealth::Healthy {
+                failure.get_or_insert((worker.id, health));
+            }
+        }
+        if let Some((worker, health)) = failure {
+            anyhow::bail!(
+                "cannot bind cached model '{}' to worker {worker} in state {health:?}; reload the model with healthy unbound workers",
+                package.id()
+            );
+        }
+        Ok(())
+    }
+
     /// A pool of exactly one worker, which owns the whole engine.
     #[cfg(test)]
     pub(crate) fn single(worker: Arc<WorkerHandle>) -> Self {
@@ -718,7 +831,7 @@ impl WorkerPool {
             let worker = self
                 .workers
                 .iter()
-                .filter(|worker| worker.is_running())
+                .filter(|worker| worker.is_running() && worker.state.accepts_turns())
                 .min_by_key(|worker| (worker.placement_load(), worker.id()))
                 .ok_or_else(|| self.no_running_worker_error())?;
             if let Ok(reservation) = worker.reserve_session() {
@@ -744,7 +857,7 @@ impl WorkerPool {
             let worker = self
                 .workers
                 .iter()
-                .filter(|worker| worker.is_running())
+                .filter(|worker| worker.is_running() && worker.state.accepts_turns())
                 .min_by_key(|worker| (worker.active_turns(), worker.id()))
                 .ok_or_else(|| self.no_running_worker_error())?;
             if let Ok(turn) = worker.reserve_turn() {
@@ -759,7 +872,41 @@ impl WorkerPool {
         worker.reserve_turn()
     }
 
+    pub(crate) fn reserve_realtime(&self) -> Result<WorkerRealtimeGuard, WorkerUnavailable> {
+        let _selection = lock(&self.selection);
+        for worker in self.workers.iter() {
+            if worker.is_running()
+                && let Ok(guard) = worker.state.reserve_realtime(worker.id())
+            {
+                return Ok(guard);
+            }
+        }
+        Err(self.no_running_worker_error())
+    }
+
+    pub(crate) fn realtime_sender(
+        &self,
+        guard: &WorkerRealtimeGuard,
+    ) -> Result<mpsc::Sender<DriverCommand>, WorkerUnavailable> {
+        let worker = self.worker(guard.worker)?;
+        if !Arc::ptr_eq(&worker.state, &guard.state) {
+            return Err(WorkerUnavailable::Unknown {
+                worker: guard.worker,
+                pool_size: self.workers.len(),
+            });
+        }
+        if worker.state.health() != WorkerHealth::Healthy {
+            return Err(WorkerUnavailable::Stopped(guard.worker));
+        }
+        lock(&worker.commands)
+            .clone()
+            .ok_or(WorkerUnavailable::Stopped(guard.worker))
+    }
+
     fn no_running_worker_error(&self) -> WorkerUnavailable {
+        if let Some(worker) = self.workers.iter().find(|worker| worker.is_running()) {
+            return WorkerUnavailable::Busy(worker.id());
+        }
         self.workers
             .iter()
             .find(|worker| worker.state.health() == WorkerHealth::Failed)
@@ -988,6 +1135,64 @@ mod tests {
             })
             .collect();
         (WorkerPool::new(workers), receivers)
+    }
+
+    #[test]
+    fn realtime_reservation_excludes_other_work_and_releases_on_drop() {
+        let (pool, _receivers) = detached_pool(2);
+        let exclusive = pool.reserve_realtime().unwrap();
+        assert_eq!(exclusive.worker(), WorkerId::new(0));
+        assert!(matches!(
+            pool.reserve_turn(WorkerId::new(0)),
+            Err(WorkerUnavailable::Busy(_))
+        ));
+        assert!(matches!(
+            pool.sender_for(WorkerId::new(0)),
+            Err(WorkerUnavailable::Busy(_))
+        ));
+        assert!(pool.realtime_sender(&exclusive).is_ok());
+        let (chosen, ordinary) = pool.reserve_stateless_turn().unwrap();
+        assert_eq!(chosen, WorkerId::new(1));
+        assert!(matches!(
+            pool.reserve_realtime(),
+            Err(WorkerUnavailable::Busy(_))
+        ));
+        drop(ordinary);
+        let second = pool.reserve_realtime().unwrap();
+        assert!(matches!(
+            pool.reserve_stateless_turn(),
+            Err(WorkerUnavailable::Busy(_))
+        ));
+        assert!(matches!(
+            pool.reserve_session_placement(),
+            Err(WorkerUnavailable::Busy(_))
+        ));
+        let (other, _other_receivers) = detached_pool(2);
+        assert!(
+            other.realtime_sender(&exclusive).is_err(),
+            "a guard from another pool cannot authorize a same-numbered worker"
+        );
+        drop(exclusive);
+        assert!(pool.reserve_turn(WorkerId::new(0)).is_ok());
+        drop(second);
+        assert_eq!(pool.statuses()[0].active_turns, 0);
+    }
+
+    #[test]
+    fn realtime_reservation_does_not_strand_existing_persistent_sessions() {
+        let (pool, _receivers) = detached_pool(1);
+        let pending = pool.reserve_session_placement().unwrap();
+        assert!(matches!(
+            pool.reserve_realtime(),
+            Err(WorkerUnavailable::Busy(_))
+        ));
+        let committed = pending.commit().unwrap();
+        assert!(matches!(
+            pool.reserve_realtime(),
+            Err(WorkerUnavailable::Busy(_))
+        ));
+        drop(committed);
+        assert!(pool.reserve_realtime().is_ok());
     }
 
     #[test]

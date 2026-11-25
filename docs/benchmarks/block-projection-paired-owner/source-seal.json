@@ -1,0 +1,10 @@
+{
+  "validated_production_sources": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs": "b5c2e5e7ad5fb8f1b4a71a37d6d95a470f69e1ce9d32e26a0ce6170574f2e30f",
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs": "bf224537a31fd7a9c0000ee0fb9c786745c594b382edbfda1450303d9057b645",
+    "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs": "e09fd1a25b28902a0a7912034f1e3ffdda8c0b575a1d118388e8a42505722752"
+  },
+  "diagnostic_source_restored": true,
+  "binary_archived": false,
+  "validation": "../block-projection-context-controls/cache-validation/validation.json"
+}

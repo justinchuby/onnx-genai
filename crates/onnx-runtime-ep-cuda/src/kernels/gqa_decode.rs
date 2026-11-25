@@ -616,7 +616,7 @@ pub(super) fn run(
 /// admitted workspace. The actual owner is retained across recorded graphs.
 #[cfg(test)]
 pub(super) struct TestScratch {
-    owner: std::sync::Arc<crate::runtime::GraphDeviceAllocation>,
+    owner: std::sync::Arc<crate::runtime::NativeDeviceAllocation>,
 }
 #[cfg(test)]
 impl TestScratch {
@@ -632,7 +632,12 @@ impl TestScratch {
             .bytes()
             .max(1);
         Self {
-            owner: crate::runtime::GraphDeviceAllocation::allocate(runtime, bytes).unwrap(),
+            owner: crate::runtime::NativeDeviceAllocation::allocate_shared(
+                runtime,
+                bytes,
+                onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
+            )
+            .unwrap(),
         }
     }
     pub(super) fn view(&self) -> onnx_runtime_ep_api::WorkspaceView {
@@ -642,7 +647,7 @@ impl TestScratch {
         )
     }
     pub(super) fn resource(&self) -> onnx_runtime_ep_api::DeviceGraphResource {
-        crate::runtime::GraphDeviceAllocation::device_graph_resource(&self.owner)
+        crate::runtime::NativeDeviceAllocation::device_graph_resource(&self.owner)
     }
 }
 
@@ -652,8 +657,8 @@ mod tests {
 
     use super::*;
 
-    fn runtime() -> Option<Arc<CudaRuntime>> {
-        crate::test_support::maybe_runtime()
+    fn runtime() -> Option<crate::test_support::NativeRuntimeFixture> {
+        crate::test_support::maybe_native_runtime()
     }
 
     fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
@@ -723,7 +728,7 @@ mod tests {
 
     #[test]
     fn decode_kernel_matches_reference_softmax() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping CUDA GQA decode parity test: CUDA runtime unavailable");
             return;
         };
@@ -968,7 +973,7 @@ mod tests {
     /// tolerance the head_dim<=128 parity test accepts.
     #[test]
     fn decode_kernel_matches_reference_softmax_head256() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping CUDA GQA decode head256 parity test: CUDA runtime unavailable");
             return;
         };
@@ -999,7 +1004,7 @@ mod tests {
     /// tolerance the head_dim<=128 test accepts.
     #[test]
     fn decode_kernel_matches_reference_softmax_general_head_dims() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!(
                 "skipping CUDA GQA decode general head-dim parity test: CUDA runtime unavailable"
             );
@@ -1028,7 +1033,8 @@ mod tests {
     #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA runner")]
     #[test]
     fn decode_kernel_matches_reference_across_partial_row_cap() {
-        let runtime = runtime().expect("row-cap numerical parity requires a CUDA runtime/device");
+        let (_provider, runtime) =
+            runtime().expect("row-cap numerical parity requires a CUDA runtime/device");
         for heads in [255, 256, 257] {
             let (absolute, relative) = parity_for_shape(&runtime, heads, 1, 7, &[1, 65, 257]);
             assert!(absolute < 1e-3, "rows={heads}: absolute error {absolute}");
@@ -1060,7 +1066,7 @@ mod tests {
         let _serial = TEST_SINGLE_SPLIT_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping GQA f32 single-split parity test: CUDA runtime unavailable");
             return;
         };

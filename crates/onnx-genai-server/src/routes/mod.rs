@@ -49,13 +49,14 @@ use crate::{
 
 mod admin;
 mod completions;
+pub(crate) mod decision;
 mod images;
 pub(crate) mod llama;
 pub(crate) mod lora;
+pub(crate) mod model_management;
 mod multimodal;
 pub(crate) mod native;
 pub(crate) mod prompt;
-pub(crate) mod proxy;
 pub(crate) mod ranking;
 mod sessions;
 pub(crate) mod slots;
@@ -115,6 +116,7 @@ struct ModelObject {
     context_length: Option<usize>,
     in_cache: bool,
     can_remove: bool,
+    source: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -483,7 +485,7 @@ impl ApiError {
         }
     }
 
-    fn unavailable(message: impl Into<String>) -> Self {
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: message.into(),
@@ -757,7 +759,7 @@ fn map_registry_error(err: crate::registry::RegistryError) -> ApiError {
 ///   all; never falls back to the default model for a named request.
 /// - **Empty `requested`** — falls back to the default model, lazily loading it
 ///   if necessary, preserving the single-model UX where clients omit `model`.
-async fn resolve_model(
+pub(crate) async fn resolve_model(
     registry: &crate::registry::ModelRegistry,
     requested: &str,
 ) -> Result<Arc<ModelHandle>, ApiError> {
@@ -770,7 +772,7 @@ async fn resolve_model(
         registry
             .default_id()
             .map_err(map_registry_error)?
-            .ok_or_else(|| ApiError::internal("no model loaded"))?
+            .ok_or_else(|| ApiError::unavailable("no model is ready; download a model with POST /models or select a configured model"))?
     } else {
         requested.to_string()
     };
@@ -785,7 +787,14 @@ async fn resolve_model(
     registry
         .load(&id)
         .await
-        .map_err(|err| ApiError::internal(format!("failed to load model '{id}': {err}")))
+        .map_err(|error| map_model_load_error(&id, error))
+}
+fn map_model_load_error(id: &str, error: anyhow::Error) -> ApiError {
+    if error.is::<crate::registry::ModelDownloadPending>() {
+        ApiError::unavailable(format!("{error:#}"))
+    } else {
+        ApiError::internal(format!("failed to load model '{id}': {error:#}"))
+    }
 }
 
 fn audio_decoder_prompt(

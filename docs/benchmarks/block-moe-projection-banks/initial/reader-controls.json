@@ -1,0 +1,49 @@
+{
+  "scope": "synthetic, no performance samples",
+  "accepted_complete_matrix": true,
+  "processes": 144,
+  "controls": [
+    {
+      "name": "vacuity_only_setup",
+      "rejected": true
+    },
+    {
+      "name": "duplicate_identity",
+      "rejected": true
+    },
+    {
+      "name": "missing_process",
+      "rejected": true
+    },
+    {
+      "name": "zero_calls_labeled_work",
+      "rejected": true
+    },
+    {
+      "name": "impossible_cpu_capacity",
+      "rejected": true
+    },
+    {
+      "name": "unreleased_backing",
+      "rejected": true
+    },
+    {
+      "name": "unstable_output_digest",
+      "rejected": true
+    },
+    {
+      "name": "unfunded_workspace",
+      "rejected": true
+    },
+    {
+      "name": "wrong_dense_payload_funding",
+      "rejected": true
+    },
+    {
+      "name": "missing_width_witness",
+      "rejected": true
+    }
+  ],
+  "failed_aa_cells_remain_unqualified": true,
+  "reader_sha256": "a8ac131cbd8a54bf77dbc9f20aef45a796a7caf54ce216b1c78fd4e45b63e19d"
+}

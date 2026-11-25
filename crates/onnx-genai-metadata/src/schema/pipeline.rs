@@ -282,7 +282,9 @@ pub struct VisionOutputBinding {
     #[schemars(length(min = 1))]
     pub source: String,
 
-    /// Workflow SSA value produced by the preprocessing adapter invocation.
+    /// Output name: a workflow SSA value under preprocessing ABI v1, or a
+    /// component-local output port under image-preprocess ABI v2. The latter
+    /// allows repeated invocations to bind independent workflow SSA values.
     #[schemars(length(min = 1), example = &"image.pixel_values")]
     pub name: String,
 

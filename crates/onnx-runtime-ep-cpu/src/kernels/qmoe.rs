@@ -22,17 +22,17 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, Weak};
 
 use onnx_runtime_ep_api::{
     EpError, ExternalMmapRegion, Kernel, KernelFactory, Result, TensorBacking, TensorMetadata,
-    TensorMut, TensorView, WorkspaceRequirement, WorkspaceView,
+    TensorMut, TensorView, WorkspaceLayout, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
 use onnx_runtime_loader::{
     ExpertQuantization, ExpertStorageOrder, ExpertTensorLayout, WeightRegionCatalog,
 };
 
-use super::decoded_projection::ProjectionScratch;
+use super::decoded_projection::{DecodedProjectionPlan, ProjectionScratch};
 use super::matmul_nbits::dequantize_nbits_row;
 use super::moe::{
-    ExpertProjection, MoeAttributes, routing_weights, run_expert_grouped, run_expert_projections,
+    DenseExpertWeights, ExpertProjection, MoeAttributes, MoeWorkspace, routing_weights,
 };
 use super::{check_arity, quantized_input_bytes, to_dense_f32, write_dense_f32};
 use crate::DerivedWeightMemory;
@@ -66,6 +66,7 @@ pub struct QMoEKernel {
     weight_offload: WeightOffloadMode,
     host_cache: WeightOffloadHostCache,
     prefetch_experts: bool,
+    prepared_projection: std::cell::Cell<Option<DecodedProjectionPlan>>,
 }
 
 /// Why this kernel cannot run a given `QMoE` node, if it cannot.
@@ -124,45 +125,126 @@ fn quantized_moe_attributes(node: &Node) -> Result<(MoeAttributes, usize, usize)
 
 impl KernelFactory for QMoEFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(QMoEKernel::new(node, self.host_cache.clone())?))
+    }
+}
+
+/// A dispatch's banks and serial decode lane stay exclusively on the main
+/// thread. The fixed plan bounds logical scratch owners, not Rayon workers.
+struct QMoEWorkspace<'a> {
+    experts: MoeWorkspace<'a>,
+    decoder: ProjectionScratch<'a>,
+    plan: DecodedProjectionPlan,
+}
+
+/// Geometry resolved from the input and FC2's packed K axis, never guessed
+/// from the FC1 gate width. Preparation and execution use the same bound.
+struct Dimensions {
+    rows: usize,
+    hidden: usize,
+    inter: usize,
+    fc1_size: usize,
+}
+
+impl QMoEKernel {
+    fn new(node: &Node, host_cache: WeightOffloadHostCache) -> Result<Self> {
         let (attributes, bits, block_size) = quantized_moe_attributes(node)?;
-        Ok(Box::new(QMoEKernel {
+        Ok(Self {
             layer_id: node.id.0,
             attributes,
             bits,
             block_size,
             weight_offload: WeightOffloadMode::from_env(),
-            host_cache: self.host_cache.clone(),
+            host_cache,
             prefetch_experts: weight_offload_prefetch_default(),
-        }))
+            prepared_projection: std::cell::Cell::new(None),
+        })
+    }
+
+    fn dimensions(&self, input: &[usize], fc2: &[usize]) -> Result<Dimensions> {
+        if !matches!(input.len(), 2 | 3) {
+            return Err(error(format!(
+                "input must be 2-D [rows, hidden] or 3-D [batch, sequence, hidden], got {input:?}"
+            )));
+        }
+        let hidden = input[input.len() - 1];
+        let rows = checked_product(&input[..input.len() - 1], "flattened input row count")?;
+        checked_tensor_layout("input 0", input, DataType::Float32)?;
+        if !hidden.is_multiple_of(self.block_size) {
+            return Err(error(format!(
+                "hidden_size {hidden} must be divisible by block_size {}",
+                self.block_size
+            )));
+        }
+        require_rank("fc2_experts_weights", fc2, 3)?;
+        if fc2[1] != hidden {
+            return Err(error(format!(
+                "fc2_experts_weights hidden axis {} must equal input hidden_size {hidden}; correct the packed expert shape",
+                fc2[1]
+            )));
+        }
+        let inter = fc2[2]
+            .checked_mul(8 / self.bits)
+            .ok_or_else(|| error("fc2 inter_size overflow"))?;
+        if inter == 0 || !inter.is_multiple_of(self.block_size) {
+            return Err(error(format!(
+                "inferred inter_size {inter} must be non-zero and divisible by block_size {}",
+                self.block_size
+            )));
+        }
+        Ok(Dimensions {
+            rows,
+            hidden,
+            inter,
+            fc1_size: self.attributes.checked_fc1_size(inter, "QMoE")?,
+        })
+    }
+
+    /// Each token selects an expert at most once. Serial experts reuse one
+    /// pair of FC banks. Contributions retain original route slots until all
+    /// experts finish; then the dead input bank becomes the accumulator.
+    fn execution_workspace_layout(
+        &self,
+        dims: &Dimensions,
+        has_fc3: bool,
+        plan: DecodedProjectionPlan,
+    ) -> Result<WorkspaceLayout<4>> {
+        let [a, b] = MoeWorkspace::bank_layouts(
+            dims.rows,
+            dims.hidden,
+            dims.inter,
+            &self.attributes,
+            has_fc3,
+        )?;
+        let elements = checked_product(
+            &[dims.rows, self.attributes.k, dims.hidden],
+            "routed contribution element count",
+        )?;
+        let contributions = std::alloc::Layout::array::<f32>(elements).map_err(|_| {
+            error("routed contribution bytes exceed addressable workspace; reduce batch, top-k or hidden width")
+        })?;
+        let decoder = plan.maximum_layout(
+            dims.rows,
+            [(dims.hidden, dims.fc1_size), (dims.inter, dims.hidden)]
+                .into_iter()
+                .chain(
+                    self.attributes
+                        .uses_separate_gate(has_fc3)
+                        .then_some((dims.hidden, dims.inter)),
+                ),
+        )?;
+        WorkspaceLayout::new([a, b, contributions, decoder])
     }
 }
 
-/// Each token selects an expert at most once, so one expert group needs at
-/// most the full input's rows. Sequential groups reuse this same Host lane.
-fn grouped_input_workspace_bytes(shape: &[usize]) -> Result<usize> {
-    if !matches!(shape.len(), 2 | 3) {
-        return Err(error(format!(
-            "input must be 2-D [rows, hidden] or 3-D [batch, sequence, hidden], got {shape:?}"
-        )));
-    }
-    let elements = checked_product(shape, "grouped input workspace element count")?;
-    let bytes = checked_byte_count(
-        elements,
-        std::mem::size_of::<f32>(),
-        "grouped input workspace byte count",
-    )?;
-    let rows = checked_product(&shape[..shape.len() - 1], "grouped input row count")?;
-    // A single routed row can borrow its already contiguous input, avoiding
-    // both gather storage and an execution-slot round trip for decode.
-    Ok(if rows <= 1 { 0 } else { bytes })
-}
-
-impl Kernel for QMoEKernel {
-    fn workspace_requirement(
+impl QMoEKernel {
+    fn workspace_for_plan(
         &self,
         inputs: &[TensorMetadata<'_>],
-        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
+        plan: DecodedProjectionPlan,
+    ) -> Result<WorkspaceRequirement> {
+        #[cfg(test)]
+        WORKSPACE_METADATA_QUERIES.with(|queries| queries.set(queries.get() + 1));
         let input = inputs
             .first()
             .filter(|input| input.present)
@@ -175,12 +257,59 @@ impl Kernel for QMoEKernel {
                 input.dtype
             )));
         }
-        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
-            WorkspaceRequirement {
-                bytes: grouped_input_workspace_bytes(input.shape)? as u64,
-                alignment: std::mem::align_of::<f32>(),
-                ..WorkspaceRequirement::NONE
-            },
+        let fc2 = inputs.get(5).filter(|input| input.present).ok_or_else(|| {
+            error("required input 5 ('fc2_experts_weights') is absent during workspace preparation; provide packed FC2 metadata")
+        })?;
+        if fc2.dtype != DataType::Uint8 {
+            return Err(error(format!(
+                "fc2_experts_weights requires Uint8, got {:?}",
+                fc2.dtype
+            )));
+        }
+        let dims = self.dimensions(input.shape, fc2.shape)?;
+        let layout =
+            self.execution_workspace_layout(&dims, inputs.get(8).is_some_and(|v| v.present), plan)?;
+        Ok(WorkspaceRequirement {
+            bytes: layout.bytes() as u64,
+            alignment: layout.alignment(),
+            ..WorkspaceRequirement::NONE
+        })
+    }
+}
+
+impl Kernel for QMoEKernel {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
+        let plan = DecodedProjectionPlan::for_current_pool(std::num::NonZeroUsize::new(1).unwrap());
+        self.workspace_for_plan(inputs, plan)
+            .map(onnx_runtime_ep_api::WorkspacePreparation::Ready)
+    }
+
+    fn workspace_requirement_for_execution(
+        &self,
+        _inputs: &[TensorView],
+        _outputs: &[TensorMut],
+        metadata: &[TensorMetadata<'_>],
+        _output_metadata: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+        cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
+    ) -> Result<onnx_runtime_ep_api::WorkspaceExecutionPreparation> {
+        // Exclusive kernel ownership spans refinement, admission and launch.
+        // Failed preparation must not leave a previously selected plan usable.
+        self.prepared_projection.set(None);
+        let plan = DecodedProjectionPlan::for_current_pool(std::num::NonZeroUsize::new(1).unwrap());
+        // The caller already matched this kernel, tensor metadata and provider
+        // context. Preserve the default hook's Ready-cache fast path; capture a
+        // fresh dispatch plan even when no metadata calculation is needed.
+        let requirement = match cached {
+            Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(requirement)) => requirement,
+            _ => self.workspace_for_plan(metadata, plan)?,
+        };
+        self.prepared_projection.set(Some(plan));
+        Ok(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready(
+            requirement,
         ))
     }
 
@@ -194,6 +323,7 @@ impl Kernel for QMoEKernel {
         outputs: &mut [TensorMut],
         workspace: Option<WorkspaceView>,
     ) -> Result<()> {
+        let projection_plan = self.prepared_projection.take();
         check_arity("QMoE", inputs, outputs, 7, 21, 1)?;
         for (index, name) in [
             (0, "input"),
@@ -265,8 +395,13 @@ impl Kernel for QMoEKernel {
                 outputs[0].shape
             )));
         }
-        let hidden = *x_shape.last().unwrap();
-        let rows = checked_product(&x_shape[..x_shape.len() - 1], "flattened input row count")?;
+        let dims = self.dimensions(x_shape, inputs[5].shape)?;
+        let Dimensions {
+            rows,
+            hidden,
+            inter,
+            fc1_size,
+        } = dims;
         for (index, input) in inputs
             .iter()
             .enumerate()
@@ -289,31 +424,12 @@ impl Kernel for QMoEKernel {
                 self.attributes.k
             )));
         }
-        if !hidden.is_multiple_of(self.block_size) {
-            return Err(error(format!(
-                "hidden_size {hidden} must be divisible by block_size {}",
-                self.block_size
-            )));
-        }
-
-        require_rank("fc2_experts_weights", inputs[5].shape, 3)?;
-        if inputs[5].shape[0] != experts || inputs[5].shape[1] != hidden {
+        if inputs[5].shape[0] != experts {
             return Err(error(format!(
                 "fc2_experts_weights must start with [experts={experts}, hidden={hidden}], got {:?}",
                 inputs[5].shape
             )));
         }
-        let pack_size = 8 / self.bits;
-        let inter = inputs[5].shape[2]
-            .checked_mul(pack_size)
-            .ok_or_else(|| error("fc2 inter_size overflow"))?;
-        if inter == 0 || inter % self.block_size != 0 {
-            return Err(error(format!(
-                "inferred inter_size {inter} must be non-zero and divisible by block_size {}",
-                self.block_size
-            )));
-        }
-        let fc1_size = self.attributes.checked_fc1_size(inter, "QMoE")?;
 
         let fc1 = QuantizedExperts::new(
             "fc1",
@@ -400,14 +516,24 @@ impl Kernel for QMoEKernel {
         // SAFETY: the executor lends Host-accessible scratch exclusively for
         // this dispatch. Only the main compute thread borrows it; the prefetch
         // worker owns weights independently and never receives this lane.
-        let mut grouped_scratch = unsafe {
-            ProjectionScratch::bind(
-                "QMoE grouped input",
-                grouped_input_workspace_bytes(x_shape)?,
+        let projection_plan = projection_plan.ok_or_else(|| error(
+            "QMoE expert workspace execution plan is absent or consumed; refine workspace_requirement_for_execution in the selected execution context before admission and launch"
+        ))?;
+        let [bank_a, bank_b, mut contribution_scratch, decoder] = unsafe {
+            ProjectionScratch::bind_layout(
+                "QMoE expert workspace",
+                self.execution_workspace_layout(&dims, has_fc3, projection_plan)?,
                 workspace,
             )?
         };
-        let mut output = vec![0.0f32; output_elements];
+        let mut expert_workspace = QMoEWorkspace {
+            experts: MoeWorkspace {
+                input: bank_a,
+                projection: bank_b,
+            },
+            decoder,
+            plan: projection_plan,
+        };
         let mut routes = Vec::with_capacity(rows);
         let mut token_counts = BTreeMap::new();
         let mut tasks = BTreeMap::<usize, Vec<(usize, usize, f32)>>::new();
@@ -466,7 +592,7 @@ impl Kernel for QMoEKernel {
             std::mem::size_of::<f32>(),
             "routed contribution byte count",
         )?;
-        let mut contributions = vec![0.0f32; contribution_elements];
+        let contributions = contribution_scratch.zeroed_prefix(contribution_elements)?;
         let route_first = self.weight_offload.enabled
             && fc1.is_pageable()
             && fc2.is_pageable()
@@ -509,7 +635,7 @@ impl Kernel for QMoEKernel {
              -> Result<()> {
                 write_grouped_contributions(
                     contributions,
-                    &mut grouped_scratch,
+                    &mut expert_workspace,
                     &x,
                     expert_tasks,
                     expert,
@@ -583,7 +709,7 @@ impl Kernel for QMoEKernel {
                                 .map_err(|_| error("route-first prefetch worker unavailable"))?;
                         }
                         let (expert, expert_tasks) = &ordered_ref[index];
-                        compute(*expert, expert_tasks, &weights, &mut contributions)?;
+                        compute(*expert, expert_tasks, &weights, contributions)?;
                     }
                     Ok(())
                 })?;
@@ -597,7 +723,7 @@ impl Kernel for QMoEKernel {
                         fc3.as_ref(),
                         &ExpertMemoryScope::OnDemand(self.host_cache.memory()),
                     )?;
-                    compute(*expert, expert_tasks, &weights, &mut contributions)?;
+                    compute(*expert, expert_tasks, &weights, contributions)?;
                 }
             }
         } else {
@@ -611,8 +737,8 @@ impl Kernel for QMoEKernel {
                     false,
                 )?;
                 write_grouped_contributions(
-                    &mut contributions,
-                    &mut grouped_scratch,
+                    contributions,
+                    &mut expert_workspace,
                     &x,
                     &expert_tasks,
                     expert,
@@ -630,6 +756,13 @@ impl Kernel for QMoEKernel {
                 )?;
             }
         }
+        // All expert reads and the prefetch scope have ended. Bank A is at
+        // least rows*hidden and is dead until it becomes the zero accumulator.
+        // Keep the original +0 start and route-slot += order, including -0/NaN.
+        let output = expert_workspace
+            .experts
+            .input
+            .zeroed_prefix(output_elements)?;
         let mut slot = 0usize;
         for (row, route) in routes.into_iter().enumerate() {
             let output_range = checked_range(row, hidden, "output row")?;
@@ -648,7 +781,7 @@ impl Kernel for QMoEKernel {
             }
         }
         debug_assert_eq!(slot, route_slots);
-        write_dense_f32(&mut outputs[0], &output)
+        write_dense_f32(&mut outputs[0], output)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -803,7 +936,7 @@ enum ExpertGrantAdmission {
 
 fn owned_expert_grant(grant: DerivedWeightGrant) -> Option<Arc<DerivedWeightGrant>> {
     match grant {
-        DerivedWeightGrant::Local => None,
+        DerivedWeightGrant::Empty | DerivedWeightGrant::Local => None,
         grant => Some(Arc::new(grant)),
     }
 }
@@ -869,10 +1002,7 @@ fn load_transient_expert(
                 fc2,
                 fc3,
                 track_residency,
-                match grant {
-                    DerivedWeightGrant::Local => None,
-                    grant => Some(Arc::new(grant)),
-                },
+                owned_expert_grant(grant),
             )?)))
         }
         WeightAdmission::Declined(reason) => Ok(ExpertExecution::RowStreamed(reason)),
@@ -1687,7 +1817,7 @@ fn lease_route_first_expert(
 #[allow(clippy::too_many_arguments)]
 fn write_grouped_contributions(
     contributions: &mut [f32],
-    grouped_scratch: &mut ProjectionScratch<'_>,
+    expert_workspace: &mut QMoEWorkspace<'_>,
     input: &[f32],
     tasks: &[(usize, usize, f32)],
     expert: usize,
@@ -1706,23 +1836,18 @@ fn write_grouped_contributions(
     let fc1_bias_range = checked_range(expert, fc1_size, "fc1 bias expert row")?;
     let fc2_bias_range = checked_range(expert, hidden, "fc2 bias expert row")?;
     let fc3_bias_range = checked_range(expert, inter, "fc3 bias expert row")?;
-    let grouped_input: &[f32] = if let [(row, _, _)] = tasks {
-        input.get(checked_range(*row, hidden, "input row")?).ok_or_else(|| {
-            error(format!("input row {row} of width {hidden} exceeds {} values; validate routed row indices", input.len()))
-        })?
-    } else {
-        grouped_scratch.gather_rows(input, hidden, tasks.iter().map(|&(row, _, _)| row))?
-    };
     let expert_out = match weights {
-        ExpertExecution::Dense(weights) => run_expert_grouped(
-            grouped_input,
-            tasks.len(),
-            &weights.fc1,
-            fc1_bias.map(|bias| &bias[fc1_bias_range]),
-            &weights.fc2,
-            fc2_bias.map(|bias| &bias[fc2_bias_range]),
-            weights.fc3.as_deref(),
-            fc3_bias.map(|bias| &bias[fc3_bias_range]),
+        ExpertExecution::Dense(weights) => expert_workspace.experts.run_dense_expert(
+            input,
+            tasks.iter().map(|&(row, _, _)| row),
+            DenseExpertWeights {
+                fc1: &weights.fc1,
+                fc1_bias: fc1_bias.map(|bias| &bias[fc1_bias_range]),
+                fc2: &weights.fc2,
+                fc2_bias: fc2_bias.map(|bias| &bias[fc2_bias_range]),
+                fc3: weights.fc3.as_deref(),
+                fc3_bias: fc3_bias.map(|bias| &bias[fc3_bias_range]),
+            },
             fc1_size,
             hidden,
             inter,
@@ -1742,9 +1867,11 @@ fn write_grouped_contributions(
                 expert,
             };
             let fc3 = fc3.map(|source| QuantizedExpertProjection { source, expert });
-            run_expert_projections(
-                grouped_input,
-                tasks.len(),
+            let decoder = &mut expert_workspace.decoder;
+            let plan = expert_workspace.plan;
+            expert_workspace.experts.run_expert_projections(
+                input,
+                tasks.iter().map(|&(row, _, _)| row),
                 &fc1,
                 fc1_bias.map(|bias| &bias[fc1_bias_range]),
                 &fc2,
@@ -1752,7 +1879,16 @@ fn write_grouped_contributions(
                 fc3.as_ref(),
                 fc3_bias.map(|bias| &bias[fc3_bias_range]),
                 attributes,
-                |projection, input, rows, bias| projection.apply(input, rows, bias),
+                |projection, input, rows, bias, output| {
+                    projection.apply_prepared(
+                        input,
+                        rows,
+                        bias,
+                        output,
+                        plan,
+                        decoder.initialized(),
+                    )
+                },
             )?
         }
     };
@@ -2063,14 +2199,59 @@ impl ExpertProjection for QuantizedExpertProjection<'_, '_> {
     }
 }
 impl QuantizedExpertProjection<'_, '_> {
-    fn apply(&self, input: &[f32], rows: usize, bias: Option<&[f32]>) -> Result<Vec<f32>> {
-        super::decoded_projection::linear_decoded_grouped::<1, _>(
+    fn apply_prepared(
+        &self,
+        input: &[f32],
+        rows: usize,
+        bias: Option<&[f32]>,
+        output: &mut [f32],
+        plan: DecodedProjectionPlan,
+        scratch: &mut [f32],
+    ) -> Result<()> {
+        (|| {
+            let (columns, decoded) =
+                plan.split_scratch(rows, self.in_features(), self.out_features(), scratch)?;
+            plan.project::<1, _>(
+                input,
+                rows,
+                self.in_features(),
+                self.out_features(),
+                bias,
+                output,
+                columns,
+                decoded,
+                || {
+                    |row, output: &mut [f32]| {
+                        self.source.decode_expert_row(self.expert, row, output)
+                    }
+                },
+                |input, row, output, rows, k, _features| {
+                    super::matmul::gemm_bt_serial(input, row, output, rows, k, 1)
+                },
+            )
+        })()
+        .map_err(|source| EpError::Backend {
+            operation: "QMoE NBits expert projection",
+            source: Box::new(source),
+        })
+    }
+
+    #[cfg(test)]
+    fn apply_dynamic_reference(
+        &self,
+        input: &[f32],
+        rows: usize,
+        bias: Option<&[f32]>,
+        output: &mut [f32],
+    ) -> Result<()> {
+        super::decoded_projection::linear_decoded_grouped_into::<1, _>(
             "QMoE NBits expert",
             input,
             rows,
             self.in_features(),
             self.out_features(),
             bias,
+            output,
             || |row, output: &mut [f32]| self.source.decode_expert_row(self.expert, row, output),
             |input, row, output, rows, k, _features| {
                 super::matmul::gemm_bt_serial(input, row, output, rows, k, 1)
@@ -2173,6 +2354,13 @@ fn error(message: impl Into<String>) -> EpError {
     EpError::KernelFailed(format!("QMoE: {}", message.into()))
 }
 
+// Test-only observation of actual metadata planning, scoped to the calling
+// thread so unrelated parallel tests cannot turn a warm-cache check into noise.
+#[cfg(test)]
+thread_local! {
+    static WORKSPACE_METADATA_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2187,6 +2375,25 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock};
 
+    fn in_single_pool(body: impl FnOnce() + Send) {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(body);
+    }
+
+    fn fixed_plan(shards: usize) -> DecodedProjectionPlan {
+        DecodedProjectionPlan::new(
+            std::num::NonZeroUsize::new(shards).unwrap(),
+            std::num::NonZeroUsize::new(1).unwrap(),
+        )
+    }
+
+    fn test_kernel(graph: &Graph, node: NodeId) -> QMoEKernel {
+        QMoEKernel::new(graph.node(node), test_resources().expert_cache().clone()).unwrap()
+    }
+
     struct Quantized {
         packed: Vec<u8>,
         scales: Vec<f32>,
@@ -2195,27 +2402,297 @@ mod tests {
     }
 
     #[test]
-    fn grouped_input_uses_one_peak_lane_without_warm_workspace_issuer_calls() {
-        use crate::kernels::testutil::RecordingGovernor;
-        use onnx_runtime_ep_api::DevicePtrMut;
-        use onnx_runtime_memory_api::Tier;
-        use onnx_runtime_memory_governor::{
-            HostWorkspacePool, MemoryGovernor, ProcessMemoryManager,
-        };
+    fn expert_banks_use_one_peak_lane_without_warm_workspace_issuer_calls() {
+        in_single_pool(|| {
+            use crate::kernels::testutil::RecordingGovernor;
+            use onnx_runtime_ep_api::DevicePtrMut;
+            use onnx_runtime_memory_api::Tier;
+            use onnx_runtime_memory_governor::{
+                HostWorkspacePool, MemoryGovernor, ProcessMemoryManager,
+            };
+            for rows in [1, 3] {
+                const H: usize = 16;
+                const E: usize = 4;
+                let banks_bytes = rows * (H + H + 2 * H) * 4;
+                let bytes = banks_bytes + (if rows > 1 { rows * H } else { 0 } + H) * 4;
+                let books = RecordingGovernor::new_host(bytes as u64);
+                let manager = ProcessMemoryManager::new().unwrap();
+                let pool = HostWorkspacePool::governed(&manager, Arc::new(books.clone())).unwrap();
+                // This isolates workspace callbacks. The kernel below explicitly uses
+                // its existing local weight source; this is not a full-process cap.
+                let cpu = CpuExecutionProvider::with_resources(
+                    crate::CpuMemoryResources::default()
+                        .with_workspace_pool(pool.clone())
+                        .unwrap(),
+                );
+                let shapes = [
+                    Some((DataType::Float32, &[rows, H][..])),
+                    Some((DataType::Float32, &[rows, E])),
+                    Some((DataType::Uint8, &[E, H, H])),
+                    Some((DataType::Float32, &[E, H, 1])),
+                    None,
+                    Some((DataType::Uint8, &[E, H, H])),
+                    Some((DataType::Float32, &[E, H, 1])),
+                ];
+                let (graph, node) =
+                    model_node("QMoE", &shapes, &[rows, H], &attributes(8, 16, 2, true));
+                let kernel = test_kernel(&graph, node);
+                let input = Owned::f32(&[rows, H], &pseudo_random_values(rows * H, 71));
+                // Sparse, noncontiguous groups as well as a full-row skew are covered.
+                let w1 = quantize(E, H, H, 8, 16, false);
+                let w2 = quantize(E, H, H, 8, 16, false);
+                let p1 = Owned::u8(&[E, H, H], &w1.packed);
+                let p2 = Owned::u8(&[E, H, H], &w2.packed);
+                let sc1 = Owned::f32(&[E, H, 1], &w1.scales);
+                let sc2 = Owned::f32(&[E, H, 1], &w2.scales);
+                let mut output = Owned::zeros_f32(&[rows, H]);
+                for logits in [
+                    [4., 3., 0., -1., 0., -1., 4., 3., 4., 0., -1., 3.][..rows * E].to_vec(),
+                    [4., 3., 0., -1.].repeat(rows),
+                ] {
+                    let router = Owned::f32(&[rows, E], &logits);
+                    let inputs = [
+                        input.view(),
+                        router.view(),
+                        p1.view(),
+                        sc1.view(),
+                        TensorView::absent(DataType::Float32),
+                        p2.view(),
+                        sc2.view(),
+                    ];
+                    let metadata = inputs
+                        .iter()
+                        .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
+                        .collect::<Vec<_>>();
+                    let req = kernel
+                        .workspace_requirement(&metadata, &[])
+                        .unwrap()
+                        .require_ready()
+                        .unwrap();
+                    assert_eq!(
+                        req.bytes, bytes as u64,
+                        "serial expert groups reuse both banks, without k or E multiplication"
+                    );
+                    kernel
+                        .workspace_requirement_for_execution(
+                            &inputs,
+                            &[output.view_mut()],
+                            &metadata,
+                            &[],
+                            None,
+                        )
+                        .unwrap()
+                        .require_ready()
+                        .unwrap();
+                    let err = kernel
+                        .execute(&inputs, &mut [output.view_mut()])
+                        .unwrap_err();
+                    assert!(err.to_string().contains("QMoE expert workspace"), "{err}");
+                    let mut invalid_backing = vec![0f32; bytes / 4];
+                    for invalid in [
+                        WorkspaceView::new(
+                            DevicePtrMut(invalid_backing.as_mut_ptr().cast()),
+                            bytes - 4,
+                        ),
+                        WorkspaceView::new(
+                            DevicePtrMut(
+                                invalid_backing
+                                    .as_mut_ptr()
+                                    .cast::<u8>()
+                                    .wrapping_add(1)
+                                    .cast(),
+                            ),
+                            bytes,
+                        ),
+                    ] {
+                        kernel
+                            .workspace_requirement_for_execution(
+                                &inputs,
+                                &[output.view_mut()],
+                                &metadata,
+                                &[],
+                                None,
+                            )
+                            .unwrap()
+                            .require_ready()
+                            .unwrap();
+                        let err = kernel
+                            .execute_with_workspace(
+                                &inputs,
+                                &mut [output.view_mut()],
+                                Some(invalid),
+                            )
+                            .unwrap_err();
+                        assert!(err.to_string().contains("QMoE expert workspace"), "{err}");
+                    }
+                    kernel
+                        .execute_prepared(&inputs, &mut [output.view_mut()])
+                        .unwrap();
+                    let expected = output.bytes.clone();
+                    let mut counts = None;
+                    for _ in 0..17 {
+                        kernel
+                            .workspace_requirement_for_execution(
+                                &inputs,
+                                &[output.view_mut()],
+                                &metadata,
+                                &[],
+                                None,
+                            )
+                            .unwrap()
+                            .require_ready()
+                            .unwrap();
+                        let mut backing = cpu
+                            .allocate_workspace(req.bytes as usize, req.alignment, req.role())
+                            .unwrap();
+                        // SAFETY: this is the exclusively borrowed, Host-accessible
+                        // allocation returned by the CPU workspace bridge.
+                        unsafe {
+                            std::ptr::write_bytes(backing.as_mut_ptr(), 0xff, backing.len());
+                        }
+                        let view =
+                            WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr()), backing.len());
+                        kernel
+                            .execute_with_workspace(&inputs, &mut [output.view_mut()], Some(view))
+                            .unwrap();
+                        // Dense local weights must never initialize streamed-only storage.
+                        // SAFETY: CPU backing is live and exclusively owned after execution.
+                        let decoder_bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                backing.as_ptr().cast::<u8>().add(banks_bytes),
+                                bytes - banks_bytes,
+                            )
+                        };
+                        assert!(decoder_bytes.iter().all(|b| *b == 0xff));
+                        cpu.deallocate_workspace(backing).unwrap();
+                        let current = (books.claims(), books.releases());
+                        assert_eq!(
+                            *counts.get_or_insert(current),
+                            current,
+                            "warm workspace checkout/compute/return must never call its issuer, including zero bytes"
+                        );
+                        assert_eq!(output.bytes, expected);
+                        assert_eq!(books.used(Tier::Host), bytes as u64);
+                        assert_eq!(manager.snapshot().unwrap().allocations.len(), 1);
+                    }
+                }
+                pool.trim_idle(u64::MAX).unwrap();
+                assert_eq!(books.used(Tier::Host), 0);
+                assert_eq!(manager.process_used(Tier::Host), 0);
+            }
+        });
+    }
+
+    #[test]
+    fn expert_workspace_metadata_checks_presence_geometry_dtype_and_overflow() {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                let kernel = overflow_test_kernel();
+                let prepare = |input: TensorMetadata<'_>, fc2: TensorMetadata<'_>| {
+                    let mut inputs = [TensorMetadata::new(DataType::Float32, &[], false); 6];
+                    inputs[0] = input;
+                    inputs[5] = fc2;
+                    kernel
+                        .workspace_requirement(&inputs, &[])
+                        .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)
+                };
+                let fc2 = TensorMetadata::new(DataType::Uint8, &[1, 16, 16], true);
+                assert!(
+                    kernel
+                        .workspace_requirement(&[], &[])
+                        .unwrap_err()
+                        .to_string()
+                        .contains("input 0")
+                );
+                assert!(
+                    prepare(
+                        TensorMetadata::new(DataType::Float32, &[1, 16], true),
+                        TensorMetadata::new(DataType::Uint8, &[], false)
+                    )
+                    .unwrap_err()
+                    .to_string()
+                    .contains("input 5")
+                );
+                // Four-bit FC2's packed K=16 means I=32. FC1 cannot replace this fact.
+                for shape in [
+                    &[2, 16][..],
+                    &[1, 2, 16][..],
+                    &[1, 16][..],
+                    &[1, 1, 16][..],
+                    &[0, 16][..],
+                ] {
+                    let rows = shape[..shape.len() - 1].iter().product::<usize>();
+                    assert_eq!(
+                        prepare(TensorMetadata::new(DataType::Float32, shape, true), fc2)
+                            .unwrap()
+                            .bytes,
+                        ((rows * (16 + 32 + 16)
+                            + if rows == 0 {
+                                0
+                            } else if rows == 1 {
+                                32
+                            } else {
+                                (rows * 32 + 16).max(rows * 16 + 32)
+                            })
+                            * 4) as u64
+                    );
+                }
+                for input in [
+                    TensorMetadata::new(DataType::Float32, &[2, 16], false),
+                    TensorMetadata::new(DataType::Int8, &[2, 16], true),
+                    TensorMetadata::new(DataType::Float32, &[16], true),
+                    TensorMetadata::new(DataType::Float32, &[1, 3], true),
+                    TensorMetadata::new(DataType::Float32, &[usize::MAX, 16], true),
+                    TensorMetadata::new(DataType::Float32, &[isize::MAX as usize, 16], true),
+                ] {
+                    assert!(prepare(input, fc2).is_err());
+                }
+                for fc2 in [
+                    TensorMetadata::new(DataType::Float32, &[1, 16, 8], true),
+                    TensorMetadata::new(DataType::Uint8, &[1, 16], true),
+                    TensorMetadata::new(DataType::Uint8, &[1, 32, 8], true),
+                    TensorMetadata::new(DataType::Uint8, &[1, 16, 0], true),
+                    TensorMetadata::new(DataType::Uint8, &[1, 16, 1], true),
+                    TensorMetadata::new(DataType::Uint8, &[1, 16, usize::MAX], true),
+                    TensorMetadata::new(DataType::Uint8, &[1, 16, isize::MAX as usize / 4], true),
+                ] {
+                    assert!(
+                        prepare(TensorMetadata::new(DataType::Float32, &[1, 16], true), fc2)
+                            .is_err()
+                    );
+                }
+                // Zero hidden is not a zero-FC shortcut: FC1 can still produce bias.
+                assert_eq!(
+                    prepare(
+                        TensorMetadata::new(DataType::Float32, &[1, 0], true),
+                        TensorMetadata::new(DataType::Uint8, &[1, 0, 16], true)
+                    )
+                    .unwrap()
+                    .bytes,
+                    32 * 4
+                );
+                assert_eq!(
+                    prepare(
+                        TensorMetadata::new(DataType::Float32, &[3, 0], true),
+                        TensorMetadata::new(DataType::Uint8, &[1, 0, 16], true)
+                    )
+                    .unwrap()
+                    .bytes,
+                    2 * 3 * 32 * 4
+                );
+            });
+    }
+
+    #[test]
+    fn routed_output_preserves_strides_and_input_output_aliases() {
+        use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
+        use onnx_runtime_ir::DeviceId;
         const ROWS: usize = 3;
         const H: usize = 16;
         const E: usize = 4;
-        const BYTES: usize = ROWS * H * 4;
-        let books = RecordingGovernor::new_host(BYTES as u64);
-        let manager = ProcessMemoryManager::new().unwrap();
-        let pool = HostWorkspacePool::governed(&manager, Arc::new(books.clone())).unwrap();
-        // This isolates workspace callbacks. The kernel below explicitly uses
-        // its existing local weight source; this is not a full-process cap.
-        let cpu = CpuExecutionProvider::with_resources(
-            crate::CpuMemoryResources::default()
-                .with_workspace_pool(pool.clone())
-                .unwrap(),
-        );
         let shapes = [
             Some((DataType::Float32, &[ROWS, H][..])),
             Some((DataType::Float32, &[ROWS, E])),
@@ -2227,153 +2704,554 @@ mod tests {
         ];
         let (graph, node) = model_node("QMoE", &shapes, &[ROWS, H], &attributes(8, 16, 2, true));
         let kernel = kernel(&graph, node).unwrap();
-        let input = Owned::f32(&[ROWS, H], &pseudo_random_values(ROWS * H, 71));
-        // Sparse, noncontiguous groups as well as a full-row skew are covered.
+        let values = pseudo_random_values(ROWS * H, 71);
+        let input = Owned::f32(&[ROWS, H], &values);
+        let router = Owned::f32(
+            &[ROWS, E],
+            &[4., 3., 0., -1., 0., -1., 4., 3., 4., 0., -1., 3.],
+        );
         let w1 = quantize(E, H, H, 8, 16, false);
         let w2 = quantize(E, H, H, 8, 16, false);
         let p1 = Owned::u8(&[E, H, H], &w1.packed);
         let p2 = Owned::u8(&[E, H, H], &w2.packed);
         let sc1 = Owned::f32(&[E, H, 1], &w1.scales);
         let sc2 = Owned::f32(&[E, H, 1], &w2.scales);
-        let mut output = Owned::zeros_f32(&[ROWS, H]);
-        for logits in [
-            vec![4., 3., 0., -1., 0., -1., 4., 3., 4., 0., -1., 3.],
-            [4., 3., 0., -1.].repeat(ROWS),
-        ] {
-            let router = Owned::f32(&[ROWS, E], &logits);
+        let inputs = [
+            input.view(),
+            router.view(),
+            p1.view(),
+            sc1.view(),
+            TensorView::absent(DataType::Float32),
+            p2.view(),
+            sc2.view(),
+        ];
+        let mut expected = Owned::zeros_f32(&[ROWS, H]);
+        kernel
+            .execute_prepared(&inputs, &mut [expected.view_mut()])
+            .unwrap();
+        let expected = expected.to_f32();
+        let shape = [ROWS, H];
+        let strides = [(2 * H + 1) as i64, 2];
+        let mut padded = vec![-123f32; ROWS * (2 * H + 1)];
+        let out = TensorMut::new(
+            DevicePtrMut(padded.as_mut_ptr().cast()),
+            DataType::Float32,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        )
+        .with_byte_offset(4);
+        kernel.execute_prepared(&inputs, &mut [out]).unwrap();
+        for (i, value) in padded.iter().enumerate() {
+            let row = i / (2 * H + 1);
+            let col = i % (2 * H + 1);
+            let target = if col % 2 == 1 {
+                expected[row * H + col / 2]
+            } else {
+                -123.
+            };
+            assert_eq!(
+                value.to_bits(),
+                target.to_bits(),
+                "physical output element {i}"
+            );
+        }
+        let mut aliased = values;
+        let pointer = aliased.as_mut_ptr();
+        let strides = [H as i64, 1];
+        let mut alias_inputs = inputs;
+        alias_inputs[0] = TensorView::new(
+            DevicePtr(pointer.cast()),
+            DataType::Float32,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        );
+        let out = TensorMut::new(
+            DevicePtrMut(pointer.cast()),
+            DataType::Float32,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        );
+        kernel.execute_prepared(&alias_inputs, &mut [out]).unwrap();
+        assert_eq!(
+            aliased.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn contribution_and_composite_bounds_reject_overflow_without_allocating() {
+        let (graph, node) = model_node("QMoE", &[], &[1, 16], &attributes(4, 16, 1, false));
+        let mut kernel = QMoEKernel {
+            layer_id: 0,
+            attributes: quantized_moe_attributes(graph.node(node)).unwrap().0,
+            bits: 4,
+            block_size: 16,
+            weight_offload: WeightOffloadMode { enabled: false },
+            host_cache: crate::CpuMemoryResources::default().expert_cache().clone(),
+            prefetch_experts: false,
+            prepared_projection: std::cell::Cell::new(None),
+        };
+        let dims = Dimensions {
+            rows: 1,
+            hidden: 16,
+            inter: 16,
+            fc1_size: 16,
+        };
+        kernel.attributes.k = usize::MAX;
+        let err = kernel
+            .execution_workspace_layout(&dims, false, fixed_plan(1))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("routed contribution element count"), "{err}");
+        kernel.attributes.k = 1;
+        let width = (isize::MAX as usize / 8 / 16) * 16;
+        let dims = Dimensions {
+            rows: 1,
+            hidden: width,
+            inter: width,
+            fc1_size: width,
+        };
+        let err = kernel
+            .execution_workspace_layout(&dims, false, fixed_plan(1))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("workspace region") && err.contains("addressable"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn routed_accumulator_starts_at_positive_zero_and_keeps_ieee_route_order() {
+        const R: usize = 4;
+        const H: usize = 16;
+        const E: usize = 4;
+        let x = Owned::f32(&[R, H], &[1.; R * H]);
+        let logits = [1f32, 3., 2., 0.]; // order 1,2,0 differs from expert order
+        let router = Owned::f32(&[R, E], &logits.repeat(R));
+        let packed = Owned::u8(&[E, H, H / 2], &[0x99; E * H * H / 2]);
+        let scales = Owned::f32(&[E, H, 1], &[1.; E * H]);
+        let weights = [
+            -0.0,
+            -0.0,
+            -0.0,
+            -0.0,
+            1.,
+            16777216.,
+            -16777216.,
+            0.,
+            f32::from_bits(0x7fc12345),
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            1.,
+            f32::INFINITY,
+            0.,
+            0.,
+            0.,
+        ];
+        let aggregation = Owned::f32(&[R, E], &weights);
+        for k in [1, 3] {
+            let shapes = [
+                Some((DataType::Float32, &[R, H][..])),
+                Some((DataType::Float32, &[R, E])),
+                Some((DataType::Uint8, &[E, H, H / 2])),
+                Some((DataType::Float32, &[E, H, 1])),
+                None,
+                Some((DataType::Uint8, &[E, H, H / 2])),
+                Some((DataType::Float32, &[E, H, 1])),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some((DataType::Float32, &[R, E])),
+            ];
+            let (graph, node) = model_node("QMoE", &shapes, &[R, H], &attributes(4, 16, k, false));
+            let kernel = kernel(&graph, node).unwrap();
+            let mut inputs = vec![TensorView::absent(DataType::Float32); 15];
+            for (i, v) in [
+                (0, x.view()),
+                (1, router.view()),
+                (2, packed.view()),
+                (3, scales.view()),
+                (5, packed.view()),
+                (6, scales.view()),
+                (14, aggregation.view()),
+            ] {
+                inputs[i] = v;
+            }
+            let mut output = Owned::f32(&[R, H], &[91.; R * H]);
+            kernel
+                .execute_prepared(&inputs, &mut [output.view_mut()])
+                .unwrap();
+            for (row, values) in output.to_f32().chunks_exact(H).enumerate() {
+                let mut expected = 0f32;
+                for (_, weight) in
+                    routing_weights(&logits, Some(&weights[row * E..(row + 1) * E]), k, false)
+                {
+                    expected += weight * (H * H) as f32;
+                }
+                for &actual in values {
+                    if expected.is_nan() {
+                        assert!(actual.is_nan());
+                    } else {
+                        assert_eq!(actual.to_bits(), expected.to_bits(), "row {row}, k={k}");
+                    }
+                }
+            }
+            // A rejected dispatch must not publish scratch or overwrite output.
+            inputs[6] = TensorView::absent(DataType::Float32);
+            let previous = output.bytes.clone();
+            assert!(
+                kernel
+                    .execute_prepared(&inputs, &mut [output.view_mut()])
+                    .is_err()
+            );
+            assert_eq!(output.bytes, previous);
+        }
+    }
+
+    #[test]
+    fn explicit_decoder_plan_matches_dynamic_across_selection_and_execution_pools() {
+        for (construction, execution) in [(1, 4), (4, 1)] {
+            let constructor = rayon::ThreadPoolBuilder::new()
+                .num_threads(construction)
+                .build()
+                .unwrap();
+            let runner = rayon::ThreadPoolBuilder::new()
+                .num_threads(execution)
+                .build()
+                .unwrap();
+            let plan = constructor.install(|| {
+                DecodedProjectionPlan::for_current_pool(std::num::NonZeroUsize::new(1).unwrap())
+            });
+            for bits in [1, 2, 4, 8] {
+                for affine in [false, true] {
+                    for k in [0, 16, 32] {
+                        for n in [0, 1, 16, 32] {
+                            let q = quantize(1, n, k, bits, 16, affine);
+                            let packed = Owned::u8(&[1, n, k / (8 / bits)], &q.packed);
+                            let scales = Owned::f32(&[1, n, k / 16], &q.scales);
+                            let point_shape = [1, n, (k / 16).div_ceil(8 / bits)];
+                            let unused_points = vec![0; point_shape.iter().product()];
+                            let points = Owned::u8(
+                                &point_shape,
+                                q.zero_points.as_deref().unwrap_or(&unused_points),
+                            );
+                            let pv = packed.view();
+                            let sv = scales.view();
+                            let zv = points.view();
+                            let source = QuantizedExperts::new(
+                                "decoder comparison",
+                                &pv,
+                                &sv,
+                                affine.then_some(&zv),
+                                1,
+                                n,
+                                k,
+                                bits,
+                                16,
+                                false,
+                            )
+                            .unwrap();
+                            let projection = QuantizedExpertProjection {
+                                source: &source,
+                                expert: 0,
+                            };
+                            let bias = (0..n).map(|v| (v % 5) as f32 * 0.125).collect::<Vec<_>>();
+                            for rows in [0, 1, 3] {
+                                let x = pseudo_random_values(rows * k, 0x731456);
+                                let mut expected = vec![0.; rows * n];
+                                runner
+                                    .install(|| {
+                                        projection.apply_dynamic_reference(
+                                            &x,
+                                            rows,
+                                            Some(&bias),
+                                            &mut expected,
+                                        )
+                                    })
+                                    .unwrap();
+                                let bytes = plan.layout(rows, k, n).unwrap().bytes();
+                                let count = bytes / 4;
+                                let mut scratch = vec![f32::NAN; count + 7];
+                                scratch[count..].fill(91.);
+                                let mut actual = vec![0.; rows * n + 7];
+                                actual[rows * n..].fill(73.);
+                                for _ in 0..2 {
+                                    scratch[..count].fill(f32::NAN);
+                                    runner
+                                        .install(|| {
+                                            projection.apply_prepared(
+                                                &x,
+                                                rows,
+                                                Some(&bias),
+                                                &mut actual[..rows * n],
+                                                plan,
+                                                &mut scratch[..count],
+                                            )
+                                        })
+                                        .unwrap();
+                                    assert_eq!(
+                                        actual[..rows * n]
+                                            .iter()
+                                            .map(|x| x.to_bits())
+                                            .collect::<Vec<_>>(),
+                                        expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                                        "pools={construction}->{execution}, bits={bits}, affine={affine}, rows={rows}, K={k}, N={n}"
+                                    );
+                                    assert!(scratch[count..].iter().all(|x| *x == 91.));
+                                    assert!(actual[rows * n..].iter().all(|x| *x == 73.));
+                                }
+                                if count > 0 {
+                                    actual[..rows * n].fill(67.);
+                                    assert!(
+                                        projection
+                                            .apply_prepared(
+                                                &x,
+                                                rows,
+                                                Some(&bias),
+                                                &mut actual[..rows * n],
+                                                plan,
+                                                &mut scratch[..count - 1]
+                                            )
+                                            .is_err()
+                                    );
+                                    assert!(actual[..rows * n].iter().all(|x| *x == 67.));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decoder_workspace_keeps_one_owner_when_execution_pool_changes() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use crate::{CpuMemoryResources, CpuWeightCacheLimits};
+        use onnx_runtime_ep_api::DevicePtrMut;
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{
+            HolderId, HostWorkspacePool, MemoryGovernor, ProcessMemoryManager,
+        };
+        const R: usize = 3;
+        const H: usize = 16;
+        const I: usize = 32;
+        const E: usize = 4;
+        for (construction, execution) in [(1, 4), (4, 1)] {
+            let constructor = rayon::ThreadPoolBuilder::new()
+                .num_threads(construction)
+                .build()
+                .unwrap();
+            let runner = rayon::ThreadPoolBuilder::new()
+                .num_threads(execution)
+                .build()
+                .unwrap();
+            let banks = R * (H + I + 2 * H) * 4;
+            let peak_width = construction.max(execution);
+            let decoder = (R * I + peak_width * H).max(R * H + peak_width * I) * 4;
+            let bytes = banks + decoder;
+            let books = RecordingGovernor::new_host(bytes as u64);
+            let manager = ProcessMemoryManager::new().unwrap();
+            let pool = HostWorkspacePool::governed(&manager, Arc::new(books.clone())).unwrap();
+            let memory = DerivedWeightMemory::governed(&books, HolderId::new(13)).unwrap();
+            let resources = CpuMemoryResources::new(
+                memory,
+                CpuWeightCacheLimits {
+                    dense_bytes: 0,
+                    expert_bytes: 0,
+                },
+            )
+            .unwrap()
+            .with_workspace_pool(pool.clone())
+            .unwrap();
+            let cache = resources.expert_cache().clone();
+            let cpu = CpuExecutionProvider::with_resources(resources);
+            let shapes = [
+                Some((DataType::Float32, &[R, H][..])),
+                Some((DataType::Float32, &[R, E])),
+                Some((DataType::Uint8, &[E, I, H / 2])),
+                Some((DataType::Float32, &[E, I, H / 16])),
+                None,
+                Some((DataType::Uint8, &[E, H, I / 2])),
+                Some((DataType::Float32, &[E, H, I / 16])),
+            ];
+            let (graph, node) = model_node("QMoE", &shapes, &[R, H], &attributes(4, 16, 2, true));
+            let mut kernel = constructor
+                .install(|| QMoEKernel::new(graph.node(node), cache))
+                .unwrap();
+            let x = Owned::f32(&[R, H], &[1.; R * H]);
+            let router = Owned::f32(&[R, E], &[0.; R * E]);
+            let w1 = Owned::u8(&[E, I, H / 2], &[0x99; E * I * H / 2]);
+            let sc1 = Owned::f32(&[E, I, H / 16], &[1.; E * I * H / 16]);
+            let w2 = Owned::u8(&[E, H, I / 2], &[0x99; E * H * I / 2]);
+            let sc2 = Owned::f32(&[E, H, I / 16], &[1.; E * H * I / 16]);
             let inputs = [
-                input.view(),
+                x.view(),
                 router.view(),
-                p1.view(),
+                w1.view(),
                 sc1.view(),
                 TensorView::absent(DataType::Float32),
-                p2.view(),
+                w2.view(),
                 sc2.view(),
             ];
             let metadata = inputs
                 .iter()
                 .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
                 .collect::<Vec<_>>();
-            let req = kernel
-                .workspace_requirement(&metadata, &[])
+            let mut output = Owned::zeros_f32(&[R, H]);
+            let initial = cpu
+                .allocate_workspace(bytes, 4, WorkspaceRequirement::NONE.role())
+                .unwrap();
+            let identity = initial.as_ptr() as usize;
+            cpu.deallocate_workspace(initial).unwrap();
+            for target in [&runner, &constructor, &runner] {
+                let req = {
+                    let kernel = &mut kernel;
+                    let metadata = &metadata;
+                    target.install(move || kernel.workspace_requirement(metadata, &[]))
+                }
                 .unwrap()
                 .require_ready()
                 .unwrap();
-            assert_eq!(
-                req.bytes, BYTES as u64,
-                "serial expert groups reuse input size, without k or E multiplication"
-            );
-            let err = kernel
-                .execute(&inputs, &mut [output.view_mut()])
-                .unwrap_err();
-            assert!(err.to_string().contains("QMoE grouped input"), "{err}");
-            let mut invalid_backing = vec![0f32; BYTES / 4];
-            for invalid in [
-                WorkspaceView::new(DevicePtrMut(invalid_backing.as_mut_ptr().cast()), BYTES - 4),
-                WorkspaceView::new(
-                    DevicePtrMut(
-                        invalid_backing
-                            .as_mut_ptr()
-                            .cast::<u8>()
-                            .wrapping_add(1)
-                            .cast(),
-                    ),
-                    BYTES,
-                ),
-            ] {
-                let err = kernel
-                    .execute_with_workspace(&inputs, &mut [output.view_mut()], Some(invalid))
-                    .unwrap_err();
-                assert!(err.to_string().contains("QMoE grouped input"), "{err}");
+                let active_width = target.current_num_threads();
+                let active_bytes =
+                    banks + (R * I + active_width * H).max(R * H + active_width * I) * 4;
+                assert_eq!(req.bytes, active_bytes as u64);
+                for warm in 0..3 {
+                    let before = (books.claims(), books.releases());
+                    let mut backing = cpu
+                        .allocate_workspace(bytes, req.alignment, req.role())
+                        .unwrap();
+                    {
+                        assert_eq!(
+                            before,
+                            (books.claims(), books.releases()),
+                            "warm workspace loan calls no issuer, even when weights later decline"
+                        );
+                    }
+                    assert_eq!(identity, backing.as_ptr() as usize);
+                    // SAFETY: this exclusive CPU allocation is Host-accessible.
+                    unsafe {
+                        std::ptr::write_bytes(backing.as_mut_ptr(), 0xff, backing.len());
+                    }
+                    let compute_before = books.claims();
+                    {
+                        let kernel = &mut kernel;
+                        let output = &mut output;
+                        let backing = &mut backing;
+                        let (x, router, w1, sc1, w2, sc2) = (&x, &router, &w1, &sc1, &w2, &sc2);
+                        let metadata = &metadata;
+                        target
+                            .install(move || {
+                                let view = WorkspaceView::new(
+                                    DevicePtrMut(backing.as_mut_ptr()),
+                                    backing.len(),
+                                );
+                                let inputs = [
+                                    x.view(),
+                                    router.view(),
+                                    w1.view(),
+                                    sc1.view(),
+                                    TensorView::absent(DataType::Float32),
+                                    w2.view(),
+                                    sc2.view(),
+                                ];
+                                let preparation = match warm {
+                                    0 => Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(req)),
+                                    1 => Some(onnx_runtime_ep_api::WorkspacePreparation::Deferred),
+                                    _ => None,
+                                };
+                                let queries_before = WORKSPACE_METADATA_QUERIES.with(std::cell::Cell::get);
+                                kernel
+                                    .workspace_requirement_for_execution(
+                                        &inputs,
+                                        &[output.view_mut()],
+                                        metadata,
+                                        &[],
+                                        preparation,
+                                    )?
+                                    .require_ready()?;
+                                assert_eq!(WORKSPACE_METADATA_QUERIES.with(std::cell::Cell::get) - queries_before,
+                                    usize::from(!matches!(preparation, Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(_)))),
+                                    "Ready reuses metadata, while Deferred/None must run the checked planner");
+                                kernel.execute_with_workspace(
+                                    &inputs,
+                                    &mut [output.view_mut()],
+                                    Some(view),
+                                )?;
+                                if warm == 0 {
+                                    let before = output.bytes.clone();
+                                    let consumed = kernel
+                                        .execute_with_workspace(
+                                            &inputs,
+                                            &mut [output.view_mut()],
+                                            Some(view),
+                                        )
+                                        .unwrap_err()
+                                        .to_string();
+                                    assert!(consumed.contains("absent or consumed"), "{consumed}");
+                                    kernel.workspace_requirement_for_execution(
+                                        &inputs,
+                                        &[output.view_mut()],
+                                        metadata,
+                                        &[],
+                                        None,
+                                    )?;
+                                    let mut invalid = metadata.to_vec();
+                                    invalid[0].present = false;
+                                    assert!(
+                                        kernel
+                                            .workspace_requirement_for_execution(
+                                                &inputs,
+                                                &[output.view_mut()],
+                                                &invalid,
+                                                &[],
+                                                None
+                                            )
+                                            .is_err()
+                                    );
+                                    let cleared = kernel
+                                        .execute_with_workspace(
+                                            &inputs,
+                                            &mut [output.view_mut()],
+                                            Some(view),
+                                        )
+                                        .unwrap_err()
+                                        .to_string();
+                                    assert!(cleared.contains("absent or consumed"), "{cleared}");
+                                    assert_eq!(output.bytes, before);
+                                }
+                                Ok::<_, EpError>(())
+                            })
+                            .unwrap();
+                    }
+                    assert!(
+                        books.claims() > compute_before,
+                        "positive transient expert requests must reach the same full authority and decline"
+                    );
+                    assert!(
+                        output.to_f32().iter().all(|x| *x == (H * I) as f32),
+                        "warm={warm}"
+                    );
+                    let before_return = (books.claims(), books.releases());
+                    cpu.deallocate_workspace(backing).unwrap();
+                    assert_eq!(before_return, (books.claims(), books.releases()));
+                    assert_eq!(books.used(Tier::Host), bytes as u64);
+                    assert_eq!(books.oversubscribed_bytes(Tier::Host), 0);
+                    assert_eq!(manager.snapshot().unwrap().allocations.len(), 1);
+                }
             }
-            kernel
-                .execute_prepared(&inputs, &mut [output.view_mut()])
-                .unwrap();
-            let expected = output.bytes.clone();
-            let mut counts = None;
-            for _ in 0..17 {
-                let mut backing = cpu
-                    .allocate_workspace(req.bytes as usize, req.alignment, req.role())
-                    .unwrap();
-                let view = WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr()), backing.len());
-                kernel
-                    .execute_with_workspace(&inputs, &mut [output.view_mut()], Some(view))
-                    .unwrap();
-                cpu.deallocate_workspace(backing).unwrap();
-                let current = (books.claims(), books.releases());
-                assert_eq!(
-                    *counts.get_or_insert(current),
-                    current,
-                    "warm workspace checkout/compute/return must never call its issuer, including zero bytes"
-                );
-                assert_eq!(output.bytes, expected);
-                assert_eq!(books.used(Tier::Host), BYTES as u64);
-                assert_eq!(manager.snapshot().unwrap().allocations.len(), 1);
-            }
-        }
-        pool.trim_idle(u64::MAX).unwrap();
-        assert_eq!(books.used(Tier::Host), 0);
-        assert_eq!(manager.process_used(Tier::Host), 0);
-    }
-
-    #[test]
-    fn grouped_input_workspace_metadata_checks_presence_rank_dtype_and_overflow() {
-        let kernel = overflow_test_kernel();
-        assert!(
-            kernel
-                .workspace_requirement(&[], &[])
-                .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)
-                .unwrap_err()
-                .to_string()
-                .contains("input 0")
-        );
-        for shape in [&[2, 3][..], &[1, 2, 3][..]] {
-            let req = kernel
-                .workspace_requirement(&[TensorMetadata::new(DataType::Float32, shape, true)], &[])
-                .unwrap()
-                .require_ready()
-                .unwrap();
-            assert_eq!(req.bytes, 24);
-        }
-        assert_eq!(
-            kernel
-                .workspace_requirement(
-                    &[TensorMetadata::new(DataType::Float32, &[0, 16], true)],
-                    &[]
-                )
-                .unwrap()
-                .require_ready()
-                .unwrap()
-                .bytes,
-            0
-        );
-        for shape in [&[1, 16][..], &[1, 1, 16][..]] {
-            assert_eq!(
-                kernel
-                    .workspace_requirement(
-                        &[TensorMetadata::new(DataType::Float32, shape, true)],
-                        &[]
-                    )
-                    .unwrap()
-                    .require_ready()
-                    .unwrap()
-                    .bytes,
-                0
-            );
-        }
-        for input in [
-            TensorMetadata::new(DataType::Float32, &[2, 3], false),
-            TensorMetadata::new(DataType::Int8, &[2, 3], true),
-            TensorMetadata::new(DataType::Float32, &[3], true),
-            TensorMetadata::new(DataType::Float32, &[usize::MAX, 2], true),
-            TensorMetadata::new(DataType::Float32, &[isize::MAX as usize, 1], true),
-        ] {
-            assert!(
-                kernel
-                    .workspace_requirement(&[input], &[])
-                    .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)
-                    .is_err()
-            );
+            pool.trim_idle(u64::MAX).unwrap();
+            assert_eq!(books.used(Tier::Host), 0);
+            assert_eq!(manager.process_used(Tier::Host), 0);
         }
     }
 
@@ -2677,7 +3555,7 @@ mod tests {
         ];
         let attrs = attributes(4, 16, 1, false);
         let (graph, node) = model_node("QMoE", &inputs, &[1, 16], &attrs);
-        kernel(&graph, node).unwrap()
+        Box::new(test_kernel(&graph, node))
     }
 
     fn assert_kernel_failure_contains(result: Result<()>, expected: &str) {
@@ -2969,6 +3847,7 @@ mod tests {
             weight_offload: WeightOffloadMode { enabled },
             host_cache: resources.expert_cache().clone(),
             prefetch_experts,
+            prepared_projection: std::cell::Cell::new(None),
         };
         let x = Owned::f32(&[ROWS, HIDDEN], input);
         let mut final_output = None;
@@ -3160,6 +4039,7 @@ mod tests {
             weight_offload: WeightOffloadMode { enabled: true },
             host_cache: test_resources().expert_cache().clone(),
             prefetch_experts,
+            prepared_projection: std::cell::Cell::new(None),
         };
 
         let input = pseudo_random_values(rows * hidden, 0xa5a5_1234);
@@ -3898,20 +4778,39 @@ mod tests {
                     });
                     let run = |execution: &ExpertExecution| {
                         let mut out = vec![0.; tasks.len() * H];
-                        let mut storage = vec![f32::NAN; tasks.len() * H];
+                        let plan = fixed_plan(2);
+                        let [bank_a, bank_b] =
+                            MoeWorkspace::bank_layouts(tasks.len(), H, I, &attrs, separate)
+                                .unwrap();
+                        let decode = plan
+                            .maximum_layout(
+                                tasks.len(),
+                                [(H, fc1_size), (I, H)]
+                                    .into_iter()
+                                    .chain(separate.then_some((H, I))),
+                            )
+                            .unwrap();
+                        let layout = WorkspaceLayout::new([bank_a, bank_b, decode]).unwrap();
+                        let count = layout.bytes() / 4;
+                        let mut storage = vec![f32::NAN; count + 7];
+                        storage[count..].fill(91.0);
                         let view = WorkspaceView::new(
                             onnx_runtime_ep_api::DevicePtrMut(storage.as_mut_ptr().cast()),
-                            storage.len() * 4,
+                            layout.bytes(),
                         );
                         // SAFETY: this test exclusively owns live Host f32 backing.
-                        let mut scratch = unsafe {
-                            ProjectionScratch::bind(
-                                "QMoE test gather",
-                                storage.len() * 4,
-                                Some(view),
-                            )
+                        let [input_bank, projection, decoder] = unsafe {
+                            ProjectionScratch::bind_layout("QMoE test banks", layout, Some(view))
                         }
                         .unwrap();
+                        let mut scratch = QMoEWorkspace {
+                            experts: MoeWorkspace {
+                                input: input_bank,
+                                projection,
+                            },
+                            decoder,
+                            plan,
+                        };
                         write_grouped_contributions(
                             &mut out,
                             &mut scratch,
@@ -3931,6 +4830,38 @@ mod tests {
                             &attrs,
                         )
                         .unwrap();
+                        assert!(storage[count..].iter().all(|x| *x == 91.0));
+                        if let ExpertExecution::Dense(weights) = execution {
+                            let gathered = tasks
+                                .iter()
+                                .flat_map(|&(row, _, _)| {
+                                    input[row * H..(row + 1) * H].iter().copied()
+                                })
+                                .collect::<Vec<_>>();
+                            let old = super::super::moe::run_expert_grouped(
+                                &gathered,
+                                tasks.len(),
+                                &weights.fc1,
+                                Some(&biases[0][fc1_size..2 * fc1_size]),
+                                &weights.fc2,
+                                Some(&biases[1][H..2 * H]),
+                                weights.fc3.as_deref(),
+                                separate.then_some(&biases[2][I..2 * I]),
+                                fc1_size,
+                                H,
+                                I,
+                                &attrs,
+                            )
+                            .unwrap();
+                            for (r, &(_, slot, weight)) in tasks.iter().enumerate() {
+                                for feature in 0..H {
+                                    assert_eq!(
+                                        out[slot * H + feature].to_bits(),
+                                        (weight * old[r * H + feature]).to_bits()
+                                    );
+                                }
+                            }
+                        }
                         out
                     };
                     let governor = LedgerGovernor::new(LeaseLedger::new(0, bytes as u64, 0));

@@ -57,7 +57,23 @@ pub enum ToolProtocol {
     AtemXmlV1,
 }
 
+const TAGGED_JSON_MARKERS: &[&str] = &["<tool_call>", "</tool_call>"];
+const ATEM_XML_MARKERS: &[&str] = &[
+    "<atem:invoke",
+    "</atem:invoke>",
+    "<atem:parameter",
+    "</atem:parameter>",
+];
+
 impl ToolProtocol {
+    /// Wire delimiters whose added-token IDs must survive text decoding.
+    pub fn syntax_markers(self) -> &'static [&'static str] {
+        match self {
+            Self::TaggedJsonV1 => TAGGED_JSON_MARKERS,
+            Self::AtemXmlV1 => ATEM_XML_MARKERS,
+        }
+    }
+
     pub fn declaration(self) -> (&'static str, &'static str) {
         match self {
             Self::TaggedJsonV1 => ("tagged-json", "v1"),
@@ -194,8 +210,8 @@ pub fn resolve(
 }
 
 fn parse_tagged_json(input: &str) -> ToolParseOutcome {
-    const OPEN: &str = "<tool_call>";
-    const CLOSE: &str = "</tool_call>";
+    const OPEN: &str = TAGGED_JSON_MARKERS[0];
+    const CLOSE: &str = TAGGED_JSON_MARKERS[1];
     if input.trim().is_empty() {
         return ToolParseOutcome::NoCall;
     }
@@ -249,8 +265,8 @@ fn parse_tagged_json(input: &str) -> ToolParseOutcome {
 }
 
 fn parse_atem_xml(input: &str) -> ToolParseOutcome {
-    const OPEN: &str = "<atem:invoke";
-    const CLOSE: &str = "</atem:invoke>";
+    const OPEN: &str = ATEM_XML_MARKERS[0];
+    const CLOSE: &str = ATEM_XML_MARKERS[1];
     let first = input.trim_start();
     if first.is_empty() {
         return ToolParseOutcome::NoCall;
@@ -283,7 +299,7 @@ fn parse_atem_xml(input: &str) -> ToolParseOutcome {
         let mut parameters = body;
         while !parameters.trim().is_empty() {
             parameters = parameters.trim_start();
-            let Some(after_open) = parameters.strip_prefix("<atem:parameter") else {
+            let Some(after_open) = parameters.strip_prefix(ATEM_XML_MARKERS[2]) else {
                 return ToolParseOutcome::Malformed(
                     "atem-xml@v1 invoke envelope contains text outside parameter envelopes"
                         .to_string(),
@@ -298,10 +314,10 @@ fn parse_atem_xml(input: &str) -> ToolParseOutcome {
                         .to_string(),
                 );
             };
-            let Some((raw, after_parameter)) = after_tag.split_once("</atem:parameter>") else {
+            let Some((raw, after_parameter)) = after_tag.split_once(ATEM_XML_MARKERS[3]) else {
                 return ToolParseOutcome::Incomplete;
             };
-            if raw.contains("<atem:parameter") {
+            if raw.contains(ATEM_XML_MARKERS[2]) {
                 return ToolParseOutcome::Malformed(
                     "atem-xml@v1 does not permit nested parameter envelopes".to_string(),
                 );
