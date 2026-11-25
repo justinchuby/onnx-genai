@@ -147,8 +147,17 @@ fn shape_specific_diagnostics_are_uniform() -> anyhow::Result<()> {
     // Both answer the same question about their component models. Native
     // components intentionally build no ORT sessions, but retain their
     // backend-neutral graph I/O diagnostics.
-    assert!(workflow.models()?.sessions.is_empty());
-    assert!(!workflow.models()?.graph_io_metadata.is_empty());
+    let workflow_models = workflow.models()?;
+    assert!(workflow_models.sessions.is_empty());
+    assert_eq!(
+        workflow_models.graph_io_metadata.keys().collect::<Vec<_>>(),
+        workflow_models
+            .directory
+            .model_paths
+            .keys()
+            .collect::<Vec<_>>(),
+        "Native retains graph diagnostics for every declared workflow component"
+    );
     assert!(
         decoder.models()?.sessions.is_empty(),
         "the decode core holds this package's one graph, so the interpreter builds no component \
