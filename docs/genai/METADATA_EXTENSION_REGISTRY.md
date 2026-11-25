@@ -22,6 +22,9 @@ A reader that accepts a schema version must implement that version's typed SSA/d
 | `v1.11` | Decision request policies declare defaults, payloads, supported question kinds, option/score bounds, ordering and legend semantics explicitly. |
 | `v1.12` | Reranking v2 profiles declare ordered query/document encoded-image inputs; reusable image preprocessing v2 names component-local output ports. |
 | `v1.13` | Realtime v1 profiles declare session-owned bounded audio/text quanta, native rates, frame bounds, control operations and actual per-quantum usage. |
+| `v1.14` | Decision v2 profiles declare ordered encoded-image inputs and authoritative text/media token usage; decision v1 remains text-only. |
+| `v1.15` | Decision v3 profiles declare typed mixed state-media inputs and an explicit spoken-question audio endpoint with authoritative per-variant usage. |
+| `v1.16` | Externally executed audio programs bind explicitly named float32 feature media inputs; analysis semantics and clip bounds come from the selected program output. |
 
 ## Optional semantic extensions
 
@@ -42,6 +45,7 @@ Packages declare an extension only through its typed declaration location. The r
 | `onnx-genai.image-preprocess@2` | component adapter ABI | `v1.12` | `pipeline.workflow.components.<name>.implementation { kind: adapter }` | §10.5, §15 | `onnx_genai_engine::pipeline::workflow` | semantic-required (fail closed) | implemented |
 | `onnx-genai.video-preprocess@1` | component adapter ABI | `v1.0` | `pipeline.workflow.components.<name>.implementation { kind: adapter }` | §10, §15 | `onnx_genai_engine::pipeline::workflow` | semantic-required (fail closed) | implemented |
 | `onnx-genai.audio-preprocess@1` | component adapter ABI | `v1.0` | `pipeline.workflow.components.<name>.implementation { kind: adapter }` | §10, §15 | `onnx_genai_engine::pipeline::workflow` | semantic-required (fail closed) | implemented |
+| `onnx-genai.audio-preprocess@2` | component adapter ABI | `v1.0` | `pipeline.workflow.components.<name>.implementation { kind: adapter }` | §10.8, §15 | `onnx_genai_engine::pipeline::workflow` | semantic-required (fail closed) | implemented |
 | `onnx-genai.text-assembly@1` | component adapter ABI | `v1.0` | `pipeline.workflow.components.<name>.implementation { kind: adapter }` | §7 | `onnx_genai_engine::pipeline::workflow` | semantic-required (fail closed) | implemented |
 | `onnx-genai.adapters@1` | package adapter service | `v1.0` | `adapters.application_capability` | §9 | `onnx_genai_metadata::validate_adapter_service` | semantic-required (fail closed) | implemented |
 | `onnx-genai.adapters.json@1` | adapter artifact loader | `v1.0` | `adapters.artifacts.<name>.weights[].loader_capability` | §9 | `onnx_genai_metadata::validate_adapter_service` | semantic-required (fail closed) | implemented |

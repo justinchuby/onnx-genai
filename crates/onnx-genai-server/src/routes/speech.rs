@@ -12,14 +12,26 @@ pub(crate) async fn audio_speech(
     State(state): State<AppState>,
     ApiJson(request): ApiJson<AudioSpeechRequest>,
 ) -> Result<Response, ApiError> {
+    let format = match request.response_format.to_ascii_lowercase().as_str() {
+        "wav" => onnx_genai_engine::AudioOutputFormat::Wav,
+        "pcm" => onnx_genai_engine::AudioOutputFormat::PcmS16Le,
+        _ => {
+            return Err(ApiError::invalid_request(
+                "speech response_format must be wav or pcm (signed 16-bit little-endian samples)",
+            ));
+        }
+    };
+    synthesize(state, request, format).await
+}
+
+pub(super) async fn synthesize(
+    state: AppState,
+    request: AudioSpeechRequest,
+    format: onnx_genai_engine::AudioOutputFormat,
+) -> Result<Response, ApiError> {
     if request.stream {
         return Err(ApiError::invalid_request(
             "stream=true is not supported for buffered audio workflows",
-        ));
-    }
-    if !request.response_format.eq_ignore_ascii_case("wav") {
-        return Err(ApiError::invalid_request(
-            "only response_format=wav is supported",
         ));
     }
     let handle = resolve_model(&state.registry, &request.model).await?;
@@ -76,12 +88,12 @@ pub(crate) async fn audio_speech(
     };
     let audio = handle
         .engine
-        .synthesize_speech(generation, capability.audio_output.clone())
+        .synthesize_speech(generation, capability.audio_output.clone(), format)
         .await
         .map_err(map_generate_submit_error)?;
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "audio/wav")],
+        [(header::CONTENT_TYPE, audio.content_type)],
         audio.bytes,
     )
         .into_response())

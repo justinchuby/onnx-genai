@@ -844,6 +844,11 @@ fn sequence_length_writes_bound_output_bytes() {
     g.value_mut(output).name = Some("output".to_string());
     g.add_output(output);
     let mut s = InferenceSession::from_graph(g).expect("build");
+    assert_eq!(
+        s.host_graph_op().map(|node| node.op_type.as_str()),
+        Some("SequenceConstruct"),
+        "a tensor-only result does not imply EP-only dispatch",
+    );
     let mut binding = s
         .allocate_device_output_binding("output", DataType::Int64, vec![], vec![])
         .expect("binding");

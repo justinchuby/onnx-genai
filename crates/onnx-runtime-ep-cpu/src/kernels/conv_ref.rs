@@ -405,34 +405,19 @@ impl Kernel for ConvKernel {
                 APPLE_CONV_LAST_DISPATCH
                     .with(|route| route.set(Some(AppleConvDispatch::PointwiseGemm)));
             }
-            if self.group == 1 {
-                im2col_gemm_execute(
-                    &x,
-                    &weights,
-                    bias.as_deref(),
-                    eff_x_shape,
-                    eff_w_shape,
-                    eff_out_shape,
-                    eff_strides,
-                    eff_dilations,
-                    eff_pads,
-                    self.relu,
-                )?
-            } else {
-                grouped_im2col_gemm_execute(
-                    &x,
-                    &weights,
-                    bias.as_deref(),
-                    eff_x_shape,
-                    eff_w_shape,
-                    eff_out_shape,
-                    self.group,
-                    eff_strides,
-                    eff_dilations,
-                    eff_pads,
-                    self.relu,
-                )?
-            }
+            convolution_gemm_execute(
+                &x,
+                &weights,
+                bias.as_deref(),
+                eff_x_shape,
+                eff_w_shape,
+                eff_out_shape,
+                self.group,
+                eff_strides,
+                eff_dilations,
+                eff_pads,
+                self.relu,
+            )?
         } else {
             // Tier 3: scalar reference for non-spatial convolutions (should not reach here
             // after the rank-3→rank-4 promotion above, but kept as a safety net).
@@ -712,63 +697,6 @@ mod bnns {
 // Tier 2: im2col + GEMM
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn im2col_gemm_execute(
-    x: &[f32],
-    weights: &[f32],
-    bias: Option<&[f32]>,
-    x_shape: &[usize],
-    w_shape: &[usize],
-    out_shape: &[usize],
-    strides: &[usize],
-    dilations: &[usize],
-    pads: &[usize],
-    relu: bool,
-) -> Result<Vec<f32>> {
-    let (batch, ic, ih, iw) = (x_shape[0], x_shape[1], x_shape[2], x_shape[3]);
-    let (oc, kh, kw) = (w_shape[0], w_shape[2], w_shape[3]);
-    let (oh, ow) = (out_shape[2], out_shape[3]);
-    let m = oc;
-    let k = ic * kh * kw;
-    let n = oh * ow;
-    if n == 0 || m == 0 {
-        return Ok(vec![]);
-    }
-    let is_1x1 = kh == 1
-        && kw == 1
-        && strides.iter().all(|&s| s == 1)
-        && dilations.iter().all(|&d| d == 1)
-        && pads.iter().all(|&p| p == 0);
-    let backend = crate::backend::CpuBackend::auto_detect();
-    let mut output = vec![0.0f32; batch * m * n];
-    for b in 0..batch {
-        let x_b = &x[b * ic * ih * iw..][..ic * ih * iw];
-        let o_b = &mut output[b * m * n..][..m * n];
-        if is_1x1 {
-            super::matmul::gemm_with_backend(backend, weights, x_b, o_b, m, k, n)?;
-        } else {
-            let mut col = vec![0.0f32; k * n];
-            im2col(
-                x_b, ic, ih, iw, kh, kw, strides, dilations, pads, oh, ow, &mut col,
-            );
-            super::matmul::gemm_with_backend(backend, weights, &col, o_b, m, k, n)?;
-        }
-        if let Some(bias) = bias {
-            for oc_idx in 0..m {
-                let bv = bias[oc_idx];
-                for s in 0..n {
-                    o_b[oc_idx * n + s] += bv;
-                }
-            }
-        }
-        if relu {
-            for v in o_b.iter_mut() {
-                *v = v.max(0.0);
-            }
-        }
-    }
-    Ok(output)
-}
-
 fn im2col(
     input: &[f32],
     c: usize,
@@ -807,9 +735,10 @@ fn im2col(
     }
 }
 
-/// Grouped im2col + GEMM: for each group, performs im2col on the group's input
-/// channels and applies GEMM with the group's weight slice.
-fn grouped_im2col_gemm_execute(
+/// One GEMM driver for ordinary and grouped convolution. Pointwise geometry
+/// borrows each group's input directly; other geometry reuses one im2col buffer
+/// across every batch and group. Output stays staged until all work succeeds.
+fn convolution_gemm_execute(
     x: &[f32],
     weights: &[f32],
     bias: Option<&[f32]>,
@@ -831,12 +760,28 @@ fn grouped_im2col_gemm_execute(
     let m = oc_per_group;
     let k = ic_per_group * kh * kw;
     let n = oh * ow;
-    if n == 0 || m == 0 {
+    if batch == 0 || n == 0 || m == 0 {
         return Ok(vec![]);
     }
+    let is_1x1 = kh == 1
+        && kw == 1
+        && strides.iter().all(|&s| s == 1)
+        && dilations.iter().all(|&d| d == 1)
+        && pads.iter().all(|&p| p == 0);
+    // This source is the production Conv without MLAS. With MLAS it is
+    // compiled only as conv_native for explicit same-binary research: force
+    // Generic here so an environment override cannot turn its GEMM into MLAS.
+    // BNNS and direct NEON remain independent native convolution routes.
+    #[cfg(not(feature = "mlas"))]
     let backend = crate::backend::CpuBackend::auto_detect();
+    #[cfg(feature = "mlas")]
+    let backend = crate::backend::CpuBackend::Generic;
     let mut output = vec![0.0f32; batch * oc * n];
-    let mut col = vec![0.0f32; k * n];
+    let mut col = if is_1x1 {
+        Vec::new()
+    } else {
+        vec![0.0f32; k * n]
+    };
     for b in 0..batch {
         for g in 0..group {
             let x_offset = b * ic * ih * iw + g * ic_per_group * ih * iw;
@@ -845,11 +790,6 @@ fn grouped_im2col_gemm_execute(
             let w_group = &weights[w_offset..][..oc_per_group * k];
             let o_offset = b * oc * n + g * oc_per_group * n;
             let o_group = &mut output[o_offset..][..oc_per_group * n];
-            let is_1x1 = kh == 1
-                && kw == 1
-                && strides.iter().all(|&s| s == 1)
-                && dilations.iter().all(|&d| d == 1)
-                && pads.iter().all(|&p| p == 0);
             if is_1x1 {
                 super::matmul::gemm_with_backend(backend, w_group, x_group, o_group, m, k, n)?;
             } else {
@@ -1309,6 +1249,70 @@ mod tests {
         }
         kernel.execute(&inputs, &mut [output.view_mut()]).unwrap();
         output.to_f32()
+    }
+
+    #[test]
+    fn gemm_driver_matches_exact_scalar_values_across_groups_batches_and_empty_axes() {
+        let mut cases = 0;
+        for group in [1, 2, 3] {
+            for batch in [0, 1, 3] {
+                for (channels, outputs) in [(2, 3), (0, 3), (2, 0)] {
+                    for (height, width, kh, kw, strides, dilations, pads) in [
+                        (5, 7, 1, 1, [1, 1], [1, 1], [0, 0, 0, 0]),
+                        (5, 7, 1, 1, [1, 1], [2, 2], [0, 0, 0, 0]),
+                        (5, 7, 2, 3, [2, 1], [1, 2], [1, 0, 0, 2]),
+                        (1, 1, 3, 2, [1, 1], [1, 1], [0, 0, 0, 0]),
+                        (0, 7, 2, 3, [1, 1], [1, 1], [0, 0, 0, 0]),
+                    ] {
+                        let x_shape = [batch, group * channels, height, width];
+                        let w_shape = [group * outputs, channels, kh, kw];
+                        let (spatial, _) = output_geometry(
+                            &[height, width],
+                            &[kh, kw],
+                            &dilations,
+                            &strides,
+                            pads.to_vec(),
+                            AutoPad::NotSet,
+                        )
+                        .unwrap();
+                        let out_shape = [batch, group * outputs, spatial[0], spatial[1]];
+                        // Small dyadic values make every scalar product/sum exact,
+                        // independently of backend reduction order and bias placement.
+                        let x: Vec<_> = (0..numel(&x_shape))
+                            .map(|i| (i as i32 % 13 - 6) as f32 * 0.25)
+                            .collect();
+                        let w: Vec<_> = (0..numel(&w_shape))
+                            .map(|i| (i as i32 % 7 - 3) as f32 * 0.5)
+                            .collect();
+                        let b: Vec<_> = (0..group * outputs)
+                            .map(|i| (i as i32 % 5 - 2) as f32 * 0.125)
+                            .collect();
+                        for bias in [None, Some(b.as_slice())] {
+                            for relu in [false, true] {
+                                let actual = convolution_gemm_execute(
+                                    &x, &w, bias, &x_shape, &w_shape, &out_shape, group, &strides,
+                                    &dilations, &pads, relu,
+                                )
+                                .unwrap();
+                                let expected = scalar_ref_execute(
+                                    &x, &w, bias, &x_shape, &w_shape, &out_shape, group, &strides,
+                                    &dilations, &pads, relu,
+                                );
+                                assert_eq!(actual.len(), numel(&out_shape));
+                                assert_eq!(
+                                    actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                    expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                    "group={group} X={x_shape:?} W={w_shape:?} strides={strides:?} dilations={dilations:?} pads={pads:?} bias={} relu={relu}",
+                                    bias.is_some(),
+                                );
+                                cases += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 540, "the geometry/epilogue matrix must execute");
     }
 
     #[test]
@@ -2493,13 +2497,14 @@ mod tests {
                     1,
                     false,
                 );
-                let _ = super::im2col_gemm_execute(
+                let _ = super::convolution_gemm_execute(
                     &x,
                     &weights,
                     Some(&bias),
                     &x_shape,
                     &w_shape,
                     &out_shape,
+                    1,
                     &strides,
                     &[1, 1],
                     &pads,
@@ -2527,13 +2532,14 @@ mod tests {
                 bnns_us.push(t0.elapsed().as_micros() as f64);
 
                 let t1 = Instant::now();
-                let _ = super::im2col_gemm_execute(
+                let _ = super::convolution_gemm_execute(
                     &x,
                     &weights,
                     Some(&bias),
                     &x_shape,
                     &w_shape,
                     &out_shape,
+                    1,
                     &strides,
                     &[1, 1],
                     &pads,
@@ -2580,13 +2586,14 @@ mod tests {
                     1,
                     false,
                 );
-                let _ = super::im2col_gemm_execute(
+                let _ = super::convolution_gemm_execute(
                     &x,
                     &w,
                     Some(&bias),
                     &x_shape,
                     &w_shape,
                     &out_shape,
+                    1,
                     &strides,
                     &[1, 1],
                     &pads,
@@ -2611,13 +2618,14 @@ mod tests {
                 );
                 bnns_us.push(t0.elapsed().as_micros() as f64);
                 let t1 = Instant::now();
-                let _ = super::im2col_gemm_execute(
+                let _ = super::convolution_gemm_execute(
                     &x,
                     &w,
                     Some(&bias),
                     &x_shape,
                     &w_shape,
                     &out_shape,
+                    1,
                     &strides,
                     &[1, 1],
                     &pads,

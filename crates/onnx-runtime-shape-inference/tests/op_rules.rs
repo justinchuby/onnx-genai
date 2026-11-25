@@ -5476,6 +5476,15 @@ fn lrn_mvn_reverse_sequence_are_shape_preserving() {
 }
 
 #[test]
+fn mean_variance_normalization_29_preserves_symbolic_shape_and_bfloat16() {
+    let n = with_attr(node("MeanVarianceNormalization", 1, 1), "axes", ints(&[-1]));
+    let shape = vec![sym(7), c(5)];
+    let out = run(&n, vec![tin(DataType::BFloat16, shape.clone())], 29);
+    assert_eq!(out_shape(&out), shape);
+    assert_eq!(out_dtype(&out), DataType::BFloat16);
+}
+
+#[test]
 fn random_generators_shape_and_dtype() {
     // RandomNormal/RandomUniform: shape from attr, dtype override.
     let n = with_attr(
@@ -6699,6 +6708,30 @@ fn seq_in(dtype: DataType, shape: Option<Vec<DimExpr>>) -> NodeIo {
         None => TensorType::dtype_only(dtype),
     };
     NodeIo::container(ValueType::sequence(ValueType::Tensor(tensor)))
+}
+
+#[test]
+fn optional_operand_forms_follow_opset() {
+    for op in ["OptionalHasElement", "OptionalGetElement"] {
+        let n = node(op, 1, 1);
+        assert!(try_run(&n, vec![f32in(vec![c(2)])], 15).is_err());
+        let direct = run(&n, vec![f32in(vec![c(2)])], 18);
+        let wrapped = run(
+            &n,
+            vec![NodeIo::container(ValueType::Optional(Box::new(
+                ValueType::tensor(DataType::Float32, vec![c(2)]),
+            )))],
+            15,
+        );
+        assert_eq!(direct[0].type_info, wrapped[0].type_info);
+    }
+    let omitted = node("OptionalHasElement", 0, 1);
+    assert!(try_run(&omitted, vec![], 15).is_err());
+    let result = run(&omitted, vec![], 28);
+    assert_eq!(
+        result[0].type_info,
+        Some(TypeInfo::new(DataType::Bool, vec![]))
+    );
 }
 
 #[test]

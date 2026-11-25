@@ -721,7 +721,7 @@ impl Kernel for EinsumKernel {
         true
     }
 
-    fn may_produce_views(&self) -> bool {
+    fn may_produce_views(&self, _input_dtypes: &[DataType]) -> bool {
         self.mode == EinsumExecutionMode::Optimized
             && matches!(
                 self.plan.planning_classification(),

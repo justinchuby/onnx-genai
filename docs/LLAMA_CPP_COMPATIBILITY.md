@@ -73,7 +73,7 @@ the configured key count; it does not contain credentials or their digests.
 | POST | `/v1/chat/completions/input_tokens`, `/chat/completions/input_tokens`, `/v1/responses/input_tokens`, `/responses/input_tokens`, `/v1/messages/count_tokens` | Input token counts from the shared inference preparation path |
 | GET, DELETE | `/v1/stream` | Byte-offset replay or explicit producer cancellation by `conv_id` |
 | POST | `/v1/streams/lookup` | Lookup only requested conversation IDs, including model-qualified IDs |
-| POST | `/v1/audio/transcriptions`, `/audio/transcriptions` | Existing multipart transcription contract |
+| POST | `/v1/audio/transcriptions`, `/audio/transcriptions` | Native frame-decoding and generative multipart transcription; typed JSON/SSE, budgets and usage; [contract](TRANSCRIPTION.md) |
 | POST | `/v1/audio/speech`, `/audio/speech`, `/tts` | Declared buffered speech workflow; native input/prompt and raw-prompt handling |
 | WS | `/v1/realtime` | Metadata-declared native streaming audio/text sessions; [contract and current limits](REALTIME.md) |
 | GET | `/models/sse` | Model status, actual per-file download progress, pause/failure and removal events |
@@ -84,6 +84,10 @@ the configured key count; it does not contain credentials or their digests.
 | GET | `/slots` | Actual serial Native slot status; model/autoload selection and fail-on-busy polling |
 | POST | `/slots/{id_slot}?action=save\|restore\|erase` | Owner-thread state actions under opt-in bounded `--slot-save-path`; nxrt state file encoding |
 | GET | `/metrics` | Existing nxrt Prometheus metrics when compiled with `metrics`; names are not llama metric aliases |
+
+Serial Native completion publishes the owner slot snapshot and releases admission
+capacity before its terminal event/reply. A following `/slots` read observes the
+committed `n_past` and idle state without waiting for a worker-loop epilogue.
 
 `/props?model=ID&autoload=false` never loads a model. The default is
 `autoload=true`. The UI uses `autoload=false` for discovery. Unknown/unloaded
@@ -275,20 +279,29 @@ same projection for buffered, SSE and logprob output. Capabilities are checked
 before generation/SSE admission. Supported combinations currently use literal
 boundaries or regex boundaries with a resolved byte DFA, plus
 ByteLevel/ByteFallback or canonical non-byte decoders. Byte decoder sequences
-also support token-local Replace/Strip before one byte stage, Fuse, and initial
-Strip after fusion. These capabilities follow decoder metadata and preserve
+also support token-local Replace/Strip before one byte stage, Fuse, and finite
+initial/trailing Strip after fusion. These capabilities follow decoder metadata and preserve
 generated-stream boundaries, including split Unicode and special-token policy. Pending Unicode bytes,
 regex priority, greedy/lazy continuations and EOF assertions share the publication
 parser's boundary rules. Regexes requiring unsupported DFA look assertions
-and other contextual byte-decoder stages (including trailing stripping) remain
-open compatibility work; errors identify the unsupported decoder path.
+and other unresolved contextual byte-decoder stages remain open compatibility
+work; errors identify the unsupported decoder path. Trailing stripping retains
+bounded UTF-8 suffixes and checks actual reachable endings before admitting a
+candidate; a withheld tail cannot hide a schema violation inside an incomplete
+value. Combined published/retained bytes share the request response budget, and
+composed Strip retention is capped at 4 MiB. Ambiguous suffix viability has an
+explicit 4096-state, bounded retained-state analysis budget and fails actionably
+when exceeded. Reasoning token-ID boundaries must be stable after their final
+token; markers delayed by trailing stripping are rejected before execution.
 Projected JSON accepts split Unicode escapes and surrogate pairs, including
 string constants, known property names, string patterns and scalar length limits.
 An unfinished escape must have a schema-valid scalar completion and never permits
-EOF. Original prompt and output spelling is retained. Escaped DEL in a schema-declared
-property name still has a backend lexical mismatch; its previously supported raw
-key spelling is preserved. Ordinary string values and free property names accept
-escaped DEL. Ordinary JSON output without a response template uses the same
+EOF. Original prompt and output spelling is retained. Declared property names,
+pattern-property exclusions and additional-property exclusions use the same JSON
+quoting lexemes, including DEL and other control escapes. Escaped spelling cannot
+change which value schema owns a known key. Raw DEL remains valid JSON string
+data and is normalized only for recognition, including free property names and
+ordinary values; raw RFC 8259 control bytes remain invalid. Ordinary JSON output without a response template uses the same
 byte-oriented schema recognition, including split escapes and surrogate pairs.
 Forced tool Lark policies use the same declared projection. Reasoning can precede
 the tool envelope, and tool-like examples inside reasoning are excluded from
@@ -355,9 +368,45 @@ are canonicalized only for schema recognition; prompt bytes retain the original
 spelling. Literal escaped backslashes keep their meaning. Grammar-only byte chunks
 may still split UTF-8 scalars. Invalid schema prefixes return a typed 400 error. Tokenizers without an interpretable
 lossless byte codec fail explicitly rather than using lossy token decoding.
-Optional progress/control subscription fields from Llama Chat are accepted, but
+Ordinary runtime-owned decoder generation returns llama.cpp `timings` in native,
+OpenAI completion and chat buffered results and final SSE chunks. Setting
+`timings_per_token=true` adds cumulative token-boundary measurements to SSE,
+including through the chat reasoning/tool-channel projection. Native/ORT clocks
+measure actual forward and selection work before commit-only publication;
+network delivery, callback delays and scheduler suspension are excluded. The
+first generated token comes from prompt logits, so predicted throughput uses
+`predicted_n - 1` generation steps. Prompt timing counts fresh tokens and reports
+input reuse separately as `cache_n`; it is unrelated to retained `tokens_cached`.
+Standalone prompt-only evaluation (`n_predict=0`) reports the same measurements
+with zero predicted tokens and generation duration. A Native full-cache hit
+executes no forward and reports zero prompt work/time; the ORT test reference
+retains its real final-token reevaluation. Executors without this timing contract
+(including ORT speculative and composite paths) omit the measurements. Native
+speculative prompt-lookup/MTP loops report actual prompt, proposal, verification
+and accepted-path work with cumulative accepted-token counts; rejected draft
+work remains included in the generation cost. Multi-token target verification
+requires one logits row per draft position and a consistent nonempty vocabulary.
+A mismatch returns an actionable error and rolls back provisional state; a
+last-token-only target can use `num_speculative_tokens=1`.
+For ordinary decoder SSE on native/OpenAI completions, chat and infill,
+`return_progress=true` publishes `prompt_progress` with `total`, `cache`,
+`processed` and elapsed `time_ms`. As upstream, `processed` includes cached tokens.
+Events describe actual execution boundaries: a whole-prompt forward reports its
+start and completion; constructing a semantic-prefix snapshot also reports that
+real intermediate boundary. Freshly computed prefix bytes count as processed
+work, never input reuse; only previously retained prefix state counts as `cache`.
+Progress is provisional execution telemetry and may precede a later error or
+cancellation; it does not expose tokens or promise a committed turn. Observer
+failure follows ordinary atomic rollback. Native prompt-only SSE also reports
+start/completion boundaries, including cache-only hits, and delivers progress
+while evaluation is running. Closing its receiver cancels provisional work;
+its final result follows state/slot and capacity publication. Native speculative
+execution reports the actual initial target-prompt forward and checks cancellation
+at proposal/verification boundaries; it currently evaluates a cold prompt and
+reports zero input reuse. ORT speculative/composite execution and continuous
+batching progress remain open contracts.
 `/props.nxrt_capabilities` advertises resumable streams and the live reasoning
-control endpoint. Per-token timing/progress events are not promised.
+control endpoint.
 An SSE request with `X-Conversation-Id` retains generation independently of its
 HTTP reader. Reconnect with `/v1/stream?conv_id=ID&from=BYTE_OFFSET`; DELETE cancels
 the producer. Retention defaults to 16 streams and 4 MiB per stream, with completed
@@ -405,9 +454,26 @@ and prompts filling the complete context. Declared standalone runtime-owned
 decoders support this operation; composite/authored workflows without an explicit
 prefill contract return an actionable 400 before execution. Portable ORT runner
 KV snapshots retain actual bytes under a host-memory lease and can warm later
-requests; `tokens_cached` counts materialized reuse, never a token-only match.
+requests; reuse counts require materialized state, never a token-only match.
 `cache_prompt=false` forces complete prompt evaluation. Other ORT runner modes can still evaluate but report zero cross-request
-reuse. Native evaluation retains its ordinary implementation cache.
+reuse. Native prompt-only evaluation reuses the actual materialized prefix when
+its metadata permits reuse and the physical owner matches. A complete hit
+executes no forward; appends evaluate only the suffix. Sliceable KV can rewind a
+diverged/shorter prefix; non-sliceable state recomputes instead of claiming a
+history-only hit. `cache_prompt=false` forces full Native evaluation too.
+Cancelled evaluations discard uncommitted stateless cache state and release
+admission capacity. For prompt-only and ordinary generation responses, `tokens_cached` is the materialized
+cache retained after the task, matching the pinned
+[upstream final-response assignment](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-context.cpp#L2185).
+It is distinct from the engine's `prefix_cache_hit_len`, which measures this
+request's input reuse. A cold evaluation can therefore retain a nonempty cache.
+Ordinary Native generation also retains newly evaluated state after
+`cache_prompt=false`; the option prevents input reuse, rather than discarding
+that request's output cache. Retention is captured in the engine result at
+completion, so a later request cannot change an earlier response's count.
+The count comes from the materialized cursor, not prompt-plus-output token
+arithmetic: the final sampled token may not yet have been consumed by a forward.
+OpenAI cached-prompt usage continues to report input reuse separately.
 Native multimodal prompt objects and infill extra files still require further
 engine support. Native embedding normalization supports -1, 0 and positive integer p-norms; zero vectors
 remain zero. Token-counting routes use the same prompt renderer and declared media expansion
@@ -425,6 +491,24 @@ bounded WAV workflow. `raw_prompt=true` bypasses text assembly and requires empt
 `instructions`; token and output-unit limits still apply. Voice cloning,
 undeclared voices/languages, and active synthesis controls are rejected rather
 than ignored. The OpenAI speech request also rejects unknown controls.
+
+Buffered speech supports native `/tts` `response_format=wav` (default), `pcm`
+(float32 little-endian), and `pcm16` (signed 16-bit little-endian). OpenAI
+`/v1/audio/speech` and `/audio/speech` accept `wav` and map `pcm` to signed
+16-bit samples. Raw PCM responses declare the package's output sample rate,
+channel count (when greater than one), encoding and bit depth in `Content-Type`.
+The declared output rate and channels are preserved; no implicit mono conversion
+or 24 kHz override is applied. Float waveform outputs retain their precision
+until transport encoding. An already encoded post-adapter PCM16 WAV can only
+provide its existing quantized samples, scaled by 32768 for float transport.
+PCM16 waveform encoding rounds `clamp(sample, -1, 1) * 32767`, including WAV;
+nonfinite waveform samples fail with their sample index. Streaming speech
+remains unsupported for these buffered workflow contracts.
+
+For example, `curl http://localhost:8080/tts -H 'Content-Type: application/json'
+-d '{"input":"hello","response_format":"pcm"}' --output speech.f32` returns
+interleaved float32 samples at the rate and channels named in the response header.
+
 
 Explicit API failures carry numeric HTTP `code`, `message` and protocol `type`.
 Invalid JSON/parameters use `invalid_request_error`; absent models/routes use
@@ -457,7 +541,8 @@ parity. These upstream capabilities remain incomplete:
   partial function-call fragment projection, broader pressure/overlap acceptance and
   device-backed wire acceptance; see [realtime](REALTIME.md) for the implemented
   WebSocket session modes, resource bounds and Native CPU evidence.
-- Multimodal/joint decision heads and shared generation/decision entry points.
+- Video decision inputs, broader audio codecs and additional DSP operations/conventions,
+  joint/packed decision heads and shared generation/decision entry points.
 - Device-state/multi-sequence slot persistence; arbitrary GGUF/PEFT LoRA imports and device-fused LoRA.
 - GGUF package import, quantization selectors and selective sidecar management.
   Hugging Face nxrt-package download, resume and deletion are supported.
@@ -465,8 +550,12 @@ parity. These upstream capabilities remain incomplete:
 `/v1/systemone` executes text/structured-state decision profiles, with explicit
 model-authored prompting, calibration outputs, variants and answer policies.
 Core schema v1.11 declares input defaults, instruction/payload rules, option
-ordering, score ranges and canonical legends. Multimodal/joint heads and shared
-generation/decision entry points remain open; see [SystemOne](SYSTEMONE.md). Route presence does not
+ordering, score ranges and canonical legends. Decision v2 in core schema v1.14 additionally executes ordered state images,
+including `files`/`images` and embedded chat image parts, with actual media-aware
+usage. Decision v3 in core schema v1.15 adds ordered mixed image/audio state and
+per-question spoken instructions using [supported encoded audio](AUDIO_PREPROCESSING.md#encoded-audio-formats). Video, unsupported audio codecs,
+joint/packed heads and shared generation/decision
+entry points remain open; see [SystemOne](SYSTEMONE.md). Route presence does not
 claim every upstream decision-model format is admitted.
 
 Model download/delete require `--model-cache-dir`; operator-configured paths
@@ -568,7 +657,7 @@ repetitions above 2,000 are refused and larger upper bounds become unbounded.
 The model must declare a dense, resolved, token-local byte vocabulary. Actual
 raw pieces include special-token spellings; only explicitly declared ending IDs
 receive terminal semantics. Token names and angle brackets do not guess roles.
-Non-byte contextual decoders and stream-initial stripping currently return an
+Non-byte contextual decoders and stream-initial/trailing stripping currently return an
 actionable capability error before SSE.
 
 Both raw grammar forms conflict with JSON `response_format`, forced `tool_choice`, and
@@ -651,3 +740,29 @@ the tokenizer; regex boundaries can declare individual registered spellings in
 tokenizer is not mutated, and buffered/SSE output uses the same policy, including
 logprob delivery and transactional publication. UTF-8 decoder lookbehind remains
 request-local. Raw grammar recognition continues to inspect model bytes and IDs.
+
+Audio preprocessing admits package-authored mel counts, sample rates, FFT/hop
+and Hann-window lengths through the executable log-mel program. Numerical
+acceptance includes an independent direct DFT and Native workflows using
+nonstandard geometry. Feature-tensor serving also executes the model-authored
+audio program, with explicit named output binding and runtime shape checks;
+rank-3 shapes never select a hidden default analysis recipe. Pure-waveform normalization, named transform dataflow and validity publication
+execute as described in [audio preprocessing](AUDIO_PREPROCESSING.md). Additional
+DSP operations, window/mel conventions and codecs remain open; this does not imply
+full audio parity.
+
+File transcription now executes declared one-pass CTC/greedy acoustic workflows
+as well as the existing generative speech path. Both aliases expose typed
+transcript done/delta events, usage, request output budgets and SSE termination.
+Native waveform-dependent HTTP acceptance is documented in
+[transcription](TRANSCRIPTION.md); generative ASR uses a versioned model-authored prompt/response contract shared
+with CLI transcription. Declared language/context conditioning and bounded
+buffered/SSE projection execute as described there; richer generative media
+accounting remains open.
+
+CLI transcription also executes frame-decoding packages and uses compiled preprocessing
+windows at the actual source rate, preserving exact sample cutoffs; encoded-audio
+serving accepts waveform outputs without a mel shape. See [transcription](TRANSCRIPTION.md).
+
+Encoded audio support and decoder limitations are documented in
+[audio preprocessing](AUDIO_PREPROCESSING.md#encoded-audio-formats).

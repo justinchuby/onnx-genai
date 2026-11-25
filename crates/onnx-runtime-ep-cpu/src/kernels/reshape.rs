@@ -26,7 +26,7 @@ impl KernelFactory for ReshapeFactory {
 }
 
 impl Kernel for ReshapeKernel {
-    fn may_produce_views(&self) -> bool {
+    fn may_produce_views(&self, _input_dtypes: &[onnx_runtime_ir::DataType]) -> bool {
         true
     }
 

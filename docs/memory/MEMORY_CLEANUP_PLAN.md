@@ -2476,3 +2476,21 @@ individual noisy repetitions remain visible. The final single-row gated point
 change is +1.4%, so a small cost is not excluded; no universal zero-overhead or
 model-throughput conclusion is made. Host resource tests retain exact full-lane
 charges, zero warm issuer callbacks and trim-to-zero checks.
+
+
+### Initialize decoded workspace according to live projections
+
+The one admitted BlockMatMul/BlockMoE/QMoE decode lane now initializes only the
+prefix requested by the current projection. A monotone dispatch-local prefix
+replaces the full-lane bool: first use clears its live span, larger later phases
+clear only new elements, and smaller phases retain initialized storage. A fresh
+binding discards the prior dispatch's proof. Prepared helpers pass the owner to
+the canonical checked plan split rather than clearing a complete maximum lane.
+
+Capacity/overflow errors precede writes. Decoder failures preserve valid f32
+initialization without publishing partial tensor output. Dense hits still leave
+decoder scratch untouched. The maximum capacity, charge, logical shard plan and
+all grant/refund operations remain unchanged; no finer quota is introduced.
+The [state/resource checks and mutation control](../benchmarks/decoded-scratch-prefix/README.md)
+cover sparse actual expert groups and pool changes. No inference latency, RSS,
+CUDA runtime or complete-process memory conclusion follows from this change.
