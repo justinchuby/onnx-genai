@@ -1,4 +1,4 @@
-//! Whisper-compatible audio preprocessing.
+//! Metadata-driven waveform preprocessing and configurable log-mel analysis.
 
 use std::f32::consts::PI;
 use std::fmt;
@@ -196,6 +196,14 @@ impl LogMelExtractor {
     }
 
     fn extract_resampled(&self, samples: &[f32]) -> Result<LogMelFeatures, AudioPreprocessError> {
+        let mut features = self.extract_log_resampled(samples)?;
+        normalize_log_mel(&mut features.data);
+        Ok(features)
+    }
+    fn extract_log_resampled(
+        &self,
+        samples: &[f32],
+    ) -> Result<LogMelFeatures, AudioPreprocessError> {
         let n_frames = samples.len() / self.hop_length;
         let count = self.n_mels.checked_mul(n_frames).ok_or_else(|| {
             AudioPreprocessError::InvalidConfig(
@@ -233,13 +241,9 @@ impl LogMelExtractor {
             }
         }
 
-        if let Some(maximum) = features.iter().copied().reduce(f32::max) {
-            let floor = maximum - 8.0;
-            for value in &mut features {
-                *value = (value.max(floor) + 4.0) / 4.0;
-            }
+        if features.iter().any(|value| !value.is_finite()) {
+            return Err(AudioPreprocessError::InvalidConfig("log-mel power/log values are nonfinite; reduce waveform amplitude or rescale before analysis".into()));
         }
-
         Ok(LogMelFeatures {
             data: features,
             n_mels: self.n_mels,
@@ -248,10 +252,22 @@ impl LogMelExtractor {
     }
 }
 
+fn normalize_log_mel(features: &mut [f32]) {
+    if let Some(maximum) = features.iter().copied().reduce(f32::max) {
+        let floor = maximum - 8.0;
+        for value in features {
+            *value = (value.max(floor) + 4.0) / 4.0;
+        }
+    }
+}
+
 /// Decodes integer 16-bit PCM WAV bytes and mixes all channels to mono.
 pub fn decode_wav_pcm16(bytes: &[u8]) -> Result<DecodedAudio, AudioPreprocessError> {
     let mut reader = hound::WavReader::new(Cursor::new(bytes))?;
     let spec = reader.spec();
+    if spec.sample_rate == 0 {
+        return Err(AudioPreprocessError::InvalidSampleRate);
+    }
     if spec.sample_format != hound::SampleFormat::Int || spec.bits_per_sample != 16 {
         return Err(AudioPreprocessError::UnsupportedWav(format!(
             "expected 16-bit integer PCM, got {:?} with {} bits",
@@ -879,250 +895,8 @@ pub struct NamedAudioTensor {
     pub data: AudioTensorData,
 }
 
-#[derive(Clone, Debug)]
-struct AudioProgramOutput {
-    name: String,
-    content: String,
-}
-
-/// An executable audio preprocessing program resolved from package metadata.
-///
-/// The program is data, not a model-family branch: the transform list says which
-/// sampling rate to resample to, how long the fixed analysis window is, and what
-/// the log-mel filterbank looks like. Everything the runtime needs to turn
-/// encoded bytes into an encoder feature tensor comes from that declaration.
-#[derive(Debug)]
-pub struct AudioProgram {
-    sample_rate: u32,
-    target_length: Option<usize>,
-    hop_length: usize,
-    extractor: LogMelExtractor,
-    outputs: Vec<AudioProgramOutput>,
-}
-
-impl AudioProgram {
-    /// Resolves an executable program from its typed metadata declaration.
-    pub fn from_program(
-        program: &onnx_genai_metadata::AudioPreprocessingProgram,
-    ) -> Result<Self, AudioPreprocessError> {
-        let mut sample_rate: Option<u32> = None;
-        let mut target_length: Option<usize> = None;
-        let mut num_mel_bins: Option<usize> = None;
-        let mut hop_length = WHISPER_HOP_LENGTH;
-        let mut n_fft = WHISPER_N_FFT;
-        let mut win_length = WHISPER_N_FFT;
-        let mut produced: Vec<String> = Vec::new();
-        let mut decoded = false;
-        let mut mel_produced = false;
-        for transform in &program.transforms {
-            match transform.op.as_str() {
-                "decode" => decoded = true,
-                "resample" => {
-                    sample_rate = Some(transform.sample_rate.ok_or_else(|| {
-                        AudioPreprocessError::InvalidConfig(
-                            "audio 'resample' transform requires sample_rate".to_owned(),
-                        )
-                    })?);
-                }
-                "pad" | "trim" => {
-                    target_length = Some(transform.target_length.ok_or_else(|| {
-                        AudioPreprocessError::InvalidConfig(format!(
-                            "audio '{}' transform requires target_length",
-                            transform.op
-                        ))
-                    })?);
-                    if transform.pad_value.unwrap_or(0.0) != 0.0 {
-                        return Err(AudioPreprocessError::InvalidConfig(
-                            "audio padding only supports silence (pad_value 0)".to_owned(),
-                        ));
-                    }
-                }
-                "log_mel" => {
-                    if !decoded {
-                        return Err(AudioPreprocessError::InvalidConfig(
-                            "audio preprocessing must decode before computing a spectrogram"
-                                .to_owned(),
-                        ));
-                    }
-                    n_fft = transform.n_fft.unwrap_or(WHISPER_N_FFT);
-                    hop_length = transform.hop_length.unwrap_or(WHISPER_HOP_LENGTH);
-                    win_length = transform.win_length.unwrap_or(n_fft);
-                    if let Some(window) = &transform.window
-                        && window != "hann"
-                    {
-                        return Err(AudioPreprocessError::InvalidConfig(format!(
-                            "unsupported analysis window '{window}'; this runtime implements hann"
-                        )));
-                    }
-                    if let Some(scale) = &transform.mel_scale
-                        && scale != "slaney"
-                    {
-                        return Err(AudioPreprocessError::InvalidConfig(format!(
-                            "unsupported mel scale '{scale}'; this runtime implements slaney"
-                        )));
-                    }
-                    num_mel_bins = Some(transform.num_mel_bins.ok_or_else(|| {
-                        AudioPreprocessError::InvalidConfig(
-                            "audio 'log_mel' transform requires num_mel_bins".to_owned(),
-                        )
-                    })?);
-                    if let Some(rate) = transform.sample_rate {
-                        sample_rate = Some(rate);
-                    }
-                    mel_produced = true;
-                }
-                "normalize" => {
-                    let mode = transform.mode.as_deref().unwrap_or("whisper_log_mel");
-                    if mode != "whisper_log_mel" {
-                        return Err(AudioPreprocessError::InvalidConfig(format!(
-                            "unsupported audio normalization mode '{mode}'"
-                        )));
-                    }
-                    if !mel_produced {
-                        return Err(AudioPreprocessError::InvalidConfig(
-                            "log-mel normalization requires a preceding spectrogram".to_owned(),
-                        ));
-                    }
-                }
-                "emit_valid_frames" | "emit_valid_samples" | "spectrogram" => {}
-                other => {
-                    return Err(AudioPreprocessError::InvalidConfig(format!(
-                        "unsupported audio transform '{other}'"
-                    )));
-                }
-            }
-            if let Some(names) = &transform.outputs {
-                produced.extend(names.iter().cloned());
-            }
-        }
-        if !decoded {
-            return Err(AudioPreprocessError::InvalidConfig(
-                "audio preprocessing must declare a decode transform".to_owned(),
-            ));
-        }
-        let num_mel_bins = num_mel_bins.ok_or_else(|| {
-            AudioPreprocessError::InvalidConfig(
-                "audio preprocessing must declare a log_mel transform".to_owned(),
-            )
-        })?;
-        let sample_rate = sample_rate.unwrap_or(WHISPER_SAMPLE_RATE);
-        let mut outputs = Vec::with_capacity(program.outputs.len());
-        for binding in &program.outputs {
-            if !produced.iter().any(|name| name == &binding.source) {
-                return Err(AudioPreprocessError::InvalidConfig(format!(
-                    "audio output '{}' has no transform producing '{}'",
-                    binding.name, binding.source
-                )));
-            }
-            outputs.push(AudioProgramOutput {
-                name: binding.name.clone(),
-                content: binding.content.clone(),
-            });
-        }
-        Ok(Self {
-            sample_rate,
-            target_length,
-            hop_length,
-            extractor: LogMelExtractor::from_config(LogMelConfig {
-                n_mels: num_mel_bins,
-                sample_rate,
-                n_fft,
-                hop_length,
-                win_length,
-            })?,
-            outputs,
-        })
-    }
-
-    /// Runs the program over a batch of encoded clips, one row per clip.
-    ///
-    /// Every row shares the declared analysis window, so a short clip is padded
-    /// with silence and reports fewer valid frames than the padded row length.
-    /// That keeps the encoder input rectangular while leaving each request's
-    /// true duration recoverable and request-aligned.
-    pub fn run(&self, encoded: &[&[u8]]) -> Result<Vec<NamedAudioTensor>, AudioPreprocessError> {
-        if encoded.is_empty() {
-            return Err(AudioPreprocessError::InvalidConfig(
-                "audio preprocessing requires at least one clip".to_owned(),
-            ));
-        }
-        let mut decoded = Vec::with_capacity(encoded.len());
-        for bytes in encoded {
-            let audio = decode_wav_pcm16(bytes)?;
-            let mut samples = resample(&audio.samples, audio.sample_rate, self.sample_rate)?;
-            let valid_samples = samples.len();
-            if let Some(target) = self.target_length {
-                // resize both pads a short clip with silence and trims a long one.
-                samples.resize(target, 0.0);
-            }
-            decoded.push((samples, valid_samples));
-        }
-        let frames = decoded
-            .iter()
-            .map(|(samples, _)| samples.len() / self.hop_length)
-            .max()
-            .unwrap_or(0);
-        if decoded.len() > 1
-            && decoded
-                .iter()
-                .any(|(samples, _)| samples.len() / self.hop_length != frames)
-        {
-            return Err(AudioPreprocessError::InvalidConfig(
-                "batched audio preprocessing requires a declared fixed analysis window".to_owned(),
-            ));
-        }
-        let n_mels = self.extractor.n_mels;
-        let mut features = Vec::with_capacity(decoded.len() * n_mels * frames);
-        let mut valid_frames = Vec::with_capacity(decoded.len());
-        let mut waveform = Vec::new();
-        for (samples, valid_samples) in &decoded {
-            let mel = self.extractor.extract_resampled(samples)?;
-            features.extend_from_slice(&mel.data);
-            valid_frames.push(i64::try_from(
-                (valid_samples.div_ceil(self.hop_length)).min(frames),
-            )?);
-            waveform.extend_from_slice(samples);
-        }
-        let batch = i64::try_from(decoded.len())?;
-        let mut tensors = Vec::with_capacity(self.outputs.len());
-        for output in &self.outputs {
-            let tensor = match output.content.as_str() {
-                "audio_features" => NamedAudioTensor {
-                    name: output.name.clone(),
-                    shape: vec![batch, i64::try_from(n_mels)?, i64::try_from(frames)?],
-                    data: AudioTensorData::Fp32(features.clone()),
-                },
-                "valid_frames" => NamedAudioTensor {
-                    name: output.name.clone(),
-                    shape: vec![batch],
-                    data: AudioTensorData::Int64(valid_frames.clone()),
-                },
-                "valid_samples" => NamedAudioTensor {
-                    name: output.name.clone(),
-                    shape: vec![batch],
-                    data: AudioTensorData::Int64(
-                        decoded
-                            .iter()
-                            .map(|(_, valid)| i64::try_from(*valid))
-                            .collect::<Result<Vec<_>, _>>()?,
-                    ),
-                },
-                "waveform" => NamedAudioTensor {
-                    name: output.name.clone(),
-                    shape: vec![batch, i64::try_from(waveform.len() / decoded.len())?],
-                    data: AudioTensorData::Fp32(waveform.clone()),
-                },
-                other => {
-                    return Err(AudioPreprocessError::InvalidConfig(format!(
-                        "unsupported audio output content '{other}'"
-                    )));
-                }
-            };
-            tensors.push(tensor);
-        }
-        Ok(tensors)
-    }
-}
+mod program;
+pub use program::AudioProgram;
 
 impl From<std::num::TryFromIntError> for AudioPreprocessError {
     fn from(error: std::num::TryFromIntError) -> Self {
@@ -1166,6 +940,7 @@ transforms:
     outputs: [features]
     mode: whisper_log_mel
   - op: emit_valid_frames
+    hop_length: 160
     inputs: [windowed]
     outputs: [valid_frames]
 outputs:
@@ -1457,8 +1232,12 @@ mod geometry_tests {
 transforms:
   - op: decode
     outputs: [samples]
-  - op: log_mel
+  - op: resample
     inputs: [samples]
+    outputs: [resampled]
+    sample_rate: 8000
+  - op: log_mel
+    inputs: [resampled]
     outputs: [features]
     sample_rate: 8000
     num_mel_bins: 7
@@ -1466,7 +1245,8 @@ transforms:
     hop_length: 64
     win_length: 96
   - op: emit_valid_frames
-    inputs: [samples]
+    hop_length: 64
+    inputs: [resampled]
     outputs: [frames]
 outputs:
   - {source: features, name: features, content: audio_features, dtype: float32}

@@ -2216,6 +2216,7 @@ dependencies = [
  "onnx-genai-metadata",
  "rustfft",
  "serde",
+ "serde_json",
  "serde_yaml",
 ]
 
