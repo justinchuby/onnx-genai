@@ -2672,3 +2672,40 @@ DFT advertised only floats despite integer controls. The exact edge union and
 per-slot floating signal/output, integer length, and int64 axis declarations
 now agree with the kernel. The cross-crate shape fixture also receives the
 explicit forward direction required by the shared DFT shape interface.
+
+
+### RMS schemas share admitted staging and one statistics pass
+
+Standard RMSNormalization and both registrations of SimplifiedLayerNormalization
+now use one kernel with an explicit schema kind. The allocating `rms_norm_dense`
+interface and the duplicate Simplified execution path are removed. The shared
+metadata geometry checks axis, normalization/group products, broadcastability,
+contiguous stride arithmetic, floating storage and complete output shapes before
+planning a two-region StepScoped Host layout. It contains `X.numel()` f32 values
+for Y and, only when requested, one f32 inverse RMS per group. An absent optional
+statistics slot consumes no storage. No kernel-owned pool or per-row grant is
+introduced; the existing execution owner admits the graph's maximum requirement.
+
+Both checked regions are initialized before f32 references form. All groups are
+computed into staging before either output is published, preserving X/output,
+scale/output and statistics/input aliases. The same inverse RMS supplies Y and
+the optional statistic; the old second sum-of-squares pass is removed. The
+existing SIMD exact-identity path and multiply order remain intact, while only
+the general broadcast path builds rank-sized index strides. Empty outer groups
+need no scratch but still validate Host accessibility, views and outputs; an
+empty normalized width remains an error.
+
+The regression set covers fresh and poisoned scratch, prefix canaries,
+missing/short/misaligned backing, optional holes, invalid shapes/dtypes,
+overflow, aliases, half/strided inputs and exact statistic bits. A real governed
+lane executes 4,096 warm preparation/checkout/compute/return cycles without
+further issuer callbacks, including zero-byte callback controls, and refunds
+physical capacity only after idle trimming. An encoded two-schema session shares
+one 40-byte peak, refuses a 39-byte Host quota and re-admits after reclamation.
+The shipping ORT plugin test disables fallback, requires both RMS schemas on
+cpu_ep, and changes shapes 2x3/3x9/2x3 while checking Y and inverse RMS values.
+
+Input/scale widening and the general broadcast path's rank-sized stride vectors
+remain outside the staging requirement. These checks prove ownership and
+numerical behavior, not zero total allocations, inference latency, complete RSS
+accounting or CUDA execution.
