@@ -21,6 +21,7 @@ required opaque application inputs:
 | `inputs.operation` | int64 scalar | Control operation below |
 | `inputs.audio` | float32 symbolic vector | Mono normalized PCM, empty except audio operations |
 | `inputs.tokens` | int64 symbolic vector | Package-assembled prompt/text/tool-result IDs, empty when unused |
+| `inputs.token_mask` (optional) | bool symbolic vector | Empty for unconstrained selection, otherwise one admission bit per tokenizer ID; apply before native sampling |
 
 Output bindings live in `profile.outputs`. `tokens` is an int64 symbolic vector;
 `audio`, when declared, is a float32 symbolic vector at
@@ -123,9 +124,24 @@ disconnect cancellation and worker shutdown bound cleanup. An ordinary GET does
 not reserve a worker or impersonate a WebSocket handshake. Transport/prompt
 budgets are configurable through `ServerConfig.realtime` / `RealtimeLimits`.
 
+## Native constrained sampling contract
+
+A workflow declaring `inputs.token_mask` consumes the host grammar mask before
+selecting its text token. A constrained quantum emits at most one text token;
+the next quantum receives a mask advanced from the actual accepted token.
+The host verifies mask membership and grammar completion before publishing
+output, and a contract violation requires native state reset. Audio codec
+state remains workflow-owned. An empty mask means unconstrained selection.
+Logical text constraints check the decoded text directly for completion. Raw
+token grammars require declared EOS IDs. After a text ending, an all-false mask
+permits codec-only quanta to finish without admitting further text.
+
 ## Remaining conformance work
 
-Native grammar forcing still needs integration with this quantum path. Tool
+Turn-based tagged-json tool forcing is connected for workflows declaring
+`inputs.token_mask`, using canonical decoder text and declared EOS roles.
+Profiles without that binding retain protocol/parameter postconditions; native
+forcing for other protocols and duplex tool responses remains open. Tool
 parameter schemas compile through the shared llguidance byte-grammar backend
 before configuration is installed, and complete call arguments must match that
 grammar before publication. This uses the backend's supported schema language,

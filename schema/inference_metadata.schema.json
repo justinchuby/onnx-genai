@@ -3469,6 +3469,13 @@
         "output_token_budget": {
           "type": "string"
         },
+        "token_mask": {
+          "description": "Optional bool vocabulary mask: empty means unconstrained; otherwise one\nadmission bit per tokenizer ID, consumed before native token selection.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "tokens": {
           "type": "string"
         }

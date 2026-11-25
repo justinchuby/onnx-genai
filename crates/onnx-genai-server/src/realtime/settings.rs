@@ -351,7 +351,7 @@ fn selection(value: &Value, field: &str) -> anyhow::Result<Option<String>> {
         .with_context(|| format!("{field} must be a string or null"))?;
     Ok((!value.is_empty()).then(|| value.to_owned()))
 }
-fn choice_name(choice: &ToolChoiceMode) -> &'static str {
+pub(super) fn choice_name(choice: &ToolChoiceMode) -> &'static str {
     match choice {
         ToolChoiceMode::Auto => "auto",
         ToolChoiceMode::None => "none",

@@ -273,6 +273,10 @@ pub enum RealtimeMode {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RealtimeInputs {
+    /// Optional bool vocabulary mask: empty means unconstrained; otherwise one
+    /// admission bit per tokenizer ID, consumed before native token selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_mask: Option<String>,
     pub output_token_budget: String,
     pub operation: String,
     pub audio: String,

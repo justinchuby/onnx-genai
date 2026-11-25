@@ -755,7 +755,13 @@ These are explicit adapter ABIs, not alternative inference of output names.
 
 The `realtime` v1 task ABI declares rates, frame bounds, supported modes and
 opaque application input bindings for operation, mono PCM, discrete text
-IDs and the remaining output-token budget. It declares a default mode and
+IDs and the remaining output-token budget. An optional bool `token_mask`
+binds one admission bit per tokenizer ID before native selection; its empty
+vector means unconstrained selection. A constrained quantum emits at most one
+text token so the next mask follows actual committed token history. Token
+endings derive from declared package token roles, independently of added-token
+registration. The host verifies membership and completion before publication;
+a native contract violation requires state reset. It declares a default mode and
 model-authored conditioning template with explicit voice/language policies.
 Its outputs are final PCM/token vectors, response completion and input-readiness
 bools, and actual per-quantum token counts. The exact operation and tensor contracts are
