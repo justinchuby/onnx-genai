@@ -289,10 +289,12 @@ open compatibility work; errors identify the unsupported decoder path.
 Projected JSON accepts split Unicode escapes and surrogate pairs, including
 string constants, known property names, string patterns and scalar length limits.
 An unfinished escape must have a schema-valid scalar completion and never permits
-EOF. Original prompt and output spelling is retained. Escaped DEL in a schema-declared
-property name still has a backend lexical mismatch; its previously supported raw
-key spelling is preserved. Ordinary string values and free property names accept
-escaped DEL. Ordinary JSON output without a response template uses the same
+EOF. Original prompt and output spelling is retained. Declared property names,
+pattern-property exclusions and additional-property exclusions use the same JSON
+quoting lexemes, including DEL and other control escapes. Escaped spelling cannot
+change which value schema owns a known key. Raw DEL remains valid JSON string
+data and is normalized only for recognition, including free property names and
+ordinary values; raw RFC 8259 control bytes remain invalid. Ordinary JSON output without a response template uses the same
 byte-oriented schema recognition, including split escapes and surrogate pairs.
 Forced tool Lark policies use the same declared projection. Reasoning can precede
 the tool envelope, and tool-like examples inside reasoning are excluded from

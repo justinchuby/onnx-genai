@@ -5021,6 +5021,7 @@ mod tests {
             "type":"object", "properties":{"\n":{"const":1}}, "required":["\n"]
         })
         .to_string();
+        let del_key_schema = serde_json::json!({"type":"object","properties":{"\u{7f}":{"const":1}},"required":["\u{7f}"],"additionalProperties":false}).to_string();
         for (kind, grammar, prefix, suffix) in [
             (
                 GrammarConstraintKind::JsonSchema,
@@ -5032,6 +5033,12 @@ mod tests {
                 GrammarConstraintKind::JsonSchema,
                 control_key_schema.as_str(),
                 r#"{"\u000a":1"#,
+                "}",
+            ),
+            (
+                GrammarConstraintKind::JsonSchema,
+                del_key_schema.as_str(),
+                r#"{"\u007F":1"#,
                 "}",
             ),
             (GrammarConstraintKind::Regex, r"\\u005bx", r"\u005b", "x"),
