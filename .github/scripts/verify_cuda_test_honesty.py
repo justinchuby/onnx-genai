@@ -309,9 +309,9 @@ EXPECTED_EINSUM_TESTS_BY_TARGET = {
     "einsum_gpu": frozenset(
         {
             "auto_fallback_snapshot_is_reused_for_capture_and_replay",
+            "captured_einsum_resources_outlive_kernel_and_caller_owners",
             "captured_generic_resources_outlive_dropped_kernel",
             "captured_optimized_plan_resources_outlive_dropped_kernel",
-            "captured_private_resources_outlive_dropped_einsum_kernels",
             "contraction_rejects_output_alias_before_launch",
             "descriptor_transpose_contractions_match_f64_reference",
             "direct_snapshot_layout_mismatch_fails_closed_during_capture",
@@ -338,6 +338,7 @@ EXPECTED_EINSUM_TESTS_BY_TARGET = {
             "permutation_and_diagonal_use_zero_copy_views_and_materialize_correctly",
             "registry_reachability_and_claim_declines_are_intentional",
             "semantic_capture_mismatch_is_pre_mutation_and_preserves_snapshot",
+            "semantic_einsum_uses_caller_prefix_rebinds_transactionally_and_pins_capture",
             "semantic_signatures_bind_raw_base_offset_and_rewarm_transactionally",
             "semantic_signatures_reject_device_and_alias_mismatch_before_launch",
             "warm_plan_is_allocation_free_with_stable_workspace_through_capture_and_replay",

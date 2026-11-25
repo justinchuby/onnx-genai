@@ -2180,3 +2180,37 @@ snapshot consistency and clean retries after progress/phase cancellation.
 Native MTP is exercised in a subprocess with the ORT library unavailable. The
 actual server driver checks the same counter snapshots after an aborted turn
 and successful retry. This increment does not close the broader acceptance rows.
+
+
+## SSE idle comment pings
+
+The previously accepted but ignored `sse_ping_interval` now configures actual
+idle comment pings for generation transports. A typed policy shares CLI,
+server-default, request validation and `/props` reporting. Default 30 seconds
+matches the pinned upstream; -1 and 0 disable pings. Data resets the idle timer
+and source EOF terminates it. Native completion/infill, OpenAI completion/chat,
+Responses and Anthropic adapters apply the same policy. Replay retains exact
+comment bytes rather than removing them and shifting reconnect offsets.
+
+Wire tests cover idle reset, disablement and termination; HTTP tests cover
+request overrides and rejection across five generation protocols; a real replay
+middleware test checks offsets across comment and UTF-8 payload bytes. This
+increment does not check off unrelated remaining compatibility acceptance rows.
+
+
+## Native final-response field projection
+
+`response_fields` now projects actual native completion/infill terminal results,
+including buffered batches, SSE batches and prompt-only evaluation. An empty
+selector preserves the original response. The pinned source traverses object
+keys and retains the complete slash path as the output key; this differs from
+its README's leaf-renaming description. Missing paths are omitted, array indices
+and JSON Pointer escapes are not inferred. Intermediate token/progress events
+and errors keep their protocol contracts. Native batch completion remains tied
+to its owner outcome channel rather than projected JSON fields.
+
+Unit cases pin nested objects, empty segments, duplicate/missing paths, arrays
+and literal tildes. Real HTTP coverage exercises unchanged empty-selection
+results, nested timing selection, buffered/SSE batches without stop/index,
+prompt-only output, admitted infill, and invalid selector types. This remains an
+increment toward the original compatibility scope, not completion of its rows.

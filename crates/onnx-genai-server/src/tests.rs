@@ -7872,6 +7872,84 @@ mod llama_compat {
     }
 
     #[tokio::test]
+    async fn sse_ping_policy_is_advertised_and_validated_across_generation_protocols() {
+        let router = app(tiny_state());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/props")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(response).await["default_generation_settings"]["params"]["sse_ping_interval"],
+            30
+        );
+        for (path, body) in [
+            ("/completion", json!({"prompt":"hello","n_predict":1})),
+            ("/v1/completions", json!({"prompt":"hello","max_tokens":1})),
+            (
+                "/v1/chat/completions",
+                json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":1}),
+            ),
+            (
+                "/v1/responses",
+                json!({"input":"hello","max_output_tokens":1}),
+            ),
+            (
+                "/v1/messages",
+                json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":1}),
+            ),
+        ] {
+            for value in [json!(-1), json!(0), json!(1), json!(-2), json!(0.5)] {
+                let valid = value.as_i64().is_some_and(|n| n >= -1);
+                let mut body = body.clone();
+                body["sse_ping_interval"] = value;
+                body["stream"] = json!(true);
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(path)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    if valid {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    },
+                    "{path}"
+                );
+                let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                if valid {
+                    assert!(
+                        std::str::from_utf8(&bytes).unwrap().contains("data:"),
+                        "{path}"
+                    );
+                } else {
+                    assert!(
+                        std::str::from_utf8(&bytes)
+                            .unwrap()
+                            .contains("sse_ping_interval"),
+                        "{path}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn upstream_chat_payload_streams_usage_and_rejects_unsupported_controls() {
         let router = app(tiny_state());
         let body = json!({
@@ -8277,6 +8355,87 @@ mod native_compat {
             .await
             .unwrap()
     }
+    #[tokio::test]
+    async fn native_response_fields_project_actual_results_and_preserve_stream_batch_completion() {
+        let router = app(tiny_state());
+        let baseline = request(
+            router.clone(),
+            "/completion",
+            json!({"prompt":"hello","n_predict":1,"return_tokens":true,"response_fields":[]}),
+        )
+        .await;
+        assert_eq!(baseline.status(), StatusCode::OK);
+        let baseline = json_body(baseline).await;
+        let response=request(router.clone(),"/completion",json!({"prompt":"hello","n_predict":1,"return_tokens":true,"response_fields":["content","tokens","timings/predicted_n","missing","tokens/0"]})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let selected = json_body(response).await;
+        assert_eq!(
+            selected,
+            json!({"content":baseline["content"],"tokens":baseline["tokens"],"timings/predicted_n":1})
+        );
+        for stream in [false, true] {
+            let response=request(router.clone(),"/completion",json!({"prompt":["hello","world"],"n_predict":1,"stream":stream,"response_fields":["tokens_predicted"]})).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            if stream {
+                let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                let events = sse_json_events(&bytes);
+                let final_count = events
+                    .iter()
+                    .filter(|value| **value == json!({"tokens_predicted":1}))
+                    .count();
+                assert_eq!(final_count, 2, "{}", String::from_utf8_lossy(&bytes));
+                assert!(
+                    events
+                        .iter()
+                        .filter(|value| value.get("stop").is_some())
+                        .all(|value| value["stop"] == false)
+                );
+            } else {
+                assert_eq!(
+                    json_body(response).await,
+                    json!([{"tokens_predicted":1},{"tokens_predicted":1}])
+                );
+            }
+        }
+        for stream in [false, true] {
+            let response=request(router.clone(),"/completion",json!({"prompt":[2,4,3],"n_predict":0,"stream":stream,"response_fields":["tokens_predicted","timings/predicted_n"]})).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let expected = json!({"tokens_predicted":0,"timings/predicted_n":0});
+            if stream {
+                let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                assert_eq!(sse_json_events(&bytes), vec![expected]);
+            } else {
+                assert_eq!(json_body(response).await, expected);
+            }
+        }
+        let fim = app(
+            tiny_state().with_default_fim_config(Some(onnx_genai_engine::FimConfig {
+                prefix_token: "<PRE>".into(),
+                middle_token: "<MID>".into(),
+                suffix_token: "<SUF>".into(),
+                format: onnx_genai_engine::FimFormat::PSM,
+            })),
+        );
+        let response=request(fim,"/infill",json!({"input_prefix":"hello","input_suffix":"world","n_predict":1,"response_fields":["tokens_predicted"]})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await, json!({"tokens_predicted":1}));
+        for fields in [json!(null), json!("content"), json!(["content", 1])] {
+            let response = request(
+                router.clone(),
+                "/completion",
+                json!({"prompt":"hello","response_fields":fields}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(
+                json_body(response).await["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("response_fields")
+            );
+        }
+    }
+
     #[tokio::test]
     async fn native_dynamic_temperature_matches_the_entropy_interval_endpoint() {
         let router = app(tiny_state());
