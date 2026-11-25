@@ -481,6 +481,67 @@ mod tests {
     use tower::ServiceExt;
 
     #[tokio::test]
+    async fn idle_ping_comments_preserve_exact_replay_offsets() {
+        use axum::response::sse::Event;
+        let registry = ReplayRegistry::new(2, 4096);
+        let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(2);
+        let source = Arc::new(Mutex::new(Some(rx)));
+        let router = Router::new()
+            .route(
+                "/produce",
+                post(move || {
+                    let source = source.clone();
+                    async move {
+                        let receiver = source.lock().unwrap().take().unwrap();
+                        "1".parse::<crate::SsePingInterval>()
+                            .unwrap()
+                            .response(ReceiverStream::new(receiver))
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                registry.clone(),
+                intercept,
+            ));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/produce")
+                    .header("x-conversation-id", "ping-replay")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let first = timeout(Duration::from_secs(5), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(first.starts_with(b":"));
+        tx.send(Ok(Event::default().data("你好"))).await.unwrap();
+        drop(tx);
+        let mut actual = first.to_vec();
+        while let Some(bytes) = timeout(Duration::from_secs(5), body.next()).await.unwrap() {
+            actual.extend_from_slice(&bytes.unwrap());
+        }
+        assert!(std::str::from_utf8(&actual).unwrap().contains("你好"));
+        let replay = registry.get("ping-replay").unwrap();
+        for offset in [0, 1, actual.len() - 1] {
+            let bytes = to_bytes(
+                reader_body(replay.clone(), ByteOffset(offset)).unwrap(),
+                usize::MAX,
+            )
+            .await
+            .unwrap();
+            assert_eq!(bytes.as_ref(), &actual[offset..]);
+        }
+    }
+
+    #[tokio::test]
     async fn replay_readers_are_bounded_and_release_admission_on_disconnect() {
         let replay = Arc::new(Replay::new(4096));
         let mut readers = Vec::new();
