@@ -1,0 +1,4 @@
+{
+  "runtime_sha256": "6502f729519bf4dc67943fcdcfe8ff518acd76f857b77c3fff9cd40331ea8bb4",
+  "note": "Full native2061/MLAS2103/session373/both strict Clippy before adding the extra IEEE test; runtime is unchanged afterward."
+}

@@ -608,8 +608,8 @@ mod tests {
 
     use super::*;
 
-    fn runtime() -> Option<Arc<CudaRuntime>> {
-        crate::test_support::maybe_runtime()
+    fn runtime() -> Option<crate::test_support::NativeRuntimeFixture> {
+        crate::test_support::maybe_native_runtime()
     }
 
     fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
@@ -643,7 +643,7 @@ mod tests {
     /// fp32 output, explicit uint8 zero points) plus a packed int4 / fp16-output
     /// case to prove the layout math generalizes across bit widths and dtypes.
     fn run_gather_parity(bits: i64, block_size: i64, scales_fp16: bool, with_zp: bool) -> f32 {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping GatherBlockQuantized parity test: CUDA runtime unavailable");
             return 0.0;
         };

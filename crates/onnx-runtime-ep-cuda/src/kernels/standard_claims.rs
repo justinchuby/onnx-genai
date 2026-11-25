@@ -17,6 +17,11 @@ pub(crate) fn unsupported_reason_at_opset(
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
         "GatherND" => gather_nd(node, opset, input_dtypes),
         "ConvTranspose" => conv_transpose(node, opset, input_shapes, input_dtypes),
+        "AveragePool" => {
+            return super::pooling::validate_average_claim(node, opset, input_shapes, input_dtypes)
+                .err()
+                .map(|error| error.to_string());
+        }
         _ => return unsupported_reason(node, input_shapes, input_dtypes),
     };
     result

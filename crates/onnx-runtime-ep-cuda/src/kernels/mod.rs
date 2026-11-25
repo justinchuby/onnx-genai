@@ -170,7 +170,8 @@ use pointwise::{
 ///   fallback) plus NVRTC `ReduceMax`/`ReduceMin`, and the f32 NVRTC family
 ///   `ReduceProd`, `ReduceSumSquare`, `ReduceL1`, `ReduceL2`, `ReduceLogSum`,
 ///   `ReduceLogSumExp`; arbitrary axes and keepdims.
-/// * **Pooling** — cuDNN `MaxPool`/`AveragePool` for 2-D NCHW f32/f16/bf16.
+/// * **Pooling** — cuDNN `MaxPool`/undilated `AveragePool` for 2-D NCHW;
+///   NVRTC for dilated N-D `AveragePool` and `LpPool`.
 /// * **Pointwise unary math** — `Abs`, `Neg`, `Reciprocal`, `Exp`, `Log`,
 ///   `Sign`, `Floor`, `Ceil`, `Round`, `Sin`, `Cos`, `Softplus`, and the
 ///   trigonometric/hyperbolic family `Tan`, `Sinh`, `Cosh`, `Asin`, `Acos`,
@@ -1364,7 +1365,7 @@ pub fn build_cuda_registry_with_metrics(
     );
     reg.register(
         OpKey::new("LinearAttention", "com.microsoft", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(linear_attention::LinearAttentionFactory {
             runtime: runtime.clone(),
         }),
@@ -1372,7 +1373,7 @@ pub fn build_cuda_registry_with_metrics(
     reg.register_through(
         OpKey::new("LinearAttention", "", 27),
         28,
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(linear_attention::LinearAttentionFactory {
             runtime: runtime.clone(),
         }),
@@ -1489,9 +1490,19 @@ pub fn build_cuda_registry_with_metrics(
             Box::new(pooling::PoolFactory {
                 kind,
                 runtime: runtime.clone(),
+                average_supports_dilation: false,
             }),
         );
     }
+    reg.register(
+        OpKey::new("AveragePool", "", 19),
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+        Box::new(pooling::PoolFactory {
+            kind: pooling::PoolKind::Average,
+            runtime: runtime.clone(),
+            average_supports_dilation: true,
+        }),
+    );
     reg.register(
         OpKey::new("LpPool", "", 18),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,

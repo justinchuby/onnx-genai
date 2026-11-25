@@ -2791,7 +2791,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "native 1-D / cuDNN 2-D conv",
     ));
     p.push(dedicated("MaxPool", "pooling_gpu.rs", "cuDNN pooling"));
-    p.push(dedicated("AveragePool", "pooling_gpu.rs", "cuDNN pooling"));
+    p.push(dedicated(
+        "AveragePool",
+        "pooling_gpu.rs",
+        "cuDNN and dilated NVRTC pooling",
+    ));
 
     // Attention / KV / sparse family.
     p.push(dedicated(

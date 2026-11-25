@@ -1044,13 +1044,13 @@ mod tests {
     use super::*;
     use onnx_runtime_memory_api::MemoryRole;
 
-    fn rt() -> Option<Arc<CudaRuntime>> {
-        crate::test_support::maybe_runtime()
+    fn rt() -> Option<crate::test_support::NativeRuntimeFixture> {
+        crate::test_support::maybe_native_runtime()
     }
 
     #[test]
     fn new_rejects_indivisible_gqa_groups() {
-        let Some(runtime) = rt() else {
+        let Some((_provider, runtime)) = rt() else {
             eprintln!("skip: no CUDA GPU");
             return;
         };
@@ -1061,7 +1061,7 @@ mod tests {
 
     #[test]
     fn new_accepts_mha_and_gqa_and_mqa() {
-        let Some(runtime) = rt() else {
+        let Some((_provider, runtime)) = rt() else {
             eprintln!("skip: no CUDA GPU");
             return;
         };
@@ -1199,7 +1199,7 @@ mod tests {
     )]
     #[test]
     fn workspace_requirement_matches_layout_for_phase2a_and_is_none_for_fused() {
-        let Some(runtime) = rt() else {
+        let Some((_provider, runtime)) = rt() else {
             eprintln!("skip: no CUDA GPU");
             return;
         };

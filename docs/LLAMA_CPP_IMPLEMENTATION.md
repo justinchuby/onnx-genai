@@ -3,6 +3,8 @@
 Goal: maximize protocol and official-frontend compatibility, implement missing
 server features with real runtime semantics and remove the terminal REPL.
 Self-review and merge tested increments until all acceptance items are complete.
+Tool execution and MCP transport are explicitly excluded by the user's revised
+scope; external harnesses own them. Chat tool-call protocols remain required.
 
 The upstream baseline is pinned in `vendor/llama-chat/UPSTREAM`. A matching route
 name or a successful empty response is not an implemented capability.
@@ -28,7 +30,7 @@ The supported surface and explicit limitations are documented in
 - [ ] Responses and Anthropic Messages, including tools and streamed event contracts.
 - [ ] Generation controls/sampling and reporting needed by the upstream frontend.
 - [ ] Capability-backed ranking, adapter and slot/state operations; audit the engine boundary before introducing transport support.
-- [ ] Optional tools/MCP proxy, model catalogue/download semantics and audio transports; preserve explicit configuration and resource bounds.
+- [ ] Complete model catalogue/source-format semantics and audio transports; preserve explicit configuration and resource bounds. Native-package download, resume and deletion are implemented; GGUF import and sidecar selection remain open.
 - [ ] Full compatibility matrix and executable conformance tests.
 - [ ] Fresh full checks, adversarial self-review, PR description update and merge (CI is currently blocked; user authorized merging after local verification).
 
@@ -1222,30 +1224,6 @@ passed 734 engine tests (1 inherited ignore) and 405 server tests (2 inherited
 ignores). These are functional checks, with no performance claim.
 
 
-## Optional MCP HTTP transport
-
-The official frontend's GET/POST `/cors-proxy` transport is implemented behind
-an independent opt-in network policy. Target admission checks every resolved
-address and pins those addresses into a client that disables environment proxies
-and automatic redirects. Only explicitly prefixed browser headers are eligible
-for forwarding. Redirects return through admission and strip forwarding headers
-when target origins differ, while preserving representation negotiation.
-Remote headers cannot set inference-origin cookies, CORS grants, storage or
-transport policy; remote documents receive a sandbox CSP.
-
-Request and response bytes and idle wait durations have positive operator
-limits. A bounded response queue propagates backpressure, the response body owns
-the transfer task, and dropping the reader cancels it. Timeout after a stalled
-reader remains an error rather than a successful truncated response. Native
-server tools, local tool execution and the other unchecked compatibility work
-remain separate delivery items. Fourteen new proxy/CLI tests passed, including
-real local SSE delivery before EOF, request/response byte limits, disconnect,
-stalled-reader timeout, cross-origin credential isolation and connection quota
-release and active SSE continuing beyond the idle interval. The full server
-library suite passed 419 tests with 2 inherited ignores. Strict server all-target
-Clippy passed. This increment does not complete the remaining delivery items.
-
-
 ## Declared reasoning budgets and grammar prefill
 
 Reasoning budgets lower into a mandatory engine processor shared by host sampling
@@ -1849,19 +1827,90 @@ the generation parser and snapshot once per batch. Native and OpenAI embedding
 transports forward overrides rather than dropping them. Decoder-only extraction
 refuses nonempty adapter selections, and model properties expose embedding-specific
 adapter admission. The compatibility goal remains active for the remaining loader,
-device, model-management, tools and full-matrix acceptance items.
+device, model-management and full-matrix acceptance items.
 
-### Explicit host tools for the official frontend
+### Upstream properties acknowledgement
 
-The seven built-in tools behind `GET/POST /tools` now execute real host operations:
-read, glob/grep, command, write/edit and runtime info. Discovery is independent of
-model loading; model-generated tool calls retain their separate metadata admission.
-`--tools` enables this privilege explicitly. Loopback/explicit trusted origins,
-JSON content type, bounded admission and host-buffer leases precede execution.
-Command SSE uses upstream chunk/done objects, preserves split UTF-8 and cancels
-Unix process groups on disconnect, including after the parent shell exits.
-Writes stage atomically; fuzzy edits preserve untouched lines and validate all
-replacements against the original file. Read-only Git listing disables repository
-fsmonitor execution. Searches and regex matching have explicit resource bounds.
-See [host tools](SERVER_TOOLS.md). MCP stdio and remote/container tool runtimes
-remain open; this increment does not close the overall compatibility goal.
+`--props` enables `POST /props` without loading a model, with the current
+upstream acknowledgement-only response. Request fields do not mutate settings;
+this matches the pinned server-context.cpp handler, which has no mutation schema.
+Both router and model properties report the configured endpoint flag. Router
+properties also report that server tools are unavailable independently of loading.
+
+
+### Tool execution belongs to the external harness
+
+The user explicitly excluded server-provided tool execution from the compatibility
+objective. Built-in filesystem/shell tools, `/tools`, stdio MCP, `/cors-proxy`, and
+container/SSH runtimes are removed from the server and its remaining-work ledger.
+Their CLI/configuration types and dedicated dependencies are removed as well;
+there are no compatibility aliases for these prerelease options.
+
+`/props` advertises `server_tools: false` and `cors_proxy_enabled: false`. Unknown
+tool/proxy routes return JSON 404. OpenAI/Anthropic/Responses tool-call transport,
+model tool-protocol admission and tool-result messages remain in scope. External
+harnesses execute calls and supply results to the next inference request.
+
+### Non-generative SystemOne workflow and transport
+
+The decision v1 profile declares an actual probability-head workflow, tokenizer
+features and model-authored prompt/answer policies. A schema v1.10 gate applies
+in parser and typed admission. `/v1/systemone` routes choice/score/noul requests
+through bounded engine workers with zero generation tokens, accurate multi-variant
+input usage and actionable shape/calibration errors. Canonical leases retain
+converted probabilities through engine-result ownership. A native ONNX fixture
+changes its decisions with the input; it does not simulate a chat answer.
+
+This increment does not establish all upstream decision-model conformance.
+Multimodal inputs, joint/packed heads and shared workflow entry points remain
+required; [SystemOne](SYSTEMONE.md) records the
+current executable contract and explicit gaps. Server tools remain out of scope.
+
+
+### Declared SystemOne input contracts
+
+Core schema v1.11 requires explicit `decision.input_policy`. A single engine
+question factory admits defaults, required/optional/forbidden instructions,
+payload types, enabled question kinds, dynamic/fixed choices, request/lexical
+order, declared score ranges, boolean alias/order rules and legend formatting.
+The HTTP transport supplies its operator limits; it does not duplicate question
+interpretation. Immutable questions/results retain their admitted contract, with
+fixed options and default instructions borrowed from that owner. No model-name
+branch selects request semantics. Schema v1.10 keeps its published contract.
+
+Native inference tests exercise missing/null/non-string default types, changed
+choice ordering, true-first boolean heads, canonical-null alias precedence,
+fixed tasks and one-/eleven-level dynamic score heads. HTTP tests cover authored
+limits, payload rejection and wire legends. These tests establish text decision
+behavior for the authored fixtures; they do not establish media or GGUF support.
+
+
+## Managed native-package downloads
+
+`--model-cache-dir` enables `/models` download/delete and cache-backed load/unload
+without enabling `/v1/admin/*`. A validated Hub plan pins one immutable commit;
+partial files, full quota reservations and publication manifests survive
+restart. Canonical registry entries own transfer or package state, and native
+worker lifetimes retain package ownership until their threads stop. Only
+server-owned cache entries can be removed.
+
+The SSE stream reports upstream model envelopes with actual per-file counters,
+bounded notification storage and consumer-side coalescing. Pause and retry
+retain the original plan and byte prefixes. Model revision changes require
+explicit deletion first. See [model management](MODEL_MANAGEMENT.md) for public
+requests, limits and unsupported GGUF/sidecar source selections.
+
+
+## Multimodal reranking
+
+Core schema v1.12 and reranking v2 declare ordered query/document encoded-image
+endpoints and authoritative workflow token usage. Prepared pairs carry their
+admitted contract and shared media ownership into the ordinary worker command.
+The HTTP layer admits all image positions before fetch, bounds the retained
+request media, and preserves Jina/TEI response semantics.
+
+Reusable image-preprocess@2 binds program output names to component-local ports;
+each invocation publishes its own SSA values. ABI v1 keeps its established
+workflow-scoped single-invocation contract. Chat media capabilities derive from
+runtime Media roles, independently of task-owned application inputs. See
+[reranking](RERANKING.md) for the public contract and native fixture.

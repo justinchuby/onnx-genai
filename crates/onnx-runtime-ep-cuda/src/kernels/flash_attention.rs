@@ -645,7 +645,6 @@ pub(super) fn run(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use half::f16;
 
@@ -660,8 +659,8 @@ mod tests {
         assert!(!supported(2, 0));
     }
 
-    fn runtime() -> Option<Arc<CudaRuntime>> {
-        crate::test_support::maybe_runtime()
+    fn runtime() -> Option<crate::test_support::NativeRuntimeFixture> {
+        crate::test_support::maybe_native_runtime()
     }
 
     fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
@@ -755,7 +754,7 @@ mod tests {
     /// because the defect only surfaces once outputs are large.
     #[test]
     fn f16_tensor_core_prefill_matches_reference_softmax() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping CUDA flash TC parity test: CUDA runtime unavailable");
             return;
         };
