@@ -734,6 +734,33 @@ fn validate_topk_nodes(graph: &Graph) -> Result<(), LoaderError> {
 pub fn validate_split_to_sequence_nodes(graph: &Graph) -> Result<(), LoaderError> {
     use onnx_runtime_ir::DataType;
 
+    fn dtype_through_identity(graph: &Graph, mut value: onnx_runtime_ir::ValueId) -> DataType {
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            let value_info = graph.value(value);
+            if value_info.dtype != DataType::Undefined {
+                return value_info.dtype;
+            }
+            if !visited.insert(value) {
+                return DataType::Undefined;
+            }
+            let Some(producer) = value_info.producer.map(|id| graph.node(id)) else {
+                return DataType::Undefined;
+            };
+            if !producer.is_default_domain()
+                || producer.op_type != "Identity"
+                || !producer.overload.is_empty()
+                || producer.outputs.as_slice() != [Some(value)]
+            {
+                return DataType::Undefined;
+            }
+            let Some(input) = producer.inputs.first().copied().flatten() else {
+                return DataType::Undefined;
+            };
+            value = input;
+        }
+    }
+
     fn admitted(dtype: DataType, opset: u64) -> bool {
         matches!(
             dtype,
@@ -778,7 +805,7 @@ pub fn validate_split_to_sequence_nodes(graph: &Graph) -> Result<(), LoaderError
             let Some(input_id) = node.inputs.first().copied().flatten() else {
                 continue;
             };
-            let dtype = graph.value(input_id).dtype;
+            let dtype = dtype_through_identity(graph, input_id);
             if dtype == DataType::Undefined {
                 continue;
             }

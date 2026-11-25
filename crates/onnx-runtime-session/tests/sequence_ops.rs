@@ -494,6 +494,39 @@ fn split_rejects_known_newer_dtype_even_when_type_metadata_is_unknown() {
     assert!(message.contains("not legal"), "{message}");
 }
 
+#[test]
+fn split_rejects_bfloat16_from_unannotated_identity_direct_graph() {
+    let mut g = Graph::new();
+    g.opset_imports.insert(String::new(), 23);
+    let data = bf16_init(&mut g, "data", &[2], &[0x3f80, 0x4000]);
+    let inferred = g.create_value(DataType::Undefined, static_shape([2]));
+    g.insert_node(Node::new(
+        NodeId(0),
+        "Identity",
+        vec![Some(data)],
+        vec![inferred],
+    ));
+    let seq = op(
+        &mut g,
+        "SplitToSequence",
+        &[inferred],
+        DataType::BFloat16,
+        &[],
+        &[],
+    );
+    let len = op(&mut g, "SequenceLength", &[seq], DataType::Int64, &[], &[]);
+    g.add_output(len);
+
+    let Err(error) = InferenceSession::from_graph(g) else {
+        panic!("opset 23 BF16 behind an unannotated Identity must be rejected");
+    };
+    let message = error.to_string();
+    assert!(message.contains("SplitToSequence"), "{message}");
+    assert!(message.contains("BFloat16"), "{message}");
+    assert!(message.contains("opset 23"), "{message}");
+    assert!(message.contains("opset 24"), "{message}");
+}
+
 /// SplitToSequence with keepdims=0 squeezes the split axis; each element is a
 /// 1-D row. Read element 1 back.
 #[test]

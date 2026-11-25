@@ -88,8 +88,9 @@ pub enum LoaderError {
 
     #[error(
         "illegal ONNX SplitToSequence at node {node}: {detail}. RULES #1: the input tensor dtype \
-         must match the schema selected by the imported ai.onnx opset. Expected: use opset 24+ \
-         for bfloat16, or cast the input to a dtype admitted by the selected SplitToSequence schema"
+         must match the schema selected by the imported ai.onnx opset. Expected: use an ai.onnx \
+         opset whose SplitToSequence schema admits the input dtype, or cast the input to a dtype \
+         admitted by the selected schema"
     )]
     InvalidSplitToSequence { node: String, detail: String },
 
