@@ -337,6 +337,138 @@ impl AudioProgram {
         }
         Ok(Self { steps, outputs })
     }
+    pub(super) fn fixed_waveform_window(rate: u32, target: NonZeroUsize) -> Self {
+        Self {
+            steps: vec![
+                Step {
+                    input: None,
+                    op: Op::Decode,
+                    context: "analysis input".into(),
+                },
+                Step {
+                    input: Some(ValueId(0)),
+                    op: Op::Resample(rate),
+                    context: "analysis sample rate".into(),
+                },
+                Step {
+                    input: Some(ValueId(1)),
+                    op: Op::Pad {
+                        target: Some(target.get()),
+                        value: 0.0,
+                        left: false,
+                        trim: true,
+                    },
+                    context: "analysis sample window".into(),
+                },
+            ],
+            outputs: vec![Output {
+                name: "window".into(),
+                source: ValueId(2),
+            }],
+        }
+    }
+    /// Largest source clip that reaches every published output without a
+    /// window discarding valid samples. Uses the same integer resampling and
+    /// validity rules as execution; unused branches do not constrain admission.
+    /// None means no live trimming window is declared, not a guessed duration.
+    pub fn maximum_input_samples(
+        &self,
+        source_rate: u32,
+    ) -> Result<Option<NonZeroUsize>, AudioPreprocessError> {
+        if source_rate == 0 {
+            return Err(AudioPreprocessError::InvalidSampleRate);
+        }
+        let mut needed = vec![false; self.steps.len()];
+        for output in &self.outputs {
+            let mut id = Some(output.source);
+            while let Some(value) = id {
+                needed[value.0] = true;
+                id = self.steps[value.0].input;
+            }
+        }
+        if !self.steps.iter().zip(&needed).any(|(step, needed)| {
+            *needed && matches!(step.op, Op::Trim(_) | Op::Pad { trim: true, .. })
+        }) {
+            return Ok(None);
+        }
+        #[derive(Clone)]
+        struct Extent {
+            length: usize,
+            rate: u32,
+            valid: Range<usize>,
+        }
+        let fits = |samples: usize| -> bool {
+            let mut values: Vec<Option<Extent>> = vec![None; self.steps.len()];
+            for (index, step) in self.steps.iter().enumerate() {
+                if !needed[index] {
+                    continue;
+                }
+                let mut value = match step.input {
+                    Some(id) => values[id.0].as_ref().unwrap().clone(),
+                    None => Extent {
+                        length: samples,
+                        rate: source_rate,
+                        valid: 0..samples,
+                    },
+                };
+                match &step.op {
+                    Op::Resample(rate) => {
+                        let Ok(length) = resampled_length(value.length, value.rate, *rate) else {
+                            return false;
+                        };
+                        value.valid =
+                            resampled_valid_range(&value.valid, value.rate, *rate, length);
+                        value.length = length;
+                        value.rate = *rate;
+                    }
+                    Op::Pad {
+                        target: Some(target),
+                        left,
+                        trim,
+                        ..
+                    } => {
+                        if *trim {
+                            if !value.valid.is_empty() && value.valid.end > *target {
+                                return false;
+                            }
+                            value.length = value.length.min(*target);
+                            value.valid.start = value.valid.start.min(*target);
+                            value.valid.end = value.valid.end.min(*target);
+                        }
+                        if value.length < *target {
+                            if *left {
+                                let pad = *target - value.length;
+                                value.valid.start += pad;
+                                value.valid.end += pad;
+                            }
+                            value.length = *target;
+                        }
+                    }
+                    Op::Trim(target) => {
+                        if !value.valid.is_empty() && value.valid.end > *target {
+                            return false;
+                        }
+                        value.length = value.length.min(*target);
+                        value.valid.start = value.valid.start.min(*target);
+                        value.valid.end = value.valid.end.min(*target);
+                    }
+                    _ => {}
+                }
+                values[index] = Some(value);
+            }
+            true
+        };
+        let (mut lower, mut upper) = (0usize, usize::MAX);
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2 + 1;
+            if fits(middle) {
+                lower = middle;
+            } else {
+                upper = middle - 1;
+            }
+        }
+        NonZeroUsize::new(lower).map(Some).ok_or_else(||invalid(format!("audio trimming windows cannot admit even one source sample at {source_rate} Hz without discarding valid audio; enlarge the authored window or change its resampling/padding order")))
+    }
     pub fn run(&self, encoded: &[&[u8]]) -> Result<Vec<NamedAudioTensor>, AudioPreprocessError> {
         if encoded.is_empty() {
             return Err(invalid("audio preprocessing requires at least one clip"));
@@ -380,7 +512,7 @@ fn execute(op: &Op, input: Option<&Data>, encoded: &[&[u8]]) -> Result<Data, Aud
         return encoded
             .iter()
             .map(|bytes| {
-                let audio = decode_wav_pcm16(bytes)?;
+                let audio = decode_audio(bytes)?;
                 let len = audio.samples.len();
                 Ok(Wave {
                     samples: audio.samples,
@@ -401,21 +533,11 @@ fn execute(op: &Op, input: Option<&Data>, encoded: &[&[u8]]) -> Result<Data, Aud
                 .iter()
                 .map(|row| -> Result<Wave, AudioPreprocessError> {
                     let samples = resample(&row.samples, row.rate, *rate)?;
-                    // The product fits u128 for every usize/u32 input. Clamp only
-                    // after division so large positions never silently saturate.
-                    let start = (row.valid.start as u128 * u128::from(*rate) / u128::from(row.rate))
-                        .min(samples.len() as u128) as usize;
-                    let end = if row.valid.is_empty() {
-                        start
-                    } else {
-                        (row.valid.end as u128 * u128::from(*rate))
-                            .div_ceil(u128::from(row.rate))
-                            .min(samples.len() as u128) as usize
-                    };
+                    let valid = resampled_valid_range(&row.valid, row.rate, *rate, samples.len());
                     Ok(Wave {
                         samples,
                         rate: *rate,
-                        valid: start..end,
+                        valid,
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -499,7 +621,7 @@ fn execute(op: &Op, input: Option<&Data>, encoded: &[&[u8]]) -> Result<Data, Aud
         Op::Mel(extractor) => {
             let rows = input.waves()?.iter().map(|row| {
                 if row.rate != extractor.sample_rate {
-                    return Err(invalid(format!("log_mel analysis rate {} does not match input WAV rate {}; declare resample before this transform", extractor.sample_rate, row.rate)));
+                    return Err(invalid(format!("log_mel analysis rate {} does not match input audio rate {}; declare resample before this transform", extractor.sample_rate, row.rate)));
                 }
                 let features = extractor.extract_log_resampled(&row.samples)?;
                 let valid = frame_range(&row.valid, features.n_frames, extractor.hop_length);

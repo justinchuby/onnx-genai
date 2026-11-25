@@ -455,7 +455,7 @@ impl ExecutionProvider for CpuExecutionProvider {
         } else {
             &op.domain
         };
-        if !self.registry.supports(&op.op_type, &op.domain, opset) {
+        let Some(factory) = self.registry.lookup(&op.op_type, &op.domain, opset) else {
             if let Some(since) = self
                 .registry
                 .earliest_since_version(&op.op_type, &op.domain)
@@ -475,10 +475,22 @@ impl ExecutionProvider for CpuExecutionProvider {
                 op.op_type,
                 opset
             );
+        };
+        if op.is_default_domain()
+            && op.op_type == "Transpose"
+            && let Some(&dtype) = input_dtypes.first()
+            && let Err(reason) = onnx_runtime_ir::transpose::validate_dtype(dtype, opset)
+        {
+            return KernelMatch::unsupported(reason);
         }
         if let Some(reason) =
             onnx_runtime_ep_api::packed_routed::unsupported_reason(op, shapes, input_dtypes)
         {
+            return KernelMatch::unsupported(reason);
+        }
+        if let Some(reason) = input_dtypes.first().and_then(|&dtype| {
+            onnx_runtime_ir::trig::bf16_unsupported_reason(&op.op_type, &op.domain, opset, dtype)
+        }) {
             return KernelMatch::unsupported(reason);
         }
         if let Some(reason) =
@@ -490,13 +502,21 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
-        if let Some(reason) = onnx_runtime_ep_api::gemm::unsupported_reason(
+        if let Some(reason) =
+            onnx_runtime_ep_api::standard_activation::unsupported_reason(op, opset, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if let Some(reason) = onnx_runtime_ep_api::mean_variance_normalization::unsupported_reason(
             op,
-            opset,
             shapes,
             input_dtypes,
-            crate::kernels::gemm::DTYPES,
         ) {
+            return KernelMatch::unsupported(reason);
+        }
+        if let Some(reason) =
+            onnx_runtime_ir::roi_align::unsupported_reason(op, opset, shapes, input_dtypes)
+        {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "DequantizePacked"
@@ -506,77 +526,12 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             deny!("DequantizePacked: {reason}");
         }
-        if op.op_type == "CompressedSparseAttention"
-            && op.domain == "pkg.nxrt"
-            && let Some(reason) = crate::kernels::compressed_sparse_attention::unsupported_reason(
-                op,
-                shapes,
-                input_dtypes,
-            )
+        if op.op_type == "Dropout"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && let Err(reason) =
+                onnx_runtime_ir::dropout::validate_claim(op, opset, shapes, input_dtypes)
         {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "BlockQuantizedMoE"
-            && op.domain == "pkg.nxrt"
-            && let Some(reason) =
-                crate::kernels::block_quantized_moe::unsupported_reason(op, shapes, input_dtypes)
-        {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "IndexShare"
-            && op.domain == "pkg.nxrt"
-            && let Some(reason) =
-                crate::kernels::index_share::unsupported_reason(op, shapes, input_dtypes)
-        {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "DsaIndexSelect"
-            && op.domain == "pkg.nxrt"
-            && let Some(reason) =
-                crate::kernels::dsa_index_select::unsupported_reason(op, shapes, input_dtypes)
-        {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "VarlenAttention"
-            && op.domain == "pkg.nxrt"
-            && let Some(reason) =
-                crate::kernels::varlen_attention::unsupported_reason(op, shapes, input_dtypes)
-        {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "PackedVarlenAttention"
-            && op.domain == "pkg.nxrt"
-            && let Some(reason) = crate::kernels::packed_varlen_attention::unsupported_reason(
-                op,
-                shapes,
-                input_dtypes,
-            )
-        {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "TensorScatter"
-            && op.domain.is_empty()
-            && let Some(reason) =
-                crate::kernels::tensor_scatter::tensor_scatter_unsupported_reason(input_dtypes)
-        {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "STFT"
-            && op.domain.is_empty()
-            && let Some(reason) = crate::kernels::stft::unsupported_dtype_reason(input_dtypes)
-        {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "Einsum"
-            && op.domain.is_empty()
-            && let Some(reason) = crate::kernels::einsum::unsupported_reason_for_opset(
-                op,
-                opset,
-                shapes,
-                input_dtypes,
-            )
-        {
-            return KernelMatch::unsupported(reason);
+            deny!("Dropout: {reason}");
         }
         // The numeric extrema kernel predates BOOL, which entered both schemas in opset 20.
         if opset < 20
@@ -589,65 +544,24 @@ impl ExecutionProvider for CpuExecutionProvider {
                 op.op_type
             );
         }
-        if op.op_type == "DeformConv"
-            && domain.is_empty()
-            && let Err(reason) =
-                onnx_runtime_ir::deform_conv::validate_claim(op, opset, shapes, input_dtypes)
-        {
-            return KernelMatch::unsupported(format!("DeformConv: {reason}"));
-        }
-        // Attribute-level capability limits for the attention and MoE family.
-        //
-        // Every one of these mirrors a rejection its kernel factory raises, and
-        // mirroring is mandatory rather than tidy: `GetCapability` consults only
-        // the dtype and shape filters, so a factory rejection arrives *after*
-        // ORT has compiled the node onto this EP and is a hard session failure
-        // that no fallback recovers from. Claiming an op we cannot configure is
-        // therefore strictly worse for the user than never claiming it — it
-        // turns a model that runs on ORT's CPU EP into one that does not load.
-        //
-        // Each `unsupported_reason` runs the factory's own attribute parse, so
-        // a new limit cannot be added to a factory without appearing here.
-        //
-        // These are *capability* declines, never performance ones: every entry
-        // is a kernel we owe. See the benchmark doc's §23.6.
-        let attribute_reason = match (op.op_type.as_str(), domain) {
-            ("MoE", "com.microsoft") => crate::kernels::moe::unsupported_reason(op),
-            ("QMoE", "com.microsoft") => crate::kernels::qmoe::unsupported_reason(op),
-            ("GroupQueryAttention", "com.microsoft") => {
-                crate::kernels::group_query_attention::unsupported_reason(op)
-            }
-            ("MultiHeadAttention", "com.microsoft") => {
-                crate::kernels::multi_head_attention::unsupported_reason(op)
-            }
-            ("Attention", "com.microsoft") => {
-                crate::kernels::msft_attention::unsupported_reason(op)
-            }
-            ("Attention", "ai.onnx") => crate::kernels::attention::unsupported_reason(
-                op,
-                opset,
-                shapes.first().map(|shape| shape.len()),
-            ),
-            _ => None,
-        };
-        if let Some(reason) = attribute_reason {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "PackedMultiHeadAttention"
-            && op.domain == "com.microsoft"
-            && let Some(reason) = crate::kernels::packed_multi_head_attention::unsupported_reason(
-                op,
-                shapes,
-                input_dtypes,
+        if opset >= 28
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && matches!(op.op_type.as_str(), "ReduceLogSum" | "ReduceLogSumExp")
+            && let Some(&dtype) = input_dtypes.first()
+            && !matches!(
+                dtype,
+                DataType::Float16 | DataType::BFloat16 | DataType::Float32 | DataType::Float64
             )
         {
-            return KernelMatch::unsupported(reason);
+            deny!(
+                "{} does not accept {dtype:?} data at opset {opset}; the opset-28 schema is float-only, so cast the data input to Float16, BFloat16, Float32, or Float64",
+                op.op_type
+            );
         }
-        if matches!(op.op_type.as_str(), "ScatterND" | "ScatterElements")
-            && (op.domain.is_empty() || op.domain == "ai.onnx")
-            && let Some(reason) =
-                crate::kernels::indexing::scatter_unsupported_reason(op, opset, input_dtypes)
-        {
+        // Structural kernel limits belong to the versioned factory selected
+        // above, alongside the parser that creation uses. No operator-name
+        // dispatch table is needed here to keep those two boundaries aligned.
+        if let Some(reason) = factory.unsupported_reason(op, opset, shapes, input_dtypes) {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "GatherND"
@@ -655,13 +569,6 @@ impl ExecutionProvider for CpuExecutionProvider {
             && let Some(&dtype) = input_dtypes.get(1)
             && let Err(reason) =
                 onnx_runtime_ir::scatter::validate_nd_index_type("GatherND", opset, dtype)
-        {
-            return KernelMatch::unsupported(reason);
-        }
-        if op.op_type == "QLinearMatMul"
-            && (op.domain.is_empty() || op.domain == "ai.onnx")
-            && let Some(reason) =
-                crate::kernels::qlinear_matmul::unsupported_reason(input_dtypes, shapes)
         {
             return KernelMatch::unsupported(reason);
         }
@@ -1113,7 +1020,44 @@ mod host_copy_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
+    fn logarithmic_reductions_apply_opset_28_float_boundary_at_admission() {
+        let ep = CpuExecutionProvider::new();
+        for op_type in ["ReduceLogSum", "ReduceLogSumExp"] {
+            let node = Node::new(NodeId(0), op_type, vec![], vec![]);
+            assert!(
+                ep.supports_op(&node, 27, &[], &[DataType::Int64], &[])
+                    .is_supported(),
+                "{op_type} opset 27 must preserve the legacy integer admission contract"
+            );
+
+            let current = ep.supports_op(&node, 28, &[], &[DataType::Int64], &[]);
+            assert!(
+                !current.is_supported(),
+                "{op_type} opset 28 must reject Int64"
+            );
+            let current_reason = current
+                .reason()
+                .expect("opset-28 rejection must explain the boundary");
+            assert!(
+                current_reason.contains("does not accept Int64 data at opset 28"),
+                "{current_reason}"
+            );
+            assert!(
+                current_reason.contains("opset-28 schema is float-only"),
+                "{current_reason}"
+            );
+            assert!(
+                ep.supports_op(&node, 28, &[], &[DataType::Float64], &[])
+                    .is_supported(),
+                "{op_type} opset 28 accepts Float64"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot spawn the child process this needs")]
     fn workspace_context_is_lazy_and_distinguishes_selected_pool_widths() {
         const CHILD: &str = "NXRT_WORKSPACE_CONTEXT_CHILD";
         if std::env::var_os(CHILD).is_some() {
@@ -1750,6 +1694,151 @@ mod tests {
     }
 
     #[test]
+    fn claim_uses_selected_factory_metadata_without_creating_a_kernel() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Gate {
+            revision: usize,
+            queried: Arc<AtomicUsize>,
+            created: Arc<AtomicUsize>,
+        }
+        impl onnx_runtime_ep_api::KernelFactory for Gate {
+            fn unsupported_reason(
+                &self,
+                node: &Node,
+                opset: u64,
+                shapes: &[Shape],
+                dtypes: &[DataType],
+            ) -> Option<String> {
+                assert_eq!(node.op_type, "FactoryMetadataProbe");
+                assert_eq!(
+                    node.attr("marker")
+                        .and_then(onnx_runtime_ir::Attribute::as_int),
+                    Some(42)
+                );
+                assert_eq!(shapes, &[onnx_runtime_ir::static_shape([2, 3, 4])]);
+                assert_eq!(dtypes, &[DataType::Float32]);
+                assert_eq!(usize::from(opset >= 13), self.revision);
+                self.queried.fetch_add(1, Ordering::Relaxed);
+                Some(format!(
+                    "factory revision {} rejects this metadata",
+                    self.revision
+                ))
+            }
+            fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+                self.created.fetch_add(1, Ordering::Relaxed);
+                panic!("claim must not construct or prepare a kernel")
+            }
+        }
+        struct NoGate;
+        impl onnx_runtime_ep_api::KernelFactory for NoGate {
+            fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+                panic!("default metadata query must not construct a kernel")
+            }
+        }
+        let mut ep = CpuExecutionProvider::new();
+        let created = Arc::new(AtomicUsize::new(0));
+        let queried = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        for (revision, since) in [(0, 1), (1, 13)] {
+            ep.registry.register(
+                onnx_runtime_ep_api::OpKey::new("FactoryMetadataProbe", "pkg.claim", since),
+                onnx_runtime_ep_api::WorkspacePlanning::None,
+                Box::new(Gate {
+                    revision,
+                    queried: queried[revision].clone(),
+                    created: created.clone(),
+                }),
+            );
+        }
+        let mut node = Node::new(NodeId(0), "FactoryMetadataProbe", vec![], vec![]);
+        node.domain = "pkg.claim".into();
+        node.attributes
+            .insert("marker".into(), onnx_runtime_ir::Attribute::Int(42));
+        for opset in [1, 12, 13, 29] {
+            let claim = ep.supports_op(
+                &node,
+                opset,
+                &[onnx_runtime_ir::static_shape([2, 3, 4])],
+                &[DataType::Float32],
+                &[],
+            );
+            let expected = format!(
+                "factory revision {} rejects this metadata",
+                usize::from(opset >= 13)
+            );
+            assert_eq!(claim.reason(), Some(expected.as_str()));
+        }
+        assert_eq!(created.load(Ordering::Relaxed), 0);
+        assert_eq!(queried[0].load(Ordering::Relaxed), 2);
+        assert_eq!(queried[1].load(Ordering::Relaxed), 2);
+        ep.registry.register(
+            onnx_runtime_ep_api::OpKey::new("NoExtraGate", "pkg.claim", 1),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(NoGate),
+        );
+        let mut node = Node::new(NodeId(1), "NoExtraGate", vec![], vec![]);
+        node.domain = "pkg.claim".into();
+        assert!(ep.supports_op(&node, 1, &[], &[], &[]).is_supported());
+    }
+
+    #[cfg(feature = "ops-cnn")]
+    #[test]
+    fn conv_claim_and_factory_share_the_registered_rank_boundary() {
+        let ep = CpuExecutionProvider::new();
+        let node = Node::new(NodeId(0), "Conv", vec![], vec![]);
+        for rank in [2, 5] {
+            let shapes = vec![onnx_runtime_ir::static_shape(vec![2; rank]); 2];
+            let claim = ep.supports_op(&node, 18, &shapes, &[DataType::Float32; 2], &[]);
+            let reason = claim
+                .reason()
+                .expect("unsupported ranks must fail during claim");
+            assert!(
+                reason.contains("matching rank-3 NCL or rank-4 NCHW"),
+                "{reason}"
+            );
+            let concrete = vec![vec![2; rank]; 2];
+            let error = ep
+                .get_kernel(&node, &concrete, 18)
+                .err()
+                .expect("factory must reject the same rank")
+                .to_string();
+            assert!(error.contains(reason), "claim={reason}; factory={error}");
+        }
+        // The current claim metadata cannot distinguish absent rank from a
+        // scalar Shape. Concrete construction still knows and rejects rank 0.
+        assert!(ep.get_kernel(&node, &[vec![], vec![]], 18).is_err());
+        let mismatched = [
+            onnx_runtime_ir::static_shape([1, 2, 9]),
+            onnx_runtime_ir::static_shape([4, 2, 3, 3]),
+        ];
+        assert!(
+            !ep.supports_op(&node, 18, &mismatched, &[DataType::Float32; 2], &[])
+                .is_supported()
+        );
+        for shapes in [
+            vec![
+                onnx_runtime_ir::static_shape([1, 2, 9]),
+                onnx_runtime_ir::static_shape([4, 2, 3]),
+            ],
+            vec![
+                onnx_runtime_ir::static_shape([1, 2, 7, 9]),
+                onnx_runtime_ir::static_shape([4, 2, 3, 3]),
+            ],
+            vec![vec![onnx_runtime_ir::Dim::Symbolic(onnx_runtime_ir::SymbolId(0)); 3]; 2],
+            vec![vec![]; 2],
+            vec![vec![], onnx_runtime_ir::static_shape([4, 2, 3])],
+            vec![onnx_runtime_ir::static_shape([1, 2, 9]), vec![]],
+            vec![],
+        ] {
+            assert!(
+                ep.supports_op(&node, 18, &shapes, &[DataType::Float32; 2], &[])
+                    .is_supported(),
+                "{shapes:?}"
+            );
+        }
+    }
+
+    #[test]
     fn supports_op_reflects_selected_operator_groups() {
         let ep = CpuExecutionProvider::new();
         let mm = Node::new(onnx_runtime_ir::NodeId(0), "MatMul", vec![], vec![]);
@@ -1759,6 +1848,29 @@ mod tests {
             ep.supports_op(&conv, 17, &[], &[], &[]).is_supported(),
             cfg!(feature = "ops-cnn")
         );
+    }
+
+    #[test]
+    fn transpose_packed_cpu_claim_respects_onnx_type_versions() {
+        let ep = CpuExecutionProvider::new();
+        let node = Node::new(onnx_runtime_ir::NodeId(0), "Transpose", vec![], vec![]);
+        let shapes = [onnx_runtime_ir::static_shape([3, 5])];
+        for (dtype, since) in [
+            (DataType::Int4, 21),
+            (DataType::Uint4, 21),
+            (DataType::Float4E2M1, 23),
+            (DataType::Float8E8M0, 24),
+            (DataType::Int2, 25),
+            (DataType::Uint2, 25),
+        ] {
+            let rejected = ep.supports_op(&node, since - 1, &shapes, &[dtype], &[]);
+            let reason = rejected.reason().expect("older opset must be declined");
+            assert!(reason.contains(&format!("use opset {since}")), "{reason}");
+            assert!(
+                ep.supports_op(&node, since, &shapes, &[dtype], &[])
+                    .is_supported()
+            );
+        }
     }
 
     #[test]
@@ -1775,6 +1887,118 @@ mod tests {
         assert!(reason.contains("registers Gelu since opset 20"), "{reason}");
 
         assert!(ep.supports_op(&gelu, 20, &[], &[], &[]).is_supported());
+    }
+
+    #[test]
+    fn activation_bf16_claims_start_at_opset_22() {
+        let ep = CpuExecutionProvider::new();
+        for op_type in ["Elu", "HardSigmoid", "Selu", "Softplus", "Softsign"] {
+            let node = Node::new(onnx_runtime_ir::NodeId(0), op_type, vec![], vec![]);
+            let rejected = ep.supports_op(&node, 21, &[], &[DataType::BFloat16], &[]);
+            let reason = rejected.reason().expect("opset 21 BF16 must be declined");
+            assert!(
+                reason.contains("does not admit BF16 at opset 21"),
+                "{reason}"
+            );
+            assert!(reason.contains("opset 22"), "{reason}");
+            assert!(
+                ep.supports_op(&node, 22, &[], &[DataType::BFloat16], &[])
+                    .is_supported(),
+                "{op_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn registered_kernel_limits_cover_both_default_domain_spellings() {
+        for domain in ["", "ai.onnx"] {
+            let ep = CpuExecutionProvider::new();
+            let mut node = Node::new(NodeId(0), "STFT", vec![], vec![]);
+            node.domain = domain.into();
+            let unsupported =
+                ep.supports_op(&node, 17, &[], &[DataType::Float64, DataType::Int64], &[]);
+            let reason = unsupported
+                .reason()
+                .expect("STFT f64 is not implemented by the f32 kernel");
+            assert!(reason.contains("STFT signal must"), "{domain}: {reason}");
+            assert!(
+                ep.supports_op(&node, 17, &[], &[DataType::Float32, DataType::Int64], &[])
+                    .is_supported()
+            );
+            node.op_type = "TensorScatter".into();
+            let unsupported = ep.supports_op(&node, 24, &[], &[DataType::Bool; 2], &[]);
+            let reason = unsupported
+                .reason()
+                .expect("TensorScatter cannot dispatch BOOL arithmetic");
+            assert!(
+                reason.contains("TensorScatter: cache dtype Bool"),
+                "{domain}: {reason}"
+            );
+            assert!(
+                ep.supports_op(&node, 24, &[], &[DataType::Int32; 2], &[])
+                    .is_supported()
+            );
+            node.op_type = "Einsum".into();
+            node.attributes.insert(
+                "equation".into(),
+                onnx_runtime_ir::Attribute::String("ij,jk->ik".into()),
+            );
+            let shapes = [
+                onnx_runtime_ir::static_shape([2, 3]),
+                onnx_runtime_ir::static_shape([3, 4]),
+            ];
+            assert!(
+                !ep.supports_op(&node, 12, &shapes, &[DataType::BFloat16; 2], &[])
+                    .is_supported()
+            );
+            assert!(
+                ep.supports_op(&node, 12, &shapes, &[DataType::Float32; 2], &[])
+                    .is_supported()
+            );
+        }
+    }
+
+    #[cfg(feature = "ops-cnn")]
+    #[test]
+    fn deform_conv_claim_preserves_schema_versions_and_unknown_rank() {
+        let ep = CpuExecutionProvider::new();
+        let mut node = Node::new(
+            NodeId(0),
+            "DeformConv",
+            (0..3).map(|i| Some(onnx_runtime_ir::ValueId(i))).collect(),
+            vec![onnx_runtime_ir::ValueId(3)],
+        );
+        let shapes = [
+            onnx_runtime_ir::static_shape([1, 1, 3, 3]),
+            onnx_runtime_ir::static_shape([1, 1, 1, 1]),
+            onnx_runtime_ir::static_shape([1, 2, 3, 3]),
+        ];
+        for domain in ["", "ai.onnx"] {
+            node.domain = domain.into();
+            let old = ep.supports_op(&node, 19, &shapes, &[DataType::BFloat16; 3], &[]);
+            let reason = old.reason().expect("BF16 entered DeformConv at opset 22");
+            assert!(reason.contains("bfloat16 requires opset 22+"), "{reason}");
+            assert!(
+                ep.supports_op(&node, 22, &shapes, &[DataType::BFloat16; 3], &[])
+                    .is_supported()
+            );
+            assert!(
+                ep.supports_op(&node, 19, &vec![vec![]; 3], &[DataType::Float32; 3], &[])
+                    .is_supported()
+            );
+        }
+        let partial = [vec![], onnx_runtime_ir::static_shape([1, 1]), vec![]];
+        assert!(
+            !ep.supports_op(&node, 19, &partial, &[DataType::Float32; 3], &[])
+                .is_supported()
+        );
+        node.inputs.push(Some(onnx_runtime_ir::ValueId(4)));
+        node.inputs.push(Some(onnx_runtime_ir::ValueId(5)));
+        node.inputs.push(Some(onnx_runtime_ir::ValueId(6)));
+        assert!(
+            !ep.supports_op(&node, 19, &[], &[DataType::Float32; 6], &[])
+                .is_supported()
+        );
     }
 
     #[test]

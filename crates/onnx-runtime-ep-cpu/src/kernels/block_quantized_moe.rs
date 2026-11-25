@@ -195,6 +195,16 @@ struct ValidatedMetadata {
 }
 
 impl KernelFactory for BlockQuantizedMoEFactory {
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        _opset: u64,
+        shapes: &[onnx_runtime_ir::Shape],
+        input_dtypes: &[DataType],
+    ) -> Option<String> {
+        unsupported_reason(node, shapes, input_dtypes).map(|reason| reason.into_owned())
+    }
+
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let ValidatedMetadata {
             attributes,
@@ -211,7 +221,7 @@ impl KernelFactory for BlockQuantizedMoEFactory {
     }
 }
 
-pub(crate) fn unsupported_reason(
+fn unsupported_reason(
     node: &Node,
     shapes: &[Shape],
     input_dtypes: &[DataType],
@@ -570,7 +580,7 @@ impl BlockQuantizedMoEKernel {
                             projection.out_features,
                             bias,
                             plan,
-                            scratch.initialized(),
+                            &mut scratch,
                             output,
                         )
                     },
@@ -3868,7 +3878,7 @@ mod tests {
                                     p.out_features,
                                     bias,
                                     plan,
-                                    &mut old_decode,
+                                    &mut ProjectionScratch::test_binding(&mut old_decode),
                                     &mut output,
                                 )?;
                                 Ok(output)
@@ -3927,7 +3937,7 @@ mod tests {
                                             p.out_features,
                                             bias,
                                             plan,
-                                            decode.initialized(),
+                                            &mut decode,
                                             output,
                                         )
                                     },

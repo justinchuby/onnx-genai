@@ -414,13 +414,22 @@ fn no_activation_or_norm_op_is_left_to_ort() {
 /// OpRegistry` and wrote past the recorder, so 18 ops were in the registry but
 /// not the descriptors — including `PRelu`, `BatchNormalization`,
 /// `InstanceNormalization` and `GroupNormalization`, all of which this EP is
-/// supposed to own. Descriptors are now derived from the registry itself, and
-/// this test holds the two together.
+/// supposed to own. Descriptors are now derived from the registry itself, except
+/// for deliberately standalone-only kernels.
 #[test]
 fn every_registered_op_has_a_kernel_registry_entry() {
     use onnx_runtime_ep_cpu::build_cpu_registry_with_descriptors;
+    use onnx_runtime_ir::is_default_domain;
 
     let (registry, descriptors) = build_cpu_registry_with_descriptors();
+    let is_standalone_roi_align =
+        |domain: &str, op: &str| is_default_domain(domain) && op == "RoiAlign";
+    assert!(
+        descriptors
+            .iter()
+            .all(|d| !is_standalone_roi_align(&d.domain, &d.op_type)),
+        "standalone-only ONNX RoiAlign must not be advertised by the ORT CPU plugin"
+    );
     let described: std::collections::BTreeSet<(String, String)> = descriptors
         .iter()
         .map(|d| (d.domain.clone(), d.op_type.clone()))
@@ -428,6 +437,7 @@ fn every_registered_op_has_a_kernel_registry_entry() {
 
     let missing: Vec<String> = registry
         .keys()
+        .filter(|k| !is_standalone_roi_align(&k.domain, &k.op_type))
         .filter(|k| !described.contains(&(k.domain.clone(), k.op_type.clone())))
         .map(|k| format!("{}::{}", k.domain, k.op_type))
         .collect();

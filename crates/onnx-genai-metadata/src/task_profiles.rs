@@ -9,6 +9,7 @@ pub(crate) fn skip_unsupported_version(profile: &crate::TaskProfile) -> bool {
     let supported = match profile.kind.as_str() {
         "embedding" | "realtime" => profile.version == "1",
         "reranking" => matches!(profile.version.as_str(), "1" | "2"),
+        "transcription" => profile.version == "1.0",
         "decision" => matches!(profile.version.as_str(), "1" | "2" | "3"),
         _ => return false,
     };
@@ -66,15 +67,44 @@ pub(crate) fn resolve_encoded_media_inputs(
         }
         let input = workflow.inputs.get(name).ok_or_else(|| invalid(format!("{path} references undeclared workflow input '{name}'")))?;
         if !matches!(input.source, WorkflowInputSource::Application { .. })
-            || input.role != SemanticInputRole::Opaque
-            || input.contract.dtype != "uint8" || input.contract.shape.len() != 1 {
+            || input.role != SemanticInputRole::Opaque {
             return Err(invalid(format!("{path} input '{name}' must be an opaque application-sourced uint8 [encoded_bytes] vector; the profile owns binding and its workflow owns media decoding")));
         }
-        let encoded_bytes = if let TensorDimension::Fixed(size) = input.contract.shape[0] {
-            Some(usize::try_from(size).ok().filter(|size| *size > 0).ok_or_else(|| invalid(format!("{path} input '{name}' requires a positive encoded byte length")))?)
-        } else { None };
-        Ok(EncodedMediaInput { endpoint: name.clone(), required: input.required && input.default.is_none(), encoded_bytes })
+        encoded_media_input(name, input, path)
+
     }).collect()
+}
+
+/// Shared byte-vector shape proof; callers separately admit input authority.
+pub(crate) fn encoded_media_input(
+    name: &str,
+    input: &crate::WorkflowInput,
+    path: &str,
+) -> Result<EncodedMediaInput, TaskProfileContractError> {
+    if input.contract.dtype != "uint8" || input.contract.rank() != 1 {
+        return Err(invalid(format!(
+            "{path} input '{name}' must be a uint8 [encoded_bytes] vector; bind encoded media bytes to the authored preprocessing workflow"
+        )));
+    }
+    let encoded_bytes = if let TensorDimension::Fixed(size) = input.contract.shape[0] {
+        Some(
+            usize::try_from(size)
+                .ok()
+                .filter(|size| *size > 0)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "{path} input '{name}' requires a positive encoded byte length"
+                    ))
+                })?,
+        )
+    } else {
+        None
+    };
+    Ok(EncodedMediaInput {
+        endpoint: name.into(),
+        required: input.required && input.default.is_none(),
+        encoded_bytes,
+    })
 }
 
 /// Proof that a package declares one executable token-pair reranking profile.

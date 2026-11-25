@@ -25,6 +25,7 @@ pub(crate) struct EngineSession {
 }
 
 pub(crate) struct ActiveGenerate {
+    pub(crate) clock: crate::decode_loop::GenerationClock,
     /// The in-flight interpretation of this request's declared generation loop.
     ///
     /// Held across scheduler steps because the loop is the workflow's: the

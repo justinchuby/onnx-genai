@@ -19,11 +19,24 @@ std::thread_local! {
 pub struct UniqueKernel {
     axis: Option<i64>,
     sorted: bool,
+    opset: u64,
 }
 
 pub struct UniqueFactory;
 
 impl KernelFactory for UniqueFactory {
+    fn unsupported_reason(
+        &self,
+        _node: &Node,
+        opset: u64,
+        _shapes: &[onnx_runtime_ir::Shape],
+        input_dtypes: &[DataType],
+    ) -> Option<String> {
+        input_dtypes
+            .first()
+            .and_then(|&dtype| unsupported_dtype_for_opset(dtype, opset))
+    }
+
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let axis = optional_int_attr(node, "axis")?;
         let sorted = match optional_int_attr(node, "sorted")?.unwrap_or(1) {
@@ -35,8 +48,18 @@ impl KernelFactory for UniqueFactory {
                 )));
             }
         };
-        Ok(Box::new(UniqueKernel { axis, sorted }))
+        Ok(Box::new(UniqueKernel {
+            axis,
+            sorted,
+            opset: node.local_opset().unwrap_or(11),
+        }))
     }
+}
+
+fn unsupported_dtype_for_opset(dtype: DataType, opset: u64) -> Option<String> {
+    (dtype == DataType::BFloat16 && opset < 28).then(|| {
+        format!("Unique: BFloat16 input requires opset 28 or later, got {opset}; export at opset 28 or use Float32")
+    })
 }
 
 impl Kernel for UniqueKernel {
@@ -112,6 +135,9 @@ impl UniqueKernel {
                  place Unique on a host EP instead of copying device payloads implicitly",
                 input.device
             )));
+        }
+        if let Some(reason) = unsupported_dtype_for_opset(input.dtype, self.opset) {
+            return Err(EpError::KernelFailed(reason));
         }
         ensure_supported_dtype(input.dtype)?;
 
@@ -225,16 +251,14 @@ fn unique_groups(
     item_count: usize,
     sorted: bool,
 ) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
-    unique_groups_by(item_count, sorted, |a, b| {
-        compare_items(dtype, &items[a], &items[b])
-    })
-}
-
-fn unique_groups_by(
-    item_count: usize,
-    sorted: bool,
-    compare: impl Fn(usize, usize) -> Ordering,
-) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+    let compare = |a: usize, b: usize| compare_items(dtype, &items[a], &items[b]);
+    // Keep a total sort order, but do not merge BF16 NaNs (including in slices).
+    let contains_bfloat16_nan = |index: usize| {
+        dtype == DataType::BFloat16
+            && items[index]
+                .chunks_exact(2)
+                .any(|bytes| half::bf16::from_le_bytes(bytes.try_into().unwrap()).is_nan())
+    };
     let mut order: Vec<usize> = (0..item_count).collect();
     order.sort_unstable_by(|&a, &b| compare(a, b).then_with(|| a.cmp(&b)));
 
@@ -243,8 +267,9 @@ fn unique_groups_by(
     let mut counts = Vec::new();
     let mut previous_index: Option<usize> = None;
     for &index in &order {
-        let new_group =
-            previous_index.is_none_or(|previous| compare(previous, index) != Ordering::Equal);
+        let new_group = previous_index.is_none_or(|previous| {
+            compare(previous, index) != Ordering::Equal || contains_bfloat16_nan(index)
+        });
         if new_group {
             first_indices.push(index);
             counts.push(0);
@@ -467,6 +492,47 @@ fn optional_int_attr(node: &Node, name: &str) -> Result<Option<i64>> {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+    use onnx_runtime_ep_api::ExecutionProvider;
+
+    #[test]
+    fn bfloat16_admission_starts_at_opset_28() {
+        let provider = crate::provider::CpuExecutionProvider::new();
+        let node = Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "Unique",
+            vec![Some(onnx_runtime_ir::ValueId(0))],
+            vec![onnx_runtime_ir::ValueId(1)],
+        );
+        let input = Owned::zeros(DataType::BFloat16, &[2]);
+        for opset in [27, 28] {
+            let claim = provider.supports_op(
+                &node,
+                opset,
+                &[onnx_runtime_ir::static_shape([2])],
+                &[DataType::BFloat16],
+                &[onnx_runtime_ir::TensorLayout::contiguous()],
+            );
+            let output = provider
+                .get_kernel(&node, &[vec![2]], opset)
+                .unwrap()
+                .execute_kernel_sized(&[input.view()], &[true], None);
+            if opset == 27 {
+                assert!(claim.reason().unwrap().contains("requires opset 28"));
+                assert!(
+                    output
+                        .unwrap_err()
+                        .to_string()
+                        .contains("requires opset 28")
+                );
+            } else {
+                assert!(claim.is_supported(), "{claim:?}");
+                let output = output.unwrap();
+                let y = output[0].as_ref().unwrap();
+                assert_eq!(y.dtype, DataType::BFloat16);
+                assert_eq!(y.shape, [1]);
+            }
+        }
+    }
 
     fn output_f32(output: &KernelSizedOutput) -> Vec<f32> {
         output
@@ -485,6 +551,27 @@ mod tests {
     }
 
     #[test]
+    fn bfloat16_nans_have_distinct_indices_and_counts() {
+        let input = Owned::bf16_bits(&[4], &[0x7fc1, 0x8000, 0x0000, 0x7fc1]);
+        let outputs = UniqueKernel {
+            axis: None,
+            sorted: false,
+            opset: 28,
+        }
+        .execute_kernel_sized(&[input.view()], &[true; 4], None)
+        .unwrap();
+        let output = |index: usize| outputs[index].as_ref().unwrap();
+        let expected = [0x7fc1u16, 0x8000, 0x7fc1]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(output(0).bytes, expected);
+        assert_eq!(output_i64(output(1)), [0, 1, 3]);
+        assert_eq!(output_i64(output(2)), [0, 1, 1, 2]);
+        assert_eq!(output_i64(output(3)), [1, 2, 1]);
+    }
+
+    #[test]
     fn sorts_axis_slices_lexicographically() {
         let input = Owned::f32(
             &[2, 4, 2],
@@ -500,6 +587,7 @@ mod tests {
         UniqueKernel {
             axis: Some(1),
             sorted: true,
+            opset: 11,
         }
         .execute(
             &[input.view()],
@@ -532,6 +620,7 @@ mod tests {
         UniqueKernel {
             axis: None,
             sorted: false,
+            opset: 11,
         }
         .execute(
             &[input.view()],
@@ -563,6 +652,7 @@ mod tests {
         UniqueKernel {
             axis: None,
             sorted: true,
+            opset: 11,
         }
         .execute(
             &[input.view()],
@@ -606,6 +696,7 @@ mod tests {
         let outputs = UniqueKernel {
             axis: None,
             sorted: false,
+            opset: 11,
         }
         .execute_kernel_sized(&[input.view()], &[true, true, true, true], None)
         .unwrap();
@@ -635,6 +726,7 @@ mod tests {
         let outputs = UniqueKernel {
             axis: None,
             sorted: true,
+            opset: 11,
         }
         .execute_kernel_sized(&[input.view()], &[true, false, true, false], None)
         .unwrap();
@@ -656,6 +748,7 @@ mod tests {
             let outputs = UniqueKernel {
                 axis: None,
                 sorted: true,
+                opset: 11,
             }
             .execute_kernel_sized(&[input.view()], &[true], None)
             .unwrap();
@@ -669,6 +762,7 @@ mod tests {
         let outputs = UniqueKernel {
             axis: None,
             sorted: false,
+            opset: 11,
         }
         .execute_kernel_sized(&[input.view()], &[true], None)
         .unwrap();
@@ -695,6 +789,7 @@ mod tests {
         let error = UniqueKernel {
             axis: None,
             sorted: true,
+            opset: 11,
         }
         .execute_kernel_sized(&[view], &[true], None)
         .unwrap_err();

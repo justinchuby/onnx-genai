@@ -466,7 +466,7 @@ impl<'a> ContinuousBatchManager<'a> {
                     FinishReason::Length,
                     0,
                     None,
-                    &options.effective_preserved_tokens(),
+                    &options,
                 )?,
             });
             return Ok(handle);
@@ -1118,6 +1118,7 @@ impl<'a> ContinuousBatchManager<'a> {
             &row.chain,
             self.tokenizer,
             Some(&mut callback),
+            None,
         )?;
         if let Some(token) = emitted_token {
             row.turn.stage_token(row.handle, token);
@@ -1141,7 +1142,7 @@ impl<'a> ContinuousBatchManager<'a> {
                 reason,
                 row.state.prefix_cache_hit_len,
                 row.state.logprobs.as_deref(),
-                &row.options.effective_preserved_tokens(),
+                &row.options,
             )?;
             row.turn.stage_finished(row.handle, result);
             Ok((token_id, true))
@@ -3281,6 +3282,77 @@ mod tests {
             Some(3),
             "the backfilled request must generate its own tokens"
         );
+    }
+
+    #[test]
+    fn prediction_time_limit_finishes_a_continuous_row_and_releases_it_for_reuse()
+    -> anyhow::Result<()> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/tokenizer.json");
+        let mut definition: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        let vocab = definition["model"]["vocab"].as_object_mut().unwrap();
+        vocab.retain(|_, id| *id != 5);
+        vocab.insert("\n".into(), serde_json::json!(5));
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("tokenizer.json");
+        std::fs::write(&path, serde_json::to_vec(&definition)?)?;
+        let tokenizer = Tokenizer::from_file(path)?;
+        let mut manager = ContinuousBatchManager::new(
+            Box::new(ScriptedBatchDecode::new(vec![one_hot(8, 5)], 8, false)),
+            &tokenizer,
+            crate::engine::EndTokenPolicy::new(Vec::new(), None)?,
+            None,
+            1,
+            batch_runtime(),
+        )?;
+        let mut request = greedy_req(1);
+        request.options.max_prediction_time = Some(std::time::Duration::from_millis(1));
+        manager.submit(request)?;
+        let mut tokens = Vec::new();
+        let mut result = None;
+        let mut waited = false;
+        for _ in 0..20 {
+            if !manager.has_pending_work() {
+                break;
+            }
+            manager.step()?;
+            for event in manager.poll() {
+                match event {
+                    ContinuousBatchEvent::Token { token, .. } => tokens.push(token.token_id),
+                    ContinuousBatchEvent::Finished {
+                        result: finished, ..
+                    } => result = Some(finished),
+                    _ => {}
+                }
+            }
+            // Public events are commit-only. Wait after the first provisional
+            // row token, before the row's terminal transaction publishes them.
+            if !waited
+                && manager
+                    .rows
+                    .iter()
+                    .flatten()
+                    .any(|row| !row.state.generated_tokens.is_empty())
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                waited = true;
+            }
+        }
+        assert!(!manager.has_pending_work());
+        assert_eq!(tokens, vec![5, 5]);
+        assert_eq!(
+            result.unwrap().finish_reason,
+            FinishReason::PredictionTimeLimit
+        );
+        manager.submit(greedy_req(1))?;
+        assert_eq!(
+            drive_to_completion(&mut manager)
+                .values()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![vec![5; 6]]
+        );
+        Ok(())
     }
 
     /// A continuous-batch row stops on a declared end token that is not the

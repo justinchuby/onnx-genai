@@ -254,14 +254,15 @@ pub enum ShapeInference {
     Window,
     /// `ai.onnx::DFT`: discrete Fourier transform along a signal axis.
     ///
-    /// Output shape is the input's, with the last dimension forced to 2 (the
-    /// complex component pair, even for real input) and the signal axis set to
-    /// `dft_length` — halved to `n / 2 + 1` when `onesided`.
+    /// The signal axis follows `dft_length`. Full/RFFT output has two complex
+    /// components; IRFFT expands the half-spectrum to a full real signal with
+    /// one component.
     ///
     /// Both `dft_length` (input 1) and, from opset 20, `axis` (input 2) arrive
     /// as *inputs*, so like [`Self::Compress`] this resolves at Compute time by
     /// reading values. `axis_attr` carries the pre-opset-20 spelling.
     Dft {
+        inverse: bool,
         onesided: bool,
         axis_attr: Option<i64>,
         default_axis: i64,
@@ -385,6 +386,11 @@ impl ShapeInference {
             let fallback = match rule {
                 SharedNativeShapeRule::ConstantOfShape => Self::ConstantOfShape,
                 SharedNativeShapeRule::Dft => Self::Dft {
+                    inverse: node
+                        .attr("inverse")
+                        .and_then(onnx_runtime_ir::Attribute::as_int)
+                        .unwrap_or(0)
+                        != 0,
                     onesided: node
                         .attr("onesided")
                         .and_then(onnx_runtime_ir::Attribute::as_int)
@@ -764,6 +770,7 @@ impl ShapeInference {
             // opset 20 it is input 2. Both are modelled, so neither reaches
             // `Unmodelled`.
             "DFT" => Self::Dft {
+                inverse: int_attr("inverse").unwrap_or(0) != 0,
                 onesided: int_attr("onesided").unwrap_or(0) != 0,
                 axis_attr: int_attr("axis"),
                 default_axis: if opset >= 20 { -2 } else { 1 },
@@ -5934,6 +5941,7 @@ fn infer_shapes(
         }
 
         ShapeInference::Dft {
+            inverse,
             onesided,
             axis_attr,
             default_axis,
@@ -5957,6 +5965,8 @@ fn infer_shapes(
                 ));
             }
 
+            let mode = onnx_runtime_ir::dft::DftMode::from_flags(*inverse, *onesided);
+            mode.validate_components(complex_dim)?;
             // opset 20 moves `axis` into input 2; before that it is an
             // attribute defaulting to -2.
             let axis_raw = match inputs.get(2) {
@@ -5972,24 +5982,19 @@ fn infer_shapes(
                 );
             }
 
-            // `dft_length` (input 1) overrides the signal extent when present.
             let signal_len = match inputs.get(1) {
-                Some(t) if !t.is_absent() && t.shape.iter().product::<usize>() > 0 => {
+                Some(t) if !t.is_absent() => {
                     let n = read_scalar_i64(t, "DFT dft_length")?;
-                    usize::try_from(n)
-                        .map_err(|_| format!("DFT: dft_length must be non-negative, got {n}"))?
+                    let n = usize::try_from(n)
+                        .map_err(|_| format!("DFT: dft_length must be positive, got {n}"))?;
+                    onnx_runtime_ir::dft::DftMode::validate_length(n)?;
+                    n
                 }
-                _ => input.shape[axis],
+                _ => mode.default_length(input.shape[axis])?,
             };
-
             let mut shape = input.shape.to_vec();
-            shape[axis] = if *onesided {
-                signal_len / 2 + 1
-            } else {
-                signal_len
-            };
-            // Always complex out, even for real input.
-            shape[last] = 2;
+            shape[axis] = mode.output_length(signal_len);
+            shape[last] = mode.output_components();
             Ok(vec![shape])
         }
 
@@ -7498,6 +7503,7 @@ fn after() {}
         assert_eq!(
             infer(
                 &ShapeInference::Dft {
+                    inverse: false,
                     onesided: false,
                     axis_attr: Some(1),
                     default_axis: 1,
@@ -7518,6 +7524,7 @@ fn after() {}
         assert_eq!(
             infer(
                 &ShapeInference::Dft {
+                    inverse: false,
                     onesided: true,
                     axis_attr: Some(1),
                     default_axis: 1,
@@ -7540,6 +7547,7 @@ fn after() {}
         assert_eq!(
             infer(
                 &ShapeInference::Dft {
+                    inverse: false,
                     onesided: false,
                     axis_attr: Some(1),
                     default_axis: 1,
@@ -7555,15 +7563,15 @@ fn after() {}
     fn dft_opset20_reads_the_axis_from_input_two() {
         // The axis input must win over the attribute. Attribute says 1, input
         // says 0 — a rule that ignored the input would resize the wrong axis.
-        let buf = vec![0.0f32; 24];
-        let x = f32_data(&[3, 4, 2], &[8, 2, 1], &buf);
-        let empty: [i64; 0] = [];
-        let no_len = i64_scalar(&empty, &[0], &[1]);
+        let buf = vec![0.0f32; 12];
+        let x = f32_data(&[3, 4, 1], &[4, 1, 1], &buf);
+        let no_len = TensorView::absent(DataType::Int64);
         let a = [0i64];
         let axis_in = i64_scalar(&a, &[1], &[1]);
         assert_eq!(
             infer(
                 &ShapeInference::Dft {
+                    inverse: false,
                     onesided: true,
                     axis_attr: Some(1),
                     default_axis: 1,
@@ -7577,11 +7585,54 @@ fn after() {}
     }
 
     #[test]
+    fn dft_real_inverse_shared_and_fallback_shapes_are_full_and_real() {
+        let buf = [0f32; 12];
+        let x = f32_data(&[2, 3, 2], &[6, 2, 1], &buf);
+        let strategy = ShapeInference::Dft {
+            inverse: true,
+            onesided: true,
+            axis_attr: None,
+            default_axis: -2,
+        };
+        assert_eq!(
+            infer(&strategy, std::slice::from_ref(&x)).unwrap(),
+            vec![vec![2, 4, 1]]
+        );
+        let length = [5i64];
+        let len = i64_scalar(&length, &[], &[]);
+        assert_eq!(infer(&strategy, &[x, len]).unwrap(), vec![vec![2, 5, 1]]);
+        for version in [17, 20] {
+            let mut node = Node::new(
+                onnx_runtime_ir::NodeId(0),
+                "DFT",
+                vec![
+                    Some(onnx_runtime_ir::ValueId(0)),
+                    Some(onnx_runtime_ir::ValueId(1)),
+                ],
+                vec![onnx_runtime_ir::ValueId(2)],
+            );
+            node.version = Some(version);
+            node.attributes
+                .insert("inverse".into(), onnx_runtime_ir::Attribute::Int(1));
+            node.attributes
+                .insert("onesided".into(), onnx_runtime_ir::Attribute::Int(1));
+            if version < 20 {
+                node.attributes
+                    .insert("axis".into(), onnx_runtime_ir::Attribute::Int(-2));
+            }
+            let shared =
+                ShapeInference::for_node(&node, &[vec![Some(2), Some(3), Some(2)], vec![]], 1);
+            assert_eq!(infer(&shared, &[x, len]).unwrap(), vec![vec![2, 5, 1]]);
+        }
+    }
+
+    #[test]
     fn dft_refuses_the_complex_dim_as_the_signal_axis() {
         let buf = vec![0.0f32; 16];
         let x = f32_data(&[2, 8, 1], &[8, 1, 1], &buf);
         let err = infer(
             &ShapeInference::Dft {
+                inverse: false,
                 onesided: false,
                 axis_attr: Some(-1),
                 default_axis: 1,

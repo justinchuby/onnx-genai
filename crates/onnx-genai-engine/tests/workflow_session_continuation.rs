@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 
 use onnx_genai_engine::{
-    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest,
+    Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GeneratePrompt, GenerateRequest,
     SessionForkParticipantKind, SessionPosition,
 };
 
@@ -979,7 +979,13 @@ fn a_carrier_decides_what_is_attended_and_what_is_recomputed() -> anyhow::Result
 
     // An ORT decode core attends its retained sequence from KV.
     let tiny = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
-    let mut decode_core = Engine::from_dir(&tiny, EngineConfig::default())?;
+    let mut decode_core = Engine::from_dir(
+        &tiny,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Ort,
+            ..EngineConfig::default()
+        },
+    )?;
     assert!(!decode_core.prepends_session_conversation());
     let session = decode_core.create_session()?;
     let first = decode_core.generate_in_session(session, tokens(&[2, 4, 3], 2))?;
