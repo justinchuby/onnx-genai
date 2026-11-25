@@ -90,7 +90,7 @@ fn run(
     dtype: DataType,
     x: &[f64],
     b: &[i64],
-) -> Result<Vec<Tensor>, onnx_runtime_session::SessionError> {
+) -> Result<Vec<Tensor>, Box<onnx_runtime_session::SessionError>> {
     let input = Tensor::from_raw(dtype, vec![2, 2, 3, 3], &floats(dtype, x)).unwrap();
     let rois = Tensor::from_raw(
         dtype,
@@ -104,7 +104,9 @@ fn run(
         &b.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>(),
     )
     .unwrap();
-    session.run(&[("X", &input), ("rois", &rois), ("batch_indices", &indices)])
+    session
+        .run(&[("X", &input), ("rois", &rois), ("batch_indices", &indices)])
+        .map_err(Box::new)
 }
 
 fn check_values(y: &Tensor, dtype: DataType, case: &roi_align_vectors::Case) {

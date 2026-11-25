@@ -2617,3 +2617,58 @@ this is not a CUDA execution result. Independent f64 sums cover odd/even sizes,
 padding/truncation and batches; a real encoded model exercises RFFT/IRFFT
 roundtrips for both schemas. Existing scalar/control, widening, output staging
 and per-batch DFT allocations still require their own workspace migration.
+
+
+### DFT batches reuse the Fourier execution lane
+
+DFT's real/imaginary input and output vectors now borrow four transform-length
+regions from the same StepScoped Host execution domain as STFT. A private
+FourierWorkspace descriptor centralizes checked partitioning and initialization;
+it owns neither backing nor quota. Both operators use its closure-scoped Host
+borrows. DFT constructs one existing DftPlan per execution and reuses it across
+all batches, instead of allocating vectors and DSP setup for each transform.
+Forward/full inverse/RFFT and the newly corrected IRFFT keep their algorithms.
+
+Metadata preparation is Ready only when axis and transform length follow shape
+facts. Present runtime controls remain Deferred; execution requires readable
+control views, permits metadata-only intermediate signals for sizing, and reads
+rank-zero Host integer controls
+without a one-element Vec. Planning and run share checked geometry. Actual
+control values are read again before binding, so stale smaller backing fails
+before DSP setup or output writes. Workspace is `4 * dft_length * sizeof(f32)` bytes, independent of signal
+length, output size, batch count or the sum of graph-node requirements.
+Empty batches retain view/control/output validation and skip scratch/DSP setup.
+
+Every scratch region starts with valid +0 f32 values before references form.
+Within one call the copied positive-frequency prefix is fixed; input padding is
+never modified by the transform, and IRFFT mirroring writes only negative bins.
+Thus padding stays zero across batches without another clear or admission.
+Separate calls initialize only their requested prefix of a retained larger lane.
+The existing ownership domain still handles concurrency, growth, pressure and
+physical release; no per-frame/expert grant or kernel-owned pool is added.
+
+Controls cover poisoned and fresh uninitialized backing, canaries, odd/even
+IRFFT, truncation/padding, scalar changes at the same address, unreadable logical
+controls, overflow, missing/short/misaligned backing, and unchanged outputs on
+refusal. A live constructor positive control distinguishes one DSP plan across
+three batches from a disconnected observer. The real governor control performs
+4,096 preparation/checkout/execute/return cycles with zero further issuer calls,
+including zero-byte callback controls; an active lane cannot fund another call.
+The encoded two-node RFFT/IRFFT session uses one 128-byte peak under an exact
+Host quota, refuses at 127 bytes, reuses its managed identity and re-admits after
+idle reclamation, then settles to zero.
+
+Only these four f32 buffers are funded by the declared requirement. Input
+materialization, output staging, small rank/index metadata and vendor DSP setup
+allocations remain separate. This is not complete RSS accounting, zero total
+runtime overhead, a latency/throughput measurement or CUDA execution evidence.
+
+
+The shipping ORT plugin test disables fallback and verifies that both DFT nodes
+are assigned to cpu_ep. Full-complex and real-inverse roundtrips change runtime
+length 8/3/9/8 at unchanged input shapes, with numerical truncation/padding
+checks on both batches. It exposed an existing dtype-descriptor omission:
+DFT advertised only floats despite integer controls. The exact edge union and
+per-slot floating signal/output, integer length, and int64 axis declarations
+now agree with the kernel. The cross-crate shape fixture also receives the
+explicit forward direction required by the shared DFT shape interface.
