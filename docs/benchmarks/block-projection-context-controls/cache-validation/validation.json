@@ -1,0 +1,183 @@
+{
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs": "b5c2e5e7ad5fb8f1b4a71a37d6d95a470f69e1ce9d32e26a0ce6170574f2e30f",
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs": "bf224537a31fd7a9c0000ee0fb9c786745c594b382edbfda1450303d9057b645",
+    "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs": "e09fd1a25b28902a0a7912034f1e3ffdda8c0b575a1d118388e8a42505722752"
+  },
+  "results": [
+    {
+      "name": "native",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib"
+      ],
+      "exit": 0,
+      "log_sha256": "288120839e2a9be4b36781b822ff91507ffb659205da85789ac23690e58638a2",
+      "counts": [
+        [
+          "2068",
+          "0",
+          "21"
+        ]
+      ]
+    },
+    {
+      "name": "mlas",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "--features",
+        "mlas"
+      ],
+      "exit": 0,
+      "log_sha256": "8dcff70a3607a27e04bf2a7b966b0b4d527aefdcb5fdefcdf4fda11157a4ae20",
+      "counts": [
+        [
+          "2110",
+          "0",
+          "37"
+        ]
+      ]
+    },
+    {
+      "name": "layout",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--test",
+        "decoded_projection_layout"
+      ],
+      "exit": 0,
+      "log_sha256": "5db9bb2527033b67864ed83f4e4d602e76bdf9ae5f12985da2a625ee7ac61c86",
+      "counts": [
+        [
+          "15",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "session",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-session",
+        "--lib"
+      ],
+      "exit": 0,
+      "log_sha256": "2cfecb24ea12c59684210dc358fe8ff3f0d3a68f64ec159f8082cac668af61ea",
+      "counts": [
+        [
+          "376",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "plugin-cache",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-plugin",
+        "--lib",
+        "workspace_plan_cache_tests"
+      ],
+      "exit": 0,
+      "log_sha256": "8f673c35ce511ac7b865f47d263fe3d0c59e93732f0850162f35fdb2711c63c9",
+      "counts": [
+        [
+          "19",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "host-oracles",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cuda",
+        "--test",
+        "block_quantized_cpu_oracle",
+        "--test",
+        "qmoe_cpu_oracle"
+      ],
+      "exit": 0,
+      "log_sha256": "570e652e5aefcf21f61283230f55a19f6682f44f179b8f99386f38f28ba9eb64",
+      "counts": [
+        [
+          "2",
+          "0",
+          "0"
+        ],
+        [
+          "1",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "-p",
+        "onnx-runtime-ep-cpu-plugin",
+        "-p",
+        "onnx-runtime-session",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit": 0,
+      "log_sha256": "7f1bf94b8d6f7f9c8005f0d222bf9fcd629cb5b1a3f9743cfcad293de2178fa6"
+    },
+    {
+      "name": "clippy-mlas",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "-p",
+        "onnx-runtime-ep-cpu-plugin",
+        "-p",
+        "onnx-runtime-session",
+        "--all-targets",
+        "--features",
+        "mlas",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit": 0,
+      "log_sha256": "74d4e3992d6c818a4b4d7cc1a58d25126d301450e9ed37258cc2ef5f2ff45a00"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "base": "d811f5a73e87bfc609d2a1c0e829636d4fa0f8f2",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/moe.rs": "094a9f26ea3bd6f09ebc53c14807c3e9151417f9f239219764a8ffa7ac3bee58",
+    "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs": "198ec86e0c862066264eabc95c87dfa4f280e5139f44bc8b9627f6193e527cc8"
+  },
+  "probe_sha256": "9eead2570f3c282f48632da3f05af5e7ee7744453bb11ab9a6cc7dc203b3464e",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "hardware": {
+    "machdep.cpu.brand_string": "Apple M1 Max",
+    "hw.memsize": "34359738368",
+    "hw.logicalcpu": "10",
+    "hardware_read_command": "/usr/sbin/sysctl -n machdep.cpu.brand_string hw.memsize hw.logicalcpu",
+    "hardware_read_exit": 0,
+    "hardware_read_authority": "separate escalated read-only command; sandbox sysctl was denied before any build or timing",
+    "hardware_read_time_utc": "2026-11-24T19:43:28.315736+00:00"
+  },
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "lock_inode": 339651569,
+  "lock_busy_control": true,
+  "parent_pid": 91361,
+  "binaries": {
+    "baseline": {
+      "sha256": "6839bc209d4b30f9dda0cb93d2dd60fe94b337a253a8c14405f2b8e75100574a",
+      "native": true,
+      "symbol_count": 28308
+    },
+    "candidate": {
+      "sha256": "a034ada472fd3f3e22c9b7170a95aa602df2224942794aac080b28e3a09a8f0d",
+      "native": true,
+      "symbol_count": 28333
+    }
+  },
+  "foreign_core_monitor": "Unavailable on Darwin; no claim of an idle host",
+  "metric": "terminal child user+system CPU seconds, includes setup/work/validation/output IO/retirement; not pure inference latency",
+  "probe_lock_sha256": "b99fca5f115cb317570362954b6602289c0ec7c9817197e4a28060329528c777",
+  "receipts_sha256": "c43d95440086745842206a6d0d0c33fdfb2cf8751c952522df7708d309c67f60",
+  "runner_sha256": "d9d5e954f2bc6c564f6b5c1ae975308659ac80d6bbb6b1e97bf252d2778553ce",
+  "processes": 144
+}

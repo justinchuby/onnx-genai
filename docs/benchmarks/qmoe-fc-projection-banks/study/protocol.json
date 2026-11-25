@@ -1,0 +1,79 @@
+{
+  "shapes_rows_hidden_inter_width_dense_separate_gate": [
+    [
+      1,
+      32,
+      64,
+      1,
+      0,
+      0
+    ],
+    [
+      1,
+      64,
+      128,
+      1,
+      1,
+      0
+    ],
+    [
+      1,
+      64,
+      128,
+      1,
+      0,
+      1
+    ],
+    [
+      8,
+      128,
+      256,
+      1,
+      0,
+      0
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      0,
+      1
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      1,
+      1
+    ]
+  ],
+  "arms": [
+    "baseline",
+    "candidate",
+    "null"
+  ],
+  "repetitions": 3,
+  "work_macs": 268435456,
+  "k": 2,
+  "fixed_warm_calls": 5,
+  "setup_only_calls": 0,
+  "double_multiplier": 2,
+  "quality": {
+    "aa": [
+      0.95,
+      1.05
+    ],
+    "setup_fraction_max": 0.25,
+    "setup_adjusted_double": [
+      1.7,
+      2.3
+    ],
+    "work_cpu_seconds_min": 0.05,
+    "physical_cpu_wall_factor": 11
+  },
+  "max_attempts": 1,
+  "binary_scope": "two source-controlled optimized native builds; null runs baseline executable; this is not one-address-space A/B",
+  "cpu_scope": "terminal child user+system CPU seconds, includes setup/work/validation/output IO/retirement; not pure inference latency"
+}

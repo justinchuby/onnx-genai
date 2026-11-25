@@ -81,6 +81,32 @@ const MATRIX: &[Row] = &[
         false,
         None,
     ),
+    row(
+        "tests/fixtures/onnx_genai_workflows/realtime/inference_metadata.yaml",
+        1,
+        SingleGraph,
+        None,
+        false,
+        None,
+    ),
+    row(
+        "tests/fixtures/onnx_genai_workflows/realtime-constrained/inference_metadata.yaml",
+        1,
+        SingleGraph,
+        None,
+        false,
+        None,
+    ),
+    // The adapter and ONNX classifier are two executable components, even
+    // though one adapter is invoked three times. Neither is a decoder.
+    row(
+        "tests/fixtures/onnx_genai_workflows/reranking_multimodal/inference_metadata.yaml",
+        2,
+        Composite,
+        None,
+        false,
+        None,
+    ),
     // ── catalogue: worked examples of the metadata format ────────────────────
     // These document graph ABIs. Several declare a lone decoder component
     // without the runtime's decode contract, which is exactly why the two
