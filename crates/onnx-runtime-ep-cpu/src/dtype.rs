@@ -39,6 +39,41 @@ use onnx_runtime_ir::DataType;
 
 use crate::strided::{elem_offset, next_index, numel};
 
+/// Read one rank-zero Host-accessible integer without materializing a Vec.
+pub(crate) fn scalar_i64(op: &str, name: &str, input: &TensorView<'_>) -> Result<i64> {
+    if input.is_absent() {
+        return Err(EpError::KernelFailed(format!(
+            "{op}: required `{name}` input is absent"
+        )));
+    }
+    if !input.shape.is_empty() {
+        return Err(EpError::KernelFailed(format!(
+            "{op}: `{name}` must be a scalar, got shape {:?}",
+            input.shape
+        )));
+    }
+    input.validate().map_err(|error| EpError::KernelFailed(format!(
+        "{op}: `{name}` scalar view is invalid: {error}; bind a valid rank-zero Host-accessible integer view"
+    )))?;
+    if !input.device.is_host_accessible() {
+        return Err(EpError::KernelFailed(format!(
+            "{op}: `{name}` must be a Host scalar, got device {:?}; copy it to CPU before execution",
+            input.device
+        )));
+    }
+    // SAFETY: the owner supplies one readable Host element; validation checks
+    // rank/offset and data_ptr applies that offset. Packed inputs may be unaligned.
+    unsafe {
+        match input.dtype {
+            DataType::Int32 => Ok(input.data_ptr::<i32>().read_unaligned() as i64),
+            DataType::Int64 => Ok(input.data_ptr::<i64>().read_unaligned()),
+            dtype => Err(EpError::KernelFailed(format!(
+                "{op}: `{name}` must be int32 or int64, got {dtype:?}"
+            ))),
+        }
+    }
+}
+
 /// The numeric domain a kernel evaluates arithmetic in.
 ///
 /// Kept separate from the storage element type so several storage widths can
@@ -1691,6 +1726,75 @@ mod tests {
         write_dense_f32_narrow("test", &mut out.view_mut(), &widened).unwrap();
         for (i, (&g, &v)) in out.to_u16_bits().iter().zip(widened.iter()).enumerate() {
             assert_eq!(g, half::bf16::from_f32(v).to_bits(), "i={i}");
+        }
+    }
+    #[test]
+    fn scalar_integer_reader_preserves_offsets_unaligned_storage_and_signed_values() {
+        use onnx_runtime_ep_api::DevicePtr;
+        use onnx_runtime_ir::{DeviceId, DeviceType};
+        // Byte offset is element aligned, while the backing itself is unaligned.
+        let mut backing = [0u8; 24];
+        for (dtype, bytes, expected) in [
+            (DataType::Int32, (-123i32).to_le_bytes().to_vec(), -123i64),
+            (DataType::Int64, i64::MIN.to_le_bytes().to_vec(), i64::MIN),
+        ] {
+            let width = bytes.len();
+            backing[1 + width..1 + width * 2].copy_from_slice(&bytes);
+            let view = TensorView::new(
+                DevicePtr(unsafe { backing.as_ptr().add(1).cast() }),
+                dtype,
+                &[],
+                &[],
+                DeviceId::cpu(),
+            )
+            .with_byte_offset(width);
+            assert_eq!(scalar_i64("DFT", "length", &view).unwrap(), expected);
+            let mut unified = view;
+            unified.device = DeviceId::new(DeviceType::Mlx, 0);
+            assert_eq!(
+                scalar_i64("STFT", "frame_step", &unified).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_integer_reader_names_invalid_controls_without_reading_them() {
+        use onnx_runtime_ep_api::DevicePtr;
+        use onnx_runtime_ir::DeviceId;
+        let value = 7i64;
+        let valid = TensorView::new(
+            DevicePtr((&value as *const i64).cast()),
+            DataType::Int64,
+            &[],
+            &[],
+            DeviceId::cpu(),
+        );
+        let mut rank = valid;
+        rank.shape = &[1];
+        rank.strides = &[1];
+        let mut malformed = valid;
+        malformed.strides = &[1];
+        let mut device = valid;
+        device.device = DeviceId::cuda(0);
+        let mut dtype = valid;
+        dtype.dtype = DataType::Float64;
+        for (view, reason) in [
+            (TensorView::absent(DataType::Int64), "absent"),
+            (rank, "must be a scalar"),
+            (malformed, "scalar view is invalid"),
+            (device, "Host scalar"),
+            (dtype, "must be int32 or int64"),
+        ] {
+            let error = scalar_i64("test op", "runtime length", &view)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("test op")
+                    && error.contains("runtime length")
+                    && error.contains(reason),
+                "{error}"
+            );
         }
     }
 }

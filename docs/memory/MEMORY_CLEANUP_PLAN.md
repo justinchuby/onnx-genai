@@ -2623,7 +2623,7 @@ and per-batch DFT allocations still require their own workspace migration.
 
 DFT's real/imaginary input and output vectors now borrow four transform-length
 regions from the same StepScoped Host execution domain as STFT. A private
-FourierWorkspace descriptor centralizes checked partitioning and initialization;
+FloatWorkspace<4> descriptor centralizes checked partitioning and initialization;
 it owns neither backing nor quota. Both operators use its closure-scoped Host
 borrows. DFT constructs one existing DftPlan per execution and reuses it across
 all batches, instead of allocating vectors and DSP setup for each transform.
@@ -2709,3 +2709,36 @@ Input/scale widening and the general broadcast path's rank-sized stride vectors
 remain outside the staging requirement. These checks prove ownership and
 numerical behavior, not zero total allocations, inference latency, complete RSS
 accounting or CUDA execution.
+
+
+### One private initialized-float binding contract for CPU kernels
+
+DFT, STFT and both RMS schemas now use `FloatWorkspace<N>` instead of separate
+Fourier and RMS raw-pointer initialization code. A kernel supplies named f32
+region lengths, keeps its own geometry and declares the same existing
+StepScoped requirement. The descriptor uses fixed-size stack arrays and the
+existing `WorkspaceLayout`; lengths are derived from checked region byte sizes
+when binding rather than retained as a second source of truth. It owns no
+backing, quota, lock or pool. This is a CPU-private helper, not a new EP ABI.
+
+Complete capacity/alignment/address validation precedes all memory writes and
+the callback. Each region is initialized before its f32 slice exists, including
+fresh backing; empty regions use aligned dangling pointers. A higher-ranked
+closure and fixed return type keep scratch references within the synchronous
+borrow. Callers still prove Host accessibility, live exclusive ownership and
+disjointness from tensors. Their existing view, optional-output, overflow and
+empty-work guards remain in the kernels. The helper introduces no per-frame,
+row or expert admission. Scalar integer reads move to the dtype module,
+independent of workspace ownership, with invalid-view errors naming the op and
+control input.
+
+Exact source comparison preserves the DFT/STFT execution and tests and the RMS
+math core. The binding regressions retain fresh/poisoned four-buffer controls
+and cover unequal region lengths, optional empty holes, no regions,
+missing/short/misaligned/wrapping backing, no writes/callback on refusal and
+reuse after a consumer error. Scalar controls cover signed values, unaligned
+backing, byte offsets, invalid views and Host-accessible unified-memory metadata.
+Existing per-kernel and governed-lane tests, public sessions and fallback-disabled
+real ORT plugin tests remain the integration checks. Byte bounds, arithmetic,
+retention and grant/refund ownership are unchanged; no timing or CUDA-runtime
+claim is made.
