@@ -1822,3 +1822,14 @@ processes use about 19–26% less CPU; this includes setup/validation and is not
 pure kernel or LLM throughput. Full native hashes match the old arithmetic.
 MLAS still wins the larger reference comparisons, so Softmax remains
 ungraduated and its optional reference remains. Other ISAs are unchanged.
+
+## CPU router selection keeps the full ordering default
+
+An exact partition-plus-prefix-ordering experiment preserves router indices and
+weight bits, but its comparator call count depends on the input at the same expert/top-k
+shape: random inputs can use fewer comparisons while already ordered or tied
+inputs use more. The [complete selection study](../benchmarks/cpu-routing-selection/README.md)
+retains all 160 cases and both candidate/final validation. No latency or LLM
+throughput was measured. Keep the existing default and add no heuristic; the
+permuted-bit/selection-boundary regression test remains as a guard for future
+native optimization. No resource, quota or public EP API changes are introduced.

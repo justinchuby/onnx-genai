@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "base": "8ddea0effeac0a8bd9aa287132a79bcc3c400aaa",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/moe.rs": "094a9f26ea3bd6f09ebc53c14807c3e9151417f9f239219764a8ffa7ac3bee58",
+    "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs": "60deb57c7ba81aa21129c9f08cf6b76a6a165b881cc2b77c9c168abf931ce6e1"
+  },
+  "probe_sha256": "9eead2570f3c282f48632da3f05af5e7ee7744453bb11ab9a6cc7dc203b3464e",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "hardware": {
+    "machdep.cpu.brand_string": "Apple M1 Max",
+    "hw.memsize": "34359738368",
+    "hw.logicalcpu": "10",
+    "hardware_read_command": "/usr/sbin/sysctl -n machdep.cpu.brand_string hw.memsize hw.logicalcpu",
+    "hardware_read_exit": 0,
+    "hardware_read_authority": "separate escalated read-only command; sandbox sysctl was denied before any build or timing",
+    "hardware_read_time_utc": "2026-11-24T19:43:28.315736+00:00"
+  },
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "lock_inode": 339651569,
+  "lock_busy_control": true,
+  "parent_pid": 97405,
+  "binaries": {
+    "baseline": {
+      "sha256": "a034ada472fd3f3e22c9b7170a95aa602df2224942794aac080b28e3a09a8f0d",
+      "native": true,
+      "symbol_count": 28333
+    },
+    "candidate": {
+      "sha256": "39b6f729e7019526e23b5f63f7bedf27d749abd3d4d202efc54def3504dcb8d8",
+      "native": true,
+      "symbol_count": 28311
+    }
+  },
+  "foreign_core_monitor": "Unavailable on Darwin; no claim of an idle host",
+  "metric": "terminal child user+system CPU seconds, includes setup/work/validation/output IO/retirement; not pure inference latency",
+  "baseline_inherited_from": {
+    "metadata": "/tmp/nxrt-qmoe-fc-banks-study/metadata.json",
+    "sha256": "1b95ee4347a3bd9d26fc959b0adda67329ffc3e4a4b2c2c4a6435f3ef87683ab"
+  },
+  "probe_lock_sha256": "b99fca5f115cb317570362954b6602289c0ec7c9817197e4a28060329528c777",
+  "receipts_sha256": "3e626089f75f072b19317ad4b89fb72b92dabf71f1ef54ed0c8eb3740837639b",
+  "runner_sha256": "e2e0e45180c0f8e0323791660d08417629e9df9d3c4fc83fe3b99b00768c14af",
+  "processes": 144
+}

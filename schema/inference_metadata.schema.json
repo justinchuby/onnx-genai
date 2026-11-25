@@ -3457,6 +3457,178 @@
       ],
       "type": "object"
     },
+    "RealtimeInputs": {
+      "additionalProperties": false,
+      "properties": {
+        "audio": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "output_token_budget": {
+          "type": "string"
+        },
+        "token_mask": {
+          "description": "Optional bool vocabulary mask: empty means unconstrained; otherwise one\nadmission bit per tokenizer ID, consumed before native token selection.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tokens": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "output_token_budget",
+        "operation",
+        "audio",
+        "tokens"
+      ],
+      "type": "object"
+    },
+    "RealtimeMode": {
+      "enum": [
+        "realtime",
+        "transcription",
+        "duplex"
+      ],
+      "type": "string"
+    },
+    "RealtimeSelections": {
+      "description": "Explicit conditioning admission: absence defaults to no override, not an\ninferred list or unrestricted model support.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "unsupported",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "any",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "choices",
+              "type": "string"
+            },
+            "values": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "values"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "RealtimeSpec": {
+      "additionalProperties": false,
+      "description": "A bounded native invocation advances one realtime session. Codec, temporal\nand acoustic state belongs to session-scoped workflow state, not transport.",
+      "properties": {
+        "default_mode": {
+          "$ref": "#/$defs/RealtimeMode"
+        },
+        "input_frame_samples": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "input_sample_rate_hz": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inputs": {
+          "$ref": "#/$defs/RealtimeInputs"
+        },
+        "languages": {
+          "$ref": "#/$defs/RealtimeSelections",
+          "default": {
+            "kind": "unsupported"
+          }
+        },
+        "modes": {
+          "items": {
+            "$ref": "#/$defs/RealtimeMode"
+          },
+          "type": "array"
+        },
+        "output_sample_rate_hz": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "prompt_template": {
+          "description": "Jinja context: operation, text, call_id and the complete session settings.",
+          "type": "string"
+        },
+        "voices": {
+          "$ref": "#/$defs/RealtimeSelections",
+          "default": {
+            "kind": "unsupported"
+          }
+        }
+      },
+      "required": [
+        "default_mode",
+        "prompt_template",
+        "modes",
+        "input_sample_rate_hz",
+        "input_frame_samples",
+        "inputs"
+      ],
+      "type": "object"
+    },
+    "RerankingSpec": {
+      "additionalProperties": false,
+      "description": "Model-authored query/document image positions. Each name references an\napplication-sourced uint8 vector; the workflow owns decoding and vision math.",
+      "properties": {
+        "document_images": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "query_images": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
     "RuntimeConfigurable": {
       "additionalProperties": false,
       "description": "Features whose concrete settings may be selected by the runtime.",
@@ -5038,10 +5210,32 @@
           ],
           "description": "Pooling applied to a sequence-valued output, when the task needs it."
         },
+        "realtime": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RealtimeSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Session-scoped audio/text quantum ABI for realtime transports."
+        },
         "requirement": {
           "$ref": "#/$defs/ProfileRequirement",
           "default": "required",
           "description": "Whether a reader that does not understand this profile may skip it."
+        },
+        "reranking": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RerankingSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Ordered encoded-image endpoints for the reranking v2 task ABI."
         },
         "version": {
           "description": "Version of this profile's own contract.",
@@ -5443,7 +5637,7 @@
           "description": "Declared output dtype. Always explicit; never inferred from the model."
         },
         "name": {
-          "description": "Workflow SSA value produced by the preprocessing adapter invocation.",
+          "description": "Output name: a workflow SSA value under preprocessing ABI v1, or a\ncomponent-local output port under image-preprocess ABI v2. The latter\nallows repeated invocations to bind independent workflow SSA values.",
           "examples": [
             "image.pixel_values"
           ],

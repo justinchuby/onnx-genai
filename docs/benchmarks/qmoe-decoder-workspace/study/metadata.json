@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "base": "3e8c8e776686a3c2489b4290c98a906e4be7e77e",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-api/src/kernel.rs": "94a731f32efeb022b034511565cfb194a1faccb7d43b50824244b008e9dcab52",
+    "crates/onnx-runtime-ep-api/src/lib.rs": "aa0a37f30e2b9a212c4856587024371bf87bd8c04e2ed23a010f9e1f3951c10d",
+    "crates/onnx-runtime-ep-api/src/provider.rs": "2b9b652ca63d4f0feaf565d03dbecfc2878ee0384af31bbdfbda6d8dd17f4c11",
+    "crates/onnx-runtime-ep-api/src/workspace.rs": "b381e5fa087c8079f57f0221ff2a493bf09697e40c481bc5e48d0f6c7e0d097f",
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs": "07004f9b636c800215f7ce645dad9d715cd29b415d13a8660ebf38e69577c278",
+    "crates/onnx-runtime-ep-cpu/src/kernels/decoded_projection.rs": "cd3fa75c97491ce90c04f34d409eb2ec7c429126c78839277305ea8085954ffd",
+    "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs": "f87e6d33d070c63783ac4bee00b008b68e869130dccc7b95c50b095e3cd73e82",
+    "crates/onnx-runtime-ep-cpu/src/provider.rs": "4360489d14dc36756cf13310145048d65e261bdb0f86706b3e4e5df54553a7ed",
+    "crates/onnx-runtime-ep-plugin/src/compute.rs": "d4a708956ea7dfee813baa0c51975648d3336f888358ed947a07834116a46e4c",
+    "crates/onnx-runtime-session/src/executor/bindings.rs": "35152ad8647a17c653527776b299ffa67d893dbd6cc13860bc898c6a26ec7a1d",
+    "crates/onnx-runtime-session/src/executor/state.rs": "add4485404ff340e6e14e5e10af10cde976531f024f7d7d369064e5dcd61c5b7",
+    "crates/onnx-runtime-session/src/executor/tests.rs": "d370a3044376fed74020f3557cde715ea4ce56434b66597adfa8ba01b35fe534",
+    "crates/onnx-runtime-session/src/hetero.rs": "86b5a408b8de5a50df8fab0199f9e563cb39e84e9547afb13d45909469d7804f",
+    "crates/onnx-runtime-session/src/plugin_provider.rs": "9d5ce53cd7db69ba22f53e0f31eedeb8aa47bd69cafd06f0919b41d5da979175",
+    "crates/onnx-runtime-session/src/executor/workspace_context_tests.rs": "401d5be69b939ab23c7866187c6d29df503656e72a5dac4703cab7cb81ab42c5"
+  },
+  "probe_sha256": "dd68985e1b642122e8b814e68bb32569c824716b045f3a02824e694b281959cf",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "hardware": {
+    "machdep.cpu.brand_string": "Apple M1 Max",
+    "hw.memsize": "34359738368",
+    "hw.logicalcpu": "10",
+    "hardware_read_command": "/usr/sbin/sysctl -n machdep.cpu.brand_string hw.memsize hw.logicalcpu",
+    "hardware_read_exit": 0,
+    "hardware_read_authority": "separate escalated read-only command; sandbox sysctl was denied before any build or timing",
+    "hardware_read_time_utc": "2026-11-24T19:43:28.315736+00:00"
+  },
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "lock_inode": 339651569,
+  "lock_busy_control": true,
+  "parent_pid": 11210,
+  "binaries": {
+    "baseline": {
+      "sha256": "f9623eae20cc558b92b843c06ae39a8ac81181304ff040e17b5ec9c6a9748964",
+      "native": true,
+      "symbol_count": 28621
+    },
+    "candidate": {
+      "sha256": "596c4866650b6d77fb12f56189ecfdbcb4a4e231aa18fc696e7be0d851744680",
+      "native": true,
+      "symbol_count": 28731
+    }
+  },
+  "foreign_core_monitor": "Unavailable on Darwin; no claim of an idle host",
+  "metric": "terminal child user+system CPU seconds, includes setup/work/validation/output IO/retirement; not pure inference latency",
+  "probe_lock_sha256": "b99fca5f115cb317570362954b6602289c0ec7c9817197e4a28060329528c777",
+  "receipts_sha256": "36be2daaab4b812e6e7b5928a475c912d032b23a81e2de81a12d494b3c1af838",
+  "runner_sha256": "e9fbb60ff1ea0a2e294e5c7974aaaf99befef58435af2db8ce5b46eaf001d97d",
+  "processes": 192
+}

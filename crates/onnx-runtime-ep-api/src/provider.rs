@@ -1225,6 +1225,19 @@ pub trait ExecutionProvider: Send + Sync {
     fn device_type(&self) -> DeviceType;
     fn device_id(&self) -> DeviceId;
 
+    /// Ambient context reader required to memoize this provider's workspace bounds.
+    /// Caches must include its read key alongside tensor metadata. The reader
+    /// itself is fixed for this provider's lifetime and can be captured cold,
+    /// avoiding provider locks on each dispatch. The default is
+    /// valid only when requirements do not depend on the caller's environment.
+    /// Keys are scoped to this provider and must stay stable during one prepare
+    /// or dispatch; a new context requires preparation/refinement before launch.
+    /// Implementations must not allocate scratch, issue quota calls or spawn a
+    /// scheduler just to report this key. Delegating providers must forward it.
+    fn workspace_preparation_context(&self) -> crate::WorkspaceContextReader {
+        crate::WorkspaceContextReader::STABLE
+    }
+
     /// PCI vendor id of this EP's device memory (0 = generic/host). Used by the
     /// plugin executor to reconstruct the device `OrtMemoryInfo` ORT registered
     /// the device allocator against, as a fallback for staging host-resident

@@ -1,0 +1,16 @@
+{
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs": "69b148fffb985768f84a44acc92e9e0fd575fd2bf10da2dbc2af40ea4b3a5895",
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs": "1d47a72a11b6ad0a374d22f0fbe9fa2f4dac157bc8efa45c20d13f996a1d959d"
+  },
+  "baseline": "61c47ee27c19978a441443ed4e42995a7a172e15",
+  "binary_sha256": "294380448f89db48aa9004dbf0cb962591fd21de1cc658423b58f904d490e10d",
+  "single_decode_symbol": [
+    "0000000100440834 t __RNvNtNtCs42teQl6N5qM_19onnx_runtime_ep_cpu7kernels22block_quantized_matmul18decode_mxfp4_block"
+  ],
+  "diagnostic_only": true,
+  "runtime_selector": "factory creation only; absent=actual execution context, present=frozen constructor context",
+  "probe_sha256": "991057184305c9bce1cfa677eff8ff4f498ef04031790d82f0e14a1b44a738d1",
+  "receipts_sha256": "ed8751e21af393198ec4481e9ee1bb03c5648fb765472b0d0ba93c6e7b7c6766",
+  "runner_sha256": "e4330efa023d981d80103c0a2175507b305a2e470104df4a5c52390a525242de"
+}
