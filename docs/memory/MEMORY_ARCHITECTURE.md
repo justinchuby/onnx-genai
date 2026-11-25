@@ -950,6 +950,13 @@ normalization and contribution addition order are preserved. This metadata is
 still outside the governed projection lane; cold setup, growth and grouping
 allocations remain. See the [routing evidence and limits](../benchmarks/cpu-routing-scratch/README.md).
 
+QMoE route-first statistics also borrow their per-expert counts directly from
+the existing task-group lengths. They do not maintain another per-dispatch
+count map, including when offload is disabled. Process/per-layer accumulated
+statistics and their lock order remain unchanged. The [route-count evidence](../benchmarks/qmoe-route-counts/README.md)
+separates this removed diagnostic index from persistent metrics and governed
+payloads.
+
 ### CPU compressed-projection scratch
 
 CPU `BlockQuantizedMatMul` and `BlockQuantizedMoE` declare metadata-planned,
