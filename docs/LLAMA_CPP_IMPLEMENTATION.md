@@ -2180,3 +2180,162 @@ snapshot consistency and clean retries after progress/phase cancellation.
 Native MTP is exercised in a subprocess with the ORT library unavailable. The
 actual server driver checks the same counter snapshots after an aborted turn
 and successful retry. This increment does not close the broader acceptance rows.
+
+
+## SSE idle comment pings
+
+The previously accepted but ignored `sse_ping_interval` now configures actual
+idle comment pings for generation transports. A typed policy shares CLI,
+server-default, request validation and `/props` reporting. Default 30 seconds
+matches the pinned upstream; -1 and 0 disable pings. Data resets the idle timer
+and source EOF terminates it. Native completion/infill, OpenAI completion/chat,
+Responses and Anthropic adapters apply the same policy. Replay retains exact
+comment bytes rather than removing them and shifting reconnect offsets.
+
+Wire tests cover idle reset, disablement and termination; HTTP tests cover
+request overrides and rejection across five generation protocols; a real replay
+middleware test checks offsets across comment and UTF-8 payload bytes. This
+increment does not check off unrelated remaining compatibility acceptance rows.
+
+
+## Native final-response field projection
+
+`response_fields` now projects actual native completion/infill terminal results,
+including buffered batches, SSE batches and prompt-only evaluation. An empty
+selector preserves the original response. The pinned source traverses object
+keys and retains the complete slash path as the output key; this differs from
+its README's leaf-renaming description. Missing paths are omitted, array indices
+and JSON Pointer escapes are not inferred. Intermediate token/progress events
+and errors keep their protocol contracts. Native batch completion remains tied
+to its owner outcome channel rather than projected JSON fields.
+
+Unit cases pin nested objects, empty segments, duplicate/missing paths, arrays
+and literal tildes. Real HTTP coverage exercises unchanged empty-selection
+results, nested timing selection, buffered/SSE batches without stop/index,
+prompt-only output, admitted infill, and invalid selector types. This remains an
+increment toward the original compatibility scope, not completion of its rows.
+
+## Prediction wall-time limit
+
+`t_max_predict_ms` now reaches the request-owned decoder stop policy rather than
+being accepted and ignored. The pinned server's implementation checks a fresh
+emitted newline after strict wall-time expiry, starting with the first generated
+token. Null and disabled values preserve ordinary generation; numeric fractions
+truncate toward zero, while unsafe overflow representations fail admission.
+This is a normal output/state commit with a limit finish reason.
+
+An explicit output-observer capability admits time/stop observers to raw-greedy
+Native speculative verification while keeping logits-transforming processors
+on their existing fallback path. Stops inside an accepted block restore only
+the retained prefix, including hidden conditioning, before token publication.
+Injected repair failure publishes no token and permits a clean retry. Generic
+authored workflows stop at declared emission boundaries; candidate-tree and
+DFlash drivers truncate before accepted-state recomputation.
+
+Local macOS CPU validation includes real Native/ORT buffered and callback
+generation, Native multi-token acceptance, continuous-row reuse, pure authored
+workflow execution, and actual candidate-tree/DFlash prefix commits and retry.
+Full server library tests passed (591, two existing ignores); full engine
+library tests passed (1083, one existing ignore). Full DFlash (24), candidate-tree
+(30) and authored workflow policy (22) suites passed; the additional DFlash
+observer-bound failure check proved no publication and a clean retry. Default
+engine/server all-target strict lint, no-default engine strict lint, both Python
+binding checks, formatting and diff checks passed after restacking onto main.
+These checks validate this increment; the unchecked goal acceptance rows remain
+open.
+
+## Numeric SSE ping overrides
+
+The pinned schema treats null numeric fields as absent and converts fractional
+numbers before checking hard bounds. `sse_ping_interval` now follows that rule:
+null inherits the operator's configured interval, fractions truncate toward
+zero, and the resulting value must fit -1 through INT32_MAX. The prediction
+millisecond limit and ping interval share safe signed conversion without
+emulating undefined upstream overflow casts. Their own units, upper bounds and
+defaults remain distinct. CLI ping intervals remain integer arguments.
+
+Coverage includes enabled/disabled custom default inheritance, fractional
+disablement and positive intervals, fractional signed boundaries, rejected
+types/overflow, and admission across five generation protocols. Existing idle
+comment timing, source termination and replay-byte tests remain required.
+
+Full server library validation passed (591 tests, two inherited ignores),
+including the existing prediction-time tests after conversion was shared.
+Server all-target strict Clippy and diff checks passed on macOS ARM64 CPU.
+This closes the numeric ping discrepancy, not the remaining goal acceptance rows.
+
+## Native final request and stop metadata
+
+Native terminal responses now carry detokenized admitted prompt tokens,
+resolved supported sampling settings, visible-output newline state and the
+matched text stop word. Serial Native executors publish their actual slot ID.
+The request preparation boundary captures the normalized settings before driver
+submission, including admitted output/context budgets. Prompt-only runs retain
+a zero generation cap. Active optional samplers report their parameters, and
+explicit seeds remain distinguishable from unspecified random seeds.
+
+The metadata travels with its own batch row through buffered and SSE delivery,
+infill and prompt-only execution, and is available to terminal response-field
+projection. Tests use an actual model with a tokenizer newline/stop suffix to
+distinguish visible newlines from newlines removed inside stop strings. They also
+exercise exact prompt tokens, sampler settings, logit biases, batch ownership,
+infill prompts and projected streams whose terminal JSON omits stop/index.
+
+Validation after main restack: full server library 592 passed, two inherited
+ignores; server all-target strict Clippy and diff checks passed on macOS ARM64
+CPU. The remaining goal acceptance rows stay open.
+
+## Stops inside decoded token fragments
+
+The ordinary decoder now detects text stop words inside a selected token rather
+than only at the end of accumulated text. It selects the earliest visible byte
+position, with configured order resolving ties, and keeps token-ID stops as
+suffix matches. A request-owned scan cursor plus longest-stop overlap preserves
+cross-token Unicode matches without rescanning the entire history on each step.
+The stop configuration is immutable after processor construction.
+
+Engine matching, output buffering, final text clipping and prediction-time
+visibility now share textual boundary classification. Incomplete stop prefixes
+remain withheld; a newline released when a prefix ceases to match becomes
+eligible for time expiry, while a newline hidden by a complete stop does not.
+Tests cover true accepted-token counts and stop reasons, stop selection within
+one token, native/OpenAI/chat buffered and logprob SSE output, and Native
+speculative prefix repair with injected failure and retry.
+The native stopping-word diagnostic uses that same match independently of the
+final stop type; a real preserved EOS token containing a stop string verifies
+that EOS priority retains the matched word in buffered and SSE responses.
+
+The audit also identified remaining work for indentation stopping (`n_indent`)
+and general stop-sequence observation in authored candidate-tree/DFlash paths.
+These remain part of the original goal, alongside the unchecked acceptance rows.
+
+Validation after restacking onto main 007d488d0: full engine library 1086
+passed with one inherited ignore, full server library 593 passed with two
+inherited ignores. Default engine/server all-target strict Clippy, no-default
+engine strict Clippy, formatting and diff checks passed on macOS ARM64 CPU.
+The unchecked goal acceptance rows remain required.
+
+
+## Authored workflow output stops
+
+The shared output observer now applies ordinary text/token stop sequences to
+candidate-tree, DFlash and generic authored loops as well as prediction time.
+The shared processor builder preserves observer priority. Token-only controls
+work without a tokenizer; text controls require one explicitly. Generic loops
+also enforce request-wide token budgets and EOS independently of authored loop
+iteration bounds. Their current body finishes atomically before the next body
+is suppressed; over-budget atomic emission rejects the whole turn.
+
+Specialized drivers retain the accepted prefix before state recomputation.
+Terminal decoder flushing occurs before semantic commit, allowing pending UTF-8
+to trigger a text stop and preserving rollback if its byte budget fails.
+Tests compare real specialized state continuations with budgeted references,
+exercise a real ONNX generic recurrence, and check buffered/callback publication,
+EOF decoding, EOS priority, missing-tokenizer admission and failed-turn retry.
+Validation: full DFlash 26, candidate-tree 32 and workflow policy 28 tests
+passed. After rebasing onto main 1ef2439da, full engine library 1086 passed
+with one inherited ignore and full server library 593 passed with two inherited
+ignores. Default engine/server all-target strict Clippy, no-default engine
+all-target strict Clippy, formatting and diff checks passed on macOS ARM64 CPU.
+The general goal remains incomplete; indentation stopping and unchecked
+acceptance rows remain required.

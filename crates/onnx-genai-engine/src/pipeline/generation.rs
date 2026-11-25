@@ -713,57 +713,248 @@ impl<B: DecodeLoopBackend + ?Sized> GenerationCore for GenerationNodeHost<'_, '_
     }
 }
 
-/// Observer-only host for a workflow whose components execute generically.
-///
-/// It implements no component contracts; it only participates in the same
-/// transaction and loop-stop hooks as a fused decode core.
-struct StagedOutputObserverHost<'a> {
-    tokenizer: &'a Tokenizer,
-    observer: &'a mut ToolCallStagedOutputObserver,
+/// Generic workflows stop at loop-body boundaries; speculative drivers retain
+/// only the accepted token prefix before recomputing state.
+pub(super) enum OutputObservationMode {
+    GenericLoop,
+    AcceptedPrefix,
 }
 
+pub(super) struct GenerationOutputObserver {
+    chain: crate::logits::ProcessorChain,
+    decoder: Option<crate::tokenization::TokenTextDecoder>,
+    context: crate::logits::ProcessorContext,
+    max_tokens: usize,
+    max_bytes: usize,
+    stop_reason: Option<GenerationStopReason>,
+}
+impl GenerationOutputObserver {
+    pub(super) fn new(
+        options: &GenerateOptions,
+        tokenizer: Option<&Tokenizer>,
+        mode: OutputObservationMode,
+    ) -> anyhow::Result<Option<Self>> {
+        use crate::logits::{ProcessorChain, StopSequence};
+        let time = options.max_prediction_time.filter(|limit| !limit.is_zero());
+        let text_stops = options
+            .stop_sequences
+            .iter()
+            .any(|stop| matches!(stop, StopSequence::Text(text) if !text.is_empty()));
+        let token_stops = options
+            .stop_sequences
+            .iter()
+            .any(|stop| matches!(stop, StopSequence::Tokens(tokens) if !tokens.is_empty()));
+        if matches!(mode, OutputObservationMode::AcceptedPrefix)
+            && time.is_none()
+            && !text_stops
+            && !token_stops
+        {
+            return Ok(None);
+        }
+        let needs_text = time.is_some() || text_stops;
+        anyhow::ensure!(
+            !needs_text || tokenizer.is_some(),
+            "text stops and prediction time limits require the package tokenizer; declare one before requesting these controls"
+        );
+        let mut chain = ProcessorChain::new();
+        crate::processors::append_output_observers(&mut chain, options);
+        Ok(Some(Self {
+            chain,
+            decoder: needs_text.then(|| {
+                crate::tokenization::TokenTextDecoder::with_preserved_tokens(
+                    &options.effective_preserved_tokens(),
+                )
+            }),
+            context: Default::default(),
+            max_tokens: options.max_new_tokens,
+            max_bytes: options.max_constraint_bytes,
+            stop_reason: None,
+        }))
+    }
+    fn append_text(&mut self, text: &str, options: &GenerateOptions) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.context
+                .generated_text
+                .len()
+                .checked_add(text.len())
+                .is_some_and(|size| size <= self.max_bytes),
+            "generation output observer exceeds max_constraint_bytes={}; shorten generated output or increase its explicit byte budget",
+            self.max_bytes
+        );
+        self.context.generated_text.push_str(text);
+        if (self.stop_reason.is_none()
+            || matches!(
+                self.stop_reason,
+                Some(GenerationStopReason::BudgetExhausted)
+            ))
+            && !self.context.generated_tokens.is_empty()
+        {
+            self.stop_reason = if self
+                .context
+                .generated_tokens
+                .last()
+                .is_some_and(|token| options.terminates(*token))
+            {
+                Some(GenerationStopReason::EosCommitted)
+            } else {
+                self.chain
+                    .signal(&self.context)
+                    .map(|signal| match signal {
+                        crate::logits::ProcessorSignal::PredictionTimeLimit => {
+                            GenerationStopReason::PredictionTimeLimit
+                        }
+                        crate::logits::ProcessorSignal::StopSequence { index } => {
+                            GenerationStopReason::StopSequence { index }
+                        }
+                    })
+                    .or_else(|| {
+                        (self.context.generated_tokens.len() >= self.max_tokens)
+                            .then_some(GenerationStopReason::BudgetExhausted)
+                    })
+            };
+        }
+        Ok(())
+    }
+    fn observe(
+        &mut self,
+        tokenizer: Option<&Tokenizer>,
+        tokens: &[crate::TokenId],
+        options: &GenerateOptions,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.context
+                .generated_tokens
+                .len()
+                .checked_add(tokens.len())
+                .is_some_and(|size| size <= self.max_tokens),
+            "generation output observer received more than max_new_tokens={}; increase the request budget to fit the workflow's atomic emitted unit, or repair its token emission budget",
+            self.max_tokens
+        );
+        for &token in tokens {
+            self.context.generated_tokens.push(token);
+            let text = match self.decoder.as_mut() {
+                Some(decoder) => decoder.step(
+                    tokenizer.context(
+                        "generation output text observation lost the admitted package tokenizer",
+                    )?,
+                    token,
+                )?,
+                None => String::new(),
+            };
+            self.append_text(&text, options)?;
+            self.context.step += 1;
+        }
+        Ok(())
+    }
+    pub(super) fn stop_reason(&self) -> Option<&GenerationStopReason> {
+        self.stop_reason.as_ref()
+    }
+    pub(super) fn observe_prefix(
+        &mut self,
+        tokenizer: Option<&Tokenizer>,
+        tokens: &[crate::TokenId],
+        options: &GenerateOptions,
+    ) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            self.stop_reason.is_none(),
+            "generation driver attempted to accept another token block after a normal output stop; repair the workflow's stop propagation before retrying"
+        );
+        for (index, &token) in tokens.iter().enumerate() {
+            self.observe(tokenizer, std::slice::from_ref(&token), options)?;
+            if self.stop_reason.is_some() {
+                return Ok(index + 1);
+            }
+        }
+        Ok(tokens.len())
+    }
+    pub(super) fn finish(
+        &mut self,
+        tokenizer: Option<&Tokenizer>,
+        options: &GenerateOptions,
+    ) -> anyhow::Result<()> {
+        let text =
+            match self.decoder.as_mut() {
+                Some(decoder) => decoder.finish(tokenizer.context(
+                    "generation output finalization lost the admitted package tokenizer",
+                )?)?,
+                None => String::new(),
+            };
+        self.append_text(&text, options)
+    }
+}
+
+/// Observer-only host participating in generic workflow transaction and stop hooks.
+struct StagedOutputObserverHost<'a> {
+    tokenizer: Option<&'a Tokenizer>,
+    observer: Option<&'a mut ToolCallStagedOutputObserver>,
+    output: Option<(GenerationOutputObserver, GenerateOptions)>,
+}
 impl WorkflowNodeHost for StagedOutputObserverHost<'_> {
     fn hosted_contracts(&self) -> &'static [&'static str] {
         &[]
     }
-
     fn begin_turn(&mut self, _turn: &super::TurnTransaction) -> anyhow::Result<()> {
-        self.observer.begin_turn();
+        if let Some(observer) = self.observer.as_deref_mut() {
+            observer.begin_turn();
+        }
         Ok(())
     }
-
     fn before_turn_commit(&mut self, _turn: &super::TurnTransaction) -> anyhow::Result<()> {
-        self.observer
-            .finish("semantic commit")
-            .context("validate staged generated tool protocol before semantic commit")?;
+        if let Some((output, options)) = self.output.as_mut() {
+            output.finish(self.tokenizer, options)?;
+        }
+        if let Some(observer) = self.observer.as_deref_mut() {
+            observer
+                .finish("semantic commit")
+                .context("validate staged generated tool protocol before semantic commit")?;
+        }
         Ok(())
     }
-
     fn turn_committed(&mut self, _outcome: super::TurnTransactionOutcome) {
-        self.observer.commit_turn();
+        if let Some(observer) = self.observer.as_deref_mut() {
+            observer.commit_turn();
+        }
     }
-
     fn turn_aborted(&mut self, _outcome: super::TurnTransactionOutcome) {
-        self.observer.abort_turn();
+        if let Some(observer) = self.observer.as_deref_mut() {
+            observer.abort_turn();
+        }
     }
-
     fn loop_host_outcome(&self) -> super::workflow::WorkflowLoopHostOutcome {
-        self.observer.stop_reason().map_or(
+        let reason = self
+            .observer
+            .as_deref()
+            .and_then(|observer| observer.stop_reason())
+            .or_else(|| {
+                self.output
+                    .as_ref()
+                    .and_then(|(output, _)| output.stop_reason().cloned())
+            });
+        reason.map_or(
             super::workflow::WorkflowLoopHostOutcome::Continue,
             super::workflow::WorkflowLoopHostOutcome::Stop,
         )
     }
-
     fn observe_staged_generation_tokens(
         &mut self,
         tokens: &[crate::TokenId],
     ) -> anyhow::Result<()> {
-        self.observer
-            .observe_tokens(self.tokenizer, tokens)
-            .context("observe staged generated output before output publication")?;
+        if let Some((output, options)) = self.output.as_mut() {
+            output
+                .observe(self.tokenizer, tokens, options)
+                .context("observe staged output for normal generation stops")?;
+        }
+        if let Some(observer) = self.observer.as_deref_mut() {
+            observer
+                .observe_tokens(
+                    self.tokenizer
+                        .context("tool-call output observation requires the package tokenizer")?,
+                    tokens,
+                )
+                .context("observe staged generated output before output publication")?;
+        }
         Ok(())
     }
-
     fn execute_contract_node(&mut self, _request: WorkflowNodeRequest<'_>) -> anyhow::Result<bool> {
         Ok(false)
     }
@@ -803,6 +994,16 @@ pub(crate) fn run_declared_generation(
         request.request.options.validate_preserved_tokens(tokenizer.context("preserved_tokens requires a package tokenizer; declare one before preserving output tokens")?)?;
     }
     let preserved_tokens = request.request.options.effective_preserved_tokens();
+    let output = if core.is_none() {
+        GenerationOutputObserver::new(
+            &request.request.options,
+            tokenizer,
+            OutputObservationMode::GenericLoop,
+        )?
+        .map(|output| (output, request.request.options.clone()))
+    } else {
+        None
+    };
     let mut plan = WorkflowExecutionPlan::new_hosted(runtime, request, hosted)?;
     let generic_execution = core.is_none();
     let (outputs, host_stop_reason) = {
@@ -811,16 +1012,20 @@ pub(crate) fn run_declared_generation(
             "a decode core owns staged-output observation; a second observer host would duplicate \
              parser authority"
         );
-        let mut observer_host = match (core.is_none(), tokenizer, staged_output_observer) {
-            (true, Some(tokenizer), Some(observer)) => Some(StagedOutputObserverHost {
-                tokenizer,
-                observer,
-            }),
-            (true, None, Some(_)) => anyhow::bail!(
-                "tool-call output observation requires the package tokenizer for canonical decode"
-            ),
-            _ => None,
-        };
+        anyhow::ensure!(
+            staged_output_observer.is_none() || tokenizer.is_some(),
+            "tool-call output observation requires the package tokenizer; declare one before requesting tool output"
+        );
+        let mut observer_host =
+            if core.is_none() && (staged_output_observer.is_some() || output.is_some()) {
+                Some(StagedOutputObserverHost {
+                    tokenizer,
+                    observer: staged_output_observer,
+                    output,
+                })
+            } else {
+                None
+            };
         let mut host: Option<&mut dyn WorkflowNodeHost> = match core.as_deref_mut() {
             Some(core) => Some(core as &mut dyn WorkflowNodeHost),
             None => observer_host

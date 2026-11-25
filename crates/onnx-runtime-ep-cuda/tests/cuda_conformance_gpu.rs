@@ -2611,11 +2611,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     ));
     p.push(sweep(
         "Sin",
-        unary_float("Sin", 13, &[-3.0, -1.0, 0.0, 1.0, 3.0]),
+        unary_float("Sin", 22, &[-3.0, -1.0, 0.0, 1.0, 3.0]),
     ));
     p.push(sweep(
         "Cos",
-        unary_float("Cos", 13, &[-3.0, -1.0, 0.0, 1.0, 3.0]),
+        unary_float("Cos", 22, &[-3.0, -1.0, 0.0, 1.0, 3.0]),
     ));
     p.push(sweep(
         "Softplus",
@@ -2741,6 +2741,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(sweep("QLinearMatMul", qlinear_matmul_cases()));
     p.push(sweep("Resize", resize_cases()));
     p.push(sweep("ConvTranspose", conv_transpose_cases()));
+    p.push(dedicated(
+        "RoiAlign",
+        "session:roi_align.rs",
+        "Pinned ONNX vectors and batch-index validation with CPU fallback disabled",
+    ));
     p.push(sweep("GridSample", grid_sample_cases()));
     p.push(dedicated(
         "DeformConv",

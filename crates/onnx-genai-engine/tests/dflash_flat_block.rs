@@ -8,7 +8,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use onnx_genai_engine::pipeline::speculative::DFlashGenerationCancelled;
 use onnx_genai_engine::{
@@ -661,12 +661,13 @@ fn package_with_target(
 }
 
 fn fixture_root() -> anyhow::Result<PathBuf> {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/test-fixtures/dflash-flat-block")
-        .join(NEXT.fetch_add(1, Ordering::Relaxed).to_string());
+    let root =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-fixtures/dflash-flat-block");
     fs::create_dir_all(&root)?;
-    Ok(root)
+    Ok(tempfile::Builder::new()
+        .prefix("case-")
+        .tempdir_in(root)?
+        .keep())
 }
 
 fn render_target(target: &str, tap_scales: &[f32; 5]) -> String {
@@ -819,7 +820,7 @@ fn install_tool_protocol_tokenizer(root: &Path, token: u64, text: &str) -> anyho
         "pre_tokenizer": null,
         "post_processor": null,
         "decoder": null,
-        "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"}
+        "model": {"type": "WordLevel", "vocab": vocab, "unk_token": if token == 1 { text } else { "<unk>" }}
     });
     fs::write(
         root.join("tokenizer.json"),
@@ -1834,5 +1835,292 @@ fn selector_convolution_v2_stays_a_typed_pre_mutation_refusal() -> anyhow::Resul
         package_execution_error(&error),
         Some(PackageExecutionError::DFlashExecutionUnavailable { version, .. }) if version == "2"
     ));
+    Ok(())
+}
+
+#[test]
+fn prediction_time_limit_commits_only_the_real_dflash_accepted_prefix() -> anyhow::Result<()> {
+    for streaming in [false, true] {
+        let root = package("1", false, &[0; 8])?;
+        install_tool_protocol_tokenizer(&root, 0, "\n")?;
+        let mut engine = Engine::from_dir(&root, ort_config())?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1, 2]));
+        request.options.max_new_tokens = 20;
+        request.options.greedy = true;
+        request.options.stop_on_eos = false;
+        request.options.max_prediction_time = Some(std::time::Duration::from_millis(50));
+        let control = GenerationControl::new().with_checkpoint(|boundary| {
+            if boundary == GenerationBoundary::AfterVerifier {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Ok(())
+        });
+        let mut delivered = Vec::new();
+        let mut callback = |token: onnx_genai_engine::GenerateToken| {
+            delivered.push(token);
+            Ok(())
+        };
+        let result = engine.generate_with_control_callbacks(
+            request.clone(),
+            control,
+            None,
+            if streaming { Some(&mut callback) } else { None },
+        )?;
+        assert_eq!(result.finish_reason, FinishReason::PredictionTimeLimit);
+        assert!(!result.token_ids.is_empty() && result.token_ids.len() < 20);
+        assert!(result.text.contains('\n'));
+        let traces = engine.take_dflash_block_traces();
+        assert!(!traces.is_empty());
+        assert_eq!(
+            traces
+                .iter()
+                .flat_map(|trace| trace.committed_tokens.iter())
+                .copied()
+                .collect::<Vec<_>>(),
+            result
+                .token_ids
+                .iter()
+                .copied()
+                .map(i64::from)
+                .collect::<Vec<_>>()
+        );
+        if streaming {
+            assert_eq!(
+                delivered
+                    .iter()
+                    .map(|token| token.token_id)
+                    .collect::<Vec<_>>(),
+                result.token_ids
+            );
+            assert_eq!(
+                delivered.last().unwrap().finish_reason,
+                Some(FinishReason::PredictionTimeLimit)
+            );
+        }
+        let mut invalid = request.clone();
+        invalid.options.max_constraint_bytes = 0;
+        let mut unexpected = Vec::new();
+        let error = engine
+            .generate_with_callbacks(
+                invalid,
+                None,
+                Some(&mut |token| {
+                    unexpected.push(token);
+                    Ok(())
+                }),
+            )
+            .expect_err("time observer byte budget must reject output before commit");
+        assert!(
+            format!("{error:#}").contains("max_constraint_bytes=0"),
+            "{error:#}"
+        );
+        assert!(unexpected.is_empty());
+        assert!(engine.take_dflash_block_traces().is_empty());
+        request.options.max_prediction_time = None;
+        request.options.max_new_tokens = 4;
+        assert_eq!(engine.generate(request)?.token_ids, vec![0; 4]);
+    }
+    Ok(())
+}
+
+#[test]
+fn output_stops_commit_dflash_prefix_state_and_retry_like_a_budgeted_reference()
+-> anyhow::Result<()> {
+    use onnx_genai_engine::logits::StopSequence;
+    for text_stop in [false, true] {
+        for streaming in [false, true] {
+            let root = package_with_target("1", false, &[0; 8], CONTEXTUAL_TARGET)?;
+            assert!(!root.join("tokenizer.json").exists());
+            let count = if text_stop { 1 } else { 2 };
+            let mut base = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1, 2]));
+            base.options.max_new_tokens = count;
+            base.options.greedy = true;
+            base.options.stop_on_eos = false;
+            let mut probe = Engine::from_dir(&root, ort_config())?;
+            let prefix = probe.generate(base.clone())?.token_ids;
+            drop(probe);
+            assert_eq!(prefix.len(), count);
+            if text_stop {
+                install_tool_protocol_tokenizer(&root, u64::from(prefix[0]), "preENDtail")?;
+            }
+            let mut reference = Engine::from_dir(&root, ort_config())?;
+            let reference_session = reference.create_session()?;
+            assert_eq!(
+                reference
+                    .generate_in_session(reference_session, base.clone())?
+                    .token_ids,
+                prefix
+            );
+            let mut continuation = base.clone();
+            continuation.options.max_new_tokens = 4;
+            let expected = reference
+                .generate_in_session(reference_session, continuation.clone())?
+                .token_ids;
+            let mut engine = Engine::from_dir(&root, ort_config())?;
+            let session = engine.create_session()?;
+            let mut request = base;
+            request.options.max_new_tokens = 20;
+            request.options.stop_sequences = if text_stop {
+                vec![
+                    StopSequence::Text("tail".into()),
+                    StopSequence::Text("END".into()),
+                ]
+            } else {
+                vec![StopSequence::Tokens(prefix.clone())]
+            };
+            let reason = FinishReason::StopSequence {
+                index: usize::from(text_stop),
+            };
+            let mut delivered = Vec::new();
+            let mut callback = |token: onnx_genai_engine::GenerateToken| {
+                delivered.push(token);
+                Ok(())
+            };
+            let result = engine.generate_in_session_with_control_callbacks(
+                session,
+                request.clone(),
+                GenerationControl::new(),
+                None,
+                if streaming { Some(&mut callback) } else { None },
+            )?;
+            assert_eq!(result.token_ids, prefix);
+            assert_eq!(result.finish_reason, reason);
+            assert_eq!(engine.session_token_count(session)?, count);
+            if !text_stop {
+                assert!(result.text.is_empty());
+            }
+            let traces = engine.take_dflash_block_traces();
+            assert_eq!(traces.len(), 1);
+            assert_eq!(
+                traces[0].committed_tokens,
+                prefix.iter().copied().map(i64::from).collect::<Vec<_>>()
+            );
+            if text_stop {
+                assert_eq!(traces[0].accepted, 0);
+            }
+            if streaming {
+                assert_eq!(
+                    delivered
+                        .iter()
+                        .map(|token| token.token_id)
+                        .collect::<Vec<_>>(),
+                    prefix
+                );
+                assert_eq!(delivered.last().unwrap().finish_reason, Some(reason));
+            }
+            if text_stop {
+                let mut invalid = request;
+                invalid.options.max_constraint_bytes = 0;
+                let mut unexpected = Vec::new();
+                let error = engine
+                    .generate_in_session_with_control_callbacks(
+                        session,
+                        invalid,
+                        GenerationControl::new(),
+                        None,
+                        Some(&mut |token| {
+                            unexpected.push(token);
+                            Ok(())
+                        }),
+                    )
+                    .expect_err("output observer must reject its byte bound before commit");
+                assert!(
+                    format!("{error:#}").contains("max_constraint_bytes=0"),
+                    "{error:#}"
+                );
+                assert!(unexpected.is_empty());
+                assert_eq!(engine.session_token_count(session)?, count);
+                assert!(engine.take_dflash_block_traces().is_empty());
+            }
+            assert_eq!(
+                engine.generate_in_session(session, continuation)?.token_ids,
+                expected
+            );
+            assert_eq!(engine.session_token_count(session)?, count + 4);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn output_stops_finalize_pending_utf8_and_roll_back_specialized_state() -> anyhow::Result<()> {
+    use onnx_genai_engine::logits::StopSequence;
+    let root = package_with_target("1", false, &[0; 8], CONTEXTUAL_TARGET)?;
+    let mut base = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1, 2]));
+    base.options.max_new_tokens = 1;
+    base.options.greedy = true;
+    base.options.stop_on_eos = false;
+    let mut probe = Engine::from_dir(&root, ort_config())?;
+    let prefix = probe.generate(base.clone())?.token_ids;
+    drop(probe);
+    assert_eq!(prefix.len(), 1);
+    install_tool_protocol_tokenizer(&root, u64::from(prefix[0]), "<0xC3>")?;
+    let path = root.join("tokenizer.json");
+    let mut tokenizer: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    tokenizer["decoder"] = serde_json::json!({"type":"ByteFallback"});
+    fs::write(path, serde_json::to_vec(&tokenizer)?)?;
+    let mut reference = Engine::from_dir(&root, ort_config())?;
+    let reference_session = reference.create_session()?;
+    reference.generate_in_session(reference_session, base.clone())?;
+    let mut continuation = base.clone();
+    continuation.options.max_new_tokens = 3;
+    let expected = reference
+        .generate_in_session(reference_session, continuation.clone())?
+        .token_ids;
+    let mut engine = Engine::from_dir(&root, ort_config())?;
+    let session = engine.create_session()?;
+    let mut request = base.clone();
+    request.options.stop_sequences = vec![StopSequence::Text("�".into())];
+    let mut delivered = Vec::new();
+    let result = engine.generate_in_session_with_control_callbacks(
+        session,
+        request.clone(),
+        GenerationControl::new(),
+        None,
+        Some(&mut |token: onnx_genai_engine::GenerateToken| {
+            delivered.push(token);
+            Ok(())
+        }),
+    )?;
+    assert_eq!(result.token_ids, prefix);
+    assert_eq!(result.text, "�");
+    assert_eq!(
+        result.finish_reason,
+        FinishReason::StopSequence { index: 0 }
+    );
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].text, "�");
+    assert_eq!(delivered[0].finish_reason, Some(result.finish_reason));
+    engine.take_committed_workflow_publications();
+    let failed_session = engine.create_session()?;
+    request.options.max_constraint_bytes = 0;
+    let mut unexpected = Vec::new();
+    let error = engine
+        .generate_in_session_with_control_callbacks(
+            failed_session,
+            request,
+            GenerationControl::new(),
+            None,
+            Some(&mut |token| {
+                unexpected.push(token);
+                Ok(())
+            }),
+        )
+        .expect_err("EOF byte-bound failure must roll back specialized state");
+    assert!(
+        format!("{error:#}").contains("max_constraint_bytes=0"),
+        "{error:#}"
+    );
+    assert!(unexpected.is_empty());
+    assert!(engine.take_committed_workflow_publications().is_empty());
+    assert_eq!(engine.session_token_count(failed_session)?, 0);
+    assert_eq!(
+        engine.generate_in_session(failed_session, base)?.token_ids,
+        prefix
+    );
+    assert_eq!(
+        engine.generate_in_session(session, continuation)?.token_ids,
+        expected
+    );
     Ok(())
 }

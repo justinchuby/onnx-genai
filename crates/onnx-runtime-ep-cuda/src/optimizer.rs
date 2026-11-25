@@ -597,7 +597,11 @@ impl OptimizationPass for CudaL2NormalizeFusion {
                 let mut lpnorm = div.clone();
                 lpnorm.op_type = "LpNormalization".to_string();
                 lpnorm.domain = String::new();
-                lpnorm.version = None;
+                // BF16 entered the public LpNormalization schema in opset 22.
+                // A node-local version preserves that boundary for this
+                // optimizer-created node without trusting a serializable
+                // attribute as provenance.
+                lpnorm.version = Some(22);
                 lpnorm.inputs = vec![Some(x)];
                 lpnorm.attributes.clear();
                 lpnorm.attributes.insert("p".into(), Attribute::Int(2));
@@ -4515,6 +4519,11 @@ mod tests {
             lp.attr("fused_reduce_chain").and_then(Attribute::as_int),
             Some(1),
             "fused node is marked to run the byte-faithful L2-normalize kernel"
+        );
+        assert_eq!(
+            graph.effective_opset(lp),
+            Some(22),
+            "optimizer-created LpNormalization uses the BF16-capable schema"
         );
         assert!(graph.validate().is_ok());
     }

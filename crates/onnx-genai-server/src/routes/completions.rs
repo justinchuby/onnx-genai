@@ -526,9 +526,10 @@ async fn stream_completions(
     first: (CompletionRequest, PreparedCompletion),
     rest: Vec<(CompletionRequest, PreparedCompletion)>,
     client_session_id: Option<String>,
-) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
+) -> Result<Response, ApiError> {
     let is_batch = !rest.is_empty();
     let (request, prepared) = first;
+    let ping = crate::SsePingInterval::resolve(&request.sampling, state.config.sse_ping_interval)?;
     let id = text_completion_id()?;
     let started = start_completion(
         &state,
@@ -630,7 +631,7 @@ async fn stream_completions(
             .context("completion receiver closed")?;
         Ok::<(), anyhow::Error>(())
     });
-    Ok(Sse::new(ReceiverStream::new(rx)))
+    Ok(ping.response(ReceiverStream::new(rx)))
 }
 
 pub(crate) async fn chat_completions(
@@ -912,7 +913,8 @@ async fn stream_chat_completion(
     handle: Arc<ModelHandle>,
     request: ChatCompletionRequest,
     client_session_id: Option<String>,
-) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
+) -> Result<Response, ApiError> {
+    let ping = crate::SsePingInterval::resolve(&request, state.config.sse_ping_interval)?;
     let id = completion_id()?;
     let created = now_unix();
     let model = request.model.clone();
@@ -1183,7 +1185,7 @@ async fn stream_chat_completion(
         Ok::<(), anyhow::Error>(())
     });
 
-    Ok(Sse::new(ReceiverStream::new(rx)))
+    Ok(ping.response(ReceiverStream::new(rx)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2394,6 +2396,7 @@ fn build_generate_options(
     // stochastic controls as an explicit request to sample.
     let stochastic_sampling_requested = requests_stochastic_sampling(request);
     let mut options = GenerateOptions {
+        max_prediction_time: request.prediction_time_limit,
         max_new_tokens: output_budget,
         temperature: request.temperature.unwrap_or(NEUTRAL_SAMPLING),
         sampler_order: request.samplers.clone(),
@@ -3372,7 +3375,9 @@ fn truncate_tokens_at_stop(tokens: &[String], stop_sequences: &[String]) -> Vec<
 
 fn finish_reason_label(reason: &FinishReason) -> &'static str {
     match reason {
-        FinishReason::MaxTokens | FinishReason::Length => "length",
+        FinishReason::MaxTokens | FinishReason::Length | FinishReason::PredictionTimeLimit => {
+            "length"
+        }
         FinishReason::EosToken | FinishReason::StopSequence { .. } => "stop",
         FinishReason::ToolCalls => "tool_calls",
     }
@@ -3760,6 +3765,41 @@ mod sampling_resolution_tests {
             object.insert(key.clone(), value.clone());
         }
         serde_json::from_value(body).unwrap()
+    }
+
+    #[test]
+    fn prediction_time_limit_maps_wire_milliseconds_without_counting_disabled_values() {
+        for milliseconds in [-1, 0, 1, i64::MAX] {
+            let request = chat_request(json!({"t_max_predict_ms":milliseconds}));
+            let expected =
+                (milliseconds > 0).then(|| std::time::Duration::from_millis(milliseconds as u64));
+            assert_eq!(
+                build_generate_options(&request, 4).max_prediction_time,
+                expected
+            );
+        }
+        for value in [json!(null), json!(0.5), json!(-1.9)] {
+            let request = chat_request(json!({"t_max_predict_ms":value}));
+            assert_eq!(
+                build_generate_options(&request, 4).max_prediction_time,
+                None
+            );
+        }
+        let request = chat_request(json!({"t_max_predict_ms":1.5}));
+        assert_eq!(
+            build_generate_options(&request, 4).max_prediction_time,
+            Some(std::time::Duration::from_millis(1))
+        );
+        for value in [
+            json!(-2),
+            json!(-2.1),
+            json!(true),
+            json!("1"),
+            json!(u64::MAX),
+        ] {
+            let body = json!({"messages":[],"t_max_predict_ms":value});
+            assert!(serde_json::from_value::<ChatCompletionRequest>(body).is_err());
+        }
     }
 
     #[test]

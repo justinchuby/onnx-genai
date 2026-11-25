@@ -353,6 +353,16 @@ JSON generation failures propagate as buffered errors or SSE error events; they
 are never replaced with an ungenerated `{}` and a successful stop. Stopping
 strings are removed before declared response-channel projection, consistently
 for buffered, live and logprob SSE output, including reasoning channels.
+Text stops match the earliest occurrence in generated output, including inside
+one token's decoded fragment and across token boundaries. Configured order
+resolves equal-position matches. The selected token remains counted and
+committed, while the stop string and following text are hidden. Native
+`stopping_word`, finish reasons and usage reflect that actual decoder stop.
+The matched word remains reported when EOS or prediction time takes priority
+over the final stop type, matching the pinned server's diagnostic behavior.
+Token-ID stop sequences retain their token-suffix semantics. Prediction-time
+checks use the same visible text boundary as delivery, including held partial
+stop prefixes, so hidden newlines do not trigger time expiry.
 Continuation intent follows the pinned upstream wire forms: `false`/`null` disable
 explicit continuation, `true` selects content unless the final message contains
 only reasoning, and `"content"` / `"reasoning_content"` select their named fields.
@@ -368,6 +378,35 @@ are canonicalized only for schema recognition; prompt bytes retain the original
 spelling. Literal escaped backslashes keep their meaning. Grammar-only byte chunks
 may still split UTF-8 scalars. Invalid schema prefixes return a typed 400 error. Tokenizers without an interpretable
 lossless byte codec fail explicitly rather than using lossy token decoding.
+`t_max_predict_ms` limits prediction wall time starting with the first generated
+token, excluding prefill. Like the pinned upstream server, it stops only when a
+newly emitted text fragment contains a newline and elapsed time is strictly
+greater than the limit. A newline removed as part of a matched stop word does
+not trigger this limit. This is a normal generation stop: accepted output and
+its session state commit, with OpenAI `finish_reason: "length"` and native
+`stop_type: "limit"`; it does not cancel or roll back the request. Scheduler gaps
+count toward this wall limit, unlike the active-work timing counters below.
+
+Omission, `null`, `-1` and `0` disable the limit. Numeric fractions truncate
+toward zero before checking the signed 64-bit millisecond range; for example,
+`1.5` becomes one millisecond. Unsafe overflow representations are rejected.
+Native, OpenAI completion/chat, Responses and Anthropic generation share this
+request field. Native speculative, candidate-tree and DFlash execution stop at
+the accepted token prefix and finalize physical state before publication.
+Generic authored workflows observe emitted tokens and stop before entering the
+next loop body. The current body finishes atomically, including its declared
+state updates. The request token budget bounds all emitted output even when an
+authored loop declares a larger iteration count; a body that would exceed that
+budget fails and rolls back the turn before publication.
+
+Text and token-ID stop sequences also apply to generic authored workflows,
+candidate-tree and DFlash execution. Specialized drivers truncate the accepted
+prefix before repairing state. Text stops and prediction-time limits require a
+package tokenizer; token-ID stops, EOS and token budgets do not. Empty stop
+sequences are inert. Pending decoder bytes are finalized before semantic commit,
+so an EOF text stop receives its actual stop reason, and a decoding or byte-bound
+failure leaves session state and callbacks uncommitted.
+
 Ordinary runtime-owned decoder generation returns llama.cpp `timings` in native,
 OpenAI completion and chat buffered results and final SSE chunks. Setting
 `timings_per_token=true` adds cumulative token-boundary measurements to SSE,
@@ -420,6 +459,19 @@ HTTP reader. Reconnect with `/v1/stream?conv_id=ID&from=BYTE_OFFSET`; DELETE can
 the producer. Retention defaults to 16 streams and 4 MiB per stream, with completed
 history expiring after five minutes. Old offsets fail explicitly once evicted.
 Requests without a conversation ID close their driver reader on disconnect.
+SSE generation streams use a 30-second idle comment ping interval by default,
+matching the pinned server. `--sse-ping-interval SECONDS` sets the server default;
+request `sse_ping_interval` overrides it. JSON numbers truncate toward zero to
+integer seconds from -1 through 2147483647; for example, `1.9` selects one second
+and `0.5` disables pings. Omission or `null` inherits the configured server
+interval, including a disabled default. Values -1 and 0 disable pings. Unsafe
+overflow representations, booleans and strings are rejected. The CLI accepts
+integer seconds. Data resets the idle timer, and EOF
+ends the timer with the source. This applies to native completion/infill,
+OpenAI completion/chat, Responses and Anthropic streams. Pings are SSE comments,
+not generation events. Resumable streams retain their actual comment bytes,
+so reconnect offsets continue to refer to the exact transmitted byte sequence.
+
 The driver carries that cancellation authority into generic workflows and fused
 ORT/native decode. Execution observes cancellation between workflow nodes and
 after decoder forwards, aborts uncommitted state and releases scheduler capacity.
@@ -437,6 +489,30 @@ support for those remaining backends is still an implementation item.
 Complete compressed-state checkpoints restore saved record cursors and partial
 carries; they do not imply arbitrary token-prefix rewind or permission to ignore
 the package's prefix-reuse policy.
+
+Native completion/infill final results include the actual detokenized prompt
+(with special tokens), `has_new_line` for visible generated text, and the matched
+text `stopping_word`. Prompt-only evaluation reports an empty stopping word and
+no generated newline. A serial Native executor reports its real `id_slot: 0`.
+`generation_settings` reports the admitted output cap and resolved sampling
+configuration: sampler order, temperature and probability filters, penalties,
+stop strings, explicit seed, EOS policy, preserved tokens, probability reporting
+and cache policy. Active dynamic-temperature, DRY, XTC and Mirostat controls
+include their resolved parameters. Randomized generation omits an unspecified
+seed. Budgets reflect the admitted cap, including model context bounds and zero
+for prompt-only evaluation. Batch results retain their own prompt and cap.
+
+Native completion/infill `response_fields` selects fields from the final result.
+An omitted or empty array returns the full result; otherwise missing paths are
+omitted. Paths traverse JSON object keys separated by `/`; arrays are not indexed
+and `~0`/`~1` are literal key text, not JSON Pointer escapes. The pinned
+`json_get_nested_values` implementation retains the entire path as the returned
+key, for example `"timings/prompt_n"`, rather than renaming it to its leaf as the
+README suggests. This also applies to each batch result and prompt-only result.
+SSE token/progress events and errors remain unchanged; only the terminal success
+object is projected, matching the pinned native task serializer. Batch stream
+completion is driven independently of whether `stop` or `index` was selected.
+Selection never fabricates a requested field that is absent from the result.
 
 Native generation accepts text, token IDs, mixed text/token rows and prompt
 batches, including text-only `prompt_string` objects. Only a first text segment

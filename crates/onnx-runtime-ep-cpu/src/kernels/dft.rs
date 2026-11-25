@@ -9,12 +9,15 @@ use std::cell::Cell;
 use std::f32::consts::PI;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::Node;
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceExecutionPreparation, WorkspacePreparation, WorkspaceView,
+};
+use onnx_runtime_ir::{Node, dft::DftMode};
 
 use super::check_arity;
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
-use crate::strided::numel;
+use super::fourier_workspace::{FourierWorkspace, scalar_i64};
+use crate::dtype::{to_dense_f32_widen, validate_f32_widen_input, write_dense_f32_narrow};
 
 /// Dispatch counter for the vDSP Accelerate DFT fast path.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -85,9 +88,30 @@ fn record_fast_path_hit() {
 pub struct DftFactory;
 
 impl KernelFactory for DftFactory {
-    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let inverse = node.attr("inverse").and_then(|a| a.as_int()).unwrap_or(0) != 0;
-        let onesided = node.attr("onesided").and_then(|a| a.as_int()).unwrap_or(0) != 0;
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        _opset: u64,
+        shapes: &[onnx_runtime_ir::Shape],
+        _dtypes: &[onnx_runtime_ir::DataType],
+    ) -> Option<String> {
+        let mode = match DftMode::parse(node) {
+            Ok(mode) => mode,
+            Err(reason) => return Some(reason),
+        };
+        shapes
+            .first()
+            .and_then(|shape| shape.last())
+            .and_then(|dim| dim.as_static())
+            .and_then(|components| mode.validate_components(components).err())
+    }
+
+    fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let mode = DftMode::parse(node).map_err(EpError::KernelFailed)?;
+        if let Some(&components) = input_shapes.first().and_then(|shape| shape.last()) {
+            mode.validate_components(components)
+                .map_err(EpError::KernelFailed)?;
+        }
         // Opset < 20: axis is an attribute (default 1).
         // Opset >= 20: axis is an input, handled at execute time.
         let axis_attr = node.attr("axis").and_then(|a| a.as_int());
@@ -97,8 +121,7 @@ impl KernelFactory for DftFactory {
             1
         };
         Ok(Box::new(DftKernel {
-            inverse,
-            onesided,
+            mode,
             axis_attr,
             default_axis,
         }))
@@ -106,160 +129,347 @@ impl KernelFactory for DftFactory {
 }
 
 struct DftKernel {
-    inverse: bool,
-    onesided: bool,
+    mode: DftMode,
     axis_attr: Option<i64>,
     default_axis: i64,
 }
 
-impl Kernel for DftKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        // DFT opset 17: inputs = [input, dft_length?]
-        // DFT opset 20: inputs = [input, dft_length?, axis?]
-        let min_in = 1;
-        let max_in = 3;
-        check_arity("DFT", inputs, outputs, min_in, max_in, 1)?;
+struct DftGeometry {
+    axis: usize,
+    signal_len: usize,
+    n: usize,
+    output_len: usize,
+    output_components: usize,
+    batches: usize,
+    output_elements: usize,
+}
 
+impl DftGeometry {
+    fn workspace(&self) -> Result<FourierWorkspace> {
+        FourierWorkspace::new("DFT", self.n, self.batches != 0)
+    }
+}
+
+impl DftKernel {
+    fn geometry(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        views: Option<&[TensorView<'_>]>,
+    ) -> Result<Option<DftGeometry>> {
+        if !(1..=3).contains(&inputs.len()) || !inputs[0].present {
+            return Err(EpError::KernelFailed(format!(
+                "DFT needs 1 to 3 input slots with present signal, got {}; provide signal and optional scalar dft_length/axis",
+                inputs.len()
+            )));
+        }
         let input = &inputs[0];
+        if input.shape.len() < 2 {
+            return Err(EpError::KernelFailed(format!(
+                "DFT: input must have rank >= 2, got {:?}",
+                input.shape
+            )));
+        }
+        if !super::FLOAT_DTYPES.contains(&input.dtype) {
+            return Err(EpError::KernelFailed(format!(
+                "DFT: signal must have floating dtype, got {:?}",
+                input.dtype
+            )));
+        }
         let rank = input.shape.len();
-        if rank < 2 {
-            return Err(EpError::KernelFailed(
-                "DFT: input must have rank >= 2".into(),
-            ));
-        }
-
-        // Determine the signal axis.
-        let axis_raw = if inputs.len() >= 3 && !inputs[2].is_absent() {
-            // Opset 20: axis as input
-            let axis_data = super::to_dense_i64(&inputs[2])?;
-            axis_data[0]
-        } else {
-            self.axis_attr.unwrap_or(self.default_axis)
-        };
-
-        let axis = normalize_axis(axis_raw, rank)?;
         let last = rank - 1;
-
-        // The last dimension is the complex component dimension (1 for real, 2 for complex).
-        let complex_dim = input.shape[last];
-        let is_real_input = complex_dim == 1;
-        if complex_dim != 1 && complex_dim != 2 {
-            return Err(EpError::KernelFailed(format!(
-                "DFT: last dimension must be 1 (real) or 2 (complex), got {complex_dim}"
-            )));
-        }
-        if self.onesided && !is_real_input {
-            return Err(EpError::KernelFailed(
-                "DFT: onesided=1 is valid only for real input (last dimension 1)".into(),
-            ));
-        }
-
-        // Determine DFT length.
-        let signal_len = input.shape[axis];
-        let dft_length = if inputs.len() >= 2 && !inputs[1].is_absent() {
-            let len_data = super::to_dense_i64(&inputs[1])?;
-            usize::try_from(len_data[0])
-                .ok()
-                .filter(|length| *length > 0)
-                .ok_or_else(|| {
-                    EpError::KernelFailed(format!(
-                        "DFT: dft_length must be positive, got {}",
-                        len_data[0]
-                    ))
-                })?
-        } else {
-            signal_len
-        };
-
-        // Validate output shape.
-        let out_signal_len = if self.onesided {
-            dft_length / 2 + 1
-        } else {
-            dft_length
-        };
-
-        let output = &mut outputs[0];
-        if output.shape[last] != 2 {
-            return Err(EpError::KernelFailed(format!(
-                "DFT: output last dim must be 2, got {}",
-                output.shape[last]
-            )));
-        }
-        if output.shape[axis] != out_signal_len {
-            return Err(EpError::KernelFailed(format!(
-                "DFT: output signal axis size mismatch: expected {out_signal_len}, got {}",
-                output.shape[axis]
-            )));
-        }
-
-        // Materialize input as f32. `to_dense_f32_widen` accepts the full ONNX
-        // DFT type constraint (float32/float16/bfloat16/float64 and strided
-        // float32) and folds every case into a dense f32 buffer, so DFT is
-        // computed in f32 and narrowed back to the output dtype on write — the
-        // same compute-in-f32 contract every other float kernel uses.
-        let input_data = to_dense_f32_widen("DFT", input)?;
-
-        // Compute batch dimensions: all dims except axis and last.
-        let mut batch_shape: Vec<usize> = Vec::with_capacity(rank - 2);
-        for (i, &d) in input.shape.iter().enumerate() {
-            if i != axis && i != last {
-                batch_shape.push(d);
-            }
-        }
-        let batch_count: usize = batch_shape.iter().product();
-
-        // Compute strides for the input layout (row-major).
-        let input_strides = row_major_strides(input.shape);
-        let output_strides = row_major_strides(output.shape);
-
-        let total_output = numel(output.shape);
-        let mut output_data = vec![0.0f32; total_output];
-
-        // Iterate over batches.
-        let mut batch_indices = vec![0usize; batch_shape.len()];
-        for _ in 0..batch_count {
-            // Map batch indices to input/output coordinates.
-            let (in_base, out_base) = compute_bases(
-                &batch_indices,
-                input.shape,
-                output.shape,
-                axis,
-                last,
-                &input_strides,
-                &output_strides,
-            );
-
-            // Extract signal from input.
-            let mut real_in = vec![0.0f32; signal_len];
-            let mut imag_in = vec![0.0f32; signal_len];
-            for i in 0..signal_len {
-                let idx = in_base + i * input_strides[axis];
-                real_in[i] = input_data[idx];
-                if !is_real_input {
-                    imag_in[i] = input_data[idx + 1];
+        self.mode
+            .validate_components(input.shape[last])
+            .map_err(EpError::KernelFailed)?;
+        let present = |i: usize| inputs.get(i).is_some_and(|input| input.present);
+        for (i, name) in [(1, "dft_length"), (2, "axis")] {
+            if present(i) {
+                let control = inputs[i];
+                if !control.shape.is_empty() {
+                    return Err(EpError::KernelFailed(format!(
+                        "DFT: `{name}` must be a scalar, got shape {:?}",
+                        control.shape
+                    )));
+                }
+                if !matches!(
+                    control.dtype,
+                    onnx_runtime_ir::DataType::Int32 | onnx_runtime_ir::DataType::Int64
+                ) || (i == 2 && control.dtype != onnx_runtime_ir::DataType::Int64)
+                {
+                    return Err(EpError::KernelFailed(format!(
+                        "DFT: `{name}` dtype {:?} is invalid; use int32/int64 for dft_length and int64 for axis",
+                        control.dtype
+                    )));
                 }
             }
-
-            // Zero-pad or truncate to dft_length.
-            real_in.resize(dft_length, 0.0);
-            imag_in.resize(dft_length, 0.0);
-
-            // Compute DFT.
-            let (real_out, imag_out) =
-                compute_dft(&real_in, &imag_in, dft_length, self.inverse, self.onesided);
-
-            // Write to output.
-            for i in 0..out_signal_len {
-                let idx = out_base + i * output_strides[axis];
-                output_data[idx] = real_out[i];
-                output_data[idx + 1] = imag_out[i];
-            }
-
-            // Advance batch indices.
-            advance_indices(&mut batch_indices, &batch_shape);
         }
+        if views.is_none() && (present(1) || present(2)) {
+            return Ok(None);
+        }
+        let read_control = |i, name| {
+            let view = views.and_then(|views| views.get(i)).ok_or_else(|| EpError::KernelFailed(format!("DFT: `{name}` metadata is present but its Host view is missing; bind the scalar before execution")))?;
+            scalar_i64("DFT", name, view)
+        };
+        let axis = normalize_axis(
+            if present(2) {
+                read_control(2, "axis")?
+            } else {
+                self.axis_attr.unwrap_or(self.default_axis)
+            },
+            rank,
+        )?;
+        let signal_len = input.shape[axis];
+        let n = if present(1) {
+            let value = read_control(1, "dft_length")?;
+            usize::try_from(value)
+                .ok()
+                .filter(|&n| n > 0)
+                .ok_or_else(|| {
+                    EpError::KernelFailed(format!("DFT: dft_length must be positive, got {value}"))
+                })?
+        } else {
+            self.mode
+                .default_length(signal_len)
+                .map_err(EpError::KernelFailed)?
+        };
+        let batch_dims = || {
+            input
+                .shape
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != axis && *i != last)
+                .map(|(_, &d)| d)
+        };
+        let batches = if batch_dims().any(|d| d == 0) {
+            0
+        } else {
+            batch_dims()
+                .try_fold(1usize, |count, d| count.checked_mul(d))
+                .ok_or_else(|| {
+                    EpError::KernelFailed(format!(
+                        "DFT: batch dimensions in {:?} overflow; reduce the input shape",
+                        input.shape
+                    ))
+                })?
+        };
+        let output_len = self.mode.output_length(n);
+        let output_components = self.mode.output_components();
+        let output_elements = batches.checked_mul(output_len).and_then(|count| count.checked_mul(output_components)).ok_or_else(|| EpError::KernelFailed(format!("DFT: output for {batches} batches of length {n} overflows; reduce shape or dft_length")))?;
+        let input_elements =
+            onnx_runtime_ir::gemm::checked_elements(input.shape).ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "DFT: input shape {:?} overflows element count; reduce the input shape",
+                    input.shape
+                ))
+            })?;
+        for (name, count) in [
+            ("input materialization", input_elements),
+            ("output staging", output_elements),
+        ] {
+            std::alloc::Layout::array::<f32>(count).map_err(|_| EpError::KernelFailed(format!("DFT: {name} of {count} f32 elements exceeds addressable capacity; reduce shape or dft_length")))?;
+        }
+        Ok(Some(DftGeometry {
+            axis,
+            signal_len,
+            n,
+            output_len,
+            output_components,
+            batches,
+            output_elements,
+        }))
+    }
 
-        write_dense_f32_narrow("DFT", output, &output_data)
+    fn live_geometry(&self, inputs: &[TensorView<'_>]) -> Result<DftGeometry> {
+        if !(1..=3).contains(&inputs.len()) {
+            return Err(EpError::KernelFailed(format!(
+                "DFT: expected 1 to 3 input slots, got {}",
+                inputs.len()
+            )));
+        }
+        let metadata = std::array::from_fn::<_, 3, _>(|i| {
+            inputs.get(i).map_or(
+                TensorMetadata::new(onnx_runtime_ir::DataType::Undefined, &[], false),
+                |input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()),
+            )
+        });
+        self.geometry(&metadata[..inputs.len()], Some(inputs))?.ok_or_else(|| EpError::KernelFailed("DFT: runtime controls are unreadable; bind Host dft_length/axis scalars before execution".into()))
+    }
+}
+
+impl Kernel for DftKernel {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        match self.geometry(inputs, None)? {
+            Some(geometry) => Ok(WorkspacePreparation::Ready(
+                geometry.workspace()?.requirement(),
+            )),
+            None => Ok(WorkspacePreparation::Deferred),
+        }
+    }
+
+    fn workspace_requirement_for_execution(
+        &self,
+        inputs: &[TensorView],
+        _outputs: &[TensorMut],
+        metadata: &[TensorMetadata<'_>],
+        _output_metadata: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+        _cached: Option<WorkspacePreparation>,
+    ) -> Result<WorkspaceExecutionPreparation> {
+        if inputs.len() != metadata.len() {
+            return Err(EpError::KernelFailed("DFT: views and metadata have different slot counts; bind every input before workspace preparation".into()));
+        }
+        for (i, (view, meta)) in inputs.iter().zip(metadata).enumerate() {
+            // Signal values are not needed for sizing. A logically present
+            // intermediate may still lack backing; only controls must be read.
+            if (!meta.present && !view.is_absent()) || (i > 0 && meta.present && view.is_absent()) {
+                return Err(EpError::KernelFailed(format!(
+                    "DFT: input {i} has inconsistent logical presence or an unreadable control; bind required Host scalars before workspace preparation"
+                )));
+            }
+            if meta.present
+                && !view.is_absent()
+                && (meta.shape != view.shape || meta.dtype != view.dtype)
+            {
+                return Err(EpError::KernelFailed(format!(
+                    "DFT: input {i} view differs from its metadata; prepare from the current shape and dtype"
+                )));
+            }
+        }
+        let geometry = self.geometry(metadata, Some(inputs))?.ok_or_else(|| {
+            EpError::KernelFailed(
+                "DFT: runtime controls remain unreadable; bind Host scalar inputs before admission"
+                    .into(),
+            )
+        })?;
+        Ok(WorkspaceExecutionPreparation::Ready(
+            geometry.workspace()?.requirement(),
+        ))
+    }
+
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
+    }
+}
+
+impl DftKernel {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        check_arity("DFT", inputs, outputs, 1, 3, 1)?;
+        let geometry = self.live_geometry(inputs)?;
+        let input = &inputs[0];
+        let output = &mut outputs[0];
+        let rank = input.shape.len();
+        let axis = geometry.axis;
+        let last = rank - 1;
+        let expected_extent = |i| {
+            if i == axis {
+                geometry.output_len
+            } else if i == last {
+                geometry.output_components
+            } else {
+                input.shape[i]
+            }
+        };
+        if output.shape.len() != rank
+            || output
+                .shape
+                .iter()
+                .enumerate()
+                .any(|(i, &d)| d != expected_extent(i))
+        {
+            let expected_shape = (0..rank).map(expected_extent).collect::<Vec<_>>();
+            return Err(EpError::KernelFailed(format!(
+                "DFT: mode {:?} output shape mismatch: expected {expected_shape:?}, got {:?}",
+                self.mode, output.shape
+            )));
+        }
+        validate_f32_widen_input("DFT", input)?;
+        if geometry.batches == 0 {
+            return write_dense_f32_narrow("DFT", output, &[]);
+        }
+        let input_strides = row_major_strides(input.shape)?;
+        let output_strides = row_major_strides(output.shape)?;
+        let batch_shape = input
+            .shape
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != axis && *i != last)
+            .map(|(_, &d)| d)
+            .collect::<Vec<_>>();
+        let plan = geometry.workspace()?;
+        // SAFETY: CPU execution owns exclusive live Host backing until this
+        // synchronous closure returns. The shared helper checks/initializes
+        // four disjoint regions before any f32 references are formed.
+        unsafe {
+            plan.with_buffers(workspace, |[real_in, imag_in, real_out, imag_out]| {
+                let input_data = to_dense_f32_widen("DFT", input)?;
+                let mut output_data = vec![0.0f32; geometry.output_elements];
+                let mut batch_indices = vec![0usize; batch_shape.len()];
+                let dft = DftPlan::new(geometry.n, self.mode.inverse());
+                let copied = geometry
+                    .signal_len
+                    .min(if self.mode == DftMode::RealInverse {
+                        geometry.n / 2 + 1
+                    } else {
+                        geometry.n
+                    });
+                for _ in 0..geometry.batches {
+                    let (in_base, out_base) = compute_bases(
+                        &batch_indices,
+                        input.shape,
+                        output.shape,
+                        axis,
+                        last,
+                        &input_strides,
+                        &output_strides,
+                    );
+                    for i in 0..copied {
+                        let idx = in_base + i * input_strides[axis];
+                        real_in[i] = input_data[idx];
+                        if input.shape[last] == 2 {
+                            imag_in[i] = input_data[idx + 1];
+                        }
+                    }
+                    // The plan never mutates its input. Positive-frequency padding
+                    // stays zero between batches; mirrors touch only negative bins.
+                    if self.mode == DftMode::RealInverse {
+                        imag_in[0] = 0.0;
+                        if geometry.n.is_multiple_of(2) {
+                            imag_in[geometry.n / 2] = 0.0;
+                        }
+                        for i in 1..geometry.n.div_ceil(2) {
+                            real_in[geometry.n - i] = real_in[i];
+                            imag_in[geometry.n - i] = -imag_in[i];
+                        }
+                    }
+                    dft.transform(real_in, imag_in, real_out, imag_out);
+                    for i in 0..geometry.output_len {
+                        let idx = out_base + i * output_strides[axis];
+                        output_data[idx] = real_out[i];
+                        if geometry.output_components == 2 {
+                            output_data[idx + 1] = imag_out[i];
+                        }
+                    }
+                    advance_indices(&mut batch_indices, &batch_shape);
+                }
+                write_dense_f32_narrow("DFT", output, &output_data)
+            })
+        }
     }
 }
 
@@ -274,13 +484,13 @@ fn normalize_axis(axis: i64, rank: usize) -> Result<usize> {
     Ok(normalized as usize)
 }
 
-fn row_major_strides(shape: &[usize]) -> Vec<usize> {
+fn row_major_strides(shape: &[usize]) -> Result<Vec<usize>> {
     let rank = shape.len();
     let mut strides = vec![1usize; rank];
     for i in (0..rank.saturating_sub(1)).rev() {
-        strides[i] = strides[i + 1] * shape[i + 1];
+        strides[i] = strides[i + 1].checked_mul(shape[i + 1]).ok_or_else(|| EpError::KernelFailed(format!("DFT: contiguous strides for shape {shape:?} overflow; reduce the input/output shape")))?;
     }
-    strides
+    Ok(strides)
 }
 
 fn compute_bases(
@@ -317,7 +527,8 @@ fn advance_indices(indices: &mut [usize], shape: &[usize]) {
     }
 }
 
-/// Compute the DFT using the best available method.
+/// Owned convenience for transform-level numerical/dispatch tests.
+#[cfg(test)]
 fn compute_dft(
     real_in: &[f32],
     imag_in: &[f32],
@@ -327,7 +538,7 @@ fn compute_dft(
 ) -> (Vec<f32>, Vec<f32>) {
     let mut real_out = vec![0.0; n];
     let mut imag_out = vec![0.0; n];
-    compute_dft_into(real_in, imag_in, &mut real_out, &mut imag_out, inverse);
+    DftPlan::new(n, inverse).transform(real_in, imag_in, &mut real_out, &mut imag_out);
     if onesided {
         let half = n / 2 + 1;
         real_out.truncate(half);
@@ -336,18 +547,12 @@ fn compute_dft(
     (real_out, imag_out)
 }
 
-/// Compute one DFT into caller-owned full-length buffers.
-pub(super) fn compute_dft_into(
-    real_in: &[f32],
-    imag_in: &[f32],
-    real_out: &mut [f32],
-    imag_out: &mut [f32],
-    inverse: bool,
-) {
-    DftPlan::new(real_in.len(), inverse).transform(real_in, imag_in, real_out, imag_out);
+#[cfg(test)]
+thread_local! {
+    static LOCAL_PLAN_CREATES: Cell<usize> = const { Cell::new(0) };
 }
 
-/// A transform plan reusable across STFT frames of one fixed length.
+/// A transform plan reusable across batches or STFT frames of one fixed length.
 pub(super) struct DftPlan {
     n: usize,
     inverse: bool,
@@ -357,6 +562,8 @@ pub(super) struct DftPlan {
 
 impl DftPlan {
     pub(super) fn new(n: usize, inverse: bool) -> Self {
+        #[cfg(test)]
+        LOCAL_PLAN_CREATES.with(|count| count.set(count.get() + 1));
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let vdsp_setup = if n.is_power_of_two() && n >= 4 {
             let direction = if inverse {
@@ -585,7 +792,7 @@ fn naive_dft_into(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::testutil::Owned;
+    use crate::kernels::testutil::{Owned, PreparedTestKernel};
     use onnx_runtime_ir::{Attribute, Node, NodeId};
 
     fn make_dft_node(axis: i64, onesided: i64) -> Node {
@@ -614,21 +821,21 @@ mod tests {
         DftFactory
             .create(&versioned_dft_node(17, None), &[vec![1, 8, 6, 1]])
             .unwrap()
-            .execute(&[input.view()], &mut [opset17_output.view_mut()])
+            .execute_prepared(&[input.view()], &mut [opset17_output.view_mut()])
             .unwrap();
 
         let mut opset20_output = Owned::zeros_f32(&[1, 8, 4, 2]);
         DftFactory
             .create(&versioned_dft_node(20, None), &[vec![1, 8, 6, 1]])
             .unwrap()
-            .execute(&[input.view()], &mut [opset20_output.view_mut()])
+            .execute_prepared(&[input.view()], &mut [opset20_output.view_mut()])
             .unwrap();
 
         let mut attr_output = Owned::zeros_f32(&[1, 8, 4, 2]);
         DftFactory
             .create(&versioned_dft_node(17, Some(2)), &[vec![1, 8, 6, 1]])
             .unwrap()
-            .execute(&[input.view()], &mut [attr_output.view_mut()])
+            .execute_prepared(&[input.view()], &mut [attr_output.view_mut()])
             .unwrap();
 
         let axis = Owned::i64(&[], &[1]);
@@ -636,7 +843,7 @@ mod tests {
         DftFactory
             .create(&versioned_dft_node(20, None), &[vec![1, 8, 6, 1]])
             .unwrap()
-            .execute(
+            .execute_prepared(
                 &[
                     input.view(),
                     TensorView::absent(onnx_runtime_ir::DataType::Int64),
@@ -645,6 +852,460 @@ mod tests {
                 &mut [input_axis_output.view_mut()],
             )
             .unwrap();
+    }
+
+    fn irfft_node(version: i64) -> Node {
+        let mut n = make_dft_node(-2, 1);
+        n.version = Some(version);
+        n.attributes.insert("inverse".into(), Attribute::Int(1));
+        n
+    }
+
+    #[test]
+    fn real_inverse_defaults_to_full_real_signal_and_ignores_endpoint_imaginary_parts() {
+        for version in [17, 20] {
+            let input = Owned::f32(&[1, 3, 2], &[10., 99., -2., 2., -2., -77.]);
+            let mut output = Owned::zeros_f32(&[1, 4, 1]);
+            DftFactory
+                .create(&irfft_node(version), &[vec![1, 3, 2]])
+                .unwrap()
+                .execute_prepared(&[input.view()], &mut [output.view_mut()])
+                .unwrap();
+            for (actual, expected) in output.to_f32().iter().zip([1., 2., 3., 4.]) {
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "{version}: {actual} versus {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn real_inverse_even_odd_padded_and_truncated_spectra_match_independent_f64_sums() {
+        for n in [1usize, 2, 3, 4, 5, 6, 9, 10] {
+            for bins in [0usize, 1, 3, 7] {
+                let values = (0..2)
+                    .flat_map(|batch| {
+                        (0..bins).flat_map(move |k| {
+                            [
+                                (batch + 1) as f32 * 0.375 + k as f32 * 0.25,
+                                0.125 - k as f32 * 0.125,
+                            ]
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let input = Owned::f32(&[2, bins, 2], &values);
+                let length = Owned::i64(&[], &[n as i64]);
+                let mut output = Owned::zeros_f32(&[2, n, 1]);
+                DftFactory
+                    .create(&irfft_node(20), &[vec![2, bins, 2]])
+                    .unwrap()
+                    .execute_prepared(&[input.view(), length.view()], &mut [output.view_mut()])
+                    .unwrap();
+                let actual = output.to_f32();
+                for batch in 0..2 {
+                    for t in 0..n {
+                        let mut expected = 0f64;
+                        for k in 0..bins.min(n / 2 + 1) {
+                            let re = values[(batch * bins + k) * 2] as f64;
+                            let im = values[(batch * bins + k) * 2 + 1] as f64;
+                            let angle = 2. * std::f64::consts::PI * (k * t) as f64 / n as f64;
+                            expected += if k == 0 || (n.is_multiple_of(2) && k == n / 2) {
+                                re * angle.cos()
+                            } else {
+                                2. * (re * angle.cos() - im * angle.sin())
+                            };
+                        }
+                        expected /= n as f64;
+                        assert!(
+                            (actual[batch * n + t] as f64 - expected).abs() < 1e-4,
+                            "n={n}, bins={bins}, batch={batch}, t={t}: {} versus {expected}",
+                            actual[batch * n + t]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn real_inverse_rejects_real_spectrum_and_wrong_output_geometry_before_writing() {
+        let n = irfft_node(20);
+        let shapes = [onnx_runtime_ir::static_shape([1, 3, 1])];
+        assert!(
+            DftFactory
+                .unsupported_reason(&n, 20, &shapes, &[])
+                .unwrap()
+                .contains("RealInverse")
+        );
+        assert!(DftFactory.create(&n, &[vec![1, 3, 1]]).is_err());
+        let input = Owned::f32(&[1, 3, 2], &[1.; 6]);
+        let kernel = DftFactory.create(&n, &[]).unwrap();
+        for shape in [vec![1], vec![2, 4, 1], vec![1, 3, 2]] {
+            let count = shape.iter().product();
+            let mut output = Owned::f32(&shape, &vec![123.; count]);
+            let error = kernel
+                .execute_prepared(&[input.view()], &mut [output.view_mut()])
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("output shape mismatch"),
+                "{error}"
+            );
+            assert!(output.to_f32().iter().all(|&v| v == 123.));
+        }
+    }
+
+    fn metadata<'a>(inputs: &[TensorView<'a>]) -> Vec<TensorMetadata<'a>> {
+        inputs
+            .iter()
+            .map(|input| TensorMetadata::new(input.dtype, input.shape, !input.is_absent()))
+            .collect()
+    }
+
+    #[test]
+    fn batches_share_one_fourier_plan_and_one_frame_scratch() {
+        let kernel = DftFactory.create(&make_dft_node(-2, 1), &[]).unwrap();
+        let input = Owned::f32(
+            &[3, 4, 1],
+            &[1., 2., 3., 4., 10., 20., 30., 40., -1., -2., -3., -4.],
+        );
+        let inputs = [input.view()];
+        let request = kernel
+            .workspace_requirement(&metadata(&inputs), &[])
+            .unwrap()
+            .require_ready()
+            .unwrap();
+        assert_eq!(
+            request.bytes, 64,
+            "four transform-length buffers, not batch times that size"
+        );
+        let before = LOCAL_PLAN_CREATES.with(Cell::get);
+        let _control = DftPlan::new(2, false);
+        assert_eq!(
+            LOCAL_PLAN_CREATES.with(Cell::get),
+            before + 1,
+            "constructor positive control"
+        );
+        let mut output = Owned::zeros_f32(&[3, 3, 2]);
+        kernel
+            .execute_prepared(&inputs, &mut [output.view_mut()])
+            .unwrap();
+        assert_eq!(
+            LOCAL_PLAN_CREATES.with(Cell::get),
+            before + 2,
+            "one plan for all three transforms"
+        );
+        for (frame, scale) in output.to_f32().chunks_exact(6).zip([1., 10., -1.]) {
+            for (actual, expected) in frame.iter().zip([10., 0., -2., 2., -2., 0.]) {
+                assert!((actual - scale * expected).abs() < 1e-4);
+            }
+        }
+    }
+
+    #[test]
+    fn live_scalar_controls_refine_deferred_metadata_and_reject_stale_backing() {
+        let kernel = DftFactory.create(&make_dft_node(-2, 0), &[]).unwrap();
+        let signal = Owned::f32(&[2, 7, 1], &[1.; 14]);
+        let mut length = Owned::i64(&[], &[3]);
+        let mut backing = [0x7fc0_1234u32; 38];
+        let workspace = WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(unsafe { backing.as_mut_ptr().add(1).cast() }),
+            144,
+        );
+        let mut old = None;
+        for n in [3usize, 9, 3] {
+            length.bytes.copy_from_slice(&(n as i64).to_le_bytes());
+            let inputs = [signal.view(), length.view()];
+            let meta = metadata(&inputs);
+            assert_eq!(
+                kernel.workspace_requirement(&meta, &[]).unwrap(),
+                WorkspacePreparation::Deferred
+            );
+            let request = kernel
+                .workspace_requirement_for_execution(
+                    &inputs,
+                    &[],
+                    &meta,
+                    &[],
+                    Some(WorkspacePreparation::Ready(
+                        onnx_runtime_ep_api::WorkspaceRequirement::NONE,
+                    )),
+                )
+                .unwrap()
+                .require_ready()
+                .unwrap();
+            assert_eq!(request.bytes as usize, 16 * n);
+            let mut output = Owned::f32(&[2, n, 2], &vec![123.; 4 * n]);
+            let calls = LOCAL_PLAN_CREATES.with(Cell::get);
+            if n == 9 {
+                let error = kernel
+                    .execute_with_workspace(&inputs, &mut [output.view_mut()], old)
+                    .unwrap_err();
+                assert!(error.to_string().contains("workspace needs"), "{error}");
+                assert!(output.to_f32().iter().all(|&value| value == 123.));
+                assert_eq!(
+                    LOCAL_PLAN_CREATES.with(Cell::get),
+                    calls,
+                    "no DSP plan before capacity validation"
+                );
+            }
+            let current = WorkspaceView::new(workspace.ptr(), request.bytes as usize);
+            kernel
+                .execute_with_workspace(&inputs, &mut [output.view_mut()], Some(current))
+                .unwrap();
+            let actual = output.to_f32();
+            for batch in 0..2 {
+                for k in 0..n {
+                    let mut re = 0f64;
+                    let mut im = 0f64;
+                    for t in 0..7.min(n) {
+                        let angle = -2. * std::f64::consts::PI * (k * t) as f64 / n as f64;
+                        re += angle.cos();
+                        im += angle.sin();
+                    }
+                    assert!((actual[(batch * n + k) * 2] as f64 - re).abs() < 1e-4);
+                    assert!((actual[(batch * n + k) * 2 + 1] as f64 - im).abs() < 1e-4);
+                }
+            }
+            assert_eq!(backing[0], 0x7fc0_1234);
+            assert_eq!(backing[37], 0x7fc0_1234);
+            old = Some(current);
+            backing[1..37].fill(0x7fc0_1234);
+        }
+    }
+
+    #[test]
+    fn axis_changes_at_one_address_and_unreadable_logical_controls_are_not_cached() {
+        let mut node = make_dft_node(-2, 0);
+        node.version = Some(20);
+        let kernel = DftFactory.create(&node, &[]).unwrap();
+        let signal = Owned::f32(&[2, 4, 1], &[1., 2., 3., 4., 10., 20., 30., 40.]);
+        let mut axis = Owned::i64(&[], &[1]);
+        let mut output = Owned::zeros_f32(&[2, 4, 2]);
+        for (value, bytes, dc) in [(1i64, 64, 10.), (0, 32, 11.), (1, 64, 10.)] {
+            axis.bytes.copy_from_slice(&value.to_le_bytes());
+            let inputs = [
+                signal.view(),
+                TensorView::absent(onnx_runtime_ir::DataType::Int64),
+                axis.view(),
+            ];
+            let meta = metadata(&inputs);
+            assert_eq!(
+                kernel.workspace_requirement(&meta, &[]).unwrap(),
+                WorkspacePreparation::Deferred
+            );
+            let request = kernel
+                .workspace_requirement_for_execution(&inputs, &[], &meta, &[], None)
+                .unwrap()
+                .require_ready()
+                .unwrap();
+            assert_eq!(request.bytes, bytes);
+            kernel
+                .execute_prepared(&inputs, &mut [output.view_mut()])
+                .unwrap();
+            assert_eq!(output.to_f32()[0], dc);
+            let missing = [
+                signal.view(),
+                inputs[1],
+                TensorView::absent(onnx_runtime_ir::DataType::Int64),
+            ];
+            assert!(
+                kernel
+                    .workspace_requirement_for_execution(&missing, &[], &meta, &[], None)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("logical presence")
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_only_signal_can_prepare_without_reading_unmaterialized_storage() {
+        let kernel = DftFactory.create(&make_dft_node(-2, 0), &[]).unwrap();
+        let length = Owned::i64(&[], &[5]);
+        let inputs = [
+            TensorView::absent(onnx_runtime_ir::DataType::Float32),
+            length.view(),
+        ];
+        let meta = [
+            TensorMetadata::new(onnx_runtime_ir::DataType::Float32, &[2, 4, 1], true),
+            TensorMetadata::new(onnx_runtime_ir::DataType::Int64, &[], true),
+        ];
+        let request = kernel
+            .workspace_requirement_for_execution(&inputs, &[], &meta, &[], None)
+            .unwrap()
+            .require_ready()
+            .unwrap();
+        assert_eq!(request.bytes, 80);
+        let missing_control = [
+            inputs[0],
+            TensorView::absent(onnx_runtime_ir::DataType::Int64),
+        ];
+        assert!(
+            kernel
+                .workspace_requirement_for_execution(&missing_control, &[], &meta, &[], None)
+                .is_err()
+        );
+        let mut output = Owned::f32(&[2, 5, 2], &[123.; 20]);
+        assert!(kernel.execute(&inputs, &mut [output.view_mut()]).is_err());
+        assert_eq!(output.to_f32(), [123.; 20]);
+    }
+
+    #[test]
+    fn invalid_workspace_and_empty_batches_keep_output_and_view_guards() {
+        let kernel = DftFactory.create(&make_dft_node(-2, 0), &[]).unwrap();
+        let signal = Owned::f32(&[1, 4, 1], &[1., 2., 3., 4.]);
+        let mut output = Owned::f32(&[1, 4, 2], &[123.; 8]);
+        let mut backing = [0u32; 17];
+        for workspace in [
+            None,
+            Some(WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(backing.as_mut_ptr().cast()),
+                63,
+            )),
+            Some(WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(unsafe {
+                    backing.as_mut_ptr().cast::<u8>().add(1).cast()
+                }),
+                64,
+            )),
+        ] {
+            let error = kernel
+                .execute_with_workspace(&[signal.view()], &mut [output.view_mut()], workspace)
+                .unwrap_err();
+            assert!(error.to_string().contains("workspace needs"), "{error}");
+            assert_eq!(output.to_f32(), [123.; 8]);
+        }
+        let empty = Owned::f32(&[0, 4, 1], &[]);
+        let mut output = Owned::zeros_f32(&[0, 4, 2]);
+        let before = LOCAL_PLAN_CREATES.with(Cell::get);
+        kernel
+            .execute(&[empty.view()], &mut [output.view_mut()])
+            .unwrap();
+        assert_eq!(LOCAL_PLAN_CREATES.with(Cell::get), before);
+        let mut invalid = empty.view();
+        invalid.device = onnx_runtime_ir::DeviceId::cuda(0);
+        assert!(
+            kernel
+                .execute(&[invalid], &mut [output.view_mut()])
+                .unwrap_err()
+                .to_string()
+                .contains("explicitly transfer")
+        );
+        for shape in [&[0usize][..], &[1][..]] {
+            let bad = Owned::i64(shape, &vec![1; shape[0]]);
+            assert!(
+                kernel
+                    .execute(&[empty.view(), bad.view()], &mut [output.view_mut()])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("must be a scalar")
+            );
+        }
+        assert!(row_major_strides(&[1, usize::MAX, 2]).is_err());
+        assert!(
+            kernel
+                .workspace_requirement(
+                    &[TensorMetadata::new(
+                        onnx_runtime_ir::DataType::Float32,
+                        &[usize::MAX, 4, 1],
+                        true
+                    )],
+                    &[]
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn governed_fourier_buffers_reuse_one_lane_without_warm_issuer_callbacks() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{
+            HolderId, HostWorkspacePool, MemoryGovernor, ProcessMemoryManager,
+        };
+        use std::sync::Arc;
+        let books = Arc::new(RecordingGovernor::new_host(64));
+        let manager = ProcessMemoryManager::new().unwrap();
+        let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+        let resources = crate::CpuMemoryResources::new(
+            books.weight_memory(HolderId::new(13)),
+            Default::default(),
+        )
+        .unwrap()
+        .with_workspace_pool(pool.clone())
+        .unwrap();
+        let provider = crate::CpuExecutionProvider::initialized_with_resources(resources).unwrap();
+        let kernel = DftFactory.create(&make_dft_node(-2, 0), &[]).unwrap();
+        let signal = Owned::f32(&[2, 4, 1], &[1., 2., 3., 4., 2., 4., 6., 8.]);
+        let inputs = [signal.view()];
+        let meta = metadata(&inputs);
+        let mut output = Owned::zeros_f32(&[2, 4, 2]);
+        let request = kernel
+            .workspace_requirement_for_execution(&inputs, &[], &meta, &[], None)
+            .unwrap()
+            .require_ready()
+            .unwrap();
+        assert_eq!(request.bytes, 64);
+        let first = provider
+            .allocate_workspace(64, request.alignment, request.role())
+            .unwrap();
+        let identity = first.managed_owner().unwrap().identity();
+        assert!(
+            provider
+                .allocate_workspace(64, request.alignment, request.role())
+                .is_err(),
+            "an active lane cannot be reused by a concurrent call"
+        );
+        provider.deallocate_workspace(first).unwrap();
+        let before = (books.claims(), books.releases());
+        drop(
+            books
+                .reserve(Tier::Host, 0, request.role(), HolderId::new(99))
+                .unwrap(),
+        );
+        books.probe_zero_release();
+        assert_eq!(
+            (books.claims(), books.releases()),
+            (before.0 + 1, before.1 + 1),
+            "zero-byte observer positive controls"
+        );
+        let calls = (books.claims(), books.releases());
+        for _ in 0..4096 {
+            let request = kernel
+                .workspace_requirement_for_execution(&inputs, &[], &meta, &[], None)
+                .unwrap()
+                .require_ready()
+                .unwrap();
+            let mut allocation = provider
+                .allocate_workspace(request.bytes as usize, request.alignment, request.role())
+                .unwrap();
+            assert_eq!(allocation.managed_owner().unwrap().identity(), identity);
+            let workspace = WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(allocation.as_mut_ptr()),
+                allocation.len(),
+            );
+            kernel
+                .execute_with_workspace(&inputs, &mut [output.view_mut()], Some(workspace))
+                .unwrap();
+            provider.deallocate_workspace(allocation).unwrap();
+        }
+        for (frame, scale) in output.to_f32().chunks_exact(8).zip([1., 2.]) {
+            for (actual, expected) in frame.iter().zip([10., 0., -2., 2., -2., 0., -2., -2.]) {
+                assert!((actual - scale * expected).abs() < 1e-4);
+            }
+        }
+        assert_eq!(
+            (books.claims(), books.releases()),
+            calls,
+            "including zero-byte callbacks"
+        );
+        assert_eq!(books.used(Tier::Host), 64);
+        assert_eq!(manager.process_used(Tier::Host), 64);
+        pool.trim_idle(64).unwrap();
+        assert_eq!(books.used(Tier::Host), 0);
+        assert_eq!(manager.process_used(Tier::Host), 0);
     }
 
     /// Verify the radix-2 FFT matches the naive DFT within tolerance.
@@ -775,7 +1436,7 @@ mod tests {
             .expect("factory create");
 
         kernel
-            .execute(&[input.view(), dft_len.view()], &mut [output.view_mut()])
+            .execute_prepared(&[input.view(), dft_len.view()], &mut [output.view_mut()])
             .expect("kernel execute");
 
         let out = output.to_f32();
@@ -793,11 +1454,12 @@ mod tests {
         let input = Owned::f32(&[1, 4, 2], &[0.0; 8]);
         let mut output = Owned::zeros_f32(&[1, 3, 2]);
         let node = make_dft_node(-2, 1);
+        assert!(DftFactory.create(&node, &[vec![1, 4, 2]]).is_err());
         let kernel = DftFactory
-            .create(&node, &[vec![1, 4, 2]])
-            .expect("factory create");
+            .create(&node, &[])
+            .expect("unresolved shape defers validation");
         let error = kernel
-            .execute(&[input.view()], &mut [output.view_mut()])
+            .execute_prepared(&[input.view()], &mut [output.view_mut()])
             .expect_err("onesided complex DFT must be rejected");
         assert!(error.to_string().contains("valid only for real input"));
     }

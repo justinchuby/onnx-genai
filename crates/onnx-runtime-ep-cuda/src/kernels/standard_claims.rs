@@ -141,10 +141,8 @@ fn global_lp_pool(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> 
 
 fn lp_normalization(node: &Node, opset: u64, input_dtypes: &[DataType]) -> Result<(), String> {
     global_pool(node, input_dtypes)?;
-    let optimizer_created = node.attr("fused_reduce_chain").and_then(Attribute::as_int) == Some(1);
     if input_dtypes.first() == Some(&DataType::BFloat16)
         && opset < 22
-        && !optimizer_created
         && !onnx_runtime_ep_api::schema_authority::authoritative_schema_validation_active()
     {
         return Err(format!(
@@ -920,10 +918,17 @@ mod lp_normalization_claim_tests {
         assert!(plugin_claim.is_ok());
         assert!(lp_normalization(&node, 21, &dtype).is_err());
 
-        let mut optimizer_node = node;
-        optimizer_node
+        let mut marked_node = node;
+        marked_node
             .attributes
             .insert("fused_reduce_chain".into(), Attribute::Int(1));
-        assert!(lp_normalization(&optimizer_node, 21, &dtype).is_ok());
+        assert!(
+            lp_normalization(&marked_node, 21, &dtype).is_err(),
+            "a model-authored marker must not bypass the schema boundary"
+        );
+        assert!(
+            lp_normalization(&marked_node, 22, &dtype).is_ok(),
+            "the optimizer-created node is admitted through its effective v22 schema"
+        );
     }
 }

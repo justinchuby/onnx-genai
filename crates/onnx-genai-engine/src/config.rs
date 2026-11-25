@@ -1332,6 +1332,9 @@ impl From<SamplerSequence> for Vec<SamplerStage> {
 /// User-controllable decoding options for Phase 1 generation.
 #[derive(Debug, Clone)]
 pub struct GenerateOptions {
+    /// Normal stop on a newly generated newline after this wall-clock prediction
+    /// budget, measured from the first selected token. None/zero disables it.
+    pub max_prediction_time: Option<std::time::Duration>,
     /// Declared adapter composition per request row. Absence selects the base model.
     pub adapter_selection: Option<crate::pipeline::AdapterSelection>,
     /// Maximum tokens to produce after the prompt.
@@ -1434,6 +1437,7 @@ pub struct GenerateOptions {
 impl Default for GenerateOptions {
     fn default() -> Self {
         Self {
+            max_prediction_time: None,
             adapter_selection: None,
             max_new_tokens: 128,
             max_constraint_bytes: 4 * 1024 * 1024,
@@ -2215,6 +2219,8 @@ pub struct PrioritizedGenerateResult {
 /// Why generation stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinishReason {
+    /// Prediction time elapsed and a new newline was committed.
+    PredictionTimeLimit,
     /// The configured maximum number of new tokens was reached.
     MaxTokens,
     /// The configured EOS token was generated.

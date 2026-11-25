@@ -64,6 +64,7 @@ schema
 scripts
 specs
 tests
+vendor
 wiki
 xtask
 

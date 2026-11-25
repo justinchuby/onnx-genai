@@ -11,6 +11,28 @@ struct NativeRequest {
     return_tokens: bool,
     prefill_only: bool,
     probabilities: NativeProbabilities,
+    response_fields: Arc<ResponseFields>,
+}
+
+/// Pinned paths traverse objects and retain the entire path as the output key.
+#[derive(Default)]
+struct ResponseFields(Vec<String>);
+impl ResponseFields {
+    fn project(&self, value: Value) -> Value {
+        if self.0.is_empty() {
+            return value;
+        }
+        let mut output = Map::new();
+        for path in &self.0 {
+            let selected = path
+                .split('/')
+                .try_fold(&value, |current, key| current.as_object()?.get(key));
+            if let Some(selected) = selected {
+                output.insert(path.clone(), selected.clone());
+            }
+        }
+        Value::Object(output)
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -20,6 +42,10 @@ struct NativeProbabilities {
 }
 
 fn parse(mut body: Map<String, Value>, infill: bool) -> Result<NativeRequest, ApiError> {
+    let response_fields=Arc::new(ResponseFields(match body.remove("response_fields") {
+        None=>Vec::new(),
+        Some(value)=>serde_json::from_value::<Vec<String>>(value).map_err(|error| ApiError::invalid_request(format!("response_fields must be an array of string paths; use [] to return every field: {error}")))?,
+    }));
     let top = match body.remove("n_probs") {
         None => 0,
         Some(value) => value
@@ -135,6 +161,7 @@ fn parse(mut body: Map<String, Value>, infill: bool) -> Result<NativeRequest, Ap
         return_tokens,
         prefill_only,
         probabilities: NativeProbabilities { top, post },
+        response_fields,
     })
 }
 
@@ -145,13 +172,11 @@ enum NativeOutput {
         completed: oneshot::Receiver<()>,
     },
 }
-impl IntoResponse for NativeOutput {
-    fn into_response(self) -> Response {
+impl NativeOutput {
+    fn response(self, ping: crate::SsePingInterval) -> Response {
         match self {
             Self::Buffered(value) => Json(value).into_response(),
-            Self::Stream { receiver, .. } => {
-                Sse::new(ReceiverStream::new(receiver)).into_response()
-            }
+            Self::Stream { receiver, .. } => ping.response(ReceiverStream::new(receiver)),
         }
     }
 }
@@ -159,6 +184,97 @@ struct PreparedNative {
     request: NativeRequest,
     handle: Arc<ModelHandle>,
     operation: NativeOperation,
+    metadata: NativeFinalMetadata,
+}
+
+struct NativeFinalMetadata {
+    model: String,
+    prompt: String,
+    slot: Option<usize>,
+    settings: Value,
+    stops: Vec<String>,
+}
+impl NativeFinalMetadata {
+    fn new(
+        handle: &ModelHandle,
+        tokens: &[u32],
+        options: &GenerateOptions,
+        request: &NativeRequest,
+        budget: usize,
+    ) -> Result<Self, ApiError> {
+        let stops = options
+            .stop_sequences
+            .iter()
+            .filter_map(|stop| match stop {
+                onnx_genai_engine::logits::StopSequence::Text(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let stages = options
+            .sampler_order
+            .as_ref()
+            .map_or(onnx_genai_engine::SamplerSequence::DEFAULT, |sequence| {
+                sequence.stages()
+            });
+        let mut settings = json!({
+            "temperature":options.temperature,"top_k":options.top_k,"top_p":options.top_p,
+            "min_p":options.min_p,"top_a":options.top_a,"typical_p":options.typical_p,
+            "top_n_sigma":options.top_n_sigma,"repeat_penalty":options.repetition_penalty,
+            "repeat_last_n":options.penalty_window.map_or(json!(-1), |n| json!(n)),
+            "presence_penalty":options.presence_penalty,"frequency_penalty":options.frequency_penalty,
+            "adaptive_target":options.adaptive_p.target,"adaptive_decay":options.adaptive_p.decay,
+            "n_predict":budget,"max_tokens":budget,"ignore_eos":!options.stop_on_eos,
+            "stream":request.sampling.stream,"stop":stops,"samplers":stages,
+            "n_probs":options.top_logprobs.unwrap_or(0),"post_sampling_probs":request.probabilities.post,
+            "cache_prompt":!options.cold_start,"preserved_tokens":options.effective_preserved_tokens(),
+            "dynatemp_range":options.dynamic_temperature.map_or(0.0, |c| c.range),
+            "dry_multiplier":options.dry.as_ref().map_or(0.0, |c| c.multiplier),
+            "xtc_probability":options.xtc.map_or(0.0, |c| c.probability),
+            "mirostat":options.mirostat.map_or(0, |c| match c.version {
+                onnx_genai_engine::MirostatVersion::V1 => 1,
+                onnx_genai_engine::MirostatVersion::V2 => 2,
+            }),
+            "timings_per_token":request.sampling.extensions.get("timings_per_token").and_then(Value::as_bool).unwrap_or(false),
+            "logit_bias":options.logit_bias.iter().map(|(token,bias)| json!({"token":token,"bias":match bias {
+                onnx_genai_engine::logits::LogitBias::Add(value) => json!(value),
+                onnx_genai_engine::logits::LogitBias::Ban => Value::Null,
+            }})).collect::<Vec<_>>(),
+        });
+        if let Some(seed) = options.seed {
+            settings["seed"] = json!(seed);
+        }
+        if let Some(config) = options.dynamic_temperature {
+            settings["dynatemp_exponent"] = json!(config.exponent);
+        }
+        if let Some(config) = options.xtc {
+            settings["xtc_threshold"] = json!(config.threshold);
+        }
+        if let Some(config) = options.mirostat {
+            settings["mirostat_tau"] = json!(config.tau);
+            settings["mirostat_eta"] = json!(config.eta);
+        }
+        if let Some(config) = &options.dry {
+            settings["dry_base"] = json!(config.base);
+            settings["dry_allowed_length"] = json!(config.allowed_length);
+            settings["dry_penalty_last_n"] = config.window.map_or(json!(-1), |n| json!(n));
+            settings["dry_sequence_breakers"] = json!(request.sampling.dry_sequence_breakers);
+        }
+        Ok(Self {
+            model:handle.id.clone(),
+            prompt:handle.tokenizer.decode_with_special_tokens(tokens).map_err(|error| ApiError::invalid_request(format!("native response prompt detokenization failed: {error}; repair the package tokenizer or send valid token IDs")))?,
+            slot:handle.engine.native_slot.as_ref().map(|_| 0),
+            settings,stops,
+        })
+    }
+    fn decorate(&self, value: &mut Value, has_new_line: bool, stopping_word: &str) {
+        value["prompt"] = json!(self.prompt);
+        value["generation_settings"] = self.settings.clone();
+        value["has_new_line"] = json!(has_new_line);
+        value["stopping_word"] = json!(stopping_word);
+        if let Some(slot) = self.slot {
+            value["id_slot"] = json!(slot);
+        }
+    }
 }
 
 enum NativeOperation {
@@ -193,9 +309,11 @@ pub(crate) async fn completions(
             return_tokens: first.return_tokens,
             prefill_only: first.prefill_only,
             probabilities: first.probabilities,
+            response_fields: Arc::clone(&first.response_fields),
         });
     }
     validate_native_request(&first, &state.config)?;
+    let ping = crate::SsePingInterval::resolve(&first.sampling, state.config.sse_ping_interval)?;
     // One batch retains one admitted package version across admin reloads.
     let handle = resolve_model(&state.registry, &first.sampling.model).await?;
     let mut prepared = Vec::with_capacity(requests.len() + 1);
@@ -253,7 +371,7 @@ pub(crate) async fn completions(
                 receiver: rx,
                 completed: outcome,
             }
-            .into_response())
+            .response(ping))
         }
     }
 }
@@ -315,10 +433,11 @@ pub(crate) async fn infill(
 ) -> Result<Response, ApiError> {
     let request = parse(body, true)?;
     validate_native_request(&request, &state.config)?;
+    let ping = crate::SsePingInterval::resolve(&request.sampling, state.config.sse_ping_interval)?;
     let handle = resolve_model(&state.registry, &request.sampling.model).await?;
     Ok(run(prepare(&state, request, handle)?, 0)
         .await?
-        .into_response())
+        .response(ping))
 }
 fn validate_native_request(request: &NativeRequest, config: &ServerConfig) -> Result<(), ApiError> {
     super::completions::validate_request(&request.sampling, config)?;
@@ -382,7 +501,14 @@ fn prepare(
             .get("cache_prompt")
             .and_then(Value::as_bool)
             == Some(false);
+        prefill_options.resolve_sampling_defaults(
+            handle.generation_defaults.as_ref(),
+            &super::completions::chat_sampling_overrides(&request.sampling),
+        );
+        prefill_options.cold_start = cold_start;
+        let metadata = NativeFinalMetadata::new(&handle, &tokens, &prefill_options, &request, 0)?;
         return Ok(PreparedNative {
+            metadata,
             request,
             operation: NativeOperation::Prefill(onnx_genai_engine::PrefillRequest {
                 prompt: GeneratePrompt::TokenIds(tokens),
@@ -446,7 +572,9 @@ fn prepare(
                 ))
             })?;
     }
+    let metadata = NativeFinalMetadata::new(&handle, &tokens, &options, &request, output_budget)?;
     Ok(PreparedNative {
+        metadata,
         request,
         handle,
         operation: NativeOperation::Generate {
@@ -455,11 +583,17 @@ fn prepare(
         },
     })
 }
-fn prefill_value(model: &str, index: usize, result: onnx_genai_engine::PrefillResult) -> Value {
-    json!({"content":"","tokens":[],"stop":true,"index":index,"model":model,
+fn prefill_value(
+    metadata: &NativeFinalMetadata,
+    index: usize,
+    result: onnx_genai_engine::PrefillResult,
+) -> Value {
+    let mut value = json!({"content":"","tokens":[],"stop":true,"index":index,"model":metadata.model,
         "tokens_predicted":0,"tokens_evaluated":result.prompt_tokens,
         "tokens_cached":result.retained_cache_tokens,"stop_type":"limit","truncated":false,
-        "timings":crate::timings::render(result.timings)})
+        "timings":crate::timings::render(result.timings)});
+    metadata.decorate(&mut value, false, "");
+    value
 }
 
 async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, ApiError> {
@@ -467,7 +601,9 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
         request,
         handle,
         operation,
+        metadata,
     } = prepared;
+    let response_fields = Arc::clone(&request.response_fields);
     let (tokens, options) = match operation {
         NativeOperation::Generate { tokens, options } => (tokens, *options),
         NativeOperation::Prefill(input) => {
@@ -483,7 +619,6 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
                 .get("return_progress")
                 .and_then(Value::as_bool)
                 == Some(true);
-            let model = handle.id.clone();
             if !request.sampling.stream {
                 let mut open = true;
                 loop {
@@ -493,7 +628,7 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
                         result = &mut prefill.result => {
                             let result = result.map_err(|_| ApiError::internal("prompt-only worker stopped before returning its committed result; inspect server logs and retry"))?
                                 .map_err(generation_failure)?;
-                            return Ok(NativeOutput::Buffered(prefill_value(&model, index, result)));
+                            return Ok(NativeOutput::Buffered(response_fields.project(prefill_value(&metadata, index, result))));
                         }
                     }
                 }
@@ -523,7 +658,7 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
                                 .and_then(|result| result.map_err(generation_failure));
                             match result {
                                 Ok(result) => {
-                                    let value = prefill_value(&model, index, result);
+                                    let value = response_fields.project(prefill_value(&metadata, index, result));
                                     if tx.send(Ok(Event::default().data(value.to_string()))).await.is_ok() {
                                         let _ = completed.send(());
                                     }
@@ -580,7 +715,6 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
     .map_err(map_generate_submit_error)?;
     super::completions::await_driver_admission(generation.admission).await?;
     crate::metrics::add_prompt_tokens(prompt_tokens);
-    let model = handle.id.clone();
     let return_tokens = request.return_tokens;
     let return_progress = request
         .sampling
@@ -605,16 +739,15 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
             .await
             .map_err(generation_failure)?;
         let mut value = final_value(
-            &model,
+            &metadata,
             prompt_tokens,
             &result,
             return_tokens,
             false,
             index,
-            &stops,
         );
         probabilities.decorate_result(&mut value, &result, &handle.tokenizer, &stops)?;
-        return Ok(NativeOutput::Buffered(value));
+        return Ok(NativeOutput::Buffered(response_fields.project(value)));
     }
     let mut source = generation.events;
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(16);
@@ -661,13 +794,12 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
                 Some(DriverEvent::WorkflowPublications(_)) => continue,
                 Some(DriverEvent::Finished(result)) => {
                     let mut value = final_value(
-                        &model,
+                        &metadata,
                         prompt_tokens,
                         &result,
                         return_tokens,
                         true,
                         index,
-                        &stops,
                     );
                     let Some(tail) =
                         text_before_stop(&result.text, &stops).strip_prefix(&published)
@@ -678,6 +810,7 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
                         break;
                     };
                     value["content"] = json!(tail);
+                    let value = response_fields.project(value);
                     if tx
                         .send(Ok(Event::default().data(value.to_string())))
                         .await
@@ -717,16 +850,19 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
     })
 }
 fn final_value(
-    model: &str,
+    metadata: &NativeFinalMetadata,
     prompt_tokens: usize,
     result: &GenerateResult,
     return_tokens: bool,
     streaming: bool,
     index: usize,
-    stops: &[String],
 ) -> Value {
+    let stops = &metadata.stops;
+    let model = &metadata.model;
     let stop_type = match result.finish_reason {
-        FinishReason::MaxTokens | FinishReason::Length => "limit",
+        FinishReason::MaxTokens | FinishReason::Length | FinishReason::PredictionTimeLimit => {
+            "limit"
+        }
         FinishReason::StopSequence { .. } => "word",
         FinishReason::EosToken | FinishReason::ToolCalls => "eos",
     };
@@ -737,6 +873,20 @@ fn final_value(
     if let Some(sample) = result.timings {
         value["timings"] = crate::timings::render(sample);
     }
+    let content = text_before_stop(&result.text, stops);
+    // The upstream diagnostic survives a later time/EOS stop-type override.
+    let stopping_word = onnx_genai_engine::logits::first_text_stop(
+        &result.text,
+        stops
+            .iter()
+            .enumerate()
+            .map(|(index, stop)| (index, stop.as_str())),
+        0,
+    )
+    .and_then(|(_, index)| stops.get(index))
+    .map(String::as_str)
+    .unwrap_or("");
+    metadata.decorate(&mut value, content.contains('\n'), stopping_word);
     value
 }
 
@@ -1148,5 +1298,36 @@ mod batch_lifecycle_tests {
         assert!(rx.recv().await.is_some());
         assert!(rx.recv().await.is_some());
         assert!(rx.recv().await.is_none());
+    }
+}
+
+#[cfg(test)]
+mod response_field_tests {
+    use super::*;
+    #[test]
+    fn paths_match_pinned_object_traversal_and_full_path_keys() {
+        let source = json!({"a":{"b":{"c":1},"":2},"x":3,"list":[4],"":5,"tilde~1key":6});
+        let fields = ResponseFields(
+            vec![
+                "a/b/c",
+                "x",
+                "a/b",
+                "a/missing",
+                "x/y",
+                "list/0",
+                "a/",
+                "",
+                "tilde~1key",
+                "a/b/c",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        );
+        assert_eq!(
+            fields.project(source.clone()),
+            json!({"a/b/c":1,"x":3,"a/b":{"c":1},"a/":2,"":5,"tilde~1key":6})
+        );
+        assert_eq!(ResponseFields::default().project(source.clone()), source);
     }
 }

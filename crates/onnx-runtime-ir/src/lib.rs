@@ -52,6 +52,7 @@ pub mod deform_conv;
 pub mod dequantize_packed;
 pub mod dequantize_packed_gather;
 mod device;
+pub mod dft;
 mod domain;
 pub mod dropout;
 mod dtype;
@@ -70,9 +71,11 @@ pub mod packed_routed;
 pub mod pattern;
 pub mod quantized_grouped;
 pub mod quantized_matmul;
+pub mod roi_align;
 pub mod scatter;
 pub mod standard_math;
 pub mod topk;
+pub mod trig;
 
 /// Descriptor for the same vendored schema that defines [`onnx`].
 pub const ONNX_FILE_DESCRIPTOR_SET: &[u8] =

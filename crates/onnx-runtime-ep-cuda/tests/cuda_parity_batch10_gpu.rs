@@ -294,15 +294,34 @@ fn lp_normalization_dtype_admission_changes_at_opset22_gpu() {
         &[],
     );
     assert!(
+        !claim.is_supported(),
+        "a model-authored fused marker must not bypass the opset boundary: {:?}",
+        claim.reason()
+    );
+
+    let (mut graph, node_id) = build_graph("LpNormalization", "", 21, &inputs, &outputs, &attrs);
+    graph.node_mut(node_id).version = Some(22);
+    let effective_opset = graph
+        .effective_opset(graph.node(node_id))
+        .expect("optimizer-created node must carry an effective opset");
+    let model = Model::new(&graph);
+    let claim = ep.supports_op(
+        model.graph.node(node_id),
+        effective_opset,
+        &[static_shape([2, 3])],
+        &[DataType::BFloat16],
+        &[],
+    );
+    assert!(
         claim.is_supported(),
-        "optimizer-created BF16 LpNormalization must remain claimable: {:?}",
+        "optimizer-created BF16 LpNormalization must remain claimable at its node-local schema: {:?}",
         claim.reason()
     );
     let cuda = run_cuda(
         &ep,
         "LpNormalization",
         "",
-        21,
+        effective_opset,
         &inputs,
         &outputs,
         &[
