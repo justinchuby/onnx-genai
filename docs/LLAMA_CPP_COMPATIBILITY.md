@@ -469,6 +469,18 @@ Complete compressed-state checkpoints restore saved record cursors and partial
 carries; they do not imply arbitrary token-prefix rewind or permission to ignore
 the package's prefix-reuse policy.
 
+Native completion/infill final results include the actual detokenized prompt
+(with special tokens), `has_new_line` for visible generated text, and the matched
+text `stopping_word`. Prompt-only evaluation reports an empty stopping word and
+no generated newline. A serial Native executor reports its real `id_slot: 0`.
+`generation_settings` reports the admitted output cap and resolved sampling
+configuration: sampler order, temperature and probability filters, penalties,
+stop strings, explicit seed, EOS policy, preserved tokens, probability reporting
+and cache policy. Active dynamic-temperature, DRY, XTC and Mirostat controls
+include their resolved parameters. Randomized generation omits an unspecified
+seed. Budgets reflect the admitted cap, including model context bounds and zero
+for prompt-only evaluation. Batch results retain their own prompt and cap.
+
 Native completion/infill `response_fields` selects fields from the final result.
 An omitted or empty array returns the full result; otherwise missing paths are
 omitted. Paths traverse JSON object keys separated by `/`; arrays are not indexed

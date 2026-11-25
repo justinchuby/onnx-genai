@@ -2263,3 +2263,24 @@ Full server library validation passed (591 tests, two inherited ignores),
 including the existing prediction-time tests after conversion was shared.
 Server all-target strict Clippy and diff checks passed on macOS ARM64 CPU.
 This closes the numeric ping discrepancy, not the remaining goal acceptance rows.
+
+## Native final request and stop metadata
+
+Native terminal responses now carry detokenized admitted prompt tokens,
+resolved supported sampling settings, visible-output newline state and the
+matched text stop word. Serial Native executors publish their actual slot ID.
+The request preparation boundary captures the normalized settings before driver
+submission, including admitted output/context budgets. Prompt-only runs retain
+a zero generation cap. Active optional samplers report their parameters, and
+explicit seeds remain distinguishable from unspecified random seeds.
+
+The metadata travels with its own batch row through buffered and SSE delivery,
+infill and prompt-only execution, and is available to terminal response-field
+projection. Tests use an actual model with a tokenizer newline/stop suffix to
+distinguish visible newlines from newlines removed inside stop strings. They also
+exercise exact prompt tokens, sampler settings, logit biases, batch ownership,
+infill prompts and projected streams whose terminal JSON omits stop/index.
+
+Validation after main restack: full server library 592 passed, two inherited
+ignores; server all-target strict Clippy and diff checks passed on macOS ARM64
+CPU. The remaining goal acceptance rows stay open.
