@@ -651,10 +651,7 @@ impl Kernel for QMoEKernel {
                 )
             };
 
-            let prefetch_memory = if self.prefetch_experts
-                && ordered.len() > 1
-                && cache_operation.prefetch_eligibility().allows_pipeline()
-            {
+            let prefetch_memory = if self.prefetch_experts && ordered.len() > 1 {
                 cache_operation.prefetch_memory(ordered.iter().map(|(expert, _)| *expert))?
             } else {
                 None
@@ -1488,10 +1485,16 @@ impl HostCacheOperation<'_> {
         }
     }
 
+    /// Prepare an eligible pipeline scope while this operation freezes bank
+    /// membership. Reject capacity-ineligible operations before consuming the
+    /// selected experts, locking payloads, pinning hits or requesting grants.
     fn prefetch_memory(
         &self,
         experts: impl Iterator<Item = usize>,
     ) -> Result<Option<ExpertMemoryScope<'_>>> {
+        if !self.prefetch_eligibility().allows_pipeline() {
+            return Ok(None);
+        }
         if !self.cache.memory.is_governed() {
             return Ok(Some(ExpertMemoryScope::OnDemand(&self.cache.memory)));
         }
@@ -5841,6 +5844,181 @@ mod tests {
         assert_eq!(governor.used(Tier::Host), 0);
         cache.clear();
         assert_eq!(governor.used(Tier::Host), 0);
+    }
+
+    #[test]
+    fn prefetch_scope_rejects_partial_banks_before_payload_lock_or_expert_inputs() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let _guard = hold_metrics_test_lock();
+        for governed in [false, true] {
+            for foreign in [false, true] {
+                metrics().reset();
+                let books = RecordingGovernor::new_host(128);
+                let memory = if governed {
+                    books.weight_memory(HolderId::new(13))
+                } else {
+                    DerivedWeightMemory::default()
+                };
+                let cache = WeightOffloadHostCache::new(8, memory).unwrap();
+                if foreign {
+                    let mut key = cache_key(0);
+                    key.layer_id = 99;
+                    let operation = cache.begin_operation(key, 1, 4).unwrap();
+                    for _ in 0..2 {
+                        drop(lease_fixture_expert(&operation, 0).unwrap());
+                    }
+                }
+                let operation = cache
+                    .begin_operation(cache_key(0), if foreign { 2 } else { 3 }, 4)
+                    .unwrap();
+                assert_eq!(
+                    operation.prefetch_eligibility(),
+                    HostPrefetchEligibility::InsufficientCapacity {
+                        required_bytes: 12,
+                        budget_bytes: 8,
+                    }
+                );
+                let callbacks = (books.claims(), books.releases());
+                let charged = books.used(Tier::Host);
+                let before_metrics = crate::weight_offload_stats();
+                let payload = cache.inner.cache.lock().unwrap();
+                let state = (
+                    payload.entries.len(),
+                    payload.history.len(),
+                    payload.owned_bytes,
+                    payload.clock,
+                    payload.reported_owned_bytes,
+                    payload.reported_budget_bytes,
+                );
+                let (tx, rx) = mpsc::channel();
+                let result = std::thread::scope(|scope| {
+                    let operation = &operation;
+                    scope.spawn(move || {
+                        let selected = std::iter::from_fn(|| -> Option<usize> {
+                            panic!("capacity rejection must not consume selected experts")
+                        });
+                        tx.send(operation.prefetch_memory(selected).unwrap().is_none())
+                            .unwrap();
+                    });
+                    let result = rx.recv_timeout(Duration::from_secs(5));
+                    // Always unlock before asserting/joining, so a misplaced
+                    // guard produces a bounded failure rather than a deadlock.
+                    drop(payload);
+                    result
+                });
+                assert!(
+                    result.expect("ineligible preflight must finish while payloads are locked"),
+                    "governed={governed}, foreign={foreign}"
+                );
+                assert_eq!((books.claims(), books.releases()), callbacks);
+                assert_eq!(books.used(Tier::Host), charged);
+                let mut after_metrics = crate::weight_offload_stats();
+                after_metrics.linux_process = before_metrics.linux_process;
+                assert_eq!(after_metrics, before_metrics);
+                let after = cache.inner.cache.lock().unwrap();
+                assert_eq!(
+                    (
+                        after.entries.len(),
+                        after.history.len(),
+                        after.owned_bytes,
+                        after.clock,
+                        after.reported_owned_bytes,
+                        after.reported_budget_bytes
+                    ),
+                    state
+                );
+                drop(after);
+                drop(operation);
+                cache.clear();
+                assert_eq!(books.used(Tier::Host), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn prefetch_scope_streaming_funds_one_window_without_registry_lock() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let _guard = hold_metrics_test_lock();
+        let books = RecordingGovernor::new_host(8);
+        let cache = WeightOffloadHostCache::new(0, books.weight_memory(HolderId::new(13))).unwrap();
+        let operation = cache.begin_operation(cache_key(0), 2, 4).unwrap();
+        let registry = cache
+            .inner
+            .banks
+            .try_write()
+            .expect("streaming leaves registry unlocked");
+        assert!(registry.is_empty());
+        let before = (books.claims(), books.releases());
+        let (tx, rx) = mpsc::channel();
+        let result = std::thread::scope(|scope| {
+            let operation = &operation;
+            scope.spawn(move || {
+                let selected = std::iter::from_fn(|| -> Option<usize> {
+                    panic!("streaming window does not inspect selected experts")
+                });
+                let memory = operation.prefetch_memory(selected).unwrap();
+                tx.send(memory)
+                    .unwrap_or_else(|_| panic!("streaming scope receiver disappeared"));
+            });
+            let result = rx.recv_timeout(Duration::from_secs(5));
+            // Release even after a regression blocks on the registry; scope
+            // joining must not strand the test or its shared host lock.
+            drop(registry);
+            result
+        });
+        let memory = result
+            .expect("streaming preflight must finish while registry is locked")
+            .unwrap();
+        assert!(matches!(memory, ExpertMemoryScope::StreamingWindow(_)));
+        assert!(cache.inner.banks.try_read().unwrap().is_empty());
+        assert_eq!(books.used(Tier::Host), 8);
+        assert_eq!((books.claims(), books.releases()), (before.0 + 1, before.1));
+        drop(memory);
+        assert_eq!(books.used(Tier::Host), 0);
+        assert_eq!(
+            (books.claims(), books.releases()),
+            (before.0 + 1, before.1 + 1)
+        );
+    }
+
+    #[test]
+    fn prefetch_scope_warm_hits_pin_payloads_without_new_issuer_calls() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
+        let _guard = hold_metrics_test_lock();
+        let books = RecordingGovernor::new_host(12);
+        let cache =
+            WeightOffloadHostCache::new(12, books.weight_memory(HolderId::new(13))).unwrap();
+        let operation = cache.begin_operation(cache_key(0), 3, 4).unwrap();
+        for expert in 0..3 {
+            for _ in 0..2 {
+                drop(lease_fixture_expert(&operation, expert).unwrap());
+            }
+        }
+        assert_eq!(cache.inner.cache.lock().unwrap().entries.len(), 3);
+        assert_eq!(books.used(Tier::Host), 12);
+        let before = (books.claims(), books.releases());
+        let memory = operation.prefetch_memory(0..3).unwrap().unwrap();
+        assert_eq!((books.claims(), books.releases()), before);
+        cache.clear();
+        assert_eq!(
+            books.used(Tier::Host),
+            12,
+            "scope pins outlive cache membership"
+        );
+        assert_eq!((books.claims(), books.releases()), before);
+        drop(memory);
+        assert_eq!(books.used(Tier::Host), 0);
+        assert_eq!((books.claims(), books.releases()), (before.0, before.1 + 3));
     }
 
     #[test]
