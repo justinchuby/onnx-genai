@@ -2,7 +2,6 @@
 use super::*;
 use onnx_genai_engine::ranking::{PreparedRerankingPair, RerankingInput};
 use serde_json::{Value, json};
-use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,38 +69,6 @@ fn item(item: Value, field: &str) -> Result<Item, ApiError> {
     }
     Ok(Item { text, images })
 }
-/// One request owns fetched media. Reused query/document URLs share their
-/// allocation; the byte budget covers all unique retained encoded images.
-struct MediaOwner {
-    remaining: usize,
-    images: HashMap<String, Arc<[u8]>>,
-}
-impl MediaOwner {
-    async fn load(&mut self, urls: &[String], field: &str) -> Result<Vec<Arc<[u8]>>, ApiError> {
-        let mut images = Vec::with_capacity(urls.len());
-        for (index, url) in urls.iter().enumerate() {
-            if let Some(bytes) = self.images.get(url) {
-                images.push(Arc::clone(bytes));
-                continue;
-            }
-            let remaining = NonZeroUsize::new(self.remaining).ok_or_else(|| ApiError::payload_too_large(format!("{field}.image[{index}] exceeds the request media budget; reduce images or raise --max-rerank-media-bytes")))?;
-            let bytes = crate::image_input::fetch_image(url, remaining).await.map_err(|error| ApiError::invalid_request(format!("{field}.image[{index}] could not be loaded within the remaining {remaining}-byte media budget (--max-rerank-media-bytes): {error:#}")))?;
-            let bytes = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-                image::ImageReader::new(std::io::Cursor::new(&bytes))
-                    .with_guessed_format()?
-                    .decode()?;
-                Ok(bytes)
-            }).await
-                .map_err(|error| ApiError::internal(format!("validate {field}.image[{index}]: image decoding task stopped: {error}; retry the request or inspect server logs")))?
-                .map_err(|error| ApiError::invalid_request(format!("{field}.image[{index}] is not a supported encoded image: {error:#}; provide valid PNG or JPEG data")))?;
-            self.remaining -= bytes.len();
-            let bytes: Arc<[u8]> = bytes.into();
-            self.images.insert(url.clone(), Arc::clone(&bytes));
-            images.push(bytes);
-        }
-        Ok(images)
-    }
-}
 
 pub(crate) async fn rerank(
     State(state): State<AppState>,
@@ -139,16 +106,16 @@ pub(crate) async fn rerank(
                 ))
             })?;
     }
-    let mut media = MediaOwner {
-        remaining: state.config.max_rerank_media_bytes.get(),
-        images: HashMap::new(),
-    };
-    let query_images = media.load(&query.images, "query").await?;
+    let mut media = crate::image_input::ImageRequest::new(
+        state.config.max_rerank_media_bytes,
+        "--max-rerank-media-bytes",
+    );
+    let query_images = media.load(&query.images, "query.image").await?;
     let mut document_images = Vec::with_capacity(documents.len());
     for (index, document) in documents.iter().enumerate() {
         document_images.push(
             media
-                .load(&document.images, &format!("documents[{index}]"))
+                .load(&document.images, &format!("documents[{index}].image"))
                 .await?,
         );
     }

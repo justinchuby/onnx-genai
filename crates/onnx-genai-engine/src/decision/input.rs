@@ -345,9 +345,13 @@ mod tests {
             std::num::NonZeroUsize::new(128).unwrap(),
         )
         .unwrap();
-        let prepared =
-            PreparedDecision::prepare(&tokenizer, &json!("hello"), q, DecisionLimits::default())
-                .unwrap();
+        let prepared = PreparedDecision::prepare(
+            &tokenizer,
+            crate::decision::DecisionInput::text(&json!("hello")),
+            q,
+            DecisionLimits::default(),
+        )
+        .unwrap();
         engine.decide(prepared).unwrap()
     }
     #[test]

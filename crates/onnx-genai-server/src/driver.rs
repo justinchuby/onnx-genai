@@ -311,6 +311,14 @@ impl DriverFailure {
                 kind: DriverFailureKind::InvalidRequest,
             };
         }
+        if let Some(limit) = error.chain().find_map(|source| {
+            source.downcast_ref::<onnx_genai_engine::decision::DecisionInputLimitError>()
+        }) {
+            return Self {
+                message: limit.to_string(),
+                kind: DriverFailureKind::InvalidRequest,
+            };
+        }
         let memory_overload = error.chain().any(|source| {
             matches!(
                 source.downcast_ref::<SchedulerAdmissionError>(),

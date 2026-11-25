@@ -2201,3 +2201,13 @@ The package's target manifest states which parameters are adaptable. The
 runtime owns loading, caching, eviction, and kernel selection. Because adapter
 selection participates in dataflow and cache dependencies, two requests with
 different adapters cannot accidentally share an incompatible prefix cache.
+
+### 10.7 Decision image workflows (v1.14)
+
+Decision v2 adds explicit `decision.images` endpoint order and requires a
+`prompt_tokens` output alongside calibrated probabilities. Encoded image inputs
+are opaque application uint8 vectors; workflow steps own vision preprocessing.
+Both typed admission and parser gates require core v1.14. The shared encoded-image
+endpoint resolver also serves reranking, with no model-name inference or
+backward aliases. Task-owned media does not become an ordinary chat Media role.
+See [SystemOne](../SYSTEMONE.md) for preparation, request order, limits and usage.

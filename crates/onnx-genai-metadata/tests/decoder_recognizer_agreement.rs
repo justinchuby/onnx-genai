@@ -66,6 +66,14 @@ use GraphCardinality::{Composite, NoGraph, SingleGraph};
 /// Every workflow this repository maintains, and how it classifies.
 const MATRIX: &[Row] = &[
     row(
+        "tests/fixtures/onnx_genai_workflows/decision_images/inference_metadata.yaml",
+        2,
+        Composite,
+        None,
+        false,
+        None,
+    ),
+    row(
         "tests/fixtures/onnx_genai_workflows/decision/inference_metadata.yaml",
         1,
         SingleGraph,

@@ -142,12 +142,8 @@ impl Engine {
             request = request.with_input(name, Value::from_vec_i64(row.clone(), &shape)?);
         }
         for (name, bytes) in pair.images {
-            let size = i64::try_from(bytes.len())
-                .context("reranking image byte length exceeds tensor dimensions")?;
-            request = request.with_input(
-                name,
-                Value::from_raw_bytes(bytes.to_vec(), &[size], onnx_genai_ort::DataType::Uint8)?,
-            );
+            let value = self.encoded_image_value(&name, &bytes)?;
+            request = request.with_input(name, value);
         }
         let outputs = self
             .run_pipeline_outputs(request)

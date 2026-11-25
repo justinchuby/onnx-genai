@@ -15,6 +15,8 @@ pub struct DecisionContract {
     profile: String,
     input_policy: std::sync::Arc<crate::DecisionInputPolicy>,
     output: String,
+    prompt_tokens_output: Option<String>,
+    images: Vec<crate::task_profiles::EncodedImageInput>,
     spec: DecisionSpec,
     bindings: Vec<(String, DecisionFeature)>,
     sequence_length: Option<usize>,
@@ -29,6 +31,34 @@ impl DecisionContract {
     }
     pub fn output(&self) -> &str {
         &self.output
+    }
+    pub fn images(&self) -> &[crate::task_profiles::EncodedImageInput] {
+        &self.images
+    }
+    pub fn prompt_tokens_output(&self) -> Option<&str> {
+        self.prompt_tokens_output.as_deref()
+    }
+    pub fn admit_images(&self, count: usize) -> Result<(), DecisionContractError> {
+        if count > self.images.len() {
+            return Err(invalid(format!(
+                "decision profile '{}' declares {} ordered state-image inputs, but request supplies {count}; reduce images or select a compatible package",
+                self.profile,
+                self.images.len()
+            )));
+        }
+        if let Some(binding) = self
+            .images
+            .iter()
+            .skip(count)
+            .find(|binding| binding.required)
+        {
+            return Err(invalid(format!(
+                "decision profile '{}' omits required state-image input '{}'; supply the declared ordered images",
+                self.profile,
+                binding.endpoint()
+            )));
+        }
+        Ok(())
     }
     pub fn spec(&self) -> &DecisionSpec {
         &self.spec
@@ -75,6 +105,21 @@ pub fn decision_contract(
             )
             .map_err(invalid)?;
         }
+        if profile.version == "2" && profile.kind == "decision"
+            || profile
+                .decision
+                .as_ref()
+                .is_some_and(|spec| !spec.images.is_empty())
+        {
+            let version =
+                crate::version::normalize(metadata.schema_version.as_deref()).map_err(invalid)?;
+            crate::version::gate_feature_use(
+                version,
+                crate::version::SchemaFeature::MultimodalDecisions,
+                &format!("profiles.{name}.decision.images"),
+            )
+            .map_err(invalid)?;
+        }
         if crate::task_profiles::skip_unsupported_version(profile) {
             continue;
         }
@@ -86,18 +131,23 @@ pub fn decision_contract(
             }
             continue;
         }
-        if profile.version != "1" {
+        if !matches!(profile.version.as_str(), "1" | "2") {
             return Err(invalid(format!(
-                "profiles.{name}.version '{}' is unsupported for decision; use version '1' or mark an unsupported profile ignorable",
+                "profiles.{name}.version '{}' is unsupported for decision; use version '1' or '2' or mark an unsupported profile ignorable",
                 profile.version
             )));
         }
         if result.is_some() {
             return Err(invalid(
-                "multiple decision profiles are ambiguous; declare one decision v1 workflow contract per package",
+                "multiple decision profiles are ambiguous; declare one decision workflow contract per package",
             ));
         }
         let spec=profile.decision.as_ref().ok_or_else(||invalid(format!("profiles.{name}.decision must declare prompt_template, max_options, variants, confidence and score policies")))?;
+        if (profile.version == "2") == spec.images.is_empty() {
+            return Err(invalid(format!(
+                "profiles.{name} decision v2 requires nonempty decision.images; decision v1 must omit images"
+            )));
+        }
         if let Some(policy) = &spec.input_policy {
             policy
                 .validate_definition(spec.max_options.get())
@@ -128,12 +178,16 @@ pub fn decision_contract(
             )
         }) {
             return Err(invalid(format!(
-                "profiles.{name} decision v1 must execute a non-generative workflow without text/token outputs; expose a separate decision-head workflow instead of reporting generated tokens as decisions"
+                "profiles.{name} decision profiles must execute a non-generative workflow without text/token outputs; expose a separate decision-head workflow instead of reporting generated tokens as decisions"
             )));
         }
-        if profile.outputs.len() != 1 || !profile.outputs.contains_key("probabilities") {
+        let expected_outputs = if profile.version == "2" { 2 } else { 1 };
+        if profile.outputs.len() != expected_outputs
+            || !profile.outputs.contains_key("probabilities")
+            || (profile.version == "2" && !profile.outputs.contains_key("prompt_tokens"))
+        {
             return Err(invalid(format!(
-                "profiles.{name}.outputs must name exactly probabilities; compute calibrated option probabilities in the workflow"
+                "profiles.{name}.outputs must name probabilities (and prompt_tokens for decision v2); compute calibrated option probabilities and complete media-aware usage in the workflow"
             )));
         }
         let output = &profile.outputs["probabilities"];
@@ -156,10 +210,47 @@ pub fn decision_contract(
             TensorDimension::Fixed(n)=>Some(usize::try_from(*n).ok().filter(|n|*n>0 && *n<=spec.max_options.get()).ok_or_else(||invalid(format!("profiles.{name} probability dimension must be positive and within decision.max_options")))?),
             _=>None,
         };
+        let images = crate::task_profiles::resolve_encoded_images(
+            workflow,
+            &spec.images,
+            &format!("profiles.{name}.decision.images"),
+            &mut std::collections::BTreeSet::new(),
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+        let prompt_tokens_output = if profile.version == "2" {
+            let endpoint = &profile.outputs["prompt_tokens"];
+            let usage = workflow.outputs.get(endpoint).ok_or_else(|| {
+                invalid(format!(
+                    "profiles.{name}.outputs.prompt_tokens references missing output '{endpoint}'"
+                ))
+            })?;
+            if usage.role != WorkflowOutputRole::Tensor
+                || usage.contract.dtype != "int64"
+                || usage.contract.shape.len() > 2
+                || usage
+                    .contract
+                    .shape
+                    .iter()
+                    .any(|dim| matches!(dim, TensorDimension::Fixed(n) if *n != 1))
+            {
+                return Err(invalid(format!(
+                    "profiles.{name}.outputs.prompt_tokens '{endpoint}' must be an int64 scalar or one count per single batch row"
+                )));
+            }
+            Some(endpoint.clone())
+        } else {
+            None
+        };
         let mut prompt_count = 0;
         let mut bindings = Vec::new();
         let mut sequence_length = None;
         for (input_name, input) in &workflow.inputs {
+            if images
+                .iter()
+                .any(|binding| binding.endpoint() == input_name)
+            {
+                continue;
+            }
             let feature = match (&input.role, &input.source) {
                 (
                     SemanticInputRole::Runtime {
@@ -184,7 +275,7 @@ pub fn decision_contract(
                 }
                 _ if input.required && input.default.is_none() => {
                     return Err(invalid(format!(
-                        "profiles.{name} required input '{input_name}' is outside decision v1; use request prompt_tokens or application attention_mask, token_type_ids, option_count"
+                        "profiles.{name} required input '{input_name}' is outside its decision contract; use request prompt_tokens, application attention_mask/token_type_ids/option_count, or declare a decision v2 image endpoint"
                     )));
                 }
                 _ => continue,
@@ -232,6 +323,8 @@ pub fn decision_contract(
             profile: name.clone(),
             input_policy,
             output: output.clone(),
+            prompt_tokens_output,
+            images,
             spec: spec.clone(),
             bindings,
             sequence_length,
@@ -330,6 +423,93 @@ mod tests {
                 }
             }
             assert!(decision_contract(&doc).is_err(), "case {case}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod image_contract_tests {
+    use super::*;
+    fn document() -> InferenceMetadata {
+        crate::parse_metadata(include_str!(
+            "../../../tests/fixtures/onnx_genai_workflows/decision_images/inference_metadata.yaml"
+        ), None)
+        .unwrap()
+    }
+    #[test]
+    fn decision_images_have_parser_and_typed_version_gates() {
+        let source = include_str!(
+            "../../../tests/fixtures/onnx_genai_workflows/decision_images/inference_metadata.yaml"
+        );
+        let error = crate::parse_metadata(
+            &source.replace("schema_version: v1.14", "schema_version: v1.13"),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("v1.14"), "{error}");
+        let mut metadata = document();
+        metadata.schema_version = Some("v1.13".into());
+        let error = decision_contract(&metadata).unwrap_err();
+        assert!(error.to_string().contains("v1.14"), "{error}");
+    }
+    #[test]
+    fn decision_images_resolve_positions_usage_and_reject_invalid_bindings() {
+        let metadata = document();
+        let contract = decision_contract(&metadata).unwrap().unwrap();
+        assert_eq!(contract.images().len(), 3);
+        assert_eq!(contract.prompt_tokens_output(), Some("usage"));
+        contract.admit_images(3).unwrap();
+        assert!(
+            contract
+                .admit_images(2)
+                .unwrap_err()
+                .to_string()
+                .contains("omits required")
+        );
+        for mutation in 0..5 {
+            let mut metadata = document();
+            let profile = metadata.profiles.get_mut("decision_head").unwrap();
+            match mutation {
+                0 => profile.version = "1".into(),
+                1 => profile
+                    .decision
+                    .as_mut()
+                    .unwrap()
+                    .images
+                    .push("request.query_picture".into()),
+                2 => {
+                    profile.outputs.remove("prompt_tokens");
+                }
+                3 => {
+                    metadata
+                        .pipeline
+                        .as_mut()
+                        .unwrap()
+                        .workflow
+                        .inputs
+                        .get_mut("request.query_picture")
+                        .unwrap()
+                        .contract
+                        .dtype = "float32".into()
+                }
+                4 => {
+                    metadata
+                        .pipeline
+                        .as_mut()
+                        .unwrap()
+                        .workflow
+                        .outputs
+                        .get_mut("usage")
+                        .unwrap()
+                        .contract
+                        .dtype = "float32".into()
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                decision_contract(&metadata).is_err(),
+                "invalid mutation {mutation} admitted"
+            );
         }
     }
 }

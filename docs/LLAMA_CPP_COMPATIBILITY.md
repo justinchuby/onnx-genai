@@ -457,7 +457,7 @@ parity. These upstream capabilities remain incomplete:
   partial function-call fragment projection, broader pressure/overlap acceptance and
   device-backed wire acceptance; see [realtime](REALTIME.md) for the implemented
   WebSocket session modes, resource bounds and Native CPU evidence.
-- Multimodal/joint decision heads and shared generation/decision entry points.
+- Audio/video/spoken decision inputs, joint/packed decision heads and shared generation/decision entry points.
 - Device-state/multi-sequence slot persistence; arbitrary GGUF/PEFT LoRA imports and device-fused LoRA.
 - GGUF package import, quantization selectors and selective sidecar management.
   Hugging Face nxrt-package download, resume and deletion are supported.
@@ -465,8 +465,10 @@ parity. These upstream capabilities remain incomplete:
 `/v1/systemone` executes text/structured-state decision profiles, with explicit
 model-authored prompting, calibration outputs, variants and answer policies.
 Core schema v1.11 declares input defaults, instruction/payload rules, option
-ordering, score ranges and canonical legends. Multimodal/joint heads and shared
-generation/decision entry points remain open; see [SystemOne](SYSTEMONE.md). Route presence does not
+ordering, score ranges and canonical legends. Decision v2 in core schema v1.14 additionally executes ordered state images,
+including `files`/`images` and embedded chat image parts, with actual media-aware
+usage. Audio/video/spoken inputs, joint/packed heads and shared generation/decision
+entry points remain open; see [SystemOne](SYSTEMONE.md). Route presence does not
 claim every upstream decision-model format is admitted.
 
 Model download/delete require `--model-cache-dir`; operator-configured paths

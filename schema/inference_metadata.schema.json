@@ -1951,6 +1951,13 @@
         "choice_confidence": {
           "$ref": "#/$defs/DecisionConfidence"
         },
+        "images": {
+          "description": "Ordered encoded state-image workflow endpoints (decision v2).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "input_policy": {
           "anyOf": [
             {

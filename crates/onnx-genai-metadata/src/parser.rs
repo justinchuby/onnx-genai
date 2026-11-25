@@ -336,6 +336,23 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
                 )
                 .map_err(crate::MetadataError::Parse)?;
             }
+            if profile
+                .get("decision")
+                .and_then(|d| d.get("images"))
+                .is_some()
+                || (profile.get("kind").and_then(|k| k.as_str()) == Some("decision")
+                    && profile.get("version").and_then(|v| v.as_str()) == Some("2"))
+            {
+                crate::version::gate_feature_use(
+                    version,
+                    crate::version::SchemaFeature::MultimodalDecisions,
+                    &format!(
+                        "profiles.{}.decision.images",
+                        name.as_str().unwrap_or("<invalid-name>")
+                    ),
+                )
+                .map_err(crate::MetadataError::Parse)?;
+            }
             if profile.get("decision").is_some() {
                 crate::version::gate_feature_use(
                     version,
