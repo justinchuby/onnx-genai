@@ -53,9 +53,18 @@ impl QMoEFactory {
     }
 }
 
-/// One routed expert and its `(row, contribution_slot, route_weight)` tasks,
-/// as materialised for the route-first offload loop.
-type RoutedExpert = (usize, Vec<(usize, usize, f32)>);
+/// An actual expert key, never a position in an ordering buffer.
+struct PrefetchExpertId(usize);
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "could not start a host worker: {source}; reduce concurrent CPU work or set {}=0 before creating the session",
+    crate::weight_offload::WEIGHT_OFFLOAD_PREFETCH_ENV
+)]
+struct PrefetchWorkerStartError {
+    #[source]
+    source: std::io::Error,
+}
 
 /// Route-grouped, per-active-expert dequantizing integer QMoE kernel.
 pub struct QMoEKernel {
@@ -608,7 +617,6 @@ impl Kernel for QMoEKernel {
             metrics().record_routes(self.layer_id, &tasks);
 
             let expanded_bytes = DequantizedExpert::expanded_bytes(&fc1, &fc2, fc3.as_ref())?;
-            let ordered: Vec<RoutedExpert> = tasks.into_iter().collect();
             let cache_operation = self.host_cache.begin_operation(
                 ExpertCacheKey::new(
                     self.layer_id,
@@ -651,8 +659,8 @@ impl Kernel for QMoEKernel {
                 )
             };
 
-            let prefetch_memory = if self.prefetch_experts && ordered.len() > 1 {
-                cache_operation.prefetch_memory(ordered.iter().map(|(expert, _)| *expert))?
+            let prefetch_memory = if self.prefetch_experts && tasks.len() > 1 {
+                cache_operation.prefetch_memory(&tasks)?
             } else {
                 None
             };
@@ -662,63 +670,36 @@ impl Kernel for QMoEKernel {
                 // thread computes expert `n`, overlapping the host-side
                 // transfer with compute. Leases are still issued strictly in
                 // ascending expert order (one request in flight). Combined with
-                // the eviction-neutrality guard above, cache admission/eviction
-                // and every counter stay byte-identical to the serial path —
-                // only the wall-clock overlaps.
-                use std::sync::mpsc;
-                let host_cache = &cache_operation;
-                let fc1_ref = &fc1;
-                let fc2_ref = &fc2;
-                let fc3_ref = fc3.as_ref();
-                let ordered_ref = &ordered;
-                let prefetch_memory = &prefetch_memory;
-                std::thread::scope(|scope| -> Result<()> {
-                    let (req_tx, req_rx) = mpsc::channel::<usize>();
-                    let (res_tx, res_rx) = mpsc::channel::<Result<ExpertExecution>>();
-                    scope.spawn(move || {
-                        while let Ok(index) = req_rx.recv() {
-                            let expert = ordered_ref[index].0;
-                            let leased = lease_route_first_expert(
-                                host_cache,
-                                expert,
-                                fc1_ref,
-                                fc2_ref,
-                                fc3_ref,
-                                prefetch_memory,
-                            );
-                            if res_tx.send(leased).is_err() {
-                                break;
-                            }
-                        }
-                    });
-                    req_tx
-                        .send(0)
-                        .map_err(|_| error("route-first prefetch worker unavailable"))?;
-                    for index in 0..ordered_ref.len() {
-                        let weights = res_rx
-                            .recv()
-                            .map_err(|_| error("route-first prefetch worker stopped"))??;
-                        if index + 1 < ordered_ref.len() {
-                            req_tx
-                                .send(index + 1)
-                                .map_err(|_| error("route-first prefetch worker unavailable"))?;
-                        }
-                        let (expert, expert_tasks) = &ordered_ref[index];
-                        compute(*expert, expert_tasks, &weights, contributions)?;
-                    }
-                    Ok(())
-                })?;
+                // the eviction-neutrality guard above, the existing cache
+                // admission order and access-counter contract are preserved.
+                // Concurrent payload-residency peaks may reflect the overlap.
+                run_prefetched_expert_groups(
+                    tasks,
+                    |expert| {
+                        lease_route_first_expert(
+                            &cache_operation,
+                            expert,
+                            &fc1,
+                            &fc2,
+                            fc3.as_ref(),
+                            &prefetch_memory,
+                        )
+                    },
+                    |expert, expert_tasks, weights| {
+                        compute(expert, expert_tasks, weights, contributions)
+                    },
+                )?;
             } else {
-                for (expert, expert_tasks) in &ordered {
+                for (expert, expert_tasks) in tasks {
                     let weights = lease_route_first_expert(
                         &cache_operation,
-                        *expert,
+                        expert,
                         &fc1,
                         &fc2,
                         fc3.as_ref(),
                         &ExpertMemoryScope::OnDemand(self.host_cache.memory()),
                     )?;
-                    compute(*expert, expert_tasks, &weights, contributions)?;
+                    compute(expert, &expert_tasks, &weights, contributions)?;
                 }
             }
         } else {
@@ -1488,9 +1469,9 @@ impl HostCacheOperation<'_> {
     /// Prepare an eligible pipeline scope while this operation freezes bank
     /// membership. Reject capacity-ineligible operations before consuming the
     /// selected experts, locking payloads, pinning hits or requesting grants.
-    fn prefetch_memory(
+    fn prefetch_memory<T>(
         &self,
-        experts: impl Iterator<Item = usize>,
+        experts: &BTreeMap<usize, T>,
     ) -> Result<Option<ExpertMemoryScope<'_>>> {
         if !self.prefetch_eligibility().allows_pipeline() {
             return Ok(None);
@@ -1525,7 +1506,7 @@ impl HostCacheOperation<'_> {
             let mut pins = Vec::new();
             let mut missing = Vec::new();
             let mut key = self.bank.key.representative.clone();
-            for expert in experts {
+            for &expert in experts.keys() {
                 key.expert = expert;
                 if let Some(entry) = cache.entries.get(&key) {
                     pins.push(Arc::clone(&entry.weights));
@@ -1785,6 +1766,52 @@ impl WeightOffloadHostCache {
         };
         drop(retired);
     }
+}
+
+/// Run one ordered group stream with at most one load ahead. Only the loader
+/// moves to the worker; task metadata and compute remain on the calling thread.
+/// All channels leave scope before scoped joining, including callback errors.
+fn run_prefetched_expert_groups<W: Send>(
+    tasks: BTreeMap<usize, Vec<(usize, usize, f32)>>,
+    mut load: impl FnMut(usize) -> Result<W> + Send,
+    mut compute: impl FnMut(usize, &[(usize, usize, f32)], &W) -> Result<()>,
+) -> Result<()> {
+    use std::sync::mpsc;
+    std::thread::scope(|scope| -> Result<()> {
+        let (req_tx, req_rx) = mpsc::channel::<PrefetchExpertId>();
+        let (res_tx, res_rx) = mpsc::channel::<Result<W>>();
+        std::thread::Builder::new()
+            .spawn_scoped(scope, move || {
+                while let Ok(PrefetchExpertId(expert)) = req_rx.recv() {
+                    let leased = load(expert);
+                    if res_tx.send(leased).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|source| EpError::Backend {
+                operation: "QMoE route-first expert prefetch",
+                source: Box::new(PrefetchWorkerStartError { source }),
+            })?;
+        let mut groups = tasks.into_iter().peekable();
+        if let Some((expert, _)) = groups.peek() {
+            req_tx.send(PrefetchExpertId(*expert)).map_err(|_| {
+                error(format!("route-first prefetch request channel closed before expert {expert}; inspect the worker failure and retry the operation"))
+            })?;
+        }
+        while let Some((expert, expert_tasks)) = groups.next() {
+            let weights = res_rx.recv().map_err(|_| {
+                error(format!("route-first prefetch response channel closed while awaiting expert {expert}; inspect the worker failure and retry the operation"))
+            })??;
+            if let Some((next, _)) = groups.peek() {
+                req_tx.send(PrefetchExpertId(*next)).map_err(|_| {
+                    error(format!("route-first prefetch request channel closed before expert {next}; inspect the worker failure and retry the operation"))
+                })?;
+            }
+            compute(expert, &expert_tasks, &weights)?;
+        }
+        Ok(())
+    })
 }
 
 fn lease_route_first_expert(
@@ -4115,6 +4142,240 @@ mod tests {
             .collect()
     }
 
+    #[derive(Default)]
+    struct PrefetchDriverProbe {
+        live: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        loaded: Mutex<Vec<usize>>,
+        computed: Mutex<Vec<usize>>,
+        dropped: Mutex<Vec<usize>>,
+    }
+
+    struct PrefetchDriverWeight {
+        expert: usize,
+        probe: Arc<PrefetchDriverProbe>,
+    }
+
+    impl PrefetchDriverWeight {
+        fn new(expert: usize, probe: Arc<PrefetchDriverProbe>) -> Self {
+            let live = probe.live.fetch_add(1, Ordering::SeqCst) + 1;
+            probe.peak.fetch_max(live, Ordering::SeqCst);
+            Self { expert, probe }
+        }
+    }
+
+    impl Drop for PrefetchDriverWeight {
+        fn drop(&mut self) {
+            let previous = self.probe.live.fetch_sub(1, Ordering::SeqCst);
+            assert!(previous > 0, "driver payload cannot retire twice");
+            self.probe.dropped.lock().unwrap().push(self.expert);
+        }
+    }
+
+    fn prefetch_driver_test_groups(ids: &[usize]) -> BTreeMap<usize, Vec<(usize, usize, f32)>> {
+        ids.iter().map(|&id| (id, vec![(id, 0, 1.)])).collect()
+    }
+
+    fn bounded_prefetch_driver_test(
+        body: impl FnOnce() -> Result<()> + Send + 'static,
+    ) -> Result<()> {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = body();
+            let _ = tx.send(result);
+        });
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("prefetch driver must finish and join on success or callback failure");
+        worker
+            .join()
+            .expect("prefetch driver harness must not panic");
+        result
+    }
+
+    #[test]
+    fn prefetch_group_driver_preserves_sparse_ids_and_two_live_payload_bound() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        for ids in [vec![3, 11, 41], vec![13], Vec::new()] {
+            let probe = Arc::new(PrefetchDriverProbe::default());
+            let loading = probe.clone();
+            let computing = probe.clone();
+            let groups = prefetch_driver_test_groups(&ids);
+            let (ready_tx, ready_rx) = mpsc::channel();
+            bounded_prefetch_driver_test(move || {
+                run_prefetched_expert_groups(
+                    groups,
+                    move |expert| {
+                        loading.loaded.lock().unwrap().push(expert);
+                        let weight = PrefetchDriverWeight::new(expert, loading.clone());
+                        if expert == 11 {
+                            ready_tx.send(()).unwrap();
+                        }
+                        Ok(weight)
+                    },
+                    move |expert, tasks, weight| {
+                        assert_eq!(
+                            weight.expert, expert,
+                            "loaded weights must match the group expert ID"
+                        );
+                        assert_eq!(tasks, &[(expert, 0, 1.)]);
+                        if expert == 3 {
+                            ready_rx.recv_timeout(Duration::from_secs(5)).map_err(|_| {
+                                error("next expert must load before current compute finishes")
+                            })?;
+                            assert_eq!(computing.live.load(Ordering::SeqCst), 2);
+                        }
+                        computing.computed.lock().unwrap().push(expert);
+                        Ok(())
+                    },
+                )
+            })
+            .unwrap();
+            assert_eq!(*probe.loaded.lock().unwrap(), ids);
+            assert_eq!(*probe.computed.lock().unwrap(), ids);
+            assert_eq!(*probe.dropped.lock().unwrap(), ids);
+            assert_eq!(probe.live.load(Ordering::SeqCst), 0);
+            assert_eq!(probe.peak.load(Ordering::SeqCst), ids.len().min(2));
+        }
+    }
+
+    #[test]
+    fn prefetch_group_driver_propagates_callback_failures_and_retires_pending_weights() {
+        use onnx_runtime_memory_api::{MemoryError, Tier};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        for fail_at in [3, 11] {
+            let probe = Arc::new(PrefetchDriverProbe::default());
+            let loading = probe.clone();
+            let computing = probe.clone();
+            let failure = bounded_prefetch_driver_test(move || {
+                run_prefetched_expert_groups(
+                    prefetch_driver_test_groups(&[3, 11, 41]),
+                    move |expert| {
+                        loading.loaded.lock().unwrap().push(expert);
+                        if expert == fail_at {
+                            return Err(EpError::Memory(MemoryError::InvalidRequest {
+                                tier: Tier::Host.name(),
+                                requested: 4,
+                                reason: "injected expert loader failure",
+                            }));
+                        }
+                        Ok(PrefetchDriverWeight::new(expert, loading.clone()))
+                    },
+                    move |expert, _, weight| {
+                        assert_eq!(weight.expert, expert);
+                        computing.computed.lock().unwrap().push(expert);
+                        Ok(())
+                    },
+                )
+            })
+            .unwrap_err();
+            assert!(matches!(
+                failure,
+                EpError::Memory(MemoryError::InvalidRequest { requested: 4, .. })
+            ));
+            let expected = if fail_at == 3 { vec![3] } else { vec![3, 11] };
+            assert_eq!(*probe.loaded.lock().unwrap(), expected);
+            assert_eq!(
+                *probe.computed.lock().unwrap(),
+                if fail_at == 3 { vec![] } else { vec![3] }
+            );
+            assert_eq!(probe.live.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                probe.dropped.lock().unwrap().len(),
+                usize::from(fail_at == 11)
+            );
+        }
+        let probe = Arc::new(PrefetchDriverProbe::default());
+        let loading = probe.clone();
+        let computing = probe.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let failure = bounded_prefetch_driver_test(move || {
+            run_prefetched_expert_groups(
+                prefetch_driver_test_groups(&[3, 11, 41]),
+                move |expert| {
+                    loading.loaded.lock().unwrap().push(expert);
+                    let weight = PrefetchDriverWeight::new(expert, loading.clone());
+                    if expert == 11 {
+                        ready_tx.send(()).unwrap();
+                    }
+                    Ok(weight)
+                },
+                move |expert, _, weight| {
+                    assert_eq!(expert, 3);
+                    assert_eq!(weight.expert, expert);
+                    ready_rx.recv_timeout(Duration::from_secs(5)).map_err(|_| {
+                        error("pending expert must be live before injected compute error")
+                    })?;
+                    assert_eq!(computing.live.load(Ordering::SeqCst), 2);
+                    Err(error("injected compute failure for expert 3"))
+                },
+            )
+        })
+        .unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("injected compute failure for expert 3")
+        );
+        assert_eq!(*probe.loaded.lock().unwrap(), [3, 11]);
+        assert_eq!(probe.live.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.dropped.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn sparse_prefetch_expert_keys_match_serial_across_capacity_modes() {
+        let _guard = hold_metrics_test_lock();
+        const E: usize = 8;
+        const R: usize = 4;
+        const H: usize = 16;
+        const I: usize = 32;
+        let one_expert = ((I * H + H * I) * 4) as u64;
+        for rotation in 0..3 {
+            let mut router = vec![-100.; R * E];
+            for row in 0..R {
+                for rank in 0..3 {
+                    router[row * E + [2, 5, 7][(rank + row + rotation) % 3]] = 3. - rank as f32;
+                }
+            }
+            for budget in [0, 3 * one_expert, E as u64 * one_expert] {
+                let routers = [router.clone()];
+                let (serial, serial_stats, _) =
+                    run_route_first_bench(E, H, I, 4, 16, R, 3, budget, &routers, false);
+                let (pipe, pipe_stats, _) =
+                    run_route_first_bench(E, H, I, 4, 16, R, 3, budget, &routers, true);
+                assert!(serial.iter().all(|v| v.is_finite()) && serial.iter().any(|v| *v != 0.));
+                assert_eq!(
+                    serial.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    pipe.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                );
+                let mut expected = serial_stats;
+                expected.peak_dequantized_experts = pipe_stats.peak_dequantized_experts;
+                expected.linux_process = pipe_stats.linux_process;
+                assert_eq!(pipe_stats, expected);
+                assert_eq!(
+                    pipe_stats.tokens_per_expert,
+                    BTreeMap::from([(2, R as u64), (5, R as u64), (7, R as u64)])
+                );
+                let source_per_expert =
+                    I * (H / 2) + I * (H / 16) * 4 + H * (I / 2) + H * (I / 16) * 4;
+                assert_eq!(
+                    pipe_stats.bytes_read_from_mmap,
+                    (3 * source_per_expert) as u64
+                );
+                if budget == 0 {
+                    assert!(
+                        pipe_stats.peak_dequantized_experts > 0
+                            && pipe_stats.peak_dequantized_experts <= 2
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn prefetch_pipeline_is_byte_and_stat_identical_to_serial() {
         let _guard = hold_metrics_test_lock();
@@ -5847,7 +6108,7 @@ mod tests {
     }
 
     #[test]
-    fn prefetch_scope_rejects_partial_banks_before_payload_lock_or_expert_inputs() {
+    fn prefetch_scope_rejects_partial_banks_before_payload_lock_or_grants() {
         use crate::kernels::testutil::RecordingGovernor;
         use onnx_runtime_memory_api::Tier;
         use onnx_runtime_memory_governor::{HolderId, MemoryGovernor};
@@ -5898,10 +6159,8 @@ mod tests {
                 let result = std::thread::scope(|scope| {
                     let operation = &operation;
                     scope.spawn(move || {
-                        let selected = std::iter::from_fn(|| -> Option<usize> {
-                            panic!("capacity rejection must not consume selected experts")
-                        });
-                        tx.send(operation.prefetch_memory(selected).unwrap().is_none())
+                        let selected = BTreeMap::from([(usize::MAX, ())]);
+                        tx.send(operation.prefetch_memory(&selected).unwrap().is_none())
                             .unwrap();
                     });
                     let result = rx.recv_timeout(Duration::from_secs(5));
@@ -5961,10 +6220,8 @@ mod tests {
         let result = std::thread::scope(|scope| {
             let operation = &operation;
             scope.spawn(move || {
-                let selected = std::iter::from_fn(|| -> Option<usize> {
-                    panic!("streaming window does not inspect selected experts")
-                });
-                let memory = operation.prefetch_memory(selected).unwrap();
+                let selected = BTreeMap::<usize, ()>::new();
+                let memory = operation.prefetch_memory(&selected).unwrap();
                 tx.send(memory)
                     .unwrap_or_else(|_| panic!("streaming scope receiver disappeared"));
             });
@@ -6007,7 +6264,10 @@ mod tests {
         assert_eq!(cache.inner.cache.lock().unwrap().entries.len(), 3);
         assert_eq!(books.used(Tier::Host), 12);
         let before = (books.claims(), books.releases());
-        let memory = operation.prefetch_memory(0..3).unwrap().unwrap();
+        let memory = operation
+            .prefetch_memory(&BTreeMap::from([(0, ()), (1, ()), (2, ())]))
+            .unwrap()
+            .unwrap();
         assert_eq!((books.claims(), books.releases()), before);
         cache.clear();
         assert_eq!(
@@ -6048,7 +6308,10 @@ mod tests {
                     .unwrap(),
             );
         }
-        let scope = operation.prefetch_memory(0..3).unwrap().unwrap();
+        let scope = operation
+            .prefetch_memory(&BTreeMap::from([(0, ()), (1, ()), (2, ())]))
+            .unwrap()
+            .unwrap();
         assert_eq!(governor.used(Tier::Host), 12);
         let mut active = None;
         for expert in 0..3 {
