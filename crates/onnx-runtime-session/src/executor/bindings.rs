@@ -621,11 +621,13 @@ impl Executor {
         let external = self.prepare_external_bindings_mode(bindings, true)?;
         let symbols = self.bind_symbols(inputs, &external)?;
         let stats = self.cache.stats();
+        let workspace_context = self.ep.workspace_preparation_context().read();
         // Input/external-binding validation above always runs. The immutable
         // graph and weights plus this exact symbol map determine every planned
         // shape (including nested shapes and capacity bounds). New/evicted
         // specializations conservatively invalidate the metadata-only plan.
         if let Some(memo) = &self.workspace_preparation_memo
+            && memo.context == workspace_context
             && memo.symbols == symbols
             && memo.output_bindings.matches(&external)
             && memo.growing_symbols == self.capture_growing_symbols
@@ -830,6 +832,7 @@ impl Executor {
         }
         let stats = self.cache.stats();
         self.workspace_preparation_memo = Some(WorkspacePreparationMemo {
+            context: workspace_context,
             output_bindings: WorkspaceOutputBindings::from_external(&external),
             symbols,
             growing_symbols: self.capture_growing_symbols.clone(),

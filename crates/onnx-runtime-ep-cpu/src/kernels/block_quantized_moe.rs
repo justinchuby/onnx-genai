@@ -270,19 +270,12 @@ impl BlockQuantizedMoEKernel {
         // Experts and their projections execute serially. An expert receives a
         // row at most once, so total rows bound every group, independent of k.
         // Cover streamed fallback even when a dense resident set is available.
-        let mut projection_bytes = 0usize;
-        let mut projection_alignment = 1usize;
-        for (k, n) in [(dims.hidden, dims.fc1_size), (dims.inter, dims.hidden)]
-            .into_iter()
-            .chain(self.formats.fc3.map(|_| (dims.hidden, dims.inter)))
-        {
-            let layout = self.projection_plan.layout(dims.rows, k, n)?;
-            projection_bytes = projection_bytes.max(layout.bytes());
-            projection_alignment = projection_alignment.max(layout.alignment());
-        }
-        let projection =
-            std::alloc::Layout::from_size_align(projection_bytes, projection_alignment)
-                .map_err(|_| error("decoded projection workspace exceeds addressable capacity"))?;
+        let projection = self.projection_plan.maximum_layout(
+            dims.rows,
+            [(dims.hidden, dims.fc1_size), (dims.inter, dims.hidden)]
+                .into_iter()
+                .chain(self.formats.fc3.map(|_| (dims.hidden, dims.inter))),
+        )?;
         let [bank_a, bank_b] = MoeWorkspace::bank_layouts(
             dims.rows,
             dims.hidden,
