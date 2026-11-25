@@ -756,7 +756,9 @@ fn final_value(
     stops: &[String],
 ) -> Value {
     let stop_type = match result.finish_reason {
-        FinishReason::MaxTokens | FinishReason::Length => "limit",
+        FinishReason::MaxTokens | FinishReason::Length | FinishReason::PredictionTimeLimit => {
+            "limit"
+        }
         FinishReason::StopSequence { .. } => "word",
         FinishReason::EosToken | FinishReason::ToolCalls => "eos",
     };

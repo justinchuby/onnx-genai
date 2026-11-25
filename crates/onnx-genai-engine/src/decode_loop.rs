@@ -419,10 +419,17 @@ pub(crate) fn select_and_commit_step<B: DecodeLoopBackend + ?Sized>(
         chain,
         tokenizer,
         callback,
+        None,
     )?;
     Ok((token_id, finish))
 }
 
+pub(crate) type SelectedTokenFinalizer<'a> =
+    dyn FnMut(Option<&FinishReason>) -> anyhow::Result<()> + 'a;
+
+// Physical finalization must run after stop selection and before publication;
+// keep its fallible hook explicit at this shared commit boundary.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn commit_selected_token(
     state: &mut DecodeLoopState,
     prompt_tokens: &[TokenId],
@@ -431,6 +438,7 @@ pub(crate) fn commit_selected_token(
     chain: &ProcessorChain,
     tokenizer: &Tokenizer,
     callback: Option<&mut GenerateTokenCallback<'_>>,
+    before_publish: Option<&mut SelectedTokenFinalizer<'_>>,
 ) -> anyhow::Result<Option<FinishReason>> {
     if state.step == 0 {
         state.text_decoder = crate::tokenization::TokenTextDecoder::with_preserved_tokens(
@@ -475,6 +483,11 @@ pub(crate) fn commit_selected_token(
             context.generated_text.push_str(&tail);
             finish_reason = finish_reason_after_token(token_id, options, chain, &context);
         }
+    }
+    if let Some(finalize) = before_publish {
+        finalize(finish_reason.as_ref()).with_context(|| {
+            format!("finalize selected token {token_id} physical state before publication")
+        })?;
     }
     state.clock.token_selected(state.generated_tokens.len());
     if let Some(callback) = callback {
@@ -824,6 +837,7 @@ mod tests {
                     &ProcessorChain::new(),
                     &tokenizer,
                     Some(&mut callback),
+                    None,
                 )?;
                 assert_eq!(finish, stop_on_eos.then_some(FinishReason::EosToken));
                 assert_eq!(state.generated_tokens, [3]);
@@ -879,7 +893,8 @@ mod tests {
                 &options,
                 &chain,
                 &tokenizer,
-                Some(&mut callback)
+                Some(&mut callback),
+                None
             )?,
             None
         );
@@ -891,7 +906,8 @@ mod tests {
                 &options,
                 &chain,
                 &tokenizer,
-                Some(&mut callback)
+                Some(&mut callback),
+                None
             )?,
             Some(FinishReason::StopSequence { index: 0 })
         );

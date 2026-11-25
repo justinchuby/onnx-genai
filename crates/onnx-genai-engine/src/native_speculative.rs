@@ -458,6 +458,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 chain,
                 tokenizer,
                 callback.as_deref_mut(),
+                None,
             )? {
                 return Ok(Some(finish_result(
                     tokenizer,
@@ -614,6 +615,29 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 }
             }
             state.clock.resume_work();
+            let mut finalize_stop_prefix = |reason: Option<&FinishReason>| -> anyhow::Result<()> {
+                if reason.is_some() && !is_bonus && idx + 1 < accepted {
+                    let keep = idx + 1;
+                    let result = match recurrent_snapshot.as_ref() {
+                        Some(snapshot) => self.session.commit_recurrent_state_to_accepted(
+                            snapshot,
+                            base,
+                            &draft[..keep],
+                        ),
+                        None => {
+                            // Refresh the last retained token too: merely slicing
+                            // KV would leave hidden conditioning from a later row.
+                            self.session.rewind(base + idx).and_then(|()| {
+                                self.session
+                                    .decode(&draft[idx..keep], base + idx)
+                                    .map(|_| ())
+                            })
+                        }
+                    };
+                    result.with_context(||format!("restore Native speculative stop prefix {keep}/{accepted} before publication"))?;
+                }
+                Ok(())
+            };
             if let Some(reason) = commit_selected_token(
                 state,
                 prompt_tokens,
@@ -622,6 +646,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 chain,
                 tokenizer,
                 callback.as_deref_mut(),
+                Some(&mut finalize_stop_prefix),
             )? {
                 return Ok(Some(finish_result(
                     tokenizer,

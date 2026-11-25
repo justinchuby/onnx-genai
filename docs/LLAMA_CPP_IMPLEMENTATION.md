@@ -2214,3 +2214,32 @@ and literal tildes. Real HTTP coverage exercises unchanged empty-selection
 results, nested timing selection, buffered/SSE batches without stop/index,
 prompt-only output, admitted infill, and invalid selector types. This remains an
 increment toward the original compatibility scope, not completion of its rows.
+
+## Prediction wall-time limit
+
+`t_max_predict_ms` now reaches the request-owned decoder stop policy rather than
+being accepted and ignored. The pinned server's implementation checks a fresh
+emitted newline after strict wall-time expiry, starting with the first generated
+token. Null and disabled values preserve ordinary generation; numeric fractions
+truncate toward zero, while unsafe overflow representations fail admission.
+This is a normal output/state commit with a limit finish reason.
+
+An explicit output-observer capability admits time/stop observers to raw-greedy
+Native speculative verification while keeping logits-transforming processors
+on their existing fallback path. Stops inside an accepted block restore only
+the retained prefix, including hidden conditioning, before token publication.
+Injected repair failure publishes no token and permits a clean retry. Generic
+authored workflows stop at declared emission boundaries; candidate-tree and
+DFlash drivers truncate before accepted-state recomputation.
+
+Local macOS CPU validation includes real Native/ORT buffered and callback
+generation, Native multi-token acceptance, continuous-row reuse, pure authored
+workflow execution, and actual candidate-tree/DFlash prefix commits and retry.
+Full server library tests passed (591, two existing ignores); full engine
+library tests passed (1083, one existing ignore). Full DFlash (24), candidate-tree
+(30) and authored workflow policy (22) suites passed; the additional DFlash
+observer-bound failure check proved no publication and a clean retry. Default
+engine/server all-target strict lint, no-default engine strict lint, both Python
+binding checks, formatting and diff checks passed after restacking onto main.
+These checks validate this increment; the unchecked goal acceptance rows remain
+open.

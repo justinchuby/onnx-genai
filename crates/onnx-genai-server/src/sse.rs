@@ -574,7 +574,9 @@ pub(crate) fn done_chunk_with_stop(
         created,
         model,
         match reason {
-            FinishReason::MaxTokens | FinishReason::Length => "length",
+            FinishReason::MaxTokens | FinishReason::Length | FinishReason::PredictionTimeLimit => {
+                "length"
+            }
             FinishReason::ToolCalls => "tool_calls",
             _ => "stop",
         },

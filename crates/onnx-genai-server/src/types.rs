@@ -150,8 +150,42 @@ impl GrammarTriggerRequest {
     }
 }
 
+fn deserialize_prediction_time<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<std::time::Duration>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    // Match field_num<int64_t>: floating numbers truncate toward zero before
+    // the inclusive lower bound is checked. Reject representations that cannot
+    // be converted safely rather than relying on an out-of-range C++ cast.
+    let milliseconds = value
+        .as_i64()
+        .or_else(|| {
+            value.as_f64().filter(|number| {
+                number.is_finite()
+                    && number.trunc() >= -1.0
+                    && number.trunc() < 9_223_372_036_854_775_808.0
+            }).map(|number| number.trunc() as i64)
+        })
+        .filter(|number| *number >= -1)
+        .ok_or_else(|| {
+            <D::Error as serde::de::Error>::custom(
+                "t_max_predict_ms must be numeric milliseconds convertible to int64 from -1 through 9223372036854775807; -1, 0 and null disable prediction time limits",
+            )
+        })?;
+    Ok((milliseconds > 0).then(|| std::time::Duration::from_millis(milliseconds as u64)))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
+    #[serde(
+        rename = "t_max_predict_ms",
+        default,
+        deserialize_with = "deserialize_prediction_time"
+    )]
+    pub prediction_time_limit: Option<std::time::Duration>,
     #[serde(default)]
     pub model: String,
     pub messages: Vec<ChatMessage>,

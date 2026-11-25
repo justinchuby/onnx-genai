@@ -585,6 +585,7 @@ struct CandidateTreeWorkflowHost<'a> {
     loop_stop: Option<super::GenerationStopReason>,
     staged_output_observer: Option<&'a mut super::ToolCallStagedOutputObserver>,
     staged_output_finalized: bool,
+    prediction_limit: Option<super::generation::PredictionLimitObserver>,
 }
 
 impl CandidateTreeWorkflowHost<'_> {
@@ -867,6 +868,22 @@ impl CandidateTreeWorkflowHost<'_> {
              the authored control path must not enter the seam after it becomes zero-trip",
             self.plan.target_path
         );
+        if let Some(limit) = self.prediction_limit.as_mut() {
+            let accepted = limit.observe_prefix(
+                self.tokenizer.context(
+                    "candidate-tree prediction time limits require the package tokenizer",
+                )?,
+                &committed,
+            )?;
+            committed.truncate(accepted);
+            if limit.stopped()
+                && !committed
+                    .last()
+                    .is_some_and(|token| self.options.terminates(*token))
+            {
+                self.finish_reason = FinishReason::PredictionTimeLimit;
+            }
+        }
         let mut accepted_context = pending.context.clone();
         accepted_context.extend(committed.iter().copied().map(i64::from));
         self.recompute_accepted_state(&accepted_context, &committed, &pending.tree, values)?;
@@ -902,7 +919,9 @@ impl CandidateTreeWorkflowHost<'_> {
                     )
                 })?;
         }
-        let loop_stop = if self.finish_reason == FinishReason::EosToken {
+        let loop_stop = if self.finish_reason == FinishReason::PredictionTimeLimit {
+            Some(super::GenerationStopReason::PredictionTimeLimit)
+        } else if self.finish_reason == FinishReason::EosToken {
             Some(super::GenerationStopReason::EosCommitted)
         } else if self.generated.len() >= self.options.max_new_tokens {
             Some(super::GenerationStopReason::BudgetExhausted)
@@ -928,6 +947,7 @@ impl CandidateTreeWorkflowHost<'_> {
         if self.plan.execution_mode == CandidateTreeExecutionMode::DrainAtSeam {
             while self.generated.len() < self.options.max_new_tokens
                 && self.finish_reason != FinishReason::EosToken
+                && self.finish_reason != FinishReason::PredictionTimeLimit
                 && !self
                     .options
                     .max_context
@@ -936,10 +956,11 @@ impl CandidateTreeWorkflowHost<'_> {
                 self.invoke_proposer(context, values)?;
                 context = self.complete_target(values)?;
             }
-            if self
-                .options
-                .max_context
-                .is_some_and(|limit| context.len() >= limit)
+            if self.finish_reason != FinishReason::PredictionTimeLimit
+                && self
+                    .options
+                    .max_context
+                    .is_some_and(|limit| context.len() >= limit)
                 && self.generated.len() < self.options.max_new_tokens
             {
                 self.finish_reason = FinishReason::Length;
@@ -1690,6 +1711,15 @@ impl WorkflowRuntime {
                 &options.effective_preserved_tokens(),
             );
         }
+        if options
+            .max_prediction_time
+            .is_some_and(|limit| !limit.is_zero())
+        {
+            anyhow::ensure!(
+                tokenizer.is_some(),
+                "candidate-tree prediction time limits require the package tokenizer; declare one before requesting the limit"
+            );
+        }
         let mut execution = super::WorkflowExecutionPlan::new_candidate_tree_driver(self, request)?;
         let mut host = CandidateTreeWorkflowHost {
             runtime: self,
@@ -1713,6 +1743,10 @@ impl WorkflowRuntime {
             loop_stop: None,
             staged_output_observer,
             staged_output_finalized: false,
+            prediction_limit: options
+                .max_prediction_time
+                .filter(|limit| !limit.is_zero())
+                .map(|limit| super::generation::PredictionLimitObserver::new(options, limit)),
         };
         {
             let mut hosted: Option<&mut dyn super::workflow::WorkflowNodeHost> = Some(&mut host);
@@ -2372,6 +2406,15 @@ impl WorkflowRuntime {
                 budget_cap: None,
             });
         }
+        if options
+            .max_prediction_time
+            .is_some_and(|limit| !limit.is_zero())
+        {
+            anyhow::ensure!(
+                tokenizer.is_some(),
+                "DFlash prediction time limits require the package tokenizer; declare one before requesting the limit"
+            );
+        }
         let mut turn = super::TurnTransaction::admit_runtime_participant(
             self.worker.next_turn_transaction_id(),
         );
@@ -2380,6 +2423,10 @@ impl WorkflowRuntime {
         }
         let mut context_start = i64::try_from(initial_tokens.len())
             .context("DFlash prompt length exceeds the absolute position type")?;
+        let mut prediction_limit = options
+            .max_prediction_time
+            .filter(|limit| !limit.is_zero())
+            .map(|limit| super::generation::PredictionLimitObserver::new(options, limit));
         let mut generated = Vec::with_capacity(options.max_new_tokens);
         let mut random = StdRng::seed_from_u64(options.seed.unwrap_or(0));
         let mut finish_reason = FinishReason::MaxTokens;
@@ -2514,6 +2561,53 @@ impl WorkflowRuntime {
             {
                 committed_path.truncate(eos + 1);
             }
+            if let Some(limit) = prediction_limit.as_mut() {
+                let observed = committed_path
+                    .iter()
+                    .map(|token| {
+                        u32::try_from(*token)
+                            .context("DFlash predicted token is outside the u32 domain")
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()
+                    .and_then(|tokens| {
+                        limit.observe_prefix(
+                            tokenizer.context(
+                                "DFlash prediction time limits require the package tokenizer",
+                            )?,
+                            &tokens,
+                        )
+                    });
+                match observed {
+                    Ok(accepted) => committed_path.truncate(accepted),
+                    Err(error) => {
+                        let mut error = error.context(
+                            "DFlash prediction time-limit observation failed before state commit",
+                        );
+                        if let Err(rollback) = self.abort_dflash_state_transaction(
+                            transaction,
+                            &mut state,
+                            super::TurnAbortReason::ExecutionFailure,
+                        ) {
+                            error = error.context(format!(
+                                "restore DFlash prediction observer baseline failed: {rollback:#}"
+                            ));
+                        }
+                        if let Err(abort) = turn.abort(super::TurnAbortReason::ExecutionFailure) {
+                            error = error.context(format!(
+                                "abort DFlash prediction observer turn failed: {abort:#}"
+                            ));
+                        }
+                        return Err(error);
+                    }
+                }
+                if limit.stopped()
+                    && !committed_path.last().is_some_and(|token| {
+                        options.terminates(u32::try_from(*token).unwrap_or(u32::MAX))
+                    })
+                {
+                    finish_reason = FinishReason::PredictionTimeLimit;
+                }
+            }
             let committed_drafts = acceptance
                 .accepted
                 .min(committed_path.len().saturating_sub(1));
@@ -2605,7 +2699,10 @@ impl WorkflowRuntime {
                     })?;
             }
             staged_contract_executions = staged_contract_executions.saturating_add(1);
-            if finish_reason == FinishReason::EosToken {
+            if matches!(
+                finish_reason,
+                FinishReason::EosToken | FinishReason::PredictionTimeLimit
+            ) {
                 break;
             }
         }

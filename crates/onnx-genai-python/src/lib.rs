@@ -24,6 +24,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn finish_reason_name(reason: &FinishReason) -> String {
     match reason {
+        FinishReason::PredictionTimeLimit => "prediction_time_limit".to_string(),
         FinishReason::MaxTokens => "max_tokens".to_string(),
         FinishReason::EosToken => "eos_token".to_string(),
         FinishReason::StopSequence { index } => format!("stop_sequence:{index}"),

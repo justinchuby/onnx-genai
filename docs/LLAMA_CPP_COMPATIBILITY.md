@@ -368,6 +368,24 @@ are canonicalized only for schema recognition; prompt bytes retain the original
 spelling. Literal escaped backslashes keep their meaning. Grammar-only byte chunks
 may still split UTF-8 scalars. Invalid schema prefixes return a typed 400 error. Tokenizers without an interpretable
 lossless byte codec fail explicitly rather than using lossy token decoding.
+`t_max_predict_ms` limits prediction wall time starting with the first generated
+token, excluding prefill. Like the pinned upstream server, it stops only when a
+newly emitted text fragment contains a newline and elapsed time is strictly
+greater than the limit. A newline removed as part of a matched stop word does
+not trigger this limit. This is a normal generation stop: accepted output and
+its session state commit, with OpenAI `finish_reason: "length"` and native
+`stop_type: "limit"`; it does not cancel or roll back the request. Scheduler gaps
+count toward this wall limit, unlike the active-work timing counters below.
+
+Omission, `null`, `-1` and `0` disable the limit. Numeric fractions truncate
+toward zero before checking the signed 64-bit millisecond range; for example,
+`1.5` becomes one millisecond. Unsafe overflow representations are rejected.
+Native, OpenAI completion/chat, Responses and Anthropic generation share this
+request field. Native speculative, candidate-tree and DFlash execution stop at
+the accepted token prefix and finalize physical state before publication.
+Generic authored workflows observe their declared emitted units and stop before
+the next unit; an already emitted unit is retained atomically.
+
 Ordinary runtime-owned decoder generation returns llama.cpp `timings` in native,
 OpenAI completion and chat buffered results and final SSE chunks. Setting
 `timings_per_token=true` adds cumulative token-boundary measurements to SSE,
