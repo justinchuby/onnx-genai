@@ -1,0 +1,4 @@
+{
+  "rejected": true,
+  "reason": "CLOCK_PROCESS_CPUTIME_ID also violated the physical bound in a 4-worker window: CPU 8595000ns, wall 242791ns on 10 logical CPUs. The Rust hard guard failed. Replace in-process short-window CPU snapshots with process-end wait4 accounting for a fixed workload, including explicit no-work/setup and work-scaling controls."
+}

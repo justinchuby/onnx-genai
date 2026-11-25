@@ -58,7 +58,9 @@ use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{LazyWeight, MmapRegionSource};
 
 use crate::pinned_pool::PinnedStagingPool;
-use crate::runtime::{CudaRuntime, FailedHtodCompletion, PinnedStaging};
+use crate::runtime::{
+    CopyCompleted, CudaRuntime, FailedHtodCompletion, NativeDeviceAllocation, PinnedStaging,
+};
 use crate::weight_paging::fill_staging_from_regions;
 
 /// An opaque fence id in the abstract transfer engine, mirroring the `u64` ids
@@ -190,6 +192,15 @@ impl<E: fmt::Display> fmt::Display for PrefillReject<E> {
                  single-buffer prefill path"
             ),
             Self::Transfer(error) => write!(f, "prefill double buffer transfer failed: {error}"),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for PrefillReject<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transfer(error) => Some(error),
+            _ => None,
         }
     }
 }
@@ -715,29 +726,118 @@ pub fn duration_ns(d: Duration) -> u64 {
 // layers, and it performs the H2D copy and the four fence primitives. It never
 // inserts a page into the residency cache and never maps or accounts device
 // memory through a second authority: the pinned pool's `can_retain_concurrent`
-// gate and the runtime's own allocator remain the sole authorities, exactly as
-// the single-slot `prefetch_block_quantized_moe` path uses them.
+// gate covers pinned retention, while native device ownership uses the runtime's
+// existing provider domain. No extra residency budget or per-layer lease exists.
 // ===========================================================================
 
 /// Error from the CUDA-backed prefill transfer. Wraps the underlying driver /
 /// runtime error text; the primitive turns it into [`PrefillReject::Transfer`]
 /// after poisoning + quarantining the affected slot.
 #[derive(Debug)]
-pub struct CudaPrefillError(String);
+pub struct CudaPrefillError {
+    message: String,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
 
 impl CudaPrefillError {
-    fn new(msg: impl Into<String>) -> Self {
-        Self(msg.into())
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    fn with_source(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            source: Some(Box::new(source)),
+        }
     }
 }
 
 impl fmt::Display for CudaPrefillError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)?;
+        if let Some(source) = &self.source {
+            write!(f, ": {source}")?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for CudaPrefillError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source.as_ref() as &(dyn std::error::Error + 'static))
     }
 }
 
-impl std::error::Error for CudaPrefillError {}
+fn prefill_slot_bytes(layer_bytes: u64) -> Result<usize, CudaPrefillError> {
+    let invalid = || {
+        CudaPrefillError::new(format!(
+            "prefill reservation needs two {layer_bytes}-byte slots with addressable 256-byte layouts; reduce the maximum layer transfer size"
+        ))
+    };
+    layer_bytes.checked_mul(SLOTS as u64).ok_or_else(invalid)?;
+    let bytes = usize::try_from(layer_bytes).map_err(|_| invalid())?;
+    if bytes == 0 {
+        return Err(invalid());
+    }
+    std::alloc::Layout::from_size_align(bytes, 256).map_err(|_| invalid())?;
+    Ok(bytes)
+}
+
+/// A zero fence is not proof after an attempted submission. Recording failure
+/// leaves Unproven, including when direct transfer use bypasses the pipeline.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SlotCopyRead {
+    #[default]
+    Idle,
+    Unproven,
+    Fenced(FenceId),
+}
+
+impl SlotCopyRead {
+    fn settle(
+        &mut self,
+        resolve: impl FnOnce(FenceId) -> Result<Option<CopyCompleted>, CudaPrefillError>,
+    ) -> Result<Option<CopyCompleted>, CudaPrefillError> {
+        let fence = match std::mem::replace(self, Self::Unproven) {
+            Self::Idle => 0,
+            Self::Fenced(fence) => fence,
+            Self::Unproven => {
+                return Err(CudaPrefillError::new(
+                    "prefill slot has an attempted H2D submission without a completion fence; quarantine its source and destination rather than reuse them",
+                ));
+            }
+        };
+        let witness = resolve(fence)?;
+        *self = Self::Idle;
+        Ok(witness)
+    }
+}
+
+fn resolve_slot_copy(
+    runtime: &CudaRuntime,
+    fence: FenceId,
+) -> Result<Option<CopyCompleted>, CudaPrefillError> {
+    match runtime.resolve_prefetch_fence(fence) {
+        Ok(completed) => Ok(Some(completed)),
+        Err(error) => {
+            let (detail, completion) = error.into_parts();
+            match completion {
+                FailedHtodCompletion::Completed(completed) => Ok(Some(completed)),
+                FailedHtodCompletion::NotSubmitted => Ok(None),
+                FailedHtodCompletion::MayBeInFlight => Err(CudaPrefillError::new(format!(
+                    "prefill copy completion could not be established; retain the staging source and native destination: {detail}"
+                ))),
+            }
+        }
+    }
+}
 
 /// A whole layer's transfer request: the layer's device-bound regions expressed
 /// as a single [`LazyWeight`] whose `regions` are filled sequentially into the
@@ -775,32 +875,42 @@ pub struct PrefillLayerView {
     pub len: usize,
 }
 
-/// One stable slot's physical buffers, reserved once and reused across layers.
+/// One exclusive native owner and pinned source, reused without per-layer grants.
 struct CudaSlotBuffers {
-    /// Stable device allocation (from `alloc_raw`); `0` once freed/quarantined.
-    device_ptr: CUdeviceptr,
-    /// Byte capacity of `device_ptr` (the pipeline's per-layer size).
-    capacity: usize,
-    /// Valid bytes written by the most recent fill (this layer's byte count).
+    device: Option<NativeDeviceAllocation>,
     valid_len: usize,
-    /// Stable pinned host staging buffer (the H2D copy source).
     staging: Option<PinnedStaging>,
-    /// A copy-stream fence recorded *after* the slot's last H2D copy, kept
-    /// un-consumed specifically so a later reuse can host-wait it (the staging
-    /// write-after-read drain). Distinct from the fence a consumer's
-    /// `compute_wait` consumes, so the consume path never blocks the host. `0`
-    /// when the slot has no prior copy to drain.
-    reuse_fence: FenceId,
+    copy_read: SlotCopyRead,
 }
 
 impl CudaSlotBuffers {
     fn empty() -> Self {
         Self {
-            device_ptr: 0,
-            capacity: 0,
+            device: None,
             valid_len: 0,
             staging: None,
-            reuse_fence: 0,
+            copy_read: SlotCopyRead::Idle,
+        }
+    }
+
+    fn ptr(&self) -> CUdeviceptr {
+        self.device.as_ref().map_or(0, NativeDeviceAllocation::ptr)
+    }
+
+    fn capacity(&self) -> usize {
+        self.device
+            .as_ref()
+            .map_or(0, NativeDeviceAllocation::bytes)
+    }
+
+    fn quarantine_device(&mut self) {
+        if let Some(mut owner) = self.device.take()
+            && let Err(error) =
+                owner.quarantine(onnx_runtime_memory_api::QuarantineReason::CompletionUnknown)
+        {
+            eprintln!(
+                "cuda_ep prefill: cannot prepare native destination quarantine; consumed ownership remains retained, inspect manager diagnostics: {error}"
+            );
         }
     }
 }
@@ -839,6 +949,64 @@ impl CudaPrefillTransfer {
     pub fn quarantined_len(&self) -> usize {
         self.quarantined.borrow().len()
     }
+
+    fn quarantine_buffers(&self, mut buffers: CudaSlotBuffers) {
+        buffers.quarantine_device();
+        // Only the pinned source/events remain here; native ownership is now
+        // explicitly quarantined and charged in the existing manager.
+        self.quarantined.borrow_mut().push(buffers);
+    }
+
+    fn retire_slots(&mut self, descriptors: [SlotTeardown; SLOTS]) {
+        for (index, descriptor) in descriptors.into_iter().enumerate() {
+            let mut buffers =
+                std::mem::replace(self.slots[index].get_mut(), CudaSlotBuffers::empty());
+            if buffers.device.is_none() && buffers.staging.is_none() {
+                continue;
+            }
+            let witness = match buffers
+                .copy_read
+                .settle(|fence| resolve_slot_copy(&self.runtime, fence))
+            {
+                Ok(witness) => witness,
+                Err(error) => {
+                    eprintln!(
+                        "cuda_ep prefill: slot {index} teardown retained source/destination: {error}"
+                    );
+                    self.quarantine_buffers(buffers);
+                    continue;
+                }
+            };
+            let mut completion_unknown = false;
+            for fence in [descriptor.last_copy_fence, descriptor.last_release_fence]
+                .into_iter()
+                .flatten()
+            {
+                if let Err(error) = resolve_slot_copy(&self.runtime, fence) {
+                    eprintln!(
+                        "cuda_ep prefill: slot {index} final fence failed; retain its buffers: {error}"
+                    );
+                    completion_unknown = true;
+                }
+            }
+            if completion_unknown {
+                self.quarantine_buffers(buffers);
+                continue;
+            }
+            if let Some(mut owner) = buffers.device.take()
+                && let Err(error) = owner.release()
+            {
+                eprintln!(
+                    "cuda_ep prefill: slot {index} native retirement refused; ownership remains retained, inspect manager diagnostics: {error}"
+                );
+            }
+            // Complete compute/copy tails govern device settlement. Pinned
+            // reuse separately requires the existing copy-read witness.
+            if let (Some(staging), Some(witness)) = (buffers.staging.take(), witness) {
+                self.staging_pool.release(staging, witness);
+            }
+        }
+    }
 }
 
 impl PrefillTransfer for CudaPrefillTransfer {
@@ -857,47 +1025,53 @@ impl PrefillTransfer for CudaPrefillTransfer {
     }
 
     fn can_retain_concurrent(&self, layer_bytes: u64) -> bool {
-        self.staging_pool
-            .can_retain_concurrent(layer_bytes as usize, SLOTS)
+        prefill_slot_bytes(layer_bytes)
+            .is_ok_and(|bytes| self.staging_pool.can_retain_concurrent(bytes, SLOTS))
     }
 
     fn reserve(&mut self, layer_bytes: u64) -> Result<(), Self::Error> {
-        let len = layer_bytes as usize;
-        // All-or-none: acquire both pinned staging buffers and both device
-        // allocations, unwinding anything acquired if a later step fails so a
-        // partial reservation never leaks.
-        let mut staging_bufs: Vec<PinnedStaging> = Vec::with_capacity(SLOTS);
-        let mut device_ptrs: Vec<CUdeviceptr> = Vec::with_capacity(SLOTS);
-        let mut acquire = || -> Result<(), Self::Error> {
-            for _ in 0..SLOTS {
-                let pooled = self.staging_pool.acquire(len).map_err(|error| {
-                    CudaPrefillError::new(format!("pinned staging acquire: {error}"))
-                })?;
-                staging_bufs.push(pooled.into_inner());
-                let ptr = self
-                    .runtime
-                    .alloc_raw(len)
-                    .map_err(|error| CudaPrefillError::new(format!("device alloc: {error}")))?;
-                device_ptrs.push(ptr);
-            }
-            Ok(())
-        };
-        if let Err(error) = acquire() {
-            for ptr in device_ptrs {
-                // SAFETY: each `ptr` is a fresh allocation owned here and freed
-                // exactly once; nothing has been enqueued against it yet.
-                let _ = unsafe { self.runtime.free_raw(ptr) };
-            }
-            // `staging_bufs` drop here, freeing their pinned host pages.
-            return Err(error);
+        let len = prefill_slot_bytes(layer_bytes)?;
+        if self.capture_active() {
+            return Err(CudaPrefillError::new(
+                "prefill slot reservation is illegal during CUDA graph capture; create the pipeline during eager preparation",
+            ));
         }
-        for (i, (ptr, staging)) in device_ptrs.into_iter().zip(staging_bufs).enumerate() {
-            let mut slot = self.slots[i].borrow_mut();
-            slot.device_ptr = ptr;
-            slot.capacity = len;
-            slot.valid_len = 0;
-            slot.staging = Some(staging);
-            slot.reuse_fence = 0;
+        if self.slots.iter().any(|slot| slot.borrow().device.is_some()) {
+            return Err(CudaPrefillError::new(
+                "prefill slots are already reserved; reuse this pipeline or construct another instead of replacing its live owners",
+            ));
+        }
+        // Publish neither slot until both native owners and pinned sources exist.
+        // A failed second admission drops the first through native retirement.
+        let mut prepared = Vec::with_capacity(SLOTS);
+        for _ in 0..SLOTS {
+            let staging = self
+                .staging_pool
+                .acquire(len)
+                .map_err(|error| {
+                    CudaPrefillError::with_source("acquire prefill pinned staging", error)
+                })?
+                .into_inner();
+            let owner = NativeDeviceAllocation::allocate(
+                &self.runtime,
+                len,
+                onnx_runtime_memory_api::MemoryRole::Weights,
+            )
+            .map_err(|error| {
+                CudaPrefillError::with_source(
+                    "admit stable prefill native slot through the provider domain",
+                    error,
+                )
+            })?;
+            prepared.push(CudaSlotBuffers {
+                device: Some(owner),
+                valid_len: 0,
+                staging: Some(staging),
+                copy_read: SlotCopyRead::Idle,
+            });
+        }
+        for (slot, prepared) in self.slots.iter_mut().zip(prepared) {
+            *slot.get_mut() = prepared;
         }
         Ok(())
     }
@@ -910,35 +1084,27 @@ impl PrefillTransfer for CudaPrefillTransfer {
     ) -> Result<FillOutcome, Self::Error> {
         let mut s = self.slots[slot].borrow_mut();
         let mut reuse_wait_ns = 0u64;
-        // Staging write-after-read drain on reuse: host-wait the slot's previous
-        // copy fence (kept un-consumed for exactly this) before overwriting the
-        // pinned buffer. This is the only host wait; its duration is the overlap
-        // metric. `plan.prev_copy_fence.is_some()` is the reuse signal; the
-        // actual event awaited is the slot's private `reuse_fence`.
+        // The prior copy-read proof is required before rewriting pinned bytes.
         if plan.prev_copy_fence.is_some() {
-            let fence = std::mem::take(&mut s.reuse_fence);
             let start = Instant::now();
-            if let Err(error) = self.runtime.resolve_prefetch_fence(fence) {
-                let (detail, completion) = error.into_parts();
-                if matches!(completion, FailedHtodCompletion::MayBeInFlight) {
-                    return Err(CudaPrefillError::new(format!(
-                        "reuse drain could not establish prior copy completion: {detail}"
-                    )));
-                }
-                // `Completed`: a fallback copy-stream sync proved the read ended,
-                // so it is safe to overwrite the staging buffer.
-            }
+            let _completed = s
+                .copy_read
+                .settle(|fence| resolve_slot_copy(&self.runtime, fence))?;
             reuse_wait_ns = duration_ns(start.elapsed());
+        } else if s.copy_read != SlotCopyRead::Idle {
+            return Err(CudaPrefillError::new(
+                "prefill refill omitted its previous-copy dependency; preserve the slot and reuse it through the pipeline's ticket/fence lifecycle",
+            ));
         }
 
         let src_len = req.weight.region_bytes_len();
         if src_len == 0 {
             return Err(CudaPrefillError::new("fill_slot on a zero-byte layer"));
         }
-        if src_len > s.capacity {
+        if src_len > s.capacity() {
             return Err(CudaPrefillError::new(format!(
                 "layer is {src_len} bytes but the pipeline reserved {}-byte buffers",
-                s.capacity
+                s.capacity()
             )));
         }
 
@@ -962,11 +1128,14 @@ impl PrefillTransfer for CudaPrefillTransfer {
                 .map_err(|error| CudaPrefillError::new(format!("copy_wait release: {error}")))?;
         }
 
-        let ptr = s.device_ptr;
+        let ptr = s.ptr();
         // SAFETY: `ptr` is this slot's stable device allocation of `capacity`
         // bytes (>= `src_len`); the staging source holds `src_len` valid bytes
         // and stays alive (owned by this slot) until a later reuse host-waits
         // this copy's `reuse_fence`.
+        // Even an enqueue error can leave an unproven read. Do not let a
+        // missing fence masquerade as an unused source during defensive Drop.
+        s.copy_read = SlotCopyRead::Unproven;
         let enqueue = {
             let staging = s.staging.as_ref().expect("staging present after fill");
             unsafe { self.runtime.htod_async(&staging.as_slice()[..src_len], ptr) }
@@ -988,7 +1157,7 @@ impl PrefillTransfer for CudaPrefillTransfer {
             .runtime
             .record_copy_fence()
             .map_err(|error| CudaPrefillError::new(format!("record reuse fence: {error}")))?;
-        s.reuse_fence = reuse_fence;
+        s.copy_read = SlotCopyRead::Fenced(reuse_fence);
 
         Ok(FillOutcome {
             copy_fence,
@@ -999,7 +1168,7 @@ impl PrefillTransfer for CudaPrefillTransfer {
     fn payload(&self, slot: usize) -> Self::Payload {
         let s = self.slots[slot].borrow();
         PrefillLayerView {
-            device_ptr: s.device_ptr,
+            device_ptr: s.ptr(),
             len: s.valid_len,
         }
     }
@@ -1017,90 +1186,27 @@ impl PrefillTransfer for CudaPrefillTransfer {
     }
 
     fn quarantine_slot(&self, slot: usize) {
-        // Retain the slot's buffers for process lifetime rather than free memory
-        // a failed/aborted transfer may still be reading.
-        let taken = std::mem::replace(
+        let buffers = std::mem::replace(
             &mut *self.slots[slot].borrow_mut(),
             CudaSlotBuffers::empty(),
         );
-        self.quarantined.borrow_mut().push(taken);
+        self.quarantine_buffers(buffers);
     }
 
     fn teardown(&mut self, slots: [SlotTeardown; SLOTS]) {
-        // Off the hot path: drain the compute stream so no consumer is still
-        // reading a slot's device buffer when it is freed (covers a slot left
-        // InUse at teardown).
-        let _ = self.runtime.drain_for_unmap();
-        for (i, descriptor) in slots.iter().enumerate() {
-            if !descriptor.live {
-                // Poisoned slot: its buffers were already moved to `quarantined`
-                // at poison time; the slot is empty.
-                continue;
-            }
-            let mut s = self.slots[i].borrow_mut();
-            // Host-establish the slot's last H2D copy completion, minting the
-            // witness the pool's release requires. Also drain any lingering
-            // compute-ordering / release fences to release their events.
-            let reuse_fence = std::mem::take(&mut s.reuse_fence);
-            let witness = match self.runtime.resolve_prefetch_fence(reuse_fence) {
-                Ok(completed) => Some(completed),
-                Err(error) => {
-                    let (_detail, completion) = error.into_parts();
-                    if matches!(completion, FailedHtodCompletion::MayBeInFlight) {
-                        // Cannot prove the copy read of staging ended: quarantine
-                        // both instead of freeing memory a DMA may still touch.
-                        let taken = std::mem::replace(&mut *s, CudaSlotBuffers::empty());
-                        drop(s);
-                        self.quarantined.borrow_mut().push(taken);
-                        continue;
-                    }
-                    None
-                }
-            };
-            let _ = self
-                .runtime
-                .resolve_prefetch_fence(descriptor.last_copy_fence.unwrap_or(0));
-            let _ = self
-                .runtime
-                .resolve_prefetch_fence(descriptor.last_release_fence.unwrap_or(0));
-
-            let ptr = std::mem::replace(&mut s.device_ptr, 0);
-            if ptr != 0 {
-                // SAFETY: `ptr` is this slot's stable allocation, owned
-                // exclusively and freed exactly once; the copy and compute
-                // streams were drained above so no in-flight op references it.
-                let _ = unsafe { self.runtime.free_raw(ptr) };
-            }
-            // Return the staging buffer to the shared pool for reuse only when
-            // `witness` proves its last copy read completed (issue #837 fix);
-            // otherwise (fallback-sync path minted no witness) let the buffer
-            // drop, freeing its pinned pages rather than reuse without proof.
-            if let (Some(staging), Some(witness)) = (s.staging.take(), witness) {
-                self.staging_pool.release(staging, witness);
-            }
-        }
+        self.retire_slots(slots);
     }
 }
 
 impl Drop for CudaPrefillTransfer {
     fn drop(&mut self) {
-        // Quarantined buffers are retained for process lifetime (a DMA may still
-        // be reading them); never run their destructors.
-        for taken in self.quarantined.get_mut().drain(..) {
-            std::mem::forget(taken);
-        }
-        // Defensive: after `teardown` every live slot is empty. Anything left
-        // here means teardown never ran (e.g. a failed reservation that already
-        // cleaned itself up, so this is normally empty). Free it; buffers are
-        // only present if no in-flight op referenced them.
-        for slot in &self.slots {
-            let mut s = slot.borrow_mut();
-            let ptr = std::mem::replace(&mut s.device_ptr, 0);
-            if ptr != 0 {
-                // SAFETY: leftover stable allocation owned here, freed once.
-                let _ = unsafe { self.runtime.free_raw(ptr) };
-            }
-            // `s.staging` (if any) drops here, freeing its pinned pages.
+        // Direct transfer use may bypass pipeline teardown. The same typed
+        // read state and native retirement apply; leftovers are never raw-freed.
+        self.retire_slots([SlotTeardown::default(); SLOTS]);
+        for buffers in self.quarantined.get_mut().drain(..) {
+            // Only sources whose completion remains unknown are intentionally
+            // retained. Device owners have already entered manager quarantine.
+            std::mem::forget(buffers);
         }
     }
 }
@@ -1108,6 +1214,89 @@ impl Drop for CudaPrefillTransfer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_slot_sizes_reject_zero_address_and_two_slot_peak_overflow() {
+        for bytes in [1, 255, 256, 1024 * 1024] {
+            assert_eq!(prefill_slot_bytes(bytes).unwrap(), bytes as usize);
+        }
+        for bytes in [0, u64::MAX, 1_u64 << 63] {
+            let error = prefill_slot_bytes(bytes).unwrap_err().to_string();
+            assert!(error.contains(&bytes.to_string()));
+            assert!(error.contains("reduce the maximum layer transfer size"));
+        }
+    }
+
+    #[test]
+    fn failed_slot_read_resolution_never_degrades_to_a_zero_fence_proof() {
+        let mut unproven = SlotCopyRead::Unproven;
+        assert!(
+            unproven
+                .settle(|_| panic!("unproven submissions have no resolvable fence"))
+                .is_err()
+        );
+        assert_eq!(unproven, SlotCopyRead::Unproven);
+        let mut submitted = SlotCopyRead::Fenced(17);
+        assert!(
+            submitted
+                .settle(|fence| {
+                    assert_eq!(fence, 17);
+                    Err(CudaPrefillError::new("injected completion failure"))
+                })
+                .is_err()
+        );
+        assert_eq!(submitted, SlotCopyRead::Unproven);
+        assert!(
+            submitted
+                .settle(|_| panic!("failed proof cannot become fence zero"))
+                .is_err()
+        );
+        let mut completed = SlotCopyRead::Fenced(23);
+        assert!(
+            completed
+                .settle(|fence| {
+                    assert_eq!(fence, 23);
+                    Ok(Some(CopyCompleted::new_for_test()))
+                })
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(completed, SlotCopyRead::Idle);
+        let mut unused = SlotCopyRead::Idle;
+        assert!(
+            unused
+                .settle(|fence| {
+                    assert_eq!(fence, 0);
+                    Ok(Some(CopyCompleted::new_for_test()))
+                })
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(unused, SlotCopyRead::Idle);
+    }
+
+    #[test]
+    fn prefill_native_failure_context_preserves_the_typed_source() {
+        let error = CudaPrefillError::with_source(
+            "admit prefill slot",
+            std::io::Error::other("capacity unavailable"),
+        );
+        assert!(error.to_string().contains("admit prefill slot"));
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .is_some()
+        );
+        let reject = PrefillReject::Transfer(error);
+        assert!(
+            std::error::Error::source(&reject)
+                .unwrap()
+                .downcast_ref::<CudaPrefillError>()
+                .is_some()
+        );
+    }
+
     use std::cell::RefCell;
     use std::rc::Rc;
 

@@ -1,0 +1,7 @@
+{
+  "sha256": "294380448f89db48aa9004dbf0cb962591fd21de1cc658423b58f904d490e10d",
+  "single_decode_symbol": [
+    "0000000100440834 t __RNvNtNtCs42teQl6N5qM_19onnx_runtime_ep_cpu7kernels22block_quantized_matmul18decode_mxfp4_block"
+  ],
+  "verified_after_terminal_matrix": true
+}

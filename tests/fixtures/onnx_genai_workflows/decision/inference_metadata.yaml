@@ -1,0 +1,61 @@
+schema_version: v1.10
+package:
+  tokenizer:
+    algorithm: word_level
+    vocab_size: 32
+    artifacts:
+    - location: tokenizer.json
+    special_tokens:
+      bos_token_id: 2
+      eos_token_id: [3]
+profiles:
+  decision_head:
+    kind: decision
+    version: '1'
+    outputs:
+      probabilities: decision.probabilities
+    decision:
+      prompt_template: '{{ state }} {{ instructions }} {{ options[0].description }} {{ options[1].description }}'
+      max_options: 2
+      variants: direct
+      choice_confidence: uniform_margin
+      score_confidence: mode_distance
+      score: expected_level
+pipeline:
+  workflow:
+    publication_mode: commit_only
+    manifest: {}
+    inputs:
+      question.ids:
+        contract:
+          dtype: int64
+          shape: [batch, sequence]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: {kind: runtime, version: '1.0', role: prompt_tokens}
+        source: {kind: request}
+        required: true
+    outputs:
+      decision.probabilities:
+        family: {kind: materialized}
+        contract:
+          dtype: float32
+          shape: [1, 2]
+          batch_layout: {kind: request_aligned, axis: 0}
+        role: tensor
+        stage: pre_adapter
+    components:
+      classifier:
+        implementation:
+          kind: onnx
+          artifact: model.onnx.textproto
+    steps:
+    - kind: invoke
+      component: classifier
+      inputs:
+        input_ids: question.ids
+      outputs:
+        probabilities: classified.probabilities
+    - kind: emit
+      value: classified.probabilities
+      output: decision.probabilities
+      mode: replace

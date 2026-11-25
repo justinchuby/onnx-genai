@@ -12,6 +12,28 @@ use crate::error::Result;
 use crate::tensor::{DevicePtrMut, TensorMut, TensorView};
 use crate::weight::WeightHandle;
 
+/// Graph-derived evolution of a node's input/output shapes. Concrete extents
+/// alone never establish growth. Unknown is the default for callers without IR facts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ShapeEvolution {
+    /// No growing or unproven dependency under the current binding configuration.
+    /// A different request/profile may still use different concrete extents.
+    Stable,
+    /// At least one edge depends on a positively identified growing shape symbol.
+    Growing,
+    /// Growth or stability could not be established from graph metadata.
+    #[default]
+    Unknown,
+}
+
+/// Cold kernel configuration. Capture policy and positive growth evidence are
+/// independent: a conservative capture classifier may reject an unknown shape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct KernelShapeFacts {
+    pub evolution: ShapeEvolution,
+    pub capture_eligible: bool,
+}
+
 /// One immutable graph initializer supplied during kernel preparation.
 ///
 /// `bytes` borrows the session's inline storage or read-only external mmap; no
@@ -1126,21 +1148,13 @@ pub trait Kernel: Send + KernelType {
         Ok(())
     }
 
-    /// Tell the kernel whether all of this node's outputs have fully-static
-    /// (sequence-independent) symbolic shapes, as derived from the graph's IR
-    /// metadata — **not** from runtime shape values.
-    ///
-    /// The session calls this exactly once, immediately after construction. A
-    /// kernel that gates CUDA-graph capture on sequence-independence (the
-    /// pointwise/elementwise/bitwise/prelu family) uses this to admit a
-    /// fully-static head-major decode shape (e.g. `[1,1,heads,dim]`) that the
-    /// runtime-extent heuristic cannot recognize, while a shape carrying a
-    /// symbolic (growing sequence) dimension stays eager. Deriving eligibility
-    /// from metadata is essential: `[heads=32, feat=128]` (capturable) is
-    /// indistinguishable from `[tokens=32, feat=128]` (unsafe) by extent alone.
-    /// Default: no-op.
-    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
-        let _ = seq_independent;
+    /// Configure graph-derived shape evolution and capture policy before use.
+    /// Session specializes/cache-keys kernels by these facts; changed capacity
+    /// pinning must not reuse an instance configured with different facts.
+    /// Eager/plugin callers without graph evidence retain the Unknown default.
+    /// Concrete runtime extents must not be used to infer growth.
+    fn configure_shape_facts(&mut self, facts: KernelShapeFacts) {
+        let _ = facts;
     }
 
     /// Execute over device-resident inputs/outputs.
@@ -1234,7 +1248,8 @@ pub trait Kernel: Send + KernelType {
     /// remain Unresolved. Return Deferred when values or storage origins are
     /// needed; Ready(NONE) means a proven zero requirement, never unknown.
     /// Runtime layout facts may refine this bound before dispatch. For a fixed
-    /// compiled kernel and both input/output metadata this is a stable upper bound: executors may
+    /// compiled kernel, provider workspace context and input/output metadata this
+    /// is a stable upper bound: executors may
     /// memoize it. It must cover both cold and warm cache residency; values or
     /// layouts that refine the bound belong in the execution-time hook below.
     fn workspace_requirement(
@@ -1250,8 +1265,8 @@ pub trait Kernel: Send + KernelType {
     /// Output storage is uninitialized: inspect geometry and pointer alignment,
     /// never read output values. The caller keeps exclusive kernel execution
     /// ownership through this refinement, admission and the following launch.
-    /// `cached` contains only the same kernel's metadata-only preparation;
-    /// address/value-dependent refinements must not enter a geometry cache.
+    /// `cached` contains only the same kernel's metadata-only preparation in the
+    /// same provider workspace context; address/value-dependent refinements must not enter a geometry cache.
     /// None asks the default to query metadata once; Some avoids that query.
     ///
     /// Prepare-only reservation walks have only [`TensorMetadata`], so

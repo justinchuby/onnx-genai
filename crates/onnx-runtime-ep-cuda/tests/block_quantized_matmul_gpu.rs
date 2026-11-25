@@ -12,6 +12,8 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
+mod common;
+
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut, TensorView,
 };
@@ -118,9 +120,8 @@ fn model_node(
 
 fn run_cpu(graph: &Graph, node: NodeId, inputs: &[HostTensor], output_shape: &[usize]) -> Vec<f32> {
     let model = Model::new(graph);
-    let kernel = CpuExecutionProvider::new()
-        .get_kernel(model.graph.node(node), &[], 1)
-        .unwrap();
+    let ep = CpuExecutionProvider::new();
+    let kernel = ep.get_kernel(model.graph.node(node), &[], 1).unwrap();
     let strides: Vec<_> = inputs
         .iter()
         .map(|input| compute_contiguous_strides(&input.shape))
@@ -147,7 +148,7 @@ fn run_cpu(graph: &Graph, node: NodeId, inputs: &[HostTensor], output_shape: &[u
         &output_strides,
         DeviceId::cpu(),
     );
-    kernel.execute(&views, &mut [output_view]).unwrap();
+    common::execute_cpu_kernel(&ep, kernel.as_ref(), &views, &mut [output_view]).unwrap();
     output
         .chunks_exact(4)
         .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))

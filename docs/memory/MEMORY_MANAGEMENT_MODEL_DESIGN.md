@@ -755,19 +755,18 @@ As shipped:
   builder is unreachable from the CUDA provider. Failure returns an error
   naming the device ordinal, the driver's own message, the specific driver
   entry points that constitute the support boundary, any requested managed
-  limit, and `with_memory` as the supported way to supply a different
+  limit, and `CudaProviderConfig::memory` as the supported way to supply a different
   mechanism. There is no second built-in mechanism for it to fall back to.
 - **Removing the built-in implementation did not remove the capability.**
   `DeviceAllocator` is unchanged, and CPU, injected and integration-boundary
   mechanisms continue to use it. A caller who needs eager `cuMemAlloc` — or any
   other mechanism — implements the trait and injects it through
-  `CudaExecutionProvider::with_memory`.
-- **Injection is authoritative, and never ignored.** A successful
-  `with_memory` retires the built-in arena and the injected mechanism serves
-  everything afterwards. It is refused, before the offered allocator is used at
-  all, in exactly two cases: the allocator serves a different device, or the
-  mechanism it would replace still has memory outstanding. Both return `Err`;
-  a call never succeeds and is then disregarded.
+  `CudaProviderConfig::memory`.
+- **Injection is authoritative, and never ignored.** Construction selects
+  `CudaProviderConfig::memory` before registering a mechanism. When supplied,
+  the injected allocator serves provider allocations and no built-in arena is
+  created. A mismatched device is rejected before CUDA initialization. The
+  selected allocator cannot be replaced after the provider is published.
 
 #### Shipped constraints of the built-in arena
 

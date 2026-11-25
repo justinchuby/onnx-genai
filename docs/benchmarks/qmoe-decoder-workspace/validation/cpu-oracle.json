@@ -1,0 +1,21 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "--offline",
+    "-p",
+    "onnx-runtime-ep-cuda",
+    "--test",
+    "qmoe_cpu_oracle"
+  ],
+  "counts": [
+    [
+      "1",
+      "0",
+      "0"
+    ]
+  ],
+  "exit": 0,
+  "sha256": "1d3562b367e6978a842a61a01700b9f16fdf635c7861b9df8ee2e51db61bfa27",
+  "gpu_execution": false
+}

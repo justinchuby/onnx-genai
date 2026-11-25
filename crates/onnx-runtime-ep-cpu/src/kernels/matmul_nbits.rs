@@ -4317,13 +4317,21 @@ impl MatMulNBitsKernel {
         result: &mut [f32],
     ) -> Result<()> {
         let rows = NBitsDenseRows::new(self, packed, scales, zero_points, group_indices)?;
-        let output = super::decoded_projection::linear_decoded_grouped::<1, _>(
+        // Keep independent staging: allocation/decoder/dispatch failures must
+        // not partially publish into a direct Float32 tensor output.
+        let mut output = super::decoded_projection::zeroed_f32(
+            "MatMulNBits",
+            "decoded output staging",
+            result.len(),
+        )?;
+        super::decoded_projection::linear_decoded_grouped_into::<1, _>(
             "MatMulNBits",
             activations,
             m,
             self.k,
             self.n,
             None,
+            &mut output,
             || {
                 |feature, output: &mut [f32]| {
                     rows.decode_row(feature, output);

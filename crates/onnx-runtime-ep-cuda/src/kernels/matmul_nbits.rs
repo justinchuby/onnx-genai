@@ -2,8 +2,8 @@
 //! the block-wise dequantization and f32 cuBLASLt GEMM fallback used for prefill.
 
 use std::ffi::c_void;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
 use onnx_runtime_ep_api::{
@@ -15,7 +15,7 @@ use onnx_runtime_ir::{DataType, Node};
 use crate::blas::{self, GemmDtype, GemmEpilogue, GemmEpilogueKind, GemmEx, GemmParams};
 use crate::error::driver_err;
 use crate::kernels::marlin_gemm;
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr, raw_ptr};
+use crate::runtime::{CudaRuntime, NativeDeviceAllocation, cuptr, raw_ptr};
 
 const DEQUANT_MODULE: &str = "matmul_nbits_dequant_f32";
 const DEQUANT_ENTRY: &str = "matmul_nbits_dequant_f32";
@@ -6668,11 +6668,11 @@ fn take_bf16_direct_out(staging: CUdeviceptr, elements: usize) -> Option<CUdevic
 /// every other node is untouched.
 ///
 /// It stays opt-in because the speedup is bought with memory, not for free:
-/// [`ensure_interleaved`] allocates a SECOND copy of every routed weight and
-/// keys the cache off the ORIGINAL packed pointer, which ORT owns and does not
-/// free while the session runs. So the routed int4 weights are resident TWICE
-/// for the life of the runtime that built them, which is what releases them
-/// (see [`crate::interleave_cache`]). Measured +8.6% on H200 (211.9 → 230.0
+/// [`CudaRuntime::prepare_interleaved_int4`] allocates a SECOND copy of each routed weight and
+/// keys the cache off the ORIGINAL proven immutable packed pointer. Source
+/// retirement invalidates the key; prepared kernels and captured graphs may
+/// retain the derived owner until their last use (see [`crate::interleave_cache`]).
+/// Measured +8.6% on H200 (211.9 → 230.0
 /// tok/s, glm base); on a 20 GB int4 model that costs ~20 GB extra VRAM, which is
 /// why it must NOT be defaulted on for the memory-tight consumer cards that would
 /// otherwise benefit most from the instruction-count win.
@@ -6709,19 +6709,14 @@ fn use_scales_f16_zp_splitk_pf() -> bool {
 /// type that owns that allocator. The rules and their falsifiers are in
 /// [`crate::interleave_cache`]; the device work is here because the interleave
 /// pass is a kernel in this module's NVRTC source.
-impl crate::interleave_cache::InterleaveDevice for CudaRuntime {
+impl crate::interleave_cache::InterleaveDevice for Arc<CudaRuntime> {
+    type Allocation = NativeDeviceAllocation;
     fn interleave_device_id(&self) -> u64 {
         self.runtime_id()
     }
 
-    fn interleave_alloc(&self, bytes: usize) -> Result<CUdeviceptr> {
-        self.alloc_raw(bytes)
-    }
-
-    unsafe fn interleave_free(&self, ptr: CUdeviceptr) {
-        // SAFETY: forwarded under the caller's obligation that `ptr` came from
-        // `interleave_alloc` above and is freed once.
-        let _ = unsafe { self.free_raw(ptr) };
+    fn interleave_alloc(&self, bytes: usize) -> Result<NativeDeviceAllocation> {
+        NativeDeviceAllocation::allocate(self, bytes, onnx_runtime_memory_api::MemoryRole::Weights)
     }
 
     fn interleave_build(&self, src: CUdeviceptr, dst: CUdeviceptr, bytes: usize) -> Result<()> {
@@ -6734,10 +6729,6 @@ impl crate::interleave_cache::InterleaveDevice for CudaRuntime {
 
     fn interleave_frees_are_observed(&self) -> bool {
         !self.weights_may_be_paged()
-    }
-
-    fn interleave_drain_before_free(&self) -> Result<()> {
-        self.drain_for_unmap()
     }
 }
 
@@ -6773,22 +6764,18 @@ fn launch_interleave_int4(
     .map_err(|err| driver_err("launch MatMulNBits int4 interleave", err))
 }
 
-/// Ensure the offline-interleaved copy of the `bytes`-byte packed weight buffer
-/// at `packed` exists on device, running the device interleave once and caching
-/// the result on `runtime`. Returns `(interleaved_ptr, warm)`; `warm == true`
-/// means the buffer was already cached (no allocation / interleave / sync this
-/// call, so it is CUDA-graph capture-safe). A cold miss while capturing is
-/// rejected so the caller falls back to the non-interleaved path rather than
-/// allocating inside a capture.
-///
-/// The entry is keyed by `(packed, bytes)` and lives no longer than `runtime`,
-/// which is what makes a device address a valid identity for it.
+/// Pointer snapshots for device cache identity tests; production retains the owner.
+#[cfg(test)]
 fn ensure_interleaved(
     runtime: &Arc<CudaRuntime>,
     packed: CUdeviceptr,
     bytes: usize,
 ) -> Result<(CUdeviceptr, bool)> {
-    runtime.ensure_interleaved_int4(packed, bytes)
+    let source =
+        crate::interleave_cache::ImmutablePackedWeight::from_input(packed, bytes, true).unwrap();
+    runtime
+        .prepare_interleaved_int4(source)
+        .map(|(entry, warm)| (entry.ptr(), warm))
 }
 
 fn use_f16_symmetric_splitk(
@@ -7102,6 +7089,7 @@ impl KernelFactory for MatMulNBitsFactory {
                 == Some(1),
             marlin_repack_cache: marlin_gemm::RepackCache::new(self.runtime.clone()),
             constant_inputs: [false; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: node
                 .attr(crate::optimizer::MATMUL_NBITS_FOLDED_BIAS_ATTR)
                 .and_then(onnx_runtime_ir::Attribute::as_int)
@@ -7123,7 +7111,7 @@ impl KernelFactory for MatMulNBitsFactory {
                 .and_then(onnx_runtime_ir::Attribute::as_float)
                 .unwrap_or(1e-5),
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_const_cache: Mutex::new(Bf16ConstCache::new(self.runtime.clone())),
+            bf16_const_cache: Bf16ConstCache::default(),
         }))
     }
 }
@@ -7198,7 +7186,7 @@ impl Accuracy4Geometry {
 struct PreparedBf16Constants {
     signature: Vec<(CUdeviceptr, usize)>,
     layout: WorkspaceLayout<BF16_MAX_CACHED_SCALES>,
-    allocation: Option<Arc<GraphDeviceAllocation>>,
+    allocation: Option<Arc<NativeDeviceAllocation>>,
 }
 
 fn bf16_constant_layout(
@@ -7253,109 +7241,125 @@ impl PreparedBf16Constants {
     }
 }
 
+/// A borrowed exact record, kept alive through the consumer's final launch.
+/// The pointer array is an invocation-local binding, never cache-owned state.
 #[derive(Debug)]
+struct Bf16ConstRead {
+    _record: arc_swap::Guard<Option<Arc<PreparedBf16Constants>>>,
+    pointers: [CUdeviceptr; BF16_MAX_CACHED_SCALES],
+}
+
+#[derive(Debug, Default)]
 struct Bf16ConstCache {
-    runtime: Arc<CudaRuntime>,
-    current: Option<PreparedBf16Constants>,
-    used: bool,
+    current: arc_swap::ArcSwapOption<PreparedBf16Constants>,
 }
 
 impl Bf16ConstCache {
-    fn new(runtime: Arc<CudaRuntime>) -> Self {
-        Self {
-            runtime,
-            current: None,
-            used: false,
-        }
-    }
-
-    fn begin_call(&mut self) {
-        self.used = false;
-    }
-
-    /// Warm hits only bind the existing immutable composite. Changed signatures
-    /// always get a new owner: an old graph retains both its address and data.
-    fn staged(
-        &mut self,
+    /// Device-independent publication contract, also exercised by Host tests
+    /// with genuine zero-element constants (which require no device backing).
+    fn get_or_prepare(
+        &self,
         consts: &[(CUdeviceptr, usize)],
-    ) -> Result<[CUdeviceptr; BF16_MAX_CACHED_SCALES]> {
-        let matches = self
-            .current
-            .as_ref()
-            .is_some_and(|entry| entry.signature == consts);
+        capturing: bool,
+        validate_capture: impl FnOnce(&PreparedBf16Constants) -> Result<()>,
+        prepare: impl FnOnce() -> Result<PreparedBf16Constants>,
+    ) -> Result<Bf16ConstRead> {
+        let current = self.current.load();
+        if let Some(entry) = current.as_ref()
+            && entry.signature == consts
+        {
+            if capturing {
+                validate_capture(entry)?;
+            }
+            let pointers = entry.pointers()?;
+            return Ok(Bf16ConstRead {
+                _record: current,
+                pointers,
+            });
+        }
+        if capturing {
+            return Err(error(
+                "BF16 constant signature changed during CUDA graph capture; abort recording and eagerly warm the exact constant signature before capture",
+            ));
+        }
+        let candidate = Arc::new(prepare()?);
+        let read = Bf16ConstRead {
+            _record: arc_swap::Guard::from_inner(Some(Arc::clone(&candidate))),
+            pointers: candidate.pointers()?,
+        };
+        // Return this exact candidate: a reload could bind another caller's
+        // signature. No old contents are overwritten or globally drained.
+        self.current.store(Some(candidate));
+        Ok(read)
+    }
+
+    /// Warm calls borrow the prepared record without constructing a signature
+    /// Vec or cloning an owner. Capture status is the caller's observation for
+    /// this invocation, shared with its workspace ownership validation.
+    fn staged(
+        &self,
+        runtime: &Arc<CudaRuntime>,
+        consts: &[(CUdeviceptr, usize)],
+        capturing: bool,
+    ) -> Result<Bf16ConstRead> {
+        self.get_or_prepare(
+            consts,
+            capturing,
+            |entry| {
+                if let Some(owner) = &entry.allocation {
+                    runtime.require_captured_address_owner(
+                        NativeDeviceAllocation::identity(owner),
+                        "MatMulNBits BF16 constants",
+                    )?;
+                }
+                Ok(())
+            },
+            || Self::prepare(runtime, consts),
+        )
+    }
+
+    fn prepare(
+        runtime: &Arc<CudaRuntime>,
+        consts: &[(CUdeviceptr, usize)],
+    ) -> Result<PreparedBf16Constants> {
+        let layout = bf16_constant_layout(consts)?;
         let contextual = |operation, source| EpError::Backend {
             operation,
             source: Box::new(source),
         };
-        let capturing = self.runtime.is_capturing().map_err(|source| contextual(
-            "query capture before staging MatMulNBits BF16 constants; restore a healthy CUDA stream before retrying", source,
-        ))?;
-        if matches {
-            let entry = self.current.as_ref().unwrap();
-            if capturing && let Some(owner) = &entry.allocation {
-                self.runtime.require_captured_address_owner(
-                    GraphDeviceAllocation::device_graph_resource(owner).identity(),
-                    "MatMulNBits BF16 constants",
-                )?;
-            }
+        let allocation = if layout.bytes() == 0 {
+            None
         } else {
-            let layout = bf16_constant_layout(consts)?;
-            if capturing {
-                return Err(error(
-                    "BF16 constant signature changed during CUDA graph capture; abort recording and eagerly warm the exact constant signature before capture",
-                ));
-            }
-            if self.current.is_some() {
-                self.runtime.drain_for_unmap().map_err(|source| contextual(
-                    "retire previous MatMulNBits BF16 constant readers; stop inference on device failure before preparing again", source,
-                ))?;
-            }
-            let allocation = if layout.bytes() == 0 {
-                None
-            } else {
-                Some(GraphDeviceAllocation::allocate(
-                    &self.runtime,
-                    layout.bytes(),
-                ).map_err(|source| contextual(
-                    "allocate immutable MatMulNBits BF16 constant composite; free device capacity or reduce constant shapes", source,
-                ))?)
-            };
-            let candidate = PreparedBf16Constants {
-                signature: consts.to_vec(),
-                layout,
-                allocation,
-            };
-            let pointers = candidate.pointers()?;
-            for (&(src, numel), dst) in consts.iter().zip(pointers) {
-                super::cast::launch_cast_raw(
-                    &self.runtime,
-                    src,
-                    DataType::BFloat16,
-                    dst,
-                    DataType::Float16,
-                    numel,
-                ).map_err(|source| contextual(
-                    "convert MatMulNBits BF16 constant candidate; verify live BF16 inputs and CUDA kernel support before warming again", source,
-                ))?;
-            }
-            self.runtime
-                .staged_warm_cache_mutation("MatMulNBits BF16 constants")?;
-            self.current = Some(candidate);
+            Some(NativeDeviceAllocation::allocate_shared(
+                runtime,
+                layout.bytes(), onnx_runtime_memory_api::MemoryRole::Weights).map_err(|source| contextual(
+                "allocate immutable MatMulNBits BF16 constant composite; free device capacity or reduce constant shapes", source,
+            ))?)
+        };
+        let candidate = PreparedBf16Constants {
+            signature: consts.to_vec(),
+            layout,
+            allocation,
+        };
+        let pointers = candidate.pointers()?;
+        for (&(src, numel), dst) in consts.iter().zip(pointers) {
+            super::cast::launch_cast_raw(
+                runtime, src, DataType::BFloat16, dst, DataType::Float16, numel,
+            ).map_err(|source| contextual(
+                "convert MatMulNBits BF16 constant candidate; verify live BF16 inputs and CUDA kernel support before warming again", source,
+            ))?;
         }
-        let pointers = self.current.as_ref().unwrap().pointers()?;
-        self.used = true;
-        Ok(pointers)
+        runtime.staged_warm_cache_mutation("MatMulNBits BF16 constants")?;
+        Ok(candidate)
     }
 
     fn device_graph_resource(&self) -> Option<DeviceGraphResource> {
-        if !self.used {
-            return None;
-        }
         self.current
+            .load()
             .as_ref()?
             .allocation
             .as_ref()
-            .map(GraphDeviceAllocation::device_graph_resource)
+            .map(NativeDeviceAllocation::device_graph_resource)
     }
 }
 
@@ -7374,6 +7378,9 @@ pub struct MatMulNBitsKernel {
     /// Session-lifetime graph constants. Only proven immutable inputs may enter
     /// the owner-scoped weight-repack or BF16 scale-conversion caches.
     constant_inputs: [bool; MATMUL_MAX_INPUTS],
+    /// One prepared conversion, shared with the runtime cache and graph pins.
+    /// Warm loads borrow the ArcSwap guard without cache locks or quota work.
+    interleaved_weight: arc_swap::ArcSwapOption<crate::interleave_cache::InterleaveEntry>,
     /// Set when this node's bias input came from folding a standalone `Add`
     /// (see [`crate::optimizer::MATMUL_NBITS_FOLDED_BIAS_ATTR`]). The fp16 GEMV
     /// then reproduces the two-op `fp16(fp16(acc) + bias)` rounding.
@@ -7397,17 +7404,24 @@ pub struct MatMulNBitsKernel {
     last_call_capture_safe: AtomicBool,
     /// Persistent Float16 staging of proven immutable BFloat16 scales, so they
     /// are cast once rather than re-cast every decode step.
-    bf16_const_cache: Mutex<Bf16ConstCache>,
+    bf16_const_cache: Bf16ConstCache,
 }
 
 impl MatMulNBitsKernel {
+    fn finish_call(&self, result: Result<()>) -> Result<()> {
+        if result.is_err() {
+            self.last_call_capture_safe.store(false, Ordering::Relaxed);
+        }
+        result
+    }
+
     fn marlin_weight_inputs_constant(&self) -> bool {
         marlin_weight_inputs_are_constant(&self.constant_inputs, self.gate_up_swiglu)
     }
 
     fn release_marlin_repack_for_decode(&self) {
         // The Marlin repack is a second, tensor-core-layout copy of this op's
-        // weights, allocated raw (invisible to the VMM arena) and only read by
+        // weights, governed by the native allocation domain and only read by
         // the M > 1 tensor-core GEMM. At decode it is pure device overhead:
         // measured at ~384 MiB on a 1.8B model whose weights are under 1 GiB.
         //
@@ -7430,10 +7444,6 @@ impl MatMulNBitsKernel {
     ) -> Result<()> {
         self.last_call_capture_safe.store(false, Ordering::Relaxed);
         self.marlin_repack_cache.begin_call();
-        self.bf16_const_cache
-            .lock()
-            .map_err(|_| error("BFloat16 constant cache lock poisoned"))?
-            .begin_call();
         let max_inputs = if self.gate_up_swiglu { 8 } else { 7 };
         if !(3..=max_inputs).contains(&inputs.len()) || outputs.len() != 1 {
             return Err(error(format!(
@@ -8216,9 +8226,8 @@ impl MatMulNBitsKernel {
             }
         }
         let parts = self.bind_workspace(inputs, workspace)?;
-        if self.runtime.is_capturing()?
-            && let Some(used) = parts.used
-        {
+        let capturing = self.runtime.is_capturing()?;
+        if capturing && let Some(used) = parts.used {
             self.runtime
                 .require_registered_workspace_capture(used, "MatMulNBits BF16 staging")?;
         }
@@ -8253,16 +8262,16 @@ impl MatMulNBitsKernel {
                 count += 1;
             }
         }
-        if count != 0 {
-            let mut cache = self
-                .bf16_const_cache
-                .lock()
-                .map_err(|_| error("MatMulNBits bf16 const cache mutex poisoned"))?;
-            let pointers = cache.staged(&consts[..count])?;
+        let prepared = if count != 0 {
+            let cache = &self.bf16_const_cache;
+            let read = cache.staged(&self.runtime, &consts[..count], capturing)?;
             for index in 0..count {
-                cached[indices[index]] = Some(pointers[index]);
+                cached[indices[index]] = Some(read.pointers[index]);
             }
-        }
+            Some(read)
+        } else {
+            None
+        };
         let mut f16_inputs = std::array::from_fn::<_, MATMUL_MAX_INPUTS, _>(|_| {
             TensorView::absent(DataType::Undefined)
         });
@@ -8340,6 +8349,9 @@ impl MatMulNBitsKernel {
                 out_n,
             )?;
         }
+        // Keep the exact prepared owner through all consumer/cast submissions,
+        // even if a later call replaces the cache's current signature.
+        drop(prepared);
         // Preserve the capture-eligibility flag set by the selected FP16 route.
         // Staging casts are ordered against caller backing and constant owners.
         Ok(())
@@ -10697,25 +10709,59 @@ impl MatMulNBitsKernel {
             None
         };
         let orig_packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
-        let interleave_on = interleave_dequant_enabled() && self.bits == 4 && zero_points.is_none();
-        let (entry, packed_ptr) = if interleave_on && let Some(target) = interleaved_entry {
-            let bytes = self.n.saturating_mul(k_blocks).saturating_mul(blob_size);
-            match ensure_interleaved(&self.runtime, orig_packed_ptr, bytes) {
-                Ok((iptr, warm)) => {
-                    if !warm {
-                        self.last_call_capture_safe.store(false, Ordering::Relaxed);
-                    }
-                    onnx_runtime_ep_api::record_kernel_variant_stage!(
-                        "dequant",
-                        "interleaved_biased",
-                        "TRT-LLM interleaved+biased int4 dequant: offline nibble-interleave + \
-                         folded symmetric -8 bias drops the per-block sub.f16x2 and the prmt.b32 \
-                         activation reorder (byte-identical to the fp32 wide/multicol/split-K path)"
-                    );
-                    (target, iptr)
-                }
-                Err(_) => (entry, orig_packed_ptr),
+        // Address-keyed conversion is sound only for immutable packed B and
+        // sources whose retirement invalidates the cache. Dynamic inputs keep
+        // the ordinary kernel even if a constant previously used this address.
+        let interleave_on = interleave_dequant_enabled()
+            && self.bits == 4
+            && zero_points.is_none()
+            && !self.runtime.weights_may_be_paged();
+        let mut candidate = None;
+        let source = if interleave_on && interleaved_entry.is_some() {
+            let bytes = self
+                .n
+                .checked_mul(k_blocks)
+                .and_then(|v| v.checked_mul(blob_size))
+                .ok_or_else(|| {
+                    error("immutable packed B byte length overflows usize; reduce N or K")
+                })?;
+            crate::interleave_cache::ImmutablePackedWeight::from_input(
+                orig_packed_ptr,
+                bytes,
+                self.constant_inputs[1],
+            )
+        } else {
+            None
+        };
+        let cached = source.map(|_| self.interleaved_weight.load());
+        let (entry, packed_ptr) = if let (Some(target), Some(source)) = (interleaved_entry, source)
+        {
+            let (owner, warm) = if let Some(owner) =
+                cached.as_ref().and_then(|guard| guard.as_ref())
+                && owner.matches(source, self.runtime.runtime_id())
+            {
+                (owner, true)
+            } else {
+                let (prepared, warm) = self.runtime.prepare_interleaved_int4(source)?;
+                (&*candidate.insert(prepared), warm)
+            };
+            // Actual driver capture status also catches externally begun
+            // capture. Missing ownership is an error, never a silent fallback.
+            if self.runtime.is_capturing()? {
+                self.runtime.require_captured_address_owner(
+                    crate::interleave_cache::InterleaveEntry::identity(owner),
+                    "MatMulNBits immutable interleaved packed B",
+                )?;
             }
+            if !warm {
+                self.last_call_capture_safe.store(false, Ordering::Relaxed);
+            }
+            onnx_runtime_ep_api::record_kernel_variant_stage!(
+                "dequant",
+                "interleaved_biased",
+                "TRT-LLM interleaved+biased int4 dequant over proven immutable packed B"
+            );
+            (target, owner.ptr())
         } else {
             (entry, orig_packed_ptr)
         };
@@ -10884,7 +10930,11 @@ impl MatMulNBitsKernel {
                 &format!("launch MatMulNBits fp16 GEMV ({})", selection.reason),
                 err,
             )
-        })
+        })?;
+        if let Some(owner) = candidate {
+            self.interleaved_weight.store(Some(owner));
+        }
+        Ok(())
     }
 
     /// General fp16 GEMV whose input activation is RMS-normalized in-kernel
@@ -11764,13 +11814,14 @@ impl MatMulNBitsKernel {
 
 impl Kernel for MatMulNBitsKernel {
     fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
+        self.interleaved_weight.store(None);
         for (index, is_constant) in self.constant_inputs.iter_mut().enumerate() {
             *is_constant = constant_inputs.get(index).copied().unwrap_or(false);
         }
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.run(inputs, outputs, None)
+        self.finish_call(self.run(inputs, outputs, None))
     }
 
     fn workspace_requirement(
@@ -11788,7 +11839,7 @@ impl Kernel for MatMulNBitsKernel {
         outputs: &mut [TensorMut],
         workspace: Option<WorkspaceView>,
     ) -> Result<()> {
-        self.run(inputs, outputs, workspace)
+        self.finish_call(self.run(inputs, outputs, workspace))
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -11797,10 +11848,11 @@ impl Kernel for MatMulNBitsKernel {
 
     fn device_graph_resources(&self) -> Vec<DeviceGraphResource> {
         let mut resources = self.marlin_repack_cache.device_graph_resources();
-        if let Ok(cache) = self.bf16_const_cache.lock()
-            && let Some(resource) = cache.device_graph_resource()
-        {
+        if let Some(resource) = self.bf16_const_cache.device_graph_resource() {
             resources.push(resource);
+        }
+        if let Some(owner) = self.interleaved_weight.load().as_ref() {
+            resources.push(crate::interleave_cache::InterleaveEntry::device_graph_resource(owner));
         }
         resources
     }
@@ -11957,16 +12009,142 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "gpu-tests")]
+    fn empty_bf16_record(signature: &[(CUdeviceptr, usize)]) -> Result<PreparedBf16Constants> {
+        Ok(PreparedBf16Constants {
+            signature: signature.to_vec(),
+            layout: bf16_constant_layout(signature)?,
+            allocation: None,
+        })
+    }
+
+    #[test]
+    fn bf16_prepared_reads_outlive_replacement_and_cache_without_repreparing_warm_hits() {
+        let cache = Bf16ConstCache::default();
+        let a = [(0x1000, 0)];
+        let b = [(0x2000, 0)];
+        let preparations = std::cell::Cell::new(0);
+        let prepare = |signature: &[_]| {
+            preparations.set(preparations.get() + 1);
+            empty_bf16_record(signature)
+        };
+        let first = cache
+            .get_or_prepare(&a, false, |_| unreachable!(), || prepare(&a))
+            .unwrap();
+        let old = Arc::downgrade(first._record.as_ref().unwrap());
+        for _ in 0..32 {
+            let warm = cache
+                .get_or_prepare(&a, false, |_| unreachable!(), || prepare(&a))
+                .unwrap();
+            assert!(Arc::ptr_eq(
+                first._record.as_ref().unwrap(),
+                warm._record.as_ref().unwrap()
+            ));
+            assert_eq!(warm.pointers, [0; BF16_MAX_CACHED_SCALES]);
+        }
+        assert_eq!(preparations.get(), 1);
+        let second = cache
+            .get_or_prepare(&b, false, |_| unreachable!(), || prepare(&b))
+            .unwrap();
+        assert_eq!(preparations.get(), 2);
+        assert_eq!(first._record.as_ref().unwrap().signature, a);
+        assert_eq!(second._record.as_ref().unwrap().signature, b);
+        drop(cache);
+        assert!(
+            old.upgrade().is_some(),
+            "consumer read must keep its exact replaced record alive"
+        );
+        drop(first);
+        assert!(old.upgrade().is_none());
+        assert_eq!(second._record.as_ref().unwrap().signature, b);
+    }
+
+    #[test]
+    fn bf16_failed_candidate_and_capture_refusal_preserve_the_previous_record() {
+        let cache = Bf16ConstCache::default();
+        let a = [(0x1000, 0)];
+        let b = [(0x2000, 0)];
+        let first = cache
+            .get_or_prepare(&a, false, |_| unreachable!(), || empty_bf16_record(&a))
+            .unwrap();
+        let failure = cache
+            .get_or_prepare(
+                &b,
+                false,
+                |_| unreachable!(),
+                || Err(error("injected preparation failure after conversion")),
+            )
+            .unwrap_err();
+        assert!(failure.to_string().contains("after conversion"));
+        assert!(Arc::ptr_eq(
+            first._record.as_ref().unwrap(),
+            cache.current.load().as_ref().unwrap()
+        ));
+        let capture_miss = cache
+            .get_or_prepare(
+                &b,
+                true,
+                |_| unreachable!(),
+                || panic!("capture miss must not prepare"),
+            )
+            .unwrap_err();
+        assert!(capture_miss.to_string().contains("eagerly warm"));
+        let missing_pin = cache
+            .get_or_prepare(
+                &a,
+                true,
+                |_| Err(error("injected missing actual owner pin")),
+                || panic!("warm capture cannot prepare"),
+            )
+            .unwrap_err();
+        assert!(missing_pin.to_string().contains("actual owner pin"));
+        let checks = std::cell::Cell::new(0);
+        let captured = cache
+            .get_or_prepare(
+                &a,
+                true,
+                |_| {
+                    checks.set(checks.get() + 1);
+                    Ok(())
+                },
+                || panic!("warm capture cannot prepare"),
+            )
+            .unwrap();
+        assert_eq!(checks.get(), 1);
+        assert!(Arc::ptr_eq(
+            first._record.as_ref().unwrap(),
+            captured._record.as_ref().unwrap()
+        ));
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable gpu-tests"
+    )]
     #[test]
     fn bf16_constant_replacements_preserve_old_graph_contents_and_reject_unpinned_capture() {
         use half::bf16;
-        let runtime =
-            Arc::new(CudaRuntime::new(0).expect("BF16 immutable cache test requires CUDA"));
+        use onnx_runtime_ep_api::ExecutionProvider;
+        let (provider, runtime) = crate::test_support::maybe_native_runtime()
+            .expect("retained artifact test requires native CUDA provider backing");
         runtime.set_defer_eager_sync(true);
-        let source_a = GraphDeviceAllocation::allocate(&runtime, 4).unwrap();
-        let source_b = GraphDeviceAllocation::allocate(&runtime, 4).unwrap();
-        let output = GraphDeviceAllocation::allocate(&runtime, 8).unwrap();
+        let source_a = NativeDeviceAllocation::allocate_shared(
+            &runtime,
+            4,
+            onnx_runtime_memory_api::MemoryRole::Weights,
+        )
+        .unwrap();
+        let source_b = NativeDeviceAllocation::allocate_shared(
+            &runtime,
+            4,
+            onnx_runtime_memory_api::MemoryRole::Weights,
+        )
+        .unwrap();
+        let output = NativeDeviceAllocation::allocate_shared(
+            &runtime,
+            8,
+            onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
+        )
+        .unwrap();
         unsafe {
             runtime
                 .htod(
@@ -11983,14 +12161,23 @@ mod tests {
         }
         let a = [(source_a.ptr(), 2)];
         let b = [(source_b.ptr(), 2)];
-        let mut cache = Bf16ConstCache::new(runtime.clone());
-        let first = cache.staged(&a).unwrap();
+        let cache = Bf16ConstCache::default();
+        let first = cache
+            .staged(&runtime, &a, runtime.is_capturing().unwrap())
+            .map(|read| read.pointers)
+            .unwrap();
         let first_resource = cache.device_graph_resource().unwrap();
         let counts = runtime.allocation_counts();
         let transfers = runtime.transfer_counts();
         let syncs = runtime.forced_synchronization_count();
         for _ in 0..4 {
-            assert_eq!(cache.staged(&a).unwrap(), first);
+            assert_eq!(
+                cache
+                    .staged(&runtime, &a, runtime.is_capturing().unwrap())
+                    .map(|read| read.pointers)
+                    .unwrap(),
+                first
+            );
         }
         assert_eq!(runtime.allocation_counts(), counts);
         assert_eq!(runtime.transfer_counts(), transfers);
@@ -12009,17 +12196,24 @@ mod tests {
                 &[],
                 vec![
                     first_resource,
-                    GraphDeviceAllocation::device_graph_resource(&output),
+                    NativeDeviceAllocation::device_graph_resource(&output),
                 ],
             )
             .unwrap();
-        assert_eq!(cache.staged(&a).unwrap(), first);
+        assert_eq!(
+            cache
+                .staged(&runtime, &a, runtime.is_capturing().unwrap())
+                .map(|read| read.pointers)
+                .unwrap(),
+            first
+        );
         let counts = runtime.allocation_counts();
         let transfers = runtime.transfer_counts();
         let syncs = runtime.forced_synchronization_count();
         assert!(
             cache
-                .staged(&b)
+                .staged(&runtime, &b, runtime.is_capturing().unwrap())
+                .map(|read| read.pointers)
                 .unwrap_err()
                 .to_string()
                 .contains("eagerly warm")
@@ -12042,16 +12236,24 @@ mod tests {
         .unwrap();
         runtime.end_graph_capture().unwrap();
 
-        runtime.fail_warm_transaction_at_for_test(1);
-        assert!(
-            cache
-                .staged(&b)
-                .unwrap_err()
-                .to_string()
-                .contains("injected staged warm-cache failure")
-        );
+        let replacement_syncs = runtime.forced_synchronization_count();
+        #[cfg(feature = "gpu-tests")]
+        {
+            runtime.fail_warm_transaction_at_for_test(1);
+            assert!(
+                cache
+                    .staged(&runtime, &b, runtime.is_capturing().unwrap())
+                    .map(|read| read.pointers)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected staged warm-cache failure")
+            );
+        }
         assert_eq!(
-            cache.staged(&a).unwrap(),
+            cache
+                .staged(&runtime, &a, runtime.is_capturing().unwrap())
+                .map(|read| read.pointers)
+                .unwrap(),
             first,
             "failed replacement preserves the previous signature and owner"
         );
@@ -12060,10 +12262,18 @@ mod tests {
             runtime.dtoh(as_bytes_mut(&mut original), first[0]).unwrap();
         }
         assert_eq!(original, [f16::from_f32(1.5), f16::from_f32(-2.0)]);
-        let second = cache.staged(&b).unwrap();
+        let second = cache
+            .staged(&runtime, &b, runtime.is_capturing().unwrap())
+            .map(|read| read.pointers)
+            .unwrap();
         assert_ne!(
             first[0], second[0],
             "equal-size replacement cannot rewrite a graph-retained artifact"
+        );
+        assert_eq!(
+            runtime.forced_synchronization_count(),
+            replacement_syncs,
+            "distinct immutable native owners must retire through the queue without a global reader drain"
         );
         let mut replacement = [f16::ZERO; 2];
         unsafe {
@@ -12096,7 +12306,8 @@ mod tests {
         let transfers = runtime.transfer_counts();
         assert!(
             cache
-                .staged(&b)
+                .staged(&runtime, &b, runtime.is_capturing().unwrap())
+                .map(|read| read.pointers)
                 .unwrap_err()
                 .to_string()
                 .contains("capture"),
@@ -12104,7 +12315,8 @@ mod tests {
         );
         assert!(
             cache
-                .staged(&a)
+                .staged(&runtime, &a, runtime.is_capturing().unwrap())
+                .map(|read| read.pointers)
                 .unwrap_err()
                 .to_string()
                 .contains("eagerly warm")
@@ -12118,11 +12330,50 @@ mod tests {
         runtime.test_end_unregistered_graph_capture().unwrap();
         drop(exclusion);
         runtime.reset_graph().unwrap();
+        // A read handle itself must keep B alive after replacement and cache
+        // destruction, even without a graph pin for B.
+        let held_b = cache.staged(&runtime, &b, false).unwrap();
+        let b_owner = Arc::downgrade(
+            held_b
+                ._record
+                .as_ref()
+                .unwrap()
+                .allocation
+                .as_ref()
+                .unwrap(),
+        );
+        cache.staged(&runtime, &a, false).unwrap();
         drop(cache);
-        let mut empty = Bf16ConstCache::new(runtime.clone());
+        assert!(b_owner.upgrade().is_some());
+        super::super::cast::launch_cast_raw(
+            &runtime,
+            held_b.pointers[0],
+            DataType::Float16,
+            output.ptr(),
+            DataType::Float32,
+            2,
+        )
+        .unwrap();
+        unsafe {
+            runtime
+                .dtoh(as_bytes_mut(&mut actual), output.ptr())
+                .unwrap();
+        }
+        assert_eq!(
+            actual,
+            [7.0, 8.0],
+            "consumer must retain the exact borrowed record"
+        );
+        drop(held_b);
+        assert!(b_owner.upgrade().is_none());
+        provider.wait_for_deferred_releases().unwrap();
+        let empty = Bf16ConstCache::default();
         let counts = runtime.allocation_counts();
         assert_eq!(
-            empty.staged(&[(0, 0)]).unwrap(),
+            empty
+                .staged(&runtime, &[(0, 0)], runtime.is_capturing().unwrap())
+                .map(|read| read.pointers)
+                .unwrap(),
             [0; BF16_MAX_CACHED_SCALES]
         );
         assert!(empty.device_graph_resource().is_none());
@@ -12169,10 +12420,11 @@ mod tests {
         let owner = if requirement.bytes == 0 {
             None
         } else {
-            Some(GraphDeviceAllocation::allocate(
+            Some(NativeDeviceAllocation::allocate_shared(
                 &kernel.runtime,
                 usize::try_from(requirement.bytes)
                     .map_err(|_| error("test workspace size exceeds usize"))?,
+                onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
             )?)
         };
         let view = owner.as_ref().map(|owner| {
@@ -12404,7 +12656,7 @@ mod tests {
             ".alloc_raw(",
             ".free_raw(",
             ".lock()",
-            "GraphDeviceAllocation",
+            "NativeDeviceAllocation",
         ] {
             assert!(
                 !source[begin..end].contains(bypass),
@@ -12907,7 +13159,7 @@ mod tests {
     )]
     #[test]
     fn prefill_workspace_empty_half_routes_preserve_output_canary() {
-        let runtime = runtime().expect("empty prefill regression requires CUDA");
+        let (_provider, runtime) = runtime().expect("empty prefill regression requires CUDA");
         runtime
             .require_nvrtc_half_headers("empty prefill regression")
             .unwrap();
@@ -12961,13 +13213,14 @@ mod tests {
                         round_affine_weights: false,
                         marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                         constant_inputs: [false; 8],
+                        interleaved_weight: arc_swap::ArcSwapOption::empty(),
                         fold_bias_post_round: false,
                         gate_up_swiglu: gate_up,
                         decomposed_silu: false,
                         rmsnorm_prologue: rmsnorm,
                         rmsnorm_epsilon: 1e-5,
                         last_call_capture_safe: AtomicBool::new(false),
-                        bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+                        bf16_const_cache: Bf16ConstCache::default(),
                     };
                     let weight = TensorView::new(
                         device_ptr(b_dev),
@@ -13285,8 +13538,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
 }
 "#;
 
-    fn runtime() -> Option<Arc<CudaRuntime>> {
-        crate::test_support::maybe_runtime()
+    fn runtime() -> Option<crate::test_support::NativeRuntimeFixture> {
+        crate::test_support::maybe_native_runtime()
     }
 
     fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
@@ -13315,7 +13568,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     #[ignore = "perf microbench; requires a dedicated idle SM80+ CUDA device"]
     fn marlin_m_gt_1_op_wall_vs_tiled() {
         let _route = TiledMarlinRoute::select();
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping Marlin M>1 wall bench: CUDA runtime unavailable");
             return;
         };
@@ -13405,13 +13658,14 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            bf16_const_cache: Bf16ConstCache::default(),
         };
 
         let time_path = |kernel: &MatMulNBitsKernel, m: usize| -> f64 {
@@ -13455,7 +13709,12 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 .collect::<Vec<_>>();
             let requirement = kernel.workspace_requirement_for(&metadata).unwrap();
             let owner = (requirement.bytes != 0).then(|| {
-                GraphDeviceAllocation::allocate(&runtime, requirement.bytes as usize).unwrap()
+                NativeDeviceAllocation::allocate_shared(
+                    &runtime,
+                    requirement.bytes as usize,
+                    onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
+                )
+                .unwrap()
             });
             let workspace = owner.as_ref().map(|owner| {
                 WorkspaceView::new(device_ptr_mut(owner.ptr()), requirement.bytes as usize)
@@ -13532,7 +13791,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     #[test]
     #[ignore = "requires an SM80+ CUDA device"]
     fn marlin_m_gt_1_rmsnorm_op_parity() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping Marlin M>1 rmsnorm parity: CUDA runtime unavailable");
             return;
         };
@@ -13663,13 +13922,14 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
             rmsnorm_prologue: true,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            bf16_const_cache: Bf16ConstCache::default(),
         };
 
         let run = |want_marlin: bool| -> Vec<f16> {
@@ -13948,13 +14208,14 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: true,
             decomposed_silu: decomposed,
             rmsnorm_prologue: with_gamma,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            bf16_const_cache: Bf16ConstCache::default(),
         };
 
         // SAFETY: serial ignored probe; prepare the upper bound with Marlin enabled.
@@ -14200,7 +14461,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         with_bias: bool,
         explicit_zp: bool,
     ) -> (f32, f32, f32, bool) {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping MatMulNBits fp16 GEMV parity test: CUDA runtime unavailable");
             return (0.0, 0.0, 0.0, true);
         };
@@ -14435,13 +14696,14 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            bf16_const_cache: Bf16ConstCache::default(),
         };
         // The default decode GEMV launch is a static grid that allocates
         // nothing, so it is capture-safe on the very first call. That only holds
@@ -14517,7 +14779,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         pipeline: Option<bool>,
         prefetch: Option<bool>,
     ) -> Option<Vec<f16>> {
-        let runtime = runtime()?;
+        let (_provider, runtime) = runtime()?;
         if runtime
             .require_nvrtc_half_headers("matmul_nbits_gemv_f16")
             .is_err()
@@ -14640,13 +14902,14 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            bf16_const_cache: Bf16ConstCache::default(),
         };
 
         // Take the EXCLUSIVE side: the env writes below are visible to every
@@ -14688,17 +14951,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 .dtoh(as_bytes_mut(&mut got_f16), output_dev)
                 .unwrap();
             runtime.free_raw(activation_dev).unwrap();
-            // NOTE: `packed_dev` is intentionally NOT freed. The interleave
-            // cache is keyed by (source pointer, byte length); freeing the
-            // packed buffer would return its address to `alloc_raw`'s size-class
-            // free list, and the next same-size allocation on this runtime would
-            // get it back with different contents behind the same key. Every
-            // case here shares one runtime, so leaking the small test buffer is
-            // what keeps each weight's address its own. Production weights are
-            // graph initializers, which the executor never frees mid-session --
-            // and the cache now dies with the runtime, so an address cannot
-            // carry an entry into a later session either (#1726 class).
-            // (Real allocations are reclaimed on process exit.)
+            runtime.invalidate_interleaved_for(packed_dev, packed.len());
+            runtime.free_raw(packed_dev).unwrap();
             runtime.free_raw(scales_dev).unwrap();
             runtime.free_raw(output_dev).unwrap();
         }
@@ -14843,11 +15097,11 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     #[test]
     fn interleaved_weights_are_not_shared_between_runtimes() {
         const BYTES: usize = 4096;
-        let Some(first) = crate::test_support::maybe_runtime() else {
+        let Some((_provider_first, first)) = crate::test_support::maybe_native_runtime() else {
             eprintln!("skipping interleave runtime-scoping test: no CUDA device");
             return;
         };
-        let Some(second) = crate::test_support::maybe_runtime() else {
+        let Some((_provider_second, second)) = crate::test_support::maybe_native_runtime() else {
             return;
         };
 
@@ -14893,7 +15147,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     #[test]
     fn tearing_down_a_runtime_releases_its_interleaved_weights() {
         const BYTES: usize = 2048;
-        let Some(runtime) = crate::test_support::maybe_runtime() else {
+        let Some((_provider_runtime, runtime)) = crate::test_support::maybe_native_runtime() else {
             eprintln!("skipping interleave teardown test: no CUDA device");
             return;
         };
@@ -14998,7 +15252,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     /// symmetric split-K entry is provably selected (asserted below).
     #[test]
     fn scales_f16_zp_splitk_prefetch_is_bit_identical_to_splitk() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping split-K prefetch byte-identity test: CUDA runtime unavailable");
             return;
         };
@@ -15057,7 +15311,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     #[ignore = "requires an SM80+ CUDA device"]
     fn marlin_m_gt_1_op_parity_and_capture_safety() {
         let _route = TiledMarlinRoute::select();
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping Marlin M>1 op parity: CUDA runtime unavailable");
             return;
         };
@@ -15228,13 +15482,14 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            bf16_const_cache: Bf16ConstCache::default(),
         };
 
         // Enable the opt-in Marlin path for the duration of this test.
@@ -15333,7 +15588,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     #[test]
     #[ignore = "requires an SM80+ CUDA device"]
     fn dequant_f16_cublas_m_gt_1_op_parity() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping dequant-f16 cuBLASLt parity: CUDA runtime unavailable");
             return;
         };
@@ -15668,13 +15923,14 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            bf16_const_cache: Bf16ConstCache::default(),
         }
     }
 
@@ -15710,7 +15966,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         use cudarc::driver::result::event;
         use cudarc::driver::sys;
 
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping zero-copy kernel probe: CUDA runtime unavailable");
             return;
         };
@@ -15974,7 +16230,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     fn zerocopy_kernel_capture_with_host_mapped_pointer() {
         use cudarc::driver::sys;
 
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping capture probe: CUDA runtime unavailable");
             return;
         };
@@ -16173,7 +16429,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         with_bias: bool,
         explicit_zp: bool,
     ) -> (f32, f32, f32, bool) {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping MatMulNBits int8 fp16 GEMV parity test: CUDA runtime unavailable");
             return (0.0, 0.0, 0.0, true);
         };
@@ -16392,13 +16648,14 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            bf16_const_cache: Bf16ConstCache::default(),
         };
         run_with_prepared_workspace(&kernel, &inputs, &mut outputs).unwrap();
         runtime.synchronize().unwrap();
@@ -16446,7 +16703,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
 
     #[test]
     fn fp16_down_projection_is_bit_exact_to_staged_kernel() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping down-projection GEMV parity test: CUDA runtime unavailable");
             return;
         };
@@ -16547,13 +16804,14 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
+                interleaved_weight: arc_swap::ArcSwapOption::empty(),
                 fold_bias_post_round: false,
                 gate_up_swiglu: false,
                 decomposed_silu: false,
                 rmsnorm_prologue: false,
                 rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
-                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+                bf16_const_cache: Bf16ConstCache::default(),
             };
             let staged_source = format!("{GEMV_F16_SRC}\n{STAGED_DOWN_REFERENCE_SRC}");
             let staged_function = runtime
@@ -17038,7 +17296,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     /// mis-strided the per-row sub-views — would diverge here.
     #[test]
     fn decode_gemv_loop_is_byte_identical_to_per_row_singlestream() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping looped decode GEMV byte-identity test: CUDA runtime unavailable");
             return;
         };
@@ -17144,13 +17402,14 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
+                interleaved_weight: arc_swap::ArcSwapOption::empty(),
                 fold_bias_post_round: false,
                 gate_up_swiglu: false,
                 decomposed_silu: false,
                 rmsnorm_prologue: false,
                 rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
-                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+                bf16_const_cache: Bf16ConstCache::default(),
             };
 
             // Batched path: m>1 routes through the looped single-row decode GEMV.
@@ -17272,7 +17531,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     /// mis-strided the per-row sub-views, would diverge here.
     #[test]
     fn gate_up_swiglu_rmsnorm_loop_is_byte_identical_to_per_row_singlestream() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!(
                 "skipping rmsnorm gate/up SwiGLU byte-identity test: CUDA runtime unavailable"
             );
@@ -17420,13 +17679,14 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
+                interleaved_weight: arc_swap::ArcSwapOption::empty(),
                 fold_bias_post_round: false,
                 gate_up_swiglu: true,
                 decomposed_silu: false,
                 rmsnorm_prologue: true,
                 rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
-                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+                bf16_const_cache: Bf16ConstCache::default(),
             };
 
             // Batched path: m>1 with gamma present routes through the looped
@@ -17915,7 +18175,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         with_bias: bool,
         explicit_zp: bool,
     ) -> (f32, f32, f32, bool) {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping MatMulNBits int8 f32 GEMV parity test: CUDA runtime unavailable");
             return (0.0, 0.0, 0.0, true);
         };
@@ -18094,13 +18354,14 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            bf16_const_cache: Bf16ConstCache::default(),
         };
         run_with_prepared_workspace(&kernel, &inputs, &mut outputs).unwrap();
         runtime.synchronize().unwrap();
@@ -18204,7 +18465,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         with_bias: bool,
         explicit_zp: bool,
     ) -> (usize, bool) {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!(
                 "skipping MatMulNBits int{bits} f32 block-128 byte-identity test: CUDA runtime unavailable"
             );
@@ -18356,13 +18617,14 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            bf16_const_cache: Bf16ConstCache::default(),
         };
 
         match bits {
@@ -18501,7 +18763,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     /// bit across every output column.
     #[test]
     fn fp16_folded_bias_is_bit_exact_to_two_op_path() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping folded-bias bit-exactness test: CUDA runtime unavailable");
             return;
         };
@@ -18629,13 +18891,14 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            bf16_const_cache: Bf16ConstCache::default(),
         };
         let kernel_fold = MatMulNBitsKernel {
             runtime: runtime.clone(),
@@ -18648,13 +18911,14 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: true,
             gate_up_swiglu: false,
             decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            bf16_const_cache: Bf16ConstCache::default(),
         };
         kernel_nobias
             .launch_f16_gemv_variant(
@@ -18752,7 +19016,7 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// five-token Qwen case plus M/N tails on a small unrelated shape.
     #[test]
     fn fp16_gate_up_swiglu_is_bit_exact_to_two_op_path() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping gate/up SwiGLU bit-exactness test: CUDA runtime unavailable");
             return;
         };
@@ -18910,13 +19174,14 @@ extern "C" __global__ void ref_silu_mul_f16(
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
+                interleaved_weight: arc_swap::ArcSwapOption::empty(),
                 fold_bias_post_round: false,
                 gate_up_swiglu: false,
                 decomposed_silu: false,
                 rmsnorm_prologue: false,
                 rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
-                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+                bf16_const_cache: Bf16ConstCache::default(),
             };
             // Reference: two standalone MatMulNBits projections.
             if m == 1 {
@@ -19298,13 +19563,14 @@ extern "C" __global__ void ref_silu_mul_f16(
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            bf16_const_cache: Bf16ConstCache::default(),
         };
         if m == 1 {
             let selection = select_f16_gemv_variant(k, n, block_size, true, false);
@@ -19479,7 +19745,7 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// default-on and only passes under `ONNX_GENAI_MARLIN_M_GT_1=0` (tiled).
     #[test]
     fn fp16_gate_up_swiglu_two_op_ulp_bound_sweep() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping gate/up SwiGLU ULP sweep: CUDA runtime unavailable");
             return;
         };
@@ -19785,13 +20051,14 @@ extern "C" __global__ void ref_silu_mul_f16(
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: epsilon,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            bf16_const_cache: Bf16ConstCache::default(),
         };
         let fused_kernel = MatMulNBitsKernel {
             runtime: runtime.clone(),
@@ -19804,13 +20071,14 @@ extern "C" __global__ void ref_silu_mul_f16(
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: true,
             decomposed_silu: false,
             rmsnorm_prologue: true,
             rmsnorm_epsilon: epsilon,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            bf16_const_cache: Bf16ConstCache::default(),
         };
 
         // Reference: normalize with the production prefill norm, then two-op on
@@ -19978,7 +20246,7 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// reassociates the K reduction and is bounded separately below.
     #[test]
     fn fp16_gate_up_swiglu_rmsnorm_two_op_ulp_bound_sweep() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping gate/up SwiGLU rmsnorm ULP sweep: CUDA runtime unavailable");
             return;
         };
@@ -20141,7 +20409,7 @@ extern "C" __global__ void ref_silu_mul_f16(
     }
 
     fn run_fused_gate_up_swiglu_rmsnorm_parity(gamma_dtype: DataType, explicit_zp: bool) {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping gate/up SwiGLU RMS-norm parity test: CUDA runtime unavailable");
             return;
         };
@@ -20361,13 +20629,14 @@ extern "C" __global__ void ref_silu_mul_f16(
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
+                interleaved_weight: arc_swap::ArcSwapOption::empty(),
                 fold_bias_post_round: false,
                 gate_up_swiglu: true,
                 decomposed_silu: false,
                 rmsnorm_prologue: false,
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
-                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+                bf16_const_cache: Bf16ConstCache::default(),
             };
             let fused_swiglu = MatMulNBitsKernel {
                 runtime: runtime.clone(),
@@ -20380,13 +20649,14 @@ extern "C" __global__ void ref_silu_mul_f16(
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
+                interleaved_weight: arc_swap::ArcSwapOption::empty(),
                 fold_bias_post_round: false,
                 gate_up_swiglu: true,
                 decomposed_silu: false,
                 rmsnorm_prologue: true,
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
-                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+                bf16_const_cache: Bf16ConstCache::default(),
             };
 
             // Reference: normalize the activation (production prefill norm
@@ -20575,7 +20845,7 @@ extern "C" __global__ void ref_silu_mul_f16(
     /// allocation, so the math is unchanged.
     #[test]
     fn gate_up_swiglu_vec_is_bit_identical_to_scalar() {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping gate/up SwiGLU _vec bit-identity test: CUDA runtime unavailable");
             return;
         };
@@ -20745,13 +21015,14 @@ extern "C" __global__ void ref_silu_mul_f16(
                             round_affine_weights: false,
                             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                             constant_inputs: [true; 8],
+                            interleaved_weight: arc_swap::ArcSwapOption::empty(),
                             fold_bias_post_round: false,
                             gate_up_swiglu: true,
                             decomposed_silu: decomposed,
                             rmsnorm_prologue: rmsnorm,
                             rmsnorm_epsilon: epsilon,
                             last_call_capture_safe: AtomicBool::new(false),
-                            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+                            bf16_const_cache: Bf16ConstCache::default(),
                         };
 
                         let run_once = |vec_on: bool, occ_on: bool| -> Vec<u16> {
@@ -20913,7 +21184,7 @@ extern "C" __global__ void ref_silu_mul_f16(
     }
 
     fn run_fused_skip_rmsnorm_parity(gamma_dtype: DataType, bits: usize, explicit_zp: bool) {
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping fused skip-rmsnorm parity test: CUDA runtime unavailable");
             return;
         };
@@ -21200,13 +21471,14 @@ extern "C" __global__ void ref_silu_mul_f16(
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [true; 8],
+                interleaved_weight: arc_swap::ArcSwapOption::empty(),
                 fold_bias_post_round: fold,
                 gate_up_swiglu: false,
                 decomposed_silu: false,
                 rmsnorm_prologue: rmsnorm,
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
-                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+                bf16_const_cache: Bf16ConstCache::default(),
             };
 
             // ── Reference: preceding GEMV → skip_rmsnorm → following GEMV ──
@@ -21494,7 +21766,7 @@ extern "C" __global__ void ref_silu_mul_f16(
     fn bf16_direct_store_matches_staged_cast_bit_for_bit() {
         use half::bf16;
 
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping MatMulNBits bf16 direct-store test: CUDA runtime unavailable");
             return;
         };
@@ -21570,13 +21842,14 @@ extern "C" __global__ void ref_silu_mul_f16(
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            bf16_const_cache: Bf16ConstCache::default(),
         };
 
         let bf16_inputs = vec![
@@ -21739,7 +22012,7 @@ extern "C" __global__ void ref_silu_mul_f16(
     fn bf16_direct_store_declines_the_small_batch_row_loop() {
         use half::bf16;
 
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!(
                 "skipping MatMulNBits bf16 small-batch direct-store test: CUDA runtime unavailable"
             );
@@ -21818,13 +22091,14 @@ extern "C" __global__ void ref_silu_mul_f16(
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            bf16_const_cache: Bf16ConstCache::default(),
         };
 
         let bf16_inputs = vec![
@@ -21989,7 +22263,8 @@ extern "C" __global__ void ref_silu_mul_f16(
     fn bf16_scale_cache_is_bit_exact_to_inline_staging() {
         use half::bf16;
 
-        let runtime = runtime().expect("BF16 scale-cache parity requires a CUDA runtime");
+        let (_provider, runtime) =
+            runtime().expect("BF16 scale-cache parity requires a CUDA runtime");
 
         let k = 256usize;
         let n = 64usize;
@@ -22084,13 +22359,14 @@ extern "C" __global__ void ref_silu_mul_f16(
             round_affine_weights: false,
             marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
             constant_inputs: [true; 8],
+            interleaved_weight: arc_swap::ArcSwapOption::empty(),
             fold_bias_post_round: false,
             gate_up_swiglu: false,
             decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
-            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+            bf16_const_cache: Bf16ConstCache::default(),
         };
 
         let mut out1 = [TensorMut::new(
@@ -22280,13 +22556,14 @@ extern "C" __global__ void ref_silu_mul_f16(
                 round_affine_weights: false,
                 marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                 constant_inputs: [false; 8],
+                interleaved_weight: arc_swap::ArcSwapOption::empty(),
                 fold_bias_post_round: false,
                 gate_up_swiglu: fused,
                 decomposed_silu: false,
                 rmsnorm_prologue: false,
                 rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
-                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+                bf16_const_cache: Bf16ConstCache::default(),
             };
             if fused {
                 let mut constants = [false; 8];
@@ -22391,9 +22668,8 @@ extern "C" __global__ void ref_silu_mul_f16(
                 assert_eq!(
                     kernel
                         .bf16_const_cache
-                        .lock()
-                        .unwrap()
                         .current
+                        .load()
                         .as_ref()
                         .map_or(0, |entry| entry.signature.len()),
                     usize::from(fused)
@@ -22557,7 +22833,7 @@ extern "C" __global__ void ref_silu_mul_f16(
         ];
         const BLOCK: usize = 32;
 
-        let Some(runtime) = runtime() else {
+        let Some((_provider, runtime)) = runtime() else {
             eprintln!("skipping GEMV bandwidth probe: CUDA runtime unavailable");
             return;
         };
@@ -22784,13 +23060,14 @@ extern "C" __global__ void ref_silu_mul_f16(
                     round_affine_weights: false,
                     marlin_repack_cache: marlin_gemm::RepackCache::new(runtime.clone()),
                     constant_inputs: [true; 8],
+                    interleaved_weight: arc_swap::ArcSwapOption::empty(),
                     fold_bias_post_round: false,
                     gate_up_swiglu: false,
                     decomposed_silu: false,
                     rmsnorm_prologue: false,
                     rmsnorm_epsilon: 1e-5,
                     last_call_capture_safe: AtomicBool::new(false),
-                    bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+                    bf16_const_cache: Bf16ConstCache::default(),
                 },
                 label,
                 k,
