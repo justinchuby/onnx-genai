@@ -264,6 +264,7 @@ fn index_completion_publications(
         .collect()
 }
 struct StartedCompletion {
+    return_progress: bool,
     timings_per_token: bool,
     _registration: crate::completion_control::Registration,
     events: mpsc::Receiver<DriverEvent>,
@@ -335,6 +336,12 @@ async fn start_completion(
     await_driver_admission(generation.admission).await?;
     crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
     Ok(StartedCompletion {
+        return_progress: request
+            .sampling
+            .extensions
+            .get("return_progress")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
         timings_per_token: request
             .sampling
             .extensions
@@ -435,6 +442,16 @@ async fn deliver_completion(
                 }
                 if matches!(token.finish_reason, Some(FinishReason::StopSequence { .. })) {
                     stop_buffer.discard_pending();
+                }
+            }
+            Some(DriverEvent::PromptProgress(progress)) => {
+                if started.return_progress {
+                    send_completion_stream_chunk(
+                        tx,
+                        completion_chunk(id, created, model, index, String::new(), None)
+                            .with_prompt_progress(progress),
+                    )
+                    .await?;
                 }
             }
             Some(DriverEvent::WorkflowPublications(publications)) => {
@@ -992,6 +1009,11 @@ async fn stream_chat_completion(
                     .get("timings_per_token")
                     .and_then(serde_json::Value::as_bool)
                     == Some(true),
+                request
+                    .extensions
+                    .get("return_progress")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true),
             )
             .await;
         }
@@ -1031,6 +1053,21 @@ async fn stream_chat_completion(
                     if requested_top_logprobs.is_none() && !content.is_empty() {
                         send_stream_chunk(&tx, content_chunk(&id, created, &model, content, None))
                             .await?;
+                    }
+                }
+                Some(DriverEvent::PromptProgress(progress)) => {
+                    if request
+                        .extensions
+                        .get("return_progress")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    {
+                        send_stream_chunk(
+                            &tx,
+                            crate::sse::role_chunk(&id, created, &model, progress.total)
+                                .with_prompt_progress(progress),
+                        )
+                        .await?;
                     }
                 }
                 Some(DriverEvent::WorkflowPublications(publications)) => {
@@ -1162,6 +1199,7 @@ async fn stream_declared_tool_chat_completion(
     prompt_tokens: usize,
     include_usage: bool,
     timings_per_token: bool,
+    return_progress: bool,
 ) -> anyhow::Result<()> {
     let (id, created, model) = response;
     let mut buffered_text = String::new();
@@ -1184,6 +1222,16 @@ async fn stream_declared_tool_chat_completion(
                         .await?;
                 }
                 buffered_text.push_str(&revealed.content);
+            }
+            Some(DriverEvent::PromptProgress(progress)) => {
+                if return_progress {
+                    send_stream_chunk(
+                        tx,
+                        crate::sse::role_chunk(id, created, model, progress.total)
+                            .with_prompt_progress(progress),
+                    )
+                    .await?;
+                }
             }
             Some(DriverEvent::WorkflowPublications(publications)) => {
                 if let Err(error) = send_workflow_publications(tx, &publications).await {
@@ -1418,6 +1466,7 @@ async fn collect_generation_with_publications(
     while let Some(event) = rx.recv().await {
         match event {
             DriverEvent::Token(_) => {}
+            DriverEvent::PromptProgress(_) => {}
             DriverEvent::WorkflowPublications(committed) => publications.extend(committed),
             DriverEvent::Finished(result) => {
                 return Ok(CollectedGeneration {
@@ -4152,6 +4201,7 @@ mod completion_delivery_tests {
                 &tx,
                 ("id", 1, "model", 3),
                 StartedCompletion {
+                    return_progress: false,
                     timings_per_token: false,
                     _registration: controls
                         .register(
@@ -4201,6 +4251,7 @@ mod completion_delivery_tests {
             &tx,
             ("id", 1, "model", 0),
             StartedCompletion {
+                return_progress: false,
                 timings_per_token: false,
                 _registration: controls
                     .register(

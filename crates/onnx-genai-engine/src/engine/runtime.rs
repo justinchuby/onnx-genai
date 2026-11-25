@@ -2143,23 +2143,33 @@ impl Engine {
         options: GenerateOptions,
         fim_config: &FimConfig,
     ) -> anyhow::Result<GenerateResult> {
-        self.generate_fim_with_config_and_callbacks(prefix, suffix, options, fim_config, None, None)
+        self.generate_fim_with_config_and_callbacks(
+            prefix, suffix, options, fim_config, None, None, None,
+        )
     }
 
     /// Generate FIM text and notify the caller immediately after scheduler admission.
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_fim_with_config_and_callbacks(
         &mut self,
         prefix: impl AsRef<str>,
         suffix: impl AsRef<str>,
         options: GenerateOptions,
         fim_config: &FimConfig,
+        control: Option<crate::pipeline::GenerationControl>,
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         let prompt = fim_config.format_prompt(prefix.as_ref(), suffix.as_ref());
         let mut request = GenerateRequest::new(prompt);
         request.options = self.fim_options(fim_config, options)?;
-        self.generate_with_callbacks(request, admission_callback, token_callback)
+        self.generate_with_tool_policy_callbacks(
+            request,
+            ToolCallPolicy::Disabled,
+            control,
+            admission_callback,
+            token_callback,
+        )
     }
 
     /// Generate text and optionally stream each generated token to `callback`.
@@ -4351,6 +4361,7 @@ impl Engine {
             callback();
         }
 
+        let mut pending_semantic_snapshot = None;
         let result = (|| -> anyhow::Result<GenerateResult> {
             let active_matches = self.native_active_session == Some(session_id);
             let semantic_prefix_len = options
@@ -4388,6 +4399,7 @@ impl Engine {
                     native.has_recurrent_state() && native.supports_past_snapshots()
                 });
             let mut restored_prefix_len = None;
+            let mut evaluated_semantic_prefix = None;
             let mut should_store_semantic_snapshot = false;
             if !active_matches
                 && supports_past_snapshots
@@ -4425,6 +4437,15 @@ impl Engine {
                 && supports_past_snapshots
                 && let Some(boundary) = semantic_prefix_len
             {
+                if let Some(control) = control {
+                    control.report_prompt_progress(crate::pipeline::PromptProgress {
+                        total: prompt_tokens.len(),
+                        cache: 0,
+                        processed: 0,
+                        elapsed: std::time::Duration::ZERO,
+                    })?;
+                }
+                let preparation_started = std::time::Instant::now();
                 let snapshot = {
                     let native = self
                         .native_session
@@ -4475,16 +4496,16 @@ impl Engine {
                             }
                         };
                         if let Some(lease) = lease {
-                            self.prefix_cache.insert_snapshot(
-                                &prompt_tokens[..boundary],
+                            pending_semantic_snapshot = Some((
+                                boundary,
                                 Arc::new(NativePrefixSnapshot {
                                     snapshot,
                                     _lease: lease,
                                 }),
-                            );
-                            self.native_recurrent_prefix_stats.stores += 1;
+                            ));
                         }
                         restored_prefix_len = Some(boundary);
+                        evaluated_semantic_prefix = Some((boundary, preparation_started.elapsed()));
                     }
                     Err(error) => {
                         tracing::debug!(
@@ -4535,7 +4556,17 @@ impl Engine {
 
                 native.generate_incremental_with_callback_and_staged_observer(
                     &prompt_tokens,
-                    resume_from,
+                    match evaluated_semantic_prefix {
+                        Some((boundary, elapsed)) if boundary == resume_from => {
+                            crate::decode_loop::PreparedPrompt::Evaluated {
+                                tokens: resume_from,
+                                elapsed,
+                            }
+                        }
+                        _ => crate::decode_loop::PreparedPrompt::Reused {
+                            tokens: resume_from,
+                        },
+                    },
                     &options,
                     &chain,
                     tokenizer,
@@ -4569,6 +4600,11 @@ impl Engine {
                 state.tokens.extend_from_slice(&result.token_ids);
                 state.last_access = last_access;
                 let _outcome = turn.commit()?;
+                if let Some((boundary, snapshot)) = pending_semantic_snapshot.take() {
+                    self.prefix_cache
+                        .insert_snapshot(&prompt_tokens[..boundary], snapshot);
+                    self.native_recurrent_prefix_stats.stores += 1;
+                }
                 if let Some(control) = control {
                     control.finish_commit();
                 }
@@ -4992,14 +5028,11 @@ mod tests {
     }
 
     #[cfg(feature = "native-backend")]
-    #[test]
-    fn native_compressed_prompt_replacement_cancellation_restores_complete_state()
-    -> anyhow::Result<()> {
+    fn compressed_native_engine(directory: &Path, prefix_reusable: bool) -> anyhow::Result<Engine> {
         let source =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-deepseek-v4-csa");
-        let directory = tempfile::tempdir()?;
         for name in ["inference_metadata.yaml", "model.onnx.textproto"] {
-            std::fs::copy(source.join(name), directory.path().join(name))?;
+            std::fs::copy(source.join(name), directory.join(name))?;
         }
         let metadata: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(
             source.join("inference_metadata.yaml"),
@@ -5011,21 +5044,41 @@ mod tests {
             .map(|token| (format!("t{token}"), serde_json::json!(token)))
             .collect();
         std::fs::write(
-            directory.path().join("tokenizer.json"),
+            directory.join("tokenizer.json"),
             serde_json::to_vec(&serde_json::json!({
                 "version":"1.0", "truncation":null, "padding":null, "added_tokens":[], "normalizer":null,
                 "pre_tokenizer":{"type":"Whitespace"}, "post_processor":null, "decoder":null,
                 "model":{"type":"WordLevel", "vocab":vocab, "unk_token":"t0"}
             }))?,
         )?;
-        let mut engine = Engine::from_dir(
-            directory.path(),
+        if prefix_reusable {
+            let path = directory.join("inference_metadata.yaml");
+            let metadata = std::fs::read_to_string(&path)?;
+            anyhow::ensure!(
+                metadata.contains("prefix_reusable: false"),
+                "compressed fixture must declare prefix-reuse authority"
+            );
+            std::fs::write(
+                path,
+                metadata.replace("prefix_reusable: false", "prefix_reusable: true"),
+            )?;
+        }
+        Engine::from_dir(
+            directory,
             EngineConfig {
                 decode_backend: EngineDecodeBackend::Native,
                 native_device: Some(crate::NativeDecodeDevice::Cpu),
                 ..EngineConfig::default()
             },
-        )?;
+        )
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_compressed_prompt_replacement_cancellation_restores_complete_state()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut engine = compressed_native_engine(directory.path(), false)?;
         let session = engine.create_session()?;
         let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1, 2, 3, 4, 5, 6, 7]));
         request.options.max_new_tokens = 1;
@@ -5190,6 +5243,272 @@ mod tests {
             });
         }
         request
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prompt_progress_failure_does_not_publish_a_provisional_semantic_snapshot()
+    -> anyhow::Result<()> {
+        use crate::pipeline::GenerationControl;
+        let prompt = vec![1, 2, 3, 4, 5, 6, 7];
+        for failure_at in [0, 3, prompt.len()] {
+            let directory = tempfile::tempdir()?;
+            let mut engine = compressed_native_engine(directory.path(), true)?;
+            let session = engine.create_session()?;
+            let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.clone()));
+            request.options.max_new_tokens = 1;
+            request.options.greedy = true;
+            request.options.stop_on_eos = false;
+            request.options.semantic_prefix_len = Some(3);
+            let control = GenerationControl::new().with_prompt_progress(move |progress| {
+                if progress.processed == failure_at {
+                    anyhow::bail!("injected semantic-prefix progress failure");
+                }
+                Ok(())
+            });
+            let error = engine
+                .generate_in_session_with_tool_policy_callbacks(
+                    session,
+                    request.clone(),
+                    ToolCallPolicy::Disabled,
+                    Some(control),
+                    None,
+                    None,
+                )
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("injected semantic-prefix progress failure"),
+                "{error:#}"
+            );
+            assert_eq!(engine.session_token_count(session)?, 0);
+            assert_eq!(engine.scheduler.running_count(), 0);
+            assert_eq!(engine.native_recurrent_prefix_stats.stores, 0);
+            assert!(
+                engine
+                    .prefix_cache
+                    .lookup_snapshot::<NativePrefixSnapshot>(&prompt)
+                    .is_none(),
+                "an aborted turn must not publish its provisional semantic prefix"
+            );
+            let retry = engine.generate_in_session(session, request)?;
+            assert_eq!(retry.token_ids.len(), 1);
+            assert_eq!(retry.prefix_cache_hit_len, 0);
+            assert_eq!(engine.native_recurrent_prefix_stats.stores, 1);
+            assert!(
+                engine
+                    .prefix_cache
+                    .lookup_snapshot::<NativePrefixSnapshot>(&prompt)
+                    .is_some()
+            );
+            engine.close_session(session)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prompt_progress_distinguishes_new_semantic_prefill_from_reused_snapshot()
+    -> anyhow::Result<()> {
+        use crate::pipeline::GenerationControl;
+        use std::sync::{Arc, Mutex};
+        let directory = tempfile::tempdir()?;
+        let mut engine = compressed_native_engine(directory.path(), true)?;
+        assert!(engine.prefix_reuse_permitted());
+        assert!(
+            engine
+                .native_session
+                .as_ref()
+                .unwrap()
+                .has_recurrent_state()
+        );
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1, 2, 3, 4, 5, 6, 7]));
+        request.options.max_new_tokens = 1;
+        request.options.greedy = true;
+        request.options.stop_on_eos = false;
+        request.options.semantic_prefix_len = Some(3);
+        let mut results = Vec::new();
+        for reused in [false, true] {
+            let session = engine.create_session()?;
+            let updates = Arc::new(Mutex::new(Vec::new()));
+            let sink = updates.clone();
+            let control = GenerationControl::new().with_prompt_progress(move |progress| {
+                sink.lock().unwrap().push(progress);
+                Ok(())
+            });
+            let result = engine.generate_in_session_with_tool_policy_callbacks(
+                session,
+                request.clone(),
+                ToolCallPolicy::Disabled,
+                Some(control),
+                None,
+                None,
+            )?;
+            let updates = updates.lock().unwrap();
+            assert_eq!(updates.len(), if reused { 2 } else { 3 });
+            assert_eq!(updates[0].processed, if reused { 3 } else { 0 });
+            for update in updates.iter() {
+                assert_eq!(update.total, 7);
+                assert_eq!(update.cache, if reused { 3 } else { 0 });
+            }
+            assert_eq!(updates.last().unwrap().processed, 7);
+            if !reused {
+                assert_eq!(updates[1].processed, 3);
+                assert!(updates[1].elapsed > std::time::Duration::ZERO);
+            }
+            assert_eq!(result.prefix_cache_hit_len, if reused { 3 } else { 0 });
+            let timing = result.timings.unwrap();
+            assert_eq!(timing.cached_prompt_tokens, result.prefix_cache_hit_len);
+            assert_eq!(timing.prompt_tokens, if reused { 4 } else { 7 });
+            assert_eq!(timing.prompt_elapsed, updates.last().unwrap().elapsed);
+            results.push(result.token_ids);
+        }
+        assert_eq!(engine.native_recurrent_prefix_stats.stores, 1);
+        assert_eq!(engine.native_recurrent_prefix_stats.hits, 1);
+        assert_eq!(
+            results[0], results[1],
+            "restored record partial-carry state must match its freshly evaluated prefix"
+        );
+        let mut oracle = compressed_native_engine(directory.path(), true)?;
+        request.options.semantic_prefix_len = None;
+        assert_eq!(oracle.generate(request)?.token_ids, results[0]);
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prompt_progress_observes_real_forwards_and_precedes_committed_output() -> anyhow::Result<()>
+    {
+        use crate::pipeline::{GenerationBoundary, GenerationControl};
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for backend in [EngineDecodeBackend::Native, EngineDecodeBackend::Ort] {
+            let mut engine = Engine::from_dir(
+                &fixture,
+                EngineConfig {
+                    decode_backend: backend,
+                    native_device: Some(crate::NativeDecodeDevice::Cpu),
+                    ..Default::default()
+                },
+            )?;
+            for cold in [true, false] {
+                let updates = Arc::new(Mutex::new(Vec::new()));
+                let forward_seen = Arc::new(AtomicBool::new(false));
+                let output_seen = Arc::new(AtomicBool::new(false));
+                let seen = forward_seen.clone();
+                let observed = updates.clone();
+                let forwarded = forward_seen.clone();
+                let published = output_seen.clone();
+                let control = GenerationControl::new()
+                    .with_checkpoint(move |boundary| {
+                        if boundary == GenerationBoundary::AfterDecoderForward {
+                            seen.store(true, Ordering::SeqCst);
+                        }
+                        Ok(())
+                    })
+                    .with_prompt_progress(move |progress| {
+                        assert!(!published.load(Ordering::SeqCst));
+                        assert_eq!(
+                            forwarded.load(Ordering::SeqCst),
+                            progress.processed == progress.total
+                        );
+                        observed.lock().unwrap().push(progress);
+                        Ok(())
+                    });
+                let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
+                request.options.max_new_tokens = 2;
+                request.options.greedy = true;
+                request.options.stop_on_eos = false;
+                request.options.cold_start = cold;
+                let mut callback = |_: crate::config::GenerateToken| {
+                    output_seen.store(true, Ordering::SeqCst);
+                    Ok(())
+                };
+                let result = engine.generate_with_tool_policy_callbacks(
+                    request,
+                    ToolCallPolicy::Disabled,
+                    Some(control),
+                    None,
+                    Some(&mut callback),
+                )?;
+                let updates = updates.lock().unwrap();
+                assert_eq!(updates.len(), 2);
+                assert_eq!(updates[0].total, 3);
+                assert_eq!(updates[0].cache, result.prefix_cache_hit_len);
+                assert_eq!(updates[0].processed, updates[0].cache);
+                assert_eq!(updates[0].elapsed, std::time::Duration::ZERO);
+                assert_eq!(updates[1].total, 3);
+                assert_eq!(updates[1].cache, updates[0].cache);
+                assert_eq!(updates[1].processed, 3);
+                assert_eq!(updates[1].elapsed, result.timings.unwrap().prompt_elapsed);
+                assert!(output_seen.load(Ordering::SeqCst));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prompt_progress_observer_failures_abort_without_publishing_tokens_or_history()
+    -> anyhow::Result<()> {
+        use crate::pipeline::GenerationControl;
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for backend in [EngineDecodeBackend::Native, EngineDecodeBackend::Ort] {
+            for fail_after_forward in [false, true] {
+                let mut engine = Engine::from_dir(
+                    &fixture,
+                    EngineConfig {
+                        decode_backend: backend,
+                        native_device: Some(crate::NativeDecodeDevice::Cpu),
+                        ..Default::default()
+                    },
+                )?;
+                let session = engine.create_session()?;
+                let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
+                request.options.max_new_tokens = 2;
+                request.options.greedy = true;
+                request.options.stop_on_eos = false;
+                let control = GenerationControl::new().with_prompt_progress(move |progress| {
+                    if (progress.processed == progress.total) == fail_after_forward {
+                        anyhow::bail!("injected prompt progress receiver failure");
+                    }
+                    Ok(())
+                });
+                let mut published = Vec::new();
+                let mut callback = |token: crate::config::GenerateToken| {
+                    published.push(token.token_id);
+                    Ok(())
+                };
+                let error = engine
+                    .generate_in_session_with_tool_policy_callbacks(
+                        session,
+                        request.clone(),
+                        ToolCallPolicy::Disabled,
+                        Some(control),
+                        None,
+                        Some(&mut callback),
+                    )
+                    .unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("injected prompt progress receiver failure"),
+                    "{error:#}"
+                );
+                assert!(published.is_empty());
+                assert_eq!(engine.session_token_count(session)?, 0);
+                assert_eq!(engine.scheduler.running_count(), 0);
+                assert_eq!(
+                    engine
+                        .generate_in_session(session, request)?
+                        .token_ids
+                        .len(),
+                    2
+                );
+                engine.close_session(session)?;
+            }
+        }
+        Ok(())
     }
 
     #[cfg(feature = "native-backend")]

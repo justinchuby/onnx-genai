@@ -304,6 +304,7 @@ fn transcription_stream(
                         let delta=output.push(&token.text).map_err(|error|ApiError::invalid_request(format!("render transcription delta: {error:#}")))?;
                         if !delta.is_empty() && !transcript_event(&tx,transcript_delta(&delta)?).await {return Ok(());}
                     }
+                    Some(DriverEvent::PromptProgress(_)) => {},
                     Some(DriverEvent::WorkflowPublications(_))=>{}
                     Some(DriverEvent::Finished(result))=>{
                         let transcript=output.finish(&result.text).map_err(|error|ApiError::invalid_request(format!("render committed transcription: {error:#}")))?;

@@ -1988,3 +1988,34 @@ remain finite. `timings_per_token=true` publishes cumulative SSE measurements;
 chat timing-only chunks have empty choices, as accepted by pinned Llama Chat.
 Standalone prefill, speculative execution, and generic authored workflow timing
 remain distinct unfinished contracts. Prompt progress events are still open.
+
+
+### Prompt-forward progress and prefix provenance
+
+`GenerationControl` has an independent typed prompt-progress observer alongside
+its cancellation/checkpoint authority. Ordinary decoder hosts report real prompt
+forward boundaries, before token publication. Native/OpenAI completion, chat and
+infill SSE only serialize these updates for `return_progress=true`. Buffered
+collectors and other transports ignore this execution metadata. FIM execution
+now uses the same cancellation/progress authority and committed token callbacks.
+
+The pinned [upstream progress assignment](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-context.cpp#L2306)
+counts cached tokens in `processed`. A whole-prompt forward therefore starts at
+`cache` and completes at `total`; it does not invent intermediate percentages.
+Progress is not semantic state publication: an aborted turn may have reported
+work, but still publishes no tokens, workflow output, or success completion.
+
+`PreparedPrompt` distinguishes reused prefix state from a semantic prefix freshly
+evaluated in the same request. Native incremental decode resumes from the physical
+cursor in either case, while input-reuse statistics use only the former. The
+clock includes fresh prefix evaluation in prompt work, and progress reports its
+actual intermediate boundary. A compressed record-state fixture with a partial
+carry proves fresh prefill and cross-session snapshot restoration match an
+independent complete cold evaluation. Declared `prefix_reusable=false` and memory
+admission guards remain in place. The new snapshot and its memory lease remain
+private until semantic commit; observer failure or cancellation cannot publish
+that provisional prefix. Failure injection before prefill, after the partial
+boundary and after full prompt evaluation proves cache/history publication stays
+atomic and retry recomputes the prefix. SSE replay coverage includes progress
+and timing frames in its byte-exact retained history. Speculative/composite,
+continuous-batch and standalone prefill progress contracts are still unfinished.

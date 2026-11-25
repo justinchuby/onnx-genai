@@ -14,16 +14,75 @@ use crate::processors::{
 use crate::sampling::{Sampler, SamplingRng};
 use onnx_genai_ort::Tokenizer;
 
+/// A physical prefix can come from an older request or be evaluated during
+/// this request to capture a semantic boundary. Only the former is cache reuse.
+#[derive(Clone, Copy)]
+// Only Native constructs prepared prefixes; the shared clock also builds in
+// reference-only ORT configurations.
+#[cfg_attr(not(feature = "native-backend"), allow(dead_code))]
+pub(crate) enum PreparedPrompt {
+    Reused {
+        tokens: usize,
+    },
+    Evaluated {
+        tokens: usize,
+        elapsed: std::time::Duration,
+    },
+}
+impl PreparedPrompt {
+    pub(crate) fn tokens(self) -> usize {
+        match self {
+            Self::Reused { tokens } | Self::Evaluated { tokens, .. } => tokens,
+        }
+    }
+    #[cfg(any(feature = "native-backend", test))]
+    pub(crate) fn cached_tokens(self) -> usize {
+        match self {
+            Self::Reused { tokens } => tokens,
+            Self::Evaluated { .. } => 0,
+        }
+    }
+    fn elapsed(self) -> std::time::Duration {
+        match self {
+            Self::Reused { .. } => std::time::Duration::ZERO,
+            Self::Evaluated { elapsed, .. } => elapsed,
+        }
+    }
+}
+
 /// Carries only active decoder work across scheduler turns. Every step closes
 /// before invoking the caller's callback, so delayed publication cannot inflate
 /// model throughput measurements.
 #[derive(Clone, Default)]
 pub(crate) struct GenerationClock {
+    prepared: Option<PreparedPrompt>,
     step_started: Option<std::time::Instant>,
     sample: Option<crate::config::GenerationTimings>,
     prompt_finished: bool,
 }
 impl GenerationClock {
+    #[cfg(any(feature = "native-backend", test))]
+    pub(crate) fn prepare_prompt(&mut self, prefix: PreparedPrompt) {
+        self.prepared = Some(prefix);
+    }
+    pub(crate) fn has_finished_prompt(&self) -> bool {
+        self.prompt_finished
+    }
+    pub(crate) fn initial_progress(
+        &self,
+        total: usize,
+        cache: usize,
+    ) -> crate::pipeline::PromptProgress {
+        crate::pipeline::PromptProgress {
+            total,
+            cache,
+            processed: self.prepared.map_or(cache, PreparedPrompt::tokens),
+            elapsed: self
+                .prepared
+                .map_or(std::time::Duration::ZERO, PreparedPrompt::elapsed),
+        }
+    }
+
     fn begin_forward(&mut self, prompt_tokens: usize, cached_prompt_tokens: usize) {
         self.begin_forward_at(
             std::time::Instant::now(),
@@ -42,7 +101,9 @@ impl GenerationClock {
             prompt_tokens: prompt_tokens.saturating_sub(cached_prompt_tokens),
             cached_prompt_tokens,
             generated_tokens: 0,
-            prompt_elapsed: std::time::Duration::ZERO,
+            prompt_elapsed: self
+                .prepared
+                .map_or(std::time::Duration::ZERO, PreparedPrompt::elapsed),
             generation_elapsed: std::time::Duration::ZERO,
         });
     }
@@ -52,7 +113,7 @@ impl GenerationClock {
     fn finish_forward_at(&mut self, now: std::time::Instant) {
         if !self.prompt_finished {
             if let (Some(start), Some(sample)) = (self.step_started, self.sample.as_mut()) {
-                sample.prompt_elapsed = now.duration_since(start);
+                sample.prompt_elapsed += now.duration_since(start);
                 self.step_started = Some(now);
             }
             self.prompt_finished = true;
@@ -1278,6 +1339,38 @@ mod tests {
 mod generation_clock_tests {
     use super::GenerationClock;
     use std::time::{Duration, Instant};
+    #[test]
+    fn generation_clock_attributes_prepared_prefix_work_to_its_actual_provenance() {
+        use super::PreparedPrompt;
+        for prefix in [
+            PreparedPrompt::Reused { tokens: 3 },
+            PreparedPrompt::Evaluated {
+                tokens: 3,
+                elapsed: Duration::from_millis(40),
+            },
+        ] {
+            let mut clock = GenerationClock::default();
+            clock.prepare_prompt(prefix);
+            let initial = clock.initial_progress(7, prefix.cached_tokens());
+            assert_eq!(initial.total, 7);
+            assert_eq!(initial.processed, 3);
+            assert_eq!(initial.cache, prefix.cached_tokens());
+            assert_eq!(initial.elapsed, prefix.elapsed());
+            let start = Instant::now();
+            clock.begin_forward_at(start, 7, prefix.cached_tokens());
+            clock.finish_forward_at(start + Duration::from_millis(10));
+            clock.token_selected_at(start + Duration::from_millis(12), 1);
+            let sample = clock.snapshot().unwrap();
+            assert_eq!(sample.prompt_tokens, 7 - prefix.cached_tokens());
+            assert_eq!(sample.cached_prompt_tokens, prefix.cached_tokens());
+            assert_eq!(
+                sample.prompt_elapsed,
+                prefix.elapsed() + Duration::from_millis(10)
+            );
+            assert_eq!(sample.generation_elapsed, Duration::from_millis(2));
+        }
+    }
+
     #[test]
     fn generation_clock_excludes_delivery_and_scheduler_gaps_from_decode_work() {
         let mut clock = GenerationClock::default();

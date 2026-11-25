@@ -260,6 +260,7 @@ pub(crate) enum DriverCommand {
 
 #[derive(Debug)]
 pub(crate) enum DriverEvent {
+    PromptProgress(onnx_genai_engine::pipeline::PromptProgress),
     Token(GenerateToken),
     WorkflowPublications(Vec<serde_json::Value>),
     Finished(GenerateResult),
@@ -1226,6 +1227,7 @@ impl EngineDriver {
         while let Some(event) = receiver.blocking_recv() {
             match event {
                 DriverEvent::Token(_) => {}
+                DriverEvent::PromptProgress(_) => {}
                 DriverEvent::WorkflowPublications(_) => {}
                 DriverEvent::Finished(_) => return Ok(()),
                 DriverEvent::Error(error) => anyhow::bail!(error.message),
@@ -2701,6 +2703,15 @@ impl std::error::Error for DriverDeliveryError {}
 /// bound tensors are what the request arrived with, and a request carrying them
 /// is bound as a workflow request because that is the only way to deliver them.
 /// Neither branch asks what kind of package is loaded.
+fn generation_control_for_events(events: &mpsc::Sender<DriverEvent>) -> GenerationControl {
+    let cancellation_events = events.clone();
+    let progress_events = events.clone();
+    GenerationControl::from_cancellation_probe(move || cancellation_events.is_closed())
+        .with_prompt_progress(move |progress| {
+            deliver_event(&progress_events, DriverEvent::PromptProgress(progress))
+        })
+}
+
 fn run_generation(
     engine: &mut Engine,
     completion: &mut Option<crate::slots::SlotExecution>,
@@ -2736,9 +2747,7 @@ fn run_generation(
             return;
         }
     };
-    let cancellation_events = events.clone();
-    let generation_control =
-        GenerationControl::from_cancellation_probe(move || cancellation_events.is_closed());
+    let generation_control = generation_control_for_events(&events);
     let bound = bound.map(|request| request.with_generation_control(generation_control.clone()));
     let mut admission = Some(admission);
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
@@ -2849,6 +2858,11 @@ fn run_fim_generation(
     let (admission, events, permit) = delivery;
     let mut metrics = GenerationMetrics::start();
     let mut admission = Some(admission);
+    let control = generation_control_for_events(&events);
+    let mut callback = |token| {
+        metrics.token();
+        deliver_event(&events, DriverEvent::Token(token))
+    };
     let result = {
         let mut admitted = || {
             if let Some(sender) = admission.take() {
@@ -2860,8 +2874,9 @@ fn run_fim_generation(
             suffix,
             options,
             &fim_config,
+            Some(control),
             Some(&mut admitted),
-            None,
+            Some(&mut callback),
         )
     };
     publish_slot_completion(engine, completion);
@@ -3735,33 +3750,39 @@ mod admission_tests {
                     .is_ok(),
                 "{route} must report scheduler admission before executing"
             );
-            match events_rx
-                .try_recv()
-                .expect("aborted generation must report its error")
-            {
-                DriverEvent::Error(failure) => assert!(
-                    failure.message.contains(
-                        "output staging exhausted its 1-token admission after buffering 1"
+            let mut saw_error = false;
+            while let Ok(event) = events_rx.try_recv() {
+                match event {
+                    DriverEvent::Error(failure) => {
+                        assert!(!saw_error, "{route} duplicated its terminal error");
+                        saw_error = true;
+                        assert!(
+                            failure.message.contains(
+                                "output staging exhausted its 1-token admission after buffering 1"
+                            ),
+                            "{route} must fail after staging token one: {}",
+                            failure.message
+                        );
+                    }
+                    DriverEvent::PromptProgress(_) => assert!(
+                        !saw_error,
+                        "{route} emitted progress after its terminal error"
                     ),
-                    "{route} must fail after staging token one: {}",
-                    failure.message
-                ),
-                DriverEvent::Token(token) => {
-                    panic!(
+                    DriverEvent::Token(token) => panic!(
                         "{route} leaked DriverEvent::Token({}) from an aborted turn",
                         token.token_id
-                    )
-                }
-                DriverEvent::WorkflowPublications(_) => {
-                    panic!("{route} leaked workflow publications from an aborted turn")
-                }
-                DriverEvent::Finished(_) => {
-                    panic!("{route} leaked a success completion from an aborted turn")
+                    ),
+                    DriverEvent::WorkflowPublications(_) => {
+                        panic!("{route} leaked workflow publications from an aborted turn")
+                    }
+                    DriverEvent::Finished(_) => {
+                        panic!("{route} leaked a success completion from an aborted turn")
+                    }
                 }
             }
             assert!(
-                events_rx.try_recv().is_err(),
-                "{route} must publish no token or success completion after its error"
+                saw_error,
+                "aborted generation must report its terminal error"
             );
 
             engine.set_native_output_staging_limit_for_test(None);
@@ -3779,6 +3800,7 @@ mod admission_tests {
             while let Ok(event) = events_rx.try_recv() {
                 match event {
                     DriverEvent::Token(token) => tokens.push(token.token_id),
+                    DriverEvent::PromptProgress(_) => {}
                     DriverEvent::WorkflowPublications(_) => {}
                     DriverEvent::Finished(result) => finished = Some(result),
                     DriverEvent::Error(failure) => {
@@ -4185,6 +4207,7 @@ mod driver_delivery_tests {
         while let Some(event) = rx.blocking_recv() {
             match event {
                 DriverEvent::Token(_) => tokens += 1,
+                DriverEvent::PromptProgress(_) => {}
                 DriverEvent::WorkflowPublications(_) => {}
                 DriverEvent::Finished(_) => {
                     finished = true;
@@ -4310,6 +4333,7 @@ mod driver_delivery_tests {
         while let Some(event) = events_rx.recv().await {
             match event {
                 DriverEvent::Token(token) => tokens.push(token.token_id),
+                DriverEvent::PromptProgress(_) => {}
                 DriverEvent::WorkflowPublications(_) => {}
                 DriverEvent::Finished(_) => finished = true,
                 DriverEvent::Error(error) => panic!("unexpected failure: {error:?}"),
@@ -4357,6 +4381,7 @@ mod driver_delivery_tests {
             Some(DriverEvent::Token(token)) => {
                 panic!("aborted turn leaked DriverEvent::Token({})", token.token_id)
             }
+            Some(DriverEvent::PromptProgress(_)) => {}
             Some(DriverEvent::WorkflowPublications(_)) => {
                 panic!("aborted turn leaked committed workflow publications")
             }
