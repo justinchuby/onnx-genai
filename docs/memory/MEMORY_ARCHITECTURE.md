@@ -937,9 +937,17 @@ expert IDs. Each expert therefore receives at most the total input row count.
 The node declares the maximum **complete** projection layout across FC1, FC2,
 and optional FC3 at that row count, rather than their sum or a multiple of
 expert count/top-k. Each projection layout includes column staging plus decoded
-tiles. The logical shard count is fixed when the kernel is created and is used
-by both planning and execution, even when a different Rayon pool runs it.
-Dense-cache admission may decline, so the bound always covers streamed fallback.
+tiles. Metadata planning follows the selected execution context. Before admission,
+the execution refiner selects a logical shard plan from that actual Rayon pool;
+launch consumes the same plan once for both layout binding and compute. Kernel
+construction no longer fixes the pool width or initializes Rayon. A failed
+refinement clears any earlier selection; a nonempty launch without a selected
+plan fails before weight admission. Existing validated-empty MoE execution still
+clears old state and returns only after its original shape validation. Dense-cache
+admission may decline, so the bound always covers streamed fallback. The same
+provider context key used by integer QMoE guards native/ORT preparation caches;
+no new public API, allocator, per-shard quota or provider lock is introduced.
+The existing architecture-dependent tile and serial arithmetic are unchanged.
 
 The decode region is borrowed by sequential projection calls. A private
 dispatch-local owner lazily initializes its required f32 span at the first
