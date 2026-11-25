@@ -440,8 +440,12 @@ history expiring after five minutes. Old offsets fail explicitly once evicted.
 Requests without a conversation ID close their driver reader on disconnect.
 SSE generation streams use a 30-second idle comment ping interval by default,
 matching the pinned server. `--sse-ping-interval SECONDS` sets the server default;
-request `sse_ping_interval` overrides it. Values are integer seconds from -1
-through 2147483647; -1 and 0 disable pings. Data resets the idle timer, and EOF
+request `sse_ping_interval` overrides it. JSON numbers truncate toward zero to
+integer seconds from -1 through 2147483647; for example, `1.9` selects one second
+and `0.5` disables pings. Omission or `null` inherits the configured server
+interval, including a disabled default. Values -1 and 0 disable pings. Unsafe
+overflow representations, booleans and strings are rejected. The CLI accepts
+integer seconds. Data resets the idle timer, and EOF
 ends the timer with the source. This applies to native completion/infill,
 OpenAI completion/chat, Responses and Anthropic streams. Pings are SSE comments,
 not generation events. Resumable streams retain their actual comment bytes,

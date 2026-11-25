@@ -27,26 +27,21 @@ impl SsePingInterval {
     pub(crate) fn seconds(self) -> i32 {
         self.0.map_or(-1, |seconds| seconds.get() as i32)
     }
-    pub(crate) fn parse(value: &serde_json::Value) -> Result<Self, crate::routes::ApiError> {
-        let number = value.as_i64().ok_or_else(|| {
-            crate::routes::ApiError::invalid_request(
-                "sse_ping_interval must be integer seconds; use -1 or 0 to disable pings",
-            )
-        })?;
-        number
-            .to_string()
-            .parse()
+    pub(crate) fn parse(
+        value: &serde_json::Value,
+    ) -> Result<Option<Self>, crate::routes::ApiError> {
+        crate::types::parse_llama_integer(value, "sse_ping_interval", i64::from(i32::MAX))
+            .map(|number| number.map(|seconds| Self(NonZeroU32::new(seconds.max(0) as u32))))
             .map_err(crate::routes::ApiError::invalid_request)
     }
     pub(crate) fn resolve(
         request: &crate::types::ChatCompletionRequest,
         default: Self,
     ) -> Result<Self, crate::routes::ApiError> {
-        request
-            .extensions
-            .get("sse_ping_interval")
-            .map(Self::parse)
-            .unwrap_or(Ok(default))
+        match request.extensions.get("sse_ping_interval") {
+            Some(value) => Ok(Self::parse(value)?.unwrap_or(default)),
+            None => Ok(default),
+        }
     }
     pub(crate) fn response(
         self,
@@ -96,13 +91,36 @@ mod tests {
         for value in [
             json!(-2),
             json!(2147483648u64),
-            json!(1.5),
+            json!(-2.1),
             json!(true),
             json!("1"),
-            json!(null),
+            json!(u64::MAX),
         ] {
             assert!(SsePingInterval::parse(&value).is_err(), "{value}");
         }
+        for (value, expected) in [
+            (json!(-1.9), -1),
+            (json!(0.5), 0),
+            (json!(1.5), 1),
+            (json!(2147483647.9), i32::MAX),
+        ] {
+            request.extensions.insert("sse_ping_interval".into(), value);
+            assert_eq!(
+                SsePingInterval::resolve(&request, default).unwrap(),
+                expected.to_string().parse().unwrap()
+            );
+        }
+        request
+            .extensions
+            .insert("sse_ping_interval".into(), json!(null));
+        for configured in ["7", "-1"] {
+            let configured = configured.parse().unwrap();
+            assert_eq!(
+                SsePingInterval::resolve(&request, configured).unwrap(),
+                configured
+            );
+        }
+        assert_eq!(SsePingInterval::parse(&json!(null)).unwrap(), None);
     }
     #[tokio::test]
     async fn idle_pings_are_comments_reset_after_data_and_end_with_the_source() {
