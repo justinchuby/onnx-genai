@@ -28,6 +28,7 @@ pub struct RealtimeContract {
     profile: String,
     spec: RealtimeSpec,
     outputs: std::collections::BTreeMap<String, String>,
+    ending_tokens: Vec<u32>,
 }
 impl RealtimeContract {
     pub fn profile(&self) -> &str {
@@ -38,6 +39,9 @@ impl RealtimeContract {
     }
     pub fn output(&self, role: &str) -> Option<&str> {
         self.outputs.get(role).map(String::as_str)
+    }
+    pub fn ending_tokens(&self) -> &[u32] {
+        &self.ending_tokens
     }
     pub fn supports(&self, mode: RealtimeMode) -> bool {
         self.spec.modes.contains(&mode)
@@ -177,6 +181,29 @@ pub fn realtime_contract(metadata: &InferenceMetadata) -> Result<Option<Realtime
                 )));
             }
         }
+        if let Some(endpoint) = &spec.inputs.token_mask {
+            if !bound.insert(endpoint) {
+                return Err(fail("input endpoints must be distinct"));
+            }
+            let input = workflow.inputs.get(endpoint).ok_or_else(|| {
+                fail(&format!(
+                    "references undeclared token_mask input '{endpoint}'"
+                ))
+            })?;
+            if !matches!(input.source, WorkflowInputSource::Application { .. })
+                || input.role != SemanticInputRole::Opaque
+                || input.contract.dtype != "bool"
+                || !matches!(
+                    input.contract.shape.as_slice(),
+                    [TensorDimension::Symbol(_)]
+                )
+                || !input.required
+            {
+                return Err(fail(
+                    "token_mask must be a required opaque application bool symbolic vector; consume each vocabulary bit before selecting the quantum's single text token",
+                ));
+            }
+        }
         let mut output_names = BTreeSet::new();
         for (role, dtype, scalar, required) in [
             ("tokens", "int64", false, true),
@@ -242,6 +269,13 @@ pub fn realtime_contract(metadata: &InferenceMetadata) -> Result<Option<Realtime
             profile: name.clone(),
             spec: spec.clone(),
             outputs: profile.outputs.clone(),
+            ending_tokens: metadata
+                .package
+                .as_ref()
+                .and_then(|p| p.tokenizer.as_ref())
+                .and_then(|t| t.special_tokens.as_ref())
+                .map(|t| t.eos_token_id.clone())
+                .unwrap_or_default(),
         });
     }
     Ok(resolved)
@@ -255,6 +289,55 @@ mod tests {
             "../../../tests/fixtures/onnx_genai_workflows/realtime/inference_metadata.yaml"
         ))
         .unwrap()
+    }
+    #[test]
+    fn realtime_token_mask_requires_a_distinct_boolean_application_endpoint() {
+        let mut doc = fixture();
+        doc.profiles
+            .get_mut("live")
+            .unwrap()
+            .realtime
+            .as_mut()
+            .unwrap()
+            .inputs
+            .token_mask = Some("request.mask".into());
+        assert!(
+            realtime_contract(&doc)
+                .unwrap_err()
+                .contains("undeclared token_mask")
+        );
+        let mut input = doc.pipeline.as_ref().unwrap().workflow.inputs["request.tokens"].clone();
+        input.contract.dtype = "bool".into();
+        doc.pipeline
+            .as_mut()
+            .unwrap()
+            .workflow
+            .inputs
+            .insert("request.mask".into(), input);
+        assert_eq!(
+            realtime_contract(&doc)
+                .unwrap()
+                .unwrap()
+                .spec()
+                .inputs
+                .token_mask
+                .as_deref(),
+            Some("request.mask")
+        );
+        doc.pipeline
+            .as_mut()
+            .unwrap()
+            .workflow
+            .inputs
+            .get_mut("request.mask")
+            .unwrap()
+            .contract
+            .dtype = "int64".into();
+        assert!(
+            realtime_contract(&doc)
+                .unwrap_err()
+                .contains("bool symbolic vector")
+        );
     }
     #[test]
     fn realtime_admission_resolves_model_authored_rates_and_modes() {

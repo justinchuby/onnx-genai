@@ -57,7 +57,10 @@ pub(crate) enum RealtimeInputOwned {
     Audio(Vec<f32>),
     Text(Vec<u32>),
     Commit,
-    Generate(Vec<u32>),
+    Generate {
+        tokens: Vec<u32>,
+        constraint: Option<onnx_genai_engine::GenerateConstraint>,
+    },
     Configure {
         mode: RealtimeMode,
         tokens: Vec<u32>,
@@ -76,7 +79,10 @@ impl RealtimeInputOwned {
             Self::Configure { mode, tokens } => return session.configure(*mode, tokens, control),
             Self::Audio(samples) => RealtimeInput::Audio(samples),
             Self::Text(tokens) => RealtimeInput::Text(tokens),
-            Self::Generate(tokens) => RealtimeInput::Generate(tokens),
+            Self::Generate { tokens, constraint } => {
+                session.set_constraint(constraint.clone())?;
+                RealtimeInput::Generate(tokens)
+            }
             Self::Commit => RealtimeInput::Commit,
             Self::Poll => RealtimeInput::Poll,
             Self::Cancel => RealtimeInput::Cancel,
@@ -361,7 +367,10 @@ mod tests {
         assert!(!connection.step(RealtimeInputOwned::Commit).await?.done);
         assert!(
             connection
-                .step(RealtimeInputOwned::Generate(vec![]))
+                .step(RealtimeInputOwned::Generate {
+                    tokens: vec![],
+                    constraint: None
+                })
                 .await?
                 .done
         );

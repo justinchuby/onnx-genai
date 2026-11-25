@@ -56,6 +56,64 @@ pub struct RealtimeSession<'a> {
     id: SessionId,
     contract: RealtimeContract,
     health: SessionHealth,
+    grammar: Option<RealtimeGrammar>,
+}
+
+struct RealtimeGrammar {
+    constraint: RealtimeConstraint,
+    context: crate::logits::ProcessorContext,
+    vocabulary: usize,
+    endings: Vec<u32>,
+    text_ended: bool,
+}
+enum RealtimeConstraint {
+    Logical(Box<crate::response_constraint::ContentConstraint>),
+    Raw(crate::ProcessorChain),
+}
+impl RealtimeGrammar {
+    fn mask(&self) -> anyhow::Result<Vec<bool>> {
+        if self.text_ended {
+            return Ok(vec![false; self.vocabulary]);
+        }
+        match &self.constraint {
+            RealtimeConstraint::Logical(constraint) => {
+                use crate::logits::Constraint as _;
+                let candidates = (0..self.vocabulary)
+                    .map(|id| crate::logits::TokenCandidate {
+                        token_id: id as u32,
+                        text: String::new(),
+                        is_eos: self.endings.contains(&(id as u32)),
+                    })
+                    .collect::<Vec<_>>();
+                let mask = constraint.allowed_next_tokens(&self.context, &candidates)?;
+                ensure!(
+                    mask.iter().any(|allowed| *allowed) || constraint.can_finish(&self.context)?,
+                    "realtime grammar admits no token before logical completion; repair the grammar or tokenizer vocabulary"
+                );
+                Ok(mask)
+            }
+            RealtimeConstraint::Raw(chain) => {
+                let mut logits = vec![0.0; self.vocabulary];
+                chain.process(&mut logits, &self.context)?;
+                Ok(logits.into_iter().map(|value| value.is_finite()).collect())
+            }
+        }
+    }
+    fn can_finish(&self) -> anyhow::Result<bool> {
+        if self.text_ended {
+            return Ok(true);
+        }
+        match &self.constraint {
+            RealtimeConstraint::Logical(constraint) => constraint.can_finish(&self.context),
+            RealtimeConstraint::Raw(_) => {
+                let next = self.mask()?;
+                Ok(self
+                    .endings
+                    .iter()
+                    .any(|id| next.get(*id as usize) == Some(&true)))
+            }
+        }
+    }
 }
 
 impl Engine {
@@ -80,6 +138,7 @@ impl Engine {
             id,
             contract,
             health: SessionHealth::Ready,
+            grammar: None,
         };
         let operation = match mode {
             RealtimeMode::Realtime => RealtimeOperation::StartRealtime,
@@ -98,6 +157,128 @@ impl Engine {
 }
 
 impl RealtimeSession<'_> {
+    /// Install a fresh response-local grammar before Generate. Native graphs
+    /// must explicitly consume the declared token mask before selecting tokens.
+    pub fn set_constraint(
+        &mut self,
+        constraint: Option<crate::GenerateConstraint>,
+    ) -> anyhow::Result<()> {
+        let grammar = if let Some(constraint) = constraint {
+            ensure!(
+                self.contract.spec().inputs.token_mask.is_some(),
+                "realtime constrained sampling requires profiles.{}.realtime.inputs.token_mask; export a workflow that masks native logits before selecting one text token per quantum",
+                self.contract.profile()
+            );
+            let tokenizer = self.engine.workflow_runtime().package_tokenizer().context("realtime constrained sampling requires the workflow package tokenizer; declare and load its tokenizer artifact")?;
+            let endings = self.contract.ending_tokens().to_vec();
+            let mut options = GenerateOptions {
+                greedy: true,
+                constraint: Some(constraint),
+                eos_token_id: endings.first().copied(),
+                eos_token_ids: endings.clone(),
+                ..Default::default()
+            };
+            if let Some(declaration) = self
+                .engine
+                .metadata()
+                .package
+                .as_ref()
+                .and_then(|p| p.tool_protocol.as_ref())
+            {
+                let protocol = onnx_genai_metadata::ToolProtocol::from_declaration(declaration)?;
+                for marker in protocol.syntax_markers() {
+                    options
+                        .preserved_tokens
+                        .extend(tokenizer.encode_with_options(marker, Default::default())?);
+                }
+            }
+            // Realtime publishes canonical streaming decoder text. Token-local
+            // byte approximations cannot model contextual whitespace or prove
+            // completion, so text grammars use the shared logical cursor.
+            let text = |grammar: &crate::config::TextGrammar, prefix: &str| {
+                crate::response_constraint::ContentConstraint::text(
+                    tokenizer,
+                    grammar,
+                    crate::text_projection::ProjectionKind::Plain,
+                    prefix,
+                    options.max_constraint_bytes,
+                    endings.clone(),
+                    &options.effective_preserved_tokens(),
+                )
+            };
+            let json = |schema: &serde_json::Value, prefix: &str| {
+                crate::response_constraint::ContentConstraint::json_schema(
+                    tokenizer,
+                    schema,
+                    crate::text_projection::ProjectionKind::Plain,
+                    prefix,
+                    options.max_constraint_bytes,
+                    endings.clone(),
+                    &options.effective_preserved_tokens(),
+                )
+            };
+            let logical = match options.constraint.as_ref() {
+                Some(crate::GenerateConstraint::Regex { pattern, prefix }) => Some(text(
+                    &crate::config::TextGrammar::Regex(pattern.clone()),
+                    prefix,
+                )?),
+                Some(crate::GenerateConstraint::Lark { grammar, prefix }) => Some(text(
+                    &crate::config::TextGrammar::Lark(grammar.clone()),
+                    prefix,
+                )?),
+                Some(crate::GenerateConstraint::Json { prefix }) => {
+                    Some(json(&serde_json::Value::Bool(true), prefix)?)
+                }
+                Some(crate::GenerateConstraint::JsonSchema { schema, prefix }) => Some(json(
+                    &serde_json::from_str(schema)
+                        .context("parse realtime JSON Schema constraint")?,
+                    prefix,
+                )?),
+                _ => None,
+            }
+            .map(Box::new);
+            let constraint = if let Some(constraint) = logical {
+                RealtimeConstraint::Logical(constraint)
+            } else {
+                ensure!(
+                    !endings.is_empty(),
+                    "raw realtime grammar requires package tokenizer EOS IDs to prove token grammar completion"
+                );
+                RealtimeConstraint::Raw(crate::processors::build_processor_chain(
+                    &options,
+                    Some(tokenizer),
+                    false,
+                )?)
+            };
+            let grammar = RealtimeGrammar {
+                constraint,
+                context: Default::default(),
+                vocabulary: usize::try_from(
+                    tokenizer
+                        .inner()
+                        .get_vocab(true)
+                        .values()
+                        .copied()
+                        .max()
+                        .context("realtime constraint tokenizer vocabulary is empty")?,
+                )?
+                .checked_add(1)
+                .context("realtime tokenizer ID span exceeds address space")?,
+                endings,
+                text_ended: false,
+            };
+            ensure!(
+                grammar.mask()?.iter().any(|allowed| *allowed),
+                "realtime constraint admits no tokenizer tokens; repair the grammar or vocabulary"
+            );
+            Some(grammar)
+        } else {
+            None
+        };
+        self.grammar = grammar;
+        Ok(())
+    }
+
     pub fn contract(&self) -> &RealtimeContract {
         &self.contract
     }
@@ -149,6 +330,7 @@ impl RealtimeSession<'_> {
             self.contract.profile()
         );
         self.health = SessionHealth::RequiresReset;
+        self.grammar = None;
         self.engine
             .reset_session(self.id)
             .context("resetting native realtime conditioning state")?;
@@ -179,9 +361,22 @@ impl RealtimeSession<'_> {
             self.health == SessionHealth::Ready,
             "realtime session requires native reset after a failed quantum; configure a fresh conditioning context or close the session before submitting more input"
         );
+        let mask = self
+            .grammar
+            .as_ref()
+            .map(RealtimeGrammar::mask)
+            .transpose()?;
         let inputs = &self.contract.spec().inputs;
+        let budget = if mask.is_some() {
+            match budget {
+                RealtimeTokenBudget::Unlimited => RealtimeTokenBudget::Remaining(1),
+                RealtimeTokenBudget::Remaining(n) => RealtimeTokenBudget::Remaining(n.min(1)),
+            }
+        } else {
+            budget
+        };
         let budget_wire = budget.wire()?;
-        let request = PipelineGenerateRequest::new(GenerateRequest {
+        let mut request = PipelineGenerateRequest::new(GenerateRequest {
             prompt: GeneratePrompt::TokenIds(Vec::new()),
             // This is a bounded workflow quantum, never an ordinary generation
             // loop. Its authored control flow decides what one invocation does.
@@ -211,6 +406,17 @@ impl RealtimeSession<'_> {
                 &[i64::try_from(tokens.len())?],
             )?,
         );
+        if let Some(endpoint) = &inputs.token_mask {
+            let mask = mask.as_deref().unwrap_or(&[]);
+            request = request.with_input(
+                endpoint,
+                Value::from_raw_bytes(
+                    mask.iter().map(|allowed| u8::from(*allowed)).collect(),
+                    &[i64::try_from(mask.len())?],
+                    onnx_genai_ort::DataType::Bool,
+                )?,
+            );
+        }
         let execution = self.engine.run_pipeline_outputs(request).with_context(|| {
             format!(
                 "realtime profile '{}' failed {operation:?} quantum",
@@ -248,7 +454,27 @@ impl RealtimeSession<'_> {
                 "realtime tokens must be a vector; got {:?}",
                 token_value.shape()
             );
-            let tokens = token_value.to_vec_i64()?.into_iter().map(|token| u32::try_from(token).with_context(|| format!("realtime workflow emitted invalid token ID {token}; emit representable tokenizer IDs"))).collect::<anyhow::Result<_>>()?;
+            let tokens: Vec<u32> = token_value.to_vec_i64()?.into_iter().map(|token| u32::try_from(token).with_context(|| format!("realtime workflow emitted invalid token ID {token}; emit representable tokenizer IDs"))).collect::<anyhow::Result<_>>()?;
+            if let Some(mask) = &mask {
+                if let RealtimeTokenBudget::Remaining(remaining) = budget {
+                    ensure!(
+                        u64::try_from(tokens.len())? <= remaining,
+                        "realtime constrained quantum emitted {} text tokens with only {remaining} remaining; obey output_token_budget even when reporting output usage",
+                        tokens.len()
+                    );
+                }
+                ensure!(
+                    tokens.len() <= 1,
+                    "realtime constrained quantum emitted {} tokens; emit at most one text token after consuming token_mask",
+                    tokens.len()
+                );
+                for token in &tokens {
+                    ensure!(
+                        mask.get(*token as usize) == Some(&true),
+                        "realtime workflow emitted token {token} forbidden by token_mask; apply the mask before native sampling"
+                    );
+                }
+            }
             let audio = if self.contract.output("audio").is_some() {
                 let audio = value("audio")?;
                 ensure!(
@@ -285,15 +511,33 @@ impl RealtimeSession<'_> {
                     "realtime {operation:?} quantum emitted {output_tokens} output tokens with only {remaining} tokens remaining; repair the workflow to obey its explicit output_token_budget input"
                 );
             }
+            let done = done.to_vec_bool()?[0];
+            if let Some(grammar) = self.grammar.as_mut() {
+                grammar.context.generated_tokens.extend_from_slice(&tokens);
+                grammar.context.step = grammar.context.generated_tokens.len();
+                grammar.text_ended |= tokens
+                    .last()
+                    .is_some_and(|token| grammar.endings.contains(token));
+                if done && operation != RealtimeOperation::Cancel && !grammar.text_ended {
+                    let complete = grammar.can_finish()?;
+                    ensure!(
+                        complete,
+                        "realtime workflow completed before its constrained grammar accepted an ending; continue sampling or cancel explicitly"
+                    );
+                }
+            }
             Ok(RealtimeOutput {
                 tokens,
                 audio,
-                done: done.to_vec_bool()?[0],
+                done,
                 needs_input,
                 prompt_tokens: count("prompt_tokens")?,
                 output_tokens,
             })
         })();
+        if result.as_ref().is_ok_and(|output| output.done) {
+            self.grammar = None;
+        }
         if result.is_err() {
             self.health = SessionHealth::RequiresReset;
         }
@@ -312,6 +556,342 @@ impl Drop for RealtimeSession<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_realtime_rejects_ignored_masks_and_premature_completion_until_reset()
+    -> anyhow::Result<()> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/realtime-constrained");
+        for (ignored, pattern, diagnostic) in [
+            (true, "hello", "forbidden by token_mask"),
+            (
+                false,
+                "hello world",
+                "completed before its constrained grammar",
+            ),
+        ] {
+            let package = tempfile::tempdir()?;
+            for file in ["tokenizer.json", "inference_metadata.yaml"] {
+                std::fs::copy(root.join(file), package.path().join(file))?;
+            }
+            let mut graph = std::fs::read_to_string(root.join("model.onnx.textproto"))?;
+            if ignored {
+                graph = graph.replace(
+                    "input: \"effective_mask\" input: \"ranked_logits\"",
+                    "input: \"all_allowed\" input: \"ranked_logits\"",
+                );
+            }
+            std::fs::write(package.path().join("model.onnx.textproto"), graph)?;
+            let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+            let (mut session, _) = engine.open_realtime_session(
+                RealtimeMode::Realtime,
+                &[],
+                crate::GenerationControl::new(),
+            )?;
+            session.set_constraint(Some(crate::GenerateConstraint::Regex {
+                pattern: pattern.into(),
+                prefix: String::new(),
+            }))?;
+            let failure = session
+                .step(
+                    RealtimeInput::Generate(&[7]),
+                    RealtimeTokenBudget::Unlimited,
+                    crate::GenerationControl::new(),
+                )
+                .unwrap_err();
+            assert!(format!("{failure:#}").contains(diagnostic), "{failure:#}");
+            let poisoned = session
+                .step(
+                    RealtimeInput::Poll,
+                    RealtimeTokenBudget::Unlimited,
+                    crate::GenerationControl::new(),
+                )
+                .unwrap_err();
+            assert!(poisoned.to_string().contains("requires native reset"));
+            session.configure(RealtimeMode::Realtime, &[], crate::GenerationControl::new())?;
+            let recovered = session.step(
+                RealtimeInput::Generate(&[7]),
+                RealtimeTokenBudget::Unlimited,
+                crate::GenerationControl::new(),
+            )?;
+            assert_eq!(recovered.tokens, [31]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_realtime_advances_grammar_across_poll_quanta_and_admits_eos_only_at_completion()
+    -> anyhow::Result<()> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/realtime-constrained");
+        let package = tempfile::tempdir()?;
+        for file in ["tokenizer.json", "inference_metadata.yaml"] {
+            std::fs::copy(root.join(file), package.path().join(file))?;
+        }
+        let graph = std::fs::read_to_string(root.join("model.onnx.textproto"))?
+            .replace("node { input: \"generating\" input: \"asr\"", "initializer { name: \"polling_op\" data_type: 7 int64_data: 7 }\nnode { input: \"operation\" input: \"polling_op\" output: \"polling\" op_type: \"Equal\" }\nnode { input: \"generating\" input: \"polling\" output: \"decoding\" op_type: \"Or\" }\nnode { input: \"decoding\" input: \"asr\"")
+            .replace("node { input: \"generating\" output: \"candidate_tokens\"", "node { input: \"decoding\" output: \"candidate_tokens\"")
+            .replace("node { input: \"responding\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }", "node { input: \"tokens_out\" output: \"emitted_id\" op_type: \"ReduceSum\" attribute { name: \"keepdims\" i: 0 type: INT } }\nnode { input: \"emitted_id\" input: \"three\" output: \"ending\" op_type: \"Equal\" }\nnode { input: \"ending\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }");
+        std::fs::write(package.path().join("model.onnx.textproto"), graph)?;
+        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+        let (mut session, _) = engine.open_realtime_session(
+            RealtimeMode::Realtime,
+            &[],
+            crate::GenerationControl::new(),
+        )?;
+        session.set_constraint(Some(crate::GenerateConstraint::Regex {
+            pattern: "hello world".into(),
+            prefix: String::new(),
+        }))?;
+        for (input, expected, done) in [
+            (RealtimeInput::Generate(&[]), 4, false),
+            (RealtimeInput::Poll, 5, false),
+            (RealtimeInput::Poll, 3, true),
+        ] {
+            let output = session.step(
+                input,
+                RealtimeTokenBudget::Unlimited,
+                crate::GenerationControl::new(),
+            )?;
+            assert_eq!(output.tokens, [expected]);
+            assert_eq!(output.done, done);
+            assert!(!output.needs_input);
+        }
+        assert!(session.grammar.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn native_realtime_zero_budget_cannot_be_bypassed_by_underreported_usage() -> anyhow::Result<()>
+    {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/realtime-constrained");
+        let package = tempfile::tempdir()?;
+        for file in ["tokenizer.json", "inference_metadata.yaml"] {
+            std::fs::copy(root.join(file), package.path().join(file))?;
+        }
+        let graph = std::fs::read_to_string(root.join("model.onnx.textproto"))?
+            .replace(
+                "input: \"responding\" input: \"output_token_budget\"",
+                "input: \"responding\" input: \"unlimited\"",
+            )
+            .replace(
+                "node { input: \"tokens_out\" output: \"count\" op_type: \"Size\" }",
+                "node { input: \"zero\" output: \"count\" op_type: \"Identity\" }",
+            );
+        std::fs::write(package.path().join("model.onnx.textproto"), graph)?;
+        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+        let (mut session, _) = engine.open_realtime_session(
+            RealtimeMode::Realtime,
+            &[],
+            crate::GenerationControl::new(),
+        )?;
+        session.set_constraint(Some(crate::GenerateConstraint::Regex {
+            pattern: "hello".into(),
+            prefix: String::new(),
+        }))?;
+        let failure = session
+            .step(
+                RealtimeInput::Generate(&[]),
+                RealtimeTokenBudget::Remaining(0),
+                crate::GenerationControl::new(),
+            )
+            .unwrap_err();
+        assert!(
+            failure.to_string().contains("only 0 remaining"),
+            "{failure:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_realtime_keeps_codec_tail_after_text_eos() -> anyhow::Result<()> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/realtime-constrained");
+        let package = tempfile::tempdir()?;
+        for file in ["tokenizer.json", "inference_metadata.yaml"] {
+            std::fs::copy(root.join(file), package.path().join(file))?;
+        }
+        let graph = std::fs::read_to_string(root.join("model.onnx.textproto"))?
+            .replace("node { input: \"generating\" input: \"asr\"", "initializer { name: \"polling_op\" data_type: 7 int64_data: 7 }\nnode { input: \"operation\" input: \"polling_op\" output: \"polling\" op_type: \"Equal\" }\nnode { input: \"generating\" input: \"polling\" output: \"decoding\" op_type: \"Or\" }\nnode { input: \"decoding\" input: \"asr\"")
+            .replace("node { input: \"generating\" output: \"candidate_tokens\"", "node { input: \"sampling\" output: \"candidate_tokens\"")
+            .replace("node { input: \"responding\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }", r#"node { input: "token_mask" output: "allowed_bits" op_type: "Cast" attribute { name: "to" i: 7 type: INT } }
+node { input: "allowed_bits" output: "allowed_count" op_type: "ReduceSum" attribute { name: "keepdims" i: 0 type: INT } }
+node { input: "allowed_count" input: "zero" output: "no_allowed" op_type: "Equal" }
+node { input: "has_mask" input: "no_allowed" output: "text_finished" op_type: "And" }
+node { input: "text_finished" output: "text_active" op_type: "Not" }
+node { input: "decoding" input: "text_active" output: "sampling" op_type: "And" }
+node { input: "text_finished" input: "cancelling" output: "done" op_type: "Or" }
+initializer { name: "tail" data_type: 1 dims: 1 float_data: 0.25 }
+node { input: "text_finished" output: "audio_out" op_type: "If"
+attribute { name: "then_branch" type: GRAPH g { name: "codec_tail" node { input: "tail" output: "result" op_type: "Identity" } output { name: "result" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } } } } } } }
+attribute { name: "else_branch" type: GRAPH g { name: "live_audio" node { input: "raw_audio" output: "result" op_type: "Identity" } output { name: "result" type { tensor_type { elem_type: 1 shape { dim { dim_param: "samples" } } } } } } }
+}"#)
+            .replace("output: \"audio_out\" op_type: \"Add\"", "output: \"raw_audio\" op_type: \"Add\"");
+        std::fs::write(package.path().join("model.onnx.textproto"), graph)?;
+        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+        let (mut session, _) = engine.open_realtime_session(
+            RealtimeMode::Realtime,
+            &[],
+            crate::GenerationControl::new(),
+        )?;
+        session.set_constraint(Some(crate::GenerateConstraint::Regex {
+            pattern: "hello".into(),
+            prefix: String::new(),
+        }))?;
+        for (input, expected) in [(RealtimeInput::Generate(&[]), 4), (RealtimeInput::Poll, 3)] {
+            let output = session.step(
+                input,
+                RealtimeTokenBudget::Unlimited,
+                crate::GenerationControl::new(),
+            )?;
+            assert_eq!(output.tokens, [expected]);
+            assert!(!output.done);
+            assert!(!output.needs_input);
+        }
+        let tail = session.step(
+            RealtimeInput::Poll,
+            RealtimeTokenBudget::Unlimited,
+            crate::GenerationControl::new(),
+        )?;
+        assert!(tail.tokens.is_empty());
+        assert_eq!(tail.audio, [0.25]);
+        assert!(tail.done);
+        assert!(session.grammar.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn native_realtime_logical_completion_does_not_require_an_eos_role() -> anyhow::Result<()> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/realtime-constrained");
+        let package = tempfile::tempdir()?;
+        for file in ["tokenizer.json", "model.onnx.textproto"] {
+            std::fs::copy(root.join(file), package.path().join(file))?;
+        }
+        let metadata = std::fs::read_to_string(root.join("inference_metadata.yaml"))?
+            .replace("eos_token_id: [3]", "eos_token_id: []");
+        std::fs::write(package.path().join("inference_metadata.yaml"), metadata)?;
+        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+        let (mut session, _) = engine.open_realtime_session(
+            RealtimeMode::Realtime,
+            &[],
+            crate::GenerationControl::new(),
+        )?;
+        assert!(session.contract.ending_tokens().is_empty());
+        session.set_constraint(Some(crate::GenerateConstraint::Regex {
+            pattern: "hello".into(),
+            prefix: String::new(),
+        }))?;
+        let output = session.step(
+            RealtimeInput::Generate(&[]),
+            RealtimeTokenBudget::Unlimited,
+            crate::GenerationControl::new(),
+        )?;
+        assert_eq!(output.tokens, [4]);
+        assert!(output.done);
+        Ok(())
+    }
+
+    #[test]
+    fn native_realtime_masks_follow_actual_token_id_span_with_vocabulary_holes()
+    -> anyhow::Result<()> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/realtime-constrained");
+        let package = tempfile::tempdir()?;
+        let mut tokenizer: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("tokenizer.json"))?)?;
+        tokenizer["model"]["vocab"]["tok31"] = serde_json::json!(40);
+        std::fs::write(
+            package.path().join("tokenizer.json"),
+            serde_json::to_vec(&tokenizer)?,
+        )?;
+        std::fs::write(
+            package.path().join("inference_metadata.yaml"),
+            std::fs::read_to_string(root.join("inference_metadata.yaml"))?
+                .replace("vocab_size: 32", "vocab_size: 41"),
+        )?;
+        let graph = std::fs::read_to_string(root.join("model.onnx.textproto"))?
+            .lines()
+            .map(|line| {
+                if line.starts_with("initializer { name: \"ranked_logits\"") {
+                    format!(
+                        "initializer {{ name: \"ranked_logits\" data_type: 1 dims: 41 {} }}",
+                        (0..41)
+                            .map(|i| format!("float_data: {i}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )
+                } else if line.starts_with("initializer { name: \"all_allowed\"") {
+                    format!(
+                        "initializer {{ name: \"all_allowed\" data_type: 9 dims: 41 {} }}",
+                        std::iter::repeat_n("int32_data: 1", 41)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(package.path().join("model.onnx.textproto"), graph)?;
+        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default())?;
+        let (mut session, _) = engine.open_realtime_session(
+            RealtimeMode::Realtime,
+            &[],
+            crate::GenerationControl::new(),
+        )?;
+        session.set_constraint(Some(crate::GenerateConstraint::Regex {
+            pattern: "tok31".into(),
+            prefix: String::new(),
+        }))?;
+        let output = session.step(
+            RealtimeInput::Generate(&[]),
+            RealtimeTokenBudget::Unlimited,
+            crate::GenerationControl::new(),
+        )?;
+        assert_eq!(output.tokens, [40]);
+        assert!(output.done);
+        Ok(())
+    }
+
+    #[test]
+    fn native_realtime_applies_response_grammar_before_selecting_tokens() -> anyhow::Result<()> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/realtime-constrained");
+        let mut engine = Engine::from_dir(&root, crate::EngineConfig::default())?;
+        let (mut session, _) = engine.open_realtime_session(
+            RealtimeMode::Realtime,
+            &[],
+            crate::GenerationControl::new(),
+        )?;
+        let baseline = session.step(
+            RealtimeInput::Generate(&[7]),
+            RealtimeTokenBudget::Unlimited,
+            crate::GenerationControl::new(),
+        )?;
+        assert_eq!(baseline.tokens, [31]);
+        for (pattern, expected) in [("hello", 4), ("world", 5)] {
+            session.set_constraint(Some(crate::GenerateConstraint::Regex {
+                pattern: pattern.into(),
+                prefix: String::new(),
+            }))?;
+            let output = session.step(
+                RealtimeInput::Generate(&[7]),
+                RealtimeTokenBudget::Unlimited,
+                crate::GenerationControl::new(),
+            )?;
+            assert_eq!(output.tokens, [expected]);
+            assert!(output.done);
+            assert_eq!(output.output_tokens, 1);
+            assert!(
+                session.grammar.is_none(),
+                "completed response releases its grammar"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn native_realtime_quanta_keep_state_and_drop_closes_the_session() -> anyhow::Result<()> {
