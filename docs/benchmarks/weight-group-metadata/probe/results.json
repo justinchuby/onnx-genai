@@ -1,0 +1,123 @@
+{
+  "scope": "native debug private WeightCache warm hit allocation/free calls; no timing or whole-kernel allocation claim",
+  "baseline": "d42eb1d4aef7cf56148bc87ad91b3571b33060df",
+  "candidate_source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/lib.rs": "3334ef4926b6f21292d9dcbb48edce28602b73d74732057adc4ac9e02fcb4530",
+    "crates/onnx-runtime-ep-cpu/src/kernels/weight_cache.rs": "25f0f0b1b45958ef481a341fbf4075fd3415a33e1226d0c131b74cb5125f561b",
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs": "24e9dd9c62e12c80c271f0b3ec47b26bcc09913c2874d0d82333d0df20d8e68a"
+  },
+  "results": [
+    {
+      "arm": "baseline",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::weight_cache::allocation_probe::warm_group_heap_calls",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "counts": [
+        {
+          "members": 0,
+          "iterations": 2048,
+          "allocations": 0,
+          "frees": 0
+        },
+        {
+          "members": 1,
+          "iterations": 2048,
+          "allocations": 4096,
+          "frees": 4096
+        },
+        {
+          "members": 2,
+          "iterations": 2048,
+          "allocations": 4096,
+          "frees": 4096
+        },
+        {
+          "members": 3,
+          "iterations": 2048,
+          "allocations": 4096,
+          "frees": 4096
+        },
+        {
+          "members": 4,
+          "iterations": 2048,
+          "allocations": 4096,
+          "frees": 4096
+        },
+        {
+          "members": 8,
+          "iterations": 2048,
+          "allocations": 4096,
+          "frees": 4096
+        }
+      ],
+      "log_sha256": "43ee59841b979d5b1772c255132b0f0e1eb9eebad84feadc40253559302bcaa7",
+      "exit": 0
+    },
+    {
+      "arm": "candidate",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::weight_cache::allocation_probe::warm_group_heap_calls",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "counts": [
+        {
+          "members": 0,
+          "iterations": 2048,
+          "allocations": 0,
+          "frees": 0
+        },
+        {
+          "members": 1,
+          "iterations": 2048,
+          "allocations": 0,
+          "frees": 0
+        },
+        {
+          "members": 2,
+          "iterations": 2048,
+          "allocations": 0,
+          "frees": 0
+        },
+        {
+          "members": 3,
+          "iterations": 2048,
+          "allocations": 0,
+          "frees": 0
+        },
+        {
+          "members": 4,
+          "iterations": 2048,
+          "allocations": 4096,
+          "frees": 4096
+        },
+        {
+          "members": 8,
+          "iterations": 2048,
+          "allocations": 4096,
+          "frees": 4096
+        }
+      ],
+      "log_sha256": "8c9262a09c98abf66e9c9268efe7c81fb1fbbfd14e4e3fb4d80d9c8b2befc464",
+      "exit": 0
+    }
+  ],
+  "production_restored": true,
+  "baseline_reused_from": "initial immutable probe; identical allocator/probe code, no rerun"
+}

@@ -428,10 +428,17 @@ fn hex(bytes: &[u8]) -> String {
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    pub api_keys: crate::ApiKeys,
     /// Node-level identifier reported by `GET /v1/status` for the cluster router
     /// (§34.8). Independent of any model; defaults to the hostname or a generated id.
     pub node_id: String,
     pub max_output_tokens: usize,
+    pub max_transcription_input_tokens: std::num::NonZeroUsize,
+    pub max_transcription_prompt_bytes: std::num::NonZeroUsize,
+    pub max_transcription_template_operations: std::num::NonZeroU64,
+    pub max_transcription_frames: std::num::NonZeroUsize,
+    pub max_transcription_text_bytes: std::num::NonZeroUsize,
+    pub realtime: crate::realtime::RealtimeLimits,
     /// Enable the upstream POST /props acknowledgement; no mutation schema exists upstream.
     pub endpoint_props: bool,
     /// Enable owned Hub package downloads and deletion in this directory.
@@ -447,6 +454,10 @@ pub struct ServerConfig {
     pub max_rerank_input_tokens: std::num::NonZeroUsize,
     /// Maximum document count in one scoring request.
     pub max_rerank_documents: std::num::NonZeroUsize,
+    /// Unique encoded image bytes retained by one reranking request.
+    pub max_rerank_media_bytes: std::num::NonZeroUsize,
+    /// Unique encoded image bytes retained by one SystemOne request.
+    pub max_decision_media_bytes: std::num::NonZeroUsize,
     /// Maximum tokens per decision prompt variant.
     pub max_decision_input_tokens: std::num::NonZeroUsize,
     /// Maximum rendered prompt bytes before decision tokenization.
@@ -510,8 +521,10 @@ impl Default for ServerConfig {
     fn default() -> Self {
         let decision = onnx_genai_engine::decision::DecisionLimits::default();
         Self {
+            api_keys: crate::ApiKeys::default(),
             node_id: default_node_id(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            realtime: crate::realtime::RealtimeLimits::default(),
             endpoint_props: false,
             model_cache_dir: None,
             model_cache_max_bytes: std::num::NonZeroU64::new(64 * 1024 * 1024 * 1024).unwrap(),
@@ -524,6 +537,23 @@ impl Default for ServerConfig {
                 .expect("positive default reranking token budget"),
             max_rerank_documents: std::num::NonZeroUsize::new(128)
                 .expect("positive default reranking document budget"),
+            max_rerank_media_bytes: std::num::NonZeroUsize::new(64 * 1024 * 1024).unwrap(),
+            max_decision_media_bytes: std::num::NonZeroUsize::new(64 * 1024 * 1024).unwrap(),
+            max_transcription_input_tokens:
+                onnx_genai_engine::transcription::generative::PromptLimits::default()
+                    .max_input_tokens,
+            max_transcription_prompt_bytes:
+                onnx_genai_engine::transcription::generative::PromptLimits::default()
+                    .template
+                    .max_output_bytes,
+            max_transcription_template_operations:
+                onnx_genai_engine::transcription::generative::PromptLimits::default()
+                    .template
+                    .max_operations,
+            max_transcription_frames:
+                onnx_genai_engine::transcription::TranscriptionLimits::default().max_frames,
+            max_transcription_text_bytes:
+                onnx_genai_engine::transcription::TranscriptionLimits::default().max_text_bytes,
             max_decision_input_tokens: decision.max_input_tokens,
             max_decision_prompt_bytes: decision.template.max_output_bytes,
             max_decision_template_operations: decision.template.max_operations,
@@ -585,6 +615,11 @@ impl ServerConfig {
         );
         if self.node_id.trim().is_empty() {
             anyhow::bail!("node_id must not be empty");
+        }
+        if self.realtime.source_bytes.get() < 2 || self.realtime.write_timeout.is_zero() {
+            anyhow::bail!(
+                "realtime limits require source_bytes >= 2 and a positive write_timeout; allow at least one PCM16 sample and a bounded websocket writer"
+            );
         }
         if self.max_output_tokens == 0 {
             anyhow::bail!("max_output_tokens must be greater than zero");

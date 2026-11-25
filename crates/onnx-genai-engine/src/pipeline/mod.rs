@@ -45,7 +45,9 @@ mod workflow;
 
 pub use adapters::{AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection};
 pub use arg_reduce::{ArgReduceRewrites, WideArgReduceLowering, lower_degenerate_arg_reductions};
-pub use audio::{EncodedAudio, encode_pcm16_wav, resample_planar};
+pub use audio::{
+    AudioOutputFormat, EncodedAudio, StreamingResampler, encode_pcm16_wav, resample_planar,
+};
 pub use batching::{
     BatchContractError, ComposedOwnership, OwnershipLevelValues, PackedOwnership,
     PackedRequestView, PackedTensor, PackedValueView, RebasedI64Slice, batch_contract_error,
@@ -135,6 +137,17 @@ pub struct GenerationCancelled {
     pub boundary: GenerationBoundary,
 }
 
+/// Observed prompt evaluation, independent of token/state publication.
+/// `processed` includes cached tokens, matching llama.cpp. A notification may
+/// precede a later transaction failure and never proves semantic commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptProgress {
+    pub total: usize,
+    pub cache: usize,
+    pub processed: usize,
+    pub elapsed: std::time::Duration,
+}
+
 /// Request-scoped cancellation and deterministic transaction checkpoints.
 ///
 /// `cancel` races with `begin_commit` through one atomic state transition. If
@@ -144,6 +157,8 @@ pub struct GenerationCancelled {
 #[derive(Clone)]
 pub struct GenerationControl {
     state: Arc<AtomicU8>,
+    prompt_progress:
+        Option<Arc<dyn Fn(PromptProgress) -> anyhow::Result<()> + Send + Sync + 'static>>,
     cancellation_probe: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     checkpoint:
         Option<Arc<dyn Fn(GenerationBoundary) -> anyhow::Result<()> + Send + Sync + 'static>>,
@@ -156,6 +171,7 @@ impl std::fmt::Debug for GenerationControl {
             .field("state", &self.state.load(Ordering::Acquire))
             .field("has_cancellation_probe", &self.cancellation_probe.is_some())
             .field("has_checkpoint", &self.checkpoint.is_some())
+            .field("has_prompt_progress", &self.prompt_progress.is_some())
             .finish()
     }
 }
@@ -164,6 +180,7 @@ impl Default for GenerationControl {
     fn default() -> Self {
         Self {
             state: Arc::new(AtomicU8::new(GENERATION_ACTIVE)),
+            prompt_progress: None,
             cancellation_probe: None,
             checkpoint: None,
         }
@@ -195,6 +212,25 @@ impl GenerationControl {
     ) -> Self {
         self.checkpoint = Some(Arc::new(checkpoint));
         self
+    }
+
+    /// Observe actual prompt-forward boundaries. This reports provisional work,
+    /// not committed output. An observer failure aborts through the same decoder
+    /// transaction and rollback path as any execution failure.
+    pub fn with_prompt_progress(
+        mut self,
+        observer: impl Fn(PromptProgress) -> anyhow::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.prompt_progress = Some(Arc::new(observer));
+        self
+    }
+
+    pub(crate) fn report_prompt_progress(&self, progress: PromptProgress) -> anyhow::Result<()> {
+        if let Some(observer) = &self.prompt_progress {
+            observer(progress)
+                .context("prompt-progress observer could not accept the execution update")?;
+        }
+        Ok(())
     }
 
     /// Request cancellation. Returns true only when cancellation wins the

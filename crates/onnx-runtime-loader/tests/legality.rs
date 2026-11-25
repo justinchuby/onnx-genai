@@ -223,6 +223,53 @@ fn constant_fp8_tensor_checks_original_opsets_before_inlining() {
 }
 
 #[test]
+fn load_topk_checks_bfloat16_opset_after_inference() {
+    use onnx_runtime_ir::DataType;
+    for (opset, dtype, accepted) in [
+        (10, DataType::BFloat16, false),
+        (23, DataType::BFloat16, false),
+        (24, DataType::BFloat16, true),
+        (10, DataType::Float32, true),
+    ] {
+        let mut m = model(onnx::GraphProto {
+            node: vec![
+                node("Identity", &["source"], &["X"]),
+                node("TopK", &["X", "K"], &["Y", "I"]),
+            ],
+            initializer: vec![
+                onnx::TensorProto {
+                    name: "source".into(),
+                    dims: vec![2],
+                    data_type: dtype.to_onnx(),
+                    raw_data: vec![0; dtype.storage_bytes(2)],
+                    ..Default::default()
+                },
+                onnx::TensorProto {
+                    name: "K".into(),
+                    dims: vec![1],
+                    data_type: DataType::Int64.to_onnx(),
+                    int64_data: vec![1],
+                    ..Default::default()
+                },
+            ],
+            output: vec![value_info("Y"), value_info("I")],
+            ..Default::default()
+        });
+        m.opset_import[0].version = opset;
+        let loaded = onnx_runtime_loader::load_model_bytes(&m.encode_to_vec());
+        if accepted {
+            assert!(
+                loaded.is_ok(),
+                "opset={opset}, {dtype:?}: {:?}",
+                loaded.err()
+            );
+        } else {
+            assert!(matches!(loaded, Err(LoaderError::InvalidTopK { .. })));
+        }
+    }
+}
+
+#[test]
 fn duplicate_value_producer_is_rejected_and_unique_values_load() {
     let duplicate = onnx::GraphProto {
         input: vec![value_info("X")],

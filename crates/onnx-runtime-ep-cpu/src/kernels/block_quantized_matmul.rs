@@ -211,7 +211,7 @@ pub struct BlockQuantizedMatMulKernel {
     format: BlockFormat,
     packed_b_constant: bool,
     weight_identity: DenseWeightIdentity,
-    projection_plan: super::decoded_projection::DecodedProjectionPlan,
+    prepared_projection: std::cell::Cell<Option<super::decoded_projection::DecodedProjectionPlan>>,
     weight_cache: WeightCache<DenseWeightCacheKey>,
 }
 
@@ -258,7 +258,7 @@ impl KernelFactory for BlockQuantizedMatMulFactory {
             format,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            projection_plan: projection_plan(),
+            prepared_projection: std::cell::Cell::new(None),
             weight_cache: WeightCache::new(
                 self.memory.clone(),
                 if node
@@ -285,19 +285,33 @@ impl Kernel for BlockQuantizedMatMulKernel {
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
     ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
-        let Some(a) = inputs.first().filter(|a| a.present) else {
-            return Err(error(
-                "workspace planning needs present activation A metadata; provide the activation shape",
-            ));
+        self.plan_workspace(inputs)
+            .map(|(_, requirement)| onnx_runtime_ep_api::WorkspacePreparation::Ready(requirement))
+    }
+
+    fn workspace_requirement_for_execution(
+        &self,
+        _inputs: &[TensorView],
+        _outputs: &[TensorMut],
+        metadata: &[TensorMetadata<'_>],
+        _output_metadata: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+        cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
+    ) -> Result<onnx_runtime_ep_api::WorkspaceExecutionPreparation> {
+        // Exclusive kernel ownership spans refinement, admission and launch.
+        // A rejected preparation must never revive an earlier execution plan.
+        self.prepared_projection.set(None);
+        // The caller already matched this kernel, tensor metadata and provider
+        // context. A Ready hit needs a new execution plan, not another metadata
+        // query. Deferred/uncached requests still take the checked planner.
+        let (plan, requirement) = match cached {
+            Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(requirement)) => {
+                (projection_plan(), requirement)
+            }
+            _ => self.plan_workspace(metadata)?,
         };
-        let rows = self.projection_rows(a.shape)?;
-        let layout = self.projection_plan.layout(rows, self.k, self.n)?;
-        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
-            WorkspaceRequirement {
-                bytes: layout.bytes() as u64,
-                alignment: layout.alignment(),
-                ..WorkspaceRequirement::NONE
-            },
+        self.prepared_projection.set(Some(plan));
+        Ok(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready(
+            requirement,
         ))
     }
 
@@ -335,6 +349,33 @@ fn require_compute_dtype(name: &str, got: DataType) -> Result<()> {
 }
 
 impl BlockQuantizedMatMulKernel {
+    fn plan_workspace(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+    ) -> Result<(
+        super::decoded_projection::DecodedProjectionPlan,
+        WorkspaceRequirement,
+    )> {
+        #[cfg(test)]
+        WORKSPACE_METADATA_QUERIES.with(|queries| queries.set(queries.get() + 1));
+        let Some(a) = inputs.first().filter(|a| a.present) else {
+            return Err(error(
+                "workspace planning needs present activation A metadata; provide the activation shape",
+            ));
+        };
+        let rows = self.projection_rows(a.shape)?;
+        let plan = projection_plan();
+        let layout = plan.layout(rows, self.k, self.n)?;
+        Ok((
+            plan,
+            WorkspaceRequirement {
+                bytes: layout.bytes() as u64,
+                alignment: layout.alignment(),
+                ..WorkspaceRequirement::NONE
+            },
+        ))
+    }
+
     fn projection_rows(&self, shape: &[usize]) -> Result<usize> {
         if shape.last() != Some(&self.k) {
             return Err(error(format!(
@@ -360,6 +401,7 @@ impl BlockQuantizedMatMulKernel {
         outputs: &mut [TensorMut],
         workspace: Option<WorkspaceView>,
     ) -> Result<()> {
+        let projection_plan = self.prepared_projection.take();
         check_arity(OP, inputs, outputs, 2, 3, 1)?;
         require_compute_dtype("A", inputs[0].dtype)?;
         require_dtype("packed_B", inputs[1].dtype, DataType::Uint8)?;
@@ -404,6 +446,9 @@ impl BlockQuantizedMatMulKernel {
 
         let activations = to_dense_f32_widen(OP, &inputs[0])?;
         let m = self.projection_rows(a_shape)?;
+        let plan = projection_plan.ok_or_else(|| error(
+            "execution plan is absent or consumed; call workspace_requirement_for_execution in the selected execution context before workspace admission and launch"
+        ))?;
         let dense_bytes = self
             .k
             .checked_mul(self.n)
@@ -477,7 +522,7 @@ impl BlockQuantizedMatMulKernel {
         };
         let Some(dense) = dense else {
             let packed = packed_tensor_bytes(&inputs[1])?;
-            let bytes = self.projection_plan.layout(m, self.k, self.n)?.bytes();
+            let bytes = plan.layout(m, self.k, self.n)?.bytes();
             // SAFETY: the executor lends valid exclusive Host storage for this
             // dispatch. The scratch owner and all views stay within this call.
             let mut scratch = unsafe {
@@ -500,8 +545,8 @@ impl BlockQuantizedMatMulKernel {
                 self.k,
                 self.n,
                 bias.as_deref(),
-                self.projection_plan,
-                scratch.initialized(),
+                plan,
+                &mut scratch,
                 &mut result,
             )?;
             return write_dense_f32_narrow(OP, &mut outputs[0], &result);
@@ -929,7 +974,7 @@ pub(super) fn linear_packed_prepared(
     out_features: usize,
     bias: Option<&[f32]>,
     plan: super::decoded_projection::DecodedProjectionPlan,
-    scratch: &mut [f32],
+    scratch: &mut ProjectionScratch<'_>,
     output: &mut [f32],
 ) -> Result<()> {
     if super::matmul::serial_projection_is_portable() {
@@ -1072,7 +1117,7 @@ fn linear_packed_prepared_tiled<const FEATURE_TILE: usize>(
     out_features: usize,
     bias: Option<&[f32]>,
     plan: super::decoded_projection::DecodedProjectionPlan,
-    scratch: &mut [f32],
+    scratch: &mut ProjectionScratch<'_>,
     output: &mut [f32],
 ) -> Result<()> {
     let packed_rows =
@@ -1768,6 +1813,13 @@ pub(super) fn packed_for_format(
     packed
 }
 
+// Test-only observation of actual metadata planning, scoped to the calling
+// thread so unrelated parallel tests cannot turn a warm-cache check into noise.
+#[cfg(test)]
+thread_local! {
+    static WORKSPACE_METADATA_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::weight_cache::{
@@ -1847,6 +1899,147 @@ mod tests {
     }
 
     #[test]
+    fn execution_refinement_selects_current_pool_and_consumes_plan() {
+        use std::num::NonZeroUsize;
+        const R: usize = 3;
+        const K: usize = 32;
+        const N: usize = 64;
+        let one = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let four = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let mut kernel = one.install(|| BlockQuantizedMatMulKernel {
+            k: K,
+            n: N,
+            format: BlockFormat::Mxfp4,
+            packed_b_constant: false,
+            weight_identity: DenseWeightIdentity::default(),
+            prepared_projection: std::cell::Cell::new(None),
+            weight_cache: WeightCache::with_limit(0),
+        });
+        let mut packed = Vec::new();
+        for _ in 0..N {
+            packed.push(127);
+            packed.extend([0x22; 16]);
+        }
+        let x = Owned::f32(&[R, K], &[1.; R * K]);
+        let w = Owned::u8(&[N, 1, 17], &packed);
+        let mut y = Owned::zeros_f32(&[R, N]);
+        for target in [&four, &one, &four] {
+            let width = target.current_num_threads();
+            let kernel = &mut kernel;
+            let (x, w, y) = (&x, &w, &mut y);
+            target.install(move || {
+                let inputs = [x.view(), w.view()];
+                let metadata = inputs
+                    .iter()
+                    .map(|v| TensorMetadata::new(v.dtype, v.shape, true))
+                    .collect::<Vec<_>>();
+                let cached = kernel.workspace_requirement(&metadata, &[]).unwrap();
+                let req = cached.require_ready().unwrap();
+                let tile = if super::super::matmul::serial_projection_is_portable() {
+                    4
+                } else {
+                    1
+                };
+                let expected = (R * N + width * tile * K) * 4;
+                assert_eq!(req.bytes, expected as u64);
+                let mut scratch = vec![f32::NAN; expected / 4 + 7];
+                scratch[expected / 4..].fill(83.);
+                let view = WorkspaceView::new(
+                    onnx_runtime_ep_api::DevicePtrMut(scratch.as_mut_ptr().cast()),
+                    expected,
+                );
+                for preparation in [
+                    Some(cached),
+                    Some(onnx_runtime_ep_api::WorkspacePreparation::Deferred),
+                    None,
+                ] {
+                    let queries_before = WORKSPACE_METADATA_QUERIES.with(std::cell::Cell::get);
+                    assert_eq!(
+                        kernel
+                            .workspace_requirement_for_execution(
+                                &inputs,
+                                &[y.view_mut()],
+                                &metadata,
+                                &[],
+                                preparation
+                            )
+                            .unwrap()
+                            .require_ready()
+                            .unwrap(),
+                        req
+                    );
+                    assert_eq!(
+                        WORKSPACE_METADATA_QUERIES.with(std::cell::Cell::get) - queries_before,
+                        usize::from(!matches!(
+                            preparation,
+                            Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(_))
+                        )),
+                        "Ready reuses metadata, while Deferred/None must run the checked planner"
+                    );
+                    let selected = kernel.prepared_projection.get().unwrap();
+                    let explicit = super::super::decoded_projection::DecodedProjectionPlan::new(
+                        NonZeroUsize::new(width).unwrap(),
+                        NonZeroUsize::new(tile).unwrap(),
+                    );
+                    assert_eq!(
+                        selected.layout(R, K, N).unwrap().bytes(),
+                        explicit.layout(R, K, N).unwrap().bytes()
+                    );
+                    kernel
+                        .execute_with_workspace(&inputs, &mut [y.view_mut()], Some(view))
+                        .unwrap();
+                    assert!(y.to_f32().iter().all(|v| *v == K as f32));
+                    assert!(scratch[expected / 4..].iter().all(|v| *v == 83.));
+                    let unchanged = y.bytes.clone();
+                    assert!(
+                        kernel
+                            .execute_with_workspace(&inputs, &mut [y.view_mut()], Some(view))
+                            .unwrap_err()
+                            .to_string()
+                            .contains("absent or consumed")
+                    );
+                    kernel
+                        .workspace_requirement_for_execution(
+                            &inputs,
+                            &[y.view_mut()],
+                            &metadata,
+                            &[],
+                            None,
+                        )
+                        .unwrap();
+                    let mut invalid = metadata.clone();
+                    invalid[0].present = false;
+                    assert!(
+                        kernel
+                            .workspace_requirement_for_execution(
+                                &inputs,
+                                &[y.view_mut()],
+                                &invalid,
+                                &[],
+                                None
+                            )
+                            .is_err()
+                    );
+                    assert!(
+                        kernel
+                            .execute_with_workspace(&inputs, &mut [y.view_mut()], Some(view))
+                            .unwrap_err()
+                            .to_string()
+                            .contains("absent or consumed")
+                    );
+                    assert_eq!(y.bytes, unchanged);
+                }
+            });
+        }
+    }
+
+    #[test]
     fn prepared_projection_fills_caller_destination_and_preserves_separate_previous_output() {
         for format in [BlockFormat::Mxfp4, BlockFormat::Q8_0] {
             for (rows, k, n) in [
@@ -1875,7 +2068,7 @@ mod tests {
                     n,
                     Some(&bias),
                     plan,
-                    &mut scratch,
+                    &mut ProjectionScratch::test_binding(&mut scratch),
                     &mut actual,
                 )
                 .unwrap();
@@ -1895,7 +2088,7 @@ mod tests {
                     n,
                     Some(&bias),
                     plan,
-                    &mut scratch,
+                    &mut ProjectionScratch::test_binding(&mut scratch),
                     &mut next,
                 )
                 .unwrap();
@@ -1931,7 +2124,7 @@ mod tests {
             n,
             Some(&bias),
             plan,
-            &mut scratch,
+            &mut ProjectionScratch::test_binding(&mut scratch),
             &mut backing[1..1 + elements],
         )
         .unwrap();
@@ -1959,7 +2152,7 @@ mod tests {
                 n,
                 Some(&bias),
                 plan,
-                &mut scratch[..workspace_len],
+                &mut ProjectionScratch::test_binding(&mut scratch[..workspace_len]),
                 &mut output,
             )
             .unwrap_err()
@@ -1990,7 +2183,7 @@ mod tests {
             format: BlockFormat::Mxfp4,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            projection_plan: projection_plan(),
+            prepared_projection: std::cell::Cell::new(None),
             weight_cache: WeightCache::default(),
         };
         let actual = kernel.dequantize_weight_kn(&view.view()).unwrap();
@@ -2145,7 +2338,7 @@ mod tests {
             format: BlockFormat::Mxfp4,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            projection_plan: projection_plan(),
+            prepared_projection: std::cell::Cell::new(None),
             weight_cache: WeightCache::default(),
         };
         let weight = kernel.dequantize_weight_kn(&packed_weight.view()).unwrap();
@@ -2203,7 +2396,7 @@ mod tests {
             format: BlockFormat::Iq4Nl,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            projection_plan: projection_plan(),
+            prepared_projection: std::cell::Cell::new(None),
             weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
@@ -2244,7 +2437,7 @@ mod tests {
             format: BlockFormat::Iq4Xs,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            projection_plan: projection_plan(),
+            prepared_projection: std::cell::Cell::new(None),
             weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
@@ -2273,7 +2466,7 @@ mod tests {
             format: BlockFormat::Iq3S,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            projection_plan: projection_plan(),
+            prepared_projection: std::cell::Cell::new(None),
             weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
@@ -2307,7 +2500,7 @@ mod tests {
             format: BlockFormat::Iq3Xxs,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            projection_plan: projection_plan(),
+            prepared_projection: std::cell::Cell::new(None),
             weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
@@ -2341,7 +2534,7 @@ mod tests {
             format: BlockFormat::Iq2S,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            projection_plan: projection_plan(),
+            prepared_projection: std::cell::Cell::new(None),
             weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
@@ -2376,7 +2569,7 @@ mod tests {
             format: BlockFormat::Iq2Xs,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            projection_plan: projection_plan(),
+            prepared_projection: std::cell::Cell::new(None),
             weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
@@ -2409,7 +2602,7 @@ mod tests {
             format: BlockFormat::Iq2Xxs,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            projection_plan: projection_plan(),
+            prepared_projection: std::cell::Cell::new(None),
             weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
@@ -2452,7 +2645,7 @@ mod tests {
             format: BlockFormat::Iq1S,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            projection_plan: projection_plan(),
+            prepared_projection: std::cell::Cell::new(None),
             weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
@@ -2480,7 +2673,7 @@ mod tests {
             format: BlockFormat::Iq1M,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            projection_plan: projection_plan(),
+            prepared_projection: std::cell::Cell::new(None),
             weight_cache: WeightCache::default(),
         };
         let actual = decoder.dequantize_weight_kn(&view.view()).unwrap();
@@ -2695,7 +2888,7 @@ mod tests {
             format: BlockFormat::Mxfp4,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
-            projection_plan: projection_plan(),
+            prepared_projection: std::cell::Cell::new(None),
             weight_cache: WeightCache::new(memory, 0),
         };
         let requirement = kernel
@@ -2714,6 +2907,16 @@ mod tests {
             .require_ready()
             .unwrap();
         assert!(requirement.bytes > 0);
+        let views = [a.view(), b.view()];
+        let metadata = views
+            .iter()
+            .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
+            .collect::<Vec<_>>();
+        kernel
+            .workspace_requirement_for_execution(&views, &[y.view_mut()], &metadata, &[], None)
+            .unwrap()
+            .require_ready()
+            .unwrap();
         let error = kernel
             .execute(&[a.view(), b.view()], &mut [y.view_mut()])
             .unwrap_err();
@@ -2734,6 +2937,11 @@ mod tests {
                 )
                 .unwrap();
             let view = WorkspaceView::new(DevicePtrMut(loan.as_mut_ptr()), loan.len());
+            kernel
+                .workspace_requirement_for_execution(&views, &[y.view_mut()], &metadata, &[], None)
+                .unwrap()
+                .require_ready()
+                .unwrap();
             kernel
                 .execute_with_workspace(&[a.view(), b.view()], &mut [y.view_mut()], Some(view))
                 .unwrap();
@@ -2878,7 +3086,7 @@ mod tests {
                                 format,
                                 packed_b_constant: constant,
                                 weight_identity: DenseWeightIdentity::default(),
-                                projection_plan: projection_plan(),
+                                prepared_projection: std::cell::Cell::new(None),
                                 weight_cache: WeightCache::with_limit_and_memory(bytes, memory),
                             };
                             let streamed = BlockQuantizedMatMulKernel {
@@ -2887,7 +3095,7 @@ mod tests {
                                 format,
                                 packed_b_constant: constant,
                                 weight_identity: DenseWeightIdentity::default(),
-                                projection_plan: projection_plan(),
+                                prepared_projection: std::cell::Cell::new(None),
                                 weight_cache: WeightCache::with_limit(0),
                             };
                             let mut packed = packed_for_format(format, 1, n, k);
@@ -3069,7 +3277,7 @@ mod tests {
                 format,
                 packed_b_constant: true,
                 weight_identity: DenseWeightIdentity::default(),
-                projection_plan: projection_plan(),
+                prepared_projection: std::cell::Cell::new(None),
                 weight_cache: WeightCache::with_limit(budget),
             };
             let dense = make(bytes);
@@ -3134,7 +3342,7 @@ mod tests {
                 format: BlockFormat::Mxfp4,
                 packed_b_constant: true,
                 weight_identity: DenseWeightIdentity::default(),
-                projection_plan: projection_plan(),
+                prepared_projection: std::cell::Cell::new(None),
                 weight_cache: WeightCache::with_limit(0),
             };
             let a = floats(&[2, 32], &[1.; 64]);
@@ -3196,7 +3404,7 @@ mod tests {
             format: BlockFormat::Mxfp4,
             packed_b_constant: true,
             weight_identity: DenseWeightIdentity::default(),
-            projection_plan: projection_plan(),
+            prepared_projection: std::cell::Cell::new(None),
             weight_cache: WeightCache::with_limit(1024),
         };
         let a = Owned::f32(&[0, 32], &[]);
@@ -3255,7 +3463,7 @@ mod tests {
                     format,
                     packed_b_constant: false,
                     weight_identity: DenseWeightIdentity::default(),
-                    projection_plan: projection_plan(),
+                    prepared_projection: std::cell::Cell::new(None),
                     weight_cache: WeightCache::default(),
                 };
                 let mut expected = Owned::zeros(dtype, &[1, n]);
@@ -3272,7 +3480,7 @@ mod tests {
                     format,
                     packed_b_constant: false,
                     weight_identity: DenseWeightIdentity::default(),
-                    projection_plan: projection_plan(),
+                    prepared_projection: std::cell::Cell::new(None),
                     weight_cache: WeightCache::default(),
                 };
                 cached.set_constant_inputs(&[false, true]);
@@ -3337,7 +3545,7 @@ mod tests {
             format: BlockFormat::Mxfp4,
             packed_b_constant: true,
             weight_identity: DenseWeightIdentity::default(),
-            projection_plan: projection_plan(),
+            prepared_projection: std::cell::Cell::new(None),
             weight_cache: WeightCache::default(),
         };
         kernel.set_constant_inputs(&[false, true]);
@@ -3609,7 +3817,7 @@ mod tests {
                 format,
                 packed_b_constant: false,
                 weight_identity: DenseWeightIdentity::default(),
-                projection_plan: projection_plan(),
+                prepared_projection: std::cell::Cell::new(None),
                 weight_cache: WeightCache::default(),
             };
 

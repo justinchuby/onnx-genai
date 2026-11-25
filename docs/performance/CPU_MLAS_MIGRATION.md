@@ -1822,3 +1822,65 @@ processes use about 19–26% less CPU; this includes setup/validation and is not
 pure kernel or LLM throughput. Full native hashes match the old arithmetic.
 MLAS still wins the larger reference comparisons, so Softmax remains
 ungraduated and its optional reference remains. Other ISAs are unchanged.
+
+## CPU router selection keeps the full ordering default
+
+An exact partition-plus-prefix-ordering experiment preserves router indices and
+weight bits, but its comparator call count depends on the input at the same expert/top-k
+shape: random inputs can use fewer comparisons while already ordered or tied
+inputs use more. The [complete selection study](../benchmarks/cpu-routing-selection/README.md)
+retains all 160 cases and both candidate/final validation. No latency or LLM
+throughput was measured. Keep the existing default and add no heuristic; the
+permuted-bit/selection-boundary regression test remains as a guard for future
+native optimization. No resource, quota or public EP API changes are introduced.
+
+
+## Native Conv shares one group GEMM driver
+
+The default native Conv implementation now uses one group-indexed GEMM driver
+for ordinary and grouped convolution. Non-pointwise geometry reuses one im2col
+buffer across batches/groups; pointwise geometry borrows input without a col
+allocation. Empty batches skip unused scratch. Existing BNNS/NEON/native-backend
+selection, arithmetic order and output staging remain. No new resource, cache or
+EP interface is introduced; the col buffer remains call-owned scratch.
+
+The [allocation and equivalence checks](../benchmarks/conv-gemm-driver/README.md)
+cover actual native execute calls and old/new same-image drivers. This removes
+redundant ownership and decisions; it does not claim inference latency, full
+memory accounting, Convolution graduation or removal of its MLAS reference.
+
+
+## Independent Conv comparison in a linked-reference build
+
+With `mlas` and `ops-cnn`, `backend_ab::convolution_factories()` exposes named
+native-Generic-GEMM and MLAS Conv factories together. The native source is
+privately compiled in addition to the unchanged registered reference factory.
+Its GEMM fallback is fixed to Generic only in this research module, so an MLAS
+environment override cannot make the two arms share the reference arithmetic.
+BNNS/NEON remain native routes; default production auto detection is unchanged.
+
+The [same-binary correctness checks](../benchmarks/conv-same-binary/README.md)
+compare 36 f32 cases against independent f64 results, verify different concrete
+kernels, preserve registry selection and witness actual Native GEMM dispatch.
+Factory-alias and backend-override mutations must fail those guards. This creates
+an inspectable comparison boundary; it measures no performance gap, graduates no
+family and removes none of the outstanding optional reference capabilities.
+
+
+## Conv gap study distinguishes production auto from Generic
+
+The [M1 Max complete-operator study](../benchmarks/conv-reference-gap/README.md)
+uses terminal parent wait4 CPU and setup/work/double/A/A controls. Ten of twelve
+production/reference comparisons qualify; both dilated production cells fail
+A/A and are retained without a performance conclusion. Qualified default
+ordinary 3x3 and large-weight 1x1 use less CPU than MLAS. Grouped and depthwise
+retain reuse CPU ratios about 1.83 and 2.37, respectively. Rank3 changes direction
+between reused and freshly constructed kernels, so lifecycle is part of the cost.
+
+The 1x1 research Generic/reference ratio is about 12.50, while actual production
+on the same geometry uses less CPU than reference. Generic is not a proxy for
+production auto selection. Frozen-binary inspection also finds NCHWc block size
+one, so this ARM64 reference uses fallback ConvPlan; NCHWc packed-filter reuse is
+not an explanation of these observations. Boundary/tail work and grouped im2col
+are candidates for separate profiling, not established causal attributions.
+No runtime policy, quota, cache, graduation verdict or whole-model claim changes.
