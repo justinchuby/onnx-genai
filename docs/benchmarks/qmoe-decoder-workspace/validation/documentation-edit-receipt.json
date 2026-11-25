@@ -1,0 +1,9 @@
+{
+  "source_seal_detected": {
+    "docs/memory/MEMORY_ARCHITECTURE.md": {
+      "recorded": "576bb587c92f40bde721baa31f0a56e02a5c78c29cd8496b6d1d769b8fb4a863",
+      "current": "7c95281495bcda1e34c748d41f3f91fe3d6d347aebc4eb504e70d3d36bdf58b1"
+    }
+  },
+  "resolution": "All Rust source files matched. Documentation was edited while checks ran; source seal now explicitly scopes runtime crates. No test was rerun or failure discarded."
+}
