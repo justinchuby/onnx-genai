@@ -1,0 +1,7 @@
+{
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "host": "arm64",
+  "shared_host_lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "timing_claim": false,
+  "cuda_executed": false
+}
