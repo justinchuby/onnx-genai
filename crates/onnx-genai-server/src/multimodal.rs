@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use onnx_genai_engine::PipelineGenerateRequest;
 use onnx_genai_metadata::{RuntimeInputRole, SemanticInputRole, TensorDimension};
-use onnx_genai_ort::{DataType, PipelineModelDirectory, PipelineModels, Tokenizer, Value};
+use onnx_genai_ort::{DataType, PipelineModelDirectory, PipelineModels, Value};
 
 pub use crate::audio_input::{AudioInputSpec, AudioTensor, preprocess_audio, preprocess_samples};
 pub use crate::media_input::MAX_EXPANDED_PROMPT_TOKENS;
@@ -291,31 +291,6 @@ pub fn tokenizer_path(
         .context("workflow package requires tokenizer.json for text convenience APIs")
 }
 
-pub fn audio_decoder_prompt(
-    tokenizer: &Tokenizer,
-    language: Option<&str>,
-) -> anyhow::Result<Vec<u32>> {
-    let mut tokens = vec![
-        tokenizer
-            .token_id("<|startoftranscript|>")
-            .context("tokenizer is missing required '<|startoftranscript|>' token")?,
-    ];
-    if let Some(language) = language.filter(|value| !value.is_empty()) {
-        let token = format!("<|{}|>", language.to_ascii_lowercase());
-        tokens.push(
-            tokenizer
-                .token_id(&token)
-                .with_context(|| format!("missing token '{token}'"))?,
-        );
-    }
-    for token in ["<|transcribe|>", "<|notimestamps|>"] {
-        if let Some(id) = tokenizer.token_id(token) {
-            tokens.push(id);
-        }
-    }
-    Ok(tokens)
-}
-
 pub fn build(directory: &PipelineModelDirectory) -> anyhow::Result<MultimodalSpecs> {
     if let Some(metadata) = directory.metadata.as_ref()
         && onnx_genai_metadata::transcription::transcription_contract(metadata)
@@ -329,11 +304,18 @@ pub fn build(directory: &PipelineModelDirectory) -> anyhow::Result<MultimodalSpe
             audio: None,
         });
     }
-    derive_specs(
+    let mut specs = derive_specs(
         &directory.spec.workflow,
         directory.preprocessing.as_ref(),
         image_placeholder_token_id(directory.metadata.as_ref()),
-    )
+    )?;
+    if let Some(audio) = &mut specs.audio {
+        audio.transcription =
+            onnx_genai_engine::transcription::generative::GenerativeTranscription::load(
+                &directory.root,
+            )?;
+    }
+    Ok(specs)
 }
 
 /// The token a package declares as its expandable image placeholder.

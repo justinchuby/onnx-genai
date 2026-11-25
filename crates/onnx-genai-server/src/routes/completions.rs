@@ -668,8 +668,8 @@ async fn prepare_chat_input(
         config.replay_buffer_bytes,
     )
     .map_err(|err| ApiError::invalid_request(format!("prompt preparation failed: {err:#}")))?;
-    if !input_audio.is_empty() {
-        prepared = prepare_audio_generate_request(request, &handle.tokenizer, output_budget)?;
+    if !input_audio.is_empty() && handle.chat_template.is_none() {
+        prepared = prepare_audio_generate_request(request, handle, config, output_budget)?;
     }
     crate::lora::apply_request(request, handle, &mut prepared.request.options, has_session)?;
     prepared.request.options.max_constraint_bytes = config.replay_buffer_bytes;
@@ -1432,9 +1432,11 @@ async fn preprocess_chat_images(
 
 fn prepare_audio_generate_request(
     request: &ChatCompletionRequest,
-    tokenizer: &Tokenizer,
+    handle: &ModelHandle,
+    config: &ServerConfig,
     output_budget: usize,
 ) -> Result<PreparedGenerateRequest, ApiError> {
+    let tokenizer = &handle.tokenizer;
     let mut options = build_generate_options_with_tokenizer(request, tokenizer, output_budget)
         .map_err(|error| {
             ApiError::invalid_request(format!("invalid audio generation controls: {error:#}"))
@@ -1455,10 +1457,58 @@ fn prepare_audio_generate_request(
             ApiError::invalid_request(format!("invalid audio reasoning protocol: {error:#}"))
         })?;
     }
-    let token_ids = audio_decoder_prompt(tokenizer, None)?;
+    let contract = handle.multimodal.as_ref().and_then(|specs|specs.audio.as_ref())
+        .and_then(|audio|audio.transcription()).ok_or_else(||ApiError::invalid_request("audio-only generation requires transcription_config.json with a declared decoder prompt; author the package contract"))?;
+    let conditioning = request
+        .messages
+        .iter()
+        .filter_map(|message| message.content.as_ref())
+        .map(|content| content.text())
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>();
+    if !conditioning.is_empty()
+        && (request.messages.len() != 1 || request.messages[0].role != "user")
+    {
+        return Err(ApiError::invalid_request(
+            "audio-only transcription prompting cannot interpret multi-turn text/role history; declare a chat_template for multimodal conversation or use /v1/audio/transcriptions prompt conditioning",
+        ));
+    }
+    let rendered = contract
+        .render(
+            tokenizer,
+            None,
+            conditioning.first().map(String::as_str),
+            onnx_genai_engine::transcription::generative::PromptLimits {
+                max_input_tokens: config.max_transcription_input_tokens,
+                template: onnx_genai_ort::TemplateLimits {
+                    max_output_bytes: config.max_transcription_prompt_bytes,
+                    max_operations: config.max_transcription_template_operations,
+                },
+                max_text_bytes: config.max_transcription_text_bytes,
+            },
+        )
+        .map_err(|error| {
+            ApiError::invalid_request(format!("prepare audio decoder prompt: {error:#}"))
+        })?;
+    if let Some(template) = &handle.response_template {
+        options.response_projection = Some(
+            onnx_genai_engine::response_template::ResponseProjection::resolve(
+                template.clone(),
+                rendered.text.clone(),
+                config.replay_buffer_bytes,
+                Some(tokenizer),
+            )
+            .map_err(|error| {
+                ApiError::invalid_request(format!(
+                    "prepare audio chat response projection: {error:#}"
+                ))
+            })?,
+        );
+    }
+    let token_ids = rendered.token_ids;
     let prompt_tokens = token_ids.len();
     Ok(PreparedGenerateRequest {
-        response_prefix: None,
+        response_prefix: Some(rendered.text),
         request: GenerateRequest {
             prompt: GeneratePrompt::TokenIds(token_ids),
             options,

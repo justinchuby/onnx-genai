@@ -796,14 +796,6 @@ fn map_model_load_error(id: &str, error: anyhow::Error) -> ApiError {
     }
 }
 
-fn audio_decoder_prompt(
-    tokenizer: &Tokenizer,
-    language: Option<&str>,
-) -> Result<Vec<u32>, ApiError> {
-    crate::multimodal::audio_decoder_prompt(tokenizer, language)
-        .map_err(|error| ApiError::invalid_request(format!("{error:#}")))
-}
-
 /// Close a session the registry let go of, on the model that owns it, under the
 /// lease it was handed back holding.
 ///

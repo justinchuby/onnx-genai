@@ -405,9 +405,25 @@ struct TranscribeArgs {
     #[arg(value_name = "AUDIO")]
     audio: Vec<PathBuf>,
 
-    /// Spoken language token, e.g. `en` or `zh`. Defaults to the model's own choice.
+    /// Model-declared spoken language label, e.g. `en` or `zh`. Defaults to the model's own choice.
     #[arg(long)]
     language: Option<String>,
+
+    /// Optional prior transcript/context, when the model declares prompt conditioning.
+    #[arg(long)]
+    prompt: Option<String>,
+    /// Maximum tokens in one generative decoder prompt.
+    #[arg(long, default_value_t=onnx_genai::engine::transcription::generative::PromptLimits::default().max_input_tokens)]
+    max_input_tokens: std::num::NonZeroUsize,
+    /// Maximum rendered decoder prompt bytes.
+    #[arg(long, default_value_t=onnx_genai::engine::transcription::generative::PromptLimits::default().template.max_output_bytes)]
+    max_prompt_bytes: std::num::NonZeroUsize,
+    /// Maximum interpreter operations in one decoder prompt template.
+    #[arg(long, default_value_t=onnx_genai::engine::transcription::generative::PromptLimits::default().template.max_operations)]
+    max_template_operations: std::num::NonZeroU64,
+    /// Maximum retained raw/projected transcript bytes per segment.
+    #[arg(long, default_value_t=onnx_genai::engine::transcription::TranscriptionLimits::default().max_text_bytes)]
+    max_text_bytes: std::num::NonZeroUsize,
 
     /// Transcript format.
     #[arg(long, value_enum, default_value_t = TranscriptFormat::Text)]
