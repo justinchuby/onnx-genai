@@ -2742,3 +2742,49 @@ Existing per-kernel and governed-lane tests, public sessions and fallback-disabl
 real ORT plugin tests remain the integration checks. Byte bounds, arithmetic,
 retention and grant/refund ownership are unchanged; no timing or CUDA-runtime
 claim is made.
+
+
+### LayerNorm and Skip share admitted output/statistics staging
+
+LayerNormalization (default and private fused domain) and SkipLayerNormalization
+now share one explicit schema-kind kernel, checked metadata geometry and
+`FloatWorkspace<4>`. The allocating `layer_norm_dense` return interface and
+Skip's residual-sum Vec are removed. The regions are Y, requested mean,
+requested inverse standard deviation, and Skip's full residual sum. Standard
+LayerNorm has no sum region; omitted statistics occupy zero bytes. Skip keeps
+its sum alongside Y because it is both the normalization input and an optional
+published output. No new EP protocol, kernel pool or per-row grant is introduced.
+
+The original f32 mean/variance/scale/beta arithmetic is preserved. Skip still
+computes `(X + skip) + bias_or_positive_zero` before normalization, including the
+final +0.0 when bias is omitted. Beta and bias remain independently optional.
+All live operands are consumed and every group computed before any output is
+published, preserving input, residual and parameter aliases. Skip Y/sum retain
+activation storage dtype, while each statistic independently supports Float32
+or activation dtype. Absent optional output holes are not validated or written.
+
+Preparation checks required slots, normalized width, group and stride products,
+parameter element counts, dtypes, complete output shapes and total layout
+capacity. Empty groups retain parameter/view/Host/output checks and need no
+scratch. Empty normalized width remains an error; axis==rank is now rejected in
+accordance with the [ONNX axis range](https://onnx.ai/onnx/operators/onnx__LayerNormalization.html).
+Standard LayerNorm's pre-existing full-normalized-parameter element-count rule
+is retained. **Follow-up remains open:** support the broader unidirectional
+Scale/B broadcasting described by that schema; this migration does not claim
+that capability or alter the accepted complete parameter layouts.
+
+Regression controls cover exact optional-region bounds, independent beta/bias
+holes, fresh and poisoned backing, prefix canaries, missing/short/misaligned
+scratch, view/shape/overflow refusal, operand/output aliases, signed zero,
+strided half input/output and existing bf16 literal goldens. A real governed
+lane alternates 48-byte standard and 80-byte Skip calls for 4,096 warm cycles
+without additional issuer callbacks (including zero-byte observer controls),
+refuses concurrent reuse and refunds physical capacity only after idle trim.
+An encoded two-node public session uses one 80-byte peak, refuses 79 bytes,
+reuses its managed identity and re-admits reclaimed storage. The shipping ORT
+plugin disables fallback, assigns both nodes to cpu_ep, changes shapes
+2x3/3x9/2x3 and checks all six published outputs against f64 references.
+
+Input widening remains outside these four staging regions. This is not complete
+RSS accounting, a zero-total-overhead or inference-speed measurement, or CUDA
+runtime validation.
