@@ -492,6 +492,24 @@ bounded WAV workflow. `raw_prompt=true` bypasses text assembly and requires empt
 undeclared voices/languages, and active synthesis controls are rejected rather
 than ignored. The OpenAI speech request also rejects unknown controls.
 
+Buffered speech supports native `/tts` `response_format=wav` (default), `pcm`
+(float32 little-endian), and `pcm16` (signed 16-bit little-endian). OpenAI
+`/v1/audio/speech` and `/audio/speech` accept `wav` and map `pcm` to signed
+16-bit samples. Raw PCM responses declare the package's output sample rate,
+channel count (when greater than one), encoding and bit depth in `Content-Type`.
+The declared output rate and channels are preserved; no implicit mono conversion
+or 24 kHz override is applied. Float waveform outputs retain their precision
+until transport encoding. An already encoded post-adapter PCM16 WAV can only
+provide its existing quantized samples, scaled by 32768 for float transport.
+PCM16 waveform encoding rounds `clamp(sample, -1, 1) * 32767`, including WAV;
+nonfinite waveform samples fail with their sample index. Streaming speech
+remains unsupported for these buffered workflow contracts.
+
+For example, `curl http://localhost:8080/tts -H 'Content-Type: application/json'
+-d '{"input":"hello","response_format":"pcm"}' --output speech.f32` returns
+interleaved float32 samples at the rate and channels named in the response header.
+
+
 Explicit API failures carry numeric HTTP `code`, `message` and protocol `type`.
 Invalid JSON/parameters use `invalid_request_error`; absent models/routes use
 `not_found_error`, and permission refusals use `permission_error`. Internal faults

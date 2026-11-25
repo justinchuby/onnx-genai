@@ -1843,7 +1843,7 @@ async fn speech_endpoint_rejects_streaming_before_execution() {
 }
 
 #[tokio::test]
-async fn speech_endpoint_accepts_only_wav_delivery() {
+async fn speech_endpoint_rejects_unsupported_output_encoding() {
     let response = app(tiny_state())
         .oneshot(
             Request::builder()
@@ -1869,7 +1869,7 @@ async fn speech_endpoint_accepts_only_wav_delivery() {
         body["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("response_format=wav")
+            .contains("response_format must be wav or pcm")
     );
 }
 
@@ -9770,6 +9770,80 @@ mod native_compat {
                     .unwrap()
                     .contains("logit_bias")
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn speech_pcm_formats_preserve_declared_rate_channels_and_sample_values() {
+        let router = app(speech_state());
+        let mut wav = Vec::new();
+        for (path, format, mime, width) in [
+            ("/tts", "wav", "audio/wav", 0),
+            (
+                "/tts",
+                "pcm16",
+                "audio/pcm;rate=24000;channels=2;encoding=signed-int;bits=16",
+                2,
+            ),
+            (
+                "/v1/audio/speech",
+                "pcm",
+                "audio/pcm;rate=24000;channels=2;encoding=signed-int;bits=16",
+                2,
+            ),
+            (
+                "/audio/speech",
+                "pcm",
+                "audio/pcm;rate=24000;channels=2;encoding=signed-int;bits=16",
+                2,
+            ),
+            (
+                "/tts",
+                "pcm",
+                "audio/pcm;rate=24000;channels=2;encoding=float;bits=32",
+                4,
+            ),
+        ] {
+            let response = request(
+                router.clone(),
+                path,
+                json!({"model":"speech-wav","input":"hello world","response_format":format}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{path} {format}");
+            assert_eq!(response.headers()[header::CONTENT_TYPE], mime);
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            match width {
+                0 => wav = bytes.to_vec(),
+                2 => assert_eq!(bytes.as_ref(), &wav[44..], "{path} {format}"),
+                4 => {
+                    assert_eq!(bytes.len(), (wav.len() - 44) * 2);
+                    for (float, pcm) in bytes.chunks_exact(4).zip(wav[44..].chunks_exact(2)) {
+                        let float = f32::from_le_bytes(float.try_into().unwrap());
+                        assert!(float.is_finite());
+                        assert_eq!(
+                            (float.clamp(-1.0, 1.0) * 32767.0).round() as i16,
+                            i16::from_le_bytes(pcm.try_into().unwrap())
+                        );
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        for (path, body) in [
+            ("/tts", json!({"input":"hi","response_format":"mp3"})),
+            (
+                "/v1/audio/speech",
+                json!({"model":"speech-wav","input":"hi","response_format":"pcm16"}),
+            ),
+            (
+                "/tts",
+                json!({"input":"hi","response_format":"pcm","stream":true}),
+            ),
+        ] {
+            let response = request(router.clone(), path, body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(json_body(response).await["error"]["message"].is_string());
         }
     }
 
