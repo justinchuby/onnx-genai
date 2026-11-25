@@ -1636,6 +1636,72 @@ fn transpose_warmed_metadata_captures_and_matches_eager() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
+fn transpose_packed_cuda_replays_odd_tail_exactly() {
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    let input_shape = [3, 5];
+    let output_shape = [5, 3];
+    let mut node = Node::new(NodeId(0), "Transpose", vec![], vec![]);
+    node.attributes
+        .insert("perm".into(), Attribute::Ints(vec![1, 0]));
+    let kernel = ep.get_kernel(&node, &[input_shape.to_vec()], 25).unwrap();
+    let data = ep.allocate(4, 256).unwrap();
+    let mut output = ep.allocate(4, 256).unwrap();
+    unsafe {
+        runtime
+            .htod(&[0xac, 0xc1, 0x1a, 0xec], cuptr(data.as_ptr()))
+            .unwrap();
+    }
+    let input_strides = compute_contiguous_strides(&input_shape);
+    let output_strides = compute_contiguous_strides(&output_shape);
+    let inputs = [TensorView::new(
+        DevicePtr(data.as_ptr()),
+        DataType::Uint2,
+        &input_shape,
+        &input_strides,
+        device,
+    )];
+    let execute = |output: &mut DeviceBuffer| {
+        kernel
+            .execute(
+                &inputs,
+                &mut [TensorMut::new(
+                    DevicePtrMut(output.as_mut_ptr()),
+                    DataType::Uint2,
+                    &output_shape,
+                    &output_strides,
+                    device,
+                )],
+            )
+            .unwrap();
+    };
+    execute(&mut output);
+    assert_eq!(kernel.capture_support(), CaptureSupport::Supported);
+    assert_eq!(kernel.device_graph_resources().len(), 1);
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute(&mut output);
+    runtime.end_graph_capture().unwrap();
+    // Poison the warm output so an omitted replay launch cannot pass.
+    unsafe {
+        runtime.htod(&[0xff; 4], cuptr(output.as_ptr())).unwrap();
+    }
+    runtime.replay_graph().unwrap();
+    let mut actual = [0; 4];
+    unsafe {
+        runtime.dtoh(&mut actual, cuptr(output.as_ptr())).unwrap();
+    }
+    assert_eq!(actual, [0xd0, 0xe0, 0xe8, 0x29]);
+    assert!(runtime.reset_graph().unwrap());
+    ep.deallocate(data).unwrap();
+    ep.deallocate(output).unwrap();
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
 fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop() {
     #[cfg(feature = "gpu-tests")]
     transpose_captured_metadata_outlives_rewarm_and_kernel_drop_gpu();

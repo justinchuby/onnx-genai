@@ -1,0 +1,19 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "--offline",
+    "-p",
+    "onnx-runtime-ep-cpu",
+    "--lib",
+    "kernels::qmoe::tests::decoder_workspace_keeps_one_owner_when_execution_pool_changes",
+    "--",
+    "--exact",
+    "--nocapture"
+  ],
+  "exit": 101,
+  "original_sha256": "ce76aabaa6dce9b7c843d232146f163196de1afa50595d0a702029bce8be1854",
+  "mutant_sha256": "6cba0057b156a280b1f8d5f17199145f3bab5bff3527826006feb69b9539d69c",
+  "log_sha256": "9b22cde69ae62f3e5bc405ec1fadbcd684aa5a6beee12108c31b1ae7abfa53c8",
+  "selected_test_failure": true
+}

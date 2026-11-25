@@ -349,10 +349,13 @@ fn zeroed_prefix_keeps_whole_bank_initialization_separate() {
             .contains("workspace has 8")
     );
     // A partial write cannot certify untouched MaybeUninit tail storage.
-    assert_eq!(scratch.initialized(), [0.; 8]);
-    scratch.initialized().fill(42.);
+    assert_eq!(scratch.initialized_prefix(8).unwrap(), [0.; 8]);
+    scratch.initialized_prefix(8).unwrap().fill(42.);
     assert_eq!(scratch.zeroed_prefix(3).unwrap(), [0.; 3]);
-    assert_eq!(scratch.initialized(), [0., 0., 0., 42., 42., 42., 42., 42.]);
+    assert_eq!(
+        scratch.initialized_prefix(8).unwrap(),
+        [0., 0., 0., 42., 42., 42., 42., 42.]
+    );
 }
 
 #[test]

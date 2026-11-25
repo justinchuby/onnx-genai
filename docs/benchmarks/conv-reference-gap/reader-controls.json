@@ -1,0 +1,85 @@
+[
+  {
+    "control": "complete_real_metadata",
+    "accepted": true,
+    "synthetic": false
+  },
+  {
+    "control": "missing_process",
+    "rejected": true,
+    "synthetic": true
+  },
+  {
+    "control": "duplicate_identity",
+    "rejected": true,
+    "synthetic": true
+  },
+  {
+    "control": "zero_work_mislabeled",
+    "rejected": true,
+    "synthetic": true
+  },
+  {
+    "control": "impossible_cpu",
+    "rejected": true,
+    "synthetic": true
+  },
+  {
+    "control": "wrong_build_claim",
+    "rejected": true,
+    "synthetic": true
+  },
+  {
+    "control": "native_gemm_witness_missing",
+    "rejected": true,
+    "synthetic": true
+  },
+  {
+    "control": "native_routes_to_reference",
+    "rejected": true,
+    "synthetic": true
+  },
+  {
+    "control": "unstable_output",
+    "rejected": true,
+    "synthetic": true
+  },
+  {
+    "control": "qualification_aa",
+    "qualified": false,
+    "synthetic": true,
+    "reasons": [
+      "AA outside 5% in at least one repetition"
+    ]
+  },
+  {
+    "control": "qualification_setup",
+    "qualified": false,
+    "synthetic": true,
+    "reasons": [
+      "setup exceeds fraction bar",
+      "double-work proportionality failed",
+      "AA outside 5% in at least one repetition"
+    ]
+  },
+  {
+    "control": "qualification_double",
+    "qualified": false,
+    "synthetic": true,
+    "reasons": [
+      "double-work proportionality failed"
+    ]
+  },
+  {
+    "control": "qualification_nonpositive",
+    "qualified": false,
+    "synthetic": true,
+    "reasons": [
+      "nonpositive setup-adjusted body",
+      "short work CPU",
+      "setup exceeds fraction bar",
+      "double-work proportionality failed",
+      "AA outside 5% in at least one repetition"
+    ]
+  }
+]

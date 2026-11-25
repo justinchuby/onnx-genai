@@ -51,8 +51,8 @@ plugin EPs (via C ABI bridge) handle them.
 | Equal | 7 | Mask generation. |
 | Less / Greater / LessOrEqual / GreaterOrEqual | 7–12 | Comparisons for masking. |
 | Expand | 8 | Broadcasting. |
-| Shape | 1 | Dynamic shape queries. |
-| ConstantOfShape | 9 | Mask/padding creation. |
+| Shape / Size | 1 | Shape returns an INT64 dimension vector (`start`/`end` since Shape-15); Size returns a scalar INT64 logical element count. For both, IR9 FP8 inputs start at opset 19, INT4/UINT4 at 21, FLOAT4E2M1 at 23, and FLOAT8E8M0 at 24. |
+| ConstantOfShape | 9 | Mask/padding creation. Native CPU and CUDA support BF16 and the four IR 9 FP8 types at opset 20, INT4/UINT4 at 21, FLOAT4E2M1 at 23, FLOAT8E8M0 at 24, and INT2/UINT2 at 25. Packed fills zero unused lanes in the last byte. |
 | ScatterND | 11 | Slice update; opset 29 adds Int32 indices and mean reduction on native CPU/CUDA. |
 | TensorScatter | 24 | KV cache update, standardized. Fixed-capacity buffer written at a per-sample `write_indices` offset; `linear` (append) and `circular` (ring) modes. Prefill omits `write_indices`; decode supplies it. |
 | GatherElements | 11 | Top-k/sampling. |
