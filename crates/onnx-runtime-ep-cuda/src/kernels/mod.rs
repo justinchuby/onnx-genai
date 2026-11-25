@@ -2471,6 +2471,8 @@ mod tests {
 
     #[test]
     fn reverse_sequence_cuda_registration_advertises_complex_and_lengths() {
+        use onnx_runtime_ir::DataType;
+
         let advertised = cuda_supported_dtypes_for_op("ReverseSequence", "");
         assert!(advertised.contains(&DataType::Complex128));
         assert!(advertised.contains(&DataType::Int64));
