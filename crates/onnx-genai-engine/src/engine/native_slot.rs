@@ -255,9 +255,9 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn native_slot_cold_start_skips_reuse_but_retains_committed_speculative_cache()
+    fn native_slot_cold_start_skips_reuse_and_successful_speculation_retains_cache()
     -> anyhow::Result<()> {
-        let mut e = engine("tiny-mtp-full")?;
+        let mut e = engine("tiny-native-engine")?;
         let mut cacheable = request();
         cacheable.prompt = GeneratePrompt::TokenIds(vec![0, 1]);
         let warm = e.generate(cacheable.clone())?;
@@ -292,6 +292,21 @@ mod tests {
         let restored = e.generate(cacheable)?;
         assert!(restored.prefix_cache_hit_len > 0);
         assert_eq!(restored.token_ids, warm.token_ids);
+
+        let mut speculative = engine("tiny-mtp-full")?;
+        let mut speculative_request = request();
+        speculative_request.prompt = GeneratePrompt::TokenIds(vec![0, 1]);
+        let first = speculative.generate(speculative_request.clone())?;
+        assert_eq!(first.prefix_cache_hit_len, 0);
+        assert!(first.retained_cache_tokens > 0);
+        let second = speculative.generate(speculative_request)?;
+        assert_eq!(second.prefix_cache_hit_len, 0);
+        assert_eq!(second.token_ids, first.token_ids);
+        assert!(second.retained_cache_tokens > 0);
+        assert_eq!(
+            second.retained_cache_tokens,
+            speculative.native_slot_state().unwrap().materialized_tokens
+        );
         Ok(())
     }
 }
