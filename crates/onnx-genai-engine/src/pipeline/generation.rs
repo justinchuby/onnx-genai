@@ -384,6 +384,7 @@ pub(crate) trait GenerationCore: WorkflowNodeHost {
     fn prefix_cache_hit_len(&self) -> usize;
     /// Per-token logprobs, when the request asked for them.
     fn logprobs(&self) -> Option<Vec<crate::config::TokenLogprob>>;
+    fn timings(&self) -> Option<crate::config::GenerationTimings>;
     /// The tokens this core committed, cross-checked against the emitted stream.
     fn committed_tokens(&self) -> Vec<crate::TokenId>;
     /// Whether this core already delivered each token to the request callback.
@@ -682,6 +683,9 @@ impl<B: DecodeLoopBackend + ?Sized> GenerationCore for GenerationNodeHost<'_, '_
     fn committed_tokens(&self) -> Vec<crate::TokenId> {
         self.state.generated_tokens.clone()
     }
+    fn timings(&self) -> Option<crate::config::GenerationTimings> {
+        self.state.clock.snapshot()
+    }
 
     fn streams_tokens(&self) -> bool {
         self.callback.is_some()
@@ -931,6 +935,7 @@ pub(crate) fn run_declared_generation(
         let pieces = crate::tokenization::token_texts(tokenizer, &token_ids, &preserved_tokens)?;
         for (index, (token_id, token_text)) in token_ids.iter().copied().zip(pieces).enumerate() {
             callback(crate::config::GenerateToken {
+                timings: None,
                 logprob: logprobs
                     .as_ref()
                     .and_then(|values| values.get(index))
@@ -943,6 +948,8 @@ pub(crate) fn run_declared_generation(
     }
 
     Ok(GenerateResult {
+        timings: core.as_deref().and_then(GenerationCore::timings),
+        retained_cache_tokens: 0,
         text,
         preserved_tokens,
         token_ids,

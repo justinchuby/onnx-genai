@@ -967,6 +967,8 @@ impl StopInput {
 
 #[derive(Debug, Serialize)]
 pub struct ChatCompletionResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<serde_json::Value>,
     pub id: String,
     pub object: &'static str,
     pub created: u64,
@@ -1021,6 +1023,8 @@ pub struct Usage {
 
 #[derive(Debug, Serialize)]
 pub struct CompletionResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<serde_json::Value>,
     pub id: String,
     pub object: &'static str,
     pub created: u64,

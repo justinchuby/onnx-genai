@@ -523,6 +523,12 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
     crate::metrics::add_prompt_tokens(prompt_tokens);
     let model = handle.id.clone();
     let return_tokens = request.return_tokens;
+    let timings_per_token = request
+        .sampling
+        .extensions
+        .get("timings_per_token")
+        .and_then(Value::as_bool)
+        == Some(true);
     let stops = request
         .sampling
         .stop
@@ -561,6 +567,9 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
                         stop_buffer.discard_pending();
                     }
                     let mut value = json!({"content":content,"tokens":if return_tokens {vec![token.token_id]} else {vec![]},"stop":false,"index":index});
+                    if timings_per_token && let Some(sample) = token.timings {
+                        value["timings"] = crate::timings::render(sample);
+                    }
                     if probabilities.config.top > 0 {
                         let probability = token.logprob.as_ref().ok_or_else(|| ApiError::internal("native probability stream is missing a committed token distribution; select a decoder with probability reporting"))
                             .and_then(|probability| probabilities.render(probability, content.as_bytes()));
@@ -648,10 +657,14 @@ fn final_value(
         FinishReason::StopSequence { .. } => "word",
         FinishReason::EosToken | FinishReason::ToolCalls => "eos",
     };
-    json!({"content":text_before_stop(&result.text, stops),"tokens":if return_tokens && !streaming { result.token_ids.clone() } else {vec![]},
+    let mut value = json!({"content":text_before_stop(&result.text, stops),"tokens":if return_tokens && !streaming { result.token_ids.clone() } else {vec![]},
         "stop":true,"index":index,"model":model,"tokens_predicted":result.token_ids.len(),
-        "tokens_evaluated":prompt_tokens,"tokens_cached":result.prefix_cache_hit_len,
-        "stop_type":stop_type,"truncated":matches!(result.finish_reason, FinishReason::Length)})
+        "tokens_evaluated":prompt_tokens,"tokens_cached":result.retained_cache_tokens,
+        "stop_type":stop_type,"truncated":matches!(result.finish_reason, FinishReason::Length)});
+    if let Some(sample) = result.timings {
+        value["timings"] = crate::timings::render(sample);
+    }
+    value
 }
 
 fn utf8_prefix(bytes: &[u8]) -> &str {

@@ -1956,3 +1956,35 @@ Prefill responses also distinguish input reuse from post-task retention:
 still retains evaluated cache. ORT reference results inspect governed snapshots
 and cached pages rather than claiming token-history-only retention. The same
 wire correction for general generation remains required work.
+
+
+### Ordinary generation retained-cache reporting
+
+`GenerateResult.retained_cache_tokens` records physical state retained at the
+completion boundary, separately from `prefix_cache_hit_len` (input reuse).
+Native final buffered/SSE responses publish the retained count as `tokens_cached`.
+Native stateless cold execution resets before evaluation and retains its newly
+evaluated state afterward. ORT ephemeral sessions report only shared snapshot
+or page payloads surviving session closure; named and prioritized results report
+their materialized session state. Generic workflows without an exposed token-cache
+contract report zero. Cached-prompt usage in OpenAI-shaped responses remains an
+input-reuse statistic.
+
+
+### Decoder timing propagation
+
+Ordinary decoder generation records prompt-forward and generation work in the
+shared token policy. `GenerationClock` closes each active step before external
+callbacks and survives priority-drive suspension. `GenerateToken` snapshots and
+`GenerateResult` carry the canonical engine measurements. Native commit-only
+journals retain the snapshots; ORT collects a private timing journal, checks its
+token ids before commit, then pairs snapshots with authoritative reconstructed
+text during post-commit delivery. No timing event can expose an aborted turn.
+
+Native completions and OpenAI completion/chat responses render the pinned
+[llama.cpp stats fields and rate denominators](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-common.cpp#L147).
+First-token rate is zero (no extra generation forward), and zero-duration values
+remain finite. `timings_per_token=true` publishes cumulative SSE measurements;
+chat timing-only chunks have empty choices, as accepted by pinned Llama Chat.
+Standalone prefill, speculative execution, and generic authored workflow timing
+remain distinct unfinished contracts. Prompt progress events are still open.
