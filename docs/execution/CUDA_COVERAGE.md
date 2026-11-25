@@ -275,6 +275,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Dropout`, `NonZero` | `` | ✅ | **NVRTC-custom** | Inference Dropout and bounded dynamic-output coordinate extraction; dynamic metadata paths decline capture where host materialization is required. |
 | `Resize`, `GridSample`, `ConvTranspose` | `` | ✅ | **NVRTC-custom** | Implemented interpolation/sampling and transposed-convolution subsets; unsupported coordinate modes, cubic/volumetric cases, and output-shape policies fail closed. |
 | `DeformConv` | `` | ✅ | **NVRTC-custom** | Opsets 19 and 22; fused N-D interpolation and grouped accumulation, with a specialized 2-D kernel. Supports up to 32 spatial axes on contiguous tensors. |
+| `RoiAlign` | `` | ✅ | **NVRTC-custom** | Standalone nxrt only, opsets 10/16/22. Supports f16/f32/f64 (bf16 from opset 22), Int64 batch indices, average/max pooling, and fixed/adaptive sampling. Device-side index validation requires eager execution; the ORT CUDA plugin does not advertise this op. |
 
 <!-- CUDA_COVERAGE_MATRIX_END -->
 
@@ -305,7 +306,7 @@ surfaces on every host:
   subtracts `CUDA_COVERED_OPS`, and rejects an undocumented gap.
 - `every_cuda_covered_op_is_named_in_current_coverage_matrix` parses
   `(domain, name)` pairs between the matrix markers above and requires every
-  advertised name to use an unambiguous domain.
+  standalone CUDA name to use an unambiguous domain.
 
 The exact pair comparison needs the real CUDA registry, whose factories hold a
 CUDA runtime. Run its source-derived census on a CUDA host:

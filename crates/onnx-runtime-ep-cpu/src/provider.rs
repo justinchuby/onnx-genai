@@ -510,6 +510,11 @@ impl ExecutionProvider for CpuExecutionProvider {
         ) {
             return KernelMatch::unsupported(reason);
         }
+        if let Some(reason) =
+            onnx_runtime_ir::roi_align::unsupported_reason(op, opset, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "DequantizePacked"
             && onnx_runtime_ir::is_default_domain(&op.domain)
             && let Err(reason) =
