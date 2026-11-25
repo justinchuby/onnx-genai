@@ -233,7 +233,7 @@ impl ToolCallStagedOutputObserver {
                 for &id in &self.tokens {
                     let piece = contract.pieces.get(id as usize).ok_or_else(|| self.projection_error(anyhow::anyhow!("tool observation token {id} is absent from the bound tokenizer vocabulary; use IDs from that model")))?;
                     let delta = decoder.step(piece);
-                    if bytes.len().checked_add(delta.len()).is_none_or(|size| size > limit) {
+                    if bytes.len().checked_add(delta.len()).and_then(|size|size.checked_add(decoder.retained_bytes())).is_none_or(|size| size > limit) {
                         return Err(self.projection_error(anyhow::anyhow!("projected tool output exceeds its {limit}-byte response buffer; reduce max_tokens or increase the response buffer")));
                     }
                     bytes.extend_from_slice(&delta);
@@ -699,7 +699,7 @@ mod tests {
                     json!({"type":"ByteFallback"})
                 };
                 tokenizer["decoder"] = if deferred {
-                    json!({"type":"Sequence","decoders":[decoder,{"type":"Strip","content":"x","start":0,"stop":1}]})
+                    json!({"type":"Sequence","decoders":[decoder,{"type":"Replace","pattern":{"String":"x"},"content":""}]})
                 } else {
                     decoder
                 };

@@ -26,6 +26,89 @@ fn tiny_state() -> AppState {
     AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture")
 }
 
+#[tokio::test]
+async fn fused_trailing_strip_constrains_real_native_output_before_buffered_and_sse_publication() {
+    async fn request(router: axum::Router, path: &str, body: Value) -> axum::response::Response {
+        router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    copy_tree(&source, scratch.path());
+    let path = scratch.path().join("tokenizer.json");
+    let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+    for (id, piece) in [(4, r#"{"ok":1}x"#), (5, r#"{"ok":2}x"#)] {
+        let old = vocab
+            .iter()
+            .find(|(_, value)| value.as_u64() == Some(id))
+            .unwrap()
+            .0
+            .clone();
+        vocab.remove(&old);
+        assert!(vocab.insert(piece.into(), json!(id)).is_none());
+    }
+    tokenizer["model"] = json!({"type":"BPE","vocab":tokenizer["model"]["vocab"],"merges":[],"unk_token":"<unk>","byte_fallback":true});
+    tokenizer["decoder"] = json!({"type":"Sequence","decoders":[{"type":"ByteFallback"},{"type":"Fuse"},
+        {"type":"Strip","content":"x","start":0,"stop":1}]});
+    std::fs::write(&path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+    std::fs::write(
+        scratch.path().join("tokenizer_config.json"),
+        r#"{"chat_template":"."}"#,
+    )
+    .unwrap();
+    let router = app(AppState::load(scratch.path(), Some("tail-strip".into())).unwrap());
+    for stream in [false, true] {
+        for logprobs in [false, true] {
+            let response=request(router.clone(),"/v1/chat/completions",json!({
+                "messages":[{"role":"user","content":"hello"}],"max_tokens":1,"temperature":0,
+                "stream":stream,"logprobs":logprobs,"top_logprobs":if logprobs {json!(2)} else {Value::Null},
+                "response_format":{"type":"json_schema","json_schema":{"name":"constant","schema":{"const":{"ok":1}}}},
+                "logit_bias":{"3":150,"5":100,"4":90}
+            })).await;
+            let status = response.status();
+            let content = if stream {
+                let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                let events = sse_json_events(&bytes);
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{}",
+                    String::from_utf8_lossy(&bytes)
+                );
+                assert!(
+                    events.iter().all(|event| event.get("error").is_none()),
+                    "{events:?}"
+                );
+                events
+                    .iter()
+                    .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+                    .collect::<String>()
+            } else {
+                let body = json_body(response).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                body["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            };
+            assert_eq!(
+                content, r#"{"ok":1}"#,
+                "stream={stream}, logprobs={logprobs}"
+            );
+        }
+    }
+}
+
 mod gbnf_wire {
     use super::*;
 
