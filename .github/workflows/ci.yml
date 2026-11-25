@@ -388,6 +388,13 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
+      # This job compiles the workspace repeatedly across tests and two clippy
+      # configurations. Keep line tables for actionable backtraces without
+      # retaining full variable debug data or incremental state on the 14 GB
+      # hosted runner.
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "1"
+      CARGO_PROFILE_TEST_DEBUG: "1"
 
     steps:
       - uses: actions/checkout@v7
@@ -423,9 +430,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-${{ github.job }}-bounded-debug-v1-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-${{ github.job }}-bounded-debug-v1-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
 
       # Every cheap gate from here down is guarded with `!cancelled()` rather
       # than the implicit `success()`, for the reason #2170 gave for the CUDA
@@ -782,6 +789,10 @@ jobs:
       #
       # Serialized for the reason the `CLI ORT` step was: several integration
       # tests select sessions through process-wide environment variables.
+      - name: Report disk usage before ORT-backed tests
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          du -sh target
       - name: Test ORT-backed workspace crates
         env:
           NXRT_REQUIRE_ORT_TESTS: "1"
