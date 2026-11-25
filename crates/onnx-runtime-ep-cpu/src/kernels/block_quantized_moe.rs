@@ -40,7 +40,7 @@ use super::block_quantized_matmul::{
 };
 use super::decoded_projection::ProjectionScratch;
 use super::moe::{
-    DenseExpertWeights, ExpertProjection, MoeAttributes, MoeWorkspace, routing_weights,
+    DenseExpertWeights, ExpertProjection, MoeAttributes, MoeWorkspace, RoutingScratch,
 };
 use super::{check_arity, to_dense_f32, write_dense_f32};
 
@@ -403,9 +403,10 @@ impl BlockQuantizedMoEKernel {
         let fc3_bias = optional_dense(inputs, 7)?;
 
         let mut tasks = BTreeMap::<usize, Vec<(usize, f32)>>::new();
+        let mut routing = RoutingScratch::default();
         for row in 0..rows {
             let range = row * experts..(row + 1) * experts;
-            let mut route = routing_weights(
+            let route = routing.weights(
                 &router_logits[range.clone()],
                 router_weights
                     .as_deref()
@@ -414,11 +415,12 @@ impl BlockQuantizedMoEKernel {
                 self.attributes.normalize_routing_weights,
             );
             route.sort_unstable_by_key(|&(expert, _)| expert);
-            for (expert, weight) in route {
+            for &(expert, weight) in route.iter() {
                 tasks.entry(expert).or_default().push((row, weight));
             }
         }
 
+        drop(routing);
         let output = accumulator.zeroed_prefix(rows * hidden)?;
         // A dense resident set must fit as a whole: separately admitting
         // projections can evict an Arc still held by this expert call and

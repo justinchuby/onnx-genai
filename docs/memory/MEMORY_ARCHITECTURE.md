@@ -938,6 +938,18 @@ explicitly unsupported until metadata preparation has a capture-safe contract.
 No new pool, quota interface or issuer callback is introduced in execution.
 CUDA numerical, asynchronous-failure and throughput validation require a device.
 
+### CPU expert routing metadata
+
+CPU MoE, QMoE and BlockQuantizedMoE share one dispatch-local routing scratch.
+The index, exponential and selected-pair vectors retain capacity across rows;
+borrowed selections are consumed before the next row, and the scratch retires
+before expert weight admission, computation or prefetch. QMoE consumes its final
+contribution slots using the already validated row/k geometry instead of keeping
+a second copy of every selected route just to recover each row's count. Sorting,
+normalization and contribution addition order are preserved. This metadata is
+still outside the governed projection lane; cold setup, growth and grouping
+allocations remain. See the [routing evidence and limits](../benchmarks/cpu-routing-scratch/README.md).
+
 ### CPU compressed-projection scratch
 
 CPU `BlockQuantizedMatMul` and `BlockQuantizedMoE` declare metadata-planned,
