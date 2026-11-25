@@ -181,11 +181,11 @@ fn dispatch_topk_rejects_bfloat16_at_opset_23() {
     let ctx = EagerContext::new().unwrap();
     let x = Tensor::from_raw(onnx_runtime_ir::DataType::BFloat16, vec![2], &[0; 4]).unwrap();
     let k = Tensor::from_i64(&[1], &[1]).unwrap();
-    let reason = ctx
-        .dispatch_with_outputs("TopK", "", &[&x, &k], &HashMap::new(), 2, Some(23))
-        .err()
-        .expect("opset 23 BF16 must be rejected")
-        .to_string();
+    let reason =
+        match ctx.dispatch_with_outputs("TopK", "", &[&x, &k], &HashMap::new(), 2, Some(23)) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("opset 23 BF16 must be rejected"),
+        };
     assert!(reason.contains("TopK") && reason.contains("BFloat16") && reason.contains("opset 24"));
 }
 
