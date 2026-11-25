@@ -240,47 +240,44 @@ pub unsafe extern "C" fn ReleaseEpFactory(
             "ReleaseEpFactory: panic during factory release (fail-closed)",
         ),
     }
-
-    #[cfg(test)]
-    mod tests {
-        #[test]
-        fn causal_conv_factory_advertises_only_legacy_schemas() {
-            use onnx_genai_ort_sys as ort;
-            use onnx_runtime_ep_plugin::factory::ExportedFactory;
-            use std::ptr;
-
-            let host = onnx_runtime_ort_testkit::ort_test_process().expect("pinned ORT test host");
-            let get_api_base: libloading::Symbol<
-                '_,
-                unsafe extern "C" fn() -> *const ort::OrtApiBase,
-            > = unsafe { host.library().get(b"OrtGetApiBase") }.expect("ORT exports OrtGetApiBase");
-            let mut factory = ptr::null_mut();
-            let mut count = 0;
-            let status = unsafe {
-                super::CreateEpFactories(
-                    ptr::null(),
-                    get_api_base(),
-                    ptr::null(),
-                    &mut factory,
-                    1,
-                    &mut count,
-                )
-            };
-            assert!(status.is_null() && count == 1 && !factory.is_null());
-            let mut ranges: Vec<_> = unsafe { &*factory.cast::<ExportedFactory>() }
-                .kernel_registry_entries
-                .iter()
-                .filter(|entry| entry.op_type == "CausalConvWithState")
-                .map(|entry| (entry.domain, entry.since_version, entry.end_version))
-                .collect();
-            assert!(unsafe { super::ReleaseEpFactory(factory) }.is_null());
-
-            ranges.sort_unstable();
-            assert_eq!(ranges, [("", 27, 28), ("com.microsoft", 1, i32::MAX)]);
-        }
-    }
 }
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn causal_conv_factory_advertises_only_legacy_schemas() {
+        use onnx_genai_ort_sys as ort;
+        use onnx_runtime_ep_plugin::factory::ExportedFactory;
+        use std::ptr;
+
+        let host = onnx_runtime_ort_testkit::ort_test_process().expect("pinned ORT test host");
+        let get_api_base: libloading::Symbol<'_, unsafe extern "C" fn() -> *const ort::OrtApiBase> =
+            unsafe { host.library().get(b"OrtGetApiBase") }.expect("ORT exports OrtGetApiBase");
+        let mut factory = ptr::null_mut();
+        let mut count = 0;
+        let status = unsafe {
+            super::CreateEpFactories(
+                ptr::null(),
+                get_api_base(),
+                ptr::null(),
+                &mut factory,
+                1,
+                &mut count,
+            )
+        };
+        assert!(status.is_null() && count == 1 && !factory.is_null());
+        let mut ranges: Vec<_> = unsafe { &*factory.cast::<ExportedFactory>() }
+            .kernel_registry_entries
+            .iter()
+            .filter(|entry| entry.op_type == "CausalConvWithState")
+            .map(|entry| (entry.domain, entry.since_version, entry.end_version))
+            .collect();
+        assert!(unsafe { super::ReleaseEpFactory(factory) }.is_null());
+
+        ranges.sort_unstable();
+        assert_eq!(ranges, [("", 27, 28), ("com.microsoft", 1, i32::MAX)]);
+    }
+}
 // ─── Test observability: compiled-node counter ───────────────────────────────
 
 /// Returns the number of nodes compiled by our EP since last reset.
