@@ -83,7 +83,7 @@ impl GenerationClock {
         }
     }
 
-    fn begin_forward(&mut self, prompt_tokens: usize, cached_prompt_tokens: usize) {
+    pub(crate) fn begin_forward(&mut self, prompt_tokens: usize, cached_prompt_tokens: usize) {
         self.begin_forward_at(
             std::time::Instant::now(),
             prompt_tokens,
@@ -107,7 +107,7 @@ impl GenerationClock {
             generation_elapsed: std::time::Duration::ZERO,
         });
     }
-    fn finish_forward(&mut self) {
+    pub(crate) fn finish_forward(&mut self) {
         self.finish_forward_at(std::time::Instant::now());
     }
     fn finish_forward_at(&mut self, now: std::time::Instant) {
@@ -123,9 +123,28 @@ impl GenerationClock {
         self.token_selected_at(std::time::Instant::now(), generated_tokens);
     }
     fn token_selected_at(&mut self, now: std::time::Instant, generated_tokens: usize) {
+        self.pause_work_at(now);
+        if let Some(sample) = self.sample.as_mut() {
+            sample.generated_tokens = generated_tokens;
+        }
+    }
+    /// Multi-token verification shares work across accepted tokens. Pause at
+    /// observer boundaries, then resume only when active execution continues.
+    #[cfg(feature = "native-backend")]
+    pub(crate) fn resume_work(&mut self) {
+        self.resume_work_at(std::time::Instant::now());
+    }
+    #[cfg(any(feature = "native-backend", test))]
+    fn resume_work_at(&mut self, now: std::time::Instant) {
+        self.step_started.get_or_insert(now);
+    }
+    #[cfg(feature = "native-backend")]
+    pub(crate) fn pause_work(&mut self) {
+        self.pause_work_at(std::time::Instant::now());
+    }
+    fn pause_work_at(&mut self, now: std::time::Instant) {
         if let (Some(start), Some(sample)) = (self.step_started.take(), self.sample.as_mut()) {
             sample.generation_elapsed += now.duration_since(start);
-            sample.generated_tokens = generated_tokens;
         }
     }
     pub(crate) fn snapshot(&self) -> Option<crate::config::GenerationTimings> {
@@ -1369,6 +1388,37 @@ mod generation_clock_tests {
             );
             assert_eq!(sample.generation_elapsed, Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn generation_clock_counts_multi_token_acceptance_and_excludes_observer_gaps() {
+        let mut clock = GenerationClock::default();
+        let start = Instant::now();
+        clock.begin_forward_at(start, 5, 0);
+        clock.finish_forward_at(start + Duration::from_millis(10));
+        clock.pause_work_at(start + Duration::from_millis(12));
+        // Progress notification takes arbitrary wall time before proposing.
+        clock.resume_work_at(start + Duration::from_millis(200));
+        clock.resume_work_at(start + Duration::from_millis(201));
+        clock.token_selected_at(start + Duration::from_millis(208), 1);
+        let first = clock.snapshot().unwrap();
+        assert_eq!(first.prompt_elapsed, Duration::from_millis(10));
+        assert_eq!(first.generation_elapsed, Duration::from_millis(10));
+        // Another token accepted by the same verify requires no new forward.
+        clock.token_selected_at(start + Duration::from_millis(300), 2);
+        let second = clock.snapshot().unwrap();
+        assert_eq!(second.generated_tokens, 2);
+        assert_eq!(second.generation_elapsed, first.generation_elapsed);
+        // Selection of the bonus resumes active work after delivery.
+        clock.resume_work_at(start + Duration::from_millis(400));
+        clock.token_selected_at(start + Duration::from_millis(403), 3);
+        assert_eq!(clock.snapshot().unwrap().generated_tokens, 3);
+        assert_eq!(
+            clock.snapshot().unwrap().generation_elapsed,
+            Duration::from_millis(13)
+        );
+        assert_eq!(clock.snapshot().unwrap().prompt_tokens, 5);
+        assert_eq!(clock.snapshot().unwrap().cached_prompt_tokens, 0);
     }
 
     #[test]
