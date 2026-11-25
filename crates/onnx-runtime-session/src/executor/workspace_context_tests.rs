@@ -191,13 +191,21 @@ fn qmoe_context_graph() -> Graph {
 
 #[test]
 fn same_shapes_reprepare_workspace_when_selected_pool_changes() {
+    check_context_repreparation(qmoe_context_graph(), &[3, 16], 512., Some((1408, 1664)));
+}
+
+fn check_context_repreparation(
+    graph: Graph,
+    input_shape: &[usize],
+    expected: f32,
+    bounds: Option<(u64, u64)>,
+) {
     let calls = Arc::new(AtomicUsize::new(0));
     let ep = Arc::new(ContextCountingCpu {
         cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
         metadata_queries: calls.clone(),
     });
-    let mut executor =
-        Executor::build(qmoe_context_graph(), Arc::new(WeightStore::new()), ep, None).unwrap();
+    let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), ep, None).unwrap();
     let one = rayon::ThreadPoolBuilder::new()
         .num_threads(1)
         .build()
@@ -212,8 +220,8 @@ fn same_shapes_reprepare_workspace_when_selected_pool_changes() {
         let before = calls.load(Ordering::SeqCst);
         let executor = &mut executor;
         let calls = &calls;
-        target.install(move || {
-            let x = Tensor::from_f32(&[3, 16], &[1.; 48]).unwrap();
+        let bytes = target.install(move || {
+            let x = Tensor::from_f32(input_shape, &vec![1.; input_shape.iter().product()]).unwrap();
             let router = Tensor::from_f32(&[3, 4], &[0.; 12]).unwrap();
             let inputs = [("x", &x), ("router", &router)];
             let req = executor
@@ -221,7 +229,10 @@ fn same_shapes_reprepare_workspace_when_selected_pool_changes() {
                 .unwrap()
                 .require_complete()
                 .unwrap();
-            assert_eq!(req.step().bytes, if width == 1 { 1408 } else { 1664 });
+            if let Some((one, four)) = bounds {
+                assert_eq!(req.step().bytes, if width == 1 { one } else { four });
+            }
+            assert!(req.step().bytes > 0);
             assert_eq!(
                 executor
                     .workspace_preparation_memo
@@ -252,7 +263,7 @@ fn same_shapes_reprepare_workspace_when_selected_pool_changes() {
             );
             for _ in 0..2 {
                 let result = executor.run(&inputs).unwrap();
-                assert!(result[0].to_vec_f32().iter().all(|x| *x == 512.));
+                assert!(result[0].to_vec_f32().iter().all(|x| *x == expected));
             }
             // Execution may prime a specialization. Re-publish against those
             // actual cache counters before testing the next context transition.
@@ -268,8 +279,101 @@ fn same_shapes_reprepare_workspace_when_selected_pool_changes() {
                 .require_complete()
                 .unwrap();
             assert_eq!(calls.load(Ordering::SeqCst), stable);
+            req.step().bytes
         });
-        assert_ne!(previous, Some(width));
-        previous = Some(width);
+        if let Some((previous_width, previous_bytes)) = previous {
+            assert_ne!(previous_width, width);
+            assert_ne!(
+                previous_bytes, bytes,
+                "these fixtures must expose the width-dependent demand"
+            );
+        }
+        previous = Some((width, bytes));
     }
+}
+
+fn block_context_graph(experts: bool) -> Graph {
+    use onnx_runtime_ir::TensorData;
+    let mut graph = Graph::new();
+    graph.opset_imports.insert("pkg.nxrt".into(), 1);
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([3, 32]));
+    let router = graph.create_named_value("router", DataType::Float32, static_shape([3, 4]));
+    let y = graph.create_named_value(
+        "y",
+        DataType::Float32,
+        static_shape([3, if experts { 32 } else { 64 }]),
+    );
+    let mut pack = |name: &str, k: usize, n: usize| {
+        let mut dims = vec![n, k / 32, 17];
+        if experts {
+            dims.insert(0, 4);
+        }
+        let mut bytes = Vec::new();
+        for _ in 0..dims.iter().product::<usize>() / 17 {
+            bytes.push(127);
+            bytes.extend([0x22; 16]);
+        }
+        let w = graph.create_named_value(name, DataType::Uint8, static_shape(dims.iter().copied()));
+        graph.set_initializer(
+            w,
+            WeightRef::Inline(TensorData::from_raw(DataType::Uint8, dims, bytes)),
+        );
+        w
+    };
+    let w1 = pack("w1", 32, 64);
+    let mut node = if experts {
+        let w2 = pack("w2", 64, 32);
+        Node::new(
+            NodeId(0),
+            "BlockQuantizedMoE",
+            vec![Some(x), Some(router), Some(w1), None, Some(w2)],
+            vec![y],
+        )
+    } else {
+        Node::new(
+            NodeId(0),
+            "BlockQuantizedMatMul",
+            vec![Some(x), Some(w1)],
+            vec![y],
+        )
+    };
+    node.domain = "pkg.nxrt".into();
+    node.attributes
+        .insert("block_layout_version".into(), Attribute::Int(1));
+    if experts {
+        for name in ["fc1_format", "fc2_format"] {
+            node.attributes
+                .insert(name.into(), Attribute::String(b"mxfp4".to_vec()));
+        }
+        for (name, value) in [
+            ("k", 2),
+            ("normalize_routing_weights", 1),
+            ("swiglu_fusion", 0),
+        ] {
+            node.attributes.insert(name.into(), Attribute::Int(value));
+        }
+        node.attributes.insert(
+            "activation_type".into(),
+            Attribute::String(b"identity".to_vec()),
+        );
+    } else {
+        node.attributes.insert("K".into(), Attribute::Int(32));
+        node.attributes.insert("N".into(), Attribute::Int(64));
+        node.attributes
+            .insert("format".into(), Attribute::String(b"mxfp4".to_vec()));
+    }
+    graph.add_input(x);
+    graph.add_input(router);
+    graph.add_output(y);
+    graph.insert_node(node);
+    graph
+}
+
+#[test]
+fn block_matmul_same_shapes_reprepare_when_selected_pool_changes() {
+    check_context_repreparation(block_context_graph(false), &[3, 32], 32., None);
+}
+#[test]
+fn block_moe_same_shapes_reprepare_when_selected_pool_changes() {
+    check_context_repreparation(block_context_graph(true), &[3, 32], 2048., None);
 }

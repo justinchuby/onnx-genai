@@ -176,6 +176,16 @@ zero/nonzero groups, positive construction peaks for empty final payloads,
 positive splitting/retirement and zero-capacity rejection.
 This establishes callback behavior, not a measured inference speedup.
 
+CPU derived-weight group control metadata uses inline storage for the common
+one-to-three projection set. Larger groups spill normally; inline capacity is
+not an eligibility or budget limit. Block-format MoE uses the same storage for
+its short projection/source/key/size/spec lists. Payload buffers remain separate,
+exactly charged owners; whole-group missing-build peaks are still preflighted
+once, and cache entries are published only after every builder succeeds. The
+[allocation diagnostic](../benchmarks/weight-group-metadata/README.md) scopes
+its result to private warm cache-hit metadata, not routing, numerical compute,
+whole-kernel allocations or inference throughput.
+
 Cold replacement borrows the caller's `Option<WorkspaceAllocation>`. The option
 retains the original owner until the provider actually takes it for retirement.
 CUDA rejects real stream capture before release-barrier waiting, growth grants,
@@ -637,8 +647,8 @@ refiner before admission. Output storage is uninitialized: only layout and
 pointer origins may be inspected. Kernel-sized output paths explicitly have no
 final output storage yet. The caller retains exclusive execution ownership from
 refinement through admission and launch. Most kernels implement only the metadata
-hook; only address/value-dependent kernels need an execution refiner. ORT caches
-metadata preparations, including `Deferred`, and refines on each Compute; exact
+hook; only address/value/context-dependent kernels need an execution refiner.
+ORT caches metadata preparations, including `Deferred`, and refines on each Compute; exact
 address/value-dependent bytes never enter that geometry cache. Cached ready
 preparations avoid repeating the metadata query.
 
@@ -659,8 +669,13 @@ Integer QMoE's execution refiner selects the actual decode plan before admission
 clears any previous plan on failure and publishes only a successful selection.
 Launch consumes that exact plan under the existing exclusive kernel boundary;
 it never recomputes a different shard count from the thread pool. Cached metadata
-does not skip this selection. Shape preparation can remain complete while a
-changed execution context takes the normal cold reprepare/growth path; existing
+does not skip this selection. A Ready bound from the same kernel, tensor metadata
+and provider context is reused without repeating metadata planning; None/Deferred
+still run the checked planner. This preserves the default refiner's warm-cache
+contract while fixing the dispatch plan. Actual-view/layout validation remains
+in execution, and failed uncached preparation clears any earlier selection.
+Shape preparation can remain complete while a changed execution context takes
+the normal cold reprepare/growth path; existing
 capture guards still reject replacing pinned backing.
 
 ActualAddress workspace sizes across alignment classes need not be monotonic.
@@ -923,6 +938,18 @@ explicitly unsupported until metadata preparation has a capture-safe contract.
 No new pool, quota interface or issuer callback is introduced in execution.
 CUDA numerical, asynchronous-failure and throughput validation require a device.
 
+### CPU expert routing metadata
+
+CPU MoE, QMoE and BlockQuantizedMoE share one dispatch-local routing scratch.
+The index, exponential and selected-pair vectors retain capacity across rows;
+borrowed selections are consumed before the next row, and the scratch retires
+before expert weight admission, computation or prefetch. QMoE consumes its final
+contribution slots using the already validated row/k geometry instead of keeping
+a second copy of every selected route just to recover each row's count. Sorting,
+normalization and contribution addition order are preserved. This metadata is
+still outside the governed projection lane; cold setup, growth and grouping
+allocations remain. See the [routing evidence and limits](../benchmarks/cpu-routing-scratch/README.md).
+
 ### CPU compressed-projection scratch
 
 CPU `BlockQuantizedMatMul` and `BlockQuantizedMoE` declare metadata-planned,
@@ -937,9 +964,20 @@ expert IDs. Each expert therefore receives at most the total input row count.
 The node declares the maximum **complete** projection layout across FC1, FC2,
 and optional FC3 at that row count, rather than their sum or a multiple of
 expert count/top-k. Each projection layout includes column staging plus decoded
-tiles. The logical shard count is fixed when the kernel is created and is used
-by both planning and execution, even when a different Rayon pool runs it.
-Dense-cache admission may decline, so the bound always covers streamed fallback.
+tiles. Metadata planning follows the selected execution context. Before admission,
+the execution refiner selects a logical shard plan from that actual Rayon pool;
+launch consumes the same plan once for both layout binding and compute. Kernel
+construction no longer fixes the pool width or initializes Rayon. A failed
+refinement clears any earlier selection; a nonempty launch without a selected
+plan fails before weight admission. Existing validated-empty MoE execution still
+clears old state and returns only after its original shape validation. Dense-cache
+admission may decline, so the bound always covers streamed fallback. The same
+provider context key used by integer QMoE guards native/ORT preparation caches;
+no new public API, allocator, per-shard quota or provider lock is introduced.
+The existing architecture-dependent tile and serial arithmetic are unchanged.
+The [adoption record and matched-owner diagnostic](../benchmarks/block-projection-paired-owner/README.md)
+retain the earlier noisy results and distinguish measured warm wall time from
+unresolved per-arm CPU cost.
 
 The decode region is borrowed by sequential projection calls. A private
 dispatch-local owner lazily initializes its required f32 span at the first

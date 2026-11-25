@@ -21,6 +21,7 @@ A reader that accepts a schema version must implement that version's typed SSA/d
 | `v1.10` | Non-generative decision profiles: explicit prompting, tokenizer inputs, calibrated probability heads and answer policies; no architecture inference. |
 | `v1.11` | Decision request policies declare defaults, payloads, supported question kinds, option/score bounds, ordering and legend semantics explicitly. |
 | `v1.12` | Reranking v2 profiles declare ordered query/document encoded-image inputs; reusable image preprocessing v2 names component-local output ports. |
+| `v1.13` | Realtime v1 profiles declare session-owned bounded audio/text quanta, native rates, frame bounds, control operations and actual per-quantum usage. |
 
 ## Optional semantic extensions
 

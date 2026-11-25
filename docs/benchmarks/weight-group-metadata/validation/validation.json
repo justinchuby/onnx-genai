@@ -1,0 +1,100 @@
+{
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/weight_cache.rs": "25f0f0b1b45958ef481a341fbf4075fd3415a33e1226d0c131b74cb5125f561b",
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs": "24e9dd9c62e12c80c271f0b3ec47b26bcc09913c2874d0d82333d0df20d8e68a"
+  },
+  "results": [
+    {
+      "name": "list",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::weight_cache::tests::",
+        "--",
+        "--list"
+      ],
+      "exit": 0,
+      "log_sha256": "48a15f43bba3ead73dc465ef47c06ef567aec4fe34b1c19c87690fa1330d526d"
+    },
+    {
+      "name": "native",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib"
+      ],
+      "exit": 0,
+      "log_sha256": "642599e43f7c50987854027fe3ee6add6a68bc3d2eaa34df688329dfc76d4be2",
+      "counts": [
+        [
+          "2069",
+          "0",
+          "21"
+        ]
+      ]
+    },
+    {
+      "name": "mlas",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "--features",
+        "mlas"
+      ],
+      "exit": 0,
+      "log_sha256": "f81a309031d4dc250fd42cb41ad224c95735670282b62cd1cec102711644d42d",
+      "counts": [
+        [
+          "2111",
+          "0",
+          "37"
+        ]
+      ]
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit": 0,
+      "log_sha256": "f886043813dd12c912a187fa883083aff7c8f757debf9705bba4c89e0759ff8c"
+    },
+    {
+      "name": "clippy-mlas",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--all-targets",
+        "--features",
+        "mlas",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit": 0,
+      "log_sha256": "7ad0d8cba0333bfc49647435f0884a9bd953fe1b80c01e9025e0ffce21071a42"
+    }
+  ]
+}

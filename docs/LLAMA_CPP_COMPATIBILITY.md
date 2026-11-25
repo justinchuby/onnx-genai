@@ -57,6 +57,7 @@ model inspection, profiling and command-line streaming remain available.
 | POST | `/v1/streams/lookup` | Lookup only requested conversation IDs, including model-qualified IDs |
 | POST | `/v1/audio/transcriptions`, `/audio/transcriptions` | Existing multipart transcription contract |
 | POST | `/v1/audio/speech`, `/audio/speech`, `/tts` | Declared buffered speech workflow; native input/prompt and raw-prompt handling |
+| WS | `/v1/realtime` | Metadata-declared native streaming audio/text sessions; [contract and current limits](REALTIME.md) |
 | GET | `/models/sse` | Model status, actual per-file download progress, pause/failure and removal events |
 | POST | `/models/load`, `/models/unload` | Configured and cached model IDs; cache mode also supports pausing downloads |
 | POST, DELETE | `/models` | Opt-in bounded Hugging Face nxrt-package download, resume and deletion |
@@ -432,9 +433,12 @@ including actual native image preprocessing and model-owned token usage. See
 ## Remaining differences
 
 This is a functional Llama Chat integration, not a claim of complete llama-server
-parity. These upstream protocols are still unimplemented:
+parity. These upstream capabilities remain incomplete:
 
-- Realtime audio/WebSocket inference and multimodal/joint decision heads.
+- Realtime tool grammar enforcement, full tool argument schema validation and
+  device-backed wire acceptance; see [realtime](REALTIME.md) for the implemented
+  WebSocket session modes, resource bounds and Native CPU evidence.
+- Multimodal/joint decision heads and shared generation/decision entry points.
 - Device-state/multi-sequence slot persistence; arbitrary GGUF/PEFT LoRA imports and device-fused LoRA.
 - GGUF package import, quantization selectors and selective sidecar management.
   Hugging Face nxrt-package download, resume and deletion are supported.

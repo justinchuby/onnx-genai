@@ -236,6 +236,7 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
     ServerConfig {
         node_id: args.node_id.clone().unwrap_or_else(default_node_id),
         max_output_tokens: args.max_output_tokens,
+        realtime: crate::RealtimeLimits::default(),
         endpoint_props: args.props,
         model_cache_dir: args.model_cache_dir.clone(),
         model_cache_max_bytes: args.model_cache_max_bytes,

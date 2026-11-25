@@ -5,7 +5,7 @@ Run the same command with `--check` to detect stale registrations.
 
 Reference: llama.cpp `8d60873dfb8619f2b5ed31adfbab07cccb40db5c`, `tools/server/server.cpp`;
 59 registrations / 55 distinct method-path contracts.
-Local registrations: 50 present, 0 disabled placeholders, 1 missing, 4 delegated to the external harness.
+Local registrations: 51 present, 0 disabled placeholders, 0 missing, 4 delegated to the external harness.
 
 **Registration presence is not behavioral conformance.** This source audit does not
 execute handlers, enable feature gates, compare schemas/results, or prove frontend
@@ -39,7 +39,7 @@ See [compatibility behavior and remaining gaps](LLAMA_CPP_COMPATIBILITY.md) and
 | POST | `/tts` | present | `routes::native::tts` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L191) |
 | POST | `/v1/audio/speech` | present | `routes::audio_speech` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L192) |
 | POST | `/audio/speech` | present | `routes::audio_speech` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L193) |
-| WS | `/v1/realtime` | missing | `—` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L194) |
+| WS | `/v1/realtime` | present | `realtime::websocket::upgrade` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L194) |
 | POST | `/v1/messages` | present | `routes::transports::messages` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L195) |
 | POST | `/infill` | present | `routes::native::infill` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L196) |
 | POST | `/embedding` | present | `routes::native::embeddings` | [source](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server.cpp#L197) |
@@ -88,6 +88,6 @@ stream framing/cancellation where applicable. Test source presence alone does no
 satisfy these cases. Cross-model and backend-specific behavior must use declared
 capabilities; a passing narrow fixture does not establish general parity.
 
-The missing realtime protocol and disabled model download/deletion
-remain implementation work. Existing handlers also retain the explicit source,
-device-state and multimodal gaps documented in the compatibility ledger.
+Realtime task admission, model-cache gates and the remaining source, device-state
+and multimodal differences require the behavioral checks documented in the
+compatibility ledger; a present registration does not close those gaps.

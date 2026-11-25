@@ -432,6 +432,7 @@ pub struct ServerConfig {
     /// (§34.8). Independent of any model; defaults to the hostname or a generated id.
     pub node_id: String,
     pub max_output_tokens: usize,
+    pub realtime: crate::realtime::RealtimeLimits,
     /// Enable the upstream POST /props acknowledgement; no mutation schema exists upstream.
     pub endpoint_props: bool,
     /// Enable owned Hub package downloads and deletion in this directory.
@@ -514,6 +515,7 @@ impl Default for ServerConfig {
         Self {
             node_id: default_node_id(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            realtime: crate::realtime::RealtimeLimits::default(),
             endpoint_props: false,
             model_cache_dir: None,
             model_cache_max_bytes: std::num::NonZeroU64::new(64 * 1024 * 1024 * 1024).unwrap(),
@@ -588,6 +590,11 @@ impl ServerConfig {
         );
         if self.node_id.trim().is_empty() {
             anyhow::bail!("node_id must not be empty");
+        }
+        if self.realtime.source_bytes.get() < 2 || self.realtime.write_timeout.is_zero() {
+            anyhow::bail!(
+                "realtime limits require source_bytes >= 2 and a positive write_timeout; allow at least one PCM16 sample and a bounded websocket writer"
+            );
         }
         if self.max_output_tokens == 0 {
             anyhow::bail!("max_output_tokens must be greater than zero");

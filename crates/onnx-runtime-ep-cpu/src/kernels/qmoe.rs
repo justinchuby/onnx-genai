@@ -32,7 +32,7 @@ use onnx_runtime_loader::{
 use super::decoded_projection::{DecodedProjectionPlan, ProjectionScratch};
 use super::matmul_nbits::dequantize_nbits_row;
 use super::moe::{
-    DenseExpertWeights, ExpertProjection, MoeAttributes, MoeWorkspace, routing_weights,
+    DenseExpertWeights, ExpertProjection, MoeAttributes, MoeWorkspace, RoutingScratch,
 };
 use super::{check_arity, quantized_input_bytes, to_dense_f32, write_dense_f32};
 use crate::DerivedWeightMemory;
@@ -243,6 +243,8 @@ impl QMoEKernel {
         inputs: &[TensorMetadata<'_>],
         plan: DecodedProjectionPlan,
     ) -> Result<WorkspaceRequirement> {
+        #[cfg(test)]
+        WORKSPACE_METADATA_QUERIES.with(|queries| queries.set(queries.get() + 1));
         let input = inputs
             .first()
             .filter(|input| input.present)
@@ -292,13 +294,19 @@ impl Kernel for QMoEKernel {
         _outputs: &[TensorMut],
         metadata: &[TensorMetadata<'_>],
         _output_metadata: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-        _cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
+        cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
     ) -> Result<onnx_runtime_ep_api::WorkspaceExecutionPreparation> {
         // Exclusive kernel ownership spans refinement, admission and launch.
         // Failed preparation must not leave a previously selected plan usable.
         self.prepared_projection.set(None);
         let plan = DecodedProjectionPlan::for_current_pool(std::num::NonZeroUsize::new(1).unwrap());
-        let requirement = self.workspace_for_plan(metadata, plan)?;
+        // The caller already matched this kernel, tensor metadata and provider
+        // context. Preserve the default hook's Ready-cache fast path; capture a
+        // fresh dispatch plan even when no metadata calculation is needed.
+        let requirement = match cached {
+            Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(requirement)) => requirement,
+            _ => self.workspace_for_plan(metadata, plan)?,
+        };
         self.prepared_projection.set(Some(plan));
         Ok(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready(
             requirement,
@@ -526,13 +534,13 @@ impl Kernel for QMoEKernel {
             decoder,
             plan: projection_plan,
         };
-        let mut routes = Vec::with_capacity(rows);
+        let mut routing = RoutingScratch::default();
         let mut token_counts = BTreeMap::new();
         let mut tasks = BTreeMap::<usize, Vec<(usize, usize, f32)>>::new();
         let mut route_slots = 0usize;
         for row in 0..rows {
             let router_range = checked_range(row, experts, "router row")?;
-            let route = routing_weights(
+            let route = routing.weights(
                 &router[router_range.clone()],
                 aggregation.as_deref().map(|weights| &weights[router_range]),
                 self.attributes.k,
@@ -565,7 +573,7 @@ impl Kernel for QMoEKernel {
                      margin={margin:.8e}"
                 );
             }
-            for &(expert, route_weight) in &route {
+            for &(expert, route_weight) in route.iter() {
                 *token_counts.entry(expert).or_insert(0usize) += 1;
                 tasks
                     .entry(expert)
@@ -575,8 +583,8 @@ impl Kernel for QMoEKernel {
                     .checked_add(1)
                     .ok_or_else(|| error("routed contribution count overflow"))?;
             }
-            routes.push(route);
         }
+        drop(routing);
         let contribution_elements =
             checked_product(&[route_slots, hidden], "routed contribution element count")?;
         checked_byte_count(
@@ -756,10 +764,14 @@ impl Kernel for QMoEKernel {
             .input
             .zeroed_prefix(output_elements)?;
         let mut slot = 0usize;
-        for (row, route) in routes.into_iter().enumerate() {
+        // RoutingScratch returns min(k, experts) selections, and k <= experts
+        // was validated above. Every row therefore owns exactly k consecutive
+        // contribution slots in the original score order; no route copy is
+        // needed after tasks have consumed the expert/weight pairs.
+        for row in 0..rows {
             let output_range = checked_range(row, hidden, "output row")?;
             let output_row = &mut output[output_range];
-            for _ in route {
+            for _ in 0..self.attributes.k {
                 let contribution_range = checked_range(slot, hidden, "routed contribution row")?;
                 for (output_value, contribution) in output_row
                     .iter_mut()
@@ -2346,8 +2358,16 @@ fn error(message: impl Into<String>) -> EpError {
     EpError::KernelFailed(format!("QMoE: {}", message.into()))
 }
 
+// Test-only observation of actual metadata planning, scoped to the calling
+// thread so unrelated parallel tests cannot turn a warm-cache check into noise.
+#[cfg(test)]
+thread_local! {
+    static WORKSPACE_METADATA_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::kernels::moe::reference_routing_weights;
 
     use super::*;
     use crate::CpuExecutionProvider;
@@ -2876,9 +2896,12 @@ mod tests {
                 .unwrap();
             for (row, values) in output.to_f32().chunks_exact(H).enumerate() {
                 let mut expected = 0f32;
-                for (_, weight) in
-                    routing_weights(&logits, Some(&weights[row * E..(row + 1) * E]), k, false)
-                {
+                for (_, weight) in reference_routing_weights(
+                    &logits,
+                    Some(&weights[row * E..(row + 1) * E]),
+                    k,
+                    false,
+                ) {
                     expected += weight * (H * H) as f32;
                 }
                 for &actual in values {
@@ -3149,15 +3172,24 @@ mod tests {
                                     w2.view(),
                                     sc2.view(),
                                 ];
+                                let preparation = match warm {
+                                    0 => Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(req)),
+                                    1 => Some(onnx_runtime_ep_api::WorkspacePreparation::Deferred),
+                                    _ => None,
+                                };
+                                let queries_before = WORKSPACE_METADATA_QUERIES.with(std::cell::Cell::get);
                                 kernel
                                     .workspace_requirement_for_execution(
                                         &inputs,
                                         &[output.view_mut()],
                                         metadata,
                                         &[],
-                                        Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(req)),
+                                        preparation,
                                     )?
                                     .require_ready()?;
+                                assert_eq!(WORKSPACE_METADATA_QUERIES.with(std::cell::Cell::get) - queries_before,
+                                    usize::from(!matches!(preparation, Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(_)))),
+                                    "Ready reuses metadata, while Deferred/None must run the checked planner");
                                 kernel.execute_with_workspace(
                                     &inputs,
                                     &mut [output.view_mut()],
@@ -4570,7 +4602,7 @@ mod tests {
             crate::kernels::moe::MoeAttributes::from_node(float_graph.node(float_node)).unwrap();
         let mut dense_fallback = vec![0.0f32; rows * hidden];
         for row in 0..rows {
-            for (expert, route_weight) in crate::kernels::moe::routing_weights(
+            for (expert, route_weight) in crate::kernels::moe::reference_routing_weights(
                 &router[row * experts..(row + 1) * experts],
                 None,
                 k,

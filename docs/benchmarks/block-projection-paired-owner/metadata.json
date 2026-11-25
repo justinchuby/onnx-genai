@@ -1,0 +1,17 @@
+{
+  "source_base": "364b2cc70765ec907a098033a0c0d6f6a5fb2bcf",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs": "b5c2e5e7ad5fb8f1b4a71a37d6d95a470f69e1ce9d32e26a0ce6170574f2e30f"
+  },
+  "binary_sha256": "56429e8316f4c1d02eefe8cf6b036a9a268a6e1eeaa5babe5f3862392f7dc29b",
+  "probe_sha256": "8fd40b816acb5b247dcf5a633c3b167121e72ac9e769c482ff12d4f8a47aad62",
+  "probe_lock_sha256": "3ac03813c21bfffe2853ab840c35864471190a18da703674492a12e4c75a75d4",
+  "single_decode_symbol": [
+    "00000001004ab2cc t __RNvNtNtCs42teQl6N5qM_19onnx_runtime_ep_cpu7kernels22block_quantized_matmul18decode_mxfp4_block"
+  ],
+  "selector": "thread-local factory-only; no process environment mutation",
+  "scope": "diagnostic, never shipped",
+  "receipts_sha256": "54566ba19916872ee1045aeecc17347993b1937ad546e18d3ae85e70accedfed",
+  "runner_sha256": "1e8ac7f66661ac6616172acf9da5c9de54e9c80652dcb52509fb8598a06ee2ec",
+  "binary_after_sha256": "56429e8316f4c1d02eefe8cf6b036a9a268a6e1eeaa5babe5f3862392f7dc29b"
+}

@@ -1,0 +1,6 @@
+{
+  "base_before_ready_changes": "bfda7f545ecf0c7bb4f57a5865dfe5fdd4906724",
+  "changes": "Only the three source snapshots changed before validation; the shared-image diagnostic used the earlier candidate and does not measure the new Ready-cache path.",
+  "review": "Read-only resource-design review found no cache/state-contract blocker. None/Deferred keeps checked planning; actual execution validation unchanged.",
+  "production_counters": false
+}

@@ -312,6 +312,19 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
         .and_then(serde_yaml::Value::as_mapping)
     {
         for (name, profile) in profiles {
+            if profile.get("realtime").is_some()
+                || profile.get("kind").and_then(serde_yaml::Value::as_str) == Some("realtime")
+            {
+                crate::version::gate_feature_use(
+                    version,
+                    crate::version::SchemaFeature::RealtimeSessions,
+                    &format!(
+                        "profiles.{}.realtime",
+                        name.as_str().unwrap_or("<invalid-name>")
+                    ),
+                )
+                .map_err(crate::MetadataError::Parse)?;
+            }
             if profile.get("reranking").is_some() {
                 crate::version::gate_feature_use(
                     version,
