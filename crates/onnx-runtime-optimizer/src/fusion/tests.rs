@@ -2875,7 +2875,7 @@ fn layernorm_fusion_requires_a_provably_nonempty_normalized_suffix() {
         for id in graph.values.keys().collect::<Vec<_>>() {
             let value = graph.value_mut(id);
             if value.shape == static_shape([4]) {
-                value.shape = vec![width.clone()];
+                value.shape = vec![width];
             }
         }
         OpFusion::new()
