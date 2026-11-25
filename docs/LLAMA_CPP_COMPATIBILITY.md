@@ -353,6 +353,16 @@ JSON generation failures propagate as buffered errors or SSE error events; they
 are never replaced with an ungenerated `{}` and a successful stop. Stopping
 strings are removed before declared response-channel projection, consistently
 for buffered, live and logprob SSE output, including reasoning channels.
+Text stops match the earliest occurrence in generated output, including inside
+one token's decoded fragment and across token boundaries. Configured order
+resolves equal-position matches. The selected token remains counted and
+committed, while the stop string and following text are hidden. Native
+`stopping_word`, finish reasons and usage reflect that actual decoder stop.
+The matched word remains reported when EOS or prediction time takes priority
+over the final stop type, matching the pinned server's diagnostic behavior.
+Token-ID stop sequences retain their token-suffix semantics. Prediction-time
+checks use the same visible text boundary as delivery, including held partial
+stop prefixes, so hidden newlines do not trigger time expiry.
 Continuation intent follows the pinned upstream wire forms: `false`/`null` disable
 explicit continuation, `true` selects content unless the final message contains
 only reasoning, and `"content"` / `"reasoning_content"` select their named fields.

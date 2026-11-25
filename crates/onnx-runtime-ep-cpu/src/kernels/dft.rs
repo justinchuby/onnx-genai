@@ -10,7 +10,7 @@ use std::f32::consts::PI;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::Node;
+use onnx_runtime_ir::{Node, dft::DftMode};
 
 use super::check_arity;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
@@ -85,9 +85,30 @@ fn record_fast_path_hit() {
 pub struct DftFactory;
 
 impl KernelFactory for DftFactory {
-    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let inverse = node.attr("inverse").and_then(|a| a.as_int()).unwrap_or(0) != 0;
-        let onesided = node.attr("onesided").and_then(|a| a.as_int()).unwrap_or(0) != 0;
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        _opset: u64,
+        shapes: &[onnx_runtime_ir::Shape],
+        _dtypes: &[onnx_runtime_ir::DataType],
+    ) -> Option<String> {
+        let mode = match DftMode::parse(node) {
+            Ok(mode) => mode,
+            Err(reason) => return Some(reason),
+        };
+        shapes
+            .first()
+            .and_then(|shape| shape.last())
+            .and_then(|dim| dim.as_static())
+            .and_then(|components| mode.validate_components(components).err())
+    }
+
+    fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let mode = DftMode::parse(node).map_err(EpError::KernelFailed)?;
+        if let Some(&components) = input_shapes.first().and_then(|shape| shape.last()) {
+            mode.validate_components(components)
+                .map_err(EpError::KernelFailed)?;
+        }
         // Opset < 20: axis is an attribute (default 1).
         // Opset >= 20: axis is an input, handled at execute time.
         let axis_attr = node.attr("axis").and_then(|a| a.as_int());
@@ -97,8 +118,7 @@ impl KernelFactory for DftFactory {
             1
         };
         Ok(Box::new(DftKernel {
-            inverse,
-            onesided,
+            mode,
             axis_attr,
             default_axis,
         }))
@@ -106,8 +126,7 @@ impl KernelFactory for DftFactory {
 }
 
 struct DftKernel {
-    inverse: bool,
-    onesided: bool,
+    mode: DftMode,
     axis_attr: Option<i64>,
     default_axis: i64,
 }
@@ -148,11 +167,9 @@ impl Kernel for DftKernel {
                 "DFT: last dimension must be 1 (real) or 2 (complex), got {complex_dim}"
             )));
         }
-        if self.onesided && !is_real_input {
-            return Err(EpError::KernelFailed(
-                "DFT: onesided=1 is valid only for real input (last dimension 1)".into(),
-            ));
-        }
+        self.mode
+            .validate_components(complex_dim)
+            .map_err(EpError::KernelFailed)?;
 
         // Determine DFT length.
         let signal_len = input.shape[axis];
@@ -168,27 +185,22 @@ impl Kernel for DftKernel {
                     ))
                 })?
         } else {
-            signal_len
+            self.mode
+                .default_length(signal_len)
+                .map_err(EpError::KernelFailed)?
         };
 
         // Validate output shape.
-        let out_signal_len = if self.onesided {
-            dft_length / 2 + 1
-        } else {
-            dft_length
-        };
-
+        let out_signal_len = self.mode.output_length(dft_length);
+        let out_components = self.mode.output_components();
         let output = &mut outputs[0];
-        if output.shape[last] != 2 {
+        let mut expected_shape = input.shape.to_vec();
+        expected_shape[axis] = out_signal_len;
+        expected_shape[last] = out_components;
+        if output.shape != expected_shape {
             return Err(EpError::KernelFailed(format!(
-                "DFT: output last dim must be 2, got {}",
-                output.shape[last]
-            )));
-        }
-        if output.shape[axis] != out_signal_len {
-            return Err(EpError::KernelFailed(format!(
-                "DFT: output signal axis size mismatch: expected {out_signal_len}, got {}",
-                output.shape[axis]
+                "DFT: mode {:?} output shape mismatch: expected {expected_shape:?}, got {:?}",
+                self.mode, output.shape
             )));
         }
 
@@ -229,10 +241,15 @@ impl Kernel for DftKernel {
                 &output_strides,
             );
 
-            // Extract signal from input.
-            let mut real_in = vec![0.0f32; signal_len];
-            let mut imag_in = vec![0.0f32; signal_len];
-            for i in 0..signal_len {
+            // IRFFT consumes only the nonredundant positive half-spectrum.
+            let copied = if self.mode == DftMode::RealInverse {
+                signal_len.min(dft_length / 2 + 1)
+            } else {
+                signal_len
+            };
+            let mut real_in = vec![0.0f32; copied];
+            let mut imag_in = vec![0.0f32; copied];
+            for i in 0..copied {
                 let idx = in_base + i * input_strides[axis];
                 real_in[i] = input_data[idx];
                 if !is_real_input {
@@ -244,15 +261,33 @@ impl Kernel for DftKernel {
             real_in.resize(dft_length, 0.0);
             imag_in.resize(dft_length, 0.0);
 
-            // Compute DFT.
-            let (real_out, imag_out) =
-                compute_dft(&real_in, &imag_in, dft_length, self.inverse, self.onesided);
+            if self.mode == DftMode::RealInverse {
+                // DC and an even-length Nyquist bin are real. Fill missing
+                // negative frequencies by conjugation after padding/truncation.
+                imag_in[0] = 0.0;
+                if dft_length.is_multiple_of(2) {
+                    imag_in[dft_length / 2] = 0.0;
+                }
+                for i in 1..dft_length.div_ceil(2) {
+                    real_in[dft_length - i] = real_in[i];
+                    imag_in[dft_length - i] = -imag_in[i];
+                }
+            }
+            let (real_out, imag_out) = compute_dft(
+                &real_in,
+                &imag_in,
+                dft_length,
+                self.mode.inverse(),
+                self.mode == DftMode::RealForward,
+            );
 
             // Write to output.
             for i in 0..out_signal_len {
                 let idx = out_base + i * output_strides[axis];
                 output_data[idx] = real_out[i];
-                output_data[idx + 1] = imag_out[i];
+                if out_components == 2 {
+                    output_data[idx + 1] = imag_out[i];
+                }
             }
 
             // Advance batch indices.
@@ -647,6 +682,107 @@ mod tests {
             .unwrap();
     }
 
+    fn irfft_node(version: i64) -> Node {
+        let mut n = make_dft_node(-2, 1);
+        n.version = Some(version);
+        n.attributes.insert("inverse".into(), Attribute::Int(1));
+        n
+    }
+
+    #[test]
+    fn real_inverse_defaults_to_full_real_signal_and_ignores_endpoint_imaginary_parts() {
+        for version in [17, 20] {
+            let input = Owned::f32(&[1, 3, 2], &[10., 99., -2., 2., -2., -77.]);
+            let mut output = Owned::zeros_f32(&[1, 4, 1]);
+            DftFactory
+                .create(&irfft_node(version), &[vec![1, 3, 2]])
+                .unwrap()
+                .execute(&[input.view()], &mut [output.view_mut()])
+                .unwrap();
+            for (actual, expected) in output.to_f32().iter().zip([1., 2., 3., 4.]) {
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "{version}: {actual} versus {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn real_inverse_even_odd_padded_and_truncated_spectra_match_independent_f64_sums() {
+        for n in [1usize, 2, 3, 4, 5, 6, 9, 10] {
+            for bins in [0usize, 1, 3, 7] {
+                let values = (0..2)
+                    .flat_map(|batch| {
+                        (0..bins).flat_map(move |k| {
+                            [
+                                (batch + 1) as f32 * 0.375 + k as f32 * 0.25,
+                                0.125 - k as f32 * 0.125,
+                            ]
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let input = Owned::f32(&[2, bins, 2], &values);
+                let length = Owned::i64(&[], &[n as i64]);
+                let mut output = Owned::zeros_f32(&[2, n, 1]);
+                DftFactory
+                    .create(&irfft_node(20), &[vec![2, bins, 2]])
+                    .unwrap()
+                    .execute(&[input.view(), length.view()], &mut [output.view_mut()])
+                    .unwrap();
+                let actual = output.to_f32();
+                for batch in 0..2 {
+                    for t in 0..n {
+                        let mut expected = 0f64;
+                        for k in 0..bins.min(n / 2 + 1) {
+                            let re = values[(batch * bins + k) * 2] as f64;
+                            let im = values[(batch * bins + k) * 2 + 1] as f64;
+                            let angle = 2. * std::f64::consts::PI * (k * t) as f64 / n as f64;
+                            expected += if k == 0 || (n.is_multiple_of(2) && k == n / 2) {
+                                re * angle.cos()
+                            } else {
+                                2. * (re * angle.cos() - im * angle.sin())
+                            };
+                        }
+                        expected /= n as f64;
+                        assert!(
+                            (actual[batch * n + t] as f64 - expected).abs() < 1e-4,
+                            "n={n}, bins={bins}, batch={batch}, t={t}: {} versus {expected}",
+                            actual[batch * n + t]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn real_inverse_rejects_real_spectrum_and_wrong_output_geometry_before_writing() {
+        let n = irfft_node(20);
+        let shapes = [onnx_runtime_ir::static_shape([1, 3, 1])];
+        assert!(
+            DftFactory
+                .unsupported_reason(&n, 20, &shapes, &[])
+                .unwrap()
+                .contains("RealInverse")
+        );
+        assert!(DftFactory.create(&n, &[vec![1, 3, 1]]).is_err());
+        let input = Owned::f32(&[1, 3, 2], &[1.; 6]);
+        let kernel = DftFactory.create(&n, &[]).unwrap();
+        for shape in [vec![1], vec![2, 4, 1], vec![1, 3, 2]] {
+            let count = shape.iter().product();
+            let mut output = Owned::f32(&shape, &vec![123.; count]);
+            let error = kernel
+                .execute(&[input.view()], &mut [output.view_mut()])
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("output shape mismatch"),
+                "{error}"
+            );
+            assert!(output.to_f32().iter().all(|&v| v == 123.));
+        }
+    }
+
     /// Verify the radix-2 FFT matches the naive DFT within tolerance.
     #[test]
     fn fft_matches_naive_forward() {
@@ -793,9 +929,10 @@ mod tests {
         let input = Owned::f32(&[1, 4, 2], &[0.0; 8]);
         let mut output = Owned::zeros_f32(&[1, 3, 2]);
         let node = make_dft_node(-2, 1);
+        assert!(DftFactory.create(&node, &[vec![1, 4, 2]]).is_err());
         let kernel = DftFactory
-            .create(&node, &[vec![1, 4, 2]])
-            .expect("factory create");
+            .create(&node, &[])
+            .expect("unresolved shape defers validation");
         let error = kernel
             .execute(&[input.view()], &mut [output.view_mut()])
             .expect_err("onesided complex DFT must be rejected");

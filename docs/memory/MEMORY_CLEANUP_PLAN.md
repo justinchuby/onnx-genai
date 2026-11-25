@@ -2590,3 +2590,30 @@ issuer callbacks. This is an accounting invariant, not zero total runtime cost.
 Signal/window materialization, the output staging Vec and Apple DSP setup's
 internal allocations remain outside these four admitted regions. This does not
 establish complete STFT/RSS accounting, inference latency or CUDA behavior.
+
+
+### DFT mode correctness before scratch migration
+
+Inspection of the remaining DFT allocations exposed a pre-existing semantic
+error: inverse+onesided used a real input, a complex inverse and truncated
+complex output instead of IRFFT. The resource migration is kept separate while
+this contract is corrected. The shared IR mode now determines accepted input
+components, implicit transform length, output length and real/complex width.
+CPU execution, symbolic shape inference and plugin runtime sizing consume it.
+The [ONNX schemas 17/20](https://onnx.ai/onnx/operators/onnx__DFT.html) and
+[official reference](https://github.com/onnx/onnx/blob/main/onnx/reference/ops/op_dft.py)
+define the same real-inverse contract.
+
+CPU IRFFT pads/truncates positive-frequency bins, ignores imaginary DC and even-
+length Nyquist components, reconstructs the conjugate half and uses the existing
+normalized inverse transform. Its default length is twice (input bins minus
+one); explicit odd lengths are preserved. Output has one real component.
+Complete output geometry is checked before writes. Forward and full inverse
+arithmetic retain their existing compute-in-f32 contract.
+
+The cuFFT adapter has no IRFFT pack/unpack implementation. Its factory and
+claim query now explicitly reject that mode with a CPU selection instruction;
+this is not a CUDA execution result. Independent f64 sums cover odd/even sizes,
+padding/truncation and batches; a real encoded model exercises RFFT/IRFFT
+roundtrips for both schemas. Existing scalar/control, widening, output staging
+and per-batch DFT allocations still require their own workspace migration.

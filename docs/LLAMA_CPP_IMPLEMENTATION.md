@@ -2284,3 +2284,33 @@ infill prompts and projected streams whose terminal JSON omits stop/index.
 Validation after main restack: full server library 592 passed, two inherited
 ignores; server all-target strict Clippy and diff checks passed on macOS ARM64
 CPU. The remaining goal acceptance rows stay open.
+
+## Stops inside decoded token fragments
+
+The ordinary decoder now detects text stop words inside a selected token rather
+than only at the end of accumulated text. It selects the earliest visible byte
+position, with configured order resolving ties, and keeps token-ID stops as
+suffix matches. A request-owned scan cursor plus longest-stop overlap preserves
+cross-token Unicode matches without rescanning the entire history on each step.
+The stop configuration is immutable after processor construction.
+
+Engine matching, output buffering, final text clipping and prediction-time
+visibility now share textual boundary classification. Incomplete stop prefixes
+remain withheld; a newline released when a prefix ceases to match becomes
+eligible for time expiry, while a newline hidden by a complete stop does not.
+Tests cover true accepted-token counts and stop reasons, stop selection within
+one token, native/OpenAI/chat buffered and logprob SSE output, and Native
+speculative prefix repair with injected failure and retry.
+The native stopping-word diagnostic uses that same match independently of the
+final stop type; a real preserved EOS token containing a stop string verifies
+that EOS priority retains the matched word in buffered and SSE responses.
+
+The audit also identified remaining work for indentation stopping (`n_indent`)
+and general stop-sequence observation in authored candidate-tree/DFlash paths.
+These remain part of the original goal, alongside the unchecked acceptance rows.
+
+Validation after restacking onto main 007d488d0: full engine library 1086
+passed with one inherited ignore, full server library 593 passed with two
+inherited ignores. Default engine/server all-target strict Clippy, no-default
+engine strict Clippy, formatting and diff checks passed on macOS ARM64 CPU.
+The unchecked goal acceptance rows remain required.

@@ -5033,14 +5033,20 @@ mod tests {
     #[test]
     fn prediction_time_limit_stop_observers_trim_unpublished_speculative_kv_before_commit()
     -> anyhow::Result<()> {
-        for fail_repair in [false, true] {
+        use crate::logits::StopSequence;
+        for (stop, fail_repair) in [
+            (StopSequence::Tokens(vec![1]), false),
+            (StopSequence::Tokens(vec![1]), true),
+            (StopSequence::Text("unk".into()), false),
+            (StopSequence::Text("unk".into()), true),
+        ] {
             let directory = tempfile::tempdir()?;
             let mut engine = native_speculative_per_position_fixture(directory.path())?;
             let mut request = tiny_native_cold_request(true);
             request.prompt = GeneratePrompt::TokenIds(vec![0, 1, 1, 1, 0]);
             request.options.max_new_tokens = 8;
             request.options.num_speculative_tokens = Some(2);
-            request.options.stop_sequences = vec![crate::logits::StopSequence::Tokens(vec![1])];
+            request.options.stop_sequences = vec![stop];
             if fail_repair {
                 engine
                     .native_session
