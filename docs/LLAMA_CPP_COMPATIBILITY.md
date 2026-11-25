@@ -534,6 +534,14 @@ bounded startup/observer waits. Append an optional screenshot path after the
 Playwright module path to save an image of the baseline chat. Coordinate this
 inference workload with other sessions using the shared host lock.
 
+For API-key onboarding, run
+`node scripts/test_llama_chat_auth.mjs /absolute/path/to/playwright/index.mjs /absolute/path/to/onnx-genai-server`
+under the same lock. This uses real Chrome and Native CPU inference to enter an
+incorrect key, retry a correct key through the UI, chat, reload the persisted
+login, and check private byte-exact replay. A fresh browser context must still
+require a key. The script uses an ephemeral loopback port and removes its
+synthetic key file, browser and server on exit.
+
 
 ## Raw GBNF and llguidance constraints
 
