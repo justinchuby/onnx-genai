@@ -3,7 +3,7 @@ use super::{
     RealtimeConnection, RealtimeInputOwned, RealtimeLimits,
     conditioning::{Conditioning, PromptOperation},
     conversation::{Conversation, ItemId, ResponseId, ResponseKind},
-    events::{ResponseEvents, TranscriptionEvents},
+    events::{ResponseEnd, ResponseEvents, TranscriptionEvents},
     pcm::PcmInput,
     settings::{Capabilities, Modalities, OutputBudget, SessionSettings},
     tools::ToolArguments,
@@ -869,10 +869,7 @@ impl Runner {
     fn budget_exhausted(&self) -> bool {
         self.active
             .as_ref()
-            .is_some_and(|active| match active.budget {
-                OutputBudget::Unlimited => false,
-                OutputBudget::Tokens(limit) => active.used >= u64::from(limit.get()),
-            })
+            .is_some_and(|active| active.budget.exhausted(active.used))
     }
     async fn quantum(
         &mut self,
@@ -993,6 +990,13 @@ impl Runner {
             self.active = Some(active);
             return Ok(());
         }
+        let end = if cancelled {
+            ResponseEnd::Cancelled
+        } else if active.budget.exhausted(active.used) {
+            ResponseEnd::TokenLimit
+        } else {
+            ResponseEnd::Model
+        };
         let mut calls = Vec::new();
         let final_events = match active.renderer {
             Rendered::Response(mut renderer) => {
@@ -1023,7 +1027,7 @@ impl Runner {
                                 self.emit(out, event).await.map_err(Failure::native)?;
                             }
                         }
-                        ToolParseOutcome::Incomplete if cancelled => {}
+                        ToolParseOutcome::Incomplete if end.permits_unfinished_tools() => {}
                         other => {
                             return Err(Failure::native(anyhow::anyhow!(
                                 "realtime tool protocol did not finish a valid envelope: {other:?}"
@@ -1031,7 +1035,7 @@ impl Runner {
                         }
                     }
                 }
-                if !cancelled
+                if !end.permits_unfinished_tools()
                     && self.conversation.active().is_some_and(|response| {
                         response.options.tool_choice == crate::types::ToolChoiceMode::Required
                     })
@@ -1041,7 +1045,7 @@ impl Runner {
                         "native realtime response did not satisfy tool_choice=required; repair the model tool constraint workflow"
                     )));
                 }
-                renderer.finish(cancelled)
+                renderer.finish(end)
             }
             Rendered::Transcription(renderer) => {
                 self.configured = false;
@@ -1133,7 +1137,14 @@ mod tests {
     async fn server_for_package(
         root: &std::path::Path,
     ) -> (AppState, std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-        let state = AppState::load(root, Some("native-realtime".into())).unwrap();
+        server_for_package_with_config(root, crate::ServerConfig::default()).await
+    }
+    async fn server_for_package_with_config(
+        root: &std::path::Path,
+        config: crate::ServerConfig,
+    ) -> (AppState, std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let state =
+            AppState::load_with_config(root, Some("native-realtime".into()), config).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let router = crate::app(state.clone());
@@ -1151,6 +1162,105 @@ mod tests {
         .await
         .unwrap()
         .0
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_rejected_frames_and_pcm_pressure_preserve_native_transcription() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/realtime");
+        let mut config = crate::ServerConfig::default();
+        config.realtime.source_bytes = NonZeroUsize::new(640).unwrap();
+        let (state, address, task) = server_for_package_with_config(&root, config).await;
+        let mut client = connect(address).await;
+        assert_eq!(event(&mut client).await["type"], "session.created");
+        let rejected = [
+            (Message::Text("{".into()), "valid JSON"),
+            (Message::Binary(vec![0, 1].into()), "JSON text frames"),
+            (Message::Text("null".into()), "type must be a string"),
+            (
+                Message::Text(json!({"type":"unknown"}).to_string().into()),
+                "unknown realtime event",
+            ),
+            (
+                Message::Text(
+                    json!({"type":"input_audio_buffer.append","audio":"!!!"})
+                        .to_string()
+                        .into(),
+                ),
+                "valid base64",
+            ),
+            (
+                Message::Text(
+                    json!({"type":"input_audio_buffer.append","audio":STANDARD.encode([0])})
+                        .to_string()
+                        .into(),
+                ),
+                "even byte count",
+            ),
+            (
+                Message::Text(
+                    json!({"type":"input_audio_buffer.append","audio":STANDARD.encode([0;642])})
+                        .to_string()
+                        .into(),
+                ),
+                "640-byte PCM queue budget",
+            ),
+        ];
+        let mut ids = BTreeSet::new();
+        for (frame, diagnostic) in rejected {
+            client.send(frame).await.unwrap();
+            let failure = event(&mut client).await;
+            assert_eq!(failure["type"], "error", "{failure}");
+            assert_eq!(failure["error"]["type"], "invalid_request_error");
+            assert!(
+                failure["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(diagnostic),
+                "{failure}"
+            );
+            assert!(ids.insert(failure["event_id"].as_str().unwrap().to_owned()));
+        }
+        // Rejected audio must neither freeze session conditioning nor consume
+        // input quota/state. A full-budget valid frame still starts an ASR turn.
+        send(
+            &mut client,
+            json!({"type":"session.update","session":{"type":"transcription"}}),
+        )
+        .await;
+        assert_eq!(event(&mut client).await["type"], "session.updated");
+        send(
+            &mut client,
+            json!({"type":"input_audio_buffer.append","audio":STANDARD.encode([0;640])}),
+        )
+        .await;
+        send(&mut client, json!({"type":"input_audio_buffer.commit"})).await;
+        let committed = event(&mut client).await;
+        assert_eq!(committed["type"], "input_audio_buffer.committed");
+        let item = committed["item_id"].clone();
+        let mut transcript = String::new();
+        loop {
+            let output = event(&mut client).await;
+            assert_ne!(output["type"], "error", "{output}");
+            if output["type"] == "conversation.item.input_audio_transcription.delta" {
+                assert_eq!(output["item_id"], item);
+                transcript.push_str(output["delta"].as_str().unwrap());
+            }
+            if output["type"] == "conversation.item.input_audio_transcription.completed" {
+                assert_eq!(output["item_id"], item);
+                assert_eq!(output["transcript"], "hello world");
+                break;
+            }
+        }
+        assert_eq!(transcript, "hello world");
+        client.close(None).await.unwrap();
+        drop(client);
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
     }
     fn tool_package(envelope: &str) -> tempfile::TempDir {
         tool_package_from("realtime", envelope)
@@ -1197,6 +1307,81 @@ mod tests {
         )
         .unwrap();
         package
+    }
+    fn streaming_tool_package(native_budget_stop: bool) -> tempfile::TempDir {
+        let package = tool_package_from("realtime-constrained", "<tool_call>\n");
+        let path = package.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let tail = "{\"name\":\"lookup\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>";
+        tokenizer["model"]["vocab"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tok17");
+        tokenizer["model"]["vocab"][tail] = json!(17);
+        tokenizer["added_tokens"].as_array_mut().unwrap().push(json!({"id":17,"content":tail,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}));
+        tokenizer["decoder"] = json!({"type":"Fuse"});
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let path = package.path().join("model.onnx.textproto");
+        let mut graph = std::fs::read_to_string(&path).unwrap()
+            .replace("node { input: \"generating\" input: \"asr\"", "initializer { name: \"polling_op\" data_type: 7 int64_data: 7 }\nnode { input: \"operation\" input: \"polling_op\" output: \"polling\" op_type: \"Equal\" }\nnode { input: \"generating\" input: \"polling\" output: \"decoding\" op_type: \"Or\" }\nnode { input: \"decoding\" input: \"asr\"")
+            .replace("node { input: \"generating\" output: \"candidate_tokens\"", "node { input: \"decoding\" output: \"candidate_tokens\"")
+            .replace("node { input: \"responding\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }", "node { input: \"tokens_out\" output: \"emitted_id\" op_type: \"ReduceSum\" attribute { name: \"keepdims\" i: 0 type: INT } }\nnode { input: \"emitted_id\" input: \"three\" output: \"ending\" op_type: \"Equal\" }\nnode { input: \"ending\" input: \"cancelling\" output: \"model_done\" op_type: \"Or\" }");
+        if native_budget_stop {
+            graph = graph.replace("node { input: \"ending\" input: \"cancelling\" output: \"model_done\" op_type: \"Or\" }", "node { input: \"ending\" input: \"cancelling\" output: \"model_done\" op_type: \"Or\" }\nnode { input: \"output_token_budget\" input: \"zero\" output: \"limited\" op_type: \"GreaterOrEqual\" }\nnode { input: \"output_token_budget\" input: \"count\" output: \"at_limit\" op_type: \"Equal\" }\nnode { input: \"limited\" input: \"at_limit\" output: \"budget_done\" op_type: \"And\" }\nnode { input: \"budget_done\" input: \"model_done\" output: \"done\" op_type: \"Or\" }");
+        } else {
+            graph = graph.replace(
+                "output: \"model_done\" op_type: \"Or\" }",
+                "output: \"done\" op_type: \"Or\" }",
+            );
+        }
+        std::fs::write(path, graph).unwrap();
+        package
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_tool_prefix_at_token_limit_completes_and_keeps_session_usable() {
+        for native_budget_stop in [false, true] {
+            let package = streaming_tool_package(native_budget_stop);
+            let (state, address, task) = server_for_package(package.path()).await;
+            let mut client = connect(address).await;
+            assert_eq!(event(&mut client).await["type"], "session.created");
+            send(&mut client,json!({"type":"session.update","session":{"output_modalities":["text"],"max_output_tokens":1,"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"city":{"const":"Paris"}},"required":["city"],"additionalProperties":false}}],"tool_choice":"required"}})).await;
+            assert_eq!(event(&mut client).await["type"], "session.updated");
+            let mut previous = None;
+            for turn in 0..2 {
+                send(&mut client,json!({"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}})).await;
+                assert_eq!(event(&mut client).await["type"], "conversation.item.added");
+                assert_eq!(event(&mut client).await["type"], "conversation.item.done");
+                send(&mut client,json!({"type":"response.create","response":{"max_output_tokens":if turn==0 {1} else {4}}})).await;
+                loop {
+                    let output = event(&mut client).await;
+                    assert_ne!(
+                        output["type"], "error",
+                        "native_budget_stop={native_budget_stop}: {output}"
+                    );
+                    if output["type"] == "response.done" {
+                        assert_eq!(output["response"]["status"], "completed");
+                        if turn == 0 {
+                            assert_eq!(output["response"]["usage"]["output_tokens"], 1);
+                            assert_eq!(output["response"]["output"], json!([]));
+                        } else {
+                            assert_eq!(output["response"]["usage"]["output_tokens"], 3);
+                            assert_eq!(output["response"]["output"][0]["name"], "lookup");
+                        }
+                        assert_ne!(previous, Some(output["response"]["id"].clone()));
+                        previous = Some(output["response"]["id"].clone());
+                        break;
+                    }
+                }
+            }
+            client.close(None).await.unwrap();
+            drop(client);
+            let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+            tokio::task::spawn_blocking(move || model.engine.shutdown())
+                .await
+                .unwrap();
+            task.abort();
+            let _ = task.await;
+        }
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn websocket_required_tool_grammar_masks_native_selection() {

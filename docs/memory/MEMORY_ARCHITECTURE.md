@@ -1059,6 +1059,18 @@ Preparation and execution share checked geometry: inter is FC2's packed input
 axis times 8/bits, never inferred backward from FC1. FC2 metadata is therefore
 required during preparation. Zero rows have zero banks; zero hidden retains
 input/weight/routing validation and can still need nonempty FC1 storage.
+QMoE's prefetch-scope preparation owns the shared-bank eligibility check as
+well as funding. It refuses ineligible operations before inspecting selected
+experts, locking payloads, pinning readers or requesting capacity, including
+for local/ungoverned sources. Callers retain only enabled/group-count scheduling
+checks; a scope carries the existing capacity proof and mode-specific funding
+contract (local sources remain on demand). Its borrow keeps the operation and
+registry proof alive.
+Streaming still avoids registry locking; governed streaming uses one two-slot
+window, while local streaming remains on demand. Warm retained hits pin existing
+owners without new issuer callbacks. See the
+[prefetch-entry resource tests and negative control](../benchmarks/qmoe-prefetch-entry/README.md).
+
 The prefetch worker owns weights independently. The main compute dispatch owns
 the lane; joined projection tasks borrow disjoint decode slices. Weight
 request/read/join order and final contribution

@@ -17,7 +17,7 @@ required opaque application inputs:
 
 | Input binding | Tensor | Meaning |
 | --- | --- | --- |
-| `inputs.output_token_budget` | int64 scalar | Remaining output tokens for this quantum, or -1 for unlimited |
+| `inputs.output_token_budget` | int64 scalar | Remaining response output-token allowance, or -1 for unlimited |
 | `inputs.operation` | int64 scalar | Control operation below |
 | `inputs.audio` | float32 symbolic vector | Mono normalized PCM, empty except audio operations |
 | `inputs.tokens` | int64 symbolic vector | Package-assembled prompt/text/tool-result IDs, empty when unused |
@@ -49,6 +49,13 @@ encoding saturates finite model peaks using llama-server's symmetric 32767 scale
 mean end of response. Duplex polling is not governed by ordinary generation's
 `max_new_tokens` default. Ordinary request-sourced/runtime inputs are rejected
 for this ABI so generation defaults cannot silently alter quantum execution.
+The remaining response allowance is passed unchanged to each invocation; it is
+not a per-quantum token cap. A constrained quantum still emits at most one text
+token, independently of that allowance. Reported output usage must cover every
+emitted text token so an underreported counter cannot evade the response limit.
+A model may finish an unfinished grammar when the actual response allowance is
+exhausted; premature natural completion remains a contract error.
+
 The workflow must obey `output_token_budget`; excess reported output is a
 contract violation that requires native reset or connection closure. The model workflow owns its codec, temporal/acoustic
 steps, delay buffers and response state. It must declare session-scoped state
@@ -136,6 +143,16 @@ Logical text constraints check the decoded text directly for completion. Raw
 token grammars require declared EOS IDs. After a text ending, an all-false mask
 permits codec-only quanta to finish without admitting further text.
 
+## Response termination
+
+A token-limited response ends with upstream-compatible `status: completed`;
+an explicit client cancellation uses `status: cancelled`. Both preserve the
+connection for later turns. An unfinished tool envelope at either intentional
+stop is not admitted as a completed tool call. Complete calls still pass name
+and parameter validation, and a natural model stop must satisfy required-tool
+postconditions. Raw partial function-call fragments are not yet projected onto
+wire call items; completed batches retain atomic admission.
+
 ## Remaining conformance work
 
 Turn-based tagged-json tool forcing is connected for workflows declaring
@@ -155,6 +172,30 @@ synthesis quality or GPU performance. Input-rate changes are rejected while an a
 next-turn PCM; retry after its completed event. Duplex cancellation discards
 old queued audio and resets native conditioning before the next response,
 matching the upstream stream/KV lifecycle.
+
+### Executed malformed-input recovery
+
+`websocket_rejected_frames_and_pcm_pressure_preserve_native_transcription`
+opens a real TCP WebSocket against a Native CPU ONNX workflow. Each case below
+must return a distinct `error` event with `invalid_request_error`, after which
+the same connection remains usable:
+
+| Rejected input | Required diagnostic |
+| --- | --- |
+| Truncated JSON text | Valid JSON required |
+| Binary WebSocket frame | JSON text frames required |
+| JSON null without an event type | String `type` required |
+| Unknown event type | Recognized realtime event required |
+| Invalid audio base64 | Valid base64 PCM16 required |
+| One decoded audio byte | Even PCM16 byte count required |
+| 642 decoded bytes with a 640-byte queue budget | Remaining PCM queue budget exceeded |
+
+After all rejections, changing the session to transcription must still succeed.
+A valid 640-byte PCM message then fills the configured budget and commits to an
+actual native transcription, with matching item IDs, deltas and terminal text.
+This proves rejection did not consume input quota or freeze conditioning. It
+does not establish oversized WebSocket frame closure, slow-reader backpressure,
+all rate epochs or device execution conformance.
 
 Tool execution belongs exclusively to the external harness. This transport
 accepts definitions/results and emits model calls; it provides no tool runtime.

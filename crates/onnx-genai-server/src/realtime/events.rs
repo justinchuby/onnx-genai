@@ -6,6 +6,26 @@ use onnx_genai_metadata::{MAX_TOOL_CALLS, ToolCall};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, num::NonZeroUsize};
 
+/// A response stop is distinct from session failure. llama-server reports a
+/// token-limited response as completed, and an explicit cancellation as cancelled.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ResponseEnd {
+    Model,
+    Cancelled,
+    TokenLimit,
+}
+impl ResponseEnd {
+    pub(super) fn permits_unfinished_tools(self) -> bool {
+        !matches!(self, Self::Model)
+    }
+    fn status(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Model | Self::TokenLimit => "completed",
+        }
+    }
+}
+
 /// Consuming `finish` makes publishing a second terminal event impossible.
 /// Event IDs are stamped once by the connection's common event sender.
 pub(super) struct ResponseEvents {
@@ -195,9 +215,9 @@ impl ResponseEvents {
         self.output[index]["arguments"] = json!(call.arguments);
         Ok(events)
     }
-    pub(super) fn finish(mut self, cancelled: bool) -> Vec<Value> {
+    pub(super) fn finish(mut self, end: ResponseEnd) -> Vec<Value> {
         let mut events = Vec::new();
-        let status = if cancelled { "cancelled" } else { "completed" };
+        let status = end.status();
         if let Some(output_index) = self.message_index {
             for (index, part) in self.parts.iter().enumerate() {
                 let mut event = json!({"response_id":self.id,"item_id":self.message_id,"output_index":output_index,"content_index":index});
@@ -319,7 +339,7 @@ mod tests {
         assert!(response.text("").unwrap().is_empty());
         response.usage(3).unwrap();
         response.usage(2).unwrap();
-        let terminal = response.finish(false);
+        let terminal = response.finish(ResponseEnd::Model);
         assert_eq!(
             kinds(&terminal),
             [
@@ -377,7 +397,7 @@ mod tests {
         }
         let text = response.text("done").unwrap();
         assert_eq!(text[0]["output_index"], 2);
-        let terminal = response.finish(true);
+        let terminal = response.finish(ResponseEnd::Cancelled);
         let done_calls: Vec<_> = terminal
             .iter()
             .filter(|event| event["type"] == "response.function_call_arguments.done")
@@ -412,7 +432,7 @@ mod tests {
                 .to_string()
                 .contains("event budget")
         );
-        let terminal = response.finish(false);
+        let terminal = response.finish(ResponseEnd::Model);
         assert_eq!(kinds(&terminal), ["response.done"]);
         assert_eq!(terminal[0]["response"]["output"], json!([]));
     }
