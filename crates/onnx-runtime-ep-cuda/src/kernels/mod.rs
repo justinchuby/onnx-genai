@@ -2222,7 +2222,7 @@ pub(crate) fn build_cuda_registry_for_contract(
 
     // ── CUDA op-coverage batch 3 (issue #67) ──
 
-    // Unary float predicates (f32/f16/bf16 → bool). `IsInf` honours the
+    // Unary float predicates (f32/f64/f16/bf16 → bool). `IsInf` honours the
     // detect_positive/detect_negative attributes; formulas mirror the CPU EP
     // (`is_inf.rs`/`is_nan.rs`).
     reg.register(

@@ -1,5 +1,5 @@
 //! Unary floating-point **predicate** ops — `IsInf` and `IsNaN` — on the GPU via
-//! runtime-compiled (NVRTC) `extern "C"` kernels. Each reads one f32/f16/bf16
+//! runtime-compiled (NVRTC) `extern "C"` kernels. Each reads one f32/f64/f16/bf16
 //! input and writes a canonical 1-byte `Bool` output, matching the CPU EP
 //! (`crates/onnx-runtime-ep-cpu/src/kernels/is_inf.rs` and `is_nan.rs`).
 //!
@@ -8,12 +8,11 @@
 //! * **`IsInf`**: `detect_positive`/`detect_negative` int attributes (default 1);
 //!   a lane is `true` when the value is `+inf` and positive detection is on, or
 //!   `-inf` and negative detection is on. f16/bf16 widen losslessly to f32 for
-//!   the classification (the widening preserves inf/nan and sign).
+//!   the classification (the widening preserves inf/nan and sign); f64 stays
+//!   f64 so finite values outside the f32 range are not misclassified.
 //! * **`IsNaN`**: no attributes; a lane is `true` iff the value is NaN.
-//! * **dtype:** f32/f16/bf16 input, `Bool` output; other dtypes return an
-//!   actionable error naming the op/dtype. (The CPU EP also accepts f64, which
-//!   the CUDA half/pointwise slice does not cover — the claim gate rejects it so
-//!   an f64 node stays on the CPU EP.)
+//! * **dtype:** f32/f64/f16/bf16 input, `Bool` output; other dtypes return an
+//!   actionable error naming the op/dtype.
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -40,17 +39,18 @@ fn grid_for(n: usize) -> u32 {
 fn float_suffix(op: &str, dtype: DataType) -> Result<&'static str> {
     match dtype {
         DataType::Float32 => Ok("f32"),
+        DataType::Float64 => Ok("f64"),
         DataType::Float16 => Ok("f16"),
         DataType::BFloat16 => Ok("bf16"),
         other => Err(not_implemented(format!(
-            "{op} with input dtype {other:?} (supported: Float32, Float16, BFloat16)"
+            "{op} with input dtype {other:?} (supported: Float32, Float64, Float16, BFloat16)"
         ))),
     }
 }
 
-/// NVRTC source: dtype-templated `IsInf`/`IsNaN` kernels. Half inputs widen to
-/// f32 first (the conversion preserves inf/nan and sign), then classify with the
-/// device intrinsics — matching the CPU EP's `f16`/`bf16` → f32 promotion.
+/// NVRTC source: dtype-templated `IsInf`/`IsNaN` kernels. Each input is
+/// classified in a compute type that preserves its floating-point categories:
+/// f16/bf16 widen losslessly to f32, while f32/f64 remain unchanged.
 const PREDICATE_SRC: &str = r#"
 #if __has_include(<cuda_fp16.h>) && __has_include(<cuda_bf16.h>)
 #define NXRT_HAS_CUDA_HALF_HEADERS 1
@@ -58,39 +58,53 @@ const PREDICATE_SRC: &str = r#"
 #include <cuda_bf16.h>
 #endif
 
-template <typename T> __device__ float load_float(T value);
-template <> __device__ float load_float<float>(float value) { return value; }
+template <typename T> struct predicate_traits;
+template <> struct predicate_traits<float> {
+    using compute_type = float;
+    __device__ static compute_type load(float value) { return value; }
+};
+template <> struct predicate_traits<double> {
+    using compute_type = double;
+    __device__ static compute_type load(double value) { return value; }
+};
 #ifdef NXRT_HAS_CUDA_HALF_HEADERS
-template <> __device__ float load_float<__half>(__half value) { return __half2float(value); }
-template <> __device__ float load_float<__nv_bfloat16>(__nv_bfloat16 value) { return __bfloat162float(value); }
+template <> struct predicate_traits<__half> {
+    using compute_type = float;
+    __device__ static compute_type load(__half value) { return __half2float(value); }
+};
+template <> struct predicate_traits<__nv_bfloat16> {
+    using compute_type = float;
+    __device__ static compute_type load(__nv_bfloat16 value) { return __bfloat162float(value); }
+};
 #endif
 
 #define DEFINE_ISINF(TYPE, SUFFIX) \
 extern "C" __global__ void is_inf_##SUFFIX(const TYPE* x, unsigned char* y, const int detect_pos, const int detect_neg, const unsigned long long n) { \
     for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x) { \
-        float v = load_float<TYPE>(x[i]); \
+        auto v = predicate_traits<TYPE>::load(x[i]); \
         bool inf = isinf(v); \
-        bool pos = inf && v > 0.0f; \
-        bool neg = inf && v < 0.0f; \
+        bool pos = inf && v > 0; \
+        bool neg = inf && v < 0; \
         y[i] = ((detect_pos && pos) || (detect_neg && neg)) ? 1 : 0; \
     } \
 }
 #define DEFINE_ISNAN(TYPE, SUFFIX) \
 extern "C" __global__ void is_nan_##SUFFIX(const TYPE* x, unsigned char* y, const unsigned long long n) { \
     for (unsigned long long i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (unsigned long long)gridDim.x * blockDim.x) { \
-        float v = load_float<TYPE>(x[i]); \
+        auto v = predicate_traits<TYPE>::load(x[i]); \
         y[i] = (v != v) ? 1 : 0; \
     } \
 }
 #define DEFINE_PRED_FOR_TYPE(TYPE, SUFFIX) DEFINE_ISINF(TYPE, SUFFIX) DEFINE_ISNAN(TYPE, SUFFIX)
 DEFINE_PRED_FOR_TYPE(float, f32)
+DEFINE_PRED_FOR_TYPE(double, f64)
 #ifdef NXRT_HAS_CUDA_HALF_HEADERS
 DEFINE_PRED_FOR_TYPE(__half, f16)
 DEFINE_PRED_FOR_TYPE(__nv_bfloat16, bf16)
 #endif
 "#;
 
-const PREDICATE_MODULE: &str = "unary_predicate_float_v1";
+const PREDICATE_MODULE: &str = "unary_predicate_float_v2";
 
 /// A supported unary predicate op.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,7 +169,7 @@ impl KernelFactory for PredicateFactory {
     }
 }
 
-/// NVRTC-backed f32/f16/bf16 unary predicate kernel with a `Bool` output.
+/// NVRTC-backed f32/f64/f16/bf16 unary predicate kernel with a `Bool` output.
 #[derive(Debug)]
 pub struct PredicateKernel {
     op: PredicateOp,
@@ -176,7 +190,7 @@ impl PredicateKernel {
         }
         let x = &inputs[0];
         let suffix = float_suffix(op, x.dtype)?;
-        if x.dtype != DataType::Float32 {
+        if matches!(x.dtype, DataType::Float16 | DataType::BFloat16) {
             self.runtime.require_nvrtc_half_headers(op)?;
         }
         if outputs[0].dtype != DataType::Bool {
@@ -267,10 +281,10 @@ impl Kernel for PredicateKernel {
     }
 }
 
-/// Claim-time contract for `IsInf`/`IsNaN`: one f32/f16/bf16 input, one output,
+/// Claim-time contract for `IsInf`/`IsNaN`: one f32/f64/f16/bf16 input, one output,
 /// and — for `IsInf` — integer `detect_positive`/`detect_negative` flags. Gated
-/// to exactly the dtypes/attrs the kernel implements so an f64 (CPU-only) node
-/// or a malformed attribute is never claimed onto CUDA.
+/// to exactly the dtypes/attrs the kernel implements so a malformed node is
+/// never claimed onto CUDA.
 pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Option<String> {
     let op = node.op_type.as_str();
     if node.inputs.len() != 1
@@ -286,10 +300,10 @@ pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Opti
     }
     if !matches!(
         input_dtypes[0],
-        DataType::Float32 | DataType::Float16 | DataType::BFloat16
+        DataType::Float32 | DataType::Float64 | DataType::Float16 | DataType::BFloat16
     ) {
         return Some(format!(
-            "{op}: input dtype {:?} unsupported on CUDA EP; expected Float32, Float16, or BFloat16",
+            "{op}: input dtype {:?} unsupported on CUDA EP; expected Float32, Float64, Float16, or BFloat16",
             input_dtypes[0]
         ));
     }
@@ -314,6 +328,7 @@ mod tests {
     fn predicate_entry_points_are_present_in_source() {
         for expansion in [
             "DEFINE_PRED_FOR_TYPE(float, f32)",
+            "DEFINE_PRED_FOR_TYPE(double, f64)",
             "DEFINE_PRED_FOR_TYPE(__half, f16)",
             "DEFINE_PRED_FOR_TYPE(__nv_bfloat16, bf16)",
         ] {
