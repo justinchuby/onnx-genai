@@ -33,6 +33,13 @@ pub(crate) fn render(sample: GenerationTimings) -> Value {
     })
 }
 
+pub(crate) fn render_prompt_progress(
+    progress: onnx_genai_engine::pipeline::PromptProgress,
+) -> Value {
+    json!({"total":progress.total,"cache":progress.cache,"processed":progress.processed,
+        "time_ms":u64::try_from(progress.elapsed.as_millis()).unwrap_or(u64::MAX)})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

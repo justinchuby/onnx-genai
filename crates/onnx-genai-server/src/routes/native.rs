@@ -523,6 +523,12 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
     crate::metrics::add_prompt_tokens(prompt_tokens);
     let model = handle.id.clone();
     let return_tokens = request.return_tokens;
+    let return_progress = request
+        .sampling
+        .extensions
+        .get("return_progress")
+        .and_then(Value::as_bool)
+        == Some(true);
     let timings_per_token = request
         .sampling
         .extensions
@@ -584,6 +590,14 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
                         }
                     }
                     value
+                }
+                Some(DriverEvent::PromptProgress(progress)) => {
+                    if !return_progress {
+                        continue;
+                    }
+                    json!({"content":"","tokens":[],"stop":false,"index":index,
+                        "tokens_predicted":0,"tokens_evaluated":prompt_tokens,
+                        "prompt_progress":crate::timings::render_prompt_progress(progress)})
                 }
                 Some(DriverEvent::WorkflowPublications(_)) => continue,
                 Some(DriverEvent::Finished(result)) => {

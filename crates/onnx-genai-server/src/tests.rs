@@ -8678,6 +8678,101 @@ mod native_compat {
     }
 
     #[tokio::test]
+    async fn prompt_progress_is_opt_in_and_reports_real_cold_and_cached_prompt_work() {
+        let router = app(tiny_state().with_default_fim_config(Some(
+            onnx_genai_engine::FimConfig {
+                prefix_token: "<PRE>".into(),
+                middle_token: "<MID>".into(),
+                suffix_token: "<SUF>".into(),
+                format: onnx_genai_engine::FimFormat::PSM,
+            },
+        )));
+        for path in [
+            "/completion",
+            "/v1/completions",
+            "/v1/chat/completions",
+            "/infill",
+        ] {
+            for (report, cold) in [(false, true), (true, true), (true, false)] {
+                let mut body = json!({"max_tokens":1,"temperature":0,"ignore_eos":true,"stream":true,
+                    "return_progress":report,"cache_prompt":!cold});
+                match path {
+                    "/v1/chat/completions" => {
+                        body["messages"] = json!([{"role":"user","content":"hello"}])
+                    }
+                    "/infill" => {
+                        body["input_prefix"] = json!("prefix");
+                        body["input_suffix"] = json!("suffix");
+                    }
+                    _ => body["prompt"] = json!([2, 4, 3]),
+                }
+                let response = request(router.clone(), path, body).await;
+                let status = response.status();
+                let values =
+                    sse_json_events(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap());
+                assert_eq!(status, StatusCode::OK, "{path}: {values:?}");
+                let updates = values
+                    .iter()
+                    .filter_map(|value| value.get("prompt_progress"))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    updates.len(),
+                    if report { 2 } else { 0 },
+                    "{path}: {values:?}"
+                );
+                let final_timing = values
+                    .iter()
+                    .filter_map(|value| value.get("timings"))
+                    .next_back()
+                    .expect("final decoder timing");
+                if report {
+                    let initial = updates[0];
+                    let done = updates[1];
+                    assert_eq!(initial["processed"], initial["cache"]);
+                    assert_eq!(initial["time_ms"], 0);
+                    assert_eq!(done["processed"], done["total"]);
+                    assert_eq!(done["cache"], initial["cache"]);
+                    assert_eq!(
+                        done["total"].as_u64().unwrap(),
+                        final_timing["cache_n"].as_u64().unwrap()
+                            + final_timing["prompt_n"].as_u64().unwrap()
+                    );
+                    assert_eq!(done["cache"], final_timing["cache_n"]);
+                    if cold {
+                        assert_eq!(done["cache"], 0);
+                    }
+                    if !cold && path == "/completion" {
+                        assert!(done["cache"].as_u64().unwrap() > 0);
+                    }
+                    let first_progress = values
+                        .iter()
+                        .position(|value| value.get("prompt_progress").is_some())
+                        .unwrap();
+                    let first_output = values
+                        .iter()
+                        .position(|value| {
+                            value["tokens_predicted"]
+                                .as_u64()
+                                .is_some_and(|count| count > 0)
+                                || value["content"]
+                                    .as_str()
+                                    .is_some_and(|text| !text.is_empty())
+                                || value["choices"][0]["delta"]["content"]
+                                    .as_str()
+                                    .is_some_and(|text| !text.is_empty())
+                                || value["choices"][0]["text"]
+                                    .as_str()
+                                    .is_some_and(|text| !text.is_empty())
+                        })
+                        .unwrap();
+                    assert!(first_progress < first_output, "{values:?}");
+                }
+                assert_eq!(final_timing["predicted_n"], 1);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn decoder_timings_reach_native_and_chat_buffered_and_streamed_responses() {
         let router = app(tiny_state());
         for path in ["/completion", "/v1/completions", "/v1/chat/completions"] {
@@ -10180,9 +10275,18 @@ mod native_compat {
         let router = app(tiny_state());
         let response = router.clone().oneshot(Request::builder().method("POST").uri("/v1/chat/completions")
             .header(header::CONTENT_TYPE,"application/json").header("x-conversation-id","known::tiny-llm")
-            .body(Body::from(json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":2,"stream":true}).to_string())).unwrap()).await.unwrap();
+            .body(Body::from(json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":2,"stream":true,"return_progress":true,"timings_per_token":true}).to_string())).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let original = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let events = sse_json_events(&original);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.get("prompt_progress").is_some())
+                .count(),
+            2
+        );
+        assert!(events.iter().any(|event| event.get("timings").is_some()));
         let response = router
             .clone()
             .oneshot(

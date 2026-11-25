@@ -480,6 +480,14 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
             "the generation loop ran two decoder forward passes without applying its token \
              policy between them; the second pass's scores would replace the first's unread"
         );
+        let first_forward = !self.state.clock.has_finished_prompt();
+        if first_forward && let Some(control) = self.control {
+            control.report_prompt_progress(
+                self.state
+                    .clock
+                    .initial_progress(self.backend.context_len(), self.state.prefix_cache_hit_len),
+            )?;
+        }
         self.pending_forward = Some(forward_step(
             self.backend,
             self.state,
@@ -488,6 +496,15 @@ impl<'a, 'c, B: DecodeLoopBackend + ?Sized> GenerationNodeHost<'a, 'c, B> {
         )?);
         if let Some(control) = self.control {
             control.check(super::GenerationBoundary::AfterDecoderForward)?;
+            if first_forward && let Some(sample) = self.state.clock.snapshot() {
+                let total = sample.prompt_tokens + sample.cached_prompt_tokens;
+                control.report_prompt_progress(super::PromptProgress {
+                    total,
+                    cache: sample.cached_prompt_tokens,
+                    processed: total,
+                    elapsed: sample.prompt_elapsed,
+                })?;
+            }
         }
         Ok(())
     }

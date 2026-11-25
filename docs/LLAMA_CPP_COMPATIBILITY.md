@@ -369,8 +369,18 @@ first generated token comes from prompt logits, so predicted throughput uses
 `predicted_n - 1` generation steps. Prompt timing counts fresh tokens and reports
 input reuse separately as `cache_n`; it is unrelated to retained `tokens_cached`.
 Executors without this timing contract (including speculative/composite paths
-and standalone prompt-only evaluation) omit the measurements. Optional
-`return_progress` is accepted, but prompt progress events remain open work.
+and standalone prompt-only evaluation) omit the measurements.
+For ordinary decoder SSE on native/OpenAI completions, chat and infill,
+`return_progress=true` publishes `prompt_progress` with `total`, `cache`,
+`processed` and elapsed `time_ms`. As upstream, `processed` includes cached tokens.
+Events describe actual execution boundaries: a whole-prompt forward reports its
+start and completion; constructing a semantic-prefix snapshot also reports that
+real intermediate boundary. Freshly computed prefix bytes count as processed
+work, never input reuse; only previously retained prefix state counts as `cache`.
+Progress is provisional execution telemetry and may precede a later error or
+cancellation; it does not expose tokens or promise a committed turn. Observer
+failure follows ordinary atomic rollback. Speculative/composite execution,
+continuous batching and standalone prompt-only progress remain open contracts.
 `/props.nxrt_capabilities` advertises resumable streams and the live reasoning
 control endpoint.
 An SSE request with `X-Conversation-Id` retains generation independently of its
