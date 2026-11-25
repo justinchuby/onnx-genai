@@ -25,6 +25,18 @@ pub struct UniqueKernel {
 pub struct UniqueFactory;
 
 impl KernelFactory for UniqueFactory {
+    fn unsupported_reason(
+        &self,
+        _node: &Node,
+        opset: u64,
+        _shapes: &[onnx_runtime_ir::Shape],
+        input_dtypes: &[DataType],
+    ) -> Option<String> {
+        input_dtypes
+            .first()
+            .and_then(|&dtype| unsupported_dtype_for_opset(dtype, opset))
+    }
+
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let axis = optional_int_attr(node, "axis")?;
         let sorted = match optional_int_attr(node, "sorted")?.unwrap_or(1) {
@@ -44,7 +56,7 @@ impl KernelFactory for UniqueFactory {
     }
 }
 
-pub(crate) fn unsupported_dtype_for_opset(dtype: DataType, opset: u64) -> Option<String> {
+fn unsupported_dtype_for_opset(dtype: DataType, opset: u64) -> Option<String> {
     (dtype == DataType::BFloat16 && opset < 28).then(|| {
         format!("Unique: BFloat16 input requires opset 28 or later, got {opset}; export at opset 28 or use Float32")
     })

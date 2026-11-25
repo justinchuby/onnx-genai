@@ -296,6 +296,16 @@ pub struct ScatterNDKernel {
 pub struct ScatterNDFactory(pub u64);
 
 impl KernelFactory for ScatterNDFactory {
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        _opset: u64,
+        _shapes: &[onnx_runtime_ir::Shape],
+        input_dtypes: &[DataType],
+    ) -> Option<String> {
+        scatter_unsupported_reason(node, self.0, input_dtypes)
+    }
+
     fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(ScatterNDKernel {
             reduction: ScatterReduction::parse(node, self.0).map_err(EpError::KernelFailed)?,
@@ -304,7 +314,7 @@ impl KernelFactory for ScatterNDFactory {
     }
 }
 
-pub(crate) fn scatter_unsupported_reason(
+fn scatter_unsupported_reason(
     node: &Node,
     opset: u64,
     input_dtypes: &[DataType],
@@ -375,6 +385,16 @@ impl Kernel for ScatterNDKernel {
 }
 pub struct ScatterElementsFactory(pub u64);
 impl KernelFactory for ScatterElementsFactory {
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        _opset: u64,
+        _shapes: &[onnx_runtime_ir::Shape],
+        input_dtypes: &[DataType],
+    ) -> Option<String> {
+        scatter_unsupported_reason(node, self.0, input_dtypes)
+    }
+
     fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(ScatterElementsKernel {
             axis: node.attr("axis").and_then(Attribute::as_int).unwrap_or(0),

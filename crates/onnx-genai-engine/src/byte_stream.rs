@@ -696,7 +696,7 @@ mod tests {
                     let mut output = Vec::new();
                     for bytes in text.as_bytes().chunks(chunk) {
                         output.extend_from_slice(&state.step(bytes));
-                        assert!(state.retained_bytes() <= 3 * character.len_utf8() - 1);
+                        assert!(state.retained_bytes() < 3 * character.len_utf8());
                     }
                     let mut preview = output.clone();
                     preview.extend(state.provisional_tail());

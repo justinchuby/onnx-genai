@@ -52,6 +52,16 @@ impl Default for GemmFactory {
 }
 
 impl KernelFactory for GemmFactory {
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        opset: u64,
+        shapes: &[onnx_runtime_ir::Shape],
+        input_dtypes: &[DataType],
+    ) -> Option<String> {
+        onnx_runtime_ep_api::gemm::unsupported_reason(node, opset, shapes, input_dtypes, DTYPES)
+    }
+
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let alpha = node.attr("alpha").and_then(|a| a.as_float()).unwrap_or(1.0);
         let beta = node.attr("beta").and_then(|a| a.as_float()).unwrap_or(1.0);

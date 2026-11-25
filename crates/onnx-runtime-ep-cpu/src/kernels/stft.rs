@@ -13,7 +13,7 @@ use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 pub struct StftFactory;
 
-pub(crate) fn unsupported_dtype_reason(input_dtypes: &[DataType]) -> Option<String> {
+fn unsupported_dtype_reason(input_dtypes: &[DataType]) -> Option<String> {
     let signal = input_dtypes.first().copied().unwrap_or(DataType::Undefined);
     if !matches!(
         signal,
@@ -50,6 +50,16 @@ pub(crate) fn unsupported_dtype_reason(input_dtypes: &[DataType]) -> Option<Stri
 }
 
 impl KernelFactory for StftFactory {
+    fn unsupported_reason(
+        &self,
+        _node: &Node,
+        _opset: u64,
+        _shapes: &[onnx_runtime_ir::Shape],
+        input_dtypes: &[DataType],
+    ) -> Option<String> {
+        unsupported_dtype_reason(input_dtypes)
+    }
+
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let onesided = node.attr("onesided").and_then(|a| a.as_int()).unwrap_or(1);
         if !matches!(onesided, 0 | 1) {
