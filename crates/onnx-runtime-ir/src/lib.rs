@@ -71,6 +71,7 @@ pub mod packed_routed;
 pub mod pattern;
 pub mod quantized_grouped;
 pub mod quantized_matmul;
+pub mod roi_align;
 pub mod scatter;
 pub mod standard_math;
 pub mod topk;
