@@ -1,0 +1,8 @@
+
+/tmp/nxrt-conv-gap-study/linked-probe:	file format mach-o arm64
+
+Disassembly of section __TEXT,__text:
+
+0000000100036f14 <__Z21MlasNchwcGetBlockSizev>:
+100036f14: 52800020    	mov	w0, #0x1                ; =1
+100036f18: d65f03c0    	ret

@@ -1,0 +1,7 @@
+{
+  "environment": {
+    "RUST_LOG": "warn"
+  },
+  "status": " M crates/onnx-runtime-ep-cpu/src/kernels/softmax_neon.rs\n?? crates/onnx-runtime-ep-cpu/src/kernels/softmax_neon_unroll_tests.rs\n",
+  "cargo_lock_sha256": "90acaae1b927feee7041d992594e6af758ea9f7558ae75e3f1d67de6ed490832"
+}

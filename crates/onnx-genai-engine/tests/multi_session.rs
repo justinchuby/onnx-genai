@@ -1,4 +1,6 @@
-use onnx_genai_engine::{Engine, EngineConfig, FinishReason, GeneratePrompt, GenerateRequest};
+use onnx_genai_engine::{
+    Engine, EngineConfig, EngineDecodeBackend, FinishReason, GeneratePrompt, GenerateRequest,
+};
 use std::path::{Path, PathBuf};
 
 fn tiny_fixture() -> anyhow::Result<PathBuf> {
@@ -15,9 +17,16 @@ fn token_request(tokens: Vec<u32>, max_new_tokens: usize) -> GenerateRequest {
     request
 }
 
+fn ort_config() -> EngineConfig {
+    EngineConfig {
+        decode_backend: EngineDecodeBackend::Ort,
+        ..EngineConfig::default()
+    }
+}
+
 #[test]
 fn interleaved_sessions_keep_independent_contexts() -> anyhow::Result<()> {
-    let mut engine = Engine::from_dir(&tiny_fixture()?, EngineConfig::default())?;
+    let mut engine = Engine::from_dir(&tiny_fixture()?, ort_config())?;
     let session_a = engine.create_session()?;
     let session_b = engine.create_session()?;
     let session_c = engine.create_session()?;

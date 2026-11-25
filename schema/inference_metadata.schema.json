@@ -481,7 +481,7 @@
           "description": "Element type of the emitted tensor."
         },
         "name": {
-          "description": "Workflow SSA value this output binds to.",
+          "description": "Workflow SSA value (audio-preprocess@1) or component output port (@2).",
           "examples": [
             "audio.input_features"
           ],
@@ -562,7 +562,7 @@
       "description": "Generic audio preprocessing program: an ordered transform pipeline plus the\nnamed workflow SSA tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata, mirroring `VisionPreprocessingProgram`. Transform operations are\ngeneric (decode, resample, downmix, rescale, normalize, pad, frame,\nspectrogram, log_mel). In workflow metadata, outputs are materialized by a\nmanifest-pinned preprocessing adapter invocation and bind processor-local\nvalues to typed SSA names. A package may name an output `input_values`,\n`input_features`, `attention_mask`, or anything else without introducing\nruntime model-family dispatch.\n\nOne program type covers every audio family. A CTC acoustic model declares\nresample/downmix/zero_mean_unit_variance over raw samples; an\nencoder-decoder speech model declares resample/pad/log_mel over a fixed\nwindow. The runtime reads the same fields either way.",
       "properties": {
         "outputs": {
-          "description": "Named tensor outputs the program emits, each bound to a workflow SSA value.",
+          "description": "Named tensor outputs; the adapter ABI selects workflow values or component-local ports.",
           "items": {
             "$ref": "#/$defs/AudioOutputBinding"
           },
@@ -1604,12 +1604,352 @@
       ],
       "type": "string"
     },
+    "DecisionBoolean": {
+      "additionalProperties": false,
+      "properties": {
+        "criteria": {
+          "$ref": "#/$defs/DecisionBooleanCriteria"
+        },
+        "order": {
+          "$ref": "#/$defs/DecisionBooleanOrder"
+        }
+      },
+      "required": [
+        "order",
+        "criteria"
+      ],
+      "type": "object"
+    },
+    "DecisionBooleanCriteria": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "forbidden",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "descriptions": {
+              "$ref": "#/$defs/DecisionPayload"
+            },
+            "kind": {
+              "const": "strict",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "descriptions"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "permissive",
+              "type": "string"
+            },
+            "no_yes_aliases": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "no_yes_aliases"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DecisionBooleanOrder": {
+      "enum": [
+        "false_first",
+        "true_first",
+        "criteria_true_first"
+      ],
+      "type": "string"
+    },
+    "DecisionChoices": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "descriptions": {
+              "$ref": "#/$defs/DecisionPayload"
+            },
+            "kind": {
+              "const": "dynamic",
+              "type": "string"
+            },
+            "minimum": {
+              "format": "uint",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "nonempty_keys": {
+              "type": "boolean"
+            },
+            "order": {
+              "$ref": "#/$defs/DecisionOrder"
+            }
+          },
+          "required": [
+            "kind",
+            "minimum",
+            "order",
+            "descriptions",
+            "nonempty_keys"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "fixed",
+              "type": "string"
+            },
+            "options": {
+              "items": {
+                "$ref": "#/$defs/DecisionOption"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "options"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "DecisionConfidence": {
       "enum": [
         "uniform_margin",
         "mode_distance",
         "normalized_entropy",
         "maximum_probability"
+      ],
+      "type": "string"
+    },
+    "DecisionInputPolicy": {
+      "additionalProperties": false,
+      "description": "Complete model-authored request rules. Absent task policies disable that type.",
+      "properties": {
+        "choice": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionChoices"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "default_type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "instructions": {
+          "$ref": "#/$defs/DecisionInstructions"
+        },
+        "max_questions": {
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "noul": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionBoolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "score": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionLevels"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/DecisionPayload"
+        }
+      },
+      "required": [
+        "state",
+        "instructions"
+      ],
+      "type": "object"
+    },
+    "DecisionInstructions": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "required",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/DecisionPayload"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "default": true,
+            "kind": {
+              "const": "optional",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/DecisionPayload"
+            }
+          },
+          "required": [
+            "kind",
+            "default",
+            "payload"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "forbidden",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DecisionKind": {
+      "description": "Decision question categories shared by metadata, preparation and transport.",
+      "enum": [
+        "choice",
+        "score",
+        "noul"
+      ],
+      "type": "string"
+    },
+    "DecisionLegend": {
+      "enum": [
+        "structured",
+        "canonical_json_text"
+      ],
+      "type": "string"
+    },
+    "DecisionLevels": {
+      "additionalProperties": false,
+      "properties": {
+        "descriptions": {
+          "$ref": "#/$defs/DecisionPayload"
+        },
+        "legend": {
+          "$ref": "#/$defs/DecisionLegend"
+        },
+        "maximum": {
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "minimum": {
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "minimum",
+        "maximum",
+        "descriptions",
+        "legend"
+      ],
+      "type": "object"
+    },
+    "DecisionMediaBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "input": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/EncodedMediaKind"
+        }
+      },
+      "required": [
+        "kind",
+        "input"
+      ],
+      "type": "object"
+    },
+    "DecisionOption": {
+      "additionalProperties": false,
+      "properties": {
+        "description": true,
+        "key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "description"
+      ],
+      "type": "object"
+    },
+    "DecisionOrder": {
+      "enum": [
+        "lexical",
+        "request"
+      ],
+      "type": "string"
+    },
+    "DecisionPayload": {
+      "enum": [
+        "any",
+        "any_non_null",
+        "payload",
+        "payload_or_null",
+        "nonempty_payload",
+        "text"
       ],
       "type": "string"
     },
@@ -1627,10 +1967,35 @@
         "choice_confidence": {
           "$ref": "#/$defs/DecisionConfidence"
         },
+        "images": {
+          "description": "Ordered encoded state-image workflow endpoints (decision v2).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "input_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionInputPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Request semantics authored explicitly in schema v1.11 and newer."
+        },
         "max_options": {
           "format": "uint",
           "minimum": 1,
           "type": "integer"
+        },
+        "media": {
+          "description": "Ordered typed state-media endpoints (decision v3).",
+          "items": {
+            "$ref": "#/$defs/DecisionMediaBinding"
+          },
+          "type": "array"
         },
         "prompt_template": {
           "description": "Jinja context: state, instructions, type, options (key/description), variant.",
@@ -1641,6 +2006,13 @@
         },
         "score_confidence": {
           "$ref": "#/$defs/DecisionConfidence"
+        },
+        "spoken_instructions": {
+          "description": "Encoded audio endpoint for a spoken question (decision v3).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "variants": {
           "$ref": "#/$defs/DecisionVariants"
@@ -1775,6 +2147,14 @@
           "type": "string"
         }
       ]
+    },
+    "EncodedMediaKind": {
+      "description": "Declared encoded-media kind; no content or model-family guessing.",
+      "enum": [
+        "image",
+        "audio"
+      ],
+      "type": "string"
     },
     "EquivalenceClass": {
       "description": "Correctness bound on substituting an equivalent component implementation.",
@@ -3120,6 +3500,178 @@
       "required": [
         "precision"
       ],
+      "type": "object"
+    },
+    "RealtimeInputs": {
+      "additionalProperties": false,
+      "properties": {
+        "audio": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "output_token_budget": {
+          "type": "string"
+        },
+        "token_mask": {
+          "description": "Optional bool vocabulary mask: empty means unconstrained; otherwise one\nadmission bit per tokenizer ID, consumed before native token selection.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tokens": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "output_token_budget",
+        "operation",
+        "audio",
+        "tokens"
+      ],
+      "type": "object"
+    },
+    "RealtimeMode": {
+      "enum": [
+        "realtime",
+        "transcription",
+        "duplex"
+      ],
+      "type": "string"
+    },
+    "RealtimeSelections": {
+      "description": "Explicit conditioning admission: absence defaults to no override, not an\ninferred list or unrestricted model support.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "unsupported",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "any",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "choices",
+              "type": "string"
+            },
+            "values": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "values"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "RealtimeSpec": {
+      "additionalProperties": false,
+      "description": "A bounded native invocation advances one realtime session. Codec, temporal\nand acoustic state belongs to session-scoped workflow state, not transport.",
+      "properties": {
+        "default_mode": {
+          "$ref": "#/$defs/RealtimeMode"
+        },
+        "input_frame_samples": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "input_sample_rate_hz": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inputs": {
+          "$ref": "#/$defs/RealtimeInputs"
+        },
+        "languages": {
+          "$ref": "#/$defs/RealtimeSelections",
+          "default": {
+            "kind": "unsupported"
+          }
+        },
+        "modes": {
+          "items": {
+            "$ref": "#/$defs/RealtimeMode"
+          },
+          "type": "array"
+        },
+        "output_sample_rate_hz": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "prompt_template": {
+          "description": "Jinja context: operation, text, call_id and the complete session settings.",
+          "type": "string"
+        },
+        "voices": {
+          "$ref": "#/$defs/RealtimeSelections",
+          "default": {
+            "kind": "unsupported"
+          }
+        }
+      },
+      "required": [
+        "default_mode",
+        "prompt_template",
+        "modes",
+        "input_sample_rate_hz",
+        "input_frame_samples",
+        "inputs"
+      ],
+      "type": "object"
+    },
+    "RerankingSpec": {
+      "additionalProperties": false,
+      "description": "Model-authored query/document image positions. Each name references an\napplication-sourced uint8 vector; the workflow owns decoding and vision math.",
+      "properties": {
+        "document_images": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "query_images": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
       "type": "object"
     },
     "RuntimeConfigurable": {
@@ -4703,10 +5255,32 @@
           ],
           "description": "Pooling applied to a sequence-valued output, when the task needs it."
         },
+        "realtime": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RealtimeSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Session-scoped audio/text quantum ABI for realtime transports."
+        },
         "requirement": {
           "$ref": "#/$defs/ProfileRequirement",
           "default": "required",
           "description": "Whether a reader that does not understand this profile may skip it."
+        },
+        "reranking": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RerankingSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Ordered encoded-image endpoints for the reranking v2 task ABI."
         },
         "version": {
           "description": "Version of this profile's own contract.",
@@ -5108,7 +5682,7 @@
           "description": "Declared output dtype. Always explicit; never inferred from the model."
         },
         "name": {
-          "description": "Workflow SSA value produced by the preprocessing adapter invocation.",
+          "description": "Output name: a workflow SSA value under preprocessing ABI v1, or a\ncomponent-local output port under image-preprocess ABI v2. The latter\nallows repeated invocations to bind independent workflow SSA values.",
           "examples": [
             "image.pixel_values"
           ],
@@ -5185,7 +5759,7 @@
       "description": "Generic pixel preprocessing program: an ordered transform pipeline plus the\nnamed workflow SSA tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata. Transform operations are generic (decode, resize, rescale, normalize,\ntile, patchify, pad, and for clips sample_frames and pad_frames). In workflow\nmetadata, outputs are materialized by a manifest-pinned preprocessing adapter\ninvocation and bind processor-local values to typed SSA names. A package may\nname an output `pixel_position_ids`, `image_grid_thw`, `video_grid_thw`, or\nanything else without introducing runtime model-family dispatch.\n\nOne program type covers stills and clips, the way one audio program covers\nevery audio family: a frame is an image, so a video program declares the\nsame spatial work plus the temporal operations that select and pad frames.",
       "properties": {
         "outputs": {
-          "description": "Named tensor outputs the program emits, each bound to a workflow SSA value.",
+          "description": "Named tensor outputs; the adapter ABI selects workflow values or component-local ports.",
           "items": {
             "$ref": "#/$defs/VisionOutputBinding"
           },

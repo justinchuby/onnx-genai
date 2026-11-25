@@ -193,22 +193,11 @@ fn response_request(mut body: Map<String, Value>) -> Result<ChatCompletionReques
         body.insert("response_format".into(), format);
     }
     if let Some(tools) = body.remove("tools") {
-        let mut lowered = Vec::new();
-        for mut tool in array(tools, "tools")? {
-            let object = tool.as_object_mut().ok_or_else(|| {
-                ApiError::invalid_request("each Responses tool must be an object")
-            })?;
-            if object.remove("type") != Some(json!("function")) {
-                return Err(ApiError::invalid_request(
-                    "Responses tools must be type=function; hosted tools are not implemented",
-                ));
-            }
-            // Strictness is enforced by the package's typed tool transaction.
-            object.remove("strict");
-            lowered.push(json!({"type":"function","function":object}));
-        }
-        body.insert("tools".into(), json!(lowered));
+        let lowered = crate::tool_protocol::responses_tools(tools)
+            .map_err(|error| ApiError::invalid_request(error.to_string()))?;
+        body.insert("tools".into(), lowered);
     }
+
     if let Some(choice) = body.remove("tool_choice") {
         let choice = if choice.is_object() {
             json!({"type":"function","function":{"name":string(&choice["name"],"tool_choice.name")?}})
@@ -437,6 +426,7 @@ async fn serve(
     protocol: Protocol,
 ) -> Result<Response, ApiError> {
     let streaming = request.stream;
+    let ping = crate::SsePingInterval::resolve(&request, state.config.sse_ping_interval)?;
     request.stream_options.include_usage = true;
     let response =
         super::completions::chat_completions(State(state), headers, ApiJson(request)).await?;
@@ -448,7 +438,7 @@ async fn serve(
             .map_err(|err| ApiError::internal(format!("chat response JSON was invalid: {err}")))?;
         return Ok(Json(buffered(&body, protocol)?).into_response());
     }
-    Ok(stream_response(response, protocol))
+    Ok(stream_response(response, protocol, ping))
 }
 fn buffered(chat: &Value, protocol: Protocol) -> Result<Value, ApiError> {
     let message = &chat["choices"][0]["message"];
@@ -815,7 +805,11 @@ impl From<&str> for AdaptedStreamFailure {
     }
 }
 
-fn stream_response(response: Response, protocol: Protocol) -> Response {
+fn stream_response(
+    response: Response,
+    protocol: Protocol,
+    ping: crate::SsePingInterval,
+) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(16);
     tokio::spawn(async move {
         let mut source = response.into_body().into_data_stream();
@@ -881,7 +875,7 @@ fn stream_response(response: Response, protocol: Protocol) -> Response {
             let _ = tx.send(Ok(event)).await;
         }
     });
-    Sse::new(ReceiverStream::new(rx)).into_response()
+    ping.response(ReceiverStream::new(rx))
 }
 
 #[cfg(test)]
@@ -1000,7 +994,7 @@ mod transport_tests {
             let source = Response::new(Body::from(
                 "event: error\ndata: {\"error\":{\"code\":429,\"type\":\"resource_limit_error\",\"message\":\"capacity exhausted\"}}\n\n",
             ));
-            let response = stream_response(source, protocol);
+            let response = stream_response(source, protocol, crate::SsePingInterval::default());
             let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
             let text = std::str::from_utf8(&bytes).unwrap();
             let value: Value = serde_json::from_str(

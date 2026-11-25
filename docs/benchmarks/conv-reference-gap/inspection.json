@@ -1,0 +1,12 @@
+{
+  "binary_sha256": "6d546c47436301dd2d5536a8be913928507c795e9240587abb13c2a13271216c",
+  "symbol": "__Z21MlasNchwcGetBlockSizev",
+  "command": [
+    "/opt/homebrew/opt/llvm/bin/llvm-objdump",
+    "--disassemble-symbols=__Z21MlasNchwcGetBlockSizev",
+    "/tmp/nxrt-conv-gap-study/linked-probe"
+  ],
+  "disassembly_sha256": "510bf97caa16603b0601ac56ef79a1bb23686b1b0af77a8b9b4a6685f7428d6e",
+  "observation": "mov w0, #0x1 followed by ret; fallback gate selects ConvPlan",
+  "reader_refinement": "I/O callback and safe nonpositive synthetic slopes; real parsed summary exactly unchanged"
+}

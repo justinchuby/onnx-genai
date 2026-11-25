@@ -97,6 +97,7 @@ EXPECTED_CUDA_TARGETS_BY_DIR = {
             "matmul_gpu",
             "matmul_nbits_gpu",
             "matmul_nbits_marlin_numerics",
+            "mean_variance_normalization_gpu",
             "megakernel_headroom_gpu",
             "movement_gpu",
             "multi_head_attention_gpu",
@@ -270,6 +271,18 @@ SESSION_GPU_FEATURES = "gpu-tests,cuda-13000"
 SESSION_HETERO_EXPECTED_TESTS = frozenset(
     {"cuda_cpu_cuda_chain_executes_on_both_real_providers"}
 )
+SESSION_METADATA_TARGET = "modern_shape_size"
+SESSION_METADATA_GPU_TESTS = frozenset(
+    {"modern_shape_dynamic_cuda", "modern_size_dynamic_cuda"}
+)
+SESSION_METADATA_EXPECTED_TESTS = SESSION_METADATA_GPU_TESTS | frozenset(
+    {
+        "modern_shape_dynamic_cpu",
+        "modern_size_dynamic_cpu",
+        "modern_shape_size_reject_pre_revision_dtypes",
+        "modern_shape_size_reject_pre_revision_dtype_without_rank",
+    }
+)
 ENGINE_PACKAGE = "onnx-genai-engine"
 ENGINE_DEFAULT_OFF_TARGET = "native_cuda_default_off_state_capture_gpu"
 ENGINE_BASE_FEATURES = "native-cuda,cuda-13000"
@@ -292,9 +305,9 @@ EXPECTED_EINSUM_TESTS_BY_TARGET = {
     "einsum_gpu": frozenset(
         {
             "auto_fallback_snapshot_is_reused_for_capture_and_replay",
+            "captured_einsum_resources_outlive_kernel_and_caller_owners",
             "captured_generic_resources_outlive_dropped_kernel",
             "captured_optimized_plan_resources_outlive_dropped_kernel",
-            "captured_private_resources_outlive_dropped_einsum_kernels",
             "contraction_rejects_output_alias_before_launch",
             "descriptor_transpose_contractions_match_f64_reference",
             "direct_snapshot_layout_mismatch_fails_closed_during_capture",
@@ -321,6 +334,7 @@ EXPECTED_EINSUM_TESTS_BY_TARGET = {
             "permutation_and_diagonal_use_zero_copy_views_and_materialize_correctly",
             "registry_reachability_and_claim_declines_are_intentional",
             "semantic_capture_mismatch_is_pre_mutation_and_preserves_snapshot",
+            "semantic_einsum_uses_caller_prefix_rebinds_transactionally_and_pins_capture",
             "semantic_signatures_bind_raw_base_offset_and_rewarm_transactionally",
             "semantic_signatures_reject_device_and_alias_mismatch_before_launch",
             "warm_plan_is_allocation_free_with_stable_workspace_through_capture_and_replay",
@@ -1389,6 +1403,26 @@ def verify_production_feature_targets() -> tuple[list[str], list[str]]:
     )
     discard_consumed_binaries([session_gpu_binary])
 
+    for features, expected_ignored in (
+        (SESSION_BASE_FEATURES, SESSION_METADATA_GPU_TESTS),
+        (SESSION_GPU_FEATURES, frozenset()),
+    ):
+        binary = build_named_test_binary(
+            SESSION_PACKAGE, SESSION_METADATA_TARGET, features
+        )
+        label = f"{SESSION_PACKAGE}/{SESSION_METADATA_TARGET} with {features}"
+        errors.extend(
+            named_inventory_errors(
+                label, list_inventory(binary), SESSION_METADATA_EXPECTED_TESTS
+            )
+        )
+        errors.extend(
+            named_inventory_errors(
+                f"{label} ignored", list_inventory(binary, "--ignored"), expected_ignored
+            )
+        )
+        discard_consumed_binaries([binary])
+
     engine_base_binary = build_named_test_binary(
         ENGINE_PACKAGE, ENGINE_DEFAULT_OFF_TARGET, ENGINE_BASE_FEATURES
     )
@@ -1442,6 +1476,9 @@ def verify_production_feature_targets() -> tuple[list[str], list[str]]:
         f"{SESSION_PACKAGE}/{SESSION_HETERO_TARGET}: "
         f"{len(session_base_inventory)} test(s) present without gpu-tests and ignored; "
         f"{len(session_gpu_inventory)} present with gpu-tests and compiled only",
+        f"{SESSION_PACKAGE}/{SESSION_METADATA_TARGET}: "
+        f"{len(SESSION_METADATA_EXPECTED_TESTS)} tests checked in each build; "
+        f"{len(SESSION_METADATA_GPU_TESTS)} CUDA tests ignored only without gpu-tests",
         f"{ENGINE_PACKAGE}/{ENGINE_DEFAULT_OFF_TARGET}: "
         f"{len(engine_base_inventory)} test(s) present without gpu-tests and ignored; "
         f"{len(engine_gpu_inventory)} present with gpu-tests and compiled only",
@@ -1473,8 +1510,8 @@ def build_test_binaries(config: FeatureConfig) -> list[TestBinary]:
     return parse_test_binaries_from_json(result.stdout)
 
 
-def list_inventory(binary: TestBinary) -> frozenset[str]:
-    result = run([binary.executable, "--list"])
+def list_inventory(binary: TestBinary, *args: str) -> frozenset[str]:
+    result = run([binary.executable, "--list", *args])
     if result.returncode != 0:
         print(result.stdout, file=sys.stderr, end="")
         print(result.stderr, file=sys.stderr, end="")
@@ -2263,6 +2300,7 @@ def main() -> int:
             | {
                 CUDA_PLUGIN_TARGET,
                 SESSION_HETERO_TARGET,
+                SESSION_METADATA_TARGET,
                 ENGINE_DEFAULT_OFF_TARGET,
             }
         )

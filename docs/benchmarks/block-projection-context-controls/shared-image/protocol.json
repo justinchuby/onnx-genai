@@ -1,0 +1,68 @@
+{
+  "scope": "shared executable/code/constant layout causal control; no production change",
+  "shapes_rows_hidden_inter_execution_dense_gate_construction_matmul": [
+    [
+      1,
+      64,
+      128,
+      1,
+      0,
+      1,
+      1,
+      0
+    ],
+    [
+      8,
+      128,
+      256,
+      1,
+      0,
+      0,
+      4,
+      1
+    ],
+    [
+      8,
+      128,
+      256,
+      4,
+      1,
+      0,
+      4,
+      1
+    ]
+  ],
+  "repetitions": 3,
+  "work_macs": 4294967296,
+  "arms": [
+    "baseline",
+    "candidate",
+    "null-baseline",
+    "null-candidate"
+  ],
+  "kinds": [
+    "setup",
+    "work",
+    "double"
+  ],
+  "double_arms": [
+    "baseline",
+    "candidate"
+  ],
+  "quality": {
+    "aa": [
+      0.95,
+      1.05
+    ],
+    "setup_fraction_max": 0.25,
+    "adjusted_double": [
+      1.7,
+      2.3
+    ],
+    "work_s_min": 0.05,
+    "physical_cpu_wall_factor": 11
+  },
+  "attempts": 1,
+  "selector_scope": "Factory creation only; no selector branch on warm dispatch",
+  "binary_sha256": "294380448f89db48aa9004dbf0cb962591fd21de1cc658423b58f904d490e10d"
+}

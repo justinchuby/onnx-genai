@@ -18,6 +18,20 @@ pub fn unary(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+fn trig(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let node = ctx.node;
+    let opset = ctx.opset(&node.domain);
+    if let Some(reason) = ctx.input_dtype(0).and_then(|dtype| {
+        onnx_runtime_ir::trig::bf16_unsupported_reason(&node.op_type, &node.domain, opset, dtype)
+    }) {
+        return Err(ShapeInferError::Invalid {
+            op: node.op_type.clone(),
+            detail: reason,
+        });
+    }
+    unary(ctx)
+}
+
 fn standard_math(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     use onnx_runtime_ir::standard_math::{DTYPES, Math};
 
@@ -260,8 +274,6 @@ pub fn register(reg: &mut InferenceRegistry) {
         "Log",
         "Neg",
         "Abs",
-        "Sin",
-        "Cos",
         "Reciprocal",
         "Softplus",
         "Softsign",
@@ -272,11 +284,8 @@ pub fn register(reg: &mut InferenceRegistry) {
     ] {
         reg.register("", op, 1, unary);
     }
-    for op in ["Acos", "Asin", "Atan", "Tan"] {
-        reg.register("", op, 7, unary);
-    }
-    for op in ["Acosh", "Asinh", "Atanh", "Cosh", "Sinh"] {
-        reg.register("", op, 9, unary);
+    for &(op, since) in onnx_runtime_ir::trig::OPS {
+        reg.register("", op, since, trig);
     }
     for op in ["Clip", "Elu", "HardSigmoid", "LeakyRelu"] {
         reg.register("", op, 1, unary);

@@ -478,6 +478,38 @@ fn text_ops_infer_broadcast_match_and_dynamic_split_shapes() {
 }
 
 #[test]
+fn trig_bf16_requires_opset_22() {
+    for (name, original) in [
+        ("Sin", 7),
+        ("Cos", 7),
+        ("Tan", 7),
+        ("Asin", 7),
+        ("Acos", 7),
+        ("Atan", 7),
+        ("Sinh", 9),
+        ("Cosh", 9),
+        ("Asinh", 9),
+        ("Acosh", 9),
+        ("Atanh", 9),
+    ] {
+        let n = node(name, 1, 1);
+        let inputs = |dtype| vec![tin(dtype, vec![c(2), c(3)])];
+        let error = try_run(&n, inputs(DataType::BFloat16), 21).unwrap_err();
+        assert_invalid(error, name, "does not accept BF16 (BFloat16) at opset 21");
+        let out = run(&n, inputs(DataType::BFloat16), 22);
+        assert_eq!(out_dtype(&out), DataType::BFloat16, "{name}");
+        assert_eq!(out_shape(&out), vec![c(2), c(3)], "{name}");
+        for opset in [original, 21, 22] {
+            for dtype in [DataType::Float16, DataType::Float32, DataType::Float64] {
+                let out = run(&n, inputs(dtype), opset);
+                assert_eq!(out_dtype(&out), dtype, "{name} at opset {opset}");
+                assert_eq!(out_shape(&out), vec![c(2), c(3)], "{name} at opset {opset}");
+            }
+        }
+    }
+}
+
+#[test]
 fn standard_math_opset_gate_and_shape_contracts() {
     for (name, since) in onnx_runtime_ir::standard_math::OPS {
         let arity = if ["SwiGLU", "GeGLU"].contains(&name) {
@@ -5476,6 +5508,15 @@ fn lrn_mvn_reverse_sequence_are_shape_preserving() {
 }
 
 #[test]
+fn mean_variance_normalization_29_preserves_symbolic_shape_and_bfloat16() {
+    let n = with_attr(node("MeanVarianceNormalization", 1, 1), "axes", ints(&[-1]));
+    let shape = vec![sym(7), c(5)];
+    let out = run(&n, vec![tin(DataType::BFloat16, shape.clone())], 29);
+    assert_eq!(out_shape(&out), shape);
+    assert_eq!(out_dtype(&out), DataType::BFloat16);
+}
+
+#[test]
 fn random_generators_shape_and_dtype() {
     // RandomNormal/RandomUniform: shape from attr, dtype override.
     let n = with_attr(
@@ -6702,6 +6743,30 @@ fn seq_in(dtype: DataType, shape: Option<Vec<DimExpr>>) -> NodeIo {
 }
 
 #[test]
+fn optional_operand_forms_follow_opset() {
+    for op in ["OptionalHasElement", "OptionalGetElement"] {
+        let n = node(op, 1, 1);
+        assert!(try_run(&n, vec![f32in(vec![c(2)])], 15).is_err());
+        let direct = run(&n, vec![f32in(vec![c(2)])], 18);
+        let wrapped = run(
+            &n,
+            vec![NodeIo::container(ValueType::Optional(Box::new(
+                ValueType::tensor(DataType::Float32, vec![c(2)]),
+            )))],
+            15,
+        );
+        assert_eq!(direct[0].type_info, wrapped[0].type_info);
+    }
+    let omitted = node("OptionalHasElement", 0, 1);
+    assert!(try_run(&omitted, vec![], 15).is_err());
+    let result = run(&omitted, vec![], 28);
+    assert_eq!(
+        result[0].type_info,
+        Some(TypeInfo::new(DataType::Bool, vec![]))
+    );
+}
+
+#[test]
 fn sequence_empty_element_dtype_follows_attr_and_defaults_to_float32() {
     // Default (no `dtype` attr) is Float32, per the ONNX spec.
     let default = run(&node("SequenceEmpty", 0, 1), vec![], 13);
@@ -7334,7 +7399,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "ConstantOfShape", 1),
     ("", "Conv", 1),
     ("", "ConvTranspose", 1),
-    ("", "Cos", 1),
+    ("", "Cos", 7),
     ("", "Cosh", 9),
     ("", "CumProd", 26),
     ("", "CumSum", 11),
@@ -7495,7 +7560,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Sigmoid", 1),
     ("", "Sign", 1),
     ("", "SimplifiedLayerNormalization", 1),
-    ("", "Sin", 1),
+    ("", "Sin", 7),
     ("", "Sinh", 9),
     ("", "Size", 1),
     ("", "Slice", 1),
