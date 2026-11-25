@@ -115,16 +115,12 @@ extern "C" __global__ void dynamic_quantize_u8(
 }
 "#;
 
-pub(super) fn legacy_geometry(
-    op: &Node,
-    shapes: &[Shape],
-    dtypes: &[DataType],
-) -> std::result::Result<(), String> {
+pub fn unsupported_reason(op: &Node, shapes: &[Shape], dtypes: &[DataType]) -> Option<String> {
     let compact_optional_zp = op.inputs.get(2) == Some(&None) && shapes.len() == 2;
     if !(2..=3).contains(&op.inputs.len())
         || (shapes.len() != op.inputs.len() && !compact_optional_zp)
     {
-        return Err(format!(
+        return Some(format!(
             "{} requires 2 or 3 present inputs with shape metadata",
             op.op_type
         ));
@@ -136,7 +132,7 @@ pub(super) fn legacy_geometry(
                 None | Some(onnx_runtime_ir::Attribute::Int(0 | 1))
             )
         {
-            return Err("DequantizeLinear CUDA supports Float32 scale and output".into());
+            return Some("DequantizeLinear CUDA supports Float32 scale and output".into());
         }
         let block = op.attr("block_size").and_then(|a| a.as_int()).unwrap_or(0);
         if block > 0
@@ -145,22 +141,22 @@ pub(super) fn legacy_geometry(
                 .get(2)
                 .is_none_or(|shape| op.inputs[2].is_none() || shape == &shapes[1])
         {
-            return Ok(());
+            return None;
         }
     }
     if !shapes[1].is_empty() {
-        return Err(format!(
+        return Some(format!(
             "{} CUDA coverage requires a scalar scale",
             op.op_type
         ));
     }
     if shapes.get(2).is_some_and(|shape| !shape.is_empty()) {
-        return Err(format!(
+        return Some(format!(
             "{} CUDA coverage requires a scalar zero_point",
             op.op_type
         ));
     }
-    Ok(())
+    None
 }
 
 pub(super) fn claim_int16(
@@ -222,19 +218,45 @@ pub(super) fn claim_int16(
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum LinearQuantOp {
+enum LinearQuantOp {
     Quantize,
     Dequantize,
 }
 
-pub struct LinearQuantFactory {
-    pub op: LinearQuantOp,
-    pub runtime: Arc<CudaRuntime>,
+struct LinearQuantFactory {
+    op: LinearQuantOp,
+    runtime: Arc<CudaRuntime>,
+    int16: bool,
+}
+
+pub(crate) fn register_linear_quantization(
+    registry: &mut onnx_runtime_ep_api::OpRegistry,
+    runtime: &Arc<CudaRuntime>,
+    native: bool,
+) {
+    use onnx_runtime_ep_api::{OpKey, WorkspacePlanning};
+    for version in [10, 13, 19, 21, 23, 25] {
+        for (name, op) in [
+            ("QuantizeLinear", LinearQuantOp::Quantize),
+            ("DequantizeLinear", LinearQuantOp::Dequantize),
+        ] {
+            registry.register(
+                OpKey::new(name, "", version),
+                WorkspacePlanning::None,
+                Box::new(LinearQuantFactory {
+                    op,
+                    runtime: runtime.clone(),
+                    int16: native && version >= 21,
+                }),
+            );
+        }
+    }
 }
 
 impl KernelFactory for LinearQuantFactory {
     fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(LinearQuantKernel {
+            int16: self.int16,
             op: self.op,
             runtime: self.runtime.clone(),
             node: node.clone(),
@@ -253,6 +275,7 @@ struct LinearQuantKernel {
     node: Node,
     axis: i64,
     block: i64,
+    int16: bool,
 }
 
 impl Kernel for LinearQuantKernel {
@@ -280,7 +303,7 @@ impl Kernel for LinearQuantKernel {
             LinearQuantOp::Quantize => outputs[0].dtype,
             LinearQuantOp::Dequantize => x.dtype,
         };
-        if q16::is_code(quant_dtype) {
+        if self.int16 && q16::is_code(quant_dtype) {
             return self.execute_int16(
                 name,
                 quant_dtype,

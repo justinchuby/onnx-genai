@@ -515,8 +515,6 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
             DataType::Int8,
             DataType::Uint8,
             DataType::Int32,
-            DataType::Int16,
-            DataType::Uint16,
         ],
         ("QuantizeLinear", "") | ("DynamicQuantizeLinear", "") | ("QLinearMatMul", "") => {
             ARITH_DTYPES
@@ -1693,20 +1691,7 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(gemm::GemmFactory::new(resources.clone())),
     );
-    // Linear quantization evolved at opsets 10, 13, 19, 21, 23, and 25. The
-    // implementation accepts the newest parameter set for all these revisions.
-    for version in [10, 13, 19, 21, 23, 25] {
-        rec.register(
-            OpKey::new("QuantizeLinear", "", version),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(quantization::QuantizeLinearFactory),
-        );
-        rec.register(
-            OpKey::new("DequantizeLinear", "", version),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(quantization::DequantizeLinearFactory),
-        );
-    }
+    quantization::register_linear_quantization(&mut rec, true);
     rec.register(
         OpKey::new("DequantizePacked", "", 29),
         onnx_runtime_ep_api::WorkspacePlanning::None,

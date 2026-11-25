@@ -271,7 +271,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `ConstantOfShape`, `OneHot`, `TensorScatter` | `` | ✅ | **NVRTC / device materialization** | Shape-driven construction and fixed-capacity scatter paths with explicit dtype, bounds, and capture checks. |
 | `QuantizeLinear`, `DequantizeLinear`, `QLinearMatMul`, `DynamicQuantizeLinear` | `` | ✅ | **NVRTC quantization** | Per-tensor/per-axis constraints and supported integer storage are enforced by each kernel's claim gate. |
 
-`QuantizeLinear` and `DequantizeLinear` support INT16 and UINT16 at opset 21+
+In the standalone runtime, `QuantizeLinear` and `DequantizeLinear` support INT16 and UINT16 at opset 21+
 with scalar, per-axis, or blocked scales. For those storage types, opset 23+
 also supports explicit division `precision` and independently typed floating
 dequantization output, respectively.

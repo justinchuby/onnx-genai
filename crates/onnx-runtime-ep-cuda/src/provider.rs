@@ -1734,6 +1734,7 @@ pub struct CudaExecutionProvider {
     memory_cleanup_armed: AtomicBool,
     workspace_release_barrier: WorkspaceReleaseBarrier,
     registry: OpRegistry,
+    native_linear_quantization: bool,
     csa_metrics: Arc<CsaMetrics>,
     /// Device weight-offload policy resolved from the environment. When enabled,
     /// the EP advertises the `nxrt` weight-paging capability and pages lazy
@@ -2201,6 +2202,7 @@ impl CudaExecutionProvider {
             memory_cleanup_armed: AtomicBool::new(false),
             workspace_release_barrier: WorkspaceReleaseBarrier::default(),
             registry,
+            native_linear_quantization: true,
             csa_metrics,
             offload_policy,
             residency,
@@ -2700,6 +2702,18 @@ impl CudaExecutionProvider {
     /// Construct a CUDA EP on the default device (`CUDA:0`).
     pub fn new_default() -> Result<Self> {
         Self::new(0)
+    }
+
+    /// Construct the default CUDA provider with the shipped ORT plug-in Q/DQ contract.
+    pub fn new_for_ort_plugin() -> Result<Self> {
+        let mut provider = Self::new_default()?;
+        provider.native_linear_quantization = false;
+        crate::kernels::quantization::register_linear_quantization(
+            &mut provider.registry,
+            &provider.runtime,
+            false,
+        );
+        Ok(provider)
     }
 
     /// Return whether a fully initialized CUDA EP can be constructed for this
@@ -4495,6 +4509,7 @@ impl ExecutionProvider for CudaExecutionProvider {
                 opset,
                 shapes,
                 input_dtypes,
+                self.native_linear_quantization,
             )
         {
             return KernelMatch::unsupported(reason);

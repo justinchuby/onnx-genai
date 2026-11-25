@@ -111,6 +111,13 @@ impl CpuExecutionProvider {
         Self::with_resources(CpuMemoryResources::default())
     }
 
+    /// Construct the CPU provider with the shipped ORT plug-in Q/DQ kernels.
+    pub fn new_for_ort_plugin() -> Self {
+        let mut provider = Self::new();
+        crate::kernels::quantization::register_linear_quantization(&mut provider.registry, false);
+        provider
+    }
+
     /// Construct all CPU factories with the same immutable session resources.
     pub fn with_resources(resources: CpuMemoryResources) -> Self {
         Self {

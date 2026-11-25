@@ -605,14 +605,10 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("BlockQuantizedMatMul", _)
         | ("BlockQuantizedMoE", _)
         | ("QLinearMatMul", _)
+        | ("QuantizeLinear", _)
         | ("DynamicQuantizeLinear", _) => CUDA_QUANT_MATMUL_DTYPES,
-        ("QuantizeLinear", _) => &[
-            DataType::Float32, DataType::Float16, DataType::BFloat16, DataType::Int32,
-            DataType::Int8, DataType::Uint8, DataType::Int16, DataType::Uint16,
-        ],
         ("DequantizeLinear", _) => &[
-            DataType::Float32, DataType::Float16, DataType::BFloat16, DataType::Int8,
-            DataType::Uint8, DataType::Int4, DataType::Uint4, DataType::Int16, DataType::Uint16,
+            DataType::Float32, DataType::Int8, DataType::Uint8, DataType::Int4, DataType::Uint4,
         ],
 
         // Quantized gather: Uint8 data + Int64/Int32 indices + f16 scales.
@@ -1068,24 +1064,7 @@ pub fn build_cuda_registry_with_metrics(
             v27: true,
         }),
     );
-    for version in [10, 13, 19, 21, 23, 25] {
-        reg.register(
-            OpKey::new("QuantizeLinear", "", version),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(quantization::LinearQuantFactory {
-                op: quantization::LinearQuantOp::Quantize,
-                runtime: runtime.clone(),
-            }),
-        );
-        reg.register(
-            OpKey::new("DequantizeLinear", "", version),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(quantization::LinearQuantFactory {
-                op: quantization::LinearQuantOp::Dequantize,
-                runtime: runtime.clone(),
-            }),
-        );
-    }
+    quantization::register_linear_quantization(&mut reg, &runtime, true);
     reg.register(
         OpKey::new("DequantizePacked", "", 29),
         onnx_runtime_ep_api::WorkspacePlanning::None,

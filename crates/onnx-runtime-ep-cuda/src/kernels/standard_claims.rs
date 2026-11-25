@@ -12,16 +12,22 @@ pub(crate) fn unsupported_reason_at_opset(
     opset: u64,
     input_shapes: &[Shape],
     input_dtypes: &[DataType],
+    native_linear_quantization: bool,
 ) -> Option<String> {
     let result = match node.op_type.as_str() {
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
         "GatherND" => gather_nd(node, opset, input_dtypes),
         "QuantizeLinear" | "DequantizeLinear" => {
-            if let Some(result) = super::quantization::claim_int16(node, opset, input_dtypes) {
-                result
-            } else {
-                return unsupported_reason(node, input_shapes, input_dtypes);
+            if native_linear_quantization
+                && let Some(result) = super::quantization::claim_int16(node, opset, input_dtypes)
+            {
+                return result
+                    .err()
+                    .map(|reason| format!("{}: {reason}", node.op_type));
             }
+            return unsupported_reason(node, input_shapes, input_dtypes).or_else(|| {
+                super::quantization::unsupported_reason(node, input_shapes, input_dtypes)
+            });
         }
         "AveragePool" => {
             return super::pooling::validate_average_claim(node, opset, input_shapes, input_dtypes)
@@ -61,10 +67,8 @@ pub(crate) fn unsupported_reason(
         "Swish" | "ThresholdedRelu" => float_activation(node, input_dtypes),
         "Sum" | "Mean" => variadic_float(node, input_dtypes),
         "Mod" => mod_op(node, input_dtypes),
-        "QuantizeLinear" => quantize_linear(node, input_dtypes)
-            .and_then(|()| super::quantization::legacy_geometry(node, input_shapes, input_dtypes)),
-        "DequantizeLinear" => dequantize_linear(node, input_dtypes)
-            .and_then(|()| super::quantization::legacy_geometry(node, input_shapes, input_dtypes)),
+        "QuantizeLinear" => quantize_linear(node, input_dtypes),
+        "DequantizeLinear" => dequantize_linear(node, input_dtypes),
         "DequantizePacked" => {
             onnx_runtime_ir::dequantize_packed::validate_claim(node, input_shapes, input_dtypes)
         }
@@ -363,6 +367,100 @@ fn quantize_linear(node: &Node, input_dtypes: &[DataType]) -> Result<(), String>
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod linear_quantization_tests {
+    use super::*;
+    use onnx_runtime_ir::{Dim, NodeId, ValueId};
+
+    fn node(op: &str, zp: Option<ValueId>) -> Node {
+        Node::new(
+            NodeId(0),
+            op,
+            vec![Some(ValueId(0)), Some(ValueId(1)), zp],
+            vec![ValueId(3)],
+        )
+    }
+
+    #[test]
+    fn int16_codes_are_admitted_only_for_native_opset_21_plus() {
+        for code in [DataType::Int16, DataType::Uint16] {
+            for (op, dtypes) in [
+                (
+                    "QuantizeLinear",
+                    [DataType::Float32, DataType::Float32, code],
+                ),
+                ("DequantizeLinear", [code, DataType::Float32, code]),
+            ] {
+                let node = node(op, Some(ValueId(2)));
+                let shapes = [vec![Dim::Static(2)], vec![], vec![]];
+                assert!(unsupported_reason_at_opset(&node, 21, &shapes, &dtypes, true).is_none());
+                assert!(
+                    unsupported_reason_at_opset(&node, 20, &shapes, &dtypes, true)
+                        .is_some_and(|reason| reason.contains("require opset 21"))
+                );
+                assert!(unsupported_reason_at_opset(&node, 21, &shapes, &dtypes, false).is_some());
+            }
+
+            // Legacy placement does not inspect the Q output attribute; its
+            // shipped descriptor rejects that output at the ABI boundary.
+            let mut q = Node::new(
+                NodeId(0),
+                "QuantizeLinear",
+                vec![Some(ValueId(0)), Some(ValueId(1))],
+                vec![ValueId(3)],
+            );
+            q.attributes
+                .insert("output_dtype".into(), Attribute::Int(code as i64));
+            let shapes = [vec![Dim::Static(2)], vec![Dim::Static(2)]];
+            let dtypes = [DataType::Float32, DataType::Float32];
+            assert!(unsupported_reason_at_opset(&q, 21, &shapes, &dtypes, true).is_none());
+            assert_eq!(
+                unsupported_reason_at_opset(&q, 21, &shapes, &dtypes, false).as_deref(),
+                Some("QuantizeLinear CUDA coverage requires a scalar scale")
+            );
+            assert!(
+                !super::super::cuda_supported_dtypes_for_op("QuantizeLinear", "").contains(&code)
+            );
+            assert!(
+                !super::super::cuda_supported_dtypes_for_op("DequantizeLinear", "").contains(&code)
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_qdq_preserves_scalar_and_blocked_claims_and_rejections() {
+        let q = node("QuantizeLinear", Some(ValueId(2)));
+        let q_types = [DataType::Float32, DataType::Float32, DataType::Uint8];
+        let scalar = [vec![Dim::Static(2)], vec![], vec![]];
+        let axis = [
+            vec![Dim::Static(2)],
+            vec![Dim::Static(2)],
+            vec![Dim::Static(2)],
+        ];
+        let mut dq = node("DequantizeLinear", None);
+        dq.attributes.insert("block_size".into(), Attribute::Int(2));
+        let blocked = [vec![Dim::Static(4)], vec![Dim::Static(2)]];
+        let dq_types = [DataType::Int4, DataType::Float32];
+        for native in [false, true] {
+            assert!(unsupported_reason_at_opset(&q, 21, &scalar, &q_types, native).is_none());
+            assert_eq!(
+                unsupported_reason_at_opset(&q, 21, &axis, &q_types, native).as_deref(),
+                Some("QuantizeLinear CUDA coverage requires a scalar scale")
+            );
+            assert!(unsupported_reason_at_opset(&dq, 21, &blocked, &dq_types, native).is_none());
+            let mut half_output = dq.clone();
+            half_output
+                .attributes
+                .insert("output_dtype".into(), Attribute::Int(10));
+            assert_eq!(
+                unsupported_reason_at_opset(&half_output, 23, &blocked, &dq_types, native)
+                    .as_deref(),
+                Some("DequantizeLinear CUDA supports Float32 scale and output")
+            );
+        }
+    }
 }
 
 fn dequantize_linear(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {

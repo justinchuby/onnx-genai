@@ -159,7 +159,7 @@ pub unsafe extern "C" fn CreateEpFactories(
                 out_factories_raw,
                 max_factories,
                 out_num_raw,
-                || Box::new(CpuExecutionProvider::new()),
+                || Box::new(CpuExecutionProvider::new_for_ort_plugin()),
                 entries,
             )
         };
