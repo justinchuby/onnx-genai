@@ -38,6 +38,7 @@ mod model_hub;
 mod model_management;
 mod models_config;
 pub mod multimodal;
+mod realtime;
 mod reasoning_request;
 mod registry;
 mod replay;
@@ -80,10 +81,22 @@ pub use types::{
     ToolChoiceSpecific, Usage,
 };
 
+pub use realtime::RealtimeLimits;
+
+/// Declare an HTTP-upgrade protocol separately from ordinary GET contracts.
+fn ws<H, T>(handler: H) -> axum::routing::MethodRouter<AppState>
+where
+    H: axum::handler::Handler<T, AppState>,
+    T: 'static,
+{
+    get(handler)
+}
+
 pub fn app(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/health", get(routes::health))
         .route("/v1/health", get(routes::health))
+        .route("/v1/realtime", ws(realtime::websocket::upgrade))
         .route("/v1/responses", post(routes::transports::responses))
         .route("/responses", post(routes::transports::responses))
         .route(
@@ -141,11 +154,23 @@ pub fn app(state: AppState) -> Router {
         .route("/completions", post(routes::native::completions))
         .route("/infill", post(routes::native::infill))
         .route("/tts", post(routes::native::tts))
-        .route("/reranking", post(routes::ranking::rerank))
-        .route("/rerank", post(routes::ranking::rerank))
+        .route(
+            "/reranking",
+            post(routes::ranking::rerank).layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
+        )
+        .route(
+            "/rerank",
+            post(routes::ranking::rerank).layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
+        )
         .route("/v1/systemone", post(routes::decision::decide))
-        .route("/v1/rerank", post(routes::ranking::rerank))
-        .route("/v1/reranking", post(routes::ranking::rerank))
+        .route(
+            "/v1/rerank",
+            post(routes::ranking::rerank).layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
+        )
+        .route(
+            "/v1/reranking",
+            post(routes::ranking::rerank).layer(DefaultBodyLimit::max(MEDIA_UPLOAD_BODY_LIMIT)),
+        )
         .route("/embedding", post(routes::native::embeddings))
         .route("/embeddings", post(routes::native::embeddings))
         .route(

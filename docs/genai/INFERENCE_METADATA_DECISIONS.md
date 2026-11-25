@@ -726,6 +726,55 @@ semantics to make items compatible, and unsupported grouped execution falls back
 to isolated execution. Placement, host/device transfers, allocation, group size,
 and scheduling remain runtime policy.
 
+### 10.5 Multimodal relevance profiles and reusable image preprocessing (v1.12)
+
+A required `kind: reranking`, `version: '2'` profile declares `reranking` with
+ordered `query_images` and `document_images` workflow-input names. At least one
+list is nonempty; names are unique across both lists. Each input is opaque,
+application-sourced and a uint8 encoded-byte vector. Its required/default and
+`present_as` declarations retain their ordinary workflow meaning. The task ABI
+supplies tokenizer pair rows and binds supplied images to the ordered endpoints;
+it never guesses model names, vision geometry, placeholders or calibration.
+The workflow owns decoding and feature fusion.
+
+`outputs.score` names a final floating scalar relevance probability in [0,1].
+`outputs.prompt_tokens` is required and names a single int64 token-usage count,
+including media-token expansion authored inside the workflow. Negative or
+unrepresentable counts fail. Version 1 text-pair profiles retain tokenizer-owned
+non-padding counts and do not admit images.
+
+The `onnx-genai.image-preprocess@2` component adapter requires schema v1.12.
+`preprocessing.image.outputs[].name` names an adapter output port, scoped to that
+component; each invocation maps it to a distinct workflow SSA value. The adapter
+may be invoked repeatedly, including inside branches, while every invocation
+binds every declared program output and preserves its exact typed contract.
+Version 1 retains workflow-scoped names and its exactly-one-invocation rule.
+These are explicit adapter ABIs, not alternative inference of output names.
+
+### 10.6 Realtime session quanta (v1.13)
+
+The `realtime` v1 task ABI declares rates, frame bounds, supported modes and
+opaque application input bindings for operation, mono PCM, discrete text
+IDs and the remaining output-token budget. An optional bool `token_mask`
+binds one admission bit per tokenizer ID before native selection; its empty
+vector means unconstrained selection. A constrained quantum emits at most one
+text token so the next mask follows actual committed token history. Token
+endings derive from declared package token roles, independently of added-token
+registration. The host verifies membership and completion before publication;
+a native contract violation requires state reset. It declares a default mode and
+model-authored conditioning template with explicit voice/language policies.
+Its outputs are final PCM/token vectors, response completion and input-readiness
+bools, and actual per-quantum token counts. The exact operation and tensor contracts are
+specified in [Realtime audio](../REALTIME.md). These fields require v1.13 at
+both parser and typed admission boundaries, including unsupported ignorable
+versions; newer ignorable task ABIs are otherwise skipped.
+
+The workflow owns all codec/conversation state and numerical computation.
+State persists under an exclusively owned native session, while every bounded
+invocation commits independently. No model identity, codec rate, frame geometry
+or silence/end-of-turn rule is inferred by the runtime. Transport cancellation
+and empty publications cannot silently close or reset model state.
+
 ## 11. Cache correctness dependencies
 
 ### 11.1 Derived, not declared

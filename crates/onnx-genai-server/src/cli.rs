@@ -95,6 +95,9 @@ pub struct ServeArgs {
     /// Maximum number of documents in one reranking request.
     #[arg(long, default_value = "128")]
     pub max_rerank_documents: std::num::NonZeroUsize,
+    /// Unique encoded image bytes retained by one reranking request.
+    #[arg(long, default_value = "67108864")]
+    pub max_rerank_media_bytes: std::num::NonZeroUsize,
 
     /// Maximum tokens per non-generative decision prompt variant.
     #[arg(long, default_value_t = onnx_genai_engine::decision::DecisionLimits::default().max_input_tokens)]
@@ -233,6 +236,7 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
     ServerConfig {
         node_id: args.node_id.clone().unwrap_or_else(default_node_id),
         max_output_tokens: args.max_output_tokens,
+        realtime: crate::RealtimeLimits::default(),
         endpoint_props: args.props,
         model_cache_dir: args.model_cache_dir.clone(),
         model_cache_max_bytes: args.model_cache_max_bytes,
@@ -242,6 +246,7 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
         max_completion_prompts: args.max_completion_prompts,
         max_rerank_input_tokens: args.max_rerank_input_tokens,
         max_rerank_documents: args.max_rerank_documents,
+        max_rerank_media_bytes: args.max_rerank_media_bytes,
         max_decision_input_tokens: args.max_decision_input_tokens,
         max_decision_prompt_bytes: args.max_decision_prompt_bytes,
         max_decision_template_operations: args.max_decision_template_operations,
@@ -640,11 +645,18 @@ mod tests {
             "256",
             "--max-rerank-documents",
             "8",
+            "--max-rerank-media-bytes",
+            "2048",
         ]);
         let config = server_config_from_args(&cli.serve);
         assert_eq!(config.max_rerank_input_tokens.get(), 256);
         assert_eq!(config.max_rerank_documents.get(), 8);
-        for flag in ["--max-rerank-input-tokens", "--max-rerank-documents"] {
+        assert_eq!(config.max_rerank_media_bytes.get(), 2048);
+        for flag in [
+            "--max-rerank-input-tokens",
+            "--max-rerank-documents",
+            "--max-rerank-media-bytes",
+        ] {
             let error = TestCli::try_parse_from(["test", "model-dir", flag, "0"]).unwrap_err();
             assert!(error.to_string().contains(flag));
         }

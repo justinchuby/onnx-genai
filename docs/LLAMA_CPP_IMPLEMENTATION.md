@@ -1899,3 +1899,18 @@ bounded notification storage and consumer-side coalescing. Pause and retry
 retain the original plan and byte prefixes. Model revision changes require
 explicit deletion first. See [model management](MODEL_MANAGEMENT.md) for public
 requests, limits and unsupported GGUF/sidecar source selections.
+
+
+## Multimodal reranking
+
+Core schema v1.12 and reranking v2 declare ordered query/document encoded-image
+endpoints and authoritative workflow token usage. Prepared pairs carry their
+admitted contract and shared media ownership into the ordinary worker command.
+The HTTP layer admits all image positions before fetch, bounds the retained
+request media, and preserves Jina/TEI response semantics.
+
+Reusable image-preprocess@2 binds program output names to component-local ports;
+each invocation publishes its own SSA values. ABI v1 keeps its established
+workflow-scoped single-invocation contract. Chat media capabilities derive from
+runtime Media roles, independently of task-owned application inputs. See
+[reranking](RERANKING.md) for the public contract and native fixture.
