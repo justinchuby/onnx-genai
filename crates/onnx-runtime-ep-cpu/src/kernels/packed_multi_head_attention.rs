@@ -37,7 +37,7 @@ struct PackedMultiHeadAttentionKernel {
 /// too — but with ORT's own `NOT_IMPLEMENTED` message rather than ours, and
 /// without the EP having claimed a node it cannot run. Implemented by running
 /// the factory's own attribute parse, so the two cannot disagree.
-pub(crate) fn unsupported_attribute_reason(node: &Node) -> Option<String> {
+fn unsupported_attribute_reason(node: &Node) -> Option<String> {
     attributes_from_node(node).err().map(|e| e.to_string())
 }
 
@@ -70,13 +70,23 @@ fn attributes_from_node(node: &Node) -> Result<PackedMultiHeadAttentionKernel> {
 }
 
 impl KernelFactory for PackedMultiHeadAttentionFactory {
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        _opset: u64,
+        shapes: &[onnx_runtime_ir::Shape],
+        input_dtypes: &[onnx_runtime_ir::DataType],
+    ) -> Option<String> {
+        unsupported_reason(node, shapes, input_dtypes).map(|reason| reason.into_owned())
+    }
+
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(attributes_from_node(node)?))
     }
 }
 
 /// Deny unsupported optional forms and layouts before graph partitioning.
-pub fn unsupported_reason(
+fn unsupported_reason(
     node: &Node,
     shapes: &[Shape],
     input_dtypes: &[DataType],

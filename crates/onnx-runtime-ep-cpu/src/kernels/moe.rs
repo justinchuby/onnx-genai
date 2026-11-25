@@ -173,11 +173,21 @@ fn float_moe_attributes(node: &Node) -> Result<MoeAttributes> {
 ///
 /// Implemented by running the factory's own attribute parse, so a limit cannot
 /// be added to `create` without appearing here too.
-pub(crate) fn unsupported_reason(node: &Node) -> Option<String> {
+fn unsupported_reason(node: &Node) -> Option<String> {
     float_moe_attributes(node).err().map(|e| e.to_string())
 }
 
 impl KernelFactory for MoEFactory {
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        _opset: u64,
+        _shapes: &[onnx_runtime_ir::Shape],
+        _input_dtypes: &[onnx_runtime_ir::DataType],
+    ) -> Option<String> {
+        unsupported_reason(node)
+    }
+
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(MoEKernel {
             attributes: float_moe_attributes(node)?,
