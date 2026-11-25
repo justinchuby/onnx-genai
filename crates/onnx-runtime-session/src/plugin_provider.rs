@@ -72,6 +72,10 @@ impl PluginExecutionProvider {
 }
 
 impl ExecutionProvider for PluginExecutionProvider {
+    fn workspace_preparation_context(&self) -> onnx_runtime_ep_api::WorkspaceContextReader {
+        self.cpu.workspace_preparation_context()
+    }
+
     fn prepare_static_constants(
         &self,
         node: &Node,

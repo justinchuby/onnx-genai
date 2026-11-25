@@ -48,7 +48,7 @@ pub mod standard_math;
 pub mod tensor;
 pub mod weight;
 pub mod workspace;
-pub use workspace::WorkspaceLayout;
+pub use workspace::{WorkspaceContextKey, WorkspaceContextReader, WorkspaceLayout};
 
 pub use abi::{LegacyOrtEp, PluginCompiledKernel, PluginExecutionPlan, SubgraphClaim};
 pub use epcontext::{EpContext, EpContextRegistry, build_ep_context_registry};
