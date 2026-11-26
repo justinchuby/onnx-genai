@@ -1330,7 +1330,7 @@ mod tests {
         assert_eq!(unpacked.bytes, vec![0, 7, 15]);
 
         let source = Owned::u8(&shape, &[4, 5, 6]);
-        let mut negative_output_bytes = [0xaa, 0xaa];
+        let mut negative_output_bytes: [u8; 2] = [0xaa, 0xaa];
         let negative_output = TensorMut::new(
             DevicePtrMut(unsafe { negative_output_bytes.as_mut_ptr().add(1) }.cast()),
             DataType::Uint4,
