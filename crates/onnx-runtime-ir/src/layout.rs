@@ -4,7 +4,6 @@
 //! [`TensorLayout`]. This lets optimization passes track non-contiguous
 //! (transposed / broadcast) layouts and eliminate copies at EP boundaries.
 
-use crate::dtype::DataType;
 use crate::error::IrError;
 
 /// A checked contiguous suffix-stride plan borrowing immutable geometry.
@@ -316,23 +315,6 @@ impl TensorLayout {
             format: MemoryFormat::Custom,
             alignment: self.alignment,
         })
-    }
-
-    /// Total backing storage size in bytes: the largest byte offset reachable
-    /// via the strides, plus one element. Handles negative strides.
-    pub fn storage_size(&self, shape: &[usize], dtype: DataType) -> usize {
-        let elem = dtype.byte_size().max(1);
-        match &self.strides {
-            None => shape.iter().product::<usize>() * elem,
-            Some(strides) => {
-                let max_offset: i64 = shape
-                    .iter()
-                    .zip(strides.iter())
-                    .map(|(&dim, &stride)| dim.saturating_sub(1) as i64 * stride.abs())
-                    .sum();
-                (max_offset as usize + 1) * elem
-            }
-        }
     }
 }
 
@@ -657,22 +639,12 @@ mod tests {
         assert_eq!(t.strides, Some(vec![1, 3]));
         assert!(!t.is_contiguous(&[3, 2]));
     }
-
-    #[test]
-    fn storage_size_contiguous_and_strided() {
-        let l = TensorLayout::contiguous();
-        assert_eq!(l.storage_size(&[2, 3], DataType::Float32), 24);
-        // transposed view still covers the same 6 elements
-        let t = l
-            .transpose(&[2, 3], &[1, 0])
-            .expect("fixture permutation is valid");
-        assert_eq!(t.storage_size(&[3, 2], DataType::Float32), 24);
-    }
 }
 
 #[cfg(test)]
 mod geometry_regression {
     use super::*;
+    use crate::DataType;
     #[test]
     fn empty_counts_ignore_the_position_of_zero_after_large_prefixes() {
         for shape in [
