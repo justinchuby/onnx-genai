@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn aliased_bindings_match_disjoint_result() {
         use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
-        use onnx_runtime_ir::{DeviceId, compute_contiguous_strides};
+        use onnx_runtime_ir::DeviceId;
 
         // K=3 (pad=2), C=2, S=1 decode step with non-zero incoming state.
         let (batch, c, k, s) = (1usize, 2usize, 3usize, 1usize);
@@ -463,7 +463,7 @@ mod tests {
         let owned_state = || Owned::f32(&[batch, c, pad], &st_vals);
 
         // Disjoint reference.
-        let (y_ref, present_ref) = {
+        let (y_fixture, present_fixture) = {
             let (x, w, bias, state) = (owned_x(), owned_w(), owned_bias(), owned_state());
             let mut y = Owned::zeros_f32(&[batch, c, s]);
             let mut present = Owned::zeros_f32(&[batch, c, pad]);
@@ -473,8 +473,10 @@ mod tests {
                     &mut [y.view_mut(), present.view_mut()],
                 )
                 .unwrap();
-            (y.to_f32(), present.to_f32())
+            (y, present)
         };
+        let y_ref = y_fixture.to_f32();
+        let present_ref = present_fixture.to_f32();
 
         let f32c = DataType::Float32;
         let cpu = DeviceId::cpu();
@@ -484,13 +486,19 @@ mod tests {
             let mut shared_state = st_vals.to_vec();
             let state_ptr = shared_state.as_ptr() as *const std::ffi::c_void;
             let present_ptr = shared_state.as_mut_ptr() as *mut std::ffi::c_void;
-            let sshape = [batch, c, pad];
-            let sstrides = compute_contiguous_strides(&sshape);
+            let sshape = &present_fixture.shape;
+            let sstrides = &present_fixture.strides;
             let (x, w, bias) = (owned_x(), owned_w(), owned_bias());
             let mut y = Owned::zeros_f32(&[batch, c, s]);
-            let state_view = TensorView::new(DevicePtr(state_ptr), f32c, &sshape, &sstrides, cpu);
+            let state_view = TensorView::new(DevicePtr(state_ptr), f32c, sshape, sstrides, cpu);
             let present_mut =
-                TensorMut::new(DevicePtrMut(present_ptr), f32c, &sshape, &sstrides, cpu);
+                TensorMut::new(DevicePtrMut(present_ptr), f32c, sshape, sstrides, cpu);
+            state_view
+                .validate()
+                .expect("invalid aliased past_state fixture");
+            present_mut
+                .validate()
+                .expect("invalid aliased present_state fixture");
             kernel(true)
                 .execute(
                     &[x.view(), w.view(), bias.view(), state_view],
@@ -506,12 +514,14 @@ mod tests {
             let mut shared_x = x_vals.to_vec();
             let x_ptr = shared_x.as_ptr() as *const std::ffi::c_void;
             let y_ptr = shared_x.as_mut_ptr() as *mut std::ffi::c_void;
-            let xshape = [batch, c, s];
-            let xstrides = compute_contiguous_strides(&xshape);
+            let xshape = &y_fixture.shape;
+            let xstrides = &y_fixture.strides;
             let (w, bias, state) = (owned_w(), owned_bias(), owned_state());
             let mut present = Owned::zeros_f32(&[batch, c, pad]);
-            let x_view = TensorView::new(DevicePtr(x_ptr), f32c, &xshape, &xstrides, cpu);
-            let y_mut = TensorMut::new(DevicePtrMut(y_ptr), f32c, &xshape, &xstrides, cpu);
+            let x_view = TensorView::new(DevicePtr(x_ptr), f32c, xshape, xstrides, cpu);
+            let y_mut = TensorMut::new(DevicePtrMut(y_ptr), f32c, xshape, xstrides, cpu);
+            x_view.validate().expect("invalid aliased x fixture");
+            y_mut.validate().expect("invalid aliased y fixture");
             kernel(true)
                 .execute(
                     &[x_view, w.view(), bias.view(), state.view()],
