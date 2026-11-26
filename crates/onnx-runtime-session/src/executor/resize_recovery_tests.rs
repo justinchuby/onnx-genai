@@ -370,3 +370,118 @@ fn shared_old_owner_survives_denied_resize_and_external_view_survives_replacemen
     run(&mut executor, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
     assert_complete_cleanup(executor, &ep);
 }
+
+fn promote(
+    executor: &mut Executor,
+    ep: &Arc<ManagedCpu>,
+    value: ValueId,
+) -> Arc<SharedTensorBuffer> {
+    let original = executor.buffers.remove(&value).unwrap();
+    let provider: Arc<dyn ExecutionProvider> = ep.clone();
+    let shared = SharedTensorBuffer::new(provider, original);
+    let external = Arc::clone(&shared);
+    executor.buffers.insert(value, shared.alias());
+    executor.shared_buffers.insert(value, shared);
+    external
+}
+
+fn read_pair(ep: &ManagedCpu, storage: &SharedTensorBuffer) -> [f32; 2] {
+    let mut bytes = [0_u8; 8];
+    ep.copy_to_host(storage.buffer(), &mut bytes).unwrap();
+    [
+        f32::from_le_bytes(bytes[..4].try_into().unwrap()),
+        f32::from_le_bytes(bytes[4..].try_into().unwrap()),
+    ]
+}
+
+#[test]
+fn shared_restore_denial_preserves_owner_and_actual_run_retries_after_headroom_release() {
+    let (mut executor, ep, middle) = fixture(128);
+    run(&mut executor, &[2.0, 5.0]);
+    let external = promote(&mut executor, &ep, middle);
+    let original = external.buffer().as_ptr();
+    let blocker = ep.allocate(108, 64).unwrap();
+    assert_eq!(ep.used(), 124);
+    let input = Tensor::from_f32(&[2], &[3.0, 7.0]).unwrap();
+    let error = executor.run(&[("input", &input)]).unwrap_err();
+    assert!(
+        error.to_string().contains("managed resize buffer"),
+        "{error}"
+    );
+    assert!(Arc::ptr_eq(&executor.shared_buffers[&middle], &external));
+    assert_eq!(executor.buffers[&middle].as_ptr(), original);
+    assert_eq!(executor.buffer_shapes[&middle], [2]);
+    assert_eq!(executor.value_dtypes[&middle], DataType::Float32);
+    assert_eq!(read_pair(&ep, &external), [-2.0, -5.0]);
+    assert_eq!(ep.used(), 124);
+    ep.deallocate(blocker).unwrap();
+    run(&mut executor, &[3.0, 7.0]);
+    assert!(!executor.shared_buffers.contains_key(&middle));
+    assert_ne!(executor.buffers[&middle].as_ptr(), original);
+    assert_eq!(read_pair(&ep, &external), [-2.0, -5.0]);
+    assert_eq!(ep.used(), 24);
+    drop(external);
+    assert_eq!(ep.used(), 16);
+    run(&mut executor, &[11.0, 13.0]);
+    assert_complete_cleanup(executor, &ep);
+}
+
+#[test]
+fn shared_restore_denial_preserves_all_unprocessed_owner_entries() {
+    let (mut executor, ep, middle) = fixture(128);
+    run(&mut executor, &[2.0, 5.0]);
+    let input = executor.graph.inputs[0];
+    // Host input borrowing can leave parked backing unwritten. Initialize
+    // this second retained source explicitly; the computed middle remains
+    // the independent real CPU numerical oracle.
+    let input_bytes: Vec<_> = [2_f32, 5.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    ep.copy_from_host(&input_bytes, executor.buffers.get_mut(&input).unwrap())
+        .unwrap();
+    let first = promote(&mut executor, &ep, middle);
+    let second = promote(&mut executor, &ep, input);
+    let blocker = ep.allocate(108, 64).unwrap();
+    assert!(executor.restore_shared_buffers().is_err());
+    assert_eq!(executor.shared_buffers.len(), 2);
+    for (value, storage) in [(middle, &first), (input, &second)] {
+        assert!(Arc::ptr_eq(&executor.shared_buffers[&value], storage));
+        assert_eq!(executor.buffers[&value].as_ptr(), storage.buffer().as_ptr());
+        assert_eq!(executor.buffer_shapes[&value], [2]);
+    }
+    assert_eq!(read_pair(&ep, &first), [-2.0, -5.0]);
+    assert_eq!(read_pair(&ep, &second), [2.0, 5.0]);
+    assert_eq!(ep.used(), 124);
+    ep.deallocate(blocker).unwrap();
+    run(&mut executor, &[3.0, 7.0]);
+    assert!(executor.shared_buffers.is_empty());
+    assert_eq!(read_pair(&ep, &first), [-2.0, -5.0]);
+    assert_eq!(read_pair(&ep, &second), [2.0, 5.0]);
+    assert_eq!(ep.used(), 32);
+    drop(first);
+    drop(second);
+    assert_eq!(ep.used(), 16);
+    assert_complete_cleanup(executor, &ep);
+}
+
+#[test]
+fn unique_shared_restore_needs_no_new_admission_at_full_capacity() {
+    let (mut executor, ep, middle) = fixture(128);
+    run(&mut executor, &[2.0, 5.0]);
+    let external = promote(&mut executor, &ep, middle);
+    let original = external.buffer().as_ptr();
+    drop(external);
+    let blocker = ep.allocate(112, 64).unwrap();
+    let allocations = ep.allocations.load(Ordering::Relaxed);
+    assert_eq!(ep.used(), 128);
+    executor.restore_shared_buffers().unwrap();
+    assert!(executor.shared_buffers.is_empty());
+    assert_eq!(executor.buffers[&middle].as_ptr(), original);
+    assert!(!executor.buffers[&middle].is_borrowed());
+    assert_eq!(ep.allocations.load(Ordering::Relaxed), allocations);
+    assert_eq!(ep.used(), 128);
+    ep.deallocate(blocker).unwrap();
+    run(&mut executor, &[3.0, 7.0]);
+    assert_complete_cleanup(executor, &ep);
+}
