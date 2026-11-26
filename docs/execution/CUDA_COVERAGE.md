@@ -661,10 +661,13 @@ Standalone `ConvTranspose` covers 1-D/2-D/3-D f16/f32/f64 and opset-22+ bf16
 overlap-add with strides, asymmetric pads, dilations, output padding, bias, groups,
 and depthwise geometry. SAME_UPPER and SAME_LOWER target `input * stride`;
 explicit `output_shape` overrides `pads`.
-`GridSample` covers 4-D bilinear/nearest sampling for zeros, border, and
-reflection padding with either `align_corners` setting. Cubic/bicubic and
-volumetric GridSample remain explicitly fail-closed. GPU parity covers the
-supported narrow storage types and out-of-bounds sampling. Historical snapshot after batch 14: **163** advertised CUDA op names, **168**
+Standalone `GridSample` supports `bilinear`, `bicubic`, and `nearest` on 2-D
+inputs at opsets 16–19; opset 20 onward supports `linear`, `cubic`, and `nearest`
+on 1-D, 2-D, and 3-D inputs. All support zeros, border, and reflection with
+either `align_corners` setting. X/Y and grid independently support f32 and f16,
+plus bf16 starting at opset 22. Higher spatial ranks and other dtypes are not
+claimed. The ORT CUDA plugin retains 2-D linear/nearest routes with matching
+f32, f16, or bf16 inputs. Historical snapshot after batch 14: **163** advertised CUDA op names, **168**
 CUDA `(domain, op_type)` pairs, and **143 / 145** CPU standard-domain op types.
 
 The issue #67 operator-coverage batch 15 adds `com.microsoft::LinearAttention`

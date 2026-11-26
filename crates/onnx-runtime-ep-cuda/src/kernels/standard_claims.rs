@@ -17,6 +17,14 @@ pub(crate) fn unsupported_reason_at_opset(
     let result = match node.op_type.as_str() {
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
         "GatherND" => gather_nd(node, opset, input_dtypes),
+        "GridSample" => match conv_transpose_contract {
+            super::conv_transpose::Contract::Standalone => {
+                super::grid_sample::validate_claim(node, opset, input_shapes, input_dtypes)
+            }
+            super::conv_transpose::Contract::OrtPlugin => {
+                grid_sample(node, input_shapes, input_dtypes)
+            }
+        },
         "Dropout" => {
             onnx_runtime_ir::dropout::validate_claim(node, opset, input_shapes, input_dtypes)
         }
@@ -84,7 +92,6 @@ pub(crate) fn unsupported_reason(
         "Col2Im" => col2im(node, input_dtypes),
         "QLinearMatMul" => qlinear_matmul(node, input_dtypes),
         "Resize" => resize(node, input_dtypes),
-        "GridSample" => grid_sample(node, input_shapes, input_dtypes),
         _ => return None,
     };
     result
