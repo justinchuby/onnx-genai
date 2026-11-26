@@ -51,16 +51,22 @@ or output channels require neither region. MoE reserves the maximum complete
 serial projection demand plus its existing separate FC banks and accumulator.
 Standalone MatMul adds a disjoint `rows * N * 4` final-output staging region to
 that complete projection layout and a separate packed-weight byte lane for
-noncontiguous weights; all three regions are simultaneously live. Dense
-hits initialize only final-output staging, while admission retains enough
-projection and packed-byte capacity for a subsequent streamed fallback.
+noncontiguous weights, plus separate A and bias conversion regions when needed.
+These regions are simultaneously live. Dense hits initialize final-output and
+needed input staging, while admission retains enough projection and packed-byte
+capacity for a subsequent streamed fallback.
 The byte lane is `round_up(N * ceil(K / block_elements) * block_bytes, 4)`
 when packed_B needs copying, and zero for contiguous weights or empty rows.
 Nonempty metadata preparation is Deferred: each launch resolves actual strides
 before one complete admission. Cold hashing reads the validated logical source
 directly; dense builders and streaming/Q8 consume the same admitted byte lane.
 Dense-cache hits leave that lane untouched. No execution path materializes a
-packed-weight Vec.
+packed-weight Vec. A/bias conversion likewise uses admitted f32 regions:
+`rows * K * 4` and `N * 4` bytes when copying/widening is needed, otherwise zero.
+Contiguous aligned F32 inputs borrow their source directly. F16/BF16, strided and
+unaligned F32 use the existing conversion implementation, including bulk half
+conversion paths, with no input-sized Vec. Empty output validates descriptors
+without converting inputs. No extra owner or admission callback is added.
 No per-token, per-row, per-block or per-expert quota requests are added.
 The existing initialized f32 scratch proof covers the byte loan, including its
 rounded tail; every exposed activation block is overwritten before use.
