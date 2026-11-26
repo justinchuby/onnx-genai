@@ -595,7 +595,8 @@ fn unresolved_if_output_preserves_a_known_declared_dtype() {
     let mut graph = Graph::new();
     let condition = graph.create_named_value("condition", DataType::Bool, Shape::new());
     graph.add_input(condition);
-    let output = graph.create_named_value("output", DataType::Float8E4M3FN, vec![Dim::Static(2)]);
+    let output = graph.create_named_value("output", DataType::Float8E4M3FN, Shape::new());
+    graph.mark_value_shape_unknown(output);
     let if_id = graph.insert_node(node(0, "If", vec![Some(condition)], vec![output]));
     graph
         .subgraphs
@@ -611,6 +612,8 @@ fn unresolved_if_output_preserves_a_known_declared_dtype() {
         .infer_graph(&mut graph, &imports, MergePolicy::Permissive)
         .expect("an implemented declared dtype remains valid while branches are unresolved");
     assert!(report.unresolved.contains(&output));
+    assert!(graph.value_type_is_known(output));
+    assert!(!graph.value_shape_is_known(output));
     assert_eq!(graph.value(output).dtype, DataType::Float8E4M3FN);
 }
 
