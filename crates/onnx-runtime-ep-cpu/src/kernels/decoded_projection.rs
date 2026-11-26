@@ -36,6 +36,7 @@ impl<'a> ProjectionScratch<'a> {
     /// Nonempty workspace must be valid, Host-accessible, writable storage,
     /// exclusively lent for `'a`. It must outlive this dispatch and every
     /// short-lived initialized slice. No references may escape the dispatch.
+    #[cfg(test)]
     pub(super) unsafe fn bind(
         operation: &'static str,
         bytes: usize,

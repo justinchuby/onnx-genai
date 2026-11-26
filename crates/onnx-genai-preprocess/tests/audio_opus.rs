@@ -218,7 +218,7 @@ fn opus_preskip_spans_packets_gain_applies_once_and_end_granule_is_exact() {
 }
 
 #[test]
-fn ogg_opus_silk_hybrid_celt_and_surround_match_independent_presented_pcm() {
+fn opus_silk_hybrid_celt_and_surround_match_independent_presented_pcm() {
     let root = root();
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("manifest.json")).unwrap()).unwrap();
@@ -227,36 +227,38 @@ fn ogg_opus_silk_hybrid_celt_and_surround_match_independent_presented_pcm() {
     for case in cases {
         let name = case["name"].as_str().unwrap();
         let channels = case["channels"].as_u64().unwrap() as usize;
-        let bytes = std::fs::read(root.join(format!("{name}.ogg"))).unwrap();
-        let reference = std::fs::read(root.join(format!("{name}.reference.f32")))
-            .unwrap()
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-            .collect::<Vec<_>>();
-        let actual = decode_audio(&bytes, limit(1024 * 1024))
-            .unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert_eq!(actual.sample_rate, 48_000, "{name}");
-        assert_eq!(
-            actual.samples.len(),
-            11_520,
-            "{name}: pre-skip/end trim must each apply once"
-        );
-        assert_eq!(reference.len(), actual.samples.len() * channels, "{name}");
-        let maximum = actual
-            .samples
-            .iter()
-            .zip(reference.chunks_exact(channels))
-            .map(|(actual, frame)| {
-                let expected = (frame.iter().map(|sample| f64::from(*sample)).sum::<f64>()
-                    / channels as f64) as f32;
-                assert!(actual.is_finite());
-                (actual - expected).abs()
-            })
-            .fold(0.0_f32, f32::max);
-        assert!(
-            maximum <= 1.0 / 32768.0,
-            "{name}: independent PCM maximum error {maximum}"
-        );
+        for suffix in ["ogg", "webm"] {
+            let bytes = std::fs::read(root.join(format!("{name}.{suffix}"))).unwrap();
+            let reference = std::fs::read(root.join(format!("{name}.reference.f32")))
+                .unwrap()
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let actual = decode_audio(&bytes, limit(1024 * 1024))
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(actual.sample_rate, 48_000, "{name}");
+            assert_eq!(
+                actual.samples.len(),
+                11_520,
+                "{name}: pre-skip/end trim must each apply once"
+            );
+            assert_eq!(reference.len(), actual.samples.len() * channels, "{name}");
+            let maximum = actual
+                .samples
+                .iter()
+                .zip(reference.chunks_exact(channels))
+                .map(|(actual, frame)| {
+                    let expected = (frame.iter().map(|sample| f64::from(*sample)).sum::<f64>()
+                        / channels as f64) as f32;
+                    assert!(actual.is_finite());
+                    (actual - expected).abs()
+                })
+                .fold(0.0_f32, f32::max);
+            assert!(
+                maximum <= 1.0 / 32768.0,
+                "{name}: independent PCM maximum error {maximum}"
+            );
+        }
     }
 }
 
@@ -318,14 +320,34 @@ fn ogg_opus_budget_bounds_initial_packet_raw_work_and_host_headroom() {
 
 #[test]
 fn opus_other_containers_chaining_and_truncated_end_fail_explicitly() {
-    for suffix in ["webm", "mp4"] {
-        let bytes = std::fs::read(root().join(format!("unsupported-opus.{suffix}"))).unwrap();
+    {
+        let bytes = std::fs::read(root().join("unsupported-opus.mp4")).unwrap();
         let error = decode_audio(&bytes, limit(1024 * 1024))
             .unwrap_err()
             .to_string();
         assert!(
             error.contains("Opus presentation in") && error.contains("unsupported by this build"),
-            "{suffix}: {error}"
+            "mp4: {error}"
+        );
+    }
+    let quantized = std::fs::read(root().join("unsupported-opus.webm")).unwrap();
+    let actual = decode_audio(&quantized, limit(1024 * 1024)).unwrap();
+    let reference = decode_audio(
+        &std::fs::read(root().join("celt-2.ogg")).unwrap(),
+        limit(1024 * 1024),
+    )
+    .unwrap();
+    assert_eq!(
+        actual.samples, reference.samples,
+        "container PTS quantization must not crop or fill PCM"
+    );
+    for name in ["celt-1", "mapping1-6"] {
+        let bytes = std::fs::read(root().join(format!("{name}.webm"))).unwrap();
+        assert!(
+            decode_audio(&bytes, limit(1024))
+                .unwrap_err()
+                .to_string()
+                .contains("max_decoded_bytes=1024")
         );
     }
     let bytes = std::fs::read(root().join("celt-1.ogg")).unwrap();
