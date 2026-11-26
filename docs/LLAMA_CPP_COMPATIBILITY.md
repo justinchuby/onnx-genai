@@ -710,7 +710,11 @@ The former tool/MCP/proxy CLI options and library configuration types are remove
 The supplied model tool protocols require object arguments. Forced tool grammars
 and realtime parameter admission share that domain restriction even for `true`,
 empty, omitted/null or union parameter schemas. Existing schema conditions and
-root reference locations are retained; contradictory schemas are not relaxed.
+root reference locations are retained; contradictory schemas are not relaxed. Forced
+JSON calls compile parameter documents independently, preserving their standalone
+root URI, dialect, pointers and anchors. Per-tool registries remain separate,
+including tools reusing the same `$id`. References do not fetch external
+resources. This remains the grammar backend's supported schema language.
 
 Chat tool calling remains supported: clients send `tools`/`tool_choice`, consume
 assistant `tool_calls` (including streaming deltas), execute those calls in their
