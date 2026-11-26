@@ -109,6 +109,9 @@ pub(crate) async fn rerank(
     let mut media = crate::media_input::MediaRequest::new(
         state.config.max_rerank_media_bytes,
         "--max-rerank-media-bytes",
+        onnx_genai_preprocess::audio::AudioDecodeLimits {
+            max_decoded_bytes: state.config.max_decoded_audio_bytes,
+        },
     );
     let query_images = media
         .load(

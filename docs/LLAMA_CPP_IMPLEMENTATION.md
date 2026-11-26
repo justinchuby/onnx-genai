@@ -2679,7 +2679,7 @@ preserve declared analysis rates and produce `[batch,bins,frames]` tensors with
 branch-local valid frames and masks. Shared streaming FFT/window analysis keeps
 log-mel projection and normalization intact; compiled Spectrum/Mel kinds reject
 Whisper normalization on linear power. Other DSP/window/centering conventions
-remain open. See [audio preprocessing](AUDIO_PREPROCESSING.md#linear-power-spectrograms).
+remain open. See [audio preprocessing](AUDIO_PREPROCESSING.md#linear-spectrograms).
 
 Independent review preserved checked mel dimension/allocation admission before
 FFT planning. Validation: all 120 preprocessing tests passed, including varied

@@ -89,7 +89,12 @@ fn authored_power_spectrogram_matches_independent_dft_for_varied_geometry() {
             features_output(),
         )
         .unwrap();
-        let result = program.run(&[&encoded(&samples)]).unwrap();
+        let result = program
+            .run(
+                &[&encoded(&samples)],
+                onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+            )
+            .unwrap();
         assert_eq!(
             result[0].shape,
             [1, (fft / 2 + 1) as i64, (samples.len() / hop) as i64]
@@ -136,7 +141,10 @@ fn power_branches_frame_validity_masks_and_input_windows_keep_their_sources() {
         16
     );
     let result = program
-        .run(&[&encoded(&[0.25, 0.5, 0.25]), &encoded(&[0.25; 8])])
+        .run(
+            &[&encoded(&[0.25, 0.5, 0.25]), &encoded(&[0.25; 8])],
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
         .unwrap();
     assert_eq!(result[0].shape, [2, 5, 4]);
     for (raw, scaled) in floats(&result[0]).iter().zip(floats(&result[1])) {
@@ -184,7 +192,13 @@ fn spectrum_geometry_modes_types_and_analysis_rate_fail_with_context() {
     );
     let program = compile(json!([{"op":"decode"},spectrum(8,2,8)]), features_output()).unwrap();
     let wrong_rate = encode_wav_pcm16(&[0.25; 8], 16000, 1).unwrap();
-    let error = program.run(&[&wrong_rate]).unwrap_err().to_string();
+    let error = program
+        .run(
+            &[&wrong_rate],
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .unwrap_err()
+        .to_string();
     assert!(
         error.contains("spectrogram") && error.contains("resample"),
         "{error}"
@@ -194,7 +208,12 @@ fn spectrum_geometry_modes_types_and_analysis_rate_fail_with_context() {
 fn empty_and_single_sample_spectra_remain_finite_and_ragged_batches_require_padding() {
     let program = compile(json!([{"op":"decode"},spectrum(8,1,8)]), features_output()).unwrap();
     for samples in [vec![], vec![0.5]] {
-        let result = program.run(&[&encoded(&samples)]).unwrap();
+        let result = program
+            .run(
+                &[&encoded(&samples)],
+                onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+            )
+            .unwrap();
         assert_eq!(result[0].shape, [1, 5, samples.len() as i64]);
         assert!(floats(&result[0]).iter().all(|v| v.is_finite()));
         let expected = reference(&samples, 8, 1, 8, "power", "hann");
@@ -203,7 +222,10 @@ fn empty_and_single_sample_spectra_remain_finite_and_ragged_batches_require_padd
         }
     }
     let error = program
-        .run(&[&encoded(&[0.5]), &encoded(&[0.5; 2])])
+        .run(
+            &[&encoded(&[0.5]), &encoded(&[0.5; 2])],
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
         .unwrap_err()
         .to_string();
     assert!(error.contains("ragged") && error.contains("pad"), "{error}");
@@ -222,7 +244,12 @@ fn every_explicit_projection_and_window_matches_independent_dft() {
                 spec["mode"] = json!(mode);
                 spec["window"] = json!(window_kind);
                 let program = compile(json!([{"op":"decode"},spec]), features_output()).unwrap();
-                let result = program.run(&[&encoded(&samples)]).unwrap();
+                let result = program
+                    .run(
+                        &[&encoded(&samples)],
+                        onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+                    )
+                    .unwrap();
                 assert_eq!(
                     result[0].shape,
                     [1, (fft / 2 + 1) as i64, (samples.len() / hop) as i64]
@@ -257,7 +284,12 @@ fn magnitude_remains_finite_when_squared_power_would_overflow() {
     };
     let bytes = encoded(&[0.25; 8]);
     let scale = 1e20;
-    let result = build("magnitude", scale).run(&[&bytes]).unwrap();
+    let result = build("magnitude", scale)
+        .run(
+            &[&bytes],
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .unwrap();
     let values = floats(&result[0]);
     assert!(values.iter().all(|value| value.is_finite()));
     // Periodic Hann(8) has DC gain 4, and the encoded 0.25 is exact.
@@ -268,7 +300,10 @@ fn magnitude_remains_finite_when_squared_power_would_overflow() {
         values[0]
     );
     let error = build("power", scale)
-        .run(&[&bytes])
+        .run(
+            &[&bytes],
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
         .unwrap_err()
         .to_string();
     assert!(
@@ -279,7 +314,10 @@ fn magnitude_remains_finite_when_squared_power_would_overflow() {
     );
     for mode in ["power", "magnitude"] {
         let error = build(mode, f64::from(f32::MAX))
-            .run(&[&encoded(&[0.5; 8])])
+            .run(
+                &[&encoded(&[0.5; 8])],
+                onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+            )
             .unwrap_err()
             .to_string();
         assert!(
