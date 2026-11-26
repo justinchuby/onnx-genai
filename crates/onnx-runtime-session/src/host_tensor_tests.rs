@@ -196,6 +196,14 @@ impl ExecutionProvider for RefusingUpload {
         }
         self.cpu.copy_from_host(src, dst)
     }
+    fn copy_async(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        size: usize,
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::Fence> {
+        self.cpu.copy_async(src, dst, size)
+    }
     fn copy_to_host(&self, src: &DeviceBuffer, dst: &mut [u8]) -> onnx_runtime_ep_api::Result<()> {
         self.cpu.copy_to_host(src, dst)
     }
