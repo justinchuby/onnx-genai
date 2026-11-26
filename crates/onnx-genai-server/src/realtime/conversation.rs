@@ -128,13 +128,17 @@ impl Conversation {
     pub(super) fn clear_audio(&self) -> Value {
         json!({"type":"input_audio_buffer.cleared"})
     }
-    pub(super) fn commit_audio(&mut self, item: ItemId) -> Result<Vec<Value>, ProtocolError> {
+    pub(super) fn validate_audio_commit(&self) -> Result<(), ProtocolError> {
         if !self.audio_uncommitted {
             return Err(ProtocolError::typed(
                 ProtocolErrorKind::EmptyAudioCommit,
                 "input_audio_buffer.commit: the audio buffer is empty; append PCM audio before committing",
             ));
         }
+        Ok(())
+    }
+    pub(super) fn commit_audio(&mut self, item: ItemId) -> Result<Vec<Value>, ProtocolError> {
+        self.validate_audio_commit()?;
         self.audio_uncommitted = false;
         self.input_turn = true;
         self.committed_audio = Some(item.clone());

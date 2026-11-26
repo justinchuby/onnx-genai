@@ -658,7 +658,7 @@ impl ContentConstraint {
                 if terminal || next.retained_bytes() == 0 {
                     return Ok(true);
                 }
-                let effect = (emitted, next, terminal);
+                let effect = (emitted, next);
                 if effects.contains(&effect) {
                     continue;
                 }
@@ -679,7 +679,7 @@ impl ContentConstraint {
                     "literal Replace continuation effects exceed {memory_limit}-byte search budget; simplify decoder composition"
                 );
                 effects.insert(effect.clone());
-                let (emitted, next, terminal) = effect;
+                let (emitted, next) = effect;
 
                 if emitted == output && next == decoder {
                     continue;
@@ -2166,6 +2166,63 @@ mod tests {
             .unwrap();
         assert!(logits[3].is_finite());
     }
+    #[test]
+    fn literal_frontier_deduplicates_large_equivalent_vocab_without_losing_distinct_tokens() {
+        let base = byte_tokenizer(true, &[(4, "a"), (5, "b"), (6, "z")]);
+        let mut value: Value =
+            serde_json::from_str(&base.inner().to_string(false).unwrap()).unwrap();
+        let vocab = value["model"]["vocab"].as_object_mut().unwrap();
+        let start = vocab.len();
+        for id in start..start + 50000 {
+            assert!(vocab.insert(format!("noise_{id}"), json!(id)).is_none());
+        }
+        value["decoder"] = json!({"type":"Sequence","decoders":[{"type":"Replace","pattern":{"Regex":"noise_[0-9]+"},"content":"!"},{"type":"ByteFallback"},{"type":"Fuse"},{"type":"Replace","pattern":{"String":"ab"},"content":"7"}]});
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tokenizer.json");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let tokenizer = Tokenizer::from_file(path).unwrap();
+        let constraint = ContentConstraint::json_schema(
+            &tokenizer,
+            &json!({"const":7}),
+            ProjectionKind::Plain,
+            "",
+            4096,
+            vec![3],
+            &Default::default(),
+            None,
+        )
+        .unwrap();
+        let candidates = [3u32, 4, 5, 6]
+            .into_iter()
+            .map(|token_id| TokenCandidate {
+                token_id,
+                text: String::new(),
+                is_eos: token_id == 3,
+            })
+            .collect::<Vec<_>>();
+        let mask = constraint
+            .allowed_next_tokens(&ProcessorContext::default(), &candidates)
+            .unwrap();
+        assert!(mask[4]);
+        assert!(!mask[3]);
+        assert!(!mask[6]);
+        let context = ProcessorContext {
+            generated_tokens: vec![4],
+            ..Default::default()
+        };
+        let mask = constraint
+            .allowed_next_tokens(&context, &candidates)
+            .unwrap();
+        assert!(mask[5]);
+        assert!(!mask[3]);
+        assert!(!mask[4]);
+        assert!(!mask[6]);
+        let context = ProcessorContext {
+            generated_tokens: vec![4, 5],
+            ..Default::default()
+        };
+        assert!(constraint.can_finish(&context).unwrap());
+    }
 }
 
 #[cfg(test)]
@@ -2348,62 +2405,5 @@ mod canonical_xml_tests {
             "<atem:invoke name=\"lookup\"><atem:parameter name=\"extra\">",
             false
         ));
-    }
-    #[test]
-    fn literal_frontier_deduplicates_large_equivalent_vocab_without_losing_distinct_tokens() {
-        let base = byte_tokenizer(true, &[(4, "a"), (5, "b"), (6, "z")]);
-        let mut value: Value =
-            serde_json::from_str(&base.inner().to_string(false).unwrap()).unwrap();
-        let vocab = value["model"]["vocab"].as_object_mut().unwrap();
-        let start = vocab.len();
-        for id in start..start + 50000 {
-            assert!(vocab.insert(format!("noise_{id}"), json!(id)).is_none());
-        }
-        value["decoder"] = json!({"type":"Sequence","decoders":[{"type":"Replace","pattern":{"Regex":"noise_[0-9]+"},"content":"!"},{"type":"ByteFallback"},{"type":"Fuse"},{"type":"Replace","pattern":{"String":"ab"},"content":"7"}]});
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("tokenizer.json");
-        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-        let tokenizer = Tokenizer::from_file(path).unwrap();
-        let constraint = ContentConstraint::json_schema(
-            &tokenizer,
-            &json!({"const":7}),
-            ProjectionKind::Plain,
-            "",
-            4096,
-            vec![3],
-            &Default::default(),
-            None,
-        )
-        .unwrap();
-        let candidates = [3u32, 4, 5, 6]
-            .into_iter()
-            .map(|token_id| TokenCandidate {
-                token_id,
-                text: String::new(),
-                is_eos: token_id == 3,
-            })
-            .collect::<Vec<_>>();
-        let mask = constraint
-            .allowed_next_tokens(&ProcessorContext::default(), &candidates)
-            .unwrap();
-        assert!(mask[4]);
-        assert!(!mask[3]);
-        assert!(!mask[6]);
-        let context = ProcessorContext {
-            generated_tokens: vec![4],
-            ..Default::default()
-        };
-        let mask = constraint
-            .allowed_next_tokens(&context, &candidates)
-            .unwrap();
-        assert!(mask[5]);
-        assert!(!mask[3]);
-        assert!(!mask[4]);
-        assert!(!mask[6]);
-        let context = ProcessorContext {
-            generated_tokens: vec![4, 5],
-            ..Default::default()
-        };
-        assert!(constraint.can_finish(&context).unwrap());
     }
 }

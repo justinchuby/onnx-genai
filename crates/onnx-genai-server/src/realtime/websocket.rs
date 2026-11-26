@@ -702,6 +702,7 @@ impl Runner {
                 "input_audio_buffer.commit: duplex models answer while listening; there is no turn to commit",
             ));
         }
+        self.conversation.validate_audio_commit()?;
         let response_options = self.settings.response.clone();
         let decoder = if self.settings.mode == RealtimeMode::Transcription {
             Some(self.admitted_decoder(&response_options, false).await?)
@@ -3340,5 +3341,63 @@ node { input: "starting" input: "operation""#);
         tokio::task::spawn_blocking(move || model.engine.shutdown())
             .await
             .unwrap();
+    }
+    #[cfg(feature = "native-backend")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_empty_transcription_commit_precedes_denied_literal_decoder_grant() {
+        use base64::Engine as _;
+        let package = tool_package("literal_unused_envelope");
+        let path = package.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        tokenizer["decoder"] = json!({"type":"Sequence","decoders":[{"type":"ByteFallback"},{"type":"Fuse"},{"type":"Replace","pattern":{"String":"literal_never_matches"},"content":"replacement"}]});
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let mut config = crate::ServerConfig::default();
+        config.engine_config.decode_backend = onnx_genai_engine::EngineDecodeBackend::Native;
+        config.engine_config.native_device = Some(onnx_genai_engine::NativeDecodeDevice::Cpu);
+        config.engine_config.limits.host_ram_limit =
+            onnx_genai_engine::ResourceLimit::Bytes(64 * 1024 * 1024);
+        config.realtime.text_bytes = NonZeroUsize::new(32 * 1024 * 1024).unwrap();
+        let (state, address, task) = server_for_package_with_config(package.path(), config).await;
+        let mut client = connect(address).await;
+        assert_eq!(event(&mut client).await["type"], "session.created");
+        send(
+            &mut client,
+            json!({"type":"session.update","session":{"type":"transcription"}}),
+        )
+        .await;
+        assert_eq!(event(&mut client).await["type"], "session.updated");
+        send(&mut client, json!({"type":"input_audio_buffer.commit"})).await;
+        let empty = event(&mut client).await;
+        assert_eq!(empty["type"], "error", "{empty}");
+        assert_eq!(
+            empty["error"]["type"], "input_audio_buffer_commit_empty",
+            "{empty}"
+        );
+        assert!(
+            empty["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("audio buffer is empty")
+        );
+        send(&mut client,json!({"type":"input_audio_buffer.append","audio":base64::engine::general_purpose::STANDARD.encode([0u8;640])})).await;
+        send(&mut client, json!({"type":"input_audio_buffer.commit"})).await;
+        let denied = event(&mut client).await;
+        assert_eq!(denied["type"], "error", "{denied}");
+        assert_eq!(denied["error"]["type"], "server_error", "{denied}");
+        assert!(
+            denied["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("bounded contextual literal decoder"),
+            "{denied}"
+        );
+        client.close(None).await.unwrap();
+        drop(client);
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
     }
 }
