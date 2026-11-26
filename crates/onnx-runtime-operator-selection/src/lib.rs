@@ -76,6 +76,7 @@ pub const CPU_OPERATOR_CATALOG: &[OperatorCatalogEntry] = &[
     entry("", "InstanceNormalization", 6, OPS_CNN),
     entry("", "LpPool", 18, OPS_CNN),
     entry("", "MaxPool", 1, OPS_CNN),
+    entry("", "MaxUnpool", 9, OPS_CNN),
     entry("", "PRelu", 16, OPS_CNN),
     entry("", "Resize", 10, OPS_CNN),
     entry("", "SpaceToDepth", 1, OPS_CNN),

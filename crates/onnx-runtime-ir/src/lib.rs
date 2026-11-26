@@ -63,6 +63,7 @@ mod graph;
 mod graph_view;
 mod layout;
 pub mod linear_attention;
+pub mod max_unpool;
 mod node;
 pub mod onnx;
 pub mod opset26;

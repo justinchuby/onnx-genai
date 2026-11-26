@@ -3373,6 +3373,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     ));
     p.push(dedicated("MaxPool", "pooling_gpu.rs", "cuDNN pooling"));
     p.push(dedicated(
+        "MaxUnpool",
+        "pooling_gpu.rs",
+        "NVRTC row-major scatter against pinned ONNX expectations",
+    ));
+    p.push(dedicated(
         "AveragePool",
         "pooling_gpu.rs",
         "cuDNN and dilated NVRTC pooling",

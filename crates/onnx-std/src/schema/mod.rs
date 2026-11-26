@@ -423,6 +423,9 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/scatter_elements_v29.yaml"),
     include_str!("../../schemas/standard/constant_of_shape.yaml"),
     include_str!("../../schemas/standard/max_pool.yaml"),
+    include_str!("../../schemas/standard/max_unpool_v9.yaml"),
+    include_str!("../../schemas/standard/max_unpool_v11.yaml"),
+    include_str!("../../schemas/standard/max_unpool.yaml"),
     include_str!("../../schemas/standard/average_pool_19.yaml"),
     include_str!("../../schemas/standard/average_pool.yaml"),
     include_str!("../../schemas/standard/global_average_pool.yaml"),
@@ -746,6 +749,7 @@ type_constraints:
             "ScatterElements",
             "ConstantOfShape",
             "MaxPool",
+            "MaxUnpool",
             "AveragePool",
             "GlobalAveragePool",
             "GlobalMaxPool",
@@ -761,8 +765,8 @@ type_constraints:
     #[test]
     fn kernel_gap_schemas_match_opset_boundaries_and_catalog_count() {
         let registry = SchemaRegistry::builtins();
-        assert_eq!(registry.schemas.len(), 118);
-        assert_eq!(registry.iter().count(), 144);
+        assert_eq!(registry.schemas.len(), 119);
+        assert_eq!(registry.iter().count(), 147);
         for (op, prior, prior_indices) in [
             ("GatherND", 13, "tensor(int64)"),
             ("ScatterND", 18, "tensor(int64)"),
@@ -1037,6 +1041,9 @@ type_constraints:
         let registry = SchemaRegistry::builtins();
         for (name, since_version, inputs, outputs) in [
             ("MaxPool", 22, 1, 2),
+            ("MaxUnpool", 9, 3, 1),
+            ("MaxUnpool", 11, 3, 1),
+            ("MaxUnpool", 22, 3, 1),
             ("AveragePool", 22, 1, 1),
             ("GlobalAveragePool", 22, 1, 1),
             ("GlobalMaxPool", 22, 1, 1),

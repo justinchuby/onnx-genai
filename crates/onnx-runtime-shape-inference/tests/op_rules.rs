@@ -6166,7 +6166,11 @@ fn max_unpool_uses_transpose_formula_or_explicit_output_shape() {
 
     // The optional output_shape input (slot 2) overrides the formula.
     let out = run(
-        &node("MaxUnpool", 3, 1),
+        &with_attr(
+            node("MaxUnpool", 3, 1),
+            "kernel_shape",
+            Attribute::Ints(vec![2, 2]),
+        ),
         vec![
             f32in(vec![c(1), c(1), c(2), c(2)]),
             tin(DataType::Int64, vec![c(1), c(1), c(2), c(2)]),
@@ -7579,6 +7583,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "MaxPool", 1),
     ("", "MaxUnpool", 9),
     ("", "MaxUnpool", 11),
+    ("", "MaxUnpool", 22),
     ("", "Mean", 1),
     ("", "MeanVarianceNormalization", 9),
     ("", "MelWeightMatrix", 17),

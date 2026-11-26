@@ -519,6 +519,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.is_default_domain()
+            && op.op_type == "MaxUnpool"
+            && let Err(reason) =
+                onnx_runtime_ir::max_unpool::validate_claim(op, opset, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "Equal"
             && onnx_runtime_ir::is_default_domain(&op.domain)
             && input_dtypes.contains(&DataType::String)
