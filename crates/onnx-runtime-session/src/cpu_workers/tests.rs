@@ -287,8 +287,7 @@ fn worker_workspace_denial_releases_claims_and_keeps_plan_retryable() {
     let input = Tensor::from_raw(DataType::Float16, vec![1, 4], &[0; 8]).unwrap();
     let error = worker
         .run(&[("input", &input)])
-        .err()
-        .expect("zero-byte authority must refuse real softmax workspace");
+        .expect_err("zero-byte authority must refuse real softmax workspace");
     assert!(error.to_string().contains("workspace"), "{error}");
     drop(worker);
     drop(refused);
