@@ -12,7 +12,7 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
-//! GPU parity tests for `pkg.nxrt::CompressedSparseAttention` v1.
+//! GPU parity tests for `pkg.nxrt._private::CompressedSparseAttention` v1.
 //!
 //! Each case builds a single-node model with the `onnx-runtime-ir` graph API and
 //! runs the SAME inputs through both the CPU CSA kernel (the authoritative
@@ -47,7 +47,7 @@ use onnx_runtime_ir::{
 };
 use onnx_runtime_loader::Model;
 
-const DOMAIN: &str = "pkg.nxrt";
+const DOMAIN: &str = "pkg.nxrt._private";
 const DIM: usize = 512;
 const ROPE_DIM: usize = 64;
 const RATIO: usize = 128;

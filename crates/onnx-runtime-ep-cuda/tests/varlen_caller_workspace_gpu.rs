@@ -70,7 +70,7 @@ fn exercise(packed: bool) {
     }
     let (graph, node) = common::build_graph(
         op,
-        "pkg.nxrt",
+        "pkg.nxrt._private",
         1,
         &tensors,
         &[(DataType::Float32, q_shape.clone())],

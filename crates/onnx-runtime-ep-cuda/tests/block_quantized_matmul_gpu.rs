@@ -27,7 +27,7 @@ use onnx_runtime_ir::{
 use onnx_runtime_loader::Model;
 use std::io::{Read, Seek, SeekFrom};
 
-const DOMAIN: &str = "pkg.nxrt";
+const DOMAIN: &str = "pkg.nxrt._private";
 
 #[derive(Clone)]
 struct HostTensor {

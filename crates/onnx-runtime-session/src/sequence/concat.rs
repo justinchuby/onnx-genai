@@ -1,6 +1,5 @@
 use onnx_runtime_ir::DataType;
 
-use crate::Tensor;
 use crate::tensor::copy_storage_elements;
 
 use super::{
@@ -181,6 +180,7 @@ impl ConcatPlan {
     pub(crate) fn write<F>(
         &self,
         sequence: &SequenceValue,
+        allocator: &crate::HostTensorAllocator,
         mut write: F,
     ) -> crate::Result<ConcatCopyStats>
     where
@@ -194,11 +194,15 @@ impl ConcatPlan {
             .map(SeqTensor::root_len)
             .max()
             .unwrap_or(0);
-        let mut scratch = if max_root == 0 {
-            Vec::new()
+        let mut scratch_owner = if max_root == 0 {
+            None
         } else {
-            zeroed_bytes(OP, "device source materialization", max_root, &self.shape)?
+            Some(allocator.array::<u8>(max_root)?)
         };
+        let mut empty_scratch = [];
+        let scratch = scratch_owner
+            .as_mut()
+            .map_or(&mut empty_scratch[..], |owner| owner.as_mut_slice());
         let mut stats = ConcatCopyStats::default();
         if self.new_axis {
             for outer_index in 0..self.outer {
@@ -234,7 +238,7 @@ impl ConcatPlan {
                         source_offset,
                         self.inner,
                         destination_offset,
-                        &mut scratch,
+                        scratch,
                         &mut write,
                         &mut stats,
                     )?;
@@ -282,7 +286,7 @@ impl ConcatPlan {
                         source_offset,
                         copy_bytes,
                         destination_offset,
-                        &mut scratch,
+                        scratch,
                         &mut write,
                         &mut stats,
                     )?;
@@ -302,11 +306,27 @@ impl ConcatPlan {
 
 /// Concatenate a sequence along an existing axis or stack it on a new axis.
 pub fn concat(sequence: &SequenceValue, axis: i64, new_axis: bool) -> SequenceResult<SeqTensor> {
+    concat_in(
+        &crate::HostTensorAllocator::standalone(),
+        sequence,
+        axis,
+        new_axis,
+    )
+}
+
+/// Concatenate into explicitly owned host backing without bypassing its domain.
+pub fn concat_in(
+    allocator: &crate::HostTensorAllocator,
+    sequence: &SequenceValue,
+    axis: i64,
+    new_axis: bool,
+) -> SequenceResult<SeqTensor> {
     const OP: &str = "ConcatFromSequence";
     let plan = ConcatPlan::new(sequence, axis, new_axis)?;
-    let mut tensor = Tensor::allocate_cpu(plan.dtype, plan.shape.clone())
+    let mut tensor = allocator
+        .zeros(plan.dtype, plan.shape.clone())
         .map_err(|source| SequenceError::TensorCreation { op: OP, source })?;
-    plan.write(sequence, |offset, bytes| {
+    plan.write(sequence, allocator, |offset, bytes| {
         tensor.copy_from_host_at(offset, bytes)
     })
     .map_err(|source| SequenceError::TensorCreation { op: OP, source })?;

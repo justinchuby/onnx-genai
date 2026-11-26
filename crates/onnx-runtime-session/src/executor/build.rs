@@ -97,7 +97,7 @@ pub(super) fn run_ep_scoped_passes(
 /// The S3 capacity-emission gate: rewrite every KV-cache-growth `Concat` the
 /// mask-cone classifier proves safe
 /// ([`geometry::kv_capacity_write_eligible_concats`]) into the
-/// CUDA-graph-capture-safe `pkg.nxrt::KvCacheCapacityAppend` op, so a
+/// CUDA-graph-capture-safe `pkg.nxrt._private::KvCacheCapacityAppend` op, so a
 /// decomposed-attention decode step becomes capture/replay-eligible instead of
 /// being permanently pinned to `captures == 0` — see that function's doc
 /// comment, and [`geometry::KV_CAPACITY_APPEND_OP`], for the full derivation
@@ -145,8 +145,8 @@ pub(super) fn rewrite_kv_capacity_appends(graph: &mut Graph, ep: &dyn ExecutionP
     // The op's registered version (see `onnx-runtime-shape-inference`'s
     // `custom_ops::kv_cache_capacity_append` registration and the CUDA kernel
     // factory's `OpKey`). Queried as a literal rather than via
-    // `effective_opset`, since `pkg.nxrt` may not yet be a graph opset-import
-    // for a decomposed-attention export that uses no other `pkg.nxrt` op —
+    // `effective_opset`, since `pkg.nxrt._private` may not yet be a graph opset-import
+    // for a decomposed-attention export that uses no other `pkg.nxrt._private` op —
     // exactly the case this rewrite exists to upgrade.
     const KV_CAPACITY_APPEND_OPSET: u64 = 1;
 

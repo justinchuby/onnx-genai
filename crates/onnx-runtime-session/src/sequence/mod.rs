@@ -12,18 +12,17 @@ mod split;
 mod tensor;
 mod value;
 
-pub use concat::concat;
 pub(crate) use concat::{ConcatCopyStats, ConcatPlan, stack_new_axis};
+pub use concat::{concat, concat_in};
 pub use error::{SequenceError, SequenceResult};
 pub use split::{SplitSpec, split, split_tensor};
 pub use tensor::SeqTensor;
 pub use value::SequenceValue;
 
-pub(crate) use tensor::clone_shape;
 use tensor::{
-    addressable, checked_add, checked_mul, checked_product, normalize_axis, overflow,
-    validate_view_bounds, zeroed_bytes,
+    addressable, checked_add, checked_mul, checked_product, normalize_axis, overflow, zeroed_bytes,
 };
+pub(crate) use tensor::{clone_shape, validate_view_bounds};
 
 #[cfg(test)]
 use tensor::validate_tensor_bytes;
@@ -224,10 +223,14 @@ mod tests {
             vec![0; plan.bytes]
         };
         let stats = plan
-            .write(&sequence, |offset, bytes| {
-                destination[offset..offset + bytes.len()].copy_from_slice(bytes);
-                Ok(())
-            })
+            .write(
+                &sequence,
+                &crate::HostTensorAllocator::standalone(),
+                |offset, bytes| {
+                    destination[offset..offset + bytes.len()].copy_from_slice(bytes);
+                    Ok(())
+                },
+            )
             .unwrap();
         assert_eq!(destination_allocations, 1);
         assert_eq!(stats.source_materializations, 0);

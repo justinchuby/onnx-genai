@@ -1,4 +1,4 @@
-//! `pkg.nxrt::CompressedSparseAttention` v1 CUDA execution for the
+//! `pkg.nxrt._private::CompressedSparseAttention` v1 CUDA execution for the
 //! DeepSeek-V4-Flash / GLM-5.2 compressed sparse-attention (CSA) operator.
 //!
 //! The fully-implemented CPU kernel in
@@ -2738,7 +2738,7 @@ impl Kernel for CompressedSparseAttentionKernel {
     }
 }
 
-/// Claim-time denial for `pkg.nxrt::CompressedSparseAttention`. Rejects any
+/// Claim-time denial for `pkg.nxrt._private::CompressedSparseAttention`. Rejects any
 /// ratio / cache-layout / sink-mode / arity combination the CPU oracle does not
 /// accept (via a dry-run of the CPU factory), plus explicit dtype gating on the
 /// dtype-fixed inputs, so unsupported combinations never reach `execute`

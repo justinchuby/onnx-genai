@@ -1,4 +1,4 @@
-//! CPU reference kernel for `pkg.nxrt::PackedVarlenAttention` v1.
+//! CPU reference kernel for `pkg.nxrt._private::PackedVarlenAttention` v1.
 
 use std::borrow::Cow;
 

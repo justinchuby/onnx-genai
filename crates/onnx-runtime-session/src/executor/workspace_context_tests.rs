@@ -341,7 +341,7 @@ fn check_context_repreparation(
 fn block_context_graph(experts: bool) -> Graph {
     use onnx_runtime_ir::TensorData;
     let mut graph = Graph::new();
-    graph.opset_imports.insert("pkg.nxrt".into(), 1);
+    graph.opset_imports.insert("pkg.nxrt._private".into(), 1);
     let x = graph.create_named_value("x", DataType::Float32, static_shape([3, 32]));
     let router = graph.create_named_value("router", DataType::Float32, static_shape([3, 4]));
     let y = graph.create_named_value(
@@ -383,7 +383,7 @@ fn block_context_graph(experts: bool) -> Graph {
             vec![y],
         )
     };
-    node.domain = "pkg.nxrt".into();
+    node.domain = "pkg.nxrt._private".into();
     node.attributes
         .insert("block_layout_version".into(), Attribute::Int(1));
     if experts {

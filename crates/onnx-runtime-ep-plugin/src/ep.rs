@@ -2374,7 +2374,7 @@ mod tests {
         const FLOATS: &[DataType] = &[DataType::Float32, DataType::Float16, DataType::BFloat16];
         let entries = vec![KernelRegistryEntry {
             op_type: "DsaIndexSelect",
-            domain: "pkg.nxrt",
+            domain: "pkg.nxrt._private",
             since_version: 1,
             end_version: i32::MAX,
             supported_dtypes: &[
@@ -2394,7 +2394,7 @@ mod tests {
 
         let (good, good_id) = graph_with_node(
             "DsaIndexSelect",
-            "pkg.nxrt",
+            "pkg.nxrt._private",
             &[
                 DataType::Float32,
                 DataType::Float32,
@@ -2411,7 +2411,7 @@ mod tests {
 
         let (bad, bad_id) = graph_with_node(
             "DsaIndexSelect",
-            "pkg.nxrt",
+            "pkg.nxrt._private",
             &[
                 DataType::Float32,
                 DataType::Float32,

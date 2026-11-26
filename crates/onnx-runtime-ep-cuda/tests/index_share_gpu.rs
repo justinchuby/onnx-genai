@@ -12,7 +12,7 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
-//! GPU parity tests for `pkg.nxrt::IndexShare` v1.
+//! GPU parity tests for `pkg.nxrt._private::IndexShare` v1.
 //!
 //! Each case builds a tiny single-node model with the `onnx-runtime-ir` graph
 //! API, runs it through both the CPU reference kernel (the authoritative
@@ -50,7 +50,7 @@ use onnx_runtime_ir::{
 };
 use onnx_runtime_loader::Model;
 
-const DOMAIN: &str = "pkg.nxrt";
+const DOMAIN: &str = "pkg.nxrt._private";
 /// Absolute tolerance for the softmax attention output `Y`. Device `expf` and
 /// fused multiply-adds differ from host `libm` by ~1 ULP at these magnitudes.
 const Y_TOLERANCE: f32 = 1e-4;

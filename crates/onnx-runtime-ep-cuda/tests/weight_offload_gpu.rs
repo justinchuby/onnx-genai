@@ -161,7 +161,7 @@ fn run_matmul_with_b_ptr(
     out_bytes
 }
 
-/// Build a `pkg.nxrt::BlockQuantizedMoE`-boundary lazy weight for `b` placed at
+/// Build a `pkg.nxrt._private::BlockQuantizedMoE`-boundary lazy weight for `b` placed at
 /// `offset` inside a fresh host mmap, plus that mmap.
 fn lazy_weight_for(b: &[f32], k: usize, n: usize, offset: usize) -> (LazyWeight, HostMmap) {
     lazy_weight_with_boundary(LazyWeightBoundary::BlockQuantizedMoe, b, k, n, offset)

@@ -1,44 +1,40 @@
 # First-Class Mixture-of-Experts Support
 
-**Status:** Phase 2 CPU grouped-expert execution is implemented. The CPU EP
-registers grouped float `MoE`, integer `QMoE`, and `BlockQuantizedMoE`;
-quantized kernels dequantize active experts route-first and cache constant
-dense expert expansions under a bounded per-kernel LRU. The CPU
-`BlockQuantizedMoE` path remains memory-format-only: routed experts are
-dequantized to dense f32 before grouped compute, rather than computed directly
-in the quantized domain. Both the dense-f32 dispatch and cached-dense hit path
-are claimed as tier3 in `dispatch_manifest.toml`. CUDA grouped MoE and the
-broader Phase 3 streaming/scheduling work are not claimed complete.
+**Status:** Standard ONNX GroupedMatMul is the primary representation for future
+MoE models. CPU supports grouped floating execution, private affine/packed
+projection targets and a supported closed affine routed-MoE fusion. Existing
+Microsoft `MoE`/`QMoE` inputs remain supported. CPU `BlockQuantizedMoE` has explicit
+`float32` and `q8_0` activation-arithmetic paths; it is no longer restricted to
+materializing dense f32 experts. See
+[packed activation arithmetic](PACKED_ACTIVATION_ARITHMETIC.md) for their precise
+format, admission and numerical contracts. CUDA supports grouped projections and
+its existing QMoE entry, but does not install whole-region AffineMoeFusion.
+Broader streaming/scheduling integration remains ongoing.
 
-## 1. Executive recommendation
+## 1. Graph and execution contract
 
-onnx-genai should treat a sparse Mixture-of-Experts (MoE) block as a first-class
-execution and memory-management unit, not merely as a large collection of ordinary
-matrix multiplications.
+Treat a sparse MoE block as a first-class execution and memory-management unit
+while preserving a standard, inspectable source graph:
 
-The recommended graph contract is:
+1. Keep router policy explicit in ONNX. Selection scores and aggregation weights
+   may differ; grouped TopK, bias correction, masking and tie rules remain visible.
+2. Express expert projections with **standard GroupedMatMul-29**, plus explicit
+   activation, routing and weighted reduction. Packed or affine weight decode is
+   also explicit. Source models do not need to emit NXRT-private fused operators.
+3. Retain `com.microsoft::MoE` and `QMoE` as supported interoperability inputs.
+   They are not the primary graph contract for future exports and are not renamed
+   into the standard domain. A standard grouped graph remains the executable
+   reference when a whole-MoE fusion does not match.
+4. EP claim/compile may fuse a closed region only after proving its exact routing,
+   weight, bias, activation and accumulation semantics. Rewrites target
+   `pkg.nxrt._private`, preserve escaping values and are enabled only where that
+   EP implements the target. Model names never decide eligibility.
 
-1. Keep the **model-specific router as an explicit ONNX subgraph**. It computes two
-   logically distinct `[tokens, experts]` tensors: `selection_scores`, including any
-   grouped-TopK or bias correction used to choose experts, and
-   `aggregation_weights`, containing the model-exact weights used to combine the
-   selected expert outputs.
-2. Make **`com.microsoft::QMoE` the primary quantized expert op** emitted by Mobius,
-   with expert-major packed weights. Use `com.microsoft::MoE` for floating-point
-   experts. These existing ONNX Runtime contrib schemas accept the input and router
-   probabilities plus stacked expert weights and own top-k dispatch and reduction.
-3. Make Mobius able to emit a **dense reference fallback**: explicit TopK/masking,
-   per-expert `MatMulNBits` (or `MatMul`), and weighted reduction. It may evaluate
-   every expert and is not a performance target; it is the portable correctness
-   oracle and fallback when no MoE kernel is available.
-4. Do **not** fuse model-specific router policy into the expert op. Router variants
-   change faster than expert FFN math, and keeping the router visible preserves exact
-   model semantics and makes export failures diagnosable.
-
-The fused op is required for first-class performance and expert streaming: a
-decomposed graph exposes hundreds of independent initializers to the generic graph
-executor, which cannot naturally union routes, group GEMMs, or make an expert slice
-resident only when selected.
+The EP can then group expert work, coordinate selected-weight residency and admit
+coarse operation workspaces without requiring an opaque vendor MoE operator in
+serialized source models. An unsupported whole-region fusion keeps the original
+grouped execution path; it must not silently evaluate all experts or change router
+policy to make a pattern fit.
 
 ## 2. What MoE is and why it matters
 
@@ -143,7 +139,11 @@ latency must be visible in planning and metrics.
 - onnx-genai must retain ONNX/Mobius portability and multi-EP execution rather than
   becoming a model-specific engine.
 
-## 4. Current onnx-genai architecture and gaps
+## 4. Historical architecture assessment
+
+This section records the original design study's baseline. Current execution and
+export direction are described in sections 1 and "EP-private fusion targets";
+the observations below are not a current implementation inventory.
 
 There is currently no first-class MoE design in `docs/architecture/DESIGN.md`, and
 [`docs/execution/OPERATORS.md`](../execution/OPERATORS.md) does not list `com.microsoft::MoE` or `QMoE`.
@@ -193,11 +193,12 @@ Relevant existing seams are:
   Expert weights are immutable model data, **not KV**, so the concepts should be
   reused but expert storage must not be inserted into the KV APIs.
 
-## 5. Graph and export contract
+## 5. Microsoft interoperability contract
 
-### 5.1 Primary contract: explicit router + fused expert op
+### 5.1 Interoperability input: explicit router + vendor expert op
 
-Mobius should emit:
+For existing Microsoft-schema models, retain the following supported input spelling.
+Future exports use standard GroupedMatMul as specified in section 1:
 
 ```text
 hidden [T,H]
@@ -378,9 +379,9 @@ Implemented integration points:
 - `.../qmoe.rs`: expert-batched integer `QMoE`, including int4, using a conversion
   established by the Phase 1 packing-validation gate rather than assuming that
   Mobius/`MatMulNBits` storage is already identical.
-- `.../block_quantized_moe.rs`: the `pkg.nxrt::BlockQuantizedMoE` CPU parity kernel.
+- `.../block_quantized_moe.rs`: the `pkg.nxrt._private::BlockQuantizedMoE` CPU parity kernel.
 - `.../mod.rs`: registrations for `com.microsoft::MoE`, `com.microsoft::QMoE`, and
-  `pkg.nxrt::BlockQuantizedMoE`.
+  `pkg.nxrt._private::BlockQuantizedMoE`.
 
 The implemented kernels route and group the token batch before expert execution.
 `QMoE` expands only routed experts. Both retained and temporary complete
@@ -493,7 +494,7 @@ memory concepts, not KV tensor formats or KV connector APIs.
 
 | Area | Current integration point | Required future work |
 |---|---|---|
-| Mobius export | External exporter; contracts documented in `docs/execution/OPERATORS.md` and `MODEL_METADATA.md` | Emit explicit router + `MoE`/`QMoE`; expert-major external data; dense reference mode; metadata validation |
+| Mobius export | External exporter; source contract in section 1 | Emit standard GroupedMatMul with explicit routing/decode/reduction; preserve Microsoft interoperability inputs; expert-major external data and reference validation |
 | CPU EP | `crates/onnx-runtime-ep-cpu/src/kernels/{moe,qmoe,block_quantized_moe}.rs`, `mod.rs` | Grouped float and quantized expert execution is implemented; further packing/prepacking optimization remains |
 | CUDA EP | `crates/onnx-runtime-ep-cuda/src/kernels/{matmul,gemm,attention}.rs`, `mod.rs` | Device dispatch/scatter, grouped int4 expert GEMM, async residency |
 | Engine | `crates/onnx-genai-engine/src/{engine,batched}.rs` | Expert store lifecycle, leases, telemetry, batch residency plan |
@@ -515,8 +516,8 @@ Deliverables:
 
 1. Mobius recognizes supported sparse FFN patterns and preserves separate selection
    scores and aggregation weights for the exact router.
-2. Mobius emits `com.microsoft::MoE`/`QMoE` with canonical expert-major layout.
-3. Mobius can emit the decomposed dense reference graph.
+2. Future exports use standard GroupedMatMul with explicit expert-major decode and routing; existing Microsoft MoE/QMoE inputs retain their vendor contract.
+3. The standard grouped source graph executes as the reference when whole-region fusion is unavailable.
 4. `docs/execution/OPERATORS.md` lists MoE/QMoE capability and fallback behavior.
 5. Runtime capability checks fail clearly when no fused op or fallback is available.
 6. Tiny deterministic fixtures cover top-1/top-2, softmax and sigmoid routers,
@@ -535,12 +536,16 @@ grouped kernel is required.
 
 ### Phase 2 — grouped-expert kernels
 
-**Status: PARTIALLY IMPLEMENTED — CPU COMPLETE; CUDA tracked separately**
+**Status: CPU grouped kernels implemented; whole-region fusion remains pattern-scoped and CUDA is tracked separately.**
 
 The CPU EP routes the complete token batch first, groups routed rows by expert,
 and invokes one expert computation per active expert. Float `MoE` and dense
 block-MoE groups share the CPU GEMM backend, including single-row groups.
 `QMoE` and `BlockQuantizedMoE` process active experts one at a time.
+
+The following dense/streamed discussion concerns explicit `float32` activation
+arithmetic. Explicit `q8_0` arithmetic has its own packed-dot, scratch and numerical
+contract in [PACKED_ACTIVATION_ARITHMETIC.md](PACKED_ACTIVATION_ARITHMETIC.md).
 
 `BlockQuantizedMoE` admits a complete expert's FC1/FC2/optional-FC3 f32 set only
 when it fits `ONNX_GENAI_CPU_DENSE_WEIGHT_CACHE_BYTES` (default 256 MiB). Constant
@@ -620,8 +625,10 @@ an actionable error rather than OOM.
 1. **ORT weight ownership:** can an EP/custom `QMoE` kernel lazily access expert
    slices without ORT materializing the full initializer? If not, Phase 3 needs an
    external-data/lazy-initializer extension or an engine-owned custom op.
-2. **Schema evolution:** is upstream `QMoE` sufficient for every target router/FFN
-   layout, or is a second schema accepting preselected expert IDs and weights needed?
+2. **Fusion coverage:** which standard GroupedMatMul router/FFN structures have
+   a complete, boundary-safe lowering proof and a supported private EP target?
+   Unrecognized patterns keep their standard execution; Microsoft schemas remain
+   separate interoperability inputs.
 3. **Packing validation result:** Phase 1 must determine whether Mobius
    `MatMulNBits` packing and ORT `QMoE` packing are byte-identical across zero-point
    defaults, transpose conventions, and EP prepacked layouts; otherwise it must
@@ -642,3 +649,39 @@ an actionable error rather than OOM.
 10. **Model breadth:** Mixtral-like SwiGLU is only the first target. Tests must cover
     shared experts, dense replacement layers, grouped routing, and nonuniform expert
     shapes before claiming broad compatibility.
+
+
+## EP-private fusion targets
+
+NXRT-owned operators use `pkg.nxrt._private` (private opset 1). The former
+`pkg.nxrt` domain has no runtime alias. Standard ONNX `GroupedMatMul` remains in
+the default domain at opset 29; Microsoft `MoE` and `QMoE` remain in
+`com.microsoft`. A source spelling does not by itself prove equivalent routing,
+tie-breaking, masking, bias, activation or reduction semantics.
+
+MoE models expressed with GroupedMatMul are a primary input representation.
+Optimization belongs to each EP's claim/compile pipeline, after receiving the
+complete graph (including control flow). Reusable recognition and boundary
+checking use the shared IR pattern infrastructure. The provider only installs
+rewrites whose target kernels it supports; graph outputs, outside consumers and
+lexical captures prevent removal of observable intermediate values.
+
+| Source structure | Execution / lowering target | CPU | CUDA |
+| --- | --- | --- | --- |
+| Standard dense GroupedMatMul-29 | Standard grouped kernel | supported | supported |
+| Eligible affine decode + GroupedMatMul | Private AffineQuantizedGroupedMatMul | supported | supported |
+| Eligible DequantizePacked-29 + GroupedMatMul | Private PackedGroupedMatMul | supported | supported |
+| Closed supported affine routed-MoE pattern | Private AffineRoutedMoE | whole-region fusion | retains projection-level execution; no whole-region target |
+| Microsoft MoE | Microsoft MoE entry | supported | no equivalent advertised entry |
+| Microsoft QMoE | Microsoft QMoE entry | supported | supported |
+
+QuantizedGroupedFusion precedes AffineMoeFusion on CPU. The latter is installed
+only when its private target is registered. CUDA does not install that whole-MoE
+rewrite. These capability statements do not claim every dense, packed or vendor
+MoE graph can be normalized into one arithmetic implementation. CUDA execution
+still requires a CUDA device; Host tests and compile checks do not prove GPU
+numerics or performance.
+
+Historical benchmark archives retain the domains and source seals actually
+measured. Current fixtures and generators author the private domain; pinned
+external fixture exporters are explicitly converted before serialization.

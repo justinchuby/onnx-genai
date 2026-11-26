@@ -4,6 +4,8 @@
 //! model-free prompt lookup. All sources feed the same target verification,
 //! longest-prefix acceptance, correction-token, and KV rewind path.
 
+use crate::logits_batch::{LogitsBatch, LogitsRow};
+
 use crate::TokenId;
 use crate::config::MtpCacheScope;
 use crate::decode::{
@@ -1597,7 +1599,7 @@ fn block_flag(value: bool) -> anyhow::Result<onnx_genai_ort::Value> {
 /// logits, any hidden state(s) the active proposer consumes, and the target's
 /// unprocessed greedy next token (used by hidden-state proposers).
 struct TargetPrediction {
-    base_logits: Vec<f32>,
+    base_logits: LogitsRow,
     target_hidden: Option<Vec<f32>>,
     target_hidden_layers: Option<Vec<Vec<f32>>>,
     guaranteed_token: Option<TokenId>,
@@ -2216,13 +2218,13 @@ impl Engine {
         state: &mut EngineSession,
         draft_tokens: &[TokenId],
         base_len: usize,
-    ) -> anyhow::Result<Vec<Vec<f32>>> {
+    ) -> anyhow::Result<LogitsBatch> {
         self.last_speculative_stats.verification_steps += 1;
         self.last_speculative_stats.proposed_tokens += draft_tokens.len();
 
         state.tokens.extend_from_slice(draft_tokens);
         let verified_logits = if draft_tokens.is_empty() {
-            Vec::new()
+            LogitsBatch::empty()
         } else if state.decode_state.has_runner() {
             let logits =
                 run_decode_session_logits(&mut state.decode_state, draft_tokens, base_len)?;
@@ -2275,7 +2277,8 @@ impl Engine {
                     .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
                 outputs,
                 state.decode_state.io.logits_output.as_deref(),
-            )?
+            )
+            .map(LogitsBatch::from_host_rows)?
         };
         Ok(verified_logits)
     }
@@ -2324,7 +2327,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn choose_accepted_prefix(
         &mut self,
-        target_logits: &mut [Vec<f32>],
+        target_logits: &mut [LogitsRow],
         draft_tokens: &[TokenId],
         base_len: usize,
         state: &EngineSession,
@@ -2357,9 +2360,14 @@ impl Engine {
                 .context("decode speculative output history with preserved_tokens")?,
                 step: step + idx,
             };
-            let probabilities = ProbabilitySnapshot::capture(options, &target_logits[idx]);
-            let target_token =
-                select_next_token_with_rng(&mut target_logits[idx], &context, options, chain, rng)?;
+            let probabilities = ProbabilitySnapshot::capture(options, &target_logits[idx])?;
+            let target_token = select_next_token_with_rng(
+                target_logits[idx].try_mut()?,
+                &context,
+                options,
+                chain,
+                rng,
+            )?;
             if let (Some(top_logprobs), Some(logprobs)) =
                 (options.top_logprobs, candidate_logprobs.as_mut())
             {
@@ -2400,7 +2408,7 @@ impl Engine {
         draft_tokens: &[TokenId],
         base_len: usize,
         state: &mut EngineSession,
-        target_logits: &mut [Vec<f32>],
+        target_logits: &mut [LogitsRow],
         generated_tokens: &[TokenId],
         options: &GenerateOptions,
         chain: &ProcessorChain,
@@ -2458,11 +2466,12 @@ impl Engine {
                 target_logits
                     .last()
                     .context("target verification did not produce next-token logits")?,
-            );
+            )?;
             let token = select_next_token_with_rng(
                 target_logits
                     .last_mut()
-                    .context("target verification did not produce next-token logits")?,
+                    .context("target verification did not produce next-token logits")?
+                    .try_mut()?,
                 &context,
                 options,
                 chain,
