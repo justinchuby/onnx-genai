@@ -1,9 +1,10 @@
 mod affine;
+mod native;
 mod packed;
-use crate::dtype::{to_dense, to_dense_f32_widen, write_dense, write_dense_f32_narrow};
 use affine::Affine;
-use onnx_runtime_ep_api::packed_routed::{GroupLayout, fail, group_layout, validate};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use native::Native;
+use onnx_runtime_ep_api::packed_routed::fail;
+use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorView};
 use onnx_runtime_ir::dequantize_packed::Metadata;
 use onnx_runtime_ir::{DataType, Node, packed_routed::Op};
 use packed::Packed;
@@ -17,8 +18,6 @@ impl KernelFactory for Factory {
         )))
     }
 }
-
-struct Native(Op);
 
 struct RouteSource<'view, 'storage> {
     op: Op,
@@ -84,90 +83,12 @@ impl<'view, 'storage> RouteSource<'view, 'storage> {
         }
     }
 }
+#[cfg(test)]
 fn route_indices(op: Op, idx: &TensorView, groups: usize) -> Result<Vec<usize>> {
     let source = RouteSource::new(op, idx)?;
     let mut routes = vec![0usize; source.count];
     source.copy_into(groups, &mut routes)?;
     Ok(routes)
-}
-
-fn grouped<F>(
-    l: GroupLayout,
-    x: &[F],
-    weight: impl Fn(usize) -> F,
-    groups: &[usize],
-    b: Option<&[F]>,
-    round: impl Fn(F) -> F,
-) -> Vec<F>
-where
-    F: Copy + Default + std::ops::Add<Output = F> + std::ops::Mul<Output = F>,
-{
-    let mut y = vec![F::default(); l.lanes];
-    for (route, row) in y.chunks_exact_mut(l.n).enumerate() {
-        let g = groups[route];
-        let token = route / l.selections;
-        for (n, out) in row.iter_mut().enumerate() {
-            let mut sum = F::default();
-            for k in 0..l.k {
-                let i = if l.transposed {
-                    n * l.k + k
-                } else {
-                    k * l.n + n
-                };
-                sum = sum + x[token * l.k + k] * weight(g * l.k * l.n + i);
-            }
-            // The ONNX function applies Add after the MatMul result is stored.
-            *out = if let Some(b) = b {
-                round(sum) + b[g * l.n + n]
-            } else {
-                sum
-            };
-        }
-    }
-    y
-}
-
-impl Kernel for Native {
-    fn execute(&self, x: &[TensorView], y: &mut [TensorMut]) -> Result<()> {
-        let op = self.0;
-        validate(op, x, y)?;
-        let l = group_layout(op, x, &y[0])?;
-        let groups = route_indices(op, &x[2], l.groups)?;
-        if l.lanes == 0 {
-            return Ok(());
-        }
-        let b = l.bias.then(|| &x[3]);
-        if x[0].dtype == DataType::Float64 {
-            let bias = b.map(to_dense::<f64>).transpose()?;
-            let weights = to_dense::<f64>(&x[1])?;
-            let data = grouped(
-                l,
-                &to_dense::<f64>(&x[0])?,
-                |i| weights[i],
-                &groups,
-                bias.as_deref(),
-                |v| v,
-            );
-            write_dense(&mut y[0], &data)
-        } else {
-            let widen = |t| to_dense_f32_widen(op.name(), t);
-            let bias = b.map(widen).transpose()?;
-            let weights = widen(&x[1])?;
-            let data = grouped(
-                l,
-                &widen(&x[0])?,
-                |i| weights[i],
-                &groups,
-                bias.as_deref(),
-                |v| match x[0].dtype {
-                    DataType::Float16 => half::f16::from_f32(v).to_f32(),
-                    DataType::BFloat16 => half::bf16::from_f32(v).to_f32(),
-                    _ => v,
-                },
-            );
-            write_dense_f32_narrow(op.name(), &mut y[0], &data)
-        }
-    }
 }
 
 pub(super) struct AffineFactory;

@@ -3,7 +3,7 @@ use super::RouteSource;
 use crate::kernels::{
     affine_bank::{self, AffineBank},
     host_rows::Rows,
-    typed_workspace::FloatIndexWorkspace,
+    typed_workspace::ValueIndexWorkspace,
 };
 use onnx_runtime_ep_api::{
     DevicePtr, EpError, Kernel, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
@@ -16,8 +16,8 @@ fn error(detail: impl std::fmt::Display) -> EpError {
     EpError::KernelFailed(format!("{OP}: {detail}"))
 }
 impl Affine {
-    fn plan(&self, l: GroupLayout) -> Result<FloatIndexWorkspace<2>> {
-        FloatIndexWorkspace::new(
+    fn plan(&self, l: GroupLayout) -> Result<ValueIndexWorkspace<f32, 2>> {
+        ValueIndexWorkspace::new(
             OP,
             [
                 ("Y staging", l.lanes),
