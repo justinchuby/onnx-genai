@@ -22,22 +22,25 @@ pub fn is_contiguous(shape: &[usize], strides: &[i64]) -> bool {
     if shape.len() != strides.len() {
         return false;
     }
-    // Accumulate the row-major stride walking backwards rather than
-    // materialising the whole vector to compare against it. Same reason as
-    // `is_dense`: this runs on the kernel fast-path checks, once per operand,
-    // and allocating to answer a question about a handful of integers is the
-    // dominant cost of asking it.
-    //
-    // Short-circuiting on the first mismatch also means this cannot overflow
-    // where the allocating version could, since that one built every stride
-    // before comparing any of them. Strictly more defensive, and unreachable
-    // either way for shapes whose element count fits in memory.
-    let mut expected: i64 = 1;
+    contiguous_relations::<false>(shape, strides)
+}
+
+/// Compare only strides that actually exist, never an unused final element
+/// total. Density's shortcut additionally requires positive extents; the general
+/// density rule below deliberately preserves its distinct empty-layout answers.
+#[inline]
+fn contiguous_relations<const NONEMPTY: bool>(shape: &[usize], strides: &[i64]) -> bool {
+    let mut expected = 1u64;
     for i in (0..shape.len()).rev() {
-        if strides[i] != expected {
+        if (NONEMPTY && shape[i] == 0) || u64::try_from(strides[i]) != Ok(expected) {
             return false;
         }
-        expected *= shape[i] as i64;
+        if i != 0 {
+            let Some(next) = expected.checked_mul(shape[i] as u64) else {
+                return false;
+            };
+            expected = next;
+        }
     }
     true
 }
@@ -90,22 +93,13 @@ pub fn is_dense(shape: &[usize], strides: &[i64]) -> bool {
     // exemption. `is_contiguous` alone is therefore the wrong predicate to
     // shortcut with, which the differential test against the reference
     // implementation caught immediately.
-    let mut expected: i64 = 1;
-    let mut fast = true;
-    for i in (0..shape.len()).rev() {
-        if shape[i] == 0 || strides[i] != expected {
-            fast = false;
-            break;
-        }
-        expected *= shape[i] as i64;
-    }
-    if fast {
+    if contiguous_relations::<true>(shape, strides) {
         return true;
     }
     const INLINE_RANK: usize = 8;
-    let nontrivial = |(&d, &s): (&usize, &i64)| (s.unsigned_abs() as i64, d);
+    let nontrivial = |(&d, &s): (&usize, &i64)| (s.unsigned_abs(), d);
     if shape.len() <= INLINE_RANK {
-        let mut pairs = [(0i64, 0usize); INLINE_RANK];
+        let mut pairs = [(0u64, 0usize); INLINE_RANK];
         let mut len = 0;
         for pair in shape
             .iter()
@@ -118,7 +112,7 @@ pub fn is_dense(shape: &[usize], strides: &[i64]) -> bool {
         }
         dense_extents(&mut pairs[..len])
     } else {
-        let mut pairs: Vec<(i64, usize)> = shape
+        let mut pairs: Vec<(u64, usize)> = shape
             .iter()
             .zip(strides)
             .filter(|&(&d, _)| d > 1)
@@ -132,7 +126,7 @@ pub fn is_dense(shape: &[usize], strides: &[i64]) -> bool {
 ///
 /// Sorts `pairs` in place by ascending stride, so the caller owns the storage
 /// and `is_dense` can keep it on the stack for ordinary ranks.
-fn dense_extents(pairs: &mut [(i64, usize)]) -> bool {
+fn dense_extents(pairs: &mut [(u64, usize)]) -> bool {
     if pairs.is_empty() {
         return true; // scalar or all-ones shape
     }
@@ -146,12 +140,17 @@ fn dense_extents(pairs: &mut [(i64, usize)]) -> bool {
         return false;
     }
     // Each subsequent stride must equal the product of all preceding sizes.
-    let mut expected_stride: i64 = 1;
-    for &(stride, size) in &*pairs {
+    let mut expected_stride = 1u64;
+    for (index, &(stride, size)) in pairs.iter().enumerate() {
         if stride != expected_stride {
             return false;
         }
-        expected_stride *= size as i64;
+        if index + 1 != pairs.len() {
+            let Some(next) = expected_stride.checked_mul(size as u64) else {
+                return false;
+            };
+            expected_stride = next;
+        }
     }
     true
 }
@@ -585,5 +584,52 @@ mod tests {
         // transposed view still covers the same 6 elements
         let t = l.transpose(&[2, 3], &[1, 0]);
         assert_eq!(t.storage_size(&[3, 2], DataType::Float32), 24);
+    }
+}
+
+#[cfg(test)]
+mod geometry_regression {
+    use super::*;
+    #[test]
+    fn empty_counts_ignore_the_position_of_zero_after_large_prefixes() {
+        for shape in [
+            vec![usize::MAX, 2, 0],
+            vec![0, usize::MAX, 2],
+            vec![usize::MAX, 0, 2],
+        ] {
+            assert_eq!(crate::checked_numel(&shape), Some(0), "{shape:?}");
+            assert_eq!(
+                crate::checked_expected_bytes(DataType::Float64, &shape),
+                Some(0)
+            );
+        }
+        assert_eq!(crate::checked_numel(&[]), Some(1));
+        assert_eq!(crate::checked_numel(&[usize::MAX, 2]), None);
+    }
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn contiguous_relations_do_not_need_an_i64_element_total() {
+        let large = 1usize << 62;
+        assert!(is_contiguous(&[2, large], &[large as i64, 1]));
+        assert!(is_contiguous(&[usize::MAX], &[1]));
+        assert_eq!(
+            crate::checked_expected_bytes(DataType::Uint4, &[2, large]),
+            Some(large)
+        );
+        assert!(!is_contiguous(&[0, large, 4], &[0, 4, 1]));
+        assert!(!is_contiguous(&[2, usize::MAX], &[-1, 1]));
+    }
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn density_uses_unsigned_stride_magnitude_without_a_final_total() {
+        let large = 1usize << 62;
+        assert!(is_dense(&[2, large], &[large as i64, 1]));
+        assert!(is_dense(&[2, large], &[-(large as i64), -1]));
+        assert!(is_dense(&[3, large], &[-(large as i64), 1]));
+        // Density describes stride relations; count admission is separate.
+        assert!(is_dense(&[1usize << 63, 2], &[1, i64::MIN]));
+        assert_eq!(crate::checked_numel(&[1usize << 63, 2]), None);
+        assert!(!is_dense(&[2, 2], &[i64::MIN, 1]));
+        assert!(!is_dense(&[2, 2], &[i64::MAX, 1]));
     }
 }

@@ -3263,3 +3263,117 @@ the same overlap-safe semantics because distinct borrowed buffer descriptors may
 name overlapping ranges. Exact/two-direction shifted overlaps, non-Host/wrapping
 pointers and a real same-backing Identity Session binding are covered without
 introducing workspace or quota requests.
+
+### Packed grouped projection reuses the whole-operation workspace
+
+For nonempty output, CPU PackedGroupedMatMul now admits one StepScoped mixed
+lane for f32 Y staging, one conservative K-element X row and usize routes, with
+checked alignment padding. Metadata returns Ready. It reuses the existing
+ValueIndexWorkspace, Host Rows and validated RouteSource helpers: no new owner,
+pool or per-token/expert/block grant is introduced. Aligned inner-contiguous X
+rows borrow even with padded/reversed outer axes; other X rows and INT32/INT64
+routes stream into admitted storage. Packed bytes remain a borrowed contiguous
+bank, and the existing 256-float block decoder buffer stays on the stack. This
+change does not add strided packed-bank support or claim that upstream gathers
+for unsupported layouts are governed by this kernel lane.
+
+Complete Host/view/address proofs and mixed binding precede all value reads.
+The positive-K decoder and accumulation order remain unchanged, and true Y is
+published after every X/route/packed read, including overlapping I/O bindings.
+Strided Y publication visits logical elements without touching padding. Shared
+packed metadata geometry derives concrete/unresolved output shapes while the
+existing live wrapper keeps descriptor validation and CUDA device independence.
+
+Packed retains its read-free return when output lanes are zero, with requirement
+NONE even if routes are nonempty. This differs intentionally from Affine's data
+validation on empty output. For K=0 with nonempty Y, the kernel still validates
+Host backing and every route before publishing initialized +0. It neither forms
+a zero-length packed slice nor computes an unnecessary expert*N intermediate;
+large expert geometry cannot overflow a row offset for an empty reduction. Null
+views still fail the existing descriptor contract.
+
+Bitwise tests cover every supported packed format, INT32/INT64 routes,
+padded/reversed/unaligned X/routes and contiguous packed-bank origins, all three
+source/Y shifted overlaps, strided Y padding, zero lanes and zero K, invalid
+routes and refusal before scratch initialization or data reads. A retained-owner
+witness exercises 4096 real executions with no additional issuer callbacks,
+including zero-byte controls, and exact trim refunds. Public Session checks use
+exact/one-byte-short budgets, dynamic shrinking/empty/trim/readmission and fixed
+physical strides with logical prefixes. Independent allocator controls detect
+former X/route/output payload sizes; repeated executions allocate no tested
+payload-sized buffers. Small bookkeeping allocations are outside that claim.
+These checks establish memory/accounting behavior, not measured latency or CUDA
+hardware performance.
+
+
+### Native grouped projection uses the same mixed workspace
+
+CPU GroupedMatMul now plans one StepScoped lane for Y staging, necessary X/W/bias
+snapshots, and usize routes. The mixed helper is ValueIndexWorkspace<T, N>,
+generalizing the existing f32 layout to f64 without another owner, pool or quota
+protocol. Affine grouped, Packed grouped and affine MoE simply specify f32 on
+this same helper. The Native multiply/add loop, transposed weight indexing and
+output conversion remain unchanged. FLOAT16/BFLOAT16 with bias still round the
+MatMul sum to storage precision before adding widened bias; DOUBLE stays f64.
+
+Aligned contiguous FLOAT/DOUBLE X/W/bias use zero-copy borrowing when storage and
+accumulator types match. Metadata therefore reports Deferred for these nonempty
+native-storage routes; execution checks actual views and charges only snapshots
+actually needed. Half/bfloat conversion uses the existing bulk widening helpers once per
+source, preserving architecture-selected conversion paths rather than widening
+weights repeatedly per route. All supported source strides are admitted directly;
+there is no upstream gather for these four operands.
+
+The complete mixed lane binds before any value read. Host/span checks precede
+binding; routes are copied and validated before float sources are consumed. Y is
+published only after every source read and all arithmetic have finished, so all
+four source/Y overlaps remain safe. Empty Y still checks all routes while leaving
+X/W/bias untouched, with only the route region charged. Empty reductions resolve
+zero-element sources before numel/conversion helpers can overflow an intermediate
+product on shapes such as [large_group_count, N, 0]. Host validation remains in
+place for nonempty Y.
+
+Tests compare the original snapshot arithmetic for four floating types, both
+transposes, optional/absent bias slots and dense/padded/reversed/unaligned inputs.
+They also cover half rounding before bias, DOUBLE precision, shifted overlaps
+with strided Y/padding, missing/short/misaligned scratch, invalid routes, stale
+metadata, non-Host and unaddressable sources, zero output and zero reduction.
+Exact and one-byte-short Session budgets exercise Deferred FLOAT/DOUBLE versus
+Ready half/bfloat, changing logical shapes, physical strides, trim and readmission.
+Allocator positive controls cover the former payload sizes; a retained-owner
+witness exercises 4096 calls with no additional issuer callbacks, including
+zero-byte controls. These establish accounting/correctness, not measured latency.
+DOUBLE now shares the typed dense-borrow predicate with FLOAT and the existing
+widening/Softmax paths; aligned native storage eliminates full source snapshots
+and their initialization writes. Strided or unaligned views still need initialized
+snapshots. Final-origin alignment (base plus byte_offset), signed zeros, subnormal,
+infinity and NaN storage bits, source/Y aliases and same-shape layout changes are
+covered explicitly. Neither removal of copies nor callback counts is a latency
+measurement.
+
+### Shared logical geometry handles empty and packed extents
+
+IR checked_numel now treats any zero extent as an empty tensor, including a zero
+following an overflowing prefix. Scalar count stays one; true nonempty overflow
+stays None. Both EP view kinds share this count and checked dense-byte queries.
+Their structural validation rejects nonempty count/byte overflow and an Undefined
+raw dtype with contextual errors, while preserving byte-offset, null and dtype
+checks. Identity consumes the validated shared byte size instead of repeating a
+private geometry checker. Bounds, Host accessibility and ownership remain separate
+proofs.
+
+Contiguity and the positive-extent density shortcut share a checked unsigned
+stride-relation walk. The general density walk uses unsigned absolute strides,
+including i64::MIN, and neither walk computes an unused final element total.
+This permits representable stride relations for large packed element counts
+without confusing signed stride capacity with logical count or physical bytes.
+The prior distinctions for empty layouts remain covered by differential tests;
+ordinary-rank density still uses stack storage. No payload or governor is added.
+
+Three regressions fail on the previous implementation (two overflow panics and
+an incorrect empty count). Boundary checks cover both view kinds, zero axes in
+each position, true nonempty/byte overflow, scalar geometry, unsigned stride
+magnitudes and packed counts exceeding i64 without reading device pointers.
+Infallible compute_contiguous_strides and its production callers still need a
+separate fallible API migration for unrepresentable suffix strides; this change
+does not claim to fix stride construction or every unvalidated geometry caller.

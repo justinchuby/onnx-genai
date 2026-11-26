@@ -5,7 +5,7 @@ use super::{
     conversation::{CompletedToolCall, Conversation, ItemId, ResponseId, ResponseKind},
     events::{ResponseEnd, ResponseEvents, TranscriptionEvents},
     pcm::PcmInput,
-    settings::{Capabilities, Modalities, OutputBudget, SessionSettings},
+    settings::{Capabilities, Modalities, OutputBudget, ResponseOptions, SessionSettings},
     tools::ToolArguments,
 };
 use crate::{
@@ -351,6 +351,7 @@ struct Active {
     renderer: Rendered,
     decoder: TokenTextDecoder,
     tools: Option<ToolText>,
+    tool_arguments: ToolArguments,
     budget: OutputBudget,
     used: u64,
     text_enabled: bool,
@@ -520,6 +521,46 @@ impl Runner {
         self.configured = true;
         Ok(())
     }
+    fn response_constraint(
+        &self,
+        arguments: &ToolArguments,
+        options: &ResponseOptions,
+    ) -> anyhow::Result<Option<onnx_genai_engine::GenerateConstraint>> {
+        let request: crate::types::ChatCompletionRequest = serde_json::from_value(json!({
+            "messages": [],
+            "tools": crate::tool_protocol::responses_tools(Value::Array(arguments.definitions().to_vec()))?,
+            "tool_choice": super::settings::choice_name(&options.tool_choice),
+        }))?;
+        match self
+            .model
+            .tool_protocol
+            .as_ref()
+            .map(|protocol| protocol.output_constraint(&request))
+            .transpose()?
+        {
+            Some(crate::tool_protocol::ToolOutputConstraint::Set(constraint)) => Ok(constraint),
+            _ => Ok(None),
+        }
+    }
+    fn duplex_constraint(&self) -> Result<Option<onnx_genai_engine::GenerateConstraint>, Failure> {
+        let constraint = self
+            .response_constraint(&self.tool_arguments, &self.settings.response)
+            .map_err(Failure::invalid)?;
+        if self.settings.response.tool_choice == crate::types::ToolChoiceMode::Required {
+            if constraint.is_none() {
+                return Err(Failure::invalid(
+                    "input-driven duplex tool_choice=required needs a declared protocol with native constraint-guided sampling; this protocol has no supported forcing plan",
+                ));
+            }
+            if self.contract.spec().inputs.token_mask.is_none() {
+                return Err(Failure::invalid(format!(
+                    "input-driven duplex tool_choice=required needs profiles.{}.realtime.inputs.token_mask; export a workflow consuming the mask before selecting text tokens",
+                    self.contract.profile()
+                )));
+            }
+        }
+        Ok(constraint)
+    }
     fn new_pcm(&self) -> anyhow::Result<PcmInput> {
         PcmInput::new(
             self.settings.input_rate,
@@ -540,11 +581,7 @@ impl Runner {
             .clone();
         let mut preserved = BTreeSet::new();
         let tools = if matches!(active.kind, ResponseKind::Realtime)
-            && self
-                .settings
-                .tools
-                .as_array()
-                .is_some_and(|tools| !tools.is_empty())
+            && !self.tool_arguments.definitions().is_empty()
             && active.options.tool_choice != crate::types::ToolChoiceMode::None
         {
             let protocol = self
@@ -598,6 +635,7 @@ impl Runner {
                 TokenTextDecoder::new(SpecialTokenHandling::Skip)
             },
             tools,
+            tool_arguments: self.tool_arguments.clone(),
             budget: active.options.budget,
             used: 0,
             text_enabled: !matches!(active.options.modalities, Modalities::Audio),
@@ -721,6 +759,14 @@ impl Runner {
             }
             "input_audio_buffer.append" => {
                 let audio = string(&event, "audio").map_err(Failure::invalid)?;
+                let starts_duplex = self.settings.mode == RealtimeMode::Duplex
+                    && !audio.is_empty()
+                    && self.conversation.active().is_none();
+                let constraint = if starts_duplex {
+                    self.duplex_constraint()?
+                } else {
+                    None
+                };
                 if self.pcm.is_none() {
                     self.pcm = Some(self.new_pcm().map_err(Failure::invalid)?);
                 }
@@ -734,14 +780,17 @@ impl Runner {
                     self.conversation.audio_appended(true);
                 }
                 self.configure().await?;
-                if self.settings.mode == RealtimeMode::Duplex
-                    && !audio.is_empty()
-                    && self.conversation.begin_duplex(
+                if starts_duplex {
+                    self.native
+                        .arm_constraint(constraint)
+                        .await
+                        .map_err(Failure::native)?;
+                    if self.conversation.begin_duplex(
                         ResponseId::new(id("resp_").map_err(Failure::native)?),
                         &self.settings,
-                    )?
-                {
-                    self.open_output(out).await?;
+                    )? {
+                        self.open_output(out).await?;
+                    }
                 }
             }
             "input_audio_buffer.clear" => self
@@ -880,25 +929,16 @@ impl Runner {
                     .options
                     .clone();
                 let constraint = if self.contract.spec().inputs.token_mask.is_some() {
-                    let request: crate::types::ChatCompletionRequest = serde_json::from_value(json!({
-                        "messages": [],
-                        "tools": crate::tool_protocol::responses_tools(settings.tools.clone()).map_err(anyhow::Error::new).map_err(Failure::native)?,
-                        "tool_choice": super::settings::choice_name(&settings.response.tool_choice),
-                    })).map_err(anyhow::Error::new).map_err(Failure::native)?;
-                    match self
-                        .model
-                        .tool_protocol
-                        .as_ref()
-                        .map(|protocol| protocol.output_constraint(&request))
-                        .transpose()
-                        .map_err(anyhow::Error::new)
-                        .map_err(Failure::native)?
-                    {
-                        Some(crate::tool_protocol::ToolOutputConstraint::Set(constraint)) => {
-                            constraint
-                        }
-                        _ => None,
-                    }
+                    self.response_constraint(
+                        &self
+                            .active
+                            .as_ref()
+                            .context("admitted response disappeared")
+                            .map_err(Failure::native)?
+                            .tool_arguments,
+                        &settings.response,
+                    )
+                    .map_err(Failure::native)?
                 } else {
                     None
                 };
@@ -1036,7 +1076,7 @@ impl Runner {
                     }
                     events.extend(
                         tools
-                            .fragments(&self.tool_arguments, renderer)
+                            .fragments(&active.tool_arguments, renderer)
                             .map_err(Failure::native)?,
                     );
                 } else if active.text_enabled {
@@ -1093,7 +1133,8 @@ impl Runner {
                         }
                         ToolParseOutcome::TerminalComplete(parsed) => {
                             calls = parsed;
-                            self.tool_arguments
+                            active
+                                .tool_arguments
                                 .admit_projected(&calls, &final_fragments)
                                 .map_err(Failure::native)?;
                             if tools.bindings.len() != calls.len() {
@@ -2201,6 +2242,787 @@ node { input: "starting" input: "operation""#);
         let _ = task.await;
         drop(state);
     }
+    #[cfg(feature = "native-backend")]
+    fn duplex_constraint_package() -> tempfile::TempDir {
+        let good =
+            "<tool_call>\n{\"name\":\"lookup\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>";
+        let bad =
+            "<tool_call>\n{\"name\":\"lookup\",\"arguments\":{\"city\":\"Rome\"}}\n</tool_call>";
+        let package = tool_package_from("realtime-constrained", good);
+        let path = package.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        tokenizer["model"]["vocab"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tok17");
+        tokenizer["model"]["vocab"][bad] = json!(17);
+        tokenizer["added_tokens"].as_array_mut().unwrap().push(json!({"id":17,"content":bad,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}));
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let path = package.path().join("inference_metadata.yaml");
+        let metadata = std::fs::read_to_string(&path).unwrap().replacen(
+            "default_mode: realtime",
+            "default_mode: duplex",
+            1,
+        );
+        assert!(metadata.contains("default_mode: duplex"));
+        std::fs::write(path, metadata).unwrap();
+        let path = package.path().join("model.onnx.textproto");
+        let graph = std::fs::read_to_string(&path).unwrap();
+        let original = "node { input: \"operation\" input: \"generate\" output: \"generating\" op_type: \"Equal\" }";
+        assert!(graph.contains(original));
+        let graph = graph.replace(original,concat!(
+            "initializer { name: \"duplex_mode_id\" data_type: 7 int64_data: 2 }\n",
+            "node { input: \"mode\" input: \"duplex_mode_id\" output: \"is_duplex\" op_type: \"Equal\" }\n",
+            "node { input: \"operation\" input: \"three\" output: \"is_audio\" op_type: \"Equal\" }\n",
+            "node { input: \"is_duplex\" input: \"is_audio\" output: \"duplex_generating\" op_type: \"And\" }\n",
+            "node { input: \"operation\" input: \"generate\" output: \"turn_generating\" op_type: \"Equal\" }\n",
+            "node { input: \"turn_generating\" input: \"duplex_generating\" output: \"generating\" op_type: \"Or\" }",
+        ));
+        let original = graph
+            .lines()
+            .find(|line| line.starts_with("initializer { name: \"ranked_logits\""))
+            .unwrap();
+        let logits = (0..32)
+            .map(|id| {
+                format!(
+                    " float_data: {}",
+                    match id {
+                        16 => 1,
+                        17 => 2,
+                        _ => -1000,
+                    }
+                )
+            })
+            .collect::<String>();
+        let graph = graph.replace(
+            original,
+            &format!("initializer {{ name: \"ranked_logits\" data_type: 1 dims: 32{logits} }}"),
+        );
+        std::fs::write(path, graph).unwrap();
+        package
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_duplex_masks_higher_ranked_invalid_tool_before_first_audio_selection() {
+        use base64::Engine as _;
+        let package = duplex_constraint_package();
+        let (state, address, task) = server_for_package_with_config(
+            package.path(),
+            crate::ServerConfig {
+                engine_config: onnx_genai_engine::EngineConfig {
+                    decode_backend: onnx_genai_engine::EngineDecodeBackend::Native,
+                    native_device: Some(onnx_genai_engine::NativeDecodeDevice::Cpu),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await;
+        let mut client = connect(address).await;
+        assert_eq!(event(&mut client).await["type"], "session.created");
+        send(&mut client,json!({"type":"session.update","session":{"output_modalities":["text"],"tools":[{"type":"function","name":"lookup","parameters":{"$defs":{"Args":{"type":"object","properties":{"city":{"const":"Paris"}},"required":["city"],"additionalProperties":false}},"$ref":"#/$defs/Args"}}],"tool_choice":"required"}})).await;
+        assert_eq!(event(&mut client).await["type"], "session.updated");
+        // No response.create: an actual native Audio quantum must consume the
+        // schema mask before ArgMax chooses between logits Paris=1 and Rome=2.
+        let pcm: Vec<u8> = (0..320).flat_map(|_| 100_i16.to_le_bytes()).collect();
+        send(&mut client,json!({"type":"input_audio_buffer.append","audio":base64::engine::general_purpose::STANDARD.encode(pcm)})).await;
+        loop {
+            let output = event(&mut client).await;
+            assert_ne!(
+                output["type"], "error",
+                "duplex must mask Rome before Native selection: {output}"
+            );
+            if output["type"] == "response.done" {
+                assert_eq!(output["response"]["status"], "completed");
+                assert_eq!(output["response"]["output"][0]["type"], "function_call");
+                assert_eq!(
+                    output["response"]["output"][0]["arguments"],
+                    r#"{"city":"Paris"}"#
+                );
+                break;
+            }
+        }
+        drop(client);
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn fragmented_duplex_constraint_package() -> tempfile::TempDir {
+        let package = duplex_constraint_package();
+        let prefix = "<tool_call>\n{\"name\":\"lookup\",\"arguments\":{\"city\":\"";
+        let path = package.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for (id, text) in [
+            (16, prefix),
+            (17, "Rome\"}}\n</tool_call>"),
+            (18, "Paris\"}}\n</tool_call>"),
+        ] {
+            let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+            let old = vocab
+                .iter()
+                .find(|(_, value)| value.as_u64() == Some(id))
+                .unwrap()
+                .0
+                .clone();
+            vocab.remove(&old);
+            vocab.insert(text.into(), json!(id));
+            tokenizer["added_tokens"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|token| token["id"] != id);
+            tokenizer["added_tokens"].as_array_mut().unwrap().push(json!({"id":id,"content":text,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}));
+        }
+        tokenizer["decoder"] = json!({"type":"Fuse"});
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let path = package.path().join("model.onnx.textproto");
+        let graph = std::fs::read_to_string(&path).unwrap();
+        let waiting = "node { input: \"responding\" output: \"needs_input\" op_type: \"Not\" }";
+        let done =
+            "node { input: \"responding\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }";
+        assert!(graph.contains(waiting) && graph.contains(done));
+        let graph=graph.replace(waiting,"initializer { name: \"wait_audio\" data_type: 9 int32_data: 1 }\nnode { input: \"wait_audio\" output: \"needs_input\" op_type: \"Identity\" }").replace(done,"");
+        // Derive completion from the actual selected token. The first Audio
+        // selects prefix=16; the next Audio must preserve grammar progress and
+        // choose a permitted suffix. Re-arming each quantum repeats the prefix.
+        let graph=graph.replace("node { input: \"tokens_out\" output: \"count\" op_type: \"Size\" }",concat!(
+            "node { input: \"tokens_out\" output: \"count\" op_type: \"Size\" }\n",
+            "initializer { name: \"prefix_id\" data_type: 7 int64_data: 16 }\n",
+            "node { input: \"tokens_out\" input: \"prefix_id\" output: \"is_prefix_vector\" op_type: \"Equal\" }\n",
+            "node { input: \"is_prefix_vector\" output: \"any_prefix\" op_type: \"Cast\" attribute { name: \"to\" type: INT i: 7 } }\n",
+            "node { input: \"any_prefix\" output: \"prefix_count\" op_type: \"ReduceSum\" attribute { name: \"keepdims\" type: INT i: 0 } }\n",
+            "node { input: \"prefix_count\" input: \"zero\" output: \"complete_piece\" op_type: \"Equal\" }\n",
+            "node { input: \"responding\" input: \"complete_piece\" output: \"completed_response\" op_type: \"And\" }\n",
+            "node { input: \"completed_response\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }",
+        ));
+        let line = graph
+            .lines()
+            .find(|line| line.starts_with("initializer { name: \"ranked_logits\""))
+            .unwrap();
+        let logits = (0..32)
+            .map(|id| {
+                format!(
+                    " float_data: {}",
+                    match id {
+                        16 => 3,
+                        17 => 2,
+                        18 => 1,
+                        _ => -1000,
+                    }
+                )
+            })
+            .collect::<String>();
+        std::fs::write(
+            path,
+            graph.replace(
+                line,
+                &format!("initializer {{ name: \"ranked_logits\" data_type: 1 dims: 32{logits} }}"),
+            ),
+        )
+        .unwrap();
+        package
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn native_constraint_config() -> crate::ServerConfig {
+        crate::ServerConfig {
+            engine_config: onnx_genai_engine::EngineConfig {
+                decode_backend: onnx_genai_engine::EngineDecodeBackend::Native,
+                native_device: Some(onnx_genai_engine::NativeDecodeDevice::Cpu),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+    #[cfg(feature = "native-backend")]
+    async fn duplex_audio(client: &mut Client) {
+        duplex_audio_sample(client, 100).await;
+    }
+    #[cfg(feature = "native-backend")]
+    async fn duplex_audio_sample(client: &mut Client, sample: i16) {
+        use base64::Engine as _;
+        let pcm: Vec<u8> = (0..320).flat_map(|_| sample.to_le_bytes()).collect();
+        send(client,json!({"type":"input_audio_buffer.append","audio":base64::engine::general_purpose::STANDARD.encode(pcm)})).await;
+    }
+    #[cfg(feature = "native-backend")]
+    async fn duplex_tools(client: &mut Client, city: &str) {
+        send(client,json!({"type":"session.update","session":{"output_modalities":["text"],"max_output_tokens":1,"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"city":{"const":city}},"required":["city"],"additionalProperties":false}}],"tool_choice":"required"}})).await;
+        let updated = event(client).await;
+        assert_eq!(updated["type"], "session.updated", "{updated}");
+    }
+    #[cfg(feature = "native-backend")]
+    async fn duplex_prefix(client: &mut Client) {
+        duplex_audio(client).await;
+        let mut response_id = None;
+        loop {
+            let output = event(client).await;
+            assert_ne!(output["type"], "error", "{output}");
+            assert_ne!(
+                output["type"], "response.done",
+                "prefix must stay incomplete: {output}"
+            );
+            if output["type"] == "response.created" {
+                assert_eq!(
+                    output["response"]["output_modalities"],
+                    json!(["text"]),
+                    "{output}"
+                );
+                response_id = Some(output["response"]["id"].clone());
+            }
+            if output["type"] == "response.function_call_arguments.delta" {
+                assert_eq!(Some(output["response_id"].clone()), response_id, "{output}");
+                assert_eq!(output["delta"], r#"{"city":""#, "{output}");
+                break;
+            }
+        }
+    }
+    #[cfg(feature = "native-backend")]
+    async fn duplex_done(client: &mut Client, status: &str) -> Value {
+        loop {
+            let output = event(client).await;
+            assert_ne!(output["type"], "error", "{output}");
+            if status == "cancelled" {
+                assert_ne!(
+                    output["type"], "response.function_call_arguments.done",
+                    "{output}"
+                );
+            }
+            if output["type"] == "response.done" {
+                assert_eq!(output["response"]["status"], status);
+                return output;
+            }
+        }
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_duplex_freezes_tool_plan_across_updates_and_rearms_after_cancel() {
+        let package = fragmented_duplex_constraint_package();
+        let (state, address, task) =
+            server_for_package_with_config(package.path(), native_constraint_config()).await;
+        let mut client = connect(address).await;
+        let created = event(&mut client).await;
+        assert_eq!(created["type"], "session.created", "{created}");
+        duplex_tools(&mut client, "Paris").await;
+        duplex_prefix(&mut client).await;
+        // Tool definitions are part of frozen model conditioning. A rejected
+        // update must not alter either Native masking or parameter admission.
+        send(&mut client,json!({"type":"session.update","session":{"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"city":{"const":"Rome"}},"required":["city"],"additionalProperties":false}}],"tool_choice":"none"}})).await;
+        let rejected = event(&mut client).await;
+        assert_eq!(rejected["type"], "error", "{rejected}");
+        assert_eq!(
+            rejected["error"]["type"], "invalid_request_error",
+            "{rejected}"
+        );
+        assert!(
+            rejected["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("session.tools cannot change"),
+            "{rejected}"
+        );
+        // Only response defaults may change after input. The active response
+        // retains its Required/Paris constraint and original text modality.
+        send(&mut client,json!({"type":"session.update","session":{"tool_choice":"none","output_modalities":["audio"],"max_output_tokens":1}})).await;
+        let updated = event(&mut client).await;
+        assert_eq!(updated["type"], "session.updated", "{updated}");
+        assert_eq!(updated["session"]["tool_choice"], "none", "{updated}");
+        assert_eq!(
+            updated["session"]["output_modalities"],
+            json!(["audio"]),
+            "{updated}"
+        );
+        assert_eq!(updated["session"]["max_output_tokens"], 1, "{updated}");
+        duplex_audio(&mut client).await;
+        let done = loop {
+            let output = event(&mut client).await;
+            assert_ne!(output["type"], "error", "{output}");
+            assert_ne!(
+                output["type"], "response.output_audio.delta",
+                "active text modality must remain frozen: {output}"
+            );
+            if output["type"] == "response.done" {
+                assert_eq!(output["response"]["status"], "completed", "{output}");
+                break output;
+            }
+        };
+        assert_eq!(
+            done["response"]["output"][0]["arguments"],
+            r#"{"city":"Paris"}"#
+        );
+        assert_eq!(done["response"]["usage"]["output_tokens"], 2, "{done}");
+        send(&mut client,json!({"type":"session.update","session":{"tool_choice":"required","output_modalities":["text"]}})).await;
+        let restored = event(&mut client).await;
+        assert_eq!(restored["type"], "session.updated", "{restored}");
+        assert_eq!(restored["session"]["tool_choice"], "required", "{restored}");
+        assert_eq!(
+            restored["session"]["output_modalities"],
+            json!(["text"]),
+            "{restored}"
+        );
+        duplex_prefix(&mut client).await;
+        send(&mut client, json!({"type":"response.cancel"})).await;
+        let cancelled = duplex_done(&mut client, "cancelled").await;
+        let call = cancelled["response"]["output"][0]["call_id"].clone();
+        send(&mut client,json!({"type":"conversation.item.create","item":{"type":"function_call_output","call_id":call,"output":"not admitted"}})).await;
+        let rejected_result = event(&mut client).await;
+        assert_eq!(rejected_result["type"], "error", "{rejected_result}");
+        duplex_prefix(&mut client).await;
+        duplex_audio(&mut client).await;
+        let done = duplex_done(&mut client, "completed").await;
+        assert_eq!(
+            done["response"]["output"][0]["arguments"],
+            r#"{"city":"Paris"}"#
+        );
+        drop(client);
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_duplex_constraint_progress_survives_poll_without_rearming() {
+        let package = fragmented_duplex_constraint_package();
+        let path = package.path().join("model.onnx.textproto");
+        let graph = std::fs::read_to_string(&path).unwrap();
+        let waiting =
+            "node { input: \"wait_audio\" output: \"needs_input\" op_type: \"Identity\" }";
+        assert!(graph.contains(waiting));
+        std::fs::write(
+            path,
+            graph.replace(
+                waiting,
+                "node { input: \"responding\" output: \"needs_input\" op_type: \"Not\" }",
+            ),
+        )
+        .unwrap();
+        // Poll must sample too, not echo the empty conditioning token vector.
+        let path = package.path().join("model.onnx.textproto");
+        let graph = std::fs::read_to_string(&path).unwrap();
+        let original = "node { input: \"is_duplex\" input: \"is_audio\" output: \"duplex_generating\" op_type: \"And\" }";
+        assert!(graph.contains(original));
+        let replacement = concat!(
+            "initializer { name: \"poll_op\" data_type: 7 int64_data: 7 }\n",
+            "node { input: \"operation\" input: \"poll_op\" output: \"is_poll\" op_type: \"Equal\" }\n",
+            "node { input: \"is_audio\" input: \"is_poll\" output: \"samples_text\" op_type: \"Or\" }\n",
+            "node { input: \"is_duplex\" input: \"samples_text\" output: \"duplex_generating\" op_type: \"And\" }",
+        );
+        std::fs::write(path, graph.replace(original, replacement)).unwrap();
+        let (state, address, task) =
+            server_for_package_with_config(package.path(), native_constraint_config()).await;
+        let mut client = connect(address).await;
+        assert_eq!(event(&mut client).await["type"], "session.created");
+        duplex_tools(&mut client, "Paris").await;
+        duplex_audio(&mut client).await;
+        let done = duplex_done(&mut client, "completed").await;
+        assert_eq!(
+            done["response"]["output"][0]["arguments"],
+            r#"{"city":"Paris"}"#
+        );
+        assert_eq!(done["response"]["usage"]["output_tokens"], 2);
+        drop(client);
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn eos_duplex_constraint_package(ignore_mask: bool) -> tempfile::TempDir {
+        let package = fragmented_duplex_constraint_package();
+        let path = package.path().join("model.onnx.textproto");
+        let graph = std::fs::read_to_string(&path).unwrap();
+        let waiting =
+            "node { input: \"wait_audio\" output: \"needs_input\" op_type: \"Identity\" }";
+        let audio = "node { input: \"is_duplex\" input: \"is_audio\" output: \"duplex_generating\" op_type: \"And\" }";
+        let turn = "node { input: \"operation\" input: \"generate\" output: \"turn_generating\" op_type: \"Equal\" }";
+        let done = "node { input: \"completed_response\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }";
+        assert!(
+            graph.contains(waiting)
+                && graph.contains(audio)
+                && graph.contains(turn)
+                && graph.contains(done)
+        );
+        let graph=graph.replace(waiting,"node { input: \"responding\" output: \"needs_input\" op_type: \"Not\" }")
+            .replace(audio,concat!(
+                "initializer { name: \"poll_op\" data_type: 7 int64_data: 7 }\n",
+                "node { input: \"operation\" input: \"poll_op\" output: \"is_poll\" op_type: \"Equal\" }\n",
+                "node { input: \"is_audio\" input: \"is_poll\" output: \"samples_text\" op_type: \"Or\" }\n",
+                "node { input: \"is_duplex\" input: \"samples_text\" output: \"duplex_generating\" op_type: \"And\" }",
+            )).replace(turn,concat!(
+                "node { input: \"operation\" input: \"generate\" output: \"turn_start\" op_type: \"Equal\" }\n",
+                "node { input: \"turn_start\" input: \"is_poll\" output: \"turn_generating\" op_type: \"Or\" }",
+            )).replace(done,concat!(
+                "node { input: \"tokens_out\" output: \"selected_id\" op_type: \"ReduceSum\" attribute { name: \"keepdims\" i: 0 type: INT } }\n",
+                "node { input: \"selected_id\" input: \"three\" output: \"selected_eos\" op_type: \"Equal\" }\n",
+                "node { input: \"selected_eos\" input: \"cancelling\" output: \"done\" op_type: \"Or\" }",
+            ));
+        // EOS has the highest native logit at every step. The bool vocabulary
+        // mask must forbid it until the complete schema-conforming envelope.
+        let line = graph
+            .lines()
+            .find(|line| line.starts_with("initializer { name: \"ranked_logits\""))
+            .unwrap();
+        let logits = (0..32)
+            .map(|id| {
+                format!(
+                    " float_data: {}",
+                    match id {
+                        3 => 10,
+                        16 => 3,
+                        17 => 2,
+                        18 => 1,
+                        _ => -1000,
+                    }
+                )
+            })
+            .collect::<String>();
+        let mut graph = graph.replace(
+            line,
+            &format!("initializer {{ name: \"ranked_logits\" data_type: 1 dims: 32{logits} }}"),
+        );
+        if ignore_mask {
+            let selection = "node { input: \"effective_mask\" input: \"ranked_logits\" input: \"banned\" output: \"masked_logits\" op_type: \"Where\" }";
+            assert!(graph.contains(selection));
+            graph=graph.replace(selection,"node { input: \"all_allowed\" input: \"ranked_logits\" input: \"banned\" output: \"masked_logits\" op_type: \"Where\" }");
+        }
+        std::fs::write(path, graph).unwrap();
+        package
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_duplex_masks_early_eos_and_admits_declared_eos_after_tool_completion() {
+        let package = eos_duplex_constraint_package(false);
+        let mut config = native_constraint_config();
+        config.max_output_tokens = 1;
+        let (state, address, task) = server_for_package_with_config(package.path(), config).await;
+        let mut client = connect(address).await;
+        assert_eq!(event(&mut client).await["type"], "session.created");
+        duplex_tools(&mut client, "Paris").await;
+        // Duplex is input-driven and intentionally unlimited, even when the
+        // server/session turn defaults are one token. Native EOS ends it.
+        duplex_audio(&mut client).await;
+        let done = duplex_done(&mut client, "completed").await;
+        assert_eq!(
+            done["response"]["output"][0]["arguments"],
+            r#"{"city":"Paris"}"#
+        );
+        assert_eq!(done["response"]["output"][0]["status"], "completed");
+        assert_eq!(done["response"]["usage"]["output_tokens"], 3);
+        // A second automatic response must arm from the beginning, after EOS
+        // cleared the first grammar; no stale EOF state may select EOS first.
+        duplex_audio(&mut client).await;
+        let next = duplex_done(&mut client, "completed").await;
+        assert_ne!(done["response"]["id"], next["response"]["id"]);
+        assert_eq!(
+            next["response"]["output"][0]["arguments"],
+            r#"{"city":"Paris"}"#
+        );
+        assert_eq!(next["response"]["usage"]["output_tokens"], 3);
+        drop(client);
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_duplex_rejects_native_eos_when_graph_ignores_required_mask() {
+        let package = eos_duplex_constraint_package(true);
+        let (state, address, task) =
+            server_for_package_with_config(package.path(), native_constraint_config()).await;
+        let mut client = connect(address).await;
+        assert_eq!(event(&mut client).await["type"], "session.created");
+        duplex_tools(&mut client, "Paris").await;
+        duplex_audio(&mut client).await;
+        loop {
+            let output = event(&mut client).await;
+            assert_ne!(
+                output["type"], "response.done",
+                "forbidden EOS cannot complete: {output}"
+            );
+            assert_ne!(
+                output["type"], "response.function_call_arguments.done",
+                "{output}"
+            );
+            assert_ne!(output["type"], "response.output_item.done", "{output}");
+            if output["type"] == "error" {
+                assert_eq!(output["error"]["type"], "server_error");
+                assert!(
+                    output["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("token 3 forbidden by token_mask"),
+                    "{output}"
+                );
+                break;
+            }
+        }
+        drop(client);
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_native_turn_limit_truncates_tool_prefix_then_override_reaches_eos() {
+        let package = eos_duplex_constraint_package(false);
+        let path = package.path().join("inference_metadata.yaml");
+        let metadata = std::fs::read_to_string(&path).unwrap().replacen(
+            "default_mode: duplex",
+            "default_mode: realtime",
+            1,
+        );
+        assert!(metadata.contains("default_mode: realtime"));
+        std::fs::write(path, metadata).unwrap();
+        let (state, address, task) =
+            server_for_package_with_config(package.path(), native_constraint_config()).await;
+        let mut client = connect(address).await;
+        assert_eq!(event(&mut client).await["type"], "session.created");
+        duplex_tools(&mut client, "Paris").await;
+        for limit in [1, 4] {
+            send(&mut client,json!({"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}})).await;
+            assert_eq!(event(&mut client).await["type"], "conversation.item.added");
+            assert_eq!(event(&mut client).await["type"], "conversation.item.done");
+            send(
+                &mut client,
+                json!({"type":"response.create","response":{"max_output_tokens":limit}}),
+            )
+            .await;
+            let done = loop {
+                let output = event(&mut client).await;
+                assert_ne!(output["type"], "error", "{output}");
+                if limit == 1 {
+                    assert_ne!(
+                        output["type"], "response.function_call_arguments.done",
+                        "truncated call is not admitted: {output}"
+                    );
+                }
+                if output["type"] == "response.done" {
+                    break output;
+                }
+            };
+            assert_eq!(done["response"]["status"], "completed");
+            let call = &done["response"]["output"][0];
+            if limit == 1 {
+                assert_eq!(done["response"]["usage"]["output_tokens"], 1);
+                assert_eq!(call["status"], "incomplete");
+                assert_eq!(call["arguments"], r#"{"city":""#);
+                send(&mut client,json!({"type":"conversation.item.create","item":{"type":"function_call_output","call_id":call["call_id"],"output":"not admitted"}})).await;
+                assert_eq!(event(&mut client).await["type"], "error");
+            } else {
+                assert_eq!(done["response"]["usage"]["output_tokens"], 3);
+                assert_eq!(call["status"], "completed");
+                assert_eq!(call["arguments"], r#"{"city":"Paris"}"#);
+            }
+        }
+        drop(client);
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_duplex_rejects_missing_mask_and_unsupported_forcing_before_audio() {
+        use base64::Engine as _;
+        for xml in [false, true] {
+            let package = duplex_constraint_package();
+            let path = package.path().join("inference_metadata.yaml");
+            let mut metadata: serde_yaml::Value =
+                serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            if xml {
+                metadata["package"]["tool_protocol"] =
+                    serde_yaml::to_value(json!({"identity":"atem-xml","version":"v1"})).unwrap();
+            } else {
+                metadata["profiles"]["live"]["realtime"]["inputs"]
+                    .as_mapping_mut()
+                    .unwrap()
+                    .remove(serde_yaml::Value::String("token_mask".into()));
+                metadata["pipeline"]["workflow"]["inputs"]
+                    .as_mapping_mut()
+                    .unwrap()
+                    .remove(serde_yaml::Value::String("request.token_mask".into()));
+                metadata["pipeline"]["workflow"]["steps"][0]["inputs"]
+                    .as_mapping_mut()
+                    .unwrap()
+                    .remove(serde_yaml::Value::String("token_mask".into()));
+                // Keep the exported graph valid: absent host binding becomes an
+                // explicit empty optional input default on this fixture graph.
+                let graph_path = package.path().join("model.onnx.textproto");
+                let graph = std::fs::read_to_string(&graph_path).unwrap();
+                let input = "input { name: \"token_mask\" type { tensor_type { elem_type: 9 shape { dim { dim_param: \"vocabulary_mask\" } } } } }";
+                assert!(graph.contains(input));
+                std::fs::write(
+                    graph_path,
+                    graph.replace(
+                        input,
+                        "initializer { name: \"token_mask\" data_type: 9 dims: 0 }",
+                    ),
+                )
+                .unwrap();
+            }
+            std::fs::write(path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
+            let (state, address, task) =
+                server_for_package_with_config(package.path(), native_constraint_config()).await;
+            let mut client = connect(address).await;
+            let created = event(&mut client).await;
+            assert_eq!(created["type"], "session.created", "xml={xml}: {created}");
+            duplex_tools(&mut client, "Paris").await;
+            duplex_audio(&mut client).await;
+            let error = event(&mut client).await;
+            assert_eq!(error["type"], "error", "xml={xml}: {error}");
+            assert_eq!(
+                error["error"]["type"], "invalid_request_error",
+                "xml={xml}: {error}"
+            );
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(if xml { "forcing plan" } else { "token_mask" }),
+                "{error}"
+            );
+            // A legal instructions update proves the rejected append did not
+            // start/freeze the conversation. Duplex commit is always rejected,
+            // so an empty-commit error would not prove this property.
+            send(&mut client,json!({"type":"session.update","session":{"instructions":"hello","tool_choice":"none","output_modalities":["audio"]}})).await;
+            let updated = event(&mut client).await;
+            assert_eq!(updated["type"], "session.updated", "xml={xml}: {updated}");
+            assert_eq!(updated["session"]["instructions"], "hello", "{updated}");
+            assert_eq!(updated["session"]["tool_choice"], "none", "{updated}");
+            // Rejected PCM was 100. A single accepted 300-valued frame must be
+            // the first Native output: queued rejected PCM would emit 100, and
+            // previously executed PCM would contaminate the fixture's KV sum.
+            duplex_audio_sample(&mut client, 300).await;
+            let mut frames = Vec::new();
+            let mut response_id = None;
+            let done = loop {
+                let output = event(&mut client).await;
+                assert_ne!(output["type"], "error", "xml={xml}: {output}");
+                assert_ne!(
+                    output["type"], "response.function_call_arguments.done",
+                    "{output}"
+                );
+                if output["type"] == "response.created" {
+                    assert_eq!(
+                        output["response"]["output_modalities"],
+                        json!(["audio"]),
+                        "{output}"
+                    );
+                    response_id = Some(output["response"]["id"].clone());
+                }
+                if output["type"] == "response.output_audio.delta" {
+                    assert_eq!(Some(output["response_id"].clone()), response_id, "{output}");
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(output["delta"].as_str().unwrap())
+                        .unwrap();
+                    assert_eq!(bytes.len(), 320 * 2, "{output}");
+                    frames.push(
+                        bytes
+                            .chunks_exact(2)
+                            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                if output["type"] == "response.done" {
+                    assert_eq!(
+                        Some(output["response"]["id"].clone()),
+                        response_id,
+                        "{output}"
+                    );
+                    assert_eq!(output["response"]["status"], "completed", "{output}");
+                    assert_eq!(output["response"]["usage"]["output_tokens"], 1, "{output}");
+                    break output;
+                }
+            };
+            assert_eq!(frames, vec![vec![300; 320]], "xml={xml}: {done}");
+            drop(client);
+            let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+            tokio::task::spawn_blocking(move || model.engine.shutdown())
+                .await
+                .unwrap();
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_owner_arms_generic_constraint_without_consuming_a_quantum() {
+        let package = duplex_constraint_package();
+        let (state, _, task) =
+            server_for_package_with_config(package.path(), native_constraint_config()).await;
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+        let (mut native, initial) = model
+            .engine
+            .open_realtime(RealtimeMode::Duplex, vec![4])
+            .await
+            .unwrap();
+        assert_eq!(initial.tokens, vec![4]);
+        // A rejected compilation is an admission error, not a KV poison event.
+        assert!(
+            native
+                .arm_constraint(Some(onnx_genai_engine::GenerateConstraint::Regex {
+                    pattern: "[".into(),
+                    prefix: String::new()
+                }))
+                .await
+                .is_err()
+        );
+        let good =
+            "<tool_call>\n{\"name\":\"lookup\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>";
+        native
+            .arm_constraint(Some(onnx_genai_engine::GenerateConstraint::Regex {
+                pattern: regex::escape(good),
+                prefix: String::new(),
+            }))
+            .await
+            .unwrap();
+        let output = native
+            .step(RealtimeInputOwned::Audio(vec![0.1; 320]))
+            .await
+            .unwrap();
+        assert_eq!(output.tokens, vec![16]);
+        assert_eq!(output.output_tokens, 1);
+        assert!(output.done);
+        // Completion clears the response grammar; no plan means higher Rome wins.
+        native.arm_constraint(None).await.unwrap();
+        let output = native
+            .step(RealtimeInputOwned::Audio(vec![0.1; 320]))
+            .await
+            .unwrap();
+        assert_eq!(output.tokens, vec![17]);
+        drop(native);
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn websocket_duplex_publishes_audio_before_commit_and_acknowledges_native_cancel() {
         use base64::Engine as _;
