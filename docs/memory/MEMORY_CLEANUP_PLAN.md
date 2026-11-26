@@ -3350,3 +3350,30 @@ snapshots. Final-origin alignment (base plus byte_offset), signed zeros, subnorm
 infinity and NaN storage bits, source/Y aliases and same-shape layout changes are
 covered explicitly. Neither removal of copies nor callback counts is a latency
 measurement.
+
+### Shared logical geometry handles empty and packed extents
+
+IR checked_numel now treats any zero extent as an empty tensor, including a zero
+following an overflowing prefix. Scalar count stays one; true nonempty overflow
+stays None. Both EP view kinds share this count and checked dense-byte queries.
+Their structural validation rejects nonempty count/byte overflow and an Undefined
+raw dtype with contextual errors, while preserving byte-offset, null and dtype
+checks. Identity consumes the validated shared byte size instead of repeating a
+private geometry checker. Bounds, Host accessibility and ownership remain separate
+proofs.
+
+Contiguity and the positive-extent density shortcut share a checked unsigned
+stride-relation walk. The general density walk uses unsigned absolute strides,
+including i64::MIN, and neither walk computes an unused final element total.
+This permits representable stride relations for large packed element counts
+without confusing signed stride capacity with logical count or physical bytes.
+The prior distinctions for empty layouts remain covered by differential tests;
+ordinary-rank density still uses stack storage. No payload or governor is added.
+
+Three regressions fail on the previous implementation (two overflow panics and
+an incorrect empty count). Boundary checks cover both view kinds, zero axes in
+each position, true nonempty/byte overflow, scalar geometry, unsigned stride
+magnitudes and packed counts exceeding i64 without reading device pointers.
+Infallible compute_contiguous_strides and its production callers still need a
+separate fallible API migration for unrepresentable suffix strides; this change
+does not claim to fix stride construction or every unvalidated geometry caller.
