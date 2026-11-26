@@ -1,0 +1,234 @@
+{
+  "cells": [
+    {
+      "K": 32,
+      "N": 256,
+      "candidate_over_row_cpu": {
+        "max": 1.8869533384758193,
+        "median": 1.8785861490651277,
+        "min": 1.8755049327542226,
+        "n": 4
+      },
+      "candidate_over_row_wall": {
+        "max": 1.8874759220670854,
+        "median": 1.8787827723544295,
+        "min": 1.875481926824445,
+        "n": 4
+      },
+      "classification": "qualified under frozen coarse controls",
+      "format": "q4",
+      "gate_failures": [],
+      "rows": 1
+    },
+    {
+      "K": 1024,
+      "N": 256,
+      "candidate_over_row_cpu": null,
+      "candidate_over_row_wall": null,
+      "classification": "diagnostic",
+      "format": "q4",
+      "gate_failures": [
+        "run-011: foreign process-average CPU outside gate",
+        "run-049: foreign process-average CPU outside gate"
+      ],
+      "rows": 1
+    },
+    {
+      "K": 32,
+      "N": 256,
+      "candidate_over_row_cpu": null,
+      "candidate_over_row_wall": null,
+      "classification": "diagnostic",
+      "format": "q4",
+      "gate_failures": [
+        "run-018: foreign process-average CPU outside gate",
+        "run-022: foreign process-average CPU outside gate",
+        "run-026: foreign process-average CPU outside gate"
+      ],
+      "rows": 3
+    },
+    {
+      "K": 1024,
+      "N": 256,
+      "candidate_over_row_cpu": null,
+      "candidate_over_row_wall": null,
+      "classification": "diagnostic",
+      "format": "q4",
+      "gate_failures": [
+        "run-029: foreign process-average CPU outside gate",
+        "run-036: foreign process-average CPU outside gate",
+        "run-046: foreign process-average CPU outside gate",
+        "run-053: foreign process-average CPU outside gate"
+      ],
+      "rows": 3
+    },
+    {
+      "K": 32,
+      "N": 256,
+      "candidate_over_row_cpu": null,
+      "candidate_over_row_wall": null,
+      "classification": "diagnostic",
+      "format": "q4",
+      "gate_failures": [
+        "run-012: foreign process-average CPU outside gate",
+        "run-056: foreign process-average CPU outside gate"
+      ],
+      "rows": 8
+    },
+    {
+      "K": 1024,
+      "N": 256,
+      "candidate_over_row_cpu": null,
+      "candidate_over_row_wall": null,
+      "classification": "diagnostic",
+      "format": "q4",
+      "gate_failures": [
+        "run-005: foreign process-average CPU outside gate",
+        "run-047: foreign process-average CPU outside gate"
+      ],
+      "rows": 8
+    },
+    {
+      "K": 32,
+      "N": 256,
+      "candidate_over_row_cpu": null,
+      "candidate_over_row_wall": null,
+      "classification": "diagnostic",
+      "format": "q4",
+      "gate_failures": [
+        "run-002: foreign process-average CPU outside gate",
+        "run-015: foreign process-average CPU outside gate",
+        "run-048: foreign process-average CPU outside gate"
+      ],
+      "rows": 32
+    },
+    {
+      "K": 1024,
+      "N": 256,
+      "candidate_over_row_cpu": null,
+      "candidate_over_row_wall": null,
+      "classification": "diagnostic",
+      "format": "q4",
+      "gate_failures": [
+        "run-009: foreign process-average CPU outside gate",
+        "run-062: foreign process-average CPU outside gate"
+      ],
+      "rows": 32
+    },
+    {
+      "K": 32,
+      "N": 256,
+      "candidate_over_row_cpu": null,
+      "candidate_over_row_wall": null,
+      "classification": "diagnostic",
+      "format": "q8",
+      "gate_failures": [
+        "run-045: foreign process-average CPU outside gate"
+      ],
+      "rows": 1
+    },
+    {
+      "K": 1024,
+      "N": 256,
+      "candidate_over_row_cpu": null,
+      "candidate_over_row_wall": null,
+      "classification": "diagnostic",
+      "format": "q8",
+      "gate_failures": [
+        "run-037: foreign process-average CPU outside gate",
+        "run-041: foreign process-average CPU outside gate",
+        "run-060: foreign process-average CPU outside gate"
+      ],
+      "rows": 1
+    },
+    {
+      "K": 32,
+      "N": 256,
+      "candidate_over_row_cpu": null,
+      "candidate_over_row_wall": null,
+      "classification": "diagnostic",
+      "format": "q8",
+      "gate_failures": [
+        "run-042: foreign process-average CPU outside gate",
+        "run-059: foreign process-average CPU outside gate"
+      ],
+      "rows": 3
+    },
+    {
+      "K": 1024,
+      "N": 256,
+      "candidate_over_row_cpu": null,
+      "candidate_over_row_wall": null,
+      "classification": "diagnostic",
+      "format": "q8",
+      "gate_failures": [
+        "run-033: foreign process-average CPU outside gate"
+      ],
+      "rows": 3
+    },
+    {
+      "K": 32,
+      "N": 256,
+      "candidate_over_row_cpu": null,
+      "candidate_over_row_wall": null,
+      "classification": "diagnostic",
+      "format": "q8",
+      "gate_failures": [
+        "run-032: foreign process-average CPU outside gate",
+        "run-039: foreign process-average CPU outside gate"
+      ],
+      "rows": 8
+    },
+    {
+      "K": 1024,
+      "N": 256,
+      "candidate_over_row_cpu": null,
+      "candidate_over_row_wall": null,
+      "classification": "diagnostic",
+      "format": "q8",
+      "gate_failures": [
+        "run-019: foreign process-average CPU outside gate",
+        "run-051: foreign process-average CPU outside gate"
+      ],
+      "rows": 8
+    },
+    {
+      "K": 32,
+      "N": 256,
+      "candidate_over_row_cpu": null,
+      "candidate_over_row_wall": null,
+      "classification": "diagnostic",
+      "format": "q8",
+      "gate_failures": [
+        "run-052: foreign process-average CPU outside gate"
+      ],
+      "rows": 32
+    },
+    {
+      "K": 1024,
+      "N": 256,
+      "candidate_over_row_cpu": {
+        "max": 0.9783762198317815,
+        "median": 0.9728463374073535,
+        "min": 0.9694097158660817,
+        "n": 4
+      },
+      "candidate_over_row_wall": {
+        "max": 0.9784595867735154,
+        "median": 0.9728325702633593,
+        "min": 0.969303643806491,
+        "n": 4
+      },
+      "classification": "qualified under frozen coarse controls",
+      "format": "q8",
+      "gate_failures": [],
+      "rows": 32
+    }
+  ],
+  "decision": "Keep production unchanged. This is a private-projection loop experiment; operator/model and multiworker effects are not established.",
+  "processes": 64,
+  "production_changed": false,
+  "qualified_cells": 2,
+  "scope": "full private projection plus fresh checked test lane binding; excludes operator publication, routing, governed admission and model inference",
+  "windows": 704
+}

@@ -42,7 +42,9 @@ pub use onnx_runtime_ep_api::DeviceBuffer;
 pub use onnx_runtime_ep_api::DeviceGraphSlot;
 pub use onnx_runtime_ep_api::WorkspaceRequirement;
 pub use workspace::{WorkspaceBounds, WorkspacePreparationReport};
+mod cpu_workers;
 mod workspace;
+pub use cpu_workers::CpuWorkerPlan;
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
 };
@@ -166,6 +168,10 @@ mod error {
     /// Errors produced by the session layer.
     #[derive(Debug, thiserror::Error)]
     pub enum SessionError {
+        #[error(
+            "CPU worker plan is unsupported: {reason}; keep a single executor or supply a supported external-mapped CPU graph"
+        )]
+        UnsupportedCpuWorkerPlan { reason: String },
         #[error(
             "fallback_execution_provider '{provider}' is bound to {device:?}; pass a CPU provider initialized with this session's memory resources"
         )]
