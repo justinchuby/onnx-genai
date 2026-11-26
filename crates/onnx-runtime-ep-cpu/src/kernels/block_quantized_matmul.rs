@@ -3850,3 +3850,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod packed_dot_contract;
