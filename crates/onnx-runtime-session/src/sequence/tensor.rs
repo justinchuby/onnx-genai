@@ -42,63 +42,29 @@ impl SeqTensor {
 
     /// Build a host tensor from raw element bytes and share it as a sequence item.
     pub fn from_raw(dtype: DataType, shape: Vec<usize>, bytes: &[u8]) -> SequenceResult<Self> {
+        Self::from_raw_in(
+            &crate::HostTensorAllocator::standalone(),
+            dtype,
+            shape,
+            bytes,
+        )
+    }
+
+    /// Construct through an explicit host allocation owner, including model budgets.
+    pub fn from_raw_in(
+        allocator: &crate::HostTensorAllocator,
+        dtype: DataType,
+        shape: Vec<usize>,
+        bytes: &[u8],
+    ) -> SequenceResult<Self> {
         validate_tensor_bytes("SequenceTensor", bytes, dtype, &shape)?;
-        let mut storage = SharedTensorBuffer::allocate_cpu(bytes.len()).map_err(|source| {
+        let tensor = allocator.from_raw(dtype, shape, bytes).map_err(|source| {
             SequenceError::TensorCreation {
                 op: "SequenceTensor",
                 source,
             }
         })?;
-        let allocator = Arc::clone(storage.allocator());
-        allocator
-            .copy_from_host(
-                bytes,
-                Arc::get_mut(&mut storage)
-                    .expect("fresh sequence storage is uniquely owned")
-                    .buffer_mut(),
-            )
-            .map_err(|source| SequenceError::TensorCreation {
-                op: "SequenceTensor",
-                source: source.into(),
-            })?;
-        Ok(Self {
-            storage,
-            dtype,
-            shape,
-            layout: TensorLayout::contiguous(),
-            byte_offset: 0,
-        })
-    }
-
-    pub(crate) fn from_shared(
-        storage: Arc<SharedTensorBuffer>,
-        dtype: DataType,
-        shape: Vec<usize>,
-        layout: TensorLayout,
-        byte_offset: usize,
-    ) -> SequenceResult<Self> {
-        let strides =
-            layout
-                .resolved_strides(&shape)
-                .map_err(|source| SequenceError::TensorCreation {
-                    op: "SequenceTensor",
-                    source: source.into(),
-                })?;
-        validate_view_bounds(
-            "SequenceTensor",
-            &shape,
-            &strides,
-            byte_offset,
-            dtype,
-            storage.buffer().len(),
-        )?;
-        Ok(Self {
-            storage,
-            dtype,
-            shape,
-            layout,
-            byte_offset,
-        })
+        Self::new(tensor)
     }
 
     /// Whether two handles share the same underlying device allocation.
@@ -591,7 +557,7 @@ pub(super) fn validate_tensor_bytes(
     Ok(())
 }
 
-pub(super) fn validate_view_bounds(
+pub(crate) fn validate_view_bounds(
     op: &'static str,
     shape: &[usize],
     strides: &[i64],

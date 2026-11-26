@@ -4,6 +4,7 @@ pub(super) fn stage_host_prefix_rewind(
     past: &HashMap<String, Tensor>,
     skip_names: &HashSet<String>,
     target_len: usize,
+    allocator: &onnx_runtime_session::HostTensorAllocator,
 ) -> anyhow::Result<Vec<(String, Tensor)>> {
     let mut rewound = Vec::new();
     for (name, tensor) in past {
@@ -17,7 +18,7 @@ pub(super) fn stage_host_prefix_rewind(
             .with_context(|| format!("native KV tensor '{name}' rank is below 2"))?;
         rewound.push((
             name.clone(),
-            prefix_slice(tensor, axis, target_len)
+            prefix_slice(allocator, tensor, axis, target_len)
                 .with_context(|| format!("rewind native KV tensor '{name}'"))?,
         ));
     }
@@ -262,7 +263,12 @@ impl NativeDecodeSession {
         if !self.compressed_state.is_empty() {
             skip_names.extend(self.compressed_state.state_past_names().cloned());
         }
-        let rewound = stage_host_prefix_rewind(&self.past, &skip_names, target_len)?;
+        let rewound = stage_host_prefix_rewind(
+            &self.past,
+            &skip_names,
+            target_len,
+            &tensor::host_tensors_for_session(&self.session)?,
+        )?;
         for (name, tensor) in rewound {
             let slot = self
                 .past

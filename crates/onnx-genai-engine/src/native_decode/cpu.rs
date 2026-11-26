@@ -458,10 +458,7 @@ impl NativeDecodeSession {
         total_len: usize,
         supplied_inputs: &[(String, Tensor)],
     ) -> anyhow::Result<Vec<(String, Tensor)>> {
-        let ids = token_ids
-            .iter()
-            .map(|&id| i64::from(id))
-            .collect::<Vec<_>>();
+        let allocator = tensor::host_tensors_for_session(&self.session)?;
         let mut supplied = HashMap::with_capacity(supplied_inputs.len());
         for (name, tensor) in supplied_inputs {
             if supplied.insert(name.as_str(), tensor).is_some() {
@@ -473,17 +470,22 @@ impl NativeDecodeSession {
         for binding in &self.step_inputs {
             let tensor = match binding.source {
                 NativeStepInputSource::TokenIds => {
-                    Tensor::from_i64(&[1, token_ids.len()], &ids)?
+                    tensor::i64_tensor_with(&allocator, vec![1, token_ids.len()], |index| i64::from(token_ids[index]))
+                        .with_context(|| format!("construct native CPU token input '{}'", binding.name))?
                 }
                 NativeStepInputSource::AttentionMask => {
-                    Tensor::from_i64(&[1, total_len], &vec![1; total_len])?
+                    tensor::i64_tensor_with(&allocator, vec![1, total_len], |_| 1)
+                        .with_context(|| format!("construct native CPU attention-mask input '{}'", binding.name))?
                 }
                 NativeStepInputSource::PositionIds => {
-                    self.build_step_positions(past_len, total_len)?
+                    self.build_step_positions(past_len, total_len)
+                        .with_context(|| format!("construct native CPU position input '{}'", binding.name))?
                 }
                 NativeStepInputSource::InputsEmbeds => supplied
                     .remove(binding.name.as_str())
-                    .cloned()
+                    .map(|source| tensor::copy_step_tensor(&allocator, source)
+                        .with_context(|| format!("materialize native CPU step input '{}'", binding.name)))
+                    .transpose()?
                     .with_context(|| {
                         format!(
                             "declared inputs_embeds input '{}' was not supplied to the native decode step; route the current embedding component output to this exact decoder port",
@@ -492,7 +494,9 @@ impl NativeDecodeSession {
                     })?,
                 NativeStepInputSource::Routed => supplied
                     .remove(binding.name.as_str())
-                    .cloned()
+                    .map(|source| tensor::copy_step_tensor(&allocator, source)
+                        .with_context(|| format!("materialize native CPU step input '{}'", binding.name)))
+                    .transpose()?
                     .with_context(|| {
                         format!(
                             "native decode graph input '{}' has no generated role and no routed step tensor; declare a pipeline dataflow edge to this exact decoder port",

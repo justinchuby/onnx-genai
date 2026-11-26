@@ -524,7 +524,7 @@ fn insert_op(
     graph.insert_node(node);
 }
 
-fn tiny_decoder(last_token_logits: bool) -> InferenceSession {
+pub(super) fn tiny_decoder(last_token_logits: bool) -> InferenceSession {
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), 11);
     let batch = graph.intern_symbol("batch");
@@ -1512,7 +1512,7 @@ fn native_decoder_auto_derive_skips_dense_ambiguous_decoder() {
     assert!(error.to_string().contains("token_input"), "{error:#}");
 }
 
-fn target_io(sequence_source: SequenceInputKind) -> DecoderAbi {
+pub(super) fn target_io(sequence_source: SequenceInputKind) -> DecoderAbi {
     DecoderAbi {
         sequence_source: Some(sequence_source),
         kv_ownership: Some(KvOwnership::Owned),
@@ -1538,7 +1538,7 @@ fn target_io(sequence_source: SequenceInputKind) -> DecoderAbi {
     }
 }
 
-fn tiny_decoder_io() -> DecoderAbi {
+pub(super) fn tiny_decoder_io() -> DecoderAbi {
     DecoderAbi {
         sequence_source: Some(SequenceInputKind::TokenIds),
         kv_ownership: Some(KvOwnership::Owned),
@@ -1575,7 +1575,7 @@ fn native_decoder_requires_explicit_ambiguous_io() {
     assert!(error.to_string().contains("token_input"), "{error:#}");
 }
 
-fn tiny_embedding_target(with_routed_input: bool) -> InferenceSession {
+pub(super) fn tiny_embedding_target(with_routed_input: bool) -> InferenceSession {
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), 11);
     let batch = graph.intern_symbol("batch");
@@ -4611,7 +4611,12 @@ fn low_rank_carries_never_enter_token_prefix_slicing() -> anyhow::Result<()> {
             ]);
 
             for target in [1usize, 2, 3] {
-                let staged = backend::stage_host_prefix_rewind(&past, &skip_names, target)?;
+                let staged = backend::stage_host_prefix_rewind(
+                    &past,
+                    &skip_names,
+                    target,
+                    &onnx_runtime_session::HostTensorAllocator::standalone(),
+                )?;
                 assert_eq!(staged.len(), 1, "rank {carry_shape:?}, target {target}");
                 assert_eq!(staged[0].0, "dense_kv");
                 assert_eq!(staged[0].1.shape, vec![1, 1, target, 1]);
@@ -4631,7 +4636,12 @@ fn low_rank_carries_never_enter_token_prefix_slicing() -> anyhow::Result<()> {
                 "past_carry".to_string(),
                 Tensor::from_f32(&carry_shape, &vec![999.0; carry_values.len()])?,
             );
-            let staged = backend::stage_host_prefix_rewind(&past, &skip_names, 2)?;
+            let staged = backend::stage_host_prefix_rewind(
+                &past,
+                &skip_names,
+                2,
+                &onnx_runtime_session::HostTensorAllocator::standalone(),
+            )?;
             for (name, tensor) in staged {
                 past.insert(name, tensor);
             }

@@ -141,12 +141,6 @@ impl SharedTensorBuffer {
         })
     }
 
-    pub(crate) fn allocate_cpu(bytes: usize) -> Result<Arc<Self>> {
-        let allocator: Arc<dyn ExecutionProvider> = shared_cpu_ep();
-        let buffer = allocator.allocate(bytes.max(1), TensorLayout::contiguous().alignment)?;
-        Ok(Self::new(allocator, buffer))
-    }
-
     pub(crate) fn buffer(&self) -> &DeviceBuffer {
         self.buffer
             .as_ref()
@@ -1209,6 +1203,14 @@ pub struct HostTensorAllocator {
     allocator: Arc<dyn ExecutionProvider>,
 }
 impl HostTensorAllocator {
+    /// Explicit standalone Host allocator, outside any model-specific budget.
+    /// Managed Engine paths must use InferenceSession::host_tensor_allocator.
+    pub fn standalone() -> Self {
+        Self {
+            allocator: shared_cpu_ep(),
+        }
+    }
+
     pub(crate) fn new(allocator: Arc<dyn ExecutionProvider>) -> Result<Self> {
         if !allocator.device_id().is_host_accessible() {
             return Err(SessionError::Internal(format!(
@@ -1220,6 +1222,79 @@ impl HostTensorAllocator {
     }
     pub fn from_raw(&self, dtype: DataType, shape: Vec<usize>, bytes: &[u8]) -> Result<Tensor> {
         Tensor::from_raw_in(Arc::clone(&self.allocator), dtype, shape, bytes)
+    }
+    /// Gather a numeric Host tensor's declared layout into admitted contiguous
+    /// backing. Bounds use the actual source span, not its logical byte prefix.
+    pub fn copy_tensor(&self, source: &Tensor) -> Result<Tensor> {
+        Tensor::require_raw_dtype(source.dtype)?;
+        if !source.device.is_host_accessible() {
+            return Err(SessionError::Internal(format!(
+                "host tensor copy requires explicit Host transfer from {:?}",
+                source.device
+            )));
+        }
+        let expected = checked_expected_bytes(source.dtype, &source.shape).ok_or_else(|| {
+            SessionError::ShapeOverflow {
+                value: "HostTensorAllocator::copy_tensor".into(),
+                dims: source.shape.clone(),
+            }
+        })?;
+        let backing = source.buffer();
+        let element_bytes = source.dtype.byte_size();
+        if element_bytes == 0 {
+            if !source.layout.is_contiguous(&source.shape) {
+                return Err(SessionError::Internal(format!(
+                    "packed {:?} tensor copy requires contiguous storage; materialize its declared packed layout explicitly",
+                    source.dtype
+                )));
+            }
+            if expected > backing.len() {
+                return Err(SessionError::Internal(format!(
+                    "packed host tensor needs {expected} bytes but source backing has {}; correct the shape or storage span",
+                    backing.len()
+                )));
+            }
+            // SAFETY: checked contiguous logical range, initialized source
+            // elements. No padding outside that logical range is borrowed.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(backing.as_ptr().cast::<u8>(), expected) };
+            return self.from_raw(source.dtype, source.shape.clone(), bytes);
+        }
+        let strides = source.layout.resolved_strides(&source.shape)?;
+        crate::sequence::validate_view_bounds(
+            "HostTensorAllocator::copy_tensor",
+            &source.shape,
+            &strides,
+            0,
+            source.dtype,
+            backing.len(),
+        )?;
+        let logical = onnx_runtime_ir::compute_contiguous_strides(&source.shape)?;
+        let source_ptr = backing.as_ptr().cast::<u8>();
+        self.fill(source.dtype, source.shape.clone(), |destination| {
+            for (linear, target) in destination.chunks_exact_mut(element_bytes).enumerate() {
+                let mut remainder = linear;
+                let mut offset = 0_i128;
+                for axis in 0..source.shape.len() {
+                    let stride = logical[axis] as usize;
+                    let coordinate = remainder / stride;
+                    remainder %= stride;
+                    offset += coordinate as i128 * strides[axis] as i128;
+                }
+                let byte_offset = (offset * element_bytes as i128) as usize;
+                // SAFETY: checked view bounds cover every addressed element;
+                // target is distinct admitted backing. Copy only initialized
+                // addressed bytes, never borrow/read uninitialized stride gaps.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        source_ptr.add(byte_offset),
+                        target.as_mut_ptr(),
+                        element_bytes,
+                    );
+                }
+            }
+            Ok(())
+        })
     }
     /// Write f32 values directly into admitted backing, without a payload Vec.
     pub fn from_f32(&self, shape: &[usize], values: &[f32]) -> Result<Tensor> {
@@ -1338,6 +1413,36 @@ impl Tensor {
 
     pub(crate) fn allocate_cpu(dtype: DataType, shape: Vec<usize>) -> Result<Self> {
         HostTensorAllocator::new(shared_cpu_ep())?.zeros(dtype, shape)
+    }
+
+    /// Allocation owner used for explicit owned Host copies of this tensor.
+    pub fn host_tensor_allocator(&self) -> Result<HostTensorAllocator> {
+        HostTensorAllocator::new(Arc::clone(&self.allocator))
+    }
+
+    pub(crate) fn unique_host_bytes_mut(&mut self) -> Result<&mut [u8]> {
+        if !self.device.is_host_accessible() || self.import_guard.is_some() {
+            return Err(SessionError::Internal("mutable host backing requires a uniquely owned host allocation without foreign import guards".into()));
+        }
+        let expected = checked_expected_bytes(self.dtype, &self.shape).ok_or_else(|| {
+            SessionError::ShapeOverflow {
+                value: "unique host backing".into(),
+                dims: self.shape.clone(),
+            }
+        })?;
+        let buffer = self.storage.raw_mut().ok_or_else(|| {
+            SessionError::Internal(
+                "mutable numeric host backing requires raw tensor storage".into(),
+            )
+        })?;
+        if buffer.is_borrowed() || buffer.len() < expected {
+            return Err(SessionError::Internal(
+                "mutable host backing cannot borrow foreign memory or exceed owned capacity".into(),
+            ));
+        }
+        // SAFETY: exclusive owned host allocation, previously initialized by
+        // HostTensorAllocator; only crate-owned arrays call this method.
+        Ok(unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<u8>(), expected) })
     }
 
     pub(crate) fn copy_from_host_at(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {

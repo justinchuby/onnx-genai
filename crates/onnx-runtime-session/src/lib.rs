@@ -2986,3 +2986,6 @@ mod option_tests {
 
 #[cfg(test)]
 mod host_tensor_tests;
+
+mod owned_host_array;
+pub use owned_host_array::{HostElement, OwnedHostArray};

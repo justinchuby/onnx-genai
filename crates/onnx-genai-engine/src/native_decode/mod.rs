@@ -700,35 +700,34 @@ impl NativeDecodeSession {
             .step_input_name(NativeStepInputSource::PositionIds)
             .map(str::to_owned);
 
-        let ids = token_ids
-            .iter()
-            .map(|&id| i64::from(id))
-            .collect::<Vec<_>>();
+        let allocator = tensor::host_tensors_for_session(&self.session)?;
         let mut owned: Vec<(String, Tensor)> = Vec::with_capacity(3 + self.kv_inputs.len());
-        // input_ids: [N, 1] — one new token per row.
-        owned.push((token_input, Tensor::from_i64(&[batch, 1], &ids)?));
-        // attention_mask: [N, past_len + 1] — every past position and the new
-        // token are valid (uniform length, no ragged admission).
+        owned.push((
+            token_input,
+            tensor::i64_tensor_with(&allocator, vec![batch, 1], |index| {
+                i64::from(token_ids[index])
+            })?,
+        ));
         if let Some(mask) = mask_input {
-            let mask_len = past_len + 1;
+            let mask_len = past_len
+                .checked_add(1)
+                .context("native batched attention-mask length overflow")?;
             owned.push((
                 mask,
-                Tensor::from_i64(&[batch, mask_len], &vec![1i64; batch * mask_len])?,
+                tensor::i64_tensor_with(&allocator, vec![batch, mask_len], |_| 1)?,
             ));
         }
-        // position_ids: every row's new token is at position `past_len`. Rank 1
-        // -> [N, 1]; a multi-axis mrope decoder (rank > 1) -> [rank, N, 1].
         if let Some(position) = position_input {
             let pos = i64::try_from(past_len).context("past_len exceeds i64 range")?;
-            let tensor = if self.position_rank <= 1 {
-                Tensor::from_i64(&[batch, 1], &vec![pos; batch])?
+            let shape = if self.position_rank <= 1 {
+                vec![batch, 1]
             } else {
-                Tensor::from_i64(
-                    &[self.position_rank, batch, 1],
-                    &vec![pos; self.position_rank * batch],
-                )?
+                vec![self.position_rank, batch, 1]
             };
-            owned.push((position, tensor));
+            owned.push((
+                position,
+                tensor::i64_tensor_with(&allocator, shape, |_| pos)?,
+            ));
         }
         // Length-`past_len` batched past for every KV / recurrent-state input,
         // batch axis = N.
@@ -1156,8 +1155,13 @@ impl NativeDecodeSession {
                     .len()
                     .checked_sub(2)
                     .with_context(|| format!("native KV tensor '{name}' rank is below 2"))?;
-                let tensor = prefix_slice(tensor, axis, target_len)
-                    .with_context(|| format!("stage native KV tensor '{name}' for rollback"))?;
+                let tensor = prefix_slice(
+                    &tensor::host_tensors_for_session(&self.session)?,
+                    tensor,
+                    axis,
+                    target_len,
+                )
+                .with_context(|| format!("stage native KV tensor '{name}' for rollback"))?;
                 next.insert(name, tensor);
             }
         }
@@ -1407,11 +1411,15 @@ impl NativeDecodeSession {
                  KV device-resident or in-place (Inc-D)"
             );
         }
+        let allocator = tensor::host_tensors_for_session(&self.session)?;
+        let mut staged = HashMap::new();
         for (name, data, shape) in entries {
-            let tensor = Tensor::from_f32(&shape, &data)
+            let tensor = allocator
+                .from_f32(&shape, &data)
                 .with_context(|| format!("seed native paged prefix KV '{name}'"))?;
-            self.past.insert(name, tensor);
+            staged.insert(name, tensor);
         }
+        self.past.extend(staged);
         self.current_len = current_len;
         Ok(())
     }
@@ -1460,17 +1468,29 @@ impl NativeDecodeSession {
     /// A rank-1 (conventional) decoder yields `[1, S]`; a rank-N mrope decoder
     /// yields `[N, 1, S]` with every coordinate axis advancing linearly with the
     /// sequence position (the pure-text `linear_increment` continuation). The
-    /// flat values + shape come from the shared [`crate::decode::position_ids_from_starts`]
-    /// helper, so native and ORT build byte-identical positions.
+    /// values use the same axis-major position formula as
+    /// [`crate::decode::position_ids_from_starts`], written directly into admitted
+    /// backing instead of first constructing an unowned payload vector.
     fn build_step_positions(&self, past_len: usize, total_len: usize) -> anyhow::Result<Tensor> {
         let input_len = total_len
             .checked_sub(past_len)
             .context("position range end precedes its start")?;
         let absolute_start = i64::try_from(past_len).context("position id exceeds i64 range")?;
-        let starts = vec![absolute_start; self.position_rank];
-        let (data, shape) = crate::decode::position_ids_from_starts(&starts, input_len)?;
-        let dims = shape.iter().map(|&dim| dim as usize).collect::<Vec<_>>();
-        Ok(Tensor::from_i64(&dims, &data)?)
+        let last_offset =
+            i64::try_from(input_len.saturating_sub(1)).context("position offset exceeds i64")?;
+        absolute_start
+            .checked_add(last_offset)
+            .context("position id overflow")?;
+        let dims = if self.position_rank == 1 {
+            vec![1, input_len]
+        } else {
+            vec![self.position_rank, 1, input_len]
+        };
+        tensor::i64_tensor_with(
+            &tensor::host_tensors_for_session(&self.session)?,
+            dims,
+            |index| absolute_start + (index % input_len) as i64,
+        )
     }
 
     /// Last target hidden-state row produced by the most recent forward.
@@ -1956,7 +1976,12 @@ impl NativeDecodeSession {
         let mut offset = 0usize;
         for slice in token_ids.chunks(chunk) {
             let past_len = self.current_len;
-            let sliced = slice_step_inputs(step_inputs, offset, slice.len())?;
+            let sliced = slice_step_inputs(
+                step_inputs,
+                offset,
+                slice.len(),
+                &tensor::host_tensors_for_session(&self.session)?,
+            )?;
             logits = self.decode_forward(slice, past_len, &sliced)?;
             offset += slice.len();
         }
@@ -2343,12 +2368,13 @@ fn slice_step_inputs(
     step_inputs: &[(String, Tensor)],
     offset: usize,
     len: usize,
+    allocator: &onnx_runtime_session::HostTensorAllocator,
 ) -> anyhow::Result<Vec<(String, Tensor)>> {
     let mut sliced = Vec::with_capacity(step_inputs.len());
     for (port, tensor) in step_inputs {
         let rows = sequence_aligned_rows(tensor)
             .with_context(|| format!("step input '{port}' has no sequence axis to chunk"))?;
-        if offset + len > rows {
+        if offset.checked_add(len).is_none_or(|end| end > rows) {
             bail!("step input '{port}' holds {rows} rows, cannot take {len} from offset {offset}");
         }
         let mut shape = tensor.shape.clone();
@@ -2362,7 +2388,8 @@ fn slice_step_inputs(
         debug_assert_eq!(row_bytes * rows, bytes.len());
         let start = offset * row_bytes;
         let end = start + len * row_bytes;
-        let slice = Tensor::from_raw(tensor.dtype, shape, &bytes[start..end])
+        let slice = allocator
+            .from_raw(tensor.dtype, shape, &bytes[start..end])
             .map_err(|error| anyhow::anyhow!("failed to slice step input '{port}': {error}"))?;
         sliced.push((port.clone(), slice));
     }
@@ -2412,7 +2439,13 @@ mod prefill_chunk_tests {
     fn slicing_a_step_input_takes_exactly_its_row_range() {
         let hidden = 3;
         let step_inputs = vec![("inputs_embeds".to_string(), embeds(4, hidden))];
-        let sliced = slice_step_inputs(&step_inputs, 1, 2).expect("slice");
+        let sliced = slice_step_inputs(
+            &step_inputs,
+            1,
+            2,
+            &onnx_runtime_session::HostTensorAllocator::standalone(),
+        )
+        .expect("slice");
         let (port, tensor) = &sliced[0];
         assert_eq!(port, "inputs_embeds");
         assert_eq!(tensor.shape, vec![1, 2, hidden]);
@@ -2430,10 +2463,19 @@ mod prefill_chunk_tests {
     #[test]
     fn slicing_past_the_sequence_axis_is_refused() {
         let step_inputs = vec![("inputs_embeds".to_string(), embeds(4, 3))];
-        let error = slice_step_inputs(&step_inputs, 3, 2).expect_err("out of range");
+        let error = slice_step_inputs(
+            &step_inputs,
+            3,
+            2,
+            &onnx_runtime_session::HostTensorAllocator::standalone(),
+        )
+        .expect_err("out of range");
         assert!(
             error.to_string().contains("cannot take"),
             "unexpected error: {error}"
         );
     }
 }
+
+#[cfg(test)]
+mod owned_payload_tests;

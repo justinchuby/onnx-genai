@@ -333,7 +333,7 @@ impl Executor {
     // Graph outputs already promise host materialization on the copy path.
     // CPU sessions preserve their own allocator; device sessions retain the
     // existing explicit device-to-host output-copy destination.
-    fn output_host_allocator(&self) -> Arc<dyn ExecutionProvider> {
+    pub(super) fn output_host_allocator(&self) -> Arc<dyn ExecutionProvider> {
         if self.ep.device_id().is_host_accessible() {
             Arc::clone(&self.ep)
         } else {
