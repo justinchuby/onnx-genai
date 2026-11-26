@@ -444,6 +444,17 @@ pub(crate) fn commit_selected_token(
         state.text_decoder = crate::tokenization::TokenTextDecoder::with_preserved_tokens(
             &options.effective_preserved_tokens(),
         );
+        state
+            .text_decoder
+            .set_byte_limit(options.max_constraint_bytes);
+        if let Some(contract) = chain.publication_decoder() {
+            state
+                .text_decoder
+                .bind_literal_decoder(contract.clone(), options.max_constraint_bytes);
+            state
+                .text_decoder
+                .retain_shared_workspace(chain.publication_workspace());
+        }
     }
     state.generated_tokens.push(token_id);
     // Which token this step produced. Without it a timeline shows that a step
@@ -453,7 +464,10 @@ pub(crate) fn commit_selected_token(
     // decodes exactly as often as an untraced one.
     let mut commit_span = onnx_genai_ort::prof_span!("loop.commit_selected_token");
     commit_span.set_arg("token_id", token_id);
-    let decode_text = callback.is_some() || !chain.is_empty() || state.custom_sampler.is_some();
+    let decode_text = callback.is_some()
+        || !chain.is_empty()
+        || state.custom_sampler.is_some()
+        || chain.publication_decoder().is_some();
     let mut token_text = if decode_text {
         let _span = onnx_genai_ort::prof_span!("loop.detokenize");
         state.text_decoder.step(tokenizer, token_id)?
@@ -878,7 +892,7 @@ mod tests {
             stop_sequences: vec![crate::logits::StopSequence::Text("tok22 tok22".into())],
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, Some(&tokenizer), false)?;
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None)?;
         let mut state = DecodeLoopState::new(0, None, None);
         let mut chunks = Vec::new();
         let mut callback = |token: GenerateToken| {
@@ -937,7 +951,7 @@ mod tests {
             seed: Some(17),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         let tokenizer = tokenizer()?;
 
         let mut fallback_backend = MockBackend::new(true);
@@ -991,7 +1005,7 @@ mod tests {
                 seed: Some(seed),
                 ..Default::default()
             };
-            let chain = build_processor_chain(&options, None, false)?;
+            let chain = build_processor_chain(&options, None, false, None)?;
             let mut backend = MockBackend::with_logits(
                 false,
                 SampledOutcome::HardError,
@@ -1047,7 +1061,7 @@ mod tests {
             seed: Some(17),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         let tokenizer = tokenizer()?;
 
         let mut na_backend = MockBackend::with_outcome(true, SampledOutcome::NotApplicable);
@@ -1112,7 +1126,7 @@ mod tests {
             seed: Some(17),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         let tokenizer = tokenizer()?;
 
         // `HardError` outcome would panic-latch if ever reached; assert it isn't.
@@ -1148,7 +1162,7 @@ mod tests {
             stop_on_eos: false,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         assert!(chain.is_empty());
         let tokenizer = tokenizer()?;
 
@@ -1243,7 +1257,7 @@ mod tests {
             stop_on_eos: false,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         let mut backend =
             MockBackend::with_logits(false, SampledOutcome::HardError, logits_for_tokens(&tokens));
         let mut state = DecodeLoopState::new(0, options.seed, None);
@@ -1295,7 +1309,7 @@ mod tests {
             stop_on_eos: false,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         let mut backend =
             MockBackend::with_logits(false, SampledOutcome::HardError, logits_for_tokens(&tokens));
         let mut state = DecodeLoopState::new(0, options.seed, None);
@@ -1341,7 +1355,7 @@ mod tests {
             stop_on_eos: false,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         let mut backend =
             MockBackend::with_logits(false, SampledOutcome::HardError, logits_for_tokens(&tokens));
         let mut state = DecodeLoopState::new(0, options.seed, None);

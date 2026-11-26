@@ -407,10 +407,14 @@ fn block_context_graph(experts: bool) -> Graph {
 
 #[test]
 fn block_matmul_same_shapes_reprepare_when_selected_pool_changes() {
-    check_context_repreparation(block_context_graph(false), &[3, 32], 32., None);
+    check_block_live_context(false, 32.);
 }
 #[test]
 fn block_moe_same_shapes_reprepare_when_selected_pool_changes() {
+    check_block_live_context(true, 2048.);
+}
+
+fn check_block_live_context(experts: bool, expected: f32) {
     let calls = Arc::new(WorkspaceCallCounts::default());
     let ep = Arc::new(ContextCountingCpu {
         cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
@@ -418,7 +422,7 @@ fn block_moe_same_shapes_reprepare_when_selected_pool_changes() {
         workspace_calls: calls.clone(),
     });
     let mut executor = Executor::build(
-        block_context_graph(true),
+        block_context_graph(experts),
         Arc::new(WeightStore::new()),
         ep,
         None,
@@ -456,7 +460,10 @@ fn block_moe_same_shapes_reprepare_when_selected_pool_changes() {
             let mut requirement = None;
             for iteration in 1..=2 {
                 let result = executor.run(&inputs).unwrap();
-                assert_eq!(result[0].to_vec_f32(), [2048.; 96]);
+                assert_eq!(
+                    result[0].to_vec_f32(),
+                    vec![expected; 3 * if experts { 32 } else { 64 }]
+                );
                 assert_eq!(
                     calls.snapshot(),
                     (

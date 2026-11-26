@@ -319,6 +319,15 @@ impl DriverFailure {
     }
 
     pub(crate) fn from_engine_error(error: &anyhow::Error) -> Self {
+        if error
+            .chain()
+            .any(|source| source.is::<onnx_genai_engine::ProcessorConfigurationError>())
+        {
+            return Self {
+                message: format!("{error:#}"),
+                kind: DriverFailureKind::InvalidRequest,
+            };
+        }
         if let Some(prefix) = error
             .chain()
             .find_map(|source| source.downcast_ref::<onnx_genai_engine::ConstraintPrefixError>())

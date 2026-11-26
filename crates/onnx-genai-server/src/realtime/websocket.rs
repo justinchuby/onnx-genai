@@ -28,10 +28,7 @@ use tokio_tungstenite::{
 };
 type WebSocket = WebSocketStream<hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>>;
 use futures_util::{SinkExt, StreamExt};
-use onnx_genai_engine::{
-    realtime::RealtimeTokenBudget,
-    tokenization::{SpecialTokenHandling, TokenTextDecoder},
-};
+use onnx_genai_engine::{realtime::RealtimeTokenBudget, tokenization::TokenTextDecoder};
 use onnx_genai_metadata::{
     RealtimeMode, ToolCallStream, ToolParseOutcome, realtime::RealtimeContract,
 };
@@ -245,6 +242,7 @@ fn string<'a>(object: &'a Value, key: &str) -> anyhow::Result<&'a str> {
 enum FailureKind {
     Protocol(super::conversation::ProtocolErrorKind),
     Native,
+    Admission,
 }
 struct Failure {
     message: String,
@@ -257,13 +255,25 @@ impl Failure {
     fn error_type(&self) -> &'static str {
         match self.kind {
             FailureKind::Protocol(kind) => kind.error_type(),
-            FailureKind::Native => "server_error",
+            FailureKind::Native | FailureKind::Admission => "server_error",
         }
     }
     fn invalid(error: impl std::fmt::Display) -> Self {
         Self {
             message: error.to_string(),
             kind: FailureKind::Protocol(super::conversation::ProtocolErrorKind::InvalidRequest),
+        }
+    }
+    fn admission(error: anyhow::Error) -> Self {
+        if error
+            .chain()
+            .any(|source| source.is::<onnx_genai_engine::ProcessorConfigurationError>())
+        {
+            return Self::invalid(format!("{error:#}"));
+        }
+        Self {
+            message: format!("{error:#}"),
+            kind: FailureKind::Admission,
         }
     }
     fn native(error: anyhow::Error) -> Self {
@@ -349,13 +359,14 @@ enum Rendered {
 struct Active {
     id: ResponseId,
     renderer: Rendered,
-    decoder: TokenTextDecoder,
     tools: Option<ToolText>,
     tool_arguments: ToolArguments,
     budget: OutputBudget,
     used: u64,
     text_enabled: bool,
     audio_enabled: bool,
+    // Own the publication lease until renderer/tool buffers have dropped.
+    decoder: TokenTextDecoder,
 }
 struct Runner {
     model: Arc<ModelHandle>,
@@ -572,14 +583,49 @@ impl Runner {
             self.limits.native_samples,
         )
     }
-    async fn open_output(&mut self, out: &mpsc::Sender<Outgoing>) -> Result<(), Failure> {
+    async fn admitted_decoder(
+        &mut self,
+        options: &ResponseOptions,
+        realtime: bool,
+    ) -> Result<TokenTextDecoder, Failure> {
+        let mut preserved = BTreeSet::new();
+        if realtime
+            && !self.tool_arguments.definitions().is_empty()
+            && options.tool_choice != crate::types::ToolChoiceMode::None
+        {
+            let protocol = self
+                .model
+                .tool_protocol
+                .as_ref()
+                .context("realtime tools require their admitted package protocol")
+                .map_err(Failure::native)?
+                .parsed();
+            for marker in protocol.syntax_markers() {
+                preserved.extend(
+                    self.model
+                        .tokenizer
+                        .encode_with_options(marker, Default::default())
+                        .map_err(anyhow::Error::new)
+                        .map_err(Failure::native)?,
+                );
+            }
+        }
+        self.native
+            .prepare_decoder(preserved, self.limits.text_bytes)
+            .await
+            .map_err(Failure::admission)
+    }
+    async fn open_output(
+        &mut self,
+        out: &mpsc::Sender<Outgoing>,
+        decoder: TokenTextDecoder,
+    ) -> Result<(), Failure> {
         let active = self
             .conversation
             .active()
             .context("native response has no admitted conversation response")
             .map_err(Failure::native)?
             .clone();
-        let mut preserved = BTreeSet::new();
         let tools = if matches!(active.kind, ResponseKind::Realtime)
             && !self.tool_arguments.definitions().is_empty()
             && active.options.tool_choice != crate::types::ToolChoiceMode::None
@@ -591,15 +637,6 @@ impl Runner {
                 .context("realtime tools need a package.tool_protocol declaration")
                 .map_err(Failure::native)?
                 .parsed();
-            for marker in protocol.syntax_markers() {
-                let ids = self
-                    .model
-                    .tokenizer
-                    .encode_with_options(marker, Default::default())
-                    .map_err(anyhow::Error::new)
-                    .map_err(Failure::native)?;
-                preserved.extend(ids);
-            }
             Some(ToolText {
                 protocol,
                 stream: ToolCallStream::default(),
@@ -629,11 +666,7 @@ impl Runner {
         self.active = Some(Active {
             id: active.id,
             renderer,
-            decoder: if tools.is_some() {
-                TokenTextDecoder::with_preserved_tokens(&preserved)
-            } else {
-                TokenTextDecoder::new(SpecialTokenHandling::Skip)
-            },
+            decoder,
             tools,
             tool_arguments: self.tool_arguments.clone(),
             budget: active.options.budget,
@@ -669,6 +702,13 @@ impl Runner {
                 "input_audio_buffer.commit: duplex models answer while listening; there is no turn to commit",
             ));
         }
+        self.conversation.validate_audio_commit()?;
+        let response_options = self.settings.response.clone();
+        let decoder = if self.settings.mode == RealtimeMode::Transcription {
+            Some(self.admitted_decoder(&response_options, false).await?)
+        } else {
+            None
+        };
         let item = ItemId::new(id("item_").map_err(Failure::native)?);
         let events = self.conversation.commit_audio(item.clone())?;
         self.configure().await?;
@@ -680,13 +720,13 @@ impl Runner {
             .map_err(Failure::invalid)?;
         self.drain_pcm(out).await?;
         self.pcm = None;
-        if self.settings.mode == RealtimeMode::Transcription {
+        if let Some(decoder) = decoder {
             self.conversation.begin_transcription(
                 ResponseId::new(id("resp_").map_err(Failure::native)?),
                 item,
                 &self.settings,
             )?;
-            self.open_output(out).await?;
+            self.open_output(out, decoder).await?;
         }
         for event in events {
             self.emit(out, event).await.map_err(Failure::native)?;
@@ -767,6 +807,12 @@ impl Runner {
                 } else {
                     None
                 };
+                let response_options = self.settings.response.clone();
+                let decoder = if starts_duplex {
+                    Some(self.admitted_decoder(&response_options, true).await?)
+                } else {
+                    None
+                };
                 if self.pcm.is_none() {
                     self.pcm = Some(self.new_pcm().map_err(Failure::invalid)?);
                 }
@@ -789,7 +835,13 @@ impl Runner {
                         ResponseId::new(id("resp_").map_err(Failure::native)?),
                         &self.settings,
                     )? {
-                        self.open_output(out).await?;
+                        self.open_output(
+                            out,
+                            decoder
+                                .context("duplex publication decoder was not admitted")
+                                .map_err(Failure::native)?,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -893,6 +945,12 @@ impl Runner {
                 }
             }
             "response.create" => {
+                let response_options = self.conversation.response_options(
+                    &self.settings,
+                    event.get("response").unwrap_or(&json!({})),
+                    self.contract.spec().output_sample_rate_hz.is_some(),
+                )?;
+                let decoder = self.admitted_decoder(&response_options, true).await?;
                 let admission = self.conversation.begin_response(
                     ResponseId::new(id("resp_").map_err(Failure::native)?),
                     ItemId::new(id("item_").map_err(Failure::native)?),
@@ -919,7 +977,7 @@ impl Runner {
                 for event in admission.events {
                     self.emit(out, event).await.map_err(Failure::native)?;
                 }
-                self.open_output(out).await?;
+                self.open_output(out, decoder).await?;
                 let mut settings = self.settings.clone();
                 settings.response = self
                     .conversation
@@ -3283,5 +3341,187 @@ node { input: "starting" input: "operation""#);
         tokio::task::spawn_blocking(move || model.engine.shutdown())
             .await
             .unwrap();
+    }
+    #[cfg(feature = "native-backend")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_empty_transcription_commit_precedes_denied_literal_decoder_grant() {
+        use base64::Engine as _;
+        let package = tool_package("literal_unused_envelope");
+        let path = package.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        tokenizer["decoder"] = json!({"type":"Sequence","decoders":[{"type":"ByteFallback"},{"type":"Fuse"},{"type":"Replace","pattern":{"String":"literal_never_matches"},"content":"replacement"}]});
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let mut config = crate::ServerConfig::default();
+        config.engine_config.decode_backend = onnx_genai_engine::EngineDecodeBackend::Native;
+        config.engine_config.native_device = Some(onnx_genai_engine::NativeDecodeDevice::Cpu);
+        config.engine_config.limits.host_ram_limit =
+            onnx_genai_engine::ResourceLimit::Bytes(64 * 1024 * 1024);
+        config.realtime.text_bytes = NonZeroUsize::new(32 * 1024 * 1024).unwrap();
+        let (state, address, task) = server_for_package_with_config(package.path(), config).await;
+        let mut client = connect(address).await;
+        assert_eq!(event(&mut client).await["type"], "session.created");
+        send(
+            &mut client,
+            json!({"type":"session.update","session":{"type":"transcription"}}),
+        )
+        .await;
+        assert_eq!(event(&mut client).await["type"], "session.updated");
+        send(&mut client, json!({"type":"input_audio_buffer.commit"})).await;
+        let empty = event(&mut client).await;
+        assert_eq!(empty["type"], "error", "{empty}");
+        assert_eq!(
+            empty["error"]["type"], "input_audio_buffer_commit_empty",
+            "{empty}"
+        );
+        assert!(
+            empty["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("audio buffer is empty")
+        );
+        send(&mut client,json!({"type":"input_audio_buffer.append","audio":base64::engine::general_purpose::STANDARD.encode([0u8;640])})).await;
+        send(&mut client, json!({"type":"input_audio_buffer.commit"})).await;
+        let denied = event(&mut client).await;
+        assert_eq!(denied["type"], "error", "{denied}");
+        assert_eq!(denied["error"]["type"], "server_error", "{denied}");
+        assert!(
+            denied["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("bounded contextual literal decoder"),
+            "{denied}"
+        );
+        client.close(None).await.unwrap();
+        drop(client);
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+    }
+    #[cfg(feature = "native-backend")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_native_literal_prepared_transfer_flushes_eof_and_releases_custom_budget() {
+        let package = tool_package("a");
+        let path = package.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        tokenizer["model"]["vocab"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tok17");
+        tokenizer["model"]["vocab"]["b"] = json!(17);
+        tokenizer["added_tokens"].as_array_mut().unwrap().push(json!({"id":17,"content":"b","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}));
+        tokenizer["decoder"] = json!({"type":"Sequence","decoders":[{"type":"ByteFallback"},{"type":"Fuse"},{"type":"Replace","pattern":{"String":"a"},"content":"7"},{"type":"Replace","pattern":{"String":"b"},"content":"77"},{"type":"Replace","pattern":{"String":"7x"},"content":"unused"}]});
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let path = package.path().join("inference_metadata.yaml");
+        let mut metadata: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        metadata["profiles"]["live"]["realtime"]["prompt_template"]=serde_yaml::Value::String("{% if operation == 'response_start' %}{{ instructions }}{% else %}{{ text }}{% endif %}".into());
+        std::fs::write(path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
+        let mut config = native_constraint_config();
+        config.realtime.text_bytes = NonZeroUsize::new(1).unwrap();
+        let (state, address, task) = server_for_package_with_config(package.path(), config).await;
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+
+        let mut baseline = None;
+        for instructions in ["a", "b", "a"] {
+            let mut client = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match connect_model(address, "native-realtime").await {
+                        Ok(client) => break client,
+                        Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                            if response.status() == StatusCode::SERVICE_UNAVAILABLE =>
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await
+                        }
+                        Err(error) => panic!("reopen Native literal connection: {error}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(event(&mut client).await["type"], "session.created");
+            send(&mut client,json!({"type":"session.update","session":{"instructions":instructions,"output_modalities":["text"],"max_output_tokens":1}})).await;
+            assert_eq!(event(&mut client).await["type"], "session.updated");
+            send(&mut client,json!({"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}})).await;
+            let added = event(&mut client).await;
+            assert_eq!(added["type"], "conversation.item.added", "{added}");
+            let done = event(&mut client).await;
+            assert_eq!(done["type"], "conversation.item.done", "{done}");
+            assert_eq!(done["item"]["id"], added["item"]["id"]);
+            send(&mut client, json!({"type":"response.create"})).await;
+            let mut transcript = String::new();
+            let mut types = Vec::new();
+            loop {
+                let output = event(&mut client).await;
+                types.push(output["type"].as_str().unwrap().to_owned());
+                assert_eq!(types[0], "response.created", "{output}; events={types:?}");
+                if output["type"] == "response.output_text.done" {
+                    assert_eq!(output["text"], "7", "{output}");
+                }
+                if output["type"] == "response.output_text.delta" {
+                    transcript.push_str(output["delta"].as_str().unwrap());
+                }
+                if instructions == "b" && output["type"] == "error" {
+                    assert_eq!(output["error"]["type"], "server_error", "{output}");
+                    assert!(
+                        transcript.is_empty(),
+                        "failed quantum published {transcript:?}; events={types:?}"
+                    );
+                    assert!(
+                        output["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("budget"),
+                        "{output}"
+                    );
+                    break;
+                }
+                assert_ne!(output["type"], "error", "{output}; events={types:?}");
+                if output["type"] == "response.done" {
+                    assert_eq!(output["response"]["usage"]["output_tokens"], 1, "{output}");
+                    assert_eq!(transcript, model.tokenizer.decode(&[16]).unwrap());
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&transcript).unwrap(),
+                        json!(7)
+                    );
+                    assert!(
+                        types.iter().any(|kind| kind == "response.output_text.done"),
+                        "{types:?}"
+                    );
+                    break;
+                }
+            }
+            let _ = client.close(None).await;
+            drop(client);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while model.engine.worker_statuses()[0].worker.active_turns != 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let used = model
+                .engine
+                .resource_snapshot()
+                .await
+                .unwrap()
+                .host_ram
+                .used;
+            if let Some(expected) = baseline {
+                assert_eq!(
+                    used, expected,
+                    "literal prepared lease leaked after {instructions:?}"
+                );
+            } else {
+                baseline = Some(used);
+            }
+        }
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
     }
 }

@@ -61,7 +61,9 @@ pub use engine::{
 #[cfg(feature = "native-backend")]
 pub use native_decode::NativeStateFileLimits;
 
-pub use config::NativeStateFilePolicy;
+pub use config::{
+    NativeStateFilePolicy, ProcessorAdmissionRequirement, ProcessorConfigurationError,
+};
 pub use onnx_genai_scheduler::SchedulerAdmissionError;
 
 pub use batched::{

@@ -206,6 +206,23 @@ contiguous/strided packed input layouts through the same compiled kernel and
 cached Deferred answer, and checks the precise changed staging demand each time.
 These counts establish avoided queries, not a measured latency improvement.
 
+CPU `BlockQuantizedMatMul` likewise admits projection scratch, final output staging
+and strided compressed-weight staging as one composite, together with any
+activation/bias conversion storage. Contiguous aligned F32 inputs need no
+conversion region; half, strided or unaligned inputs convert directly into
+separate admitted f32 regions while preserving bulk conversion implementations.
+Nonempty metadata is Deferred; live refinement resolves actual source layouts
+on every launch. The
+packed region is zero for contiguous weights and otherwise one logical packed
+payload rounded to f32 alignment. Dense-cache hits do not copy or initialize
+that region; retaining its admitted capacity permits a streamed fallback without
+another request. Hashing walks the source directly and payload copying starts
+only after complete backing binding. Input conversion has the same full-binding
+guard. Empty output validates source descriptors without reading any payload.
+This removes the former execution-time packed and input payload Vecs without
+adding pool or issuer
+calls; it establishes ownership/accounting, not a latency improvement.
+
 CPU `BlockQuantizedMoE` includes strided compressed-weight staging in the
 same whole-operation workspace as decode scratch, FC activation banks and the
 output accumulator. One serial byte lane holds the maximum non-borrowable FC
