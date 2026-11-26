@@ -9,6 +9,10 @@ Scratch backing and output vectors are allocated once before timing; the
 operator's separate final-output-bank initialization is excluded. This study
 does not measure or claim that an entire projection/operator is allocation-free.
 
+The complete measured source snapshot is
+[`362580b`](https://github.com/justinchuby/onnx-genai/commit/362580bc8f627e1f5b0aa1b12070dd302c72aa59).
+Use that snapshot and the recorded source hashes for measurement reproduction.
+
 The production base is
 [`bb8ec2e`](https://github.com/justinchuby/onnx-genai/commit/bb8ec2e887ba7f7e13296236c698e329cba94f7a).
 The only change to the production module is a `cfg(test)` study declaration.
@@ -83,8 +87,8 @@ summary regeneration.
 
 ## Results
 
-On Apple M1 Max (10 logical CPUs), native CPU release with one Rayon worker,
-the single completed sweep retained 16 calibrations, 64 confirmatory processes
+The single completed sweep ran on 2026-11-26 on Apple M1 Max (10 logical CPUs),
+using native CPU release and one Rayon worker. It retained 16 calibrations, 64 confirmatory processes
 and 704 windows. All output checks passed. Two of sixteen cells passed every
 frozen coarse control; the other fourteen failed the foreign process-average
 CPU gate and expose no speed ratios. All A/A, double-work, binding-setup and
