@@ -98,10 +98,10 @@ impl KernelKey {
 /// the authoritative structural list in
 /// [`kernel_input_uses_physical_capacity`](super::geometry::kernel_input_uses_physical_capacity):
 /// GQA past_key/value = inputs 3,4; default-domain `Attention` = inputs 4,5;
-/// `pkg.nxrt::IndexShare` = inputs 3,4. `present_key`/`present_value` are the
+/// `pkg.nxrt._private::IndexShare` = inputs 3,4. `present_key`/`present_value` are the
 /// GQA-family `outputs[1]`/`outputs[2]`.
 ///
-/// `pkg.nxrt`/`com.microsoft`::`CompressedSparseAttention` (CSA) has no separate
+/// `pkg.nxrt._private`/`com.microsoft`::`CompressedSparseAttention` (CSA) has no separate
 /// past-KV inputs (its cache is stateful device state); instead its
 /// total-sequence-length-derived cache records land on `outputs[1]`/`outputs[3]`
 /// (`[query[0], records, width]`, penultimate = `records`). Dynamic ratio-4 CSA
@@ -141,14 +141,14 @@ fn attention_kv_cache_slots(node: &Node) -> Option<KvCacheSlots> {
             last_axis_outputs: &[],
         });
     }
-    if node.domain == "pkg.nxrt" && node.op_type == "IndexShare" {
+    if node.domain == "pkg.nxrt._private" && node.op_type == "IndexShare" {
         return Some(KvCacheSlots {
             past_inputs: &[3, 4],
             present_outputs: &[1, 2],
             last_axis_outputs: &[],
         });
     }
-    if (node.domain == "pkg.nxrt" || node.domain == "com.microsoft")
+    if (node.domain == "pkg.nxrt._private" || node.domain == "com.microsoft")
         && node.op_type == "CompressedSparseAttention"
     {
         // CSA cache records (derived from total_sequence_length) live on the
@@ -834,10 +834,96 @@ pub struct CacheStats {
     pub evictions: u64,
 }
 
+/// Pure metadata preparation belongs to exactly one compiled kernel. No raw
+/// pointer, execution plan, workspace owner or admission proof enters this memo.
+/// Boxing the cold memo keeps entries without workspace metadata compact.
+pub(super) struct CachedKernel {
+    pub(super) kernel: Box<dyn Kernel>,
+    workspace: std::cell::RefCell<Option<Box<KernelWorkspaceMemo>>>,
+}
+
+struct KernelWorkspaceInput {
+    dtype: DataType,
+    shape: Vec<usize>,
+    present: bool,
+}
+struct KernelWorkspaceMemo {
+    context: onnx_runtime_ep_api::WorkspaceContextKey,
+    inputs: Vec<KernelWorkspaceInput>,
+    outputs: Vec<OutputMetadata<'static>>,
+    preparation: onnx_runtime_ep_api::WorkspacePreparation,
+}
+impl KernelWorkspaceMemo {
+    fn matches(
+        &self,
+        context: onnx_runtime_ep_api::WorkspaceContextKey,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> bool {
+        self.context == context
+            && self.inputs.len() == inputs.len()
+            && self.inputs.iter().zip(inputs).all(|(saved, input)| {
+                saved.dtype == input.dtype
+                    && saved.present == input.present
+                    && saved.shape == input.shape
+            })
+            && self.outputs == outputs
+    }
+}
+impl CachedKernel {
+    pub(super) fn new(kernel: Box<dyn Kernel>) -> Self {
+        Self {
+            kernel,
+            workspace: std::cell::RefCell::new(None),
+        }
+    }
+
+    pub(super) fn workspace_preparation(
+        &self,
+        context: onnx_runtime_ep_api::WorkspaceContextKey,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspacePreparation> {
+        if let Some(memo) = self.workspace.borrow().as_ref()
+            && memo.matches(context, inputs, outputs)
+        {
+            return Ok(memo.preparation);
+        }
+        // Never hold a RefCell loan across provider code, and never publish a
+        // failed query. A previous successful metadata key may remain usable.
+        let preparation = self.kernel.workspace_requirement(inputs, outputs)?;
+        *self.workspace.borrow_mut() = Some(Box::new(KernelWorkspaceMemo {
+            context,
+            inputs: inputs
+                .iter()
+                .map(|input| KernelWorkspaceInput {
+                    dtype: input.dtype,
+                    shape: input.shape.to_vec(),
+                    present: input.present,
+                })
+                .collect(),
+            outputs: outputs
+                .iter()
+                .cloned()
+                .map(OutputMetadata::into_owned)
+                .collect(),
+            preparation,
+        }));
+        Ok(preparation)
+    }
+
+    fn kernel_mut(&mut self) -> &mut dyn Kernel {
+        // Explicit reconfiguration is not the same fixed compiled kernel
+        // contract. Mutable controls invalidate metadata before calling the EP.
+        *self.workspace.get_mut() = None;
+        self.kernel.as_mut()
+    }
+}
+
 /// Shape-keyed kernel cache (§11.1). Owns the compiled kernels for the session.
 #[derive(Default)]
 pub(crate) struct KernelCache {
-    pub(super) entries: HashMap<KernelKey, Box<dyn onnx_runtime_ep_api::Kernel>>,
+    pub(super) entries: HashMap<KernelKey, CachedKernel>,
     /// Node-scoped load-time owners survive specialization/variant eviction and
     /// are offered to the first kernel, including fully static materialization.
     pub(super) static_constant_states: HashMap<NodeId, StaticConstantState>,
@@ -905,7 +991,10 @@ impl KernelCache {
         let mut failure = None;
         for (key, kernel) in &mut self.entries {
             if visited.insert(key.node) {
-                match kernel.arm_block_quantized_moe_traffic(request_id) {
+                match kernel
+                    .kernel_mut()
+                    .arm_block_quantized_moe_traffic(request_id)
+                {
                     Ok(true) => armed += 1,
                     Ok(false) => {}
                     Err(error) => {
@@ -919,7 +1008,7 @@ impl KernelCache {
             let mut rollback = HashSet::new();
             for (key, kernel) in &mut self.entries {
                 if rollback.insert(key.node) {
-                    let _ = kernel.disarm_block_quantized_moe_traffic();
+                    let _ = kernel.kernel_mut().disarm_block_quantized_moe_traffic();
                 }
             }
             return Err(error.into());
@@ -932,7 +1021,7 @@ impl KernelCache {
         let mut visited = HashSet::new();
         for (key, kernel) in &mut self.entries {
             if visited.insert(key.node) {
-                kernel.reset_block_quantized_moe_traffic()?;
+                kernel.kernel_mut().reset_block_quantized_moe_traffic()?;
             }
         }
         Ok(())
@@ -950,7 +1039,7 @@ impl KernelCache {
             if !visited.insert(key.node) {
                 continue;
             }
-            let Some(snapshot) = kernel.snapshot_block_quantized_moe_traffic()? else {
+            let Some(snapshot) = kernel.kernel.snapshot_block_quantized_moe_traffic()? else {
                 continue;
             };
             observed = true;
@@ -1003,7 +1092,7 @@ impl KernelCache {
             if !visited.insert(key.node) {
                 continue;
             }
-            let Some(kernel) = kernel
+            let Some(kernel) = kernel.kernel
                 .as_any()
                 .downcast_ref::<onnx_runtime_ep_cuda::kernels::block_quantized_moe::BlockQuantizedMoEKernel>()
             else {
@@ -1024,7 +1113,7 @@ impl KernelCache {
         let mut visited = HashSet::new();
         for (key, kernel) in &mut self.entries {
             if visited.insert(key.node) {
-                kernel.disarm_block_quantized_moe_traffic()?;
+                kernel.kernel_mut().disarm_block_quantized_moe_traffic()?;
             }
         }
         self.block_quantized_moe_traffic_request = None;
@@ -1116,11 +1205,11 @@ impl KernelCache {
         binding: &KernelKey,
         input_shapes: &[Vec<usize>],
         shape_facts: KernelShapeFacts,
-    ) -> Option<&'a dyn onnx_runtime_ep_api::Kernel> {
+    ) -> Option<&'a CachedKernel> {
         if binding.shape_facts != shape_facts || !binding.matches_shapes(input_shapes) {
             return None;
         }
-        let kernel = self.entries.get(binding)?.as_ref();
+        let kernel = self.entries.get(binding)?;
         self.touch(binding);
         self.prebind_hits.fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
@@ -1163,7 +1252,7 @@ impl KernelCache {
         ep: &dyn ExecutionProvider,
         graph_tokens: [Option<DeviceGraphToken>; DeviceGraphSlot::COUNT],
         graph_request: Option<onnx_runtime_ep_api::GraphKernelRequest<'_>>,
-    ) -> Result<(&dyn onnx_runtime_ep_api::Kernel, KernelKey)> {
+    ) -> Result<(&CachedKernel, KernelKey)> {
         let key = KernelKey {
             node: node_id.0,
             shapes: input_shapes.to_vec(),
@@ -1184,7 +1273,7 @@ impl KernelCache {
                 .entries
                 .iter()
                 .filter(|(existing, _)| existing.node == key.node)
-                .find_map(|(_, kernel)| kernel.shareable_constant_state());
+                .find_map(|(_, kernel)| kernel.kernel.shareable_constant_state());
             // Verify the EP claims this op at these concrete shapes/layouts
             // before compiling — same gate the static path used at build.
             let shape_dims: Vec<Shape> = input_shapes
@@ -1265,7 +1354,7 @@ impl KernelCache {
             if !adopted && let Some(request_id) = self.block_quantized_moe_traffic_request {
                 kernel.arm_block_quantized_moe_traffic(request_id)?;
             }
-            self.entries.insert(key.clone(), kernel);
+            self.entries.insert(key.clone(), CachedKernel::new(kernel));
             self.last_used
                 .insert(key.clone(), AtomicU64::new(self.tick()));
             self.misses = next_misses;
@@ -1279,7 +1368,11 @@ impl KernelCache {
         self.touch(&key);
         #[cfg(test)]
         PREBIND_FALLBACK_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let kernel_ref = self.entries.get(&key).expect("just inserted").as_ref();
+        let kernel_ref = self.entries.get(&key).expect("just inserted");
         Ok((kernel_ref, key))
     }
 }
+
+#[cfg(test)]
+#[path = "workspace_metadata_tests.rs"]
+mod workspace_metadata_tests;

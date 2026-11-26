@@ -1,19 +1,6 @@
-//! CUDA kernels for the Phase-2a slice (`docs/architecture/ORT2.md` §15). Standard **GEMM**
-//! (`MatMul`, cuBLASLt) plus the SDPA/GQA **Attention** baseline (`Attention` in
-//! the `com.microsoft` domain — cuBLAS batched GEMM + NVRTC softmax). One
-//! [`Kernel`] per op, keyed purely by (op type, domain) — there are **no**
-//! model-specific shapes or constants anywhere in this crate (the §15.1
-//! model-agnostic hard rule; attention dims are runtime data / attributes).
-//!
-//! ## Deferred to later slices (Phase 2b+)
-//!
-//! Custom fused norm/RoPE kernels, cuDNN-fused SDPA / FlashAttention-3 behind
-//! the same [`attention::AttentionKernel`] binding (§13.3), paged-KV (§13.4),
-//! and FP8 GEMM are **not** implemented here. Ops we don't cover are simply not
-//! registered, so [`crate::CudaExecutionProvider::supports_op`] reports them
-//! Unsupported and the session routes them to another EP (e.g. CPU). A direct
-//! [`crate::CudaExecutionProvider::get_kernel`] for an unregistered op returns
-//! an actionable [`onnx_runtime_ep_api::EpError`] — never a panic.
+//! CUDA operator kernels keyed by op type and domain. Kernels use runtime
+//! shapes and node attributes, not model-specific constants.
+//! See `docs/execution/CUDA_COVERAGE.md` for supported operators and backends.
 
 use std::sync::Arc;
 
@@ -37,6 +24,7 @@ impl SealedLaunchAccess {
 }
 
 pub mod activations;
+mod affine_moe;
 pub mod argreduce;
 pub mod attention;
 pub mod batch_normalization;
@@ -740,7 +728,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
 /// registry so the advertised kernel versions match the constructed provider.
 pub fn build_cuda_registry_descriptors(registry: &OpRegistry) -> Vec<CudaOpDescriptor> {
     let mut descriptors: Vec<CudaOpDescriptor> = registry
-        .keys()
+        .plugin_keys()
         // RoiAlign is currently supported only in standalone nxrt.
         .filter(|key| !(key.op_type == "RoiAlign" && key.domain.is_empty()))
         .map(|key| CudaOpDescriptor {
@@ -772,6 +760,19 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
         Arc::new(csa_checkpoint::CsaMetrics::default()),
         Arc::new(qmoe::RouteTelemetrySourceRegistry::default()),
     )
+}
+
+// Internal standalone rewrite targets must not enter the ORT registry descriptor projection.
+pub(crate) fn register_standalone_kernels(reg: &mut OpRegistry, runtime: Arc<CudaRuntime>) {
+    reg.register(
+        OpKey::new(
+            onnx_runtime_optimizer::affine_moe::softmax_first::OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+        Box::new(affine_moe::Factory(runtime)),
+    );
 }
 
 /// Like [`build_cuda_registry`] but threads a shared [`CsaMetrics`] telemetry
@@ -1423,28 +1424,32 @@ pub(crate) fn build_cuda_registry_for_contract(
         }),
     );
     reg.register(
-        OpKey::new("BlockQuantizedMatMul", "pkg.nxrt", 1),
+        OpKey::new("BlockQuantizedMatMul", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(block_quantized_matmul::BlockQuantizedMatMulFactory {
             runtime: runtime.clone(),
         }),
     );
     reg.register(
-        OpKey::new("BlockQuantizedMoE", "pkg.nxrt", 1),
+        OpKey::new("BlockQuantizedMoE", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(block_quantized_moe::BlockQuantizedMoEFactory {
             runtime: runtime.clone(),
         }),
     );
     reg.register(
-        OpKey::new("SparseKvGather", "pkg.nxrt", 1),
+        OpKey::new("SparseKvGather", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(sparse_kv_gather::SparseKvGatherFactory {
             runtime: runtime.clone(),
         }),
     );
     reg.register(
-        OpKey::new("CompressedSparseAttention", "pkg.nxrt", 1),
+        OpKey::new(
+            "CompressedSparseAttention",
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(
             compressed_sparse_attention::CompressedSparseAttentionFactory {
@@ -1454,35 +1459,35 @@ pub(crate) fn build_cuda_registry_for_contract(
         ),
     );
     reg.register(
-        OpKey::new("IndexShare", "pkg.nxrt", 1),
+        OpKey::new("IndexShare", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(index_share::IndexShareFactory {
             runtime: runtime.clone(),
         }),
     );
     reg.register(
-        OpKey::new("DsaIndexSelect", "pkg.nxrt", 1),
+        OpKey::new("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(dsa_index_select::DsaIndexSelectFactory {
             runtime: runtime.clone(),
         }),
     );
     reg.register(
-        OpKey::new("KvCacheCapacityAppend", "pkg.nxrt", 1),
+        OpKey::new("KvCacheCapacityAppend", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(kv_cache_capacity_append::KvCacheCapacityAppendFactory {
             runtime: runtime.clone(),
         }),
     );
     reg.register(
-        OpKey::new("PackedVarlenAttention", "pkg.nxrt", 1),
+        OpKey::new("PackedVarlenAttention", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(packed_varlen_attention::PackedVarlenAttentionFactory {
             runtime: runtime.clone(),
         }),
     );
     reg.register(
-        OpKey::new("VarlenAttention", "pkg.nxrt", 1),
+        OpKey::new("VarlenAttention", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(varlen_attention::VarlenAttentionFactory {
             runtime: runtime.clone(),
@@ -1668,7 +1673,7 @@ pub(crate) fn build_cuda_registry_for_contract(
         );
     }
 
-    // Attention (Phase-2b fused prefill with a Phase-2a fallback).
+    // Attention (fused prefill with a cuBLASLt/softmax fallback).
     reg.register(
         OpKey::new("Attention", "com.microsoft", 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
@@ -1790,15 +1795,27 @@ pub(crate) fn build_cuda_registry_for_contract(
     );
 
     // Cast / CastLike (NVRTC element-wise dtype conversion).
-    for (op_type, version) in [("Cast", 1), ("CastLike", 1), ("Cast", 28)] {
+    for (op_type, version, opset) in [("Cast", 1, 1), ("CastLike", 1, 15), ("Cast", 28, 28)] {
         reg.register(
             OpKey::new(op_type, "", version),
             onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(cast::CastFactory {
                 runtime: runtime.clone(),
-                float6: version >= 28,
+                opset,
             }),
         );
+    }
+    for op_type in ["Cast", "CastLike"] {
+        for opset in [19, 24] {
+            reg.register_native_only(
+                OpKey::new(op_type, "", opset),
+                onnx_runtime_ep_api::WorkspacePlanning::None,
+                Box::new(cast::CastFactory {
+                    runtime: runtime.clone(),
+                    opset,
+                }),
+            );
+        }
     }
 
     // Reductions (sum/mean cuDNN with f32 NVRTC fallback; max/min NVRTC).
@@ -2084,6 +2101,8 @@ pub(crate) fn build_cuda_registry_for_contract(
 mod tests {
     use std::collections::BTreeSet;
 
+    use onnx_runtime_ir::DataType;
+
     use super::{
         CUDA_COVERED_OPS, CUDA_DFT_DTYPES, CUDA_FLOAT_DTYPES, CUDA_NMS_DTYPES, CUDA_STFT_DTYPES,
         build_cuda_registry, build_cuda_registry_descriptors, cuda_supported_dtypes_for_op,
@@ -2258,7 +2277,11 @@ mod tests {
             matrix.contains(needle),
             "GatherBlockQuantized must be documented in its registered com.microsoft domain"
         );
-        let mutated = matrix.replacen(needle, "| `GatherBlockQuantized` | `pkg.nxrt` |", 1);
+        let mutated = matrix.replacen(
+            needle,
+            "| `GatherBlockQuantized` | `pkg.nxrt._private` |",
+            1,
+        );
         let actual = coverage_matrix_pairs(&mutated);
         assert_ne!(
             actual, expected,
@@ -2400,6 +2423,43 @@ mod tests {
             }),
             "standalone-only ONNX RoiAlign must not be advertised by the CUDA ORT plugin"
         );
+        let cast_versions = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.op_type == "Cast")
+            .map(|descriptor| descriptor.since_version)
+            .collect::<Vec<_>>();
+        let cast_like_versions = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.op_type == "CastLike")
+            .map(|descriptor| descriptor.since_version)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cast_versions,
+            vec![1, 28],
+            "standalone packed Cast dtypes must not change CUDA ORT plugin revisions"
+        );
+        assert_eq!(
+            cast_like_versions,
+            vec![1],
+            "standalone packed CastLike dtypes must not change CUDA ORT plugin revisions"
+        );
+        for descriptor in descriptors
+            .iter()
+            .filter(|descriptor| matches!(descriptor.op_type.as_str(), "Cast" | "CastLike"))
+        {
+            for packed in [
+                DataType::Uint4,
+                DataType::Int4,
+                DataType::Uint2,
+                DataType::Int2,
+            ] {
+                assert!(
+                    !descriptor.supported_dtypes.contains(&packed),
+                    "CUDA ORT plugin descriptor {:?} must keep rejecting packed dtype {packed:?}",
+                    descriptor.op_type
+                );
+            }
+        }
     }
 
     #[test]
@@ -2475,7 +2535,7 @@ mod tests {
     /// so it cannot arrive through ordinary export. It never appears on the
     /// decoder-only LLM path this project targets (which uses `Attention` /
     /// `MultiHeadAttention` / `GroupQueryAttention`, plus the runtime-invented
-    /// `pkg.nxrt::PackedVarlenAttention` for packed sequences). The real
+    /// `pkg.nxrt._private::PackedVarlenAttention` for packed sequences). The real
     /// Qwen3.5-0.8B hybrid decode graph places on CUDA with zero declines, and
     /// the only producer anywhere in the repo is a synthetic CPU-EP fixture.
     /// See the non-gap write-up in `docs/execution/CUDA_COVERAGE.md`, which

@@ -249,12 +249,14 @@ pub trait LogitProcessor: Send + Sync {
 
 /// Ordered chain of logit processors.
 pub struct ProcessorChain {
+    publication_decoder: Option<std::sync::Arc<crate::byte_stream::ByteStreamContract>>,
     processors: Vec<Box<dyn LogitProcessor>>,
     device_transforms: Option<Vec<DeviceSamplingTransform>>,
     track_candidates: bool,
     track_candidate_ids: bool,
     optional_start: Option<usize>,
     selection_feedback: bool,
+    _decoder_workspace: Option<std::sync::Arc<onnx_runtime_memory_governor::MemoryLease>>,
 }
 impl Default for ProcessorChain {
     fn default() -> Self {
@@ -263,8 +265,32 @@ impl Default for ProcessorChain {
 }
 
 impl ProcessorChain {
+    pub(crate) fn bind_publication_decoder(
+        &mut self,
+        decoder: Option<std::sync::Arc<crate::byte_stream::ByteStreamContract>>,
+    ) {
+        self.publication_decoder = decoder;
+    }
+    pub(crate) fn publication_workspace(
+        &self,
+    ) -> Option<std::sync::Arc<onnx_runtime_memory_governor::MemoryLease>> {
+        self._decoder_workspace.clone()
+    }
+    pub(crate) fn publication_decoder(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::byte_stream::ByteStreamContract>> {
+        self.publication_decoder.as_ref()
+    }
+    pub(crate) fn retain_decoder_workspace(
+        &mut self,
+        lease: Option<onnx_runtime_memory_governor::MemoryLease>,
+    ) {
+        self._decoder_workspace = lease.map(std::sync::Arc::new);
+    }
     pub fn new() -> Self {
         Self {
+            _decoder_workspace: None,
+            publication_decoder: None,
             processors: Vec::new(),
             device_transforms: Some(Vec::new()),
             track_candidates: false,
@@ -4905,8 +4931,11 @@ mod tests {
             crate::text_projection::ProjectionKind::Plain,
             prefix,
             4096,
-            vec![eos],
-            &Default::default(),
+            crate::response_constraint::ConstraintTokens::decoded(
+                vec![eos],
+                &Default::default(),
+                None,
+            ),
         )
         .unwrap();
         ConstraintProcessor::new(Box::new(constraint), texts, vec![eos])

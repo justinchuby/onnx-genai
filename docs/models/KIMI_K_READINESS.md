@@ -35,8 +35,8 @@ runtime snapshot is stale in two important ways:
    `53ef68c` and `74a891b`. Any older statement that these kernels are
    host-staged is superseded.
 2. CPU now registers the complete frozen
-   `pkg.nxrt::CompressedSparseAttention` v1 reference plus
-   `pkg.nxrt::SparseKvGather`; CUDA registers neither on this `main`
+   `pkg.nxrt._private::CompressedSparseAttention` v1 reference plus
+   `pkg.nxrt._private::SparseKvGather`; CUDA registers neither on this `main`
    ([CPU registry](../../crates/onnx-runtime-ep-cpu/src/kernels/mod.rs#L220-L231),
    [CUDA covered ops](../../crates/onnx-runtime-ep-cuda/src/kernels/mod.rs#L94-L178)).
    A CUDA `SparseKvGather` port is in progress outside this audited tree; it must
@@ -79,8 +79,8 @@ fallback exist. `❌` means a new semantic/runtime boundary is required.
 | KDA prefix cache / rollback | Paged KV checkpoints; CSA compressed-state/carry precedent | ❌ | Current engine state is token K/V-centric. KDA needs typed recurrent and convolution state, prefix import/composition rules, capacity accounting, and speculative rollback. Moonshot explicitly says conventional prefix caching needs a KDA-specific implementation. |
 | AttnRes | MatMul/RMSNorm/Softmax and generic SSA values | ◐ | A portable decomposition is plausible. New work is activation-lifetime planning and retaining block representations across depth; a fused op is optional until profiling. Do not map AttnRes to KV pages. |
 | 896-expert, top-16 sparse routing | CPU `MoE`/`QMoE`; CUDA `QMoE` grouping/GEMM | ◐ | Dynamic expert count/top-k and selected-route grouping are reusable. Stable LatentMoE's router and any inference-visible quantile rule must be verified. Current QMoE accepts only affine integer `quant_type="int"` ([CPU](../../crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs#L79-L89), [CUDA](../../crates/onnx-runtime-ep-cuda/src/kernels/qmoe.rs#L709-L723)). |
-| MXFP4 dense weights | CPU/CUDA `pkg.nxrt::BlockQuantizedMatMul` | ◐ | Both backends decode the repository's OCP/llama-style MXFP4 blocks. This is reusable only after byte-level proof that Moonshot's checkpoint packing matches, or after an explicit conversion. CUDA currently consumes f32 activations/outputs, not MXFP8. |
-| MXFP4/MXFP8 routed experts | Proposed `pkg.nxrt::BlockQuantizedMoE`; QMoE route grouping; block decoders | ❌ | `BlockQuantizedMoE` is design-only and unregistered. The lazy-weight seam recognizes its name but can bind/materialize only whole weights, not selected expert slices ([design](../quantization/BLOCKQUANTIZEDMOE_DESIGN.md), [weight seam](../../crates/onnx-runtime-ep-api/src/weight.rs#L94-L105), [binder](../../crates/onnx-runtime-ep-api/src/weight.rs#L205-L243)). K3 also needs an exact MXFP8 activation contract. |
+| MXFP4 dense weights | CPU/CUDA `pkg.nxrt._private::BlockQuantizedMatMul` | ◐ | Both backends decode the repository's OCP/llama-style MXFP4 blocks. This is reusable only after byte-level proof that Moonshot's checkpoint packing matches, or after an explicit conversion. CUDA currently consumes f32 activations/outputs, not MXFP8. |
+| MXFP4/MXFP8 routed experts | Proposed `pkg.nxrt._private::BlockQuantizedMoE`; QMoE route grouping; block decoders | ❌ | `BlockQuantizedMoE` is design-only and unregistered. The lazy-weight seam recognizes its name but can bind/materialize only whole weights, not selected expert slices ([design](../quantization/BLOCKQUANTIZEDMOE_DESIGN.md), [weight seam](../../crates/onnx-runtime-ep-api/src/weight.rs#L94-L105), [binder](../../crates/onnx-runtime-ep-api/src/weight.rs#L205-L243)). K3 also needs an exact MXFP8 activation contract. |
 | Expert weight paging | External mmap, `WeightHandle`, lazy-boundary negotiation | ◐ | Host materialization fallback exists; live device paging and per-expert leases do not. A 2.8T model cannot treat whole-weight materialization as the production path. |
 | Multi-device expert parallelism | `MOE_EXPERT_PARALLELISM.md` design | ❌ | No `MoeDispatch`/`MoeGather`, NCCL all-to-all, per-node placement, or distributed KDA/MLA state is implemented. This is required for practical deployment, independently of single-device kernel correctness. |
 | MTP/speculation, if K3 publishes it | Generic speculative loop and `MtpProposer` | ◐ / conditional | The reusable draft/verify/accept loop exists, but metadata still marks MTP unsupported and the proposer is rebuilt each iteration ([parser](../../crates/onnx-genai-metadata/src/parser.rs#L70-L90), [loop](../../crates/onnx-genai-engine/src/speculative.rs#L965-L980)). Do not make K3 readiness depend on this without an artifact. |
@@ -126,7 +126,7 @@ that two KDA generations can use incompatible gate equations.
 ### P0 — add typed KDA state and CPU/CUDA KDA kernels — genuinely new
 
 Add a versioned semantic operator (for example
-`pkg.nxrt::KimiDeltaAttention`) with explicit Q/K/V/gate/beta inputs,
+`pkg.nxrt._private::KimiDeltaAttention`) with explicit Q/K/V/gate/beta inputs,
 initial/final recurrent state, convolution state, variable-length batching, and
 prefill/decode modes. Extend the runtime state manager beyond `[K,V]` pages to
 typed attention state with checkpoint/restore/fork/prefix-import. Implement a
@@ -144,7 +144,7 @@ path.
 ### P0 — implement model-exact block-quantized MoE and expert leases
 
 Reuse QMoE routing/grouping and BlockQuantizedMatMul's decode infrastructure,
-but implement and register `pkg.nxrt::BlockQuantizedMoE` on CPU/CUDA, add exact
+but implement and register `pkg.nxrt._private::BlockQuantizedMoE` on CPU/CUDA, add exact
 Moonshot MXFP4 packing or an explicit converter, support the required MXFP8
 activation path, and extend lazy binding to selected expert slices. This is
 partly reuse, but the op, activation format, and lease granularity are new.

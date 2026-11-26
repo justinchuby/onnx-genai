@@ -1475,7 +1475,7 @@ mod binding_tests {
             vec![Some(input), Some(weight)],
             vec![output],
         );
-        node.domain = "pkg.nxrt".to_string();
+        node.domain = "pkg.nxrt._private".to_string();
         (graph.insert_node(node), weight)
     }
 

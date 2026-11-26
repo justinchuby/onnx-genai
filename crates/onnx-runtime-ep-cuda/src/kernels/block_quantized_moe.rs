@@ -1,4 +1,4 @@
-//! CUDA implementation of the `pkg.nxrt::BlockQuantizedMoE` operator
+//! CUDA implementation of the `pkg.nxrt._private::BlockQuantizedMoE` operator
 //! (mixed-projection ABI).
 //!
 //! This is the CUDA counterpart to the CPU parity oracle

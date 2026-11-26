@@ -50,7 +50,8 @@ pub use onnx_runtime_loader::{
 };
 pub use plugin_provider::{PluginExecutionProvider, is_plugin_fused_node};
 pub use tensor::{
-    DeviceBindingTransferStats, DeviceIoBinding, ExternalMemorySpec, Tensor, cpu_allocator,
+    DeviceBindingTransferStats, DeviceIoBinding, ExternalMemorySpec, HostTensorAllocator, Tensor,
+    cpu_allocator,
 };
 /// Device-bound graph outputs, stored inline for the common fixed-output case.
 pub type DeviceBindingOutputs = smallvec::SmallVec<[Option<Tensor>; 16]>;
@@ -346,6 +347,16 @@ mod error {
 
         #[error("internal executor error: {0}")]
         Internal(String),
+
+        #[error(
+            "initialize Host tensor {dtype:?} {shape:?} payload: {source}; repair the initializer or release memory before retrying"
+        )]
+        HostTensorInitialization {
+            dtype: onnx_runtime_ir::DataType,
+            shape: Vec<usize>,
+            #[source]
+            source: Box<dyn std::error::Error + Send + Sync>,
+        },
 
         #[error("Sequence op {op}: {reason}")]
         SequenceOp { op: String, reason: String },
@@ -2045,6 +2056,13 @@ impl InferenceSession {
         self.exec.max_lazy_weight_working_set_bytes()
     }
 
+    /// Construct owned host tensors through this session's allocation domain.
+    /// Returned tensors retain their provider and allocation owners independently
+    /// of the session lifetime. No implicit cross-device transfer is performed.
+    pub fn host_tensor_allocator(&self) -> Result<HostTensorAllocator> {
+        self.exec.host_tensor_allocator()
+    }
+
     pub fn device_id(&self) -> onnx_runtime_ir::DeviceId {
         self.exec.device_id()
     }
@@ -2975,3 +2993,9 @@ mod option_tests {
         assert_eq!(ctx.embed_mode, 0);
     }
 }
+
+#[cfg(test)]
+mod host_tensor_tests;
+
+mod owned_host_array;
+pub use owned_host_array::{HostElement, OwnedHostArray};

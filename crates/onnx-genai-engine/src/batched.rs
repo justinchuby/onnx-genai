@@ -1,5 +1,7 @@
 //! Batched static-cache generation path.
 
+use crate::LogitsRow;
+
 use crate::config::{
     EngineDecodeBackend, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
     GenerateResult,
@@ -91,7 +93,7 @@ struct ContinuousBatchRow {
 enum RowPending {
     /// Full host logits; the row's processor chain and sampler run in
     /// `advance_row`.
-    HostLogits(Vec<f32>),
+    HostLogits(LogitsRow),
     /// The token id already selected entirely on the device.
     DeviceToken(TokenId),
 }
@@ -242,6 +244,7 @@ impl BatchingCapability {
 pub struct ContinuousBatchManager<'a> {
     decode: Box<dyn BatchedDecodeSession<'a> + 'a>,
     tokenizer: &'a Tokenizer,
+    memory: Option<crate::memory_authority::EngineMemoryGovernor>,
     /// Every token id this model ends on, resolved once when the manager is
     /// built. Held here because the manager cannot reach the package's workflow
     /// itself, and reading only the tokenizer's first id is what made a
@@ -382,6 +385,7 @@ impl<'a> ContinuousBatchManager<'a> {
         metadata_max_context: Option<usize>,
         max_batch: usize,
         runtime: Rc<WorkflowRuntime>,
+        memory: Option<crate::memory_authority::EngineMemoryGovernor>,
     ) -> anyhow::Result<Self> {
         if max_batch == 0 {
             anyhow::bail!("continuous batch max_batch must be greater than zero");
@@ -401,6 +405,7 @@ impl<'a> ContinuousBatchManager<'a> {
         Ok(Self {
             decode,
             tokenizer,
+            memory,
             end_tokens,
             metadata_max_context,
             static_max_len,
@@ -453,7 +458,20 @@ impl<'a> ContinuousBatchManager<'a> {
             anyhow::bail!("prompt must contain at least one token");
         }
         let max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(self.tokenizer), false)?;
+        let lease = self
+            .memory
+            .as_ref()
+            .map(|memory| crate::byte_stream::reserve_workspace(self.tokenizer, &options, memory))
+            .transpose()?
+            .flatten();
+        let decoder = crate::byte_stream::prepare_literal_output(
+            self.tokenizer,
+            &options.effective_preserved_tokens(),
+        )
+        .map_err(crate::ProcessorConfigurationError::classify)?;
+        let mut chain = build_processor_chain(&options, Some(self.tokenizer), false, decoder)
+            .map_err(crate::ProcessorConfigurationError::classify)?;
+        chain.retain_decoder_workspace(lease);
         if reached_context_limit(prompt_tokens.len(), max_context) {
             self.admissions
                 .push_back(ContinuousBatchAdmission::Assigned { handle });
@@ -1086,9 +1104,9 @@ impl<'a> ContinuousBatchManager<'a> {
             RowPending::DeviceToken(token_id) => token_id,
             RowPending::HostLogits(mut logits) => {
                 let context = row.processor_context();
-                let probabilities = ProbabilitySnapshot::capture(&row.options, &logits);
+                let probabilities = ProbabilitySnapshot::capture(&row.options, &logits)?;
                 let token_id = select_next_token_with_rng(
-                    &mut logits,
+                    logits.try_mut()?,
                     &context,
                     &row.options,
                     &row.chain,
@@ -1212,7 +1230,7 @@ impl<'a> ContinuousBatchManager<'a> {
                     self.routed_stats.bytes += host.len() as u128 * u128::from(LOGIT_BYTES);
                     self.routed_stats.rows_host_copied += 1;
                 }
-                row.pending = Some(RowPending::HostLogits(host));
+                row.pending = Some(RowPending::HostLogits(LogitsRow::from_host_row(host)));
             }
         }
         Ok(())
@@ -1561,6 +1579,7 @@ impl Engine {
         // the precondition is checked once, here, rather than once per caller
         // where a new caller could forget it.
         self.assert_batched_generation_declared()?;
+        let memory = self.governor.memory().clone();
         // The authored document this batch iterates. Built before the session
         // borrows below because it is read from the package's declared
         // workflow, which the manager cannot reach once it holds a mutable
@@ -1610,6 +1629,7 @@ impl Engine {
                 metadata_max_context,
                 max_batch,
                 runtime,
+                Some(memory.clone()),
             );
         }
         #[cfg(not(feature = "native-backend"))]
@@ -1706,6 +1726,7 @@ impl Engine {
             metadata_max_context,
             max_batch,
             runtime,
+            Some(memory.clone()),
         )
     }
 
@@ -2533,6 +2554,7 @@ mod tests {
             None,
             1,
             batch_runtime(),
+            None,
         )
         .unwrap();
         let handle = manager
@@ -2570,6 +2592,7 @@ mod tests {
             None,
             1,
             batch_runtime(),
+            None,
         )
         .unwrap();
         let handle = manager
@@ -2594,6 +2617,7 @@ mod tests {
             None,
             1,
             batch_runtime(),
+            None,
         )
         .unwrap();
         let handle = manager
@@ -2834,6 +2858,7 @@ mod tests {
                 None,
                 1,
                 batch_runtime(),
+                None,
             )
             .unwrap();
             let mut request = greedy_req(1);
@@ -2917,6 +2942,7 @@ mod tests {
             None,
             4,
             batch_runtime(),
+            None,
         )
         .unwrap();
 
@@ -2972,6 +2998,7 @@ mod tests {
             None,
             2,
             batch_runtime(),
+            None,
         )
         .unwrap();
         for _ in 0..2 {
@@ -3001,6 +3028,7 @@ mod tests {
             None,
             1,
             batch_runtime(),
+            None,
         )
         .unwrap();
         let mut request = greedy_req(1);
@@ -3057,6 +3085,7 @@ mod tests {
             None,
             2,
             batch_runtime(),
+            None,
         )
         .unwrap();
         let mut first_request = greedy_req(1);
@@ -3141,6 +3170,7 @@ mod tests {
             None,
             1,
             batch_runtime(),
+            None,
         )
         .unwrap();
         let mut request = greedy_req(1);
@@ -3221,6 +3251,7 @@ mod tests {
             None,
             2,
             batch_runtime(),
+            None,
         )
         .unwrap();
 
@@ -3304,6 +3335,7 @@ mod tests {
             None,
             1,
             batch_runtime(),
+            None,
         )?;
         let mut request = greedy_req(1);
         request.options.max_prediction_time = Some(std::time::Duration::from_millis(1));
@@ -3385,6 +3417,7 @@ mod tests {
             None,
             1,
             batch_runtime(),
+            None,
         )
         .unwrap();
 
@@ -3444,6 +3477,7 @@ mod tests {
             None,
             3,
             batch_runtime(),
+            None,
         )
         .unwrap();
         let mut host_manager = ContinuousBatchManager::new(
@@ -3453,6 +3487,7 @@ mod tests {
             None,
             3,
             batch_runtime(),
+            None,
         )
         .unwrap();
         for req in build_requests() {
@@ -3527,6 +3562,7 @@ mod tests {
             None,
             3,
             batch_runtime(),
+            None,
         )
         .unwrap();
         for _ in 0..3 {
@@ -3568,6 +3604,7 @@ mod tests {
             None,
             8,
             batch_runtime(),
+            None,
         )
         .unwrap();
         manager.submit(capped_greedy_req(1, 3)).unwrap();
@@ -3598,6 +3635,7 @@ mod tests {
             None,
             3,
             batch_runtime(),
+            None,
         )
         .unwrap();
         manager.submit(capped_greedy_req(1, 1)).unwrap();
@@ -3635,6 +3673,7 @@ mod tests {
             None,
             2,
             batch_runtime(),
+            None,
         )
         .unwrap();
         let short = manager.submit(capped_greedy_req(1, 1)).unwrap();
@@ -3679,6 +3718,7 @@ mod tests {
             None,
             1,
             batch_runtime(),
+            None,
         )
         .unwrap();
         let occupancy = manager.occupancy();

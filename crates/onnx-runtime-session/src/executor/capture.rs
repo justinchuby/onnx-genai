@@ -751,7 +751,7 @@ impl Executor {
                 "kernel has not been warmed for the requested capture shape",
             ));
         };
-        kernel_capture_decline(plan.node_id, node, kernel.as_ref())
+        kernel_capture_decline(plan.node_id, node, kernel.kernel.as_ref())
     }
 
     /// Partition the plan into maximal contiguous captured segments separated by
@@ -862,7 +862,7 @@ impl Executor {
                     plan.node_id.0
                 ))
             })?;
-            kernels.push(kernel.as_ref());
+            kernels.push(kernel.kernel.as_ref());
         }
         Ok(kernels)
     }

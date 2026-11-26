@@ -319,6 +319,15 @@ impl DriverFailure {
     }
 
     pub(crate) fn from_engine_error(error: &anyhow::Error) -> Self {
+        if error
+            .chain()
+            .any(|source| source.is::<onnx_genai_engine::ProcessorConfigurationError>())
+        {
+            return Self {
+                message: format!("{error:#}"),
+                kind: DriverFailureKind::InvalidRequest,
+            };
+        }
         if let Some(prefix) = error
             .chain()
             .find_map(|source| source.downcast_ref::<onnx_genai_engine::ConstraintPrefixError>())
@@ -3476,6 +3485,57 @@ mod admission_tests {
             DriverFailure::from_engine_error(&batch_error).kind,
             DriverFailureKind::Internal
         );
+    }
+
+    #[test]
+    fn actual_process_capacity_refusal_preserves_typed_source_and_memory_overload()
+    -> anyhow::Result<()> {
+        use onnx_runtime_memory_api::{DeviceKey, MemoryError, MemoryRole, Tier};
+        use onnx_runtime_memory_governor::{
+            LeaseLedger, LedgerGovernor, MemoryGovernor, ProcessMemoryLimits, ProcessMemoryManager,
+        };
+        let manager = ProcessMemoryManager::with_limits(ProcessMemoryLimits {
+            host_bytes: 0,
+            ..ProcessMemoryLimits::UNLIMITED
+        })?;
+        let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+            DeviceKey::HOST,
+            0,
+            64,
+            0,
+        )));
+        let authority = manager.register_authority(
+            DeviceKey::HOST,
+            "HTTP process-capacity fixture",
+            Arc::new(()),
+            governor.clone(),
+        )?;
+        let holder = manager.register_holder(&authority, "response payload", None)?;
+        let source = manager
+            .reserve_external_capacity(&authority, &holder, Tier::Host, MemoryRole::KvCache, 4)
+            .expect_err("zero process quota must refuse a real capacity transaction");
+        let error =
+            anyhow::Error::new(source).context("prepare response payload before publication");
+        assert!(error.chain().any(|cause| cause.is::<MemoryError>()));
+        let failure = DriverFailure::from_engine_error(&error);
+        assert_eq!(failure.kind, DriverFailureKind::MemoryOverload);
+        assert!(failure.message.contains("host"), "{}", failure.message);
+        assert_eq!(manager.process_used(Tier::Host), 0);
+        assert_eq!(governor.used(Tier::Host), 0);
+        assert!(manager.snapshot()?.external_capacities.is_empty());
+        manager.set_process_limit(Tier::Host, 4)?;
+        let retry = manager.reserve_external_capacity(
+            &authority,
+            &holder,
+            Tier::Host,
+            MemoryRole::KvCache,
+            4,
+        )?;
+        assert_eq!(manager.process_used(Tier::Host), 4);
+        drop(retry);
+        assert_eq!(manager.process_used(Tier::Host), 0);
+        assert_eq!(governor.used(Tier::Host), 0);
+        Ok(())
     }
 
     #[tokio::test]

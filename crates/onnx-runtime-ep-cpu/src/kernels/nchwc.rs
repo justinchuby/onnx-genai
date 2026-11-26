@@ -16,7 +16,7 @@
 //! buffer (the channel axis is merely reblocked); only `Conv` and pooling need
 //! dedicated blocked kernels, which live here.
 //!
-//! All ops are registered in the private `pkg.nxrt` domain and are only ever
+//! All ops are registered in the private `pkg.nxrt._private` domain and are only ever
 //! produced by the CPU EP's own pass, never parsed from a model.
 
 use std::borrow::Cow;

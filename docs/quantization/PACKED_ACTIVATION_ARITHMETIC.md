@@ -1,6 +1,6 @@
 # Packed activation arithmetic
 
-`pkg.nxrt::BlockQuantizedMatMul` and `pkg.nxrt::BlockQuantizedMoE` carry
+`pkg.nxrt._private::BlockQuantizedMatMul` and `pkg.nxrt._private::BlockQuantizedMoE` carry
 `activation_arithmetic` independently of their compressed weight formats.
 This is graph numerical semantics: it cannot change when a resource grant is
 refused or when a dense weight cache becomes available.
@@ -50,16 +50,51 @@ and output channels exceed one, `rows * N * 4` column staging bytes. Empty rows
 or output channels require neither region. MoE reserves the maximum complete
 serial projection demand plus its existing separate FC banks and accumulator.
 Standalone MatMul adds a disjoint `rows * N * 4` final-output staging region to
-that complete projection layout; the two regions are simultaneously live. Dense
-hits initialize only final-output staging, while admission retains enough
-projection capacity for a subsequent streamed fallback.
+that complete projection layout and a separate packed-weight byte lane for
+noncontiguous weights, plus separate A and bias conversion regions when needed.
+These regions are simultaneously live. Dense hits initialize final-output and
+needed input staging, while admission retains enough projection and packed-byte
+capacity for a subsequent streamed fallback.
+The byte lane is `round_up(N * ceil(K / block_elements) * block_bytes, 4)`
+when packed_B needs copying, and zero for contiguous weights or empty rows.
+Nonempty metadata preparation is Deferred: each launch resolves actual strides
+before one complete admission. Cold hashing reads the validated logical source
+directly; dense builders and streaming/Q8 consume the same admitted byte lane.
+Dense-cache hits leave that lane untouched. No execution path materializes a
+packed-weight Vec. A/bias conversion likewise uses admitted f32 regions:
+`rows * K * 4` and `N * 4` bytes when copying/widening is needed, otherwise zero.
+Contiguous aligned F32 inputs borrow their source directly. F16/BF16, strided and
+unaligned F32 use the existing conversion implementation, including bulk half
+conversion paths, with no input-sized Vec. Empty output validates descriptors
+without converting inputs. No extra owner or admission callback is added.
 No per-token, per-row, per-block or per-expert quota requests are added.
 The existing initialized f32 scratch proof covers the byte loan, including its
 rounded tail; every exposed activation block is overwritten before use.
 
 Contiguous, aligned F32 input, router logits, optional router weights and FC
 biases in BlockQuantizedMoE are borrowed through their final read. Strided or
-unaligned sources still materialize. Runtime metadata validation retains the
+unaligned sources convert into six disjoint regions of the same whole-operation
+workspace. Only non-borrowable present sources consume conversion capacity;
+optional holes consume none. These inputs can coexist across all serial experts,
+so their capacities add to the projection/FC/accumulator/packed regions.
+Routing scratch and expert grouping share one additional typed arena: with
+`M = rows * min(k, experts)`, it holds M decisions and M stable bucket indices,
+expert cursors/prefixes and TopK indices, k selected weights, and softmax storage
+only when aggregation weights are absent. Twelve outer regions still use one
+owner and one admission, with no per-input/expert quota operations. The typed
+arena preserves usize/decision alignment; alignment padding is included in the
+complete bound. Floating/routing payload Vecs and per-expert task Vecs are absent
+from this kernel's execution path. Rank metadata allocations remain.
+Score ordering and normalization finish before grouping. Stable buckets preserve
+expert and token order without another router evaluation or global route sort.
+Counts/prefix work and indirect indices have costs; no latency win is inferred
+from allocation removal.
+The arena is shared with ONNX integer QMoE. Decisions remain in score order;
+expert grouping changes access indices only. QMoE retains each original decision
+index as its contribution slot and keeps its final score-order accumulation.
+A typed unique-expert/count view serves metrics and prefetch policy without
+rebuilding a map or exporting workspace references to the loader worker.
+ Runtime metadata validation retains the
 op's F32-only interface; reuse of the widening helper does not enable half or
 F64 MoE inputs. Projection banks and the final accumulator keep publication
 after every source read and successful expert, including when Y overlaps one of
