@@ -1983,6 +1983,7 @@ impl NativeDecodeSession {
         self.last_hidden = match (&self.hidden_output, hidden) {
             (Some(name), Some(tensor)) => Some(
                 extract_last_row(&tensor)
+                    .map(NativeHidden::from_host)
                     .with_context(|| format!("read native decoder hidden output '{name}'"))?,
             ),
             (Some(name), None) => {
@@ -3041,7 +3042,10 @@ impl NativeDecodeSession {
                     profile.finish("decode_inline", step_wall);
                 }
                 if let Some(hidden_output) = self.hidden_output.as_deref() {
-                    self.last_hidden = Some(read_aux_hidden_last_row(state, hidden_output)?);
+                    self.last_hidden = Some(NativeHidden::from_host(read_aux_hidden_last_row(
+                        state,
+                        hidden_output,
+                    )?));
                 }
                 state.set_logical_len(total_len)?;
                 self.current_len = total_len;
@@ -3083,7 +3087,10 @@ impl NativeDecodeSession {
                 profile.finish("decode", step_wall);
             }
             if let Some(hidden_output) = self.hidden_output.as_deref() {
-                self.last_hidden = Some(read_aux_hidden_last_row(state, hidden_output)?);
+                self.last_hidden = Some(NativeHidden::from_host(read_aux_hidden_last_row(
+                    state,
+                    hidden_output,
+                )?));
             }
             state.set_logical_len(total_len)?;
             self.current_len = total_len;

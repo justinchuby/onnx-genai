@@ -169,7 +169,7 @@ impl NativePastSnapshot {
                     })
                     .collect()
             }),
-            hidden: self.last_hidden.as_ref().map(Vec::len),
+            hidden: self.last_hidden.as_ref().map(NativeHidden::len),
         };
         anyhow::ensure!(
             manifest.payload_bytes()? == self.bytes,
@@ -217,7 +217,7 @@ impl NativePastSnapshot {
             }
         }
         if let Some(hidden) = &self.last_hidden {
-            for value in hidden {
+            for value in hidden.as_slice() {
                 put(&value.to_le_bytes())?;
             }
         }
@@ -355,14 +355,18 @@ impl NativeDecodeSession {
         let last_hidden = manifest
             .hidden
             .map(|len| -> anyhow::Result<_> {
-                let mut raw=allocator.array::<u8>(usize::try_from(times(len as u64,4)?)?).context("admit Native hidden-state file staging before reading; release Host headroom")?;
-                reader.read_exact(raw.as_mut_slice()).context("read complete Native hidden state; restore an intact file")?;
-                hash.update(raw.as_slice());
-                Ok(raw.as_slice().chunks_exact(4)
-                    .map(|bytes| {
-                        f32::from_le_bytes(bytes.try_into().expect("four-byte hidden chunk"))
-                    })
-                    .collect())
+                let mut values = allocator.array::<f32>(len).context(
+                    "admit Native hidden-state file payload before reading; release Host headroom",
+                )?;
+                for value in values.as_mut_slice() {
+                    let mut bytes = [0; 4];
+                    reader
+                        .read_exact(&mut bytes)
+                        .context("read complete Native hidden state; restore an intact file")?;
+                    hash.update(bytes);
+                    *value = f32::from_le_bytes(bytes);
+                }
+                Ok(NativeHidden::from_cpu(values))
             })
             .transpose()?;
         let mut checksum = [0; 32];

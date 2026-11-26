@@ -287,7 +287,7 @@ where
     Ok(best_index - row_start)
 }
 
-pub(crate) fn extract_last_row(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
+fn last_row_values(tensor: &Tensor) -> anyhow::Result<impl ExactSizeIterator<Item = f32> + '_> {
     let width = *tensor
         .shape
         .last()
@@ -316,15 +316,33 @@ pub(crate) fn extract_last_row(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
         .context("native final row exceeds output backing")?;
     Ok(row
         .chunks_exact(element_bytes)
-        .map(|bytes| match tensor.dtype {
+        .map(move |bytes| match tensor.dtype {
             DataType::Float32 => f32::from_le_bytes(bytes.try_into().expect("f32 row element")),
             DataType::Float16 => f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]])),
             DataType::BFloat16 => {
                 f32::from_bits(u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) << 16)
             }
             _ => unreachable!("dtype checked above"),
-        })
-        .collect())
+        }))
+}
+
+#[cfg(any(feature = "native-cuda", test))]
+pub(crate) fn extract_last_row(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
+    Ok(last_row_values(tensor)?.collect())
+}
+
+pub(super) fn extract_owned_last_row(
+    tensor: &Tensor,
+    allocator: &onnx_runtime_session::HostTensorAllocator,
+) -> anyhow::Result<onnx_runtime_session::OwnedHostArray<f32>> {
+    let values = last_row_values(tensor)?;
+    let mut owned = allocator.array::<f32>(values.len()).context(
+        "admit Native hidden final row before copying output values; release Host headroom",
+    )?;
+    for (destination, value) in owned.as_mut_slice().iter_mut().zip(values) {
+        *destination = value;
+    }
+    Ok(owned)
 }
 
 pub(super) fn tensor_to_f32(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {

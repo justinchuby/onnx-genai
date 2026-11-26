@@ -605,7 +605,8 @@ impl NativeDecodeSession {
         };
         self.last_hidden = match (&self.hidden_output, hidden) {
             (Some(name), Some(tensor)) => Some(
-                extract_last_row(&tensor)
+                tensor::extract_owned_last_row(&tensor, &self.session.host_tensor_allocator()?)
+                    .map(NativeHidden::from_cpu)
                     .with_context(|| format!("read native decoder hidden output '{name}'"))?,
             ),
             (Some(name), None) => {

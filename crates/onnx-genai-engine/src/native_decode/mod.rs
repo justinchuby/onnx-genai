@@ -27,7 +27,9 @@ mod backend;
 mod cpu;
 mod csa;
 mod cuda;
+mod hidden;
 mod io;
+use hidden::NativeHidden;
 mod kv_commit;
 mod load;
 mod paged_gqa;
@@ -41,6 +43,8 @@ pub use csa::{
 };
 #[cfg(feature = "native-cuda")]
 pub(crate) use tensor::recurrent_state_bytes_from_graph;
+#[cfg(test)]
+mod hidden_tests;
 #[cfg(test)]
 mod tests;
 
@@ -147,7 +151,7 @@ pub struct NativeDecodeSession {
     cpu_kv: Option<DecodeCpuKvState>,
     trace: TraceContext,
     pub(crate) current_len: usize,
-    last_hidden: Option<Vec<f32>>,
+    last_hidden: Option<NativeHidden>,
     uses_decode_pool: bool,
     has_plugin_fused: bool,
     /// Coordinate rank of the `position_ids` input, derived from the graph's
@@ -312,7 +316,7 @@ pub(crate) struct NativePastSnapshot {
     past: HashMap<String, Tensor>,
     len: usize,
     bytes: u64,
-    last_hidden: Option<Vec<f32>>,
+    last_hidden: Option<NativeHidden>,
     cpu_kv: Option<cpu::CpuKvSnapshot>,
 }
 
