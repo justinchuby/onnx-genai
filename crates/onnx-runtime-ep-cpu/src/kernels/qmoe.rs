@@ -31,8 +31,9 @@ use onnx_runtime_loader::{
 
 use super::decoded_projection::{DecodedProjectionPlan, ProjectionScratch};
 use super::matmul_nbits::dequantize_nbits_row;
-use super::moe::{
-    DenseExpertWeights, ExpertProjection, MoeAttributes, MoeWorkspace, RoutingScratch,
+use super::moe::{DenseExpertWeights, ExpertProjection, MoeAttributes, MoeWorkspace};
+use super::routing_workspace::{
+    ExpertGroupCounts, ExpertRoutes, ExpertTasks, RoutedTask, RoutingArena,
 };
 use super::{check_arity, quantized_input_bytes, to_dense_f32, write_dense_f32};
 use crate::DerivedWeightMemory;
@@ -159,6 +160,7 @@ struct QMoEWorkspace<'a> {
 /// Geometry resolved from the input and FC2's packed K axis, never guessed
 /// from the FC1 gate width. Preparation and execution use the same bound.
 struct Dimensions {
+    experts: usize,
     rows: usize,
     hidden: usize,
     inter: usize,
@@ -212,6 +214,7 @@ impl QMoEKernel {
             )));
         }
         Ok(Dimensions {
+            experts: fc2[0],
             rows,
             hidden,
             inter,
@@ -227,7 +230,8 @@ impl QMoEKernel {
         dims: &Dimensions,
         has_fc3: bool,
         plan: DecodedProjectionPlan,
-    ) -> Result<WorkspaceLayout<4>> {
+        has_router_weights: bool,
+    ) -> Result<WorkspaceLayout<5>> {
         let [a, b] = MoeWorkspace::bank_layouts(
             dims.rows,
             dims.hidden,
@@ -252,7 +256,17 @@ impl QMoEKernel {
                         .then_some((dims.hidden, dims.inter)),
                 ),
         )?;
-        WorkspaceLayout::new([a, b, contributions, decoder])
+        let routing = if dims.rows == 0 {
+            std::alloc::Layout::new::<()>()
+        } else {
+            RoutingArena::layout(
+                dims.rows,
+                dims.experts,
+                self.attributes.k,
+                has_router_weights,
+            )?
+        };
+        WorkspaceLayout::new([a, b, contributions, decoder, routing])
     }
 }
 
@@ -286,8 +300,12 @@ impl QMoEKernel {
             )));
         }
         let dims = self.dimensions(input.shape, fc2.shape)?;
-        let layout =
-            self.execution_workspace_layout(&dims, inputs.get(8).is_some_and(|v| v.present), plan)?;
+        let layout = self.execution_workspace_layout(
+            &dims,
+            inputs.get(8).is_some_and(|v| v.present),
+            plan,
+            inputs.get(14).is_some_and(|v| v.present),
+        )?;
         Ok(WorkspaceRequirement {
             bytes: layout.bytes() as u64,
             alignment: layout.alignment(),
@@ -420,6 +438,7 @@ impl Kernel for QMoEKernel {
             hidden,
             inter,
             fc1_size,
+            ..
         } = dims;
         for (index, input) in inputs
             .iter()
@@ -523,9 +542,7 @@ impl Kernel for QMoEKernel {
             require_exact_shape("router_weights", router_weights.shape, &[rows, experts])?;
         }
 
-        let x = to_dense_f32(&inputs[0])?;
-        let router = to_dense_f32(&inputs[1])?;
-        let aggregation = optional_dense(inputs, 14)?;
+        let has_router_weights = optional_input(inputs, 14).is_some();
         let expected_output_elements = checked_product(&[rows, hidden], "output element count")?;
         if output_elements != expected_output_elements {
             return Err(error(format!(
@@ -538,13 +555,28 @@ impl Kernel for QMoEKernel {
         let projection_plan = projection_plan.ok_or_else(|| error(
             "QMoE expert workspace execution plan is absent or consumed; refine workspace_requirement_for_execution in the selected execution context before admission and launch"
         ))?;
-        let [bank_a, bank_b, mut contribution_scratch, decoder] = unsafe {
+        let [
+            bank_a,
+            bank_b,
+            mut contribution_scratch,
+            decoder,
+            mut routing_lane,
+        ] = unsafe {
             ProjectionScratch::bind_layout(
                 "QMoE expert workspace",
-                self.execution_workspace_layout(&dims, has_fc3, projection_plan)?,
+                self.execution_workspace_layout(
+                    &dims,
+                    has_fc3,
+                    projection_plan,
+                    has_router_weights,
+                )?,
                 workspace,
             )?
         };
+        // Route input copies and score reads follow complete operation binding.
+        let x = to_dense_f32(&inputs[0])?;
+        let router = to_dense_f32(&inputs[1])?;
+        let aggregation = optional_dense(inputs, 14)?;
         let mut expert_workspace = QMoEWorkspace {
             experts: MoeWorkspace {
                 input: bank_a,
@@ -553,17 +585,24 @@ impl Kernel for QMoEKernel {
             decoder,
             plan: projection_plan,
         };
-        let mut routing = RoutingScratch::default();
-        let mut tasks = BTreeMap::<usize, Vec<(usize, usize, f32)>>::new();
-        let mut route_slots = 0usize;
-        for row in 0..rows {
-            let router_range = checked_range(row, experts, "router row")?;
-            let route = routing.weights(
-                &router[router_range.clone()],
-                aggregation.as_deref().map(|weights| &weights[router_range]),
+        let tasks = if rows == 0 {
+            ExpertRoutes::empty(self.attributes.k)?
+        } else {
+            RoutingArena::bind(
+                rows,
+                experts,
                 self.attributes.k,
+                aggregation.is_some(),
+                &mut routing_lane,
+            )?
+            .build(
+                &router,
+                aggregation.as_deref(),
                 self.attributes.normalize_routing_weights,
-            )?;
+            )?
+        };
+        let route_slots = tasks.route_count();
+        for row in 0..rows {
             // Investigation probe (default-OFF): mirror of the CUDA route dump so
             // a CPU-vs-CUDA run can be diffed for benign borderline-argmax
             // reassociation vs a real router top-k divergence.
@@ -571,7 +610,7 @@ impl Kernel for QMoEKernel {
                 static CALL: AtomicU64 = AtomicU64::new(0);
                 let call = CALL.fetch_add(1, Ordering::Relaxed);
                 let row_logits = &router[checked_range(row, experts, "router row")?];
-                let order: Vec<usize> = route.iter().map(|&(e, _)| e).collect();
+                let order: Vec<usize> = tasks.row_selections(row)?.map(|(e, _)| e).collect();
                 let mut sorted = order.clone();
                 sorted.sort_unstable();
                 let selected_set: std::collections::HashSet<usize> =
@@ -591,17 +630,7 @@ impl Kernel for QMoEKernel {
                      margin={margin:.8e}"
                 );
             }
-            for &(expert, route_weight) in route.iter() {
-                tasks
-                    .entry(expert)
-                    .or_default()
-                    .push((row, route_slots, route_weight));
-                route_slots = route_slots
-                    .checked_add(1)
-                    .ok_or_else(|| error("routed contribution count overflow"))?;
-            }
         }
-        drop(routing);
         let contribution_elements =
             checked_product(&[route_slots, hidden], "routed contribution element count")?;
         checked_byte_count(
@@ -624,7 +653,7 @@ impl Kernel for QMoEKernel {
             metrics()
                 .record_mapped_regions(&mapped_regions)
                 .map_err(error)?;
-            metrics().record_routes(self.layer_id, &tasks);
+            metrics().record_routes(self.layer_id, tasks.counts());
 
             let expanded_bytes = DequantizedExpert::expanded_bytes(&fc1, &fc2, fc3.as_ref())?;
             let cache_operation = self.host_cache.begin_operation(
@@ -645,7 +674,7 @@ impl Kernel for QMoEKernel {
             // its worker finishes, so another layer cannot invalidate the proof
             // by registering and admitting a previously unseen bank midway.
             let mut compute = |expert: usize,
-                               expert_tasks: &[(usize, usize, f32)],
+                               expert_tasks: ExpertTasks<'_>,
                                weights: &ExpertExecution,
                                contributions: &mut [f32]|
              -> Result<()> {
@@ -653,7 +682,7 @@ impl Kernel for QMoEKernel {
                     contributions,
                     &mut expert_workspace,
                     &x,
-                    expert_tasks,
+                    expert_tasks.iter(),
                     expert,
                     weights,
                     &fc1,
@@ -669,8 +698,8 @@ impl Kernel for QMoEKernel {
                 )
             };
 
-            let prefetch_memory = if self.prefetch_experts && tasks.len() > 1 {
-                cache_operation.prefetch_memory(&tasks)?
+            let prefetch_memory = if self.prefetch_experts && tasks.counts().len() > 1 {
+                cache_operation.prefetch_memory(tasks.counts())?
             } else {
                 None
             };
@@ -684,7 +713,7 @@ impl Kernel for QMoEKernel {
                 // admission order and access-counter contract are preserved.
                 // Concurrent payload-residency peaks may reflect the overlap.
                 run_prefetched_expert_groups(
-                    tasks,
+                    tasks.groups(),
                     |expert| {
                         lease_route_first_expert(
                             &cache_operation,
@@ -700,7 +729,7 @@ impl Kernel for QMoEKernel {
                     },
                 )?;
             } else {
-                for (expert, expert_tasks) in tasks {
+                for (expert, expert_tasks) in tasks.groups() {
                     let weights = lease_route_first_expert(
                         &cache_operation,
                         expert,
@@ -709,11 +738,11 @@ impl Kernel for QMoEKernel {
                         fc3.as_ref(),
                         &ExpertMemoryScope::OnDemand(self.host_cache.memory()),
                     )?;
-                    compute(expert, &expert_tasks, &weights, contributions)?;
+                    compute(expert, expert_tasks, &weights, contributions)?;
                 }
             }
         } else {
-            for (expert, expert_tasks) in tasks {
+            for (expert, expert_tasks) in tasks.groups() {
                 let weights = load_transient_expert(
                     expert,
                     &fc1,
@@ -726,7 +755,7 @@ impl Kernel for QMoEKernel {
                     contributions,
                     &mut expert_workspace,
                     &x,
-                    &expert_tasks,
+                    expert_tasks.iter(),
                     expert,
                     &weights,
                     &fc1,
@@ -1479,9 +1508,9 @@ impl HostCacheOperation<'_> {
     /// Prepare an eligible pipeline scope while this operation freezes bank
     /// membership. Reject capacity-ineligible operations before consuming the
     /// selected experts, locking payloads, pinning hits or requesting grants.
-    fn prefetch_memory<T>(
+    fn prefetch_memory(
         &self,
-        experts: &BTreeMap<usize, T>,
+        experts: &ExpertGroupCounts<'_>,
     ) -> Result<Option<ExpertMemoryScope<'_>>> {
         if !self.prefetch_eligibility().allows_pipeline() {
             return Ok(None);
@@ -1516,7 +1545,7 @@ impl HostCacheOperation<'_> {
             let mut pins = Vec::new();
             let mut missing = Vec::new();
             let mut key = self.bank.key.representative.clone();
-            for &expert in experts.keys() {
+            for expert in experts.expert_ids() {
                 key.expert = expert;
                 if let Some(entry) = cache.entries.get(&key) {
                     pins.push(Arc::clone(&entry.weights));
@@ -1781,10 +1810,10 @@ impl WeightOffloadHostCache {
 /// Run one ordered group stream with at most one load ahead. Only the loader
 /// moves to the worker; task metadata and compute remain on the calling thread.
 /// All channels leave scope before scoped joining, including callback errors.
-fn run_prefetched_expert_groups<W: Send>(
-    tasks: BTreeMap<usize, Vec<(usize, usize, f32)>>,
+fn run_prefetched_expert_groups<W: Send, T>(
+    tasks: impl IntoIterator<Item = (usize, T)>,
     mut load: impl FnMut(usize) -> Result<W> + Send,
-    mut compute: impl FnMut(usize, &[(usize, usize, f32)], &W) -> Result<()>,
+    mut compute: impl FnMut(usize, T, &W) -> Result<()>,
 ) -> Result<()> {
     use std::sync::mpsc;
     std::thread::scope(|scope| -> Result<()> {
@@ -1818,7 +1847,7 @@ fn run_prefetched_expert_groups<W: Send>(
                     error(format!("route-first prefetch request channel closed before expert {next}; inspect the worker failure and retry the operation"))
                 })?;
             }
-            compute(expert, &expert_tasks, &weights)?;
+            compute(expert, expert_tasks, &weights)?;
         }
         Ok(())
     })
@@ -1861,7 +1890,7 @@ fn write_grouped_contributions(
     contributions: &mut [f32],
     expert_workspace: &mut QMoEWorkspace<'_>,
     input: &[f32],
-    tasks: &[(usize, usize, f32)],
+    tasks: impl ExactSizeIterator<Item = RoutedTask> + Clone,
     expert: usize,
     weights: &ExpertExecution,
     fc1: &QuantizedExperts<'_>,
@@ -1881,7 +1910,7 @@ fn write_grouped_contributions(
     let expert_out = match weights {
         ExpertExecution::Dense(weights) => expert_workspace.experts.run_dense_expert(
             input,
-            tasks.iter().map(|&(row, _, _)| row),
+            tasks.clone().map(|task| task.row),
             DenseExpertWeights {
                 fc1: &weights.fc1,
                 fc1_bias: fc1_bias.map(|bias| &bias[fc1_bias_range]),
@@ -1913,7 +1942,7 @@ fn write_grouped_contributions(
             let plan = expert_workspace.plan;
             expert_workspace.experts.run_expert_projections(
                 input,
-                tasks.iter().map(|&(row, _, _)| row),
+                tasks.clone().map(|task| task.row),
                 &fc1,
                 fc1_bias.map(|bias| &bias[fc1_bias_range]),
                 &fc2,
@@ -1927,11 +1956,11 @@ fn write_grouped_contributions(
             )?
         }
     };
-    for (grouped_row, &(_, slot, route_weight)) in tasks.iter().enumerate() {
+    for (grouped_row, task) in tasks.enumerate() {
         let contribution =
-            &mut contributions[checked_range(slot, hidden, "routed contribution row")?];
+            &mut contributions[checked_range(task.slot, hidden, "routed contribution row")?];
         for feature in 0..hidden {
-            contribution[feature] = route_weight * expert_out[grouped_row * hidden + feature];
+            contribution[feature] = task.weight * expert_out[grouped_row * hidden + feature];
         }
     }
     Ok(())
@@ -2411,6 +2440,27 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock};
 
+    fn with_routing_bytes(
+        base: usize,
+        rows: usize,
+        experts: usize,
+        k: usize,
+        has_weights: bool,
+    ) -> usize {
+        if rows == 0 {
+            return base;
+        }
+        let k = k.min(experts);
+        let index = std::mem::size_of::<usize>();
+        let selection = std::mem::size_of::<(usize, f32)>();
+        let body = rows * k * (selection + index)
+            + (3 * experts + 1) * index
+            + if has_weights { 0 } else { experts * 4 };
+        base.next_multiple_of(std::mem::align_of::<usize>())
+            + body.next_multiple_of(std::mem::align_of::<(usize, f32)>())
+            + k * selection
+    }
+
     fn in_single_pool(body: impl FnOnce() + Send) {
         rayon::ThreadPoolBuilder::new()
             .num_threads(1)
@@ -2450,7 +2500,8 @@ mod tests {
                 const H: usize = 16;
                 const E: usize = 4;
                 let banks_bytes = rows * (H + H + 2 * H) * 4;
-                let bytes = banks_bytes + (if rows > 1 { rows * H } else { 0 } + H) * 4;
+                let base = banks_bytes + (if rows > 1 { rows * H } else { 0 } + H) * 4;
+                let bytes = with_routing_bytes(base, rows, E, 2, false);
                 let books = RecordingGovernor::new_host(bytes as u64);
                 let manager = ProcessMemoryManager::new().unwrap();
                 let pool = HostWorkspacePool::governed(&manager, Arc::new(books.clone())).unwrap();
@@ -2596,7 +2647,7 @@ mod tests {
                         let decoder_bytes = unsafe {
                             std::slice::from_raw_parts(
                                 backing.as_ptr().cast::<u8>().add(banks_bytes),
-                                bytes - banks_bytes,
+                                base - banks_bytes,
                             )
                         };
                         assert!(decoder_bytes.iter().all(|b| *b == 0xff));
@@ -2617,6 +2668,85 @@ mod tests {
                 assert_eq!(manager.process_used(Tier::Host), 0);
             }
         });
+    }
+
+    #[test]
+    fn routing_budget_rejection_precedes_input_copies_and_can_retry() {
+        let (rows, hidden, experts) = (3, 16, 4);
+        let shapes = [
+            Some((DataType::Float32, &[3, 16][..])),
+            Some((DataType::Float32, &[3, 4])),
+            Some((DataType::Uint8, &[4, 16, 16])),
+            Some((DataType::Float32, &[4, 16, 1])),
+            None,
+            Some((DataType::Uint8, &[4, 16, 16])),
+            Some((DataType::Float32, &[4, 16, 1])),
+        ];
+        let (graph, node) = model_node("QMoE", &shapes, &[3, 16], &attributes(8, 16, 2, true));
+        let kernel = test_kernel(&graph, node);
+        let x = Owned::f32(&[rows, hidden], &vec![1.; rows * hidden]);
+        let router = Owned::f32(&[rows, experts], &vec![0.; rows * experts]);
+        let packed = Owned::u8(
+            &[experts, hidden, hidden],
+            &vec![128; experts * hidden * hidden],
+        );
+        let scales = Owned::f32(&[experts, hidden, 1], &vec![1.; experts * hidden]);
+        let original = [
+            x.view(),
+            router.view(),
+            packed.view(),
+            scales.view(),
+            TensorView::absent(DataType::Float32),
+            packed.view(),
+            scales.view(),
+        ];
+        let metadata = original
+            .iter()
+            .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
+            .collect::<Vec<_>>();
+        let req = kernel
+            .workspace_requirement_for_execution(&original, &[], &metadata, &[], None)
+            .unwrap()
+            .require_ready()
+            .unwrap();
+        let mut bad = original;
+        bad[0].data = DevicePtr(std::ptr::without_provenance(4096));
+        bad[1].data = DevicePtr(std::ptr::without_provenance(8192));
+        let mut backing = vec![91u128; (req.bytes as usize).div_ceil(16)];
+        let mut y = Owned::f32(&[rows, hidden], &vec![37.; rows * hidden]);
+        let short = WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(backing.as_mut_ptr().cast()),
+            req.bytes as usize - 1,
+        );
+        assert!(
+            kernel
+                .execute_with_workspace(&bad, &mut [y.view_mut()], Some(short))
+                .unwrap_err()
+                .to_string()
+                .contains("QMoE expert workspace")
+        );
+        assert_eq!(y.to_f32(), vec![37.; rows * hidden]);
+        assert!(backing.iter().all(|&b| b == 91));
+        let view = WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(backing.as_mut_ptr().cast()),
+            req.bytes as usize,
+        );
+        assert!(
+            kernel
+                .execute_with_workspace(&original, &mut [y.view_mut()], Some(view))
+                .unwrap_err()
+                .to_string()
+                .contains("absent or consumed")
+        );
+        kernel
+            .workspace_requirement_for_execution(&original, &[], &metadata, &[], None)
+            .unwrap()
+            .require_ready()
+            .unwrap();
+        kernel
+            .execute_with_workspace(&original, &mut [y.view_mut()], Some(view))
+            .unwrap();
+        assert_eq!(y.to_f32(), vec![0.; rows * hidden]);
     }
 
     #[test]
@@ -2665,15 +2795,21 @@ mod tests {
                         prepare(TensorMetadata::new(DataType::Float32, shape, true), fc2)
                             .unwrap()
                             .bytes,
-                        ((rows * (16 + 32 + 16)
-                            + if rows == 0 {
-                                0
-                            } else if rows == 1 {
-                                32
-                            } else {
-                                (rows * 32 + 16).max(rows * 16 + 32)
-                            })
-                            * 4) as u64
+                        with_routing_bytes(
+                            (rows * (16 + 32 + 16)
+                                + if rows == 0 {
+                                    0
+                                } else if rows == 1 {
+                                    32
+                                } else {
+                                    (rows * 32 + 16).max(rows * 16 + 32)
+                                })
+                                * 4,
+                            rows,
+                            1,
+                            1,
+                            false
+                        ) as u64
                     );
                 }
                 for input in [
@@ -2708,7 +2844,7 @@ mod tests {
                     )
                     .unwrap()
                     .bytes,
-                    32 * 4
+                    with_routing_bytes(32 * 4, 1, 1, 1, false) as u64
                 );
                 assert_eq!(
                     prepare(
@@ -2717,7 +2853,7 @@ mod tests {
                     )
                     .unwrap()
                     .bytes,
-                    2 * 3 * 32 * 4
+                    with_routing_bytes(2 * 3 * 32 * 4, 3, 1, 1, false) as u64
                 );
             });
     }
@@ -2831,6 +2967,7 @@ mod tests {
             prepared_projection: std::cell::Cell::new(None),
         };
         let dims = Dimensions {
+            experts: 1,
             rows: 1,
             hidden: 16,
             inter: 16,
@@ -2838,20 +2975,21 @@ mod tests {
         };
         kernel.attributes.k = usize::MAX;
         let err = kernel
-            .execution_workspace_layout(&dims, false, fixed_plan(1))
+            .execution_workspace_layout(&dims, false, fixed_plan(1), false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("routed contribution element count"), "{err}");
         kernel.attributes.k = 1;
         let width = (isize::MAX as usize / 8 / 16) * 16;
         let dims = Dimensions {
+            experts: 1,
             rows: 1,
             hidden: width,
             inter: width,
             fc1_size: width,
         };
         let err = kernel
-            .execution_workspace_layout(&dims, false, fixed_plan(1))
+            .execution_workspace_layout(&dims, false, fixed_plan(1), false)
             .unwrap_err()
             .to_string();
         assert!(
@@ -3102,7 +3240,7 @@ mod tests {
             let banks = R * (H + I + 2 * H) * 4;
             let peak_width = construction.max(execution);
             let decoder = (R * I + peak_width * H).max(R * H + peak_width * I) * 4;
-            let bytes = banks + decoder;
+            let bytes = with_routing_bytes(banks + decoder, R, E, 2, false);
             let books = RecordingGovernor::new_host(bytes as u64);
             let manager = ProcessMemoryManager::new().unwrap();
             let pool = HostWorkspacePool::governed(&manager, Arc::new(books.clone())).unwrap();
@@ -3160,7 +3298,11 @@ mod tests {
                 .collect::<Vec<_>>();
             let mut output = Owned::zeros_f32(&[R, H]);
             let initial = cpu
-                .allocate_workspace(bytes, 4, WorkspaceRequirement::NONE.role())
+                .allocate_workspace(
+                    bytes,
+                    std::mem::align_of::<(usize, f32)>(),
+                    WorkspaceRequirement::NONE.role(),
+                )
                 .unwrap();
             let identity = initial.as_ptr() as usize;
             cpu.deallocate_workspace(initial).unwrap();
@@ -3174,8 +3316,13 @@ mod tests {
                 .require_ready()
                 .unwrap();
                 let active_width = target.current_num_threads();
-                let active_bytes =
-                    banks + (R * I + active_width * H).max(R * H + active_width * I) * 4;
+                let active_bytes = with_routing_bytes(
+                    banks + (R * I + active_width * H).max(R * H + active_width * I) * 4,
+                    R,
+                    E,
+                    2,
+                    false,
+                );
                 assert_eq!(req.bytes, active_bytes as u64);
                 for warm in 0..3 {
                     let before = (books.claims(), books.releases());
@@ -3298,19 +3445,30 @@ mod tests {
                         .max(group_rows * H + active_width * I)
                         * 4;
                     if sparse {
-                        assert!(banks + used_decoder < active_bytes);
+                        let actual_decoder =
+                            (R * I + active_width * H).max(R * H + active_width * I) * 4;
+                        assert!(used_decoder < actual_decoder);
                     }
-                    // SAFETY: the live exclusive CPU allocation was poisoned above.
-                    let unused = unsafe {
-                        std::slice::from_raw_parts(
-                            backing.as_ptr().cast::<u8>().add(banks + used_decoder),
-                            bytes - banks - used_decoder,
-                        )
-                    };
-                    assert!(
-                        unused.iter().all(|&b| b == 0xff),
-                        "only actual grouped projections may initialize decoder prefixes"
-                    );
+                    let actual_decoder =
+                        (R * I + active_width * H).max(R * H + active_width * I) * 4;
+                    // SAFETY: backing is live and poisoned. Routing may write its
+                    // own region after the active decoder, but neither unused
+                    // decoder values nor the retained post-plan tail may change.
+                    for (start, end) in [
+                        (banks + used_decoder, banks + actual_decoder),
+                        (active_bytes, bytes),
+                    ] {
+                        let unused = unsafe {
+                            std::slice::from_raw_parts(
+                                backing.as_ptr().cast::<u8>().add(start),
+                                end - start,
+                            )
+                        };
+                        assert!(
+                            unused.iter().all(|&b| b == 0xff),
+                            "only actual decode and routing regions may initialize their prefixes"
+                        );
+                    }
                     let before_return = (books.claims(), books.releases());
                     cpu.deallocate_workspace(backing).unwrap();
                     assert_eq!(before_return, (books.claims(), books.releases()));
@@ -5119,7 +5277,11 @@ mod tests {
                             &mut out,
                             &mut scratch,
                             &input,
-                            &tasks,
+                            tasks.iter().map(|&(row, slot, weight)| RoutedTask {
+                                row,
+                                slot,
+                                weight,
+                            }),
                             1,
                             execution,
                             fc1,
@@ -6193,7 +6355,7 @@ mod tests {
                 let result = std::thread::scope(|scope| {
                     let operation = &operation;
                     scope.spawn(move || {
-                        let selected = BTreeMap::from([(usize::MAX, ())]);
+                        let selected = ExpertGroupCounts::checked(&[usize::MAX], &[1]).unwrap();
                         tx.send(operation.prefetch_memory(&selected).unwrap().is_none())
                             .unwrap();
                     });
@@ -6254,7 +6416,7 @@ mod tests {
         let result = std::thread::scope(|scope| {
             let operation = &operation;
             scope.spawn(move || {
-                let selected = BTreeMap::<usize, ()>::new();
+                let selected = ExpertGroupCounts::checked(&[], &[]).unwrap();
                 let memory = operation.prefetch_memory(&selected).unwrap();
                 tx.send(memory)
                     .unwrap_or_else(|_| panic!("streaming scope receiver disappeared"));
@@ -6299,7 +6461,7 @@ mod tests {
         assert_eq!(books.used(Tier::Host), 12);
         let before = (books.claims(), books.releases());
         let memory = operation
-            .prefetch_memory(&BTreeMap::from([(0, ()), (1, ()), (2, ())]))
+            .prefetch_memory(&ExpertGroupCounts::checked(&[0, 1, 2], &[1, 1, 1]).unwrap())
             .unwrap()
             .unwrap();
         assert_eq!((books.claims(), books.releases()), before);
@@ -6343,7 +6505,7 @@ mod tests {
             );
         }
         let scope = operation
-            .prefetch_memory(&BTreeMap::from([(0, ()), (1, ()), (2, ())]))
+            .prefetch_memory(&ExpertGroupCounts::checked(&[0, 1, 2], &[1, 1, 1]).unwrap())
             .unwrap()
             .unwrap();
         assert_eq!(governor.used(Tier::Host), 12);
