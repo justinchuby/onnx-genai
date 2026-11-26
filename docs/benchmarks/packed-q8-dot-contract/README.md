@@ -1,5 +1,10 @@
 # Grouped Q8-dot arithmetic contract
 
+This records the original test-only study. The subsequent opt-in production
+integration has its own [arithmetic and workspace contract](../../quantization/PACKED_ACTIVATION_ARITHMETIC.md).
+The study's test-owned Vecs and numerical results remain historical evidence,
+not production allocation or performance measurements.
+
 The cold packed projection currently decodes a bounded f32 weight tile and
 reuses it across the expert's tokens. A quantized-domain dot can remove that
 weight representation, but quantizing its f32 activation is a separate numerical

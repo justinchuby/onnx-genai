@@ -4016,4 +4016,5 @@ mod tests {
 }
 
 mod decoded_projection;
+mod packed_projection;
 pub(crate) mod weight_cache;
