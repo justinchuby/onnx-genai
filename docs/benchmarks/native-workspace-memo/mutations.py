@@ -36,6 +36,9 @@ def main():
             build.write(root/f'{r["name"]}.json',{k:v for k,v in r.items() if k!='rep'})
             build.write(root/'processes.json',records)
             build.write(root/'summary.json',analyze.summarize(root))
+            if (root/'checksums.json').exists():
+                checksums={p.relative_to(root).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file() and p.name!='checksums.json'}
+                build.write(root/'checksums.json',checksums)
             rejected=False
             try:
                 verify.verify(root)

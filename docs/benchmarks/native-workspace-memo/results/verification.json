@@ -1,0 +1,25 @@
+{
+  "checksum_repaired_mutations": [
+    {
+      "checksums_and_summary_repaired": true,
+      "message": "actual prebound dispatch cardinality",
+      "mutation": "dispatch_count",
+      "rejected": true
+    },
+    {
+      "checksums_and_summary_repaired": true,
+      "message": "independent full-output oracle",
+      "mutation": "complete_output",
+      "rejected": true
+    },
+    {
+      "checksums_and_summary_repaired": true,
+      "message": "(3.397756636128729, 3.147756636128729)",
+      "mutation": "derived_foreign_cpu",
+      "rejected": true
+    }
+  ],
+  "outer_file_inventory_also_repaired_in_mutations": true,
+  "raw_verifier_passed": true,
+  "source_audit_passed": true
+}
