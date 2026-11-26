@@ -253,10 +253,10 @@ fn assert_complete_cleanup(executor: Executor, ep: &Arc<ManagedCpu>) {
 fn managed_grow_denial_keeps_original_backing_shape_and_small_retry_then_grows() {
     let (mut executor, ep, middle) = fixture(128);
     run(&mut executor, &[2.0, 5.0]);
-    assert_eq!(ep.used(), 24);
+    assert_eq!(ep.used(), 16);
     let original = executor.buffers[&middle].as_ptr();
     let dtype = executor.value_dtypes[&middle];
-    let blocker = ep.allocate(88, 64).unwrap();
+    let blocker = ep.allocate(96, 64).unwrap();
     assert_eq!(ep.used(), 112);
     let error = executor
         .ensure_buffer(middle, DataType::Float32, &[8])
@@ -286,7 +286,7 @@ fn managed_resize_admission_counts_live_old_and_new_peak() {
     let (mut executor, ep, middle) = fixture(64);
     run(&mut executor, &[2.0, 5.0]);
     let original = executor.buffers[&middle].as_ptr();
-    let blocker = ep.allocate(32, 64).unwrap();
+    let blocker = ep.allocate(40, 64).unwrap();
     assert_eq!(ep.used(), 56);
     // Old-first freeing would incorrectly admit 56-8+16=64. The actual
     // transactional peak is 56+16=72 and must be refused under this cap.
@@ -317,14 +317,14 @@ fn old_release_error_keeps_published_replacement_coherent_and_old_claim_funded()
     assert_ne!(executor.buffers[&middle].as_ptr(), original);
     assert_eq!(executor.buffer_shapes[&middle], [8]);
     assert_eq!(executor.buffers[&middle].len(), 32);
-    assert_eq!(ep.used(), 56);
+    assert_eq!(ep.used(), 48);
     let allocations = ep.allocations.load(Ordering::Relaxed);
     executor
         .ensure_buffer(middle, DataType::Float32, &[8])
         .unwrap();
     assert_eq!(ep.allocations.load(Ordering::Relaxed), allocations);
     ep.release_retained();
-    assert_eq!(ep.used(), 48);
+    assert_eq!(ep.used(), 40);
     run(&mut executor, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
     assert_complete_cleanup(executor, &ep);
 }
@@ -338,7 +338,7 @@ fn shared_old_owner_survives_denied_resize_and_external_view_survives_replacemen
     let external = Arc::clone(&shared);
     executor.buffers.insert(middle, shared.alias());
     executor.shared_buffers.insert(middle, shared);
-    let blocker = ep.allocate(88, 64).unwrap();
+    let blocker = ep.allocate(96, 64).unwrap();
     assert_eq!(ep.used(), 112);
     assert!(
         executor
@@ -362,15 +362,11 @@ fn shared_old_owner_survives_denied_resize_and_external_view_survives_replacemen
         .ensure_buffer(middle, DataType::Float32, &[8])
         .unwrap();
     assert!(!executor.shared_buffers.contains_key(&middle));
-    assert_eq!(
-        ep.used(),
-        56,
-        "old view retains8 plus input8, output8, and new32"
-    );
+    assert_eq!(ep.used(), 48, "old view retains8 plus input8 and new32");
     ep.copy_to_host(external.buffer(), &mut bytes).unwrap();
     assert_eq!(f32::from_le_bytes(bytes[..4].try_into().unwrap()), -2.0);
     drop(external);
-    assert_eq!(ep.used(), 48);
+    assert_eq!(ep.used(), 40);
     run(&mut executor, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
     assert_complete_cleanup(executor, &ep);
 }
