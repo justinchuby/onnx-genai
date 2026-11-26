@@ -126,6 +126,84 @@ fn native_generative_mp3_process_uses_the_authored_window_for_every_segment() {
 }
 
 #[test]
+fn native_generative_stdin_and_feature_attachment_enforce_the_selected_pcm_policy() {
+    let scratch = tempfile::tempdir().unwrap();
+    let wav = onnx_genai::preprocess::audio::encode_wav_pcm16(&[0.5; 32], 8000, 1).unwrap();
+    let file = scratch.path().join("feature.wav");
+    std::fs::write(&file, &wav).unwrap();
+    for package in ["transcription_tokens", "transcription_features"] {
+        let mut child = command(
+            &model(package),
+            Path::new("-"),
+            &["--max-decoded-audio-bytes", "16"],
+            None,
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+        child.stdin.take().unwrap().write_all(&wav).unwrap();
+        let rejected = child.wait_with_output().unwrap();
+        let error = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            !rejected.status.success(),
+            "{package}: stdin must reject the selected low PCM policy"
+        );
+        assert!(error.contains("max_decoded_bytes=16"), "{package}: {error}");
+        assert!(
+            rejected.stdout.is_empty(),
+            "{package}: rejected segment must not produce transcript output"
+        );
+    }
+    // This package binds computed features, so no downstream audio adapter can
+    // repair a missing frontend admission check. Exercise the actual binary.
+    for (maximum, accepted) in [("16", false), ("4096", true)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_onnx-genai"))
+            .arg("generate")
+            .arg(model("transcription_features"))
+            .arg("--prompt")
+            .arg("")
+            .arg("--audio")
+            .arg(&file)
+            .args([
+                "--max-decoded-audio-bytes",
+                maximum,
+                "--max-new-tokens",
+                "2",
+                "--temperature",
+                "0",
+                "--no-stats",
+                "--cpu-cores",
+                "1",
+            ])
+            .env_remove("ONNX_GENAI_BACKEND")
+            .env("ONNX_GENAI_EP", "cpu")
+            .env(
+                "ONNX_GENAI_ORT_LIB",
+                "/missing/nxrt-native-audio-policy-reference-test/onnxruntime",
+            )
+            .output()
+            .unwrap();
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.success(),
+            accepted,
+            "generate --audio policy {maximum}: {error}"
+        );
+        if accepted {
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("hello"),
+                "actual Native feature-dependent output"
+            );
+        } else {
+            assert!(error.contains("max_decoded_bytes=16"), "{error}");
+            assert!(output.stdout.is_empty());
+        }
+    }
+}
+
+#[test]
 fn native_authored_transcription_process_projects_framing_and_conditions_the_prompt() {
     let scratch = tempfile::tempdir().unwrap();
     let path = scratch.path().join("silent.wav");

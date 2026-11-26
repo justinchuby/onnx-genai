@@ -191,7 +191,9 @@ mapping families fail explicitly. Ogg code 3 packets with 32–48 frames also fa
 Symphonia 0.6.1 masks their frame count to five bits, damaging page timestamps.
 The runtime independently checks the six-bit RFC count and refuses those packets
 until a published demuxer repair is available. It never trusts the damaged packet
-duration to cut PCM. WebM/Matroska and MP4 Opus remain explicitly unsupported;
+duration to cut PCM. Typed packet PTS and valid-duration/end-trim metadata must
+agree with the independent raw TOC cursor and final granule; a final granule
+preceding already declared valid audio is rejected. WebM/Matroska and MP4 Opus remain explicitly unsupported;
 their delay, discard-padding and identification-header conventions need separate
 complete repairs. Existing non-Opus codecs in those containers remain available.
 
@@ -202,17 +204,22 @@ simultaneously retained mono waveform, interleaved staging and codec PCM packet
 capacity. It also bounds packet progress at one packet per four budget bytes;
 zero-frame packets cannot evade this bound. The maximum 120 ms Opus packet PCM
 allocation is checked before decoder construction, and each Opus packet's exact
-TOC duration is checked before decode/growth. Codec-private fixed-size state and
-container metadata are not exact heap accounting under this PCM policy.
+TOC duration is checked before decode/growth. Other codecs retain their existing
+decoder path: packet PCM capacity is checked after `decoder.decode`, before our
+interleaved/mono buffers grow. This does not bound a non-Opus decoder's first
+internal allocation. Codec-private fixed-size state and container metadata are
+not exact heap accounting under this PCM policy.
 
-The CLI file decoder and server expose `--max-decoded-audio-bytes` with a finite
+The CLI `generate --audio`, file/stdin transcription and server expose `--max-decoded-audio-bytes` with a finite
 64 MiB default. Engine-backed admission additionally intersects the policy with
-live host-memory headroom; zero headroom fails. Workflow audio uses the same
+live host-memory ledger headroom; zero headroom fails. This is an admission
+snapshot, not a PCM memory lease: concurrent requests can observe the same
+headroom, so it does not guarantee atomic aggregate host occupancy. Workflow audio uses the same
 configured `EngineConfig.audio_decode_limits` and its existing shared host
 authority. A program divides its caller budget across its declared decode
 invocations and encoded batch rows. These bounds do not cover every later
-authored DSP tensor or all request allocations. The API provides no unbounded default or compressed-byte expansion
-guess. Encoding/generation tools are only used to prepare independent test
+authored DSP tensor or all request allocations. The API provides no unbounded
+default or compressed-byte expansion guess. Encoding/generation tools are only used to prepare independent test
 fixtures, never during runtime decoding. Dependency license/source information
 is recorded in [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
 

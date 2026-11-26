@@ -41,6 +41,112 @@ fn rewrite_page(bytes: &mut [u8], offset: usize, change: impl FnOnce(&mut [u8], 
     bytes[offset + 22..offset + 26].copy_from_slice(&crc.to_le_bytes());
 }
 
+// Re-page the real encoded CELT fixture without modifying any Opus packets.
+// The small fixture has no continued packets; production has no Ogg parser here.
+fn two_audio_page_fixture(final_granule: u64) -> Vec<u8> {
+    let source = std::fs::read(root().join("celt-1.ogg")).unwrap();
+    let mut pages = Vec::new();
+    let mut offset = 0;
+    while offset < source.len() {
+        assert_eq!(&source[offset..offset + 4], b"OggS");
+        let count = usize::from(source[offset + 26]);
+        let body = offset + 27 + count;
+        let laces = &source[offset + 27..body];
+        assert!(
+            laces.iter().all(|length| *length < 255),
+            "fixture has complete packets per lace"
+        );
+        let end = body
+            + laces
+                .iter()
+                .map(|length| usize::from(*length))
+                .sum::<usize>();
+        let mut position = body;
+        let packets = laces
+            .iter()
+            .map(|length| {
+                let end = position + usize::from(*length);
+                let packet = source[position..end].to_vec();
+                position = end;
+                packet
+            })
+            .collect::<Vec<_>>();
+        pages.push((source[offset..end].to_vec(), packets));
+        offset = end;
+    }
+    assert_eq!(pages.len(), 3, "OpusHead, OpusTags, one EOS audio page");
+    let audio = &pages[2].1;
+    assert_eq!(audio.len(), 13);
+    let serial = &pages[0].0[14..18];
+    let mut output = Vec::new();
+    output.extend_from_slice(&pages[0].0);
+    output.extend_from_slice(&pages[1].0);
+    for (index, (packets, granule, flags)) in [
+        (&audio[..6], 5760_u64, 0_u8),
+        (&audio[6..], final_granule, 4_u8),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut page = vec![0_u8; 27 + packets.len()];
+        page[..4].copy_from_slice(b"OggS");
+        page[5] = flags;
+        page[6..14].copy_from_slice(&granule.to_le_bytes());
+        page[14..18].copy_from_slice(serial);
+        page[18..22].copy_from_slice(&(index as u32 + 2).to_le_bytes());
+        page[26] = packets.len() as u8;
+        for (index, packet) in packets.iter().enumerate() {
+            page[27 + index] = packet.len() as u8;
+            page.extend_from_slice(packet);
+        }
+        rewrite_page(&mut page, 0, |_, _| {});
+        // Independently recompute the serialized page's stored CRC, including
+        // its final granule/sequence/lacing. Both cases are actual valid Ogg pages.
+        let stored = u32::from_le_bytes(page[22..26].try_into().unwrap());
+        let mut checksum = 0_u32;
+        for (index, byte) in page.iter().enumerate() {
+            let byte = if (22..26).contains(&index) { 0 } else { *byte };
+            checksum ^= u32::from(byte) << 24;
+            for _ in 0..8 {
+                checksum = if checksum & 0x8000_0000 != 0 {
+                    (checksum << 1) ^ 0x04c1_1db7
+                } else {
+                    checksum << 1
+                };
+            }
+        }
+        assert_eq!(stored, checksum);
+        output.extend_from_slice(&page);
+    }
+    output
+}
+
+#[test]
+fn ogg_opus_rejects_eos_granule_before_a_previous_audio_page() {
+    let valid = two_audio_page_fixture(11640);
+    let actual = decode_audio(&valid, limit(1024 * 1024)).unwrap();
+    let original = decode_audio(
+        &std::fs::read(root().join("celt-1.ogg")).unwrap(),
+        limit(1024 * 1024),
+    )
+    .unwrap();
+    assert_eq!(
+        actual.samples, original.samples,
+        "re-paging unchanged packets preserves all presented PCM"
+    );
+    assert_eq!(actual.samples.len(), 11520);
+    // Earlier page granule=5760; final=5000 > pre-skip120. Merely cropping the
+    // raw buffer to final-pre-skip would silently accept 4880 frames.
+    let backward = two_audio_page_fixture(5000);
+    let error = decode_audio(&backward, limit(1024 * 1024))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("final granule 5000 precedes") && error.contains("must not move backwards"),
+        "{error}"
+    );
+}
+
 #[test]
 fn opus_preskip_spans_packets_gain_applies_once_and_end_granule_is_exact() {
     let original = std::fs::read(root().join("celt-1.ogg")).unwrap();

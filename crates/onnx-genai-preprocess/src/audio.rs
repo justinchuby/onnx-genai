@@ -706,8 +706,9 @@ pub fn decode_audio(
                 "Ogg Opus packet {packet_index} is empty; file decoding does not invent packet-loss concealment for malformed container packets"
             )));
         }
-        let opus_packet = if is_opus {
+        let opus_packet = if let Some(presentation) = opus.as_ref() {
             let frames = opus::OggOpus::packet_frames(&packet)?;
+            presentation.validate_packet(&packet, frames)?;
             let valid = frames;
             let channels = empty_spec
                 .as_ref()

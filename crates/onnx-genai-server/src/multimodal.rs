@@ -157,11 +157,12 @@ impl MultimodalInput {
         spec: &AudioInputSpec,
         samples: &[f32],
         sample_rate: u32,
+        limits: onnx_genai_preprocess::audio::AudioDecodeLimits,
     ) -> anyhow::Result<Self> {
         if spec.is_encoded() {
             // The package's own program decodes a container, so a caller that
             // holds bare samples has to hand one back.
-            let bytes = crate::audio_input::encode_samples_wav(samples, sample_rate)?;
+            let bytes = crate::audio_input::encode_samples_wav(samples, sample_rate, limits)?;
             return Ok(Self {
                 tensors: vec![PreparedTensor::EncodedAudio {
                     name: spec.endpoint.clone(),
@@ -169,7 +170,7 @@ impl MultimodalInput {
                 }],
             });
         }
-        let tensor = preprocess_samples(samples, sample_rate, spec)?;
+        let tensor = preprocess_samples(samples, sample_rate, spec, limits)?;
         Ok(Self {
             tensors: vec![PreparedTensor::Audio {
                 name: tensor.endpoint,
@@ -605,8 +606,20 @@ mod media_binding_tests {
         let declaration = feature_program("features", 7, 4).audio.unwrap();
         let spec =
             super::AudioInputSpec::from_input("features".into(), &[1, 7, 4], &declaration).unwrap();
-        let silent = super::preprocess_samples(&[0.0; 512], 16000, &spec).unwrap();
-        let tone = super::preprocess_samples(&[0.5; 512], 16000, &spec).unwrap();
+        let silent = super::preprocess_samples(
+            &[0.0; 512],
+            16000,
+            &spec,
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .unwrap();
+        let tone = super::preprocess_samples(
+            &[0.5; 512],
+            16000,
+            &spec,
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .unwrap();
         assert_eq!(tone.shape, [1, 7, 4]);
         assert_eq!(tone.data.len(), 28);
         assert_eq!(
@@ -642,9 +655,14 @@ mod media_binding_tests {
         wrong.transforms[2].target_length = Some(384);
         let wrong =
             super::AudioInputSpec::from_input("features".into(), &[1, 7, 4], &wrong).unwrap();
-        let error = super::preprocess_samples(&[0.5; 512], 16000, &wrong)
-            .unwrap_err()
-            .to_string();
+        let error = super::preprocess_samples(
+            &[0.5; 512],
+            16000,
+            &wrong,
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             error.contains("features") && error.contains("shape") && error.contains("geometry"),
             "{error}"
@@ -663,9 +681,14 @@ mod media_binding_tests {
             1413
         );
         assert_eq!(
-            super::preprocess_samples(&[0.5; 512], 16000, &branched)
-                .unwrap()
-                .data,
+            super::preprocess_samples(
+                &[0.5; 512],
+                16000,
+                &branched,
+                onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY
+            )
+            .unwrap()
+            .data,
             tone.data
         );
         for shape in [[1, 0, 4], [1, 7, -1], [2, 7, 4]] {

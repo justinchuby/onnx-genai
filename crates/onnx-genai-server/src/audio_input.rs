@@ -151,11 +151,12 @@ pub fn preprocess_samples(
     samples: &[f32],
     sample_rate: u32,
     spec: &AudioInputSpec,
+    limits: onnx_genai_preprocess::audio::AudioDecodeLimits,
 ) -> anyhow::Result<AudioTensor> {
     preprocess_audio(
-        &encode_wav_f32(samples, sample_rate, 1)?,
+        &encode_samples_wav(samples, sample_rate, limits)?,
         spec,
-        onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        limits,
     )
 }
 
@@ -163,7 +164,20 @@ pub fn preprocess_samples(
 ///
 /// A package whose preprocessing program starts at `decode` accepts a container,
 /// not bare samples, so a stream segment has to be wrapped before it is bound.
-pub fn encode_samples_wav(samples: &[f32], sample_rate: u32) -> anyhow::Result<Vec<u8>> {
+pub fn encode_samples_wav(
+    samples: &[f32],
+    sample_rate: u32,
+    limits: onnx_genai_preprocess::audio::AudioDecodeLimits,
+) -> anyhow::Result<Vec<u8>> {
+    let bytes = samples
+        .len()
+        .checked_mul(size_of::<f32>())
+        .context("mono sample PCM byte count overflows; shorten the input segment")?;
+    anyhow::ensure!(
+        bytes <= limits.max_decoded_bytes.get(),
+        "mono sample PCM requires {bytes} bytes, exceeding max_decoded_bytes={}; shorten the segment or raise the caller decoded-audio policy",
+        limits.max_decoded_bytes
+    );
     Ok(encode_wav_f32(samples, sample_rate, 1)?)
 }
 

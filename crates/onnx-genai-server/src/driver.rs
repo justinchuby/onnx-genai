@@ -3576,8 +3576,13 @@ mod admission_tests {
         let spec =
             crate::audio_input::AudioInputSpec::from_encoded_input("audio_bytes".into(), &program)
                 .unwrap();
-        let input = MultimodalInput::from_samples(&spec, &[0.0f32; 16], 16_000)
-            .expect("an encoded-audio spec binds the samples it is handed");
+        let input = MultimodalInput::from_samples(
+            &spec,
+            &[0.0f32; 16],
+            16_000,
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .expect("an encoded-audio spec binds the samples it is handed");
 
         // Assert the precondition rather than trusting the test's name: a
         // request whose inputs went missing is prompt-only, takes the
@@ -3593,8 +3598,13 @@ mod admission_tests {
             !probe.inputs.is_empty(),
             "this test is only about the branch a tensor-carrying request takes"
         );
-        let input = MultimodalInput::from_samples(&spec, &[0.0f32; 16], 16_000)
-            .expect("an encoded-audio spec binds the samples it is handed");
+        let input = MultimodalInput::from_samples(
+            &spec,
+            &[0.0f32; 16],
+            16_000,
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .expect("an encoded-audio spec binds the samples it is handed");
 
         let mut request = GenerateRequest::new(onnx_genai::GeneratePrompt::TokenIds(vec![1]));
         request.options.max_new_tokens = 1;

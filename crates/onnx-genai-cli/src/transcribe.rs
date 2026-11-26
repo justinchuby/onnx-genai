@@ -104,6 +104,7 @@ enum SpeechExecution {
 }
 struct Transcriber {
     engine: Engine,
+    audio_decode_limits: onnx_genai::preprocess::audio::AudioDecodeLimits,
     execution: SpeechExecution,
     language: Option<String>,
     prompt: Option<String>,
@@ -117,6 +118,7 @@ impl Transcriber {
         config.audio_decode_limits = onnx_genai::preprocess::audio::AudioDecodeLimits {
             max_decoded_bytes: args.max_decoded_audio_bytes,
         };
+        let audio_decode_limits = config.audio_decode_limits;
         let engine = Engine::from_dir(model_dir, config)?;
         let execution = if let Some(contract) =
             onnx_genai::metadata::transcription::transcription_contract(engine.metadata())
@@ -159,6 +161,7 @@ impl Transcriber {
         };
         Ok(Self {
             engine,
+            audio_decode_limits,
             execution,
             language: args.language.clone(),
             prompt: args.prompt.clone(),
@@ -192,6 +195,7 @@ impl Transcriber {
         INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
         GENERATING.store(true, Ordering::SeqCst);
         let result = (|| -> anyhow::Result<String> {
+            let audio_limits = self.audio_decode_limits.within_host(self.engine.resource_snapshot().host_ram.headroom).context("admit transcription segment under configured PCM policy and current host headroom")?;
             match &self.execution {
                 SpeechExecution::Frames { contract, .. } => {
                     use onnx_genai::engine::transcription::{
@@ -219,8 +223,12 @@ impl Transcriber {
                     Ok(result.text)
                 }
                 SpeechExecution::Generative { tokenizer, spec } => {
-                    let input =
-                        multimodal::MultimodalInput::from_samples(spec, samples, sample_rate)?;
+                    let input = multimodal::MultimodalInput::from_samples(
+                        spec,
+                        samples,
+                        sample_rate,
+                        audio_limits,
+                    )?;
                     let prepared=spec.transcription().context("generative transcription contract is absent; declare transcription_config.json")?
                         .prepare(tokenizer,self.language.as_deref(),self.prompt.as_deref(),self.prompt_limits)?;
                     let mut output = prepared.output;

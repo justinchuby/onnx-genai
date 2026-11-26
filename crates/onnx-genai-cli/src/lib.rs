@@ -326,6 +326,9 @@ struct AttachmentArgs {
 
 #[derive(Debug, Args)]
 struct GenerateArgs {
+    /// Maximum raw decoded PCM work and resident PCM bytes per audio attachment.
+    #[arg(long, default_value_t = onnx_genai::preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY.max_decoded_bytes)]
+    max_decoded_audio_bytes: std::num::NonZeroUsize,
     /// Model directory, or a config file inside it (e.g. inference_metadata.yaml).
     model: PathBuf,
 

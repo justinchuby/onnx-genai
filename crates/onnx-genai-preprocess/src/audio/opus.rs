@@ -172,6 +172,52 @@ impl OggOpus {
         raw.start + discard..raw.start + available
     }
 
+    /// Check the demuxer's packet timing against the independent raw TOC clock.
+    /// Timing proves consistency only; this layer still owns every PCM cut.
+    pub(super) fn validate_packet(
+        &self,
+        packet: &symphonia::core::packet::Packet,
+        raw: usize,
+    ) -> Result<(), AudioPreprocessError> {
+        let cursor = i64::try_from(self.cursor).map_err(|_| {
+            invalid("Ogg Opus raw presentation cursor exceeds the signed timestamp range")
+        })?;
+        if packet.pts.get() != cursor || packet.trim_start.get() != 0 {
+            return Err(invalid(format!(
+                "Ogg Opus packet clock {:?} disagrees with raw TOC cursor {}; discontinuous/cropped streams or duplicated start trimming are unsupported",
+                packet.pts, self.cursor
+            )));
+        }
+        let declared = packet
+            .dur
+            .get()
+            .checked_add(packet.trim_end.get())
+            .ok_or_else(|| invalid("Ogg Opus packet valid duration plus end trim overflows"))?;
+        if declared != raw as u64 {
+            return Err(invalid(format!(
+                "Ogg Opus packet timing declares {declared} raw frames, but its TOC declares {raw}; repair the container duration metadata"
+            )));
+        }
+        // A later page's final granule cannot precede frames already declared
+        // valid on an earlier page. Symphonia's saturating end trim otherwise
+        // hides a backwards EOS granule; do not silently truncate prior audio.
+        if packet.dur.get() != 0 {
+            let valid_end = self
+                .cursor
+                .checked_add(usize::try_from(packet.dur.get()).map_err(|_| {
+                    invalid("Ogg Opus packet duration exceeds the host frame range")
+                })?)
+                .ok_or_else(|| invalid("Ogg Opus packet end timestamp overflows"))?;
+            if valid_end > self.end {
+                return Err(invalid(format!(
+                    "Ogg Opus final granule {} precedes a container-declared valid packet end {valid_end}; granule positions must not move backwards, so repair the recording",
+                    self.end
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn canonicalize(&self, samples: &mut [f32]) {
         let channels = self.canonical.len();
         for frame in samples.chunks_exact_mut(channels) {
