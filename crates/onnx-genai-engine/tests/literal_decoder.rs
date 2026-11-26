@@ -159,3 +159,99 @@ fn native_literal_byte_group_cancellation_discards_pending_state_and_retries() {
         assert_eq!(retry.text, "7");
     }
 }
+
+fn native_decoded_text_constraint_roundtrip(lark: bool) {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    for split in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        decoder::build(
+            root.path(),
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures"),
+            split,
+        );
+        let mut engine = Engine::from_dir(
+            root.path(),
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                native_device: Some(NativeDecodeDevice::Cpu),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let constraint = |impossible: bool| {
+            if lark {
+                GenerateConstraint::Lark {
+                    grammar: format!("start: {:?}", if impossible { "~" } else { "7" }),
+                    prefix: String::new(),
+                }
+            } else {
+                GenerateConstraint::Regex {
+                    pattern: if impossible { "~".into() } else { "7".into() },
+                    prefix: String::new(),
+                }
+            }
+        };
+        let mut good = request(4096);
+        good.options.constraint = Some(constraint(false));
+        good.options.max_new_tokens = if split { 2 } else { 1 };
+        good.options.logit_bias.insert(
+            if split { 24 } else { 23 },
+            onnx_genai_engine::logits::LogitBias::Add(1002.),
+        );
+        for failed in [false, true, false] {
+            let mut current = good.clone();
+            current.options.constraint = Some(constraint(failed));
+            let forwards = Arc::new(AtomicUsize::new(0));
+            let observed = forwards.clone();
+            let control =
+                onnx_genai_engine::GenerationControl::new().with_checkpoint(move |boundary| {
+                    if boundary == onnx_genai_engine::GenerationBoundary::AfterDecoderForward {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(())
+                });
+            let mut published = Vec::new();
+            let mut callback = |token: onnx_genai_engine::GenerateToken| {
+                published.push(token.text);
+                Ok(())
+            };
+            let result =
+                engine.generate_with_control_callbacks(current, control, None, Some(&mut callback));
+            assert!(
+                forwards.load(Ordering::SeqCst) > 0,
+                "lark={lark}, split={split}, failed={failed}: no actual Native decoder execution"
+            );
+            if failed {
+                let error = result
+                    .expect_err("unreachable decoded constraint must reject the actual vocabulary");
+                assert!(
+                    format!("{error:#}").contains("no finite selectable token"),
+                    "lark={lark}, split={split}: {error:#}"
+                );
+                assert!(
+                    published.is_empty(),
+                    "aborted cold turn published {published:?}"
+                );
+            } else {
+                let result = result.unwrap();
+                assert_eq!(result.text, "7");
+                assert_eq!(
+                    result.token_ids,
+                    if split { vec![22, 23] } else { vec![22] }
+                );
+                assert_eq!(published.concat(), "7");
+            }
+        }
+    }
+}
+#[test]
+fn native_literal_decoded_regex_masks_real_tokens_rejects_unreachable_output_and_retries() {
+    native_decoded_text_constraint_roundtrip(false);
+}
+#[test]
+fn native_literal_decoded_lark_masks_real_tokens_rejects_unreachable_output_and_retries() {
+    native_decoded_text_constraint_roundtrip(true);
+}

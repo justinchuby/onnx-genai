@@ -328,3 +328,102 @@ async fn native_literal_deferred_semantic_errors_precede_sse_and_valid_retry_rem
     assert_eq!(status, StatusCode::OK, "{wire}");
     assert!(wire.contains("data: [DONE]"));
 }
+
+#[tokio::test]
+async fn native_literal_tool_lark_masks_decoded_envelope_before_http_and_sse_publication() {
+    let root = tempfile::tempdir().unwrap();
+    decoder::build(
+        root.path(),
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures"),
+        false,
+    );
+    let envelope =
+        "<tool_call>\n{\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>";
+    let path = root.path().join("tokenizer.json");
+    let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    tokenizer["decoder"]["decoders"][2]["content"] = json!(envelope);
+    std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+    let path = root.path().join("inference_metadata.yaml");
+    let mut metadata: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    metadata["schema_version"] = serde_yaml::Value::String("v1.3".into());
+    metadata["package"]["tool_protocol"] =
+        serde_yaml::to_value(json!({"identity":"tagged-json","version":"v1"})).unwrap();
+    std::fs::write(path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
+    let router = app(AppState::load_with_config(
+        root.path(),
+        Some("literal".into()),
+        ServerConfig {
+            engine_config: EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                native_device: Some(NativeDecodeDevice::Cpu),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap());
+    for stream in [false, true] {
+        let body = json!({"model":"literal","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"temperature":0,"logit_bias":{"22":1000,"23":1001},"stream":stream,"stream_options":{"include_usage":true},"tool_choice":"required","tools":[{"type":"function","function":{"name":"weather","parameters":{"type":"object","properties":{"city":{"const":"Paris"}},"required":["city"],"additionalProperties":false}}}]});
+        for invalid in [false, true, false] {
+            let mut current = body.clone();
+            if invalid {
+                current["tools"][0]["function"]["parameters"] = json!({"type":"not-a-schema-type"});
+            }
+            let (status, wire) = request(router.clone(), current).await;
+            if invalid {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{wire}");
+                assert!(!wire.contains("data:"), "{wire}");
+                continue;
+            }
+            assert_eq!(status, StatusCode::OK, "{wire}");
+            let mut name = String::new();
+            let mut arguments = String::new();
+            let mut usage = None;
+            if stream {
+                assert!(wire.contains("data: [DONE]"), "{wire}");
+                for line in wire
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|line| *line != "[DONE]")
+                {
+                    let event: Value = serde_json::from_str(line).unwrap();
+                    assert!(
+                        event["choices"][0]["delta"]["content"]
+                            .as_str()
+                            .is_none_or(str::is_empty),
+                        "raw envelope leaked: {event}"
+                    );
+                    if let Some(calls) = event["choices"][0]["delta"]["tool_calls"].as_array() {
+                        for call in calls {
+                            assert_eq!(call["index"], 0);
+                            if let Some(value) = call["function"]["name"].as_str() {
+                                name.push_str(value);
+                            }
+                            if let Some(value) = call["function"]["arguments"].as_str() {
+                                arguments.push_str(value);
+                            }
+                        }
+                    }
+                    if let Some(value) = event["usage"]["completion_tokens"].as_u64() {
+                        usage = Some(value);
+                    }
+                }
+            } else {
+                let event: Value = serde_json::from_str(&wire).unwrap();
+                assert_eq!(event["choices"][0]["finish_reason"], "tool_calls");
+                assert!(event["choices"][0]["message"]["content"].is_null());
+                let call = &event["choices"][0]["message"]["tool_calls"][0];
+                name = call["function"]["name"].as_str().unwrap().into();
+                arguments = call["function"]["arguments"].as_str().unwrap().into();
+                usage = event["usage"]["completion_tokens"].as_u64();
+            }
+            assert_eq!(name, "weather");
+            assert_eq!(
+                serde_json::from_str::<Value>(&arguments).unwrap(),
+                json!({"city":"Paris"})
+            );
+            assert_eq!(usage, Some(1));
+        }
+    }
+}
