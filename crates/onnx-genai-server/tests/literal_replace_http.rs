@@ -343,6 +343,13 @@ async fn native_literal_tool_lark_masks_decoded_envelope_before_http_and_sse_pub
     let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     tokenizer["decoder"]["decoders"][2]["content"] = json!(envelope);
     std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+    // Keep the authored tool prompt within this real fixture's 16-token context.
+    std::fs::write(
+        root.path().join("tokenizer_config.json"),
+        json!({"chat_template":"{{ tools[0].function.name }} {{ messages[-1].content }}"})
+            .to_string(),
+    )
+    .unwrap();
     let path = root.path().join("inference_metadata.yaml");
     let mut metadata: serde_yaml::Value =
         serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
