@@ -68,7 +68,7 @@ impl ToolProtocol {
     ) -> Result<ToolOutputConstraint, ToolProtocolError> {
         match self.0 {
             ParsedToolProtocol::TaggedJsonV1 => {
-                let Some(schemas) = forced_tool_choice_schemas(request) else {
+                let Some(schemas) = forced_tool_choice_schemas(request)? else {
                     return Ok(ToolOutputConstraint::Unchanged);
                 };
                 let schema = if schemas.len() == 1 {
@@ -88,11 +88,13 @@ impl ToolProtocol {
                     prefix: String::new(),
                 })))
             }
-            ParsedToolProtocol::AtemXmlV1 => Ok(if forced_tool_choice_schemas(request).is_some() {
-                ToolOutputConstraint::Set(None)
-            } else {
-                ToolOutputConstraint::Unchanged
-            }),
+            ParsedToolProtocol::AtemXmlV1 => {
+                Ok(if forced_tool_choice_schemas(request)?.is_some() {
+                    ToolOutputConstraint::Set(None)
+                } else {
+                    ToolOutputConstraint::Unchanged
+                })
+            }
         }
     }
 
@@ -519,13 +521,38 @@ fn render_request(
     })
 }
 
-fn forced_tool_choice_schemas(request: &ChatCompletionRequest) -> Option<Vec<serde_json::Value>> {
-    let tools = request
-        .tools
-        .as_ref()?
-        .iter()
-        .filter(|tool| tool.kind == "function");
-    let selected = match request.tool_choice.as_ref()? {
+/// Both registered model protocols require object arguments. Constrain that
+/// domain without relocating the supplied schema or its root definitions/refs.
+pub(crate) fn object_argument_schema(
+    schema: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, ToolProtocolError> {
+    use serde_json::{Value, json};
+    let domain = json!({"type":"object"});
+    match schema {
+        None | Some(Value::Null | Value::Bool(true)) => Ok(domain),
+        Some(Value::Bool(false)) => Ok(Value::Bool(false)),
+        Some(Value::Object(original)) => {
+            let mut object = original.clone();
+            let needs_domain = !matches!(object.get("type"), Some(Value::String(kind)) if kind == "object");
+            match object.get_mut("allOf") {
+                Some(Value::Array(terms)) => { if needs_domain { terms.push(domain); } }
+                Some(_) => return Err(ToolProtocolError("tool parameters.allOf must be an array of schemas; supply a valid JSON Schema object or boolean".into())),
+                None => { if needs_domain { object.insert("allOf".into(), json!([domain])); } }
+            }
+            Ok(Value::Object(object))
+        }
+        Some(_) => Err(ToolProtocolError("tool parameters must be a JSON Schema object or boolean; omit it (or use null) for unconstrained object arguments".into())),
+    }
+}
+
+fn forced_tool_choice_schemas(
+    request: &ChatCompletionRequest,
+) -> Result<Option<Vec<serde_json::Value>>, ToolProtocolError> {
+    let (Some(tools), Some(choice)) = (request.tools.as_ref(), request.tool_choice.as_ref()) else {
+        return Ok(None);
+    };
+    let tools = tools.iter().filter(|tool| tool.kind == "function");
+    let selected = match choice {
         ToolChoice::Mode(ToolChoiceMode::Required) => tools.collect::<Vec<_>>(),
         ToolChoice::Specific(choice) if choice.kind == "function" => tools
             .filter(|tool| tool.function.name == choice.function.name)
@@ -537,25 +564,51 @@ fn forced_tool_choice_schemas(request: &ChatCompletionRequest) -> Option<Vec<ser
     let schemas = selected
         .into_iter()
         .map(tool_call_schema_for_tool)
-        .collect::<Vec<_>>();
-    (!schemas.is_empty()).then_some(schemas)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((!schemas.is_empty()).then_some(schemas))
 }
 
-fn tool_call_schema_for_tool(tool: &ChatTool) -> serde_json::Value {
-    let arguments_schema = tool
-        .function
-        .parameters
-        .clone()
-        .unwrap_or_else(|| serde_json::json!({ "type": "object" }));
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "name": { "enum": [tool.function.name.clone()] },
-            "arguments": arguments_schema
-        },
-        "required": ["name", "arguments"],
-        "additionalProperties": false
-    })
+fn tool_call_schema_for_tool(tool: &ChatTool) -> Result<serde_json::Value, ToolProtocolError> {
+    let arguments_schema =
+        object_argument_schema(tool.function.parameters.as_ref()).map_err(|error| {
+            ToolProtocolError(format!(
+                "function {:?} parameters: {error}",
+                tool.function.name
+            ))
+        })?;
+    let fields = [
+        (
+            "name",
+            serde_json::json!({"enum":[tool.function.name.clone()]}),
+        ),
+        (
+            "id",
+            serde_json::json!({"type":"string","minLength":1,"maxLength":onnx_genai_metadata::MAX_TOOL_CALL_ID_BYTES}),
+        ),
+        ("arguments", arguments_schema),
+    ];
+    // The backend emits object properties in schema order. Every ordering of
+    // the protocol's fields denotes the same envelope; an optional ID may be
+    // present before or after the name/arguments without changing admission.
+    let mut alternatives = Vec::new();
+    for first in 0..fields.len() {
+        for second in 0..fields.len() {
+            for third in 0..fields.len() {
+                if first == second || first == third || second == third {
+                    continue;
+                }
+                let properties = [first, second, third]
+                    .into_iter()
+                    .map(|index| (fields[index].0.to_owned(), fields[index].1.clone()))
+                    .collect::<serde_json::Map<_, _>>();
+                alternatives.push(serde_json::json!({
+                    "type":"object","properties":properties,
+                    "required":["name","arguments"],"additionalProperties":false
+                }));
+            }
+        }
+    }
+    Ok(serde_json::json!({"anyOf":alternatives}))
 }
 
 fn tools_offered_to_model(request: &ChatCompletionRequest) -> Option<&Vec<ChatTool>> {
@@ -591,6 +644,73 @@ mod tests {
             Path::new("fixtures/inference_metadata.yaml"),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn argument_object_domain_retains_union_constraints_and_root_definitions() {
+        use onnx_genai_engine::byte_grammar::{GrammarByteCursor, GrammarCandidate};
+        for schema in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(true)),
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"type":["array","object"]})),
+        ] {
+            let constrained = object_argument_schema(schema.as_ref()).unwrap();
+            let cursor = GrammarByteCursor::json_schema(&constrained, 4096).unwrap();
+            assert!(matches!(
+                cursor.preview_json_root(r#"{"x":1}"#).unwrap(),
+                GrammarCandidate::Viable { complete: true }
+            ));
+            for scalar in ["[]", "1", "null", r#""text""#] {
+                assert!(
+                    matches!(
+                        cursor.preview_json_root(scalar).unwrap(),
+                        GrammarCandidate::Rejected { .. }
+                    ),
+                    "schema={schema:?} value={scalar}"
+                );
+            }
+        }
+        let schema = serde_json::json!({"$defs":{"Args":{"type":"object","properties":{"x":{"const":1}},"required":["x"],"additionalProperties":false}},"$ref":"#/$defs/Args","allOf":[{"minProperties":1}]});
+        let constrained = object_argument_schema(Some(&schema)).unwrap();
+        let cursor = GrammarByteCursor::json_schema(&constrained, 4096).unwrap();
+        assert!(matches!(
+            cursor.preview_json_root(r#"{"x":1}"#).unwrap(),
+            GrammarCandidate::Viable { complete: true }
+        ));
+        for invalid in ["[]", "{}", r#"{"x":2}"#, r#"{"x":1,"y":2}"#] {
+            assert!(
+                matches!(
+                    cursor.preview_json_root(invalid).unwrap(),
+                    GrammarCandidate::Rejected { .. }
+                ),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn argument_object_domain_does_not_turn_impossible_or_invalid_schemas_into_valid_tools() {
+        use onnx_genai_engine::byte_grammar::GrammarByteCursor;
+        for schema in [
+            serde_json::json!(false),
+            serde_json::json!({"type":"string"}),
+            serde_json::json!({"const":[]}),
+        ] {
+            let constrained = object_argument_schema(Some(&schema)).unwrap();
+            assert!(
+                GrammarByteCursor::json_schema(&constrained, 4096).is_err(),
+                "{schema}"
+            );
+        }
+        for schema in [
+            serde_json::json!(3),
+            serde_json::json!([]),
+            serde_json::json!({"type":"object","allOf":false}),
+        ] {
+            assert!(object_argument_schema(Some(&schema)).is_err(), "{schema}");
+        }
     }
 
     #[test]

@@ -496,6 +496,21 @@ impl GrammarByteCursor {
         self.empty_fork()?.preview(bytes)
     }
 
+    /// Check a raw JSON spelling, including unfinished Unicode escapes, from
+    /// the root of a JSON Schema cursor. The raw budget is enforced before
+    /// escape/whitespace normalization, independently of canonical byte length.
+    pub fn preview_json_root(&self, text: &str) -> anyhow::Result<GrammarCandidate> {
+        if text.len() > self.max_bytes.get() {
+            return Err(GrammarByteBudgetExceeded {
+                limit: self.max_bytes.get(),
+                offset: 0,
+            }
+            .into());
+        }
+        let normalized = crate::json_prefix::JsonPrefix::parse(text)?;
+        normalized.preview(&mut self.empty_fork()?, "", b"")
+    }
+
     /// Atomically replace the logical prefix after a representation change.
     pub fn replace_prefix(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         let mut fresh = self.empty_fork()?;
@@ -514,6 +529,36 @@ impl GrammarByteCursor {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn json_root_preview_normalizes_partial_escapes_without_losing_raw_budget_or_state() {
+        let mut cursor =
+            GrammarByteCursor::json_schema(&json!({"const":{"city":"Paris"}}), 256).unwrap();
+        cursor.commit(b"{").unwrap();
+        assert!(matches!(
+            cursor
+                .preview_json_root(r#"{"c\u0069ty":"Pa\u007"#)
+                .unwrap(),
+            GrammarCandidate::Viable { complete: false }
+        ));
+        assert!(matches!(
+            cursor
+                .preview_json_root(r#"{"city":"Pa\u0072is"} "#)
+                .unwrap(),
+            GrammarCandidate::Viable { complete: true }
+        ));
+        assert!(matches!(
+            cursor.preview_json_root(r#"{"city":"Ro"#).unwrap(),
+            GrammarCandidate::Rejected { .. }
+        ));
+        assert!(
+            cursor
+                .preview_json_root(&" ".repeat(257))
+                .unwrap_err()
+                .is::<GrammarByteBudgetExceeded>()
+        );
+        assert_eq!(cursor.committed_bytes(), 1);
+    }
 
     #[test]
     fn grammar_byte_cursor_regex_and_lark_preserve_unicode_and_literal_spelling() {

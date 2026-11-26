@@ -2296,6 +2296,7 @@ dependencies = [
  "onnx-genai-metadata",
  "onnx-genai-ort",
  "onnx-genai-preprocess",
+ "onnx-model-package",
  "onnx-runtime-ep-cuda",
  "onnx-runtime-memory-api",
  "onnx-runtime-memory-governor",

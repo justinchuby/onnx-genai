@@ -871,6 +871,8 @@ pub struct EngineConfig {
     /// or `native` instead. An explicit `Ort` or `Native` value always takes
     /// precedence over the environment variable.
     pub decode_backend: EngineDecodeBackend,
+    /// Explicit authored model-package variant. Flat directories reject a selector.
+    pub package_variant: Option<String>,
     /// Native decoder device override. `None` follows the execution provider in
     /// [`onnx_genai_ort::SessionOptions`], including `ONNX_GENAI_EP`.
     pub native_device: Option<crate::native_decode_device::NativeDecodeDevice>,
@@ -945,6 +947,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             decode_backend: EngineDecodeBackend::Native,
+            package_variant: None,
             native_device: None,
             native_decode_batch: None,
             native_state_files: NativeStateFilePolicy::Disabled,
@@ -1744,13 +1747,34 @@ pub enum GrammarTrigger {
     PatternFull(String),
 }
 
+/// Explicit C++ classic-locale bracket collation, independent of the host.
+/// This selects bracket traits/range rules, not a different overall regex grammar.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GrammarCollation {
+    /// Preserve the existing libc++ classic-locale trigger contract.
+    #[default]
+    Libcxx,
+    /// Match libstdc++ classic-locale element names and primary equivalence.
+    Libstdcxx,
+}
+impl GrammarCollation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Libcxx => "libcxx",
+            Self::Libstdcxx => "libstdcxx",
+        }
+    }
+}
+
 /// A nonempty, bounded set of lazy activation conditions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrammarActivation {
     triggers: Vec<GrammarTrigger>,
+    collation: GrammarCollation,
 }
 impl GrammarActivation {
-    pub fn new(triggers: Vec<GrammarTrigger>) -> anyhow::Result<Self> {
+    pub fn new(triggers: Vec<GrammarTrigger>, collation: GrammarCollation) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !triggers.is_empty(),
             "lazy grammar has no triggers; provide at least one token, word or pattern trigger"
@@ -1759,7 +1783,10 @@ impl GrammarActivation {
             triggers.len() <= 1024,
             "lazy grammar exceeds 1024 triggers; combine patterns or use fewer triggers"
         );
-        Ok(Self { triggers })
+        Ok(Self {
+            triggers,
+            collation,
+        })
     }
     pub fn validate_with_tokenizer(
         &self,
@@ -1778,6 +1805,9 @@ impl GrammarActivation {
     ) -> anyhow::Result<()> {
         crate::gbnf::lazy::validate_words(tokenizer, self, preserved)
     }
+    pub fn collation(&self) -> GrammarCollation {
+        self.collation
+    }
     pub fn triggers(&self) -> &[GrammarTrigger] {
         &self.triggers
     }
@@ -1792,6 +1822,12 @@ pub enum GenerateConstraint {
     Gbnf {
         grammar: String,
         activation: Option<GrammarActivation>,
+    },
+    /// JSON Schema over newly generated raw bytes after a trigger. Before
+    /// activation output is unconstrained; assistant prefill is not consumed.
+    LazyJsonSchema {
+        schema: String,
+        activation: GrammarActivation,
     },
     /// Raw llguidance Lark over new model output, without assistant-prefill
     /// consumption or response-content projection. Keep the %llguidance header.
@@ -1864,7 +1900,11 @@ impl GenerateOptions {
         anyhow::ensure!(
             !matches!(
                 self.constraint,
-                Some(GenerateConstraint::Gbnf { .. } | GenerateConstraint::RawLark { .. })
+                Some(
+                    GenerateConstraint::Gbnf { .. }
+                        | GenerateConstraint::RawLark { .. }
+                        | GenerateConstraint::LazyJsonSchema { .. }
+                )
             ) || self.stop_on_eos,
             "raw grammar requires stop_on_eos=true; allow root completion to terminate the generation"
         );

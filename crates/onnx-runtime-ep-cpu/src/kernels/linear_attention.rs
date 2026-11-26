@@ -425,7 +425,7 @@ impl Kernel for LinearAttentionKernel {
         let direct_output = {
             let mut ranges = input_ranges;
             ranges.push(slice_byte_range(state));
-            output_direct_write_eligible(&mut primary_output[0], output_len, &ranges)
+            output_direct_write_eligible(&primary_output[0], output_len, &ranges)
         };
         let mut owned_output;
         let output: &mut [f32] = if direct_output {

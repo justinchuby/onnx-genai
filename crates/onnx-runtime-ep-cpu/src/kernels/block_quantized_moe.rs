@@ -1467,6 +1467,9 @@ thread_local! {
 }
 
 #[cfg(test)]
+mod numerical;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::CpuExecutionProvider;
@@ -2832,15 +2835,40 @@ mod tests {
                     .map_or_else(|| TensorView::absent(DataType::Float32), Owned::view),
                 router.view(),
             ];
-            for _ in 0..2 {
+            let oracle = super::numerical::Oracle::new(
+                &input,
+                &router,
+                [Some(&w1), Some(&w2), w3.as_ref()],
+                [Some(&b1), Some(&b2), b3.as_ref()],
+                [l1, l2, l3],
+                crate::kernels::moe::MoeActivationAttributes {
+                    activation: match activation {
+                        "identity" => crate::kernels::moe::Activation::Identity,
+                        "relu" => crate::kernels::moe::Activation::Relu,
+                        "gelu" => crate::kernels::moe::Activation::Gelu,
+                        "silu" => crate::kernels::moe::Activation::Silu,
+                        "swiglu" => crate::kernels::moe::Activation::Swiglu,
+                        _ => unreachable!(),
+                    },
+                    swiglu_fusion: fusion,
+                    activation_alpha: 1.,
+                    activation_beta: 0.,
+                    swiglu_limit: f32::MAX,
+                },
+            );
+            for iteration in 0..2 {
                 let mut expected = Owned::f32(&[rows, hidden], &vec![0.; rows * hidden]);
                 let mut actual = Owned::f32(&[rows, hidden], &vec![0.; rows * hidden]);
+                let trace = crate::kernels::moe::numerical_trace::Trace::start();
                 reference
                     .execute_prepared(&views, &mut [expected.view_mut()])
                     .unwrap();
+                let dense_trace = trace.finish();
+                let trace = crate::kernels::moe::numerical_trace::Trace::start();
                 streamed
                     .execute_prepared(&views, &mut [actual.view_mut()])
                     .unwrap();
+                let streamed_trace = trace.finish();
                 let mut denied_output = Owned::zeros_f32(&[rows, hidden]);
                 denied
                     .execute_prepared(&views, &mut [denied_output.view_mut()])
@@ -2862,16 +2890,18 @@ mod tests {
                     0
                 );
 
-                for (index, (got, want)) in actual
-                    .to_f32()
-                    .into_iter()
-                    .zip(expected.to_f32())
-                    .enumerate()
-                {
-                    assert!(
-                        (got - want).abs() <= 1e-5 + 1e-4 * want.abs(),
-                        "case {case} element {index}: {got} vs {want}"
-                    );
+                oracle.check(
+                    &format!("case {case} dense pass {iteration}"),
+                    &dense_trace,
+                    &expected,
+                );
+                oracle.check(
+                    &format!("case {case} streamed pass {iteration}"),
+                    &streamed_trace,
+                    &actual,
+                );
+                if iteration == 0 {
+                    oracle.check_negative_controls(&dense_trace, &expected);
                 }
             }
             assert_eq!(

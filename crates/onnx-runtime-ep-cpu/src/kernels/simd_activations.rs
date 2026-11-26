@@ -185,6 +185,7 @@ pub(crate) fn write_mapped_reading<F>(
 where
     F: Fn(&[f32], &mut [f32]),
 {
+    crate::dtype::validate_host_output(op, out)?;
     let n = x.len();
     let eligible = if also_read.is_empty() {
         output_direct_write_eligible(out, n, &[slice_byte_range(x)])
@@ -195,7 +196,6 @@ where
         output_direct_write_eligible(out, n, &reads)
     };
     if eligible {
-        out.validate()?;
         if n == 0 {
             return Ok(());
         }
@@ -230,41 +230,33 @@ where
             _ => None,
         };
         if let Some(narrow) = narrow {
-            out.validate()?;
             let out_ptr = out.data_ptr_mut::<u16>();
             let out_bytes = (out_ptr as usize)..(out_ptr as usize + n * 2);
             let x_bytes = slice_byte_range(x);
-            debug_assert!(
-                x_bytes.start >= out_bytes.end || out_bytes.start >= x_bytes.end,
-                "the fused narrow writes `out` while still reading `x`; widening \
-                 to f32 always allocates, so they must never overlap"
-            );
-            // SAFETY: a validated contiguous `Float16`/`BFloat16` output
-            // addresses exactly `n` 2-byte elements -- the dtype match is what
-            // makes the element width 16 bits -- and `half::f16`/`half::bf16`
-            // are `repr(transparent)` over `u16`, so writing `u16` bit patterns
-            // is sound. `dst` is disjoint from `x`: reaching a 16-bit output
-            // means `x` came from `to_dense_f32_widen`, which always allocates
-            // a fresh `Cow::Owned` buffer when it has to widen, so no live
-            // borrow of `out`'s storage can be in `x`. The `debug_assert` above
-            // is the tripwire for a future caller that breaks that.
-            let dst = unsafe { std::slice::from_raw_parts_mut(out_ptr, n) };
-            // The final chunk can absorb a short tail, so size for that.
-            let mut scratch = vec![0.0f32; (NARROW_CHUNK + SIMD_MIN_LEN).min(n)];
-            // Serial for the same reason the unfused arm is: see `serial_scope`.
-            serial_scope(|| {
-                let mut start = 0;
-                while start < n {
-                    let end = chunk_end(start, n);
-                    let mid = &mut scratch[..end - start];
-                    f(&x[start..end], mid);
-                    // SAFETY: `available()` confirmed the ISA above, and the
-                    // two slices are the same length by construction.
-                    unsafe { narrow(mid, &mut dst[start..end]) };
-                    start = end;
-                }
-            });
-            return Ok(());
+            // Mixed-dtype callers can still borrow x from the output's bytes.
+            // Only construct a typed mutable slice after proving alignment and
+            // disjointness; otherwise compute everything before publishing.
+            if out_ptr.is_aligned() && !crate::dtype::byte_ranges_overlap(&x_bytes, &out_bytes) {
+                // SAFETY: validated contiguous 16-bit storage is aligned and
+                // disjoint from the live input; f16/bf16 are transparent over u16.
+                let dst = unsafe { std::slice::from_raw_parts_mut(out_ptr, n) };
+                // The final chunk can absorb a short tail, so size for that.
+                let mut scratch = vec![0.0f32; (NARROW_CHUNK + SIMD_MIN_LEN).min(n)];
+                // Serial for the same reason the unfused arm is: see `serial_scope`.
+                serial_scope(|| {
+                    let mut start = 0;
+                    while start < n {
+                        let end = chunk_end(start, n);
+                        let mid = &mut scratch[..end - start];
+                        f(&x[start..end], mid);
+                        // SAFETY: `available()` confirmed the ISA above, and the
+                        // two slices are the same length by construction.
+                        unsafe { narrow(mid, &mut dst[start..end]) };
+                        start = end;
+                    }
+                });
+                return Ok(());
+            }
         }
     }
     let mut y = vec![0.0f32; n];

@@ -325,39 +325,109 @@ pub fn to_dense_bool(view: &TensorView) -> Result<Vec<u8>> {
     read_strided::<u8>(view, DataType::Bool)
 }
 
-fn read_strided<T: Copy>(view: &TensorView, want: DataType) -> Result<Vec<T>> {
-    view.validate()?;
-    debug_assert_eq!(
-        std::mem::size_of::<T>(),
-        want.byte_size(),
-        "read_strided element width must match dtype byte size"
-    );
-    if view.dtype != want {
-        return Err(EpError::InvalidTensorView {
-            reason: format!("expected {want:?} view, got {:?}", view.dtype),
-        });
+/// Copy storage elements into an already admitted dense destination without
+/// widening, narrowing or allocating a tensor payload. The owning EP proves
+/// backing bounds and that the destination is disjoint from the source view.
+pub(crate) fn to_dense_into<T: NumericElem>(
+    op: &str,
+    view: &TensorView,
+    out: &mut [T],
+) -> Result<()> {
+    let read = StorageRead::<T>::new(op, view, T::DTYPE)?;
+    if out.len() != read.count {
+        return Err(EpError::KernelFailed(format!(
+            "{op}: storage destination has {} elements, expected {} for {:?} shape {:?}; bind the complete dense destination before copying",
+            out.len(),
+            read.count,
+            view.dtype,
+            view.shape
+        )));
     }
-    let n = numel(view.shape);
-    let mut out = Vec::with_capacity(n);
-    if n == 0 {
-        return Ok(out);
+    read.visit(|index, value| out[index] = value);
+    Ok(())
+}
+
+/// Validated storage-read geometry, shared by allocating and admitted copies.
+struct StorageRead<'view, 'storage, T> {
+    view: &'view TensorView<'storage>,
+    count: usize,
+    element: std::marker::PhantomData<T>,
+}
+impl<'view, 'storage, T: Copy> StorageRead<'view, 'storage, T> {
+    fn new(op: &str, view: &'view TensorView<'storage>, want: DataType) -> Result<Self> {
+        view.validate().map_err(|error| {
+            EpError::KernelFailed(format!(
+                "{op}: invalid source view: {error}; bind valid Host-accessible storage"
+            ))
+        })?;
+        debug_assert_eq!(std::mem::size_of::<T>(), want.byte_size());
+        if view.dtype != want {
+            return Err(EpError::InvalidTensorView {
+                reason: format!(
+                    "{op}: expected {want:?} view, got {:?}; select the matching storage element type",
+                    view.dtype
+                ),
+            });
+        }
+        if !view.device.is_host_accessible() {
+            return Err(EpError::KernelFailed(format!(
+                "{op}: source {:?} on {:?} is not Host-accessible; explicitly transfer it before CPU storage reads",
+                view.dtype, view.device
+            )));
+        }
+        let count = view
+            .shape
+            .iter()
+            .rev()
+            .try_fold(1usize, |n, &d| n.checked_mul(d))
+            .ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "{op}: source shape {:?} overflows dense indexing; reduce dimensions",
+                    view.shape
+                ))
+            })?;
+        std::alloc::Layout::array::<T>(count).map_err(|_| {
+            EpError::KernelFailed(format!(
+                "{op}: source shape {:?} exceeds addressable storage capacity; reduce dimensions",
+                view.shape
+            ))
+        })?;
+        Ok(Self {
+            view,
+            count,
+            element: std::marker::PhantomData,
+        })
     }
-    let origin = view.data_ptr::<T>();
-    let mut idx = vec![0usize; view.shape.len()];
-    loop {
-        let off = elem_offset(view.strides, &idx);
-        // SAFETY: `origin` is the element origin of a validated view; `off` is an
-        // in-shape element offset (each component `< shape[d]`), so the address
-        // lies within the extent the view describes — bounds-checked against the
-        // backing allocation by the owning EP (ep-api invariant #1). `T` is a
-        // plain numeric/`half` type with no invalid bit patterns. `read_unaligned`
-        // because `data_ptr` is a cast from a byte pointer plus an arbitrary
-        // `byte_offset`, so `T`'s alignment is not guaranteed.
-        out.push(unsafe { origin.offset(off).read_unaligned() });
-        if !next_index(view.shape, &mut idx) {
-            break;
+    #[inline]
+    fn visit(self, mut consume: impl FnMut(usize, T)) {
+        if self.count == 0 {
+            return;
+        }
+        let origin = self.view.data_ptr::<T>();
+        if self.view.is_contiguous() {
+            for index in 0..self.count {
+                // SAFETY: validated Host view and matching element type. The
+                // owning EP supplies backing bounds; byte origins may be unaligned.
+                consume(index, unsafe { origin.add(index).read_unaligned() });
+            }
+        } else {
+            let mut coordinates = smallvec::SmallVec::<[usize; 8]>::new();
+            coordinates.resize(self.view.shape.len(), 0);
+            for index in 0..self.count {
+                let offset = elem_offset(self.view.strides, &coordinates);
+                // SAFETY: each coordinate lies inside the validated logical
+                // shape. Backing bounds, including negative strides, are owned
+                // by the EP. Copy raw T bits; no arithmetic conversion occurs.
+                consume(index, unsafe { origin.offset(offset).read_unaligned() });
+                next_index(self.view.shape, &mut coordinates);
+            }
         }
     }
+}
+fn read_strided<T: Copy>(view: &TensorView, want: DataType) -> Result<Vec<T>> {
+    let read = StorageRead::<T>::new("CPU storage read", view, want)?;
+    let mut out = Vec::with_capacity(read.count);
+    read.visit(|_, value| out.push(value));
     Ok(out)
 }
 
@@ -374,17 +444,29 @@ pub fn write_dense_float<T: FloatElem>(out: &mut TensorMut, data: &[T]) -> Resul
 }
 
 fn write_strided<T: Copy>(out: &mut TensorMut, data: &[T], want: DataType) -> Result<()> {
-    out.validate()?;
+    write_strided_with(out, data.len(), want, |index| data[index])
+}
+
+// Sources are disjoint from output, as required by the typed write and narrowing
+// contracts. Produce one storage value at a time instead of materializing a
+// converted tensor. Validation completes before the first conversion or write.
+fn write_strided_with<T: Copy>(
+    out: &mut TensorMut,
+    produced: usize,
+    want: DataType,
+    value: impl Fn(usize) -> T,
+) -> Result<()> {
+    validate_host_output("CPU output", out)?;
     if out.dtype != want {
         return Err(EpError::InvalidTensorView {
             reason: format!("expected {want:?} output, got {:?}", out.dtype),
         });
     }
     let n = numel(out.shape);
-    if data.len() != n {
+    if produced != n {
         return Err(EpError::KernelFailed(format!(
-            "output element count {n} does not match produced {}",
-            data.len()
+            "CPU output: {want:?} shape {:?} requires {n} elements, but producer supplied {produced}; provide one value per logical output element",
+            out.shape
         )));
     }
     if n == 0 {
@@ -404,7 +486,7 @@ fn write_strided<T: Copy>(out: &mut TensorMut, data: &[T], want: DataType) -> Re
         // `write_unaligned` because `data_ptr_mut` is a cast from a byte pointer
         // plus an arbitrary `byte_offset`, so `T`'s alignment is not guaranteed.
         unsafe {
-            origin.offset(off).write_unaligned(data[i]);
+            origin.offset(off).write_unaligned(value(i));
         }
         i += 1;
         if !next_index(shape, &mut idx) {
@@ -857,16 +939,20 @@ pub fn narrow_bf16_slice_into(src: &[f32], dst: &mut [u16]) {
     }
 }
 
+/// Storage geometry used by widening and address-only execution refinement.
+/// Callers separately validate view geometry and Host accessibility.
+#[inline]
+pub(crate) fn can_borrow_dense_f32(view: &TensorView<'_>) -> bool {
+    view.dtype == DataType::Float32 && view.is_contiguous() && view.data_ptr::<f32>().is_aligned()
+}
+
 /// Borrow a contiguous f32 view zero-copy, or materialize/widen any other
 /// supported float view (`f16`/`bf16`/`f64` or strided f32) into dense f32.
 /// Rejects non-float dtypes with a RULE #1 error.
 pub fn to_dense_f32_widen<'a>(op: &str, view: &'a TensorView<'_>) -> Result<Cow<'a, [f32]>> {
     validate_f32_widen_input(op, view)?;
     let len = view.numel();
-    if view.dtype == DataType::Float32
-        && view.is_contiguous()
-        && view.data_ptr::<f32>().is_aligned()
-    {
+    if can_borrow_dense_f32(view) {
         if len == 0 {
             return Ok(Cow::Borrowed(&[]));
         }
@@ -995,9 +1081,28 @@ pub(crate) fn to_dense_f32_widen_into(
     })
 }
 
-/// Narrow a dense `Vec<f32>` result into `out`, rounding to `out`'s float dtype
+/// Validate a CPU output before either typed borrowing or byte-wise stores.
+pub(crate) fn validate_host_output(op: &str, out: &TensorMut) -> Result<()> {
+    out.validate().map_err(|error| {
+        EpError::KernelFailed(format!(
+            "{op}: output view is invalid: {error}; bind valid Host-accessible storage"
+        ))
+    })?;
+    if !out.device.is_host_accessible() {
+        return Err(EpError::KernelFailed(format!(
+            "{op}: output on {:?} is not Host-accessible; explicitly transfer it before CPU execution",
+            out.device
+        )));
+    }
+    Ok(())
+}
+
+/// Narrow a dense f32 result into `out`, rounding to its float storage dtype
 /// (`f32`/`f16`/`bf16`/`f64`). Counterpart to [`to_dense_f32_widen`].
+/// As with the existing SIMD and memcpy routes, `data` must be disjoint from
+/// output storage; complete source reads/snapshots before publishing aliased tensors.
 pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Result<()> {
+    validate_host_output(op, out)?;
     // F16C bulk narrow for a contiguous f16 output (the KV-cache decode hot path).
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if out.dtype == DataType::Float16
@@ -1005,7 +1110,6 @@ pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Re
         && out.data_ptr_mut::<u16>().is_aligned()
         && f16c::available()
     {
-        out.validate()?;
         let n = out.numel();
         if data.len() != n {
             return Err(EpError::KernelFailed(format!(
@@ -1031,7 +1135,6 @@ pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Re
         && out.data_ptr_mut::<u16>().is_aligned()
         && bf16x::available()
     {
-        out.validate()?;
         let n = out.numel();
         if data.len() != n {
             return Err(EpError::KernelFailed(format!(
@@ -1057,7 +1160,6 @@ pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Re
         && out.is_contiguous()
         && out.data_ptr_mut::<u16>().is_aligned()
     {
-        out.validate()?;
         let n = out.numel();
         if data.len() != n {
             return Err(EpError::KernelFailed(format!(
@@ -1079,7 +1181,6 @@ pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Re
         && out.is_contiguous()
         && out.data_ptr_mut::<f32>().is_aligned()
     {
-        out.validate()?;
         let n = out.numel();
         if data.len() != n {
             return Err(EpError::KernelFailed(format!(
@@ -1098,8 +1199,7 @@ pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Re
         return Ok(());
     }
     dispatch_float!(out.dtype, op, T => {
-        let narrowed: Vec<T> = data.iter().map(|&v| T::from_f32(v)).collect();
-        write_dense_float::<T>(out, &narrowed)
+        write_strided_with::<T>(out, data.len(), <T as FloatElem>::DTYPE, |index| T::from_f32(data[index]))
     })
 }
 
@@ -1147,7 +1247,7 @@ pub fn byte_ranges_overlap(a: &core::ops::Range<usize>, b: &core::ops::Range<usi
 /// the caller's `unsafe` slice, so the element-count match here is what makes
 /// that slice in-bounds. No hardcoded dimensions — usable by any kernel.
 pub fn output_direct_write_eligible(
-    output: &mut TensorMut,
+    output: &TensorMut,
     len: usize,
     read_ranges: &[core::ops::Range<usize>],
 ) -> bool {
@@ -1158,8 +1258,23 @@ pub fn output_direct_write_eligible(
     {
         return false;
     }
-    let start = output.data_ptr_mut::<f32>() as usize;
-    let out_range = start..start.saturating_add(len * std::mem::size_of::<f32>());
+    let pointer = output
+        .data
+        .0
+        .cast::<u8>()
+        .wrapping_add(output.byte_offset)
+        .cast::<f32>();
+    if pointer.is_null() || !pointer.is_aligned() {
+        return false;
+    }
+    let start = pointer as usize;
+    let Some(end) = len
+        .checked_mul(size_of::<f32>())
+        .and_then(|bytes| start.checked_add(bytes))
+    else {
+        return false;
+    };
+    let out_range = start..end;
     read_ranges
         .iter()
         .all(|r| !byte_ranges_overlap(&out_range, r))
@@ -1540,7 +1655,7 @@ mod tests {
         use onnx_runtime_ep_api::DevicePtrMut;
         use onnx_runtime_ir::{DeviceId, compute_contiguous_strides};
 
-        let mut buf = vec![0.0f32; 8];
+        let mut buf = vec![0.0f32; 10];
         let base = buf.as_ptr() as usize;
         let shape = [2usize, 4];
         let strides = compute_contiguous_strides(&shape);
@@ -1554,14 +1669,24 @@ mod tests {
 
         // Disjoint input range -> eligible for the direct path.
         let disjoint = (base + 8 * 4)..(base + 8 * 4 + 16);
-        assert!(output_direct_write_eligible(&mut out, 8, &[disjoint]));
+        assert!(output_direct_write_eligible(&out, 8, &[disjoint]));
 
         // Overlapping input range -> must reject (fall back to owned buffer).
         let overlap = (base + 4)..(base + 4 + 16);
-        assert!(!output_direct_write_eligible(&mut out, 8, &[overlap]));
+        assert!(!output_direct_write_eligible(&out, 8, &[overlap]));
 
         // Wrong element count -> reject even with no aliasing input.
-        assert!(!output_direct_write_eligible(&mut out, 7, &[]));
+        assert!(!output_direct_write_eligible(&out, 7, &[]));
+
+        // A packed backing may be byte-addressable yet not aligned for f32.
+        out.data = DevicePtrMut(unsafe { buf.as_mut_ptr().cast::<u8>().add(1).cast() });
+        out.validate().unwrap();
+        assert!(!output_direct_write_eligible(&out, 8, &[]));
+        out.byte_offset = 4;
+        assert!(!output_direct_write_eligible(&out, 8, &[]));
+        out.data = DevicePtrMut(std::ptr::null_mut());
+        out.byte_offset = 0;
+        assert!(!output_direct_write_eligible(&out, 8, &[]));
 
         // Range helpers.
         let s = [0.0f32; 4];
@@ -1729,6 +1854,54 @@ mod tests {
         }
     }
     #[test]
+    fn scalar_narrow_scatter_preserves_storage_bits_and_checks_count_before_writes() {
+        use onnx_runtime_ep_api::DevicePtrMut;
+        use onnx_runtime_ir::DeviceId;
+        let values = [
+            -0.,
+            f32::from_bits(1),
+            f32::from_bits(0x7fc1_2345),
+            f32::NEG_INFINITY,
+            1.000_488_3,
+            -123.75,
+        ];
+        for dtype in [
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Float32,
+            DataType::Float64,
+        ] {
+            let width = dtype.byte_size();
+            let mut storage = vec![0xa5u8; 16 * width + 2];
+            let mut expected = storage.clone();
+            let mut out = TensorMut::new(
+                DevicePtrMut(unsafe { storage.as_mut_ptr().add(1).cast() }),
+                dtype,
+                &[2, 3],
+                &[7, -2],
+                DeviceId::cpu(),
+            )
+            .with_byte_offset(4 * width);
+            let error = write_dense_f32_narrow("scatter", &mut out, &values[..5]).unwrap_err();
+            assert!(error.to_string().contains("6"), "{error}");
+            assert_eq!(storage, expected, "short producer must not write any bytes");
+            for (i, &v) in values.iter().enumerate() {
+                let offset = 1 + (4 + (i / 3) * 7 - (i % 3) * 2) * width;
+                let bits = match dtype {
+                    DataType::Float16 => half::f16::from_f32(v).to_bits().to_ne_bytes().to_vec(),
+                    DataType::BFloat16 => half::bf16::from_f32(v).to_bits().to_ne_bytes().to_vec(),
+                    DataType::Float32 => v.to_ne_bytes().to_vec(),
+                    DataType::Float64 => f64::from(v).to_ne_bytes().to_vec(),
+                    _ => unreachable!(),
+                };
+                expected[offset..offset + width].copy_from_slice(&bits);
+            }
+            write_dense_f32_narrow("scatter", &mut out, &values).unwrap();
+            assert_eq!(storage, expected, "dtype={dtype:?}");
+        }
+    }
+
+    #[test]
     fn scalar_integer_reader_preserves_offsets_unaligned_storage_and_signed_values() {
         use onnx_runtime_ep_api::DevicePtr;
         use onnx_runtime_ir::{DeviceId, DeviceType};
@@ -1796,5 +1969,225 @@ mod tests {
                 "{error}"
             );
         }
+    }
+    #[test]
+    fn mapped_half_output_checks_alignment_and_live_input_aliases() {
+        use onnx_runtime_ep_api::DevicePtrMut;
+        use onnx_runtime_ir::DeviceId;
+        let values = (0..64).map(|i| i as f32 * 0.25 - 4.).collect::<Vec<_>>();
+        let map = |x: &[f32], y: &mut [f32]| {
+            for (x, y) in x.iter().zip(y) {
+                *y = *x * 2.;
+            }
+        };
+        for dtype in [DataType::Float16, DataType::BFloat16] {
+            let narrow = |v: f32| {
+                if dtype == DataType::Float16 {
+                    half::f16::from_f32(v).to_bits()
+                } else {
+                    half::bf16::from_f32(v).to_bits()
+                }
+            };
+            let mut backing = [0xa5a5u16; 66];
+            let pointer = backing.as_mut_ptr().cast::<u8>();
+            let mut out = TensorMut::new(
+                DevicePtrMut(unsafe { pointer.add(1).cast() }),
+                dtype,
+                &[64],
+                &[1],
+                DeviceId::cpu(),
+            );
+            out.validate().unwrap();
+            crate::kernels::simd_activations::write_mapped("test", &mut out, &values, map).unwrap();
+            for (i, &v) in values.iter().enumerate() {
+                assert_eq!(
+                    unsafe { pointer.add(1 + i * 2).cast::<u16>().read_unaligned() },
+                    narrow(v * 2.)
+                );
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(pointer, 132) };
+            assert_eq!(bytes[0], 0xa5);
+            assert!(bytes[129..].iter().all(|&b| b == 0xa5));
+            let mut shared = values.clone();
+            let pointer = shared.as_mut_ptr();
+            let input = unsafe { std::slice::from_raw_parts(pointer, 64) };
+            let mut out = TensorMut::new(
+                DevicePtrMut(pointer.cast()),
+                dtype,
+                &[64],
+                &[1],
+                DeviceId::cpu(),
+            );
+            crate::kernels::simd_activations::write_mapped("test", &mut out, input, map).unwrap();
+            for (i, &v) in values.iter().enumerate() {
+                assert_eq!(
+                    unsafe { pointer.cast::<u16>().add(i).read_unaligned() },
+                    narrow(v * 2.)
+                );
+            }
+            assert_eq!(&shared[32..], &values[32..]);
+        }
+    }
+    #[test]
+    fn output_writers_refuse_device_only_storage_before_any_access() {
+        use onnx_runtime_ep_api::DevicePtrMut;
+        use onnx_runtime_ir::DeviceId;
+        let pointer = DevicePtrMut(std::ptr::NonNull::<u8>::dangling().as_ptr().cast());
+        for dtype in [
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Float32,
+            DataType::Float64,
+        ] {
+            let mut out = TensorMut::new(pointer, dtype, &[2], &[1], DeviceId::cuda(0));
+            let error = write_dense_f32_narrow("probe", &mut out, &[1., 2.])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("probe")
+                    && error.contains("Host-accessible")
+                    && error.contains("transfer"),
+                "{error}"
+            );
+            let called = std::cell::Cell::new(false);
+            let error = crate::kernels::simd_activations::write_mapped(
+                "mapped probe",
+                &mut out,
+                &[1., 2.],
+                |_, _| called.set(true),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(!called.get());
+            assert!(
+                error.contains("mapped probe") && error.contains("Host-accessible"),
+                "{error}"
+            );
+        }
+        let mut out = TensorMut::new(pointer, DataType::Int32, &[2], &[1], DeviceId::cuda(0));
+        assert!(
+            write_dense(&mut out, &[1i32, 2])
+                .unwrap_err()
+                .to_string()
+                .contains("Host-accessible")
+        );
+    }
+    #[test]
+    fn admitted_storage_copy_preserves_raw_bits_strides_offsets_and_unaligned_origins() {
+        fn check<T: NumericElem + Default>(values: &[T]) {
+            let bytes = std::mem::size_of_val(values);
+            let raw = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), bytes) };
+            let mut packed = vec![0xabu8; bytes + 2];
+            packed[1..1 + bytes].copy_from_slice(raw);
+            let shape = [2, 3];
+            for (strides, offset, indices) in [
+                ([3, 1], 0, [0, 1, 2, 3, 4, 5]),
+                ([1, 2], 0, [0, 2, 4, 1, 3, 5]),
+                ([-3, 1], 3, [3, 4, 5, 0, 1, 2]),
+            ] {
+                let mut view = TensorView::new(
+                    onnx_runtime_ep_api::DevicePtr(unsafe { packed.as_ptr().add(1).cast() }),
+                    T::DTYPE,
+                    &shape,
+                    &strides,
+                    onnx_runtime_ir::DeviceId::cpu(),
+                );
+                view.byte_offset = offset * size_of::<T>();
+                let mut out = vec![T::default(); 6];
+                to_dense_into("storage fixture", &view, &mut out).unwrap();
+                let actual =
+                    unsafe { std::slice::from_raw_parts(out.as_ptr().cast::<u8>(), bytes) };
+                let expected = indices
+                    .into_iter()
+                    .flat_map(|i| {
+                        raw[i * size_of::<T>()..(i + 1) * size_of::<T>()]
+                            .iter()
+                            .copied()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+                let allocated = to_dense::<T>(&view).unwrap();
+                assert_eq!(
+                    unsafe { std::slice::from_raw_parts(allocated.as_ptr().cast::<u8>(), bytes) },
+                    actual
+                );
+            }
+            assert_eq!((packed[0], packed[bytes + 1]), (0xab, 0xab));
+        }
+        check(&[
+            f32::from_bits(0x7f801234),
+            -0.,
+            0.,
+            f32::INFINITY,
+            f32::MIN_POSITIVE,
+            17.,
+        ]);
+        check(&[
+            f64::from_bits(0x7ff0000012345678),
+            -0.,
+            0.,
+            f64::INFINITY,
+            f64::MIN_POSITIVE,
+            1e100,
+        ]);
+        check(&[0x7c01, 0x8000, 0, 0x7c00, 1, 0x3c00].map(half::f16::from_bits));
+        check(&[0x7f81, 0x8000, 0, 0x7f80, 1, 0x3f80].map(half::bf16::from_bits));
+    }
+    #[test]
+    fn storage_reads_refuse_bad_destinations_geometry_and_device_before_writes() {
+        let x = crate::kernels::testutil::Owned::f32(&[2, 3], &[1.; 6]);
+        let mut out = [-123.; 6];
+        let error = to_dense_into("X snapshot", &x.view(), &mut out[..5]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("X snapshot: storage destination")
+        );
+        assert_eq!(out, [-123.; 6]);
+        for case in 0..5 {
+            let mut view = x.view();
+            match case {
+                0 => view.dtype = DataType::Float64,
+                1 => view.strides = &[],
+                2 => {
+                    view.device = onnx_runtime_ir::DeviceId::cuda(0);
+                    view.data = onnx_runtime_ep_api::DevicePtr(4usize as *const _);
+                }
+                3 => {
+                    view.shape = &[0, usize::MAX, 2];
+                    view.strides = &[0, 2, 1];
+                }
+                _ => {
+                    view.shape = &[isize::MAX as usize];
+                    view.strides = &[1];
+                }
+            }
+            let error = to_dense_into::<f32>("X snapshot", &view, &mut out).unwrap_err();
+            assert!(error.to_string().contains("X snapshot"), "{error}");
+            assert_eq!(out, [-123.; 6]);
+        }
+        let mut gpu = x.view();
+        gpu.device = onnx_runtime_ir::DeviceId::cuda(0);
+        gpu.data = onnx_runtime_ep_api::DevicePtr(4usize as *const _);
+        assert!(
+            to_dense::<f32>(&gpu)
+                .unwrap_err()
+                .to_string()
+                .contains("Host-accessible")
+        );
+        let empty = crate::kernels::testutil::Owned::zeros_f32(&[0]);
+        to_dense_into::<f32>("empty", &empty.view(), &mut []).unwrap();
+        let mut empty_gpu = empty.view();
+        empty_gpu.device = onnx_runtime_ir::DeviceId::cuda(0);
+        assert!(to_dense_into::<f32>("empty", &empty_gpu, &mut []).is_err());
+        let shape = [0];
+        let view = TensorView::new(
+            onnx_runtime_ep_api::DevicePtr(std::ptr::null()),
+            DataType::Float32,
+            &shape,
+            &[1],
+            onnx_runtime_ir::DeviceId::cpu(),
+        );
+        assert!(to_dense_into::<f32>("empty", &view, &mut []).is_err());
     }
 }

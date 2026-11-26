@@ -80,7 +80,7 @@ pub use types::{
     ChatMessageToolCall, ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatToolFunction,
     ChatTopLogprob, CompletionChoice, CompletionLogprobs, CompletionRequest, CompletionResponse,
     EmbeddingData, EmbeddingEncodingFormat, EmbeddingInput, EmbeddingRequest, EmbeddingResponse,
-    EmbeddingUsage, EmbeddingVector, ImageUrl, InputAudio, JsonSchemaSpec, ResponseFormat,
+    EmbeddingUsage, EmbeddingVector, ImageUrl, InputAudio, JsonSchemaDocument, ResponseFormat,
     StopInput, ToolChoice, ToolChoiceFunction, ToolChoiceMode, ToolChoiceSpecific,
     TranscriptInputTokenDetails, TranscriptResponse, TranscriptTokenUsage, Usage,
 };

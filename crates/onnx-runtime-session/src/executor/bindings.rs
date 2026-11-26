@@ -1092,6 +1092,15 @@ impl Executor {
                 .ok_or_else(|| SessionError::InputNotFound {
                     name: (*name).to_string(),
                 })?;
+            // Ordinary host uploads borrow/copy a contiguous byte prefix. A
+            // custom strided Tensor must never be silently reinterpreted as
+            // dense storage; explicit fixed-stride bindings carry that layout.
+            if !tensor.layout.is_contiguous(&tensor.shape) {
+                return Err(SessionError::Internal(format!(
+                    "host input '{name}' has non-contiguous strides {:?} for {:?} shape {:?}; ordinary Tensor uploads require contiguous storage: materialize a contiguous host tensor or use allocate_device_binding_fixed_strides to preserve a physical layout",
+                    tensor.layout.strides, tensor.dtype, tensor.shape
+                )));
+            }
             self.bind_input_shape(name, vid, tensor.dtype, &tensor.shape, &mut bindings)?;
         }
         for (&vid, value) in &external.inputs {

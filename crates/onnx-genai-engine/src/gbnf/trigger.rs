@@ -5,6 +5,7 @@ use super::{
     MAX_ITEMS,
     trigger_vm::{Id, Kind, Node, Program},
 };
+use crate::config::GrammarCollation;
 use anyhow::{Context, Result, ensure};
 use std::ops::Range;
 const MAX_DEPTH: usize = 128;
@@ -17,13 +18,14 @@ pub struct EcmaBytePattern {
     program_bytes: usize,
 }
 impl EcmaBytePattern {
-    pub fn compile(pattern: &str, max_bytes: usize) -> Result<Self> {
+    pub fn compile(pattern: &str, max_bytes: usize, collation: GrammarCollation) -> Result<Self> {
         ensure!(
             max_bytes > 0 && pattern.len() <= max_bytes,
             "grammar trigger pattern exceeds max_constraint_bytes={max_bytes}; shorten it or configure a positive sufficient budget"
         );
         let mut parser = Parser {
             bytes: pattern.as_bytes(),
+            collation,
             position: 0,
             captures: 0,
             open: Vec::new(),
@@ -63,6 +65,7 @@ impl EcmaBytePattern {
     }
 }
 struct Parser<'a> {
+    collation: GrammarCollation,
     bytes: &'a [u8],
     position: usize,
     captures: usize,
@@ -72,14 +75,230 @@ struct Parser<'a> {
 }
 enum ClassAtom {
     Scalar(u32),
+    Collating(u32),
     Set(Vec<(u32, u32)>),
+    // POSIX/equivalence classes finish their bracket term and cannot start a range.
+    StandaloneSet(Vec<(u32, u32)>),
 }
 impl ClassAtom {
     fn ranges(self) -> Vec<(u32, u32)> {
         match self {
-            Self::Scalar(c) => vec![(c, c)],
-            Self::Set(ranges) => ranges,
+            Self::Scalar(c) | Self::Collating(c) => vec![(c, c)],
+            Self::Set(ranges) | Self::StandaloneSet(ranges) => ranges,
         }
+    }
+}
+
+// C-locale named collating elements, independent of the host locale. Single
+// bytes name themselves. These are protocol character names, not Unicode folds.
+// Reference: LLVM libc++ src/regex.cpp collatenames and regex_traits<char>.
+fn libcxx_collating_byte(name: &[u8]) -> Option<u8> {
+    if let [byte] = name {
+        return Some(*byte);
+    }
+    // libc++ performs its named-element lookup through a C string, before
+    // considering the complete byte sequence as a direct collating element.
+    let name = name.split(|byte| *byte == 0).next().unwrap_or_default();
+    if let [byte] = name
+        && byte.is_ascii_alphabetic()
+    {
+        return Some(*byte);
+    }
+    Some(match name {
+        b"NUL" => 0,
+        b"alert" => 7,
+        b"backspace" => 8,
+        b"tab" => b'\t',
+        b"newline" => b'\n',
+        b"vertical-tab" => 11,
+        b"form-feed" => 12,
+        b"carriage-return" => b'\r',
+        b"space" => b' ',
+        b"exclamation-mark" => b'!',
+        b"quotation-mark" => b'"',
+        b"number-sign" => b'#',
+        b"dollar-sign" => b'$',
+        b"percent-sign" => b'%',
+        b"ampersand" => b'&',
+        b"apostrophe" => b'\'',
+        b"left-parenthesis" => b'(',
+        b"right-parenthesis" => b')',
+        b"asterisk" => b'*',
+        b"plus-sign" => b'+',
+        b"comma" => b',',
+        b"hyphen" | b"hyphen-minus" => b'-',
+        b"period" | b"full-stop" => b'.',
+        b"slash" | b"solidus" => b'/',
+        b"zero" => b'0',
+        b"one" => b'1',
+        b"two" => b'2',
+        b"three" => b'3',
+        b"four" => b'4',
+        b"five" => b'5',
+        b"six" => b'6',
+        b"seven" => b'7',
+        b"eight" => b'8',
+        b"nine" => b'9',
+        b"colon" => b':',
+        b"semicolon" => b';',
+        b"less-than-sign" => b'<',
+        b"equals-sign" => b'=',
+        b"greater-than-sign" => b'>',
+        b"question-mark" => b'?',
+        b"commercial-at" => b'@',
+        b"left-square-bracket" => b'[',
+        b"backslash" | b"reverse-solidus" => b'\\',
+        b"right-square-bracket" => b']',
+        b"circumflex" | b"circumflex-accent" => b'^',
+        b"low-line" | b"underscore" => b'_',
+        b"grave-accent" => b'`',
+        b"left-brace" | b"left-curly-bracket" => b'{',
+        b"vertical-line" => b'|',
+        b"right-brace" | b"right-curly-bracket" => b'}',
+        b"tilde" => b'~',
+        _ => return None,
+    })
+}
+
+// ASCII element names used by libstdc++ regex_traits<char>; the index is
+// the byte value. They are character-name facts, not host locale lookups.
+const GNU_COLLATING_NAMES: [&str; 128] = [
+    "NUL",
+    "SOH",
+    "STX",
+    "ETX",
+    "EOT",
+    "ENQ",
+    "ACK",
+    "alert",
+    "backspace",
+    "tab",
+    "newline",
+    "vertical-tab",
+    "form-feed",
+    "carriage-return",
+    "SO",
+    "SI",
+    "DLE",
+    "DC1",
+    "DC2",
+    "DC3",
+    "DC4",
+    "NAK",
+    "SYN",
+    "ETB",
+    "CAN",
+    "EM",
+    "SUB",
+    "ESC",
+    "IS4",
+    "IS3",
+    "IS2",
+    "IS1",
+    "space",
+    "exclamation-mark",
+    "quotation-mark",
+    "number-sign",
+    "dollar-sign",
+    "percent-sign",
+    "ampersand",
+    "apostrophe",
+    "left-parenthesis",
+    "right-parenthesis",
+    "asterisk",
+    "plus-sign",
+    "comma",
+    "hyphen",
+    "period",
+    "slash",
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "colon",
+    "semicolon",
+    "less-than-sign",
+    "equals-sign",
+    "greater-than-sign",
+    "question-mark",
+    "commercial-at",
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "H",
+    "I",
+    "J",
+    "K",
+    "L",
+    "M",
+    "N",
+    "O",
+    "P",
+    "Q",
+    "R",
+    "S",
+    "T",
+    "U",
+    "V",
+    "W",
+    "X",
+    "Y",
+    "Z",
+    "left-square-bracket",
+    "backslash",
+    "right-square-bracket",
+    "circumflex",
+    "underscore",
+    "grave-accent",
+    "a",
+    "b",
+    "c",
+    "d",
+    "e",
+    "f",
+    "g",
+    "h",
+    "i",
+    "j",
+    "k",
+    "l",
+    "m",
+    "n",
+    "o",
+    "p",
+    "q",
+    "r",
+    "s",
+    "t",
+    "u",
+    "v",
+    "w",
+    "x",
+    "y",
+    "z",
+    "left-curly-bracket",
+    "vertical-line",
+    "right-curly-bracket",
+    "tilde",
+    "DEL",
+];
+fn collating_byte(name: &[u8], collation: GrammarCollation) -> Option<u8> {
+    match collation {
+        GrammarCollation::Libcxx => libcxx_collating_byte(name),
+        GrammarCollation::Libstdcxx => GNU_COLLATING_NAMES
+            .iter()
+            .position(|candidate| candidate.as_bytes() == name)
+            .map(|byte| byte as u8),
     }
 }
 
@@ -230,6 +449,9 @@ impl Parser<'_> {
                 b'^' => (self.node(Kind::Start, 0..0)?, true),
                 b'$' => (self.node(Kind::End, 0..0)?, true),
                 b'\\' => self.escape()?,
+                b']' if self.collation == GrammarCollation::Libstdcxx => {
+                    (self.node(Kind::Byte(b']'), 0..0)?, false)
+                }
                 b'*' | b'+' | b'?' | b'{' | b'}' | b']' => anyhow::bail!(
                     "grammar trigger pattern has an unescaped syntax character at byte {}; escape literals or attach one valid quantifier to an atom",
                     self.position - 1
@@ -389,7 +611,8 @@ impl Parser<'_> {
                 let name = std::str::from_utf8(&self.bytes[start..self.position])?;
                 self.expect(b':')?;
                 self.expect(b']')?;
-                let ranges = match name {
+                let normalized = name.to_ascii_lowercase();
+                let ranges = match normalized.as_str() {
                     "alnum" => vec![(48, 57), (65, 90), (97, 122)],
                     "alpha" => vec![(65, 90), (97, 122)],
                     "blank" => vec![(9, 9), (32, 32)],
@@ -407,11 +630,48 @@ impl Parser<'_> {
                         "grammar trigger has unknown C-locale character class {name:?}; use a declared ECMAScript/POSIX character class"
                     ),
                 };
-                Ok(ClassAtom::Set(ranges))
+                Ok(ClassAtom::StandaloneSet(ranges))
             }
-            b'[' if matches!(self.peek(), Some(b'.' | b'=')) => anyhow::bail!(
-                "grammar trigger collating/equivalence bracket forms are not implemented yet; use explicit byte character classes"
-            ),
+            b'[' if matches!(self.peek(), Some(b'.' | b'=')) => {
+                let marker = self.take()?;
+                let start = self.position;
+                while self.bytes.get(self.position..self.position + 2) != Some(&[marker, b']']) {
+                    ensure!(
+                        self.position < self.bytes.len(),
+                        "grammar trigger has an unterminated collating/equivalence element at byte {start}; close it with {}] and close the outer character class",
+                        char::from(marker)
+                    );
+                    self.position += 1;
+                }
+                let name = &self.bytes[start..self.position];
+                let resolved = collating_byte(name, self.collation);
+                let byte = resolved.with_context(|| format!(
+                    "grammar trigger has invalid {} C-locale collating element {:?} at byte {start}; use a character name supported by the selected grammar_trigger_collation",
+                    self.collation.as_str(), String::from_utf8_lossy(name)
+                ))?;
+                self.position += 2;
+                if marker == b'.' {
+                    Ok(ClassAtom::Collating(u32::from(byte)))
+                } else {
+                    let ranges = if self.collation == GrammarCollation::Libstdcxx
+                        && byte.is_ascii_alphabetic()
+                    {
+                        vec![
+                            (
+                                u32::from(byte.to_ascii_uppercase()),
+                                u32::from(byte.to_ascii_uppercase()),
+                            ),
+                            (
+                                u32::from(byte.to_ascii_lowercase()),
+                                u32::from(byte.to_ascii_lowercase()),
+                            ),
+                        ]
+                    } else {
+                        vec![(u32::from(byte), u32::from(byte))]
+                    };
+                    Ok(ClassAtom::StandaloneSet(ranges))
+                }
+            }
             byte => Ok(ClassAtom::Scalar(u32::from(byte))),
         }
     }
@@ -423,13 +683,29 @@ impl Parser<'_> {
         let mut ranges = Vec::new();
         while self.peek() != Some(b']') {
             let first = self.class_atom()?;
-            if self.peek() == Some(b'-') && self.bytes.get(self.position + 1) != Some(&b']') {
+            if (self.collation == GrammarCollation::Libstdcxx
+                || !matches!(&first, ClassAtom::StandaloneSet(_)))
+                && self.peek() == Some(b'-')
+                && self.bytes.get(self.position + 1) != Some(&b']')
+            {
                 self.position += 1;
                 let last = self.class_atom()?;
-                let (ClassAtom::Scalar(lo), ClassAtom::Scalar(hi)) = (first, last) else {
-                    anyhow::bail!(
-                        "grammar trigger class range endpoints must be characters; move class escapes outside the range"
-                    );
+                let lo = match first {
+                    ClassAtom::Scalar(byte) | ClassAtom::Collating(byte) => byte,
+                    _ => anyhow::bail!(
+                        "grammar trigger range must start with one character for {}; move character classes outside the range",
+                        self.collation.as_str()
+                    ),
+                };
+                let hi = match last {
+                    ClassAtom::Scalar(byte) => byte,
+                    ClassAtom::Collating(byte) if self.collation == GrammarCollation::Libcxx => {
+                        byte
+                    }
+                    _ => anyhow::bail!(
+                        "grammar trigger range must end with a literal character for {}; use a literal endpoint or independent class terms",
+                        self.collation.as_str()
+                    ),
                 };
                 ensure!(
                     lo <= hi,
@@ -451,6 +727,69 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn libcxx_pattern(pattern: &str, max_bytes: usize) -> Result<EcmaBytePattern> {
+        EcmaBytePattern::compile(pattern, max_bytes, GrammarCollation::Libcxx)
+    }
+    #[test]
+    fn collation_brackets_match_c_locale_cpp_for_all_input_bytes() -> Result<()> {
+        fn unhex(hex: &str) -> Result<Vec<u8>> {
+            if hex == "-" {
+                return Ok(Vec::new());
+            }
+            ensure!(
+                hex.len().is_multiple_of(2),
+                "oracle hex must have complete bytes"
+            );
+            (0..hex.len())
+                .step_by(2)
+                .map(|offset| u8::from_str_radix(&hex[offset..offset + 2], 16).map_err(Into::into))
+                .collect()
+        }
+        for (collation, fixture) in [
+            (
+                GrammarCollation::Libcxx,
+                include_str!("../../../../tests/fixtures/llama-regex-collation/oracle.tsv"),
+            ),
+            (
+                GrammarCollation::Libstdcxx,
+                include_str!(
+                    "../../../../tests/fixtures/llama-regex-collation/oracle-libstdcxx.tsv"
+                ),
+            ),
+        ] {
+            let mut checked = 0;
+            for row in fixture.lines().filter(|row| !row.starts_with('#')) {
+                let columns: Vec<_> = row.split('\t').collect();
+                assert_eq!(columns.len(), 3);
+                let pattern = String::from_utf8(unhex(columns[0])?)?;
+                let compiled = EcmaBytePattern::compile(&pattern, 4096, collation);
+                assert!(
+                    matches!(columns[1], "valid" | "invalid"),
+                    "invalid oracle status: {}",
+                    columns[1]
+                );
+                if columns[1] == "invalid" {
+                    assert_eq!(columns[2], "-");
+                    assert!(compiled.is_err(), "{collation:?} C++ rejects {pattern:?}");
+                } else {
+                    let compiled = compiled
+                        .with_context(|| format!("{collation:?} C++ accepts {pattern:?}"))?;
+                    let accepted = unhex(columns[2])?;
+                    for byte in 0..=u8::MAX {
+                        assert_eq!(
+                            compiled.find(&[byte])?,
+                            accepted.contains(&byte).then_some(0),
+                            "{collation:?} {pattern:?} on byte {byte:#04x}"
+                        );
+                    }
+                }
+                checked += 1;
+            }
+            assert_eq!(checked, 504);
+        }
+        Ok(())
+    }
+
     #[test]
     fn byte_patterns_match_exhaustive_upstream_oracle() -> Result<()> {
         let mut checked = 0;
@@ -461,7 +800,7 @@ mod tests {
             let columns: Vec<_> = row.split('\t').collect();
             assert_eq!(columns.len(), 3);
             let expected = columns[2].parse::<isize>()?;
-            let actual = EcmaBytePattern::compile(columns[0], 4096)?.find(columns[1].as_bytes())?;
+            let actual = libcxx_pattern(columns[0], 4096)?.find(columns[1].as_bytes())?;
             assert_eq!(
                 actual,
                 usize::try_from(expected).ok(),
@@ -507,7 +846,7 @@ mod tests {
             (r"(?!(a))b\1", "b", None),
         ] {
             assert_eq!(
-                EcmaBytePattern::compile(pattern, 4096)?.find(input.as_bytes())?,
+                libcxx_pattern(pattern, 4096)?.find(input.as_bytes())?,
                 expected,
                 "{pattern:?} on {input:?}"
             );
@@ -532,68 +871,51 @@ mod tests {
             r"\b?a",
             r"[0-\d]",
         ] {
-            assert!(
-                EcmaBytePattern::compile(pattern, 4096).is_err(),
-                "{pattern}"
-            );
+            assert!(libcxx_pattern(pattern, 4096).is_err(), "{pattern}");
         }
     }
     #[test]
     fn byte_patterns_preserve_nonunicode_classes_and_full_match_backtracking() -> Result<()> {
-        assert_eq!(EcmaBytePattern::compile(r"\s", 64)?.find(&[0xa0])?, None);
-        assert_eq!(EcmaBytePattern::compile(r"\S", 64)?.find(&[0xa0])?, Some(0));
-        assert_eq!(EcmaBytePattern::compile("[é]", 64)?.find(&[0xc3])?, Some(0));
-        assert_eq!(
-            EcmaBytePattern::compile("^a|ab$", 64)?.find(b"ab")?,
-            Some(0)
-        );
-        assert_eq!(
-            EcmaBytePattern::compile(r"[\x00-\x02]", 64)?.find(&[1])?,
-            Some(0)
-        );
+        assert_eq!(libcxx_pattern(r"\s", 64)?.find(&[0xa0])?, None);
+        assert_eq!(libcxx_pattern(r"\S", 64)?.find(&[0xa0])?, Some(0));
+        assert_eq!(libcxx_pattern("[é]", 64)?.find(&[0xc3])?, Some(0));
+        assert_eq!(libcxx_pattern("^a|ab$", 64)?.find(b"ab")?, Some(0));
+        assert_eq!(libcxx_pattern(r"[\x00-\x02]", 64)?.find(&[1])?, Some(0));
         Ok(())
     }
     #[test]
     fn byte_patterns_named_classes_keep_the_upstream_c_locale() -> Result<()> {
         assert_eq!(
-            EcmaBytePattern::compile("[[:alpha:]]", 64)?.find("é".as_bytes())?,
+            libcxx_pattern("[[:alpha:]]", 64)?.find("é".as_bytes())?,
             None
         );
         assert_eq!(
-            EcmaBytePattern::compile("[[:alpha:]_]+", 64)?.find(b"2_Ab9")?,
+            libcxx_pattern("[[:alpha:]_]+", 64)?.find(b"2_Ab9")?,
             Some(1)
         );
-        assert_eq!(
-            EcmaBytePattern::compile("[[:xdigit:]]+", 64)?.find(b"zF0a")?,
-            Some(1)
-        );
-        assert_eq!(
-            EcmaBytePattern::compile("[^[:space:]]", 64)?.find(b"\r\nx")?,
-            Some(2)
-        );
-        assert!(EcmaBytePattern::compile("[[:unknown:]]", 64).is_err());
+        assert_eq!(libcxx_pattern("[[:xdigit:]]+", 64)?.find(b"zF0a")?, Some(1));
+        assert_eq!(libcxx_pattern("[^[:space:]]", 64)?.find(b"\r\nx")?, Some(2));
+        assert!(libcxx_pattern("[[:unknown:]]", 64).is_err());
         Ok(())
     }
     #[test]
     fn byte_patterns_bound_translated_program_depth_and_captures() {
-        let expansion = EcmaBytePattern::compile(&r"\W".repeat(32768), 65536)
-            .err()
-            .unwrap();
+        let expansion = libcxx_pattern(&r"\W".repeat(32768), 65536).err().unwrap();
         assert!(
             expansion.to_string().contains("translated program"),
             "{expansion:#}"
         );
         let nested = format!("{}a{}", "(".repeat(129), ")".repeat(129));
         assert!(
-            EcmaBytePattern::compile(&nested, 4096)
+            libcxx_pattern(&nested, 4096)
                 .err()
                 .unwrap()
                 .to_string()
                 .contains("depth")
         );
-        assert!(EcmaBytePattern::compile("a{2001}", 4096).is_err());
+        assert!(libcxx_pattern("a{2001}", 4096).is_err());
         assert!(
-            EcmaBytePattern::compile(&"(a)".repeat(1025), 4096)
+            libcxx_pattern(&"(a)".repeat(1025), 4096)
                 .err()
                 .unwrap()
                 .to_string()
@@ -601,35 +923,26 @@ mod tests {
         );
     }
     #[test]
-    fn byte_patterns_bound_class_items_and_name_unimplemented_bracket_forms() {
+    fn byte_patterns_bound_class_items() {
         let class = format!("[{}]", "a".repeat(MAX_ITEMS + 1));
         assert!(
-            EcmaBytePattern::compile(&class, class.len())
+            libcxx_pattern(&class, class.len())
                 .err()
                 .unwrap()
                 .to_string()
                 .contains("class exceeds")
         );
-        for pattern in ["[[.a.]]", "[[=a=]]"] {
-            assert!(
-                EcmaBytePattern::compile(pattern, 64)
-                    .err()
-                    .unwrap()
-                    .to_string()
-                    .contains("collating/equivalence")
-            );
-        }
     }
     #[test]
     fn byte_patterns_enforce_input_and_backtracking_budgets() -> Result<()> {
         assert!(
-            EcmaBytePattern::compile("a", 1)?
+            libcxx_pattern("a", 1)?
                 .find(b"aa")
                 .unwrap_err()
                 .to_string()
                 .contains("max_constraint_bytes=1")
         );
-        let regex = EcmaBytePattern::compile(r"^(a+)+\1$", 4096)?;
+        let regex = libcxx_pattern(r"^(a+)+\1$", 4096)?;
         let mut bytes = vec![b'a'; 512];
         bytes.push(b'b');
         assert!(regex.find(&bytes).is_err());
