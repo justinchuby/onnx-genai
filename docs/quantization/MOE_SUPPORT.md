@@ -193,11 +193,12 @@ Relevant existing seams are:
   Expert weights are immutable model data, **not KV**, so the concepts should be
   reused but expert storage must not be inserted into the KV APIs.
 
-## 5. Graph and export contract
+## 5. Microsoft interoperability contract
 
-### 5.1 Primary contract: explicit router + fused expert op
+### 5.1 Interoperability input: explicit router + vendor expert op
 
-Mobius should emit:
+For existing Microsoft-schema models, retain the following supported input spelling.
+Future exports use standard GroupedMatMul as specified in section 1:
 
 ```text
 hidden [T,H]
@@ -493,7 +494,7 @@ memory concepts, not KV tensor formats or KV connector APIs.
 
 | Area | Current integration point | Required future work |
 |---|---|---|
-| Mobius export | External exporter; contracts documented in `docs/execution/OPERATORS.md` and `MODEL_METADATA.md` | Emit explicit router + `MoE`/`QMoE`; expert-major external data; dense reference mode; metadata validation |
+| Mobius export | External exporter; source contract in section 1 | Emit standard GroupedMatMul with explicit routing/decode/reduction; preserve Microsoft interoperability inputs; expert-major external data and reference validation |
 | CPU EP | `crates/onnx-runtime-ep-cpu/src/kernels/{moe,qmoe,block_quantized_moe}.rs`, `mod.rs` | Grouped float and quantized expert execution is implemented; further packing/prepacking optimization remains |
 | CUDA EP | `crates/onnx-runtime-ep-cuda/src/kernels/{matmul,gemm,attention}.rs`, `mod.rs` | Device dispatch/scatter, grouped int4 expert GEMM, async residency |
 | Engine | `crates/onnx-genai-engine/src/{engine,batched}.rs` | Expert store lifecycle, leases, telemetry, batch residency plan |
@@ -515,8 +516,8 @@ Deliverables:
 
 1. Mobius recognizes supported sparse FFN patterns and preserves separate selection
    scores and aggregation weights for the exact router.
-2. Mobius emits `com.microsoft::MoE`/`QMoE` with canonical expert-major layout.
-3. Mobius can emit the decomposed dense reference graph.
+2. Future exports use standard GroupedMatMul with explicit expert-major decode and routing; existing Microsoft MoE/QMoE inputs retain their vendor contract.
+3. The standard grouped source graph executes as the reference when whole-region fusion is unavailable.
 4. `docs/execution/OPERATORS.md` lists MoE/QMoE capability and fallback behavior.
 5. Runtime capability checks fail clearly when no fused op or fallback is available.
 6. Tiny deterministic fixtures cover top-1/top-2, softmax and sigmoid routers,
@@ -535,12 +536,16 @@ grouped kernel is required.
 
 ### Phase 2 — grouped-expert kernels
 
-**Status: PARTIALLY IMPLEMENTED — CPU COMPLETE; CUDA tracked separately**
+**Status: CPU grouped kernels implemented; whole-region fusion remains pattern-scoped and CUDA is tracked separately.**
 
 The CPU EP routes the complete token batch first, groups routed rows by expert,
 and invokes one expert computation per active expert. Float `MoE` and dense
 block-MoE groups share the CPU GEMM backend, including single-row groups.
 `QMoE` and `BlockQuantizedMoE` process active experts one at a time.
+
+The following dense/streamed discussion concerns explicit `float32` activation
+arithmetic. Explicit `q8_0` arithmetic has its own packed-dot, scratch and numerical
+contract in [PACKED_ACTIVATION_ARITHMETIC.md](PACKED_ACTIVATION_ARITHMETIC.md).
 
 `BlockQuantizedMoE` admits a complete expert's FC1/FC2/optional-FC3 f32 set only
 when it fits `ONNX_GENAI_CPU_DENSE_WEIGHT_CACHE_BYTES` (default 256 MiB). Constant
@@ -620,8 +625,10 @@ an actionable error rather than OOM.
 1. **ORT weight ownership:** can an EP/custom `QMoE` kernel lazily access expert
    slices without ORT materializing the full initializer? If not, Phase 3 needs an
    external-data/lazy-initializer extension or an engine-owned custom op.
-2. **Schema evolution:** is upstream `QMoE` sufficient for every target router/FFN
-   layout, or is a second schema accepting preselected expert IDs and weights needed?
+2. **Fusion coverage:** which standard GroupedMatMul router/FFN structures have
+   a complete, boundary-safe lowering proof and a supported private EP target?
+   Unrecognized patterns keep their standard execution; Microsoft schemas remain
+   separate interoperability inputs.
 3. **Packing validation result:** Phase 1 must determine whether Mobius
    `MatMulNBits` packing and ORT `QMoE` packing are byte-identical across zero-point
    defaults, transpose conventions, and EP prepacked layouts; otherwise it must
