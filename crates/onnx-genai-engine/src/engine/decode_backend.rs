@@ -26,43 +26,6 @@ pub(crate) fn admit_keyed_weight_backend(
     }
 }
 
-#[cfg(test)]
-mod keyed_backend_tests {
-    use super::*;
-
-    #[test]
-    fn keyed_declarations_require_native_capability_and_preserve_explicit_selection() {
-        for requested in [
-            EngineDecodeBackend::Auto,
-            EngineDecodeBackend::Native,
-            EngineDecodeBackend::Ort,
-        ] {
-            assert_eq!(
-                admit_keyed_weight_backend(requested, false).unwrap(),
-                requested
-            );
-        }
-        let error = admit_keyed_weight_backend(EngineDecodeBackend::Ort, true).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("graph_weights requires the Native backend")
-        );
-        for requested in [EngineDecodeBackend::Auto, EngineDecodeBackend::Native] {
-            let result = admit_keyed_weight_backend(requested, true);
-            #[cfg(feature = "native-backend")]
-            assert_eq!(result.unwrap(), EngineDecodeBackend::Native);
-            #[cfg(not(feature = "native-backend"))]
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("native-backend build feature")
-            );
-        }
-    }
-}
-
 pub(crate) fn resolve_decode_backend(
     model_path: &Path,
     requested: EngineDecodeBackend,
@@ -324,5 +287,42 @@ mod prediction_limit_tests {
             "rank preservation alone must not admit speculative logit transforms"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod keyed_backend_tests {
+    use super::*;
+
+    #[test]
+    fn keyed_declarations_require_native_capability_and_preserve_explicit_selection() {
+        for requested in [
+            EngineDecodeBackend::Auto,
+            EngineDecodeBackend::Native,
+            EngineDecodeBackend::Ort,
+        ] {
+            assert_eq!(
+                admit_keyed_weight_backend(requested, false).unwrap(),
+                requested
+            );
+        }
+        let error = admit_keyed_weight_backend(EngineDecodeBackend::Ort, true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("graph_weights requires the Native backend")
+        );
+        for requested in [EngineDecodeBackend::Auto, EngineDecodeBackend::Native] {
+            let result = admit_keyed_weight_backend(requested, true);
+            #[cfg(feature = "native-backend")]
+            assert_eq!(result.unwrap(), EngineDecodeBackend::Native);
+            #[cfg(not(feature = "native-backend"))]
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("native-backend build feature")
+            );
+        }
     }
 }

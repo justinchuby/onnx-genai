@@ -653,6 +653,12 @@ impl ExecutionProvider for CpuExecutionProvider {
         passes
     }
 
+    fn host_payload_funding(&self) -> Option<onnx_runtime_ep_api::HostPayloadFunding> {
+        self.resources
+            .buffer_memory()
+            .map(crate::CpuBufferMemory::host_payload_funding)
+    }
+
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {
         if let Some(memory) = self.resources.buffer_memory() {
             return memory.allocate(size, alignment, self.device);

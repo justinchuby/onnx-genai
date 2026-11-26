@@ -1983,6 +1983,7 @@ impl NativeDecodeSession {
         self.last_hidden = match (&self.hidden_output, hidden) {
             (Some(name), Some(tensor)) => Some(
                 extract_last_row(&tensor)
+                    .map(NativeHidden::from_host)
                     .with_context(|| format!("read native decoder hidden output '{name}'"))?,
             ),
             (Some(name), None) => {
@@ -3041,7 +3042,10 @@ impl NativeDecodeSession {
                     profile.finish("decode_inline", step_wall);
                 }
                 if let Some(hidden_output) = self.hidden_output.as_deref() {
-                    self.last_hidden = Some(read_aux_hidden_last_row(state, hidden_output)?);
+                    self.last_hidden = Some(NativeHidden::from_host(read_aux_hidden_last_row(
+                        state,
+                        hidden_output,
+                    )?));
                 }
                 state.set_logical_len(total_len)?;
                 self.current_len = total_len;
@@ -3083,7 +3087,10 @@ impl NativeDecodeSession {
                 profile.finish("decode", step_wall);
             }
             if let Some(hidden_output) = self.hidden_output.as_deref() {
-                self.last_hidden = Some(read_aux_hidden_last_row(state, hidden_output)?);
+                self.last_hidden = Some(NativeHidden::from_host(read_aux_hidden_last_row(
+                    state,
+                    hidden_output,
+                )?));
             }
             state.set_logical_len(total_len)?;
             self.current_len = total_len;
@@ -3397,11 +3404,7 @@ impl NativeDecodeSession {
     /// path stays byte-identical. Greedy is the target regime, but returning raw
     /// logits also lets a driver fall back to host sampling for non-greedy
     /// requests. `past` must equal the committed length (`current_len`).
-    pub fn decode_verify(
-        &mut self,
-        draft: &[TokenId],
-        past: usize,
-    ) -> anyhow::Result<Vec<Vec<f32>>> {
+    pub fn decode_verify(&mut self, draft: &[TokenId], past: usize) -> anyhow::Result<LogitsBatch> {
         if draft.is_empty() {
             bail!("native decode_verify requires at least one draft token");
         }
@@ -3412,7 +3415,9 @@ impl NativeDecodeSession {
             );
         }
         if self.cuda.is_some() {
-            return self.decode_cuda_eager(draft, past);
+            return self
+                .decode_cuda_eager(draft, past)
+                .map(LogitsBatch::from_host_rows);
         }
         // CPU sessions already run any M>1 forward eagerly through the shared
         // decode path, which returns the full [K, vocab] rows verify needs.
