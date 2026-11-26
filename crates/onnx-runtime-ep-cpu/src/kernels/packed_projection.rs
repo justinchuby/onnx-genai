@@ -274,3 +274,6 @@ fn project_q8(
 thread_local! { static ACTIVATION_CONVERSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod loop_order_study;
