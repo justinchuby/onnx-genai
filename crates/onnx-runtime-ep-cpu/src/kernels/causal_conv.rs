@@ -171,8 +171,7 @@ impl Kernel for CausalConvWithStateKernel {
             .map(slice_byte_range)
             .collect();
 
-        let direct_out =
-            output_direct_write_eligible(&mut primary_output[0], out_len, &read_ranges);
+        let direct_out = output_direct_write_eligible(&primary_output[0], out_len, &read_ranges);
         let mut owned_out;
         let out: &mut [f32] = if direct_out {
             // SAFETY: `output_direct_write_eligible` proved the buffer is a

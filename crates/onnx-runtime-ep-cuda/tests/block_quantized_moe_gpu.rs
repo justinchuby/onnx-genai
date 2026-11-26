@@ -20,6 +20,8 @@
 //! selected-expert execution. CPU-only CI reports GPU cases as ignored unless
 //! `gpu-tests` is enabled.
 
+mod common;
+
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelConstantInput, KernelMatch,
     TensorMetadata, TensorMut, TensorView, WorkspaceView,
@@ -478,9 +480,8 @@ fn run_cpu_node(
     node: NodeId,
 ) -> Vec<f32> {
     let model = Model::new(graph);
-    let kernel = CpuExecutionProvider::new()
-        .get_kernel(model.graph.node(node), &[], 1)
-        .unwrap();
+    let ep = CpuExecutionProvider::new();
+    let kernel = ep.get_kernel(model.graph.node(node), &[], 1).unwrap();
     let strides: Vec<_> = inputs
         .iter()
         .map(|input| {
@@ -500,28 +501,7 @@ fn run_cpu_node(
         &output_strides,
         DeviceId::cpu(),
     );
-    let metadata: Vec<_> = views
-        .iter()
-        .map(|input| {
-            onnx_runtime_ep_api::TensorMetadata::new(input.dtype, input.shape, !input.is_absent())
-        })
-        .collect();
-    let req = kernel
-        .workspace_requirement(&metadata, &[])
-        .unwrap()
-        .require_ready()
-        .unwrap();
-    assert!(req.alignment <= std::mem::align_of::<u128>());
-    let mut scratch = vec![0u128; usize::try_from(req.bytes).unwrap().div_ceil(16)];
-    let workspace = (!scratch.is_empty()).then(|| {
-        onnx_runtime_ep_api::WorkspaceView::new(
-            DevicePtrMut(scratch.as_mut_ptr().cast()),
-            scratch.len() * 16,
-        )
-    });
-    kernel
-        .execute_with_workspace(&views, &mut [output_view], workspace)
-        .unwrap();
+    common::execute_cpu_kernel(&ep, kernel.as_ref(), &views, &mut [output_view]).unwrap();
     output
         .chunks_exact(4)
         .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))

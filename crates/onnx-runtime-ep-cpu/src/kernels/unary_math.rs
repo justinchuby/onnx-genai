@@ -137,6 +137,7 @@ fn softplus(x: f32) -> f32 {
 /// A stateless unary math kernel.
 pub struct UnaryMathKernel {
     op: MathOp,
+    opset: Option<u64>,
 }
 
 macro_rules! math_factory {
@@ -144,8 +145,11 @@ macro_rules! math_factory {
         /// Factory (no attributes).
         pub struct $factory;
         impl KernelFactory for $factory {
-            fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-                Ok(Box::new(UnaryMathKernel { op: $variant }))
+            fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+                Ok(Box::new(UnaryMathKernel {
+                    op: $variant,
+                    opset: node.local_opset().filter(|_| node.is_default_domain()),
+                }))
             }
         }
     };
@@ -213,6 +217,16 @@ impl UnaryMathKernel {
 impl Kernel for UnaryMathKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity(self.op.name(), inputs, outputs, 1, 1, 1)?;
+        if let Some(opset) = self.opset
+            && let Some(reason) = onnx_runtime_ir::trig::bf16_unsupported_reason(
+                self.op.name(),
+                "",
+                opset,
+                inputs[0].dtype,
+            )
+        {
+            return Err(EpError::KernelFailed(reason));
+        }
         if self.op == MathOp::Neg {
             return match inputs[0].dtype {
                 DataType::Int32 => {
@@ -309,7 +323,7 @@ mod tests {
     use crate::kernels::testutil::Owned;
 
     fn run(op: MathOp, x: &Owned, out: &mut Owned) {
-        UnaryMathKernel { op }
+        UnaryMathKernel { op, opset: None }
             .execute(&[x.view()], &mut [out.view_mut()])
             .unwrap();
     }

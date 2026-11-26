@@ -22,13 +22,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use onnx_genai_ort_sys as ort;
-use onnx_runtime_ep_api::HostToDeviceCopier;
 use onnx_runtime_ep_api::kernel::validate_kernel_sized_outputs;
 use onnx_runtime_ep_api::kernel::{
     Kernel, KernelSizedOutput, KernelSizedOutputMetadata, KernelSizedOutputPolicy, OutputMetadata,
     TensorMetadata, WorkspaceLifetime, WorkspacePreparation, WorkspaceView,
 };
 use onnx_runtime_ep_api::tensor::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
+use onnx_runtime_ep_api::{HostToDeviceCopier, WorkspaceContextKey, WorkspaceContextReader};
 use onnx_runtime_ir::{DataType, DeviceId, Node};
 
 use crate::kernel_ctx::{allocate_output, read_inputs_into};
@@ -254,14 +254,15 @@ pub enum ShapeInference {
     Window,
     /// `ai.onnx::DFT`: discrete Fourier transform along a signal axis.
     ///
-    /// Output shape is the input's, with the last dimension forced to 2 (the
-    /// complex component pair, even for real input) and the signal axis set to
-    /// `dft_length` — halved to `n / 2 + 1` when `onesided`.
+    /// The signal axis follows `dft_length`. Full/RFFT output has two complex
+    /// components; IRFFT expands the half-spectrum to a full real signal with
+    /// one component.
     ///
     /// Both `dft_length` (input 1) and, from opset 20, `axis` (input 2) arrive
     /// as *inputs*, so like [`Self::Compress`] this resolves at Compute time by
     /// reading values. `axis_attr` carries the pre-opset-20 spelling.
     Dft {
+        inverse: bool,
         onesided: bool,
         axis_attr: Option<i64>,
         default_axis: i64,
@@ -385,6 +386,11 @@ impl ShapeInference {
             let fallback = match rule {
                 SharedNativeShapeRule::ConstantOfShape => Self::ConstantOfShape,
                 SharedNativeShapeRule::Dft => Self::Dft {
+                    inverse: node
+                        .attr("inverse")
+                        .and_then(onnx_runtime_ir::Attribute::as_int)
+                        .unwrap_or(0)
+                        != 0,
                     onesided: node
                         .attr("onesided")
                         .and_then(onnx_runtime_ir::Attribute::as_int)
@@ -499,6 +505,7 @@ impl ShapeInference {
             | "Hardmax"
             | "BatchNormalization"
             | "InstanceNormalization"
+            | "MeanVarianceNormalization"
             | "GroupNormalization"
             | "LpNormalization"
             // Shape-preserving attention / MoE / KV-cache ops. Absent from this
@@ -764,6 +771,7 @@ impl ShapeInference {
             // opset 20 it is input 2. Both are modelled, so neither reaches
             // `Unmodelled`.
             "DFT" => Self::Dft {
+                inverse: int_attr("inverse").unwrap_or(0) != 0,
                 onesided: int_attr("onesided").unwrap_or(0) != 0,
                 axis_attr: int_attr("axis"),
                 default_axis: if opset >= 20 { -2 } else { 1 },
@@ -1140,16 +1148,19 @@ impl OperandKey {
 /// Owned copy of the metadata a [`WorkspaceRequirement`] was computed from.
 #[derive(PartialEq, Eq)]
 struct WorkspaceSignature {
+    context: WorkspaceContextKey,
     inputs: Vec<OperandKey>,
     outputs: Vec<OutputMetadata<'static>>,
 }
 
 fn signature_matches(
     signature: &WorkspaceSignature,
+    context: WorkspaceContextKey,
     metadata: &[TensorMetadata<'_>],
     outputs: &[OutputMetadata<'_>],
 ) -> bool {
-    signature.inputs.len() == metadata.len()
+    signature.context == context
+        && signature.inputs.len() == metadata.len()
         && signature
             .inputs
             .iter()
@@ -1159,10 +1170,12 @@ fn signature_matches(
 }
 
 fn signature_of(
+    context: WorkspaceContextKey,
     metadata: &[TensorMetadata<'_>],
     outputs: &[OutputMetadata<'_>],
 ) -> WorkspaceSignature {
     WorkspaceSignature {
+        context,
         inputs: metadata
             .iter()
             .map(|meta| OperandKey {
@@ -1191,6 +1204,7 @@ const WORKSPACE_PLAN_CACHE_CAPACITY: usize = 8;
 /// the immutable metadata and requirement alive for all subsequent comparisons.
 #[derive(Debug)]
 struct HotPlan {
+    context: WorkspaceContextKey,
     operands: Box<[OperandKey]>,
     outputs: Box<[OutputMetadata<'static>]>,
     requirement: WorkspacePreparation,
@@ -1255,11 +1269,13 @@ impl WorkspacePlanCache {
     /// The lock-free hit test, against already-built metadata.
     fn hot_hit(
         &self,
+        context: WorkspaceContextKey,
         metadata: &[TensorMetadata<'_>],
         outputs: &[OutputMetadata<'_>],
     ) -> Option<WorkspacePreparation> {
         let hot = self.hot.get()?;
-        (hot.outputs.as_ref() == outputs
+        (hot.context == context
+            && hot.outputs.as_ref() == outputs
             && hot.operands.len() == metadata.len()
             && hot
                 .operands
@@ -1275,11 +1291,13 @@ impl WorkspacePlanCache {
     /// built from `inputs`, but it does not build that `Vec`.
     fn hot_hit_views(
         &self,
+        context: WorkspaceContextKey,
         inputs: &[TensorView<'_>],
         outputs: &[OutputMetadata<'_>],
     ) -> Option<WorkspacePreparation> {
         let hot = self.hot.get()?;
-        (hot.outputs.as_ref() == outputs
+        (hot.context == context
+            && hot.outputs.as_ref() == outputs
             && hot.operands.len() == inputs.len()
             && hot
                 .operands
@@ -1294,6 +1312,7 @@ impl WorkspacePlanCache {
     /// this dispatch already has its answer.
     fn publish_hot(
         &self,
+        context: WorkspaceContextKey,
         metadata: &[TensorMetadata<'_>],
         outputs: &[OutputMetadata<'_>],
         requirement: WorkspacePreparation,
@@ -1305,8 +1324,9 @@ impl WorkspacePlanCache {
         if self.hot.get().is_some() {
             return;
         }
-        let signature = signature_of(metadata, outputs);
+        let signature = signature_of(context, metadata, outputs);
         let _ = self.hot.set(HotPlan {
+            context,
             operands: signature.inputs.into_boxed_slice(),
             outputs: signature.outputs.into_boxed_slice(),
             requirement,
@@ -1321,50 +1341,53 @@ impl WorkspacePlanCache {
     /// `Kernel::workspace_requirement`.
     fn get_or_plan_views(
         &self,
+        context: WorkspaceContextKey,
         inputs: &[TensorView<'_>],
         outputs: &[OutputMetadata<'_>],
         plan: impl FnOnce(&[TensorMetadata<'_>]) -> Result<WorkspacePreparation, String>,
     ) -> Result<WorkspacePreparation, String> {
-        if let Some(hit) = self.hot_hit_views(inputs, outputs) {
+        if let Some(hit) = self.hot_hit_views(context, inputs, outputs) {
             return Ok(hit);
         }
         let metadata: Vec<TensorMetadata<'_>> = inputs
             .iter()
             .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
             .collect();
-        self.get_or_plan(&metadata, outputs, || plan(&metadata))
+        self.get_or_plan(context, &metadata, outputs, || plan(&metadata))
     }
 
     /// Look up the plan for `metadata`, computing and remembering it on a miss.
     fn get_or_plan(
         &self,
+        context: WorkspaceContextKey,
         metadata: &[TensorMetadata<'_>],
         outputs: &[OutputMetadata<'_>],
         plan: impl FnOnce() -> Result<WorkspacePreparation, String>,
     ) -> Result<WorkspacePreparation, String> {
-        if let Some(hit) = self.hot_hit(metadata, outputs) {
+        if let Some(hit) = self.hot_hit(context, metadata, outputs) {
             return Ok(hit);
         }
-        if let Some(hit) = self.lookup(metadata, outputs) {
+        if let Some(hit) = self.lookup(context, metadata, outputs) {
             // Second sighting: this signature recurs, so it is the one worth
             // publishing.
-            self.publish_hot(metadata, outputs, hit);
+            self.publish_hot(context, metadata, outputs, hit);
             return Ok(hit);
         }
         let requirement = plan()?;
-        self.remember(signature_of(metadata, outputs), requirement);
+        self.remember(signature_of(context, metadata, outputs), requirement);
         Ok(requirement)
     }
 
     fn lookup(
         &self,
+        context: WorkspaceContextKey,
         metadata: &[TensorMetadata<'_>],
         outputs: &[OutputMetadata<'_>],
     ) -> Option<WorkspacePreparation> {
         let mut plans = self.plans.lock().unwrap_or_else(PoisonError::into_inner);
         let idx = plans
             .iter()
-            .position(|(signature, _)| signature_matches(signature, metadata, outputs))?;
+            .position(|(signature, _)| signature_matches(signature, context, metadata, outputs))?;
         let requirement = plans[idx].1;
         // Move-to-front so the hot signature stays ahead of a one-off prefill
         // shape once the cache is full.
@@ -1421,6 +1444,8 @@ pub struct ExportedComputeInfo {
     /// Kernels are Send, not Sync. Independent states of the same compiled info
     /// must serialize host execution as well as retaining disjoint workspaces.
     execution: Mutex<()>,
+    /// Captured while the origin is available; no provider lock in Compute.
+    workspace_context: WorkspaceContextReader,
     /// Optional routing table for multi-node fused subgraphs.
     pub routing: Option<SubgraphRouting>,
     /// One [`WorkspacePlanCache`] per entry in `entries`, same index. Built in
@@ -1523,6 +1548,11 @@ struct ComputeState {
 impl ExportedComputeInfo {
     pub fn new(entries: Vec<CompiledKernelEntry>, provider: Option<crate::ep::EpHandle>) -> Self {
         let workspace_plans = entries.iter().map(|_| WorkspacePlanCache::new()).collect();
+        let workspace_context = provider
+            .as_ref()
+            .map_or(WorkspaceContextReader::STABLE, |origin| {
+                origin.with(|ep| ep.workspace_preparation_context())
+            });
         Self {
             vtable: ort::OrtNodeComputeInfo {
                 ort_version_supported: ort::ORT_API_VERSION,
@@ -1532,6 +1562,7 @@ impl ExportedComputeInfo {
             },
             entries,
             execution: Mutex::new(()),
+            workspace_context,
             routing: None,
             workspace_plans,
             device_staging: None,
@@ -2370,14 +2401,18 @@ unsafe fn prepare_workspace(
     ctx: *mut ort::OrtKernelContext,
     placement: PlacementSources<'_>,
     kernel: &dyn Kernel,
-    workspace: (&WorkspacePlanCache, &mut crate::workspace::WorkspaceLane),
+    workspace: (
+        &WorkspacePlanCache,
+        &mut crate::workspace::WorkspaceLane,
+        WorkspaceContextKey,
+    ),
     operands: (&[TensorView<'_>], &[OutputMetadata<'_>], &[TensorMut<'_>]),
     node_label: impl std::fmt::Display + Copy,
 ) -> Result<Option<WorkspaceView>, String> {
-    let (plans, lane) = workspace;
+    let (plans, lane, context) = workspace;
     let (inputs, outputs, output_views) = operands;
     let preparation: WorkspacePreparation =
-        plans.get_or_plan_views(inputs, outputs, |metadata| {
+        plans.get_or_plan_views(context, inputs, outputs, |metadata| {
             kernel
                 .workspace_requirement(metadata, outputs)
                 .map_err(|e| format!("{node_label}: workspace_requirement failed: {e}"))
@@ -2618,6 +2653,8 @@ unsafe extern "C" fn compute_execute(
         }
 
         let exported = unsafe { &*(info.cast::<ExportedComputeInfo>()) };
+        // Read once per Compute without locking the retained provider.
+        let workspace_context = exported.workspace_context.read();
         // Lock order is compiled info, then state. A kernel panic retires the
         // shared kernel instance for every state, including previously idle ones.
         let _execution = match exported.execution.lock() {
@@ -2921,7 +2958,7 @@ unsafe extern "C" fn compute_execute(
                                         },
                                     },
                                     &*entry.kernel,
-                                    (plans, &mut workspace_lane),
+                                    (plans, &mut workspace_lane, workspace_context),
                                     (
                                         &kernel_inputs,
                                         &unresolved_workspace_outputs(
@@ -3158,7 +3195,7 @@ unsafe extern "C" fn compute_execute(
                                     },
                                 },
                                 &*entry.kernel,
-                                (plans, &mut workspace_lane),
+                                (plans, &mut workspace_lane, workspace_context),
                                 (
                                     &kernel_inputs,
                                     &unresolved_workspace_outputs(
@@ -3585,7 +3622,7 @@ unsafe extern "C" fn compute_execute(
                                 },
                             },
                             &*entry.kernel,
-                            (plans, &mut workspace_lane),
+                            (plans, &mut workspace_lane, workspace_context),
                             (
                                 &kernel_inputs,
                                 &workspace_outputs(all_output_views),
@@ -3734,7 +3771,7 @@ unsafe extern "C" fn compute_execute(
                                     },
                                 },
                                 &*entry.kernel,
-                                (plans, &mut workspace_lane),
+                                (plans, &mut workspace_lane, workspace_context),
                                 (
                                     kernel_inputs,
                                     &unresolved_workspace_outputs(
@@ -3833,7 +3870,7 @@ unsafe extern "C" fn compute_execute(
                                 },
                             },
                             &*entry.kernel,
-                            (plans, &mut workspace_lane),
+                            (plans, &mut workspace_lane, workspace_context),
                             (
                                 kernel_inputs,
                                 &unresolved_workspace_outputs(
@@ -4072,7 +4109,7 @@ unsafe extern "C" fn compute_execute(
                             },
                         },
                         &*entry.kernel,
-                        (plans, &mut workspace_lane),
+                        (plans, &mut workspace_lane, workspace_context),
                         (
                             kernel_inputs,
                             &workspace_outputs(output_views),
@@ -5905,6 +5942,7 @@ fn infer_shapes(
         }
 
         ShapeInference::Dft {
+            inverse,
             onesided,
             axis_attr,
             default_axis,
@@ -5928,6 +5966,8 @@ fn infer_shapes(
                 ));
             }
 
+            let mode = onnx_runtime_ir::dft::DftMode::from_flags(*inverse, *onesided);
+            mode.validate_components(complex_dim)?;
             // opset 20 moves `axis` into input 2; before that it is an
             // attribute defaulting to -2.
             let axis_raw = match inputs.get(2) {
@@ -5943,24 +5983,19 @@ fn infer_shapes(
                 );
             }
 
-            // `dft_length` (input 1) overrides the signal extent when present.
             let signal_len = match inputs.get(1) {
-                Some(t) if !t.is_absent() && t.shape.iter().product::<usize>() > 0 => {
+                Some(t) if !t.is_absent() => {
                     let n = read_scalar_i64(t, "DFT dft_length")?;
-                    usize::try_from(n)
-                        .map_err(|_| format!("DFT: dft_length must be non-negative, got {n}"))?
+                    let n = usize::try_from(n)
+                        .map_err(|_| format!("DFT: dft_length must be positive, got {n}"))?;
+                    onnx_runtime_ir::dft::DftMode::validate_length(n)?;
+                    n
                 }
-                _ => input.shape[axis],
+                _ => mode.default_length(input.shape[axis])?,
             };
-
             let mut shape = input.shape.to_vec();
-            shape[axis] = if *onesided {
-                signal_len / 2 + 1
-            } else {
-                signal_len
-            };
-            // Always complex out, even for real input.
-            shape[last] = 2;
+            shape[axis] = mode.output_length(signal_len);
+            shape[last] = mode.output_components();
             Ok(vec![shape])
         }
 
@@ -7469,6 +7504,7 @@ fn after() {}
         assert_eq!(
             infer(
                 &ShapeInference::Dft {
+                    inverse: false,
                     onesided: false,
                     axis_attr: Some(1),
                     default_axis: 1,
@@ -7489,6 +7525,7 @@ fn after() {}
         assert_eq!(
             infer(
                 &ShapeInference::Dft {
+                    inverse: false,
                     onesided: true,
                     axis_attr: Some(1),
                     default_axis: 1,
@@ -7511,6 +7548,7 @@ fn after() {}
         assert_eq!(
             infer(
                 &ShapeInference::Dft {
+                    inverse: false,
                     onesided: false,
                     axis_attr: Some(1),
                     default_axis: 1,
@@ -7526,15 +7564,15 @@ fn after() {}
     fn dft_opset20_reads_the_axis_from_input_two() {
         // The axis input must win over the attribute. Attribute says 1, input
         // says 0 — a rule that ignored the input would resize the wrong axis.
-        let buf = vec![0.0f32; 24];
-        let x = f32_data(&[3, 4, 2], &[8, 2, 1], &buf);
-        let empty: [i64; 0] = [];
-        let no_len = i64_scalar(&empty, &[0], &[1]);
+        let buf = vec![0.0f32; 12];
+        let x = f32_data(&[3, 4, 1], &[4, 1, 1], &buf);
+        let no_len = TensorView::absent(DataType::Int64);
         let a = [0i64];
         let axis_in = i64_scalar(&a, &[1], &[1]);
         assert_eq!(
             infer(
                 &ShapeInference::Dft {
+                    inverse: false,
                     onesided: true,
                     axis_attr: Some(1),
                     default_axis: 1,
@@ -7548,11 +7586,54 @@ fn after() {}
     }
 
     #[test]
+    fn dft_real_inverse_shared_and_fallback_shapes_are_full_and_real() {
+        let buf = [0f32; 12];
+        let x = f32_data(&[2, 3, 2], &[6, 2, 1], &buf);
+        let strategy = ShapeInference::Dft {
+            inverse: true,
+            onesided: true,
+            axis_attr: None,
+            default_axis: -2,
+        };
+        assert_eq!(
+            infer(&strategy, std::slice::from_ref(&x)).unwrap(),
+            vec![vec![2, 4, 1]]
+        );
+        let length = [5i64];
+        let len = i64_scalar(&length, &[], &[]);
+        assert_eq!(infer(&strategy, &[x, len]).unwrap(), vec![vec![2, 5, 1]]);
+        for version in [17, 20] {
+            let mut node = Node::new(
+                onnx_runtime_ir::NodeId(0),
+                "DFT",
+                vec![
+                    Some(onnx_runtime_ir::ValueId(0)),
+                    Some(onnx_runtime_ir::ValueId(1)),
+                ],
+                vec![onnx_runtime_ir::ValueId(2)],
+            );
+            node.version = Some(version);
+            node.attributes
+                .insert("inverse".into(), onnx_runtime_ir::Attribute::Int(1));
+            node.attributes
+                .insert("onesided".into(), onnx_runtime_ir::Attribute::Int(1));
+            if version < 20 {
+                node.attributes
+                    .insert("axis".into(), onnx_runtime_ir::Attribute::Int(-2));
+            }
+            let shared =
+                ShapeInference::for_node(&node, &[vec![Some(2), Some(3), Some(2)], vec![]], 1);
+            assert_eq!(infer(&shared, &[x, len]).unwrap(), vec![vec![2, 5, 1]]);
+        }
+    }
+
+    #[test]
     fn dft_refuses_the_complex_dim_as_the_signal_axis() {
         let buf = vec![0.0f32; 16];
         let x = f32_data(&[2, 8, 1], &[8, 1, 1], &buf);
         let err = infer(
             &ShapeInference::Dft {
+                inverse: false,
                 onesided: false,
                 axis_attr: Some(-1),
                 default_axis: 1,
@@ -9114,7 +9195,14 @@ fn after() {}
 
     #[test]
     fn for_node_unary_coverage() {
-        for op in ["Relu", "Sigmoid", "Cast", "Identity", "Softmax"] {
+        for op in [
+            "Relu",
+            "Sigmoid",
+            "Cast",
+            "Identity",
+            "Softmax",
+            "MeanVarianceNormalization",
+        ] {
             assert!(
                 matches!(
                     ShapeInference::for_node(&bare_node(op), &[], 1),
@@ -9980,9 +10068,19 @@ fn after() {}
             "the set of thread-locals in compute.rs changed; a new per-`Run` \
              pool costs another __tls_get_addr on the hot path"
         );
+        // Other objects (for example the cold provider handle) may also have
+        // a `with` method. Count resolutions of every declared TLS name; the
+        // declaration assertion above still rejects a second scratch pool.
+        declared.dedup();
+        let resolutions: usize = declared
+            .iter()
+            .map(|name| {
+                prod.matches(&format!("{name}.with(")).count()
+                    + prod.matches(&format!("{name}.try_with(")).count()
+            })
+            .sum();
         assert_eq!(
-            prod.matches(".with(").count() + prod.matches(".try_with(").count(),
-            1,
+            resolutions, 1,
             "the number of thread-local resolutions in compute.rs changed"
         );
 
@@ -10248,6 +10346,40 @@ mod workspace_plan_cache_tests {
     /// state.
 
     #[test]
+    fn changed_context_cannot_hit_hot_or_locked_workspace_capacity() {
+        use onnx_runtime_ep_api::{OutputMetadata, WorkspaceContextKey};
+        for locked in [false, true] {
+            let cache = if locked {
+                WorkspacePlanCache::locked_only()
+            } else {
+                WorkspacePlanCache::new()
+            };
+            let inputs = [meta(DataType::Float32, &[2], true)];
+            let outputs = [OutputMetadata::tensor(DataType::Float32, &[2])];
+            let calls = AtomicUsize::new(0);
+            for (context, bytes, count) in [
+                (1, 16, 1),
+                (1, 16, 1),
+                (4, 64, 2),
+                (4, 64, 2),
+                (1, 16, 2),
+                (4, 64, 2),
+            ] {
+                let req = cache
+                    .get_or_plan(WorkspaceContextKey::new(context), &inputs, &outputs, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(requirement(bytes))
+                    })
+                    .unwrap()
+                    .require_ready()
+                    .unwrap();
+                assert_eq!(req.bytes, bytes);
+                assert_eq!(calls.load(Ordering::SeqCst), count);
+            }
+        }
+    }
+
+    #[test]
     fn changed_output_facts_cannot_hit_locked_or_published_workspace_plan() {
         use super::*;
         for locked in [false, true] {
@@ -10262,13 +10394,18 @@ mod workspace_plan_cache_tests {
             let calls = AtomicUsize::new(0);
             let query = |outputs: &[OutputMetadata<'_>], bytes| {
                 cache
-                    .get_or_plan(&inputs, outputs, || {
-                        calls.fetch_add(1, Ordering::Relaxed);
-                        Ok(WorkspacePreparation::Ready(WorkspaceRequirement {
-                            bytes,
-                            ..WorkspaceRequirement::NONE
-                        }))
-                    })
+                    .get_or_plan(
+                        onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                        &inputs,
+                        outputs,
+                        || {
+                            calls.fetch_add(1, Ordering::Relaxed);
+                            Ok(WorkspacePreparation::Ready(WorkspaceRequirement {
+                                bytes,
+                                ..WorkspaceRequirement::NONE
+                            }))
+                        },
+                    )
                     .unwrap()
                     .require_ready()
                     .unwrap()
@@ -10309,7 +10446,14 @@ mod workspace_plan_cache_tests {
 
         let hot_shape = vec![1usize];
         let hot = [meta(DataType::Float32, &hot_shape, true)];
-        cache.get_or_plan(&hot, &[], || planner.plan(&hot)).unwrap();
+        cache
+            .get_or_plan(
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                &hot,
+                &[],
+                || planner.plan(&hot),
+            )
+            .unwrap();
 
         // Fill the rest of the cache. `hot` is now at the back, next to evict.
         let cold: Vec<Vec<usize>> = (2..=WORKSPACE_PLAN_CACHE_CAPACITY)
@@ -10317,12 +10461,26 @@ mod workspace_plan_cache_tests {
             .collect();
         for sh in &cold {
             let m = [meta(DataType::Float32, sh, true)];
-            cache.get_or_plan(&m, &[], || planner.plan(&m)).unwrap();
+            cache
+                .get_or_plan(
+                    onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                    &m,
+                    &[],
+                    || planner.plan(&m),
+                )
+                .unwrap();
         }
 
         // Using `hot` again is the access that must promote it.
         let before = planner.calls();
-        cache.get_or_plan(&hot, &[], || planner.plan(&hot)).unwrap();
+        cache
+            .get_or_plan(
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                &hot,
+                &[],
+                || planner.plan(&hot),
+            )
+            .unwrap();
         assert_eq!(
             planner.calls(),
             before,
@@ -10333,11 +10491,23 @@ mod workspace_plan_cache_tests {
         let evictor_shape = vec![WORKSPACE_PLAN_CACHE_CAPACITY + 1];
         let evictor = [meta(DataType::Float32, &evictor_shape, true)];
         cache
-            .get_or_plan(&evictor, &[], || planner.plan(&evictor))
+            .get_or_plan(
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                &evictor,
+                &[],
+                || planner.plan(&evictor),
+            )
             .unwrap();
 
         let before = planner.calls();
-        let got = cache.get_or_plan(&hot, &[], || planner.plan(&hot)).unwrap();
+        let got = cache
+            .get_or_plan(
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                &hot,
+                &[],
+                || planner.plan(&hot),
+            )
+            .unwrap();
         assert_eq!(
             planner.calls(),
             before,
@@ -10362,11 +10532,21 @@ mod workspace_plan_cache_tests {
         let metadata = [meta(DataType::Float32, &shape, true)];
 
         let first = cache
-            .get_or_plan(&metadata, &[], || planner.plan(&metadata))
+            .get_or_plan(
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                &metadata,
+                &[],
+                || planner.plan(&metadata),
+            )
             .expect("plan");
         for _ in 0..16 {
             let again = cache
-                .get_or_plan(&metadata, &[], || planner.plan(&metadata))
+                .get_or_plan(
+                    onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                    &metadata,
+                    &[],
+                    || planner.plan(&metadata),
+                )
                 .expect("plan");
             assert_eq!(
                 again, first,
@@ -10392,10 +10572,20 @@ mod workspace_plan_cache_tests {
         let small_meta = [meta(DataType::Float32, &small, true)];
         let large_meta = [meta(DataType::Float32, &large, true)];
         let small_req = cache
-            .get_or_plan(&small_meta, &[], || planner.plan(&small_meta))
+            .get_or_plan(
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                &small_meta,
+                &[],
+                || planner.plan(&small_meta),
+            )
             .expect("plan");
         let large_req = cache
-            .get_or_plan(&large_meta, &[], || planner.plan(&large_meta))
+            .get_or_plan(
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                &large_meta,
+                &[],
+                || planner.plan(&large_meta),
+            )
             .expect("plan");
 
         assert_eq!(small_req.require_ready().unwrap().bytes, 4 * 8 * 4);
@@ -10409,13 +10599,23 @@ mod workspace_plan_cache_tests {
         // And both remain individually correct once cached.
         assert_eq!(
             cache
-                .get_or_plan(&small_meta, &[], || planner.plan(&small_meta))
+                .get_or_plan(
+                    onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                    &small_meta,
+                    &[],
+                    || planner.plan(&small_meta)
+                )
                 .expect("plan"),
             small_req
         );
         assert_eq!(
             cache
-                .get_or_plan(&large_meta, &[], || planner.plan(&large_meta))
+                .get_or_plan(
+                    onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                    &large_meta,
+                    &[],
+                    || planner.plan(&large_meta)
+                )
                 .expect("plan"),
             large_req
         );
@@ -10434,10 +10634,20 @@ mod workspace_plan_cache_tests {
         let f32_meta = [meta(DataType::Float32, &shape, true)];
         let f16_meta = [meta(DataType::Float16, &shape, true)];
         let f32_req = cache
-            .get_or_plan(&f32_meta, &[], || planner.plan(&f32_meta))
+            .get_or_plan(
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                &f32_meta,
+                &[],
+                || planner.plan(&f32_meta),
+            )
             .expect("plan");
         let f16_req = cache
-            .get_or_plan(&f16_meta, &[], || planner.plan(&f16_meta))
+            .get_or_plan(
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                &f16_meta,
+                &[],
+                || planner.plan(&f16_meta),
+            )
             .expect("plan");
 
         assert_eq!(f32_req.require_ready().unwrap().bytes, 64 * 4);
@@ -10470,10 +10680,20 @@ mod workspace_plan_cache_tests {
             meta(DataType::Float32, &bias, false),
         ];
         let with = cache
-            .get_or_plan(&with_bias, &[], || planner.plan(&with_bias))
+            .get_or_plan(
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                &with_bias,
+                &[],
+                || planner.plan(&with_bias),
+            )
             .expect("plan");
         let without = cache
-            .get_or_plan(&without_bias, &[], || planner.plan(&without_bias))
+            .get_or_plan(
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                &without_bias,
+                &[],
+                || planner.plan(&without_bias),
+            )
             .expect("plan");
 
         assert_eq!(with.require_ready().unwrap().bytes, 16 * 4 * 2);
@@ -10499,10 +10719,20 @@ mod workspace_plan_cache_tests {
             meta(DataType::Float32, &shape, true),
         ];
         let one_req = cache
-            .get_or_plan(&one, &[], || planner.plan(&one))
+            .get_or_plan(
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                &one,
+                &[],
+                || planner.plan(&one),
+            )
             .expect("plan");
         let two_req = cache
-            .get_or_plan(&two, &[], || planner.plan(&two))
+            .get_or_plan(
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                &two,
+                &[],
+                || planner.plan(&two),
+            )
             .expect("plan");
 
         assert_eq!(one_req.require_ready().unwrap().bytes, 8 * 4);
@@ -10526,7 +10756,12 @@ mod workspace_plan_cache_tests {
             for shape in &shapes {
                 let metadata = [meta(DataType::Float32, shape.as_slice(), true)];
                 let got = cache
-                    .get_or_plan(&metadata, &[], || planner.plan(&metadata))
+                    .get_or_plan(
+                        onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                        &metadata,
+                        &[],
+                        || planner.plan(&metadata),
+                    )
                     .expect("plan");
                 assert_eq!(
                     got.require_ready().unwrap().bytes,
@@ -10556,7 +10791,12 @@ mod workspace_plan_cache_tests {
         let hot_meta = [meta(DataType::Float32, &hot, true)];
 
         cache
-            .get_or_plan(&hot_meta, &[], || planner.plan(&hot_meta))
+            .get_or_plan(
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                &hot_meta,
+                &[],
+                || planner.plan(&hot_meta),
+            )
             .expect("plan");
         let after_hot = planner.calls();
 
@@ -10565,11 +10805,21 @@ mod workspace_plan_cache_tests {
             let cold = [n];
             let cold_meta = [meta(DataType::Float32, &cold, true)];
             cache
-                .get_or_plan(&cold_meta, &[], || planner.plan(&cold_meta))
+                .get_or_plan(
+                    onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                    &cold_meta,
+                    &[],
+                    || planner.plan(&cold_meta),
+                )
                 .expect("plan");
             // Touch the hot signature between cold ones, as decode does.
             cache
-                .get_or_plan(&hot_meta, &[], || planner.plan(&hot_meta))
+                .get_or_plan(
+                    onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                    &hot_meta,
+                    &[],
+                    || planner.plan(&hot_meta),
+                )
                 .expect("plan");
         }
         assert_eq!(
@@ -10591,10 +10841,15 @@ mod workspace_plan_cache_tests {
 
         for expected in 1..=3 {
             let err = cache
-                .get_or_plan(&metadata, &[], || {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    Err("cuBLASLt heuristic found no algorithm".to_string())
-                })
+                .get_or_plan(
+                    onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                    &metadata,
+                    &[],
+                    || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Err("cuBLASLt heuristic found no algorithm".to_string())
+                    },
+                )
                 .expect_err("the planner failed, so the dispatch must fail");
             assert!(err.contains("no algorithm"), "got: {err}");
             assert_eq!(
@@ -10625,7 +10880,12 @@ mod workspace_plan_cache_tests {
                         let shape = [id * 32];
                         let metadata = [meta(DataType::Float32, shape.as_slice(), true)];
                         let got = cache
-                            .get_or_plan(&metadata, &[], || planner.plan(&metadata))
+                            .get_or_plan(
+                                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                                &metadata,
+                                &[],
+                                || planner.plan(&metadata),
+                            )
                             .expect("plan");
                         assert_eq!(
                             got.require_ready().unwrap().bytes,
@@ -10662,7 +10922,12 @@ mod workspace_plan_cache_tests {
         let shape = [12usize];
         let metadata = [meta(DataType::Float32, &shape, true)];
         cache
-            .get_or_plan(&metadata, &[], || planner.plan(&metadata))
+            .get_or_plan(
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                &metadata,
+                &[],
+                || planner.plan(&metadata),
+            )
             .expect("plan");
 
         let poisoner = {
@@ -10675,7 +10940,12 @@ mod workspace_plan_cache_tests {
         assert!(poisoner.join().is_err(), "the poisoning thread must panic");
 
         let got = cache
-            .get_or_plan(&metadata, &[], || planner.plan(&metadata))
+            .get_or_plan(
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                &metadata,
+                &[],
+                || planner.plan(&metadata),
+            )
             .expect("a poisoned lock must not fail the dispatch");
         assert_eq!(got.require_ready().unwrap().bytes, 12 * 4);
         assert_eq!(
@@ -10767,7 +11037,12 @@ mod workspace_plan_cache_tests {
         let inputs = [view(&data, DataType::Float32, &shape, &strides)];
 
         cache
-            .get_or_plan_views(&inputs, &[], |m| planner.plan(m))
+            .get_or_plan_views(
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                &inputs,
+                &[],
+                |m| planner.plan(m),
+            )
             .expect("plan");
         assert!(
             cache.hot.get().is_none(),
@@ -10775,7 +11050,12 @@ mod workspace_plan_cache_tests {
         );
 
         cache
-            .get_or_plan_views(&inputs, &[], |m| planner.plan(m))
+            .get_or_plan_views(
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                &inputs,
+                &[],
+                |m| planner.plan(m),
+            )
             .expect("plan");
         assert!(
             cache.hot.get().is_some(),
@@ -10784,9 +11064,12 @@ mod workspace_plan_cache_tests {
 
         let before = planner.calls();
         let got = cache
-            .get_or_plan_views(&inputs, &[], |_| {
-                panic!("the published plan must not be re-planned")
-            })
+            .get_or_plan_views(
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                &inputs,
+                &[],
+                |_| panic!("the published plan must not be re-planned"),
+            )
             .expect("served from the lock-free slot");
         assert_eq!(got.require_ready().unwrap().bytes, 8 * 4);
         assert_eq!(planner.calls(), before);
@@ -10805,7 +11088,12 @@ mod workspace_plan_cache_tests {
         let inputs = [view(&data, DataType::Float32, &shape, &strides)];
         for _ in 0..2 {
             cache
-                .get_or_plan_views(&inputs, &[], |m| planner.plan(m))
+                .get_or_plan_views(
+                    onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                    &inputs,
+                    &[],
+                    |m| planner.plan(m),
+                )
                 .expect("plan");
         }
         assert!(cache.hot.get().is_some(), "signature must be published");
@@ -10820,7 +11108,12 @@ mod workspace_plan_cache_tests {
                 let strides = [1i64];
                 let inputs = [view(&data, DataType::Float32, &shape, &strides)];
                 let got = cache
-                    .get_or_plan_views(&inputs, &[], |_| panic!("must not re-plan"))
+                    .get_or_plan_views(
+                        onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                        &inputs,
+                        &[],
+                        |_| panic!("must not re-plan"),
+                    )
                     .expect("served");
                 let _ = tx.send(got.require_ready().unwrap().bytes);
             })
@@ -10846,12 +11139,22 @@ mod workspace_plan_cache_tests {
 
         let p = [view(&data, DataType::Float32, &prefill, &strides)];
         cache
-            .get_or_plan_views(&p, &[], |m| planner.plan(m))
+            .get_or_plan_views(
+                onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                &p,
+                &[],
+                |m| planner.plan(m),
+            )
             .expect("plan");
         let d = [view(&data, DataType::Float32, &decode, &strides)];
         for _ in 0..2 {
             cache
-                .get_or_plan_views(&d, &[], |m| planner.plan(m))
+                .get_or_plan_views(
+                    onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                    &d,
+                    &[],
+                    |m| planner.plan(m),
+                )
                 .expect("plan");
         }
 
@@ -10880,7 +11183,12 @@ mod workspace_plan_cache_tests {
             let inputs = [view(&data, DataType::Float32, &hot_shape, &strides[..1])];
             for _ in 0..2 {
                 cache
-                    .get_or_plan_views(&inputs, &[], |m| planner.plan(m))
+                    .get_or_plan_views(
+                        onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                        &inputs,
+                        &[],
+                        |m| planner.plan(m),
+                    )
                     .expect("plan");
             }
             assert!(cache.hot.get().is_some(), "publication precondition failed");
@@ -10894,7 +11202,12 @@ mod workspace_plan_cache_tests {
             let other_shape = [4usize];
             let other = [view(&data, DataType::Float32, &other_shape, &strides[..1])];
             let got = cache
-                .get_or_plan_views(&other, &[], |m| planner.plan(m))
+                .get_or_plan_views(
+                    onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                    &other,
+                    &[],
+                    |m| planner.plan(m),
+                )
                 .expect("plan");
             assert_eq!(
                 got.require_ready().unwrap().bytes,
@@ -10909,7 +11222,12 @@ mod workspace_plan_cache_tests {
             publish(&cache, &planner);
             let other = [view(&data, DataType::Float16, &hot_shape, &strides[..1])];
             let got = cache
-                .get_or_plan_views(&other, &[], |m| planner.plan(m))
+                .get_or_plan_views(
+                    onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                    &other,
+                    &[],
+                    |m| planner.plan(m),
+                )
                 .expect("plan");
             assert_eq!(
                 got.require_ready().unwrap().bytes,
@@ -10924,7 +11242,12 @@ mod workspace_plan_cache_tests {
             publish(&cache, &planner);
             let other = [TensorView::absent(DataType::Float32)];
             let got = cache
-                .get_or_plan_views(&other, &[], |m| planner.plan(m))
+                .get_or_plan_views(
+                    onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                    &other,
+                    &[],
+                    |m| planner.plan(m),
+                )
                 .expect("plan");
             assert_eq!(
                 got.require_ready().unwrap().bytes,
@@ -10942,7 +11265,12 @@ mod workspace_plan_cache_tests {
                 view(&data, DataType::Float32, &hot_shape, &strides[..1]),
             ];
             let got = cache
-                .get_or_plan_views(&other, &[], |m| planner.plan(m))
+                .get_or_plan_views(
+                    onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                    &other,
+                    &[],
+                    |m| planner.plan(m),
+                )
                 .expect("plan");
             assert_eq!(
                 got.require_ready().unwrap().bytes,
@@ -10970,7 +11298,12 @@ mod workspace_plan_cache_tests {
                     let shape = [n * 2];
                     let inputs = [view(&data, DataType::Float32, &shape, &strides)];
                     let got = cache
-                        .get_or_plan_views(&inputs, &[], |m| planner.plan(m))
+                        .get_or_plan_views(
+                            onnx_runtime_ep_api::WorkspaceContextKey::STABLE,
+                            &inputs,
+                            &[],
+                            |m| planner.plan(m),
+                        )
                         .expect("plan");
                     assert_eq!(
                         got.require_ready().unwrap().bytes as usize,

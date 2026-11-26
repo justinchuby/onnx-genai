@@ -38,12 +38,11 @@ use crate::{
     },
     state::{AppState, DEFAULT_MAX_OUTPUT_TOKENS, ServerConfig},
     types::{
-        AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest, ChatCompletionResponse,
-        ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageToolCall, ChatTokenLogprob,
-        ChatTopLogprob, CompletionChoice, CompletionLogprobs, CompletionRequest,
-        CompletionResponse, EmbeddingData, EmbeddingInput, EmbeddingRequest, EmbeddingResponse,
-        EmbeddingUsage, EmbeddingVector, InputAudio, ReasoningEffort, ResponseFormat, StopInput,
-        ToolChoice, ToolChoiceMode, Usage,
+        ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatLogprobs, ChatMessage,
+        ChatMessageContent, ChatMessageToolCall, ChatTokenLogprob, ChatTopLogprob,
+        CompletionChoice, CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData,
+        EmbeddingInput, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector,
+        InputAudio, ReasoningEffort, StopInput, ToolChoice, ToolChoiceMode, Usage,
     },
 };
 
@@ -532,7 +531,7 @@ impl ApiError {
         }
     }
 
-    fn payload_too_large(message: impl Into<String>) -> Self {
+    pub(crate) fn payload_too_large(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             message: message.into(),
@@ -759,7 +758,7 @@ fn map_registry_error(err: crate::registry::RegistryError) -> ApiError {
 ///   all; never falls back to the default model for a named request.
 /// - **Empty `requested`** — falls back to the default model, lazily loading it
 ///   if necessary, preserving the single-model UX where clients omit `model`.
-async fn resolve_model(
+pub(crate) async fn resolve_model(
     registry: &crate::registry::ModelRegistry,
     requested: &str,
 ) -> Result<Arc<ModelHandle>, ApiError> {
@@ -795,14 +794,6 @@ fn map_model_load_error(id: &str, error: anyhow::Error) -> ApiError {
     } else {
         ApiError::internal(format!("failed to load model '{id}': {error:#}"))
     }
-}
-
-fn audio_decoder_prompt(
-    tokenizer: &Tokenizer,
-    language: Option<&str>,
-) -> Result<Vec<u32>, ApiError> {
-    crate::multimodal::audio_decoder_prompt(tokenizer, language)
-        .map_err(|error| ApiError::invalid_request(format!("{error:#}")))
 }
 
 /// Close a session the registry let go of, on the model that owns it, under the

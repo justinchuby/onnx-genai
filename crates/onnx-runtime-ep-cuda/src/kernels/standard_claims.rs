@@ -12,14 +12,16 @@ pub(crate) fn unsupported_reason_at_opset(
     opset: u64,
     input_shapes: &[Shape],
     input_dtypes: &[DataType],
-    native_linear_quantization: bool,
+    conv_transpose_contract: super::conv_transpose::Contract,
 ) -> Option<String> {
     let result = match node.op_type.as_str() {
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
         "GatherND" => gather_nd(node, opset, input_dtypes),
         "QuantizeLinear" | "DequantizeLinear" => {
-            if native_linear_quantization
-                && let Some(result) = super::quantization::claim_int16(node, opset, input_dtypes)
+            if matches!(
+                conv_transpose_contract,
+                super::conv_transpose::Contract::Standalone
+            ) && let Some(result) = super::quantization::claim_int16(node, opset, input_dtypes)
             {
                 return result
                     .err()
@@ -29,11 +31,21 @@ pub(crate) fn unsupported_reason_at_opset(
                 super::quantization::unsupported_reason(node, input_shapes, input_dtypes)
             });
         }
+        "Dropout" => {
+            onnx_runtime_ir::dropout::validate_claim(node, opset, input_shapes, input_dtypes)
+        }
         "AveragePool" => {
             return super::pooling::validate_average_claim(node, opset, input_shapes, input_dtypes)
                 .err()
                 .map(|error| error.to_string());
         }
+        "ConvTranspose" => conv_transpose(
+            node,
+            opset,
+            input_shapes,
+            input_dtypes,
+            conv_transpose_contract,
+        ),
         _ => return unsupported_reason(node, input_shapes, input_dtypes),
     };
     result
@@ -72,7 +84,6 @@ pub(crate) fn unsupported_reason(
         "DequantizePacked" => {
             onnx_runtime_ir::dequantize_packed::validate_claim(node, input_shapes, input_dtypes)
         }
-        "Dropout" => dropout(node, input_dtypes),
         "NonZero" => nonzero(node, input_dtypes),
         "AffineGrid" => affine_grid(node, input_dtypes),
         "BatchNormalization" => batch_normalization(node, input_dtypes),
@@ -87,7 +98,6 @@ pub(crate) fn unsupported_reason(
         "Col2Im" => col2im(node, input_dtypes),
         "QLinearMatMul" => qlinear_matmul(node, input_dtypes),
         "Resize" => resize(node, input_dtypes),
-        "ConvTranspose" => conv_transpose(node, input_shapes, input_dtypes),
         "GridSample" => grid_sample(node, input_shapes, input_dtypes),
         _ => return None,
     };
@@ -212,8 +222,10 @@ fn qlinear_matmul(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> 
 
 fn conv_transpose(
     node: &Node,
+    opset: u64,
     input_shapes: &[Shape],
     input_dtypes: &[DataType],
+    contract: super::conv_transpose::Contract,
 ) -> Result<(), String> {
     if !(2..=3).contains(&node.inputs.len()) || node.outputs.len() != 1 {
         return Err("requires X, W, optional B, and one output".into());
@@ -222,7 +234,14 @@ fn conv_transpose(
     if node.inputs.iter().any(Option::is_none) {
         return Err("all declared inputs must be present".into());
     }
-    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")?;
+    match contract {
+        super::conv_transpose::Contract::Standalone => {
+            super::conv_transpose::storage(input_dtypes[0], opset)?;
+        }
+        super::conv_transpose::Contract::OrtPlugin => {
+            require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")?;
+        }
+    }
     if input_dtypes[1] != input_dtypes[0]
         || input_dtypes
             .get(2)
@@ -230,15 +249,16 @@ fn conv_transpose(
     {
         return Err("W and optional B must match X dtype".into());
     }
-    match node.attr("auto_pad").and_then(Attribute::as_str) {
-        None | Some("" | "NOTSET" | "VALID") => {}
-        Some(value) => return Err(format!("auto_pad {value:?} is deferred")),
+    match contract {
+        super::conv_transpose::Contract::Standalone => {
+            super::conv_transpose::validate_claim(node, input_shapes)
+                .map_err(|error| error.to_string())
+        }
+        super::conv_transpose::Contract::OrtPlugin => {
+            super::conv_transpose_ort::reject_deferred(node).map_err(|error| error.to_string())?;
+            require_input_rank(input_shapes, 0, &[3, 4], "X")
+        }
     }
-    if node.attr("output_shape").is_some() {
-        return Err("output_shape-driven padding is deferred".into());
-    }
-    require_input_rank(input_shapes, 0, &[3, 4], "X")?;
-    Ok(())
 }
 
 fn grid_sample(
@@ -371,6 +391,7 @@ fn quantize_linear(node: &Node, input_dtypes: &[DataType]) -> Result<(), String>
 
 #[cfg(test)]
 mod linear_quantization_tests {
+    use super::super::conv_transpose::Contract::{OrtPlugin, Standalone};
     use super::*;
     use onnx_runtime_ir::{Dim, NodeId, ValueId};
 
@@ -395,12 +416,16 @@ mod linear_quantization_tests {
             ] {
                 let node = node(op, Some(ValueId(2)));
                 let shapes = [vec![Dim::Static(2)], vec![], vec![]];
-                assert!(unsupported_reason_at_opset(&node, 21, &shapes, &dtypes, true).is_none());
                 assert!(
-                    unsupported_reason_at_opset(&node, 20, &shapes, &dtypes, true)
+                    unsupported_reason_at_opset(&node, 21, &shapes, &dtypes, Standalone).is_none()
+                );
+                assert!(
+                    unsupported_reason_at_opset(&node, 20, &shapes, &dtypes, Standalone)
                         .is_some_and(|reason| reason.contains("require opset 21"))
                 );
-                assert!(unsupported_reason_at_opset(&node, 21, &shapes, &dtypes, false).is_some());
+                assert!(
+                    unsupported_reason_at_opset(&node, 21, &shapes, &dtypes, OrtPlugin).is_some()
+                );
             }
 
             // Legacy placement does not inspect the Q output attribute; its
@@ -415,9 +440,9 @@ mod linear_quantization_tests {
                 .insert("output_dtype".into(), Attribute::Int(code as i64));
             let shapes = [vec![Dim::Static(2)], vec![Dim::Static(2)]];
             let dtypes = [DataType::Float32, DataType::Float32];
-            assert!(unsupported_reason_at_opset(&q, 21, &shapes, &dtypes, true).is_none());
+            assert!(unsupported_reason_at_opset(&q, 21, &shapes, &dtypes, Standalone).is_none());
             assert_eq!(
-                unsupported_reason_at_opset(&q, 21, &shapes, &dtypes, false).as_deref(),
+                unsupported_reason_at_opset(&q, 21, &shapes, &dtypes, OrtPlugin).as_deref(),
                 Some("QuantizeLinear CUDA coverage requires a scalar scale")
             );
             assert!(
@@ -443,7 +468,7 @@ mod linear_quantization_tests {
         dq.attributes.insert("block_size".into(), Attribute::Int(2));
         let blocked = [vec![Dim::Static(4)], vec![Dim::Static(2)]];
         let dq_types = [DataType::Int4, DataType::Float32];
-        for native in [false, true] {
+        for native in [OrtPlugin, Standalone] {
             assert!(unsupported_reason_at_opset(&q, 21, &scalar, &q_types, native).is_none());
             assert_eq!(
                 unsupported_reason_at_opset(&q, 21, &axis, &q_types, native).as_deref(),
@@ -493,11 +518,6 @@ fn dequantize_linear(node: &Node, input_dtypes: &[DataType]) -> Result<(), Strin
         return Err("zero_point dtype must match x".into());
     }
     Ok(())
-}
-
-fn dropout(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
-    required_arity(node, input_dtypes, 1, 1, 2)?;
-    require_fixed_width(input_dtypes, 0, "data")
 }
 
 fn nonzero(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {

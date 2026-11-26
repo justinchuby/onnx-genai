@@ -3,19 +3,71 @@
 //!
 //! `Flatten` and `Squeeze` only change a tensor's *shape*, never its row-major
 //! element order, and the runtime pre-allocates the output with the target
-//! shape (computed by shape inference). Each kernel therefore moves raw element
-//! bytes through [`to_dense_bytes`]/[`write_dense_bytes`], serving every
-//! fixed-width dtype uniformly. `Squeeze`'s optional `axes` input is consumed
+//! shape (computed by shape inference). Each kernel therefore moves raw storage
+//! bytes, including packed elements. `Squeeze`'s optional `axes` input is consumed
 //! upstream when the output shape is built, so the kernel ignores it.
 //!
 //! `Size` reports the input's total element count as a rank-0 `int64` scalar; it
 //! reads only shape metadata and is dtype-agnostic on its input.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Attribute, DataType, Node};
+use onnx_runtime_ir::{Attribute, DataType, Node, checked_numel};
 
 use super::{check_arity, to_dense_bytes, to_dense_i64, write_dense_bytes};
 use crate::strided::numel;
+
+/// Copy a shape-only result in logical row-major order without changing its dtype.
+pub(super) fn copy_shape_only(op: &str, input: &TensorView, output: &mut TensorMut) -> Result<()> {
+    if input.dtype != output.dtype {
+        return Err(EpError::KernelFailed(format!(
+            "{op}: output dtype {:?} must match input dtype {:?}",
+            output.dtype, input.dtype
+        )));
+    }
+    let elements = |shape: &[usize]| {
+        checked_numel(shape).ok_or_else(|| {
+            EpError::KernelFailed(format!("{op}: element count overflows for shape {shape:?}"))
+        })
+    };
+    let len = elements(input.shape)?;
+    if len != elements(output.shape)? {
+        return Err(EpError::KernelFailed(format!(
+            "{op}: input shape {:?} and output shape {:?} must have the same element count",
+            input.shape, output.shape
+        )));
+    }
+    if !input.dtype.is_sub_byte() {
+        let bytes = to_dense_bytes(input)?;
+        return write_dense_bytes(output, &bytes);
+    }
+
+    input.validate()?;
+    output.validate()?;
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Err(EpError::KernelFailed(format!(
+            "{op}: packed {:?} storage requires contiguous input and output",
+            input.dtype
+        )));
+    }
+    let bytes = input.dtype.checked_storage_bytes(len).ok_or_else(|| {
+        EpError::KernelFailed(format!(
+            "{op}: packed {:?} storage size overflows for {len} elements",
+            input.dtype
+        ))
+    })?;
+    if bytes != 0 {
+        // SAFETY: the CPU executor bounds-checks the two contiguous host views
+        // at their byte origins and gives kernels disjoint output storage.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                input.data_ptr::<u8>(),
+                output.data_ptr_mut::<u8>(),
+                bytes,
+            );
+        }
+    }
+    Ok(())
+}
 
 /// Stateless `Flatten` kernel (row-major byte copy into the pre-shaped output).
 pub struct FlattenKernel;
@@ -33,8 +85,7 @@ impl KernelFactory for FlattenFactory {
 impl Kernel for FlattenKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Flatten", inputs, outputs, 1, 1, 1)?;
-        let bytes = to_dense_bytes(&inputs[0])?;
-        write_dense_bytes(&mut outputs[0], &bytes)
+        copy_shape_only("Flatten", &inputs[0], &mut outputs[0])
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -59,8 +110,7 @@ impl Kernel for SqueezeKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         // data (+ optional axes input, which is metadata only here).
         check_arity("Squeeze", inputs, outputs, 1, 2, 1)?;
-        let bytes = to_dense_bytes(&inputs[0])?;
-        write_dense_bytes(&mut outputs[0], &bytes)
+        copy_shape_only("Squeeze", &inputs[0], &mut outputs[0])
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -174,6 +224,42 @@ mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
     use onnx_runtime_ir::{DataType, Graph, Node, NodeId, TensorData, WeightRef, static_shape};
+
+    #[test]
+    fn packed_shape_only_rejects_different_counts_in_the_same_byte() {
+        let mut input = Owned::zeros(DataType::Int2, &[1, 3]);
+        let mut output = Owned::zeros(DataType::Int2, &[1, 4]);
+        input.bytes = vec![0x39];
+        output.bytes = vec![0];
+        let error = FlattenKernel
+            .execute(&[input.view()], &mut [output.view_mut()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Flatten") && error.contains("same element count"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn packed_shape_only_copies_at_nonzero_byte_origins() {
+        for (dtype, raw) in [
+            (DataType::Int4, &[0x21, 0x43, 0xf5][..]),
+            (DataType::Int2, &[0xe4, 0xfa][..]),
+        ] {
+            let mut input = Owned::zeros(dtype, &[5, 1, 1]);
+            input.bytes = [&[0xa6], raw, &[0xa7]].concat();
+            let mut output = Owned::zeros(dtype, &[5, 1]);
+            output.bytes = vec![0x5a; raw.len() + 3];
+            FlattenKernel
+                .execute(
+                    &[input.view().with_byte_offset(1)],
+                    &mut [output.view_mut().with_byte_offset(2)],
+                )
+                .unwrap();
+            assert_eq!(output.bytes, [&[0x5a, 0x5a], raw, &[0x5a]].concat());
+        }
+    }
 
     fn i64_bytes(data: &[i64]) -> Vec<u8> {
         data.iter().flat_map(|v| v.to_le_bytes()).collect()

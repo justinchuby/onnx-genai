@@ -40,9 +40,3 @@ pub(crate) fn worker_span(label: &'static str) -> Option<onnx_runtime_tracer::Sp
 pub(crate) fn worker_span(_label: &'static str) -> Option<()> {
     None
 }
-
-pub(crate) fn product(values: impl IntoIterator<Item = usize>) -> u64 {
-    values
-        .into_iter()
-        .fold(1_u64, |total, value| total.saturating_mul(value as u64))
-}

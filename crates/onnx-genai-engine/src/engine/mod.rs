@@ -48,15 +48,16 @@ pub use crate::config::{
     AdaptivePConfig, DecisionSource, DevicePolicy, DevicePolicyParseError, DryConfig,
     DynamicTemperatureConfig, Eagle3Config, EngineConfig, EngineConfigError, EngineDecodeBackend,
     FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest,
-    GenerateResult, GenerateToken, GenerateTokenCallback, GenerationBudgetCap, GrammarActivation,
-    GrammarTrigger, KvConnectorBackend, KvConnectorConfig, LayerWeightBytes, LimitParseError,
-    LogprobSource, MemoryPolicyApplication, MemoryStrategy, MemoryStrategyDecision,
-    MemoryStrategyPlan, MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout,
-    MtpWeightSource, PrefillRequest, PrefillResult, PrioritizedGenerateRequest,
-    PrioritizedGenerateResult, RecurrentPrefixCacheStats, RewindTokenCount, SamplerSequence,
-    SamplerStage, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint, SessionId,
-    SessionPosition, SpeculativeMode, TokenLogprob, ToolCallPolicy, WeightAccessPattern,
-    WeightPlacementReport, XtcConfig, parse_device_policy, parse_resource_limit,
+    GenerateResult, GenerateToken, GenerateTokenCallback, GenerationBudgetCap, GenerationTimings,
+    GrammarActivation, GrammarCollation, GrammarTrigger, KvConnectorBackend, KvConnectorConfig,
+    LayerWeightBytes, LimitParseError, LogprobSource, MemoryPolicyApplication, MemoryStrategy,
+    MemoryStrategyDecision, MemoryStrategyPlan, MirostatConfig, MirostatVersion, MtpCacheScope,
+    MtpConfig, MtpHiddenLayout, MtpWeightSource, PrefillRequest, PrefillResult,
+    PrioritizedGenerateRequest, PrioritizedGenerateResult, RecurrentPrefixCacheStats,
+    RewindTokenCount, SamplerSequence, SamplerStage, SamplingOverrides, ScheduledGenerateArrival,
+    SessionCheckpoint, SessionId, SessionPosition, SpeculativeMode, TokenLogprob, ToolCallPolicy,
+    WeightAccessPattern, WeightPlacementReport, XtcConfig, parse_device_policy,
+    parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{
@@ -1351,9 +1352,10 @@ mod tests {
     #[cfg(not(feature = "native-backend"))]
     #[test]
     fn forced_native_without_feature_reports_how_to_switch() {
-        let error = resolve_decode_backend(Path::new("unused.onnx"), EngineDecodeBackend::Native)
-            .unwrap_err()
-            .to_string();
+        let error =
+            resolve_decode_backend(Path::new("unused.onnx"), EngineDecodeBackend::Native, false)
+                .unwrap_err()
+                .to_string();
         assert!(error.contains("ONNX_GENAI_BACKEND=ort"), "{error}");
         assert!(error.contains("EngineDecodeBackend::Ort"), "{error}");
     }

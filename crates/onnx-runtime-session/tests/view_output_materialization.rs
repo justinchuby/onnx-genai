@@ -31,7 +31,52 @@
 use onnx_runtime_ir::{
     Attribute, DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef, static_shape,
 };
-use onnx_runtime_session::InferenceSession;
+use onnx_runtime_session::{InferenceSession, Tensor};
+
+#[test]
+fn transpose_packed_cpu_materializes_exact_bytes() {
+    // [3,5] -> [5,3]. The reference reads the original rows by columns.
+    // Input padding is deliberately nonzero; materialized output clears it.
+    let nibble_input = [0x70, 0x6e, 0x4d, 0x3c, 0x2a, 0x09, 0xf8, 0xf6];
+    let nibble_expected = [0x40, 0x79, 0x0c, 0x3e, 0x68, 0xfa, 0x2d, 0x06];
+    let two_bit_input = [0xac, 0xc1, 0x1a, 0xec];
+    let two_bit_expected = [0xd0, 0xe0, 0xe8, 0x29];
+    let float8_input = [0, 7, 14, 6, 13, 4, 12, 3, 10, 2, 9, 0, 8, 15, 6];
+    let float8_expected = [0, 4, 9, 7, 12, 0, 14, 3, 8, 6, 10, 15, 13, 2, 6];
+    let cases: [(DataType, u64, &[u8], &[u8]); 6] = [
+        (DataType::Int4, 21, &nibble_input, &nibble_expected),
+        (DataType::Uint4, 21, &nibble_input, &nibble_expected),
+        (DataType::Float4E2M1, 23, &nibble_input, &nibble_expected),
+        (DataType::Float8E8M0, 24, &float8_input, &float8_expected),
+        (DataType::Int2, 25, &two_bit_input, &two_bit_expected),
+        (DataType::Uint2, 25, &two_bit_input, &two_bit_expected),
+    ];
+    for (dtype, opset, input, expected) in cases {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), opset);
+        let source = graph.create_named_value("data", dtype, static_shape([3, 5]));
+        let output = graph.create_named_value("result", dtype, static_shape([5, 3]));
+        graph.add_input(source);
+        // Default reverse, complementing the explicit CUDA permutation.
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Transpose",
+            vec![Some(source)],
+            vec![output],
+        ));
+        graph.add_output(output);
+        let mut session = InferenceSession::from_graph(graph).unwrap();
+        let input = Tensor::from_raw(dtype, vec![3, 5], input).unwrap();
+        let outputs = session.run(&[("data", &input)]).unwrap();
+        assert_eq!(outputs[0].dtype, dtype);
+        assert_eq!(outputs[0].shape, [5, 3]);
+        assert_eq!(
+            outputs[0].as_bytes(),
+            expected,
+            "{dtype:?} at opset {opset}"
+        );
+    }
+}
 
 fn f32_bytes(data: &[f32]) -> Vec<u8> {
     data.iter().flat_map(|v| v.to_le_bytes()).collect()

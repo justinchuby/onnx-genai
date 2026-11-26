@@ -217,12 +217,20 @@ impl NativeComponentSet {
     /// logic; only the executor differs.
     pub(crate) fn load(
         model_paths: &BTreeMap<String, PathBuf>,
+        graph_weights: &crate::keyed_weights::GraphWeightFiles,
         device: &NativeDecodeDevice,
         cpu_resources: onnx_runtime_ep_cpu::CpuMemoryResources,
     ) -> anyhow::Result<Self> {
         let mut components = HashMap::with_capacity(model_paths.len());
         for (component, path) in model_paths {
-            let session = load_native_component(component, path, device, cpu_resources.clone())?;
+            let files = graph_weights.for_graph(path)?;
+            let session = load_native_component(
+                component,
+                path,
+                files.map_or(&[][..], |files| files.containers.as_slice()),
+                device,
+                cpu_resources.clone(),
+            )?;
             let output_names = session.outputs().iter().map(|io| io.name.clone()).collect();
             components.insert(
                 component.clone(),
@@ -754,6 +762,7 @@ fn native_device_label(device: &NativeDecodeDevice) -> String {
 fn load_native_component(
     component: &str,
     path: &Path,
+    keyed_weight_files: &[onnx_runtime_session::KeyedWeightFile],
     device: &NativeDecodeDevice,
     cpu_resources: onnx_runtime_ep_cpu::CpuMemoryResources,
 ) -> anyhow::Result<InferenceSession> {
@@ -766,6 +775,9 @@ fn load_native_component(
     let mut builder = InferenceSession::builder()
         .model(path)
         .fallback_execution_provider(Arc::clone(&cpu));
+    for file in keyed_weight_files {
+        builder = builder.keyed_weight_file(file.clone());
+    }
     match device {
         NativeDecodeDevice::Cpu => {
             builder = builder
@@ -838,11 +850,13 @@ pub(crate) struct NativeMtpHead {
 impl NativeMtpHead {
     pub(crate) fn load(
         path: &Path,
+        graph_weights: &crate::keyed_weights::GraphWeightFiles,
         device: &NativeDecodeDevice,
         resources: onnx_runtime_ep_cpu::CpuMemoryResources,
     ) -> anyhow::Result<Arc<Self>> {
         let components = NativeComponentSet::load(
             &BTreeMap::from([("mtp_head".into(), path.to_owned())]),
+            graph_weights,
             device,
             resources,
         )?;
@@ -943,6 +957,77 @@ mod mtp_execution_tests {
     };
 
     #[test]
+    fn keyed_containers_execute_mtp_head_graphs() -> anyhow::Result<()> {
+        use prost::Message;
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-qwen35-mtp/model.onnx.textproto");
+        for format in ["gguf", "safetensors"] {
+            let root = tempfile::tempdir()?;
+            let mut model = onnx_runtime_loader::proto::onnx::ModelProto::decode(
+                onnx_runtime_loader::read_model_binary(&source)?.as_slice(),
+            )?;
+            let tensor = model
+                .graph
+                .as_mut()
+                .context("MTP fixture graph")?
+                .initializer
+                .iter_mut()
+                .find(|tensor| {
+                    tensor.data_type == 1 && !tensor.raw_data.is_empty() && !tensor.dims.is_empty()
+                })
+                .context("MTP fixture float weight")?;
+            let (bytes, _) =
+                crate::keyed_weights_tests::container(format, &tensor.dims, &tensor.raw_data);
+            let name = tensor.name.clone();
+            tensor.raw_data.clear();
+            tensor.data_location =
+                onnx_runtime_loader::proto::onnx::tensor_proto::DataLocation::External as i32;
+            let path = root.path().join("head.onnx");
+            std::fs::write(&path, model.encode_to_vec())?;
+            let file = format!("weights.{format}");
+            std::fs::write(root.path().join(&file), bytes)?;
+            let metadata = onnx_genai_metadata::parse_metadata_json(&serde_json::json!({
+                "schema_version":"v1.17", "graph_weights":{"head.onnx":[{
+                    "path":file,"format":format,"renames":{"container.parameter":name}
+                }]}
+            }))?;
+            let weights = crate::keyed_weights::GraphWeightFiles::resolve(root.path(), &metadata)?;
+            let mut sessions = Vec::new();
+            for (path, bindings) in [
+                (&source, crate::keyed_weights::GraphWeightFiles::default()),
+                (&path, weights),
+            ] {
+                let head = NativeMtpHead::load(
+                    path,
+                    &bindings,
+                    &NativeDecodeDevice::Cpu,
+                    onnx_runtime_ep_cpu::CpuMemoryResources::default(),
+                )?;
+                sessions.push(MtpDecodeSession::from_executor(
+                    head.executor(),
+                    MtpDecodeOptions::default(),
+                )?);
+            }
+            let h = sessions[0].signature().hidden_size;
+            let mut states = [vec![0.1; h], vec![0.1; h]];
+            for position in 0..3 {
+                let expected = sessions[0].step_with_state(&vec![0.25; h], &states[0], position)?;
+                let actual = sessions[1].step_with_state(&vec![0.25; h], &states[1], position)?;
+                assert_eq!(
+                    actual.hidden, expected.hidden,
+                    "{format}: hidden at {position}"
+                );
+                assert_eq!(
+                    actual.state, expected.state,
+                    "{format}: state at {position}"
+                );
+                states = [expected.state, actual.state];
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn native_mtp_head_matches_reference_and_runs_without_ort() -> anyhow::Result<()> {
         const CHILD: &str = "NXRT_NATIVE_MTP_HEAD_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -986,6 +1071,7 @@ mod mtp_execution_tests {
         ] {
             let head = NativeMtpHead::load(
                 &path,
+                &crate::keyed_weights::GraphWeightFiles::default(),
                 &NativeDecodeDevice::Cpu,
                 onnx_runtime_ep_cpu::CpuMemoryResources::default(),
             )?;
@@ -1114,9 +1200,39 @@ mod mtp_execution_tests {
                 ..Default::default()
             },
         };
-        let result = engine.generate(request.clone())?;
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = progress.clone();
+        let control = crate::GenerationControl::new().with_prompt_progress(move |update| {
+            sink.lock().unwrap().push(update);
+            Ok(())
+        });
+        let mut tokens = Vec::new();
+        let result = engine.generate_with_control_callbacks(
+            request.clone(),
+            control,
+            None,
+            Some(&mut |token| {
+                tokens.push(token);
+                Ok(())
+            }),
+        )?;
+        let timing = result.timings.context("Native MTP timing report")?;
+        assert_eq!(timing.prompt_tokens, 2);
+        assert_eq!(timing.cached_prompt_tokens, 0);
+        assert_eq!(timing.generated_tokens, 6);
+        assert!(!timing.prompt_elapsed.is_zero());
+        assert!(!timing.generation_elapsed.is_zero());
+        assert_eq!(tokens.last().unwrap().timings, result.timings);
+        for (index, token) in tokens.iter().enumerate() {
+            assert_eq!(token.timings.unwrap().generated_tokens, index + 1);
+        }
+        let progress = progress.lock().unwrap();
+        assert_eq!(progress.len(), 2);
+        assert_eq!(progress[0].processed, 0);
+        assert_eq!(progress[1].processed, 2);
+        assert_eq!(progress[1].elapsed, timing.prompt_elapsed);
         let mut baseline = crate::Engine::from_dir(&root, crate::EngineConfig::default())?;
-        let ordinary = baseline.generate(request)?;
+        let ordinary = baseline.generate(request.clone())?;
         anyhow::ensure!(
             result.token_ids == ordinary.token_ids,
             "Native MTP changed greedy target tokens: {:?} vs {:?}",
@@ -1128,10 +1244,56 @@ mod mtp_execution_tests {
             "Native MTP did not produce the requested token budget"
         );
         let stats = engine.last_speculative_stats();
+        assert_eq!(timing.speculative, Some(stats));
+        for token in &tokens {
+            let snapshot = token
+                .timings
+                .unwrap()
+                .speculative
+                .expect("Native MTP counter snapshot");
+            assert!(snapshot.proposed_tokens > 0);
+            assert!(snapshot.accepted_tokens <= snapshot.proposed_tokens);
+            assert!(snapshot.proposed_tokens <= stats.proposed_tokens);
+        }
         anyhow::ensure!(
             stats.proposed_tokens > 0 && stats.verification_steps > 0,
             "Native MTP did not actually propose and verify: {stats:?}"
         );
+        for boundary in [
+            crate::GenerationBoundary::AfterProposer,
+            crate::GenerationBoundary::AfterVerifier,
+        ] {
+            let authority = crate::GenerationControl::new();
+            let cancel = authority.clone();
+            let control = authority.with_checkpoint(move |observed| {
+                if observed == boundary {
+                    cancel.cancel();
+                }
+                Ok(())
+            });
+            let mut output = Vec::new();
+            let error = engine
+                .generate_with_control_callbacks(
+                    request.clone(),
+                    control,
+                    None,
+                    Some(&mut |token| {
+                        output.push(token);
+                        Ok(())
+                    }),
+                )
+                .unwrap_err();
+            assert!(
+                error.downcast_ref::<crate::GenerationCancelled>().is_some(),
+                "{error:#}"
+            );
+            assert!(output.is_empty());
+            assert_eq!(
+                engine.generate(request.clone())?.token_ids,
+                ordinary.token_ids,
+                "Native MTP retry after {boundary:?}"
+            );
+        }
         Ok(())
     }
 }

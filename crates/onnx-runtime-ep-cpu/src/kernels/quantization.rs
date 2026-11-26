@@ -552,7 +552,7 @@ mod tests {
     #[test]
     fn ort_plugin_keeps_legacy_linear_quantization_factories() {
         let native = crate::CpuExecutionProvider::new();
-        let plugin = crate::CpuExecutionProvider::new_for_ort_plugin();
+        let plugin = crate::CpuExecutionProvider::for_ort_plugin();
         let q = Node::new(onnx_runtime_ir::NodeId(0), "QuantizeLinear", vec![], vec![]);
         let dq = Node::new(
             onnx_runtime_ir::NodeId(1),

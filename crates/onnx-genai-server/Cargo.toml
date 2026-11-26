@@ -68,6 +68,7 @@ onnx-runtime-memory-api = { workspace = true }
 onnx-genai = { path = "../onnx-genai", version = "=0.1.0-dev.6", default-features = false }
 onnx-genai-engine = { path = "../onnx-genai-engine", version = "=0.1.0-dev.6", default-features = false }
 onnx-genai-metadata = { workspace = true }
+onnx-model-package = { workspace = true }
 # default-features = false so callers overriding the default CUDA 13.0 selector
 # with `--no-default-features` do not accidentally unify in a second cudarc CUDA
 # binding version from this inter-crate dependency.
@@ -89,9 +90,14 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 tokio-stream = { workspace = true }
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 getrandom = "0.3"
 base64 = "0.22"
 sha2 = { workspace = true }
+subtle = "2.6"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 image = { workspace = true, features = ["png"] }

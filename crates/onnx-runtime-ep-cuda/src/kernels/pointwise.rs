@@ -352,6 +352,7 @@ impl KernelFactory for UnaryMathFactory {
         Ok(Box::new(UnaryMathKernel {
             op,
             runtime: self.runtime.clone(),
+            opset: node.local_opset().filter(|_| node.is_default_domain()),
         }))
     }
 }
@@ -361,6 +362,7 @@ impl KernelFactory for UnaryMathFactory {
 pub struct UnaryMathKernel {
     op: UnaryMathOp,
     runtime: Arc<CudaRuntime>,
+    opset: Option<u64>,
 }
 
 impl UnaryMathKernel {
@@ -374,6 +376,12 @@ impl UnaryMathKernel {
             )));
         }
         let x = &inputs[0];
+        if let Some(opset) = self.opset
+            && let Some(reason) =
+                onnx_runtime_ir::trig::bf16_unsupported_reason(op, "", opset, x.dtype)
+        {
+            return Err(EpError::KernelFailed(reason));
+        }
         let dtype = FloatDtype::from_onnx(op, "input", x.dtype)?;
         if dtype != FloatDtype::F32 {
             self.runtime.require_nvrtc_half_headers(op)?;
