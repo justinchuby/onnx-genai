@@ -3855,8 +3855,8 @@ mod tests {
 
     #[test]
     fn descriptors_derived_from_real_registry_not_hand_maintained() {
-        // Every registered op other than explicitly standalone-only RoiAlign
-        // must have a descriptor.
+        // Every registered op version must have a descriptor except
+        // standalone-only Celu-28 and RoiAlign.
         //
         // This used to allow a delta of up to 50 and documented CNN ops as the
         // expected difference. That tolerance was hiding a real bug: the plugin
@@ -3880,13 +3880,14 @@ mod tests {
             })
             .map(|k| (k.op_type.as_str(), k.domain.as_str(), k.since_version))
             .collect();
-        #[cfg(feature = "ops-cnn")]
-        let expected = onnx_runtime_ir::roi_align::VERSIONS
-            .into_iter()
-            .map(|version| ("RoiAlign", "", version))
-            .collect();
-        #[cfg(not(feature = "ops-cnn"))]
-        let expected = std::collections::BTreeSet::new();
+        let mut expected = std::collections::BTreeSet::from([("Celu", "", 28)]);
+        if cfg!(feature = "ops-cnn") {
+            expected.extend(
+                onnx_runtime_ir::roi_align::VERSIONS
+                    .into_iter()
+                    .map(|version| ("RoiAlign", "", version)),
+            );
+        }
         assert_eq!(missing, expected);
         assert_eq!(
             descriptors.len() + missing.len(),
