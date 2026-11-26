@@ -444,6 +444,18 @@ pub fn write_dense_float<T: FloatElem>(out: &mut TensorMut, data: &[T]) -> Resul
 }
 
 fn write_strided<T: Copy>(out: &mut TensorMut, data: &[T], want: DataType) -> Result<()> {
+    write_strided_with(out, data.len(), want, |index| data[index])
+}
+
+// Sources are disjoint from output, as required by the typed write and narrowing
+// contracts. Produce one storage value at a time instead of materializing a
+// converted tensor. Validation completes before the first conversion or write.
+fn write_strided_with<T: Copy>(
+    out: &mut TensorMut,
+    produced: usize,
+    want: DataType,
+    value: impl Fn(usize) -> T,
+) -> Result<()> {
     validate_host_output("CPU output", out)?;
     if out.dtype != want {
         return Err(EpError::InvalidTensorView {
@@ -451,10 +463,10 @@ fn write_strided<T: Copy>(out: &mut TensorMut, data: &[T], want: DataType) -> Re
         });
     }
     let n = numel(out.shape);
-    if data.len() != n {
+    if produced != n {
         return Err(EpError::KernelFailed(format!(
-            "output element count {n} does not match produced {}",
-            data.len()
+            "CPU output: {want:?} shape {:?} requires {n} elements, but producer supplied {produced}; provide one value per logical output element",
+            out.shape
         )));
     }
     if n == 0 {
@@ -474,7 +486,7 @@ fn write_strided<T: Copy>(out: &mut TensorMut, data: &[T], want: DataType) -> Re
         // `write_unaligned` because `data_ptr_mut` is a cast from a byte pointer
         // plus an arbitrary `byte_offset`, so `T`'s alignment is not guaranteed.
         unsafe {
-            origin.offset(off).write_unaligned(data[i]);
+            origin.offset(off).write_unaligned(value(i));
         }
         i += 1;
         if !next_index(shape, &mut idx) {
@@ -1085,8 +1097,10 @@ pub(crate) fn validate_host_output(op: &str, out: &TensorMut) -> Result<()> {
     Ok(())
 }
 
-/// Narrow a dense `Vec<f32>` result into `out`, rounding to `out`'s float dtype
+/// Narrow a dense f32 result into `out`, rounding to its float storage dtype
 /// (`f32`/`f16`/`bf16`/`f64`). Counterpart to [`to_dense_f32_widen`].
+/// As with the existing SIMD and memcpy routes, `data` must be disjoint from
+/// output storage; complete source reads/snapshots before publishing aliased tensors.
 pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Result<()> {
     validate_host_output(op, out)?;
     // F16C bulk narrow for a contiguous f16 output (the KV-cache decode hot path).
@@ -1185,8 +1199,7 @@ pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Re
         return Ok(());
     }
     dispatch_float!(out.dtype, op, T => {
-        let narrowed: Vec<T> = data.iter().map(|&v| T::from_f32(v)).collect();
-        write_dense_float::<T>(out, &narrowed)
+        write_strided_with::<T>(out, data.len(), <T as FloatElem>::DTYPE, |index| T::from_f32(data[index]))
     })
 }
 
@@ -1840,6 +1853,54 @@ mod tests {
             assert_eq!(g, half::bf16::from_f32(v).to_bits(), "i={i}");
         }
     }
+    #[test]
+    fn scalar_narrow_scatter_preserves_storage_bits_and_checks_count_before_writes() {
+        use onnx_runtime_ep_api::DevicePtrMut;
+        use onnx_runtime_ir::DeviceId;
+        let values = [
+            -0.,
+            f32::from_bits(1),
+            f32::from_bits(0x7fc1_2345),
+            f32::NEG_INFINITY,
+            1.000_488_3,
+            -123.75,
+        ];
+        for dtype in [
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Float32,
+            DataType::Float64,
+        ] {
+            let width = dtype.byte_size();
+            let mut storage = vec![0xa5u8; 16 * width + 2];
+            let mut expected = storage.clone();
+            let mut out = TensorMut::new(
+                DevicePtrMut(unsafe { storage.as_mut_ptr().add(1).cast() }),
+                dtype,
+                &[2, 3],
+                &[7, -2],
+                DeviceId::cpu(),
+            )
+            .with_byte_offset(4 * width);
+            let error = write_dense_f32_narrow("scatter", &mut out, &values[..5]).unwrap_err();
+            assert!(error.to_string().contains("6"), "{error}");
+            assert_eq!(storage, expected, "short producer must not write any bytes");
+            for (i, &v) in values.iter().enumerate() {
+                let offset = 1 + (4 + (i / 3) * 7 - (i % 3) * 2) * width;
+                let bits = match dtype {
+                    DataType::Float16 => half::f16::from_f32(v).to_bits().to_ne_bytes().to_vec(),
+                    DataType::BFloat16 => half::bf16::from_f32(v).to_bits().to_ne_bytes().to_vec(),
+                    DataType::Float32 => v.to_ne_bytes().to_vec(),
+                    DataType::Float64 => f64::from(v).to_ne_bytes().to_vec(),
+                    _ => unreachable!(),
+                };
+                expected[offset..offset + width].copy_from_slice(&bits);
+            }
+            write_dense_f32_narrow("scatter", &mut out, &values).unwrap();
+            assert_eq!(storage, expected, "dtype={dtype:?}");
+        }
+    }
+
     #[test]
     fn scalar_integer_reader_preserves_offsets_unaligned_storage_and_signed_values() {
         use onnx_runtime_ep_api::DevicePtr;

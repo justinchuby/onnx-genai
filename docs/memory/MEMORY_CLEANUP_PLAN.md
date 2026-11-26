@@ -3002,3 +3002,37 @@ schema-callback executions. This proves the real plugin compute path under the
 provided descriptor, not built-in ORT MVN-29 schema compatibility. Native Session
 tests exercise the unmodified MVN-29 attributes and computation directly.
 Official schema: https://onnx.ai/onnx/operators/onnx__MeanVarianceNormalization.html
+
+
+### LogSoftmax reuses staging for widening and streams narrowed output
+
+LogSoftmax now widens non-borrowable input directly into its existing admitted
+f32 lane, then reduces that snapshot in place. Each logical coordinate belongs
+to one `(outer, inner)` group. A group's maximum and exponential sum finish
+before its first write; no later group can read that group's results. The
+arithmetic loop is shared with the unchanged contiguous aligned-f32 borrowing
+route through statically dispatched source accessors. The original reduction
+order, f32 computation (including f64 input conversion), and storage narrowing
+are preserved for both opset families. Real output is published only after all
+source reads, including shifted overlap.
+
+The allocation witness also exposed a second payload: scalar output narrowing
+collected a complete storage-T Vec before scattering. Typed writes and scalar
+narrowing now share one private checked scatter visitor, which converts and
+writes one element at a time. Existing f16/bf16 SIMD and f32 memcpy routes remain
+unchanged. The source/output disjoint contract already required by those routes
+is explicit; production callers were audited for owned or workspace-backed
+results and direct-output bypasses. There is no new snapshot owner, pool,
+per-group request, or workspace-bound increase: LogSoftmax still uses one
+StepScoped `4 * numel` lane. Rank-sized indexing metadata may still allocate.
+
+Real allocator tests cover all four float storage types, contiguous/strided
+sources, padded strided outputs, every axis and both opset semantics. A real
+allocating storage-copy positive control verifies the counter; 32 repeated calls
+per combination allocate no matrix-sized payload. Immutable coordinate oracles
+check storage-converted output bits and padding. Separate tests exercise both
+directions of shifted overlap (including NaN/Inf), unaligned negative-stride
+narrowing with exact byte canaries, and short-producer refusal before writes.
+Existing warm governor, peak refusal/reuse/trim, public Session and real ORT
+assignment tests remain in place. These are correctness and allocation results;
+no latency or CUDA-runtime improvement is inferred.
