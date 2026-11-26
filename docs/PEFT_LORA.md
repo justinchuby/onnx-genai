@@ -30,7 +30,7 @@ patterns, modules-to-save, nonstandard bias, weight tying, DoRA/RSLoRA,
 quantized/activated/routed/other numeric variants, F16/BF16 conversion and
 unrecognized configuration fields remain unsupported and produce errors.
 Known disabled variant defaults are accepted only in their disabled form.
-See the upstream [PEFT LoRA configuration](https://github.com/huggingface/peft/blob/main/src/peft/tuners/lora/config.py).
+See the upstream [PEFT LoRA configuration](https://github.com/huggingface/peft/blob/v0.22.0/src/peft/tuners/lora/config.py).
 
 Loading reuses the strict SafeTensors parser already used by the native ONNX
 weight loader. File/config parsing staging and normalized factor buffers use

@@ -254,3 +254,26 @@ fn native_peft_rejects_variants_rank_mismatch_and_unmapped_tensors_without_parti
         assert_eq!(run(&mut engine, None).unwrap(), [4.0, 15.0]);
     }
 }
+
+#[test]
+fn native_peft_malformed_custom_config_names_the_source_and_adapter() {
+    let root = package();
+    let metadata_path = root.path().join("inference_metadata.yaml");
+    let mut metadata: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&metadata_path).unwrap()).unwrap();
+    let custom = "adapters/peft/custom-linear-config.json";
+    metadata["adapters"]["artifacts"]["peft"]["weights"][0]["config_location"] =
+        serde_yaml::Value::String(custom.into());
+    std::fs::write(metadata_path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
+    for contents in ["{malformed", "[]"] {
+        std::fs::write(root.path().join(custom), contents).unwrap();
+        let mut native = engine(root.path());
+        let error = run(&mut native, Some(1.0)).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(custom) && text.contains("peft@1") && text.contains("JSON"),
+            "{text}"
+        );
+        assert_eq!(run(&mut native, None).unwrap(), [4.0, 15.0]);
+    }
+}

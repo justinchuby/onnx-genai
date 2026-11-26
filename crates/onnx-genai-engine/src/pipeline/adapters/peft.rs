@@ -93,11 +93,18 @@ pub(super) fn load(
         "HF PEFT ordinary saved factors require scale_encoding alpha_over_rank; baked scales are a different artifact format and cannot be inferred"
     );
     let (config_bytes, _config_lease) = configuration(root, weight, authority)?;
-    let config: Value =
-        serde_json::from_slice(&config_bytes).context("parse HF PEFT adapter_config.json")?;
-    let config = config
-        .as_object()
-        .context("HF PEFT adapter_config.json must be an object")?;
+    let config: Value = serde_json::from_slice(&config_bytes).with_context(|| {
+        format!(
+            "parse HF PEFT config {:?} for adapter {}@{}; provide valid JSON",
+            weight.config_location, artifact.identity, artifact.version
+        )
+    })?;
+    let config = config.as_object().with_context(|| {
+        format!(
+            "HF PEFT config {:?} for adapter {}@{} must be a JSON object",
+            weight.config_location, artifact.identity, artifact.version
+        )
+    })?;
     ensure!(
         config.get("peft_type").and_then(Value::as_str) == Some("LORA"),
         "PEFT peft_type must be LORA; other adapter algorithms require an explicit implementation"
