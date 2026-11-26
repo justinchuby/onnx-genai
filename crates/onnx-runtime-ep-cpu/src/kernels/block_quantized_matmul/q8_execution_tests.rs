@@ -154,7 +154,9 @@ fn q8_rejects_missing_short_or_misaligned_workspace_before_payload_and_can_retry
             .execute_with_workspace(&views, &mut [y.view_mut()], workspace)
             .unwrap_err();
         assert!(
-            error.to_string().contains("streamed workspace binding"),
+            error
+                .to_string()
+                .contains("BlockQuantizedMatMul execution workspace binding"),
             "{error}"
         );
         assert_eq!(y.to_f32(), [37.; 2]);

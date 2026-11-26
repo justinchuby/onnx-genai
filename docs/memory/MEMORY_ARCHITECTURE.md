@@ -1010,9 +1010,22 @@ allocated outside the lane. The conservative physical bound can be larger than
 the previous declared workspace; it is not an RSS-saving claim. Admission may
 refuse a cap that previously omitted those intermediates. Routing, tensor
 widening, strided compressed copies, final tensor storage and GEMM internals
-remain separate; this is not a process-memory cap. Standalone MatMul retains
-its caller-owned output staging. Dense weight residency keeps its existing
-weight-cache authority. No allocator, pool or public EP API is added.
+remain separate; this is not a process-memory cap. Dense weight residency keeps
+its existing weight-cache authority. No allocator, pool or public EP API is added.
+
+Standalone `BlockQuantizedMatMul` composes two simultaneously live regions in
+the same admission: the complete projection layout plus R*N f32 output values.
+Both dense and streamed routes validate this whole backing before materializing
+activation, bias or packed payloads. Dense hits initialize only the output region;
+the projection region remains available for streamed fallback. Arithmetic errors
+leave Y unchanged because publication follows the complete projection and bias
+epilogue. Contiguous F32 bias is borrowed through that epilogue; half or strided
+bias still requires widening/materialization. This moves the former final-output
+Vec into retained, charged workspace and removes its per-dispatch allocation. It
+increases the declared workspace bound; it does not establish an RSS reduction
+or an inference latency improvement. The allocator regression test observes the
+removed payload sizes at the real CPU kernel seam, with positive controls; it
+does not claim the entire launch is allocation-free.
 
 [Public-session evidence](../benchmarks/block-moe-projection-banks/README.md)
 retains the initial measured gated regression and the inline-hint refinement,
