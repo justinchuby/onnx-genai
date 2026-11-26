@@ -115,30 +115,45 @@ fn native_literal_byte_group_cancellation_discards_pending_state_and_retries() {
         let mut request = request(4096);
         request.options.max_new_tokens = 3;
         request.options.logit_bias.clear();
+        // Cold Engine callbacks publish only after transaction commit. Cancel
+        // from the real per-forward hook: two earlier forwards selected C3/A9;
+        // the third advances KV but must abort before decoding FF/committing.
+        let forwards = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = forwards.clone();
         let control = onnx_genai_engine::GenerationControl::new();
         let cancel = control.clone();
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let observed = seen.clone();
-        let mut callback = move |token: onnx_genai_engine::GenerateToken| {
-            assert!(
-                token.text.is_empty(),
-                "incomplete replacement prefix must remain unpublished"
-            );
-            let mut seen = observed.lock().unwrap();
-            seen.push(token.token_id);
-            if seen.len() == 2 {
-                cancel.cancel();
+        let control = control.with_checkpoint(move |boundary| {
+            if boundary == onnx_genai_engine::GenerationBoundary::AfterDecoderForward {
+                let count = observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if count == 3 {
+                    assert!(cancel.cancel());
+                }
             }
+            Ok(())
+        });
+        let mut published = Vec::new();
+        let mut callback = |token: onnx_genai_engine::GenerateToken| {
+            published.push((token.token_id, token.text));
             Ok(())
         };
         let error = engine
             .generate_with_control_callbacks(request.clone(), control, None, Some(&mut callback))
-            .expect_err("cancelled provisional generation aborts its Native transaction");
+            .expect_err(
+                "cancel must abort while the two-token byte/replacement prefix is provisional",
+            );
         assert!(
             error.is::<onnx_genai_engine::GenerationCancelled>(),
-            "{error:#}"
+            "byte_level={byte_level}: {error:#}"
         );
-        assert_eq!(*seen.lock().unwrap(), vec![22, 23]);
+        assert_eq!(
+            forwards.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "byte_level={byte_level}: cancel must follow two selected tokens and third real forward"
+        );
+        assert!(
+            published.is_empty(),
+            "byte_level={byte_level}: aborted cold turn published {published:?}"
+        );
         let retry = engine.generate(request).unwrap();
         assert_eq!(retry.token_ids, vec![22, 23, 24]);
         assert_eq!(retry.text, "7");
