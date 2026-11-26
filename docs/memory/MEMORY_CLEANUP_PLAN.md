@@ -2849,3 +2849,39 @@ re-admission for opsets 11 and 13. Real ORT plugin fixtures disable fallback,
 require LogSoftmax assignment to cpu_ep and check both versions numerically
 across those changing shapes. These are correctness and allocation invariants,
 not inference-speed or CUDA-runtime measurements.
+
+
+### BlockMoE checks actual numerical stages across cache-budget routes
+
+The optional-MLAS mixed-format expert regression used a full-width GEMM as the
+reference for a streamed one-column GEMM, then judged only their final residual.
+On main `4eaa636`, case 0 element 329 was -0.10598877 versus -0.10596141; the
+existing output-relative threshold rejected this cancellation-sensitive result.
+That failure independently reproduced before the CPU output-safety change.
+
+The test now observes actual FC1/optional FC3/FC2 boundaries within the shared
+expert workspace. Every projection is checked against f64 dot+bias arithmetic on
+its actual f32 input, using gamma_(2K+1) times the sum of absolute products plus
+bias. Reference rounding and propagated input uncertainty are explicit. An
+additional full two-projection affine reference propagates those error bounds
+through the identity fixture and routing. The canonical decoder still produces
+f32 weights; arithmetic is independent, while decoding has separate regressions.
+Normal/zero operands are checked before f64 conversion. The fixture's underflow
+allowance is not a general certification of arbitrary hardware DAZ modes.
+
+Identity, ReLU and tanh-GELU activation results are bit-checked from independent
+formulas. SiLU/SwiGLU use a fixed fixture-local eight-ULP contract, separate from
+the GEMM bound; each case logs maximum ULP, position and operands. Expert-order
+scatter is reconstructed bit for bit from observed FC2 outputs and supplied
+normalized routing weights. This oracle deliberately targets the all-experts,
+all-rows fixture; it does not silently assume those properties for arbitrary
+routed models.
+
+Negative controls exercise the actual checker: projection error above its
+computed budget, wrong gather order, wrong bias slice, excessive activation ULP
+(with FC2 recomputed to avoid an unrelated downstream refusal), and a one-bit
+scatter change. Existing streamed/denied byte equality, whole-group admission,
+no partial expansion and no retained streamed weights remain unchanged. Scoped
+thread-local observations are non-Send, clear after unwinding and exist only
+under cfg(test). Production arithmetic, routing, cache owners and grant/refund
+paths are unchanged; no timing or CUDA validation is inferred.
