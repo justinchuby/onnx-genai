@@ -201,8 +201,7 @@ fn real_reader_rejects_unsupported_timeline_lacing_and_codec_state() {
         assert!(
             reader
                 .next_packet()
-                .err()
-                .expect("unsupported packet must fail")
+                .expect_err("unsupported packet must fail")
                 .to_string()
                 .contains(context),
             "{context}"
