@@ -337,6 +337,28 @@ The old public character-based `JsonConstraint` was removed; pure request syntax
 preflight uses `validate_json_prefix`, while generation uses the shared schema
 recognizer.
 
+JSON object defaults follow the pinned [chat conversion](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-common.cpp#L1420)
+and [native schema handler](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-schema.cpp#L270).
+`json_schema: {}` and implicit/empty response-format schemas constrain the root
+to an object. Explicit nonempty schemas and boolean schemas keep their JSON
+Schema meaning. This applies to eager and lazy generation. The engine's generic
+`GenerateConstraint::Json` remains an any-value constraint; the transport selects
+the appropriate schema explicitly.
+
+Accepted forms include top-level `json_schema`, `json_object.schema`, flat
+`json_schema.schema`, and the OpenAI nested `json_schema.json_schema.schema`
+wrapper. Nested wrappers take precedence over a flat schema. An implicit
+`json_object` keeps a supplied top-level schema; its explicit `schema` overrides
+that field. `text` preserves an explicitly supplied top-level schema. In native
+requests, presence of `grammar` takes precedence over legacy `json_schema`, even
+for an empty grammar; chat rejects conflicting grammar/schema constraints.
+Responses `text.format` uses the same schema selection after wire conversion.
+For example, an explicit schema can allow a scalar despite the format label:
+
+```json
+{"response_format":{"type":"json_object","schema":{"const":7}}}
+```
+
 Without explicit continuation, declared content/reasoning text in the template
 prefill is included in the response, matching upstream session projection.
 The same include/exclude policy governs buffered, SSE and logprob replay; only
@@ -644,14 +666,21 @@ This is a functional Llama Chat integration, not a claim of complete llama-serve
 parity. These upstream capabilities remain incomplete:
 
 - Realtime grammar forcing beyond declared turn-based tagged-json mask workflows,
-  partial function-call fragment projection, broader pressure/overlap acceptance and
+  broader pressure/overlap acceptance and
   device-backed wire acceptance; see [realtime](REALTIME.md) for the implemented
   WebSocket session modes, resource bounds and Native CPU evidence.
 - Video decision inputs, broader audio codecs and additional DSP operations/conventions,
   joint/packed decision heads and shared generation/decision entry points.
 - Device-state/multi-sequence slot persistence; arbitrary GGUF/PEFT LoRA imports and device-fused LoRA.
-- GGUF package import, quantization selectors and selective sidecar management.
-  Hugging Face nxrt-package download, resume and deletion are supported.
+- Bare GGUF graph import, filename-based GGUF quantization selection and selective sidecar management.
+  Native nxrt packages can explicitly bind GGUF or SafeTensors weights to their
+  ONNX graphs through schema `v1.17` `graph_weights`; decoder, workflow and MTP
+  loading share the bindings. Exact tensor dtype/shape matching is required.
+  See [inference metadata](genai/MODEL_METADATA.md#components-and-graph).
+  Hugging Face nxrt-package download, resume and deletion are supported. Explicit
+  `repository:variant` selection supports authored model-package variants,
+  including selective installation and shared tokenizer assets; this does not
+  infer an executable graph from a bare GGUF repository.
 
 `/v1/systemone` executes text/structured-state decision profiles, with explicit
 model-authored prompting, calibration outputs, variants and answer policies.
@@ -677,6 +706,11 @@ Docker/Podman/SSH tool runtimes. These are deliberate scope exclusions, not
 pending compatibility work. `/props` reports `server_tools: false` in
 `nxrt_capabilities` and `cors_proxy_enabled: false` in both router and model modes.
 The former tool/MCP/proxy CLI options and library configuration types are removed.
+
+The supplied model tool protocols require object arguments. Forced tool grammars
+and realtime parameter admission share that domain restriction even for `true`,
+empty, omitted/null or union parameter schemas. Existing schema conditions and
+root reference locations are retained; contradictory schemas are not relaxed.
 
 Chat tool calling remains supported: clients send `tools`/`tool_choice`, consume
 assistant `tool_calls` (including streaming deltas), execute those calls in their
@@ -763,8 +797,14 @@ repetitions above 2,000 are refused and larger upper bounds become unbounded.
 The model must declare a dense, resolved, token-local byte vocabulary. Actual
 raw pieces include special-token spellings; only explicitly declared ending IDs
 receive terminal semantics. Token names and angle brackets do not guess roles.
-Non-byte contextual decoders and stream-initial/trailing stripping currently return an
-actionable capability error before SSE.
+Resolved stream-initial/trailing Strip stages apply to published text; raw
+GBNF/Lark and lazy JSON inspect the vocabulary pieces before those stages.
+For example, a raw piece ` hello ` remains subject to a grammar requiring both
+spaces even when the tokenizer publishes `hello`. This matches the pinned
+[vocabulary cache](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/src/llama-vocab.cpp)
+and [grammar sampler](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/src/llama-grammar.cpp).
+Non-byte and unresolved contextual decoders still return an actionable capability
+error before SSE; ordinary content constraints continue to inspect published content.
 
 Both raw grammar forms conflict with JSON `response_format`, forced `tool_choice`, and
 `ignore_eos=true`. Raw GBNF accepts `grammar_lazy=true` with nonempty
@@ -801,8 +841,28 @@ answer (alongside the route's normal prompt/messages fields):
 
 As in the pinned upstream sampler, raw `%llguidance` Lark remains eager and
 ignores lazy token/pattern effects, while tokenizer-level word preservation is
-still validated. Lazy JSON `response_format` without a raw GBNF grammar is still
-unsupported and returns a pre-SSE error. Collating symbols (`[[.a.]]`,
+still validated. JSON `response_format` and native `json_schema` also accept
+lazy activation. They use the same trigger ordering, raw newly generated bytes,
+reasoning gate and ending roles as GBNF; assistant prefill and declared content
+projection do not feed the activated JSON value. The complete JSON Schema
+recognizer and equivalent JSON escape handling are shared with eager JSON.
+Before a trigger, arbitrary text and EOS remain legal. After activation the
+captured suffix must be a viable schema prefix and EOS requires a complete value;
+length limits and explicit stops may still truncate it. Selected triggers are
+validated before publication even on the final generation step. A JSON trigger
+therefore normally captures the opening brace rather than an answer label:
+
+```json
+{
+  "response_format": {"type": "json_object"},
+  "grammar_lazy": true,
+  "grammar_triggers": [{"type": 2, "value": "ANSWER: (\\{)"}]
+}
+```
+
+Lazy JSON requires the same identity raw byte decoder capability as raw GBNF,
+a positive source/output byte budget and `ignore_eos=false`; it conflicts with
+forced tool choice. Schema/trigger compilation happens before SSE. Collating symbols (`[[.a.]]`,
 `[[.space.]]`) and equivalence classes (`[[=a=]]`) have explicit classic-locale
 byte semantics. Because C++ libraries disagree, nxrt accepts the request extension
 `grammar_trigger_collation`: omission/null or `"libcxx"` preserves the existing

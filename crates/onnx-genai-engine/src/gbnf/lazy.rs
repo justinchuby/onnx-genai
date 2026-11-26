@@ -18,8 +18,16 @@ struct Position {
     start: usize,
     end: usize,
 }
+enum Compiled {
+    Gbnf(GbnfReplay),
+    Json(Box<crate::response_constraint::ContentConstraint>),
+}
+enum Cursor {
+    Gbnf(GbnfReplay),
+    Json { history: Vec<TokenId> },
+}
 struct Active {
-    cursor: GbnfReplay,
+    cursor: Cursor,
     ended: bool,
 }
 #[derive(Default)]
@@ -30,8 +38,8 @@ struct State {
     active: Option<Active>,
 }
 
-pub(crate) struct LazyGbnfConstraint {
-    initial: GbnfReplay,
+pub(crate) struct LazyGrammarConstraint {
+    initial: Compiled,
     pieces: Vec<Vec<u8>>,
     endings: HashSet<TokenId>,
     tokens: HashSet<TokenId>,
@@ -161,7 +169,7 @@ fn resolve_activation(
     Ok(ResolvedTriggers { tokens, patterns })
 }
 
-impl LazyGbnfConstraint {
+impl LazyGrammarConstraint {
     pub(crate) fn new(
         grammar: &str,
         tokenizer: &Tokenizer,
@@ -183,11 +191,11 @@ impl LazyGbnfConstraint {
             );
         }
         Ok(Self {
-            initial: GbnfReplay::compile(
+            initial: Compiled::Gbnf(GbnfReplay::compile(
                 grammar,
                 options.max_constraint_bytes,
                 token_resolver(tokenizer),
-            )?,
+            )?),
             pieces,
             endings: endings.into_iter().collect(),
             tokens,
@@ -203,6 +211,110 @@ impl LazyGbnfConstraint {
         })
     }
 
+    pub(crate) fn json_schema(
+        schema: &str,
+        tokenizer: &Tokenizer,
+        options: &GenerateOptions,
+        contract: crate::byte_stream::ByteStreamContract,
+        endings: Vec<TokenId>,
+        activation: &GrammarActivation,
+    ) -> Result<Self> {
+        ensure!(
+            options.max_constraint_bytes > 0 && schema.len() <= options.max_constraint_bytes,
+            "lazy JSON Schema source has {} bytes with max_constraint_bytes={}; shorten the schema or configure a positive sufficient budget",
+            schema.len(),
+            options.max_constraint_bytes
+        );
+        let schema = serde_json::from_str(schema)
+            .context("parse lazy JSON Schema; supply a valid JSON schema value")?;
+        let pieces = contract.pieces.clone();
+        let initial = crate::response_constraint::ContentConstraint::raw_json_schema(
+            tokenizer,
+            &schema,
+            options.max_constraint_bytes,
+            contract,
+        )
+        .context("compile lazy JSON Schema before sampling")?;
+        let ResolvedTriggers { tokens, patterns } = resolve_activation(
+            tokenizer,
+            activation,
+            options.max_constraint_bytes,
+            &options.effective_preserved_tokens(),
+        )?;
+        Ok(Self {
+            initial: Compiled::Json(Box::new(initial)),
+            pieces,
+            endings: endings.into_iter().collect(),
+            tokens,
+            patterns,
+            max_bytes: options.max_constraint_bytes,
+            gate: options
+                .reasoning_budget
+                .clone()
+                .map(crate::reasoning::GrammarCursor::new)
+                .transpose()?
+                .map(Mutex::new),
+            state: Mutex::new(State::default()),
+        })
+    }
+
+    fn start(&self) -> Cursor {
+        match &self.initial {
+            Compiled::Gbnf(initial) => Cursor::Gbnf(initial.clone()),
+            Compiled::Json(_) => Cursor::Json {
+                history: Vec::new(),
+            },
+        }
+    }
+
+    fn consume(
+        &self,
+        cursor: &mut Cursor,
+        token: TokenId,
+        piece: &[u8],
+        replay: bool,
+    ) -> Result<bool> {
+        match (cursor, &self.initial) {
+            (Cursor::Gbnf(cursor), _) => cursor.consume(token, piece),
+            (Cursor::Json { history }, Compiled::Json(initial)) => {
+                if replay {
+                    // All captured bytes are seeded together by activation.
+                    initial.seed_raw_bytes(piece)?;
+                } else {
+                    let mut selected = history.clone();
+                    selected.push(token);
+                    initial.allowed_next_tokens(
+                        &ProcessorContext {
+                            generated_tokens: selected,
+                            ..Default::default()
+                        },
+                        &[],
+                    )?;
+                    history.push(token);
+                }
+                Ok(true)
+            }
+            _ => anyhow::bail!(
+                "lazy grammar cursor does not match its compiled recognizer; restart this completion"
+            ),
+        }
+    }
+
+    fn complete(&self, cursor: &Cursor) -> Result<bool> {
+        match (cursor, &self.initial) {
+            (Cursor::Gbnf(cursor), _) => Ok(cursor.is_accepting()),
+            (Cursor::Json { history }, Compiled::Json(initial)) => {
+                initial.can_finish(&ProcessorContext {
+                    generated_tokens: history.clone(),
+                    ..Default::default()
+                })
+            }
+            _ => anyhow::bail!(
+                "lazy grammar cursor does not match its compiled recognizer; restart this completion"
+            ),
+        }
+    }
+
     fn accept(&self, state: &mut State, token: TokenId) -> Result<()> {
         let piece = self.pieces.get(token as usize).with_context(|| format!("lazy grammar history token {token} is outside the model byte vocabulary; repair the generated history"))?;
         if let Some(active) = &mut state.active {
@@ -212,28 +324,30 @@ impl LazyGbnfConstraint {
             );
             if self.endings.contains(&token) {
                 ensure!(
-                    active.cursor.is_accepting(),
+                    self.complete(&active.cursor)?,
                     "lazy grammar ending token {token} precedes root completion; discard the invalid history suffix"
                 );
                 active.ended = true;
             } else {
                 ensure!(
-                    active.cursor.consume(token, piece)?,
+                    self.consume(&mut active.cursor, token, piece, false)?,
                     "lazy grammar history token {token} rejects its supplied byte piece; replay only history admitted by the same grammar"
                 );
             }
             return Ok(());
         }
         if self.tokens.contains(&token) {
-            let mut cursor = self.initial.clone();
+            let mut cursor = self.start();
             ensure!(
-                cursor.consume(token, piece)?,
+                self.consume(&mut cursor, token, piece, true)?,
                 "lazy grammar token trigger {token} is rejected at the root; include the triggering token itself in the grammar"
             );
-            state.active = Some(Active {
-                cursor,
-                ended: self.endings.contains(&token),
-            });
+            let ended = self.endings.contains(&token);
+            ensure!(
+                !ended || self.complete(&cursor)?,
+                "lazy grammar ending trigger token {token} precedes root completion; include a complete root in the triggering token or choose another trigger"
+            );
+            state.active = Some(Active { cursor, ended });
             state.bytes.clear();
             state.positions.clear();
             return Ok(());
@@ -265,29 +379,37 @@ impl LazyGbnfConstraint {
                     start <= state.bytes.len(),
                     "grammar_triggers[{index}] returned an invalid replay offset; restart with a freshly compiled pattern"
                 );
-                let mut cursor = self.initial.clone();
-                for position in &state.positions {
-                    if position.end <= start {
-                        continue;
+                let mut cursor = self.start();
+                if matches!(cursor, Cursor::Json { .. }) {
+                    self.consume(&mut cursor, token, &state.bytes[start..], true)
+                        .with_context(|| {
+                            format!("replay grammar_triggers[{index}] JSON suffix at byte {start}")
+                        })?;
+                } else {
+                    for position in &state.positions {
+                        if position.end <= start {
+                            continue;
+                        }
+                        let piece = &state.bytes[position.start.max(start)..position.end];
+                        ensure!(
+                            self.consume(&mut cursor, position.token, piece, true)
+                                .with_context(|| format!(
+                                    "replay lazy grammar trigger piece for token {} at byte {}",
+                                    position.token,
+                                    position.start.max(start)
+                                ))?,
+                            "grammar_triggers[{index}] replay rejects token {} at byte {}; include the captured trigger and its suffix in the grammar",
+                            position.token,
+                            position.start.max(start)
+                        );
                     }
-                    let piece = &state.bytes[position.start.max(start)..position.end];
-                    ensure!(
-                        cursor
-                            .consume(position.token, piece)
-                            .with_context(|| format!(
-                                "replay lazy grammar trigger piece for token {} at byte {}",
-                                position.token,
-                                position.start.max(start)
-                            ))?,
-                        "grammar_triggers[{index}] replay rejects token {} at byte {}; include the captured trigger and its suffix in the grammar",
-                        position.token,
-                        position.start.max(start)
-                    );
                 }
-                state.active = Some(Active {
-                    cursor,
-                    ended: false,
-                });
+                let ended = self.endings.contains(&token);
+                ensure!(
+                    !ended || self.complete(&cursor)?,
+                    "grammar_triggers[{index}] activates on ending token {token} before root completion; use a trigger whose replay completes the root before ending"
+                );
+                state.active = Some(Active { cursor, ended });
                 state.bytes.clear();
                 state.positions.clear();
                 break;
@@ -296,7 +418,7 @@ impl LazyGbnfConstraint {
         Ok(())
     }
 }
-impl Constraint for LazyGbnfConstraint {
+impl Constraint for LazyGrammarConstraint {
     fn allowed_next_tokens(
         &self,
         context: &ProcessorContext,
@@ -340,6 +462,33 @@ impl Constraint for LazyGbnfConstraint {
                 self.accept(&mut state, token)?;
                 state.history.push(token);
             }
+            if apply
+                && let Some(Active {
+                    cursor: Cursor::Json { history },
+                    ended,
+                }) = &state.active
+            {
+                let Compiled::Json(initial) = &self.initial else {
+                    anyhow::bail!(
+                        "lazy JSON cursor has no compiled schema; restart this completion"
+                    )
+                };
+                if *ended {
+                    return Ok(vec![false; candidates.len()]);
+                }
+                let context = ProcessorContext {
+                    generated_tokens: history.clone(),
+                    ..Default::default()
+                };
+                let mut mask = initial.allowed_next_tokens(&context, candidates)?;
+                let complete = initial.can_finish(&context)?;
+                for (candidate, allowed) in candidates.iter().zip(&mut mask) {
+                    if self.endings.contains(&candidate.token_id) {
+                        *allowed = complete;
+                    }
+                }
+                return Ok(mask);
+            }
             candidates
                 .iter()
                 .map(|candidate| {
@@ -352,14 +501,19 @@ impl Constraint for LazyGbnfConstraint {
                     let Some(active) = &state.active else {
                         return Ok(true);
                     };
-                    if self.endings.contains(&candidate.token_id) {
-                        return Ok(active.cursor.is_accepting());
-                    }
-                    if active.ended || piece.is_empty() || !active.cursor.fits_piece(piece.len()) {
+                    if active.ended {
                         return Ok(false);
                     }
-                    active
-                        .cursor
+                    if self.endings.contains(&candidate.token_id) {
+                        return self.complete(&active.cursor);
+                    }
+                    let Cursor::Gbnf(cursor) = &active.cursor else {
+                        anyhow::bail!("lazy grammar cursor has no compiled GBNF recognizer; restart this completion")
+                    };
+                    if piece.is_empty() || !cursor.fits_piece(piece.len()) {
+                        return Ok(false);
+                    }
+                    cursor
                         .clone()
                         .consume(candidate.token_id, piece)
                         .with_context(|| {
@@ -376,8 +530,32 @@ impl Constraint for LazyGbnfConstraint {
         }
         result
     }
+    fn needs_selection_feedback(&self) -> bool {
+        true
+    }
+
+    fn on_selected(&self, token: TokenId, context: &ProcessorContext) -> Result<()> {
+        ensure!(
+            context.generated_tokens.len() < MAX_ITEMS,
+            "lazy grammar selected token exceeds the {MAX_ITEMS}-token history budget; shorten the completion"
+        );
+        let mut history = context.generated_tokens.clone();
+        history.push(token);
+        self.allowed_next_tokens(
+            &ProcessorContext {
+                generated_tokens: history,
+                ..Default::default()
+            },
+            &[],
+        )
+        .with_context(|| {
+            format!("validate selected lazy grammar token {token} before publishing output")
+        })?;
+        Ok(())
+    }
+
     fn name(&self) -> &str {
-        "lazy_gbnf_constraint"
+        "lazy_grammar_constraint"
     }
 }
 
@@ -388,13 +566,7 @@ mod tests {
         config::GenerateConstraint, logits::ProcessorChain, processors::build_processor_chain,
     };
     fn tokenizer() -> Tokenizer {
-        let mut value: serde_json::Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../tests/fixtures/tiny-llm/tokenizer.json"
-        )))
-        .unwrap();
-        let vocab = value["model"]["vocab"].as_object_mut().unwrap();
-        for (id, text) in [
+        tokenizer_pieces(&[
             (22, "free"),
             (23, "prefixOPENtail"),
             (24, "B"),
@@ -405,7 +577,19 @@ mod tests {
             (29, "op"),
             (30, "en"),
             (31, "é"),
-        ] {
+        ])
+    }
+    fn tokenizer_pieces(pieces: &[(u64, &str)]) -> Tokenizer {
+        tokenizer_with_decoder(pieces, serde_json::json!({"type":"ByteFallback"}))
+    }
+    fn tokenizer_with_decoder(pieces: &[(u64, &str)], decoder: serde_json::Value) -> Tokenizer {
+        let mut value: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/tiny-llm/tokenizer.json"
+        )))
+        .unwrap();
+        let vocab = value["model"]["vocab"].as_object_mut().unwrap();
+        for &(id, text) in pieces {
             let old = vocab
                 .iter()
                 .find(|(_, value)| value.as_u64() == Some(id))
@@ -415,7 +599,7 @@ mod tests {
             vocab.remove(&old);
             vocab.insert(text.into(), serde_json::json!(id));
         }
-        value["decoder"] = serde_json::json!({"type":"ByteFallback"});
+        value["decoder"] = decoder;
         let scratch = tempfile::tempdir().unwrap();
         let path = scratch.path().join("tokenizer.json");
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
@@ -452,6 +636,171 @@ mod tests {
             .filter_map(|(id, score)| score.is_finite().then_some(id))
             .collect())
     }
+    fn json_chain(schema: &str, triggers: Vec<GrammarTrigger>) -> ProcessorChain {
+        let tokenizer = tokenizer_pieces(&[
+            (22, "free"),
+            (23, "prefix{\"n\":"),
+            (24, "1}"),
+            (25, "{\"n\":"),
+            (26, "2}"),
+            (27, "{\"n\":2}"),
+            (28, "\"A\""),
+            (29, "\"\\u0041\""),
+            (30, "{\"n\":1}"),
+            (31, "é"),
+        ]);
+        let options = GenerateOptions {
+            constraint: Some(GenerateConstraint::LazyJsonSchema {
+                schema: schema.into(),
+                activation: GrammarActivation::new(triggers, crate::GrammarCollation::Libcxx)
+                    .unwrap(),
+            }),
+            eos_token_id: Some(3),
+            greedy: true,
+            ..Default::default()
+        };
+        build_processor_chain(&options, Some(&tokenizer), false).unwrap()
+    }
+
+    #[test]
+    fn lazy_json_uses_raw_bytes_after_trigger_despite_publication_stripping() {
+        let tokenizer = tokenizer_with_decoder(
+            &[(22, "\""), (23, "A"), (24, "B")],
+            serde_json::json!({"type":"Sequence","decoders":[
+                {"type":"ByteFallback"}, {"type":"Fuse"},
+                {"type":"Strip","content":"\"","start":1,"stop":1}
+            ]}),
+        );
+        assert_eq!(tokenizer.inner().decode(&[22, 23, 22], false).unwrap(), "A");
+        let projected = crate::response_constraint::ContentConstraint::json_schema(
+            &tokenizer,
+            &serde_json::json!({"const":"A"}),
+            crate::text_projection::ProjectionKind::Plain,
+            "",
+            4096,
+            vec![3],
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(
+            projected
+                .allowed_next_tokens(
+                    &ProcessorContext {
+                        generated_tokens: vec![22, 23, 22],
+                        ..Default::default()
+                    },
+                    &[],
+                )
+                .is_err(),
+            "published A lacks JSON quotes and must remain invalid for content constraints"
+        );
+
+        let options = GenerateOptions {
+            constraint: Some(GenerateConstraint::LazyJsonSchema {
+                schema: r#"{"const":"A"}"#.into(),
+                activation: GrammarActivation::new(
+                    vec![GrammarTrigger::Token(22)],
+                    crate::GrammarCollation::Libcxx,
+                )
+                .unwrap(),
+            }),
+            eos_token_id: Some(3),
+            ..Default::default()
+        };
+        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        assert!(allowed(&chain, &[22]).unwrap().contains(&23));
+        assert!(!allowed(&chain, &[22]).unwrap().contains(&24));
+        assert!(allowed(&chain, &[22, 23]).unwrap().contains(&22));
+        assert_eq!(allowed(&chain, &[22, 23, 22]).unwrap(), [3]);
+        assert!(allowed(&chain, &[22, 24]).is_err());
+        assert!(allowed(&chain, &[22]).unwrap().contains(&23));
+    }
+
+    #[test]
+    fn lazy_json_schema_replays_capture_and_resets_after_rewind_and_rejection() {
+        let chain = json_chain(
+            r#"{"type":"object","properties":{"n":{"const":1}},"required":["n"],"additionalProperties":false}"#,
+            vec![GrammarTrigger::Pattern(r"prefix(\{)".into())],
+        );
+        assert_eq!(allowed(&chain, &[22]).unwrap().len(), 32);
+        let mask = allowed(&chain, &[22, 23]).unwrap();
+        assert!(mask.contains(&24), "{mask:?}");
+        assert!(!mask.contains(&26) && !mask.contains(&3), "{mask:?}");
+        assert_eq!(allowed(&chain, &[22, 23, 24]).unwrap(), [3]);
+        assert!(allowed(&chain, &[22, 23, 26]).is_err());
+        assert_eq!(allowed(&chain, &[22]).unwrap().len(), 32);
+        assert!(allowed(&chain, &[23]).unwrap().contains(&24));
+    }
+
+    #[test]
+    fn lazy_json_schema_preserves_equivalent_escapes_and_terminal_feedback() {
+        let chain = json_chain(r#"{"const":"A"}"#, vec![GrammarTrigger::Token(29)]);
+        chain.on_selected(29, &ProcessorContext::default()).unwrap();
+        assert_eq!(allowed(&chain, &[29]).unwrap(), [3]);
+        chain
+            .on_selected(
+                3,
+                &ProcessorContext {
+                    generated_tokens: vec![29],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let invalid = json_chain(r#"{"const":"B"}"#, vec![GrammarTrigger::Token(29)]);
+        assert!(
+            invalid
+                .on_selected(29, &ProcessorContext::default())
+                .is_err()
+        );
+        assert_eq!(allowed(&invalid, &[]).unwrap().len(), 32);
+    }
+
+    #[test]
+    fn lazy_chain_checks_last_selected_trigger_before_publication_and_recovers() {
+        let chain = chain(r#"root ::= "OPENB""#, vec![GrammarTrigger::Token(23)]);
+        let context = ProcessorContext {
+            generated_tokens: vec![22],
+            ..Default::default()
+        };
+        assert_eq!(allowed(&chain, &[22]).unwrap().len(), 32);
+        let error = chain.on_selected(23, &context).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("token trigger 23"),
+            "{error:#}"
+        );
+        assert_eq!(allowed(&chain, &[22]).unwrap().len(), 32);
+        chain.on_selected(25, &context).unwrap();
+        assert_eq!(allowed(&chain, &[22, 25]).unwrap().len(), 32);
+    }
+
+    #[test]
+    fn lazy_chain_selected_trigger_validates_root_and_selected_eos() {
+        let chain = chain(r#"root ::= "OPENB""#, vec![GrammarTrigger::Token(25)]);
+        chain.on_selected(25, &ProcessorContext::default()).unwrap();
+        let context = ProcessorContext {
+            generated_tokens: vec![25],
+            ..Default::default()
+        };
+        assert_eq!(allowed(&chain, &[25]).unwrap(), [24]);
+        let error = chain.on_selected(3, &context).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("precedes root completion"),
+            "{error:#}"
+        );
+        chain.on_selected(24, &context).unwrap();
+        assert_eq!(allowed(&chain, &[25, 24]).unwrap(), [3]);
+        chain
+            .on_selected(
+                3,
+                &ProcessorContext {
+                    generated_tokens: vec![25, 24],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(allowed(&chain, &[25, 24, 3]).is_err());
+    }
+
     #[test]
     fn lazy_chain_token_activation_recovers_after_rollback_and_invalid_suffix() {
         let chain = chain(r#"root ::= <[25]> "B""#, vec![GrammarTrigger::Token(25)]);

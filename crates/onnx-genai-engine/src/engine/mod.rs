@@ -1352,9 +1352,10 @@ mod tests {
     #[cfg(not(feature = "native-backend"))]
     #[test]
     fn forced_native_without_feature_reports_how_to_switch() {
-        let error = resolve_decode_backend(Path::new("unused.onnx"), EngineDecodeBackend::Native)
-            .unwrap_err()
-            .to_string();
+        let error =
+            resolve_decode_backend(Path::new("unused.onnx"), EngineDecodeBackend::Native, false)
+                .unwrap_err()
+                .to_string();
         assert!(error.contains("ONNX_GENAI_BACKEND=ort"), "{error}");
         assert!(error.contains("EngineDecodeBackend::Ort"), "{error}");
     }

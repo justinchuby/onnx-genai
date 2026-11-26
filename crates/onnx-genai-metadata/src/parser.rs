@@ -293,6 +293,14 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
             crate::MetadataError::UnsupportedSchema(error)
         }
     })?;
+    if document.get("graph_weights").is_some() {
+        crate::version::gate_feature_use(
+            version,
+            crate::version::SchemaFeature::GraphWeights,
+            "graph_weights",
+        )
+        .map_err(crate::MetadataError::Parse)?;
+    }
     if document
         .get("package")
         .and_then(|p| p.get("tokenizer"))

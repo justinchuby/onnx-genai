@@ -871,6 +871,8 @@ pub struct EngineConfig {
     /// or `native` instead. An explicit `Ort` or `Native` value always takes
     /// precedence over the environment variable.
     pub decode_backend: EngineDecodeBackend,
+    /// Explicit authored model-package variant. Flat directories reject a selector.
+    pub package_variant: Option<String>,
     /// Native decoder device override. `None` follows the execution provider in
     /// [`onnx_genai_ort::SessionOptions`], including `ONNX_GENAI_EP`.
     pub native_device: Option<crate::native_decode_device::NativeDecodeDevice>,
@@ -945,6 +947,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             decode_backend: EngineDecodeBackend::Native,
+            package_variant: None,
             native_device: None,
             native_decode_batch: None,
             native_state_files: NativeStateFilePolicy::Disabled,
@@ -1820,6 +1823,12 @@ pub enum GenerateConstraint {
         grammar: String,
         activation: Option<GrammarActivation>,
     },
+    /// JSON Schema over newly generated raw bytes after a trigger. Before
+    /// activation output is unconstrained; assistant prefill is not consumed.
+    LazyJsonSchema {
+        schema: String,
+        activation: GrammarActivation,
+    },
     /// Raw llguidance Lark over new model output, without assistant-prefill
     /// consumption or response-content projection. Keep the %llguidance header.
     RawLark { grammar: String },
@@ -1891,7 +1900,11 @@ impl GenerateOptions {
         anyhow::ensure!(
             !matches!(
                 self.constraint,
-                Some(GenerateConstraint::Gbnf { .. } | GenerateConstraint::RawLark { .. })
+                Some(
+                    GenerateConstraint::Gbnf { .. }
+                        | GenerateConstraint::RawLark { .. }
+                        | GenerateConstraint::LazyJsonSchema { .. }
+                )
             ) || self.stop_on_eos,
             "raw grammar requires stop_on_eos=true; allow root completion to terminate the generation"
         );

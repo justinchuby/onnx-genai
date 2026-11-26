@@ -25,6 +25,7 @@ A reader that accepts a schema version must implement that version's typed SSA/d
 | `v1.14` | Decision v2 profiles declare ordered encoded-image inputs and authoritative text/media token usage; decision v1 remains text-only. |
 | `v1.15` | Decision v3 profiles declare typed mixed state-media inputs and an explicit spoken-question audio endpoint with authoritative per-variant usage. |
 | `v1.16` | Externally executed audio programs bind explicitly named float32 feature media inputs; analysis semantics and clip bounds come from the selected program output. |
+| `v1.17` | Each ONNX graph can declare immutable GGUF/SafeTensors containers with explicit tensor-key mappings; geometry and executable semantics stay in the graph. |
 
 ## Optional semantic extensions
 

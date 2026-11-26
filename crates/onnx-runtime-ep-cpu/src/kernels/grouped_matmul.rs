@@ -1,3 +1,4 @@
+use super::affine_bank::AffineBank;
 use crate::dtype::{to_dense, to_dense_f32_widen, write_dense, write_dense_f32_narrow};
 use onnx_runtime_ep_api::packed_routed::{
     GroupLayout, fail, group_layout, packed_group_layout, validate,
@@ -198,52 +199,33 @@ impl Kernel for Packed {
 }
 
 impl Kernel for Affine {
+    fn supports_strided_input(&self, index: usize) -> bool {
+        matches!(index, 1 | 3 | 4)
+    }
     fn execute(&self, x: &[TensorView], y: &mut [TensorMut]) -> Result<()> {
         let l = self.0.layout(x, y)?;
         let op = Op::GroupedMatMul { transposed: true };
         let routes = route_indices(op, &x[2], l.groups)?;
-        let scales = super::to_dense_f32(&x[3])?;
-        if scales.iter().any(|&v| v <= 0.0 || !v.is_finite()) {
-            return Err(fail(
-                op,
-                "DequantizeLinear scales must be positive and finite",
-            ));
-        }
+        let bank = AffineBank::new(
+            &x[1],
+            &x[3],
+            x.get(4),
+            [l.groups, l.n, l.k],
+            self.0.block,
+            self.0.zero,
+        )?;
         if l.lanes == 0 {
             return Ok(());
         }
-        fn read<'a>(view: &'a TensorView<'_>) -> Result<std::borrow::Cow<'a, [u8]>> {
-            if !view.is_contiguous() {
-                return super::to_dense_bytes(view).map(std::borrow::Cow::Owned);
+        let activation = super::to_dense_f32(&x[0])?;
+        let mut data = vec![0f32; l.lanes];
+        for (route, output) in data.chunks_exact_mut(l.n).enumerate() {
+            let token = route / l.selections;
+            let input = &activation[token * l.k..(token + 1) * l.k];
+            for (column, value) in output.iter_mut().enumerate() {
+                *value = bank.dot(routes[route] * l.n + column, input);
             }
-            // SAFETY: layout validated a one-byte tensor spanning `numel` bytes.
-            Ok(std::borrow::Cow::Borrowed(unsafe {
-                std::slice::from_raw_parts(view.data_ptr::<u8>(), view.numel())
-            }))
         }
-        let codes = read(&x[1])?;
-        let zeros = x.get(4).map(read).transpose()?;
-        let blocks = l.k / self.0.block;
-        let nibble = |bytes: &[u8], row, col: usize, width: usize| {
-            (bytes[row * width.div_ceil(2) + col / 2] >> ((col % 2) * 4)) & 15
-        };
-        let weight = |i| {
-            let (row, col) = (i / l.k, i % l.k);
-            let p = col / self.0.block;
-            let z = zeros
-                .as_ref()
-                .map_or(self.0.zero, |z| nibble(z, row, p, blocks));
-            f32::from(i16::from(nibble(&codes, row, col, l.k)) - i16::from(z))
-                * scales[row * blocks + p]
-        };
-        let data = grouped(
-            l,
-            &super::to_dense_f32(&x[0])?,
-            weight,
-            &routes,
-            None,
-            |v| v,
-        );
         write_dense(&mut y[0], &data)
     }
 }

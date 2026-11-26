@@ -21,6 +21,10 @@ pub mod fim;
 pub mod gbnf;
 pub mod indentation;
 mod json_prefix;
+#[cfg(feature = "native-backend")]
+mod keyed_weights;
+#[cfg(all(test, feature = "native-backend"))]
+mod keyed_weights_tests;
 pub(crate) mod kv_bridge;
 pub(crate) mod kv_sizing;
 pub mod logits;
