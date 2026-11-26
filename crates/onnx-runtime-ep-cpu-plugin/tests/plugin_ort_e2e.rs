@@ -10116,3 +10116,82 @@ graph {
         }
     }
 }
+
+#[test]
+fn softmax_workspace_preserves_both_opsets_through_real_plugin() {
+    let _lock = lock_ort_ep();
+    for opset in [11, 13] {
+        let name = format!("softmax_workspace_{opset}");
+        let model = r#"ir_version: 10
+opset_import: [{ version: OPSET }]
+graph {
+ name: "softmax_workspace"
+ node: [{ input: ["X"] output: ["Y"] op_type: "Softmax" attribute: [{ name: "axis" i: -2 type: INT }] }]
+ input: [{ name: "X" type { tensor_type { elem_type: 1 shape { dim: [{dim_param:"batch"},{dim_param:"rows"},{dim_param:"cols"}] } } } }]
+ output: [{ name: "Y" type { tensor_type { elem_type: 1 shape { dim: [{dim_param:"batch"},{dim_param:"rows"},{dim_param:"cols"}] } } } }]
+}
+"#.replace("OPSET", &opset.to_string());
+        let path = write_generated_model(&name, &model);
+        let (_library, api, env, options, session) = skip_if_missing!(
+            unsafe { conformance_setup(&name, &path, true) },
+            "Softmax workspace: ORT/plugin unavailable"
+        );
+        unsafe {
+            let assignment = query_ep_assignment(api, session);
+            assert_eq!(
+                assignment.ops_on_our_ep(),
+                ["Softmax"],
+                "{:?}",
+                assignment.assignments
+            );
+            assert!(assignment.ops_not_on_our_ep().is_empty());
+            for (iteration, [batch, rows, cols]) in [[2usize, 3, 4], [1, 2, 5], [2, 3, 4]]
+                .into_iter()
+                .enumerate()
+            {
+                let mut values = (0..batch * rows * cols)
+                    .map(|i| (i as f32 * 0.175).cos() * 2. + iteration as f32 * 0.25)
+                    .collect::<Vec<_>>();
+                let mut expected = vec![0.; values.len()];
+                for b in 0..batch {
+                    for c in 0..if opset < 13 { 1 } else { cols } {
+                        let indices = if opset < 13 {
+                            (b * rows * cols..(b + 1) * rows * cols).collect::<Vec<_>>()
+                        } else {
+                            (0..rows)
+                                .map(|r| (b * rows + r) * cols + c)
+                                .collect::<Vec<_>>()
+                        };
+                        let max = indices
+                            .iter()
+                            .map(|&j| f64::from(values[j]))
+                            .fold(f64::NEG_INFINITY, f64::max);
+                        let sum = indices
+                            .iter()
+                            .map(|&j| (f64::from(values[j]) - max).exp())
+                            .sum::<f64>();
+                        for j in indices {
+                            expected[j] = (f64::from(values[j]) - max).exp() / sum;
+                        }
+                    }
+                }
+                let x =
+                    make_float_tensor(api, &mut values, &[batch as i64, rows as i64, cols as i64]);
+                let outputs = run_and_collect_f32(api, session, &["X"], &[x], &["Y"]);
+                ((*api).ReleaseValue.unwrap())(x);
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(outputs[0].len(), expected.len());
+                for (&actual, want) in outputs[0].iter().zip(expected) {
+                    assert!(
+                        (f64::from(actual) - want).abs() < 2e-6,
+                        "{name} iteration={iteration}: {actual} versus {want}"
+                    );
+                }
+            }
+            eprintln!(
+                "[{name}] Softmax assigned to cpu_ep; dynamic 2x3x4/1x2x5/2x3x4 outputs passed"
+            );
+            conformance_teardown(api, env, options, session, &name);
+        }
+    }
+}

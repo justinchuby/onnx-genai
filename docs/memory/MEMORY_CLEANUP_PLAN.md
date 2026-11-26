@@ -2885,3 +2885,26 @@ no partial expansion and no retained streamed weights remain unchanged. Scoped
 thread-local observations are non-Send, clear after unwinding and exist only
 under cfg(test). Production arithmetic, routing, cache owners and grant/refund
 paths are unchanged; no timing or CUDA validation is inferred.
+
+
+### Softmax preserves direct output and admits fallback staging
+
+Softmax and LogSoftmax share checked axis, output-shape and capacity geometry.
+Softmax metadata preparation reports Deferred for nonempty f32 Y because tensor
+metadata cannot prove address alignment or input/output disjointness. Execution
+refinement uses actual Host views without reading tensor values: safe direct
+output needs no scratch; other routes admit one StepScoped `4 * numel` f32 lane.
+Missing actual output views retain the complete conservative staging bound.
+Non-f32 Y has that known bound at metadata preparation; empty shapes need none.
+Deferred preparation is deliberately not a completed zero-byte reservation.
+
+The borrowing predicate is shared with input widening: a source materialized
+into owned storage can alias direct Y because materialization finishes first.
+Borrowed f32 input/output overlap instead uses the admitted lane. This removes
+the ungoverned per-call output Vec without adding a pool, owner, or per-row grant.
+Input widening allocations remain outside this output-staging budget. Reducer
+arithmetic and ISA dispatch remain unchanged. Tests check direct execution under
+zero workspace capacity, fallback refusal/reuse/trim, dynamic shapes in both
+opset families, real ORT assignment with fallback disabled, and 4096 warm cycles
+with no governor callbacks (including zero-byte callbacks). These correctness
+checks do not establish zero latency overhead or CUDA behavior.
