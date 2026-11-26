@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-exclude = ["vendor/llguidance"]
 members = [
+    "vendor/llguidance",
     "xtask",
     "crates/onnx-genai",
     "crates/onnx-genai-preprocess",
@@ -197,6 +197,7 @@ uninlined_format_args = "warn"
 chunks_exact_to_as_chunks = "allow"
 
 [workspace.dependencies]
+onnx-genai-llguidance = { path = "vendor/llguidance", version = "=0.1.0-dev.6" }
 # Internal crates
 onnx-genai = { path = "crates/onnx-genai", version = "=0.1.0-dev.6" }
 onnx-genai-preprocess = { path = "crates/onnx-genai-preprocess", version = "=0.1.0-dev.6" }
@@ -295,7 +296,3 @@ libloading = "0.8"
 memmap2 = "0.9"
 prost-reflect = { version = "0.14" }
 smallvec = "1"
-
-# Published external source snapshots are not workspace release crates.
-[workspace.metadata]
-vendored-crates = ["vendor/llguidance/UPSTREAM.json"]

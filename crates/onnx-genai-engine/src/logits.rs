@@ -11,9 +11,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::MirostatVersion;
-use llguidance::api::TopLevelGrammar;
-use llguidance::toktrie::{ApproximateTokEnv, InferenceCapabilities, TokRxInfo, TokTrie};
-use llguidance::{Constraint as LlgConstraint, ParserFactory};
+use onnx_genai_llguidance::api::TopLevelGrammar;
+use onnx_genai_llguidance::toktrie::{
+    ApproximateTokEnv, InferenceCapabilities, TokRxInfo, TokTrie,
+};
+use onnx_genai_llguidance::{Constraint as LlgConstraint, ParserFactory};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -744,7 +746,7 @@ impl LlguidanceConstraint {
         } else {
             tok_trie
         };
-        let tok_env: llguidance::toktrie::TokEnv =
+        let tok_env: onnx_genai_llguidance::toktrie::TokEnv =
             std::sync::Arc::new(ApproximateTokEnv::new(tok_trie));
         Self::from_tok_env(kind, grammar, &tok_env, &prefix_ids, sampled_vocab_size)
     }
@@ -752,7 +754,7 @@ impl LlguidanceConstraint {
     fn from_tok_env(
         kind: GrammarConstraintKind,
         grammar: &str,
-        tok_env: &llguidance::toktrie::TokEnv,
+        tok_env: &onnx_genai_llguidance::toktrie::TokEnv,
         prefix_ids: &[TokenId],
         sampled_vocab_size: usize,
     ) -> anyhow::Result<Self> {
@@ -905,7 +907,7 @@ impl Constraint for LlguidanceConstraint {
 }
 
 impl LlguidanceState {
-    fn current_step(&mut self) -> anyhow::Result<llguidance::toktrie::StepResult> {
+    fn current_step(&mut self) -> anyhow::Result<onnx_genai_llguidance::toktrie::StepResult> {
         let previous = self.constraint.step_result();
         if previous.is_stop() || previous.sample_mask.is_some() {
             return Ok(previous.clone());

@@ -2061,10 +2061,12 @@ optional keys, anyOf branches, Unicode/surrogate keys and literal backslashes.
 HTTP continuation forces valid/invalid competing suffixes through the actual
 model in buffered/SSE mode, with and without response projection.
 
-This workspace patch and bundled source-distribution path are distinct from a
-registry-only dependency install; publishing dependent crates to crates.io removes
-local dependency paths. Upstream or publish the compiler fix before claiming
-this extended key-escape behavior for registry-only crate distributions.
+The former external vendored-package identity did not supply these fixes to
+registry-only consumers after Cargo removed local dependency paths. The compiler
+is now the first-class `onnx-genai-llguidance` package, published before the engine
+with the same audited source and public typed distinction. See the
+[compiler artifact verification](GRAMMAR_COMPILER.md) for the exact packaged/local
+registry proof; configuring that release graph does not claim an upload occurred.
 
 Full server verification also exposed a realtime disconnect release race.
 Admission capacity now drops before the worker reservation advertises idle,
@@ -2789,3 +2791,22 @@ These fixture processes disable ORT discovery and check actual output/backend
 facts. Profiling uses OS temporary directories rather than repository target
 paths. Packaged console-launcher acceptance and the full model/device/control
 cross-product remain open; parser and process evidence are distinct.
+
+
+## Publishable maintained grammar dependency
+
+The single audited compiler tree now has the owned package identity
+`onnx-genai-llguidance`; engine imports use its canonical Rust name. Its exact
+versioned release dependency precedes the engine in the publish graph, retaining
+the original MIT source, archive hash and all 71 provenance records. There is no
+registry/path switch or duplicate compiler implementation. Two token-range
+vector constructions retain their values with lint-clean syntax.
+
+The compiler source passed 56 unit and 2 public-surface tests, strict all-target
+Clippy and 20 Python provenance/release/registry checks. An exact 77-file Cargo
+archive was served through a temporary sparse registry and consumed without
+path/git/patch overrides; its registry-only public tests passed locked/offline.
+This proves the artifact surface, not a crates.io publication. The standalone
+key-ownership regression uses legal raw DEL spelling; the engine normalizes
+arbitrary JSON Unicode escapes before backend recognition. See
+[compiler checks](GRAMMAR_COMPILER.md) for reproducible artifact evidence.
