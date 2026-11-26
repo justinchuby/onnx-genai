@@ -637,8 +637,9 @@ impl<K: WeightCacheKey, T: Copy + Default + Send + Sync + 'static> WeightCache<K
 mod tests {
     use super::*;
     use crate::kernels::block_quantized_matmul::{
-        BlockFormat, DenseWeightCacheKey, DenseWeightIdentity, packed_tensor_bytes,
+        BlockFormat, DenseWeightCacheKey, DenseWeightIdentity,
     };
+    use crate::kernels::packed_bytes::PackedByteSource;
     use crate::kernels::testutil::Owned;
     use onnx_runtime_memory_api::{MemoryRole, Tier};
     use onnx_runtime_memory_governor::{
@@ -652,10 +653,9 @@ mod tests {
         let view = packed.view();
         DenseWeightIdentity::default()
             .resolve(&view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&view)
+                PackedByteSource::full("weight cache fixture", &view)?.digest()
             })
             .unwrap()
-            .key
     }
     fn cached(key: &DenseWeightCacheKey) -> WeightSpec<'_, DenseWeightCacheKey> {
         WeightSpec {
