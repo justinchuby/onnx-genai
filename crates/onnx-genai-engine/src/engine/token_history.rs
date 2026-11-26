@@ -1,7 +1,8 @@
 //! Immutable logical Native history. Snapshot aliases share payload funding;
 //! shorter logical views retain the whole backing until the final owner drops.
 use super::*;
-use onnx_runtime_memory_governor::{MemoryGovernor, MemoryLease};
+#[cfg(test)]
+use onnx_runtime_memory_governor::MemoryGovernor;
 
 #[derive(Clone, Default)]
 pub(crate) struct NativeTokenHistory {
@@ -9,12 +10,9 @@ pub(crate) struct NativeTokenHistory {
     length: usize,
 }
 struct HistoryStorage {
-    data: onnx_runtime_session::OwnedHostArray<TokenId>,
-    // Only absent/foreign domains need a paired legacy Engine grant. A matching
-    // allocator already retains actual funding; neither case is a complete
-    // managed-worker capability.
-    _admission: Option<MemoryLease>,
+    data: crate::ProcessorArray<TokenId>,
 }
+
 impl NativeTokenHistory {
     pub(crate) fn as_slice(&self) -> &[TokenId] {
         self.storage
@@ -58,46 +56,11 @@ impl Engine {
         if length == 0 {
             return Ok(NativeTokenHistory::default());
         }
-        let bytes = length
-            .checked_mul(std::mem::size_of::<TokenId>())
-            .context("Native logical history byte count overflows; shorten prompt or generation")?;
-        let session = self
-            .native_session
-            .as_ref()
-            .context(
-                "Native decoder is unavailable while admitting logical history; reload the model",
-            )?
-            .inference_session();
-        let mut context = crate::native_decode::host_tensors_for_session(session)?;
-        let funding = context.host_payload_funding();
-        let actual_domain = funding.as_ref().is_some_and(|domain| {
-            domain.matches(
-                self.governor
-                    .memory()
-                    .authority_id(onnx_runtime_memory_api::Tier::Host),
-                &self.governor.process_memory_manager(),
-            )
-        });
-        let admission = if actual_domain {
-            None
-        } else {
-            // A foreign managed provider is not this Engine's domain. Keep its
-            // allocation authority untouched and use explicit legacy Host
-            // staging, funded by the Engine grant, until B4 binds all paths.
-            if funding.is_some() {
-                context = onnx_runtime_session::HostTensorAllocator::standalone();
-            }
-            let holder = memory_plan::Holder::NativeTokenHistory;
-            Some(self.governor.memory().reserve(onnx_runtime_memory_api::Tier::Host,u64::try_from(bytes)?,holder.role(),holder.id()).context("admit Native logical history before publication; release retained sessions/snapshots or increase Host headroom")?)
-        };
-        let mut data=context.array::<TokenId>(length).context("allocate owned Native logical history before publication; release Host headroom or shorten the request")?;
+        let mut data = self.processor_allocation_scope()?.allocate::<TokenId>(length, crate::ProcessorAllocationRole::History).context("admit Native logical history before publication; release retained sessions/snapshots or increase Host headroom")?;
         data.as_mut_slice()[..prompt.len()].copy_from_slice(prompt);
         data.as_mut_slice()[prompt.len()..].copy_from_slice(generated);
         Ok(NativeTokenHistory {
-            storage: Some(Arc::new(HistoryStorage {
-                data,
-                _admission: admission,
-            })),
+            storage: Some(Arc::new(HistoryStorage { data })),
             length,
         })
     }

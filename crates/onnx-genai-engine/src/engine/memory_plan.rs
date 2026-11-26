@@ -159,6 +159,9 @@ holder_registry! {
     /// Request-owned contextual decoder, candidate frontier and publication buffers.
     DecoderTransforms = 16,
     NativeTokenHistory = 17,
+    ProcessorScratch = 18,
+    ProcessorHistory = 19,
+    ProcessorProbabilities = 20,
 }
 
 impl Holder {
@@ -177,7 +180,10 @@ impl Holder {
             | Holder::DecoderTurnSnapshot
             | Holder::OrtPrefixSnapshot
             | Holder::NativeSessionSnapshot => MemoryRole::KvCache,
-            Holder::NativeTokenHistory => MemoryRole::KvCache,
+            Holder::NativeTokenHistory | Holder::ProcessorHistory => MemoryRole::KvCache,
+            Holder::ProcessorScratch | Holder::ProcessorProbabilities => {
+                MemoryRole::Workspace { step_scoped: false }
+            }
             Holder::DecoderTransforms => MemoryRole::Workspace { step_scoped: false },
             Holder::Activations => MemoryRole::Activation,
             Holder::FixedDeviceReservation => MemoryRole::Weights,
@@ -205,6 +211,9 @@ impl Holder {
             Holder::NativeSessionSnapshot => "complete native session snapshots",
             Holder::DecoderTransforms => "contextual decoder workspace",
             Holder::NativeTokenHistory => "Native logical token history",
+            Holder::ProcessorScratch => "processor numeric scratch",
+            Holder::ProcessorHistory => "processor retained history",
+            Holder::ProcessorProbabilities => "processor retained probabilities",
             Holder::Activations => "activations",
             Holder::FixedDeviceReservation => "fixed device reservation",
             Holder::PipelineComponentPool => "pipeline component device pool",
@@ -224,7 +233,7 @@ impl Holder {
             // Charging it to `Device` would let it exhaust host RAM while the
             // device ledger still reported headroom.
             Holder::KvPool | Holder::PipelineKvPool | Holder::DraftKvPool => Tier::Host,
-            Holder::CpuDerivedWeights | Holder::DecoderTurnSnapshot | Holder::OrtPrefixSnapshot | Holder::NativeSessionSnapshot | Holder::DecoderTransforms | Holder::NativeTokenHistory => Tier::Host,
+            Holder::CpuDerivedWeights | Holder::DecoderTurnSnapshot | Holder::OrtPrefixSnapshot | Holder::NativeSessionSnapshot | Holder::DecoderTransforms | Holder::NativeTokenHistory | Holder::ProcessorScratch | Holder::ProcessorHistory | Holder::ProcessorProbabilities => Tier::Host,
             Holder::WeightResidency
             | Holder::RecurrentState
             | Holder::RecurrentPrefixSnapshot

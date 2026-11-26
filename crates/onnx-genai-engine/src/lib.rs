@@ -29,7 +29,11 @@ pub(crate) mod kv_bridge;
 pub(crate) mod kv_sizing;
 pub mod logits;
 pub mod logits_batch;
+pub mod processor_memory;
 pub use logits_batch::{LogitsBatch, LogitsRow};
+pub use processor_memory::{
+    ProcessorAllocationRole, ProcessorAllocationScope, ProcessorArray, ProcessorElement,
+};
 mod memory_authority;
 #[cfg(feature = "native-backend")]
 pub mod native_decode;
