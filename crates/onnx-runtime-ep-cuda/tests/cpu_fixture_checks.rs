@@ -73,6 +73,17 @@ fn standard_attention_opset25_windows_cpu() {
 #[path = "fixtures/pooling.rs"]
 mod pooling;
 
+#[path = "fixtures/mean_variance_normalization.rs"]
+mod mean_variance_normalization;
+
+#[test]
+fn mean_variance_normalization_cpu_goldens_and_claims() {
+    use onnx_runtime_ep_cpu::CpuExecutionProvider;
+
+    mean_variance_normalization::claims(&CpuExecutionProvider::new());
+    mean_variance_normalization::goldens(None);
+}
+
 #[test]
 fn cpu_dilated_averagepool_matches_expected_vectors() {
     use half::{bf16, f16};

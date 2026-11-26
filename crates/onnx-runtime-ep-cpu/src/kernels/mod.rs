@@ -753,6 +753,7 @@ operator_group_modules!(
     conv_transpose,
     deform_conv,
     grid_sample,
+    mean_variance_normalization,
     norm_ops,
     pooling,
     resize,
@@ -1064,8 +1065,8 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
     );
     registry.register(
         OpKey::new("MeanVarianceNormalization", "", 29),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(norm_ops::MeanVarianceNormalizationFactory),
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+        Box::new(mean_variance_normalization::MeanVarianceNormalizationFactory),
     );
     registry.register(
         OpKey::new("GroupNormalization", "", 18),

@@ -342,17 +342,24 @@ impl Engine {
     pub(crate) fn decode_core_covers_declared_workflow(
         model_dir: &Path,
         backend: EngineDecodeBackend,
+        selection: &onnx_genai_ort::ModelPackageSelection,
     ) -> anyhow::Result<bool> {
+        let selected = ModelDirectory::package_metadata(model_dir, selection)
+            .context("resolve selected package metadata before workflow admission")?;
         // An authored package answers from its own metadata. Only a package
         // that ships none needs the `genai_config.json` importer, which converts
         // that foreign format into this project's one representation — and which
         // needs a resolvable model directory, something a composite workflow
         // package (components in subdirectories) deliberately does not present.
-        let metadata = if onnx_genai_metadata::find_metadata_path(model_dir).is_some() {
+        let metadata = if selected
+            .as_ref()
+            .is_some_and(|directory| directory.metadata_path.is_some())
+            || onnx_genai_metadata::find_metadata_path(model_dir).is_some()
+        {
             let mut capability_error = None;
             let directory =
-                match onnx_genai_ort::PipelineModelDirectory::load_with_metadata_preflight(
-                    model_dir,
+                match onnx_genai_ort::PipelineModelDirectory::load_with_metadata_preflight_and_selection(
+                    model_dir, selection,
                     |metadata| {
                         crate::pipeline::WorkflowExecutionAdmission::from_metadata(
                             metadata, backend,
@@ -379,11 +386,19 @@ impl Engine {
                     .and_then(|metadata| metadata.speculative.as_ref()),
             );
             return Ok(decode_core_covers);
+        } else if selected.is_some() {
+            let selected = ModelDirectory::load_with_package_selection(model_dir, selection)
+                .context("resolve selected compatibility package")?;
+            Some(
+                load_inference_metadata(&selected)
+                    .context("read selected package inference contract")?,
+            )
         } else {
             onnx_genai_ort::ModelDirectory::load(model_dir)
                 .ok()
                 .and_then(|directory| load_inference_metadata(&directory).ok())
         };
+
         let workflow = metadata
             .as_ref()
             .and_then(|metadata| metadata.pipeline.as_ref())
@@ -471,7 +486,14 @@ impl Engine {
     /// executor for the package's declared decode step, which is a question
     /// about the contract that step names.
     pub fn from_dir(model_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
-        if !Self::decode_core_covers_declared_workflow(model_dir, config.decode_backend)? {
+        if !Self::decode_core_covers_declared_workflow(
+            model_dir,
+            config.decode_backend,
+            &package_selection_from_session_options(
+                &SessionOptions::default(),
+                config.package_variant.as_deref(),
+            ),
+        )? {
             return Self::from_interpreted_dir(model_dir, config, SessionOptions::default(), None);
         }
         Self::from_dir_impl(model_dir, config, SessionOptions::default(), false, None)
@@ -483,7 +505,14 @@ impl Engine {
         config: EngineConfig,
         provider: Arc<dyn MemoryAuthorityProvider>,
     ) -> anyhow::Result<Self> {
-        if !Self::decode_core_covers_declared_workflow(model_dir, config.decode_backend)? {
+        if !Self::decode_core_covers_declared_workflow(
+            model_dir,
+            config.decode_backend,
+            &package_selection_from_session_options(
+                &SessionOptions::default(),
+                config.package_variant.as_deref(),
+            ),
+        )? {
             return Self::from_interpreted_dir(
                 model_dir,
                 config,
@@ -506,7 +535,14 @@ impl Engine {
         config: EngineConfig,
         session_options: SessionOptions,
     ) -> anyhow::Result<Self> {
-        if !Self::decode_core_covers_declared_workflow(model_dir, config.decode_backend)? {
+        if !Self::decode_core_covers_declared_workflow(
+            model_dir,
+            config.decode_backend,
+            &package_selection_from_session_options(
+                &session_options,
+                config.package_variant.as_deref(),
+            ),
+        )? {
             return Self::from_interpreted_dir(model_dir, config, session_options, None);
         }
         Self::from_dir_impl(model_dir, config, session_options, true, None)
@@ -552,7 +588,10 @@ impl Engine {
     ) -> anyhow::Result<Self> {
         let model_directory = {
             let _span = onnx_genai_ort::prof_span!("engine.resolve_model_directory");
-            let package_selection = package_selection_from_session_options(&session_options);
+            let package_selection = package_selection_from_session_options(
+                &session_options,
+                config.package_variant.as_deref(),
+            );
             ModelDirectory::load_with_package_selection(model_dir, &package_selection)
                 .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {e}"))?
         };
@@ -1682,6 +1721,7 @@ fn decoder_io_seeded_with(
 
 fn package_selection_from_session_options(
     session_options: &SessionOptions,
+    variant: Option<&str>,
 ) -> onnx_genai_ort::ModelPackageSelection {
     let execution_provider = session_options.execution_providers.first().map(|provider| {
         match provider.selection.name.as_str() {
@@ -1695,6 +1735,7 @@ fn package_selection_from_session_options(
         }
     });
     onnx_genai_ort::ModelPackageSelection {
+        variant: variant.map(str::to_owned),
         execution_provider,
         ..Default::default()
     }

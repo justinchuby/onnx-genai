@@ -2952,3 +2952,87 @@ still allocate. A real global-allocator probe uses the old allocating copy as a
 positive control and verifies that kernel executions allocate no matrix-sized
 payload for any of the four float storage types. Existing public peak/trim and
 4096-cycle warm governor tests retain their original bounds and callbacks.
+
+
+### MeanVarianceNormalization preserves direct output and governs snapshots
+
+MeanVarianceNormalization now lives in its own CPU module within the existing
+ops-cnn capability group. It reuses the shared MVN axes layout and NormAcc
+computation domain. All actual views are validated for Host access, exact
+metadata shape/dtype and computable origin/range overflow before any reads or
+writes, including empty inputs. This closes the contiguous-pointer route's
+missing Host guard and rejects mismatched actual bindings.
+
+Nonempty metadata preparation returns Deferred because stride and alias safety
+are not known from shapes. Execution refinement needs no scratch when both
+actual views are contiguous and either disjoint or have the same element
+origin. Raw unaligned scalar loads/stores preserve packed-address direct paths.
+Shifted overlap and strided views use one StepScoped storage-T snapshot lane;
+missing actual views keep the complete `numel * sizeof(T)` bound. Empty metadata
+has no workspace requirement after geometry validation.
+
+Both routes share the original mean/variance loop, including f64 accumulation
+and `sqrt(variance)+epsilon`. Snapshot execution first copies every original
+storage element into the admitted lane, normalizes disjoint groups in place,
+and publishes the real output last. No matrix-sized input/output Vec remains;
+no owner, pool or per-group grant is added. Scoped rank metadata can still
+allocate. Direct zero scratch does not imply zero Host allocations or latency.
+
+
+The MVN public regression uses actual fixed-stride persistent input/output
+bindings, with physical padding and logical subshapes. Ordinary host Tensor
+uploads currently borrow/copy a contiguous byte prefix; custom non-contiguous
+layouts are now rejected during shared input binding for both prepare and run,
+with a named input and an explicit materialization/fixed-stride-binding remedy.
+They are no longer silently interpreted as dense storage. Canonical contiguous
+strides remain accepted regardless of the layout format hint. General strided
+host Tensor uploads require a separate explicit ownership/transfer design;
+this change does not add an implicit gather allocation.
+
+
+Real ORT testing also exposed a missing MVN entry in the shared plugin's
+shape-preserving route table; it now uses the existing SameAsInput(0) mechanism.
+ORT 1.32.0 (current PyPI release at validation) does not ship the ONNX MVN-29
+schema. The integration fixture therefore supplies a test-local schema
+descriptor in the standard domain and enables unreleased opsets only in that
+session. This is schema transport, not an alternate implementation: the
+schema-only CPU callback returns an error if invoked, a positive control checks
+that guard, and actual inference must assign the node to cpu_ep with zero
+schema-callback executions. This proves the real plugin compute path under the
+provided descriptor, not built-in ORT MVN-29 schema compatibility. Native Session
+tests exercise the unmodified MVN-29 attributes and computation directly.
+Official schema: https://onnx.ai/onnx/operators/onnx__MeanVarianceNormalization.html
+
+
+### LogSoftmax reuses staging for widening and streams narrowed output
+
+LogSoftmax now widens non-borrowable input directly into its existing admitted
+f32 lane, then reduces that snapshot in place. Each logical coordinate belongs
+to one `(outer, inner)` group. A group's maximum and exponential sum finish
+before its first write; no later group can read that group's results. The
+arithmetic loop is shared with the unchanged contiguous aligned-f32 borrowing
+route through statically dispatched source accessors. The original reduction
+order, f32 computation (including f64 input conversion), and storage narrowing
+are preserved for both opset families. Real output is published only after all
+source reads, including shifted overlap.
+
+The allocation witness also exposed a second payload: scalar output narrowing
+collected a complete storage-T Vec before scattering. Typed writes and scalar
+narrowing now share one private checked scatter visitor, which converts and
+writes one element at a time. Existing f16/bf16 SIMD and f32 memcpy routes remain
+unchanged. The source/output disjoint contract already required by those routes
+is explicit; production callers were audited for owned or workspace-backed
+results and direct-output bypasses. There is no new snapshot owner, pool,
+per-group request, or workspace-bound increase: LogSoftmax still uses one
+StepScoped `4 * numel` lane. Rank-sized indexing metadata may still allocate.
+
+Real allocator tests cover all four float storage types, contiguous/strided
+sources, padded strided outputs, every axis and both opset semantics. A real
+allocating storage-copy positive control verifies the counter; 32 repeated calls
+per combination allocate no matrix-sized payload. Immutable coordinate oracles
+check storage-converted output bits and padding. Separate tests exercise both
+directions of shifted overlap (including NaN/Inf), unaligned negative-stride
+narrowing with exact byte canaries, and short-producer refusal before writes.
+Existing warm governor, peak refusal/reuse/trim, public Session and real ORT
+assignment tests remain in place. These are correctness and allocation results;
+no latency or CUDA-runtime improvement is inferred.

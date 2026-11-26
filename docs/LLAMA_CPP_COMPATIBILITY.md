@@ -672,12 +672,15 @@ parity. These upstream capabilities remain incomplete:
 - Video decision inputs, broader audio codecs and additional DSP operations/conventions,
   joint/packed decision heads and shared generation/decision entry points.
 - Device-state/multi-sequence slot persistence; arbitrary GGUF/PEFT LoRA imports and device-fused LoRA.
-- Bare GGUF graph import, quantization selectors and selective sidecar management.
+- Bare GGUF graph import, filename-based GGUF quantization selection and selective sidecar management.
   Native nxrt packages can explicitly bind GGUF or SafeTensors weights to their
   ONNX graphs through schema `v1.17` `graph_weights`; decoder, workflow and MTP
   loading share the bindings. Exact tensor dtype/shape matching is required.
   See [inference metadata](genai/MODEL_METADATA.md#components-and-graph).
-  Hugging Face nxrt-package download, resume and deletion are supported.
+  Hugging Face nxrt-package download, resume and deletion are supported. Explicit
+  `repository:variant` selection supports authored model-package variants,
+  including selective installation and shared tokenizer assets; this does not
+  infer an executable graph from a bare GGUF repository.
 
 `/v1/systemone` executes text/structured-state decision profiles, with explicit
 model-authored prompting, calibration outputs, variants and answer policies.

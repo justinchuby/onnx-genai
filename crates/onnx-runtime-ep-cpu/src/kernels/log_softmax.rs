@@ -1,6 +1,9 @@
 //! Numerically stable `LogSoftmax` with ONNX-versioned axis semantics.
 
-use crate::dtype::{to_dense_f32_widen, validate_f32_widen_input, write_dense_f32_narrow};
+use crate::dtype::{
+    can_borrow_dense_f32, to_dense_f32_widen, to_dense_f32_widen_into, validate_f32_widen_input,
+    write_dense_f32_narrow,
+};
 use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
     WorkspacePreparation, WorkspaceView,
@@ -45,21 +48,32 @@ impl KernelFactory for LogSoftmaxLegacyFactory {
 
 /// Write `x - logsumexp(x)` over strided reduction slices. Subtracting the
 /// slice maximum before exponentiation makes the logsumexp calculation stable.
-fn log_softmax_slices(x: &[f32], out: &mut [f32], outer: usize, axis_dim: usize, inner: usize) {
+// `read` selects either an immutable borrowed source or the current staging
+// lane. Every element belongs to exactly one (outer, inner) group; the max and
+// sum finish before that group's first write, so in-place reads never observe
+// another group's normalized outputs. Static closures keep both routes in one
+// arithmetic implementation without constructing aliased shared/mutable slices.
+fn log_softmax_slices(
+    out: &mut [f32],
+    read: impl Fn(&[f32], usize) -> f32,
+    outer: usize,
+    axis_dim: usize,
+    inner: usize,
+) {
     for o in 0..outer {
         for i in 0..inner {
             let base = o * axis_dim * inner + i;
             let mut max = f32::NEG_INFINITY;
             for a in 0..axis_dim {
-                max = max.max(x[base + a * inner]);
+                max = max.max(read(out, base + a * inner));
             }
             let mut sum = 0.0;
             for a in 0..axis_dim {
-                sum += (x[base + a * inner] - max).exp();
+                sum += (read(out, base + a * inner) - max).exp();
             }
             let log_sum = sum.ln();
             for a in 0..axis_dim {
-                out[base + a * inner] = (x[base + a * inner] - max) - log_sum;
+                out[base + a * inner] = (read(out, base + a * inner) - max) - log_sum;
             }
         }
     }
@@ -108,8 +122,29 @@ impl LogSoftmaxKernel {
                 if geometry.count == 0 {
                     return Ok(());
                 }
-                let x = to_dense_f32_widen("LogSoftmax", &inputs[0])?;
-                log_softmax_slices(&x, y, geometry.outer, geometry.width, geometry.inner);
+                if can_borrow_dense_f32(&inputs[0]) {
+                    // Keep the existing zero-copy source path. Y is exclusive
+                    // workspace, disjoint from X even when the real output aliases X.
+                    let x = to_dense_f32_widen("LogSoftmax", &inputs[0])?;
+                    log_softmax_slices(
+                        y,
+                        |_, index| x[index],
+                        geometry.outer,
+                        geometry.width,
+                        geometry.inner,
+                    );
+                } else {
+                    // Snapshot every source value before reducing or publishing.
+                    // Conversion retains its existing ISA paths and f64->f32 semantics.
+                    to_dense_f32_widen_into("LogSoftmax", &inputs[0], y)?;
+                    log_softmax_slices(
+                        y,
+                        |lane, index| lane[index],
+                        geometry.outer,
+                        geometry.width,
+                        geometry.inner,
+                    );
+                }
                 // Finish all reads before publishing, preserving overlapping X/Y.
                 write_dense_f32_narrow("LogSoftmax", &mut outputs[0], y)
             })
@@ -221,7 +256,7 @@ mod tests {
         run(-1, false, &x, &mut out);
         let rounded = x.to_bf16_as_f32();
         let mut reference = vec![0.0; rounded.len()];
-        log_softmax_slices(&rounded, &mut reference, 2, 3, 1);
+        log_softmax_slices(&mut reference, |_, index| rounded[index], 2, 3, 1);
         let expected: Vec<_> = reference
             .into_iter()
             .map(half::bf16::from_f32)
@@ -469,6 +504,65 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
+    #[test]
+    fn widened_snapshot_finishes_before_shifted_overlapping_output_is_published() {
+        use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
+        use onnx_runtime_ir::{DataType, DeviceId};
+        for values in [
+            [1., -2., 3., -4., 5., -6.],
+            [f32::NEG_INFINITY, 0., 1., -0., f32::NAN, f32::INFINITY],
+        ] {
+            for legacy in [false, true] {
+                for axis in [0, 1] {
+                    let source = Owned::f32(&[2, 3], &values);
+                    let mut expected = Owned::zeros_f32(&[2, 3]);
+                    run(axis, legacy, &source, &mut expected);
+                    for destination in [0, 6] {
+                        let mut storage = [123f32; 16];
+                        for (i, &value) in values.iter().enumerate() {
+                            storage[1 + 2 * i] = value;
+                        }
+                        let before = storage.map(f32::to_bits);
+                        let pointer = storage.as_mut_ptr();
+                        let mut x = TensorView::new(
+                            DevicePtr(pointer.cast()),
+                            DataType::Float32,
+                            &[2, 3],
+                            &[6, 2],
+                            DeviceId::cpu(),
+                        );
+                        x.byte_offset = size_of::<f32>();
+                        let mut y = TensorMut::new(
+                            DevicePtrMut(pointer.cast()),
+                            DataType::Float32,
+                            &[2, 3],
+                            &[3, 1],
+                            DeviceId::cpu(),
+                        );
+                        y.byte_offset = destination * size_of::<f32>();
+                        LogSoftmaxKernel {
+                            axis,
+                            coerce_2d: legacy,
+                        }
+                        .execute_prepared(&[x], &mut [y])
+                        .unwrap();
+                        for (actual, want) in storage[destination..destination + 6]
+                            .iter()
+                            .zip(expected.to_f32())
+                        {
+                            assert_eq!(actual.to_bits(), want.to_bits());
+                        }
+                        for i in 0..16 {
+                            if !(destination..destination + 6).contains(&i) {
+                                assert_eq!(storage[i].to_bits(), before[i]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn governed_logsoftmax_staging_reuses_one_lane_without_warm_issuer_callbacks() {
         use crate::kernels::testutil::RecordingGovernor;

@@ -14,9 +14,11 @@ protocol; it does not enable the separate `/v1/admin/*` API.
 The current managed source is a Hugging Face **nxrt package** containing its
 inference metadata, tokenizer and declared model artifacts. The package may use
 `inference_metadata.yaml`, `.yml`, `.json`, or the supported GenAI package
-configuration. Loading still uses the configured backend and the package's
-explicit workflow. A GGUF repository or quantization selector is not converted
-into an ONNX workflow automatically. Selective GGUF sidecars remain unsupported;
+configuration, or the supported ORT model-package `manifest.json`. Loading still
+uses the configured backend and the package's explicit workflow. Native packages
+can bind GGUF/SafeTensors containers through `graph_weights`; containers alone
+do not declare an executable graph. Named quantization/variant selectors require
+an authored manifest entry. Selective GGUF sidecars remain unsupported;
 nonempty `sidecars` or `sidecar` selectors fail explicitly rather than deleting
 or downloading a different selection. `/props` advertises
 `nxrt_capabilities.model_management` and `managed_model_formats`.
@@ -59,6 +61,53 @@ restart. Resume uses HTTP Range when a prefix exists. If the source returns a
 complete response instead, the server restarts that owned file; an inconsistent
 `Content-Range` is rejected without appending to the prefix. To select a different
 revision, delete the old entry first.
+
+## Explicit package variants
+
+```http
+POST /models
+Content-Type: application/json
+
+{"model":"organization/native-package:Q4_K_M","sidecars":[]}
+```
+
+The suffix names the exact `manifest.json` variant key. No filename matching,
+architecture inference, quantization conversion or fallback to a different
+variant occurs. Named selectors use portable identifier characters (letters,
+digits, `.`, `_`, `-`). A flat package rejects a named selector.
+
+The server reads the package index at the resolved immutable commit, using the
+same component and variant selection rules as local loading. Inline component
+indexes and external `component.json` references are supported. The transfer
+contains the index documents, the selected `variant_directory`, standard
+`shared_assets/` content and explicitly mapped shared-asset roots. Unrelated
+variant directories are excluded. Limits and reservations apply to this selected
+transfer; each JSON index is bounded to 4 MiB and checked for exact size and any
+LFS SHA-256 before planning. All remote file names are validated before index
+requests, including unselected names.
+
+The full selector is the model ID for progress, load, inference, resume and
+deletion. Its separate variant field persists in cache-manifest **version 2**;
+older cache versions are explicitly refused. Use a separate cache directory or a
+compatible build to access an older cache; the server does not rewrite or delete
+operator files to migrate it. Variants are independent cache entries, including
+their shared payloads and quotas. Deleting one entry does not delete another.
+
+For installed packages, `--models-config` accepts the same explicit selection:
+
+```toml
+[[models]]
+id = "my-model"
+path = "/models/native-package"
+package_variant = "Q4_K_M"
+```
+
+The selected graph, workflow, metadata, tokenizer and serving templates use that
+variant consistently. Shared tokenizer assets are supported, with variant-local
+prompt assets taking precedence. A contradictory workflow tokenizer declaration
+is rejected. Runtime loading validates every selected reference and canonical
+path; an explicit full-package audit still checks all declared variants, even
+ones that have not been installed.
 
 ## Progress and deletion
 
