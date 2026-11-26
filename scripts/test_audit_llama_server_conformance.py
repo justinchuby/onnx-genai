@@ -71,6 +71,80 @@ class InventoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing evidence"):
             audit.validate(audit.ROOT, self.inventory)
 
+    def test_package_identity_is_explicit_and_matches_manifest_and_source(self):
+        for missing in ["package", "package_manifest"]:
+            inventory = copy.deepcopy(self.inventory)
+            inventory["evidence"]["discovery"].pop(missing)
+            with self.assertRaisesRegex(ValueError, "explicit package"):
+                audit.validate(audit.ROOT, inventory)
+        inventory = copy.deepcopy(self.inventory)
+        inventory["evidence"]["discovery"]["package"] = "onnx-genai-cli"
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            audit.validate(audit.ROOT, inventory)
+        inventory["evidence"]["discovery"]["package_manifest"] = (
+            "crates/onnx-genai-cli/Cargo.toml"
+        )
+        with self.assertRaisesRegex(ValueError, "outside its declared package"):
+            audit.validate(audit.ROOT, inventory)
+
+    def test_target_must_match_its_package_source_layout(self):
+        for target in ["test:http", "test:missing_target", "bin:onnx_genai_server"]:
+            inventory = copy.deepcopy(self.inventory)
+            inventory["evidence"]["discovery"]["target"] = target
+            with self.assertRaisesRegex(ValueError, "entrypoint|invalid Rust target"):
+                audit.validate(audit.ROOT, inventory)
+
+    def test_custom_target_path_workspace_exclusion_and_harness_are_checked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "member"
+            (package / "tests").mkdir(parents=True)
+            (root / "Cargo.toml").write_text('[workspace]\nmembers=["member"]\n')
+            manifest = package / "Cargo.toml"
+            manifest.write_text(
+                '[package]\nname="sample-package"\nversion="0.0.0"\n[[test]]\nname="wire"\npath="tests/custom.rs"\n'
+            )
+            (package / "tests" / "custom.rs").write_text("#[test] fn wire() {}\n")
+            case = {
+                "package": "sample-package",
+                "package_manifest": "member/Cargo.toml",
+                "target": "test:wire",
+                "source": "member/tests/custom.rs",
+            }
+            self.assertEqual(audit.package_target(root, case, "fixture"), manifest)
+            manifest.write_text(manifest.read_text() + "harness=false\n")
+            with self.assertRaisesRegex(ValueError, "custom test harness"):
+                audit.package_target(root, case, "fixture")
+            (root / "Cargo.toml").write_text(
+                '[workspace]\nmembers=["member"]\nexclude=["member"]\n'
+            )
+            with self.assertRaisesRegex(ValueError, "not a selected workspace member"):
+                audit.package_target(root, case, "fixture")
+
+    def test_custom_lib_harness_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "member"
+            (package / "src").mkdir(parents=True)
+            (root / "Cargo.toml").write_text('[workspace]\nmembers=["member"]\n')
+            manifest = package / "Cargo.toml"
+            manifest.write_text(
+                '[package]\nname="sample-package"\nversion="0.0.0"\n[lib]\nharness=false\n'
+            )
+            (package / "src" / "lib.rs").write_text("#[test] fn native_default() {}\n")
+            case = {
+                "package": "sample-package",
+                "package_manifest": "member/Cargo.toml",
+                "target": "lib",
+                "source": "member/src/lib.rs",
+            }
+            with self.assertRaisesRegex(ValueError, "custom lib test harness"):
+                audit.package_target(root, case, "fixture")
+            manifest.write_text(
+                manifest.read_text().replace("harness=false", "harness=true")
+            )
+            self.assertEqual(audit.package_target(root, case, "fixture"), manifest)
+
     def test_source_paths_cannot_escape_repository(self):
         with self.assertRaisesRegex(ValueError, "invalid evidence source"):
             audit.source_path(audit.ROOT, "../../outside.rs")
@@ -347,6 +421,68 @@ class ExecutionTests(unittest.TestCase):
             self.assertIn("--list", receipt["cases"][0]["list"]["command"])
             self.assertIn("--exact", receipt["cases"][0]["run"]["command"])
             self.assertEqual(receipt["source"]["revision"], "a" * 40)
+
+    def test_mixed_package_commands_and_manifest_hashes_follow_each_case(self):
+        inventory = json.loads((audit.ROOT / audit.INVENTORY).read_text())
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.args(directory)
+            args.run = ["aliases_counts", "cli_removed_repl"]
+            with (
+                patch.object(
+                    audit,
+                    "source_state",
+                    return_value={"revision": "a" * 40, "tree": "b" * 40},
+                ),
+                patch.object(audit, "run_contained", side_effect=self.fake_cargo),
+            ):
+                audit.run(inventory, args)
+            receipt = json.loads(args.receipt.read_text())
+            self.assertEqual(receipt["status"], "passed")
+            self.assertEqual(
+                [entry["package"] for entry in receipt["cases"]],
+                ["onnx-genai-server", "onnx-genai-cli"],
+            )
+            for entry in receipt["cases"]:
+                self.assertIn(entry["package_manifest"], receipt["content_sha256"])
+                for phase in ["list", "run"]:
+                    command = entry[phase]["command"]
+                    self.assertEqual(command[command.index("-p") + 1], entry["package"])
+            self.assertIn("crates/onnx-genai-cli/Cargo.toml", receipt["content_sha256"])
+            self.assertIn(
+                "crates/onnx-genai-server/Cargo.toml", receipt["content_sha256"]
+            )
+
+    def test_selected_cli_manifest_change_invalidates_receipt(self):
+        inventory = json.loads((audit.ROOT / audit.INVENTORY).read_text())
+        original_digest = audit.digest
+        seen = 0
+
+        def changed_digest(path):
+            nonlocal seen
+            if path == audit.ROOT / "crates/onnx-genai-cli/Cargo.toml":
+                seen += 1
+                return "initial" if seen == 1 else "changed"
+            return original_digest(path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.args(directory)
+            args.run = ["cli_removed_repl"]
+            with (
+                patch.object(
+                    audit,
+                    "source_state",
+                    return_value={"revision": "a" * 40, "tree": "b" * 40},
+                ),
+                patch.object(audit, "run_contained", side_effect=self.fake_cargo),
+                patch.object(audit, "digest", side_effect=changed_digest),
+                self.assertRaisesRegex(ValueError, "source/config changed"),
+            ):
+                audit.run(inventory, args)
+            receipt = json.loads(args.receipt.read_text())
+            self.assertEqual(receipt["status"], "failed")
+            self.assertEqual(
+                receipt["content_sha256"]["crates/onnx-genai-cli/Cargo.toml"], "initial"
+            )
 
     def test_failed_or_changed_source_cannot_leave_a_success_receipt(self):
         inventory = json.loads((audit.ROOT / audit.INVENTORY).read_text())
