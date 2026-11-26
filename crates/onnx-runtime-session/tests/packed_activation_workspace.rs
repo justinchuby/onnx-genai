@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 fn bytes(rows: usize) -> u64 {
     let columns = if rows > 1 { rows * 2 * 4 } else { 0 };
-    (columns + (rows * 34).next_multiple_of(4)) as u64
+    (columns + (rows * 34).next_multiple_of(4) + rows * 2 * 4) as u64
 }
 
 fn model() -> Vec<u8> {

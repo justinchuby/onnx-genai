@@ -430,6 +430,7 @@ fn hex(bytes: &[u8]) -> String {
 pub struct ServerConfig {
     pub sse_ping_interval: crate::SsePingInterval,
     pub api_keys: crate::ApiKeys,
+    pub cors: crate::CorsPolicy,
     /// Node-level identifier reported by `GET /v1/status` for the cluster router
     /// (§34.8). Independent of any model; defaults to the hostname or a generated id.
     pub node_id: String,
@@ -530,6 +531,7 @@ impl Default for ServerConfig {
         Self {
             sse_ping_interval: crate::SsePingInterval::default(),
             api_keys: crate::ApiKeys::default(),
+            cors: crate::CorsPolicy::default(),
             node_id: default_node_id(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             realtime: crate::realtime::RealtimeLimits::default(),

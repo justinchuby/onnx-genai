@@ -314,9 +314,14 @@ try {
   const firstResponse = await responsePromise;
   assert(firstResponse.ok(), `chat request failed: ${firstResponse.status()} ${await firstResponse.text()}`);
   await firstResponse.finished();
+  // Navigation can retire Chrome's response-body handle. Capture the completed
+  // wire bytes once while that document is live, then compare replay after reload.
+  const originalWire = await firstResponse.text();
+  const conversationId = (await firstResponse.request().allHeaders())['x-conversation-id'];
+  assert(conversationId, 'UI did not identify its conversation for resumable streaming');
   const payload = firstResponse.request().postDataJSON();
   assert(!payload.tools?.length, 'UI attached tools to a model that explicitly declares no tool protocol');
-  const wireAnswer = (await firstResponse.text()).split('\n')
+  const wireAnswer = originalWire.split('\n')
     .filter(line => line.startsWith('data: ') && line !== 'data: [DONE]')
     .flatMap(line => JSON.parse(line.slice(6)).choices ?? [])
     .map(choice => choice.delta?.content ?? '').join('');
@@ -332,9 +337,6 @@ try {
   await page.reload({ waitUntil: 'networkidle' });
   await page.getByLabel('User message with actions', { exact: true }).first().waitFor({ timeout: 15000 });
   assert((await page.locator('body').innerText()).includes('hello'), 'conversation was not restored after reload');
-  const conversationId = (await firstResponse.request().allHeaders())['x-conversation-id'];
-  assert(conversationId, 'UI did not identify its conversation for resumable streaming');
-  const originalWire = await firstResponse.text();
   const replay = await page.evaluate(async ({ origin, conversationId }) => {
     const response = await fetch(`${origin}/v1/stream?conv_id=${encodeURIComponent(conversationId)}&from=0`);
     return { status: response.status, body: await response.text() };

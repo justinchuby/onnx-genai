@@ -337,3 +337,37 @@ fn retired_capability_lists_have_actionable_typed_extension_migration() {
         "{error}"
     );
 }
+
+#[test]
+fn gguf_adapter_bindings_have_mandatory_core_obligations_and_a_valid_fixture() {
+    let floor = onnx_genai_metadata::GGUF_ADAPTER_SCHEMA_VERSION;
+    let row = CORE_CONFORMANCE
+        .iter()
+        .find_map(|(version, row)| (*version == floor).then_some(*row))
+        .expect("GGUF adapter schema floor has a core row");
+    for required in [
+        "GGUF LoRA",
+        "exact source/target bindings",
+        "factor storage",
+        "alpha/rank",
+        "unsupported adapter variants fail closed",
+    ] {
+        assert!(row.contains(required), "missing {required}: {row}");
+    }
+    assert_eq!(
+        find("onnx-genai.adapters.gguf", "1").unwrap().schema_floor,
+        floor
+    );
+    let metadata = parse_metadata(
+        include_str!("fixtures/gguf_adapter_v1_19.json"),
+        Some("json"),
+    )
+    .unwrap();
+    onnx_genai_metadata::validate_metadata(&metadata).unwrap();
+    let adapter = &metadata.adapters.as_ref().unwrap().artifacts["mapped"];
+    assert_eq!(adapter.bindings[0].weight_key, "explicit.saved.projection");
+    assert_eq!(
+        adapter.weights[0].format,
+        onnx_genai_metadata::AdapterWeightFormat::Gguf
+    );
+}

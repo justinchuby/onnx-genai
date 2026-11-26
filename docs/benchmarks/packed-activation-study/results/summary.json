@@ -1,0 +1,349 @@
+{
+  "cells": [
+    {
+      "format": "q4",
+      "rows": 1,
+      "k": 1024,
+      "n": 256,
+      "status": "diagnostic",
+      "failures": [
+        {
+          "gate": "foreign process-average CPU",
+          "processes": [
+            "paired-q4-1-0",
+            "process-q4-1-q8_0-work-0",
+            "paired-q4-1-1",
+            "process-q4-1-float32-work-1",
+            "process-q4-1-float32-setup-1",
+            "paired-q4-1-2",
+            "process-q4-1-float32-work-copy-2",
+            "process-q4-1-float32-work-double-2"
+          ]
+        }
+      ],
+      "calls_per_window": 2048,
+      "paired_repetitions": 3,
+      "paired_aa_delta_pct": [
+        0.04028136891847112,
+        0.2963525895335106,
+        0.18867359768692804
+      ],
+      "paired_range_pct": {
+        "0": 3.033002244488257,
+        "2": 6.622965949808836
+      },
+      "process_controls": {
+        "float32": {
+          "aa_delta_pct": [
+            0.2262120588053973,
+            3.1098943058387674,
+            0.1973770566187083
+          ],
+          "setup_fraction": [
+            0.015043530456758346,
+            0.013340792158778432,
+            0.015097219403288004
+          ],
+          "double_marginal_cpu_ratio": [
+            1.997743008500678,
+            1.9393016455075551,
+            2.057923396370123
+          ]
+        },
+        "q8_0": {
+          "aa_delta_pct": [
+            3.0631397834512297,
+            0.03032876379960303,
+            0.108145520612557
+          ],
+          "setup_fraction": [
+            0.09300776540222423,
+            0.07643130018971386,
+            0.07772880477054706
+          ],
+          "double_marginal_cpu_ratio": [
+            1.9845312906704347,
+            2.002363667060611,
+            1.9944057123580343
+          ]
+        }
+      },
+      "declared_workspace_bytes": [
+        16384,
+        16384,
+        1088
+      ],
+      "retained_physical_workspace_bytes": 16384,
+      "warm_issuer_callbacks": {
+        "claims": 0,
+        "returns": 0
+      },
+      "output_contract": "Every output checked bitwise against independent integer coordinate oracle; exact-quantization fixture only",
+      "timing_comparison": null
+    },
+    {
+      "format": "q4",
+      "rows": 8,
+      "k": 1024,
+      "n": 256,
+      "status": "diagnostic",
+      "failures": [
+        {
+          "gate": "foreign process-average CPU",
+          "processes": [
+            "process-q4-8-q8_0-work-double-0",
+            "paired-q4-8-1",
+            "process-q4-8-float32-work-double-1",
+            "process-q4-8-float32-setup-2",
+            "process-q4-8-q8_0-setup-double-2"
+          ]
+        },
+        {
+          "gate": "setup CPU fraction",
+          "arm": "float32",
+          "fractions": [
+            0.12419651274628371,
+            0.1239406779661017,
+            0.13519955180370521
+          ]
+        },
+        {
+          "gate": "setup CPU fraction",
+          "arm": "q8_0",
+          "fractions": [
+            0.11271676300578035,
+            0.13628589508970565,
+            0.11291614816835142
+          ]
+        }
+      ],
+      "calls_per_window": 256,
+      "paired_repetitions": 3,
+      "paired_aa_delta_pct": [
+        0.025922226421104533,
+        0.06410036292713306,
+        0.041562940474915155
+      ],
+      "paired_range_pct": {
+        "0": 2.2842820627164677,
+        "2": 2.6971792830209442
+      },
+      "process_controls": {
+        "float32": {
+          "aa_delta_pct": [
+            0.225182426269388,
+            0.14239977063124076,
+            0.20838884025424775
+          ],
+          "setup_fraction": [
+            0.12419651274628371,
+            0.1239406779661017,
+            0.13519955180370521
+          ],
+          "double_marginal_cpu_ratio": [
+            1.9969772423316552,
+            2.010610368530562,
+            2.0187432059995825
+          ]
+        },
+        "q8_0": {
+          "aa_delta_pct": [
+            0.07102211953964321,
+            0.44440660650433284,
+            0.046855964764314084
+          ],
+          "setup_fraction": [
+            0.11271676300578035,
+            0.13628589508970565,
+            0.11291614816835142
+          ],
+          "double_marginal_cpu_ratio": [
+            2.014995277836671,
+            2.0327719527529426,
+            2.007926747247257
+          ]
+        }
+      },
+      "declared_workspace_bytes": [
+        24576,
+        24576,
+        16896
+      ],
+      "retained_physical_workspace_bytes": 24576,
+      "warm_issuer_callbacks": {
+        "claims": 0,
+        "returns": 0
+      },
+      "output_contract": "Every output checked bitwise against independent integer coordinate oracle; exact-quantization fixture only",
+      "timing_comparison": null
+    },
+    {
+      "format": "q8",
+      "rows": 1,
+      "k": 1024,
+      "n": 256,
+      "status": "diagnostic",
+      "failures": [
+        {
+          "gate": "foreign process-average CPU",
+          "processes": [
+            "paired-q8-1-0",
+            "process-q8-1-float32-work-copy-0",
+            "paired-q8-1-1",
+            "process-q8-1-q8_0-work-double-1",
+            "process-q8-1-float32-work-1",
+            "process-q8-1-float32-work-double-1",
+            "paired-q8-1-2",
+            "process-q8-1-q8_0-work-copy-2"
+          ]
+        }
+      ],
+      "calls_per_window": 8192,
+      "paired_repetitions": 3,
+      "paired_aa_delta_pct": [
+        0.07792725533855016,
+        0.07499262632326698,
+        0.046749181997185474
+      ],
+      "paired_range_pct": {
+        "0": 3.846242346891494,
+        "2": 5.016694966283275
+      },
+      "process_controls": {
+        "float32": {
+          "aa_delta_pct": [
+            1.1363890566628787,
+            0.6119674105805828,
+            0.4730010076462676
+          ],
+          "setup_fraction": [
+            0.00917686228241721,
+            0.009984643951708762,
+            0.01199407053997988
+          ],
+          "double_marginal_cpu_ratio": [
+            1.9990626135031504,
+            2.02586883862803,
+            1.9981630898305527
+          ]
+        },
+        "q8_0": {
+          "aa_delta_pct": [
+            0.5950800814087054,
+            0.0391531108254628,
+            2.6177142568848066
+          ],
+          "setup_fraction": [
+            0.08316457104706797,
+            0.060142041045575814,
+            0.0674610516967028
+          ],
+          "double_marginal_cpu_ratio": [
+            2.052494457659757,
+            2.0586750540593672,
+            2.022253968253968
+          ]
+        }
+      },
+      "declared_workspace_bytes": [
+        16384,
+        16384,
+        1088
+      ],
+      "retained_physical_workspace_bytes": 16384,
+      "warm_issuer_callbacks": {
+        "claims": 0,
+        "returns": 0
+      },
+      "output_contract": "Every output checked bitwise against independent integer coordinate oracle; exact-quantization fixture only",
+      "timing_comparison": null
+    },
+    {
+      "format": "q8",
+      "rows": 8,
+      "k": 1024,
+      "n": 256,
+      "status": "diagnostic",
+      "failures": [
+        {
+          "gate": "foreign process-average CPU",
+          "processes": [
+            "process-q8-8-float32-work-double-0",
+            "process-q8-8-float32-setup-double-0",
+            "paired-q8-8-2"
+          ]
+        },
+        {
+          "gate": "setup CPU fraction",
+          "arm": "q8_0",
+          "fractions": [
+            0.10623852271313917,
+            0.08478848542412508,
+            0.08585636008402744
+          ]
+        }
+      ],
+      "calls_per_window": 1024,
+      "paired_repetitions": 3,
+      "paired_aa_delta_pct": [
+        0.15491730102183965,
+        0.020803620046339066,
+        0.0766521180705082
+      ],
+      "paired_range_pct": {
+        "0": 4.012880858176603,
+        "2": 6.557857984722188
+      },
+      "process_controls": {
+        "float32": {
+          "aa_delta_pct": [
+            0.2098531551238736,
+            0.6406083174917199,
+            0.2915132042943358
+          ],
+          "setup_fraction": [
+            0.05798827074422807,
+            0.0739195387236273,
+            0.061784477383590865
+          ],
+          "double_marginal_cpu_ratio": [
+            2.0360621566333856,
+            2.036338319947021,
+            2.0014743249657947
+          ]
+        },
+        "q8_0": {
+          "aa_delta_pct": [
+            0.20807779919397307,
+            0.17358578638736466,
+            0.7124989972506435
+          ],
+          "setup_fraction": [
+            0.10623852271313917,
+            0.08478848542412508,
+            0.08585636008402744
+          ],
+          "double_marginal_cpu_ratio": [
+            2.046577495456853,
+            1.991857262603281,
+            2.007978659295982
+          ]
+        }
+      },
+      "declared_workspace_bytes": [
+        24576,
+        24576,
+        16896
+      ],
+      "retained_physical_workspace_bytes": 24576,
+      "warm_issuer_callbacks": {
+        "claims": 0,
+        "returns": 0
+      },
+      "output_contract": "Every output checked bitwise against independent integer coordinate oracle; exact-quantization fixture only",
+      "timing_comparison": null
+    }
+  ],
+  "interpretation": "Cache-hot synthetic CPU projection; one thread; no model/GPU/quality extrapolation",
+  "policy": "Screened cells pass the stated process-average/AA/range controls, without proving window-level absence of contention; diagnostic cells remain recorded and excluded from timing conclusions."
+}

@@ -1,4 +1,4 @@
-//! Real saved F32 SafeTensors PEFT factors through Native ONNX and the existing
+//! Real saved floating-point SafeTensors PEFT factors through Native ONNX and the existing
 //! parameter-overlay target manifest. No Python/PEFT dependency or mock executor.
 #![cfg(feature = "native-backend")]
 use onnx_genai_engine::{
@@ -249,7 +249,11 @@ fn native_peft_rejects_variants_rank_mismatch_and_unmapped_tensors_without_parti
     std::fs::write(tensor_path(root.path()), f16).unwrap();
     let mut native = engine(root.path());
     let error = run(&mut native, Some(1.0)).unwrap_err();
-    assert!(format!("{error:#}").contains("export F32"), "{error:#}");
+    assert!(
+        format!("{error:#}").contains("storage dtype Float16")
+            && format!("{error:#}").contains("declared dtype Float32"),
+        "{error:#}"
+    );
     assert_eq!(run(&mut native, None).unwrap(), [4.0, 15.0]);
     for bytes in [
         saved_tensors(&[1.0, 2.0], &[3.0, 4.0], "F32", true),
@@ -395,4 +399,316 @@ fn native_peft_governor_denies_staging_before_safetensors_decode_and_recovers() 
     assert_eq!(run(&mut native, None).unwrap(), [4.0, 15.0]);
     std::fs::write(tensor_path(root.path()), original).unwrap();
     assert_eq!(run(&mut native, Some(0.5)).unwrap(), [40.0, 63.0]);
+}
+
+fn raw_factors(dtype_a: &str, dtype_b: &str, rank: usize, a: &[u8], b: &[u8]) -> Vec<u8> {
+    let header=serde_json::to_vec(&json!({
+        format!("{MODULE}.lora_A.weight"):{"dtype":dtype_a,"shape":[rank,2],"data_offsets":[0,a.len()]},
+        format!("{MODULE}.lora_B.weight"):{"dtype":dtype_b,"shape":[2,rank],"data_offsets":[a.len(),a.len()+b.len()]}
+    })).unwrap();
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend(header);
+    bytes.extend(a);
+    bytes.extend(b);
+    bytes
+}
+fn half_bytes(bits: &[u16]) -> Vec<u8> {
+    bits.iter().flat_map(|bits| bits.to_le_bytes()).collect()
+}
+fn half_package(dtype: &str, a: &[u16], b: &[u16]) -> tempfile::TempDir {
+    let root = package();
+    let path = root.path().join("inference_metadata.yaml");
+    let mut metadata: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    metadata["adapters"]["artifacts"]["peft"]["dtype"] = serde_yaml::Value::String(
+        if dtype == "F16" {
+            "float16"
+        } else {
+            "bfloat16"
+        }
+        .into(),
+    );
+    metadata["adapters"]["artifacts"]["peft"]["rank"] = serde_yaml::to_value(2).unwrap();
+    metadata["adapters"]["artifacts"]["peft"]["alpha"] = serde_yaml::to_value(4.0).unwrap();
+    metadata["adapters"]["target_manifest"]["targets"][0]["rank"] =
+        serde_yaml::to_value(2).unwrap();
+    metadata["adapters"]["target_manifest"]["targets"][0]["alpha"] =
+        serde_yaml::to_value(4.0).unwrap();
+    let capacity = json!({"budgets":[{"dimensions":["batch"],"max_total":2}]});
+    for component in ["decoder", "overlay"] {
+        metadata["pipeline"]["workflow"]["components"][component]["batch_capacity"] =
+            serde_yaml::to_value(&capacity).unwrap();
+    }
+    let port = json!({"dtype":"float32","shape":["batch",2],"batch_layout":{"kind":"request_aligned","axis":0}});
+    metadata["pipeline"]["workflow"]["components"]["decoder"]["ports"] = serde_yaml::to_value(
+        json!({"inputs":{"activations":port.clone()},"outputs":{"projection.output":port}}),
+    )
+    .unwrap();
+    std::fs::write(path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
+    let mut cfg = config();
+    cfg["r"] = json!(2);
+    cfg["lora_alpha"] = json!(4);
+    std::fs::write(config_path(root.path()), serde_json::to_vec(&cfg).unwrap()).unwrap();
+    std::fs::write(
+        tensor_path(root.path()),
+        raw_factors(dtype, dtype, 2, &half_bytes(a), &half_bytes(b)),
+    )
+    .unwrap();
+    root
+}
+fn run_rows(
+    engine: &mut Engine,
+    rows: Vec<Vec<AdapterActivation>>,
+    values: &[f32],
+) -> anyhow::Result<Vec<f32>> {
+    let request = PipelineGenerateRequest::new(GenerateRequest {
+        prompt: GeneratePrompt::TokenIds(vec![]),
+        options: GenerateOptions {
+            adapter_selection: Some(AdapterSelection { rows }),
+            ..Default::default()
+        },
+    })
+    .with_input(
+        "activations",
+        Value::from_slice_f32(values, &[(values.len() / 2) as i64, 2])?,
+    );
+    Ok(engine.run_pipeline(request)?["result"].to_vec_f32()?)
+}
+#[test]
+fn native_peft_f16_bf16_rank_two_storage_preserves_f32_computation_and_row_scales() {
+    // Hand-authored IEEE storage bits; no half conversion library in the oracle.
+    // F16 A[0,0]=1365/4096; BF16 A[0,0]=171/512. Other A values=-1,1/2,2;
+    // B=[[1,1/2],[-1/2,1]]. alpha/r=2. Exact dyadic results below include base diag[2,3].
+    for (dtype, a, b, positive, negative) in [
+        (
+            "F16",
+            [0x3555, 0xbc00, 0x3800, 0x4000],
+            [0x3c00, 0x3800, 0xb800, 0x3c00],
+            [10581.0 / 2048.0, 115371.0 / 4096.0],
+            [97965.0 / 8192.0, 296275.0 / 16384.0],
+        ),
+        (
+            "BF16",
+            [0x3eab, 0xbf80, 0x3f00, 0x4000],
+            [0x3f80, 0x3f00, 0xbf00, 0x3f80],
+            [1323.0 / 256.0, 14421.0 / 512.0],
+            [12243.0 / 1024.0, 37037.0 / 2048.0],
+        ),
+    ] {
+        let root = half_package(dtype, &a, &b);
+        let mut native = engine(root.path());
+        assert_eq!(
+            run_rows(
+                &mut native,
+                vec![
+                    vec![AdapterActivation::new("peft", 0.5)],
+                    vec![AdapterActivation::new("peft", -0.25)]
+                ],
+                &[2.0, 5.0, 7.0, 11.0]
+            )
+            .unwrap(),
+            [positive[0], positive[1], negative[0], negative[1]],
+            "{dtype}"
+        );
+        assert_eq!(
+            run_rows(
+                &mut native,
+                vec![vec![AdapterActivation::new("peft", 0.0)], vec![]],
+                &[2.0, 5.0, 7.0, 11.0]
+            )
+            .unwrap(),
+            [4.0, 15.0, 14.0, 33.0],
+            "{dtype}: zero and absent selection retain F32 base"
+        );
+        assert_eq!(run(&mut native, None).unwrap(), [4.0, 15.0]);
+    }
+}
+#[test]
+fn native_peft_half_dtype_and_nonfinite_errors_leave_cached_valid_adapters_usable() {
+    for (dtype, a, b, invalid, expected) in [
+        (
+            "F16",
+            [0x3555, 0xbc00, 0x3800, 0x4000],
+            [0x3c00, 0x3800, 0xb800, 0x3c00],
+            [0x7c00, 0xfc00, 0x7c01],
+            [10581.0 / 2048.0, 115371.0 / 4096.0],
+        ),
+        (
+            "BF16",
+            [0x3eab, 0xbf80, 0x3f00, 0x4000],
+            [0x3f80, 0x3f00, 0xbf00, 0x3f80],
+            [0x7f80, 0xff80, 0x7f81],
+            [1323.0 / 256.0, 14421.0 / 512.0],
+        ),
+    ] {
+        let root = half_package(dtype, &a, &b);
+        let path = root.path().join("inference_metadata.yaml");
+        let mut metadata: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut bad = metadata["adapters"]["artifacts"]["peft"].clone();
+        bad["index"] = serde_yaml::to_value(1).unwrap();
+        bad["identity"] = serde_yaml::Value::String("bad".into());
+        bad["weights"][0]["location"] =
+            serde_yaml::Value::String("adapters/bad/adapter_model.safetensors".into());
+        bad["weights"][0]["config_location"] =
+            serde_yaml::Value::String("adapters/bad/adapter_config.json".into());
+        metadata["adapters"]["artifacts"]["bad"] = bad;
+        std::fs::write(path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
+        std::fs::create_dir(root.path().join("adapters/bad")).unwrap();
+        std::fs::copy(
+            config_path(root.path()),
+            root.path().join("adapters/bad/adapter_config.json"),
+        )
+        .unwrap();
+        let bad_path = root.path().join("adapters/bad/adapter_model.safetensors");
+        let fp32 = [1_f32, 0.5, -0.5, 1.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>();
+        let fp64 = [1_f64, 0.5, -0.5, 1.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>();
+        let other = if dtype == "F16" { "BF16" } else { "F16" };
+        let mut failures = vec![
+            (
+                raw_factors(other, other, 2, &half_bytes(&a), &half_bytes(&b)),
+                "storage dtype",
+            ),
+            (
+                raw_factors(dtype, "F32", 2, &half_bytes(&a), &fp32),
+                "storage dtype",
+            ),
+            (raw_factors("F64", "F64", 2, &fp64, &fp64), "storage dtype"),
+        ];
+        for bits in invalid {
+            let mut broken = a;
+            broken[0] = bits;
+            failures.push((
+                raw_factors(dtype, dtype, 2, &half_bytes(&broken), &half_bytes(&b)),
+                "nonfinite",
+            ));
+        }
+        let mut native = engine(root.path());
+        assert_eq!(
+            run(&mut native, Some(0.5)).unwrap(),
+            expected,
+            "{dtype}: preload valid cache"
+        );
+        for (bytes, message) in failures {
+            std::fs::write(&bad_path, bytes).unwrap();
+            let error = run_rows(
+                &mut native,
+                vec![vec![
+                    AdapterActivation::new("peft", 0.5),
+                    AdapterActivation::new("bad", 1.0),
+                ]],
+                &[2.0, 5.0],
+            )
+            .unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains(message), "{dtype}: {text}");
+            assert_eq!(
+                run(&mut native, Some(0.5)).unwrap(),
+                expected,
+                "{dtype}: invalid mixed selection cannot contaminate cached valid overlay"
+            );
+            assert_eq!(run(&mut native, None).unwrap(), [4.0, 15.0]);
+        }
+        std::fs::copy(tensor_path(root.path()), bad_path).unwrap();
+        assert_eq!(
+            run_rows(
+                &mut native,
+                vec![vec![AdapterActivation::new("bad", 0.5)]],
+                &[2.0, 5.0]
+            )
+            .unwrap(),
+            expected,
+            "{dtype}: failed load is retryable after a valid file is supplied"
+        );
+    }
+}
+#[test]
+fn native_peft_half_staging_denial_precedes_conversion_and_recovers() {
+    for (dtype, a, b, expected) in [
+        (
+            "F16",
+            [0x3555, 0xbc00, 0x3800, 0x4000],
+            [0x3c00, 0x3800, 0xb800, 0x3c00],
+            [10581.0 / 2048.0, 115371.0 / 4096.0],
+        ),
+        (
+            "BF16",
+            [0x3eab, 0xbf80, 0x3f00, 0x4000],
+            [0x3f80, 0x3f00, 0xbf00, 0x3f80],
+            [1323.0 / 256.0, 14421.0 / 512.0],
+        ),
+    ] {
+        let root = half_package(dtype, &a, &b);
+        let original = std::fs::read(tensor_path(root.path())).unwrap();
+        let length = u64::from_le_bytes(original[..8].try_into().unwrap()) as usize;
+        let mut padded = (8 * 1024 * 1024_u64).to_le_bytes().to_vec();
+        padded.extend(&original[8..8 + length]);
+        padded.resize(8 + 8 * 1024 * 1024, b' ');
+        padded.extend(&original[8 + length..]);
+        std::fs::write(tensor_path(root.path()), padded).unwrap();
+        let mut native = Engine::from_dir(
+            root.path(),
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                native_device: Some(NativeDecodeDevice::Cpu),
+                limits: onnx_genai_engine::ResourceLimits {
+                    host_ram_limit: onnx_genai_engine::ResourceLimit::Bytes(64 * 1024 * 1024),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(run(&mut native, None).unwrap(), [4.0, 15.0]);
+        let error = run(&mut native, Some(0.5)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("reserve adapter container parsing memory"),
+            "{dtype}: {error:#}"
+        );
+        assert_eq!(run(&mut native, None).unwrap(), [4.0, 15.0]);
+        std::fs::write(tensor_path(root.path()), original).unwrap();
+        assert_eq!(
+            run(&mut native, Some(0.5)).unwrap(),
+            expected,
+            "{dtype}: valid inference recovers after pre-conversion budget refusal"
+        );
+    }
+}
+
+#[test]
+fn native_portable_json_requires_f32_storage_instead_of_guessing_half_from_numbers() {
+    for dtype in ["float16", "bfloat16"] {
+        let root = package();
+        let path = root.path().join("inference_metadata.yaml");
+        let mut metadata: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        metadata["adapters"]["artifacts"]["peft"]["dtype"] =
+            serde_yaml::Value::String(dtype.into());
+        metadata["adapters"]["artifacts"]["peft"]["weights"]=serde_yaml::to_value(json!([{"format":"json","location":"adapters/peft/adapter.json","loader_capability":"onnx-genai.adapters.json@1","scale_encoding":"alpha_over_rank"}])).unwrap();
+        std::fs::write(&path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
+        std::fs::write(
+            root.path().join("adapters/peft/adapter.json"),
+            serde_json::to_vec(&json!({"targets":{(MODULE):{"a":[1.0,2.0],"b":[3.0,4.0]}}}))
+                .unwrap(),
+        )
+        .unwrap();
+        let mut native = engine(root.path());
+        let error = run(&mut native, Some(0.5)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("JSON adapter normalization requires float32"),
+            "{dtype}: {error:#}"
+        );
+        assert_eq!(run(&mut native, None).unwrap(), [4.0, 15.0]);
+        metadata["adapters"]["artifacts"]["peft"]["dtype"] =
+            serde_yaml::Value::String("float32".into());
+        std::fs::write(path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
+        let mut repaired = engine(root.path());
+        assert_eq!(run(&mut repaired, Some(0.5)).unwrap(), [40.0, 63.0]);
+    }
 }
