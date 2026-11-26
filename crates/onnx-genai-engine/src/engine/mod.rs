@@ -1809,7 +1809,7 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&fixture, crate::fixture_engine_config())?;
         let mut request = GenerateRequest::new("hello");
         request.options.max_new_tokens = 3;
         request.options.temperature = 0.0;
@@ -1856,7 +1856,7 @@ mod tests {
                     &format!("max_sequence_length: {max_context}"),
                 ),
             )?;
-            let mut engine = Engine::from_dir(scratch.path(), EngineConfig::default())?;
+            let mut engine = Engine::from_dir(scratch.path(), crate::fixture_engine_config())?;
             for constraint in [
                 GenerateConstraint::Json {
                     prefix: String::new(),
@@ -1890,7 +1890,7 @@ mod tests {
             .canonicalize()?;
         let mut engine = Engine::from_dir_with_session_options(
             &fixture,
-            EngineConfig::default(),
+            crate::fixture_engine_config(),
             SessionOptions::default().with_intra_op_threads(1),
         )?;
         let mut request = GenerateRequest::new("hello");
@@ -2087,7 +2087,7 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&fixture, crate::fixture_engine_config())?;
         let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
         request.options.max_new_tokens = 32;
         request.options.temperature = 0.0;
@@ -2108,7 +2108,7 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&fixture, crate::fixture_engine_config())?;
         let session_id = engine.create_session()?;
         let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
         request.options.max_new_tokens = 32;
@@ -2609,7 +2609,7 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut baseline = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut baseline = Engine::from_dir(&fixture, crate::fixture_engine_config())?;
         assert!(!baseline.connector.is_active());
 
         let mut request =
@@ -2640,7 +2640,7 @@ mod tests {
         request.options.stop_on_eos = false;
 
         let baseline_ids = {
-            let mut baseline = Engine::from_dir(&fixture, EngineConfig::default())?;
+            let mut baseline = Engine::from_dir(&fixture, crate::fixture_engine_config())?;
             baseline.generate(request.clone())?.token_ids
         };
 
@@ -2699,7 +2699,7 @@ mod tests {
         // (b) Output is byte-for-byte identical to full recompute with a Null
         // connector — proving the materialized KV is correct, not just present.
         let baseline_ids = {
-            let mut baseline = Engine::from_dir(&fixture, EngineConfig::default())?;
+            let mut baseline = Engine::from_dir(&fixture, crate::fixture_engine_config())?;
             let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.clone()));
             request.options.max_new_tokens = 4;
             request.options.temperature = 0.0;

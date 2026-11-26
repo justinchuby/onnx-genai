@@ -231,3 +231,16 @@ pub use speculative::{
     SpeculativeAcceptContext, SpeculativeProposal, SpeculativeProposer, SpeculativeProposerContext,
     SpeculativeStats, TokenEmbedder, argmax,
 };
+
+/// Test fixtures run Native when compiled in, and explicitly select ORT in the
+/// reference-only build. Production defaults and backend refusal are unchanged.
+#[cfg(test)]
+pub(crate) fn fixture_engine_config() -> EngineConfig {
+    EngineConfig {
+        #[cfg(feature = "native-backend")]
+        decode_backend: EngineDecodeBackend::Native,
+        #[cfg(not(feature = "native-backend"))]
+        decode_backend: EngineDecodeBackend::Ort,
+        ..EngineConfig::default()
+    }
+}

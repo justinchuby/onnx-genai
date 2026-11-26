@@ -4936,7 +4936,7 @@ mod tests {
                     Engine::from_dir(
                         &Path::new(env!("CARGO_MANIFEST_DIR"))
                             .join("../../tests/fixtures/tiny-llm"),
-                        EngineConfig::default(),
+                        crate::fixture_engine_config(),
                     )
                 },
                 cancel_before_commit,
@@ -7356,7 +7356,7 @@ mod tests {
     fn prompt_only_prefill_refuses_empty_invalid_and_over_context_before_admission()
     -> anyhow::Result<()> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&fixture, crate::fixture_engine_config())?;
         for (tokens, limit, field) in [
             (vec![], None, "at least one"),
             (vec![999999], None, "token id"),
@@ -7396,7 +7396,7 @@ mod tests {
                 chunk_size,
                 ..KvConnectorConfig::default()
             },
-            ..EngineConfig::default()
+            ..crate::fixture_engine_config()
         };
         let mut engine = Engine::from_dir(&fixture, config)?;
         let prompt = vec![10, 11, 12, 13, 14, 15];
@@ -7461,7 +7461,8 @@ mod tests {
         retry.options.temperature = 0.0;
         retry.options.stop_on_eos = false;
         let actual = engine.generate_in_session(target, retry.clone())?;
-        let expected = Engine::from_dir(&fixture, EngineConfig::default())?.generate(retry)?;
+        let expected =
+            Engine::from_dir(&fixture, crate::fixture_engine_config())?.generate(retry)?;
         assert_eq!(actual.token_ids, expected.token_ids);
         assert_eq!(engine.session_token_count(sibling)?, sibling_len);
         Ok(())
@@ -8360,10 +8361,10 @@ mod canonical_refusal_tests {
     #[test]
     fn every_constructor_presents_the_declared_workflow() -> anyhow::Result<()> {
         for engine in [
-            Engine::from_dir(&decoder_package(), EngineConfig::default())?,
+            Engine::from_dir(&decoder_package(), crate::fixture_engine_config())?,
             Engine::from_dir_with_session_options(
                 &decoder_package(),
-                EngineConfig::default(),
+                crate::fixture_engine_config(),
                 onnx_genai_ort::SessionOptions::default(),
             )?,
         ] {
