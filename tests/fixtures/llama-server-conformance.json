@@ -11,11 +11,16 @@
         "cli_generate_controls",
         "cli_native_default",
         "cli_transcribe_controls",
-        "cli_profiling_flags"
+        "cli_profiling_flags",
+        "cli_native_generation_runtime",
+        "cli_native_trace_runtime",
+        "cli_native_transcription_io",
+        "cli_native_transcription_mp3",
+        "cli_native_transcription_prompt"
       ],
       "remaining": [
         "Fresh complete browser acceptance on the final revision; source-linked drivers are not current results.",
-        "CLI evidence establishes parser removal/defaults/retained flags only. End-to-end generation/transcription, emitted profile JSON/trace files and packaged console launcher behavior still require runtime acceptance."
+        "CLI runtime links exercise maintained synthetic Native CPU fixtures through the Cargo-built executable, not the packaged console launcher. Fresh final-revision runs, broader model/device/format/config permutations and installed wheel/console launcher acceptance remain open."
       ]
     },
     {
@@ -77,7 +82,9 @@
       "evidence": [
         "sampling",
         "grammar_native",
-        "progress"
+        "progress",
+        "cli_native_generation_runtime",
+        "cli_native_trace_runtime"
       ],
       "remaining": [
         "Remaining contextual decoder/DFA assertions; continuous batching progress; full control/default/reporting cross-product."
@@ -109,7 +116,10 @@
         "transcription_stream",
         "speech",
         "decision_media",
-        "realtime"
+        "realtime",
+        "cli_native_transcription_io",
+        "cli_native_transcription_mp3",
+        "cli_native_transcription_prompt"
       ],
       "remaining": [
         "Bare GGUF import, filename quantization, selective sidecars; more codecs/DSP/video/joint decision heads; realtime forcing/pressure/device acceptance."
@@ -657,6 +667,82 @@
       "execution_contract": "Public Clap parser/unit test only; no model loading, runtime inference or profile output files",
       "assertions": "Top-level profiling/report/trace arguments survive generate and transcribe parsing without installing tracing or writing files.",
       "source_markers": []
+    },
+    "cli_native_generation_runtime": {
+      "kind": "rust",
+      "package": "onnx-genai-cli",
+      "package_manifest": "crates/onnx-genai-cli/Cargo.toml",
+      "source": "crates/onnx-genai-cli/tests/profile_e2e.rs",
+      "target": "test:profile_e2e",
+      "test": "generate_defaults_to_native_and_profiles_the_actual_backend",
+      "execution_contract": "Cargo-built executable subprocess using maintained synthetic Native CPU ONNX fixture; invalid ORT library path prevents reference fallback; not packaged console launcher",
+      "assertions": "Default Native tiny-llm command actually emits text and one generated token, writes parseable profile JSON, and reports decode_backend=native/execution_provider=native.",
+      "source_markers": [
+        "Native generation must emit text",
+        "value[\"generated_tokens\"]",
+        "value[\"decode_backend\"]"
+      ]
+    },
+    "cli_native_trace_runtime": {
+      "kind": "rust",
+      "package": "onnx-genai-cli",
+      "package_manifest": "crates/onnx-genai-cli/Cargo.toml",
+      "source": "crates/onnx-genai-cli/tests/profile_e2e.rs",
+      "target": "test:profile_e2e",
+      "test": "native_generate_trace_contains_execution_events_matching_the_profile_backend",
+      "execution_contract": "Cargo-built executable subprocess using maintained synthetic Native CPU ONNX fixture; invalid ORT library path prevents reference fallback; not packaged console launcher",
+      "assertions": "CPU generation emits text and two tokens while writing both JSON profile and Chrome trace; live profile reports Native, nonempty valid-timing trace contains native.session_run and CPU operator/node events, and no ORT execution spans. Zero-duration events are valid.",
+      "source_markers": [
+        "\"native.session_run\"",
+        "\"traceEvents\"",
+        "\"node_id\"",
+        "\"--profile-trace\""
+      ]
+    },
+    "cli_native_transcription_io": {
+      "kind": "rust",
+      "package": "onnx-genai-cli",
+      "package_manifest": "crates/onnx-genai-cli/Cargo.toml",
+      "source": "crates/onnx-genai-cli/tests/transcription_e2e.rs",
+      "target": "test:transcription_e2e",
+      "test": "native_frame_transcription_process_handles_files_wav_stdin_and_raw_pcm_without_ort",
+      "execution_contract": "Cargo-built executable subprocess using maintained synthetic Native CPU ONNX fixture; invalid ORT library path prevents reference fallback; not packaged console launcher",
+      "assertions": "Real Native CTC subprocess transcribes WAV file to bb aa with profile backend/provider checks; encoded WAV stdin and raw PCM stdin match the file result exactly; max-new-tokens=1 truncates output to b.",
+      "source_markers": [
+        "\"bb aa\"",
+        "\"native-cpu\"",
+        "child.wait_with_output()"
+      ]
+    },
+    "cli_native_transcription_mp3": {
+      "kind": "rust",
+      "package": "onnx-genai-cli",
+      "package_manifest": "crates/onnx-genai-cli/Cargo.toml",
+      "source": "crates/onnx-genai-cli/tests/transcription_e2e.rs",
+      "target": "test:transcription_e2e",
+      "test": "native_generative_mp3_process_uses_the_authored_window_for_every_segment",
+      "execution_contract": "Cargo-built executable subprocess using maintained synthetic Native CPU ONNX fixture; invalid ORT library path prevents reference fallback; not packaged console launcher",
+      "assertions": "Real token and feature transcription subprocesses decode maintained stereo MP3 into exactly four authored 32 ms windows/tail, assert hello for each segment, sequential indices and exact 0.032/0.096/0.1 boundaries.",
+      "source_markers": [
+        "stereo-tone.mp3",
+        "\"transcription_tokens\"",
+        "\"transcription_features\""
+      ]
+    },
+    "cli_native_transcription_prompt": {
+      "kind": "rust",
+      "package": "onnx-genai-cli",
+      "package_manifest": "crates/onnx-genai-cli/Cargo.toml",
+      "source": "crates/onnx-genai-cli/tests/transcription_e2e.rs",
+      "target": "test:transcription_e2e",
+      "test": "native_authored_transcription_process_projects_framing_and_conditions_the_prompt",
+      "execution_contract": "Cargo-built executable subprocess using maintained synthetic Native CPU ONNX fixture; invalid ORT library path prevents reference fallback; not packaged console launcher",
+      "assertions": "Real Native projected speech subprocess transcribes authored WAV with expected world/hello changes under default, language=zh and prompt=tok31 conditioning.",
+      "source_markers": [
+        "\"transcription_projected\"",
+        "\"--language\"",
+        "\"--prompt\""
+      ]
     }
   },
   "routes": [
