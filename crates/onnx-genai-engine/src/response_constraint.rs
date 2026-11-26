@@ -2200,12 +2200,18 @@ mod tests {
                 is_eos: token_id == 3,
             })
             .collect::<Vec<_>>();
+        let allows = |mask: &[bool], token_id| {
+            mask[candidates
+                .iter()
+                .position(|candidate| candidate.token_id == token_id)
+                .unwrap()]
+        };
         let mask = constraint
             .allowed_next_tokens(&ProcessorContext::default(), &candidates)
             .unwrap();
-        assert!(mask[4]);
-        assert!(!mask[3]);
-        assert!(!mask[6]);
+        assert!(allows(&mask, 4));
+        assert!(!allows(&mask, 3));
+        assert!(!allows(&mask, 6));
         let context = ProcessorContext {
             generated_tokens: vec![4],
             ..Default::default()
@@ -2213,10 +2219,10 @@ mod tests {
         let mask = constraint
             .allowed_next_tokens(&context, &candidates)
             .unwrap();
-        assert!(mask[5]);
-        assert!(!mask[3]);
-        assert!(!mask[4]);
-        assert!(!mask[6]);
+        assert!(allows(&mask, 5));
+        assert!(!allows(&mask, 3));
+        assert!(!allows(&mask, 4));
+        assert!(!allows(&mask, 6));
         let context = ProcessorContext {
             generated_tokens: vec![4, 5],
             ..Default::default()
