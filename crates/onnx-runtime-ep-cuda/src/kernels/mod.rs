@@ -2090,6 +2090,8 @@ pub fn build_cuda_registry_with_metrics(
 mod tests {
     use std::collections::BTreeSet;
 
+    use onnx_runtime_ir::DataType;
+
     use super::{
         CUDA_COVERED_OPS, CUDA_DFT_DTYPES, CUDA_FLOAT_DTYPES, CUDA_NMS_DTYPES, CUDA_STFT_DTYPES,
         build_cuda_registry, build_cuda_registry_descriptors, cuda_supported_dtypes_for_op,
