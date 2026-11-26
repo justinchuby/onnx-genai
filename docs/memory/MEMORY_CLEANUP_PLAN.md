@@ -3198,3 +3198,109 @@ a CPU raw slice over a device pointer. Packed bank device access and address
 wrap failures report the operator and `packed weights` input while leaving Y
 unchanged. Contiguous byte offsets remain supported; empty executions keep the
 existing read-free return. This adds no data copy, resource owner or admission.
+
+### Affine grouped projection admits one mixed execution workspace
+
+The CPU affine grouped projection now plans one StepScoped lane containing
+f32 Y staging, one conservative K-element activation row for nonempty output,
+and one usize per route, including alignment padding. Metadata returns Ready;
+there is no new execution refiner or owner. The row remains in the bound even
+when aligned contiguous X rows borrow directly. Outer padding/negative strides
+do not prevent that borrow. Other X layouts copy one row into the reusable
+scratch, rather than materializing the full activation matrix. All operand slots
+advertise strided support so upstream gathers do not hide those paths.
+
+The mixed layout and validated Host-row reader are extracted from affine MoE
+into CPU-private helpers shared by both kernels. These helpers only compose and
+borrow the existing lane: they allocate no backing and add no pool or admission
+protocol. Full outer binding precedes initialization of either typed region.
+MoE retains its previous exact execution refinement and numerical behavior.
+
+A fallible form of the existing numeric storage walk converts INT32/INT64 routes
+directly into the admitted usize region, retaining first-error position/value.
+The infallible storage walk delegates to that same loop. Native/Packed grouped
+callers use the same validated route source with their existing usize Vec;
+their other payloads are outside this change. A route source carries checked
+count/Host/address geometry, avoiding a second span validation when filled.
+
+Affine geometry has a shared device-independent metadata path for concrete or
+unresolved output shapes. The live-view wrapper still validates descriptors,
+including for CUDA consumers; it adds no Host restriction there. CPU storage
+proofs precede complete scratch binding and all value reads. All routes are
+validated before the complete scale scan, and Y is published last for source
+alias safety. Unlike Packed's early empty return, empty Affine still validates
+route values and all scales. N=0 can therefore require route scratch even with
+no output payload; an entirely empty route/output lane needs no admission.
+
+Tests cover bitwise old-order results, optional zeros, INT32/INT64, odd depths
+and block counts, nonfinite X, padded/reversed/unaligned bindings, source/Y
+shifted aliases, untouched strided-output padding, and refusal before source
+reads or scratch initialization. Fresh mixed backing is initialized before typed
+references are formed. A retained-governor witness checks 4096 real executions,
+one identity and no warm issuer callbacks, including zero-byte controls and
+exact trim refunds. Public Session checks exercise exact/one-byte-short budgets,
+dynamic shrinking/empty/re-admission and fixed-stride X bindings. Real allocator
+controls detect the former activation, integer/usize route and output payloads;
+repeated executions use the admitted lane without payload-sized heap copies.
+Small bookkeeping allocations remain outside that assertion. These checks make
+no latency or CUDA hardware performance claim.
+
+Logical-prefix capacity planning now distinguishes declared static axes from
+physical padding. A binding that exposes a logical shape keeps every Static(n)
+axis at n after checking logical==n and physical>=n; symbolic axes still reserve
+physical capacity. The same rule covers ordinary and fixed-stride logical-prefix
+bindings. Unknown declarations remain conservative, and non-logical-exposing
+bindings keep the previous physical-shape rule. Physical strides, backing span
+and output capacity facts are unchanged. Shared-symbol capacity conflicts still
+fail explicitly. This lets a [T,4] input plan against physical [3,8] with logical
+[1,4] without pretending the contraction width can grow to eight.
+
+Public aliased I/O coverage also exposed Identity's false non-overlap assumption.
+Identity now uses checked raw byte sizes and validates both nonempty Host spans
+before an overlap-safe byte move. It retains its explicit contiguous-layout
+contract and copies packed storage bits unchanged. CPU provider byte copies use
+the same overlap-safe semantics because distinct borrowed buffer descriptors may
+name overlapping ranges. Exact/two-direction shifted overlaps, non-Host/wrapping
+pointers and a real same-backing Identity Session binding are covered without
+introducing workspace or quota requests.
+
+### Packed grouped projection reuses the whole-operation workspace
+
+For nonempty output, CPU PackedGroupedMatMul now admits one StepScoped mixed
+lane for f32 Y staging, one conservative K-element X row and usize routes, with
+checked alignment padding. Metadata returns Ready. It reuses the existing
+FloatIndexWorkspace, Host Rows and validated RouteSource helpers: no new owner,
+pool or per-token/expert/block grant is introduced. Aligned inner-contiguous X
+rows borrow even with padded/reversed outer axes; other X rows and INT32/INT64
+routes stream into admitted storage. Packed bytes remain a borrowed contiguous
+bank, and the existing 256-float block decoder buffer stays on the stack. This
+change does not add strided packed-bank support or claim that upstream gathers
+for unsupported layouts are governed by this kernel lane.
+
+Complete Host/view/address proofs and mixed binding precede all value reads.
+The positive-K decoder and accumulation order remain unchanged, and true Y is
+published after every X/route/packed read, including overlapping I/O bindings.
+Strided Y publication visits logical elements without touching padding. Shared
+packed metadata geometry derives concrete/unresolved output shapes while the
+existing live wrapper keeps descriptor validation and CUDA device independence.
+
+Packed retains its read-free return when output lanes are zero, with requirement
+NONE even if routes are nonempty. This differs intentionally from Affine's data
+validation on empty output. For K=0 with nonempty Y, the kernel still validates
+Host backing and every route before publishing initialized +0. It neither forms
+a zero-length packed slice nor computes an unnecessary expert*N intermediate;
+large expert geometry cannot overflow a row offset for an empty reduction. Null
+views still fail the existing descriptor contract.
+
+Bitwise tests cover every supported packed format, INT32/INT64 routes,
+padded/reversed/unaligned X/routes and contiguous packed-bank origins, all three
+source/Y shifted overlaps, strided Y padding, zero lanes and zero K, invalid
+routes and refusal before scratch initialization or data reads. A retained-owner
+witness exercises 4096 real executions with no additional issuer callbacks,
+including zero-byte controls, and exact trim refunds. Public Session checks use
+exact/one-byte-short budgets, dynamic shrinking/empty/trim/readmission and fixed
+physical strides with logical prefixes. Independent allocator controls detect
+former X/route/output payload sizes; repeated executions allocate no tested
+payload-sized buffers. Small bookkeeping allocations are outside that claim.
+These checks establish memory/accounting behavior, not measured latency or CUDA
+hardware performance.

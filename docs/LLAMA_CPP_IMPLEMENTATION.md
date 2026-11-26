@@ -2687,3 +2687,70 @@ Full server library: 629 passed, 2 inherited ignores. Strict all-target default
 preprocess/engine/server and explicit ORT-reference server Clippy, formatting and
 diff checks passed. This is functional macOS ARM64 CPU coverage; no device or
 performance claim and no completion of the broader acceptance list.
+
+
+## Executable behavioral acceptance inventory
+
+The [behavioral matrix](LLAMA_CPP_BEHAVIOR_MATRIX.md) accounts for all 55 pinned
+method/path contracts and nine original acceptance categories, including explicit
+external-harness exclusions and unfinished requirements. Its source-linked cases
+are not fresh execution claims. The optional POSIX receipt runner discovers an
+exact test identity before requiring one passed/zero ignored, binds clean source
+revision/tree/content plus explicit/implicit Cargo configuration and environment
+hashes, and invalidates evidence if inputs change. Timeout/interruption cleanup
+terminates the owned local process group before returning to the shared lock.
+
+New explicit Native CPU integration cases cover Responses and input-count aliases,
+pooled embedding aliases and full typed SSE ordering/identity/terminal consistency.
+The maintained browser driver accepts the chosen built binary and uses ephemeral
+fixture/proxy ports. Complete device/model/control cross-products, original CLI
+executable evidence and the other listed acceptance gaps remain open.
+
+Validation on the post-spectrogram production tree: all 23 Python checker/runner
+regressions and all four explicit Native CPU alias integration tests passed;
+strict default/reference server Clippy passed. Fresh Chrome chat/persistence,
+byte-exact completed replay, induced reader-disconnect recovery, genuinely active
+16,384-token refresh recovery and Stop/worker release passed without page errors.
+API-key onboarding rejected the wrong key, accepted and persisted the valid key,
+and protected replay. Browser evidence records the built binary/driver hashes;
+these fixture results do not close the full model/device/control acceptance list.
+
+
+## Explicit spectrum projections and periodic windows
+
+Standalone audio spectra now admit explicit power/magnitude and periodic
+Hann/Hamming/rectangular selectors. Magnitude projects finite complex FFT values
+with stable hypot, so squared-magnitude overflow does not reject representable
+amplitudes. Log-mel keeps the original power/Hann arithmetic, mel resource
+admission before planning and normalization; geometry/rate/branch/mask guards
+are unchanged. Uncentered/complex and other DSP conventions remain open.
+
+Validation: all 122 preprocessing tests passed, including independent f64 DFT
+for each projection/window, odd/short/length-one windows, and finite-input
+magnitude-vs-power overflow checks. Six Native audio tests passed; the spectrum
+case executes all six combinations at multiple amplitudes/lengths against
+analytic head outputs. Full server library: 629 passed, 2 inherited ignores.
+Strict all-target default preprocess/engine/server and explicit ORT-reference
+server Clippy, formatting and diff checks passed. Functional macOS ARM64 CPU
+coverage only; no device/performance or whole-goal parity claim.
+
+
+## Package-bound CLI behavioral evidence
+
+The behavioral inventory now binds each Rust case to an explicit workspace
+package manifest and enabled lib/integration target. The checker rejects
+mismatched package identities, excluded packages, escaped source paths and
+custom test harnesses; execution records the chosen package and target and
+binds the package manifests into its receipt. The inventory contains 47 Rust
+cases plus one browser case across the existing 55 contracts/nine categories.
+
+Five CLI cases establish removed REPL rejection, the Native default, retained
+generation CPU/context controls, transcription input/format/conditioning controls
+and global profiling flag parsing. These parser assertions do not establish
+end-to-end inference, emitted profiling files or packaged launcher behavior.
+
+Validation: all 78 CLI library tests and 29 Python checker/runner regressions
+passed. Strict all-target default CLI/server and explicit ORT-reference CLI
+(`--no-default-features --features onnx-genai-server/metrics,cuda-13000`)
+Clippy, inventory, Python lint, formatting and diff checks passed. No hardware
+performance claim or broader acceptance completion is implied.

@@ -7,9 +7,8 @@ use onnx_runtime_optimizer::affine_moe::{OP, THRESHOLD};
 
 use super::affine_bank::{AffineBank, PreparedAffineBank};
 mod geometry;
-mod workspace;
+use super::host_rows::Rows;
 use geometry::Geometry;
-use workspace::Rows;
 struct Actual<'a> {
     x: Rows<'a>,
     router: Rows<'a>,
@@ -93,8 +92,8 @@ impl AffineMoe {
         out: &TensorMut,
         g: &Geometry,
     ) -> Result<Actual<'a>> {
-        let x = Rows::new("X", &inputs[0])?;
-        let router = Rows::new("router", &inputs[1])?;
+        let x = Rows::new(OP, "X", &inputs[0])?;
+        let router = Rows::new(OP, "router", &inputs[1])?;
         let output = TensorView::new(
             DevicePtr(out.data.0.cast_const()),
             out.dtype,

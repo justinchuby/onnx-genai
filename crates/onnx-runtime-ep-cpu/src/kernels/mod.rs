@@ -679,6 +679,7 @@ mod grouped_matmul;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod half_gemv;
 pub mod hardmax;
+mod host_rows;
 pub mod identity;
 pub mod index_share;
 pub mod indexing;
@@ -1171,7 +1172,7 @@ pub(crate) fn build_cpu_registry_with_resources(
             onnx_runtime_ir::RUNTIME_DOMAIN,
             1,
         ),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(grouped_matmul::AffineFactory),
     );
     rec.register(
@@ -1180,7 +1181,7 @@ pub(crate) fn build_cpu_registry_with_resources(
             onnx_runtime_ir::RUNTIME_DOMAIN,
             1,
         ),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(grouped_matmul::PackedFactory),
     );
     rec.register(
@@ -2620,6 +2621,87 @@ pub(crate) mod testutil {
 
     use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
     use onnx_runtime_ir::{DataType, DeviceId, compute_contiguous_strides};
+
+    /// Dense fixed-width fixture materialized with padded, reversed or packed
+    /// origins. Input shapes are positive and source bytes are canonical dense.
+    pub(crate) struct Repacked {
+        backing: Vec<u128>,
+        shape: Vec<usize>,
+        strides: Vec<i64>,
+        base: usize,
+        offset: usize,
+        dtype: DataType,
+    }
+    impl Repacked {
+        pub(crate) fn new(source: &Owned, mode: usize) -> Self {
+            let shape = source.shape.clone();
+            let width = source.dtype.byte_size();
+            let mut strides = compute_contiguous_strides(&shape);
+            if matches!(mode, 1..=3 | 5) {
+                let mut step = if mode == 2 { 2 } else { 1 };
+                for (axis, &dim) in shape.iter().enumerate().rev() {
+                    strides[axis] = step;
+                    step = step * dim as i64 + 3;
+                }
+            }
+            let extent = shape
+                .iter()
+                .zip(&strides)
+                .map(|(&d, &s)| (d - 1) * s as usize)
+                .sum::<usize>();
+            let offset = if mode == 3 {
+                extent * width
+            } else if mode == 5 {
+                (shape[0] - 1) * strides[0] as usize * width
+            } else {
+                0
+            };
+            if mode == 3 {
+                strides.iter_mut().for_each(|s| *s = -*s);
+            }
+            if mode == 5 {
+                strides[0] = -strides[0];
+            }
+            let base = usize::from(mode == 4);
+            let len = (extent + 1) * width + base;
+            let mut backing = vec![0xccccccccccccccccccccccccccccccccu128; len.div_ceil(16)];
+            let storage = unsafe {
+                std::slice::from_raw_parts_mut(
+                    backing.as_mut_ptr().cast::<u8>(),
+                    backing.len() * 16,
+                )
+            };
+            for (logical, value) in source.bytes.chunks_exact(width).enumerate() {
+                let mut n = logical;
+                let mut at = (offset + base) as i64;
+                for (axis, &dim) in shape.iter().enumerate().rev() {
+                    let coordinate = n % dim;
+                    n /= dim;
+                    at += coordinate as i64 * strides[axis] * width as i64;
+                }
+                let at = at as usize;
+                storage[at..at + width].copy_from_slice(value);
+            }
+            Self {
+                backing,
+                shape,
+                strides,
+                base,
+                offset,
+                dtype: source.dtype,
+            }
+        }
+        pub(crate) fn view(&self) -> TensorView<'_> {
+            TensorView::new(
+                DevicePtr(unsafe { self.backing.as_ptr().cast::<u8>().add(self.base).cast() }),
+                self.dtype,
+                &self.shape,
+                &self.strides,
+                DeviceId::cpu(),
+            )
+            .with_byte_offset(self.offset)
+        }
+    }
 
     pub trait PreparedTestKernel: onnx_runtime_ep_api::Kernel {
         fn execute_prepared(

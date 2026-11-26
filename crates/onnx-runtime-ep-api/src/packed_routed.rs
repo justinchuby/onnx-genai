@@ -1,6 +1,6 @@
 //! Concrete tensor contracts shared by the standalone packing and routing kernels.
 
-use crate::{EpError, Result, TensorMut, TensorView};
+use crate::{EpError, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView};
 use onnx_runtime_ir::{
     DataType, Node, Shape,
     dequantize_packed::Metadata,
@@ -206,13 +206,47 @@ pub fn group_layout(op: Op, x: &[TensorView], y: &TensorMut) -> Result<GroupLayo
         .get(3)
         .filter(|b| b.dtype != DataType::Undefined && !b.is_absent())
         .map(|b| b.shape);
-    group_layout_shapes(op, x[0].shape, x[1].shape, x[2].shape, bias, y.shape)
+    group_layout_shapes(op, x[0].shape, x[1].shape, x[2].shape, bias, Some(y.shape))
 }
 
+/// Validate live descriptors through the same device-independent geometry used
+/// for metadata planning. CPU Host access is established by its own reader.
 pub fn packed_group_layout(
     metadata: &Metadata,
     x: &[TensorView],
     y: &[TensorMut],
+) -> Result<GroupLayout> {
+    let [a, packed, idx] = x else {
+        return Err(EpError::KernelFailed("PackedGroupedMatMul: expected activation, packed weights and group indices; bind all three inputs".into()));
+    };
+    let [out] = y else {
+        return Err(EpError::KernelFailed(
+            "PackedGroupedMatMul: expected one output; bind the projection result".into(),
+        ));
+    };
+    let inputs = [a, packed, idx].map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()));
+    let outputs = [OutputMetadata::tensor(out.dtype, out.shape)];
+    let layout = packed_group_metadata_layout(metadata, &inputs, &outputs)?;
+    for (index, tensor) in x.iter().enumerate() {
+        tensor.validate().map_err(|e| {
+            EpError::KernelFailed(format!(
+                "PackedGroupedMatMul: invalid input {index}: {e}; bind a valid tensor descriptor"
+            ))
+        })?;
+    }
+    out.validate().map_err(|e| {
+        EpError::KernelFailed(format!(
+            "PackedGroupedMatMul: invalid output: {e}; bind a valid tensor descriptor"
+        ))
+    })?;
+    Ok(layout)
+}
+/// Complete packed projection geometry without reading tensor values or
+/// assuming a device. An unresolved output shape is derived from operands.
+pub fn packed_group_metadata_layout(
+    metadata: &Metadata,
+    x: &[TensorMetadata<'_>],
+    y: &[OutputMetadata<'_>],
 ) -> Result<GroupLayout> {
     let fail = |detail: &str| EpError::KernelFailed(format!("PackedGroupedMatMul: {detail}"));
     let [a, packed, idx] = x else {
@@ -226,9 +260,16 @@ pub fn packed_group_layout(
     let [groups, n, k] = metadata.shape() else {
         return Err(fail("decoded weight shape must be [groups,N,K]"));
     };
+    let (output_dtype, output_shape) = match out {
+        OutputMetadata::Tensor { dtype, shape } => (*dtype, Some(shape.as_ref())),
+        OutputMetadata::Unresolved { dtype } => (*dtype, None),
+        OutputMetadata::Absent => {
+            return Err(fail("expected a FLOAT output; bind the projection result"));
+        }
+    };
     if metadata.dtype() != DataType::Float32
         || a.dtype != DataType::Float32
-        || out.dtype != DataType::Float32
+        || output_dtype != DataType::Float32
         || !matches!(idx.dtype, DataType::Int32 | DataType::Int64)
     {
         return Err(fail(
@@ -238,17 +279,20 @@ pub fn packed_group_layout(
     metadata
         .validate_input(packed.dtype, packed.shape)
         .map_err(|detail| fail(&detail))?;
-    for tensor in x {
-        tensor.validate()?;
+    for (index, input) in x.iter().enumerate() {
+        if !input.present && !input.shape.contains(&0) {
+            return Err(fail(&format!(
+                "input {index} is absent; bind activation, packed bank and routes"
+            )));
+        }
     }
-    out.validate()?;
     group_layout_shapes(
         Op::GroupedMatMul { transposed: true },
         a.shape,
         &[*groups, *n, *k],
         idx.shape,
         None,
-        out.shape,
+        output_shape,
     )
 }
 
@@ -258,7 +302,7 @@ fn group_layout_shapes(
     w: &[usize],
     idx: &[usize],
     bias: Option<&[usize]>,
-    out: &[usize],
+    out: Option<&[usize]>,
 ) -> Result<GroupLayout> {
     let Op::GroupedMatMul { transposed } = op else {
         unreachable!()
@@ -289,7 +333,9 @@ fn group_layout_shapes(
         ));
     }
     let expected = [*m, *selections, n];
-    if out != expected {
+    if let Some(out) = out
+        && out != expected
+    {
         return Err(fail(
             op,
             format!("output must have shape {expected:?}, got {out:?}"),
@@ -343,9 +389,47 @@ impl AffineGrouped {
         })
     }
 
+    /// Validate concrete tensor descriptors through the same metadata geometry
+    /// used for planning, then validate live view descriptors without reading data.
     pub fn layout(self, x: &[TensorView], y: &[TensorMut]) -> Result<GroupLayout> {
+        if x.len() > 5 || y.len() != 1 {
+            return Err(EpError::KernelFailed("AffineQuantizedGroupedMatMul: expected four or five inputs and one output; bind the complete projection signature".into()));
+        }
+        let mut metadata = [TensorMetadata::new(DataType::Undefined, &[], false); 5];
+        for (m, t) in metadata.iter_mut().zip(x) {
+            *m = TensorMetadata::new(t.dtype, t.shape, !t.is_absent());
+        }
+        let output = [OutputMetadata::tensor(y[0].dtype, y[0].shape)];
+        let layout = self.metadata_layout(&metadata[..x.len()], &output)?;
+        for t in x {
+            t.validate()?;
+        }
+        y[0].validate()?;
+        Ok(layout)
+    }
+    /// Device-independent shape/dtype geometry, including unresolved output
+    /// shape planning. Readability and backing bounds belong to the executing EP.
+    pub fn metadata_layout(
+        self,
+        x: &[TensorMetadata<'_>],
+        y: &[OutputMetadata<'_>],
+    ) -> Result<GroupLayout> {
         let fail =
             |detail: &str| EpError::KernelFailed(format!("AffineQuantizedGroupedMatMul: {detail}"));
+        if self.block == 0
+            || self.depth == 0
+            || !self.depth.is_multiple_of(self.block)
+            || self.zero > 15
+        {
+            return Err(fail(
+                "depth must be positive and divisible by a positive block_size, with a UINT4 zero point; construct a valid affine configuration",
+            ));
+        }
+        if !(4..=5).contains(&x.len()) {
+            return Err(fail(
+                "expected four or five inputs; bind activation, packed bank, routes, scales and optional zeros",
+            ));
+        }
         let [a, packed, idx, scale, ..] = x else {
             return Err(fail("expected four or five inputs"));
         };
@@ -355,12 +439,34 @@ impl AffineGrouped {
         let [e, n, words] = packed.shape else {
             return Err(fail("expected rank-three packed weight bank"));
         };
+        let (output_dtype, output_shape) = match out {
+            OutputMetadata::Tensor { dtype, shape } => (*dtype, Some(shape.as_ref())),
+            OutputMetadata::Unresolved { dtype } => (*dtype, None),
+            OutputMetadata::Absent => return Err(fail("expected a present FLOAT output")),
+        };
+        if a.dtype != DataType::Float32 || output_dtype != DataType::Float32 {
+            return Err(fail(&format!(
+                "X and Y must be FLOAT, got {:?} and {:?}; bind matching floating activation/output tensors",
+                a.dtype, output_dtype
+            )));
+        }
+        if !matches!(idx.dtype, DataType::Int32 | DataType::Int64) {
+            return Err(fail(&format!(
+                "group_indices must be INT32 or INT64, got {:?}; bind integer routes",
+                idx.dtype
+            )));
+        }
+        if let Some((index, _)) = x
+            .iter()
+            .enumerate()
+            .find(|(_, v)| !v.present && !v.shape.contains(&0))
+        {
+            return Err(fail(&format!(
+                "input {index} is absent; bind all required projection tensors or omit the optional zero slot"
+            )));
+        }
         let blocks = self.depth / self.block;
-        if x.len() > 5
-            || a.dtype != DataType::Float32
-            || out.dtype != DataType::Float32
-            || !matches!(idx.dtype, DataType::Int32 | DataType::Int64)
-            || packed.dtype != DataType::Uint8
+        if packed.dtype != DataType::Uint8
             || scale.dtype != DataType::Float32
             || *words != self.depth.div_ceil(2)
             || scale.shape != [*e, *n, blocks]
@@ -374,17 +480,248 @@ impl AffineGrouped {
         }
         let op = Op::GroupedMatMul { transposed: true };
         elements(op, &[*e, *n, self.depth])?;
-        for t in x {
-            t.validate()?;
-        }
-        out.validate()?;
         group_layout_shapes(
             op,
             a.shape,
             &[*e, *n, self.depth],
             idx.shape,
             None,
-            out.shape,
+            output_shape,
         )
+    }
+}
+
+#[cfg(test)]
+mod affine_metadata_tests {
+    use super::*;
+    use crate::{DevicePtr, DevicePtrMut};
+    use onnx_runtime_ir::DeviceId;
+    fn metadata() -> [TensorMetadata<'static>; 5] {
+        [
+            TensorMetadata::new(DataType::Float32, &[2, 4], true),
+            TensorMetadata::new(DataType::Uint8, &[3, 3, 2], true),
+            TensorMetadata::new(DataType::Int64, &[2, 2], true),
+            TensorMetadata::new(DataType::Float32, &[3, 3, 2], true),
+            TensorMetadata::new(DataType::Uint8, &[3, 3, 1], true),
+        ]
+    }
+    fn config() -> AffineGrouped {
+        AffineGrouped {
+            depth: 4,
+            block: 2,
+            zero: 7,
+        }
+    }
+    #[test]
+    fn metadata_and_live_device_independent_geometry_share_the_same_contract() {
+        let metadata = metadata();
+        let strides = [
+            vec![4, 1],
+            vec![6, 2, 1],
+            vec![2, 1],
+            vec![6, 2, 1],
+            vec![3, 1, 1],
+        ];
+        let inputs = metadata
+            .iter()
+            .zip(&strides)
+            .map(|(m, s)| {
+                TensorView::new(
+                    DevicePtr(8usize as *const std::ffi::c_void),
+                    m.dtype,
+                    m.shape,
+                    s,
+                    DeviceId::cuda(0),
+                )
+            })
+            .collect::<Vec<_>>();
+        let output = TensorMut::new(
+            DevicePtrMut(8usize as *mut std::ffi::c_void),
+            DataType::Float32,
+            &[2, 2, 3],
+            &[6, 3, 1],
+            DeviceId::cuda(0),
+        );
+        for slots in [4, 5] {
+            let actual = config()
+                .layout(&inputs[..slots], std::slice::from_ref(&output))
+                .unwrap();
+            for fact in [
+                OutputMetadata::tensor(DataType::Float32, &[2, 2, 3]),
+                OutputMetadata::Unresolved {
+                    dtype: DataType::Float32,
+                },
+            ] {
+                let planned = config()
+                    .metadata_layout(&metadata[..slots], &[fact])
+                    .unwrap();
+                assert_eq!(
+                    (
+                        planned.k,
+                        planned.n,
+                        planned.routes,
+                        planned.lanes,
+                        planned.groups
+                    ),
+                    (
+                        actual.k,
+                        actual.n,
+                        actual.routes,
+                        actual.lanes,
+                        actual.groups
+                    )
+                );
+            }
+        }
+    }
+    #[test]
+    fn invalid_metadata_reports_the_argument_and_zero_output_preserves_nonzero_routes() {
+        let mut m = metadata();
+        let out = [OutputMetadata::Unresolved {
+            dtype: DataType::Float32,
+        }];
+        m[0].dtype = DataType::Float64;
+        assert!(
+            config()
+                .metadata_layout(&m, &out)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("X and Y must be FLOAT")
+        );
+        m = metadata();
+        m[2].present = false;
+        assert!(
+            config()
+                .metadata_layout(&m, &out)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("input 2 is absent")
+        );
+        m = metadata();
+        m[1].shape = &[3, 0, 2];
+        m[3].shape = &[3, 0, 2];
+        m[4].shape = &[3, 0, 1];
+        let l = config().metadata_layout(&m, &out).unwrap();
+        assert_eq!((l.routes, l.lanes), (4, 0));
+        let bad = AffineGrouped {
+            depth: 4,
+            block: 0,
+            zero: 7,
+        };
+        assert!(
+            bad.metadata_layout(&metadata(), &out)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("block_size")
+        );
+    }
+}
+
+#[cfg(test)]
+mod packed_metadata_tests {
+    use super::*;
+    use crate::{DevicePtr, DevicePtrMut};
+    use onnx_runtime_ir::{Attribute, DeviceId, NodeId};
+    fn bank(shape: [usize; 3]) -> Metadata {
+        let mut node = Node::new(NodeId(0), "PackedGroupedMatMul", vec![], vec![]);
+        node.attributes
+            .insert("format".into(), Attribute::String("gguf:q4_0".into()));
+        node.attributes.insert(
+            "shape".into(),
+            Attribute::Ints(shape.map(|d| d as i64).to_vec()),
+        );
+        Metadata::from_node(&node).unwrap()
+    }
+    #[test]
+    fn packed_metadata_and_live_cuda_descriptors_share_geometry_without_data_reads() {
+        let bank = bank([3, 2, 64]);
+        let m = [
+            TensorMetadata::new(DataType::Float32, &[2, 64], true),
+            TensorMetadata::new(DataType::Uint8, &[216], true),
+            TensorMetadata::new(DataType::Int64, &[2, 2], true),
+        ];
+        let strides = [vec![64, 1], vec![1], vec![2, 1]];
+        let inputs = m
+            .iter()
+            .zip(&strides)
+            .map(|(v, s)| {
+                TensorView::new(
+                    DevicePtr(8usize as *const std::ffi::c_void),
+                    v.dtype,
+                    v.shape,
+                    s,
+                    DeviceId::cuda(0),
+                )
+            })
+            .collect::<Vec<_>>();
+        let out = TensorMut::new(
+            DevicePtrMut(8usize as *mut std::ffi::c_void),
+            DataType::Float32,
+            &[2, 2, 2],
+            &[4, 2, 1],
+            DeviceId::cuda(0),
+        );
+        let actual = packed_group_layout(&bank, &inputs, &[out]).unwrap();
+        for output in [
+            OutputMetadata::Unresolved {
+                dtype: DataType::Float32,
+            },
+            OutputMetadata::tensor(DataType::Float32, &[2, 2, 2]),
+        ] {
+            let l = packed_group_metadata_layout(&bank, &m, &[output]).unwrap();
+            assert_eq!(
+                (l.k, l.n, l.groups, l.routes, l.lanes),
+                (
+                    actual.k,
+                    actual.n,
+                    actual.groups,
+                    actual.routes,
+                    actual.lanes
+                )
+            );
+        }
+    }
+    #[test]
+    fn packed_empty_reductions_and_metadata_errors_keep_explicit_contracts() {
+        let bank = bank([isize::MAX as usize, 5, 0]);
+        let m = [
+            TensorMetadata::new(DataType::Float32, &[1, 0], true),
+            TensorMetadata::new(DataType::Uint8, &[0], true),
+            TensorMetadata::new(DataType::Int32, &[1, 1], true),
+        ];
+        let out = [OutputMetadata::Unresolved {
+            dtype: DataType::Float32,
+        }];
+        let l = packed_group_metadata_layout(&bank, &m, &out).unwrap();
+        assert_eq!((l.k, l.n, l.routes, l.lanes), (0, 5, 1, 5));
+        assert!(
+            packed_group_metadata_layout(&bank, &m[..2], &out)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("activation")
+        );
+        assert!(
+            packed_group_metadata_layout(&bank, &m, &[OutputMetadata::Absent])
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("output")
+        );
+        let mut bad = m;
+        bad[2].present = false;
+        assert!(
+            packed_group_metadata_layout(&bank, &bad, &out)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("input 2 is absent")
+        );
+        bad = m;
+        bad[1].shape = &[1];
+        assert!(packed_group_metadata_layout(&bank, &bad, &out).is_err());
     }
 }
