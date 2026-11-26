@@ -982,6 +982,12 @@ admission may decline, so the bound always covers streamed fallback. The same
 provider context key used by integer QMoE guards native/ORT preparation caches;
 no new public API, allocator, per-shard quota or provider lock is introduced.
 The existing architecture-dependent tile and serial arithmetic are unchanged.
+BlockQuantizedMoE borrows aligned contiguous F32 activations, router logits,
+optional router weights and FC biases instead of copying their complete payloads
+on each launch. Its runtime F32 dtype restriction and final-output publication
+remain unchanged; strided/unaligned payloads still materialize through the
+existing conversion helper. These are caller-input borrows, not new governed
+storage or persistent cached views.
 The [adoption record and matched-owner diagnostic](../benchmarks/block-projection-paired-owner/README.md)
 retain the earlier noisy results and distinguish measured warm wall time from
 unresolved per-arm CPU cost.
