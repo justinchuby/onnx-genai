@@ -359,7 +359,7 @@ fn registry_reachability_and_claim_declines_are_intentional() {
         onnx_runtime_ep_cuda::CUDA_COVERED_OPS.contains(&"Einsum"),
         "coverage census must expose Einsum"
     );
-    let descriptors = build_cuda_registry_descriptors(ep.runtime().clone());
+    let descriptors = build_cuda_registry_descriptors(ep.registry());
     let entries = descriptors
         .iter()
         .filter(|descriptor| descriptor.domain.is_empty() && descriptor.op_type == "Einsum")

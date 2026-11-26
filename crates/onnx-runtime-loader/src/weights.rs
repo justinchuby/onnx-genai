@@ -771,11 +771,21 @@ pub fn referenced_weight_bytes(model: &ModelProto) -> ReferencedWeightBytes {
             TensorData::from_raw(dtype, dims, Vec::new()).checked_expected_bytes()
         });
         if init.data_location == tensor_proto::DataLocation::External as i32 {
-            let declared_length = init
+            // A missing/empty location is a keyed-container placeholder: the
+            // container must match its dtype/shape exactly. An ONNX file-region
+            // length cannot resize that named tensor or change its budget.
+            let located = init
                 .external_data
                 .iter()
-                .find(|kv| kv.key == "length")
-                .and_then(|kv| kv.value.parse::<u64>().ok());
+                .any(|item| item.key == "location" && !item.value.is_empty());
+            let declared_length = if located {
+                init.external_data
+                    .iter()
+                    .find(|item| item.key == "length")
+                    .and_then(|item| item.value.parse::<u64>().ok())
+            } else {
+                None
+            };
             let bytes = declared_length
                 .or_else(|| declared_geometry.map(|bytes| bytes as u64))
                 .unwrap_or(0);
@@ -1227,6 +1237,47 @@ pub(crate) fn tensor_data_from_proto(
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn keyed_placeholder_weight_bytes_come_from_geometry_not_file_region_length() {
+        let mut tensor = TensorProto {
+            name: "keyed".into(),
+            data_type: DataType::Float32.to_onnx(),
+            dims: vec![2, 3],
+            data_location: tensor_proto::DataLocation::External as i32,
+            external_data: vec![crate::proto::onnx::StringStringEntryProto {
+                key: "length".into(),
+                value: "1".into(),
+            }],
+            ..Default::default()
+        };
+        for location in [None, Some(""), Some("ordinary.bin")] {
+            tensor.external_data.retain(|item| item.key != "location");
+            if let Some(location) = location {
+                tensor
+                    .external_data
+                    .push(crate::proto::onnx::StringStringEntryProto {
+                        key: "location".into(),
+                        value: location.into(),
+                    });
+            }
+            let model = ModelProto {
+                graph: Some(crate::proto::onnx::GraphProto {
+                    initializer: vec![tensor.clone()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                referenced_weight_bytes(&model).external,
+                if location == Some("ordinary.bin") {
+                    1
+                } else {
+                    24
+                }
+            );
+        }
+    }
 
     #[test]
     fn float8_typed_data_preserves_each_byte() {

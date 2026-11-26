@@ -546,16 +546,40 @@ fn tool_call_schema_for_tool(tool: &ChatTool) -> serde_json::Value {
         .function
         .parameters
         .clone()
-        .unwrap_or_else(|| serde_json::json!({ "type": "object" }));
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "name": { "enum": [tool.function.name.clone()] },
-            "arguments": arguments_schema
-        },
-        "required": ["name", "arguments"],
-        "additionalProperties": false
-    })
+        .unwrap_or_else(|| serde_json::json!({"type":"object"}));
+    let fields = [
+        (
+            "name",
+            serde_json::json!({"enum":[tool.function.name.clone()]}),
+        ),
+        (
+            "id",
+            serde_json::json!({"type":"string","minLength":1,"maxLength":onnx_genai_metadata::MAX_TOOL_CALL_ID_BYTES}),
+        ),
+        ("arguments", arguments_schema),
+    ];
+    // The backend emits object properties in schema order. Every ordering of
+    // the protocol's fields denotes the same envelope; an optional ID may be
+    // present before or after the name/arguments without changing admission.
+    let mut alternatives = Vec::new();
+    for first in 0..fields.len() {
+        for second in 0..fields.len() {
+            for third in 0..fields.len() {
+                if first == second || first == third || second == third {
+                    continue;
+                }
+                let properties = [first, second, third]
+                    .into_iter()
+                    .map(|index| (fields[index].0.to_owned(), fields[index].1.clone()))
+                    .collect::<serde_json::Map<_, _>>();
+                alternatives.push(serde_json::json!({
+                    "type":"object","properties":properties,
+                    "required":["name","arguments"],"additionalProperties":false
+                }));
+            }
+        }
+    }
+    serde_json::json!({"anyOf":alternatives})
 }
 
 fn tools_offered_to_model(request: &ChatCompletionRequest) -> Option<&Vec<ChatTool>> {

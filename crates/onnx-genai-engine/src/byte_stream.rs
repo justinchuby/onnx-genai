@@ -105,6 +105,13 @@ fn byte_level_alphabet() -> anyhow::Result<HashMap<char, u8>> {
 }
 
 impl ByteStreamContract {
+    /// Raw grammars consume vocabulary pieces before publication-only stripping.
+    /// Only an already resolved contract can produce this identity codec.
+    pub(crate) fn into_raw(mut self) -> Self {
+        self.strips.clear();
+        self
+    }
+
     /// Filter special IDs before any stream-context transforms run.
     pub(crate) fn resolve_output(
         tokenizer: &Tokenizer,

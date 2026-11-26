@@ -2374,45 +2374,33 @@ pub fn default_passes() -> Vec<Box<dyn OptimizationPass>> {
 
 ### 18.2 Fusion Pattern Matching
 
+`OpFusion` runs in an EP's custom-pass registry, so its private fused operators
+are introduced only by a provider that implements them. Generic session passes
+remain provider-independent. Recognition and rewriting use the IR pattern
+engine; the pass scans eligible regions to a fixpoint and refreshes affected
+matches after each rewrite.
+
 ```rust
-pub struct OpFusion;
+OpFusion::new().run(graph, context)?;
+```
 
-impl OptimizationPass for OpFusion {
-    fn name(&self) -> &str { "OpFusion" }
+The explicit-match API uses the same read-only context for eligibility and
+application. Initializer-backed coefficients and axes can therefore resolve
+inline or mapped bytes without copying weights:
 
-    fn run(&self, graph: &mut Graph, ctx: &PassContext) -> Result<()> {
-        let patterns = vec![
-            FusionPattern::new("MatMul+Bias+Relu", &["MatMul", "Add", "Relu"], "FusedGemm"),
-            FusionPattern::new("MatMul+Bias", &["MatMul", "Add"], "FusedMatMulBias"),
-            FusionPattern::new("LayerNorm", &["ReduceMean", "Sub", "Pow", "ReduceMean", "Add", "Sqrt", "Div", "Mul", "Add"], "LayerNormalization"),
-            FusionPattern::new("Residual+LayerNorm", &["Add", "LayerNormalization"], "FusedResidualLayerNorm"),
-            FusionPattern::new("GELU", &["Mul", "Pow", "Mul", "Add", "Mul", "Tanh", "Add", "Mul"], "Gelu"),
-        ];
-
-        for pattern in &patterns {
-            while let Some(match_) = pattern.find_match(graph) {
-                pattern.apply_fusion(graph, &match_)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-pub struct FusionPattern {
-    name: String,
-    /// Op sequence to match (must form a connected subgraph).
-    ops: Vec<String>,
-    /// Replacement op type.
-    replacement: String,
-}
-
-impl FusionPattern {
-    /// Find the next match in the graph (DFS from each node).
-    pub fn find_match(&self, graph: &Graph) -> Option<PatternMatch>;
-    /// Apply the fusion: remove matched nodes, insert replacement.
-    pub fn apply_fusion(&self, graph: &mut Graph, match_: &PatternMatch) -> Result<()>;
+```rust
+let pattern = FusionPattern::layernorm();
+if let Some(matched) = pattern.find_match(graph, context)? {
+    pattern.apply_fusion(graph, &matched, context)?;
 }
 ```
+
+`find_match` returns `Result<Option<PatternMatch>>`: invalid graphs, matcher
+errors and exhausted budgets propagate as errors. A caller applying an explicit
+match must not mutate the graph between recognition and application. Unresolved
+or overridable literals decline semantic fusion. LayerNorm additionally proves
+complete suffix reduction, nonempty normalized width and affine broadcasting
+that cannot expand the activation shape.
 
 ---
 

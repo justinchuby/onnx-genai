@@ -110,6 +110,16 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
     // derived complaint about the same missing fact.
     let version = crate::version::normalize(metadata.schema_version.as_deref())
         .unwrap_or(crate::version::INITIAL_SCHEMA_VERSION);
+    crate::schema::validate_graph_weights(&metadata.graph_weights, &mut errors);
+    if !metadata.graph_weights.is_empty()
+        && let Err(error) = crate::version::gate_feature_use(
+            version,
+            crate::version::SchemaFeature::GraphWeights,
+            "graph_weights",
+        )
+    {
+        errors.push(error);
+    }
     if let Some(pipeline) = &metadata.pipeline
         && let Err(error) = validate_pipeline_spec(pipeline, version)
     {

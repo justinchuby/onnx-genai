@@ -1658,10 +1658,21 @@ This server currently supplies these exact v1 adapters:
 | `tagged-json@v1` | Supplies the offered OpenAI `tools` JSON value to a chat template; without a template, prefixes it with `<\|tools\|>\n`. It emits the caller's `tool_choice` after `<\|tool_choice\|>\n`. | One or more adjacent `<tool_call>{...}</tool_call>` envelopes, separated only by whitespace. Every object has `name`, optionally `id`, and `arguments` or `parameters`. |
 | `atem-xml@v1` | Supplies the same `tools` JSON template value; without a template, prefixes it with `<atem:tools>\n`. It uses the same explicit `tool_choice` placement. | One or more adjacent `<atem:invoke name="...">...</atem:invoke>` envelopes. Each argument is `<atem:parameter name="...">JSON-or-text</atem:parameter>`; `&quot;`, `&apos;`, `&lt;`, `&gt;`, and `&amp;` are unescaped exactly once. |
 
-For both adapters, explicit IDs are preserved and absent IDs become stable
-`call_<index>` values in envelope order. Duplicate IDs, empty/oversized names
+For complete model calls, tagged JSON explicit IDs are preserved; absent IDs
+(including XML invokes) become stable `call_<index>` values in envelope order. Duplicate IDs, empty/oversized names
 or IDs, excess calls, non-whitespace envelope interstitials, invalid JSON, and
-text outside XML parameters are malformed. Neither v1 protocol declares an
+text outside XML parameters are malformed.
+Tagged JSON call fields must be unique. Its envelope boundary is determined by
+JSON parsing, so a `</tool_call>` string inside an argument is ordinary data.
+`ToolCallStream.fragments` exposes cumulative provisional snapshots with an
+optional model ID and raw argument spelling; it does not admit a completed call.
+Atem XML retains an open parameter until its JSON-or-text value is resolved.
+Its complete and provisional parses share one scanner. Quoted attributes accept
+single or double quotes, and `>` inside a quoted attribute is not a tag end.
+Duplicate attributes, missing exact `name` attributes, incompatible parameter
+prefixes and incomplete parameters inside a closed invoke are rejected.
+Streaming transports may assign an opaque wire ID before a model ID is known,
+but must retain a mapping back to the complete model ID for tool-result prompting. Neither v1 protocol declares an
 unambiguous end marker for a sequence containing one or more adjacent calls.
 Before an opening envelope parsing is `NoCall`; after an unclosed opening
 envelope it is `Incomplete`; one or more closed envelopes are `CompleteSoFar`

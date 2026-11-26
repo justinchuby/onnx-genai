@@ -342,17 +342,24 @@ impl Engine {
     pub(crate) fn decode_core_covers_declared_workflow(
         model_dir: &Path,
         backend: EngineDecodeBackend,
+        selection: &onnx_genai_ort::ModelPackageSelection,
     ) -> anyhow::Result<bool> {
+        let selected = ModelDirectory::package_metadata(model_dir, selection)
+            .context("resolve selected package metadata before workflow admission")?;
         // An authored package answers from its own metadata. Only a package
         // that ships none needs the `genai_config.json` importer, which converts
         // that foreign format into this project's one representation — and which
         // needs a resolvable model directory, something a composite workflow
         // package (components in subdirectories) deliberately does not present.
-        let metadata = if onnx_genai_metadata::find_metadata_path(model_dir).is_some() {
+        let metadata = if selected
+            .as_ref()
+            .is_some_and(|directory| directory.metadata_path.is_some())
+            || onnx_genai_metadata::find_metadata_path(model_dir).is_some()
+        {
             let mut capability_error = None;
             let directory =
-                match onnx_genai_ort::PipelineModelDirectory::load_with_metadata_preflight(
-                    model_dir,
+                match onnx_genai_ort::PipelineModelDirectory::load_with_metadata_preflight_and_selection(
+                    model_dir, selection,
                     |metadata| {
                         crate::pipeline::WorkflowExecutionAdmission::from_metadata(
                             metadata, backend,
@@ -379,11 +386,19 @@ impl Engine {
                     .and_then(|metadata| metadata.speculative.as_ref()),
             );
             return Ok(decode_core_covers);
+        } else if selected.is_some() {
+            let selected = ModelDirectory::load_with_package_selection(model_dir, selection)
+                .context("resolve selected compatibility package")?;
+            Some(
+                load_inference_metadata(&selected)
+                    .context("read selected package inference contract")?,
+            )
         } else {
             onnx_genai_ort::ModelDirectory::load(model_dir)
                 .ok()
                 .and_then(|directory| load_inference_metadata(&directory).ok())
         };
+
         let workflow = metadata
             .as_ref()
             .and_then(|metadata| metadata.pipeline.as_ref())
@@ -471,7 +486,14 @@ impl Engine {
     /// executor for the package's declared decode step, which is a question
     /// about the contract that step names.
     pub fn from_dir(model_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
-        if !Self::decode_core_covers_declared_workflow(model_dir, config.decode_backend)? {
+        if !Self::decode_core_covers_declared_workflow(
+            model_dir,
+            config.decode_backend,
+            &package_selection_from_session_options(
+                &SessionOptions::default(),
+                config.package_variant.as_deref(),
+            ),
+        )? {
             return Self::from_interpreted_dir(model_dir, config, SessionOptions::default(), None);
         }
         Self::from_dir_impl(model_dir, config, SessionOptions::default(), false, None)
@@ -483,7 +505,14 @@ impl Engine {
         config: EngineConfig,
         provider: Arc<dyn MemoryAuthorityProvider>,
     ) -> anyhow::Result<Self> {
-        if !Self::decode_core_covers_declared_workflow(model_dir, config.decode_backend)? {
+        if !Self::decode_core_covers_declared_workflow(
+            model_dir,
+            config.decode_backend,
+            &package_selection_from_session_options(
+                &SessionOptions::default(),
+                config.package_variant.as_deref(),
+            ),
+        )? {
             return Self::from_interpreted_dir(
                 model_dir,
                 config,
@@ -506,7 +535,14 @@ impl Engine {
         config: EngineConfig,
         session_options: SessionOptions,
     ) -> anyhow::Result<Self> {
-        if !Self::decode_core_covers_declared_workflow(model_dir, config.decode_backend)? {
+        if !Self::decode_core_covers_declared_workflow(
+            model_dir,
+            config.decode_backend,
+            &package_selection_from_session_options(
+                &session_options,
+                config.package_variant.as_deref(),
+            ),
+        )? {
             return Self::from_interpreted_dir(model_dir, config, session_options, None);
         }
         Self::from_dir_impl(model_dir, config, session_options, true, None)
@@ -552,7 +588,10 @@ impl Engine {
     ) -> anyhow::Result<Self> {
         let model_directory = {
             let _span = onnx_genai_ort::prof_span!("engine.resolve_model_directory");
-            let package_selection = package_selection_from_session_options(&session_options);
+            let package_selection = package_selection_from_session_options(
+                &session_options,
+                config.package_variant.as_deref(),
+            );
             ModelDirectory::load_with_package_selection(model_dir, &package_selection)
                 .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {e}"))?
         };
@@ -577,9 +616,14 @@ impl Engine {
             &metadata_hints,
             session_options_are_programmatic,
         )?;
+        let metadata = load_inference_metadata(&model_directory)?;
         let decode_backend = {
             let _span = onnx_genai_ort::prof_span!("engine.resolve_decode_backend");
-            resolve_decode_backend(&model_directory.model_path, config.decode_backend)?
+            resolve_decode_backend(
+                &model_directory.model_path,
+                config.decode_backend,
+                !metadata.graph_weights.is_empty(),
+            )?
         };
         anyhow::ensure!(
             config.native_state_files != crate::NativeStateFilePolicy::Required
@@ -602,6 +646,7 @@ impl Engine {
                         model_directory,
                         config,
                         metadata_hints,
+                        metadata,
                         native_device,
                         authority_provider.as_ref(),
                         &domain,
@@ -612,7 +657,12 @@ impl Engine {
             #[cfg(not(feature = "native-backend"))]
             {
                 return augment_backend_error(
-                    Self::from_native_model_directory(model_directory, config, metadata_hints),
+                    Self::from_native_model_directory(
+                        model_directory,
+                        config,
+                        metadata_hints,
+                        metadata,
+                    ),
                     EngineDecodeBackend::Native,
                 );
             }
@@ -623,7 +673,6 @@ impl Engine {
             &domain,
             config.limits.vram_limit,
         )?;
-        let metadata = load_inference_metadata(&model_directory)?;
         let decoder_abi = metadata.decoder_io();
         let kv_inputs = decoder_abi
             .and_then(|abi| abi.kv_inputs.clone())
@@ -884,6 +933,7 @@ impl Engine {
         model_directory: ModelDirectory,
         config: EngineConfig,
         metadata_hints: MetadataHints,
+        mut metadata: InferenceMetadata,
         native_device: crate::native_decode::NativeDecodeDevice,
         authority_provider: Option<&SharedMemoryAuthorityProvider>,
         authority_domain: &DeviceCompatibilityDomain,
@@ -903,21 +953,6 @@ impl Engine {
         if !matches!(&config.kv_connector.backend, KvConnectorBackend::Null) {
             anyhow::bail!("native decoder backend does not yet support external KV connectors");
         }
-        let mut metadata = {
-            let _span = onnx_genai_ort::prof_span!("engine.metadata_load");
-            if let Some(metadata_path) = &model_directory.metadata_path {
-                onnx_genai_metadata::load_metadata(metadata_path)
-                    .map_err(|e| anyhow::anyhow!("Failed to load metadata: {e}"))?
-            } else if let Some(compat) = genai_config_compat_metadata_from_model_path(
-                model_directory.genai_config_path.as_deref(),
-                &model_directory.model_path,
-            )? {
-                compat
-            } else {
-                tracing::warn!("No inference metadata found, using defaults");
-                default_inference_metadata()
-            }
-        };
         // Auto-derive the decoder `io` port contract from the ONNX graph when the
         // package's `inference_metadata.yaml` declares none. This engages ONLY
         // for hybrid linear-attention decoders — graphs that expose recurrent
@@ -983,8 +1018,15 @@ impl Engine {
             }
             None => governor_kv_config(None, &config)?,
         };
+        let graph_weights =
+            crate::keyed_weights::GraphWeightFiles::resolve(&model_directory.root, &metadata)?;
+        let graph_files = graph_weights.for_graph(&model_directory.model_path)?;
+        let keyed_weight_files = graph_files.map_or(&[][..], |files| files.containers.as_slice());
         let model_weight_bytes = device_weight_package_bytes(&model_directory.model_path);
-        let graph_memory = analyze_model_memory(&model_directory.model_path);
+        let graph_memory = analyze_model_memory_with_keyed_weights(
+            &model_directory.model_path,
+            keyed_weight_files,
+        );
         let minimum_useful_weight_budget_bytes = graph_memory
             .per_layer_weight_bytes
             .iter()
@@ -1197,6 +1239,7 @@ impl Engine {
                 &model_directory.model_path,
                 native_device.clone(),
                 crate::native_decode::NativeDecodeLoadOptions {
+                    keyed_weight_files,
                     cpu_resources: governor.cpu_memory_resources(cache_retention.clone()),
                     #[cfg(feature = "native-cuda")]
                     cuda_offload_policy,
@@ -1233,6 +1276,7 @@ impl Engine {
                         &tokenizer,
                         config.decode_precision,
                         native_session.inference_session().graph(),
+                        &graph_weights,
                     )
                     .context("resolve Native state file identity at model load")?,
                 );
@@ -1491,8 +1535,11 @@ impl Engine {
         // The declared MTP head executes through the same selected Native
         // component backend as ordinary workflow graphs.
         let mtp = load_native_mtp_proposer(
-            &metadata,
-            &model_directory,
+            NativeMtpPackage {
+                metadata: &metadata,
+                directory: &model_directory,
+                graph_weights: &graph_weights,
+            },
             &native_device,
             governor.cpu_memory_resources(cache_retention.clone()),
             match native_device.cuda_index() {
@@ -1583,6 +1630,7 @@ impl Engine {
         _model_directory: ModelDirectory,
         _config: EngineConfig,
         _metadata_hints: MetadataHints,
+        _metadata: InferenceMetadata,
     ) -> anyhow::Result<Self> {
         anyhow::bail!(
             "native decoder backend requires building onnx-genai-engine with the 'native-backend' feature"
@@ -1673,6 +1721,7 @@ fn decoder_io_seeded_with(
 
 fn package_selection_from_session_options(
     session_options: &SessionOptions,
+    variant: Option<&str>,
 ) -> onnx_genai_ort::ModelPackageSelection {
     let execution_provider = session_options.execution_providers.first().map(|provider| {
         match provider.selection.name.as_str() {
@@ -1686,6 +1735,7 @@ fn package_selection_from_session_options(
         }
     });
     onnx_genai_ort::ModelPackageSelection {
+        variant: variant.map(str::to_owned),
         execution_provider,
         ..Default::default()
     }
@@ -2775,6 +2825,7 @@ fn load_mtp_model(
             // shared LM-head therefore still fails fast in the adapter loader,
             // preserving the existing ORT-backend behaviour exactly.
             None,
+            &[],
         )?)
     } else {
         None
@@ -2789,6 +2840,7 @@ fn build_mtp_model_from_resolved(
     head_session: MtpHeadModel,
     model_directory: &ModelDirectory,
     draft_projection: Option<crate::speculative::DraftProjectionDevice>,
+    keyed_weight_files: &[onnx_runtime_loader::KeyedWeightFile],
 ) -> anyhow::Result<MtpModel> {
     if mtp_config.cache_scope == MtpCacheScope::AcceptedPrefix {
         anyhow::bail!(
@@ -2844,6 +2896,7 @@ fn build_mtp_model_from_resolved(
                 lm_head,
                 mtp_config.public_config.hidden_size,
                 draft_projection,
+                keyed_weight_files,
             )?;
             if vocab_size != mtp_config.public_config.vocab_size {
                 anyhow::bail!(
@@ -2872,15 +2925,26 @@ fn build_mtp_model_from_resolved(
 /// Resolve an enabled declared head on the selected Native executor, without
 /// creating an ORT environment or reference session.
 #[cfg(feature = "native-backend")]
+struct NativeMtpPackage<'a> {
+    metadata: &'a InferenceMetadata,
+    directory: &'a ModelDirectory,
+    graph_weights: &'a crate::keyed_weights::GraphWeightFiles,
+}
+
+#[cfg(feature = "native-backend")]
 fn load_native_mtp_proposer(
-    metadata: &InferenceMetadata,
-    model_directory: &ModelDirectory,
+    package: NativeMtpPackage<'_>,
     device: &crate::native_decode::NativeDecodeDevice,
     resources: onnx_runtime_ep_cpu::CpuMemoryResources,
     draft_projection: crate::speculative::DraftProjectionDevice,
     requested_drafts: usize,
     enabled: bool,
 ) -> anyhow::Result<Option<MtpModel>> {
+    let NativeMtpPackage {
+        metadata,
+        directory: model_directory,
+        graph_weights,
+    } = package;
     if !enabled {
         return Ok(None);
     }
@@ -2916,14 +2980,22 @@ fn load_native_mtp_proposer(
     validate_resolved_mtp_config(&resolved)?;
     validate_native_mtp_hidden_output(&model_directory.model_path, &resolved)?;
     let head = MtpHeadModel::Native(
-        crate::pipeline::NativeMtpHead::load(&resolved.public_config.head_model, device, resources)
-            .context("load the metadata-declared Native MTP head")?,
+        crate::pipeline::NativeMtpHead::load(
+            &resolved.public_config.head_model,
+            graph_weights,
+            device,
+            resources,
+        )
+        .context("load the metadata-declared Native MTP head")?,
     );
     Ok(Some(build_mtp_model_from_resolved(
         resolved,
         head,
         model_directory,
         Some(draft_projection),
+        graph_weights
+            .for_graph(&model_directory.model_path)?
+            .map_or(&[][..], |files| files.containers.as_slice()),
     )?))
 }
 

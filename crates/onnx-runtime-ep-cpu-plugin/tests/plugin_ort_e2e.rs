@@ -853,12 +853,77 @@ fn dsa_schema_op(output_type: ort::ONNXTensorElementDataType) -> Box<ort::OrtCus
     })
 }
 
+// ORT 1.32 ships schemas through opset 28. Supply only the schema shape/type
+// descriptor for the current ONNX MVN-29 fixture. This never implements MVN:
+// fallback is disabled, assignment must name cpu_ep, and this callback fails
+// loudly if ORT ever tries to execute the descriptor's CPU kernel.
+static MVN_SCHEMA_COMPUTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+unsafe extern "C" fn mvn_schema_name(_op: *const ort::OrtCustomOp) -> *const std::os::raw::c_char {
+    c"MeanVarianceNormalization".as_ptr()
+}
+unsafe extern "C" fn mvn_schema_version(_op: *const ort::OrtCustomOp) -> i32 {
+    29
+}
+unsafe extern "C" fn mvn_schema_create(
+    _op: *const ort::OrtCustomOp,
+    api: *const ort::OrtApi,
+    _info: *const ort::OrtKernelInfo,
+    kernel: *mut *mut std::ffi::c_void,
+) -> *mut ort::OrtStatus {
+    unsafe { *kernel = Box::into_raw(Box::new(api)).cast() };
+    ptr::null_mut()
+}
+unsafe extern "C" fn mvn_schema_destroy(kernel: *mut std::ffi::c_void) {
+    if !kernel.is_null() {
+        drop(unsafe { Box::from_raw(kernel.cast::<*const ort::OrtApi>()) });
+    }
+}
+unsafe extern "C" fn mvn_schema_compute(
+    kernel: *mut std::ffi::c_void,
+    _context: *mut ort::OrtKernelContext,
+) -> *mut ort::OrtStatus {
+    MVN_SCHEMA_COMPUTES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let api = unsafe { *kernel.cast::<*const ort::OrtApi>() };
+    match unsafe { (*api).CreateStatus } {
+        Some(create) => unsafe {
+            create(ort::ORT_FAIL,c"MVN-29 schema descriptor cannot execute; the native cpu_ep must claim and run this node".as_ptr())
+        },
+        None => std::process::abort(),
+    }
+}
+fn mvn_schema_op() -> Box<ort::OrtCustomOp> {
+    let mut op = dsa_schema_op(ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+    op.GetName = Some(mvn_schema_name);
+    op.GetInputTypeCount = Some(dsa_schema_output_count);
+    op.GetStartVersion = Some(mvn_schema_version);
+    op.GetEndVersion = Some(mvn_schema_version);
+    op.CreateKernel = None;
+    op.CreateKernelV2 = Some(mvn_schema_create);
+    op.KernelDestroy = Some(mvn_schema_destroy);
+    op.KernelCompute = None;
+    op.KernelComputeV2 = Some(mvn_schema_compute);
+    op
+}
+enum ConformanceSchema {
+    DsaIndexSelect(ort::ONNXTensorElementDataType),
+    MeanVarianceNormalization29,
+}
+impl ConformanceSchema {
+    fn descriptor(self) -> (&'static std::ffi::CStr, Box<ort::OrtCustomOp>) {
+        match self {
+            Self::DsaIndexSelect(dtype) => (c"pkg.nxrt", dsa_schema_op(dtype)),
+            Self::MeanVarianceNormalization29 => (c"", mvn_schema_op()),
+        }
+    }
+}
+
 #[allow(clippy::type_complexity)]
 unsafe fn conformance_setup_with_session_status(
     reg_name: &str,
     model_path: &std::path::Path,
     disable_fallback: bool,
-    custom_schema_output: Option<ort::ONNXTensorElementDataType>,
+    custom_schema: Option<ConformanceSchema>,
+    session_config: &[(&std::ffi::CStr, &std::ffi::CStr)],
 ) -> Option<(
     &'static libloading::Library,
     *const ort::OrtApi,
@@ -954,17 +1019,33 @@ unsafe fn conformance_setup_with_session_status(
     let status = unsafe { ((*api).CreateSessionOptions.unwrap())(&mut session_options) };
     unsafe { check_status(api, status, "CreateSessionOptions") };
     unsafe { pin_intra_op_threads(api, session_options) };
+    for &(key, value) in session_config {
+        let status = unsafe {
+            ((*api).AddSessionConfigEntry.expect("AddSessionConfigEntry"))(
+                session_options,
+                key.as_ptr(),
+                value.as_ptr(),
+            )
+        };
+        unsafe {
+            check_status(
+                api,
+                status,
+                &format!("AddSessionConfigEntry({})", key.to_string_lossy()),
+            )
+        };
+    }
 
-    let (custom_op_domain, custom_op) = if let Some(output_type) = custom_schema_output {
-        let custom_op = dsa_schema_op(output_type);
+    let (custom_op_domain, custom_op) = if let Some(schema) = custom_schema {
+        let (domain_name, custom_op) = schema.descriptor();
         let mut domain: *mut ort::OrtCustomOpDomain = ptr::null_mut();
         let status =
-            unsafe { ((*api).CreateCustomOpDomain.unwrap())(c"pkg.nxrt".as_ptr(), &mut domain) };
-        unsafe { check_status(api, status, "CreateCustomOpDomain(pkg.nxrt)") };
+            unsafe { ((*api).CreateCustomOpDomain.unwrap())(domain_name.as_ptr(), &mut domain) };
+        unsafe { check_status(api, status, "CreateCustomOpDomain(conformance schema)") };
         let status = unsafe { ((*api).CustomOpDomain_Add.unwrap())(domain, custom_op.as_ref()) };
-        unsafe { check_status(api, status, "CustomOpDomain_Add(DsaIndexSelect)") };
+        unsafe { check_status(api, status, "CustomOpDomain_Add(conformance schema)") };
         let status = unsafe { ((*api).AddCustomOpDomain.unwrap())(session_options, domain) };
-        unsafe { check_status(api, status, "AddCustomOpDomain(pkg.nxrt)") };
+        unsafe { check_status(api, status, "AddCustomOpDomain(conformance schema)") };
         (domain, Some(custom_op))
     } else {
         (ptr::null_mut(), None)
@@ -1048,7 +1129,7 @@ unsafe fn conformance_setup(
     *mut ort::OrtSession,
 )> {
     let (lib, api, env, session_options, session, domain, custom_op, status) = unsafe {
-        conformance_setup_with_session_status(reg_name, model_path, disable_fallback, None)?
+        conformance_setup_with_session_status(reg_name, model_path, disable_fallback, None, &[])?
     };
     debug_assert!(domain.is_null());
     debug_assert!(custom_op.is_none());
@@ -2532,6 +2613,7 @@ fn conformance_einsum12_bfloat16_is_rejected_before_execution() {
             &model_path,
             true,
             None,
+            &[],
         )
     }) else {
         eprintln!(
@@ -4724,7 +4806,10 @@ fn dsa_index_select_later_opset_import_assigns_and_runs_v1() {
             "cpu_ep_dsa_opset2",
             &model_path,
             true,
-            Some(ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64),
+            Some(ConformanceSchema::DsaIndexSelect(
+                ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+            )),
+            &[],
         )
     }) else {
         eprintln!(
@@ -4843,7 +4928,10 @@ fn dsa_index_select_non_int64_output_is_declined_before_compile_or_compute() {
             "cpu_ep_dsa_bad_output",
             &model_path,
             false,
-            Some(ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT),
+            Some(ConformanceSchema::DsaIndexSelect(
+                ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            )),
+            &[],
         )
     }) else {
         eprintln!(
@@ -9748,5 +9836,730 @@ graph {
             "[rms_workspace] both RMS schemas assigned to cpu_ep; shapes 2x3/3x9/2x3 and statistics passed"
         );
         conformance_teardown(api, env, options, session, name);
+    }
+}
+
+#[test]
+fn layernorm_workspace_tracks_dynamic_shapes_and_all_outputs_through_real_plugin() {
+    let _lock = lock_ort_ep();
+    let name = "layernorm_workspace";
+    let model = r#"ir_version: 10
+opset_import: [{ version: 17 }, { domain: "com.microsoft" version: 1 }]
+graph {
+ name: "layernorm_workspace"
+ node: [
+  { input: ["X","scale","beta"] output: ["first","first_mean","first_inv"] op_type: "LayerNormalization" },
+  { input: ["first","skip","scale","beta","bias"] output: ["Y","mean","inv","sum"] op_type: "SkipLayerNormalization" domain: "com.microsoft" attribute: [{ name: "epsilon" f: 0.00001 type: FLOAT }] }
+ ]
+ input: [
+  { name: "X" type { tensor_type { elem_type: 1 shape { dim: [{dim_param:"rows"},{dim_param:"width"}] } } } },
+  { name: "skip" type { tensor_type { elem_type: 1 shape { dim: [{dim_param:"rows"},{dim_param:"width"}] } } } },
+  { name: "scale" type { tensor_type { elem_type: 1 shape { dim: [{dim_param:"width"}] } } } },
+  { name: "beta" type { tensor_type { elem_type: 1 shape { dim: [{dim_param:"width"}] } } } },
+  { name: "bias" type { tensor_type { elem_type: 1 shape { dim: [{dim_param:"width"}] } } } }
+ ]
+ value_info: [{ name:"first" type { tensor_type { elem_type:1 shape { dim:[{dim_param:"rows"},{dim_param:"width"}] } } } }]
+ output: [
+  { name:"first_mean" type { tensor_type { elem_type:1 shape { dim:[{dim_param:"rows"},{dim_value:1}] } } } },
+  { name:"first_inv" type { tensor_type { elem_type:1 shape { dim:[{dim_param:"rows"},{dim_value:1}] } } } },
+  { name:"Y" type { tensor_type { elem_type:1 shape { dim:[{dim_param:"rows"},{dim_param:"width"}] } } } },
+  { name:"mean" type { tensor_type { elem_type:1 shape { dim:[{dim_param:"rows"},{dim_value:1}] } } } },
+  { name:"inv" type { tensor_type { elem_type:1 shape { dim:[{dim_param:"rows"},{dim_value:1}] } } } },
+  { name:"sum" type { tensor_type { elem_type:1 shape { dim:[{dim_param:"rows"},{dim_param:"width"}] } } } }
+ ]
+}
+"#;
+    let path = write_generated_model(name, model);
+    let (_library, api, env, options, session) = skip_if_missing!(
+        unsafe { conformance_setup(name, &path, true) },
+        "LayerNorm workspace: ORT/plugin unavailable"
+    );
+    unsafe {
+        let assignment = query_ep_assignment(api, session);
+        assert_eq!(
+            assignment.ops_on_our_ep(),
+            ["LayerNormalization", "SkipLayerNormalization"],
+            "{:?}",
+            assignment.assignments
+        );
+        assert!(assignment.ops_not_on_our_ep().is_empty());
+        for (iteration, (rows, width)) in [(2usize, 3usize), (3, 9), (2, 3)].into_iter().enumerate()
+        {
+            let mut values = (0..rows * width)
+                .map(|i| (i as f32 * 0.175).cos() * 2. + iteration as f32 * 0.25)
+                .collect::<Vec<_>>();
+            let mut skips = (0..rows * width)
+                .map(|i| i as f32 * 0.075 - 0.5)
+                .collect::<Vec<_>>();
+            let mut scales = (0..width)
+                .map(|i| 0.25 + i as f32 * 0.125)
+                .collect::<Vec<_>>();
+            let mut betas = (0..width)
+                .map(|i| i as f32 * 0.025 - 0.1)
+                .collect::<Vec<_>>();
+            let mut biases = (0..width)
+                .map(|i| 0.15 - i as f32 * 0.05)
+                .collect::<Vec<_>>();
+            let reference = |input: &[f64]| {
+                let mut y = Vec::new();
+                let mut means = Vec::new();
+                let mut inverses = Vec::new();
+                for row in input.chunks_exact(width) {
+                    let mean = row.iter().sum::<f64>() / width as f64;
+                    let variance =
+                        row.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / width as f64;
+                    let inv = 1. / (variance + 1e-5).sqrt();
+                    means.push(mean);
+                    inverses.push(inv);
+                    y.extend(
+                        row.iter()
+                            .zip(&scales)
+                            .zip(&betas)
+                            .map(|((&x, &s), &b)| (x - mean) * inv * f64::from(s) + f64::from(b)),
+                    );
+                }
+                [y, means, inverses]
+            };
+            let [first, first_mean, first_inv] =
+                reference(&values.iter().copied().map(f64::from).collect::<Vec<_>>());
+            let sum = first
+                .iter()
+                .zip(&skips)
+                .enumerate()
+                .map(|(i, (&x, &s))| x + f64::from(s) + f64::from(biases[i % width]))
+                .collect::<Vec<_>>();
+            let [expected, mean, inv] = reference(&sum);
+            let expected = [first_mean, first_inv, expected, mean, inv, sum];
+            let x = make_float_tensor(api, &mut values, &[rows as i64, width as i64]);
+            let skip = make_float_tensor(api, &mut skips, &[rows as i64, width as i64]);
+            let scale = make_float_tensor(api, &mut scales, &[width as i64]);
+            let beta = make_float_tensor(api, &mut betas, &[width as i64]);
+            let bias = make_float_tensor(api, &mut biases, &[width as i64]);
+            let outputs = run_and_collect_f32(
+                api,
+                session,
+                &["X", "skip", "scale", "beta", "bias"],
+                &[x, skip, scale, beta, bias],
+                &["first_mean", "first_inv", "Y", "mean", "inv", "sum"],
+            );
+            for value in [x, skip, scale, beta, bias] {
+                ((*api).ReleaseValue.unwrap())(value);
+            }
+            assert_eq!(outputs.len(), 6);
+            for (actual, expected) in outputs.iter().zip(expected) {
+                assert_eq!(actual.len(), expected.len());
+                for (&got, want) in actual.iter().zip(expected) {
+                    assert!(
+                        (f64::from(got) - want).abs() < 1e-4,
+                        "shape {rows}x{width}: {got} vs {want}"
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "[layernorm_workspace] both normalization nodes assigned to cpu_ep; shapes 2x3/3x9/2x3 and all six outputs passed"
+        );
+        conformance_teardown(api, env, options, session, name);
+    }
+}
+
+/// Broadcast coefficients never become expanded tensor inputs or extra ORT nodes.
+#[test]
+fn layernorm_affine_broadcasts_through_real_plugin_without_fallback() {
+    struct Case {
+        axis: usize,
+        scale: &'static [usize],
+        bias: &'static [usize],
+        si: fn(usize) -> usize,
+        bi: fn(usize) -> usize,
+    }
+    let cases = [
+        Case {
+            axis: 1,
+            scale: &[],
+            bias: &[4],
+            si: |_| 0,
+            bi: |i| i % 4,
+        },
+        Case {
+            axis: 1,
+            scale: &[3, 1],
+            bias: &[],
+            si: |i| (i % 12) / 4,
+            bi: |_| 0,
+        },
+        Case {
+            axis: 2,
+            scale: &[2, 1, 1],
+            bias: &[1, 3, 1],
+            si: |i| i / 12,
+            bi: |i| (i % 12) / 4,
+        },
+        Case {
+            axis: 0,
+            scale: &[4],
+            bias: &[2, 1, 1],
+            si: |i| i % 4,
+            bi: |i| i / 12,
+        },
+        Case {
+            axis: 1,
+            scale: &[2, 3, 4],
+            bias: &[1, 1, 1],
+            si: |i| i,
+            bi: |_| 0,
+        },
+        Case {
+            axis: 1,
+            scale: &[1, 3, 4],
+            bias: &[1, 3, 4],
+            si: |i| i % 12,
+            bi: |i| i % 12,
+        },
+    ];
+    let _lock = lock_ort_ep();
+    for (id, case) in cases.iter().enumerate() {
+        let name = format!("layernorm_affine_{id}");
+        let dims = |shape: &[usize]| {
+            shape
+                .iter()
+                .map(|n| format!("{{dim_value:{n}}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let mut reduced = [2, 3, 4];
+        reduced[case.axis..].fill(1);
+        let model=r#"ir_version: 10
+opset_import: [{version:17}]
+graph {
+ name:"layernorm_affine"
+ node:[{input:["X","scale","B"] output:["Y","mean","inv"] op_type:"LayerNormalization" attribute:[{name:"axis" i:$AXIS type:INT}]}]
+ input:[
+  {name:"X" type {tensor_type {elem_type:1 shape {dim:[{dim_value:2},{dim_value:3},{dim_value:4}]}}}},
+  {name:"scale" type {tensor_type {elem_type:1 shape {dim:[$SCALE]}}}},
+  {name:"B" type {tensor_type {elem_type:1 shape {dim:[$BIAS]}}}}
+ ]
+ output:[
+  {name:"Y" type {tensor_type {elem_type:1 shape {dim:[{dim_value:2},{dim_value:3},{dim_value:4}]}}}},
+  {name:"mean" type {tensor_type {elem_type:1 shape {dim:[$REDUCED]}}}},
+  {name:"inv" type {tensor_type {elem_type:1 shape {dim:[$REDUCED]}}}}
+ ]
+}
+"#.replace("$AXIS",&case.axis.to_string()).replace("$SCALE",&dims(case.scale)).replace("$BIAS",&dims(case.bias)).replace("$REDUCED",&dims(&reduced));
+        let path = write_generated_model(&name, &model);
+        let (_library, api, env, options, session) = skip_if_missing!(
+            unsafe { conformance_setup(&name, &path, true) },
+            "LayerNorm affine: ORT/plugin unavailable"
+        );
+        unsafe {
+            let assignment = query_ep_assignment(api, session);
+            assert_eq!(
+                assignment.ops_on_our_ep(),
+                ["LayerNormalization"],
+                "{:?}",
+                assignment.assignments
+            );
+            assert!(assignment.ops_not_on_our_ep().is_empty());
+            for iteration in 0..2 {
+                let mut values = (0..24)
+                    .map(|i| i as f32 - 12. + iteration as f32 * 0.25)
+                    .collect::<Vec<_>>();
+                let mut scales = (0..case.scale.iter().product::<usize>())
+                    .map(|i| 0.5 + i as f32 * 0.125 + iteration as f32 * 0.025)
+                    .collect::<Vec<_>>();
+                let mut biases = (0..case.bias.iter().product::<usize>())
+                    .map(|i| -0.25 + i as f32 * 0.05)
+                    .collect::<Vec<_>>();
+                let width = [2, 3, 4][case.axis..].iter().product::<usize>();
+                let groups = 24 / width;
+                let mut expected = vec![0.; 24];
+                let mut means = Vec::new();
+                let mut inverses = Vec::new();
+                for (g, row) in values.chunks_exact(width).enumerate() {
+                    let m = row.iter().map(|&x| f64::from(x)).sum::<f64>() / width as f64;
+                    let v =
+                        row.iter().map(|&x| (f64::from(x) - m).powi(2)).sum::<f64>() / width as f64;
+                    let r = 1. / (v + 1e-5).sqrt();
+                    means.push(m);
+                    inverses.push(r);
+                    for (e, &x) in row.iter().enumerate() {
+                        let flat = g * width + e;
+                        expected[flat] =
+                            (f64::from(x) - m) * r * f64::from(scales[(case.si)(flat)])
+                                + f64::from(biases[(case.bi)(flat)]);
+                    }
+                }
+                let s_shape = case.scale.iter().map(|&d| d as i64).collect::<Vec<_>>();
+                let b_shape = case.bias.iter().map(|&d| d as i64).collect::<Vec<_>>();
+                let x = make_float_tensor(api, &mut values, &[2, 3, 4]);
+                let scale = make_float_tensor(api, &mut scales, &s_shape);
+                let bias = make_float_tensor(api, &mut biases, &b_shape);
+                let outputs = run_and_collect_f32(
+                    api,
+                    session,
+                    &["X", "scale", "B"],
+                    &[x, scale, bias],
+                    &["Y", "mean", "inv"],
+                );
+                for value in [x, scale, bias] {
+                    ((*api).ReleaseValue.unwrap())(value);
+                }
+                assert_eq!(outputs.len(), 3);
+                assert_eq!(outputs[1].len(), groups);
+                assert_eq!(outputs[2].len(), groups);
+                for (actual, expected) in outputs.iter().zip([expected, means, inverses]) {
+                    assert_eq!(actual.len(), expected.len());
+                    for (&got, want) in actual.iter().zip(expected) {
+                        assert!(
+                            (f64::from(got) - want).abs() < 2e-5,
+                            "case {id}, axis {}: {got} vs {want}",
+                            case.axis
+                        );
+                    }
+                }
+            }
+            conformance_teardown(api, env, options, session, &name);
+        }
+    }
+    eprintln!(
+        "[layernorm_affine] six scalar/interior/group/full fixtures assigned to cpu_ep; Y and statistics passed twice each"
+    );
+}
+
+#[test]
+fn logsoftmax_workspace_preserves_both_opsets_through_real_plugin() {
+    let _lock = lock_ort_ep();
+    for opset in [11, 13] {
+        let name = format!("logsoftmax_workspace_{opset}");
+        let model = r#"ir_version: 10
+opset_import: [{ version: OPSET }]
+graph {
+ name: "logsoftmax_workspace"
+ node: [{ input: ["X"] output: ["Y"] op_type: "LogSoftmax" attribute: [{ name: "axis" i: -2 type: INT }] }]
+ input: [{ name: "X" type { tensor_type { elem_type: 1 shape { dim: [{dim_param:"batch"},{dim_param:"rows"},{dim_param:"cols"}] } } } }]
+ output: [{ name: "Y" type { tensor_type { elem_type: 1 shape { dim: [{dim_param:"batch"},{dim_param:"rows"},{dim_param:"cols"}] } } } }]
+}
+"#.replace("OPSET", &opset.to_string());
+        let path = write_generated_model(&name, &model);
+        let (_library, api, env, options, session) = skip_if_missing!(
+            unsafe { conformance_setup(&name, &path, true) },
+            "LogSoftmax workspace: ORT/plugin unavailable"
+        );
+        unsafe {
+            let assignment = query_ep_assignment(api, session);
+            assert_eq!(
+                assignment.ops_on_our_ep(),
+                ["LogSoftmax"],
+                "{:?}",
+                assignment.assignments
+            );
+            assert!(assignment.ops_not_on_our_ep().is_empty());
+            for (iteration, [batch, rows, cols]) in [[2usize, 3, 4], [1, 2, 5], [2, 3, 4]]
+                .into_iter()
+                .enumerate()
+            {
+                let mut values = (0..batch * rows * cols)
+                    .map(|i| (i as f32 * 0.175).cos() * 2. + iteration as f32 * 0.25)
+                    .collect::<Vec<_>>();
+                let mut expected = vec![0.; values.len()];
+                for b in 0..batch {
+                    for c in 0..if opset < 13 { 1 } else { cols } {
+                        let indices = if opset < 13 {
+                            (b * rows * cols..(b + 1) * rows * cols).collect::<Vec<_>>()
+                        } else {
+                            (0..rows)
+                                .map(|r| (b * rows + r) * cols + c)
+                                .collect::<Vec<_>>()
+                        };
+                        let max = indices
+                            .iter()
+                            .map(|&j| f64::from(values[j]))
+                            .fold(f64::NEG_INFINITY, f64::max);
+                        let sum = indices
+                            .iter()
+                            .map(|&j| (f64::from(values[j]) - max).exp())
+                            .sum::<f64>();
+                        for j in indices {
+                            expected[j] = f64::from(values[j]) - max - sum.ln();
+                        }
+                    }
+                }
+                let x =
+                    make_float_tensor(api, &mut values, &[batch as i64, rows as i64, cols as i64]);
+                let outputs = run_and_collect_f32(api, session, &["X"], &[x], &["Y"]);
+                ((*api).ReleaseValue.unwrap())(x);
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(outputs[0].len(), expected.len());
+                for (&actual, want) in outputs[0].iter().zip(expected) {
+                    assert!(
+                        (f64::from(actual) - want).abs() < 2e-6,
+                        "{name} iteration={iteration}: {actual} versus {want}"
+                    );
+                }
+            }
+            eprintln!(
+                "[{name}] LogSoftmax assigned to cpu_ep; dynamic 2x3x4/1x2x5/2x3x4 outputs passed"
+            );
+            conformance_teardown(api, env, options, session, &name);
+        }
+    }
+}
+
+#[test]
+fn softmax_workspace_preserves_both_opsets_through_real_plugin() {
+    let _lock = lock_ort_ep();
+    for opset in [11, 13] {
+        let name = format!("softmax_workspace_{opset}");
+        let model = r#"ir_version: 10
+opset_import: [{ version: OPSET }]
+graph {
+ name: "softmax_workspace"
+ node: [{ input: ["X"] output: ["Y"] op_type: "Softmax" attribute: [{ name: "axis" i: -2 type: INT }] }]
+ input: [{ name: "X" type { tensor_type { elem_type: 1 shape { dim: [{dim_param:"batch"},{dim_param:"rows"},{dim_param:"cols"}] } } } }]
+ output: [{ name: "Y" type { tensor_type { elem_type: 1 shape { dim: [{dim_param:"batch"},{dim_param:"rows"},{dim_param:"cols"}] } } } }]
+}
+"#.replace("OPSET", &opset.to_string());
+        let path = write_generated_model(&name, &model);
+        let (_library, api, env, options, session) = skip_if_missing!(
+            unsafe { conformance_setup(&name, &path, true) },
+            "Softmax workspace: ORT/plugin unavailable"
+        );
+        unsafe {
+            let assignment = query_ep_assignment(api, session);
+            assert_eq!(
+                assignment.ops_on_our_ep(),
+                ["Softmax"],
+                "{:?}",
+                assignment.assignments
+            );
+            assert!(assignment.ops_not_on_our_ep().is_empty());
+            for (iteration, [batch, rows, cols]) in [[2usize, 3, 4], [1, 2, 5], [2, 3, 4]]
+                .into_iter()
+                .enumerate()
+            {
+                let mut values = (0..batch * rows * cols)
+                    .map(|i| (i as f32 * 0.175).cos() * 2. + iteration as f32 * 0.25)
+                    .collect::<Vec<_>>();
+                let mut expected = vec![0.; values.len()];
+                for b in 0..batch {
+                    for c in 0..if opset < 13 { 1 } else { cols } {
+                        let indices = if opset < 13 {
+                            (b * rows * cols..(b + 1) * rows * cols).collect::<Vec<_>>()
+                        } else {
+                            (0..rows)
+                                .map(|r| (b * rows + r) * cols + c)
+                                .collect::<Vec<_>>()
+                        };
+                        let max = indices
+                            .iter()
+                            .map(|&j| f64::from(values[j]))
+                            .fold(f64::NEG_INFINITY, f64::max);
+                        let sum = indices
+                            .iter()
+                            .map(|&j| (f64::from(values[j]) - max).exp())
+                            .sum::<f64>();
+                        for j in indices {
+                            expected[j] = (f64::from(values[j]) - max).exp() / sum;
+                        }
+                    }
+                }
+                let x =
+                    make_float_tensor(api, &mut values, &[batch as i64, rows as i64, cols as i64]);
+                let outputs = run_and_collect_f32(api, session, &["X"], &[x], &["Y"]);
+                ((*api).ReleaseValue.unwrap())(x);
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(outputs[0].len(), expected.len());
+                for (&actual, want) in outputs[0].iter().zip(expected) {
+                    assert!(
+                        (f64::from(actual) - want).abs() < 2e-6,
+                        "{name} iteration={iteration}: {actual} versus {want}"
+                    );
+                }
+            }
+            eprintln!(
+                "[{name}] Softmax assigned to cpu_ep; dynamic 2x3x4/1x2x5/2x3x4 outputs passed"
+            );
+            conformance_teardown(api, env, options, session, &name);
+        }
+    }
+}
+
+#[test]
+fn lpnorm_workspace_preserves_both_opsets_through_real_plugin() {
+    let _lock = lock_ort_ep();
+    for opset in [11, 13] {
+        let name = format!("lpnorm_workspace_{opset}");
+        let model = r#"ir_version: 10
+opset_import: [{ version: OPSET }]
+graph {
+ name: "lpnorm_workspace"
+ node: [{ input: ["X"] output: ["Y"] op_type: "LpNormalization" attribute: [{ name: "axis" i: -2 type: INT }] }]
+ input: [{ name: "X" type { tensor_type { elem_type: 1 shape { dim: [{dim_param:"batch"},{dim_param:"rows"},{dim_param:"cols"}] } } } }]
+ output: [{ name: "Y" type { tensor_type { elem_type: 1 shape { dim: [{dim_param:"batch"},{dim_param:"rows"},{dim_param:"cols"}] } } } }]
+}
+"#.replace("OPSET", &opset.to_string());
+        let path = write_generated_model(&name, &model);
+        let (_library, api, env, options, session) = skip_if_missing!(
+            unsafe { conformance_setup(&name, &path, true) },
+            "LpNormalization workspace: ORT/plugin unavailable"
+        );
+        unsafe {
+            let assignment = query_ep_assignment(api, session);
+            assert_eq!(
+                assignment.ops_on_our_ep(),
+                ["LpNormalization"],
+                "{:?}",
+                assignment.assignments
+            );
+            assert!(assignment.ops_not_on_our_ep().is_empty());
+            for (iteration, [batch, rows, cols]) in [[2usize, 3, 4], [1, 2, 5], [2, 3, 4]]
+                .into_iter()
+                .enumerate()
+            {
+                let mut values = (0..batch * rows * cols)
+                    .map(|i| (i as f32 * 0.175).cos() * 2. + iteration as f32 * 0.25)
+                    .collect::<Vec<_>>();
+                let mut expected = vec![0.; values.len()];
+                for b in 0..batch {
+                    for c in 0..cols {
+                        let indices = {
+                            (0..rows)
+                                .map(|r| (b * rows + r) * cols + c)
+                                .collect::<Vec<_>>()
+                        };
+                        let norm = indices
+                            .iter()
+                            .map(|&j| f64::from(values[j]).powi(2))
+                            .sum::<f64>()
+                            .sqrt();
+                        for j in indices {
+                            expected[j] = f64::from(values[j]) / norm;
+                        }
+                    }
+                }
+                let x =
+                    make_float_tensor(api, &mut values, &[batch as i64, rows as i64, cols as i64]);
+                let outputs = run_and_collect_f32(api, session, &["X"], &[x], &["Y"]);
+                ((*api).ReleaseValue.unwrap())(x);
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(outputs[0].len(), expected.len());
+                for (&actual, want) in outputs[0].iter().zip(expected) {
+                    assert!(
+                        (f64::from(actual) - want).abs() < 2e-6,
+                        "{name} iteration={iteration}: {actual} versus {want}"
+                    );
+                }
+            }
+            eprintln!(
+                "[{name}] LpNormalization assigned to cpu_ep; dynamic 2x3x4/1x2x5/2x3x4 outputs passed"
+            );
+            conformance_teardown(api, env, options, session, &name);
+        }
+    }
+}
+
+#[test]
+fn mvn_workspace_preserves_dynamic_interleaved_axes_through_real_plugin() {
+    let _lock = lock_ort_ep();
+    let name = "mvn_workspace_29";
+    MVN_SCHEMA_COMPUTES.store(0, std::sync::atomic::Ordering::Relaxed);
+    let model = r#"ir_version:10
+opset_import:[{version:29}]
+graph {
+ name:"mvn_workspace"
+ node:[{input:["X"] output:["Y"] op_type:"MeanVarianceNormalization" attribute:[{name:"axes" ints:[0,-1] type:INTS},{name:"epsilon" f:0.125 type:FLOAT}]}]
+ input:[{name:"X" type{tensor_type{elem_type:1 shape{dim:[{dim_param:"batch"},{dim_param:"rows"},{dim_param:"cols"}]}}}}]
+ output:[{name:"Y" type{tensor_type{elem_type:1 shape{dim:[{dim_param:"batch"},{dim_param:"rows"},{dim_param:"cols"}]}}}}]
+}
+"#;
+    let path = write_generated_model(name, model);
+    let (_library, api, env, options, session, domain, custom_op, status) = skip_if_missing!(
+        unsafe {
+            conformance_setup_with_session_status(
+                name,
+                &path,
+                true,
+                Some(ConformanceSchema::MeanVarianceNormalization29),
+                &[(c"session.allow_released_opsets_only", c"0")],
+            )
+        },
+        "MeanVarianceNormalization workspace: ORT/plugin unavailable"
+    );
+    assert!(!domain.is_null() && custom_op.is_some());
+    unsafe {
+        check_status(
+            api,
+            status,
+            "CreateSession(MVN-29 test-local schema descriptor)",
+        );
+        assert_eq!(
+            MVN_SCHEMA_COMPUTES.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        // Load-bearing positive control: the schema-only callback must report
+        // failure and the counter must observe it before inference is tested.
+        let mut control = ptr::null_mut();
+        check_status(
+            api,
+            mvn_schema_create(ptr::null(), api, ptr::null(), &mut control),
+            "CreateKernelV2(schema positive control)",
+        );
+        let rejected = mvn_schema_compute(control, ptr::null_mut());
+        assert!(!rejected.is_null());
+        assert_eq!(((*api).GetErrorCode.unwrap())(rejected), ort::ORT_FAIL);
+        ((*api).ReleaseStatus.unwrap())(rejected);
+        mvn_schema_destroy(control);
+        assert_eq!(
+            MVN_SCHEMA_COMPUTES.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        MVN_SCHEMA_COMPUTES.store(0, std::sync::atomic::Ordering::Relaxed);
+        let assignment = query_ep_assignment(api, session);
+        assert_eq!(
+            assignment.ops_on_our_ep(),
+            ["MeanVarianceNormalization"],
+            "{:?}",
+            assignment.assignments
+        );
+        assert!(assignment.ops_not_on_our_ep().is_empty());
+        for (iteration, [batch, rows, cols]) in [[2usize, 3, 4], [1, 2, 5], [2, 3, 4]]
+            .into_iter()
+            .enumerate()
+        {
+            let mut values = (0..batch * rows * cols)
+                .map(|i| (i as f32 * 0.175).cos() * 2. + iteration as f32 * 0.25)
+                .collect::<Vec<_>>();
+            let mut expected = vec![0.; values.len()];
+            for row in 0..rows {
+                let indices = (0..batch)
+                    .flat_map(|b| (0..cols).map(move |c| (b * rows + row) * cols + c))
+                    .collect::<Vec<_>>();
+                let mean = indices.iter().map(|&j| f64::from(values[j])).sum::<f64>()
+                    / indices.len() as f64;
+                let variance = indices
+                    .iter()
+                    .map(|&j| (f64::from(values[j]) - mean).powi(2))
+                    .sum::<f64>()
+                    / indices.len() as f64;
+                for j in indices {
+                    expected[j] = (f64::from(values[j]) - mean) / (variance.sqrt() + 0.125);
+                }
+            }
+            let x = make_float_tensor(api, &mut values, &[batch as i64, rows as i64, cols as i64]);
+            let outputs = run_and_collect_f32(api, session, &["X"], &[x], &["Y"]);
+            ((*api).ReleaseValue.unwrap())(x);
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].len(), expected.len());
+            for (&actual, want) in outputs[0].iter().zip(expected) {
+                assert!(
+                    (f64::from(actual) - want).abs() < 3e-6,
+                    "{name} iteration={iteration}: {actual} versus {want}"
+                );
+            }
+        }
+        eprintln!(
+            "[{name}] MeanVarianceNormalization assigned to cpu_ep; dynamic 2x3x4/1x2x5/2x3x4 outputs passed"
+        );
+        assert_eq!(
+            MVN_SCHEMA_COMPUTES.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "schema-only CPU callback must never execute"
+        );
+        conformance_teardown_with_custom_domain(api, env, options, session, name, domain);
+    }
+}
+
+#[test]
+fn batchnorm_workspace_tracks_dynamic_channels_through_real_plugin() {
+    let _lock = lock_ort_ep();
+    for opset in [7, 15] {
+        let name = format!("batchnorm_workspace_{opset}");
+        let model=r#"ir_version:10
+opset_import:[{version:OPSET}]
+graph {
+ name:"batchnorm_workspace"
+ node:[{input:["X","scale","B","mean","variance"] output:["Y"] op_type:"BatchNormalization" attribute:[{name:"epsilon" f:0.125 type:FLOAT}]}]
+ input:[
+ {name:"X" type{tensor_type{elem_type:1 shape{dim:[{dim_param:"batch"},{dim_param:"channels"},{dim_param:"spatial"}]}}}},
+ {name:"scale" type{tensor_type{elem_type:1 shape{dim:[{dim_param:"channels"}]}}}},
+ {name:"B" type{tensor_type{elem_type:1 shape{dim:[{dim_param:"channels"}]}}}},
+ {name:"mean" type{tensor_type{elem_type:1 shape{dim:[{dim_param:"channels"}]}}}},
+ {name:"variance" type{tensor_type{elem_type:1 shape{dim:[{dim_param:"channels"}]}}}}
+ ]
+ output:[{name:"Y" type{tensor_type{elem_type:1 shape{dim:[{dim_param:"batch"},{dim_param:"channels"},{dim_param:"spatial"}]}}}}]
+}
+"#.replace("OPSET",&opset.to_string());
+        let path = write_generated_model(&name, &model);
+        let (_library, api, env, options, session) = skip_if_missing!(
+            unsafe { conformance_setup(&name, &path, true) },
+            "BatchNormalization workspace: ORT/plugin unavailable"
+        );
+        unsafe {
+            let assignment = query_ep_assignment(api, session);
+            assert_eq!(
+                assignment.ops_on_our_ep(),
+                ["BatchNormalization"],
+                "{:?}",
+                assignment.assignments
+            );
+            assert!(assignment.ops_not_on_our_ep().is_empty());
+            for (iteration, [batch, channels, spatial]) in [[2usize, 3, 4], [1, 2, 5], [2, 3, 4]]
+                .into_iter()
+                .enumerate()
+            {
+                let mut values = (0..batch * channels * spatial)
+                    .map(|i| (i as f32 - 9.) * 0.25 + iteration as f32 * 0.125)
+                    .collect::<Vec<_>>();
+                let mut scale = (0..channels)
+                    .map(|c| 1. + c as f32 * 0.25)
+                    .collect::<Vec<_>>();
+                let mut bias = (0..channels).map(|c| -0.25 * c as f32).collect::<Vec<_>>();
+                let mut mean = (0..channels).map(|c| 0.5 * c as f32).collect::<Vec<_>>();
+                let mut variance = (0..channels)
+                    .map(|c| 1. + 0.25 * c as f32)
+                    .collect::<Vec<_>>();
+                let expected = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| {
+                        let c = (i / spatial) % channels;
+                        ((f64::from(v) - f64::from(mean[c]))
+                            / (f64::from(variance[c]) + 0.125).sqrt())
+                            * f64::from(scale[c])
+                            + f64::from(bias[c])
+                    })
+                    .collect::<Vec<_>>();
+                let x = make_float_tensor(
+                    api,
+                    &mut values,
+                    &[batch as i64, channels as i64, spatial as i64],
+                );
+                let p = [&mut scale, &mut bias, &mut mean, &mut variance]
+                    .map(|values| make_float_tensor(api, values, &[channels as i64]));
+                let inputs = [x, p[0], p[1], p[2], p[3]];
+                let outputs = run_and_collect_f32(
+                    api,
+                    session,
+                    &["X", "scale", "B", "mean", "variance"],
+                    &inputs,
+                    &["Y"],
+                );
+                for input in inputs {
+                    ((*api).ReleaseValue.unwrap())(input);
+                }
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(outputs[0].len(), expected.len());
+                for (&actual, want) in outputs[0].iter().zip(expected) {
+                    assert!(
+                        (f64::from(actual) - want).abs() < 3e-6,
+                        "{name} shape={batch}x{channels}x{spatial}: {actual} vs {want}"
+                    );
+                }
+            }
+            eprintln!(
+                "[{name}] BatchNormalization assigned to cpu_ep; dynamic 2x3x4/1x2x5/2x3x4 outputs passed"
+            );
+            conformance_teardown(api, env, options, session, &name);
+        }
     }
 }

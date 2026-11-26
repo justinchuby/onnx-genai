@@ -18,7 +18,7 @@ use onnx_runtime_ir::{
     dft::{self, DftMode},
 };
 
-use super::float_workspace::FloatWorkspace;
+use super::typed_workspace::TypedWorkspace;
 use crate::dtype::{
     scalar_i64, to_dense_f32_widen, validate_f32_widen_input, write_dense_f32_narrow,
 };
@@ -143,9 +143,9 @@ struct DftGeometry {
 }
 
 impl DftGeometry {
-    fn workspace<T: Float>(&self) -> Result<FloatWorkspace<4, T>> {
+    fn workspace<T: Float + Default>(&self) -> Result<TypedWorkspace<T, 4>> {
         let len = if self.batches == 0 { 0 } else { self.n };
-        FloatWorkspace::new(
+        TypedWorkspace::new(
             "DFT",
             [
                 ("real input", len),
@@ -479,7 +479,7 @@ impl DftKernel {
         }
     }
 
-    fn transform_batches<T: Float, D: AsRef<[T]>>(
+    fn transform_batches<T: Float + Default, D: AsRef<[T]>>(
         &self,
         geometry: &DftGeometry,
         input: &TensorView<'_>,

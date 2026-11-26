@@ -209,9 +209,8 @@ mod cuda_impl {
     /// node (MatMulNBits, GroupQueryAttention, SkipSimplifiedLayerNormalization,
     /// GatherBlockQuantized — 61% of a real decoder) could ever match.
     ///
-    /// Requires the constructed EP's `CudaRuntime`; at factory-construction time
-    /// this is available from the already-built `CudaExecutionProvider`
-    /// (`ep.runtime()`), so no separate GPU context is needed.
+    /// Read the constructed provider's registry so advertisement cannot
+    /// accidentally use a different contract than capability and compilation.
     ///
     /// The registry is derived from the real `OpRegistry`, not a hand-maintained
     /// list, so it cannot drift from the kernels. Advertising the real domains
@@ -220,9 +219,9 @@ mod cuda_impl {
     /// (see `onnx-runtime-ep-plugin`'s partial-GPU-claim gate, off by default
     /// because executing an interspersed CPU/GPU partition currently hits #982).
     pub(crate) fn build_kernel_registry_entries(
-        runtime: std::sync::Arc<onnx_runtime_ep_cuda::CudaRuntime>,
+        ep: &CudaExecutionProvider,
     ) -> Vec<KernelRegistryEntry> {
-        let descriptors = onnx_runtime_ep_cuda::build_cuda_registry_descriptors(runtime);
+        let descriptors = onnx_runtime_ep_cuda::build_cuda_registry_descriptors(ep.registry());
         descriptors
             .iter()
             .enumerate()
@@ -296,7 +295,7 @@ mod cuda_impl {
             format!("CUDA EP construction failed (no GPU or driver unavailable): {e}")
         })?;
         let stream_handle = ep.runtime().stream_ptr() as *mut std::os::raw::c_void;
-        let entries = build_kernel_registry_entries(ep.runtime().clone());
+        let entries = build_kernel_registry_entries(&ep);
         let runtime = ep.runtime().clone();
         let preflight: onnx_runtime_ep_plugin::factory::WorkspaceExecutionGuard =
             std::sync::Arc::new(move || {
@@ -312,6 +311,55 @@ mod cuda_impl {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[cfg_attr(
+            not(feature = "gpu-tests"),
+            ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+        )]
+        #[test]
+        fn conv_transpose_keeps_legacy_advertisement_and_compilation() {
+            use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, ValueId};
+
+            let (ep, _, entries, _) = construct_ep_with_stream().expect("CUDA device 0");
+            let conv_transpose: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry.op_type == "ConvTranspose" && entry.domain.is_empty())
+                .collect();
+            let [entry] = conv_transpose.as_slice() else {
+                panic!("expected exactly one ConvTranspose advertisement")
+            };
+            assert_eq!(entry.since_version, 1);
+            assert_eq!(entry.end_version, i32::MAX);
+            assert!(entry.supported_dtypes.contains(&DataType::Float16));
+            assert!(entry.supported_dtypes.contains(&DataType::Float32));
+            assert!(entry.supported_dtypes.contains(&DataType::BFloat16));
+            assert!(!entry.supported_dtypes.contains(&DataType::Float64));
+
+            let mut node = Node::new(
+                NodeId(0),
+                "ConvTranspose",
+                vec![Some(ValueId(0)), Some(ValueId(1))],
+                vec![ValueId(2)],
+            );
+            let shapes_2d = [vec![1, 1, 2, 2], vec![1, 1, 2, 2]];
+            let shapes_3d = [vec![1, 1, 2, 2, 2], vec![1, 1, 2, 2, 2]];
+            let claim_shapes = shapes_2d
+                .each_ref()
+                .map(|shape| onnx_runtime_ir::static_shape(shape.iter().copied()));
+            assert!(
+                ep.supports_op(&node, 11, &claim_shapes, &[DataType::BFloat16; 2], &[])
+                    .is_supported()
+            );
+            assert!(
+                !ep.supports_op(&node, 11, &claim_shapes, &[DataType::Float64; 2], &[])
+                    .is_supported()
+            );
+            assert!(ep.get_kernel(&node, &shapes_2d, 11).is_ok());
+            assert!(ep.get_kernel(&node, &shapes_3d, 11).is_err());
+            node.attributes
+                .insert("auto_pad".into(), Attribute::String(b"SAME_UPPER".to_vec()));
+            assert!(ep.get_kernel(&node, &shapes_2d, 11).is_err());
+        }
 
         fn descriptor(
             op_type: &str,

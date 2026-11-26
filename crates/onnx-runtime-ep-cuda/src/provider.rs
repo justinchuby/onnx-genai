@@ -69,7 +69,8 @@ use crate::deferred_release::{
     CudaDeferredReleaseQueue, CudaStreamFences, DEFAULT_DEFERRED_RELEASE_CAPACITY,
     DeferredActionOutcome, DeferredReleaseAction, ReleaseObserver, StreamOrderedKeepAlive,
 };
-use crate::kernels::build_cuda_registry_with_metrics;
+use crate::kernels::build_cuda_registry_for_contract;
+use crate::kernels::conv_transpose::Contract as ConvTransposeContract;
 use crate::kernels::csa_checkpoint::CsaMetrics;
 use crate::optimizer::cuda_optimization_passes;
 use crate::route_residency::{
@@ -1734,7 +1735,7 @@ pub struct CudaExecutionProvider {
     memory_cleanup_armed: AtomicBool,
     workspace_release_barrier: WorkspaceReleaseBarrier,
     registry: OpRegistry,
-    ort_plugin: bool,
+    conv_transpose_contract: ConvTransposeContract,
     csa_metrics: Arc<CsaMetrics>,
     /// Device weight-offload policy resolved from the environment. When enabled,
     /// the EP advertises the `nxrt` weight-paging capability and pages lazy
@@ -1933,7 +1934,19 @@ impl CudaExecutionProvider {
         ordinal: u32,
         offload_policy: DeviceOffloadPolicy,
     ) -> Result<Self> {
-        Self::from_config(
+        Self::new_with_offload_policy_and_contract(
+            ordinal,
+            offload_policy,
+            ConvTransposeContract::Standalone,
+        )
+    }
+
+    fn new_with_offload_policy_and_contract(
+        ordinal: u32,
+        offload_policy: DeviceOffloadPolicy,
+        conv_transpose_contract: ConvTransposeContract,
+    ) -> Result<Self> {
+        Self::from_config_with_contract(
             ordinal,
             CudaProviderConfig {
                 offload_policy,
@@ -1942,6 +1955,7 @@ impl CudaExecutionProvider {
                 route_residency_config: Self::route_residency_config_from_env(),
                 memory: None,
             },
+            conv_transpose_contract,
         )
     }
 
@@ -2017,6 +2031,14 @@ impl CudaExecutionProvider {
     /// Construct with allocator selection complete before any runtime is exposed.
     /// An injected allocator is authoritative: the built-in VMM is never created.
     pub fn from_config(ordinal: u32, config: CudaProviderConfig) -> Result<Self> {
+        Self::from_config_with_contract(ordinal, config, ConvTransposeContract::Standalone)
+    }
+
+    fn from_config_with_contract(
+        ordinal: u32,
+        config: CudaProviderConfig,
+        conv_transpose_contract: ConvTransposeContract,
+    ) -> Result<Self> {
         let CudaProviderConfig {
             offload_policy,
             governor,
@@ -2038,10 +2060,11 @@ impl CudaExecutionProvider {
         let route_telemetry_registry = Arc::new(
             crate::kernels::qmoe::RouteTelemetrySourceRegistry::new(route_residency_config),
         );
-        let registry = build_cuda_registry_with_metrics(
+        let registry = build_cuda_registry_for_contract(
             runtime.clone(),
             csa_metrics.clone(),
             Arc::clone(&route_telemetry_registry),
+            conv_transpose_contract,
         );
         let auto_dynamic_lending = auto_dynamic_lending_for(
             governor.is_some(),
@@ -2202,7 +2225,7 @@ impl CudaExecutionProvider {
             memory_cleanup_armed: AtomicBool::new(false),
             workspace_release_barrier: WorkspaceReleaseBarrier::default(),
             registry,
-            ort_plugin: false,
+            conv_transpose_contract,
             csa_metrics,
             offload_policy,
             residency,
@@ -2704,16 +2727,21 @@ impl CudaExecutionProvider {
         Self::new(0)
     }
 
-    /// Create a CUDA provider with the shipped ORT plugin's admission contract.
+    /// Construct the provider behind the ORT CUDA plugin's existing contract.
     pub fn new_for_ort_plugin() -> Result<Self> {
-        let mut provider = Self::new_default()?;
-        provider.ort_plugin = true;
-        Ok(provider)
+        Self::new_with_offload_policy_and_contract(
+            0,
+            DeviceOffloadPolicy::from_env(),
+            ConvTransposeContract::OrtPlugin,
+        )
     }
 
     fn validate_execution_surface(&self, node: &Node) -> Result<()> {
-        if self.ort_plugin
-            && node.op_type == "DFT"
+        // The construction contract also identifies the shipped plugin surface.
+        if matches!(
+            self.conv_transpose_contract,
+            ConvTransposeContract::OrtPlugin
+        ) && node.op_type == "DFT"
             && onnx_runtime_ir::is_default_domain(&node.domain)
             && onnx_runtime_ir::dft::DftMode::parse(node).map_err(EpError::KernelFailed)?
                 == onnx_runtime_ir::dft::DftMode::RealInverse
@@ -4552,6 +4580,7 @@ impl ExecutionProvider for CudaExecutionProvider {
                 opset,
                 shapes,
                 input_dtypes,
+                self.conv_transpose_contract,
             )
         {
             return KernelMatch::unsupported(reason);
@@ -7516,8 +7545,8 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
     }
 
     /// Criterion 1 and 8, on the plugin construction path: the provider built
-    /// exactly as the CUDA plugin builds it (`CudaExecutionProvider::new_default`
-    /// == `new(0)`) routes every device allocation — including the ORT scratch
+    /// exactly as the CUDA plugin builds it (`CudaExecutionProvider::new_for_ort_plugin`)
+    /// routes every device allocation — including the ORT scratch
     /// the plugin projects through `allocate`/`deallocate` — through the pooled
     /// VMM arena.
     ///
@@ -7531,8 +7560,8 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
     )]
     #[test]
     fn plugin_construction_path_routes_device_memory_through_pooled_vmm_arena() {
-        let provider =
-            CudaExecutionProvider::new(0).expect("plugin-path CUDA provider under VMM arena");
+        let provider = CudaExecutionProvider::new_for_ort_plugin()
+            .expect("plugin-path CUDA provider under VMM arena");
         assert!(
             provider.commits_on_demand(),
             "the VMM arena, not the cuMemAlloc path, must serve allocations on the plugin path"
