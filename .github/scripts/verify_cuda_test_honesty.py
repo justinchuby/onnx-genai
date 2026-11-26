@@ -125,6 +125,7 @@ EXPECTED_CUDA_TARGETS_BY_DIR = {
             "route_residency_consume_gpu",
             "route_residency_install_gpu",
             "route_residency_reservation_lifecycle_gpu",
+            "rnn_gpu",
             "shape_metadata_workspace_gpu",
             "simplified_layer_norm_gpu",
             "skip_simplified_layer_norm_gpu",

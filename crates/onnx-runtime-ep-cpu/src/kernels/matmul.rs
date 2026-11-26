@@ -12410,6 +12410,9 @@ mod weight_cache_accounting {
             "DeformConv" => NoWeightCache(
                 "samples into execution-local panels and consumes weights without retaining them",
             ),
+            "RNN" => NoWeightCache(
+                "W/R weights and any transformed staging remain execution-local",
+            ),
             "RoiAlign" => NoWeightCache(
                 "retains only parsed attributes; tensor copies and pooled output staging are per execution",
             ),

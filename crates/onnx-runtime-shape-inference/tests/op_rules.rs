@@ -841,6 +841,24 @@ fn recurrent_only_sets_declared_outputs() {
 }
 
 #[test]
+fn rnn_infers_optional_hidden_size_from_recurrent_weights() {
+    let outputs = run(
+        &node("RNN", 3, 2),
+        vec![
+            f32in(vec![c(5), c(3), c(7)]),
+            f32in(vec![c(1), sym(90), c(7)]),
+            f32in(vec![c(1), sym(90), sym(90)]),
+        ],
+        22,
+    );
+    assert_eq!(out_shape(&outputs), vec![c(5), c(1), c(3), sym(90)]);
+    assert_eq!(
+        outputs[1].type_info.as_ref().unwrap().shape,
+        vec![c(1), c(3), sym(90)]
+    );
+}
+
+#[test]
 fn recurrent_reverse_direction_is_unidirectional() {
     // `reverse` runs a single pass backwards, so num_directions == 1 just like
     // `forward` — only `bidirectional` yields 2.
