@@ -162,6 +162,27 @@ does not refund those bytes. Idle capacity can be reclaimed under pressure.
 Pending asynchronous work, active readers and capture pins prevent reuse, and
 quarantined backing retains its charge until physical release is settled.
 
+For the native CPU provider, a fitting Step workspace owner is shared by the
+sequential nodes of one execution. At completion the executor returns it to the
+CPU pool; the next run checks it out again. CPU does not expose the executor
+`workspace_pressure_registry` capability: its `deallocate_workspace` recycles
+into its own reclaimable pool, whereas that capability requires actual backing
+retirement. The executor's generic pressure-parked lane must not be mistaken for
+an enabled CPU fast path. Each fitting CPU checkout/return still locks the pool,
+and each kernel still performs live execution refinement and backing validation.
+
+The `cpu_three_node_runs_share_one_checkout_and_warm_calls_keep_the_original_grant`
+regression wraps the real CPU provider only to count boundary calls. After one
+cold run, 64 warm runs of three real packed projections perform 192 refinements
+but only 64 provider checkouts and 64 returns, with zero additional issuer
+callbacks and one unchanged physical owner. Trimming the completed pool owner
+releases its charge; the following execution must fund a new owner. This tests
+call granularity and accounting, not nanoseconds or lock contention. Likewise,
+the 1,036,816 calls in the historical packed-activation study are the aggregate
+of 136 processes and 320 windows, including setup controls, not one inference.
+That study did not qualify its timing cells and cannot establish negligible
+checkout overhead.
+
 CPU `BlockQuantizedMoE` includes strided compressed-weight staging in the
 same whole-operation workspace as decode scratch, FC activation banks and the
 output accumulator. One serial byte lane holds the maximum non-borrowable FC
