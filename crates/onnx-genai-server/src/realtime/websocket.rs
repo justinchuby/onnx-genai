@@ -3400,4 +3400,122 @@ node { input: "starting" input: "operation""#);
         task.abort();
         let _ = task.await;
     }
+    #[cfg(feature = "native-backend")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_native_literal_prepared_transfer_flushes_eof_and_releases_custom_budget() {
+        let package = tool_package("a");
+        let path = package.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        tokenizer["model"]["vocab"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tok17");
+        tokenizer["model"]["vocab"]["b"] = json!(17);
+        tokenizer["added_tokens"].as_array_mut().unwrap().push(json!({"id":17,"content":"b","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}));
+        tokenizer["decoder"] = json!({"type":"Sequence","decoders":[{"type":"ByteFallback"},{"type":"Fuse"},{"type":"Replace","pattern":{"String":"a"},"content":"7"},{"type":"Replace","pattern":{"String":"b"},"content":"77"},{"type":"Replace","pattern":{"String":"7x"},"content":"unused"}]});
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let path = package.path().join("inference_metadata.yaml");
+        let mut metadata: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        metadata["profiles"]["live"]["realtime"]["prompt_template"]=serde_yaml::Value::String("{% if operation == 'response_start' %}{{ instructions }}{% else %}{{ text }}{% endif %}".into());
+        std::fs::write(path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
+        let mut config = native_constraint_config();
+        config.realtime.text_bytes = NonZeroUsize::new(1).unwrap();
+        let (state, address, task) = server_for_package_with_config(package.path(), config).await;
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+
+        let mut baseline = None;
+        for instructions in ["a", "b", "a"] {
+            let mut client = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match connect_model(address, "native-realtime").await {
+                        Ok(client) => break client,
+                        Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                            if response.status() == StatusCode::SERVICE_UNAVAILABLE =>
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await
+                        }
+                        Err(error) => panic!("reopen Native literal connection: {error}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(event(&mut client).await["type"], "session.created");
+            send(&mut client,json!({"type":"session.update","session":{"instructions":instructions,"output_modalities":["text"],"max_output_tokens":1}})).await;
+            assert_eq!(event(&mut client).await["type"], "session.updated");
+            send(&mut client, json!({"type":"response.create"})).await;
+            let mut transcript = String::new();
+            let mut types = Vec::new();
+            loop {
+                let output = event(&mut client).await;
+                types.push(output["type"].as_str().unwrap().to_owned());
+                assert_eq!(types[0], "response.created", "{output}; events={types:?}");
+                if output["type"] == "response.output_text.done" {
+                    assert_eq!(output["text"], "7", "{output}");
+                }
+                if output["type"] == "response.output_text.delta" {
+                    transcript.push_str(output["delta"].as_str().unwrap());
+                }
+                if instructions == "b" && output["type"] == "error" {
+                    assert_eq!(output["error"]["type"], "server_error", "{output}");
+                    assert!(
+                        transcript.is_empty(),
+                        "failed quantum published {transcript:?}; events={types:?}"
+                    );
+                    assert!(
+                        output["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("budget"),
+                        "{output}"
+                    );
+                    break;
+                }
+                assert_ne!(output["type"], "error", "{output}; events={types:?}");
+                if output["type"] == "response.done" {
+                    assert_eq!(output["response"]["usage"]["output_tokens"], 1, "{output}");
+                    assert_eq!(transcript, model.tokenizer.decode(&[16]).unwrap());
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&transcript).unwrap(),
+                        json!(7)
+                    );
+                    assert!(
+                        types.iter().any(|kind| kind == "response.output_text.done"),
+                        "{types:?}"
+                    );
+                    break;
+                }
+            }
+            let _ = client.close(None).await;
+            drop(client);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while model.engine.worker_statuses()[0].worker.active_turns != 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let used = model
+                .engine
+                .resource_snapshot()
+                .await
+                .unwrap()
+                .host_ram
+                .used;
+            if let Some(expected) = baseline {
+                assert_eq!(
+                    used, expected,
+                    "literal prepared lease leaked after {instructions:?}"
+                );
+            } else {
+                baseline = Some(used);
+            }
+        }
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+    }
 }

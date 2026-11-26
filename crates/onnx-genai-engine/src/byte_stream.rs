@@ -1331,16 +1331,22 @@ impl ByteStreamState {
             return Ok(Cow::Borrowed(&[]));
         }
         if self.is_identity() {
-            ensure!(
-                bytes.len() <= limit,
-                "decoded byte delta exceeds its {limit}-byte response budget; increase the response buffer"
-            );
+            if bytes.len() > limit {
+                return Err(ByteStreamBufferExceeded {
+                    retained: bytes.len(),
+                    limit,
+                }
+                .into());
+            }
             return Ok(Cow::Borrowed(bytes));
         }
-        ensure!(
-            bytes.len() <= limit,
-            "raw byte delta exceeds its {limit}-byte decoder budget; increase the response buffer"
-        );
+        if bytes.len() > limit {
+            return Err(ByteStreamBufferExceeded {
+                retained: bytes.len(),
+                limit,
+            }
+            .into());
+        }
         work.charge(bytes.len(), "tokenizer.decoder input copy")?;
         let mut output = Vec::new();
         output.try_reserve_exact(bytes.len()).context(
@@ -2322,5 +2328,25 @@ mod tests {
             text.contains("tokenizer.decoder.decoders[3]") && text.contains("remaining"),
             "{text}"
         );
+    }
+    #[test]
+    fn oversized_identity_and_transformed_deltas_keep_typed_buffer_rejection() {
+        for transforms in [
+            vec![],
+            vec![StreamTransformState::Trailing {
+                character: 'x',
+                count: NonZeroUsize::new(1).unwrap(),
+                held: VecDeque::new(),
+            }],
+        ] {
+            let mut state = ByteStreamState { transforms };
+            let before = state.clone();
+            let error = state.step(b"1234", BytePieceKind::Text, 3).unwrap_err();
+            let exceeded = error.downcast_ref::<ByteStreamBufferExceeded>().expect(
+                "candidate-size failure must remain distinguishable from internal/work failures",
+            );
+            assert_eq!((exceeded.retained, exceeded.limit), (4, 3));
+            assert!(state == before, "rejected delta mutated decoder state");
+        }
     }
 }
