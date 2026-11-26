@@ -114,9 +114,12 @@ fn run_gather(
     let index_buffer = upload(ep, index_bytes);
     let output_bytes = output_shape.iter().product::<usize>() * 4;
     let mut output_buffer = ep.allocate(output_bytes, 256).unwrap();
-    let data_strides = compute_contiguous_strides(data_shape);
-    let index_strides = compute_contiguous_strides(index_shape);
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let data_strides = compute_contiguous_strides(data_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let index_strides = compute_contiguous_strides(index_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [
         TensorView::new(
             DevicePtr(data_buffer.as_ptr()),
@@ -406,9 +409,11 @@ fn run_shape(ep: &CudaExecutionProvider, start: i64, end: Option<i64>) -> Vec<i6
     let kernel = ep.get_kernel(model.graph.node(node), &[], 15).unwrap();
     let input_buffer = ep.allocate(2 * 3 * 5 * 7 * 4, 256).unwrap();
     let mut output_buffer = ep.allocate(dims.len() * 8, 256).unwrap();
-    let input_strides = compute_contiguous_strides(&input_shape);
+    let input_strides = compute_contiguous_strides(&input_shape)
+        .expect("fixture shape has representable contiguous strides");
     let output_shape = [dims.len()];
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let input_view = TensorView::new(
         DevicePtr(input_buffer.as_ptr()),
         DataType::Float32,
@@ -471,7 +476,8 @@ fn run_constant(
     let kernel = ep.get_kernel(model.graph.node(node), &[], 13).unwrap();
     let output_bytes = dtype.storage_bytes(shape.iter().product());
     let mut output_buffer = ep.allocate(output_bytes, 256).unwrap();
-    let strides = compute_contiguous_strides(shape);
+    let strides = compute_contiguous_strides(shape)
+        .expect("fixture shape has representable contiguous strides");
     let output = TensorMut::new(
         DevicePtrMut(output_buffer.as_mut_ptr()),
         dtype,

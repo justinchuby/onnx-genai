@@ -297,8 +297,10 @@ fn skip_norm_workspace_bf16_broadcast_holes_capture_and_failure_revoke_warm_proo
     let gamma = [1.0, 0.5, 1.25, -0.5, 2.0];
     let bias = [0.125, 0.25, -0.5, 0.0, 0.5];
     let facts = inputs();
-    let strides: [_; 4] =
-        std::array::from_fn(|index| compute_contiguous_strides(facts[index].shape));
+    let strides: [_; 4] = std::array::from_fn(|index| {
+        compute_contiguous_strides(facts[index].shape)
+            .expect("fixture shape has representable contiguous strides")
+    });
     let input_owners = [
         upload(&x, DataType::BFloat16),
         upload(&skip, DataType::BFloat16),

@@ -1177,7 +1177,8 @@ mod parallel_tests {
         let shape = [batch, seq, heads * head_size];
         let f32c = DataType::Float32;
         let cpu = DeviceId::cpu();
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
 
         // Full rotation is elementwise alias-safe on its own; partial rotary
         // adds a pass-through `copy_from_slice`, which is only sound when the

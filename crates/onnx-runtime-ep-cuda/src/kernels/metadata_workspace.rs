@@ -162,7 +162,7 @@ pub(super) fn checked_metadata_strides(op: &str, name: &str, shape: &[usize]) ->
         return Ok(vec![0; shape.len()]);
     }
     checked_tensor_bytes(op, name, onnx_runtime_ir::DataType::Uint8, shape)?;
-    Ok(onnx_runtime_ir::compute_contiguous_strides(shape))
+    Ok(onnx_runtime_ir::compute_contiguous_strides(shape)?)
 }
 
 #[cfg(test)]

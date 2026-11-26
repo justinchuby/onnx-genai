@@ -77,7 +77,13 @@ impl SeqTensor {
         layout: TensorLayout,
         byte_offset: usize,
     ) -> SequenceResult<Self> {
-        let strides = layout.resolved_strides(&shape);
+        let strides =
+            layout
+                .resolved_strides(&shape)
+                .map_err(|source| SequenceError::TensorCreation {
+                    op: "SequenceTensor",
+                    source: source.into(),
+                })?;
         validate_view_bounds(
             "SequenceTensor",
             &shape,
@@ -155,7 +161,13 @@ impl SeqTensor {
                 })?;
             &copied
         };
-        let strides = self.layout.resolved_strides(&self.shape);
+        let strides = self
+            .layout
+            .resolved_strides(&self.shape)
+            .map_err(|source| SequenceError::TensorCreation {
+                op: "SequenceTensor",
+                source: source.into(),
+            })?;
         if onnx_runtime_ir::is_contiguous(&self.shape, &strides) {
             let bytes = self
                 .dtype
@@ -250,7 +262,13 @@ impl SeqTensor {
             stats.source_materializations += 1;
             destination
         };
-        let strides = self.layout.resolved_strides(&self.shape);
+        let strides = self
+            .layout
+            .resolved_strides(&self.shape)
+            .map_err(|source| SequenceError::TensorCreation {
+                op: "SequenceTensor",
+                source: source.into(),
+            })?;
         validate_view_bounds(
             OP,
             &self.shape,
@@ -282,7 +300,12 @@ impl SeqTensor {
             return Ok(());
         }
 
-        let logical_strides = compute_contiguous_strides(&self.shape);
+        let logical_strides = compute_contiguous_strides(&self.shape).map_err(|source| {
+            SequenceError::TensorCreation {
+                op: "SequenceTensor",
+                source: source.into(),
+            }
+        })?;
         let start_element = logical_offset / esize;
         let elements = bytes / esize;
         for element_offset in 0..elements {
@@ -353,7 +376,13 @@ impl SeqTensor {
                 reason: "the storage is not host-accessible",
             });
         }
-        let strides = self.layout.resolved_strides(&self.shape);
+        let strides = self
+            .layout
+            .resolved_strides(&self.shape)
+            .map_err(|source| SequenceError::TensorCreation {
+                op: "SequenceTensor",
+                source: source.into(),
+            })?;
         if !onnx_runtime_ir::is_contiguous(&self.shape, &strides) {
             return Err(SequenceError::ByteBorrowUnavailable {
                 shape: self.shape.clone(),
@@ -614,7 +643,11 @@ fn gather_strided(
     if numel == 0 {
         return Ok(output);
     }
-    let logical_strides = compute_contiguous_strides(shape);
+    let logical_strides =
+        compute_contiguous_strides(shape).map_err(|source| SequenceError::TensorCreation {
+            op: "SequenceTensor",
+            source: source.into(),
+        })?;
     for linear in 0..numel {
         let mut remainder = linear;
         let mut source_element = 0i128;
