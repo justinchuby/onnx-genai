@@ -2624,3 +2624,47 @@ Strict all-target engine/server Clippy and the explicit ORT reference server
 configuration passed, as did formatting/diff checks. This is CPU functional
 coverage, without device or performance claims; the overall acceptance list
 remains open.
+
+
+## Tool parameter reference scope
+
+Forced tagged-JSON calls compile each parameter document as its own `%json`
+rule. Its root URI, dialect, local pointers, anchors and recursive references
+therefore have the same meaning as in standalone parameter admission. Tool
+schemas may reuse resource IDs without sharing a registry. Absolute references
+to the standalone default root also retain their target.
+
+The outer Lark grammar owns only the call envelope: required name/arguments,
+optional bounded ID, exact fields and every field ordering. Keys and identity
+values use JSON rules; argument documents occur once and are never rewritten
+or embedded under another schema root. The backend's supported schema language
+and response byte bounds remain enforced, and no external retrieval is added.
+
+Validation: the Native websocket regression covers local and absolute default-root
+references, escaped JSON pointers and Draft 4. Compiled grammar cases additionally
+cover anchors, relative resources, recursive roots, duplicate IDs across tools,
+literal reference-like annotation data, JSON whitespace, invalid extra/duplicate
+fields, required arguments and ID limits. The complete server library passed
+627 tests (2 inherited ignores); strict all-target engine/server Clippy with
+defaults and strict server Clippy with explicit ORT-reference features
+`--no-default-features --features metrics,cuda-13000` passed. Formatting/diff
+checks passed. Evidence is functional macOS ARM64 Native CPU, with no device or
+performance claims; the broader compatibility acceptance list remains open.
+
+Independent review additionally reproduced a required-tool union regression:
+a backend-proven impossible parameter schema must not poison another viable
+tool. Multi-tool forced selection now uses the same compiler's typed
+unsatisfiability classification to prune only impossible branches. Invalid,
+unsupported and unresolved schemas still fail with function context; specifically
+selected or wholly impossible choices still fail. Single-tool forcing retains
+its direct compilation path. Vendor provenance records the minimal typed-error
+export used by this classification.
+
+Final validation including the reviewed union-pruning fix: engine library
+1115 passed (1 inherited ignore), server library 629 passed (2 inherited
+ignores), and complete HTTP integration target 39 passed. The Native HTTP
+case generates a valid tool call with an impossible competing schema. Strict
+all-target default engine/server and explicit ORT-reference server Clippy,
+format/diff and vendored compiler provenance checks passed. The compiler error
+export is available in the bundled source; registry-only Rust publication
+requires the patched compiler dependency to be published/upstreamed first.
