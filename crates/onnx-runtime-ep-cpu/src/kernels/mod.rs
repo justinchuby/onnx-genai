@@ -3856,7 +3856,7 @@ mod tests {
     #[test]
     fn descriptors_derived_from_real_registry_not_hand_maintained() {
         // Every registered op version must have a descriptor except
-        // standalone-only Celu-28 and RoiAlign.
+        // standalone-only Celu-28, AffineMoe, and RoiAlign.
         //
         // This used to allow a delta of up to 50 and documented CNN ops as the
         // expected difference. That tolerance was hiding a real bug: the plugin
@@ -3866,7 +3866,8 @@ mod tests {
         // `InstanceNormalization`, `GroupNormalization`, `Conv`, pooling,
         // `Resize`, ...) was claimed by `supports_op` and then silently handed
         // back to ORT's CPU EP at capability time.
-        let reg = build_cpu_registry();
+        let provider = crate::CpuExecutionProvider::new();
+        let reg = provider.registry();
         let (_reg2, descriptors) = shared_registry_with_descriptors();
 
         let described: std::collections::BTreeSet<(&str, &str, u64)> = descriptors
@@ -3880,7 +3881,14 @@ mod tests {
             })
             .map(|k| (k.op_type.as_str(), k.domain.as_str(), k.since_version))
             .collect();
-        let mut expected = std::collections::BTreeSet::from([("Celu", "", 28)]);
+        let mut expected = std::collections::BTreeSet::from([
+            ("Celu", "", 28),
+            (
+                onnx_runtime_optimizer::affine_moe::OP,
+                onnx_runtime_ir::RUNTIME_DOMAIN,
+                1,
+            ),
+        ]);
         if cfg!(feature = "ops-cnn") {
             expected.extend(
                 onnx_runtime_ir::roi_align::VERSIONS
