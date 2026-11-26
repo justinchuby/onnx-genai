@@ -68,6 +68,7 @@ onnx-runtime-memory-api = { workspace = true }
 onnx-genai = { path = "../onnx-genai", version = "=0.1.0-dev.6", default-features = false }
 onnx-genai-engine = { path = "../onnx-genai-engine", version = "=0.1.0-dev.6", default-features = false }
 onnx-genai-metadata = { workspace = true }
+onnx-model-package = { workspace = true }
 # default-features = false so callers overriding the default CUDA 13.0 selector
 # with `--no-default-features` do not accidentally unify in a second cudarc CUDA
 # binding version from this inter-crate dependency.

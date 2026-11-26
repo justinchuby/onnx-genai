@@ -871,6 +871,8 @@ pub struct EngineConfig {
     /// or `native` instead. An explicit `Ort` or `Native` value always takes
     /// precedence over the environment variable.
     pub decode_backend: EngineDecodeBackend,
+    /// Explicit authored model-package variant. Flat directories reject a selector.
+    pub package_variant: Option<String>,
     /// Native decoder device override. `None` follows the execution provider in
     /// [`onnx_genai_ort::SessionOptions`], including `ONNX_GENAI_EP`.
     pub native_device: Option<crate::native_decode_device::NativeDecodeDevice>,
@@ -945,6 +947,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             decode_backend: EngineDecodeBackend::Native,
+            package_variant: None,
             native_device: None,
             native_decode_batch: None,
             native_state_files: NativeStateFilePolicy::Disabled,

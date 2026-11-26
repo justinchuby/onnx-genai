@@ -574,6 +574,8 @@ impl TransferJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "native-backend")]
+    use crate::model_hub::tests::variant_hub;
     use crate::model_hub::tests::{Transfer, hub};
     use axum::{
         Router,
@@ -680,6 +682,119 @@ mod tests {
     fn request() -> Value {
         json!({"model":"owner/package","sidecars":[]})
     }
+    #[cfg(feature = "native-backend")]
+    #[tokio::test]
+    async fn http_package_variant_identity_covers_progress_load_inference_and_independent_deletion()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let (client, trace, server) =
+            variant_hub("onnx_genai_workflows/decision", true, true, None).await;
+        let router = crate::app(state(root.path(), client));
+        let mut feed = Feed::open(router.clone()).await;
+        for id in ["owner/package:small", "owner/package:other"] {
+            let (status, value) = call(
+                router.clone(),
+                "POST",
+                "/models",
+                json!({"model":id,"sidecars":[]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{id}: {value}");
+            let events = feed
+                .until(|event| event["event"] == "download_finished" && event["model"] == id)
+                .await;
+            let progress = events
+                .iter()
+                .filter(|event| event["event"] == "download_progress" && event["model"] == id)
+                .collect::<Vec<_>>();
+            assert!(!progress.is_empty(), "{events:?}");
+            for event in progress {
+                let files = event["data"]["progress"].as_object().unwrap();
+                assert_eq!(files.len(), 6);
+                assert!(
+                    files.keys().all(|url| !url.contains("/large/")
+                        && !url.contains(":small")
+                        && !url.contains(":other")),
+                    "{event}"
+                );
+                assert_eq!(
+                    files
+                        .values()
+                        .map(|file| file["total"].as_u64().unwrap())
+                        .sum::<u64>(),
+                    event["data"]["total"].as_u64().unwrap()
+                );
+            }
+        }
+        let (_, models) = call(router.clone(), "GET", "/v1/models", Value::Null).await;
+        assert_eq!(models["data"].as_array().unwrap().len(), 2);
+        for (id, text, expected) in [
+            ("owner/package:small", "hello", "a"),
+            ("owner/package:other", "world", "b"),
+        ] {
+            let (status, value) =
+                call(router.clone(), "POST", "/models/load", json!({"model":id})).await;
+            assert_eq!(status, StatusCode::OK, "{id}: {value}");
+            let encoded = id.replace('/', "%2F").replace(':', "%3A");
+            let (status, props) = call(
+                router.clone(),
+                "GET",
+                &format!("/props?model={encoded}"),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{props}");
+            assert!(
+                props["chat_template"]
+                    .as_str()
+                    .unwrap()
+                    .contains("messages[0].content"),
+                "{props}"
+            );
+            assert_eq!(
+                props["nxrt_capabilities"]["managed_model_formats"],
+                json!(["nxrt_package", "ort_model_package"])
+            );
+            let (status,answer) = call(router.clone(),"POST","/v1/systemone",json!({"model":id,"state":text,"questions":{
+                "select":{"type":"choice","instructions":"the","criteria":{"a":"hello","b":"world"}}
+            }})).await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            assert_eq!(answer["model"], id);
+            assert_eq!(answer["answers"]["select"]["choice"], expected);
+            let (status, value) = call(
+                router.clone(),
+                "DELETE",
+                &format!("/models?model={encoded}"),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{value}");
+            feed.until(|event| event["event"] == "model_remove" && event["model"] == id)
+                .await;
+            let (_, models) = call(router.clone(), "GET", "/models", Value::Null).await;
+            if id.ends_with(":small") {
+                assert_eq!(models["data"].as_array().unwrap().len(), 1);
+                assert_eq!(models["data"][0]["id"], "owner/package:other");
+                assert_eq!(models["data"][0]["in_cache"], true);
+            } else {
+                assert!(models["data"].as_array().unwrap().is_empty());
+            }
+        }
+        assert!(
+            trace
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|path| !path.contains("/large/"))
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            1,
+            "only the stable cache lock remains"
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn http_download_stream_load_native_inference_and_delete_form_one_workflow() {
         let root = tempfile::tempdir().unwrap();
@@ -689,6 +804,10 @@ mod tests {
         let (_, props) = call(router.clone(), "GET", "/props", Value::Null).await;
         assert_eq!(props["role"], "router");
         assert_eq!(props["nxrt_capabilities"]["model_management"], true);
+        assert_eq!(
+            props["nxrt_capabilities"]["managed_model_formats"],
+            json!(["nxrt_package", "ort_model_package"])
+        );
         assert_eq!(props["nxrt_capabilities"]["server_tools"], false);
         let mut feed = Feed::open(router.clone()).await;
         let (status, ack) = call(router.clone(), "POST", "/models", request()).await;
@@ -1013,6 +1132,7 @@ mod tests {
             ..Default::default()
         };
         let spec = crate::ModelSpec {
+            package_variant: None,
             id: "configured".into(),
             path: root.path().join("future"),
             eager: false,
@@ -1029,6 +1149,7 @@ mod tests {
         std::fs::write(external.path().join("operator-data"), "keep").unwrap();
         let state = crate::AppState::load_from_specs(
             vec![crate::ModelSpec {
+                package_variant: None,
                 id: "configured".into(),
                 path: external.path().into(),
                 eager: false,

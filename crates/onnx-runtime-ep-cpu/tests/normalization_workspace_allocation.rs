@@ -1,4 +1,4 @@
-//! Real allocator evidence that LpNormalization snapshots reuse admitted storage.
+//! Real allocator evidence that normalization snapshots reuse admitted storage.
 use onnx_runtime_ep_api::{
     DevicePtr, DevicePtrMut, KernelFactory, OutputMetadata, TensorMetadata, TensorMut, TensorView,
     WorkspaceView,
@@ -140,6 +140,94 @@ fn lpnorm_snapshot_has_no_matrix_sized_heap_allocation_and_keeps_one_lane() {
                 })
                 .sum::<f32>();
             assert!((sum - 1.).abs() < 0.01);
+        }
+    }
+    check::<f32>();
+    check::<f64>();
+    check::<half::f16>();
+    check::<half::bf16>();
+}
+
+#[cfg(feature = "ops-cnn")]
+#[test]
+fn mvn_direct_and_snapshot_routes_avoid_matrix_sized_heap_allocations() {
+    use onnx_runtime_ep_cpu::kernels::mean_variance_normalization::MeanVarianceNormalizationFactory;
+    fn check<T: NumericElem + FloatElem + Default>() {
+        let shape = [16, 16];
+        let strides = [16, 1];
+        let source = (0..256)
+            .map(|i| T::from_f32_scalar((i % 17) as f32 - 7.25))
+            .collect::<Vec<_>>();
+        let mut output = vec![T::default(); 512];
+        let bytes = 256 * size_of::<T>();
+        let x = TensorView::new(
+            DevicePtr(source.as_ptr().cast()),
+            <T as NumericElem>::DTYPE,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        );
+        let mut node = Node::new(NodeId(0), "MeanVarianceNormalization", vec![], vec![]);
+        node.attributes
+            .insert("axes".into(), Attribute::Ints(vec![1]));
+        node.attributes
+            .insert("epsilon".into(), Attribute::Float(0.125));
+        let k = MeanVarianceNormalizationFactory.create(&node, &[]).unwrap();
+        let mut scratch = vec![0u128; bytes.div_ceil(16)];
+        let ws = WorkspaceView::new(DevicePtrMut(scratch.as_mut_ptr().cast()), bytes);
+        let control = observed(bytes, || {
+            drop(std::hint::black_box(to_dense::<T>(&x).unwrap()))
+        });
+        assert!(
+            control.1 > 0,
+            "allocating-copy positive control must be observed: {control:?}"
+        );
+        for strided in [false, true] {
+            let strides = if strided { [32, 2] } else { [16, 1] };
+            let mut y = TensorMut::new(
+                DevicePtrMut(output.as_mut_ptr().cast()),
+                <T as NumericElem>::DTYPE,
+                &shape,
+                &strides,
+                DeviceId::cpu(),
+            );
+            let request = k
+                .workspace_requirement_for_execution(
+                    &[x],
+                    std::slice::from_ref(&y),
+                    &[TensorMetadata::new(x.dtype, x.shape, true)],
+                    &[OutputMetadata::from_view(&y)],
+                    None,
+                )
+                .unwrap()
+                .require_ready()
+                .unwrap();
+            assert_eq!(request.bytes, if strided { bytes as u64 } else { 0 });
+            let workspace = if strided { Some(ws) } else { None };
+            k.execute_with_workspace(&[x], std::slice::from_mut(&mut y), workspace)
+                .unwrap();
+            let counts = observed(bytes, || {
+                for _ in 0..32 {
+                    k.execute_with_workspace(
+                        std::hint::black_box(&[x]),
+                        std::slice::from_mut(&mut y),
+                        workspace,
+                    )
+                    .unwrap();
+                }
+            });
+            assert_eq!(
+                counts.1, 0,
+                "serial MVN route strided={strided}: {counts:?}"
+            );
+            for row in 0..16 {
+                let sum = (0..16)
+                    .map(|column| {
+                        output[(row * 16 + column) * if strided { 2 } else { 1 }].to_f32()
+                    })
+                    .sum::<f32>();
+                assert!(sum.abs() < 0.05);
+            }
         }
     }
     check::<f32>();
