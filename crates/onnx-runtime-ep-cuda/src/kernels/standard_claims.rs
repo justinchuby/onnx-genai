@@ -390,144 +390,6 @@ fn quantize_linear(node: &Node, input_dtypes: &[DataType]) -> Result<(), String>
     Ok(())
 }
 
-#[cfg(test)]
-mod linear_quantization_tests {
-    use super::super::conv_transpose::Contract::{OrtPlugin, Standalone};
-    use super::*;
-    use onnx_runtime_ir::{Dim, NodeId, ValueId};
-
-    fn node(op: &str, zp: Option<ValueId>) -> Node {
-        Node::new(
-            NodeId(0),
-            op,
-            vec![Some(ValueId(0)), Some(ValueId(1)), zp],
-            vec![ValueId(3)],
-        )
-    }
-
-    #[test]
-    fn int16_codes_are_admitted_for_standalone_revision_compatible_forms() {
-        for code in [DataType::Int16, DataType::Uint16] {
-            for (op, dtypes) in [
-                (
-                    "QuantizeLinear",
-                    [DataType::Float32, DataType::Float32, code],
-                ),
-                ("DequantizeLinear", [code, DataType::Float32, code]),
-            ] {
-                let node = node(op, Some(ValueId(2)));
-                let shapes = [vec![Dim::Static(2)], vec![], vec![]];
-                for opset in [10, 13, 19, 20, 21] {
-                    assert!(
-                        unsupported_reason_at_opset(&node, opset, &shapes, &dtypes, Standalone)
-                            .is_none()
-                    );
-                    assert!(
-                        unsupported_reason_at_opset(&node, opset, &shapes, &dtypes, OrtPlugin)
-                            .is_some()
-                    );
-                }
-                let per_axis = vec![vec![Dim::Static(2)]; 3];
-                assert!(
-                    unsupported_reason_at_opset(&node, 10, &per_axis, &dtypes, Standalone)
-                        .is_some_and(|reason| reason.contains("requires a scalar scale"))
-                );
-                let mut half_types = dtypes;
-                half_types[1] = DataType::Float16;
-                if op == "QuantizeLinear" {
-                    half_types[0] = DataType::Float16;
-                }
-                assert!(
-                    unsupported_reason_at_opset(&node, 13, &shapes, &half_types, Standalone)
-                        .is_some_and(|reason| reason.contains("FLOAT scale"))
-                );
-                assert!(
-                    unsupported_reason_at_opset(&node, 19, &shapes, &half_types, Standalone)
-                        .is_none()
-                );
-                let mut newer = node;
-                let attr = if op == "QuantizeLinear" {
-                    "precision"
-                } else {
-                    "output_dtype"
-                };
-                newer
-                    .attributes
-                    .insert(attr.into(), Attribute::Int(DataType::Float16 as i64));
-                assert!(
-                    unsupported_reason_at_opset(&newer, 21, &shapes, &dtypes, Standalone)
-                        .is_some_and(|reason| reason
-                            == format!("{op}: {attr} requires opset 23 or later (got 21)"))
-                );
-                assert!(
-                    unsupported_reason_at_opset(&newer, 23, &shapes, &dtypes, Standalone).is_none()
-                );
-            }
-
-            // Legacy placement does not inspect the Q output attribute; its
-            // shipped descriptor rejects that output at the ABI boundary.
-            let mut q = Node::new(
-                NodeId(0),
-                "QuantizeLinear",
-                vec![Some(ValueId(0)), Some(ValueId(1))],
-                vec![ValueId(3)],
-            );
-            q.attributes
-                .insert("output_dtype".into(), Attribute::Int(code as i64));
-            let shapes = [vec![Dim::Static(2)], vec![Dim::Static(2)]];
-            let dtypes = [DataType::Float32, DataType::Float32];
-            assert!(unsupported_reason_at_opset(&q, 21, &shapes, &dtypes, Standalone).is_none());
-            assert!(
-                unsupported_reason_at_opset(&q, 20, &shapes, &dtypes, Standalone)
-                    .is_some_and(|reason| reason.contains("output_dtype requires opset 21"))
-            );
-            assert_eq!(
-                unsupported_reason_at_opset(&q, 21, &shapes, &dtypes, OrtPlugin).as_deref(),
-                Some("QuantizeLinear CUDA coverage requires a scalar scale")
-            );
-            assert!(
-                !super::super::cuda_supported_dtypes_for_op("QuantizeLinear", "").contains(&code)
-            );
-            assert!(
-                !super::super::cuda_supported_dtypes_for_op("DequantizeLinear", "").contains(&code)
-            );
-        }
-    }
-
-    #[test]
-    fn legacy_qdq_preserves_scalar_and_blocked_claims_and_rejections() {
-        let q = node("QuantizeLinear", Some(ValueId(2)));
-        let q_types = [DataType::Float32, DataType::Float32, DataType::Uint8];
-        let scalar = [vec![Dim::Static(2)], vec![], vec![]];
-        let axis = [
-            vec![Dim::Static(2)],
-            vec![Dim::Static(2)],
-            vec![Dim::Static(2)],
-        ];
-        let mut dq = node("DequantizeLinear", None);
-        dq.attributes.insert("block_size".into(), Attribute::Int(2));
-        let blocked = [vec![Dim::Static(4)], vec![Dim::Static(2)]];
-        let dq_types = [DataType::Int4, DataType::Float32];
-        for native in [OrtPlugin, Standalone] {
-            assert!(unsupported_reason_at_opset(&q, 21, &scalar, &q_types, native).is_none());
-            assert_eq!(
-                unsupported_reason_at_opset(&q, 21, &axis, &q_types, native).as_deref(),
-                Some("QuantizeLinear CUDA coverage requires a scalar scale")
-            );
-            assert!(unsupported_reason_at_opset(&dq, 21, &blocked, &dq_types, native).is_none());
-            let mut half_output = dq.clone();
-            half_output
-                .attributes
-                .insert("output_dtype".into(), Attribute::Int(10));
-            assert_eq!(
-                unsupported_reason_at_opset(&half_output, 23, &blocked, &dq_types, native)
-                    .as_deref(),
-                Some("DequantizeLinear CUDA supports Float32 scale and output")
-            );
-        }
-    }
-}
-
 fn dequantize_linear(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     if !(2..=3).contains(&node.inputs.len())
         || node.inputs[..2].iter().any(Option::is_none)
@@ -1048,4 +910,142 @@ fn mod_op(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
         return Err("Float32 Mod requires fmod=1".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod linear_quantization_tests {
+    use super::super::conv_transpose::Contract::{OrtPlugin, Standalone};
+    use super::*;
+    use onnx_runtime_ir::{Dim, NodeId, ValueId};
+
+    fn node(op: &str, zp: Option<ValueId>) -> Node {
+        Node::new(
+            NodeId(0),
+            op,
+            vec![Some(ValueId(0)), Some(ValueId(1)), zp],
+            vec![ValueId(3)],
+        )
+    }
+
+    #[test]
+    fn int16_codes_are_admitted_for_standalone_revision_compatible_forms() {
+        for code in [DataType::Int16, DataType::Uint16] {
+            for (op, dtypes) in [
+                (
+                    "QuantizeLinear",
+                    [DataType::Float32, DataType::Float32, code],
+                ),
+                ("DequantizeLinear", [code, DataType::Float32, code]),
+            ] {
+                let node = node(op, Some(ValueId(2)));
+                let shapes = [vec![Dim::Static(2)], vec![], vec![]];
+                for opset in [10, 13, 19, 20, 21] {
+                    assert!(
+                        unsupported_reason_at_opset(&node, opset, &shapes, &dtypes, Standalone)
+                            .is_none()
+                    );
+                    assert!(
+                        unsupported_reason_at_opset(&node, opset, &shapes, &dtypes, OrtPlugin)
+                            .is_some()
+                    );
+                }
+                let per_axis = vec![vec![Dim::Static(2)]; 3];
+                assert!(
+                    unsupported_reason_at_opset(&node, 10, &per_axis, &dtypes, Standalone)
+                        .is_some_and(|reason| reason.contains("requires a scalar scale"))
+                );
+                let mut half_types = dtypes;
+                half_types[1] = DataType::Float16;
+                if op == "QuantizeLinear" {
+                    half_types[0] = DataType::Float16;
+                }
+                assert!(
+                    unsupported_reason_at_opset(&node, 13, &shapes, &half_types, Standalone)
+                        .is_some_and(|reason| reason.contains("FLOAT scale"))
+                );
+                assert!(
+                    unsupported_reason_at_opset(&node, 19, &shapes, &half_types, Standalone)
+                        .is_none()
+                );
+                let mut newer = node;
+                let attr = if op == "QuantizeLinear" {
+                    "precision"
+                } else {
+                    "output_dtype"
+                };
+                newer
+                    .attributes
+                    .insert(attr.into(), Attribute::Int(DataType::Float16 as i64));
+                assert!(
+                    unsupported_reason_at_opset(&newer, 21, &shapes, &dtypes, Standalone)
+                        .is_some_and(|reason| reason
+                            == format!("{op}: {attr} requires opset 23 or later (got 21)"))
+                );
+                assert!(
+                    unsupported_reason_at_opset(&newer, 23, &shapes, &dtypes, Standalone).is_none()
+                );
+            }
+
+            // Legacy placement does not inspect the Q output attribute; its
+            // shipped descriptor rejects that output at the ABI boundary.
+            let mut q = Node::new(
+                NodeId(0),
+                "QuantizeLinear",
+                vec![Some(ValueId(0)), Some(ValueId(1))],
+                vec![ValueId(3)],
+            );
+            q.attributes
+                .insert("output_dtype".into(), Attribute::Int(code as i64));
+            let shapes = [vec![Dim::Static(2)], vec![Dim::Static(2)]];
+            let dtypes = [DataType::Float32, DataType::Float32];
+            assert!(unsupported_reason_at_opset(&q, 21, &shapes, &dtypes, Standalone).is_none());
+            assert!(
+                unsupported_reason_at_opset(&q, 20, &shapes, &dtypes, Standalone)
+                    .is_some_and(|reason| reason.contains("output_dtype requires opset 21"))
+            );
+            assert_eq!(
+                unsupported_reason_at_opset(&q, 21, &shapes, &dtypes, OrtPlugin).as_deref(),
+                Some("QuantizeLinear CUDA coverage requires a scalar scale")
+            );
+            assert!(
+                !super::super::cuda_supported_dtypes_for_op("QuantizeLinear", "").contains(&code)
+            );
+            assert!(
+                !super::super::cuda_supported_dtypes_for_op("DequantizeLinear", "").contains(&code)
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_qdq_preserves_scalar_and_blocked_claims_and_rejections() {
+        let q = node("QuantizeLinear", Some(ValueId(2)));
+        let q_types = [DataType::Float32, DataType::Float32, DataType::Uint8];
+        let scalar = [vec![Dim::Static(2)], vec![], vec![]];
+        let axis = [
+            vec![Dim::Static(2)],
+            vec![Dim::Static(2)],
+            vec![Dim::Static(2)],
+        ];
+        let mut dq = node("DequantizeLinear", None);
+        dq.attributes.insert("block_size".into(), Attribute::Int(2));
+        let blocked = [vec![Dim::Static(4)], vec![Dim::Static(2)]];
+        let dq_types = [DataType::Int4, DataType::Float32];
+        for native in [OrtPlugin, Standalone] {
+            assert!(unsupported_reason_at_opset(&q, 21, &scalar, &q_types, native).is_none());
+            assert_eq!(
+                unsupported_reason_at_opset(&q, 21, &axis, &q_types, native).as_deref(),
+                Some("QuantizeLinear CUDA coverage requires a scalar scale")
+            );
+            assert!(unsupported_reason_at_opset(&dq, 21, &blocked, &dq_types, native).is_none());
+            let mut half_output = dq.clone();
+            half_output
+                .attributes
+                .insert("output_dtype".into(), Attribute::Int(10));
+            assert_eq!(
+                unsupported_reason_at_opset(&half_output, 23, &blocked, &dq_types, native)
+                    .as_deref(),
+                Some("DequantizeLinear CUDA supports Float32 scale and output")
+            );
+        }
+    }
 }
