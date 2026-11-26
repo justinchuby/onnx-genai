@@ -1,7 +1,7 @@
 //! One admitted operation lane for packed grouped output, X rows and routes.
 use super::RouteSource;
 use crate::{
-    kernels::{host_rows::Rows, typed_workspace::FloatIndexWorkspace},
+    kernels::{host_rows::Rows, typed_workspace::ValueIndexWorkspace},
     strided::validate_host_storage,
 };
 use onnx_runtime_ep_api::{
@@ -19,8 +19,8 @@ fn error(detail: impl std::fmt::Display) -> EpError {
     EpError::KernelFailed(format!("{PACKED_OP}: {detail}"))
 }
 impl Packed {
-    fn plan(l: GroupLayout) -> Result<FloatIndexWorkspace<2>> {
-        FloatIndexWorkspace::new(
+    fn plan(l: GroupLayout) -> Result<ValueIndexWorkspace<f32, 2>> {
+        ValueIndexWorkspace::new(
             PACKED_OP,
             [("Y staging", l.lanes), ("activation row", l.k)],
             ("routing indices", l.routes),
