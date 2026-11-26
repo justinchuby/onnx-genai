@@ -227,7 +227,8 @@ pub const STANDALONE_CAUSAL_CONV_RNN_AND_RANDOM: OperatorExclusions = &{
     rules
 };
 
-pub(crate) fn first_excluded_revision(
+/// Earliest excluded schema revision for the normalized operator name.
+pub fn first_excluded_revision(
     exclusions: OperatorExclusions,
     domain: &str,
     op_type: &str,
