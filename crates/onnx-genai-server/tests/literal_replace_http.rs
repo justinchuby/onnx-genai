@@ -347,6 +347,9 @@ async fn native_literal_tool_lark_masks_decoded_envelope_before_http_and_sse_pub
     let mut metadata: serde_yaml::Value =
         serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     metadata["schema_version"] = serde_yaml::Value::String("v1.3".into());
+    // An explicit package declaration also owns the fixture's generation EOS.
+    metadata["package"]["tokenizer"]["special_tokens"]["eos_token_id"] =
+        serde_yaml::to_value(vec![3_u32]).unwrap();
     metadata["package"]["tool_protocol"] =
         serde_yaml::to_value(json!({"identity":"tagged-json","version":"v1"})).unwrap();
     std::fs::write(path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
