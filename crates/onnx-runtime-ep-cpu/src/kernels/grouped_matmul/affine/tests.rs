@@ -1,7 +1,7 @@
 use super::*;
-use crate::kernels::testutil::{Owned, PreparedTestKernel};
+use crate::kernels::testutil::{Owned, PreparedTestKernel, Repacked};
 use onnx_runtime_ep_api::{DevicePtrMut, WorkspaceRequirement};
-use onnx_runtime_ir::{DataType, DeviceId, compute_contiguous_strides};
+use onnx_runtime_ir::{DataType, DeviceId};
 fn kernel() -> Affine {
     Affine(AffineGrouped {
         depth: 4,
@@ -70,81 +70,7 @@ fn reference(inputs: &[TensorView]) -> Vec<f32> {
 fn bits(values: Vec<f32>) -> Vec<u32> {
     values.into_iter().map(f32::to_bits).collect()
 }
-struct Repacked {
-    backing: Vec<u128>,
-    shape: Vec<usize>,
-    strides: Vec<i64>,
-    base: usize,
-    offset: usize,
-    dtype: DataType,
-}
-impl Repacked {
-    fn new(source: &Owned, mode: usize) -> Self {
-        let shape = source.shape.clone();
-        let width = source.dtype.byte_size();
-        let mut strides = compute_contiguous_strides(&shape);
-        if matches!(mode, 1..=3 | 5) {
-            let mut step = if mode == 2 { 2 } else { 1 };
-            for (axis, &dim) in shape.iter().enumerate().rev() {
-                strides[axis] = step;
-                step = step * dim as i64 + 3;
-            }
-        }
-        let extent = shape
-            .iter()
-            .zip(&strides)
-            .map(|(&d, &s)| (d - 1) * s as usize)
-            .sum::<usize>();
-        let offset = if mode == 3 {
-            extent * width
-        } else if mode == 5 {
-            (shape[0] - 1) * strides[0] as usize * width
-        } else {
-            0
-        };
-        if mode == 3 {
-            strides.iter_mut().for_each(|s| *s = -*s);
-        }
-        if mode == 5 {
-            strides[0] = -strides[0];
-        }
-        let base = usize::from(mode == 4);
-        let len = (extent + 1) * width + base;
-        let mut backing = vec![0xccccccccccccccccccccccccccccccccu128; len.div_ceil(16)];
-        let storage = unsafe {
-            std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>(), backing.len() * 16)
-        };
-        for (logical, value) in source.bytes.chunks_exact(width).enumerate() {
-            let mut n = logical;
-            let mut at = (offset + base) as i64;
-            for (axis, &dim) in shape.iter().enumerate().rev() {
-                let coordinate = n % dim;
-                n /= dim;
-                at += coordinate as i64 * strides[axis] * width as i64;
-            }
-            let at = at as usize;
-            storage[at..at + width].copy_from_slice(value);
-        }
-        Self {
-            backing,
-            shape,
-            strides,
-            base,
-            offset,
-            dtype: source.dtype,
-        }
-    }
-    fn view(&self) -> TensorView<'_> {
-        TensorView::new(
-            DevicePtr(unsafe { self.backing.as_ptr().cast::<u8>().add(self.base).cast() }),
-            self.dtype,
-            &self.shape,
-            &self.strides,
-            DeviceId::cpu(),
-        )
-        .with_byte_offset(self.offset)
-    }
-}
+
 #[test]
 fn whole_workspace_preserves_route_order_for_every_source_layout_and_optional_zero() {
     let k = kernel();
