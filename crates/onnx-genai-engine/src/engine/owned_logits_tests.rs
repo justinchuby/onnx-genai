@@ -209,8 +209,7 @@ fn native_token_history_matching_managed_domain_funds_exactly_one_owner_and_alia
     Ok(())
 }
 #[test]
-fn native_token_history_same_authority_foreign_manager_keeps_explicit_legacy_boundary()
--> anyhow::Result<()> {
+fn native_token_history_foreign_allocator_uses_own_shared_process_capacity() -> anyhow::Result<()> {
     let (mut engine, _context) = managed_engine()?;
     let memory = engine.governor.memory().clone();
     let manager = engine.governor.process_memory_manager();
@@ -249,16 +248,32 @@ fn native_token_history_same_authority_foreign_manager_keeps_explicit_legacy_bou
     let before = memory.used(Tier::Host);
     let local = manager.process_used(Tier::Host);
     let other = foreign.process_used(Tier::Host);
+    manager.set_process_limit(Tier::Host, local + 11)?;
+    let denied = engine.admit_native_token_history(&[1, 2], &[3]);
+    assert!(
+        denied.is_err(),
+        "the owning process quota must deny before allocation"
+    );
+    assert_eq!(memory.used(Tier::Host), before);
+    assert_eq!(manager.process_used(Tier::Host), local);
+    assert_eq!(foreign.process_used(Tier::Host), other);
+    manager.set_process_limit(Tier::Host, local + 12)?;
     let history = engine.admit_native_token_history(&[1, 2], &[3])?;
     assert_eq!(history.as_slice(), [1, 2, 3]);
     assert_eq!(memory.used(Tier::Host) - before, 12);
-    assert_eq!(manager.process_used(Tier::Host), local);
+    assert_eq!(manager.process_used(Tier::Host), local + 12);
     assert_eq!(
         foreign.process_used(Tier::Host),
         other,
         "foreign manager must not receive an allocation mistaken for this Engine's managed domain"
     );
+    let alias = history.clone();
     drop(history);
+    assert_eq!(alias.as_slice(), [1, 2, 3]);
+    assert_eq!(manager.process_used(Tier::Host), local + 12);
+    assert_eq!(memory.used(Tier::Host) - before, 12);
+    drop(alias);
     assert_eq!(memory.used(Tier::Host), before);
+    assert_eq!(manager.process_used(Tier::Host), local);
     Ok(())
 }
