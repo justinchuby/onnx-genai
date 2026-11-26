@@ -37,6 +37,7 @@ impl SealedLaunchAccess {
 }
 
 pub mod activations;
+mod affine_moe;
 pub mod argreduce;
 pub mod attention;
 pub mod batch_normalization;
@@ -772,6 +773,19 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
         Arc::new(csa_checkpoint::CsaMetrics::default()),
         Arc::new(qmoe::RouteTelemetrySourceRegistry::default()),
     )
+}
+
+// Internal standalone rewrite targets must not enter the ORT registry descriptor projection.
+pub(crate) fn register_standalone_kernels(reg: &mut OpRegistry, runtime: Arc<CudaRuntime>) {
+    reg.register(
+        OpKey::new(
+            onnx_runtime_optimizer::affine_moe::softmax_first::OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+        Box::new(affine_moe::Factory(runtime)),
+    );
 }
 
 /// Like [`build_cuda_registry`] but threads a shared [`CsaMetrics`] telemetry

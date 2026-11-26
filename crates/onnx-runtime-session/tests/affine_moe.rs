@@ -556,3 +556,435 @@ fn affine_moe_declines_observable_routes_and_changed_topk() {
         assert!(session.graph().nodes.values().any(|n| n.op_type == "TopK"));
     }
 }
+
+mod softmax_first {
+    use super::*;
+    use onnx_runtime_optimizer::affine_moe::softmax_first::{Fusion, OP};
+    use onnx_runtime_optimizer::{
+        OptimizationPass, PassContext, quantized_grouped::QuantizedGroupedFusion,
+    };
+
+    const OUTPUT: &str = "output";
+
+    fn fixture(t: usize) -> Fixture {
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 29);
+        let x = input(&mut g, "x", D::Float32, &[t, 16]);
+        let logits = input(&mut g, "router", D::Float32, &[1, t, 3]);
+        let last = [("axis", A::Int(-1))];
+        let probability = op(&mut g, "Softmax", &[logits], D::Float32, &[1, t, 3], &last);
+        let flat_router = ints(&mut g, &[-1, 3]);
+        let flat_probability = op(
+            &mut g,
+            "Reshape",
+            &[probability, flat_router],
+            D::Float32,
+            &[t, 3],
+            &[],
+        );
+        let cast_float = [("to", A::Int(1))];
+        let probability = op(
+            &mut g,
+            "Cast",
+            &[flat_probability],
+            D::Float32,
+            &[t, 3],
+            &cast_float,
+        );
+        let k = ints(&mut g, &[2]);
+        let routing = g.create_value(D::Float32, static_shape([t, 2]));
+        let selected = g.create_value(D::Int64, static_shape([t, 2]));
+        let mut node = Node::new(
+            NodeId(0),
+            "TopK",
+            vec![Some(probability), Some(k)],
+            vec![routing, selected],
+        );
+        node.attributes.insert("axis".into(), A::Int(-1));
+        let top = g.insert_node(node);
+        let routing = op(&mut g, "Cast", &[routing], D::Float32, &[t, 2], &cast_float);
+        let w1 = bank(&mut g, ["w1", "s1", "z1"], 64, 16);
+        let w2 = bank(&mut g, ["w2", "s2", "z2"], 16, 32);
+        let trans = [("transB", A::Int(1))];
+        let first = op(
+            &mut g,
+            "GroupedMatMul",
+            &[x, w1, selected],
+            D::Float32,
+            &[t, 2, 64],
+            &trans,
+        );
+        let split = ints(&mut g, &[32, 32]);
+        let gate = g.create_value(D::Float32, static_shape([t, 2, 32]));
+        let up = g.create_value(D::Float32, static_shape([t, 2, 32]));
+        let mut node = Node::new(
+            NodeId(0),
+            "Split",
+            vec![Some(first), Some(split)],
+            vec![gate, up],
+        );
+        node.attributes.insert("axis".into(), A::Int(-1));
+        g.insert_node(node);
+        let f = |g: &mut Graph, name, inputs: &[ValueId]| {
+            op(g, name, inputs, D::Float32, &[t, 2, 32], &[])
+        };
+        let neg = f(&mut g, "Neg", &[gate]);
+        let exp = f(&mut g, "Exp", &[neg]);
+        let one = f32_const(&mut g, 1.0);
+        let denom = f(&mut g, "Add", &[one, exp]);
+        let silu = f(&mut g, "Div", &[gate, denom]);
+        let act = f(&mut g, "Mul", &[silu, up]);
+        let act_shape = ints(&mut g, &[-1, 32]);
+        let id_shape = ints(&mut g, &[-1, 1]);
+        let act = op(
+            &mut g,
+            "Reshape",
+            &[act, act_shape],
+            D::Float32,
+            &[t * 2, 32],
+            &[],
+        );
+        let ids = op(
+            &mut g,
+            "Reshape",
+            &[selected, id_shape],
+            D::Int64,
+            &[t * 2, 1],
+            &[],
+        );
+        let down = op(
+            &mut g,
+            "GroupedMatMul",
+            &[act, w2, ids],
+            D::Float32,
+            &[t * 2, 1, 16],
+            &trans,
+        );
+        let down_shape = ints(&mut g, &[-1, 2, 16]);
+        let down = op(
+            &mut g,
+            "Reshape",
+            &[down, down_shape],
+            D::Float32,
+            &[t, 2, 16],
+            &[],
+        );
+        let axis = ints(&mut g, &[2]);
+        let routing = op(
+            &mut g,
+            "Unsqueeze",
+            &[routing, axis],
+            D::Float32,
+            &[t, 2, 1],
+            &[],
+        );
+        let weighted = op(
+            &mut g,
+            "Mul",
+            &[down, routing],
+            D::Float32,
+            &[t, 2, 16],
+            &[],
+        );
+        let axis = ints(&mut g, &[1]);
+        let output = op(
+            &mut g,
+            "ReduceSum",
+            &[weighted, axis],
+            D::Float32,
+            &[t, 16],
+            &[("keepdims", A::Int(0))],
+        );
+        g.value_mut(output).name = Some(OUTPUT.into());
+        g.add_output(output);
+        Fixture {
+            graph: g,
+            selected,
+            banks: [w1, w2],
+            top,
+        }
+    }
+
+    fn rewrite(graph: &mut Graph) {
+        let ctx = PassContext::new();
+        QuantizedGroupedFusion.run(graph, &ctx).unwrap();
+        Fusion.run(graph, &ctx).unwrap();
+    }
+
+    #[test]
+    fn affine_softmax_first_moe_admission() {
+        let mut accepted = fixture(2).graph;
+        assert_eq!(accepted.opset_imports.len(), 1);
+        assert_eq!(accepted.opset_imports.get(""), Some(&29));
+        assert!(accepted.nodes.values().all(Node::is_default_domain));
+        rewrite(&mut accepted);
+        let target = accepted.nodes.values().find(|n| n.op_type == OP).unwrap();
+        assert_eq!(target.domain, "pkg.nxrt._private");
+        assert_eq!(accepted.opset_imports.get(target.domain.as_str()), Some(&1));
+        assert_eq!(accepted.effective_opset(target), Some(1));
+        assert!(accepted.nodes.values().all(|n| n.domain != "pkg.nxrt"));
+        assert!(accepted.nodes.values().any(|n| n.op_type == "Softmax"));
+        assert!(!accepted.nodes.values().any(|n| n.op_type == "TopK"));
+
+        for variant in [
+            "smallest",
+            "observable_routes",
+            "wrong_softmax_axis",
+            "wrong_scale_shape",
+        ] {
+            let Fixture {
+                mut graph,
+                selected,
+                top,
+                ..
+            } = fixture(2);
+            match variant {
+                "smallest" => {
+                    graph
+                        .node_mut(top)
+                        .attributes
+                        .insert("largest".into(), A::Int(0));
+                }
+                "observable_routes" => graph.add_output(selected),
+                "wrong_softmax_axis" => {
+                    let id = graph
+                        .nodes
+                        .values()
+                        .find(|n| n.op_type == "Softmax")
+                        .unwrap()
+                        .id;
+                    graph
+                        .node_mut(id)
+                        .attributes
+                        .insert("axis".into(), A::Int(1));
+                }
+                "wrong_scale_shape" => {
+                    let id = graph
+                        .nodes
+                        .values()
+                        .find(|n| n.op_type == "DequantizeLinear")
+                        .unwrap()
+                        .id;
+                    graph
+                        .node_mut(id)
+                        .attributes
+                        .insert("block_size".into(), A::Int(8));
+                }
+                _ => unreachable!(),
+            }
+            rewrite(&mut graph);
+            assert!(!graph.nodes.values().any(|n| n.op_type == OP), "{variant}");
+            for op in ["TopK", "Split", "ReduceSum"] {
+                assert!(
+                    graph.nodes.values().any(|n| n.op_type == op),
+                    "{variant}: lost {op}"
+                );
+            }
+        }
+        let mut reversed_masked = super::fixture(2).graph;
+        rewrite(&mut reversed_masked);
+        assert!(!reversed_masked.nodes.values().any(|n| n.op_type == OP));
+        assert!(reversed_masked.nodes.values().any(|n| n.op_type == "Where"));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires a CUDA device and NVRTC"
+    )]
+    fn affine_softmax_first_moe_native_cuda_matches_decomposed_graph() {
+        use onnx_runtime_ep_api::ExecutionProvider;
+        use onnx_runtime_ep_cuda::{CudaExecutionProvider, build_cuda_registry_descriptors};
+        use std::{path::Path, sync::Arc};
+
+        let ep = Arc::new(CudaExecutionProvider::initialized(0).expect("initialize CUDA device 0"));
+        let plugin = CudaExecutionProvider::new_for_ort_plugin()
+            .expect("initialize the shipped CUDA provider configuration");
+        assert!(
+            !plugin
+                .registry()
+                .supports(OP, onnx_runtime_ir::RUNTIME_DOMAIN, 1)
+        );
+        assert!(
+            !plugin
+                .custom_passes()
+                .iter()
+                .any(|pass| pass.name() == "AffineSoftmaxFirstMoeFusion")
+        );
+        assert!(
+            !build_cuda_registry_descriptors(plugin.registry())
+                .iter()
+                .any(|d| d.op_type == OP)
+        );
+        drop(plugin);
+
+        for (t, poison) in [(1, false), (4, false), (1, true)] {
+            let Fixture { graph, banks, .. } = fixture(t);
+            let mut reference =
+                InferenceSession::from_graph(unfused_reference(&graph, banks)).unwrap();
+            assert!(
+                reference
+                    .graph()
+                    .nodes
+                    .values()
+                    .any(|n| n.op_type == "TopK")
+            );
+            let mut cuda = InferenceSession::from_graph_with_provider(
+                graph,
+                Arc::new(onnx_runtime_loader::WeightStore::new()),
+                Path::new("."),
+                ep.clone(),
+                None,
+            )
+            .unwrap();
+            let target = cuda
+                .graph()
+                .nodes
+                .values()
+                .find(|n| n.op_type == OP)
+                .unwrap();
+            assert_eq!(target.domain, onnx_runtime_ir::RUNTIME_DOMAIN);
+            assert_eq!(cuda.graph().effective_opset(target), Some(1));
+            assert!(!cuda.graph().nodes.values().any(|n| n.op_type == "QMoE"));
+            assert!(
+                cuda.execution_provider_fallback_report().is_none(),
+                "{:?}",
+                cuda.execution_provider_fallback_report()
+            );
+
+            let mut x = vec![0.0; t * 16];
+            for row in x.chunks_exact_mut(16) {
+                row[0] = 1.0;
+            }
+            let mut w1 = vec![0; 3 * 64 * 8];
+            for expert in w1.chunks_exact_mut(64 * 8) {
+                expert[0] = 4;
+                expert[32 * 8] = 4;
+            }
+            let mut w2 = vec![0; 3 * 16 * 16];
+            for (expert, code) in w2.chunks_exact_mut(16 * 16).zip([1, 2, 4]) {
+                for row in expert.chunks_exact_mut(16) {
+                    row[0] = code;
+                }
+            }
+            let mut s2 = vec![1.0; 3 * 16 * 2];
+            if poison {
+                // Expert 1 has a zero softmax probability, but its nonfinite
+                // selected projection must still contribute NaN via 0 * Inf.
+                s2[32..64].fill(f32::MAX);
+            }
+            let mut logits = [
+                0.0, 0.0, 0.0, // Lower-ID boundary tie, mass is 2/3.
+                1.0, 0.0, -1.0, // Excluded expert still contributes to denominator.
+                1e-8, 0.0, 2e-8, // Distinct logits, equal rounded FLOAT probabilities.
+                5.0, -1000.0, -1000.0,
+            ];
+            if poison {
+                logits[..3].copy_from_slice(&[0.0, -1000.0, -1000.0]);
+            }
+            let inputs = [
+                ("x", Tensor::from_f32(&[t, 16], &x).unwrap()),
+                (
+                    "router",
+                    Tensor::from_f32(&[1, t, 3], &logits[..t * 3]).unwrap(),
+                ),
+                (
+                    "w1",
+                    Tensor::from_raw(D::Uint8, vec![3, 64, 8], &w1).unwrap(),
+                ),
+                ("s1", Tensor::from_f32(&[3, 64, 1], &[0.25; 192]).unwrap()),
+                (
+                    "z1",
+                    Tensor::from_raw(D::Uint8, vec![3, 64, 1], &[0; 192]).unwrap(),
+                ),
+                (
+                    "w2",
+                    Tensor::from_raw(D::Uint8, vec![3, 16, 16], &w2).unwrap(),
+                ),
+                ("s2", Tensor::from_f32(&[3, 16, 2], &s2).unwrap()),
+                (
+                    "z2",
+                    Tensor::from_raw(D::Uint8, vec![3, 16, 1], &[0; 48]).unwrap(),
+                ),
+            ];
+            let inputs: Vec<_> = inputs
+                .iter()
+                .map(|(name, tensor)| (*name, tensor))
+                .collect();
+            let got = if t == 4 {
+                let mut bindings = Vec::new();
+                for &(name, tensor) in &inputs {
+                    let mut binding = cuda
+                        .allocate_device_binding(
+                            name,
+                            None::<String>,
+                            tensor.dtype,
+                            tensor.shape.clone(),
+                            tensor.shape.clone(),
+                        )
+                        .unwrap_or_else(|e| panic!("allocate CUDA input {name}: {e}"));
+                    binding
+                        .write_bytes(0, tensor.as_bytes())
+                        .unwrap_or_else(|e| panic!("upload CUDA input {name}: {e}"));
+                    bindings.push(binding);
+                }
+                bindings.push(
+                    cuda.allocate_device_output_binding(
+                        OUTPUT,
+                        D::Float32,
+                        vec![t, 16],
+                        vec![t, 16],
+                    )
+                    .expect("allocate CUDA MoE output"),
+                );
+                let device = ep.device_id();
+                assert!(!device.is_host_accessible());
+                for binding in &bindings {
+                    assert_eq!(binding.allocator().device_id(), device);
+                }
+                let outputs = cuda
+                    .run_with_device_bindings(&[], &mut bindings)
+                    .expect("run CUDA MoE with device inputs and output");
+                assert_eq!(outputs.len(), 1);
+                assert!(outputs[0].is_none(), "output must stay device-bound");
+                let output = bindings.last_mut().unwrap();
+                assert_eq!(output.logical_shape(), &[t, 16]);
+                let bytes = output
+                    .read_bytes()
+                    .expect("explicitly download CUDA MoE output");
+                Tensor::from_raw(D::Float32, vec![t, 16], &bytes).unwrap()
+            } else {
+                cuda.run(&inputs).unwrap().remove(0)
+            };
+            let want = reference.run(&inputs).unwrap();
+            assert_eq!(got.shape, [t, 16]);
+            let got = got.to_vec_f32();
+            let want = want[0].to_vec_f32();
+            let silu = 1.0 / (1.0 + (-1.0f32).exp());
+            let near = |a: f32, b: f32| assert!((a - b).abs() < 2e-6, "got {a}, expected {b}");
+            for (&a, &b) in got.iter().zip(&want) {
+                if poison {
+                    assert!(
+                        a.is_nan() && b.is_nan(),
+                        "unmasked combine returned {a}, reference {b}"
+                    );
+                } else {
+                    near(a, b);
+                }
+            }
+            if !poison {
+                near(got[0], silu);
+                if t > 1 {
+                    near(
+                        got[16],
+                        silu * (1.0 + 2.0 * (-1.0f32).exp())
+                            / (1.0 + (-1.0f32).exp() + (-2.0f32).exp()),
+                    );
+                    near(got[32], silu);
+                    near(got[48], silu);
+                }
+            }
+        }
+    }
+}
