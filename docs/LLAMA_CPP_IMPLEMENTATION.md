@@ -2777,3 +2777,15 @@ turn versus unlimited duplex budget behavior. The dedicated driver requires
 clean source trees, binds HEAD/tree/source/manifests/lock and Cargo inputs, and
 checks those bindings before and after every exact discovered/executed test.
 The broader compatibility acceptance rows remain open.
+
+
+## Native CLI process-boundary evidence
+
+The behavioral inventory now links five additional real Native CLI process
+cases: generation and its JSON profile, emitted CPU trace spans, file/WAV-stdin/
+raw-PCM transcription, authored MP3 feature windows, and language/prompt
+projection. The inventory has 52 Rust cases plus its separate browser driver.
+These fixture processes disable ORT discovery and check actual output/backend
+facts. Profiling uses OS temporary directories rather than repository target
+paths. Packaged console-launcher acceptance and the full model/device/control
+cross-product remain open; parser and process evidence are distinct.
