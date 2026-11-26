@@ -1,0 +1,217 @@
+{
+  "base": "bb8ec2e887ba7f7e13296236c698e329cba94f7a",
+  "binary": "/private/tmp/nxrt-q8-loop-study-target/release/deps/onnx_runtime_ep_cpu-090abab5a20f1b3f",
+  "binary_sha256": "dfc9d7409b9a77d79c10d378b31c384099a383f224a5faa4727c5b7e6020ef66",
+  "build_receipt": {
+    "base": "bb8ec2e887ba7f7e13296236c698e329cba94f7a",
+    "binary": "/private/tmp/nxrt-q8-loop-study-target/release/deps/onnx_runtime_ep_cpu-090abab5a20f1b3f",
+    "binary_sha256": "dfc9d7409b9a77d79c10d378b31c384099a383f224a5faa4727c5b7e6020ef66",
+    "cargo_artifact": {
+      "executable": "/private/tmp/nxrt-q8-loop-study-target/release/deps/onnx_runtime_ep_cpu-090abab5a20f1b3f",
+      "features": [
+        "default",
+        "full",
+        "ops-cnn",
+        "ops-core",
+        "ops-elementwise",
+        "ops-quantized",
+        "ops-reduction",
+        "ops-sequence",
+        "ops-transformer"
+      ],
+      "filenames": [
+        "/private/tmp/nxrt-q8-loop-study-target/release/deps/onnx_runtime_ep_cpu-090abab5a20f1b3f"
+      ],
+      "fresh": false,
+      "manifest_path": "/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-ep-cpu/Cargo.toml",
+      "package_id": "path+file:///private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-ep-cpu#0.1.0-dev.6",
+      "profile": {
+        "debug_assertions": false,
+        "debuginfo": 0,
+        "opt_level": "3",
+        "overflow_checks": false,
+        "test": true
+      },
+      "reason": "compiler-artifact",
+      "target": {
+        "crate_types": [
+          "lib"
+        ],
+        "doc": true,
+        "doctest": true,
+        "edition": "2024",
+        "kind": [
+          "lib"
+        ],
+        "name": "onnx_runtime_ep_cpu",
+        "src_path": "/private/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-ep-cpu/src/lib.rs",
+        "test": true
+      }
+    },
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "--release",
+      "-p",
+      "onnx-runtime-ep-cpu",
+      "--lib",
+      "packed_projection::loop_order_study",
+      "--no-run",
+      "--message-format=json-render-diagnostics"
+    ],
+    "controlled_environment": {
+      "CARGO_BUILD_JOBS": "1",
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "1",
+      "CARGO_PROFILE_RELEASE_DEBUG": "0",
+      "CARGO_TARGET_DIR": "/private/tmp/nxrt-q8-loop-study-target"
+    },
+    "lock": {
+      "inode": 344052582,
+      "path": "/tmp/onnx-genai-hostlock-darwin.flock"
+    },
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8",
+    "sources": {
+      "Cargo.lock": "014b44cfa82c9d63801c5c1e97f86c4ca81b5e3f3f5abc5955a301912451e8be",
+      "Cargo.toml": "870bf93c24253aa6245b3d7e33d8c39ffdd3fd9674d4068a3804c865d4694f3c",
+      "crates/onnx-runtime-ep-cpu/Cargo.toml": "6f791cc4639d4c25e3a850b18b66050c3d382278571aa50776c979a75ed2e3f8",
+      "crates/onnx-runtime-ep-cpu/src/kernels/packed_projection.rs": "30d11f5117131bcff5064a4b428496820a4c49e964b9de5d96f68760dfbb16ab",
+      "crates/onnx-runtime-ep-cpu/src/kernels/packed_projection/loop_order_study.rs": "51d4adeb6a5858f3c9af30e19ab9bc3ea8792cd426b8bd9ed1dc334c71a22c27"
+    }
+  },
+  "build_receipt_sha256": "891fae183fd192c8445bbca251c5041888bee74cdf18f9bec7caf81718cb2c89",
+  "cases": [
+    [
+      "q4",
+      1,
+      32
+    ],
+    [
+      "q4",
+      1,
+      1024
+    ],
+    [
+      "q4",
+      3,
+      32
+    ],
+    [
+      "q4",
+      3,
+      1024
+    ],
+    [
+      "q4",
+      8,
+      32
+    ],
+    [
+      "q4",
+      8,
+      1024
+    ],
+    [
+      "q4",
+      32,
+      32
+    ],
+    [
+      "q4",
+      32,
+      1024
+    ],
+    [
+      "q8",
+      1,
+      32
+    ],
+    [
+      "q8",
+      1,
+      1024
+    ],
+    [
+      "q8",
+      3,
+      32
+    ],
+    [
+      "q8",
+      3,
+      1024
+    ],
+    [
+      "q8",
+      8,
+      32
+    ],
+    [
+      "q8",
+      8,
+      1024
+    ],
+    [
+      "q8",
+      32,
+      32
+    ],
+    [
+      "q8",
+      32,
+      1024
+    ]
+  ],
+  "environment": {
+    "RAYON_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1"
+  },
+  "gates": {
+    "aa_ratio": [
+      0.95,
+      1.05
+    ],
+    "cpu_per_wall": [
+      0.85,
+      1.15
+    ],
+    "double_ratio": [
+      1.8,
+      2.2
+    ],
+    "foreign_process_average_cores_max": 0.5,
+    "setup_fraction_max": 0.1
+  },
+  "lock": {
+    "inherited_by_children": true,
+    "inode": 344052582,
+    "parent_pid": 62961,
+    "path": "/tmp/onnx-genai-hostlock-darwin.flock"
+  },
+  "logical_cpus": 10,
+  "machine": "Apple M1 Max",
+  "n": 256,
+  "os": "ProductName:\t\tmacOS\nProductVersion:\t\t27.0.1\nBuildVersion:\t\t26A434",
+  "pool_width": 1,
+  "production_parent_before_study_sha256": "ec9f1d6806e83099c673160ab71f76b2a987fbdc914d99d45961f11a37a67f67",
+  "repetitions": 4,
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8",
+  "sampler": "uncached host_processor_info over each complete child process; complete child CPU subtracted; no affinity or per-window foreign-CPU bound",
+  "scope": "full private projection plus fresh checked test lane binding; excludes operator publication, routing, governed admission and model inference",
+  "seed": 20261126,
+  "sources": {
+    "Cargo.lock": "014b44cfa82c9d63801c5c1e97f86c4ca81b5e3f3f5abc5955a301912451e8be",
+    "Cargo.toml": "870bf93c24253aa6245b3d7e33d8c39ffdd3fd9674d4068a3804c865d4694f3c",
+    "crates/onnx-runtime-ep-cpu/Cargo.toml": "6f791cc4639d4c25e3a850b18b66050c3d382278571aa50776c979a75ed2e3f8",
+    "crates/onnx-runtime-ep-cpu/src/kernels/packed_projection.rs": "30d11f5117131bcff5064a4b428496820a4c49e964b9de5d96f68760dfbb16ab",
+    "crates/onnx-runtime-ep-cpu/src/kernels/packed_projection/loop_order_study.rs": "51d4adeb6a5858f3c9af30e19ab9bc3ea8792cd426b8bd9ed1dc334c71a22c27",
+    "docs/benchmarks/packed-activation-study/run.py": "18a462aa0d47444d4ef45822564a044ac6b5c333cb4c98bf5cfe5ef415243976",
+    "docs/benchmarks/q8-loop-order/analyze.py": "26c458a1ba14e8ed62bcbec77f40ab74562e299e517099e43ba39ae4503d87d7",
+    "docs/benchmarks/q8-loop-order/build.py": "239ea195fdbf1ec73eb38fb03752f92c358e2524059742a7846764e9c81d6943",
+    "docs/benchmarks/q8-loop-order/run.py": "7abbe7018a78318f981c1cbc642f1d9a6d80bdd8210184d4490bdf81fcae986a",
+    "docs/benchmarks/q8-loop-order/verify.py": "bf433bc3af7ae76840411e319c722c4d6607867e5c2143f7ec58d86d7c6112fe"
+  },
+  "target_window_s": 0.2,
+  "version": 1
+}
