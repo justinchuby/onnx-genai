@@ -225,12 +225,8 @@ impl AudioProgram {
                     }
                     "spectrogram" => {
                         let input_rate = wave_rate()?;
-                        if t.mode.as_deref() != Some("power") || t.window.as_deref() != Some("hann")
-                        {
-                            return Err(invalid(
-                                "spectrogram requires mode: power and window: hann; this operation uses one-sided, unnormalized power with periodic-Hann centered/reflected analysis",
-                            ));
-                        }
+                        let projection = SpectrumProjection::from_declared(t.mode.as_deref())?;
+                        let window = AnalysisWindow::from_declared(t.window.as_deref())?;
                         let rate = t.sample_rate.or(input_rate).ok_or_else(|| invalid("spectrogram needs sample_rate or a preceding declared resample; author the analysis rate explicitly"))?;
                         if input_rate.is_some_and(|input| input != rate) {
                             return Err(invalid(format!(
@@ -242,6 +238,8 @@ impl AudioProgram {
                             positive(t.n_fft, "n_fft")?,
                             positive(t.hop_length, "hop_length")?,
                             positive(t.win_length, "win_length")?,
+                            projection,
+                            window,
                         )?;
                         (Op::Spectrum(Box::new(extractor)), Kind::Spectrum)
                     }

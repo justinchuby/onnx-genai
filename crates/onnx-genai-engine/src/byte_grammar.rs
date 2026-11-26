@@ -1,11 +1,11 @@
 //! Reversible byte-oriented grammar recognition for projected response text.
 use anyhow::{Context, ensure};
-use llguidance::api::TopLevelGrammar;
-use llguidance::earley::{BiasComputer, ParserRecognizer};
-use llguidance::toktrie::{
+use onnx_genai_llguidance::api::TopLevelGrammar;
+use onnx_genai_llguidance::earley::{BiasComputer, ParserRecognizer};
+use onnx_genai_llguidance::toktrie::{
     ApproximateTokEnv, InferenceCapabilities, SimpleVob, TokEnv, TokRxInfo, TokTrie,
 };
-use llguidance::{ParserFactory, TokenParser};
+use onnx_genai_llguidance::{ParserFactory, TokenParser};
 use std::{fmt, num::NonZeroUsize, sync::Arc};
 
 /// Recognition of a candidate after the committed logical grammar bytes.
@@ -26,14 +26,15 @@ pub enum GrammarCandidate {
 /// callers must not silently discard those branches. This is not a general
 /// JSON Schema satisfiability solver.
 pub fn json_schema_is_satisfiable(schema: &serde_json::Value) -> anyhow::Result<bool> {
-    use llguidance::{GrammarBuilder, JsonCompileOptions, UnsatisfiableSchemaError};
+    use onnx_genai_llguidance::{GrammarBuilder, JsonCompileOptions, UnsatisfiableSchemaError};
 
-    let compiled = llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        JsonCompileOptions::default().json_to_llg_with_overrides(
-            GrammarBuilder::new(None, llguidance::api::ParserLimits::default()),
-            schema.clone(),
-        )
-    }));
+    let compiled =
+        onnx_genai_llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            JsonCompileOptions::default().json_to_llg_with_overrides(
+                GrammarBuilder::new(None, onnx_genai_llguidance::api::ParserLimits::default()),
+                schema.clone(),
+            )
+        }));
     match compiled {
         Ok(_) => Ok(true),
         Err(error) if error.downcast_ref::<UnsatisfiableSchemaError>().is_some() => Ok(false),
@@ -157,11 +158,9 @@ impl ByteMatcher {
     ) -> anyhow::Result<T> {
         let result = match self {
             Self::Failed(failure) => return Err(failure.clone().into()),
-            Self::Ready(parser) => {
-                llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    operation(parser)
-                }))
-            }
+            Self::Ready(parser) => onnx_genai_llguidance::panic_utils::catch_unwind(
+                std::panic::AssertUnwindSafe(|| operation(parser)),
+            ),
         };
         match result {
             Ok(value) => Ok(value),
@@ -300,14 +299,15 @@ impl GrammarByteCursor {
         let env: TokEnv = Arc::new(ApproximateTokEnv::new(TokTrie::from(&info, &pieces)));
         let factory = ParserFactory::new(&env, InferenceCapabilities::default(), &[])
             .context("initialize byte grammar factory")?;
-        let parser = llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            factory.create_parser(grammar)
-        }))
-        .with_context(|| {
-            format!(
-                "compile {kind} for projected response bytes; repair the grammar if unsupported"
-            )
-        })?;
+        let parser =
+            onnx_genai_llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                factory.create_parser(grammar)
+            }))
+            .with_context(|| {
+                format!(
+                    "compile {kind} for projected response bytes; repair the grammar if unsupported"
+                )
+            })?;
         let compiled = parser.parser.grammar();
         let lexemes = compiled.lexer_spec();
         ensure!(
@@ -594,7 +594,7 @@ mod tests {
             );
             assert!(
                 error
-                    .downcast_ref::<llguidance::UnsatisfiableSchemaError>()
+                    .downcast_ref::<onnx_genai_llguidance::UnsatisfiableSchemaError>()
                     .is_none(),
                 "invalid/unsupported schema was classified as empty: {schema}: {error:#}"
             );

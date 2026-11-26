@@ -209,10 +209,96 @@ pub fn group_layout(op: Op, x: &[TensorView], y: &TensorMut) -> Result<GroupLayo
     group_layout_shapes(op, x[0].shape, x[1].shape, x[2].shape, bias, Some(y.shape))
 }
 
+/// Grouped projection shape/type contract for planning without tensor reads.
+pub fn group_metadata_layout(
+    op: Op,
+    x: &[TensorMetadata<'_>],
+    y: &[OutputMetadata<'_>],
+) -> Result<GroupLayout> {
+    if !matches!(op, Op::GroupedMatMul { .. }) || !(3..=4).contains(&x.len()) || y.len() != 1 {
+        return Err(fail(
+            op,
+            "expected activation, weights, routes, optional bias and one output; bind the complete grouped projection signature",
+        ));
+    }
+    let mut dtypes = [DataType::Undefined; 4];
+    for (index, input) in x.iter().enumerate() {
+        if index < 3
+            && (!input.present && !input.shape.contains(&0) || input.dtype == DataType::Undefined)
+        {
+            return Err(fail(
+                op,
+                format!(
+                    "required input {index} is absent; bind activation, weights and integer routes"
+                ),
+            ));
+        }
+        if index < 3 || input.present {
+            dtypes[index] = input.dtype;
+        }
+        if dtypes[index] != DataType::Undefined {
+            elements(op, input.shape)?.checked_mul(input.dtype.byte_size()).ok_or_else(|| fail(op, format!("input {index} shape {:?} exceeds addressable bytes; reduce tensor dimensions", input.shape)))?;
+        }
+    }
+    op.validate_dtypes(&dtypes).map_err(EpError::KernelFailed)?;
+    let out = match &y[0] {
+        OutputMetadata::Tensor { dtype, shape } if *dtype == x[0].dtype => Some(shape.as_ref()),
+        OutputMetadata::Unresolved { dtype } if *dtype == x[0].dtype => None,
+        _ => {
+            return Err(fail(
+                op,
+                format!(
+                    "output must have dtype {:?}; bind a matching projection result",
+                    x[0].dtype
+                ),
+            ));
+        }
+    };
+    let bias = x
+        .get(3)
+        .filter(|b| b.present && b.dtype != DataType::Undefined)
+        .map(|b| b.shape);
+    group_layout_shapes(op, x[0].shape, x[1].shape, x[2].shape, bias, out)
+}
+
+/// Validate live descriptors through the same device-independent geometry used
+/// for metadata planning. CPU Host access is established by its own reader.
 pub fn packed_group_layout(
     metadata: &Metadata,
     x: &[TensorView],
     y: &[TensorMut],
+) -> Result<GroupLayout> {
+    let [a, packed, idx] = x else {
+        return Err(EpError::KernelFailed("PackedGroupedMatMul: expected activation, packed weights and group indices; bind all three inputs".into()));
+    };
+    let [out] = y else {
+        return Err(EpError::KernelFailed(
+            "PackedGroupedMatMul: expected one output; bind the projection result".into(),
+        ));
+    };
+    let inputs = [a, packed, idx].map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()));
+    let outputs = [OutputMetadata::tensor(out.dtype, out.shape)];
+    let layout = packed_group_metadata_layout(metadata, &inputs, &outputs)?;
+    for (index, tensor) in x.iter().enumerate() {
+        tensor.validate().map_err(|e| {
+            EpError::KernelFailed(format!(
+                "PackedGroupedMatMul: invalid input {index}: {e}; bind a valid tensor descriptor"
+            ))
+        })?;
+    }
+    out.validate().map_err(|e| {
+        EpError::KernelFailed(format!(
+            "PackedGroupedMatMul: invalid output: {e}; bind a valid tensor descriptor"
+        ))
+    })?;
+    Ok(layout)
+}
+/// Complete packed projection geometry without reading tensor values or
+/// assuming a device. An unresolved output shape is derived from operands.
+pub fn packed_group_metadata_layout(
+    metadata: &Metadata,
+    x: &[TensorMetadata<'_>],
+    y: &[OutputMetadata<'_>],
 ) -> Result<GroupLayout> {
     let fail = |detail: &str| EpError::KernelFailed(format!("PackedGroupedMatMul: {detail}"));
     let [a, packed, idx] = x else {
@@ -226,9 +312,16 @@ pub fn packed_group_layout(
     let [groups, n, k] = metadata.shape() else {
         return Err(fail("decoded weight shape must be [groups,N,K]"));
     };
+    let (output_dtype, output_shape) = match out {
+        OutputMetadata::Tensor { dtype, shape } => (*dtype, Some(shape.as_ref())),
+        OutputMetadata::Unresolved { dtype } => (*dtype, None),
+        OutputMetadata::Absent => {
+            return Err(fail("expected a FLOAT output; bind the projection result"));
+        }
+    };
     if metadata.dtype() != DataType::Float32
         || a.dtype != DataType::Float32
-        || out.dtype != DataType::Float32
+        || output_dtype != DataType::Float32
         || !matches!(idx.dtype, DataType::Int32 | DataType::Int64)
     {
         return Err(fail(
@@ -238,17 +331,20 @@ pub fn packed_group_layout(
     metadata
         .validate_input(packed.dtype, packed.shape)
         .map_err(|detail| fail(&detail))?;
-    for tensor in x {
-        tensor.validate()?;
+    for (index, input) in x.iter().enumerate() {
+        if !input.present && !input.shape.contains(&0) {
+            return Err(fail(&format!(
+                "input {index} is absent; bind activation, packed bank and routes"
+            )));
+        }
     }
-    out.validate()?;
     group_layout_shapes(
         Op::GroupedMatMul { transposed: true },
         a.shape,
         &[*groups, *n, *k],
         idx.shape,
         None,
-        Some(out.shape),
+        output_shape,
     )
 }
 
@@ -572,6 +668,246 @@ mod affine_metadata_tests {
                 .unwrap()
                 .to_string()
                 .contains("block_size")
+        );
+    }
+}
+
+#[cfg(test)]
+mod packed_metadata_tests {
+    use super::*;
+    use crate::{DevicePtr, DevicePtrMut};
+    use onnx_runtime_ir::{Attribute, DeviceId, NodeId};
+    fn bank(shape: [usize; 3]) -> Metadata {
+        let mut node = Node::new(NodeId(0), "PackedGroupedMatMul", vec![], vec![]);
+        node.attributes
+            .insert("format".into(), Attribute::String("gguf:q4_0".into()));
+        node.attributes.insert(
+            "shape".into(),
+            Attribute::Ints(shape.map(|d| d as i64).to_vec()),
+        );
+        Metadata::from_node(&node).unwrap()
+    }
+    #[test]
+    fn packed_metadata_and_live_cuda_descriptors_share_geometry_without_data_reads() {
+        let bank = bank([3, 2, 64]);
+        let m = [
+            TensorMetadata::new(DataType::Float32, &[2, 64], true),
+            TensorMetadata::new(DataType::Uint8, &[216], true),
+            TensorMetadata::new(DataType::Int64, &[2, 2], true),
+        ];
+        let strides = [vec![64, 1], vec![1], vec![2, 1]];
+        let inputs = m
+            .iter()
+            .zip(&strides)
+            .map(|(v, s)| {
+                TensorView::new(
+                    DevicePtr(8usize as *const std::ffi::c_void),
+                    v.dtype,
+                    v.shape,
+                    s,
+                    DeviceId::cuda(0),
+                )
+            })
+            .collect::<Vec<_>>();
+        let out = TensorMut::new(
+            DevicePtrMut(8usize as *mut std::ffi::c_void),
+            DataType::Float32,
+            &[2, 2, 2],
+            &[4, 2, 1],
+            DeviceId::cuda(0),
+        );
+        let actual = packed_group_layout(&bank, &inputs, &[out]).unwrap();
+        for output in [
+            OutputMetadata::Unresolved {
+                dtype: DataType::Float32,
+            },
+            OutputMetadata::tensor(DataType::Float32, &[2, 2, 2]),
+        ] {
+            let l = packed_group_metadata_layout(&bank, &m, &[output]).unwrap();
+            assert_eq!(
+                (l.k, l.n, l.groups, l.routes, l.lanes),
+                (
+                    actual.k,
+                    actual.n,
+                    actual.groups,
+                    actual.routes,
+                    actual.lanes
+                )
+            );
+        }
+    }
+    #[test]
+    fn packed_empty_reductions_and_metadata_errors_keep_explicit_contracts() {
+        let bank = bank([isize::MAX as usize, 5, 0]);
+        let m = [
+            TensorMetadata::new(DataType::Float32, &[1, 0], true),
+            TensorMetadata::new(DataType::Uint8, &[0], true),
+            TensorMetadata::new(DataType::Int32, &[1, 1], true),
+        ];
+        let out = [OutputMetadata::Unresolved {
+            dtype: DataType::Float32,
+        }];
+        let l = packed_group_metadata_layout(&bank, &m, &out).unwrap();
+        assert_eq!((l.k, l.n, l.routes, l.lanes), (0, 5, 1, 5));
+        assert!(
+            packed_group_metadata_layout(&bank, &m[..2], &out)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("activation")
+        );
+        assert!(
+            packed_group_metadata_layout(&bank, &m, &[OutputMetadata::Absent])
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("output")
+        );
+        let mut bad = m;
+        bad[2].present = false;
+        assert!(
+            packed_group_metadata_layout(&bank, &bad, &out)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("input 2 is absent")
+        );
+        bad = m;
+        bad[1].shape = &[1];
+        assert!(packed_group_metadata_layout(&bank, &bad, &out).is_err());
+    }
+}
+
+#[cfg(test)]
+mod native_metadata_tests {
+    use super::*;
+    use crate::{DevicePtr, DevicePtrMut};
+    use onnx_runtime_ir::DeviceId;
+    #[test]
+    fn native_metadata_matches_live_geometry_for_both_transposes_and_optional_bias() {
+        for transposed in [false, true] {
+            for dt in [
+                DataType::Float16,
+                DataType::BFloat16,
+                DataType::Float32,
+                DataType::Float64,
+            ] {
+                for bias in 0..3 {
+                    let op = Op::GroupedMatMul { transposed };
+                    let w = if transposed { [3, 5, 4] } else { [3, 4, 5] };
+                    let mut x = vec![
+                        TensorMetadata::new(dt, &[2, 4], true),
+                        TensorMetadata::new(dt, &w, true),
+                        TensorMetadata::new(DataType::Int64, &[2, 2], true),
+                    ];
+                    if bias == 1 {
+                        x.push(TensorMetadata::new(DataType::Undefined, &[], false));
+                    } else if bias == 2 {
+                        x.push(TensorMetadata::new(dt, &[3, 5], true));
+                    }
+                    let strides = x
+                        .iter()
+                        .map(|v| onnx_runtime_ir::compute_contiguous_strides(v.shape))
+                        .collect::<Vec<_>>();
+                    let views = x
+                        .iter()
+                        .zip(&strides)
+                        .map(|(v, s)| {
+                            if v.dtype == DataType::Undefined {
+                                TensorView::absent(v.dtype)
+                            } else {
+                                TensorView::new(
+                                    DevicePtr(16usize as *const _),
+                                    v.dtype,
+                                    v.shape,
+                                    s,
+                                    DeviceId::cuda(0),
+                                )
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let out = TensorMut::new(
+                        DevicePtrMut(16usize as *mut _),
+                        dt,
+                        &[2, 2, 5],
+                        &[10, 5, 1],
+                        DeviceId::cuda(0),
+                    );
+                    let live = group_layout(op, &views, &out).unwrap();
+                    for out in [
+                        OutputMetadata::tensor(dt, &[2, 2, 5]),
+                        OutputMetadata::Unresolved { dtype: dt },
+                    ] {
+                        let l = group_metadata_layout(op, &x, &[out]).unwrap();
+                        assert_eq!(
+                            (l.k, l.n, l.groups, l.routes, l.lanes, l.bias),
+                            (
+                                live.k,
+                                live.n,
+                                live.groups,
+                                live.routes,
+                                live.lanes,
+                                live.bias
+                            )
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn native_metadata_rejects_missing_mismatched_and_unaddressable_operands() {
+        let op = Op::GroupedMatMul { transposed: false };
+        let m = [
+            TensorMetadata::new(DataType::Float32, &[2, 4], true),
+            TensorMetadata::new(DataType::Float32, &[3, 4, 5], true),
+            TensorMetadata::new(DataType::Int64, &[2, 2], true),
+        ];
+        let out = [OutputMetadata::Unresolved {
+            dtype: DataType::Float32,
+        }];
+        assert!(group_metadata_layout(op, &m[..2], &out).is_err());
+        let mut bad = m;
+        bad[1].present = false;
+        assert!(
+            group_metadata_layout(op, &bad, &out)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("input 1")
+        );
+        bad = m;
+        bad[1].dtype = DataType::Float16;
+        assert!(
+            group_metadata_layout(op, &bad, &out)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("matching")
+        );
+        bad = m;
+        bad[2].shape = &[2, 1];
+        assert!(
+            group_metadata_layout(
+                op,
+                &bad,
+                &[OutputMetadata::tensor(DataType::Float32, &[2, 2, 5])]
+            )
+            .is_err()
+        );
+        bad = m;
+        bad[0].shape = &[usize::MAX, 4];
+        assert!(group_metadata_layout(op, &bad, &out).is_err());
+        assert!(group_metadata_layout(op, &m, &[OutputMetadata::Absent]).is_err());
+        assert!(
+            group_metadata_layout(
+                op,
+                &m,
+                &[OutputMetadata::Unresolved {
+                    dtype: DataType::Float64
+                }]
+            )
+            .is_err()
         );
     }
 }

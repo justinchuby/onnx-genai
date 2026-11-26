@@ -1,34 +1,53 @@
-# llguidance source provenance and local patches
+# Maintained grammar compiler and upstream provenance
 
-This directory contains the published llguidance 1.9.1 crate, licensed under
-[MIT](LICENSE). `UPSTREAM.json` records the archive SHA-256 from Cargo.lock and
-hashes of every original file. The archive is the authority for this snapshot;
-the publisher's `.cargo_vcs_info.json` records a dirty source tree.
+This is the single source tree for the workspace-owned
+`onnx-genai-llguidance` package (Rust name `onnx_genai_llguidance`). Its release
+version follows the workspace, and its implementation derives from the published
+llguidance 1.9.1 crate under the original [MIT license](LICENSE). It is an
+explicit maintained fork, not an unchanged registry copy or an import alias.
 
-The engine uses this explicit versioned path dependency as its canonical compiler.
-Python source distributions therefore include and resolve the audited source. `src/json/compiler.rs` changes object-key lexemes to
-recognize legal JSON quoting consistently and reuses exactly those lexemes for
-known-name exclusion from pattern/additional properties. Existing raw key spelling
-is retained. No schema rewriting or model-specific normalization is introduced.
+`UPSTREAM.json` retains the original archive SHA-256 and every original file
+hash. `UPSTREAM-Cargo.toml`, `UPSTREAM-Cargo.lock` and `UPSTREAM-VCS.json` preserve
+published metadata byte-for-byte under names distinct from Cargo's generated
+package metadata. The publisher's VCS record identifies a dirty upstream tree;
+the published archive is the authority for the audited base. The archive's
+`Cargo.toml.orig` remains an explicitly recorded omission because Cargo reserves
+that filename for the maintained package's own source manifest.
 
-`src/json/compiler.rs` also makes its existing `UnsatisfiableSchemaError` type
-public, and `src/lib.rs` reexports it. Fields remain private, and compiler error
-construction and branch pruning are unchanged. The engine can therefore classify
-only a backend-proven empty schema language without matching error strings or
-silently treating malformed, unsupported or resource-limited schemas as empty.
+The audited compiler changes:
 
-Remove these local patches after an upstream release provides the same behavior
-and typed distinction, and the repository's key-escape and schema-satisfiability
-regressions pass against it.
+- Object-key lexemes recognize legal JSON quoting consistently and reuse those
+  lexemes for known-name exclusion from pattern/additional properties. Raw
+  spelling is retained; schemas and model-specific text are not rewritten.
+- The existing `UnsatisfiableSchemaError` is public and reexported, with private
+  fields. Existing error construction/pruning is unchanged. The engine can
+  distinguish backend-proven empty languages from malformed, unsupported or
+  resource-limited schemas without matching error strings.
 
-`python3 scripts/check_llguidance_vendor.py` checks the original file hashes,
-allowed patch footprint, and exact audited patch hashes without network access.
+Two single-range token vectors use `std::iter::once(...).collect()` rather than
+ambiguous single-range `vec!` syntax, preserving their exact values while passing
+the current toolchain's strict Clippy gate.
 
-Repository builds and bundled source distributions use this path dependency.
-Crates.io publication removes dependency paths; upstream or publish the compiler
-patches before publishing a registry-only engine that requires the typed export.
-Release-order validation recognizes only explicit vendored provenance with an unchanged
-published manifest identity/version; it still rejects missing workspace crates.
+The managed manifest preserves upstream Rust 2021 edition, minimum Rust version,
+features, runtime dependency requirements and build/header behavior. The archive's
+integration/benchmark sources depend on unpublished upstream test utilities; they
+are retained as provenance, not selected as executable acceptance. Source unit
+tests, the explicit `registry_surface` integration target and the engine/server
+conformance suites test this maintained compiler directly.
 
-`Cargo.toml.orig` is an explicitly recorded omission: it is a generated registry
-manifest copy whose reserved filename prevents Cargo source packaging.
+`python3 scripts/check_llguidance_vendor.py` verifies source provenance, explicit
+relocations, the exact code-patch footprint and owned source hashes. Its
+`--root EXTRACTED_PACKAGE --packaged` mode additionally binds Cargo's generated
+manifest to `Cargo.toml.orig`, checks the managed identity and preserves features.
+No original compiler source is duplicated or selected by configuration fallbacks.
+
+The release workflow publishes `onnx-genai-llguidance` before the engine. Engine
+packages depend on this versioned package, so Cargo's normalization no longer
+substitutes an unpatched `llguidance` registry package. Registry-only publication
+is validated using the exact packaged archive and a temporary local registry;
+see [verification instructions](https://github.com/justinchuby/onnx-genai/blob/main/docs/GRAMMAR_COMPILER.md). This does not
+claim that a release has already been uploaded.
+
+Remove the fork only when a published upstream version supplies both required
+behaviors and the key-escape/typed-satisfiability regressions pass against it;
+update every caller and release edge together without compatibility shims.

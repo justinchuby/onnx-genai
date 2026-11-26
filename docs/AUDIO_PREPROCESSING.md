@@ -79,15 +79,31 @@ The CLI uses this proof for both file and live transcription after resolving the
 recording's actual source rate. Serving encoded audio binds the compiled program,
 not a guessed rank-3 mel output or a fixed hop/rate formula.
 
-## Linear power spectrograms
+## Linear spectrograms
 
 `spectrogram` consumes its named waveform and publishes a float32 tensor with
 shape `[batch, n_fft / 2 + 1, floor(samples / hop_length)]`, in frequency-major
-order. Author `mode: power`, `window: hann`, positive `n_fft` (at least 2),
-`hop_length` and `win_length` (at most `n_fft`). It uses a periodic Hann window
-centered within the FFT input, centered/reflected sample boundaries, an
-unnormalized forward FFT and one-sided squared magnitudes. These are the fixed
-semantics of this operation; magnitude and other window selectors are rejected.
+order. Declare `mode: power` or `mode: magnitude`, and `window: hann`,
+`window: hamming` or `window: rectangular`. Both selectors are required; unknown
+or missing selectors fail at compilation. Also author positive `n_fft` (at least
+2), `hop_length` and `win_length` (at most `n_fft`).
+
+All three windows occupy the centered `win_length` positions of the FFT input,
+with zero coefficients outside that interval. For `0 <= j < win_length`, their
+explicit coefficient contracts are:
+
+| Selector | Coefficient |
+| --- | --- |
+| `hann` | `0.5 - 0.5 cos(2πj / win_length)` |
+| `hamming` | `0.54 - 0.46 cos(2πj / win_length)` |
+| `rectangular` | `1` |
+
+Hann and Hamming are periodic, using `win_length` rather than `win_length - 1`
+in the denominator, including a length-one window. Sample boundaries use
+centered reflection, the forward FFT is unnormalized, and only its nonnegative
+frequency bins are emitted without doubling. Power is `re² + im²`; magnitude is
+`hypot(re, im)` directly, preserving representable finite magnitudes when squaring
+would overflow. A nonfinite projected value still fails with rescaling guidance.
 Complex and uncentered analyses have no operation/selector in this contract.
 Odd FFT lengths and windows shorter than the FFT are supported.
 
@@ -97,9 +113,9 @@ It must match the input rate; the operation does not implicitly resample.
 retains its own valid-frame interval for `emit_valid_frames` and
 `emit_validity_mask`, including padding and clipping on the selected branch.
 An unpadded ragged batch fails with padding guidance. `whisper_log_mel`
-normalization requires a `log_mel` source and rejects a linear power spectrum.
-The FFT/window implementation is shared with log-mel, which retains its existing
-projection and normalization recipe without materializing a full intermediate
+normalization requires a `log_mel` source and rejects a linear spectrum.
+The FFT implementation is shared with log-mel, which retains its existing
+periodic-Hann/power projection and normalization recipe without materializing a full intermediate
 spectrum.
 
 ```yaml

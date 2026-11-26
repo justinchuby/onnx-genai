@@ -2061,10 +2061,12 @@ optional keys, anyOf branches, Unicode/surrogate keys and literal backslashes.
 HTTP continuation forces valid/invalid competing suffixes through the actual
 model in buffered/SSE mode, with and without response projection.
 
-This workspace patch and bundled source-distribution path are distinct from a
-registry-only dependency install; publishing dependent crates to crates.io removes
-local dependency paths. Upstream or publish the compiler fix before claiming
-this extended key-escape behavior for registry-only crate distributions.
+The former external vendored-package identity did not supply these fixes to
+registry-only consumers after Cargo removed local dependency paths. The compiler
+is now the first-class `onnx-genai-llguidance` package, published before the engine
+with the same audited source and public typed distinction. See the
+[compiler artifact verification](GRAMMAR_COMPILER.md) for the exact packaged/local
+registry proof; configuring that release graph does not claim an upload occurred.
 
 Full server verification also exposed a realtime disconnect release race.
 Admission capacity now drops before the worker reservation advertises idle,
@@ -2714,3 +2716,97 @@ byte-exact completed replay, induced reader-disconnect recovery, genuinely activ
 API-key onboarding rejected the wrong key, accepted and persisted the valid key,
 and protected replay. Browser evidence records the built binary/driver hashes;
 these fixture results do not close the full model/device/control acceptance list.
+
+
+## Explicit spectrum projections and periodic windows
+
+Standalone audio spectra now admit explicit power/magnitude and periodic
+Hann/Hamming/rectangular selectors. Magnitude projects finite complex FFT values
+with stable hypot, so squared-magnitude overflow does not reject representable
+amplitudes. Log-mel keeps the original power/Hann arithmetic, mel resource
+admission before planning and normalization; geometry/rate/branch/mask guards
+are unchanged. Uncentered/complex and other DSP conventions remain open.
+
+Validation: all 122 preprocessing tests passed, including independent f64 DFT
+for each projection/window, odd/short/length-one windows, and finite-input
+magnitude-vs-power overflow checks. Six Native audio tests passed; the spectrum
+case executes all six combinations at multiple amplitudes/lengths against
+analytic head outputs. Full server library: 629 passed, 2 inherited ignores.
+Strict all-target default preprocess/engine/server and explicit ORT-reference
+server Clippy, formatting and diff checks passed. Functional macOS ARM64 CPU
+coverage only; no device/performance or whole-goal parity claim.
+
+
+## Package-bound CLI behavioral evidence
+
+The behavioral inventory now binds each Rust case to an explicit workspace
+package manifest and enabled lib/integration target. The checker rejects
+mismatched package identities, excluded packages, escaped source paths and
+custom test harnesses; execution records the chosen package and target and
+binds the package manifests into its receipt. The inventory contains 47 Rust
+cases plus one browser case across the existing 55 contracts/nine categories.
+
+Five CLI cases establish removed REPL rejection, the Native default, retained
+generation CPU/context controls, transcription input/format/conditioning controls
+and global profiling flag parsing. These parser assertions do not establish
+end-to-end inference, emitted profiling files or packaged launcher behavior.
+
+Validation: all 78 CLI library tests and 29 Python checker/runner regressions
+passed. Strict all-target default CLI/server and explicit ORT-reference CLI
+(`--no-default-features --features onnx-genai-server/metrics,cuda-13000`)
+Clippy, inventory, Python lint, formatting and diff checks passed. No hardware
+performance claim or broader acceptance completion is implied.
+
+
+## Native duplex response-local constraints
+
+Input-driven duplex responses now arm the admitted constraint on the native
+owner after Configure and before their first Audio quantum. Arming performs no
+workflow quantum and does not consume usage; subsequent Audio/Poll retains the
+same grammar cursor. Active responses own immutable tool/schema snapshots. Mutable response
+default updates affect the following response rather than current sampling or
+result admission; tool definitions remain frozen after first input because they
+participate in session-start conditioning. Dynamic tool-definition updates need
+a separate conditioning/state design and remain open. Missing masks and unsupported forcing fail before PCM is
+queued. Tool execution remains owned by the external harness.
+
+The exact old-code Native counterexample was reproduced: a higher-ranked invalid
+city token was selected before schema rejection, failing the intended mask
+assertion (one failed, zero passed/ignored). Nine fixed-source regressions cover
+first-token selection, updates/cancel/rearm, cursor progress, admission failure,
+non-quantum arming, schema ownership, EOS masking/ignore-mask refusal and finite
+turn versus unlimited duplex budget behavior. The dedicated driver requires
+clean source trees, binds HEAD/tree/source/manifests/lock and Cargo inputs, and
+checks those bindings before and after every exact discovered/executed test.
+The broader compatibility acceptance rows remain open.
+
+
+## Native CLI process-boundary evidence
+
+The behavioral inventory now links five additional real Native CLI process
+cases: generation and its JSON profile, emitted CPU trace spans, file/WAV-stdin/
+raw-PCM transcription, authored MP3 feature windows, and language/prompt
+projection. The inventory has 52 Rust cases plus its separate browser driver.
+These fixture processes disable ORT discovery and check actual output/backend
+facts. Profiling uses OS temporary directories rather than repository target
+paths. Packaged console-launcher acceptance and the full model/device/control
+cross-product remain open; parser and process evidence are distinct.
+
+
+## Publishable maintained grammar dependency
+
+The single audited compiler tree now has the owned package identity
+`onnx-genai-llguidance`; engine imports use its canonical Rust name. Its exact
+versioned release dependency precedes the engine in the publish graph, retaining
+the original MIT source, archive hash and all 71 provenance records. There is no
+registry/path switch or duplicate compiler implementation. Two token-range
+vector constructions retain their values with lint-clean syntax.
+
+The compiler source passed 56 unit and 2 public-surface tests, strict all-target
+Clippy and 20 Python provenance/release/registry checks. An exact 77-file Cargo
+archive was served through a temporary sparse registry and consumed without
+path/git/patch overrides; its registry-only public tests passed locked/offline.
+This proves the artifact surface, not a crates.io publication. The standalone
+key-ownership regression uses legal raw DEL spelling; the engine normalizes
+arbitrary JSON Unicode escapes before backend recognition. See
+[compiler checks](GRAMMAR_COMPILER.md) for reproducible artifact evidence.

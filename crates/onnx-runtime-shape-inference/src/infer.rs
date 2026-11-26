@@ -518,7 +518,7 @@ fn validate_control_flow_schema(
                 node.op_type != "Scan",
             )?;
         } else if let Some(type_info) = types.get(&input) {
-            validate_control_flow_dtype(node, version, "input", slot, type_info.dtype, false)?;
+            validate_concrete_control_flow_dtype(node, version, "input", slot, type_info.dtype)?;
         }
     }
 
@@ -546,10 +546,16 @@ fn validate_control_flow_schema(
                 )?;
             }
             CfOutput::Typed(type_info) => {
-                validate_control_flow_dtype(node, version, "output", slot, type_info.dtype, false)?;
+                validate_concrete_control_flow_dtype(
+                    node,
+                    version,
+                    "output",
+                    slot,
+                    type_info.dtype,
+                )?;
             }
             CfOutput::UnknownRank(dtype) => {
-                validate_control_flow_dtype(node, version, "output", slot, *dtype, false)?;
+                validate_concrete_control_flow_dtype(node, version, "output", slot, *dtype)?;
             }
             CfOutput::Unresolved => {
                 let Some(output) = node.outputs.get(slot).copied().flatten() else {
@@ -571,13 +577,12 @@ fn validate_control_flow_schema(
                         container_allowed,
                     )?;
                 } else if let Some(type_info) = types.get(&output) {
-                    validate_control_flow_dtype(
+                    validate_concrete_control_flow_dtype(
                         node,
                         version,
                         "output",
                         slot,
                         type_info.dtype,
-                        false,
                     )?;
                 }
             }
@@ -606,11 +611,11 @@ fn validate_control_flow_value(
     }
     match value_type {
         ValueType::Tensor(tensor) => {
-            validate_control_flow_dtype(node, version, role, slot, tensor.dtype, false)
+            validate_concrete_control_flow_dtype(node, version, role, slot, tensor.dtype)
         }
         ValueType::Sequence(element) => match element.as_ref() {
             ValueType::Tensor(tensor) => {
-                validate_control_flow_dtype(node, version, role, slot, tensor.dtype, false)
+                validate_concrete_control_flow_dtype(node, version, role, slot, tensor.dtype)
             }
             _ => Err(control_flow_schema_error(
                 node,
@@ -623,11 +628,26 @@ fn validate_control_flow_value(
         },
         ValueType::Optional(element) => match element.as_ref() {
             ValueType::Tensor(tensor) => {
-                validate_control_flow_dtype(node, version, role, slot, tensor.dtype, false)
+                validate_concrete_control_flow_dtype(node, version, role, slot, tensor.dtype)
             }
             ValueType::Sequence(sequence_element) => match sequence_element.as_ref() {
                 ValueType::Tensor(tensor) => {
-                    validate_control_flow_dtype(node, version, role, slot, tensor.dtype, true)
+                    validate_concrete_control_flow_dtype(node, version, role, slot, tensor.dtype)?;
+                    if optional_sequence_element_dtype_is_ir4(tensor.dtype) {
+                        Ok(())
+                    } else {
+                        Err(control_flow_schema_error(
+                            node,
+                            version,
+                            role,
+                            slot,
+                            format!("{value_type:?}"),
+                            &format!(
+                                "optional sequences are limited to IRv4 tensor element types, got {:?}",
+                                tensor.dtype
+                            ),
+                        ))
+                    }
                 }
                 _ => Err(control_flow_schema_error(
                     node,
@@ -658,54 +678,46 @@ fn validate_control_flow_value(
     }
 }
 
-fn validate_control_flow_dtype(
+fn validate_concrete_control_flow_dtype(
     node: &Node,
     version: u64,
     role: &str,
     slot: usize,
     dtype: DataType,
-    optional_sequence: bool,
 ) -> Result<(), ShapeInferError> {
-    let first_opset = control_flow_dtype_first_opset(dtype);
-    let admitted = if optional_sequence {
-        first_opset.is_some_and(|first| first <= 18)
-    } else {
-        first_opset.is_some_and(|first| first <= version)
-    };
-    if admitted {
+    if dtype != DataType::Undefined {
         return Ok(());
     }
-
-    let requirement = if optional_sequence && first_opset.is_some() {
-        "optional sequences are limited to IRv4 tensor element types".to_string()
-    } else if let Some(first) = first_opset {
-        format!("this tensor dtype is first admitted at opset {first}")
-    } else {
-        "this tensor dtype is not admitted by any registered control-flow schema".to_string()
-    };
     Err(control_flow_schema_error(
         node,
         version,
         role,
         slot,
         format!("{dtype:?}"),
-        &requirement,
+        "tensor dtype must be concrete; leave unresolved values unknown instead of declaring Undefined",
     ))
 }
 
-fn control_flow_dtype_first_opset(dtype: DataType) -> Option<u64> {
-    match dtype {
-        DataType::Undefined | DataType::Float6E2M3 | DataType::Float6E3M2 => None,
-        DataType::Float8E4M3FN
-        | DataType::Float8E4M3FNUZ
-        | DataType::Float8E5M2
-        | DataType::Float8E5M2FNUZ => Some(19),
-        DataType::Uint4 | DataType::Int4 => Some(21),
-        DataType::Float4E2M1 => Some(23),
-        DataType::Float8E8M0 => Some(24),
-        DataType::Uint2 | DataType::Int2 => Some(25),
-        _ => Some(1),
-    }
+fn optional_sequence_element_dtype_is_ir4(dtype: DataType) -> bool {
+    matches!(
+        dtype,
+        DataType::Float32
+            | DataType::Uint8
+            | DataType::Int8
+            | DataType::Uint16
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::String
+            | DataType::Bool
+            | DataType::Float16
+            | DataType::Float64
+            | DataType::Uint32
+            | DataType::Uint64
+            | DataType::Complex64
+            | DataType::Complex128
+            | DataType::BFloat16
+    )
 }
 
 fn control_flow_schema_error(
@@ -1798,12 +1810,11 @@ mod control_flow_schema_tests {
     }
 
     #[test]
-    fn optional_tensor_uses_revision_dtype_boundaries() {
+    fn optional_tensor_dtype_is_not_opset_gated() {
         let node = schema_node("If");
         let int4 = ValueType::Optional(Box::new(tensor_value(DataType::Int4)));
-        assert!(validate_control_flow_value(&node, 20, "output", 0, &int4, true).is_err());
-        validate_control_flow_value(&node, 21, "output", 0, &int4, true)
-            .expect("If-21 admits Optional<Tensor<int4>>");
+        validate_control_flow_value(&node, 18, "output", 0, &int4, true)
+            .expect("standalone If admits implemented Optional<Tensor<int4>> storage");
     }
 
     #[test]
@@ -1825,6 +1836,24 @@ mod control_flow_schema_tests {
                 .to_string()
                 .contains("optional sequences are limited to IRv4")
         );
+    }
+
+    #[test]
+    fn container_tensor_leaves_require_a_concrete_dtype() {
+        let node = schema_node("If");
+        for value_type in [
+            tensor_value(DataType::Undefined),
+            ValueType::sequence(tensor_value(DataType::Undefined)),
+            ValueType::Optional(Box::new(tensor_value(DataType::Undefined))),
+        ] {
+            let error = validate_control_flow_value(&node, 18, "output", 0, &value_type, true)
+                .expect_err("container tensor leaves cannot declare Undefined");
+            let message = error.to_string();
+            assert!(
+                message.contains("Undefined") && message.contains("dtype must be concrete"),
+                "unexpected error: {message}"
+            );
+        }
     }
 
     #[test]
