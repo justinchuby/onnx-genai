@@ -236,14 +236,14 @@ does not: it aliases the caller's KV buffers and never allocates a cache.
 | **GLM‑5.2 `--glm-full-attention` (dense MLA)** | **YES — `LATENT`** | Dense attention over the full prefix; absorbed MLA maps to a single latent row with `v_head_size = kv_lora_rank < head_size`, `rotary_offset = kv_lora_rank`, explicit `scale`, `kv_num_heads=1` (§3). This is the op's headline mode. |
 | **DeepSeek‑V2 / V3 (dense MLA)** | **YES — `LATENT`** | Same mapping; the schema names DSV3 `head_size=576, v_head_size=512`. |
 | **Genuine dense GQA/MHA** (any) | **YES — `SEPARATE`** | Full per‑head symmetric K/V is the default mode. |
-| **GLM‑5.2 DSA / IndexShare** (default) | **NO** | Per‑query learned **shared‑index top‑k** selection; the schema has **no** per‑query sparse‑index input — the kernel attends to the entire `block_table`. Served by `pkg.nxrt::IndexShare` v1. |
-| **DeepSeek‑V4 CSA / HCA** | **NO** | Temporal **compression** (ratios 4/128; 128 = HCA) **plus** learned FP4 index **top‑k** selection; query‑dependent selection is not expressible. `head_sink` covers the learned sink term but not the selection. Served by `pkg.nxrt::CompressedSparseAttention` + `SparseKvGather` v1. |
+| **GLM‑5.2 DSA / IndexShare** (default) | **NO** | Per‑query learned **shared‑index top‑k** selection; the schema has **no** per‑query sparse‑index input — the kernel attends to the entire `block_table`. Served by `pkg.nxrt._private::IndexShare` v1. |
+| **DeepSeek‑V4 CSA / HCA** | **NO** | Temporal **compression** (ratios 4/128; 128 = HCA) **plus** learned FP4 index **top‑k** selection; query‑dependent selection is not expressible. `head_sink` covers the learned sink term but not the selection. Served by `pkg.nxrt._private::CompressedSparseAttention` + `SparseKvGather` v1. |
 
 The rejections are decided by the **query‑dependent‑selection** property in §2, so
 they generalize to any future model with the same shape and do not depend on a
-name allowlist. (The `pkg.nxrt::*` custom ops referenced above exist in‑tree:
+name allowlist. (The `pkg.nxrt._private::*` custom ops referenced above exist in‑tree:
 `crates/onnx-runtime-ep-cpu/src/kernels/{index_share,compressed_sparse_attention,sparse_kv_gather}.rs`,
-registered under domain `pkg.nxrt` in `provider.rs`.)
+registered under domain `pkg.nxrt._private` in `provider.rs`.)
 
 ## 6. Providers: who executes it
 

@@ -46,7 +46,9 @@ mod tool_protocol;
 mod turn_transaction;
 mod workflow;
 
-pub use adapters::{AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection};
+pub use adapters::{
+    AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection, select_portable_adapter_source,
+};
 pub use arg_reduce::{ArgReduceRewrites, WideArgReduceLowering, lower_degenerate_arg_reductions};
 pub use audio::{
     AudioOutputFormat, EncodedAudio, StreamingResampler, encode_pcm16_wav, resample_planar,
@@ -2715,7 +2717,7 @@ mod speculative_admission_tests {
         assert_candidate_tree_refusal(
             WorkflowRuntime::from_dir_with_session_options(
                 &fixture,
-                EngineConfig::default(),
+                crate::fixture_engine_config(),
                 SessionOptions::default(),
             ),
             "WorkflowRuntime::from_dir_with_session_options",
@@ -2728,7 +2730,7 @@ mod speculative_admission_tests {
         assert_candidate_tree_refusal(
             WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
                 &fixture,
-                EngineConfig::default(),
+                crate::fixture_engine_config(),
                 SessionOptions::default(),
                 Arc::new(NeverCalledAuthorityProvider),
             ),

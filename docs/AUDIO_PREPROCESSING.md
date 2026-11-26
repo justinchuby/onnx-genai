@@ -172,9 +172,10 @@ be supported. Chat `input_audio.format` is a nonempty descriptive label; bytes
 determine the actual format. Decoding preserves the source sample rate and uses
 the arithmetic channel mean; internal WAV transport uses float32.
 
-Ogg Opus uses the published pure-Rust `symphonia-opus` 0.1.3 decoder with the
+Admitted Ogg and WebM Opus use the published pure-Rust `symphonia-opus` 0.1.3 decoder with the
 same Symphonia content probe. This decoder is constructed only after the probe
-identifies Ogg and Opus; it is never globally registered for other containers.
+identifies an admitted container and Opus; it is never globally registered.
+Ogg retains its own clip-level contract below; WebM uses normalized packet trims.
 Its raw 48 kHz PCM is presented by one clip-level cursor: `OpusHead` pre-skip
 can span packets, the exact typed track final granule removes end padding, and
 the decoder applies Q7.8 output gain once. Family 0 mono/stereo and fully routed
@@ -193,9 +194,40 @@ The runtime independently checks the six-bit RFC count and refuses those packets
 until a published demuxer repair is available. It never trusts the damaged packet
 duration to cut PCM. Typed packet PTS and valid-duration/end-trim metadata must
 agree with the independent raw TOC cursor and final granule; a final granule
-preceding already declared valid audio is rejected. WebM/Matroska and MP4 Opus remain explicitly unsupported;
-their delay, discard-padding and identification-header conventions need separate
-complete repairs. Existing non-Opus codecs in those containers remain available.
+preceding already declared valid audio is rejected.
+
+WebM/Matroska Opus uses the maintained MPL-2.0 `onnx-genai-symphonia-mkv` reader,
+registered in one private content probe with unchanged published Symphonia core
+and other format factories. Only the canonical default audio track is normalized;
+other tracks retain upstream metadata/packet behavior. Full-file playback requires
+a zero coded origin, unit track scale, exact integral frame conversion of CodecDelay/DiscardPadding,
+explicit CodecDelay matching pre-skip, known matching original recording rate,
+no lacing/CodecState changes, and no seeking. The raw 48 kHz decoder output is
+cropped once using normalized packet trims. Priming and signed padding intersect
+in raw coordinates, so overlaps do not subtract samples twice.
+
+The waveform API concatenates valid decoded packet intervals, as it does for
+other codecs: it does not render an A/V timeline or fill timestamp gaps. Actual
+container PTS minus CodecDelay is preserved precisely in the normalized packet
+clock, independently of the cumulative raw cursor that distributes priming.
+Quantized millisecond PTS therefore neither inserts silence nor crops extra PCM.
+BlockDuration/DefaultDuration describe presentation timing; their original values
+remain in reader debug diagnostics, but never choose decoded sample cuts (see
+[Matroska BlockDuration and DiscardPadding](https://www.matroska.org/technical/elements.html#BlockDuration)). TOC
+geometry and exact discard padding determine those cuts. Approximate
+Segment.Duration is not an endpoint: track duration/frame-count and aggregate
+padding stay unknown. Nonintegral conversions and backwards timestamps fail
+explicitly rather than being rounded; positive end padding must be terminal.
+
+The real FFmpeg stream-copy WebM fixtures preserve their original 0,21,41,... ms
+coded timestamps, rounded final BlockDuration, and unchanged Opus packets. Their
+full-channel PCM references use the same fixed independent libopus oracle as Ogg.
+This is a bounded packet-concatenation capability, not full Matroska A/V playback
+or browser-producer certification. MP4 Opus remains unsupported because its
+identification-header and edit-list presentation need their own repair. Existing
+non-Opus codecs in those containers remain available. The maintained package ships
+original notices, exact upstream source archive/hash and modified covered source;
+see its README and `verify_upstream.py` for provenance.
 
 `decode_audio(bytes, limits)` and `AudioProgram::run(encoded, limits)` require
 an explicit `AudioDecodeLimits`. `max_decoded_bytes` bounds cumulative raw

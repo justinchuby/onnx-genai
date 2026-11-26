@@ -3,21 +3,20 @@
 //! The packed weight tensor keeps llama.cpp's serialized block layout. MXFP4
 //! decoding follows OCP MX E2M1/E8M0 and llama.cpp's `block_mxfp4`; IQ
 //! decoding follows llama.cpp's native super-block layouts and audited grids.
-//! This CPU kernel uses f32 compute. A complete dense weight must fit the
-//! existing dense-cache budget to use dense GEMM and constant-weight caching;
-//! larger weights use bounded row decoding shared with BlockQuantizedMoE.
-//! Neither path performs integer-domain matmul compute.
+//! Default float32 arithmetic retains dense-cache and bounded decoded-row
+//! execution. Explicit q8_0 activation arithmetic uses shared compressed integer
+//! block dots and caller-owned activation scratch; it never selects dense-f32
+//! compute based on cache admission.
 
 use super::weight_cache::{WeightCache, WeightCacheStatus, WeightLoad, WeightSpec};
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, Result, TensorBacking, TensorMetadata, TensorMut, TensorView,
-    WorkspaceRequirement, WorkspaceView,
+    WorkspaceLayout, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
 use onnx_runtime_quantization::{
@@ -26,14 +25,17 @@ use onnx_runtime_quantization::{
 use rayon::prelude::*;
 
 use super::block_dequant::{decode_e2m1, decode_e8m0_scale};
+use super::check_arity;
 use super::decoded_projection::ProjectionScratch;
 use super::matmul::gemm;
-use super::{check_arity, to_dense_bytes};
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use super::packed_bytes::{PackedByteDigest, PackedByteSource};
+use super::packed_projection::{PackedProjectionPlan, validate_format};
+use super::projection_input::ProjectionInput;
+use crate::dtype::write_dense_f32_narrow;
+use onnx_runtime_ir::packed_arithmetic::ActivationArithmetic;
 
 const OP: &str = "BlockQuantizedMatMul";
 const DOMAIN: &str = onnx_runtime_ir::RUNTIME_DOMAIN;
-const LAYOUT_VERSION: i64 = 1;
 
 const MXFP4_QK: usize = 32;
 const MXFP4_BLOCK_BYTES: usize = 17;
@@ -96,7 +98,7 @@ pub(super) enum BlockFormat {
 }
 
 impl BlockFormat {
-    fn parse_projection(value: &str) -> Result<Self> {
+    pub(super) fn parse_projection(value: &str) -> Result<Self> {
         if let Some(format) = onnx_runtime_ir::dequantize_packed::Format::parse(value) {
             return Ok(
                 super::dequantize_packed::legacy_block_format(format).unwrap_or(Self::Onnx(format))
@@ -205,13 +207,36 @@ impl BlockFormat {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct InputStaging {
+    activation: usize,
+    bias: usize,
+}
+
+impl InputStaging {
+    fn for_sources(
+        rows: usize,
+        activation: &ProjectionInput<'_>,
+        bias: Option<&ProjectionInput<'_>>,
+    ) -> Self {
+        if rows == 0 {
+            return Self::default();
+        }
+        Self {
+            activation: activation.staging_elements(),
+            bias: bias.map_or(0, ProjectionInput::staging_elements),
+        }
+    }
+}
+
 pub struct BlockQuantizedMatMulKernel {
     k: usize,
     n: usize,
     format: BlockFormat,
+    arithmetic: ActivationArithmetic,
     packed_b_constant: bool,
     weight_identity: DenseWeightIdentity,
-    prepared_projection: std::cell::Cell<Option<super::decoded_projection::DecodedProjectionPlan>>,
+    prepared_projection: std::cell::Cell<Option<PackedProjectionPlan>>,
     weight_cache: WeightCache<DenseWeightCacheKey>,
 }
 
@@ -235,27 +260,26 @@ impl BlockQuantizedMatMulFactory {
 }
 
 impl KernelFactory for BlockQuantizedMatMulFactory {
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        _opset: u64,
+        _shapes: &[onnx_runtime_ir::Shape],
+        _dtypes: &[DataType],
+    ) -> Option<String> {
+        packed_configuration(node).err().map(|e| e.to_string())
+    }
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let k = required_positive_attr(node, "K")?;
         let n = required_positive_attr(node, "N")?;
-        let layout_version = optional_int_attr(node, "block_layout_version")?.unwrap_or(1);
-        if layout_version != LAYOUT_VERSION {
-            return Err(error(format!(
-                "block_layout_version must be {LAYOUT_VERSION}, got {layout_version}"
-            )));
-        }
-        let format = match node.attr("format") {
-            Some(attribute) => attribute
-                .as_str()
-                .ok_or_else(|| error("attribute 'format' must be a UTF-8 string"))
-                .and_then(BlockFormat::parse_projection)?,
-            None => return Err(error("missing required string attribute 'format'")),
-        };
+
+        let (format, arithmetic) = packed_configuration(node)?;
 
         Ok(Box::new(BlockQuantizedMatMulKernel {
             k,
             n,
             format,
+            arithmetic,
             packed_b_constant: false,
             weight_identity: DenseWeightIdentity::default(),
             prepared_projection: std::cell::Cell::new(None),
@@ -275,6 +299,18 @@ impl KernelFactory for BlockQuantizedMatMulFactory {
     }
 }
 
+fn packed_configuration(node: &Node) -> Result<(BlockFormat, ActivationArithmetic)> {
+    let arithmetic = ActivationArithmetic::from_node(node).map_err(error)?;
+    let format = node
+        .attr("format")
+        .ok_or_else(|| error("missing required string attribute 'format'"))?
+        .as_str()
+        .ok_or_else(|| error("attribute 'format' must be a UTF-8 string"))
+        .and_then(BlockFormat::parse_projection)?;
+    validate_format(arithmetic, format)?;
+    Ok((format, arithmetic))
+}
+
 impl Kernel for BlockQuantizedMatMulKernel {
     fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
         self.packed_b_constant = constant_inputs.get(1).copied().unwrap_or(false);
@@ -285,30 +321,38 @@ impl Kernel for BlockQuantizedMatMulKernel {
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
     ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
-        self.plan_workspace(inputs)
-            .map(|(_, requirement)| onnx_runtime_ep_api::WorkspacePreparation::Ready(requirement))
+        #[cfg(test)]
+        WORKSPACE_METADATA_QUERIES.with(|queries| queries.set(queries.get() + 1));
+        let rows = self.metadata_rows(inputs)?;
+        if rows != 0 {
+            return Ok(onnx_runtime_ep_api::WorkspacePreparation::Deferred);
+        }
+        let (_, requirement) = self.plan_workspace(rows, 0, InputStaging::default())?;
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            requirement,
+        ))
     }
 
     fn workspace_requirement_for_execution(
         &self,
-        _inputs: &[TensorView],
+        inputs: &[TensorView],
         _outputs: &[TensorMut],
         metadata: &[TensorMetadata<'_>],
         _output_metadata: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-        cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
+        _cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
     ) -> Result<onnx_runtime_ep_api::WorkspaceExecutionPreparation> {
-        // Exclusive kernel ownership spans refinement, admission and launch.
-        // A rejected preparation must never revive an earlier execution plan.
         self.prepared_projection.set(None);
-        // The caller already matched this kernel, tensor metadata and provider
-        // context. A Ready hit needs a new execution plan, not another metadata
-        // query. Deferred/uncached requests still take the checked planner.
-        let (plan, requirement) = match cached {
-            Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(requirement)) => {
-                (projection_plan(), requirement)
-            }
-            _ => self.plan_workspace(metadata)?,
-        };
+        let rows = self.metadata_rows(metadata)?;
+        let packed_bytes = self.packed_lane_bytes(rows, inputs)?;
+        let activation = inputs.first().filter(|v| !v.is_absent()).ok_or_else(|| error("live workspace planning needs activation A; bind its Host tensor view before admission"))?;
+        let activation = ProjectionInput::new(OP, "A", activation)?;
+        let bias = inputs
+            .get(2)
+            .filter(|v| !v.is_absent())
+            .map(|v| ProjectionInput::new(OP, "bias", v))
+            .transpose()?;
+        let staging = InputStaging::for_sources(rows, &activation, bias.as_ref());
+        let (plan, requirement) = self.plan_workspace(rows, packed_bytes, staging)?;
         self.prepared_projection.set(Some(plan));
         Ok(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready(
             requirement,
@@ -341,31 +385,48 @@ fn require_compute_dtype(name: &str, got: DataType) -> Result<()> {
         Ok(())
     } else {
         Err(error(format!(
-            "{name} has unsupported dtype {got:?}; BlockQuantizedMatMul computes floating-point \
-             activations in Float32 and supports Float32, Float16, or BFloat16 storage. Cast \
+            "{name} has unsupported dtype {got:?}; BlockQuantizedMatMul requires Float32, Float16, or BFloat16 activation storage; \
+             internal arithmetic is selected explicitly. Cast \
              {name} to one of those dtypes before this operator"
         )))
     }
 }
 
 impl BlockQuantizedMatMulKernel {
-    fn plan_workspace(
-        &self,
-        inputs: &[TensorMetadata<'_>],
-    ) -> Result<(
-        super::decoded_projection::DecodedProjectionPlan,
-        WorkspaceRequirement,
-    )> {
-        #[cfg(test)]
-        WORKSPACE_METADATA_QUERIES.with(|queries| queries.set(queries.get() + 1));
+    fn metadata_rows(&self, inputs: &[TensorMetadata<'_>]) -> Result<usize> {
         let Some(a) = inputs.first().filter(|a| a.present) else {
             return Err(error(
                 "workspace planning needs present activation A metadata; provide the activation shape",
             ));
         };
-        let rows = self.projection_rows(a.shape)?;
-        let plan = projection_plan();
-        let layout = plan.layout(rows, self.k, self.n)?;
+        self.projection_rows(a.shape)
+    }
+
+    fn packed_lane_bytes(&self, rows: usize, inputs: &[TensorView]) -> Result<usize> {
+        let packed = inputs.get(1).filter(|v| !v.is_absent()).ok_or_else(|| error(
+            "live workspace planning needs present packed_B storage; bind the packed weight view before admission"
+        ))?;
+        require_shape(
+            "packed_B",
+            packed.shape,
+            &[
+                self.n,
+                self.k.div_ceil(self.format.qk()),
+                self.format.block_bytes(),
+            ],
+        )?;
+        let source = PackedByteSource::full(OP, packed)?;
+        Ok(if rows == 0 { 0 } else { source.copy_bytes() })
+    }
+
+    fn plan_workspace(
+        &self,
+        rows: usize,
+        packed_bytes: usize,
+        staging: InputStaging,
+    ) -> Result<(PackedProjectionPlan, WorkspaceRequirement)> {
+        let plan = PackedProjectionPlan::for_current_pool(self.arithmetic);
+        let (layout, _) = self.execution_workspace_layout(rows, plan, packed_bytes, staging)?;
         Ok((
             plan,
             WorkspaceRequirement {
@@ -373,6 +434,43 @@ impl BlockQuantizedMatMulKernel {
                 alignment: layout.alignment(),
                 ..WorkspaceRequirement::NONE
             },
+        ))
+    }
+
+    fn execution_workspace_layout(
+        &self,
+        rows: usize,
+        plan: PackedProjectionPlan,
+        packed_bytes: usize,
+        staging: InputStaging,
+    ) -> Result<(WorkspaceLayout<5>, usize)> {
+        let result_elements = rows.checked_mul(self.n).ok_or_else(|| error(format!(
+            "final output staging element count overflows for rows={rows}, N={}; reduce batch or projection dimensions", self.n
+        )))?;
+        let result = std::alloc::Layout::array::<f32>(result_elements).map_err(|_| error(format!(
+            "final f32 output staging for rows={rows}, N={} exceeds addressable capacity; reduce batch or projection dimensions", self.n
+        )))?;
+        // All regions coexist. Dense hits skip decode and packed staging,
+        // but still consume current activations and bias. Complete admission
+        // covers a streamed fallback without another workspace request.
+        let projection = plan.maximum_layout(rows, [(self.k, self.n)])?;
+        let packed = std::alloc::Layout::array::<f32>(packed_bytes.div_ceil(4)).map_err(|_| error(format!(
+            "packed_B workspace of {packed_bytes} bytes exceeds addressable capacity; reduce projection dimensions"
+        )))?;
+        let input_layout = |elements, name| {
+            std::alloc::Layout::array::<f32>(elements).map_err(|_| error(format!(
+            "{name} conversion workspace for {elements} f32 values exceeds addressable capacity; reduce projection dimensions"
+        )))
+        };
+        Ok((
+            WorkspaceLayout::new([
+                projection,
+                result,
+                packed,
+                input_layout(staging.activation, "A")?,
+                input_layout(staging.bias, "bias")?,
+            ])?,
+            result_elements,
         ))
     }
 
@@ -420,8 +518,17 @@ impl BlockQuantizedMatMulKernel {
                 self.k, a_shape
             )));
         }
-        let expected_output_shape = [&a_shape[..a_shape.len() - 1], &[self.n]].concat();
-        require_shape("Y", outputs[0].shape, &expected_output_shape)?;
+        let y_shape = outputs[0].shape;
+        if y_shape.len() != a_shape.len()
+            || y_shape.last() != Some(&self.n)
+            || y_shape[..y_shape.len() - 1] != a_shape[..a_shape.len() - 1]
+        {
+            return Err(error(format!(
+                "Y must have shape with leading dimensions {:?} followed by N={}, got {y_shape:?}; match A's leading dimensions and the configured output width",
+                &a_shape[..a_shape.len() - 1],
+                self.n
+            )));
+        }
 
         let blocks = self.k.div_ceil(self.format.qk());
         require_shape(
@@ -430,7 +537,12 @@ impl BlockQuantizedMatMulKernel {
             &[self.n, blocks, self.format.block_bytes()],
         )?;
 
-        let bias = if let Some(bias) = inputs.get(2).filter(|input| !input.is_absent()) {
+        let m = self.projection_rows(a_shape)?;
+        let plan = projection_plan.ok_or_else(|| error(
+            "execution plan is absent or consumed; call workspace_requirement_for_execution in the selected execution context before workspace admission and launch"
+        ))?;
+        let bias_view = inputs.get(2).filter(|input| !input.is_absent());
+        if let Some(bias) = bias_view {
             require_compute_dtype("bias", bias.dtype)?;
             if bias.dtype != inputs[0].dtype {
                 return Err(error(format!(
@@ -439,117 +551,122 @@ impl BlockQuantizedMatMulKernel {
                 )));
             }
             require_shape("bias", bias.shape, &[self.n])?;
-            Some(to_dense_f32_widen(OP, bias)?.into_owned())
-        } else {
+        }
+        let source = PackedByteSource::full(OP, &inputs[1])?;
+        let packed_bytes = if m == 0 { 0 } else { source.copy_bytes() };
+        let activation_source = ProjectionInput::new(OP, "A", &inputs[0])?;
+        let bias_source = bias_view
+            .map(|v| ProjectionInput::new(OP, "bias", v))
+            .transpose()?;
+        let staging = InputStaging::for_sources(m, &activation_source, bias_source.as_ref());
+        let (layout, result_elements) =
+            self.execution_workspace_layout(m, plan, packed_bytes, staging)?;
+        // SAFETY: the executor exclusively lends live Host storage for this
+        // dispatch. Complete binding proves capacity, alignment and disjoint
+        // regions before materializing any activation, bias or packed payload.
+        let [
+            mut scratch,
+            mut output_staging,
+            mut packed_lane,
+            mut activation_lane,
+            mut bias_lane,
+        ] = unsafe {
+            ProjectionScratch::bind_layout(
+                "BlockQuantizedMatMul execution workspace binding",
+                layout,
+                workspace,
+            )
+        }?;
+        if m == 0 {
+            return write_dense_f32_narrow(OP, &mut outputs[0], &[]);
+        }
+        let bias = bias_source
+            .as_ref()
+            .map(|source| source.read(&mut bias_lane))
+            .transpose()?;
+        let activations = activation_source.read(&mut activation_lane)?;
+        let dense = if self.arithmetic == ActivationArithmetic::Q8_0 {
             None
-        };
-
-        let activations = to_dense_f32_widen(OP, &inputs[0])?;
-        let m = self.projection_rows(a_shape)?;
-        let plan = projection_plan.ok_or_else(|| error(
-            "execution plan is absent or consumed; call workspace_requirement_for_execution in the selected execution context before workspace admission and launch"
-        ))?;
-        let dense_bytes = self
+        } else {
+            let dense_bytes = self
             .k
             .checked_mul(self.n)
             .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
             .ok_or_else(|| error(format!(
                 "dense weight byte count overflow for K={}, N={}; supply dimensions whose f32 projection fits the address space", self.k, self.n
             )))?;
-        let cache_budget = if m == 0 {
-            0
-        } else {
-            self.weight_cache.byte_limit()
-        };
-        let use_dense = dense_bytes <= cache_budget;
-        let dense = if use_dense {
-            let resolved = if self.packed_b_constant {
-                Some(self.weight_identity.resolve(
-                    &inputs[1],
-                    self.format,
-                    self.k,
-                    self.n,
-                    0,
-                    None,
-                    || packed_tensor_bytes(&inputs[1]),
-                )?)
-            } else {
-                None
-            };
-            let key = resolved.as_ref().map(|resolved| Arc::clone(&resolved.key));
-            let mut resolved_payload = resolved.and_then(|resolved| resolved.payload);
-            match self.weight_cache.load_group(
-                &[match key.as_deref() {
-                    Some(key) => WeightSpec::cached(key)?,
-                    None => WeightSpec::transient(dense_bytes),
-                }],
-                |_, output| {
-                    BLOCK_QUANT_MATMUL_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
-                    let packed = match resolved_payload.take() {
-                        Some(packed) => packed,
-                        None => packed_tensor_bytes(&inputs[1])?,
-                    };
-                    decode_dense_weight_into(
+            let cache_budget = self.weight_cache.byte_limit();
+            let use_dense = dense_bytes <= cache_budget;
+            if use_dense {
+                let key = if self.packed_b_constant {
+                    Some(self.weight_identity.resolve(
+                        &inputs[1],
                         self.format,
                         self.k,
                         self.n,
-                        &packed,
-                        output,
-                        DenseWeightLayout::Kn,
-                    )
-                },
-            )? {
-                WeightLoad::Ready(mut loaded) => {
-                    if loaded.statuses[0] == WeightCacheStatus::Hit {
-                        BLOCK_QUANT_MATMUL_CACHED_DENSE_TEST_HITS.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Some(loaded.weights.remove(0))
-                }
-                WeightLoad::Declined(reason) => {
-                    onnx_runtime_ep_api::record_kernel_variant!(
-                        "block_matmul.streamed_rows",
-                        "Host derived-weight grant declined: {reason}"
-                    );
+                        0,
+                        None,
+                        || source.digest(),
+                    )?)
+                } else {
                     None
+                };
+                match self.weight_cache.load_group(
+                    &[match key.as_deref() {
+                        Some(key) => WeightSpec::cached(key)?,
+                        None => WeightSpec::transient(dense_bytes),
+                    }],
+                    |_, output| {
+                        BLOCK_QUANT_MATMUL_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
+                        let packed = source.read(&mut packed_lane)?;
+                        decode_dense_weight_into(
+                            self.format,
+                            self.k,
+                            self.n,
+                            packed,
+                            output,
+                            DenseWeightLayout::Kn,
+                        )
+                    },
+                )? {
+                    WeightLoad::Ready(mut loaded) => {
+                        if loaded.statuses[0] == WeightCacheStatus::Hit {
+                            BLOCK_QUANT_MATMUL_CACHED_DENSE_TEST_HITS
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        Some((loaded.weights.remove(0), dense_bytes, cache_budget))
+                    }
+                    WeightLoad::Declined(reason) => {
+                        onnx_runtime_ep_api::record_kernel_variant!(
+                            "block_matmul.streamed_rows",
+                            "Host derived-weight grant declined: {reason}"
+                        );
+                        None
+                    }
                 }
+            } else {
+                onnx_runtime_ep_api::record_kernel_variant!(
+                    "block_matmul.streamed_rows",
+                    "dense projection requires {dense_bytes} bytes; dense cache budget is {cache_budget} bytes"
+                );
+                None
             }
-        } else {
-            onnx_runtime_ep_api::record_kernel_variant!(
-                "block_matmul.streamed_rows",
-                "dense projection requires {dense_bytes} bytes; dense cache budget is {cache_budget} bytes"
-            );
-            None
         };
-        let Some(dense) = dense else {
-            let packed = packed_tensor_bytes(&inputs[1])?;
-            let bytes = plan.layout(m, self.k, self.n)?.bytes();
-            // SAFETY: the executor lends valid exclusive Host storage for this
-            // dispatch. The scratch owner and all views stay within this call.
-            let mut scratch = unsafe {
-                ProjectionScratch::bind(
-                    "block-quantized streamed workspace binding",
-                    bytes,
-                    workspace,
-                )
-            }?;
-            let elements = m.checked_mul(self.n).ok_or_else(|| {
-                error("streamed output element count overflows; reduce projection dimensions")
-            })?;
-            let mut result =
-                super::decoded_projection::zeroed_f32(OP, "final output staging", elements)?;
-            linear_packed_prepared(
+        let Some((dense, dense_bytes, cache_budget)) = dense else {
+            let packed = source.read(&mut packed_lane)?;
+            let result = output_staging.initialized_prefix(result_elements)?;
+            plan.project(
                 self.format,
-                &packed,
-                &activations,
+                packed,
+                activations,
                 m,
                 self.k,
                 self.n,
-                bias.as_deref(),
-                plan,
+                bias,
                 &mut scratch,
-                &mut result,
+                result,
             )?;
-            return write_dense_f32_narrow(OP, &mut outputs[0], &result);
+            return write_dense_f32_narrow(OP, &mut outputs[0], result);
         };
         onnx_runtime_ep_api::record_kernel_variant!(
             "block_matmul.dense_resident_set",
@@ -557,27 +674,24 @@ impl BlockQuantizedMatMulKernel {
         );
         let weight_kn = dense.as_slice();
 
-        let result_elements = m
-            .checked_mul(self.n)
-            .ok_or_else(|| error("Y element count overflow"))?;
-        let mut result = vec![0.0f32; result_elements];
+        let result = output_staging.initialized_prefix(result_elements)?;
         #[cfg(test)]
         BLOCK_QUANTIZED_MATMUL_DENSE_F32_TEST_HITS
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        gemm(&activations, weight_kn, &mut result, m, self.k, self.n)?;
+        gemm(activations, weight_kn, result, m, self.k, self.n)?;
         if let Some(bias) = bias {
             for row in result.chunks_exact_mut(self.n) {
-                for (value, bias) in row.iter_mut().zip(&bias) {
+                for (value, bias) in row.iter_mut().zip(bias) {
                     *value += bias;
                 }
             }
         }
-        write_dense_f32_narrow(OP, &mut outputs[0], &result)
+        write_dense_f32_narrow(OP, &mut outputs[0], result)
     }
 
     #[cfg(test)]
     fn dequantize_weight_kn(&self, packed: &TensorView) -> Result<Vec<f32>> {
-        let packed = packed_tensor_bytes(packed)?;
+        let packed = PackedByteSource::full(OP, packed)?.owned()?;
         BLOCK_QUANT_MATMUL_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
         dequantize_weight_kn(self.format, self.k, self.n, &packed)
     }
@@ -605,8 +719,6 @@ struct DenseWeightIdentityState {
     keys: HashMap<DenseWeightSubKey, Arc<DenseWeightCacheKey>>,
     #[cfg(test)]
     hashed_bytes: usize,
-    #[cfg(test)]
-    materialized_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -638,25 +750,19 @@ struct DenseWeightSubKey {
     out_features: usize,
 }
 
-pub(super) struct ResolvedDenseWeight<'a> {
-    pub(super) key: Arc<DenseWeightCacheKey>,
-    /// Present only when resolving a new content key. The caller can reuse this
-    /// payload for the cache build, avoiding a second strided materialization.
-    pub(super) payload: Option<Cow<'a, [u8]>>,
-}
-
 impl DenseWeightIdentity {
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn resolve<'a>(
+    pub(super) fn resolve(
         &self,
-        view: &'a TensorView<'_>,
+        view: &TensorView<'_>,
         format: BlockFormat,
         in_features: usize,
         out_features: usize,
         role: u8,
         expert: Option<usize>,
-        payload: impl FnOnce() -> Result<Cow<'a, [u8]>>,
-    ) -> Result<ResolvedDenseWeight<'a>> {
+        digest: impl FnOnce() -> Result<PackedByteDigest>,
+    ) -> Result<Arc<DenseWeightCacheKey>> {
+        crate::strided::validate_host_storage::<u8>(OP, "constant packed weight", view)?;
         let source = DenseWeightSource::from_tensor(view)?;
         let mut inner = self
             .inner
@@ -689,24 +795,18 @@ impl DenseWeightIdentity {
             out_features,
         };
         if let Some(key) = inner.keys.get(&sub_key) {
-            return Ok(ResolvedDenseWeight {
-                key: Arc::clone(key),
-                payload: None,
-            });
+            return Ok(Arc::clone(key));
         }
 
-        let payload = payload()?;
+        let digest = digest()?;
         // The hash is computed once for diagnostics/collision hardening, but it
         // is never the sole identity: the immutable kernel slot generation,
         // source provenance, role/expert, dtype, format, dimensions, and layout
         // all participate in equality.
-        let content_hash = stable_bytes_hash(&payload);
+        let content_hash = digest.hash;
         #[cfg(test)]
         {
-            inner.hashed_bytes = inner.hashed_bytes.saturating_add(payload.len());
-            if matches!(payload, Cow::Owned(_)) {
-                inner.materialized_bytes = inner.materialized_bytes.saturating_add(payload.len());
-            }
+            inner.hashed_bytes = inner.hashed_bytes.saturating_add(digest.bytes);
         }
         let metadata = inner
             .metadata
@@ -722,25 +822,18 @@ impl DenseWeightIdentity {
             expert,
             tensor_shape: Arc::clone(&metadata.shape),
             tensor_strides: Arc::clone(&metadata.strides),
-            byte_len: payload.len(),
+            byte_len: digest.bytes,
             content_hash,
             source,
         });
         inner.keys.insert(sub_key, Arc::clone(&key));
-        Ok(ResolvedDenseWeight {
-            key,
-            payload: Some(payload),
-        })
+        Ok(key)
     }
 
     #[cfg(test)]
-    pub(super) fn stats(&self) -> (usize, usize, usize) {
+    pub(super) fn stats(&self) -> (usize, usize) {
         let inner = self.inner.lock().unwrap();
-        (
-            inner.keys.len(),
-            inner.hashed_bytes,
-            inner.materialized_bytes,
-        )
+        (inner.keys.len(), inner.hashed_bytes)
     }
 }
 
@@ -808,38 +901,6 @@ impl DenseWeightSource {
             }
         })
     }
-}
-
-pub(super) fn packed_tensor_bytes<'a>(view: &'a TensorView<'_>) -> Result<Cow<'a, [u8]>> {
-    view.validate()?;
-    if view.dtype != DataType::Uint8 {
-        return Err(error(format!(
-            "packed weight dtype {:?} unsupported; expected Uint8",
-            view.dtype
-        )));
-    }
-    if view.is_contiguous() {
-        let len = view.byte_size();
-        if len == 0 {
-            return Ok(Cow::Borrowed(&[]));
-        }
-        // SAFETY: `view` is validated, contiguous Uint8 storage, and the
-        // executor has bounds-checked the logical byte extent against the live
-        // backing allocation. The borrow cannot outlive the input view.
-        return Ok(Cow::Borrowed(unsafe {
-            std::slice::from_raw_parts(view.data_ptr::<u8>(), len)
-        }));
-    }
-    Ok(Cow::Owned(to_dense_bytes(view)?))
-}
-
-fn stable_bytes_hash(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for &byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1913,6 +1974,7 @@ mod tests {
             .build()
             .unwrap();
         let mut kernel = one.install(|| BlockQuantizedMatMulKernel {
+            arithmetic: ActivationArithmetic::Float32,
             k: K,
             n: N,
             format: BlockFormat::Mxfp4,
@@ -1940,13 +2002,21 @@ mod tests {
                     .map(|v| TensorMetadata::new(v.dtype, v.shape, true))
                     .collect::<Vec<_>>();
                 let cached = kernel.workspace_requirement(&metadata, &[]).unwrap();
-                let req = cached.require_ready().unwrap();
+                assert!(matches!(
+                    cached,
+                    onnx_runtime_ep_api::WorkspacePreparation::Deferred
+                ));
+                let req = kernel
+                    .workspace_requirement_for_execution(&inputs, &[], &metadata, &[], Some(cached))
+                    .unwrap()
+                    .require_ready()
+                    .unwrap();
                 let tile = if super::super::matmul::serial_projection_is_portable() {
                     4
                 } else {
                     1
                 };
-                let expected = (R * N + width * tile * K) * 4;
+                let expected = (2 * R * N + width * tile * K) * 4;
                 assert_eq!(req.bytes, expected as u64);
                 let mut scratch = vec![f32::NAN; expected / 4 + 7];
                 scratch[expected / 4..].fill(83.);
@@ -1954,11 +2024,7 @@ mod tests {
                     onnx_runtime_ep_api::DevicePtrMut(scratch.as_mut_ptr().cast()),
                     expected,
                 );
-                for preparation in [
-                    Some(cached),
-                    Some(onnx_runtime_ep_api::WorkspacePreparation::Deferred),
-                    None,
-                ] {
+                for preparation in [Some(cached), None] {
                     let queries_before = WORKSPACE_METADATA_QUERIES.with(std::cell::Cell::get);
                     assert_eq!(
                         kernel
@@ -1976,11 +2042,8 @@ mod tests {
                     );
                     assert_eq!(
                         WORKSPACE_METADATA_QUERIES.with(std::cell::Cell::get) - queries_before,
-                        usize::from(!matches!(
-                            preparation,
-                            Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(_))
-                        )),
-                        "Ready reuses metadata, while Deferred/None must run the checked planner"
+                        0,
+                        "live refinement must not issue a metadata query"
                     );
                     let selected = kernel.prepared_projection.get().unwrap();
                     let explicit = super::super::decoded_projection::DecodedProjectionPlan::new(
@@ -2178,6 +2241,7 @@ mod tests {
         packed.extend((0u8..16).map(|code| code | (code << 4)));
         let view = Owned::u8(&[1, 1, 17], &packed);
         let kernel = BlockQuantizedMatMulKernel {
+            arithmetic: ActivationArithmetic::Float32,
             k: 32,
             n: 1,
             format: BlockFormat::Mxfp4,
@@ -2333,6 +2397,7 @@ mod tests {
         }
         let packed_weight = Owned::u8(&[n, 1, MXFP4_BLOCK_BYTES], &packed);
         let kernel = BlockQuantizedMatMulKernel {
+            arithmetic: ActivationArithmetic::Float32,
             k,
             n,
             format: BlockFormat::Mxfp4,
@@ -2391,6 +2456,7 @@ mod tests {
         packed.extend((0u8..16).map(|code| code | ((15 - code) << 4)));
         let view = Owned::u8(&[1, 1, IQ4_NL_BLOCK_BYTES], &packed);
         let decoder = BlockQuantizedMatMulKernel {
+            arithmetic: ActivationArithmetic::Float32,
             k: 32,
             n: 1,
             format: BlockFormat::Iq4Nl,
@@ -2432,6 +2498,7 @@ mod tests {
         packed.extend([0x98; 128]);
         let view = Owned::u8(&[1, 1, IQ4_XS_BLOCK_BYTES], &packed);
         let decoder = BlockQuantizedMatMulKernel {
+            arithmetic: ActivationArithmetic::Float32,
             k: IQ_SUPER_QK,
             n: 1,
             format: BlockFormat::Iq4Xs,
@@ -2461,6 +2528,7 @@ mod tests {
         packed[106..110].fill(0x10);
         let view = Owned::u8(&[1, 1, IQ3_S_BLOCK_BYTES], &packed);
         let decoder = BlockQuantizedMatMulKernel {
+            arithmetic: ActivationArithmetic::Float32,
             k: IQ_SUPER_QK,
             n: 1,
             format: BlockFormat::Iq3S,
@@ -2495,6 +2563,7 @@ mod tests {
         }
         let view = Owned::u8(&[1, 1, IQ3_XXS_BLOCK_BYTES], &packed);
         let decoder = BlockQuantizedMatMulKernel {
+            arithmetic: ActivationArithmetic::Float32,
             k: IQ_SUPER_QK,
             n: 1,
             format: BlockFormat::Iq3Xxs,
@@ -2529,6 +2598,7 @@ mod tests {
         }
         let view = Owned::u8(&[1, 1, IQ2_S_BLOCK_BYTES], &packed);
         let decoder = BlockQuantizedMatMulKernel {
+            arithmetic: ActivationArithmetic::Float32,
             k: IQ_SUPER_QK,
             n: 1,
             format: BlockFormat::Iq2S,
@@ -2564,6 +2634,7 @@ mod tests {
         }
         let view = Owned::u8(&[1, 1, IQ2_XS_BLOCK_BYTES], &packed);
         let decoder = BlockQuantizedMatMulKernel {
+            arithmetic: ActivationArithmetic::Float32,
             k: IQ_SUPER_QK,
             n: 1,
             format: BlockFormat::Iq2Xs,
@@ -2597,6 +2668,7 @@ mod tests {
         }
         let view = Owned::u8(&[1, 1, IQ2_XXS_BLOCK_BYTES], &packed);
         let decoder = BlockQuantizedMatMulKernel {
+            arithmetic: ActivationArithmetic::Float32,
             k: IQ_SUPER_QK,
             n: 1,
             format: BlockFormat::Iq2Xxs,
@@ -2640,6 +2712,7 @@ mod tests {
         packed[34..36].copy_from_slice(&0xa1c0u16.to_le_bytes());
         let view = Owned::u8(&[1, 1, IQ1_S_BLOCK_BYTES], &packed);
         let decoder = BlockQuantizedMatMulKernel {
+            arithmetic: ActivationArithmetic::Float32,
             k: IQ_SUPER_QK,
             n: 1,
             format: BlockFormat::Iq1S,
@@ -2668,6 +2741,7 @@ mod tests {
         packed[48..56].copy_from_slice(&[0x1a, 0, 0, 0, 0, 0, 0, 0x40]);
         let view = Owned::u8(&[1, 1, IQ1_M_BLOCK_BYTES], &packed);
         let decoder = BlockQuantizedMatMulKernel {
+            arithmetic: ActivationArithmetic::Float32,
             k: IQ_SUPER_QK,
             n: 1,
             format: BlockFormat::Iq1M,
@@ -2867,102 +2941,138 @@ mod tests {
         use crate::kernels::testutil::RecordingGovernor;
         use onnx_runtime_ep_api::{DevicePtrMut, ExecutionProvider};
         use onnx_runtime_memory_governor::{HolderId, HostWorkspacePool, ProcessMemoryManager};
-        let (m, k, n) = (3, 35, 13);
-        let packed = packed_for_format(BlockFormat::Mxfp4, 1, n, k);
-        let activations: Vec<f32> = (0..m * k).map(|i| (i % 19) as f32 / 16.).collect();
-        let a = Owned::f32(&[m, k], &activations);
-        let b = Owned::u8(&[n, k.div_ceil(32), MXFP4_BLOCK_BYTES], &packed);
-        let mut y = Owned::zeros_f32(&[m, n]);
-        let books = RecordingGovernor::new_host(1 << 20);
-        let memory = books.weight_memory(HolderId::new(13));
-        let manager = ProcessMemoryManager::new().unwrap();
-        let pool = HostWorkspacePool::governed(&manager, Arc::new(books.clone())).unwrap();
-        let resources = crate::CpuMemoryResources::new(memory.clone(), Default::default())
-            .unwrap()
-            .with_workspace_pool(pool.clone())
-            .unwrap();
-        let cpu = crate::CpuExecutionProvider::initialized_with_resources(resources).unwrap();
-        let kernel = BlockQuantizedMatMulKernel {
-            k,
-            n,
-            format: BlockFormat::Mxfp4,
-            packed_b_constant: false,
-            weight_identity: DenseWeightIdentity::default(),
-            prepared_projection: std::cell::Cell::new(None),
-            weight_cache: WeightCache::new(memory, 0),
-        };
-        let requirement = kernel
-            .workspace_requirement(
-                &[
-                    TensorMetadata::new(DataType::Float32, &[m, k], true),
-                    TensorMetadata::new(
-                        DataType::Uint8,
-                        &[n, k.div_ceil(32), MXFP4_BLOCK_BYTES],
-                        true,
-                    ),
-                ],
-                &[],
-            )
-            .unwrap()
-            .require_ready()
-            .unwrap();
-        assert!(requirement.bytes > 0);
-        let views = [a.view(), b.view()];
-        let metadata = views
-            .iter()
-            .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
-            .collect::<Vec<_>>();
-        kernel
-            .workspace_requirement_for_execution(&views, &[y.view_mut()], &metadata, &[], None)
-            .unwrap()
-            .require_ready()
-            .unwrap();
-        let error = kernel
-            .execute(&[a.view(), b.view()], &mut [y.view_mut()])
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("streamed workspace binding"),
-            "{error}"
-        );
-        let expected =
-            linear_packed_grouped(BlockFormat::Mxfp4, &packed, &activations, m, k, n, None)
+        for (arithmetic, format, budget) in [
+            (ActivationArithmetic::Float32, BlockFormat::Mxfp4, 0),
+            (ActivationArithmetic::Float32, BlockFormat::Q8_0, 1 << 20),
+            (ActivationArithmetic::Q8_0, BlockFormat::Q8_0, 0),
+            (ActivationArithmetic::Q8_0, BlockFormat::Q8_0, 1 << 20),
+            (
+                ActivationArithmetic::Q8_0,
+                BlockFormat::Onnx(onnx_runtime_ir::dequantize_packed::Format::Q4_0),
+                1 << 20,
+            ),
+        ] {
+            let block_bytes = format.block_bytes();
+            let (m, k, n) = (3, 35, 13);
+            let packed = packed_for_format(format, 1, n, k);
+            let activations: Vec<f32> = (0..m * k).map(|i| (i % 19) as f32 / 16.).collect();
+            let a = Owned::f32(&[m, k], &activations);
+            let b = Owned::u8(&[n, k.div_ceil(32), block_bytes], &packed);
+            let mut y = Owned::zeros_f32(&[m, n]);
+            let books = RecordingGovernor::new_host(1 << 20);
+            let memory = books.weight_memory(HolderId::new(13));
+            let manager = ProcessMemoryManager::new().unwrap();
+            let pool = HostWorkspacePool::governed(&manager, Arc::new(books.clone())).unwrap();
+            let resources = crate::CpuMemoryResources::new(memory.clone(), Default::default())
+                .unwrap()
+                .with_workspace_pool(pool.clone())
                 .unwrap();
-        let mut warm_counts = None;
-        for iteration in 0..65 {
-            let mut loan = cpu
-                .allocate_workspace(
-                    requirement.bytes as usize,
-                    requirement.alignment,
-                    requirement.role(),
-                )
-                .unwrap();
-            let view = WorkspaceView::new(DevicePtrMut(loan.as_mut_ptr()), loan.len());
-            kernel
+            let cpu = crate::CpuExecutionProvider::initialized_with_resources(resources).unwrap();
+            let kernel = BlockQuantizedMatMulKernel {
+                arithmetic,
+                k,
+                n,
+                format,
+                packed_b_constant: true,
+                weight_identity: DenseWeightIdentity::default(),
+                prepared_projection: std::cell::Cell::new(None),
+                weight_cache: WeightCache::new(memory, budget),
+            };
+            let views = [a.view(), b.view()];
+            let metadata = views
+                .iter()
+                .map(|v| TensorMetadata::new(v.dtype, v.shape, true))
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                kernel.workspace_requirement(&metadata, &[]).unwrap(),
+                onnx_runtime_ep_api::WorkspacePreparation::Deferred
+            ));
+            let requirement = kernel
                 .workspace_requirement_for_execution(&views, &[y.view_mut()], &metadata, &[], None)
                 .unwrap()
                 .require_ready()
                 .unwrap();
-            kernel
-                .execute_with_workspace(&[a.view(), b.view()], &mut [y.view_mut()], Some(view))
-                .unwrap();
-            cpu.deallocate_workspace(loan).unwrap();
-            let counts = (books.claims(), books.releases());
-            if iteration == 0 {
-                warm_counts = Some(counts);
-            }
-            assert_eq!(
-                Some(counts),
-                warm_counts,
-                "warm checkout/compute/return must not call the issuer, including zero-byte calls"
+            assert!(requirement.bytes > 0);
+            let error = kernel
+                .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("BlockQuantizedMatMul execution workspace binding"),
+                "{error}"
             );
-            assert_eq!(y.to_f32(), expected);
+            let mut expected = vec![0.; m * n];
+            let plan = PackedProjectionPlan::for_current_pool(arithmetic);
+            let mut reference_storage = vec![0.; plan.layout(m, k, n).unwrap().bytes() / 4];
+            plan.project(
+                format,
+                &packed,
+                &activations,
+                m,
+                k,
+                n,
+                None,
+                &mut ProjectionScratch::test_binding(&mut reference_storage),
+                &mut expected,
+            )
+            .unwrap();
+            let mut warm_counts = None;
+            for iteration in 0..65 {
+                let mut loan = cpu
+                    .allocate_workspace(
+                        requirement.bytes as usize,
+                        requirement.alignment,
+                        requirement.role(),
+                    )
+                    .unwrap();
+                let view = WorkspaceView::new(DevicePtrMut(loan.as_mut_ptr()), loan.len());
+                kernel
+                    .workspace_requirement_for_execution(
+                        &views,
+                        &[y.view_mut()],
+                        &metadata,
+                        &[],
+                        None,
+                    )
+                    .unwrap()
+                    .require_ready()
+                    .unwrap();
+                kernel
+                    .execute_with_workspace(&[a.view(), b.view()], &mut [y.view_mut()], Some(view))
+                    .unwrap();
+                cpu.deallocate_workspace(loan).unwrap();
+                let counts = (books.claims(), books.releases());
+                if iteration == 0 {
+                    warm_counts = Some(counts);
+                }
+                assert_eq!(
+                    Some(counts),
+                    warm_counts,
+                    "warm checkout/compute/return must not call the issuer, including zero-byte calls"
+                );
+                assert_eq!(y.to_f32(), expected);
+            }
+            if arithmetic == ActivationArithmetic::Float32 && budget != 0 {
+                assert_eq!(
+                    kernel.weight_cache.stats().0,
+                    1,
+                    "dense route must retain its admitted weight"
+                );
+                assert!(
+                    kernel.weight_cache.activity().1 > 0,
+                    "dense positive control must exercise expansion"
+                );
+            } else {
+                assert_eq!(kernel.weight_cache.activity(), (0, 0));
+            }
+            drop(cpu);
+            pool.trim_idle(u64::MAX).unwrap();
+            assert!(
+                books.releases() > warm_counts.unwrap().1,
+                "actual physical trim must return funding"
+            );
         }
-        drop(cpu);
-        pool.trim_idle(u64::MAX).unwrap();
-        assert!(
-            books.releases() > warm_counts.unwrap().1,
-            "actual physical trim must return funding"
-        );
     }
 
     #[test]
@@ -3081,6 +3191,7 @@ mod tests {
                                 crate::DerivedWeightMemory::governed(&governor, HolderId::new(13))
                                     .unwrap();
                             let actual = BlockQuantizedMatMulKernel {
+                                arithmetic: ActivationArithmetic::Float32,
                                 k,
                                 n,
                                 format,
@@ -3090,6 +3201,7 @@ mod tests {
                                 weight_cache: WeightCache::with_limit_and_memory(bytes, memory),
                             };
                             let streamed = BlockQuantizedMatMulKernel {
+                                arithmetic: ActivationArithmetic::Float32,
                                 k,
                                 n,
                                 format,
@@ -3194,10 +3306,10 @@ mod tests {
         let resolved = concrete
             .weight_identity
             .resolve(&view, BlockFormat::Mxfp4, k, n, 0, None, || {
-                packed_tensor_bytes(&view)
+                PackedByteSource::full(OP, &view)?.digest()
             })
             .unwrap();
-        let active = concrete.weight_cache.test_get(&resolved.key).unwrap();
+        let active = concrete.weight_cache.test_get(&resolved).unwrap();
         second
             .execute_prepared(&[input.view(), weights.view()], &mut [actual.view_mut()])
             .unwrap();
@@ -3273,6 +3385,7 @@ mod tests {
             let bias = Owned::f32(&[n], &biases);
             let bytes = k * n * std::mem::size_of::<f32>();
             let make = |budget| BlockQuantizedMatMulKernel {
+                arithmetic: ActivationArithmetic::Float32,
                 k,
                 n,
                 format,
@@ -3321,7 +3434,7 @@ mod tests {
                 }
                 assert_eq!(streamed.weight_cache.stats(), (0, 0));
                 assert_eq!(streamed.weight_cache.activity(), (0, 0));
-                assert_eq!(streamed.weight_identity.stats(), (0, 0, 0));
+                assert_eq!(streamed.weight_identity.stats(), (0, 0));
             }
             assert_eq!(dense.weight_cache.stats(), (1, bytes));
             assert_eq!(dense.weight_cache.activity().1, 1);
@@ -3338,6 +3451,7 @@ mod tests {
                 _ => unreachable!(),
             };
             let kernel = BlockQuantizedMatMulKernel {
+                arithmetic: ActivationArithmetic::Float32,
                 k: 32,
                 n: 2,
                 format: BlockFormat::Mxfp4,
@@ -3392,7 +3506,7 @@ mod tests {
                 .execute_prepared(&[a.view(), b, bias.view()], &mut [y.view_mut()])
                 .unwrap();
             assert_eq!(compute_values(&y, dtype), vec![33.5, 31.5, 33.5, 31.5]);
-            assert_eq!(kernel.weight_identity.stats(), (0, 0, 0));
+            assert_eq!(kernel.weight_identity.stats(), (0, 0));
             assert_eq!(kernel.weight_cache.activity(), (0, 0));
         }
     }
@@ -3400,6 +3514,7 @@ mod tests {
     #[test]
     fn bounded_projection_empty_rows_skip_expansion_and_preserve_bias_validation() {
         let kernel = BlockQuantizedMatMulKernel {
+            arithmetic: ActivationArithmetic::Float32,
             k: 32,
             n: 2,
             format: BlockFormat::Mxfp4,
@@ -3427,7 +3542,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("bias must have shape [2]"), "{error}");
-        assert_eq!(kernel.weight_identity.stats(), (0, 0, 0));
+        assert_eq!(kernel.weight_identity.stats(), (0, 0));
         assert_eq!(kernel.weight_cache.activity(), (0, 0));
     }
 
@@ -3459,6 +3574,7 @@ mod tests {
                     _ => unreachable!(),
                 };
                 let uncached = BlockQuantizedMatMulKernel {
+                    arithmetic: ActivationArithmetic::Float32,
                     k,
                     n,
                     format,
@@ -3476,6 +3592,7 @@ mod tests {
                     .unwrap();
 
                 let mut cached = BlockQuantizedMatMulKernel {
+                    arithmetic: ActivationArithmetic::Float32,
                     k,
                     n,
                     format,
@@ -3541,6 +3658,7 @@ mod tests {
         let b = Owned::u8(&[n, 1, MXFP4_BLOCK_BYTES], &packed);
         let mut y = Owned::zeros_f32(&[m, n]);
         let mut kernel = BlockQuantizedMatMulKernel {
+            arithmetic: ActivationArithmetic::Float32,
             k,
             n,
             format: BlockFormat::Mxfp4,
@@ -3573,7 +3691,7 @@ mod tests {
         );
         assert_eq!(
             identity_after_first,
-            (1, packed.len(), 0),
+            (1, packed.len()),
             "the initial contiguous weight should be hashed once without materialization"
         );
         assert_eq!(
@@ -3598,16 +3716,14 @@ mod tests {
         let packed2_view = packed2.view();
         let key1 = identity1
             .resolve(&packed1_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&packed1_view)
+                PackedByteSource::full(OP, &packed1_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         let key2 = identity2
             .resolve(&packed2_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&packed2_view)
+                PackedByteSource::full(OP, &packed2_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         let _ = cache
             .test_get_or_insert_with(key1.as_ref(), || Ok(vec![1.0, 2.0, 3.0, 4.0]))
             .unwrap();
@@ -3637,10 +3753,9 @@ mod tests {
         let packed_view = packed.view();
         let key = identity
             .resolve(&packed_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&packed_view)
+                PackedByteSource::full(OP, &packed_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
 
         for limit in [0, 15] {
             let cache = WeightCache::<DenseWeightCacheKey>::with_limit(limit);
@@ -3656,6 +3771,46 @@ mod tests {
     }
 
     #[test]
+    fn dense_weight_identity_failed_digest_is_not_published_and_warm_views_are_validated() {
+        let packed = Owned::u8(&[4], &[1, 2, 3, 4]);
+        let view = packed.view();
+        let identity = DenseWeightIdentity::default();
+        let error = identity
+            .resolve(&view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
+                Err(EpError::KernelFailed(
+                    "digest source unavailable; rebind packed storage".into(),
+                ))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("rebind packed storage"));
+        assert_eq!(identity.stats(), (0, 0));
+        let key = identity
+            .resolve(&view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
+                PackedByteSource::full(OP, &view)?.digest()
+            })
+            .unwrap();
+        assert_eq!(identity.stats(), (1, 4));
+        let mut invalid = view;
+        invalid.dtype = DataType::Float32;
+        let error = identity
+            .resolve(&invalid, BlockFormat::Mxfp4, 4, 1, 0, None, || {
+                unreachable!("invalid warm descriptor cannot request payload")
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Host-accessible Uint8"),
+            "{error}"
+        );
+        let repeated = identity
+            .resolve(&view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
+                unreachable!("failed warm validation cannot evict a valid key")
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(&key, &repeated));
+        assert_eq!(identity.stats(), (1, 4));
+    }
+
+    #[test]
     fn dense_weight_identity_rekeys_when_the_constant_source_changes() {
         let first = Owned::u8(&[4], &[1, 2, 3, 4]);
         let second = Owned::u8(&[4], &[4, 3, 2, 1]);
@@ -3663,29 +3818,26 @@ mod tests {
         let first_view = first.view();
         let first_key = identity
             .resolve(&first_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&first_view)
+                PackedByteSource::full(OP, &first_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         let repeated_key = identity
             .resolve(&first_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
                 unreachable!("stable identity must not request the payload again")
             })
-            .unwrap()
-            .key;
+            .unwrap();
         assert!(Arc::ptr_eq(&first_key, &repeated_key));
 
         let second_view = second.view();
         let second_key = identity
             .resolve(&second_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&second_view)
+                PackedByteSource::full(OP, &second_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         assert_ne!(first_key, second_key);
         assert_eq!(
             identity.stats(),
-            (1, 8, 0),
+            (1, 8),
             "each observable source identity must be hashed exactly once"
         );
     }
@@ -3703,10 +3855,9 @@ mod tests {
         ));
         let first_key = identity
             .resolve(&first_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&first_view)
+                PackedByteSource::full(OP, &first_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         let second_view = packed.view().with_backing(TensorBacking::ExternalMmap(
             onnx_runtime_ep_api::ExternalMmapRegion {
                 mapping_id: 42,
@@ -3716,12 +3867,11 @@ mod tests {
         ));
         let second_key = identity
             .resolve(&second_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&second_view)
+                PackedByteSource::full(OP, &second_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         assert_ne!(first_key, second_key);
-        assert_eq!(identity.stats(), (1, 8, 0));
+        assert_eq!(identity.stats(), (1, 8));
     }
 
     #[test]
@@ -3752,10 +3902,9 @@ mod tests {
         let packed_view = packed.view();
         let key = identity
             .resolve(&packed_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&packed_view)
+                PackedByteSource::full(OP, &packed_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         let builds = std::sync::Arc::new(AtomicUsize::new(0));
         let barrier = std::sync::Arc::new(Barrier::new(4));
         std::thread::scope(|scope| {
@@ -3813,6 +3962,7 @@ mod tests {
             }
             let packed = Owned::u8(&[N, blocks, block_bytes], &packed);
             let kernel = BlockQuantizedMatMulKernel {
+                arithmetic: ActivationArithmetic::Float32,
                 k: K,
                 n: N,
                 format,
@@ -3853,3 +4003,9 @@ mod tests {
 
 #[cfg(test)]
 mod packed_dot_contract;
+
+#[cfg(test)]
+mod q8_execution_tests;
+
+#[cfg(test)]
+mod output_workspace_tests;

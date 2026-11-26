@@ -1,0 +1,88 @@
+{
+  "version": 1,
+  "baseline": "0b63647d5ad874d5fa2b7157c600d76ec660bafd",
+  "candidate": "91752cf4639139d947cc73ee0c5f514f40a0dda8",
+  "cases": [
+    [
+      "relu",
+      12,
+      1,
+      "run"
+    ],
+    [
+      "q8",
+      1,
+      1,
+      "run"
+    ],
+    [
+      "q8",
+      3,
+      1,
+      "run"
+    ],
+    [
+      "q8",
+      12,
+      1,
+      "run"
+    ],
+    [
+      "q8",
+      3,
+      8,
+      "run"
+    ],
+    [
+      "q8",
+      3,
+      1,
+      "prepare_run"
+    ]
+  ],
+  "width": 32,
+  "pool_width": 1,
+  "process_repetitions_per_label": 3,
+  "labels": [
+    "baseline",
+    "candidate",
+    "null"
+  ],
+  "null": "byte-identical baseline executable",
+  "schedule_seed": 20261126,
+  "calibration": "one excluded baseline and candidate pilot per case; common calls are maximum of their 150-ms CPU target estimates",
+  "windows_per_process": {
+    "single": 9,
+    "double": 9
+  },
+  "window_order": "alternating single/double pairs; double executes twice the same outer call count",
+  "gates": {
+    "minimum_window_cpu_s": 0.1,
+    "foreign_process_average_cores_max": 0.5,
+    "cpu_per_wall": [
+      0.85,
+      1.15
+    ],
+    "within_process_aa": [
+      0.95,
+      1.05
+    ],
+    "double_over_single": [
+      1.8,
+      2.2
+    ],
+    "baseline_null_ratio": [
+      0.95,
+      1.05
+    ],
+    "process_median_spread_max": 1.1,
+    "setup_fraction_max": 0.1
+  },
+  "scope": "optimized public InferenceSession run or prepare+run, including output destruction; one Rayon/decode thread; synthetic exact Q8 arithmetic; no model or GPU extrapolation",
+  "cold_scope": "model/input creation, session construction and first fully validated run; excludes process startup, Rayon/provider/Host-pool construction; diagnostic only",
+  "validation_scope": "additional untimed complete-output request after each timed window; timed outputs are black-boxed and dropped inside the window",
+  "host_observation": "shared stable Darwin flock for complete cohort; uncached Mach host_processor_info over each whole process minus complete child CPU; no affinity and no window-level foreign CPU bound",
+  "failure_policy": "one frozen cohort, retain all failures, no repeats selected by measured outcomes; every process/control gate must pass for a cell to publish ratios; overlapping process ranges do not resolve a difference",
+  "memory_scope": "64 MiB governed workspace/derived limit, not a process memory cap; warm issuer callback deltas zero; actual CPU pool retained identity checked; teardown/trim settle to zero",
+  "digest_algorithm": "64-bit FNV-style u32-word fold, one xor/multiply per output bit word"
+}

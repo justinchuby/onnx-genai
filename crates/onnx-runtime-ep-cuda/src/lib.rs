@@ -1,7 +1,7 @@
 //! # `onnx-runtime-ep-cuda`
 //!
-//! The CUDA execution provider for the ORT 2.0 runtime (`docs/architecture/ORT2.md` §15 and
-//! §56 Phase 2). It implements [`onnx_runtime_ep_api::ExecutionProvider`] on top
+//! The CUDA execution provider for the ONNX runtime. It implements
+//! [`onnx_runtime_ep_api::ExecutionProvider`] on top
 //! of [`cudarc`] plus dynamically loaded NVIDIA libraries, mirroring the CPU EP.
 //!
 //! ## Scope — cuBLASLt GEMM + cuFFT DFT + NVRTC elementwise + attention
@@ -18,9 +18,10 @@
 //!   `Sub`, `Mul`, `Div`, `Pow`, `Min`, `Max`) via runtime-compiled (NVRTC) f32
 //!   pointwise kernels — kept as our own kernels so they can later fuse into a
 //!   GEMM epilogue or an elementwise chain (RULES.md #4).
-//! * **Attention** — tiled online-softmax prefill (`Attention` and
-//!   `GroupQueryAttention`, `com.microsoft`) compiled by NVRTC, with an f16
-//!   tensor-core specialization and retained decode/unsupported-shape baselines.
+//! * **Attention** — NVRTC tiled online-softmax prefill for `Attention` and
+//!   `GroupQueryAttention`, split-K decode and f32 reference routes for
+//!   `GroupQueryAttention`, and a shared unfused cuBLASLt/softmax implementation
+//!   also used by `MultiHeadAttention`. All three ops use the `com.microsoft` domain.
 //! * **Signal** — f32 `DFT`/`STFT` through cuFFT with governed execution
 //!   workspace, arbitrary-axis DFT packing, and fused STFT frame/window packing.
 //! * **Selection** — bounded flattened f32 `Unique` via one device
@@ -29,9 +30,7 @@
 //!
 //! The full op → backend mapping matrix, remaining coverage, and the
 //! prioritised custom-kernel candidate list live in `docs/execution/CUDA_COVERAGE.md`.
-//! Roadmap ops not yet wired (cuDNN softmax/norm, cub reductions, data-movement,
-//! FP8 and remaining fusion-node lowering return an actionable
-//! [`onnx_runtime_ep_api::EpError`].
+//! Unsupported operator cases return an actionable [`onnx_runtime_ep_api::EpError`].
 //!
 //! No `.cu` sources and no `nvcc`/`build.rs` compile step exist in this crate:
 //! `cudarc` is used in its **dynamic-loading** configuration, so `cargo build`
@@ -47,8 +46,8 @@
 //! ## Error discipline (KEY PROJECT RULE)
 //!
 //! Every unsupported op / dtype / rank / device condition returns an actionable
-//! [`onnx_runtime_ep_api::EpError`] stating *what* is unsupported and that it is
-//! *CUDA-EP Phase-2a* scope. NVRTC compile failures surface the compiler log.
+//! [`onnx_runtime_ep_api::EpError`] stating what is unsupported on the CUDA EP.
+//! NVRTC compile failures surface the compiler log.
 //! There are no bare panics on the dispatch path.
 //!
 //! ## `unsafe`

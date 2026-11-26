@@ -111,7 +111,8 @@ pub use large_alloc_cache::{
 pub use manager::{
     AllocationChargeMode, AllocationPublication, AllocationRequest, AllocationSettlementStatus,
     AllocationSettlementToken, AllocationSettlementWait, AllocationStepError,
-    AllocationTransactionError, AuthorityMemorySnapshot, DeviceLossListener, ManagedAllocation,
+    AllocationTransactionError, AuthorityMemorySnapshot, DeviceLossListener,
+    ExternalCapacityReservation, ExternalCapacitySnapshot, ManagedAllocation,
     ManagedAllocationSnapshot, ManagedAllocationState, ManagedPreparedRelease, ManagedReleaseError,
     MemoryContextOperation, MemoryContextScope, ProcessAuthorityId, ProcessMemoryLimits,
     ProcessMemoryManager, ProcessMemorySnapshot, RegisteredMemoryAuthority,

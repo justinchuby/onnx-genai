@@ -17,7 +17,7 @@
 Land the two missing features through separate, independently testable tracks:
 
 1. **CSA:** add a private, versioned
-   `pkg.nxrt::CompressedSparseAttention` operator for the
+   `pkg.nxrt._private::CompressedSparseAttention` operator for the
    production path, plus a small `SparseKvGather` correctness/debug primitive.
    Keep learned projections in ordinary `MatMul`, `MatMulNBits`, or
    `BlockQuantizedMatMul` nodes; the custom op owns only temporal compression,
@@ -368,7 +368,7 @@ the existing loop, not a new speculative algorithm.
 Add:
 
 ```text
-domain: pkg.nxrt
+domain: pkg.nxrt._private
 name:   SparseKvGather
 since:  1
 
@@ -404,7 +404,7 @@ helper without allocating `selected`.
 Add:
 
 ```text
-domain: pkg.nxrt
+domain: pkg.nxrt._private
 name:   CompressedSparseAttention
 since:  1
 ```
@@ -1000,7 +1000,7 @@ Failure rules:
 
 | ID | Proposed decision | Rationale |
 |---|---|---|
-| CSA-1 | Use private domain `pkg.nxrt`, version 1. | Matches `BlockQuantizedMatMul` incubation and permits explicit layout versioning. |
+| CSA-1 | Use private domain `pkg.nxrt._private`, version 1. | Matches `BlockQuantizedMatMul` incubation and permits explicit layout versioning. |
 | CSA-2 | Keep learned projections outside the CSA op. | Reuses existing quantized linear kernels and avoids coupling sparse attention to every weight format. |
 | CSA-3 | Add `SparseKvGather` as a correctness/reuse primitive, but fuse gather into production CSA. | Gives testable semantics without imposing a large intermediate on the fast path. |
 | CSA-4 | Do not emit the custom op for ratio 0. | Dense attention is the correct and simpler contract. |
@@ -1065,7 +1065,7 @@ Failure rules:
 13. **Upstream path:** should the private op be designed immediately as an ORT
     contrib proposal, or incubated until DeepSeek and GLM contracts both
     stabilize?
-    **Resolution:** Incubate in the private `pkg.nxrt` domain, as with `BlockQuantizedMatMul`. Propose ORT contrib only after both DeepSeek and GLM contracts stabilize and v1 layout and goldens are frozen; tracking this upstream is optional and non-urgent.
+    **Resolution:** Incubate in the private `pkg.nxrt._private` domain, as with `BlockQuantizedMatMul`. Propose ORT contrib only after both DeepSeek and GLM contracts stabilize and v1 layout and goldens are frozen; tracking this upstream is optional and non-urgent.
 14. **Acceptance tolerance:** what tensor/logit tolerance is acceptable for
     f16/bf16 CPU/CUDA while still requiring exact greedy token identity?
     **Resolution:** Greedy final tokens must be bit-identical: exact integer argmax is a hard correctness gate. Intermediate compressor, index, and attention f16/bf16 tolerances must be calibrated from official goldens by measuring the real error distribution, not guessed, and set per layer for localizability.

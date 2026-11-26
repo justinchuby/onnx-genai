@@ -689,7 +689,7 @@ the `WeightHandle`/`nxrt` capability seam, resident fallback, and
 quant-block-aligned tile sizing. Its VRAM sub-budget arbitration has since been
 removed in favour of the memory governor's ledger, which arbitrates for every
 holder on a tier rather than for these three. Phase 3b remains responsible
-for live device allocation, H2D transfer, lazy `pkg.nxrt::BlockQuantizedMoE` binding,
+for live device allocation, H2D transfer, lazy `pkg.nxrt._private::BlockQuantizedMoE` binding,
 and device execution.
 
 **Ship independently:**
@@ -752,7 +752,7 @@ latency.
    materialized resident-tensor fallback. Paging is opt-in, never a correctness dependency.
 2. **ORT integration:** can upstream `QMoE`/plugin EPs lazily access external expert
    slices, or does practical offload require the private `BlockQuantizedMoE` boundary?
-   **Resolution:** `pkg.nxrt::BlockQuantizedMoE` is the offload boundary and alone honors
+   **Resolution:** `pkg.nxrt._private::BlockQuantizedMoE` is the offload boundary and alone honors
    lazy expert leases, capability-negotiated with a plain `QMoE` fallback. Mobius emits
    `BlockQuantizedMoE` when the `nxrt` capability is present, otherwise `QMoE`; file an
    upstream ORT issue for lazy-external-weight `QMoE`.

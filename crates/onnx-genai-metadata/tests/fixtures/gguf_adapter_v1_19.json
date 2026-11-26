@@ -1,0 +1,63 @@
+{
+  "schema_version": "1.19",
+  "adapters": {
+    "target_manifest": {
+      "targets": [
+        {
+          "id": "projection",
+          "component": "model",
+          "initializer": "projection",
+          "node_name": "projection",
+          "output_name": "projection.output",
+          "activation_dtype": "float32",
+          "input_features": 3,
+          "output_features": 2,
+          "rank": 2,
+          "alpha": 4.0
+        }
+      ]
+    },
+    "selection": {
+      "segments": "segments",
+      "adapter_counts": "counts",
+      "scales": "scales",
+      "active": "active",
+      "max_adapters": 2
+    },
+    "application_capability": "onnx-genai.adapters@1",
+    "portable_fallback": true,
+    "cache": {
+      "max_entries": 2,
+      "eviction": "lru"
+    },
+    "planning": {
+      "bucket_by_adapter_set": true,
+      "stable_buffers": true,
+      "invalidate_capture_on_eviction": true
+    },
+    "artifacts": {
+      "mapped": {
+        "index": 0,
+        "identity": "mapped",
+        "version": "1",
+        "rank": 2,
+        "alpha": 4.0,
+        "dtype": "float32",
+        "weights": [
+          {
+            "format": "gguf",
+            "location": "adapters/mapped/adapter.gguf",
+            "loader_capability": "onnx-genai.adapters.gguf@1",
+            "scale_encoding": "alpha_over_rank"
+          }
+        ],
+        "bindings": [
+          {
+            "target": "projection",
+            "weight_key": "explicit.saved.projection"
+          }
+        ]
+      }
+    }
+  }
+}

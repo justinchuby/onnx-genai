@@ -97,6 +97,11 @@ struct Step {
     reply: oneshot::Sender<anyhow::Result<RealtimeOutput>>,
 }
 enum ConnectionRequest {
+    PrepareDecoder {
+        preserved: std::collections::BTreeSet<u32>,
+        max_bytes: std::num::NonZeroUsize,
+        reply: oneshot::Sender<anyhow::Result<onnx_genai_engine::tokenization::TokenTextDecoder>>,
+    },
     Quantum(Step),
     ArmConstraint {
         constraint: Option<onnx_genai_engine::GenerateConstraint>,
@@ -118,6 +123,24 @@ pub(crate) struct RealtimeConnection {
     budget: RealtimeTokenBudget,
 }
 impl RealtimeConnection {
+    pub(crate) async fn prepare_decoder(
+        &mut self,
+        preserved: std::collections::BTreeSet<u32>,
+        max_bytes: std::num::NonZeroUsize,
+    ) -> anyhow::Result<onnx_genai_engine::tokenization::TokenTextDecoder> {
+        let (reply, response) = oneshot::channel();
+        self.steps
+            .send(ConnectionRequest::PrepareDecoder {
+                preserved,
+                max_bytes,
+                reply,
+            })
+            .await
+            .context("native realtime owner closed before publication admission")?;
+        response
+            .await
+            .context("native realtime owner closed while preparing publication decoder")?
+    }
     /// Prepare a response-local constraint on the native owner without running
     /// a quantum or consuming input/usage. Generate retains its existing path.
     pub(crate) async fn arm_constraint(
@@ -256,6 +279,20 @@ impl RealtimeCommand {
             });
             let step = match next {
                 None => break,
+                Some(ConnectionRequest::PrepareDecoder {
+                    preserved,
+                    max_bytes,
+                    reply,
+                }) => {
+                    if !reply.is_closed()
+                        && reply
+                            .send(session.prepare_text_decoder(&preserved, max_bytes))
+                            .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
                 Some(ConnectionRequest::ArmConstraint { constraint, reply }) => {
                     // Compilation is transactional and does not execute the
                     // workflow. Admission rejection need not poison native KV.

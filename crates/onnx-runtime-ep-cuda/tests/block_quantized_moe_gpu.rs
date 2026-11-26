@@ -12,7 +12,7 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
-//! GPU parity regressions for the mixed-projection `pkg.nxrt::BlockQuantizedMoE` op.
+//! GPU parity regressions for the mixed-projection `pkg.nxrt._private::BlockQuantizedMoE` op.
 //!
 //! Synthetic cases cover every supported mixed GLM projection pair and use the
 //! CPU kernel as the independent oracle. Opt-in tests also read official
@@ -90,7 +90,7 @@ fn count_host_allocations<T>(operation: impl FnOnce() -> T) -> (T, u64) {
     (result, allocations)
 }
 
-const DOMAIN: &str = "pkg.nxrt";
+const DOMAIN: &str = "pkg.nxrt._private";
 const FORMAT: &str = "mxfp4";
 
 #[derive(Clone)]

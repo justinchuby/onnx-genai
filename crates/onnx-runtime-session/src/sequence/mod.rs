@@ -12,18 +12,17 @@ mod split;
 mod tensor;
 mod value;
 
-pub use concat::concat;
 pub(crate) use concat::{ConcatCopyStats, ConcatPlan, stack_new_axis};
+pub use concat::{concat, concat_in};
 pub use error::{SequenceError, SequenceResult};
 pub use split::{SplitSpec, split, split_tensor};
 pub use tensor::SeqTensor;
 pub use value::SequenceValue;
 
-pub(crate) use tensor::clone_shape;
 use tensor::{
-    addressable, checked_add, checked_mul, checked_product, normalize_axis, overflow,
-    validate_view_bounds, zeroed_bytes,
+    addressable, checked_add, checked_mul, checked_product, normalize_axis, overflow, zeroed_bytes,
 };
+pub(crate) use tensor::{clone_shape, validate_view_bounds};
 
 #[cfg(test)]
 use tensor::validate_tensor_bytes;
@@ -196,6 +195,23 @@ mod tests {
     }
 
     #[test]
+    fn scan_stack_rejects_zero_element_nonleading_axis_row_count_overflow() {
+        let outer = usize::MAX / 2 + 1;
+        let error = stack_new_axis(&[], 2, &[outer, 0], 1, false, DataType::Float32)
+            .expect_err("Scan stacking must check row count before accepting zero output elements");
+        assert!(
+            matches!(
+                &error,
+                SequenceError::ShapeOverflow { op, context, shape }
+                    if *op == "Loop/Scan"
+                        && *context == "stacked tensor output row count"
+                        && shape.as_slice() == [outer, 0]
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn concat_plan_uses_one_final_destination_without_source_materialization() {
         let a = elem(DataType::Uint8, &[2], &[1, 2]);
         let b = elem(DataType::Uint8, &[2], &[3, 4]);
@@ -207,10 +223,14 @@ mod tests {
             vec![0; plan.bytes]
         };
         let stats = plan
-            .write(&sequence, |offset, bytes| {
-                destination[offset..offset + bytes.len()].copy_from_slice(bytes);
-                Ok(())
-            })
+            .write(
+                &sequence,
+                &crate::HostTensorAllocator::standalone(),
+                |offset, bytes| {
+                    destination[offset..offset + bytes.len()].copy_from_slice(bytes);
+                    Ok(())
+                },
+            )
             .unwrap();
         assert_eq!(destination_allocations, 1);
         assert_eq!(stats.source_materializations, 0);

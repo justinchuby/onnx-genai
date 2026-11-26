@@ -73,7 +73,7 @@ fn native_artifacts_cover_only_declared_target_pairs() {
     ] {
         let err = artifact_for(os, arch).unwrap_err();
         assert!(err.contains(&format!("{os}/{arch}")));
-        assert!(err.contains("ORT_ROOT"));
+        assert!(err.contains("ONNX_GENAI_ORT_LIB"));
     }
 }
 
@@ -144,7 +144,7 @@ fn missing_required_runtime_does_not_publish_partial_extraction() {
     let lib = fixture.0.join("lib");
     let error = extract_native_libraries(&wheel, &lib, "onnxruntime.dll").unwrap_err();
     assert!(error.contains("onnxruntime/capi/onnxruntime.dll"));
-    assert!(error.contains("ORT_ROOT"));
+    assert!(error.contains("ONNX_GENAI_ORT_LIB"));
     assert!(!lib.exists());
 }
 
