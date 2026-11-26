@@ -2161,13 +2161,14 @@ pub(crate) fn prepare_completion(
             ));
         };
         let prompt = fim_config.format_prompt(prefix, suffix);
-        let prompt_tokens = tokenize_prompt(&handle.tokenizer, &prompt)?;
+        let tokens = handle.tokenizer.encode(&prompt).map_err(|error| {
+            ApiError::invalid_request(format!(
+                "FIM tokenization failed: {error}; repair the package tokenizer"
+            ))
+        })?;
+        let prompt_tokens = tokens.len();
         Ok(PreparedCompletion {
-            generation: CompletionGeneration::Fim {
-                prefix: prefix.clone(),
-                suffix: suffix.clone(),
-                options,
-            },
+            generation: CompletionGeneration::Fim { tokens, options },
             prompt_tokens,
         })
     } else {
@@ -2210,29 +2211,18 @@ async fn submit_completion(
             )
             .await
             .map_err(map_generate_submit_error),
-        CompletionGeneration::Fim {
-            prefix,
-            suffix,
-            options,
-        } => {
+        CompletionGeneration::Fim { tokens, options } => {
             let fim_config = handle
                 .fim_config
                 .clone()
                 .ok_or_else(|| ApiError::invalid_request("FIM is not supported by this model"))?;
             handle
                 .engine
-                .generate_fim(prefix, suffix, fim_config, options)
+                .generate_fim(tokens, fim_config, options)
                 .await
                 .map_err(map_generate_submit_error)
         }
     }
-}
-
-fn tokenize_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<usize, ApiError> {
-    tokenizer
-        .encode(prompt)
-        .map(|tokens| tokens.len())
-        .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))
 }
 
 /// The text spelling of this model's image placeholder, if it declares one.

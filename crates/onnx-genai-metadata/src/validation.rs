@@ -110,6 +110,43 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
     // derived complaint about the same missing fact.
     let version = crate::version::normalize(metadata.schema_version.as_deref())
         .unwrap_or(crate::version::INITIAL_SCHEMA_VERSION);
+    if let Some(infill) = metadata
+        .package
+        .as_ref()
+        .and_then(|package| package.infill.as_ref())
+    {
+        if let Err(error) = crate::version::gate_feature_use(
+            version,
+            crate::version::SchemaFeature::InfillContext,
+            "package.infill",
+        ) {
+            errors.push(error);
+        }
+        let tokens = [
+            &infill.prefix_token,
+            &infill.middle_token,
+            &infill.suffix_token,
+        ];
+        if tokens.iter().any(|token| token.is_empty())
+            || tokens
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != 3
+        {
+            errors.push("package.infill requires three distinct nonempty control token spellings; use the package tokenizer's exact registered roles".into());
+        }
+        if infill.additional_stop_tokens.iter().any(String::is_empty) {
+            errors.push("package.infill.additional_stop_tokens contains an empty spelling; declare exact registered tokenizer tokens or omit the list".into());
+        }
+        if infill
+            .extra_context_template
+            .as_ref()
+            .is_some_and(|template| template.trim().is_empty())
+        {
+            errors.push("package.infill.extra_context_template must be nonempty; author the file context serialization or omit the capability".into());
+        }
+    }
     crate::schema::validate_graph_weights(&metadata.graph_weights, &mut errors);
     if !metadata.graph_weights.is_empty()
         && let Err(error) = crate::version::gate_feature_use(
