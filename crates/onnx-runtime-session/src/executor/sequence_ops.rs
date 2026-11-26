@@ -246,10 +246,11 @@ impl Executor {
             resolved,
             external,
         )?;
+        let allocator = crate::HostTensorAllocator::new(self.output_host_allocator())?;
         let ep = Arc::clone(&self.ep);
         if let Some(value) = external.outputs.get(&outputs[0]) {
             let mut buffer = value.writable_buffer()?;
-            plan.write(&seq, |offset, bytes| {
+            plan.write(&seq, &allocator, |offset, bytes| {
                 ep.copy_from_host_at(bytes, &mut buffer, offset)?;
                 Ok(())
             })?;
@@ -260,7 +261,7 @@ impl Executor {
                     outputs[0].0
                 ))
             })?;
-            plan.write(&seq, |offset, bytes| {
+            plan.write(&seq, &allocator, |offset, bytes| {
                 ep.copy_from_host_at(bytes, buffer, offset)?;
                 Ok(())
             })?;

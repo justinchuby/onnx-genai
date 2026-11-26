@@ -351,7 +351,7 @@ mod tests {
         package
     }
     fn run(package: &std::path::Path, body: Value) -> crate::decision::DecisionResult {
-        let mut engine = crate::Engine::from_dir(package, crate::EngineConfig::default()).unwrap();
+        let mut engine = crate::Engine::from_dir(package, crate::fixture_engine_config()).unwrap();
         let contract = Arc::new(
             onnx_genai_metadata::decision::decision_contract(engine.metadata())
                 .unwrap()

@@ -148,6 +148,17 @@ pub(crate) fn validate_generation_workflow(workflow: &WorkflowSpec) -> anyhow::R
          different predicate would never be updated",
         serving.active
     );
+    let active_seed = workflow
+        .state
+        .get(&serving.active)
+        .map_or(serving.active.as_str(), |state| state.initializer.as_str());
+    anyhow::ensure!(
+        workflow.inputs.contains_key(active_seed),
+        "this workflow's serving active value '{}' resolves to initializer '{active_seed}', which \
+         is not a workflow input; generation admission must know the initial active request rows \
+         before setup executes",
+        serving.active
+    );
     for carry in carried {
         anyhow::ensure!(
             workflow.state.contains_key(&carry.cell),
@@ -1011,6 +1022,14 @@ pub(crate) fn run_declared_generation(
         None
     };
     let mut plan = WorkflowExecutionPlan::new_hosted(runtime, request, hosted)?;
+    plan.ensure_single_stream_generation()?;
+    let output_name = runtime
+        .workflow_spec()
+        .outputs
+        .iter()
+        .find(|(_, output)| output.role == onnx_genai_metadata::WorkflowOutputRole::Tokens)
+        .map(|(name, _)| name)
+        .context("generation requires one package output with role: tokens")?;
     let generic_execution = core.is_none();
     let (outputs, host_stop_reason) = {
         anyhow::ensure!(
@@ -1057,23 +1076,16 @@ pub(crate) fn run_declared_generation(
         )
     };
 
-    let output = runtime
-        .workflow_spec()
-        .outputs
-        .iter()
-        .find(|(_, output)| output.role == onnx_genai_metadata::WorkflowOutputRole::Tokens)
-        .map(|(name, _)| name.clone())
-        .context("generation requires one package output with role: tokens")?;
-    let rows = outputs.rows(&output);
+    let rows = outputs.rows(output_name);
     anyhow::ensure!(
         rows.len() <= 1,
-        "generation cannot flatten multi-row ragged output '{output}'; consume semantic row \
+        "generation cannot flatten multi-row ragged output '{output_name}'; consume semantic row \
          streams with the tensor workflow API instead"
     );
     let token_ids = outputs
-        .aggregate(&output)
+        .aggregate(output_name)
         .or_else(|| rows.first().map(|(_, value)| *value))
-        .with_context(|| format!("the workflow did not emit tokens output '{output}'"))?
+        .with_context(|| format!("the workflow did not emit tokens output '{output_name}'"))?
         .to_vec_i64()?
         .into_iter()
         .map(|token| u32::try_from(token).context("the workflow emitted a token outside uint32"))
@@ -1083,7 +1095,7 @@ pub(crate) fn run_declared_generation(
     // generation. If they disagree, one is wrong and nothing outside can tell
     // which — so this refuses rather than picking one.
     if let Some(core) = core.as_deref() {
-        assert_streams_agree(&output, &token_ids, &core.committed_tokens())?;
+        assert_streams_agree(output_name, &token_ids, &core.committed_tokens())?;
     }
 
     /// Reject generic token output conversion or decoding failures before its

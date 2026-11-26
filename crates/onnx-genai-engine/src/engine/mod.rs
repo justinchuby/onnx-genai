@@ -76,6 +76,10 @@ mod model;
 #[cfg(feature = "native-backend")]
 mod native_session_snapshot;
 #[cfg(feature = "native-backend")]
+mod token_history;
+#[cfg(feature = "native-backend")]
+pub(crate) use token_history::NativeTokenHistory;
+#[cfg(feature = "native-backend")]
 mod native_slot;
 #[cfg(feature = "native-backend")]
 mod native_state_identity;
@@ -194,7 +198,7 @@ mod tests {
         Ok(())
     }
 
-    fn model_free_rewind_test_engine(
+    pub(super) fn model_free_rewind_test_engine(
         kv_cache: PagedKvCache,
         sessions: HashMap<SessionId, EngineSession>,
     ) -> anyhow::Result<Engine> {
@@ -484,7 +488,7 @@ mod tests {
     }
 
     #[cfg(feature = "native-backend")]
-    fn tiny_dense_native_decoder() -> onnx_runtime_session::InferenceSession {
+    pub(super) fn tiny_dense_native_decoder() -> onnx_runtime_session::InferenceSession {
         let mut graph = Graph::new();
         graph.opset_imports.insert(String::new(), 11);
         let batch = graph.intern_symbol("batch");
@@ -601,7 +605,7 @@ mod tests {
     }
 
     #[cfg(feature = "native-backend")]
-    fn tiny_dense_decoder_io() -> DecoderAbi {
+    pub(super) fn tiny_dense_decoder_io() -> DecoderAbi {
         DecoderAbi {
             sequence_source: Some(SequenceInputKind::TokenIds),
             kv_ownership: Some(KvOwnership::Owned),
@@ -1162,12 +1166,12 @@ mod tests {
         assert!(!model_proto_requires_native_backend(&model));
 
         model.graph.as_mut().unwrap().node.push(NodeProto {
-            domain: "pkg.nxrt".to_string(),
+            domain: "pkg.nxrt._private".to_string(),
             op_type: "BlockQuantizedMatMul".to_string(),
             ..NodeProto::default()
         });
         model.opset_import.push(OperatorSetIdProto {
-            domain: "pkg.nxrt".to_string(),
+            domain: "pkg.nxrt._private".to_string(),
             version: 1,
         });
         assert!(model_proto_requires_native_backend(&model));
@@ -1175,7 +1179,7 @@ mod tests {
         model.graph.as_mut().unwrap().node[0].domain = "example.wrong.domain".to_string();
         assert!(!model_proto_requires_native_backend(&model));
 
-        model.graph.as_mut().unwrap().node[0].domain = "pkg.nxrt".to_string();
+        model.graph.as_mut().unwrap().node[0].domain = "pkg.nxrt._private".to_string();
         model.opset_import[0].version = 2;
         assert!(!model_proto_requires_native_backend(&model));
     }
@@ -1805,7 +1809,7 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&fixture, crate::fixture_engine_config())?;
         let mut request = GenerateRequest::new("hello");
         request.options.max_new_tokens = 3;
         request.options.temperature = 0.0;
@@ -1852,7 +1856,7 @@ mod tests {
                     &format!("max_sequence_length: {max_context}"),
                 ),
             )?;
-            let mut engine = Engine::from_dir(scratch.path(), EngineConfig::default())?;
+            let mut engine = Engine::from_dir(scratch.path(), crate::fixture_engine_config())?;
             for constraint in [
                 GenerateConstraint::Json {
                     prefix: String::new(),
@@ -1886,7 +1890,7 @@ mod tests {
             .canonicalize()?;
         let mut engine = Engine::from_dir_with_session_options(
             &fixture,
-            EngineConfig::default(),
+            crate::fixture_engine_config(),
             SessionOptions::default().with_intra_op_threads(1),
         )?;
         let mut request = GenerateRequest::new("hello");
@@ -2083,7 +2087,7 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&fixture, crate::fixture_engine_config())?;
         let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
         request.options.max_new_tokens = 32;
         request.options.temperature = 0.0;
@@ -2104,7 +2108,7 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&fixture, crate::fixture_engine_config())?;
         let session_id = engine.create_session()?;
         let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
         request.options.max_new_tokens = 32;
@@ -2605,7 +2609,7 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut baseline = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut baseline = Engine::from_dir(&fixture, crate::fixture_engine_config())?;
         assert!(!baseline.connector.is_active());
 
         let mut request =
@@ -2636,7 +2640,7 @@ mod tests {
         request.options.stop_on_eos = false;
 
         let baseline_ids = {
-            let mut baseline = Engine::from_dir(&fixture, EngineConfig::default())?;
+            let mut baseline = Engine::from_dir(&fixture, crate::fixture_engine_config())?;
             baseline.generate(request.clone())?.token_ids
         };
 
@@ -2695,7 +2699,7 @@ mod tests {
         // (b) Output is byte-for-byte identical to full recompute with a Null
         // connector — proving the materialized KV is correct, not just present.
         let baseline_ids = {
-            let mut baseline = Engine::from_dir(&fixture, EngineConfig::default())?;
+            let mut baseline = Engine::from_dir(&fixture, crate::fixture_engine_config())?;
             let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.clone()));
             request.options.max_new_tokens = 4;
             request.options.temperature = 0.0;
@@ -2739,3 +2743,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(all(test, feature = "native-backend"))]
+mod owned_logits_tests;

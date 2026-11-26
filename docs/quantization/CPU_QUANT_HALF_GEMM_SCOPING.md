@@ -27,7 +27,7 @@ This is a mixed implementation, not merely dequantize-then-f32-GEMM:
   original packed nibbles and uses AVX-VNNI/AVX-512-VNNI dot products
   (`matmul_nbits.rs:156-202`, `516-531`, `551-623`).
 
-The registry also contains private `pkg.nxrt::BlockQuantizedMatMul` and
+The registry also contains private `pkg.nxrt._private::BlockQuantizedMatMul` and
 `BlockQuantizedMoE` alongside `MatMulNBits`
 (`crates/onnx-runtime-ep-cpu/src/kernels/mod.rs:235-247`), and
 `com.microsoft::QMoE` (`kernels/mod.rs:372-373`).  Standard registered

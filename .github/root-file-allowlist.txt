@@ -79,6 +79,7 @@ Cargo.toml
 LICENSE
 README.md
 RULES.md
+THIRD_PARTY_NOTICES.md
 codecov.yml
 dispatch_manifest.toml
 feature_gate_exemptions.toml

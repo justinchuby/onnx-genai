@@ -1,8 +1,8 @@
 # DsaIndexSelect — GLM-5.2 DSA query-dependent index selection — frozen v1
 
 **Status:** frozen v1 (CPU oracle + native/plugin CUDA implementation)
-**Operator:** `pkg.nxrt::DsaIndexSelect`, version 1
-**Pairs with:** `pkg.nxrt::IndexShare` (see `INDEXSHARE_DESIGN.md`)
+**Operator:** `pkg.nxrt._private::DsaIndexSelect`, version 1
+**Pairs with:** `pkg.nxrt._private::IndexShare` (see `INDEXSHARE_DESIGN.md`)
 
 ## Why this op exists
 
@@ -18,7 +18,7 @@ DSA decomposes cleanly into two halves along one data boundary — the
 1. **index selection** — score + causal-mask + top-`k` + sort → `selected_indices`.
    This op, `DsaIndexSelect`.
 2. **sparse attention** — gather the selected KV and attend → `output`.
-   The existing `pkg.nxrt::IndexShare`.
+   The existing `pkg.nxrt._private::IndexShare`.
 
 `onnx-genai-kv` remains the sole page/cache authority: `DsaIndexSelect` allocates
 no pages, owns no cache, and invents no PagedAttention inputs. It is a pure
@@ -251,7 +251,7 @@ are compiled here; CUDA execution and performance remain unverified locally.
 
 ### Schema and capability
 
-`pkg.nxrt::DsaIndexSelect` has one schema with `since_version = 1`; imports 1,
+`pkg.nxrt._private::DsaIndexSelect` has one schema with `since_version = 1`; imports 1,
 2, and later resolve to that sole v1 registration until a newer schema exists,
 while import 0 rejects. Native and plugin capability validation delegates to the
 shared CPU contract. CUDA projects only query/key/weights f16/bf16 metadata to
@@ -262,7 +262,7 @@ the strict f32 bias contract remains enforced.
 
 `DsaIndexSelect` fuses the **index-selection** half of DSA (the scoring MatMul +
 top-k). Its `[B,1,S,top_k]` int64 output is consumed directly by the existing
-native CUDA `pkg.nxrt::IndexShare` kernel, which already owns the sparse KV
+native CUDA `pkg.nxrt._private::IndexShare` kernel, which already owns the sparse KV
 gather + attention and the run-time index validation. Real GLM-5.2 DSA is
 therefore fully covered by **`DsaIndexSelect` (CUDA) + `IndexShare` (CUDA)** with
 no additional boundary op: the "smallest sparse gather/attention consumer" the

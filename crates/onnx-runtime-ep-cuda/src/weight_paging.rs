@@ -1,5 +1,5 @@
 //! Live GPU weight paging (WEIGHT_OFFLOAD Phase 3b): allocate a bounded VRAM
-//! page for one offloaded `pkg.nxrt::BlockQuantizedMoE` weight tensor, copy its
+//! page for one offloaded `pkg.nxrt._private::BlockQuantizedMoE` weight tensor, copy its
 //! canonical compressed bytes host→device, and hand back an owned device
 //! binding a kernel can read.
 //!

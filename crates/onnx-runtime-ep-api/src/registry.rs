@@ -200,7 +200,7 @@ mod tests {
         let mut registry = OpRegistry::new();
         let mut state = 0x9e37_79b9_u64;
         let ops = ["Add", "Mul", "Gemm", "Attention"];
-        let domains = ["", "ai.onnx", "com.microsoft", "pkg.nxrt"];
+        let domains = ["", "ai.onnx", "com.microsoft", "pkg.nxrt._private"];
 
         for factory_id in 0..256 {
             state = state
@@ -273,43 +273,47 @@ mod tests {
     fn schema_resolution_selects_latest_registered_since_version() {
         let mut registry = OpRegistry::new();
         registry.register(
-            OpKey::new("DsaIndexSelect", "pkg.nxrt", 1),
+            OpKey::new("DsaIndexSelect", "pkg.nxrt._private", 1),
             WorkspacePlanning::None,
             Box::new(DummyFactory(1)),
         );
         registry.register(
-            OpKey::new("DsaIndexSelect", "pkg.nxrt", 3),
+            OpKey::new("DsaIndexSelect", "pkg.nxrt._private", 3),
             WorkspacePlanning::Metadata,
             Box::new(DummyFactory(3)),
         );
 
         let resolved_v1 = registry
-            .lookup("DsaIndexSelect", "pkg.nxrt", 1)
+            .lookup("DsaIndexSelect", "pkg.nxrt._private", 1)
             .expect("opset 1 resolves schema v1");
         let resolved_v2 = registry
-            .lookup("DsaIndexSelect", "pkg.nxrt", 2)
+            .lookup("DsaIndexSelect", "pkg.nxrt._private", 2)
             .expect("opset 2 still resolves schema v1");
         let resolved_v3 = registry
-            .lookup("DsaIndexSelect", "pkg.nxrt", 3)
+            .lookup("DsaIndexSelect", "pkg.nxrt._private", 3)
             .expect("opset 3 resolves the newly registered schema");
         let resolved_v4 = registry
-            .lookup("DsaIndexSelect", "pkg.nxrt", 4)
+            .lookup("DsaIndexSelect", "pkg.nxrt._private", 4)
             .expect("opset 4 keeps using the newest schema");
 
         assert!(std::ptr::eq(resolved_v1, resolved_v2));
         assert!(!std::ptr::eq(resolved_v1, resolved_v3));
         assert!(std::ptr::eq(resolved_v3, resolved_v4));
-        assert!(registry.lookup("DsaIndexSelect", "pkg.nxrt", 0).is_none());
+        assert!(
+            registry
+                .lookup("DsaIndexSelect", "pkg.nxrt._private", 0)
+                .is_none()
+        );
         assert_eq!(
-            registry.workspace_planning("DsaIndexSelect", "pkg.nxrt", 0),
+            registry.workspace_planning("DsaIndexSelect", "pkg.nxrt._private", 0),
             None
         );
         assert_eq!(
-            registry.workspace_planning("DsaIndexSelect", "pkg.nxrt", 2),
+            registry.workspace_planning("DsaIndexSelect", "pkg.nxrt._private", 2),
             Some(WorkspacePlanning::None)
         );
         assert_eq!(
-            registry.workspace_planning("DsaIndexSelect", "pkg.nxrt", 3),
+            registry.workspace_planning("DsaIndexSelect", "pkg.nxrt._private", 3),
             Some(WorkspacePlanning::Metadata)
         );
     }

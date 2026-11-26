@@ -1,4 +1,4 @@
-//! CPU parity oracle for `pkg.nxrt::BlockQuantizedMoE` (mixed-projection ABI).
+//! CPU parity oracle for `pkg.nxrt._private::BlockQuantizedMoE` (mixed-projection ABI).
 //!
 //! Each routed expert carries an independent native block-quantized format for
 //! every projection: `fc1_format` (gate/up), `fc2_format` (down), and
@@ -26,7 +26,6 @@
 use super::weight_cache::{WeightCache, WeightCacheStatus, WeightLoad, WeightSpec};
 use smallvec::{SmallVec, smallvec};
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 #[cfg(test)]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -42,13 +41,12 @@ use super::block_quantized_matmul::{
     decode_dense_weight_into,
 };
 use super::decoded_projection::ProjectionScratch;
-use super::moe::{
-    DenseExpertWeights, ExpertProjection, MoeAttributes, MoeWorkspace, RoutingScratch,
-};
+use super::moe::{DenseExpertWeights, ExpertProjection, MoeAttributes, MoeWorkspace};
 use super::packed_bytes::PackedByteSource;
 use super::packed_projection::{PackedProjectionPlan, validate_format};
 use super::{check_arity, write_dense_f32};
 mod input_workspace;
+use super::routing_workspace::RoutingArena;
 use input_workspace::{MoeInputValues, MoeInputs};
 use onnx_runtime_ir::packed_arithmetic::ActivationArithmetic;
 
@@ -292,7 +290,13 @@ impl Kernel for BlockQuantizedMoEKernel {
         } else {
             MoeInputs::new(inputs, metadata)?.layouts()?
         };
-        let layout = self.execution_workspace_layout(dims, plan, packed_bytes, floating_layouts)?;
+        let layout = self.execution_workspace_layout(
+            dims,
+            plan,
+            packed_bytes,
+            floating_layouts,
+            optional_input(inputs, 8).is_some(),
+        )?;
         let requirement = WorkspaceRequirement {
             bytes: layout.bytes() as u64,
             alignment: layout.alignment(),
@@ -335,10 +339,11 @@ impl BlockQuantizedMoEKernel {
         plan: PackedProjectionPlan,
         packed_bytes: usize,
         floating: [std::alloc::Layout; 6],
-    ) -> Result<WorkspaceLayout<11>> {
+        has_router_weights: bool,
+    ) -> Result<WorkspaceLayout<12>> {
         // A validated empty final output cannot consume projections or gathers.
         if dims.rows == 0 || dims.hidden == 0 {
-            return WorkspaceLayout::new([std::alloc::Layout::new::<()>(); 11]);
+            return WorkspaceLayout::new([std::alloc::Layout::new::<()>(); 12]);
         }
         // Experts and their projections execute serially. An expert receives a
         // row at most once, so total rows bound every group, independent of k.
@@ -380,6 +385,12 @@ impl BlockQuantizedMoEKernel {
             fc1,
             fc2,
             fc3,
+            RoutingArena::layout(
+                dims.rows,
+                dims.experts,
+                self.attributes.k,
+                has_router_weights,
+            )?,
         ])
     }
 
@@ -444,8 +455,13 @@ impl BlockQuantizedMoEKernel {
         ))?;
         let packed_bytes = self.packed_lane_bytes(dimensions, inputs)?;
         let floating = MoeInputs::new(inputs, &metadata)?;
-        let layout =
-            self.execution_workspace_layout(dimensions, plan, packed_bytes, floating.layouts()?)?;
+        let layout = self.execution_workspace_layout(
+            dimensions,
+            plan,
+            packed_bytes,
+            floating.layouts()?,
+            optional_input(inputs, 8).is_some(),
+        )?;
         // SAFETY: one checked layout lends disjoint Host regions for this
         // dispatch. Neither short borrow nor a projection output escapes.
         let [
@@ -460,6 +476,7 @@ impl BlockQuantizedMoEKernel {
             fc1_lane,
             fc2_lane,
             fc3_lane,
+            mut routing_lane,
         ] = unsafe {
             ProjectionScratch::bind_layout(
                 "BlockQuantizedMoE execution workspace binding",
@@ -467,6 +484,13 @@ impl BlockQuantizedMoEKernel {
                 workspace,
             )?
         };
+        let routing = RoutingArena::bind(
+            dimensions.rows,
+            dimensions.experts,
+            self.attributes.k,
+            optional_input(inputs, 8).is_some(),
+            &mut routing_lane,
+        )?;
         let mut expert_workspace = MoeWorkspace {
             input: bank_a,
             projection: bank_b,
@@ -496,23 +520,11 @@ impl BlockQuantizedMoEKernel {
             fc3_bias,
         } = floating.read(&mut input_lanes)?;
 
-        let mut tasks = BTreeMap::<usize, Vec<(usize, f32)>>::new();
-        let mut routing = RoutingScratch::default();
-        for row in 0..rows {
-            let range = row * experts..(row + 1) * experts;
-            let route = routing.weights(
-                &router_logits[range.clone()],
-                router_weights.map(|weights| &weights[range.clone()]),
-                self.attributes.k,
-                self.attributes.normalize_routing_weights,
-            );
-            route.sort_unstable_by_key(|&(expert, _)| expert);
-            for &(expert, weight) in route.iter() {
-                tasks.entry(expert).or_default().push((row, weight));
-            }
-        }
-
-        drop(routing);
+        let tasks = routing.build(
+            router_logits,
+            router_weights,
+            self.attributes.normalize_routing_weights,
+        )?;
         let output = accumulator.zeroed_prefix(rows * hidden)?;
         // A dense resident set must fit as a whole: separately admitting
         // projections can evict an Arc still held by this expert call and
@@ -551,7 +563,7 @@ impl BlockQuantizedMoEKernel {
         let mut grant_refusal = None;
         #[cfg(test)]
         let mut counted_dense = false;
-        for (expert, expert_tasks) in tasks {
+        for (expert, expert_tasks) in tasks.groups() {
             let dense = if use_dense {
                 match self.dequantize_expert_group(
                     inputs,
@@ -591,7 +603,7 @@ impl BlockQuantizedMoEKernel {
                 let fc3 = weights.get(2);
                 expert_workspace.run_dense_expert(
                     input,
-                    expert_tasks.iter().map(|&(row, _)| row),
+                    expert_tasks.iter().map(|task| task.row),
                     DenseExpertWeights {
                         fc1: fc1.as_slice(),
                         fc1_bias: fc1_bias
@@ -640,7 +652,7 @@ impl BlockQuantizedMoEKernel {
                     .transpose()?;
                 expert_workspace.run_expert_projections(
                     input,
-                    expert_tasks.iter().map(|&(row, _)| row),
+                    expert_tasks.iter().map(|task| task.row),
                     &fc1,
                     fc1_bias.map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
                     &fc2,
@@ -664,10 +676,10 @@ impl BlockQuantizedMoEKernel {
                     },
                 )?
             };
-            for (grouped_row, (row, route_weight)) in expert_tasks.into_iter().enumerate() {
+            for (grouped_row, task) in expert_tasks.iter().enumerate() {
                 for feature in 0..hidden {
-                    output[row * hidden + feature] +=
-                        route_weight * expert_output[grouped_row * hidden + feature];
+                    output[task.row * hidden + feature] +=
+                        task.weight * expert_output[grouped_row * hidden + feature];
                 }
             }
         }
@@ -1627,7 +1639,7 @@ mod tests {
         attrs: &[(&str, Attribute)],
     ) -> (Graph, NodeId) {
         let mut graph = Graph::new();
-        graph.opset_imports.insert("pkg.nxrt".into(), 1);
+        graph.opset_imports.insert("pkg.nxrt._private".into(), 1);
         let inputs = shapes
             .iter()
             .enumerate()
@@ -1645,7 +1657,7 @@ mod tests {
             .collect();
         let output = graph.create_named_value("output", DataType::Float32, static_shape([1, H]));
         let mut node = Node::new(NodeId(0), OP, inputs, vec![output]);
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         for (name, value) in attrs {
             node.attributes.insert((*name).into(), value.clone());
         }
@@ -1875,7 +1887,13 @@ mod tests {
                 };
                 let decoder =
                     (R * INTER + width * tile * HIDDEN).max(R * HIDDEN + width * tile * INTER);
-                let expected = (decoder + R * (HIDDEN + INTER + HIDDEN)) * 4;
+                let base = (decoder + R * (HIDDEN + INTER + HIDDEN)) * 4;
+                let expected = std::alloc::Layout::from_size_align(base, 4)
+                    .unwrap()
+                    .extend(RoutingArena::layout(R, EXPERTS, 2, false).unwrap())
+                    .unwrap()
+                    .0
+                    .size();
                 assert_eq!(req.bytes, expected as u64);
                 let mut scratch = vec![f32::NAN; expected / 4 + 7];
                 scratch[expected / 4..].fill(83.);
@@ -2073,13 +2091,33 @@ mod tests {
             kernel
                 .execute_with_workspace(&views, &mut [output.view_mut()], Some(workspace))
                 .unwrap();
+            let dims = validate_runtime_shapes(&metadata, None, &kernel.attributes, kernel.formats)
+                .unwrap();
+            let layout = kernel
+                .execution_workspace_layout(
+                    dims,
+                    PackedProjectionPlan::for_current_pool(kernel.arithmetic),
+                    0,
+                    [std::alloc::Layout::new::<()>(); 6],
+                    false,
+                )
+                .unwrap();
+            let regions = layout.bind(Some(workspace)).unwrap();
+            // SAFETY: decode scratch began initialized to 29; all bank values
+            // below were initialized by the completed synchronous dense launch.
+            let decode = unsafe {
+                std::slice::from_raw_parts(regions[0].ptr().0.cast::<f32>(), regions[0].bytes() / 4)
+            };
             assert!(
-                scratch[..scratch.len() - 3 * H]
-                    .iter()
-                    .all(|&value| value == 29.0),
-                "cold dense expansion and warm resident hits must leave streamed scratch untouched"
+                decode.iter().all(|&v| v == 29.),
+                "dense launches must leave decode scratch untouched"
             );
-            assert_eq!(&scratch[scratch.len() - 3 * H..], &[0.125; 3 * H]);
+            for region in &regions[1..4] {
+                let values = unsafe {
+                    std::slice::from_raw_parts(region.ptr().0.cast::<f32>(), region.bytes() / 4)
+                };
+                assert_eq!(values, &[0.125; H]);
+            }
             assert_eq!(output.to_f32(), vec![0.125; H]);
         }
         assert_eq!(
@@ -2213,8 +2251,8 @@ mod tests {
                     (hidden.max(inter), (fc1_size + if separate { inter } else { 0 }).max(hidden))
                 };
                 assert_eq!(
-                    req.bytes, (max + rows * (a + b + hidden) * std::mem::size_of::<f32>()) as u64,
-                    "serial experts/projections share max plus two FC banks and accumulator, not k*E buffers"
+                    req.bytes, std::alloc::Layout::from_size_align(max + rows * (a + b + hidden) * std::mem::size_of::<f32>(),4).unwrap().extend(RoutingArena::layout(rows,experts,2,false).unwrap()).unwrap().0.size() as u64,
+                    "serial projections share their max; routing separately covers rows*k and expert scratch"
                 );
                 assert!(max < l1.bytes() + l2.bytes());
                 let mut output = Owned::zeros_f32(&[rows, hidden]);

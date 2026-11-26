@@ -5,7 +5,7 @@
     clippy::type_complexity,
     clippy::drop_non_drop
 )]
-//! GPU parity tests for `pkg.nxrt::DsaIndexSelect` v1.
+//! GPU parity tests for `pkg.nxrt._private::DsaIndexSelect` v1.
 //!
 //! Each case builds a tiny single-node model with the `onnx-runtime-ir` graph
 //! API, runs it through both the CPU reference kernel (the authoritative
@@ -43,7 +43,7 @@ use onnx_runtime_ir::{
 };
 use onnx_runtime_loader::Model;
 
-const DOMAIN: &str = "pkg.nxrt";
+const DOMAIN: &str = "pkg.nxrt._private";
 
 #[derive(Clone)]
 struct HostTensor {

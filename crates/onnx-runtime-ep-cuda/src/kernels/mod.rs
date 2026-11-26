@@ -1423,28 +1423,32 @@ pub(crate) fn build_cuda_registry_for_contract(
         }),
     );
     reg.register(
-        OpKey::new("BlockQuantizedMatMul", "pkg.nxrt", 1),
+        OpKey::new("BlockQuantizedMatMul", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(block_quantized_matmul::BlockQuantizedMatMulFactory {
             runtime: runtime.clone(),
         }),
     );
     reg.register(
-        OpKey::new("BlockQuantizedMoE", "pkg.nxrt", 1),
+        OpKey::new("BlockQuantizedMoE", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(block_quantized_moe::BlockQuantizedMoEFactory {
             runtime: runtime.clone(),
         }),
     );
     reg.register(
-        OpKey::new("SparseKvGather", "pkg.nxrt", 1),
+        OpKey::new("SparseKvGather", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(sparse_kv_gather::SparseKvGatherFactory {
             runtime: runtime.clone(),
         }),
     );
     reg.register(
-        OpKey::new("CompressedSparseAttention", "pkg.nxrt", 1),
+        OpKey::new(
+            "CompressedSparseAttention",
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(
             compressed_sparse_attention::CompressedSparseAttentionFactory {
@@ -1454,35 +1458,35 @@ pub(crate) fn build_cuda_registry_for_contract(
         ),
     );
     reg.register(
-        OpKey::new("IndexShare", "pkg.nxrt", 1),
+        OpKey::new("IndexShare", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(index_share::IndexShareFactory {
             runtime: runtime.clone(),
         }),
     );
     reg.register(
-        OpKey::new("DsaIndexSelect", "pkg.nxrt", 1),
+        OpKey::new("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(dsa_index_select::DsaIndexSelectFactory {
             runtime: runtime.clone(),
         }),
     );
     reg.register(
-        OpKey::new("KvCacheCapacityAppend", "pkg.nxrt", 1),
+        OpKey::new("KvCacheCapacityAppend", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(kv_cache_capacity_append::KvCacheCapacityAppendFactory {
             runtime: runtime.clone(),
         }),
     );
     reg.register(
-        OpKey::new("PackedVarlenAttention", "pkg.nxrt", 1),
+        OpKey::new("PackedVarlenAttention", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(packed_varlen_attention::PackedVarlenAttentionFactory {
             runtime: runtime.clone(),
         }),
     );
     reg.register(
-        OpKey::new("VarlenAttention", "pkg.nxrt", 1),
+        OpKey::new("VarlenAttention", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(varlen_attention::VarlenAttentionFactory {
             runtime: runtime.clone(),
@@ -2258,7 +2262,11 @@ mod tests {
             matrix.contains(needle),
             "GatherBlockQuantized must be documented in its registered com.microsoft domain"
         );
-        let mutated = matrix.replacen(needle, "| `GatherBlockQuantized` | `pkg.nxrt` |", 1);
+        let mutated = matrix.replacen(
+            needle,
+            "| `GatherBlockQuantized` | `pkg.nxrt._private` |",
+            1,
+        );
         let actual = coverage_matrix_pairs(&mutated);
         assert_ne!(
             actual, expected,
@@ -2475,7 +2483,7 @@ mod tests {
     /// so it cannot arrive through ordinary export. It never appears on the
     /// decoder-only LLM path this project targets (which uses `Attention` /
     /// `MultiHeadAttention` / `GroupQueryAttention`, plus the runtime-invented
-    /// `pkg.nxrt::PackedVarlenAttention` for packed sequences). The real
+    /// `pkg.nxrt._private::PackedVarlenAttention` for packed sequences). The real
     /// Qwen3.5-0.8B hybrid decode graph places on CUDA with zero declines, and
     /// the only producer anywhere in the repo is a synthetic CPU-EP fixture.
     /// See the non-gap write-up in `docs/execution/CUDA_COVERAGE.md`, which
