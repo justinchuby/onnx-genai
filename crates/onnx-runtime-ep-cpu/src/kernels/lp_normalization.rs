@@ -1,12 +1,14 @@
 //! ONNX `LpNormalization` along one axis.
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspacePreparation, WorkspaceView,
+};
 use onnx_runtime_ir::Node;
 
-use super::add::require_same_dtype;
-use super::check_arity;
+use super::typed_workspace::TypedWorkspace;
 use crate::dispatch_float;
-use crate::dtype::{ComputeDomain, NumericElem, to_dense, write_dense};
+use crate::dtype::{ComputeDomain, NumericElem, to_dense_into, write_dense};
 
 trait LpAcc: ComputeDomain + PartialOrd {
     const TINY: Self;
@@ -61,91 +63,186 @@ pub struct LpNormalizationKernel {
     p: u8,
 }
 
-impl Kernel for LpNormalizationKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        check_arity("LpNormalization", inputs, outputs, 1, 1, 1)?;
-        dispatch_float!(inputs[0].dtype, "LpNormalization", T =>
-            lp_normalization_typed::<T>(inputs, outputs, self.axis, self.p)
-        )
+struct Geometry {
+    outer: usize,
+    axis_len: usize,
+    inner: usize,
+    count: usize,
+}
+impl LpNormalizationKernel {
+    fn geometry(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> Result<Geometry> {
+        let fail = |why: String| EpError::KernelFailed(format!("LpNormalization: {why}"));
+        let ([x], [y]) = (inputs, outputs) else {
+            return Err(fail(format!(
+                "expected exactly one X and one Y, got {} inputs and {} outputs",
+                inputs.len(),
+                outputs.len()
+            )));
+        };
+        if !x.present || !super::FLOAT_DTYPES.contains(&x.dtype) {
+            return Err(fail(format!(
+                "X must be present floating storage, got present={} dtype {:?}",
+                x.present, x.dtype
+            )));
+        }
+        match y {
+            OutputMetadata::Tensor { dtype, shape }
+                if *dtype == x.dtype && shape.as_ref() == x.shape => {}
+            OutputMetadata::Unresolved { dtype } if *dtype == x.dtype => {}
+            _ => {
+                return Err(fail(format!(
+                    "Y {y:?} must be present and match X shape {:?} and dtype {:?}; bind a matching output",
+                    x.shape, x.dtype
+                )));
+            }
+        }
+        if !matches!(self.p, 1 | 2) {
+            return Err(fail(format!("p={} must be 1 or 2", self.p)));
+        }
+        let rank = x.shape.len();
+        let axis = if self.axis < 0 {
+            self.axis.checked_add(rank as i64)
+        } else {
+            Some(self.axis)
+        }
+        .filter(|&a| a >= 0 && (a as usize) < rank)
+        .ok_or_else(|| {
+            fail(format!(
+                "axis {} out of range for rank {rank}; provide rank >= 1 and axis in [-rank, rank)",
+                self.axis
+            ))
+        })? as usize;
+        let product = |dims: &[usize]| {
+            dims.iter()
+                .rev()
+                .try_fold(1usize, |n, &d| n.checked_mul(d))
+                .ok_or_else(|| {
+                    fail(format!(
+                        "X shape {:?} overflows dense indexing; reduce dimensions",
+                        x.shape
+                    ))
+                })
+        };
+        Ok(Geometry {
+            outer: product(&x.shape[..axis])?,
+            axis_len: x.shape[axis],
+            inner: product(&x.shape[axis + 1..])?,
+            count: product(x.shape)?,
+        })
     }
-
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        let metadata = inputs
+            .iter()
+            .map(|x| TensorMetadata::new(x.dtype, x.shape, !x.is_absent()))
+            .collect::<smallvec::SmallVec<[_; 1]>>();
+        let facts = outputs
+            .iter()
+            .map(OutputMetadata::from_view)
+            .collect::<smallvec::SmallVec<[_; 1]>>();
+        let geometry = self.geometry(&metadata, &facts)?;
+        crate::dtype::validate_f32_widen_input("LpNormalization", &inputs[0]).map_err(|e| {
+            EpError::KernelFailed(format!(
+                "LpNormalization: invalid X view: {e}; bind valid floating Host-accessible storage"
+            ))
+        })?;
+        crate::dtype::validate_host_output("LpNormalization", &outputs[0])?;
+        dispatch_float!(inputs[0].dtype,"LpNormalization",T => lp_normalization_typed::<T>(inputs,outputs,&geometry,self.p,workspace))
+    }
+}
+impl Kernel for LpNormalizationKernel {
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        let geometry = self.geometry(inputs, outputs)?;
+        dispatch_float!(inputs[0].dtype,"LpNormalization",T => Ok(WorkspacePreparation::Ready(TypedWorkspace::<T,1>::new("LpNormalization",[("Y staging",geometry.count)])?.requirement())))
+    }
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
+    }
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
     }
 }
 
-fn lp_normalization_typed<T: NumericElem>(
+fn lp_normalization_typed<T: NumericElem + Default>(
     inputs: &[TensorView],
     outputs: &mut [TensorMut],
-    raw_axis: i64,
+    geometry: &Geometry,
     p: u8,
+    workspace: Option<WorkspaceView>,
 ) -> Result<()>
 where
     T::Acc: LpAcc,
 {
     let input = &inputs[0];
     let output = &mut outputs[0];
-    require_same_dtype("LpNormalization", input, T::DTYPE)?;
-    if output.dtype != T::DTYPE {
-        return Err(EpError::KernelFailed(format!(
-            "LpNormalization: output dtype {:?} must match input dtype {:?}",
-            output.dtype,
-            T::DTYPE
-        )));
-    }
-    if input.shape != output.shape {
-        return Err(EpError::KernelFailed(format!(
-            "LpNormalization: output shape {:?} must match input shape {:?}",
-            output.shape, input.shape
-        )));
-    }
-    let rank = input.shape.len();
-    let axis = if raw_axis < 0 {
-        raw_axis + rank as i64
-    } else {
-        raw_axis
-    };
-    if axis < 0 || axis as usize >= rank {
-        return Err(EpError::KernelFailed(format!(
-            "LpNormalization: axis {raw_axis} out of range for rank {rank}"
-        )));
-    }
-    let axis = axis as usize;
-    let outer = input.shape[..axis].iter().product::<usize>();
-    let axis_len = input.shape[axis];
-    let inner = input.shape[axis + 1..].iter().product::<usize>();
-    let x = to_dense::<T>(input)?;
-    let mut y = vec![T::Acc::default(); x.len()];
+    let Geometry {
+        outer,
+        axis_len,
+        inner,
+        count,
+    } = *geometry;
+    let plan = TypedWorkspace::<T, 1>::new("LpNormalization", [("Y staging", count)])?;
+    // SAFETY: the synchronous executor lends exclusive live Host storage,
+    // disjoint from all tensor storage. Validate the whole binding first.
+    unsafe {
+        plan.with_buffers(workspace, |[y]| {
+            if count == 0 {
+                return Ok(());
+            }
+            // Each (outer, inner) group is disjoint. Snapshot all input
+            // before reducing any group; finish each norm before overwriting
+            // that group's elements. Publish the real output only at the end.
+            to_dense_into::<T>("LpNormalization X snapshot", input, y)?;
+            for outer_index in 0..outer {
+                for inner_index in 0..inner {
+                    let mut norm = T::Acc::default();
+                    for axis_index in 0..axis_len {
+                        let index = (outer_index * axis_len + axis_index) * inner + inner_index;
+                        let value = y[index].to_acc().abs();
+                        norm = norm.c_add(if p == 1 { value } else { value.c_mul(value) });
+                    }
+                    if p == 2 {
+                        norm = norm.sqrt();
+                    }
+                    if norm < T::Acc::TINY {
+                        norm = T::Acc::TINY;
+                    }
+                    for axis_index in 0..axis_len {
+                        let index = (outer_index * axis_len + axis_index) * inner + inner_index;
+                        y[index] = T::from_acc(y[index].to_acc().c_div(norm));
+                    }
+                }
+            }
 
-    for outer_index in 0..outer {
-        for inner_index in 0..inner {
-            let mut norm = T::Acc::default();
-            for axis_index in 0..axis_len {
-                let index = (outer_index * axis_len + axis_index) * inner + inner_index;
-                let value = x[index].to_acc().abs();
-                norm = norm.c_add(if p == 1 { value } else { value.c_mul(value) });
-            }
-            if p == 2 {
-                norm = norm.sqrt();
-            }
-            if norm < T::Acc::TINY {
-                norm = T::Acc::TINY;
-            }
-            for axis_index in 0..axis_len {
-                let index = (outer_index * axis_len + axis_index) * inner + inner_index;
-                y[index] = x[index].to_acc().c_div(norm);
-            }
-        }
+            write_dense::<T>(output, y)
+        })
     }
-
-    let y = y.into_iter().map(T::from_acc).collect::<Vec<_>>();
-    write_dense::<T>(output, &y)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::testutil::Owned;
+    use crate::kernels::testutil::{Owned, PreparedTestKernel};
     use onnx_runtime_ir::NodeId;
 
     fn assert_close(got: &[f32], want: &[f32]) {
@@ -162,7 +259,7 @@ mod tests {
         let x = Owned::f32(shape, values);
         let mut y = Owned::zeros_f32(shape);
         LpNormalizationKernel { axis, p }
-            .execute(&[x.view()], &mut [y.view_mut()])
+            .execute_prepared(&[x.view()], &mut [y.view_mut()])
             .unwrap();
         y.to_f32()
     }
@@ -174,7 +271,7 @@ mod tests {
         let x = Owned::bf16(&[2, 3], &values);
         let mut y = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[2, 3]);
         LpNormalizationKernel { axis: 1, p: 2 }
-            .execute(&[x.view()], &mut [y.view_mut()])
+            .execute_prepared(&[x.view()], &mut [y.view_mut()])
             .unwrap();
         for (&r, &g) in reference.iter().zip(y.to_bf16_as_f32().iter()) {
             assert!(
@@ -220,8 +317,11 @@ mod tests {
         LpNormalizationFactory
             .create(&node, &[])
             .unwrap()
-            .execute(&[x.view()], &mut [y.view_mut()])
+            .execute_prepared(&[x.view()], &mut [y.view_mut()])
             .unwrap();
         assert_close(&y.to_f32(), &expected);
     }
 }
+
+#[cfg(test)]
+mod workspace_tests;

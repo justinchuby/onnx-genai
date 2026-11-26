@@ -79,6 +79,58 @@ The CLI uses this proof for both file and live transcription after resolving the
 recording's actual source rate. Serving encoded audio binds the compiled program,
 not a guessed rank-3 mel output or a fixed hop/rate formula.
 
+## Linear spectrograms
+
+`spectrogram` consumes its named waveform and publishes a float32 tensor with
+shape `[batch, n_fft / 2 + 1, floor(samples / hop_length)]`, in frequency-major
+order. Declare `mode: power` or `mode: magnitude`, and `window: hann`,
+`window: hamming` or `window: rectangular`. Both selectors are required; unknown
+or missing selectors fail at compilation. Also author positive `n_fft` (at least
+2), `hop_length` and `win_length` (at most `n_fft`).
+
+All three windows occupy the centered `win_length` positions of the FFT input,
+with zero coefficients outside that interval. For `0 <= j < win_length`, their
+explicit coefficient contracts are:
+
+| Selector | Coefficient |
+| --- | --- |
+| `hann` | `0.5 - 0.5 cos(2πj / win_length)` |
+| `hamming` | `0.54 - 0.46 cos(2πj / win_length)` |
+| `rectangular` | `1` |
+
+Hann and Hamming are periodic, using `win_length` rather than `win_length - 1`
+in the denominator, including a length-one window. Sample boundaries use
+centered reflection, the forward FFT is unnormalized, and only its nonnegative
+frequency bins are emitted without doubling. Power is `re² + im²`; magnitude is
+`hypot(re, im)` directly, preserving representable finite magnitudes when squaring
+would overflow. A nonfinite projected value still fails with rescaling guidance.
+Complex and uncentered analyses have no operation/selector in this contract.
+Odd FFT lengths and windows shorter than the FFT are supported.
+
+The analysis rate comes from `sample_rate` or a preceding declared `resample`.
+It must match the input rate; the operation does not implicitly resample.
+`audio_features`/`features` outputs select the resulting matrix. The spectrum
+retains its own valid-frame interval for `emit_valid_frames` and
+`emit_validity_mask`, including padding and clipping on the selected branch.
+An unpadded ragged batch fails with padding guidance. `whisper_log_mel`
+normalization requires a `log_mel` source and rejects a linear spectrum.
+The FFT implementation is shared with log-mel, which retains its existing
+periodic-Hann/power projection and normalization recipe without materializing a full intermediate
+spectrum.
+
+```yaml
+- {op: decode, outputs: [decoded]}
+- {op: resample, sample_rate: 16000, outputs: [samples]}
+- op: spectrogram
+  mode: power
+  window: hann
+  n_fft: 512
+  hop_length: 160
+  win_length: 400
+  outputs: [power]
+- {op: emit_valid_frames, inputs: [power], outputs: [frames]}
+```
+
 ## Log-mel and normalization
 
 `log_mel` consumes its named waveform, using the declared mel count, sample rate,
@@ -99,8 +151,8 @@ Sample and frame length output roles are checked as different units.
 
 The public `LogMelExtractor` convenience API still returns normalized features;
 the executable program applies only the transforms it actually declares.
-Unsupported operations such as standalone `spectrogram` fail explicitly instead
-of being accepted as no-ops. More DSP operations, windows/scales, codecs and the
+Unsupported operations fail explicitly instead of being accepted as no-ops.
+More DSP operations, windows/scales, codecs and the
 server's remaining legacy feature-input path still require compatibility work.
 Declared pure-waveform CTC/greedy packages execute through the
 [file transcription API](TRANSCRIPTION.md).

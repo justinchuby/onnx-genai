@@ -23,6 +23,7 @@ mod norm;
 mod packed_routed;
 mod pooling;
 mod recurrent;
+mod roi_align;
 mod selection;
 mod sequence;
 mod signal;
@@ -63,6 +64,9 @@ pub fn register_all(registry: &mut InferenceRegistry) {
     data_ops::register(registry);
     registry.register("", "DequantizePacked", 29, dequantize_packed::infer);
     pooling::register(registry);
+    for version in onnx_runtime_ir::roi_align::VERSIONS {
+        registry.register("", "RoiAlign", version, roi_align::infer);
+    }
     recurrent::register(registry);
     selection::register(registry);
     sequence::register(registry);

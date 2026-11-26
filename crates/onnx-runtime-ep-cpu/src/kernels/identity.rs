@@ -42,14 +42,26 @@ impl Kernel for IdentityKernel {
             )));
         }
 
-        // The executor always hands kernels contiguous row-major views, so a
-        // flat byte copy is exact for any dtype. Guard the invariant instead of
-        // silently corrupting data if that ever changes.
+        input.validate().map_err(|e| {
+            EpError::KernelFailed(format!(
+                "Identity: invalid input: {e}; bind a valid raw tensor"
+            ))
+        })?;
+        output.validate().map_err(|e| {
+            EpError::KernelFailed(format!(
+                "Identity: invalid output: {e}; bind a valid raw tensor"
+            ))
+        })?;
+        // This raw byte-copy implementation requires contiguous logical views.
+        // Explicit bindings may carry strides, so refuse unsupported layouts.
         if !input.is_contiguous() || !output.is_contiguous() {
-            return Err(EpError::KernelFailed(
-                "Identity: expected contiguous input/output views".to_string(),
-            ));
+            return Err(EpError::KernelFailed(format!(
+                "Identity: expected contiguous input/output views, got strides {:?}/{:?}; bind contiguous views",
+                input.strides, output.strides
+            )));
         }
+        // Shared view validation already proves concrete raw dtype and complete
+        // dense count/byte arithmetic, including packed storage and empty shapes.
         let in_bytes = input.byte_size();
         let out_bytes = output.byte_size();
         if in_bytes != out_bytes {
@@ -63,15 +75,46 @@ impl Kernel for IdentityKernel {
             return Ok(());
         }
 
+        // Complete both Host/span proofs before reading or writing any bytes.
+        for (name, base, offset, device) in [
+            (
+                "input",
+                input.data.0 as usize,
+                input.byte_offset,
+                input.device,
+            ),
+            (
+                "output",
+                output.data.0 as usize,
+                output.byte_offset,
+                output.device,
+            ),
+        ] {
+            if !device.is_host_accessible() {
+                return Err(EpError::KernelFailed(format!(
+                    "Identity: {name} on {device:?} is not Host-accessible; explicitly transfer before CPU copying"
+                )));
+            }
+            if std::alloc::Layout::array::<u8>(in_bytes).is_err()
+                || base
+                    .checked_add(offset)
+                    .and_then(|p| p.checked_add(in_bytes))
+                    .is_none()
+            {
+                return Err(EpError::KernelFailed(format!(
+                    "Identity: {name} byte_offset {offset} and {in_bytes} storage bytes exceed addressable Host backing; bind valid smaller storage"
+                )));
+            }
+        }
         let src = input.data_ptr::<u8>();
         let dst = output.data_ptr_mut::<u8>();
-        // SAFETY: both views are contiguous host allocations of `in_bytes`
-        // (checked equal above); `src`/`dst` are the element origins the
-        // executor bounds-gated before dispatch, and SSA guarantees the output
-        // buffer is disjoint from the input, so the ranges do not overlap.
+        // SAFETY: validated contiguous Host spans of equal checked byte count;
+        // the owner supplies live backing bounds. Explicit I/O bindings may
+        // alias, so copying must support identical and shifted overlaps.
         unsafe {
-            std::ptr::copy_nonoverlapping(src, dst, in_bytes);
+            std::ptr::copy(src, dst, in_bytes);
         }
+
         Ok(())
     }
 
@@ -154,5 +197,109 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("String tensors are not supported"));
         assert!(message.contains("silently lose all string data"));
+    }
+    #[test]
+    fn identity_preserves_raw_bits_for_exact_and_shifted_overlap() {
+        use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
+        use onnx_runtime_ir::DeviceId;
+        for (dtype, count, size, shifts) in [
+            (DataType::Float32, 2usize, 8usize, [0usize, 4, 8]),
+            (DataType::Uint4, 5, 3, [3, 4, 5]),
+        ] {
+            for dst in shifts {
+                let mut backing = (0..24).map(|n| (n * 17 + 3) as u8).collect::<Vec<_>>();
+                let mut expected = backing.clone();
+                expected.copy_within(4..4 + size, dst);
+                let shape = [count];
+                let input = TensorView::new(
+                    DevicePtr(backing.as_ptr().cast()),
+                    dtype,
+                    &shape,
+                    &[1],
+                    DeviceId::cpu(),
+                )
+                .with_byte_offset(4);
+                let output = TensorMut::new(
+                    DevicePtrMut(backing.as_mut_ptr().cast()),
+                    dtype,
+                    &shape,
+                    &[1],
+                    DeviceId::cpu(),
+                )
+                .with_byte_offset(dst);
+                IdentityKernel.execute(&[input], &mut [output]).unwrap();
+                assert_eq!(backing, expected, "{dtype:?} dst={dst}");
+            }
+        }
+    }
+    #[test]
+    fn identity_refuses_nonhost_or_wrapping_storage_before_copying() {
+        use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
+        use onnx_runtime_ir::DeviceId;
+        for bad in 0..4 {
+            let mut backing = [123u8; 8];
+            let mut input = TensorView::new(
+                DevicePtr(8usize as *const std::ffi::c_void),
+                DataType::Uint8,
+                &[3],
+                &[1],
+                DeviceId::cpu(),
+            );
+            let mut output = TensorMut::new(
+                DevicePtrMut(backing.as_mut_ptr().cast()),
+                DataType::Uint8,
+                &[3],
+                &[1],
+                DeviceId::cpu(),
+            );
+            match bad {
+                0 => input.device = DeviceId::cuda(0),
+                1 => {
+                    output.device = DeviceId::cuda(0);
+                    output.data = DevicePtrMut(8usize as *mut std::ffi::c_void);
+                }
+                2 => input.data = DevicePtr((usize::MAX - 1) as *const std::ffi::c_void),
+                _ => output.data = DevicePtrMut((usize::MAX - 1) as *mut std::ffi::c_void),
+            }
+            let text = IdentityKernel
+                .execute(&[input], &mut [output])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                text.contains("Identity")
+                    && text.contains(if bad < 2 {
+                        "Host-accessible"
+                    } else {
+                        "addressable Host backing"
+                    }),
+                "{text}"
+            );
+            assert_eq!(backing, [123; 8]);
+        }
+        let input = TensorView::new(
+            DevicePtr(8usize as *const std::ffi::c_void),
+            DataType::Float64,
+            &[usize::MAX],
+            &[1],
+            DeviceId::cpu(),
+        );
+        let output = TensorMut::new(
+            DevicePtrMut(8usize as *mut std::ffi::c_void),
+            DataType::Float64,
+            &[usize::MAX],
+            &[1],
+            DeviceId::cpu(),
+        );
+        let text = IdentityKernel
+            .execute(&[input], &mut [output])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.contains("input")
+                && text.contains("dense byte count overflows usize")
+                && text.contains("Float64")
+                && text.contains(&usize::MAX.to_string()),
+            "{text}"
+        );
     }
 }

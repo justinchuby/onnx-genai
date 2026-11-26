@@ -89,11 +89,12 @@ fn byte_level_alphabet() -> anyhow::Result<HashMap<char, u8>> {
         "decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
         "model":{"type":"BPE","vocab":vocab,"merges":[],"unk_token":null,"byte_fallback":false}});
     let bytes = serde_json::to_vec(&config)?;
-    let pieces = llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        toktrie_hf_tokenizers::ByteTokenizer::from_json_bytes(&bytes)
-    }))
-    .context("resolve the ByteLevel protocol alphabet from the tokenizer adapter")?
-    .token_bytes();
+    let pieces =
+        onnx_genai_llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            toktrie_hf_tokenizers::ByteTokenizer::from_json_bytes(&bytes)
+        }))
+        .context("resolve the ByteLevel protocol alphabet from the tokenizer adapter")?
+        .token_bytes();
     ensure!(
         pieces.len() == alphabet.len(),
         "ByteLevel adapter returned a different alphabet size; use matching tokenizer and byte-adapter dependencies"
@@ -105,6 +106,13 @@ fn byte_level_alphabet() -> anyhow::Result<HashMap<char, u8>> {
 }
 
 impl ByteStreamContract {
+    /// Raw grammars consume vocabulary pieces before publication-only stripping.
+    /// Only an already resolved contract can produce this identity codec.
+    pub(crate) fn into_raw(mut self) -> Self {
+        self.strips.clear();
+        self
+    }
+
     /// Filter special IDs before any stream-context transforms run.
     pub(crate) fn resolve_output(
         tokenizer: &Tokenizer,
@@ -214,17 +222,18 @@ impl ByteStreamContract {
             }
             let mut token=tokenizer.inner().id_to_token(id).with_context(||format!("tokenizer.model.vocab is missing byte token ID {id}; repair the dense vocabulary"))?;
             for (path, stage) in &stages[..byte_index] {
-                let mut transformed =
-                    llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut transformed = onnx_genai_llguidance::panic_utils::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| {
                         stage
                             .decode_chain(vec![token])
                             .map_err(anyhow::Error::from_boxed)
-                    }))
-                    .with_context(|| {
-                        format!(
-                            "decode token {id} through {path}; repair the token-local decoder stage"
-                        )
-                    })?;
+                    }),
+                )
+                .with_context(|| {
+                    format!(
+                        "decode token {id} through {path}; repair the token-local decoder stage"
+                    )
+                })?;
                 ensure!(
                     transformed.len() == 1,
                     "{path} changed token {id} into multiple pieces; use a token-local byte decoder contract"

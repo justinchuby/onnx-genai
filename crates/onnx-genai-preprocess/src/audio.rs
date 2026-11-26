@@ -100,29 +100,263 @@ pub struct LogMelConfig {
     pub win_length: usize,
 }
 
-/// Reusable configurable log-mel extractor.
-///
-/// The extractor uses a periodic Hann window, centered/reflected STFT,
-/// Slaney-normalized mel filters, power spectra, and Whisper's dynamic-range
-/// normalization.
-pub struct LogMelExtractor {
-    n_mels: usize,
-    sample_rate: u32,
+/// A compiled, explicit projection of the one-sided complex FFT.
+#[derive(Debug, Clone, Copy)]
+enum SpectrumProjection {
+    Power,
+    Magnitude,
+}
+impl SpectrumProjection {
+    fn from_declared(mode: Option<&str>) -> Result<Self, AudioPreprocessError> {
+        match mode {
+            Some("power") => Ok(Self::Power),
+            Some("magnitude") => Ok(Self::Magnitude),
+            other => Err(AudioPreprocessError::InvalidConfig(format!(
+                "spectrogram requires explicit mode: power or magnitude; got {other:?}; declare one supported projection"
+            ))),
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Power => "power",
+            Self::Magnitude => "magnitude",
+        }
+    }
+}
+/// Window coefficients are sampled periodically over the authored win_length;
+/// the shorter window is zero-padded at the center of the FFT input.
+#[derive(Debug, Clone, Copy)]
+enum AnalysisWindow {
+    Hann,
+    Hamming,
+    Rectangular,
+}
+impl AnalysisWindow {
+    fn from_declared(window: Option<&str>) -> Result<Self, AudioPreprocessError> {
+        match window {
+            Some("hann") => Ok(Self::Hann),
+            Some("hamming") => Ok(Self::Hamming),
+            Some("rectangular") => Ok(Self::Rectangular),
+            other => Err(AudioPreprocessError::InvalidConfig(format!(
+                "spectrogram requires explicit window: hann, hamming or rectangular; got {other:?}; declare one supported analysis window"
+            ))),
+        }
+    }
+}
+
+/// Shared centered/reflected FFT analysis. The compiled window and projection
+/// are explicit; log-mel keeps its periodic-Hann/power recipe.
+struct SpectrumAnalysis {
     n_fft: usize,
     hop_length: usize,
     window: Vec<f32>,
-    mel_filters: Vec<f32>,
     fft: Arc<dyn Fft<f32>>,
 }
+impl fmt::Debug for SpectrumAnalysis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpectrumAnalysis")
+            .field("n_fft", &self.n_fft)
+            .field("hop_length", &self.hop_length)
+            .finish_non_exhaustive()
+    }
+}
+impl SpectrumAnalysis {
+    fn new(
+        n_fft: usize,
+        hop_length: usize,
+        win_length: usize,
+        window_kind: AnalysisWindow,
+    ) -> Result<Self, AudioPreprocessError> {
+        if n_fft < 2
+            || hop_length == 0
+            || win_length == 0
+            || win_length > n_fft
+            || n_fft > isize::MAX as usize
+        {
+            return Err(AudioPreprocessError::InvalidConfig(format!(
+                "spectral analysis requires n_fft >= 2, positive hop_length and 1 <= win_length <= n_fft; got n_fft={n_fft}, hop_length={hop_length}, win_length={win_length}; correct the declared analysis geometry"
+            )));
+        }
+        let mut window = Vec::new();
+        window.try_reserve_exact(n_fft).map_err(|error| {
+            AudioPreprocessError::InvalidConfig(format!(
+                "allocate {n_fft}-point analysis window: {error}; reduce n_fft or free host memory"
+            ))
+        })?;
+        window.resize(n_fft, 0.0);
+        let offset = (n_fft - win_length) / 2;
+        for index in 0..win_length {
+            window[offset + index] = match window_kind {
+                AnalysisWindow::Hann => {
+                    0.5 - 0.5 * (2.0 * PI * index as f32 / win_length as f32).cos()
+                }
+                AnalysisWindow::Hamming => {
+                    0.54 - 0.46 * (2.0 * PI * index as f32 / win_length as f32).cos()
+                }
+                AnalysisWindow::Rectangular => 1.0,
+            };
+        }
+        Ok(Self {
+            n_fft,
+            hop_length,
+            window,
+            fft: FftPlanner::<f32>::new().plan_fft_forward(n_fft),
+        })
+    }
+    fn bins(&self) -> usize {
+        self.n_fft / 2 + 1
+    }
+    fn frames(&self, samples: &[f32]) -> usize {
+        samples.len() / self.hop_length
+    }
+    fn for_each_frame(
+        &self,
+        samples: &[f32],
+        projection: SpectrumProjection,
+        consume: impl FnMut(usize, &[f32]),
+    ) -> Result<(), AudioPreprocessError> {
+        // Dispatch once per analysis, not per bin. Each projection keeps its
+        // own arithmetic, including stable magnitude when squared power would
+        // overflow for otherwise finite FFT coefficients.
+        match projection {
+            SpectrumProjection::Power => {
+                self.projected_frames(samples, |value| value.norm_sqr(), projection, consume)
+            }
+            SpectrumProjection::Magnitude => self.projected_frames(
+                samples,
+                |value| value.re.hypot(value.im),
+                projection,
+                consume,
+            ),
+        }
+    }
+    fn projected_frames(
+        &self,
+        samples: &[f32],
+        project: impl Fn(Complex32) -> f32,
+        projection: SpectrumProjection,
+        mut consume: impl FnMut(usize, &[f32]),
+    ) -> Result<(), AudioPreprocessError> {
+        let mut fft_buffer = Vec::new();
+        fft_buffer.try_reserve_exact(self.n_fft).map_err(|e| {
+            AudioPreprocessError::InvalidConfig(format!(
+                "allocate {}-point FFT buffer: {e}; reduce n_fft or free host memory",
+                self.n_fft
+            ))
+        })?;
+        fft_buffer.resize(self.n_fft, Complex32::default());
+        let mut values = Vec::new();
+        values.try_reserve_exact(self.bins()).map_err(|e| {
+            AudioPreprocessError::InvalidConfig(format!(
+                "allocate {} spectral bins: {e}; reduce n_fft or free host memory",
+                self.bins()
+            ))
+        })?;
+        values.resize(self.bins(), 0.0);
+        for frame in 0..self.frames(samples) {
+            let frame_start = frame * self.hop_length;
+            for (index, value) in fft_buffer.iter_mut().enumerate() {
+                let sample_index =
+                    frame_start as isize + index as isize - (self.n_fft / 2) as isize;
+                value.re = reflected_sample(samples, sample_index) * self.window[index];
+                value.im = 0.0;
+            }
+            self.fft.process(&mut fft_buffer);
+            for (bin, value) in values.iter_mut().enumerate() {
+                *value = project(fft_buffer[bin]);
+            }
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(AudioPreprocessError::InvalidConfig(format!(
+                    "{} spectrum contains nonfinite values; reduce waveform amplitude or rescale before analysis",
+                    projection.name()
+                )));
+            }
+            consume(frame, &values);
+        }
+        Ok(())
+    }
+}
 
+/// Reusable configurable log-mel extractor using centered/reflected power
+/// analysis, Slaney-normalized mel filters and explicit normalization.
+pub struct LogMelExtractor {
+    n_mels: usize,
+    sample_rate: u32,
+    analysis: SpectrumAnalysis,
+    mel_filters: Vec<f32>,
+}
 impl fmt::Debug for LogMelExtractor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LogMelExtractor")
             .field("n_mels", &self.n_mels)
             .field("sample_rate", &self.sample_rate)
-            .field("n_fft", &self.n_fft)
-            .field("hop_length", &self.hop_length)
+            .field("analysis", &self.analysis)
             .finish_non_exhaustive()
+    }
+}
+
+/// Processor-local frequency-major feature matrix, shared by linear and mel
+/// projections without assigning mel units to linear FFT bins.
+#[derive(Clone, Debug)]
+struct FrequencyFeatures {
+    data: Vec<f32>,
+    bins: usize,
+    frames: usize,
+}
+impl From<LogMelFeatures> for FrequencyFeatures {
+    fn from(features: LogMelFeatures) -> Self {
+        Self {
+            data: features.data,
+            bins: features.n_mels,
+            frames: features.n_frames,
+        }
+    }
+}
+#[derive(Debug)]
+struct SpectrogramExtractor {
+    sample_rate: u32,
+    projection: SpectrumProjection,
+    analysis: SpectrumAnalysis,
+}
+impl SpectrogramExtractor {
+    fn new(
+        sample_rate: u32,
+        n_fft: usize,
+        hop_length: usize,
+        win_length: usize,
+        projection: SpectrumProjection,
+        window: AnalysisWindow,
+    ) -> Result<Self, AudioPreprocessError> {
+        if sample_rate == 0 {
+            return Err(AudioPreprocessError::InvalidSampleRate);
+        }
+        Ok(Self {
+            sample_rate,
+            projection,
+            analysis: SpectrumAnalysis::new(n_fft, hop_length, win_length, window)?,
+        })
+    }
+    fn extract(&self, samples: &[f32]) -> Result<FrequencyFeatures, AudioPreprocessError> {
+        let (bins, frames) = (self.analysis.bins(), self.analysis.frames(samples));
+        let count = bins.checked_mul(frames).ok_or_else(|| {
+            AudioPreprocessError::InvalidConfig(
+                "spectrogram dimensions overflow; shorten audio or reduce n_fft".into(),
+            )
+        })?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(count).map_err(|e| {
+            AudioPreprocessError::InvalidConfig(format!(
+                "allocate {count} spectrogram values: {e}; shorten audio or free host memory"
+            ))
+        })?;
+        data.resize(count, 0.0);
+        self.analysis
+            .for_each_frame(samples, self.projection, |frame, values| {
+                for (bin, value) in values.iter().enumerate() {
+                    data[bin * frames + frame] = *value;
+                }
+            })?;
+        Ok(FrequencyFeatures { data, bins, frames })
     }
 }
 
@@ -160,28 +394,15 @@ impl LogMelExtractor {
                 "log-mel requires positive mel bins/sample rate/hop and 1 <= win_length <= n_fft (n_fft >= 2); got bins={n_mels}, sample_rate={sample_rate}, n_fft={n_fft}, hop_length={hop_length}, win_length={win_length}; correct the declared analysis geometry"
             )));
         }
-        let mut window = Vec::new();
-        window.try_reserve_exact(n_fft).map_err(|error| {
-            AudioPreprocessError::InvalidConfig(format!(
-                "allocate {n_fft}-point analysis window: {error}; reduce n_fft or free host memory"
-            ))
-        })?;
-        window.resize(n_fft, 0.0);
-        let offset = (n_fft - win_length) / 2;
-        for index in 0..win_length {
-            window[offset + index] =
-                0.5 - 0.5 * (2.0 * PI * index as f32 / win_length as f32).cos();
-        }
+        // Reject overflowing/unallocatable mel dimensions before constructing
+        // the FFT analysis plan and its scratch/window allocations.
         let mel_filters = create_mel_filterbank(n_mels, sample_rate, n_fft)?;
-        let fft = FftPlanner::<f32>::new().plan_fft_forward(n_fft);
+        let analysis = SpectrumAnalysis::new(n_fft, hop_length, win_length, AnalysisWindow::Hann)?;
         Ok(Self {
             n_mels,
             sample_rate,
-            n_fft,
-            hop_length,
-            window,
+            analysis,
             mel_filters,
-            fft,
         })
     }
 
@@ -237,7 +458,7 @@ impl LogMelExtractor {
         &self,
         frames: std::num::NonZeroUsize,
     ) -> Result<std::num::NonZeroUsize, AudioPreprocessError> {
-        frames.get().checked_mul(self.hop_length).and_then(std::num::NonZeroUsize::new)
+        frames.get().checked_mul(self.analysis.hop_length).and_then(std::num::NonZeroUsize::new)
             .ok_or_else(|| AudioPreprocessError::InvalidConfig("requested frames times analysis hop overflows the waveform window; reduce the frame count or hop".into()))
     }
     /// Exact source clip bound for fixed-frame extraction, through the same
@@ -275,7 +496,7 @@ impl LogMelExtractor {
         &self,
         samples: &[f32],
     ) -> Result<LogMelFeatures, AudioPreprocessError> {
-        let n_frames = samples.len() / self.hop_length;
+        let n_frames = self.analysis.frames(samples);
         let count = self.n_mels.checked_mul(n_frames).ok_or_else(|| {
             AudioPreprocessError::InvalidConfig(
                 "log-mel feature dimensions overflow; shorten audio or reduce num_mel_bins".into(),
@@ -284,33 +505,19 @@ impl LogMelExtractor {
         let mut features = Vec::new();
         features.try_reserve_exact(count).map_err(|error|AudioPreprocessError::InvalidConfig(format!("allocate {count} log-mel feature values: {error}; shorten audio or free host memory")))?;
         features.resize(count, 0.0);
-        let mut fft_buffer = vec![Complex32::default(); self.n_fft];
-        let mut power = vec![0.0; self.n_fft / 2 + 1];
-
-        for frame in 0..n_frames {
-            let frame_start = frame * self.hop_length;
-            for (index, value) in fft_buffer.iter_mut().enumerate() {
-                let sample_index =
-                    frame_start as isize + index as isize - (self.n_fft / 2) as isize;
-                value.re = reflected_sample(samples, sample_index) * self.window[index];
-                value.im = 0.0;
-            }
-            self.fft.process(&mut fft_buffer);
-            for (bin, magnitude) in power.iter_mut().enumerate() {
-                *magnitude = fft_buffer[bin].norm_sqr();
-            }
-
-            for mel in 0..self.n_mels {
-                let filter = &self.mel_filters[mel * power.len()..(mel + 1) * power.len()];
-                let energy = filter
-                    .iter()
-                    .zip(&power)
-                    .map(|(weight, magnitude)| weight * magnitude)
-                    .sum::<f32>()
-                    .max(1e-10);
-                features[mel * n_frames + frame] = energy.log10();
-            }
-        }
+        self.analysis
+            .for_each_frame(samples, SpectrumProjection::Power, |frame, power| {
+                for mel in 0..self.n_mels {
+                    let filter = &self.mel_filters[mel * power.len()..(mel + 1) * power.len()];
+                    let energy = filter
+                        .iter()
+                        .zip(power)
+                        .map(|(weight, magnitude)| weight * magnitude)
+                        .sum::<f32>()
+                        .max(1e-10);
+                    features[mel * n_frames + frame] = energy.log10();
+                }
+            })?;
 
         if features.iter().any(|value| !value.is_finite()) {
             return Err(AudioPreprocessError::InvalidConfig("log-mel power/log values are nonfinite; reduce waveform amplitude or rescale before analysis".into()));
@@ -1475,18 +1682,23 @@ mod geometry_tests {
     }
     #[test]
     fn excessive_mel_dimensions_fail_without_allocation_or_panic() {
-        let error = LogMelExtractor::from_config(LogMelConfig {
-            n_mels: usize::MAX,
-            sample_rate: 8000,
-            n_fft: 16,
-            hop_length: 4,
-            win_length: 16,
-        })
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("filter dimensions overflow"),
-            "{error}"
-        );
+        // The modest FFT exercises ordinary early rejection. The second FFT
+        // would itself fail a window capacity check without allocating, so the
+        // reported error also pins mel admission before analysis construction.
+        for n_fft in [16, isize::MAX as usize] {
+            let error = LogMelExtractor::from_config(LogMelConfig {
+                n_mels: usize::MAX,
+                sample_rate: 8000,
+                n_fft,
+                hop_length: 4,
+                win_length: 16,
+            })
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("filter dimensions overflow"),
+                "n_fft={n_fft}: {error}"
+            );
+        }
     }
     #[test]
     fn thirty_second_padding_uses_the_declared_target_rate() {

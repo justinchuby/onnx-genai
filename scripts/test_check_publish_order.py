@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 
 import unittest
-import tempfile
-import hashlib
-import json
-from pathlib import Path
 
 import check_publish_order
 
@@ -41,50 +37,30 @@ def metadata(packages: list[dict]):
 
 
 class PublishOrderTests(unittest.TestCase):
-    def test_audited_external_vendor_is_not_a_missing_workspace_release(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            directory = root / "vendor" / "external"
-            directory.mkdir(parents=True)
-            manifest = b'[package]\nname = "external"\nversion = "1.9.1"\n'
-            (directory / "Cargo.toml").write_bytes(manifest)
-            record = {
-                "crate": "external", "version": "1.9.1",
-                "source": "https://crates.io/api/v1/crates/external/1.9.1/download",
-                "sha256": "0" * 64,
-                "upstream_file_sha256": {"Cargo.toml": hashlib.sha256(manifest).hexdigest()},
-            }
-            (directory / "UPSTREAM.json").write_text(json.dumps(record))
-            owned = package("consumer", str(root / "consumer" / "Cargo.toml"))
-            owned["dependencies"] = [{"name":"external","path":str(directory),"req":"^1.9.1"}]
-            graph = metadata([owned])
-            graph["workspace_root"] = str(root)
-            graph["metadata"] = {"vendored-crates":["vendor/external/UPSTREAM.json"]}
-            errors, edges = check_publish_order.validate_publish_order(["consumer"], graph, exclusions=frozenset())
-            self.assertEqual(errors, [])
-            self.assertEqual(edges, 0)
-            owned["dependencies"][0]["req"] = "^2.0.0"
-            errors, _ = check_publish_order.validate_publish_order(["consumer"], graph, exclusions=frozenset())
-            self.assertTrue(any("identity/version differs" in error for error in errors))
-            owned["dependencies"][0]["req"] = "^1.9.1"
-            (directory / "Cargo.toml").write_bytes(manifest + b"# unaudited edit\n")
-            errors, _ = check_publish_order.validate_publish_order(["consumer"], graph, exclusions=frozenset())
-            self.assertTrue(any("differs from its published snapshot" in error for error in errors))
-            (directory / "Cargo.toml").write_bytes(manifest)
-            graph["metadata"] = {}
-            errors, _ = check_publish_order.validate_publish_order(["consumer"], graph, exclusions=frozenset())
-            self.assertTrue(any("not a workspace package" in error for error in errors))
+    def test_managed_compiler_is_an_owned_dependency_published_before_engine(self):
+        packages = [
+            package("onnx-genai-llguidance", "/repo/vendor/llguidance/Cargo.toml"),
+            package("onnx-genai-engine", "/repo/crates/onnx-genai-engine/Cargo.toml"),
+        ]
+        packages[1]["dependencies"] = [{"name":"onnx-genai-llguidance","path":"/repo/vendor/llguidance","req":"=0.1.0-dev.6"}]
+        graph = metadata(packages)
+        problems, edges = check_publish_order.validate_publish_order(
+            ["onnx-genai-llguidance", "onnx-genai-engine"], graph, exclusions=frozenset()
+        )
+        self.assertEqual(problems, [])
+        self.assertEqual(edges, 1)
+        problems, _ = check_publish_order.validate_publish_order(
+            ["onnx-genai-engine", "onnx-genai-llguidance"], graph, exclusions=frozenset()
+        )
+        self.assertTrue(any("published later" in problem for problem in problems), problems)
 
-    def test_owned_or_outside_sources_cannot_use_vendor_exemption(self):
+    def test_external_vendor_metadata_cannot_hide_a_missing_release_package(self):
         owned = package("consumer", "/repo/consumer/Cargo.toml")
+        owned["dependencies"] = [{"name":"external","path":"/repo/vendor/external","req":"^1.9.1"}]
         graph = metadata([owned])
-        for declared, message in [
-            (["consumer/UPSTREAM.json"], "workspace-owned"),
-            (["../outside/UPSTREAM.json"], "escapes the workspace"),
-        ]:
-            graph["metadata"] = {"vendored-crates": declared}
-            errors, _ = check_publish_order.validate_publish_order(["consumer"], graph, exclusions=frozenset())
-            self.assertTrue(any(message in error for error in errors), errors)
+        graph["metadata"] = {"vendored-crates":["vendor/external/UPSTREAM.json"]}
+        errors, _ = check_publish_order.validate_publish_order(["consumer"], graph, exclusions=frozenset())
+        self.assertTrue(any("not a workspace package" in error for error in errors), errors)
 
     def test_nested_manifest_dependency_violation_is_detected(self):
         packages = [

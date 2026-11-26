@@ -29,24 +29,20 @@ impl PredictionTimeLimit {
         }
         let started = *self.started.get_or_init(|| now);
         let text = &context.generated_text;
-        let previous = self.observed_bytes.swap(text.len(), Ordering::Relaxed);
         // The native protocol checks the text fragment after removing a matched
         // stop word. A newline that belongs only to the stop word is not emitted.
-        let mut end = text.len();
-        for stop in &self.stops {
-            match stop {
-                StopSequence::Text(stop) if !stop.is_empty() && text.ends_with(stop) => {
-                    end -= stop.len();
-                    break;
-                }
-                StopSequence::Tokens(stop)
-                    if !stop.is_empty() && context.generated_tokens.ends_with(stop) =>
-                {
-                    break;
-                }
-                _ => {}
-            }
-        }
+        let end = crate::logits::text_stop_boundary(
+            text,
+            self.stops
+                .iter()
+                .enumerate()
+                .filter_map(|(index, stop)| match stop {
+                    StopSequence::Text(stop) => Some((index, stop.as_str())),
+                    _ => None,
+                }),
+        )
+        .visible_bytes;
+        let previous = self.observed_bytes.swap(end, Ordering::Relaxed);
         if now.saturating_duration_since(started) > self.limit
             && text
                 .as_bytes()
@@ -110,6 +106,35 @@ mod tests {
                 start + Duration::from_millis(31)
             ),
             Some(ProcessorSignal::PredictionTimeLimit)
+        );
+    }
+    #[test]
+    fn held_stop_prefix_newlines_wait_until_visible_and_hidden_trailing_bytes_never_trigger() {
+        let start = Instant::now();
+        let limit = PredictionTimeLimit::new(
+            Duration::from_millis(10),
+            vec![StopSequence::Text("END\nTAIL".into())],
+        );
+        assert_eq!(limit.signal_at(&context("head", 1), start), None);
+        assert_eq!(
+            limit.signal_at(&context("headEND\n", 2), start + Duration::from_millis(20)),
+            None
+        );
+        assert_eq!(
+            limit.signal_at(&context("headEND\nX", 3), start + Duration::from_millis(30)),
+            Some(ProcessorSignal::PredictionTimeLimit)
+        );
+        let limit = PredictionTimeLimit::new(
+            Duration::from_millis(10),
+            vec![StopSequence::Text("END\nTAIL".into())],
+        );
+        assert_eq!(limit.signal_at(&context("head", 1), start), None);
+        assert_eq!(
+            limit.signal_at(
+                &context("headEND\nTAILsuffix\n", 2),
+                start + Duration::from_millis(20)
+            ),
+            None
         );
     }
     #[test]

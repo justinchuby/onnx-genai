@@ -1,5 +1,34 @@
 use super::*;
 
+/// Capacity describes possible logical growth, not padding on a statically
+/// declared axis. This applies only when execution exposes a logical prefix.
+fn refill_binding_capacity_shape(
+    name: &str,
+    decl: Option<&[Dim]>,
+    physical: &[usize],
+    logical: &[usize],
+    exposes_logical: bool,
+    out: &mut Vec<usize>,
+) -> Result<()> {
+    out.clear();
+    out.extend_from_slice(physical);
+    if !exposes_logical {
+        return Ok(());
+    }
+    let Some(decl) = decl.filter(|d| d.len() == physical.len()) else {
+        return Ok(());
+    };
+    for (axis, dimension) in decl.iter().enumerate() {
+        if let Dim::Static(n) = dimension {
+            if logical.get(axis) != Some(n) || physical[axis] < *n {
+                return Err(EpError::InvalidTensorView{reason:format!("input binding '{name}' axis {axis} must expose static logical extent {n}, with physical capacity at least {n}; got logical {logical:?}, physical {physical:?}. Bind a model-compatible logical shape and sufficient backing")}.into());
+            }
+            out[axis] = *n;
+        }
+    }
+    Ok(())
+}
+
 /// Consume the selected implementation's shape-independent promise before
 /// attempting concrete shape resolution. Unsupported executor-owned structural
 /// nodes have no leaf-kernel requirement. Accepted graph kernels are planned as
@@ -1092,6 +1121,15 @@ impl Executor {
                 .ok_or_else(|| SessionError::InputNotFound {
                     name: (*name).to_string(),
                 })?;
+            // Ordinary host uploads borrow/copy a contiguous byte prefix. A
+            // custom strided Tensor must never be silently reinterpreted as
+            // dense storage; explicit fixed-stride bindings carry that layout.
+            if !tensor.layout.is_contiguous(&tensor.shape) {
+                return Err(SessionError::Internal(format!(
+                    "host input '{name}' has non-contiguous strides {:?} for {:?} shape {:?}; ordinary Tensor uploads require contiguous storage: materialize a contiguous host tensor or use allocate_device_binding_fixed_strides to preserve a physical layout",
+                    tensor.layout.strides, tensor.dtype, tensor.shape
+                )));
+            }
             self.bind_input_shape(name, vid, tensor.dtype, &tensor.shape, &mut bindings)?;
         }
         for (&vid, value) in &external.inputs {
@@ -1716,7 +1754,9 @@ impl Executor {
     /// decode consumes and later steps fault on the workspace invariant (#1179).
     /// Sizing against physical capacity over-reserves (reserve ≥ consume), which
     /// is exactly correct for a reservation; execution still binds the logical
-    /// prefix and fits under it.
+    /// prefix and fits under it. For logical-exposing bindings, declared static
+    /// axes remain fixed after logical/capacity validation; padding on those
+    /// axes still contributes to physical strides/backing, not logical growth.
     pub(super) fn prepare_external_bindings_mode(
         &self,
         bindings: &mut [DeviceIoBinding],
@@ -1809,12 +1849,19 @@ impl Executor {
                         device,
                     });
                 value.dtype = dtype;
-                value.shape.clear();
-                value.shape.extend_from_slice(if plan_capacity {
-                    binding.physical_shape()
+                if plan_capacity {
+                    refill_binding_capacity_shape(
+                        input_name,
+                        self.value_shapes.get(&input_vid).and_then(|s| s.as_deref()),
+                        physical_shape,
+                        binding.logical_shape(),
+                        binding.exposes_logical_input_shape(),
+                        &mut value.shape,
+                    )?;
                 } else {
-                    binding.kernel_input_shape()
-                });
+                    value.shape.clear();
+                    value.shape.extend_from_slice(binding.kernel_input_shape());
+                }
                 value.accepts_subshape = false;
                 if fixed_physical_strides {
                     dispatch::refill_contiguous_strides(
@@ -2087,5 +2134,55 @@ mod output_workspace_metadata_tests {
             ),
             "storage bounds cannot invent the unknown logical view"
         );
+    }
+}
+
+#[cfg(test)]
+mod binding_capacity_shape_tests {
+    use super::*;
+    #[test]
+    fn logical_exposure_preserves_static_axes_without_losing_symbolic_capacity() {
+        let decl = [Dim::Symbolic(SymbolId(0)), Dim::Static(4)];
+        let mut shape = Vec::new();
+        refill_binding_capacity_shape("X", Some(&decl), &[3, 8], &[1, 4], true, &mut shape)
+            .unwrap();
+        assert_eq!(shape, [3, 4]);
+        refill_binding_capacity_shape("X", Some(&decl), &[3, 8], &[1, 4], false, &mut shape)
+            .unwrap();
+        assert_eq!(shape, [3, 8]);
+        refill_binding_capacity_shape("X", None, &[3, 8], &[1, 4], true, &mut shape).unwrap();
+        assert_eq!(shape, [3, 8]);
+        let symbolic = [Dim::Symbolic(SymbolId(0)), Dim::Symbolic(SymbolId(1))];
+        refill_binding_capacity_shape("X", Some(&symbolic), &[3, 8], &[1, 4], true, &mut shape)
+            .unwrap();
+        assert_eq!(shape, [3, 8]);
+        refill_binding_capacity_shape("X", Some(&decl), &[24], &[12], true, &mut shape).unwrap();
+        assert_eq!(shape, [24]); // normal rank validation still owns rank mismatch
+    }
+    #[test]
+    fn static_logical_and_capacity_mismatches_name_the_binding_axis_and_extents() {
+        let decl = [Dim::Symbolic(SymbolId(0)), Dim::Static(4)];
+        for (physical, logical) in [([3, 8], [1, 3]), ([3, 3], [1, 4])] {
+            let text = refill_binding_capacity_shape(
+                "X",
+                Some(&decl),
+                &physical,
+                &logical,
+                true,
+                &mut Vec::new(),
+            )
+            .unwrap_err()
+            .to_string();
+            for detail in [
+                "X",
+                "axis 1",
+                "extent 4",
+                "logical",
+                "physical",
+                "model-compatible",
+            ] {
+                assert!(text.contains(detail), "{text}");
+            }
+        }
     }
 }

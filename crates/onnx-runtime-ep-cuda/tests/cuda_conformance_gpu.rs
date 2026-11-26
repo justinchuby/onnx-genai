@@ -655,7 +655,7 @@ fn conv_transpose_cases() -> Vec<Case> {
             label: "ConvTranspose[2d,grouped,multiple-output-channels]".into(),
             op: "ConvTranspose",
             domain: "",
-            opset: 11,
+            opset: 22,
             inputs: vec![
                 float_input(
                     DataType::BFloat16,
@@ -674,6 +674,34 @@ fn conv_transpose_cases() -> Vec<Case> {
             outputs: vec![(DataType::BFloat16, vec![1, 4, 2, 2])],
             attrs: vec![("group", Attribute::Int(2))],
             compare: Compare::Float { tol: 3e-2 },
+        },
+        Case {
+            label: "ConvTranspose[3d,grouped,dilated,asymmetric]".into(),
+            op: "ConvTranspose",
+            domain: "",
+            opset: 22,
+            inputs: vec![
+                float_input(
+                    DataType::Float32,
+                    &[1, 2, 2, 1, 2],
+                    &[1., 2., 3., 4., -1., -2., -3., -4.],
+                ),
+                float_input(
+                    DataType::Float32,
+                    &[2, 1, 2, 2, 1],
+                    &[1., 2., 3., 4., 0.5, 1.5, -0.5, -1.5],
+                ),
+                float_input(DataType::Float32, &[2], &[0.25, 2.]),
+            ],
+            outputs: vec![(DataType::Float32, vec![1, 2, 4, 2, 3])],
+            attrs: vec![
+                ("group", Attribute::Int(2)),
+                ("strides", Attribute::Ints(vec![2, 1, 2])),
+                ("dilations", Attribute::Ints(vec![2, 1, 1])),
+                ("pads", Attribute::Ints(vec![1, 0, 0, 1, 0, 1])),
+                ("output_padding", Attribute::Ints(vec![1, 0, 1])),
+            ],
+            compare: Compare::Float { tol: 1e-5 },
         },
     ]
 }
@@ -2741,6 +2769,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(sweep("QLinearMatMul", qlinear_matmul_cases()));
     p.push(sweep("Resize", resize_cases()));
     p.push(sweep("ConvTranspose", conv_transpose_cases()));
+    p.push(dedicated(
+        "RoiAlign",
+        "session:roi_align.rs",
+        "Pinned ONNX vectors and batch-index validation with CPU fallback disabled",
+    ));
     p.push(sweep("GridSample", grid_sample_cases()));
     p.push(dedicated(
         "DeformConv",
@@ -3364,6 +3397,73 @@ fn run_case(ep: &CudaExecutionProvider, case: &Case) -> Vec<Vec<u8>> {
         }
     }
     cuda
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn conv_transpose_native_cuda_conformance() {
+    let ep = require_cuda();
+    for case in conv_transpose_cases() {
+        run_case(&ep, &case);
+    }
+
+    // Both SAME modes crop an odd cell on opposite sides in height, and
+    // extend an odd cell on opposite sides in width (effective kernel < stride).
+    let inputs = [
+        float_input(DataType::Float32, &[1, 1, 1, 1], &[2.]),
+        float_input(DataType::Float32, &[1, 1, 3, 1], &[1., 2., 3.]),
+    ];
+    for (mode, expected) in [
+        ("SAME_UPPER", [0., 2., 0., 4.]),
+        ("SAME_LOWER", [4., 0., 6., 0.]),
+    ] {
+        let outputs = run_cuda(
+            &ep,
+            "ConvTranspose",
+            "",
+            22,
+            &inputs,
+            &[(DataType::Float32, vec![1, 1, 2, 2])],
+            &[
+                ("strides", Attribute::Ints(vec![2, 2])),
+                ("auto_pad", Attribute::String(mode.as_bytes().to_vec())),
+            ],
+        );
+        assert_eq!(
+            decode_floats(&outputs[0], DataType::Float32),
+            expected,
+            "{mode}"
+        );
+    }
+
+    // Explicit output_shape ignores supplied pads and still uses output_padding
+    // in the split. DOUBLE values here are deliberately not representable in f32.
+    let x = 1.0_f64 + 2.0_f64.powi(-40);
+    let outputs = run_cuda(
+        &ep,
+        "ConvTranspose",
+        "",
+        22,
+        &[
+            input(DataType::Float64, &[1, 1, 2], &[x, -2.0 * x]),
+            input(DataType::Float64, &[1, 1, 2], &[1.0_f64, 0.5]),
+        ],
+        &[(DataType::Float64, vec![1, 1, 4])],
+        &[
+            ("strides", Attribute::Ints(vec![2])),
+            ("output_shape", Attribute::Ints(vec![4])),
+            ("output_padding", Attribute::Ints(vec![1])),
+            ("pads", Attribute::Ints(vec![0, 2])),
+        ],
+    );
+    assert_eq!(
+        outputs[0],
+        [0.5 * x, -2.0 * x, -x, 0.0].map(f64::to_ne_bytes).concat(),
+        "explicit output_shape must shift the DOUBLE contribution without narrowing"
+    );
 }
 
 #[cfg_attr(

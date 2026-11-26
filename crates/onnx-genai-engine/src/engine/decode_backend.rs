@@ -2,11 +2,74 @@
 
 use super::*;
 
+/// A declared keyed container is a Native execution requirement, not a hint.
+pub(crate) fn admit_keyed_weight_backend(
+    requested: EngineDecodeBackend,
+    declared: bool,
+) -> anyhow::Result<EngineDecodeBackend> {
+    if !declared {
+        return Ok(requested);
+    }
+    anyhow::ensure!(
+        requested != EngineDecodeBackend::Ort,
+        "graph_weights requires the Native backend; select --backend native or materialize ordinary ONNX external data for the ORT reference backend"
+    );
+    #[cfg(feature = "native-backend")]
+    {
+        Ok(EngineDecodeBackend::Native)
+    }
+    #[cfg(not(feature = "native-backend"))]
+    {
+        anyhow::bail!(
+            "graph_weights requires the native-backend build feature; rebuild with Native support or export ordinary ONNX external data"
+        )
+    }
+}
+
+#[cfg(test)]
+mod keyed_backend_tests {
+    use super::*;
+
+    #[test]
+    fn keyed_declarations_require_native_capability_and_preserve_explicit_selection() {
+        for requested in [
+            EngineDecodeBackend::Auto,
+            EngineDecodeBackend::Native,
+            EngineDecodeBackend::Ort,
+        ] {
+            assert_eq!(
+                admit_keyed_weight_backend(requested, false).unwrap(),
+                requested
+            );
+        }
+        let error = admit_keyed_weight_backend(EngineDecodeBackend::Ort, true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("graph_weights requires the Native backend")
+        );
+        for requested in [EngineDecodeBackend::Auto, EngineDecodeBackend::Native] {
+            let result = admit_keyed_weight_backend(requested, true);
+            #[cfg(feature = "native-backend")]
+            assert_eq!(result.unwrap(), EngineDecodeBackend::Native);
+            #[cfg(not(feature = "native-backend"))]
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("native-backend build feature")
+            );
+        }
+    }
+}
+
 pub(crate) fn resolve_decode_backend(
     model_path: &Path,
     requested: EngineDecodeBackend,
+    keyed_weights: bool,
 ) -> anyhow::Result<EngineDecodeBackend> {
-    let requested = requested_decode_backend(requested)?;
+    let requested =
+        admit_keyed_weight_backend(requested_decode_backend(requested)?, keyed_weights)?;
     match requested {
         EngineDecodeBackend::Ort => Ok(EngineDecodeBackend::Ort),
         EngineDecodeBackend::Native => {
@@ -92,7 +155,8 @@ pub(crate) fn ort_to_native_hint() -> &'static str {
 pub(crate) fn native_to_ort_hint() -> &'static str {
     "if this model uses operators unsupported by the native backend, \
      set decode_backend = EngineDecodeBackend::Ort (or ONNX_GENAI_BACKEND=ort) \
-     to run this model on ONNX Runtime"
+     to run this model on ONNX Runtime; packages declaring graph_weights first \
+     require an export with ordinary ONNX external data and no graph_weights bindings"
 }
 
 pub(crate) fn augment_backend_error<T>(
