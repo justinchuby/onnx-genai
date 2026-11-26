@@ -30,7 +30,8 @@ use super::decoded_projection::ProjectionScratch;
 use super::matmul::gemm;
 use super::packed_bytes::{PackedByteDigest, PackedByteSource};
 use super::packed_projection::{PackedProjectionPlan, validate_format};
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use crate::dtype::{can_borrow_dense, to_dense_f32_widen_into, write_dense_f32_narrow};
+use crate::strided::validate_host_storage;
 use onnx_runtime_ir::packed_arithmetic::ActivationArithmetic;
 
 const OP: &str = "BlockQuantizedMatMul";
@@ -206,6 +207,78 @@ impl BlockFormat {
     }
 }
 
+/// A validated source, with no payload read or allocation before admission.
+struct ProjectionInput<'a> {
+    view: &'a TensorView<'a>,
+    elements: usize,
+    borrowed: bool,
+    name: &'static str,
+}
+
+impl<'a> ProjectionInput<'a> {
+    fn new(name: &'static str, view: &'a TensorView<'a>) -> Result<Self> {
+        let elements = match view.dtype {
+            DataType::Float32 => validate_host_storage::<f32>(OP, name, view)?,
+            DataType::Float16 => validate_host_storage::<half::f16>(OP, name, view)?,
+            DataType::BFloat16 => validate_host_storage::<half::bf16>(OP, name, view)?,
+            dtype => {
+                return Err(error(format!(
+                    "{name} has unsupported dtype {dtype:?}; bind Float32, Float16 or BFloat16 storage"
+                )));
+            }
+        };
+        let borrowed = elements == 0 || can_borrow_dense::<f32>(view);
+        Ok(Self {
+            view,
+            elements,
+            borrowed,
+            name,
+        })
+    }
+
+    fn staging_elements(&self) -> usize {
+        if self.borrowed { 0 } else { self.elements }
+    }
+
+    fn read<'b>(&'b self, lane: &'b mut ProjectionScratch<'_>) -> Result<&'b [f32]> {
+        if self.elements == 0 {
+            return Ok(&[]);
+        }
+        if self.borrowed {
+            // SAFETY: construction proves Host span, Float32 dtype, contiguous
+            // layout and alignment. The source lives through this short borrow.
+            return Ok(unsafe {
+                std::slice::from_raw_parts(self.view.data_ptr::<f32>(), self.elements)
+            });
+        }
+        let values = lane.initialized_prefix(self.elements)?;
+        to_dense_f32_widen_into(self.name, self.view, values)?;
+        Ok(values)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct InputStaging {
+    activation: usize,
+    bias: usize,
+}
+
+impl InputStaging {
+    fn for_sources(
+        rows: usize,
+        activation: &ProjectionInput<'_>,
+        bias: Option<&ProjectionInput<'_>>,
+    ) -> Self {
+        if rows == 0 {
+            return Self::default();
+        }
+        Self {
+            activation: activation.staging_elements(),
+            bias: bias.map_or(0, ProjectionInput::staging_elements),
+        }
+    }
+}
+
 pub struct BlockQuantizedMatMulKernel {
     k: usize,
     n: usize,
@@ -304,7 +377,7 @@ impl Kernel for BlockQuantizedMatMulKernel {
         if rows != 0 {
             return Ok(onnx_runtime_ep_api::WorkspacePreparation::Deferred);
         }
-        let (_, requirement) = self.plan_workspace(rows, 0)?;
+        let (_, requirement) = self.plan_workspace(rows, 0, InputStaging::default())?;
         Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
             requirement,
         ))
@@ -321,7 +394,15 @@ impl Kernel for BlockQuantizedMatMulKernel {
         self.prepared_projection.set(None);
         let rows = self.metadata_rows(metadata)?;
         let packed_bytes = self.packed_lane_bytes(rows, inputs)?;
-        let (plan, requirement) = self.plan_workspace(rows, packed_bytes)?;
+        let activation = inputs.first().filter(|v| !v.is_absent()).ok_or_else(|| error("live workspace planning needs activation A; bind its Host tensor view before admission"))?;
+        let activation = ProjectionInput::new("A", activation)?;
+        let bias = inputs
+            .get(2)
+            .filter(|v| !v.is_absent())
+            .map(|v| ProjectionInput::new("bias", v))
+            .transpose()?;
+        let staging = InputStaging::for_sources(rows, &activation, bias.as_ref());
+        let (plan, requirement) = self.plan_workspace(rows, packed_bytes, staging)?;
         self.prepared_projection.set(Some(plan));
         Ok(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready(
             requirement,
@@ -392,9 +473,10 @@ impl BlockQuantizedMatMulKernel {
         &self,
         rows: usize,
         packed_bytes: usize,
+        staging: InputStaging,
     ) -> Result<(PackedProjectionPlan, WorkspaceRequirement)> {
         let plan = PackedProjectionPlan::for_current_pool(self.arithmetic);
-        let (layout, _) = self.execution_workspace_layout(rows, plan, packed_bytes)?;
+        let (layout, _) = self.execution_workspace_layout(rows, plan, packed_bytes, staging)?;
         Ok((
             plan,
             WorkspaceRequirement {
@@ -410,22 +492,34 @@ impl BlockQuantizedMatMulKernel {
         rows: usize,
         plan: PackedProjectionPlan,
         packed_bytes: usize,
-    ) -> Result<(WorkspaceLayout<3>, usize)> {
+        staging: InputStaging,
+    ) -> Result<(WorkspaceLayout<5>, usize)> {
         let result_elements = rows.checked_mul(self.n).ok_or_else(|| error(format!(
             "final output staging element count overflows for rows={rows}, N={}; reduce batch or projection dimensions", self.n
         )))?;
         let result = std::alloc::Layout::array::<f32>(result_elements).map_err(|_| error(format!(
             "final f32 output staging for rows={rows}, N={} exceeds addressable capacity; reduce batch or projection dimensions", self.n
         )))?;
-        // Projection, result and packed staging coexist. Dense-cache hits only
-        // initialize the result region, while the complete admission continues
-        // to cover a later streamed fallback without changing arithmetic.
+        // All regions coexist. Dense hits skip decode and packed staging,
+        // but still consume current activations and bias. Complete admission
+        // covers a streamed fallback without another workspace request.
         let projection = plan.maximum_layout(rows, [(self.k, self.n)])?;
         let packed = std::alloc::Layout::array::<f32>(packed_bytes.div_ceil(4)).map_err(|_| error(format!(
             "packed_B workspace of {packed_bytes} bytes exceeds addressable capacity; reduce projection dimensions"
         )))?;
+        let input_layout = |elements, name| {
+            std::alloc::Layout::array::<f32>(elements).map_err(|_| error(format!(
+            "{name} conversion workspace for {elements} f32 values exceeds addressable capacity; reduce projection dimensions"
+        )))
+        };
         Ok((
-            WorkspaceLayout::new([projection, result, packed])?,
+            WorkspaceLayout::new([
+                projection,
+                result,
+                packed,
+                input_layout(staging.activation, "A")?,
+                input_layout(staging.bias, "bias")?,
+            ])?,
             result_elements,
         ))
     }
@@ -510,25 +604,37 @@ impl BlockQuantizedMatMulKernel {
         }
         let source = PackedByteSource::full(OP, &inputs[1])?;
         let packed_bytes = if m == 0 { 0 } else { source.copy_bytes() };
-        let (layout, result_elements) = self.execution_workspace_layout(m, plan, packed_bytes)?;
+        let activation_source = ProjectionInput::new("A", &inputs[0])?;
+        let bias_source = bias_view
+            .map(|v| ProjectionInput::new("bias", v))
+            .transpose()?;
+        let staging = InputStaging::for_sources(m, &activation_source, bias_source.as_ref());
+        let (layout, result_elements) =
+            self.execution_workspace_layout(m, plan, packed_bytes, staging)?;
         // SAFETY: the executor exclusively lends live Host storage for this
         // dispatch. Complete binding proves capacity, alignment and disjoint
         // regions before materializing any activation, bias or packed payload.
-        let [mut scratch, mut output_staging, mut packed_lane] = unsafe {
+        let [
+            mut scratch,
+            mut output_staging,
+            mut packed_lane,
+            mut activation_lane,
+            mut bias_lane,
+        ] = unsafe {
             ProjectionScratch::bind_layout(
                 "BlockQuantizedMatMul execution workspace binding",
                 layout,
                 workspace,
             )
         }?;
-        let bias = bias_view
-            .map(|view| to_dense_f32_widen(OP, view))
-            .transpose()?;
-
-        let activations = to_dense_f32_widen(OP, &inputs[0])?;
         if m == 0 {
             return write_dense_f32_narrow(OP, &mut outputs[0], &[]);
         }
+        let bias = bias_source
+            .as_ref()
+            .map(|source| source.read(&mut bias_lane))
+            .transpose()?;
+        let activations = activation_source.read(&mut activation_lane)?;
         let dense = if self.arithmetic == ActivationArithmetic::Q8_0 {
             None
         } else {
@@ -602,11 +708,11 @@ impl BlockQuantizedMatMulKernel {
             plan.project(
                 self.format,
                 packed,
-                &activations,
+                activations,
                 m,
                 self.k,
                 self.n,
-                bias.as_deref(),
+                bias,
                 &mut scratch,
                 result,
             )?;
@@ -622,8 +728,8 @@ impl BlockQuantizedMatMulKernel {
         #[cfg(test)]
         BLOCK_QUANTIZED_MATMUL_DENSE_F32_TEST_HITS
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        gemm(&activations, weight_kn, result, m, self.k, self.n)?;
-        if let Some(bias) = bias.as_deref() {
+        gemm(activations, weight_kn, result, m, self.k, self.n)?;
+        if let Some(bias) = bias {
             for row in result.chunks_exact_mut(self.n) {
                 for (value, bias) in row.iter_mut().zip(bias) {
                     *value += bias;
