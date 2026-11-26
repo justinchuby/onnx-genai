@@ -8,7 +8,7 @@ use onnx_runtime_ir::Node;
 
 use super::typed_workspace::TypedWorkspace;
 use crate::dispatch_float;
-use crate::dtype::{ComputeDomain, NumericElem, to_dense, write_dense};
+use crate::dtype::{ComputeDomain, NumericElem, to_dense_into, write_dense};
 
 trait LpAcc: ComputeDomain + PartialOrd {
     const TINY: Self;
@@ -209,13 +209,16 @@ where
             if count == 0 {
                 return Ok(());
             }
-            let x = to_dense::<T>(input)?;
+            // Each (outer, inner) group is disjoint. Snapshot all input
+            // before reducing any group; finish each norm before overwriting
+            // that group's elements. Publish the real output only at the end.
+            to_dense_into::<T>("LpNormalization X snapshot", input, y)?;
             for outer_index in 0..outer {
                 for inner_index in 0..inner {
                     let mut norm = T::Acc::default();
                     for axis_index in 0..axis_len {
                         let index = (outer_index * axis_len + axis_index) * inner + inner_index;
-                        let value = x[index].to_acc().abs();
+                        let value = y[index].to_acc().abs();
                         norm = norm.c_add(if p == 1 { value } else { value.c_mul(value) });
                     }
                     if p == 2 {
@@ -226,7 +229,7 @@ where
                     }
                     for axis_index in 0..axis_len {
                         let index = (outer_index * axis_len + axis_index) * inner + inner_index;
-                        y[index] = T::from_acc(x[index].to_acc().c_div(norm));
+                        y[index] = T::from_acc(y[index].to_acc().c_div(norm));
                     }
                 }
             }

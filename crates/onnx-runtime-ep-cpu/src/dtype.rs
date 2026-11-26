@@ -325,39 +325,109 @@ pub fn to_dense_bool(view: &TensorView) -> Result<Vec<u8>> {
     read_strided::<u8>(view, DataType::Bool)
 }
 
-fn read_strided<T: Copy>(view: &TensorView, want: DataType) -> Result<Vec<T>> {
-    view.validate()?;
-    debug_assert_eq!(
-        std::mem::size_of::<T>(),
-        want.byte_size(),
-        "read_strided element width must match dtype byte size"
-    );
-    if view.dtype != want {
-        return Err(EpError::InvalidTensorView {
-            reason: format!("expected {want:?} view, got {:?}", view.dtype),
-        });
+/// Copy storage elements into an already admitted dense destination without
+/// widening, narrowing or allocating a tensor payload. The owning EP proves
+/// backing bounds and that the destination is disjoint from the source view.
+pub(crate) fn to_dense_into<T: NumericElem>(
+    op: &str,
+    view: &TensorView,
+    out: &mut [T],
+) -> Result<()> {
+    let read = StorageRead::<T>::new(op, view, T::DTYPE)?;
+    if out.len() != read.count {
+        return Err(EpError::KernelFailed(format!(
+            "{op}: storage destination has {} elements, expected {} for {:?} shape {:?}; bind the complete dense destination before copying",
+            out.len(),
+            read.count,
+            view.dtype,
+            view.shape
+        )));
     }
-    let n = numel(view.shape);
-    let mut out = Vec::with_capacity(n);
-    if n == 0 {
-        return Ok(out);
+    read.visit(|index, value| out[index] = value);
+    Ok(())
+}
+
+/// Validated storage-read geometry, shared by allocating and admitted copies.
+struct StorageRead<'view, 'storage, T> {
+    view: &'view TensorView<'storage>,
+    count: usize,
+    element: std::marker::PhantomData<T>,
+}
+impl<'view, 'storage, T: Copy> StorageRead<'view, 'storage, T> {
+    fn new(op: &str, view: &'view TensorView<'storage>, want: DataType) -> Result<Self> {
+        view.validate().map_err(|error| {
+            EpError::KernelFailed(format!(
+                "{op}: invalid source view: {error}; bind valid Host-accessible storage"
+            ))
+        })?;
+        debug_assert_eq!(std::mem::size_of::<T>(), want.byte_size());
+        if view.dtype != want {
+            return Err(EpError::InvalidTensorView {
+                reason: format!(
+                    "{op}: expected {want:?} view, got {:?}; select the matching storage element type",
+                    view.dtype
+                ),
+            });
+        }
+        if !view.device.is_host_accessible() {
+            return Err(EpError::KernelFailed(format!(
+                "{op}: source {:?} on {:?} is not Host-accessible; explicitly transfer it before CPU storage reads",
+                view.dtype, view.device
+            )));
+        }
+        let count = view
+            .shape
+            .iter()
+            .rev()
+            .try_fold(1usize, |n, &d| n.checked_mul(d))
+            .ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "{op}: source shape {:?} overflows dense indexing; reduce dimensions",
+                    view.shape
+                ))
+            })?;
+        std::alloc::Layout::array::<T>(count).map_err(|_| {
+            EpError::KernelFailed(format!(
+                "{op}: source shape {:?} exceeds addressable storage capacity; reduce dimensions",
+                view.shape
+            ))
+        })?;
+        Ok(Self {
+            view,
+            count,
+            element: std::marker::PhantomData,
+        })
     }
-    let origin = view.data_ptr::<T>();
-    let mut idx = vec![0usize; view.shape.len()];
-    loop {
-        let off = elem_offset(view.strides, &idx);
-        // SAFETY: `origin` is the element origin of a validated view; `off` is an
-        // in-shape element offset (each component `< shape[d]`), so the address
-        // lies within the extent the view describes — bounds-checked against the
-        // backing allocation by the owning EP (ep-api invariant #1). `T` is a
-        // plain numeric/`half` type with no invalid bit patterns. `read_unaligned`
-        // because `data_ptr` is a cast from a byte pointer plus an arbitrary
-        // `byte_offset`, so `T`'s alignment is not guaranteed.
-        out.push(unsafe { origin.offset(off).read_unaligned() });
-        if !next_index(view.shape, &mut idx) {
-            break;
+    #[inline]
+    fn visit(self, mut consume: impl FnMut(usize, T)) {
+        if self.count == 0 {
+            return;
+        }
+        let origin = self.view.data_ptr::<T>();
+        if self.view.is_contiguous() {
+            for index in 0..self.count {
+                // SAFETY: validated Host view and matching element type. The
+                // owning EP supplies backing bounds; byte origins may be unaligned.
+                consume(index, unsafe { origin.add(index).read_unaligned() });
+            }
+        } else {
+            let mut coordinates = smallvec::SmallVec::<[usize; 8]>::new();
+            coordinates.resize(self.view.shape.len(), 0);
+            for index in 0..self.count {
+                let offset = elem_offset(self.view.strides, &coordinates);
+                // SAFETY: each coordinate lies inside the validated logical
+                // shape. Backing bounds, including negative strides, are owned
+                // by the EP. Copy raw T bits; no arithmetic conversion occurs.
+                consume(index, unsafe { origin.offset(offset).read_unaligned() });
+                next_index(self.view.shape, &mut coordinates);
+            }
         }
     }
+}
+fn read_strided<T: Copy>(view: &TensorView, want: DataType) -> Result<Vec<T>> {
+    let read = StorageRead::<T>::new("CPU storage read", view, want)?;
+    let mut out = Vec::with_capacity(read.count);
+    read.visit(|_, value| out.push(value));
     Ok(out)
 }
 
@@ -1940,5 +2010,123 @@ mod tests {
                 .to_string()
                 .contains("Host-accessible")
         );
+    }
+    #[test]
+    fn admitted_storage_copy_preserves_raw_bits_strides_offsets_and_unaligned_origins() {
+        fn check<T: NumericElem + Default>(values: &[T]) {
+            let bytes = std::mem::size_of_val(values);
+            let raw = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), bytes) };
+            let mut packed = vec![0xabu8; bytes + 2];
+            packed[1..1 + bytes].copy_from_slice(raw);
+            let shape = [2, 3];
+            for (strides, offset, indices) in [
+                ([3, 1], 0, [0, 1, 2, 3, 4, 5]),
+                ([1, 2], 0, [0, 2, 4, 1, 3, 5]),
+                ([-3, 1], 3, [3, 4, 5, 0, 1, 2]),
+            ] {
+                let mut view = TensorView::new(
+                    onnx_runtime_ep_api::DevicePtr(unsafe { packed.as_ptr().add(1).cast() }),
+                    T::DTYPE,
+                    &shape,
+                    &strides,
+                    onnx_runtime_ir::DeviceId::cpu(),
+                );
+                view.byte_offset = offset * size_of::<T>();
+                let mut out = vec![T::default(); 6];
+                to_dense_into("storage fixture", &view, &mut out).unwrap();
+                let actual =
+                    unsafe { std::slice::from_raw_parts(out.as_ptr().cast::<u8>(), bytes) };
+                let expected = indices
+                    .into_iter()
+                    .flat_map(|i| {
+                        raw[i * size_of::<T>()..(i + 1) * size_of::<T>()]
+                            .iter()
+                            .copied()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+                let allocated = to_dense::<T>(&view).unwrap();
+                assert_eq!(
+                    unsafe { std::slice::from_raw_parts(allocated.as_ptr().cast::<u8>(), bytes) },
+                    actual
+                );
+            }
+            assert_eq!((packed[0], packed[bytes + 1]), (0xab, 0xab));
+        }
+        check(&[
+            f32::from_bits(0x7f801234),
+            -0.,
+            0.,
+            f32::INFINITY,
+            f32::MIN_POSITIVE,
+            17.,
+        ]);
+        check(&[
+            f64::from_bits(0x7ff0000012345678),
+            -0.,
+            0.,
+            f64::INFINITY,
+            f64::MIN_POSITIVE,
+            1e100,
+        ]);
+        check(&[0x7c01, 0x8000, 0, 0x7c00, 1, 0x3c00].map(half::f16::from_bits));
+        check(&[0x7f81, 0x8000, 0, 0x7f80, 1, 0x3f80].map(half::bf16::from_bits));
+    }
+    #[test]
+    fn storage_reads_refuse_bad_destinations_geometry_and_device_before_writes() {
+        let x = crate::kernels::testutil::Owned::f32(&[2, 3], &[1.; 6]);
+        let mut out = [-123.; 6];
+        let error = to_dense_into("X snapshot", &x.view(), &mut out[..5]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("X snapshot: storage destination")
+        );
+        assert_eq!(out, [-123.; 6]);
+        for case in 0..5 {
+            let mut view = x.view();
+            match case {
+                0 => view.dtype = DataType::Float64,
+                1 => view.strides = &[],
+                2 => {
+                    view.device = onnx_runtime_ir::DeviceId::cuda(0);
+                    view.data = onnx_runtime_ep_api::DevicePtr(4usize as *const _);
+                }
+                3 => {
+                    view.shape = &[0, usize::MAX, 2];
+                    view.strides = &[0, 2, 1];
+                }
+                _ => {
+                    view.shape = &[isize::MAX as usize];
+                    view.strides = &[1];
+                }
+            }
+            let error = to_dense_into::<f32>("X snapshot", &view, &mut out).unwrap_err();
+            assert!(error.to_string().contains("X snapshot"), "{error}");
+            assert_eq!(out, [-123.; 6]);
+        }
+        let mut gpu = x.view();
+        gpu.device = onnx_runtime_ir::DeviceId::cuda(0);
+        gpu.data = onnx_runtime_ep_api::DevicePtr(4usize as *const _);
+        assert!(
+            to_dense::<f32>(&gpu)
+                .unwrap_err()
+                .to_string()
+                .contains("Host-accessible")
+        );
+        let empty = crate::kernels::testutil::Owned::zeros_f32(&[0]);
+        to_dense_into::<f32>("empty", &empty.view(), &mut []).unwrap();
+        let mut empty_gpu = empty.view();
+        empty_gpu.device = onnx_runtime_ir::DeviceId::cuda(0);
+        assert!(to_dense_into::<f32>("empty", &empty_gpu, &mut []).is_err());
+        let shape = [0];
+        let view = TensorView::new(
+            onnx_runtime_ep_api::DevicePtr(std::ptr::null()),
+            DataType::Float32,
+            &shape,
+            &[1],
+            onnx_runtime_ir::DeviceId::cpu(),
+        );
+        assert!(to_dense_into::<f32>("empty", &view, &mut []).is_err());
     }
 }
