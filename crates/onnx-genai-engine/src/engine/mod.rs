@@ -76,6 +76,10 @@ mod model;
 #[cfg(feature = "native-backend")]
 mod native_session_snapshot;
 #[cfg(feature = "native-backend")]
+mod token_history;
+#[cfg(feature = "native-backend")]
+pub(crate) use token_history::NativeTokenHistory;
+#[cfg(feature = "native-backend")]
 mod native_slot;
 #[cfg(feature = "native-backend")]
 mod native_state_identity;

@@ -16,7 +16,7 @@ use onnx_runtime_memory_governor::{MemoryGovernor, MemoryLease};
 pub struct NativeSessionSnapshot {
     pub(super) origin: SessionForkOrigin,
     pub(super) source: SessionId,
-    pub(super) tokens: Vec<TokenId>,
+    pub(super) tokens: NativeTokenHistory,
     pub(super) state: crate::native_decode::NativePastSnapshot,
     pub(super) _leases: Vec<MemoryLease>,
 }
@@ -99,13 +99,8 @@ impl Engine {
             native.current_len(),
             logical.tokens.len()
         );
-        let token_bytes = u64::try_from(logical.tokens.len())?
-            .checked_mul(u64::try_from(std::mem::size_of::<TokenId>())?)
-            .context("native session token snapshot size overflow")?;
-        let bytes = native
-            .past_snapshot_bytes()?
-            .checked_add(token_bytes)
-            .context("native session snapshot size overflow")?;
+        // Logical history is an immutable shared owner, not another payload copy.
+        let bytes = native.past_snapshot_bytes()?;
         let lease = reserve(self.governor.memory(), bytes).with_context(|| {
             format!("reserve complete state capture for native session {session}")
         })?;
@@ -276,7 +271,7 @@ impl Engine {
             NativeSessionSnapshot {
                 origin: self.session_fork_origin,
                 source: target,
-                tokens: decoded.tokens,
+                tokens: self.admit_native_token_history(&decoded.tokens, &[])?,
                 state: decoded.state,
                 _leases: decoded.leases,
             },
@@ -357,8 +352,8 @@ mod tests {
         )
     }
 
-    fn request(tokens: Vec<TokenId>, count: usize) -> GenerateRequest {
-        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(tokens));
+    fn request(tokens: impl AsRef<[TokenId]>, count: usize) -> GenerateRequest {
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(tokens.as_ref().to_vec()));
         request.options.max_new_tokens = count;
         request.options.temperature = 0.0;
         request.options.stop_on_eos = false;
@@ -415,7 +410,10 @@ mod tests {
                 engine.native_session.as_ref().unwrap().last_hidden(),
                 hidden.as_deref()
             );
-            assert_eq!(engine.native_sessions[&target].tokens, original);
+            assert_eq!(
+                &(engine.native_sessions[&target].tokens)[..],
+                &(original)[..]
+            );
             assert_eq!(engine.native_active_session, Some(target));
             assert_eq!(engine.native_sessions[&target].generation, 2);
             assert_eq!(
@@ -458,7 +456,7 @@ mod tests {
         engine.generate_in_session(source, request(tokens.clone(), 2))?;
         engine.restore_native_session(source, capture)?;
         assert_same_physical(&mut engine, &baseline)?;
-        assert_eq!(engine.native_sessions[&source].tokens, tokens);
+        assert_eq!(&(engine.native_sessions[&source].tokens)[..], &(tokens)[..]);
         engine.generate_in_session(source, request(tokens, 1))?;
         Ok(())
     }
@@ -516,7 +514,10 @@ mod tests {
             .token_ids;
         engine.restore_native_session(session, capture)?;
         assert_same_physical(&mut engine, &baseline)?;
-        assert_eq!(engine.native_sessions[&session].tokens, tokens);
+        assert_eq!(
+            &(engine.native_sessions[&session].tokens)[..],
+            &(tokens)[..]
+        );
         assert_eq!(
             engine
                 .generate_in_session(session, request(tokens, 3))?
@@ -539,7 +540,7 @@ mod tests {
         let error = engine.capture_native_session(source).unwrap_err();
         assert!(format!("{error:#}").contains("reserve complete state capture"));
         assert_same_physical(&mut engine, &baseline)?;
-        assert_eq!(engine.native_sessions[&source].tokens, tokens);
+        assert_eq!(&(engine.native_sessions[&source].tokens)[..], &(tokens)[..]);
         assert_eq!(engine.native_access_counter, stamp);
         drop(guard);
         let capture = engine.capture_native_session(source)?;
@@ -547,7 +548,7 @@ mod tests {
         let error = engine.restore_native_session(source, capture).unwrap_err();
         assert!(format!("{error:#}").contains("reserve rollback state"));
         assert_same_physical(&mut engine, &baseline)?;
-        assert_eq!(engine.native_sessions[&source].tokens, tokens);
+        assert_eq!(&(engine.native_sessions[&source].tokens)[..], &(tokens)[..]);
         assert_eq!(engine.native_access_counter, stamp);
         drop(guard);
         Ok(())
@@ -564,7 +565,7 @@ mod tests {
         engine.close_session(source)?;
         let target = engine.create_session()?;
         engine.restore_native_session(target, capture)?;
-        assert_eq!(engine.native_sessions[&target].tokens, tokens);
+        assert_eq!(&(engine.native_sessions[&target].tokens)[..], &(tokens)[..]);
         engine.generate_in_session(target, request(tokens, 2))?;
         Ok(())
     }
@@ -593,7 +594,7 @@ mod tests {
                 .contains("different engine instance or generation")
         );
         assert_same_physical(&mut b, &before)?;
-        assert_eq!(b.native_sessions[&target].tokens, tokens);
+        assert_eq!(&(b.native_sessions[&target].tokens)[..], &(tokens)[..]);
         assert_eq!(b.native_access_counter, stamp);
         a.advance_session_fork_generation_for_test();
         // A snapshot becomes stale when the engine ownership generation changes.
@@ -622,13 +623,18 @@ mod tests {
         engine.generate_in_session(source, request(vec![0], 3))?;
         let used = || MemoryGovernor::used(engine.governor.memory(), Tier::Host);
         let before = used();
-        let token_bytes = engine.native_sessions[&source].tokens.len() as u64
-            * std::mem::size_of::<TokenId>() as u64;
         let stamp = engine.native_access_counter;
         let capture = engine.capture_native_session(source)?;
+        assert!(
+            std::ptr::eq(
+                capture.tokens.as_slice().as_ptr(),
+                engine.native_sessions[&source].tokens.as_slice().as_ptr()
+            ),
+            "snapshot must share the funded logical-history owner without copying"
+        );
         assert_eq!(
             MemoryGovernor::used(engine.governor.memory(), Tier::Host) - before,
-            capture.state_bytes() + token_bytes
+            capture.state_bytes()
         );
         assert_eq!(engine.native_access_counter, stamp);
         drop(capture);
@@ -663,7 +669,7 @@ mod tests {
         assert!(format!("{error:#}").contains("after CPU KV writes"));
         assert_same_physical(&mut engine, &before)?;
         assert_eq!(engine.native_active_session, Some(target));
-        assert_eq!(engine.native_sessions[&target].tokens, tokens);
+        assert_eq!(&(engine.native_sessions[&target].tokens)[..], &(tokens)[..]);
         assert_eq!(engine.native_sessions[&target].generation, generation);
         assert_eq!(
             engine.native_access_counter,

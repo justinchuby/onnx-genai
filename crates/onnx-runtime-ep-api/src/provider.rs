@@ -1217,6 +1217,32 @@ pub trait SealedDeviceAllocation: Send + Sync {
     fn runtime_identity(&self) -> usize;
 }
 
+/// Exact funding domain for every ordinary Host buffer produced by an EP.
+/// This proves buffer funding only, not complete session/worker ownership.
+#[derive(Clone, Debug)]
+pub struct HostPayloadFunding {
+    authority: onnx_runtime_memory_api::MemoryAuthorityId,
+    manager: onnx_runtime_memory_governor::ProcessMemoryManager,
+}
+impl HostPayloadFunding {
+    /// Providers must supply the authority and manager retained by their actual
+    /// ordinary-buffer owner, rather than a separately configured budget.
+    pub fn new(
+        authority: onnx_runtime_memory_api::MemoryAuthorityId,
+        manager: onnx_runtime_memory_governor::ProcessMemoryManager,
+    ) -> Self {
+        Self { authority, manager }
+    }
+    /// Both identities must match; either alone is insufficient funding proof.
+    pub fn matches(
+        &self,
+        authority: onnx_runtime_memory_api::MemoryAuthorityId,
+        manager: &onnx_runtime_memory_governor::ProcessMemoryManager,
+    ) -> bool {
+        self.authority == authority && self.manager.is_same_instance(manager)
+    }
+}
+
 /// The core EP interface. Every backend crate implements this (§4.1).
 pub trait ExecutionProvider: Send + Sync {
     /// EP identifier (snake_case, e.g. `"cpu_ep"`, `"cuda_ep"`).
@@ -1224,6 +1250,12 @@ pub trait ExecutionProvider: Send + Sync {
 
     fn device_type(&self) -> DeviceType;
     fn device_id(&self) -> DeviceId;
+
+    /// Return this only when ordinary Host allocations retain the reported
+    /// authority and process-manager owners through their physical release.
+    fn host_payload_funding(&self) -> Option<HostPayloadFunding> {
+        None
+    }
 
     /// Ambient context reader required to memoize this provider's workspace bounds.
     /// Caches must include its read key alongside tensor metadata. The reader

@@ -158,6 +158,7 @@ holder_registry! {
     NativeSessionSnapshot = 15,
     /// Request-owned contextual decoder, candidate frontier and publication buffers.
     DecoderTransforms = 16,
+    NativeTokenHistory = 17,
 }
 
 impl Holder {
@@ -176,6 +177,7 @@ impl Holder {
             | Holder::DecoderTurnSnapshot
             | Holder::OrtPrefixSnapshot
             | Holder::NativeSessionSnapshot => MemoryRole::KvCache,
+            Holder::NativeTokenHistory => MemoryRole::KvCache,
             Holder::DecoderTransforms => MemoryRole::Workspace { step_scoped: false },
             Holder::Activations => MemoryRole::Activation,
             Holder::FixedDeviceReservation => MemoryRole::Weights,
@@ -202,6 +204,7 @@ impl Holder {
             Holder::OrtPrefixSnapshot => "portable ORT prefix snapshots",
             Holder::NativeSessionSnapshot => "complete native session snapshots",
             Holder::DecoderTransforms => "contextual decoder workspace",
+            Holder::NativeTokenHistory => "Native logical token history",
             Holder::Activations => "activations",
             Holder::FixedDeviceReservation => "fixed device reservation",
             Holder::PipelineComponentPool => "pipeline component device pool",
@@ -221,7 +224,7 @@ impl Holder {
             // Charging it to `Device` would let it exhaust host RAM while the
             // device ledger still reported headroom.
             Holder::KvPool | Holder::PipelineKvPool | Holder::DraftKvPool => Tier::Host,
-            Holder::CpuDerivedWeights | Holder::DecoderTurnSnapshot | Holder::OrtPrefixSnapshot | Holder::NativeSessionSnapshot | Holder::DecoderTransforms => Tier::Host,
+            Holder::CpuDerivedWeights | Holder::DecoderTurnSnapshot | Holder::OrtPrefixSnapshot | Holder::NativeSessionSnapshot | Holder::DecoderTransforms | Holder::NativeTokenHistory => Tier::Host,
             Holder::WeightResidency
             | Holder::RecurrentState
             | Holder::RecurrentPrefixSnapshot

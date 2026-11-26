@@ -81,6 +81,7 @@ impl Engine {
     ) -> anyhow::Result<NativeStateFileSummary> {
         self.require_native_slot()?;
         let decoded = self.read_native_file(reader, limits)?;
+        let history = self.admit_native_token_history(&decoded.tokens, &[])?;
         let report = NativeStateFileSummary {
             logical_tokens: decoded.tokens.len(),
             materialized_tokens: decoded.state.len(),
@@ -95,7 +96,7 @@ impl Engine {
                 NativeSessionSnapshot {
                     origin: self.session_fork_origin,
                     source: id,
-                    tokens: decoded.tokens,
+                    tokens: history.clone(),
                     state: decoded.state,
                     _leases: decoded.leases,
                 },
@@ -112,7 +113,7 @@ impl Engine {
             self.native_sessions.insert(
                 id,
                 NativeSessionState {
-                    tokens: decoded.tokens,
+                    tokens: history.clone(),
                     last_access: stamp,
                     generation: 1,
                     poison: None,
@@ -275,10 +276,10 @@ mod tests {
             e.native_slot_state().unwrap().materialized_tokens,
             saved.materialized_tokens
         );
-        assert_eq!(e.native_sessions[&named].tokens, tokens);
+        assert_eq!(&(e.native_sessions[&named].tokens)[..], &(tokens)[..]);
         assert_eq!(e.native_sessions[&named].generation, generation);
         assert_eq!(e.erase_native_slot_state()?, saved.materialized_tokens);
-        assert_eq!(e.native_sessions[&named].tokens, tokens);
+        assert_eq!(&(e.native_sessions[&named].tokens)[..], &(tokens)[..]);
         Ok(())
     }
     #[test]

@@ -649,8 +649,8 @@ struct NativeSessionsRef<'a>(&'a Engine);
 /// A target at or beyond the decoder cursor removes only unmaterialized logical
 /// tokens, so capability checks for a physical CSA/HCA rewind do not apply.
 #[cfg(feature = "native-backend")]
-fn apply_native_rewind<T>(
-    logical_tokens: Option<&mut Vec<T>>,
+fn apply_native_rewind(
+    truncate_logical: impl FnOnce(usize),
     logical_target: usize,
     materialized_len: Option<usize>,
     rewind_materialized: impl FnOnce(usize) -> anyhow::Result<()>,
@@ -661,9 +661,7 @@ fn apply_native_rewind<T>(
             rewind_materialized(target)?;
         }
     }
-    if let Some(tokens) = logical_tokens {
-        tokens.truncate(logical_target);
-    }
+    truncate_logical(logical_target);
     Ok(())
 }
 
@@ -750,7 +748,11 @@ impl SessionStore for NativeSessions<'_> {
             .get_mut(&id)
             .map(|state| &mut state.tokens);
         apply_native_rewind(
-            logical_tokens,
+            |target| {
+                if let Some(tokens) = logical_tokens {
+                    tokens.truncate(target);
+                }
+            },
             position,
             materialized_len,
             |physical_target| {
@@ -1273,19 +1275,19 @@ impl Engine {
                 if let Some(control) = control {
                     control.require_commit()?;
                 }
-                Ok(result)
+                let history = self.admit_native_token_history(&prompt_tokens, &result.token_ids)?;
+                Ok((result, history))
             }),
             EngineDecodeBackend::Native,
         );
         let result = match result {
-            Ok(mut result) => {
+            Ok((mut result, history)) => {
                 let stamp = self.touch_native_session();
                 let state = self
                     .native_sessions
                     .get_mut(&retained)
                     .expect("admitted default cache remains until commit");
-                state.tokens.clone_from(&prompt_tokens);
-                state.tokens.extend_from_slice(&result.token_ids);
+                state.tokens = history;
                 state.last_access = stamp;
                 let _outcome = turn.commit()?;
                 self.native_active_session = Some(retained);
@@ -1393,7 +1395,7 @@ impl Engine {
         self.native_sessions.insert(
             id,
             NativeSessionState {
-                tokens: Vec::new(),
+                tokens: NativeTokenHistory::default(),
                 last_access,
                 generation: 1,
                 poison: None,
@@ -1790,14 +1792,16 @@ impl Engine {
                     retained_cache_tokens: native.current_len(),
                 })
             })();
+            let result = result
+                .and_then(|result| Ok((result, self.admit_native_token_history(tokens, &[])?)));
             match result {
-                Ok(result) => {
+                Ok((result, history)) => {
                     let last_access = self.touch_native_session();
                     let state = self
                         .native_sessions
                         .get_mut(&session)
                         .context("admitted native prefill session disappeared")?;
-                    state.tokens = tokens.to_vec();
+                    state.tokens = history;
                     state.last_access = last_access;
                     turn.commit()?;
                     if let Some(control) = control {
@@ -4675,10 +4679,11 @@ impl Engine {
             if let Some(control) = control {
                 control.require_commit()?;
             }
-            Ok(result)
+            let history = self.admit_native_token_history(&prompt_tokens, &result.token_ids)?;
+            Ok((result, history))
         });
         let result = match result {
-            Ok(mut result) => {
+            Ok((mut result, history)) => {
                 // Staging validation and cancellation must finish before any
                 // durable history or retention policy changes. The exclusive
                 // engine borrow keeps this admitted session present until here.
@@ -4687,8 +4692,7 @@ impl Engine {
                     .native_sessions
                     .get_mut(&session_id)
                     .expect("admitted native session remains until turn resolution");
-                state.tokens.clone_from(&prompt_tokens);
-                state.tokens.extend_from_slice(&result.token_ids);
+                state.tokens = history;
                 state.last_access = last_access;
                 let _outcome = turn.commit()?;
                 if let Some((boundary, snapshot)) = pending_semantic_snapshot.take() {
@@ -4747,10 +4751,15 @@ mod tests {
     fn native_zero_count_rewind_does_not_touch_materialized_state() {
         let mut tokens = (0..10).collect::<Vec<_>>();
         let mut physical_called = false;
-        apply_native_rewind(Some(&mut tokens), 10, Some(8), |_| {
-            physical_called = true;
-            Ok(())
-        })
+        apply_native_rewind(
+            |target| tokens.truncate(target),
+            10,
+            Some(8),
+            |_| {
+                physical_called = true;
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(tokens.len(), 10);
         assert!(!physical_called);
@@ -4761,10 +4770,15 @@ mod tests {
     fn native_logical_tail_can_shrink_without_rewinding_materialized_state() {
         let mut tokens = (0..10).collect::<Vec<_>>();
         let mut physical_called = false;
-        apply_native_rewind(Some(&mut tokens), 9, Some(8), |_| {
-            physical_called = true;
-            Ok(())
-        })
+        apply_native_rewind(
+            |target| tokens.truncate(target),
+            9,
+            Some(8),
+            |_| {
+                physical_called = true;
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(tokens.len(), 9);
         assert!(!physical_called);
@@ -4776,18 +4790,28 @@ mod tests {
         let mut tokens = (0..10).collect::<Vec<_>>();
         let before = tokens.clone();
         let mut attempts = Vec::new();
-        let error = apply_native_rewind(Some(&mut tokens), 7, Some(8), |target| {
-            attempts.push(target);
-            anyhow::bail!("synthetic physical refusal")
-        })
+        let error = apply_native_rewind(
+            |target| tokens.truncate(target),
+            7,
+            Some(8),
+            |target| {
+                attempts.push(target);
+                anyhow::bail!("synthetic physical refusal")
+            },
+        )
         .unwrap_err();
         assert_eq!(error.to_string(), "synthetic physical refusal");
         assert_eq!(tokens, before);
 
-        apply_native_rewind(Some(&mut tokens), 7, Some(8), |target| {
-            attempts.push(target);
-            Ok(())
-        })
+        apply_native_rewind(
+            |target| tokens.truncate(target),
+            7,
+            Some(8),
+            |target| {
+                attempts.push(target);
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(attempts, [7, 7]);
         assert_eq!(tokens, (0..7).collect::<Vec<_>>());
@@ -5375,7 +5399,7 @@ mod tests {
             )
         };
         let before = used();
-        let mut append = engine.native_sessions[&session].tokens.clone();
+        let mut append = engine.native_sessions[&session].tokens.to_vec();
         append.push(0);
         let append_turn = NativeDecoderTurnParticipant::admit(
             &mut engine,
@@ -5536,7 +5560,10 @@ mod tests {
             "{error:#}"
         );
         assert!(published.is_empty());
-        assert_eq!(engine.native_sessions[&session].tokens, tokens);
+        assert_eq!(
+            &(engine.native_sessions[&session].tokens)[..],
+            &(tokens)[..]
+        );
         let restored = engine.native_session.as_mut().unwrap().snapshot_past()?;
         assert_eq!(restored.len(), baseline.len());
         assert_eq!(
@@ -5626,7 +5653,10 @@ mod tests {
             engine.native_session.as_ref().unwrap().current_len(),
             materialized
         );
-        assert_eq!(engine.native_sessions[&session].tokens, tokens);
+        assert_eq!(
+            &(engine.native_sessions[&session].tokens)[..],
+            &(tokens)[..]
+        );
         assert_eq!(engine.native_sessions[&session].last_access, stamp);
         assert_eq!(engine.scheduler.running_count(), 0);
         replacement.options.max_new_tokens = 1;
@@ -6480,7 +6510,10 @@ mod tests {
             "poison refusal must name the exact repair: {refusal}"
         );
         assert_eq!(engine.native_active_session, Some(sibling));
-        assert_eq!(engine.native_sessions[&sibling].tokens, sibling_tokens);
+        assert_eq!(
+            &(engine.native_sessions[&sibling].tokens)[..],
+            &(sibling_tokens)[..]
+        );
         assert_eq!(engine.native_sessions[&sibling].last_access, sibling_access);
         assert_eq!(engine.native_access_counter, access_counter);
         assert_eq!(engine.last_speculative_stats, speculative_stats);
@@ -6491,7 +6524,10 @@ mod tests {
         assert_eq!(reset.generation, 2);
         assert!(reset.poison.is_none());
         assert!(reset.tokens.is_empty());
-        assert_eq!(engine.native_sessions[&sibling].tokens, sibling_tokens);
+        assert_eq!(
+            &(engine.native_sessions[&sibling].tokens)[..],
+            &(sibling_tokens)[..]
+        );
         let recovered = engine.generate_in_session(poisoned, request)?;
         assert!(!recovered.token_ids.is_empty());
         assert_eq!(engine.native_active_session, Some(poisoned));
@@ -6581,7 +6617,10 @@ mod tests {
             "native logical session {failed} generation 1 is poisoned"
         )));
         assert_eq!(engine.native_active_session, Some(sibling));
-        assert_eq!(engine.native_sessions[&sibling].tokens, sibling_tokens);
+        assert_eq!(
+            &(engine.native_sessions[&sibling].tokens)[..],
+            &(sibling_tokens)[..]
+        );
         assert_eq!(engine.native_sessions[&sibling].last_access, sibling_access);
         assert_eq!(engine.native_access_counter, access_counter);
 
@@ -6618,7 +6657,10 @@ mod tests {
             format!("{reset:#}").contains("injected native decoder reset failure"),
             "reset error must retain its physical cause: {reset:#}"
         );
-        assert_eq!(engine.native_sessions[&session].tokens, before_tokens);
+        assert_eq!(
+            &(engine.native_sessions[&session].tokens)[..],
+            &(before_tokens)[..]
+        );
         assert_eq!(
             engine.native_sessions[&session].generation,
             before_generation
@@ -6660,7 +6702,10 @@ mod tests {
             format!("{close:#}").contains("injected native decoder reset failure"),
             "close error must retain its physical cause: {close:#}"
         );
-        assert_eq!(engine.native_sessions[&session].tokens, before_close_tokens);
+        assert_eq!(
+            &(engine.native_sessions[&session].tokens)[..],
+            &(before_close_tokens)[..]
+        );
         assert_eq!(
             engine.native_sessions[&session].generation,
             before_close_generation
@@ -7240,7 +7285,10 @@ mod tests {
             0,
             "matching logical tokens owned by another physical session cannot count as reuse"
         );
-        assert_eq!(engine.native_sessions[&other].tokens, other_history);
+        assert_eq!(
+            &(engine.native_sessions[&other].tokens)[..],
+            &(other_history)[..]
+        );
         assert_eq!(
             engine
                 .prefill(prefill_request(&[4, 5, 6]))?
@@ -7258,7 +7306,10 @@ mod tests {
         let result = engine.prefill(prefill_request(&prompt))?;
         assert_eq!(result.prompt_tokens, prompt.len());
         let session = engine.native_default_session.unwrap();
-        assert_eq!(engine.native_sessions[&session].tokens, prompt);
+        assert_eq!(
+            &(engine.native_sessions[&session].tokens)[..],
+            &(prompt)[..]
+        );
         assert_eq!(
             engine.native_session.as_ref().unwrap().current_len(),
             prompt.len()
@@ -7279,7 +7330,10 @@ mod tests {
             error.downcast_ref::<crate::GenerationCancelled>().is_some(),
             "{error:#}"
         );
-        assert_eq!(engine.native_sessions[&session].tokens, prompt);
+        assert_eq!(
+            &(engine.native_sessions[&session].tokens)[..],
+            &(prompt)[..]
+        );
         assert_eq!(engine.native_sessions[&session].last_access, access);
         assert_eq!(engine.native_active_session, None);
         assert_eq!(engine.scheduler.running_count(), 0);
@@ -8466,7 +8520,10 @@ mod literal_rollback_tests {
                 engine.native_session.as_ref().unwrap().current_len(),
                 length
             );
-            assert_eq!(engine.native_sessions[&session].tokens, tokens);
+            assert_eq!(
+                &(engine.native_sessions[&session].tokens)[..],
+                &(tokens)[..]
+            );
             assert_eq!(engine.scheduler.running_count(), 0);
             assert_eq!(
                 engine.resource_snapshot().host_ram.used,

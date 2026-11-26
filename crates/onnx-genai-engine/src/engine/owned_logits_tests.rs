@@ -169,3 +169,96 @@ fn actual_native_row_copy_denial_after_forward_rolls_back_and_same_engine_retry_
     );
     Ok(())
 }
+
+#[test]
+fn native_token_history_matching_managed_domain_funds_exactly_one_owner_and_aliases()
+-> anyhow::Result<()> {
+    let (engine, context) = managed_engine()?;
+    let memory = engine.governor.memory().clone();
+    let manager = engine.governor.process_memory_manager();
+    let funding = context
+        .host_payload_funding()
+        .expect("real managed fixture must report its allocation domain");
+    assert!(funding.matches(memory.authority_id(Tier::Host), &manager));
+    let unrelated = onnx_runtime_memory_governor::LedgerGovernor::new(
+        onnx_runtime_memory_governor::LeaseLedger::new_for_device(
+            onnx_runtime_memory_api::DeviceKey::HOST,
+            0,
+            1024 * 1024,
+            0,
+        ),
+    );
+    assert!(
+        !funding.matches(unrelated.authority_id(Tier::Host), &manager),
+        "matching manager alone must not establish this Engine's funding authority"
+    );
+    let before = memory.used(Tier::Host);
+    let physical = manager.process_used(Tier::Host);
+    let history = engine.admit_native_token_history(&[1, 2], &[3])?;
+    assert_eq!(history.as_slice(), [1, 2, 3]);
+    assert_eq!(memory.used(Tier::Host) - before, 12);
+    assert_eq!(manager.process_used(Tier::Host) - physical, 12);
+    let alias = history.clone();
+    assert_eq!(memory.used(Tier::Host) - before, 12);
+    drop(history);
+    assert_eq!(alias.as_slice(), [1, 2, 3]);
+    assert_eq!(memory.used(Tier::Host) - before, 12);
+    drop(alias);
+    assert_eq!(memory.used(Tier::Host), before);
+    assert_eq!(manager.process_used(Tier::Host), physical);
+    Ok(())
+}
+#[test]
+fn native_token_history_same_authority_foreign_manager_keeps_explicit_legacy_boundary()
+-> anyhow::Result<()> {
+    let (mut engine, _context) = managed_engine()?;
+    let memory = engine.governor.memory().clone();
+    let manager = engine.governor.process_memory_manager();
+    let foreign = onnx_runtime_memory_governor::ProcessMemoryManager::new()?;
+    assert!(!manager.is_same_instance(&foreign));
+    let resources = onnx_runtime_ep_cpu::CpuMemoryResources::default().with_buffer_memory(
+        CpuBufferMemory::governed(&foreign, Arc::new(memory.clone()))?,
+    )?;
+    let cpu = Arc::new(CpuExecutionProvider::initialized_with_resources(resources)?);
+    let graph = engine
+        .native_session
+        .as_ref()
+        .unwrap()
+        .inference_session()
+        .graph()
+        .clone();
+    let session = InferenceSession::from_graph_with_provider(
+        graph,
+        Arc::new(onnx_runtime_loader::WeightStore::new()),
+        Path::new("."),
+        cpu,
+        None,
+    )?;
+    let funding = session
+        .host_tensor_allocator()?
+        .host_payload_funding()
+        .unwrap();
+    assert!(!funding.matches(memory.authority_id(Tier::Host), &manager));
+    assert!(funding.matches(memory.authority_id(Tier::Host), &foreign));
+    engine.native_session = Some(
+        crate::native_decode::NativeDecodeSession::from_session_with_io(
+            session,
+            &super::tests::tiny_dense_decoder_io(),
+        )?,
+    );
+    let before = memory.used(Tier::Host);
+    let local = manager.process_used(Tier::Host);
+    let other = foreign.process_used(Tier::Host);
+    let history = engine.admit_native_token_history(&[1, 2], &[3])?;
+    assert_eq!(history.as_slice(), [1, 2, 3]);
+    assert_eq!(memory.used(Tier::Host) - before, 12);
+    assert_eq!(manager.process_used(Tier::Host), local);
+    assert_eq!(
+        foreign.process_used(Tier::Host),
+        other,
+        "foreign manager must not receive an allocation mistaken for this Engine's managed domain"
+    );
+    drop(history);
+    assert_eq!(memory.used(Tier::Host), before);
+    Ok(())
+}

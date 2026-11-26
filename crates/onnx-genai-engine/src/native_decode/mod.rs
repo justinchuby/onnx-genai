@@ -41,6 +41,7 @@ pub use csa::{
     CompressedStateLoadRefusal, CompressedStateTensorPhase, CompressedStateTransitionRefusal,
     compressed_state_map_lookups,
 };
+pub(crate) use tensor::host_tensors_for_session;
 #[cfg(feature = "native-cuda")]
 pub(crate) use tensor::recurrent_state_bytes_from_graph;
 #[cfg(test)]

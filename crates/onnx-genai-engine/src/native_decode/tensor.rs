@@ -2,7 +2,7 @@ use super::*;
 
 /// CPU-owned execution payloads use the actual session domain. CUDA's existing
 /// Host staging remains explicitly standalone until its own migration.
-pub(super) fn host_tensors_for_session(
+pub(crate) fn host_tensors_for_session(
     session: &InferenceSession,
 ) -> anyhow::Result<onnx_runtime_session::HostTensorAllocator> {
     if session.device_id().is_host_accessible() {

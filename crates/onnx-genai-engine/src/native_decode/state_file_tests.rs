@@ -17,8 +17,8 @@ fn load(path: &Path) -> anyhow::Result<Engine> {
         },
     )
 }
-fn request(tokens: Vec<TokenId>, count: usize) -> GenerateRequest {
-    let mut r = GenerateRequest::new(GeneratePrompt::TokenIds(tokens));
+fn request(tokens: impl AsRef<[TokenId]>, count: usize) -> GenerateRequest {
+    let mut r = GenerateRequest::new(GeneratePrompt::TokenIds(tokens.as_ref().to_vec()));
     r.options.max_new_tokens = count;
     r.options.greedy = true;
     r.options.stop_on_eos = false;
@@ -61,7 +61,7 @@ fn assert_state(
     } else {
         assert_eq!(actual.cpu_kv.is_some(), baseline.cpu_kv.is_some());
     }
-    assert_eq!(engine.native_sessions[&target].tokens, tokens);
+    assert_eq!(&(engine.native_sessions[&target].tokens)[..], &(tokens)[..]);
     Ok(())
 }
 

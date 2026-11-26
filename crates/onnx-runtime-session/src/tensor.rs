@@ -1229,6 +1229,10 @@ impl HostTensorAllocator {
         }
         Ok(Self { allocator })
     }
+    /// Ordinary-buffer proof supplied by the actual immutable provider.
+    pub fn host_payload_funding(&self) -> Option<onnx_runtime_ep_api::HostPayloadFunding> {
+        self.allocator.host_payload_funding()
+    }
     pub fn from_raw(&self, dtype: DataType, shape: Vec<usize>, bytes: &[u8]) -> Result<Tensor> {
         Tensor::from_raw_in(Arc::clone(&self.allocator), dtype, shape, bytes)
     }
