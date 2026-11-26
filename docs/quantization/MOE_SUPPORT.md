@@ -672,13 +672,17 @@ lexical captures prevent removal of observable intermediate values.
 | Eligible affine decode + GroupedMatMul | Private AffineQuantizedGroupedMatMul | supported | supported |
 | Eligible DequantizePacked-29 + GroupedMatMul | Private PackedGroupedMatMul | supported | supported |
 | Closed supported affine routed-MoE pattern | Private AffineRoutedMoE | whole-region fusion | retains projection-level execution; no whole-region target |
+| Closed FLOAT split-bank pattern with full-expert Softmax, TopK and unmasked combine | Private AffineSoftmaxFirstMoE | no whole-region target | whole-region fusion on standalone CUDA |
 | Microsoft MoE | Microsoft MoE entry | supported | no equivalent advertised entry |
 | Microsoft QMoE | Microsoft QMoE entry | supported | supported |
 
 QuantizedGroupedFusion precedes AffineMoeFusion on CPU. The latter is installed
 only when its private target is registered. CUDA does not install that whole-MoE
-rewrite. These capability statements do not claim every dense, packed or vendor
-MoE graph can be normalized into one arithmetic implementation. CUDA execution
+rewrite. Standalone CUDA instead installs the softmax-first rewrite: it keeps
+the standard Softmax, ranks its rounded FLOAT probabilities, and publishes the
+staged output only after scale validation. The shipped ORT CUDA plugin does
+not register this private target. These capability statements do not claim every
+dense, packed or vendor MoE graph can be normalized into one arithmetic implementation. CUDA execution
 still requires a CUDA device; Host tests and compile checks do not prove GPU
 numerics or performance.
 
