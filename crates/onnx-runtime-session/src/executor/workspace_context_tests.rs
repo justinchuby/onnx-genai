@@ -513,9 +513,10 @@ fn cpu_three_node_runs_share_one_checkout_and_warm_calls_keep_the_original_grant
     .with_workspace_pool(pool.clone())
     .unwrap();
     let calls = Arc::new(WorkspaceCallCounts::default());
+    let metadata_queries = Arc::new(AtomicUsize::new(0));
     let ep = Arc::new(ContextCountingCpu {
         cpu: CpuExecutionProvider::initialized_with_resources(resources).unwrap(),
-        metadata_queries: Arc::default(),
+        metadata_queries: metadata_queries.clone(),
         workspace_calls: calls.clone(),
     });
     assert!(ep.cpu.workspace_pressure_registry().unwrap().is_none());
@@ -580,6 +581,7 @@ fn cpu_three_node_runs_share_one_checkout_and_warm_calls_keep_the_original_grant
         (1, 1, 3),
         "three actual kernels share one Step owner per execution"
     );
+    assert_eq!(metadata_queries.load(Ordering::Relaxed), 3);
     let first = manager.snapshot().unwrap().allocations;
     assert_eq!(first.len(), 1);
     let physical_bytes = first[0].physical_bytes.unwrap();
@@ -597,6 +599,11 @@ fn cpu_three_node_runs_share_one_checkout_and_warm_calls_keep_the_original_grant
             issuer,
             "warm pool borrow/return is not issuer admission/refund"
         );
+        assert_eq!(
+            metadata_queries.load(Ordering::Relaxed),
+            3,
+            "warm live refinement must reuse the three compiled metadata plans"
+        );
         let current = manager.snapshot().unwrap().allocations;
         assert_eq!(current.len(), 1);
         assert_eq!(current[0].identity, first[0].identity);
@@ -610,6 +617,11 @@ fn cpu_three_node_runs_share_one_checkout_and_warm_calls_keep_the_original_grant
     assert!(after_trim.1 > issuer.1);
     run(&mut executor);
     assert_eq!(calls.snapshot(), (66, 66, 198));
+    assert_eq!(
+        metadata_queries.load(Ordering::Relaxed),
+        3,
+        "workspace trim revokes backing, not stable compiled metadata"
+    );
     assert!(books.callbacks().0 > after_trim.0);
     let second = manager.snapshot().unwrap().allocations;
     assert_eq!(second.len(), 1);
@@ -619,4 +631,158 @@ fn cpu_three_node_runs_share_one_checkout_and_warm_calls_keep_the_original_grant
     pool.trim_idle(u64::MAX).unwrap();
     assert_eq!(books.used(Tier::Host), 0);
     assert_eq!(manager.process_used(Tier::Host), 0);
+}
+
+#[test]
+fn native_no_workspace_nodes_keep_original_unmemoized_dispatch() {
+    let metadata_queries = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(WorkspaceCallCounts::default());
+    let ep = Arc::new(ContextCountingCpu {
+        cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
+        metadata_queries: metadata_queries.clone(),
+        workspace_calls: calls.clone(),
+    });
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([2]));
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([2]));
+    graph.add_input(x);
+    graph.add_output(y);
+    graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(x)], vec![y]));
+    let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), ep, None).unwrap();
+    assert_eq!(
+        executor.plan[0].workspace_planning,
+        onnx_runtime_ep_api::WorkspacePlanning::None
+    );
+    let input = Tensor::from_f32(&[2], &[-1., 2.]).unwrap();
+    for iteration in 1..=8 {
+        assert_eq!(
+            executor.run(&[("x", &input)]).unwrap()[0].to_vec_f32(),
+            [0., 2.]
+        );
+        assert_eq!(calls.snapshot(), (0, 0, iteration));
+        assert_eq!(
+            metadata_queries.load(Ordering::Relaxed),
+            0,
+            "no declared workspace must not gain entry-memo planning work"
+        );
+    }
+}
+
+#[test]
+fn workspace_metadata_memo_hits_allocate_no_host_storage() {
+    let cpu = CpuExecutionProvider::new();
+    let metadata_queries = Arc::new(AtomicUsize::new(0));
+    let node = Node::new(NodeId(0), "Relu", vec![Some(ValueId(0))], vec![ValueId(1)]);
+    let compiled = CachedKernel::new(Box::new(ContextCountingKernel {
+        inner: cpu.get_kernel(&node, &[vec![1]], 17).unwrap(),
+        metadata_queries: metadata_queries.clone(),
+        workspace_calls: Arc::default(),
+    }));
+    let metadata = [TensorMetadata::new(DataType::Float32, &[1], true)];
+    let outputs = [OutputMetadata::tensor(DataType::Float32, &[1])];
+    let context = cpu.workspace_preparation_context().read();
+    let (preparation, cold) = count_host_allocations(|| {
+        compiled
+            .workspace_preparation(context, &metadata, &outputs)
+            .unwrap()
+    });
+    assert!(
+        cold > 0,
+        "cold owned metadata is a positive allocator-observer control"
+    );
+    let ((), warm) = count_host_allocations(|| {
+        for _ in 0..128 {
+            assert_eq!(
+                compiled
+                    .workspace_preparation(context, &metadata, &outputs)
+                    .unwrap(),
+                preparation
+            );
+        }
+    });
+    assert_eq!(warm, 0);
+    assert_eq!(metadata_queries.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn native_deferred_memo_keeps_one_kernel_while_actual_packed_strides_change() {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap()
+        .install(|| {
+            let calls = Arc::new(WorkspaceCallCounts::default());
+            let metadata_queries = Arc::new(AtomicUsize::new(0));
+            let ep = Arc::new(ContextCountingCpu {
+                cpu: CpuExecutionProvider::initialized_with_resources(Default::default()).unwrap(),
+                metadata_queries: metadata_queries.clone(),
+                workspace_calls: calls.clone(),
+            });
+            let mut graph = block_context_graph(true);
+            let w1 = graph.node(NodeId(0)).inputs[2].unwrap();
+            // Use runtime weight storage and expose the same logical output so
+            // fixed-stride device bindings can lend the source.
+            graph.initializers.remove(&w1);
+            graph.add_input(w1);
+            graph.add_output(w1);
+            let mut executor =
+                Executor::build(graph, Arc::new(WeightStore::new()), ep, None).unwrap();
+            let x = Tensor::from_f32(&[3, 32], &[1.; 96]).unwrap();
+            let router = Tensor::from_f32(&[3, 4], &[0.; 12]).unwrap();
+            let codes = (0..4 * 64)
+                .flat_map(|_| std::iter::once(127u8).chain([0x22; 16]))
+                .collect::<Vec<_>>();
+            let contiguous = Tensor::from_raw(DataType::Uint8, vec![4, 64, 1, 17], &codes).unwrap();
+            let mut binding = executor
+                .allocate_device_binding_fixed_strides(
+                    "w1".into(),
+                    "w1".into(),
+                    DataType::Uint8,
+                    vec![4, 64, 1, 34],
+                    vec![4, 64, 1, 17],
+                )
+                .unwrap();
+            let physical = codes
+                .chunks_exact(17)
+                .flat_map(|block| block.iter().copied().chain([0xa5; 17]))
+                .collect::<Vec<_>>();
+            binding.write_bytes(0, &physical).unwrap();
+            let mut base = None;
+            let mut misses = None;
+            for (index, strided) in [false, true, false, true].into_iter().enumerate() {
+                let actual = if strided {
+                    executor
+                        .run_with_device_bindings(
+                            &[("x", &x), ("router", &router)],
+                            std::slice::from_mut(&mut binding),
+                        )
+                        .unwrap()[0]
+                        .as_ref()
+                        .unwrap()
+                        .to_vec_f32()
+                } else {
+                    executor
+                        .run(&[("x", &x), ("router", &router), ("w1", &contiguous)])
+                        .unwrap()[0]
+                        .to_vec_f32()
+                };
+                assert_eq!(actual, [2048.; 96]);
+                let requested = calls.last_request_bytes.load(Ordering::Relaxed);
+                let base = *base.get_or_insert(requested);
+                assert_eq!(requested, base + if strided { 64 * 17 } else { 0 });
+                assert_eq!(
+                    metadata_queries.load(Ordering::Relaxed),
+                    1,
+                    "actual strides must refine a cached Deferred result, not replace metadata"
+                );
+                let current = executor.cache.stats().misses;
+                assert_eq!(
+                    *misses.get_or_insert(current),
+                    current,
+                    "all layouts must execute the same compiled kernel"
+                );
+                assert_eq!(calls.snapshot(), (index + 1, index + 1, index + 1));
+            }
+        });
 }

@@ -183,6 +183,29 @@ of 136 processes and 320 windows, including setup controls, not one inference.
 That study did not qualify its timing cells and cannot establish negligible
 checkout overhead.
 
+Native metadata workspace preparation is memoized by the compiled kernel entry,
+not a raw kernel address or an executor-wide identity table. Each entry retains
+at most its latest provider-context key and canonical input/output dtype, shape
+and presence facts; absent, unresolved and scalar outputs remain distinct.
+Successful `Ready` and `Deferred` answers are both reusable. Failed metadata
+queries do not replace a valid answer. Evicting or reconfiguring a kernel drops
+its memo. Prepare-only traversal of cached entries and their actual dispatch
+share this same memo; cold nested-bound collection that creates temporary kernels
+still queries those temporary kernels directly.
+
+Every launch still calls execution refinement with the current views, including
+after a metadata hit, backing trim, address/stride change, or previous execution
+failure. Execution plans, pointers, owners and final runtime-value requirements
+are never memoized here. Operators declaring no workspace keep the original
+uncached live path, including rejection of an undeclared nonzero request; they
+pay no memo geometry comparison or context read. Warm metadata comparisons use
+borrowed facts and allocate no Host storage. The three-projection regression
+queries metadata three times at cold start and zero times during its 64 warm
+runs, while all 192 live refinements remain. A native MoE regression switches
+contiguous/strided packed input layouts through the same compiled kernel and
+cached Deferred answer, and checks the precise changed staging demand each time.
+These counts establish avoided queries, not a measured latency improvement.
+
 CPU `BlockQuantizedMoE` includes strided compressed-weight staging in the
 same whole-operation workspace as decode scratch, FC activation banks and the
 output accumulator. One serial byte lane holds the maximum non-borrowable FC

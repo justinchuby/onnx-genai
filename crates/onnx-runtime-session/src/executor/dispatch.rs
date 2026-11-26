@@ -679,7 +679,7 @@ impl Executor {
         }
 
         let opset = effective_opset(ctx.graph, node);
-        let kernel = {
+        let compiled = {
             let _s = phase_span!("exec_kernel.get_kernel");
             // Pre-bound fast path: if the binding exists and shapes match, skip
             // the HashMap-key allocation entirely. This is the hot path during
@@ -742,6 +742,7 @@ impl Executor {
                 )
                 .expect("kernel binding resolved immediately before lookup")
         };
+        let kernel = compiled.kernel.as_ref();
         // Preflight cannot compile a node whose inputs become concrete only
         // during runtime shape resolution. If lookup above created that
         // specialization, the cache publication chokepoint invalidated the
@@ -807,7 +808,7 @@ impl Executor {
                 .collect::<Vec<_>>();
             let output_metadata = unresolved_output_metadata(node, ctx.graph);
             let (_, workspace) = ctx.prepare_kernel_workspace(
-                kernel,
+                compiled,
                 inputs,
                 &views,
                 (&output_metadata, &[]),
@@ -972,7 +973,7 @@ impl Executor {
 
         ctx.execute_kernel(
             workspace_planning,
-            kernel,
+            compiled,
             inputs,
             outputs,
             node,
@@ -1966,13 +1967,14 @@ impl KernelDispatchContext<'_> {
     /// existing lifetime slot; no owner is returned to a pool during the call.
     fn prepare_kernel_workspace(
         &mut self,
-        kernel: &dyn Kernel,
+        compiled: &CachedKernel,
         inputs: &[Option<ValueId>],
         views: &[TensorView],
         outputs: (&[OutputMetadata<'_>], &[TensorMut]),
         node: &Node,
         workspace_planning: onnx_runtime_ep_api::WorkspacePlanning,
     ) -> Result<(WorkspaceRequirement, Option<WorkspaceView>)> {
+        let kernel = compiled.kernel.as_ref();
         let (output_metadata, output_views) = outputs;
         let metadata: SmallVec<[TensorMetadata<'_>; 16]> = views
             .iter()
@@ -1997,12 +1999,23 @@ impl KernelDispatchContext<'_> {
                 TensorMetadata::new(view.dtype, view.shape, !view.is_absent())
             })
             .collect();
+        let cached = if workspace_planning == onnx_runtime_ep_api::WorkspacePlanning::Metadata {
+            Some(compiled.workspace_preparation(
+                self.ep.workspace_preparation_context().read(),
+                &metadata,
+                output_metadata,
+            )?)
+        } else {
+            // Undeclared workspace still gets the original live contract and
+            // nonzero-demand rejection, without adding geometry memo overhead.
+            None
+        };
         let preparation = kernel.workspace_requirement_for_execution(
             views,
             output_views,
             &metadata,
             output_metadata,
-            None,
+            cached,
         )?;
         preparation.resolve(kernel, |requirement| {
             self.admit_kernel_workspace(node, workspace_planning, requirement)
@@ -2109,7 +2122,7 @@ impl KernelDispatchContext<'_> {
     fn execute_kernel(
         &mut self,
         workspace_planning: onnx_runtime_ep_api::WorkspacePlanning,
-        kernel: &dyn Kernel,
+        compiled: &CachedKernel,
         inputs: &[Option<ValueId>],
         outputs: &[ValueId],
         node: &Node,
@@ -2118,6 +2131,7 @@ impl KernelDispatchContext<'_> {
         views: &[TensorView],
         outs: &mut [TensorMut],
     ) -> Result<()> {
+        let kernel = compiled.kernel.as_ref();
         let output_metadata: SmallVec<[OutputMetadata<'_>; 8]> =
             outs.iter().map(OutputMetadata::from_view).collect();
         let kernel_inputs = has_lazy_inputs.then(|| {
@@ -2183,7 +2197,7 @@ impl KernelDispatchContext<'_> {
         let execution = {
             let _s = phase_span!("exec_kernel.compute");
             let (_, workspace) = self.prepare_kernel_workspace(
-                kernel,
+                compiled,
                 inputs,
                 views,
                 (&output_metadata, outs),

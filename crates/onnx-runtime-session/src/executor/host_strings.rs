@@ -177,7 +177,7 @@ impl Executor {
             self.kernel_bindings[pi] = Some(key);
             kernel
         };
-        let outputs = kernel.execute_managed_host(&inputs)?;
+        let outputs = kernel.kernel.execute_managed_host(&inputs)?;
         drop(inputs);
         if outputs.len() != plan.outputs.len() {
             return Err(fail(
