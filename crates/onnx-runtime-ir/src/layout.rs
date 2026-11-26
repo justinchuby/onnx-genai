@@ -4,17 +4,54 @@
 //! [`TensorLayout`]. This lets optimization passes track non-contiguous
 //! (transposed / broadcast) layouts and eliminate copies at EP boundaries.
 
-use crate::dtype::DataType;
 use crate::error::IrError;
 
-/// Compute row-major (C-order) contiguous strides, in **elements**, for a shape.
-pub fn compute_contiguous_strides(shape: &[usize]) -> Vec<i64> {
-    let n = shape.len();
-    let mut strides = vec![1i64; n];
-    for i in (0..n.saturating_sub(1)).rev() {
-        strides[i] = strides[i + 1] * shape[i + 1] as i64;
+/// A checked contiguous suffix-stride plan borrowing immutable geometry.
+/// This owns no buffer. Construction validates before callers resize/publish
+/// their reused storage; writing cannot rediscover arithmetic failure.
+pub struct ContiguousStridePlan<'a> {
+    shape: &'a [usize],
+}
+impl<'a> ContiguousStridePlan<'a> {
+    pub fn new(shape: &'a [usize]) -> Result<Self, IrError> {
+        let mut stride = 1u64;
+        for axis in (0..shape.len().saturating_sub(1)).rev() {
+            let dimension = shape[axis + 1] as u64;
+            stride = stride.checked_mul(dimension).filter(|&n| n <= i64::MAX as u64)
+                .ok_or_else(|| IrError::InvalidLayout { shape: shape.to_vec(), reason: format!("contiguous axis {axis} needs suffix product {stride} * {dimension}, exceeding i64::MAX; reduce trailing dimensions") })?;
+        }
+        Ok(Self { shape })
     }
-    strides
+    /// Fill a complete existing buffer. A wrong rank is rejected before writes.
+    pub fn write(&self, out: &mut [i64]) -> Result<(), IrError> {
+        if out.len() != self.shape.len() {
+            return Err(IrError::InvalidLayout {
+                shape: self.shape.to_vec(),
+                reason: format!(
+                    "stride buffer has rank {}, expected {}; resize it before filling",
+                    out.len(),
+                    self.shape.len()
+                ),
+            });
+        }
+        let mut stride = 1u64;
+        for axis in (0..self.shape.len()).rev() {
+            out[axis] = stride as i64;
+            if axis != 0 {
+                stride *= self.shape[axis] as u64;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Compute row-major strides. Only stored suffix strides must fit i64; total
+/// element/byte admission is separate. No wrapped or saturated stride is emitted.
+pub fn compute_contiguous_strides(shape: &[usize]) -> Result<Vec<i64>, IrError> {
+    let plan = ContiguousStridePlan::new(shape)?;
+    let mut strides = vec![0; shape.len()];
+    plan.write(&mut strides)?;
+    Ok(strides)
 }
 
 /// Whether `strides` describe a row-major contiguous layout for `shape`.
@@ -243,38 +280,41 @@ impl TensorLayout {
 
     /// The strides for `shape` under this layout, materializing the implied
     /// contiguous strides when `strides == None`.
-    pub fn resolved_strides(&self, shape: &[usize]) -> Vec<i64> {
-        self.strides
-            .clone()
-            .unwrap_or_else(|| compute_contiguous_strides(shape))
+    pub fn resolved_strides(&self, shape: &[usize]) -> Result<Vec<i64>, IrError> {
+        match &self.strides {
+            Some(strides) if strides.len() == shape.len() => Ok(strides.clone()),
+            Some(strides) => Err(IrError::InvalidLayout {
+                shape: shape.to_vec(),
+                reason: format!(
+                    "explicit strides have rank {}, expected {}",
+                    strides.len(),
+                    shape.len()
+                ),
+            }),
+            None => compute_contiguous_strides(shape),
+        }
     }
 
     /// Reorder axes without copying data (a lazy transpose).
-    pub fn transpose(&self, shape: &[usize], perm: &[usize]) -> Self {
-        let base = self.resolved_strides(shape);
+    pub fn transpose(&self, shape: &[usize], perm: &[usize]) -> Result<Self, IrError> {
+        if perm.len() != shape.len()
+            || perm
+                .iter()
+                .enumerate()
+                .any(|(i, &p)| p >= shape.len() || perm[..i].contains(&p))
+        {
+            return Err(IrError::InvalidLayout {
+                shape: shape.to_vec(),
+                reason: format!("axis permutation {perm:?} must contain every axis exactly once"),
+            });
+        }
+        let base = self.resolved_strides(shape)?;
         let strides = perm.iter().map(|&p| base[p]).collect();
-        Self {
+        Ok(Self {
             strides: Some(strides),
             format: MemoryFormat::Custom,
             alignment: self.alignment,
-        }
-    }
-
-    /// Total backing storage size in bytes: the largest byte offset reachable
-    /// via the strides, plus one element. Handles negative strides.
-    pub fn storage_size(&self, shape: &[usize], dtype: DataType) -> usize {
-        let elem = dtype.byte_size().max(1);
-        match &self.strides {
-            None => shape.iter().product::<usize>() * elem,
-            Some(strides) => {
-                let max_offset: i64 = shape
-                    .iter()
-                    .zip(strides.iter())
-                    .map(|(&dim, &stride)| dim.saturating_sub(1) as i64 * stride.abs())
-                    .sum();
-                (max_offset as usize + 1) * elem
-            }
-        }
+        })
     }
 }
 
@@ -285,7 +325,10 @@ mod tests {
     /// The pre-optimisation `is_contiguous`, verbatim, as a differential
     /// oracle -- it materialised the full stride vector and compared slices.
     fn is_contiguous_reference(shape: &[usize], strides: &[i64]) -> bool {
-        strides == compute_contiguous_strides(shape).as_slice()
+        strides
+            == compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+                .as_slice()
     }
 
     /// The allocation-free walk must agree with the materialise-and-compare
@@ -308,10 +351,12 @@ mod tests {
                 let shape: Vec<usize> = (0..rank).map(|_| next(4) as usize).collect();
                 let strides: Vec<i64> = match next(3) {
                     // Exactly contiguous, so the accepting arm is exercised.
-                    0 => compute_contiguous_strides(&shape),
+                    0 => compute_contiguous_strides(&shape)
+                        .expect("fixture shape has representable contiguous strides"),
                     // Contiguous with one axis disturbed, the near-miss case.
                     1 => {
-                        let mut s = compute_contiguous_strides(&shape);
+                        let mut s = compute_contiguous_strides(&shape)
+                            .expect("fixture shape has representable contiguous strides");
                         if !s.is_empty() {
                             let i = next(s.len() as u64) as usize;
                             s[i] += next(3) as i64 - 1;
@@ -424,7 +469,8 @@ mod tests {
         );
         // Rank above INLINE_RANK still agrees.
         let shape = [2usize, 1, 2, 1, 2, 1, 2, 1, 2, 2];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         assert!(is_dense(&shape, &strides));
         assert_eq!(
             is_dense(&shape, &strides),
@@ -454,6 +500,7 @@ mod tests {
                 // arbitrary ones.
                 let strides: Vec<i64> = if next(2) == 0 {
                     compute_contiguous_strides(&shape)
+                        .expect("fixture shape has representable contiguous strides")
                 } else {
                     (0..rank)
                         .map(|_| next(9) as i64 - 4) // includes 0 and negatives
@@ -503,7 +550,8 @@ mod tests {
         let shape = [2usize; 8];
         assert_eq!(shape.len(), 8, "this test must fill the inline array");
 
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         assert!(is_dense(&shape, &strides));
         assert!(is_dense_reference(&shape, &strides));
 
@@ -529,7 +577,8 @@ mod tests {
     #[test]
     fn ranks_above_the_inline_bound_use_the_heap_path_correctly() {
         let shape = [2usize, 2, 2, 2, 2, 2, 2, 2, 2];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         assert!(shape.len() > 8, "this test must exercise the fallback");
         assert!(is_dense(&shape, &strides));
         assert!(is_dense_reference(&shape, &strides));
@@ -542,9 +591,21 @@ mod tests {
 
     #[test]
     fn contiguous_strides_row_major() {
-        assert_eq!(compute_contiguous_strides(&[2, 3, 4]), vec![12, 4, 1]);
-        assert_eq!(compute_contiguous_strides(&[5]), vec![1]);
-        assert_eq!(compute_contiguous_strides(&[]), Vec::<i64>::new());
+        assert_eq!(
+            compute_contiguous_strides(&[2, 3, 4])
+                .expect("fixture shape has representable contiguous strides"),
+            vec![12, 4, 1]
+        );
+        assert_eq!(
+            compute_contiguous_strides(&[5])
+                .expect("fixture shape has representable contiguous strides"),
+            vec![1]
+        );
+        assert_eq!(
+            compute_contiguous_strides(&[])
+                .expect("fixture shape has representable contiguous strides"),
+            Vec::<i64>::new()
+        );
     }
 
     #[test]
@@ -571,25 +632,19 @@ mod tests {
     #[test]
     fn transpose_swaps_strides() {
         let l = TensorLayout::contiguous();
-        let t = l.transpose(&[2, 3], &[1, 0]);
+        let t = l
+            .transpose(&[2, 3], &[1, 0])
+            .expect("fixture permutation is valid");
         // contiguous [2,3] -> strides [3,1]; transposed -> [1,3]
         assert_eq!(t.strides, Some(vec![1, 3]));
         assert!(!t.is_contiguous(&[3, 2]));
-    }
-
-    #[test]
-    fn storage_size_contiguous_and_strided() {
-        let l = TensorLayout::contiguous();
-        assert_eq!(l.storage_size(&[2, 3], DataType::Float32), 24);
-        // transposed view still covers the same 6 elements
-        let t = l.transpose(&[2, 3], &[1, 0]);
-        assert_eq!(t.storage_size(&[3, 2], DataType::Float32), 24);
     }
 }
 
 #[cfg(test)]
 mod geometry_regression {
     use super::*;
+    use crate::DataType;
     #[test]
     fn empty_counts_ignore_the_position_of_zero_after_large_prefixes() {
         for shape in [
@@ -631,5 +686,84 @@ mod geometry_regression {
         assert_eq!(crate::checked_numel(&[1usize << 63, 2]), None);
         assert!(!is_dense(&[2, 2], &[i64::MIN, 1]));
         assert!(!is_dense(&[2, 2], &[i64::MAX, 1]));
+    }
+}
+
+#[cfg(test)]
+mod fallible_stride_tests {
+    use super::*;
+    #[test]
+    fn only_stored_suffixes_need_signed_capacity() {
+        assert_eq!(compute_contiguous_strides(&[]).unwrap(), Vec::<i64>::new());
+        assert_eq!(compute_contiguous_strides(&[usize::MAX]).unwrap(), [1]);
+        assert_eq!(
+            compute_contiguous_strides(&[usize::MAX, 2]).unwrap(),
+            [2, 1]
+        );
+        assert_eq!(
+            compute_contiguous_strides(&[usize::MAX, 2, 0]).unwrap(),
+            [0, 0, 1]
+        );
+        assert_eq!(compute_contiguous_strides(&[2, 0, 3]).unwrap(), [0, 3, 1]);
+    }
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn unrepresentable_suffixes_are_errors_even_for_empty_tensors() {
+        for shape in [
+            vec![0, usize::MAX, 2],
+            vec![0, 1usize << 62, 4],
+            vec![1, (i64::MAX as usize) + 1],
+        ] {
+            let error = compute_contiguous_strides(&shape).unwrap_err().to_string();
+            assert!(
+                error.contains("axis 0")
+                    && error.contains("suffix product")
+                    && error.contains("reduce trailing"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            compute_contiguous_strides(&[2, 1usize << 62]).unwrap(),
+            [1i64 << 62, 1]
+        );
+    }
+    #[test]
+    fn validated_plan_writes_existing_storage_without_partial_rank_failure() {
+        let plan = ContiguousStridePlan::new(&[2, 3, 4]).unwrap();
+        let mut wrong = [123i64; 4];
+        assert!(
+            plan.write(&mut wrong)
+                .unwrap_err()
+                .to_string()
+                .contains("rank 4")
+        );
+        assert_eq!(wrong, [123; 4]);
+        let mut output = [0; 3];
+        plan.write(&mut output).unwrap();
+        assert_eq!(output, [12, 4, 1]);
+        output.fill(99);
+        plan.write(&mut output).unwrap();
+        assert_eq!(output, [12, 4, 1]);
+    }
+    #[test]
+    fn layout_resolution_and_transpose_reject_bad_rank_and_permutations() {
+        assert!(
+            TensorLayout::strided(vec![1])
+                .resolved_strides(&[2, 3])
+                .is_err()
+        );
+        for perm in [vec![0], vec![0, 0], vec![0, 2]] {
+            assert!(
+                TensorLayout::contiguous()
+                    .transpose(&[2, 3], &perm)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("permutation")
+            );
+        }
+        let value = TensorLayout::contiguous()
+            .transpose(&[2, 3], &[1, 0])
+            .unwrap();
+        assert_eq!(value.resolved_strides(&[3, 2]).unwrap(), [1, 3]);
     }
 }

@@ -787,7 +787,8 @@ mod tests {
     fn add_kernel_requires_workspace_and_execute_fails_closed() {
         let k = WorkspaceAddKernel;
         let shape = [4usize];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let a = [1.0f32, 2.0, 3.0, 4.0];
         let b = [10.0f32, 20.0, 30.0, 40.0];
         let mut out = [0.0f32; 4];
@@ -841,7 +842,8 @@ mod tests {
     fn add_kernel_rejects_undersized_workspace() {
         let k = WorkspaceAddKernel;
         let shape = [4usize];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let a = [1.0f32; 4];
         let b = [1.0f32; 4];
         let mut out = [0.0f32; 4];
@@ -885,7 +887,8 @@ mod tests {
     fn add_kernel_computes_through_a_valid_workspace() {
         let k = WorkspaceAddKernel;
         let shape = [4usize];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let a = [1.0f32, 2.0, 3.0, 4.0];
         let b = [10.0f32, 20.0, 30.0, 40.0];
         let mut out = [0.0f32; 4];

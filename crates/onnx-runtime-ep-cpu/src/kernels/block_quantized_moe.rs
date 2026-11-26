@@ -19,7 +19,9 @@
 //! per worker shard and applied to every routed token in that expert group.
 //! This bounds temporary decoded weight storage without introducing a second
 //! routing or activation implementation. It is row-streamed f32 computation,
-//! not an integer/quantized-domain dot product.
+//! not an integer/quantized-domain dot product. Explicit q8_0 activation
+//! arithmetic instead uses the shared integer-dot path for every FC and skips
+//! dense-f32 cache admission, preserving its arithmetic independently of budgets.
 
 use super::weight_cache::{WeightCache, WeightCacheStatus, WeightLoad, WeightSpec};
 use smallvec::{SmallVec, smallvec};
@@ -36,19 +38,21 @@ use onnx_runtime_ir::{DataType, Node, Shape};
 
 use super::block_quantized_matmul::{
     BlockFormat, DenseWeightCacheKey, DenseWeightIdentity, DenseWeightLayout,
-    decode_dense_weight_into, linear_packed_prepared, projection_plan,
+    decode_dense_weight_into,
 };
 use super::decoded_projection::ProjectionScratch;
 use super::moe::{
     DenseExpertWeights, ExpertProjection, MoeAttributes, MoeWorkspace, RoutingScratch,
 };
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use super::packed_projection::{PackedProjectionPlan, validate_format};
+use super::{check_arity, write_dense_f32};
+use crate::dtype::to_dense_f32_widen;
+use onnx_runtime_ir::packed_arithmetic::ActivationArithmetic;
 
 #[cfg(test)]
 use super::moe::run_expert_grouped;
 
 const OP: &str = "BlockQuantizedMoE";
-const LAYOUT_VERSION: i64 = 1;
 
 pub static BLOCK_QUANT_MOE_CACHED_DENSE_TEST_HITS: AtomicUsize = AtomicUsize::new(0);
 pub static BLOCK_QUANT_MOE_DENSE_EXPANSIONS: AtomicUsize = AtomicUsize::new(0);
@@ -180,16 +184,18 @@ impl BlockQuantizedMoEFactory {
 }
 
 pub struct BlockQuantizedMoEKernel {
+    arithmetic: ActivationArithmetic,
     attributes: MoeAttributes,
     formats: ProjectionFormats,
     constant_inputs: [bool; 9],
     weight_identities: [DenseWeightIdentity; 3],
     weight_cache: WeightCache<DenseWeightCacheKey>,
-    prepared_projection: std::cell::Cell<Option<super::decoded_projection::DecodedProjectionPlan>>,
+    prepared_projection: std::cell::Cell<Option<PackedProjectionPlan>>,
 }
 
 #[derive(Debug)]
 struct ValidatedMetadata {
+    arithmetic: ActivationArithmetic,
     attributes: MoeAttributes,
     formats: ProjectionFormats,
 }
@@ -207,10 +213,12 @@ impl KernelFactory for BlockQuantizedMoEFactory {
 
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let ValidatedMetadata {
+            arithmetic,
             attributes,
             formats,
         } = validate_metadata(node, None)?;
         Ok(Box::new(BlockQuantizedMoEKernel {
+            arithmetic,
             attributes,
             formats,
             constant_inputs: [false; 9],
@@ -262,9 +270,10 @@ impl Kernel for BlockQuantizedMoEKernel {
         // context. A Ready hit needs a new execution plan, not another metadata
         // query. Deferred/uncached requests still take the checked planner.
         let (plan, requirement) = match cached {
-            Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(requirement)) => {
-                (projection_plan(), requirement)
-            }
+            Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(requirement)) => (
+                PackedProjectionPlan::for_current_pool(self.arithmetic),
+                requirement,
+            ),
             _ => self.plan_workspace(metadata)?,
         };
         self.prepared_projection.set(Some(plan));
@@ -295,14 +304,11 @@ impl BlockQuantizedMoEKernel {
     fn plan_workspace(
         &self,
         inputs: &[TensorMetadata<'_>],
-    ) -> Result<(
-        super::decoded_projection::DecodedProjectionPlan,
-        WorkspaceRequirement,
-    )> {
+    ) -> Result<(PackedProjectionPlan, WorkspaceRequirement)> {
         #[cfg(test)]
         WORKSPACE_METADATA_QUERIES.with(|queries| queries.set(queries.get() + 1));
         let dims = validate_runtime_shapes(inputs, None, &self.attributes, self.formats)?;
-        let plan = projection_plan();
+        let plan = PackedProjectionPlan::for_current_pool(self.arithmetic);
         let layout = self.execution_workspace_layout(dims, plan)?;
         Ok((
             plan,
@@ -317,7 +323,7 @@ impl BlockQuantizedMoEKernel {
     fn execution_workspace_layout(
         &self,
         dims: Dimensions,
-        plan: super::decoded_projection::DecodedProjectionPlan,
+        plan: PackedProjectionPlan,
     ) -> Result<WorkspaceLayout<4>> {
         // A validated empty final output cannot consume projections or gathers.
         if dims.rows == 0 || dims.hidden == 0 {
@@ -405,8 +411,8 @@ impl BlockQuantizedMoEKernel {
             fc1_size,
         } = dimensions;
 
-        let input = to_dense_f32(&inputs[0])?;
-        let router_logits = to_dense_f32(&inputs[1])?;
+        let input = to_dense_f32_widen(OP, &inputs[0])?;
+        let router_logits = to_dense_f32_widen(OP, &inputs[1])?;
         let router_weights = optional_dense(inputs, 8)?;
         let fc1_bias = optional_dense(inputs, 3)?;
         let fc2_bias = optional_dense(inputs, 5)?;
@@ -435,30 +441,35 @@ impl BlockQuantizedMoEKernel {
         // A dense resident set must fit as a whole: separately admitting
         // projections can evict an Arc still held by this expert call and
         // hide its live expansion outside the cache's resident-byte count.
-        let dense_bytes = fc1_size
-            .checked_mul(hidden)
-            .and_then(|count| {
-                hidden
-                    .checked_mul(inter)
-                    .and_then(|down| count.checked_add(down))
-            })
-            .and_then(|count| {
-                if optional_input(inputs, 6).is_some() {
-                    inter
-                        .checked_mul(hidden)
-                        .and_then(|up| count.checked_add(up))
-                } else {
-                    Some(count)
-                }
-            })
-            .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
-            .ok_or_else(|| error("expert dense resident-set byte count overflow"))?;
+        let dense_bytes = if self.arithmetic == ActivationArithmetic::Q8_0 {
+            0
+        } else {
+            fc1_size
+                .checked_mul(hidden)
+                .and_then(|count| {
+                    hidden
+                        .checked_mul(inter)
+                        .and_then(|down| count.checked_add(down))
+                })
+                .and_then(|count| {
+                    if optional_input(inputs, 6).is_some() {
+                        inter
+                            .checked_mul(hidden)
+                            .and_then(|up| count.checked_add(up))
+                    } else {
+                        Some(count)
+                    }
+                })
+                .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or_else(|| error("expert dense resident-set byte count overflow"))?
+        };
         let cache_budget = if tasks.is_empty() {
             0
         } else {
             self.weight_cache.byte_limit()
         };
-        let use_dense = dense_bytes <= cache_budget;
+        let use_dense =
+            self.arithmetic == ActivationArithmetic::Float32 && dense_bytes <= cache_budget;
         let mut dense_experts = 0usize;
         let mut streamed_experts = 0usize;
         let mut grant_refusal = None;
@@ -571,7 +582,7 @@ impl BlockQuantizedMoEKernel {
                         .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
                     &self.attributes,
                     |projection, input, rows, bias, output| {
-                        linear_packed_prepared(
+                        plan.project(
                             projection.format,
                             &projection.bytes,
                             input,
@@ -579,7 +590,6 @@ impl BlockQuantizedMoEKernel {
                             projection.in_features,
                             projection.out_features,
                             bias,
-                            plan,
                             &mut scratch,
                             output,
                         )
@@ -595,7 +605,12 @@ impl BlockQuantizedMoEKernel {
         }
         // One annotation describes the whole node; a mixed operation must not
         // report only the final expert's path.
-        if streamed_experts == 0 {
+        if self.arithmetic == ActivationArithmetic::Q8_0 {
+            onnx_runtime_ep_api::record_kernel_variant!(
+                "block_moe.q8_0",
+                "{streamed_experts} compressed integer-dot expert sets; explicit q8_0 activation arithmetic"
+            );
+        } else if streamed_experts == 0 {
             onnx_runtime_ep_api::record_kernel_variant!(
                 "block_moe.dense_resident_set",
                 "{dense_experts} dense expert sets, {dense_bytes} bytes per set; cache budget {cache_budget} bytes"
@@ -1031,6 +1046,7 @@ fn validate_attributes(node: &Node) -> Result<()> {
         if !matches!(
             name.as_str(),
             "k" | "activation_type"
+                | "activation_arithmetic"
                 | "normalize_routing_weights"
                 | "swiglu_fusion"
                 | "activation_alpha"
@@ -1054,7 +1070,7 @@ fn parse_format_attr(node: &Node, name: &str) -> Result<BlockFormat> {
         .ok_or_else(|| error(format!("missing required string attribute '{name}'")))?
         .as_str()
         .ok_or_else(|| error(format!("attribute '{name}' must be a UTF-8 string")))
-        .and_then(BlockFormat::parse)
+        .and_then(BlockFormat::parse_projection)
 }
 
 fn optional_format_attr(node: &Node, name: &str) -> Result<Option<BlockFormat>> {
@@ -1063,7 +1079,7 @@ fn optional_format_attr(node: &Node, name: &str) -> Result<Option<BlockFormat>> 
         Some(attr) => attr
             .as_str()
             .ok_or_else(|| error(format!("attribute '{name}' must be a UTF-8 string")))
-            .and_then(BlockFormat::parse)
+            .and_then(BlockFormat::parse_projection)
             .map(Some),
     }
 }
@@ -1101,17 +1117,20 @@ fn validate_metadata(
 ) -> Result<ValidatedMetadata> {
     validate_attributes(node)?;
     let attributes = MoeAttributes::from_block_quantized_node(node)?;
-    let layout_version = optional_int_attr(node, "block_layout_version")?.unwrap_or(1);
-    if layout_version != LAYOUT_VERSION {
-        return Err(error(format!(
-            "block_layout_version must be {LAYOUT_VERSION}, got {layout_version}"
-        )));
-    }
+
     let formats = parse_projection_formats(node)?;
+    let arithmetic = ActivationArithmetic::from_node(node).map_err(error)?;
+    for format in [Some(formats.fc1), Some(formats.fc2), formats.fc3]
+        .into_iter()
+        .flatten()
+    {
+        validate_format(arithmetic, format)?;
+    }
     if let Some((shapes, dtypes)) = claim_metadata {
         validate_claim_metadata(node, shapes, dtypes, &attributes, formats).map_err(error)?;
     }
     Ok(ValidatedMetadata {
+        arithmetic,
         attributes,
         formats,
     })
@@ -1434,8 +1453,13 @@ fn optional_input<'a>(inputs: &'a [TensorView<'a>], index: usize) -> Option<&'a 
     inputs.get(index).filter(|input| !input.is_absent())
 }
 
-fn optional_dense(inputs: &[TensorView], index: usize) -> Result<Option<Vec<f32>>> {
-    optional_input(inputs, index).map(to_dense_f32).transpose()
+fn optional_dense<'a>(
+    inputs: &'a [TensorView<'_>],
+    index: usize,
+) -> Result<Option<Cow<'a, [f32]>>> {
+    optional_input(inputs, index)
+        .map(|view| to_dense_f32_widen(OP, view))
+        .transpose()
 }
 
 fn checked_product(shape: &[usize], name: &str) -> Result<usize> {
@@ -1444,15 +1468,6 @@ fn checked_product(shape: &[usize], name: &str) -> Result<usize> {
             .checked_mul(dimension)
             .ok_or_else(|| error(format!("{name} overflow")))
     })
-}
-
-fn optional_int_attr(node: &Node, name: &str) -> Result<Option<i64>> {
-    node.attr(name)
-        .map(|attr| {
-            attr.as_int()
-                .ok_or_else(|| error(format!("attribute '{name}' must be an integer")))
-        })
-        .transpose()
 }
 
 fn error(message: impl Into<String>) -> EpError {
@@ -1471,6 +1486,8 @@ mod numerical;
 
 #[cfg(test)]
 mod tests {
+    mod borrowed_inputs_tests;
+
     use super::*;
     use crate::CpuExecutionProvider;
     use crate::kernels::block_quantized_matmul::packed_for_format;
@@ -1481,6 +1498,103 @@ mod tests {
 
     const H: usize = 32;
     const E: usize = 2;
+
+    #[test]
+    fn q8_mixed_three_projection_kernel_matches_closed_form_gates_biases_and_routing() {
+        let rows = 3;
+        let mut spec = attrs("silu", 2, true, 0);
+        for (name, value) in &mut spec {
+            match *name {
+                "fc1_format" => *value = Attribute::String(b"gguf:q4_0".to_vec()),
+                "fc2_format" => *value = Attribute::String(b"q8_0".to_vec()),
+                "block_layout_version" => *value = Attribute::Int(2),
+                _ => {}
+            }
+        }
+        spec = with_fc3_format(spec, "gguf:q4_0");
+        spec.push(("activation_arithmetic", Attribute::String(b"q8_0".to_vec())));
+        let shapes = vec![
+            Some((DataType::Float32, vec![rows, H])),
+            Some((DataType::Float32, vec![rows, E])),
+            Some((DataType::Uint8, vec![E, H, 1, 18])),
+            Some((DataType::Float32, vec![E, H])),
+            Some((DataType::Uint8, vec![E, H, 1, 34])),
+            Some((DataType::Float32, vec![E, H])),
+            Some((DataType::Uint8, vec![E, H, 1, 18])),
+            Some((DataType::Float32, vec![E, H])),
+        ];
+        let (graph, node) = model_node(&shapes, &spec);
+        let ValidatedMetadata {
+            attributes,
+            formats,
+            arithmetic,
+        } = validate_metadata(graph.node(node), None).unwrap();
+        let kernel = BlockQuantizedMoEKernel {
+            arithmetic,
+            attributes,
+            formats,
+            constant_inputs: [true; 9],
+            weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+            weight_cache: WeightCache::new(Default::default(), 1 << 20),
+            prepared_projection: std::cell::Cell::new(None),
+        };
+        // Independent identity matrices: Q4 uses offset binary low/high halves;
+        // Q8 uses signed bytes. No production pack/decode helper is used.
+        let identity = |q4: bool| {
+            let width = if q4 { 18 } else { 34 };
+            let mut bytes = vec![if q4 { 0x88 } else { 0 }; E * H * width];
+            for expert in 0..E {
+                for feature in 0..H {
+                    let block = &mut bytes[(expert * H + feature) * width..][..width];
+                    block[..2].copy_from_slice(&half::f16::ONE.to_le_bytes());
+                    if q4 {
+                        block[2 + feature % 16] += if feature < 16 { 1 } else { 16 };
+                    } else {
+                        block[2 + feature] = 1;
+                    }
+                }
+            }
+            Owned::u8(&[E, H, 1, width], &bytes)
+        };
+        let input = Owned::f32(&[rows, H], &[127.; 3 * H]);
+        let router = Owned::f32(&[rows, E], &[3., -2., -2., 3., 0., 0.]);
+        let w1 = identity(true);
+        let w2 = identity(false);
+        let w3 = identity(true);
+        let zero = Owned::f32(&[E, H], &[0.; E * H]);
+        let bias = Owned::f32(&[E, H], &[1.; E * H]);
+        let views = [
+            input.view(),
+            router.view(),
+            w1.view(),
+            zero.view(),
+            w2.view(),
+            bias.view(),
+            w3.view(),
+            zero.view(),
+        ];
+        let mut output = Owned::zeros_f32(&[rows, H]);
+        for _ in 0..3 {
+            kernel
+                .execute_prepared(&views, &mut [output.view_mut()])
+                .unwrap();
+            // silu(127) rounds to 127 in f32; gate=127, identity down, bias=1.
+            // Identical experts make every normalized route sum to that value.
+            for value in output.to_f32() {
+                assert!((value - 16130.).abs() <= 0.004, "{value}");
+            }
+            assert_eq!(kernel.weight_cache.activity(), (0, 0));
+        }
+        let mut invalid = graph.node(node).clone();
+        invalid
+            .attributes
+            .insert("fc3_format".into(), Attribute::String(b"mxfp4".to_vec()));
+        let error = validate_metadata(&invalid, None).unwrap_err().to_string();
+        assert!(
+            error.contains("q8_0") && error.contains("float32"),
+            "{error}"
+        );
+    }
 
     fn attrs(
         activation: &str,
@@ -1717,8 +1831,10 @@ mod tests {
         let ValidatedMetadata {
             attributes,
             formats,
+            ..
         } = validate_metadata(graph.node(node), None).unwrap();
         let mut kernel = one.install(|| BlockQuantizedMoEKernel {
+            arithmetic: ActivationArithmetic::Float32,
             attributes,
             formats,
             constant_inputs: [false; 9],
@@ -1904,8 +2020,10 @@ mod tests {
         let ValidatedMetadata {
             attributes,
             formats,
+            ..
         } = validate_metadata(graph.node(node), None).unwrap();
         let kernel = BlockQuantizedMoEKernel {
+            arithmetic: ActivationArithmetic::Float32,
             attributes,
             formats,
             constant_inputs: [false, false, true, false, true, false, false, false, false],
@@ -1982,146 +2100,165 @@ mod tests {
             .build()
             .unwrap();
         pool_threads.install(|| {
-        for (activation, fusion, separate) in [
-            ("identity", 0, false),
-            ("swiglu", 1, false),
-            ("swiglu", 2, false),
-            ("swiglu", 0, true),
-            ("silu", 0, true),
-        ] {
-            let (rows, hidden, inter, experts) = (3, 32, 64, 4);
-            let fc1_size = if fusion == 0 { inter } else { 2 * inter };
-            let mut spec = attrs(activation, 2, true, fusion);
-            if separate {
-                spec = with_fc3_format(spec, "mxfp4");
-            }
-            let shapes = vec![
-                Some((DataType::Float32, vec![rows, hidden])),
-                Some((DataType::Float32, vec![rows, experts])),
-                Some((DataType::Uint8, vec![experts, fc1_size, 1, 17])),
-                None,
-                Some((DataType::Uint8, vec![experts, hidden, 2, 17])),
-                None,
-                separate.then(|| (DataType::Uint8, vec![experts, inter, 1, 17])),
-                None,
-            ];
-            let (graph, node) = model_node(&shapes, &spec);
-            let ValidatedMetadata {
-                attributes,
-                formats,
-            } = validate_metadata(graph.node(node), None).unwrap();
-            let books = RecordingGovernor::new_host(1 << 20);
-            let manager = ProcessMemoryManager::new().unwrap();
-            let pool = HostWorkspacePool::governed(&manager, Arc::new(books.clone())).unwrap();
-            let memory = books.weight_memory(HolderId::new(13));
-            let resources = crate::CpuMemoryResources::new(memory.clone(), Default::default())
-                .unwrap()
-                .with_workspace_pool(pool.clone())
-                .unwrap();
-            let cpu = CpuExecutionProvider::initialized_with_resources(resources).unwrap();
-            let kernel = BlockQuantizedMoEKernel {
-                attributes,
-                formats,
-                constant_inputs: [false; 9],
-                weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
-                weight_cache: WeightCache::new(memory, 0),
-                prepared_projection: std::cell::Cell::new(None),
-            };
-            let input = Owned::f32(&[rows, hidden], &vec![0.001; rows * hidden]);
-            // Every row selects experts 0 and 1: each receives all rows, while
-            // experts 2 and 3 receive none. The bound must cover this skew.
-            let router = Owned::f32(&[rows, experts], &[4., 3., -4., -5.].repeat(rows));
-            let w1 = Owned::u8(
-                &[experts, fc1_size, 1, 17],
-                &packed_for_format(BlockFormat::Mxfp4, experts, fc1_size, hidden),
-            );
-            let w2 = Owned::u8(
-                &[experts, hidden, 2, 17],
-                &packed_for_format(BlockFormat::Mxfp4, experts, hidden, inter),
-            );
-            let w3 = separate.then(|| {
-                Owned::u8(
-                    &[experts, inter, 1, 17],
-                    &packed_for_format(BlockFormat::Mxfp4, experts, inter, hidden),
-                )
+            for (arithmetic, format) in [
+                (ActivationArithmetic::Float32, BlockFormat::Mxfp4),
+                (ActivationArithmetic::Q8_0, BlockFormat::Q8_0),
+            ] {
+                let block_bytes = format.block_bytes();
+                for (activation, fusion, separate) in [
+                    ("identity", 0, false),
+                    ("swiglu", 1, false),
+                    ("swiglu", 2, false),
+                    ("swiglu", 0, true),
+                    ("silu", 0, true),
+                ] {
+                    let (rows, hidden, inter, experts) = (3, 32, 64, 4);
+                    let fc1_size = if fusion == 0 { inter } else { 2 * inter };
+                    let mut spec = attrs(activation, 2, true, fusion);
+                    if separate {
+                        spec = with_fc3_format(spec, "mxfp4");
+                    }
+                    if arithmetic == ActivationArithmetic::Q8_0 {
+                        for (name, value) in &mut spec {
+                            match *name {
+                                "fc1_format" | "fc2_format" | "fc3_format" => *value = Attribute::String(b"q8_0".to_vec()),
+                                "block_layout_version" => *value = Attribute::Int(2),
+                                _ => {}
+                            }
+                        }
+                        spec.push(("activation_arithmetic", Attribute::String(b"q8_0".to_vec())));
+                    }
+                    let shapes = vec![
+                        Some((DataType::Float32, vec![rows, hidden])),
+                        Some((DataType::Float32, vec![rows, experts])),
+                        Some((DataType::Uint8, vec![experts, fc1_size, 1, block_bytes])),
+                        None,
+                        Some((DataType::Uint8, vec![experts, hidden, 2, block_bytes])),
+                        None,
+                        separate.then(|| (DataType::Uint8, vec![experts, inter, 1, block_bytes])),
+                        None,
+                    ];
+                    let (graph, node) = model_node(&shapes, &spec);
+                    let ValidatedMetadata {
+                        attributes,
+                        formats,
+                        ..
+                    } = validate_metadata(graph.node(node), None).unwrap();
+                    let books = RecordingGovernor::new_host(1 << 20);
+                    let manager = ProcessMemoryManager::new().unwrap();
+                    let pool = HostWorkspacePool::governed(&manager, Arc::new(books.clone())).unwrap();
+                    let memory = books.weight_memory(HolderId::new(13));
+                    let resources = crate::CpuMemoryResources::new(memory.clone(), Default::default())
+                        .unwrap()
+                        .with_workspace_pool(pool.clone())
+                        .unwrap();
+                    let cpu = CpuExecutionProvider::initialized_with_resources(resources).unwrap();
+                    let kernel = BlockQuantizedMoEKernel {
+                    arithmetic,
+                        attributes,
+                        formats,
+                        constant_inputs: [false; 9],
+                        weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+                        weight_cache: WeightCache::new(memory, if arithmetic == ActivationArithmetic::Q8_0 { 1 << 20 } else { 0 }),
+                        prepared_projection: std::cell::Cell::new(None),
+                    };
+                    let input = Owned::f32(&[rows, hidden], &vec![0.001; rows * hidden]);
+                    // Every row selects experts 0 and 1: each receives all rows, while
+                    // experts 2 and 3 receive none. The bound must cover this skew.
+                    let router = Owned::f32(&[rows, experts], &[4., 3., -4., -5.].repeat(rows));
+                    let w1 = Owned::u8(
+                        &[experts, fc1_size, 1, block_bytes],
+                        &packed_for_format(format, experts, fc1_size, hidden),
+                    );
+                    let w2 = Owned::u8(
+                        &[experts, hidden, 2, block_bytes],
+                        &packed_for_format(format, experts, hidden, inter),
+                    );
+                    let w3 = separate.then(|| {
+                        Owned::u8(
+                            &[experts, inter, 1, block_bytes],
+                            &packed_for_format(format, experts, inter, hidden),
+                        )
+
             });
-            let views = [
-                input.view(),
-                router.view(),
-                w1.view(),
-                TensorView::absent(DataType::Float32),
-                w2.view(),
-                TensorView::absent(DataType::Float32),
-                w3.as_ref()
-                    .map_or_else(|| TensorView::absent(DataType::Uint8), Owned::view),
-                TensorView::absent(DataType::Float32),
-            ];
-            let metadata: Vec<_> = views
-                .iter()
-                .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
-                .collect();
-            let req = kernel.workspace_requirement(&metadata, &[]).unwrap().require_ready().unwrap();
-            let plan = projection_plan();
-            let l1 = plan.layout(rows, hidden, fc1_size).unwrap();
-            let l2 = plan.layout(rows, inter, hidden).unwrap();
-            let l3 = plan.layout(rows, hidden, inter).unwrap();
-            let max = l1
-                .bytes()
-                .max(l2.bytes())
-                .max(if separate { l3.bytes() } else { 0 });
-            let (a, b) = if activation == "identity" {
-                (hidden, inter)
-            } else {
-                (hidden.max(inter), (fc1_size + if separate { inter } else { 0 }).max(hidden))
-            };
-            assert_eq!(
-                req.bytes, (max + rows * (a + b + hidden) * std::mem::size_of::<f32>()) as u64,
-                "serial experts/projections share max plus two FC banks and accumulator, not k*E buffers"
-            );
-            assert!(max < l1.bytes() + l2.bytes());
-            let mut output = Owned::zeros_f32(&[rows, hidden]);
-            kernel.workspace_requirement_for_execution(
-                &views, &[output.view_mut()], &metadata, &[], None,
-            ).unwrap().require_ready().unwrap();
-            let err = kernel
-                .execute(&views, &mut [output.view_mut()])
-                .unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("BlockQuantizedMoE execution workspace binding"),
-                "{err}"
-            );
-            let mut expected = None;
-            let mut counts = None;
-            for _ in 0..17 {
-                let mut backing = cpu
-                    .allocate_workspace(req.bytes as usize, req.alignment, req.role())
-                    .unwrap();
-                let workspace =
-                    WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr()), backing.len());
+                let views = [
+                    input.view(),
+                    router.view(),
+                    w1.view(),
+                    TensorView::absent(DataType::Float32),
+                    w2.view(),
+                    TensorView::absent(DataType::Float32),
+                    w3.as_ref()
+                        .map_or_else(|| TensorView::absent(DataType::Uint8), Owned::view),
+                    TensorView::absent(DataType::Float32),
+                ];
+                let metadata: Vec<_> = views
+                    .iter()
+                    .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
+                    .collect();
+                let req = kernel.workspace_requirement(&metadata, &[]).unwrap().require_ready().unwrap();
+                let plan = PackedProjectionPlan::for_current_pool(arithmetic);
+                let l1 = plan.layout(rows, hidden, fc1_size).unwrap();
+                let l2 = plan.layout(rows, inter, hidden).unwrap();
+                let l3 = plan.layout(rows, hidden, inter).unwrap();
+                let max = l1
+                    .bytes()
+                    .max(l2.bytes())
+                    .max(if separate { l3.bytes() } else { 0 });
+                let (a, b) = if activation == "identity" {
+                    (hidden, inter)
+                } else {
+                    (hidden.max(inter), (fc1_size + if separate { inter } else { 0 }).max(hidden))
+                };
+                assert_eq!(
+                    req.bytes, (max + rows * (a + b + hidden) * std::mem::size_of::<f32>()) as u64,
+                    "serial experts/projections share max plus two FC banks and accumulator, not k*E buffers"
+                );
+                assert!(max < l1.bytes() + l2.bytes());
+                let mut output = Owned::zeros_f32(&[rows, hidden]);
                 kernel.workspace_requirement_for_execution(
                     &views, &[output.view_mut()], &metadata, &[], None,
                 ).unwrap().require_ready().unwrap();
-                kernel.execute_with_workspace(&views, &mut [output.view_mut()], Some(workspace)).unwrap();
-                cpu.deallocate_workspace(backing).unwrap();
-                assert_eq!(manager.process_used(onnx_runtime_memory_api::Tier::Host), req.bytes,
-                    "idle backing stays charged at the complete physical lane capacity");
-                let current = (books.claims(), books.releases());
-                assert_eq!(
-                    *counts.get_or_insert(current),
-                    current,
-                    "warm checkout/compute/return must never call the issuer, including zero bytes"
+                let err = kernel
+                    .execute(&views, &mut [output.view_mut()])
+                    .unwrap_err();
+                assert!(
+                    err.to_string()
+                        .contains("BlockQuantizedMoE execution workspace binding"),
+                    "{err}"
                 );
-                assert_eq!(
-                    *expected.get_or_insert_with(|| output.bytes.clone()),
-                    output.bytes
-                );
+                let mut expected = None;
+                let mut counts = None;
+                for _ in 0..17 {
+                    let mut backing = cpu
+                        .allocate_workspace(req.bytes as usize, req.alignment, req.role())
+                        .unwrap();
+                    let workspace =
+                        WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr()), backing.len());
+                    kernel.workspace_requirement_for_execution(
+                        &views, &[output.view_mut()], &metadata, &[], None,
+                    ).unwrap().require_ready().unwrap();
+                    kernel.execute_with_workspace(&views, &mut [output.view_mut()], Some(workspace)).unwrap();
+                    cpu.deallocate_workspace(backing).unwrap();
+                    assert_eq!(manager.process_used(onnx_runtime_memory_api::Tier::Host), req.bytes,
+                        "idle backing stays charged at the complete physical lane capacity");
+                    let current = (books.claims(), books.releases());
+                    assert_eq!(
+                        *counts.get_or_insert(current),
+                        current,
+                        "warm checkout/compute/return must never call the issuer, including zero bytes"
+                    );
+                    assert_eq!(
+                        *expected.get_or_insert_with(|| output.bytes.clone()),
+                        output.bytes
+                    );
+                }
+                assert_eq!(kernel.weight_cache.activity(), (0, 0));
+                drop(cpu);
+                pool.trim_idle(u64::MAX).unwrap();
+                assert_eq!(manager.process_used(onnx_runtime_memory_api::Tier::Host), 0);
+                assert!(books.releases() > counts.unwrap().1);
             }
-            assert_eq!(kernel.weight_cache.activity(), (0, 0));
-            drop(cpu);
-            pool.trim_idle(u64::MAX).unwrap();
-            assert_eq!(manager.process_used(onnx_runtime_memory_api::Tier::Host), 0);
-            assert!(books.releases() > counts.unwrap().1);
         }
         });
     }
@@ -2204,8 +2341,10 @@ mod tests {
         let ValidatedMetadata {
             attributes,
             formats,
+            ..
         } = validate_metadata(graph.node(node), None).expect("valid BlockQuantizedMoE metadata");
         let mut kernel = BlockQuantizedMoEKernel {
+            arithmetic: ActivationArithmetic::Float32,
             attributes,
             formats,
             constant_inputs: [false; 9],
@@ -2315,8 +2454,10 @@ mod tests {
         let ValidatedMetadata {
             attributes,
             formats,
+            ..
         } = validate_metadata(graph.node(node), None).expect("valid BlockQuantizedMoE metadata");
         let mut kernel = BlockQuantizedMoEKernel {
+            arithmetic: ActivationArithmetic::Float32,
             attributes,
             formats,
             constant_inputs: [false; 9],
@@ -2446,8 +2587,10 @@ mod tests {
             let ValidatedMetadata {
                 attributes,
                 formats,
+                ..
             } = validate_metadata(graph.node(node), None).expect("valid gated MoE metadata");
             let mut kernel = BlockQuantizedMoEKernel {
+                arithmetic: ActivationArithmetic::Float32,
                 attributes,
                 formats,
                 constant_inputs: [false; 9],
@@ -2525,8 +2668,10 @@ mod tests {
         let ValidatedMetadata {
             attributes,
             formats,
+            ..
         } = validate_metadata(graph.node(node), None).unwrap();
         let mut kernel = BlockQuantizedMoEKernel {
+            arithmetic: ActivationArithmetic::Float32,
             attributes,
             formats,
             constant_inputs: [false; 9],
@@ -2570,6 +2715,7 @@ mod tests {
         padded[2] = 4;
         let shape = [E, H, 1, 17];
         let strides = onnx_runtime_ir::compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides")
             .into_iter()
             .map(|stride| stride * 2)
             .collect::<Vec<_>>();
@@ -2762,9 +2908,11 @@ mod tests {
             let ValidatedMetadata {
                 attributes,
                 formats,
+                ..
             } = validate_metadata(graph.node(node), None).unwrap();
             let make_kernel = |budget| {
                 let mut kernel = BlockQuantizedMoEKernel {
+                    arithmetic: ActivationArithmetic::Float32,
                     attributes,
                     formats,
                     constant_inputs: [false; 9],
@@ -2971,6 +3119,7 @@ mod tests {
             let ValidatedMetadata {
                 attributes,
                 formats,
+                ..
             } = validate_metadata(graph.node(node), None).expect("valid block format");
             assert_eq!(formats.fc1, expected_format);
             assert_eq!(formats.fc2, expected_format);
@@ -2993,6 +3142,7 @@ mod tests {
             ];
 
             let uncached = BlockQuantizedMoEKernel {
+                arithmetic: ActivationArithmetic::Float32,
                 attributes,
                 formats,
                 constant_inputs: [false; 9],
@@ -3006,6 +3156,7 @@ mod tests {
                 .expect("uncached MoE reference");
 
             let mut cached = BlockQuantizedMoEKernel {
+                arithmetic: ActivationArithmetic::Float32,
                 attributes,
                 formats,
                 constant_inputs: [false; 9],
@@ -3500,12 +3651,14 @@ mod tests {
         let ValidatedMetadata {
             attributes,
             formats,
+            ..
         } = validate_metadata(graph.node(node), None).expect("valid mixed-format metadata");
         assert_eq!(formats.fc1, fc1_format);
         assert_eq!(formats.fc2, fc2_format);
         assert!(formats.fc3.is_none());
 
         let kernel = BlockQuantizedMoEKernel {
+            arithmetic: ActivationArithmetic::Float32,
             attributes,
             formats,
             constant_inputs: [false; 9],
@@ -3614,12 +3767,14 @@ mod tests {
         let ValidatedMetadata {
             attributes,
             formats,
+            ..
         } = validate_metadata(graph.node(node), None).expect("valid mixed gated metadata");
         assert_eq!(formats.fc1, fc1_format);
         assert_eq!(formats.fc2, fc2_format);
         assert_eq!(formats.fc3, Some(fc3_format));
 
         let kernel = BlockQuantizedMoEKernel {
+            arithmetic: ActivationArithmetic::Float32,
             attributes,
             formats,
             constant_inputs: [false; 9],
@@ -3880,7 +4035,8 @@ mod tests {
                                 input[row * hidden..(row + 1) * hidden].iter().copied()
                             })
                             .collect();
-                        let plan = projection_plan();
+                        let plan =
+                            PackedProjectionPlan::for_current_pool(ActivationArithmetic::Float32);
                         let max_decode = [(hidden, fc1_size), (inter, hidden), (hidden, inter)]
                             .into_iter()
                             .map(|(k, n)| plan.layout(rows, k, n).unwrap().bytes())
@@ -3899,7 +4055,7 @@ mod tests {
                             &attributes,
                             |p, x, rows, bias| {
                                 let mut output = vec![0.; rows * p.out_features];
-                                linear_packed_prepared(
+                                plan.project(
                                     p.format,
                                     &p.bytes,
                                     x,
@@ -3907,7 +4063,6 @@ mod tests {
                                     p.in_features,
                                     p.out_features,
                                     bias,
-                                    plan,
                                     &mut ProjectionScratch::test_binding(&mut old_decode),
                                     &mut output,
                                 )?;
@@ -3958,7 +4113,7 @@ mod tests {
                                     separate.then_some(b3.as_slice()),
                                     &attributes,
                                     |p, x, rows, bias, output| {
-                                        linear_packed_prepared(
+                                        plan.project(
                                             p.format,
                                             &p.bytes,
                                             x,
@@ -3966,7 +4121,6 @@ mod tests {
                                             p.in_features,
                                             p.out_features,
                                             bias,
-                                            plan,
                                             &mut decode,
                                             output,
                                         )

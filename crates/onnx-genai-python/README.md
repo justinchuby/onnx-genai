@@ -4,7 +4,7 @@ Native text generation for Python.
 
 `onnx-genai` exposes the high-level `Engine` / `GenerateResult` API also offered
 by `nxrt.genai`. The shared engine compiles and selects Native execution by
-default. ORT remains linked for runtime infrastructure and reference tests.
+default. ORT is optional and used only for reference tests.
 
 ```python
 import onnx_genai
@@ -27,11 +27,15 @@ metadata (`inference_metadata.yaml` or `genai_config.json`).
 ## Wheels
 
 Distributed as stable-ABI (`abi3`) wheels tagged `cp310-abi3`, so a single wheel
-per platform loads on CPython 3.10 and newer. ONNX Runtime is **not** bundled:
-`onnx_genai` loads `libonnxruntime` from the installed `onnxruntime` (CPU) or
-`onnxruntime-gpu` (CUDA) wheel at import time for runtime infrastructure and
-reference execution. Installing an ORT provider does not change the Native
-decoder default.
+per platform loads on standard CPython 3.10 and newer. Wheels are built on
+CPython 3.12; free-threaded wheels require a separate `abi3t` build.
+Native CPU execution requires no `onnxruntime` or MLX Python package and no
+ORT shared library. Importing `onnx_genai` only records optional installed
+library paths; it does not import or load those reference packages.
+
+The `ort`, `ort-cuda`, and `mlx` extras install optional reference dependencies.
+The compiled `ort-cuda` Cargo feature enables ORT CUDA reference support;
+installing a provider does not change the Native engine default.
 
 ## Related packages
 

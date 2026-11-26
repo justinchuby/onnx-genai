@@ -133,7 +133,8 @@ mod tests {
         Owned {
             bytes: bytes.to_vec(),
             shape: shape.to_vec(),
-            strides: compute_contiguous_strides(shape),
+            strides: compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides"),
             dtype,
         }
     }

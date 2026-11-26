@@ -322,6 +322,11 @@ impl EngineMemoryAccounting {
         self.tier_snapshot(Tier::Device)
     }
 
+    /// Current aggregate host-tier usage and headroom for this authority.
+    pub fn host_snapshot(&self) -> TierSnapshot {
+        self.tier_snapshot(Tier::Host)
+    }
+
     /// Stable identity of the shared device authority.
     pub fn device_authority_id(&self) -> MemoryAuthorityId {
         self.memory.device_authority().authority_id()

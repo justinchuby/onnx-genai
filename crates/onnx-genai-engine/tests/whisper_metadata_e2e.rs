@@ -37,7 +37,10 @@ fn package_dir() -> Option<PathBuf> {
 }
 
 fn log_mel(path: &str) -> anyhow::Result<Vec<f32>> {
-    let audio = decode_audio(&std::fs::read(path)?)?;
+    let audio = decode_audio(
+        &std::fs::read(path)?,
+        onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+    )?;
     let features = LogMelExtractor::new(80, WHISPER_SAMPLE_RATE)?
         .extract_padded(&audio.samples, audio.sample_rate)?;
     anyhow::ensure!(

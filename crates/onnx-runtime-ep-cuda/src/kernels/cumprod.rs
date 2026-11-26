@@ -300,7 +300,8 @@ mod tests {
                 fixed_axis: Some(dim as i64),
             };
             unsafe { rt.htod(&(dim as i64).to_le_bytes(), axis_dev).unwrap() };
-            let strides = compute_contiguous_strides(&shape);
+            let strides = compute_contiguous_strides(&shape)
+                .expect("fixture shape has representable contiguous strides");
             let count = shape[0] * shape[1];
             let x = rt.alloc_raw(count * 4).unwrap();
             let y = rt.alloc_raw(count * 4).unwrap();

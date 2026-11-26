@@ -158,11 +158,18 @@ fn borrowed_dense_padded_reversed_and_packed_banks_match_scalar_weight_bits() {
                                 * scales[row * blocks + p];
                             expected += x * weight;
                         }
-                        assert_eq!(
-                            bank.dot(row, &input).to_bits(),
-                            expected.to_bits(),
+                        let actual = bank.dot(row, &input);
+                        let context = format!(
                             "depth={depth} block={block} mode={mode} zeros={zero_points} row={row} special={special}"
                         );
+                        if expected.is_nan() {
+                            // This is an arithmetic result, not a raw copy. IEEE-754
+                            // and ONNX do not prescribe which NaN payload survives
+                            // when the fold encounters multiple NaN-producing terms.
+                            assert!(actual.is_nan(), "{context}: got {actual:?}");
+                        } else {
+                            assert_eq!(actual.to_bits(), expected.to_bits(), "{context}");
+                        }
                     }
                 }
             }

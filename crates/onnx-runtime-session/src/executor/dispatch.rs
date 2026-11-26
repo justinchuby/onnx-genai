@@ -9,14 +9,11 @@ use smallvec::SmallVec;
 /// needed for that slot, `None` when the input was used in place.
 type MaterializedInputs = Vec<Option<(Vec<u8>, Vec<i64>)>>;
 
-pub(super) fn refill_contiguous_strides(strides: &mut Vec<i64>, shape: &[usize]) {
-    strides.clear();
+pub(super) fn refill_contiguous_strides(strides: &mut Vec<i64>, shape: &[usize]) -> Result<()> {
+    let plan = onnx_runtime_ir::ContiguousStridePlan::new(shape)?;
     strides.resize(shape.len(), 0);
-    let mut stride = 1_i64;
-    for (axis, &dim) in shape.iter().enumerate().rev() {
-        strides[axis] = stride;
-        stride = stride.saturating_mul(dim as i64);
-    }
+    plan.write(strides)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -33,18 +30,30 @@ fn refill_in_info(
     root_len: usize,
     lazy_unresolved: bool,
     prepared_unresolved: bool,
-) {
+) -> Result<()> {
+    // Complete fallible layout preparation before publishing descriptor fields.
+    match strides {
+        Some(s) if s.len() != shape.len() => {
+            return Err(onnx_runtime_ir::IrError::InvalidLayout {
+                shape: shape.to_vec(),
+                reason: format!(
+                    "input strides rank {} differs from shape rank {}",
+                    s.len(),
+                    shape.len()
+                ),
+            }
+            .into());
+        }
+        Some(s) => {
+            info.strides.clear();
+            info.strides.extend_from_slice(s);
+        }
+        None => refill_contiguous_strides(&mut info.strides, shape)?,
+    }
     info.present = present;
     info.dtype = dtype;
     info.shape.clear();
     info.shape.extend_from_slice(shape);
-    match strides {
-        Some(strides) => {
-            info.strides.clear();
-            info.strides.extend_from_slice(strides);
-        }
-        None => refill_contiguous_strides(&mut info.strides, shape),
-    }
     info.byte_offset = byte_offset;
     info.base_ptr = base_ptr as usize;
     info.device = device;
@@ -52,6 +61,7 @@ fn refill_in_info(
     info.root_len = root_len;
     info.lazy_unresolved = lazy_unresolved;
     info.prepared_unresolved = prepared_unresolved;
+    Ok(())
 }
 
 /// Whether GroupQueryAttention with capacity-bound (persistently bound, aliased
@@ -948,7 +958,7 @@ impl Executor {
                 strides.clear();
                 strides.extend_from_slice(fixed);
             } else {
-                refill_contiguous_strides(strides, shape);
+                refill_contiguous_strides(strides, shape)?;
             }
         }
         let mut outs = build_output_bindings(
@@ -1275,7 +1285,7 @@ impl Executor {
                     0,
                     false,
                     false,
-                );
+                )?;
                 continue;
             };
             if let Some(value) = external
@@ -1296,7 +1306,7 @@ impl Executor {
                     value.len,
                     false,
                     false,
-                );
+                )?;
                 view_bounds(&info.shape, &info.strides, 0, value.dtype, value.len)?;
                 continue;
             }
@@ -1305,7 +1315,7 @@ impl Executor {
             // directly over the immutable shared allocation.
             if let Some(elem) = self.seq_elem_values.get(&vid) {
                 let shape = &input_shapes[i];
-                let strides = elem.layout.resolved_strides(shape);
+                let strides = elem.layout.resolved_strides(shape)?;
                 let root_len = elem.root_len();
                 let base_ptr = elem.as_ptr();
                 view_bounds(
@@ -1328,7 +1338,7 @@ impl Executor {
                     root_len,
                     false,
                     false,
-                );
+                )?;
                 continue;
             }
             if accepts_lazy_weights
@@ -1372,7 +1382,7 @@ impl Executor {
                             root_len,
                             false,
                             false,
-                        );
+                        )?;
                         paged_weights.push(paged);
                     }
                     None => {
@@ -1389,7 +1399,7 @@ impl Executor {
                             0,
                             true,
                             false,
-                        );
+                        )?;
                     }
                 }
                 continue;
@@ -1413,7 +1423,7 @@ impl Executor {
                     0,
                     false,
                     true,
-                );
+                )?;
                 continue;
             }
             let root = self.root_of(vid);
@@ -1467,7 +1477,7 @@ impl Executor {
                 root_len,
                 false,
                 false,
-            );
+            )?;
             view_bounds(
                 &info.shape,
                 &info.strides,
@@ -1733,7 +1743,7 @@ fn materialize_strided_inputs(
         }
         let src = unsafe { std::slice::from_raw_parts(info.base_ptr as *const u8, info.root_len) };
         let gathered = gather_view(src, &info.shape, &info.strides, info.byte_offset, esize);
-        let strides = compute_contiguous_strides(&info.shape);
+        let strides = compute_contiguous_strides(&info.shape)?;
         mat[i] = Some((gathered, strides));
     }
     Ok(mat)
@@ -2360,5 +2370,78 @@ mod output_binding_tests {
                 ep.deallocate(buffer).unwrap();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stride_refill_tests {
+    use super::*;
+    #[test]
+    fn failed_refill_preserves_the_previous_descriptor_and_recovers() {
+        let mut strides = Vec::with_capacity(16);
+        strides.extend_from_slice(&[3, 1]);
+        let pointer = strides.as_ptr();
+        let capacity = strides.capacity();
+        let bad = [0, i64::MAX as usize, i64::MAX as usize];
+        assert!(
+            refill_contiguous_strides(&mut strides, &bad)
+                .unwrap_err()
+                .to_string()
+                .contains("axis 0")
+        );
+        assert_eq!(strides, [3, 1]);
+        assert_eq!(strides.as_ptr(), pointer);
+        assert_eq!(strides.capacity(), capacity);
+        refill_contiguous_strides(&mut strides, &[2, 3, 4]).unwrap();
+        assert_eq!(strides, [12, 4, 1]);
+        assert_eq!(strides.as_ptr(), pointer);
+        assert_eq!(strides.capacity(), capacity);
+        let shape = vec![2; 12];
+        refill_contiguous_strides(&mut strides, &shape).unwrap();
+        assert_eq!(strides, compute_contiguous_strides(&shape).unwrap());
+        assert_eq!(strides.as_ptr(), pointer);
+    }
+    #[test]
+    fn failed_input_info_refill_does_not_publish_any_new_field() {
+        let mut info = InInfo {
+            present: true,
+            dtype: DataType::Float32,
+            shape: vec![2, 3],
+            strides: vec![3, 1],
+            byte_offset: 4,
+            base_ptr: 16,
+            device: onnx_runtime_ir::DeviceId::cpu(),
+            backing: onnx_runtime_ep_api::TensorBacking::Opaque,
+            root_len: 64,
+            lazy_unresolved: false,
+            prepared_unresolved: false,
+        };
+        assert!(
+            refill_in_info(
+                &mut info,
+                false,
+                DataType::Float64,
+                &[0, i64::MAX as usize, i64::MAX as usize],
+                None,
+                8,
+                32usize as *const _,
+                onnx_runtime_ir::DeviceId::cuda(0),
+                onnx_runtime_ep_api::TensorBacking::Opaque,
+                128,
+                true,
+                true
+            )
+            .is_err()
+        );
+        assert!(info.present);
+        assert_eq!(info.dtype, DataType::Float32);
+        assert_eq!(info.shape, [2, 3]);
+        assert_eq!(info.strides, [3, 1]);
+        assert_eq!(
+            (info.byte_offset, info.base_ptr, info.root_len),
+            (4, 16, 64)
+        );
+        assert_eq!(info.device, onnx_runtime_ir::DeviceId::cpu());
+        assert!(!info.lazy_unresolved && !info.prepared_unresolved);
     }
 }

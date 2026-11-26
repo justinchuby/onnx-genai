@@ -163,9 +163,12 @@ mod linked {
         });
         let expected = oracle(case, x, w, bias, relu);
         let (sx, sw, sy) = (
-            compute_contiguous_strides(&xs),
-            compute_contiguous_strides(&ws),
-            compute_contiguous_strides(&ys),
+            compute_contiguous_strides(&xs)
+                .expect("fixture shape has representable contiguous strides"),
+            compute_contiguous_strides(&ws)
+                .expect("fixture shape has representable contiguous strides"),
+            compute_contiguous_strides(&ys)
+                .expect("fixture shape has representable contiguous strides"),
         );
         let bs = [case.w[0]];
         let mut inputs = vec![

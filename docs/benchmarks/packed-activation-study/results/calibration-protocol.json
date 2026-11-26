@@ -1,0 +1,90 @@
+{
+  "calls": {
+    "q4-1": 2048,
+    "q4-8": 256,
+    "q8-1": 8192,
+    "q8-8": 1024
+  },
+  "repetitions": 3,
+  "cases": [
+    [
+      "q4",
+      1,
+      1024,
+      256
+    ],
+    [
+      "q4",
+      8,
+      1024,
+      256
+    ],
+    [
+      "q8",
+      1,
+      1024,
+      256
+    ],
+    [
+      "q8",
+      8,
+      1024,
+      256
+    ]
+  ],
+  "paired_sequences": {
+    "aa": [
+      0,
+      1,
+      1,
+      0
+    ],
+    "ab": [
+      0,
+      2,
+      2,
+      0
+    ],
+    "ba": [
+      2,
+      0,
+      0,
+      2
+    ],
+    "aa_reverse": [
+      1,
+      0,
+      0,
+      1
+    ]
+  },
+  "arm_names": [
+    "float32-A",
+    "float32-A-copy",
+    "q8_0"
+  ],
+  "parent_controls": [
+    "work",
+    "work-copy",
+    "work-double",
+    "setup",
+    "setup-double"
+  ],
+  "gates": {
+    "foreign_process_average_cores_max": 0.5,
+    "window_cpu_per_wall": [
+      0.85,
+      1.15
+    ],
+    "aa_median_delta_pct_max": 3,
+    "aa_process_delta_pct_max": 5,
+    "per_arm_range_pct_max": 15,
+    "setup_parent_cpu_fraction_max": 0.1,
+    "double_marginal_cpu_ratio": [
+      1.7,
+      2.3
+    ]
+  },
+  "binary_sha256": "556621dbad80baae203de3186fbf34dc59ebde574fd1e96e69ad41519a79dfbb",
+  "interpretation": "Cache-hot synthetic CPU projection; one thread; no model/GPU/quality extrapolation"
+}

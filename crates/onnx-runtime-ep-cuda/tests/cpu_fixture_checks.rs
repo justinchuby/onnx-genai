@@ -116,8 +116,10 @@ fn cpu_dilated_averagepool_matches_expected_vectors() {
         } else {
             narrow.as_mut_ptr().cast()
         };
-        let input_strides = compute_contiguous_strides(&input_shape);
-        let output_strides = compute_contiguous_strides(&output_shape);
+        let input_strides = compute_contiguous_strides(&input_shape)
+            .expect("fixture shape has representable contiguous strides");
+        let output_strides = compute_contiguous_strides(&output_shape)
+            .expect("fixture shape has representable contiguous strides");
         let input = TensorView::new(
             DevicePtr(input_ptr),
             dtype,

@@ -17,7 +17,6 @@ use crate::runtime::{CudaRuntime, cuptr};
 
 const OP: &str = "BlockQuantizedMatMul";
 const DOMAIN: &str = onnx_runtime_ir::RUNTIME_DOMAIN;
-const LAYOUT_VERSION: i64 = 1;
 const SMALL_QK: usize = 32;
 const IQ_SUPER_QK: usize = 256;
 const MXFP4_BLOCK_BYTES: usize = 17;
@@ -732,14 +731,10 @@ pub struct BlockQuantizedMatMulFactory {
 
 impl KernelFactory for BlockQuantizedMatMulFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        super::packed_arithmetic::validate(node)?;
         let k = required_positive_attr(node, "K")?;
         let n = required_positive_attr(node, "N")?;
-        let layout_version = optional_int_attr(node, "block_layout_version")?.unwrap_or(1);
-        if layout_version != LAYOUT_VERSION {
-            return Err(error(format!(
-                "block_layout_version must be {LAYOUT_VERSION}, got {layout_version}"
-            )));
-        }
+
         let format = match node.attr("format") {
             Some(attribute) => attribute
                 .as_str()
@@ -902,6 +897,9 @@ impl Kernel for BlockQuantizedMatMulKernel {
 }
 
 pub(crate) fn unsupported_reason(node: &Node) -> Option<Cow<'static, str>> {
+    if let Err(error) = super::packed_arithmetic::validate(node) {
+        return Some(Cow::Owned(error.to_string()));
+    }
     let format = match node.attr("format") {
         Some(attribute) => match attribute.as_str() {
             Some(format) => format,
@@ -922,21 +920,7 @@ pub(crate) fn unsupported_reason(node: &Node) -> Option<Cow<'static, str>> {
             "BlockQuantizedMatMul: CUDA does not support format '{format}' — re-export weights as mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, iq1_m, q2_k, q3_k, q5_k, q6_k, or q8_0"
         )));
     }
-    if let Some(attribute) = node.attr("block_layout_version") {
-        match attribute.as_int() {
-            Some(version) if version == LAYOUT_VERSION => {}
-            Some(version) => {
-                return Some(Cow::Owned(format!(
-                    "BlockQuantizedMatMul: CUDA requires block_layout_version={LAYOUT_VERSION}, got {version} — re-export the packed weights with the current layout"
-                )));
-            }
-            None => {
-                return Some(Cow::Owned(format!(
-                    "BlockQuantizedMatMul: block_layout_version must be integer {LAYOUT_VERSION} — re-export the packed weights with the current layout"
-                )));
-            }
-        }
-    }
+
     for name in ["K", "N"] {
         match node.attr(name) {
             Some(attribute) => match attribute.as_int() {
@@ -1200,5 +1184,32 @@ mod tests {
         .to_string();
         assert!(output_error.contains("Y byte count"));
         assert!(output_error.contains("exceeds isize::MAX"));
+    }
+}
+
+#[cfg(test)]
+mod arithmetic_claim_tests {
+    #[test]
+    fn claim_refuses_quantized_arithmetic_before_device_or_format_resolution() {
+        let mut node = onnx_runtime_ir::Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "BlockQuantizedMatMul",
+            vec![],
+            vec![],
+        );
+        node.attributes.insert(
+            "activation_arithmetic".into(),
+            onnx_runtime_ir::Attribute::String(b"q8_0".to_vec()),
+        );
+        node.attributes.insert(
+            "block_layout_version".into(),
+            onnx_runtime_ir::Attribute::Int(2),
+        );
+        let reason =
+            super::unsupported_reason(&node).expect("CUDA must decline explicit q8 arithmetic");
+        assert!(
+            reason.contains("activation_arithmetic") && reason.contains("CUDA EP"),
+            "{reason}"
+        );
     }
 }
