@@ -2,7 +2,10 @@
 //! owned numeric payloads, not arbitrary allocator metadata, graph IR, or RSS.
 use anyhow::Context as _;
 use onnx_runtime_memory_api::{DeviceKey, Tier};
-use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryLease};
+use onnx_runtime_memory_governor::{
+    ExternalCapacityReservation, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryLease,
+    ProcessMemoryManager, RegisteredMemoryAuthority, RegisteredMemoryHolder,
+};
 use std::sync::Arc;
 
 mod sealed {
@@ -51,7 +54,61 @@ pub struct ProcessorAllocationScope {
 struct ScopeInner {
     memory: Arc<dyn MemoryGovernor + Send + Sync>,
     storage: ScopeStorage,
+    // Last: the canonical process domain outlives every allocation and grant.
+    fallback: Option<ProcessFallbackDomain>,
 }
+/// Backing allocated outside managed Native allocators still participates in
+/// the exact Engine Host authority AND its shared process policy. This owns
+/// conservative payload capacity, without claiming allocator/RSS facts.
+struct ProcessFallbackDomain {
+    manager: ProcessMemoryManager,
+    authority: RegisteredMemoryAuthority,
+    holder: RegisteredMemoryHolder,
+}
+impl ProcessFallbackDomain {
+    fn new(
+        memory: Arc<dyn MemoryGovernor + Send + Sync>,
+        manager: &ProcessMemoryManager,
+    ) -> anyhow::Result<Self> {
+        let authority=manager.register_authority(DeviceKey::HOST,"processor fallback Host",Arc::new(()),memory)
+            .context("register processor fallback against the owning Host authority; use the Engine's Host governor and process manager")?;
+        let holder = manager
+            .register_holder(&authority, "processor fallback numeric payloads", None)
+            .context("register processor fallback payload owner")?;
+        Ok(Self {
+            manager: manager.clone(),
+            authority,
+            holder,
+        })
+    }
+    fn reserve(
+        &self,
+        bytes: u64,
+        role: ProcessorAllocationRole,
+    ) -> anyhow::Result<ProcessorPayloadGrant> {
+        let reservation=self.manager.reserve_external_capacity(&self.authority,&self.holder,Tier::Host,role.holder().role(),bytes)
+            .with_context(||format!("admit {role:?} processor fallback payload of {bytes} bytes against shared Host/process capacity before allocation; release retained state or increase configured headroom"))?;
+        Ok(ProcessorPayloadGrant::Process {
+            _reservation: reservation,
+        })
+    }
+}
+impl Drop for ProcessFallbackDomain {
+    fn drop(&mut self) {
+        // Arrays retain the Scope until after their data and capacity owner
+        // have dropped. Canonical authorities may still serve other contexts.
+        let _ = self.manager.unregister_holder(&self.holder);
+    }
+}
+enum ProcessorPayloadGrant {
+    Standalone {
+        _lease: MemoryLease,
+    },
+    Process {
+        _reservation: ExternalCapacityReservation,
+    },
+}
+
 enum ScopeStorage {
     /// ORT/reference and explicitly bounded standalone callers retain their
     /// own typed allocations with a real pre-allocation payload grant.
@@ -66,27 +123,38 @@ impl ProcessorAllocationScope {
     /// A low-level caller must select a finite explicit payload budget. Engine
     /// paths instead construct a scope from their existing actual authority.
     pub fn standalone(max_bytes: u64) -> Self {
-        Self::reference(Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
-            DeviceKey::HOST,
-            0,
-            max_bytes,
-            0,
-        ))))
-    }
-    pub(crate) fn reference(memory: Arc<dyn MemoryGovernor + Send + Sync>) -> Self {
         Self {
+            inner: Arc::new(ScopeInner {
+                memory: Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+                    DeviceKey::HOST,
+                    0,
+                    max_bytes,
+                    0,
+                ))),
+                storage: ScopeStorage::Reference,
+                fallback: None,
+            }),
+        }
+    }
+    pub(crate) fn reference(
+        memory: Arc<dyn MemoryGovernor + Send + Sync>,
+        manager: &ProcessMemoryManager,
+    ) -> anyhow::Result<Self> {
+        let fallback = ProcessFallbackDomain::new(Arc::clone(&memory), manager)?;
+        Ok(Self {
             inner: Arc::new(ScopeInner {
                 memory,
                 storage: ScopeStorage::Reference,
+                fallback: Some(fallback),
             }),
-        }
+        })
     }
     #[cfg(feature = "native-backend")]
     pub(crate) fn host(
         memory: Arc<dyn MemoryGovernor + Send + Sync>,
         manager: &onnx_runtime_memory_governor::ProcessMemoryManager,
         mut allocator: onnx_runtime_session::HostTensorAllocator,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let funding = allocator.host_payload_funding();
         let already_funded = funding
             .as_ref()
@@ -96,15 +164,21 @@ impl ProcessorAllocationScope {
             // explicit staging owner is funded by this scope's Engine grant.
             allocator = onnx_runtime_session::HostTensorAllocator::standalone();
         }
-        Self {
+        let fallback = if already_funded {
+            None
+        } else {
+            Some(ProcessFallbackDomain::new(Arc::clone(&memory), manager)?)
+        };
+        Ok(Self {
             inner: Arc::new(ScopeInner {
                 memory,
                 storage: ScopeStorage::Host {
                     allocator,
                     already_funded,
                 },
+                fallback,
             }),
-        }
+        })
     }
     pub fn allocate<T: ProcessorElement>(
         &self,
@@ -128,8 +202,17 @@ impl ProcessorAllocationScope {
             ScopeStorage::Host { already_funded, .. } => !already_funded,
         };
         let grant = if needs_grant {
-            let holder = role.holder();
-            Some(self.inner.memory.reserve(Tier::Host, u64::try_from(bytes)?, holder.role(), holder.id()).with_context(|| format!("admit {role:?} processor payload of {length} elements ({bytes} bytes) before allocation; release retained state or increase Host headroom"))?)
+            let bytes = u64::try_from(bytes).context(
+                "processor payload bytes exceed the authority counter; reduce request limits",
+            )?;
+            Some(match &self.inner.fallback {
+                Some(domain) => domain.reserve(bytes, role)?,
+                None => {
+                    let holder = role.holder();
+                    ProcessorPayloadGrant::Standalone {_lease:self.inner.memory.reserve(Tier::Host,bytes,holder.role(),holder.id())
+                        .with_context(||format!("admit {role:?} standalone processor payload of {length} elements ({bytes} bytes) before allocation; reduce payload size or increase its explicit budget"))?}
+                }
+            })
         } else {
             None
         };
@@ -164,7 +247,7 @@ impl ProcessorAllocationScope {
 /// or Vec escape. Deep clone/resize admits the true old+new live peak first.
 pub struct ProcessorArray<T: ProcessorElement> {
     data: ArrayStorage<T>,
-    _grant: Option<MemoryLease>,
+    _grant: Option<ProcessorPayloadGrant>,
     scope: ProcessorAllocationScope,
     role: ProcessorAllocationRole,
 }
@@ -227,13 +310,13 @@ impl crate::Engine {
         #[cfg(feature = "native-backend")]
         if self.decode_backend == crate::EngineDecodeBackend::Native {
             let session = self.native_session.as_ref().context("Native processor allocation scope requires the loaded decoder; reload the model")?.inference_session();
-            return Ok(ProcessorAllocationScope::host(
+            return ProcessorAllocationScope::host(
                 memory,
                 &self.governor.process_memory_manager(),
                 crate::native_decode::host_tensors_for_session(session)?,
-            ));
+            );
         }
-        Ok(ProcessorAllocationScope::reference(memory))
+        ProcessorAllocationScope::reference(memory, &self.governor.process_memory_manager())
     }
 }
 
@@ -282,6 +365,67 @@ mod tests {
         assert_eq!(flags.as_slice(), &[false, true]);
     }
 
+    #[test]
+    fn reference_scope_enforces_real_process_peak_and_keeps_last_owner_funded() {
+        let manager =
+            ProcessMemoryManager::with_limits(onnx_runtime_memory_governor::ProcessMemoryLimits {
+                host_bytes: 36,
+                ..onnx_runtime_memory_governor::ProcessMemoryLimits::UNLIMITED
+            })
+            .unwrap();
+        let books = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+            DeviceKey::HOST,
+            0,
+            64,
+            0,
+        )));
+        let scope = ProcessorAllocationScope::reference(books.clone(), &manager).unwrap();
+        let second_scope = ProcessorAllocationScope::reference(books.clone(), &manager).unwrap();
+        assert_eq!(
+            manager.snapshot().unwrap().authority_count,
+            1,
+            "same physical Host books must not create another authority"
+        );
+        let mut values = scope
+            .allocate::<u32>(3, ProcessorAllocationRole::History)
+            .unwrap();
+        values.as_mut_slice().copy_from_slice(&[2, 3, 5]);
+        let blocker = second_scope
+            .allocate::<u8>(20, ProcessorAllocationRole::Scratch)
+            .unwrap();
+        assert_eq!(books.used(Tier::Host), 32);
+        assert_eq!(manager.process_used(Tier::Host), 32);
+        assert!(
+            values.try_resize(6).is_err(),
+            "Host ledger can fit 56B but the real shared process ceiling is 36B"
+        );
+        assert_eq!(values.as_slice(), &[2, 3, 5]);
+        assert_eq!(books.used(Tier::Host), 32);
+        assert_eq!(manager.process_used(Tier::Host), 32);
+        drop(blocker);
+        values.try_resize(6).unwrap();
+        assert_eq!(values.as_slice(), &[2, 3, 5, 0, 0, 0]);
+        assert_eq!(books.used(Tier::Host), 24);
+        assert_eq!(manager.process_used(Tier::Host), 24);
+        assert!(values.try_clone().is_err());
+        let retained = Arc::new(values);
+        let alias = Arc::clone(&retained);
+        drop(scope);
+        drop(second_scope);
+        drop(retained);
+        assert_eq!(manager.process_used(Tier::Host), 24);
+        assert_eq!(alias.as_slice(), &[2, 3, 5, 0, 0, 0]);
+        drop(alias);
+        assert_eq!(books.used(Tier::Host), 0);
+        assert_eq!(manager.process_used(Tier::Host), 0);
+        let snapshot = manager.snapshot().unwrap();
+        assert!(snapshot.external_capacities.is_empty());
+        assert!(
+            snapshot.allocations.is_empty(),
+            "reference payload has capacity ownership without invented allocator identity"
+        );
+    }
+
     #[cfg(feature = "native-backend")]
     fn allocator(
         manager: &onnx_runtime_memory_governor::ProcessMemoryManager,
@@ -327,7 +471,7 @@ mod tests {
             0,
         )));
         let context = allocator(&manager, books.clone());
-        let scope = ProcessorAllocationScope::host(books.clone(), &manager, context);
+        let scope = ProcessorAllocationScope::host(books.clone(), &manager, context).unwrap();
         let mut values = scope
             .allocate::<f32>(3, ProcessorAllocationRole::Probabilities)
             .unwrap();
@@ -368,16 +512,28 @@ mod tests {
                 (&foreign, books.clone())
             };
             let context = allocator(context_manager, context_books);
-            let scope = ProcessorAllocationScope::host(books.clone(), &local, context);
+            local.set_process_limit(Tier::Host, 11).unwrap();
+            let scope = ProcessorAllocationScope::host(books.clone(), &local, context).unwrap();
+            assert!(
+                scope
+                    .allocate::<u32>(3, ProcessorAllocationRole::History)
+                    .is_err()
+            );
+            assert_eq!(books.used(Tier::Host), 0);
+            assert_eq!(local.process_used(Tier::Host), 0);
+            assert_eq!(foreign.process_used(Tier::Host), 0);
+            local.set_process_limit(Tier::Host, 12).unwrap();
             let values = scope
                 .allocate::<u32>(3, ProcessorAllocationRole::History)
                 .unwrap();
             assert_eq!(books.used(Tier::Host), 12);
             assert_eq!(other.used(Tier::Host), 0);
-            assert_eq!(local.process_used(Tier::Host), 0);
+            assert_eq!(local.process_used(Tier::Host), 12);
             assert_eq!(foreign.process_used(Tier::Host), 0);
             drop(values);
             assert_eq!(books.used(Tier::Host), 0);
+            assert_eq!(local.process_used(Tier::Host), 0);
+            assert!(local.snapshot().unwrap().external_capacities.is_empty());
         }
     }
 }
