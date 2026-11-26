@@ -96,3 +96,12 @@ For a real release, replace each crate's explicit `0.1.0-dev.0` version with
 the chosen stable version, update all twelve workspace dependency pins to the
 same exact version, rebuild, and publish again in this order. Published
 prerelease versions are immutable and remain on crates.io.
+
+## Maintained GenAI compiler dependency
+
+`onnx-genai-llguidance` is a workspace-owned maintained compiler package derived
+from the audited MIT-licensed llguidance archive. It uses the workspace version
+and is published before `onnx-genai-engine`; the engine exact-pins that package.
+Its canonical Rust import is `onnx_genai_llguidance`, with no legacy import alias
+or registry/path fallback. The source remains one tree in `vendor/llguidance`.
+See [compiler provenance and registry artifact verification](../GRAMMAR_COMPILER.md).
