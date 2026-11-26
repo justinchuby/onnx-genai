@@ -155,10 +155,8 @@ fn packed_integer_cast_cuda_matches_strict_reference_bytes() {
         .is_some_and(|reason| reason.contains("does not support source dtype"))
     );
 
-    node.attributes.insert(
-        "to".into(),
-        Attribute::Int(DataType::Float32 as i64),
-    );
+    node.attributes
+        .insert("to".into(), Attribute::Int(DataType::Float32 as i64));
     assert!(
         ep.supports_op(
             &node,

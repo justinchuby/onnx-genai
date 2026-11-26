@@ -161,9 +161,7 @@ mod tests {
 
     #[test]
     fn cast_dtype_admission_is_capability_based() {
-        assert!(
-            cast_unsupported_reason("Cast", 1, false, Some(DataType::Uint4), None).is_none()
-        );
+        assert!(cast_unsupported_reason("Cast", 1, false, Some(DataType::Uint4), None).is_none());
         assert!(
             cast_unsupported_reason("CastLike", 15, false, None, Some(DataType::Int2)).is_none()
         );

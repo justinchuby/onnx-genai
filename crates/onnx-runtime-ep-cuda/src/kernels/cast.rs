@@ -275,8 +275,7 @@ fn cast_pair_supported(src: DataType, dst: DataType) -> bool {
             DataType::Float16 | DataType::BFloat16 | DataType::Float32 | DataType::Float64
         )
     } else {
-        let supported =
-            |dtype| is_fixed_width_supported(dtype) || packed_integer(dtype).is_some();
+        let supported = |dtype| is_fixed_width_supported(dtype) || packed_integer(dtype).is_some();
         supported(src) && supported(dst)
     }
 }

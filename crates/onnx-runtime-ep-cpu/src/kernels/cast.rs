@@ -186,13 +186,7 @@ impl Kernel for CastKernel {
         let to = self.to.ok_or_else(|| {
             EpError::KernelFailed("Cast: missing or unsupported `to` attribute".into())
         })?;
-        cast_to(
-            "Cast",
-            &inputs[0],
-            &mut outputs[0],
-            to,
-            self.float6,
-        )
+        cast_to("Cast", &inputs[0], &mut outputs[0], to, self.float6)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -247,9 +241,7 @@ fn cast_to(
         )));
     }
     if packed_integer(input.dtype).is_some() || packed_integer(to).is_some() {
-        if let Some(reason) =
-            cast_unsupported_reason(op, 28, float6, Some(input.dtype), Some(to))
-        {
+        if let Some(reason) = cast_unsupported_reason(op, 28, float6, Some(input.dtype), Some(to)) {
             return Err(EpError::KernelFailed(reason));
         }
         return cast_packed_integer(input, output, to);
@@ -1254,44 +1246,24 @@ mod tests {
         let provider = crate::CpuExecutionProvider::new();
         let shape = static_shape([3]);
         let mut cast = Node::new(NodeId(0), "Cast", vec![], vec![]);
-        cast.attributes.insert(
-            "to".into(),
-            Attribute::Int(DataType::Float32 as i64),
-        );
+        cast.attributes
+            .insert("to".into(), Attribute::Int(DataType::Float32 as i64));
         assert!(
             provider
-                .supports_op(
-                    &cast,
-                    27,
-                    &[shape.clone()],
-                    &[DataType::Float6E2M3],
-                    &[],
-                )
+                .supports_op(&cast, 27, &[shape.clone()], &[DataType::Float6E2M3], &[],)
                 .reason()
                 .is_some_and(|reason| reason.contains("opset 28"))
         );
         assert!(
             provider
-                .supports_op(
-                    &cast,
-                    28,
-                    &[shape.clone()],
-                    &[DataType::Float6E2M3],
-                    &[],
-                )
+                .supports_op(&cast, 28, &[shape.clone()], &[DataType::Float6E2M3], &[],)
                 .is_supported()
         );
         cast.attributes
             .insert("to".into(), Attribute::Int(DataType::Int32 as i64));
         assert!(
             provider
-                .supports_op(
-                    &cast,
-                    28,
-                    &[shape.clone()],
-                    &[DataType::Float6E2M3],
-                    &[],
-                )
+                .supports_op(&cast, 28, &[shape.clone()], &[DataType::Float6E2M3], &[],)
                 .reason()
                 .is_some_and(|reason| reason.contains("supports only"))
         );
