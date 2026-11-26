@@ -1,3 +1,4 @@
+use super::affine_bank::AffineBank;
 use crate::dtype::{to_dense, to_dense_f32_widen, write_dense, write_dense_f32_narrow};
 use onnx_runtime_ep_api::packed_routed::{
     GroupLayout, fail, group_layout, packed_group_layout, validate,
@@ -136,96 +137,6 @@ impl KernelFactory for AffineFactory {
 
 struct Affine(onnx_runtime_ep_api::packed_routed::AffineGrouped);
 
-pub(super) struct AffineBank<'a> {
-    codes: std::borrow::Cow<'a, [u8]>,
-    scales: Vec<f32>,
-    zeros: Option<std::borrow::Cow<'a, [u8]>>,
-    depth: usize,
-    block: usize,
-    zero: u8,
-}
-
-impl<'a> AffineBank<'a> {
-    pub(super) fn new(
-        codes: &'a TensorView<'_>,
-        scales: &TensorView<'_>,
-        zeros: Option<&'a TensorView<'_>>,
-        [experts, width, depth]: [usize; 3],
-        block: usize,
-        zero: u8,
-    ) -> Result<Self> {
-        let op = Op::GroupedMatMul { transposed: true };
-        if block == 0 || !depth.is_multiple_of(block) || zero > 15 {
-            return Err(fail(
-                op,
-                "affine block must divide projection depth; zero point must fit UINT4",
-            ));
-        }
-        let blocks = depth / block;
-        if codes.dtype != DataType::Uint8
-            || codes.shape != [experts, width, depth.div_ceil(2)]
-            || scales.dtype != DataType::Float32
-            || scales.shape != [experts, width, blocks]
-            || zeros.is_some_and(|z| {
-                z.dtype != DataType::Uint8 || z.shape != [experts, width, blocks.div_ceil(2)]
-            })
-        {
-            return Err(fail(
-                op,
-                format!(
-                    "inconsistent packed expert bank for [experts, width, depth]=[{experts}, {width}, {depth}], block={block}"
-                ),
-            ));
-        }
-        let scales = super::to_dense_f32(scales)?;
-        if scales.iter().any(|&v| v <= 0.0 || !v.is_finite()) {
-            return Err(fail(
-                op,
-                "DequantizeLinear scales must be positive and finite",
-            ));
-        }
-        fn read<'a>(view: &'a TensorView<'_>) -> Result<std::borrow::Cow<'a, [u8]>> {
-            view.validate()?;
-            if !view.is_contiguous() {
-                return super::to_dense_bytes(view).map(std::borrow::Cow::Owned);
-            }
-            // SAFETY: the geometry above validated a one-byte tensor.
-            Ok(std::borrow::Cow::Borrowed(unsafe {
-                std::slice::from_raw_parts(view.data_ptr::<u8>(), view.numel())
-            }))
-        }
-        Ok(Self {
-            codes: read(codes)?,
-            scales,
-            zeros: zeros.map(read).transpose()?,
-            depth,
-            block,
-            zero,
-        })
-    }
-
-    fn weight(&self, row: usize, col: usize) -> f32 {
-        let blocks = self.depth / self.block;
-        let nibble = |bytes: &[u8], col: usize, width: usize| {
-            (bytes[row * width.div_ceil(2) + col / 2] >> ((col % 2) * 4)) & 15
-        };
-        let p = col / self.block;
-        let z = self
-            .zeros
-            .as_ref()
-            .map_or(self.zero, |z| nibble(z, p, blocks));
-        f32::from(i16::from(nibble(&self.codes, col, self.depth)) - i16::from(z))
-            * self.scales[row * blocks + p]
-    }
-
-    pub(super) fn dot(&self, row: usize, input: &[f32]) -> f32 {
-        input
-            .iter()
-            .enumerate()
-            .fold(0.0, |sum, (col, &x)| sum + x * self.weight(row, col))
-    }
-}
-
 pub(super) struct PackedFactory;
 
 impl KernelFactory for PackedFactory {
@@ -288,6 +199,9 @@ impl Kernel for Packed {
 }
 
 impl Kernel for Affine {
+    fn supports_strided_input(&self, index: usize) -> bool {
+        matches!(index, 1 | 3 | 4)
+    }
     fn execute(&self, x: &[TensorView], y: &mut [TensorMut]) -> Result<()> {
         let l = self.0.layout(x, y)?;
         let op = Op::GroupedMatMul { transposed: true };
@@ -303,14 +217,15 @@ impl Kernel for Affine {
         if l.lanes == 0 {
             return Ok(());
         }
-        let data = grouped(
-            l,
-            &super::to_dense_f32(&x[0])?,
-            |i| bank.weight(i / l.k, i % l.k),
-            &routes,
-            None,
-            |v| v,
-        );
+        let activation = super::to_dense_f32(&x[0])?;
+        let mut data = vec![0f32; l.lanes];
+        for (route, output) in data.chunks_exact_mut(l.n).enumerate() {
+            let token = route / l.selections;
+            let input = &activation[token * l.k..(token + 1) * l.k];
+            for (column, value) in output.iter_mut().enumerate() {
+                *value = bank.dot(routes[route] * l.n + column, input);
+            }
+        }
         write_dense(&mut y[0], &data)
     }
 }
