@@ -78,7 +78,7 @@ fn native_waveform_branches_normalization_padding_and_masks_reach_the_head() {
 }
 
 #[test]
-fn native_ogg_opus_presentation_survives_authored_decode_resample_and_head() {
+fn native_opus_presentation_survives_authored_decode_resample_and_head() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
     let source = root.join("onnx_genai_workflows/audio_waveform");
     let package = tempfile::tempdir().unwrap();
@@ -122,67 +122,70 @@ fn native_ogg_opus_presentation_survives_authored_decode_resample_and_head() {
         ("celt-2", 2),
         ("mapping1-6", 6),
     ] {
-        let bytes = std::fs::read(root.join(format!("audio/opus/{name}.ogg"))).unwrap();
-        let reference = std::fs::read(root.join(format!("audio/opus/{name}.reference.f32")))
-            .unwrap()
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-            .collect::<Vec<_>>();
-        let request = PipelineGenerateRequest::new(GenerateRequest {
-            prompt: GeneratePrompt::TokenIds(vec![]),
-            options: GenerateOptions {
-                max_new_tokens: 0,
-                ..Default::default()
-            },
-        })
-        .with_input(
-            "encoded",
-            Value::from_raw_bytes(bytes.clone(), &[bytes.len() as i64], DataType::Uint8).unwrap(),
-        );
-        let outputs = engine
-            .run_pipeline_outputs(request)
-            .unwrap_or_else(|error| panic!("{name}: {error:#}"));
-        let raw = outputs.aggregate("audio.raw").unwrap();
-        assert_eq!(
-            raw.shape(),
-            [1, 11520],
-            "{name}: presented source frame count"
-        );
-        let raw = raw.to_vec_f32().unwrap();
-        for (actual, frame) in raw.iter().zip(reference.chunks_exact(channels)) {
-            let expected = (frame.iter().map(|sample| f64::from(*sample)).sum::<f64>()
-                / channels as f64) as f32;
+        for suffix in ["ogg", "webm"] {
+            let bytes = std::fs::read(root.join(format!("audio/opus/{name}.{suffix}"))).unwrap();
+            let reference = std::fs::read(root.join(format!("audio/opus/{name}.reference.f32")))
+                .unwrap()
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let request = PipelineGenerateRequest::new(GenerateRequest {
+                prompt: GeneratePrompt::TokenIds(vec![]),
+                options: GenerateOptions {
+                    max_new_tokens: 0,
+                    ..Default::default()
+                },
+            })
+            .with_input(
+                "encoded",
+                Value::from_raw_bytes(bytes.clone(), &[bytes.len() as i64], DataType::Uint8)
+                    .unwrap(),
+            );
+            let outputs = engine
+                .run_pipeline_outputs(request)
+                .unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            let raw = outputs.aggregate("audio.raw").unwrap();
+            assert_eq!(
+                raw.shape(),
+                [1, 11520],
+                "{name}: presented source frame count"
+            );
+            let raw = raw.to_vec_f32().unwrap();
+            for (actual, frame) in raw.iter().zip(reference.chunks_exact(channels)) {
+                let expected = (frame.iter().map(|sample| f64::from(*sample)).sum::<f64>()
+                    / channels as f64) as f32;
+                assert!(
+                    (actual - expected).abs() <= 1.0 / 32768.0,
+                    "{name}: independent source PCM reference"
+                );
+            }
+            let scaled = outputs
+                .aggregate("audio.scaled")
+                .unwrap()
+                .to_vec_f32()
+                .unwrap();
+            assert_eq!(
+                scaled,
+                raw.iter().map(|sample| 2.0 * sample).collect::<Vec<_>>()
+            );
+            let features = outputs.aggregate("audio.features").unwrap();
+            assert_eq!(features.shape(), [1, 8]);
+            let features = features.to_vec_f32().unwrap();
+            assert!(features.iter().all(|value| value.is_finite()));
+            assert_eq!(
+                outputs
+                    .aggregate("audio.valid_samples")
+                    .unwrap()
+                    .to_vec_i64()
+                    .unwrap(),
+                [8]
+            );
+            let score = outputs.aggregate("score").unwrap().to_vec_f32().unwrap()[0];
             assert!(
-                (actual - expected).abs() <= 1.0 / 32768.0,
-                "{name}: independent source PCM reference"
+                (score - features.iter().sum::<f32>() / 8.0).abs() < 1e-6,
+                "{name}: native head value"
             );
         }
-        let scaled = outputs
-            .aggregate("audio.scaled")
-            .unwrap()
-            .to_vec_f32()
-            .unwrap();
-        assert_eq!(
-            scaled,
-            raw.iter().map(|sample| 2.0 * sample).collect::<Vec<_>>()
-        );
-        let features = outputs.aggregate("audio.features").unwrap();
-        assert_eq!(features.shape(), [1, 8]);
-        let features = features.to_vec_f32().unwrap();
-        assert!(features.iter().all(|value| value.is_finite()));
-        assert_eq!(
-            outputs
-                .aggregate("audio.valid_samples")
-                .unwrap()
-                .to_vec_i64()
-                .unwrap(),
-            [8]
-        );
-        let score = outputs.aggregate("score").unwrap().to_vec_f32().unwrap()[0];
-        assert!(
-            (score - features.iter().sum::<f32>() / 8.0).abs() < 1e-6,
-            "{name}: native head value"
-        );
     }
     let mut bounded = Engine::from_dir(
         package.path(),

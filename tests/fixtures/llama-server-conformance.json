@@ -17,11 +17,12 @@
         "cli_native_transcription_io",
         "cli_native_transcription_mp3",
         "cli_native_transcription_prompt",
-        "cli_native_audio_pcm_policy"
+        "cli_native_audio_pcm_policy",
+        "server_cli_infill_limits"
       ],
       "remaining": [
         "Fresh complete browser acceptance on the final revision; source-linked drivers are not current results.",
-        "CLI runtime links exercise maintained synthetic Native CPU fixtures through the Cargo-built executable, not the packaged console launcher. Fresh final-revision runs, broader model/device/format/config permutations and installed wheel/console launcher acceptance remain open."
+        "CLI Cargo-built runtime fixtures and maintained [binding wheel smoke](../crates/onnx-genai-python/tests/python_wheel_smoke.py) / [installed console smoke](../crates/onnx-genai-cli/tests/python_wheel_smoke.py) cover synthetic Native CPU workflows without ORT. Remaining installed-artifact acceptance includes release/LTO builds, free-threaded wheels, Linux/Windows, other interpreter versions and broader model/device/format/config permutations; fresh final-revision runs remain required."
       ]
     },
     {
@@ -57,10 +58,16 @@
         "native_completion",
         "legacy_completion",
         "infill",
-        "aliases_embeddings"
+        "aliases_embeddings",
+        "infill_context_native",
+        "infill_context_errors",
+        "infill_stop_roles",
+        "infill_template_bounds",
+        "infill_public_token_errors",
+        "server_cli_infill_limits"
       ],
       "remaining": [
-        "Complete protocol/parameter/default/model/backend cross-product."
+        "Complete protocol/parameter/default/model/backend cross-product. Linked file-context tests cover synthetic Native CPU PSM requests, errors before SSE and bounded template execution; broader successful SSE/cancellation, SPM, tokenizer and model/device combinations remain open. The authored file-context template belongs only to native /infill; OpenAI suffix and engine convenience framing deliberately omit that wire-specific template."
       ]
     },
     {
@@ -773,9 +780,9 @@
       "package_manifest": "crates/onnx-genai-engine/Cargo.toml",
       "source": "crates/onnx-genai-engine/tests/audio_waveform.rs",
       "target": "test:audio_waveform",
-      "test": "native_ogg_opus_presentation_survives_authored_decode_resample_and_head",
-      "execution_contract": "Maintained SILK mono, hybrid/CELT stereo and mapping1 six-channel Ogg Opus fixtures through authored audio preprocessing and actual Native CPU ONNX head; requires native-backend without native-cuda",
-      "assertions": "Four clips preserve 11520 presented mono samples against independent source PCM within 1/32768 after channel averaging; authored resampling/scaling/window reaches finite eight-value features and analytical Native head; explicit 1024-byte decode budget rejects with component context.",
+      "test": "native_opus_presentation_survives_authored_decode_resample_and_head",
+      "execution_contract": "Maintained SILK mono, hybrid/CELT stereo and mapping1 six-channel Ogg and WebM Opus fixtures through authored audio preprocessing and actual Native CPU ONNX head; requires native-backend without native-cuda",
+      "assertions": "Four source clips in each of Ogg and WebM preserve 11520 presented mono samples against independent source PCM within 1/32768 after channel averaging; authored resampling/scaling/window reaches finite eight-value features and analytical Native head; explicit 1024-byte Ogg decode budget rejects with component context.",
       "source_markers": [
         "independent source PCM reference",
         "native head value",
@@ -866,6 +873,94 @@
         "Whitespace is valid SafeTensors header padding",
         "reserve adapter container parsing memory",
         "ResourceLimit::Bytes(64 * 1024 * 1024)"
+      ]
+    },
+    "infill_context_native": {
+      "kind": "rust",
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml",
+      "source": "crates/onnx-genai-server/tests/http.rs",
+      "target": "test:http",
+      "test": "infill_extra_context::native_infill_extra_context_drives_native_tokens_and_exact_prefill_accounting",
+      "execution_contract": "Actual Native CPU synthetic ONNX input-dependent generation through the in-process /infill HTTP router; PSM fixture, not upstream/model/device cross-product parity",
+      "assertions": "Ordered filename/text context changes actual generated tokens; omitted filename defaults to tmp, empty values work and unknown object fields are ignored. Prefill-only and generation counts equal the complete independently tokenized context plus FIM envelope; returned prompt matches decoded IDs.",
+      "source_markers": [
+        "tmp hello",
+        "tokens_evaluated",
+        "decode_with_special_tokens"
+      ]
+    },
+    "infill_context_errors": {
+      "kind": "rust",
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml",
+      "source": "crates/onnx-genai-server/tests/http.rs",
+      "target": "test:http",
+      "test": "infill_extra_context::native_infill_extra_context_errors_precede_sse_and_keep_valid_requests_usable",
+      "execution_contract": "Actual Native CPU synthetic ONNX input-dependent generation through the in-process /infill HTTP router; PSM fixture, not upstream/model/device cross-product parity",
+      "assertions": "Wrong context shape, missing text, nonstring fields, excess filename/context bytes and file count reject with HTTP 400 before SSE; each rejection is followed by successful input-dependent Native generation.",
+      "source_markers": [
+        "StatusCode::BAD_REQUEST",
+        "text/event-stream",
+        "max_infill_files"
+      ]
+    },
+    "infill_stop_roles": {
+      "kind": "rust",
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml",
+      "source": "crates/onnx-genai-server/tests/http.rs",
+      "target": "test:http",
+      "test": "infill_extra_context::native_infill_explicit_stop_roles_do_not_guess_file_separator_semantics",
+      "execution_contract": "Actual Native CPU synthetic ONNX input-dependent generation through the in-process /infill HTTP router; PSM fixture, not upstream/model/device cross-product parity",
+      "assertions": "Custom explicit FIM roles do not infer a stop from the file_sep spelling: actual output is [18,5] with limit completion unless additional_stop_tokens explicitly declares it, then generation stops after one prediction with word completion.",
+      "source_markers": [
+        "json!([18, 5])",
+        "additional_stop_tokens",
+        "tokens_predicted"
+      ]
+    },
+    "infill_template_bounds": {
+      "kind": "rust",
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml",
+      "source": "crates/onnx-genai-server/tests/http.rs",
+      "target": "test:http",
+      "test": "infill_extra_context::native_infill_extra_requires_authored_serialization_and_template_budgets",
+      "execution_contract": "Actual Native CPU synthetic ONNX input-dependent generation through the in-process /infill HTTP router; PSM fixture, not upstream/model/device cross-product parity",
+      "assertions": "Nonempty file context requires an authored template; empty lists render a declared fixed header and preserve exact prefill/generation token counts. Template operation and rendered-output byte caps reject, oversized streamed request fails before SSE, and later valid requests generate correctly.",
+      "source_markers": [
+        "alpha hello <CTX_PRE>hello<CTX_SUF>world<CTX_MID>",
+        "max_infill_template_operations",
+        "max_infill_context_bytes"
+      ]
+    },
+    "infill_public_token_errors": {
+      "kind": "rust",
+      "package": "onnx-genai-engine",
+      "package_manifest": "crates/onnx-genai-engine/Cargo.toml",
+      "source": "crates/onnx-genai-engine/src/engine/runtime.rs",
+      "target": "lib",
+      "test": "engine::runtime::tests::native_fim_rejects_unknown_public_additional_stop_tokens",
+      "execution_contract": "Loads a synthetic Native CPU engine, then directly checks public FIM configuration preparation; no generation/inference is executed by this test",
+      "assertions": "Unknown additional-stop and prefix-role spellings fail options preparation with the exact FimConfig field and missing token spelling, instead of silently ignoring the role.",
+      "source_markers": [
+        "FimConfig.additional_stop_tokens",
+        "missing-explicit-fim-prefix"
+      ]
+    },
+    "server_cli_infill_limits": {
+      "kind": "rust",
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml",
+      "source": "crates/onnx-genai-server/src/cli.rs",
+      "target": "lib",
+      "test": "cli::tests::infill_resource_limits_have_shared_defaults_and_positive_overrides",
+      "execution_contract": "Server public Clap parser and ServerConfig lowering only; no subprocess, model loading or HTTP/inference execution",
+      "assertions": "Four infill resource flags share ServerConfig defaults, explicit positive file-count/filename/context/operation values are forwarded, and zero is rejected for each flag.",
+      "source_markers": [
+        "infill_resource_limits_have_shared_defaults_and_positive_overrides",
+        "--max-infill-template-operations"
       ]
     }
   },
@@ -1187,11 +1282,15 @@
       "path": "/infill",
       "scope": "server",
       "evidence": [
-        "infill"
+        "infill",
+        "infill_context_native",
+        "infill_context_errors",
+        "infill_stop_roles",
+        "infill_template_bounds"
       ],
-      "assertions": "Declared FIM executes through Native generation and response projection.",
+      "assertions": "Declared FIM and ordered authored file context change actual Native generation; prepared token IDs agree with prefill/counts, explicit stop roles apply, and malformed/oversized context rejects before SSE.",
       "remaining": [
-        "Broader prefix/suffix/extra-context and malformed-input cross-product."
+        "Broader prefix/suffix/template/PSM-SPM/tokenizer/model/device cross-product; successful extra-context SSE event/cancellation acceptance. File-context serialization is specific to native /infill, not OpenAI suffix or convenience API framing."
       ]
     },
     {

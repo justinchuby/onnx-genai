@@ -2711,3 +2711,5 @@ mod tests {
         }
     }
 }
+
+mod packed_arithmetic;

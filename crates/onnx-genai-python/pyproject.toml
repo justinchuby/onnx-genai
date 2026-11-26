@@ -1,76 +1,54 @@
-# onnx-genai — Python packaging via maturin.
-#
-# onnx_genai exposes the same high-level Engine API as nxrt.genai. The shared
-# engine compiles and selects Native by default.
-#
-# The ONNX Runtime shared library remains linked for runtime infrastructure
-# and reference execution. It is loaded from the installed onnxruntime or
-# onnxruntime-gpu wheel rather than bundled in this wheel.
-#
-# Wheel: stable ABI `abi3`, tagged `cp310-abi3`. The ABI floor is 3.10, but the
-# supported minimum is Python 3.11 (enforced by requires-python and the
-# `onnxruntime` dependency, which ships no cp310 wheels).
+# Native-default Python engine wheel. Reference libraries are optional.
+# Standard CPython ABI: abi3-py310, built on CPython 3.12.
 [build-system]
-requires = ["maturin>=1.7,<2"]
+requires = ["maturin>=1.14.1,<2"]
 build-backend = "maturin"
 
 [project]
 name = "onnx-genai"
 description = "Native text generation engine (same API as nxrt.genai)"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Justin Chu" }]
 readme = "README.md"
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Rust",
     "License :: OSI Approved :: MIT License",
 ]
-# Default runtime: the CPU ONNX Runtime wheel on every platform, which the loader
-# shim discovers to supply libonnxruntime. macOS additionally pulls the MLX
-# execution-provider plugin so Apple Silicon is fast out of the box. Install the
-# `cuda` extra (Windows/Linux) to swap in the GPU ONNX Runtime + CUDA runtime.
-dependencies = [
-    "onnxruntime>=1.32,<2",
-    "onnxruntime-ep-mlx>=0.27 ; platform_system == 'Darwin'",
-]
+# Native CPU execution has no Python runtime dependency.
+dependencies = []
 dynamic = ["version"]
 
 [project.optional-dependencies]
-# `pip install onnx-genai[cuda]` (Windows/Linux x86_64): CUDA is not bundled in
-# the wheel — this pulls the GPU ONNX Runtime plus its CUDA 13 / cuDNN 9 pip
-# runtime. onnxruntime-gpu installs the same `onnxruntime` import package as the
-# CPU wheel, so it effectively replaces the default CPU runtime.
-cuda = ["onnxruntime-gpu[cuda,cudnn]>=1.32,<2 ; platform_system == 'Windows' or platform_system == 'Linux'"]
+# Reference testing only; ORT 1.32 wheels require Python 3.11+.
+ort = ["onnxruntime>=1.32,<2"]
+ort-cuda = ["onnxruntime-gpu[cuda,cudnn]>=1.32,<2 ; platform_system == 'Windows' or platform_system == 'Linux'"]
+mlx = ["onnxruntime-ep-mlx>=0.27 ; platform_system == 'Darwin'"]
 
 [project.urls]
 repository = "https://github.com/justinchuby/onnx-genai"
 
 [tool.maturin]
+# Embed the maintained MPL reader's exact build-source snapshot, not a second source tree.
+include = [{ path = "onnx-genai-symphonia-mkv-*/**/*", from = "out-dir", to = "onnx_genai/_third_party", crate_name = "onnx-genai-symphonia-mkv" }]
 # Mixed layout: the Python package lives in python/onnx_genai and the compiled
 # extension is installed as its private `_onnx_genai` submodule.
 python-source = "python"
 module-name = "onnx_genai._onnx_genai"
-# Build the stable-ABI wheel. `abi3-py310` builds against the limited API so the
-# wheel (tagged cp310-abi3) loads from a single build on any CPython >= 3.10. The
-# real minimum is 3.11 (see requires-python + the onnxruntime dependency); the
-# ABI floor is 3.10 because maturin's Windows abi3 path fixes the limited-API
-# config at 3.10.
+# Standard CPython 3.10+ limited API; free-threaded wheels use a separate abi3t build.
 features = ["pyo3/abi3-py310", "pyo3/extension-module"]
 strip = true
 
 [tool.cibuildwheel]
-# Build once on CPython 3.11 (our supported minimum). maturin emits a single
-# cp310-abi3 wheel from the abi3 feature; requires-python (>=3.11) keeps it off
-# 3.10 at install time. That wheel remains installable on later CPython versions.
-build = "cp311-*"
+# Build once on CPython 3.12; the abi3 wheel supports standard CPython 3.10+.
+build = "cp312-*"
 skip = "*-musllinux_*"
-# Import the package (which loads libonnxruntime from the onnxruntime wheel) to
-# prove the loader shim resolves the runtime.
-test-command = 'python -c "import onnx_genai; print(onnx_genai.__version__)"'
+test-command = 'python "{project}/tests/python_wheel_smoke.py" "{project}/../../tests/fixtures/tiny-llm"'
 
 [tool.cibuildwheel.linux]
 # Linux wheel builds run inside a manylinux container, so provision Rust and

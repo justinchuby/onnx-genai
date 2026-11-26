@@ -16,6 +16,16 @@ pub fn moe(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+fn packed_moe(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    onnx_runtime_ir::packed_arithmetic::ActivationArithmetic::from_node(ctx.node).map_err(
+        |detail| ShapeInferError::Invalid {
+            op: ctx.node.op_type.clone(),
+            detail,
+        },
+    )?;
+    moe(ctx)
+}
+
 /// `SparseKvGather`: cache `[B,G,C,D]` and indices `[B,G,Q,K]` produce
 /// selected KV `[B,G,Q,K,D]`.
 pub fn sparse_kv_gather(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
@@ -720,7 +730,7 @@ pub fn register(reg: &mut InferenceRegistry) {
         gather_block_quantized,
     );
     reg.register("com.microsoft", "RotaryEmbedding", 1, rotary_embedding);
-    reg.register("pkg.nxrt", "BlockQuantizedMoE", 1, moe);
+    reg.register("pkg.nxrt", "BlockQuantizedMoE", 1, packed_moe);
     reg.register("pkg.nxrt", "SparseKvGather", 1, sparse_kv_gather);
     reg.register("pkg.nxrt", "IndexShare", 1, index_share);
     reg.register(
