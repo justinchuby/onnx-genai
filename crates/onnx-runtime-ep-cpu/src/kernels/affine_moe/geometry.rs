@@ -1,5 +1,6 @@
-use super::{AffineMoe, error, workspace::Workspace};
+use super::{AffineMoe, error};
 use crate::kernels::affine_bank;
+use crate::kernels::typed_workspace::FloatIndexWorkspace;
 use onnx_runtime_ep_api::{OutputMetadata, Result, TensorMetadata};
 use onnx_runtime_ir::DataType;
 
@@ -126,17 +127,26 @@ impl Geometry {
             output,
         })
     }
-    pub(super) fn plan(&self, k: usize, x_row: usize, router_row: usize) -> Result<Workspace> {
-        Workspace::new(
-            self.output,
-            x_row,
-            router_row,
-            k,
-            self.intermediate,
-            self.experts,
+    pub(super) fn plan(
+        &self,
+        k: usize,
+        x_row: usize,
+        router_row: usize,
+    ) -> Result<FloatIndexWorkspace<6>> {
+        FloatIndexWorkspace::new(
+            super::OP,
+            [
+                ("Y staging", self.output),
+                ("activation row", x_row),
+                ("router row", router_row),
+                ("selected logits", k),
+                ("probabilities", k),
+                ("activated projection", self.intermediate),
+            ],
+            ("routing indices", self.experts),
         )
     }
-    pub(super) fn conservative(&self, k: usize) -> Result<Workspace> {
+    pub(super) fn conservative(&self, k: usize) -> Result<FloatIndexWorkspace<6>> {
         self.plan(k, self.hidden, self.experts)
     }
 }

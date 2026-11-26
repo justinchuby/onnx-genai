@@ -679,6 +679,7 @@ mod grouped_matmul;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod half_gemv;
 pub mod hardmax;
+mod host_rows;
 pub mod identity;
 pub mod index_share;
 pub mod indexing;
@@ -1171,7 +1172,7 @@ pub(crate) fn build_cpu_registry_with_resources(
             onnx_runtime_ir::RUNTIME_DOMAIN,
             1,
         ),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(grouped_matmul::AffineFactory),
     );
     rec.register(

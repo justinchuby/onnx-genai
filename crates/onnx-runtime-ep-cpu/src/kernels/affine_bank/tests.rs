@@ -116,7 +116,7 @@ fn borrowed_dense_padded_reversed_and_packed_banks_match_scalar_weight_bits() {
                     mode,
                 );
                 let (cv, sv, zv) = (c.view(), s.view(), z.view());
-                let bank = AffineBank::new(
+                let bank = AffineBank::prepare(
                     &cv,
                     &sv,
                     zero_points.then_some(&zv),
@@ -124,6 +124,7 @@ fn borrowed_dense_padded_reversed_and_packed_banks_match_scalar_weight_bits() {
                     block,
                     7,
                 )
+                .and_then(|bank| bank.validate())
                 .unwrap();
                 for special in [false, true] {
                     let input = (0..depth)
@@ -181,10 +182,13 @@ fn every_bank_is_host_validated_before_any_scale_read() {
         views[1].data = DevicePtr(4usize as *const _);
         views[slot].device = DeviceId::cuda(0);
         views[slot].data = DevicePtr(4usize as *const _);
-        let error = match AffineBank::new(&views[0], &views[1], Some(&views[2]), [1, 2, 4], 2, 7) {
-            Ok(_) => panic!("non-Host bank must fail"),
-            Err(e) => e,
-        };
+        let error =
+            match AffineBank::prepare(&views[0], &views[1], Some(&views[2]), [1, 2, 4], 2, 7)
+                .and_then(|bank| bank.validate())
+            {
+                Ok(_) => panic!("non-Host bank must fail"),
+                Err(e) => e,
+            };
         let message = error.to_string();
         assert!(message.contains("Host-accessible"), "{message}");
         assert!(
@@ -206,7 +210,9 @@ fn malformed_scales_shapes_and_address_spans_fail_with_context() {
             0,
         );
         let (cv, sv, zv) = (codes.view(), scales.view(), zeros.view());
-        let error = match AffineBank::new(&cv, &sv, Some(&zv), [1, 2, 4], 2, 7) {
+        let error = match AffineBank::prepare(&cv, &sv, Some(&zv), [1, 2, 4], 2, 7)
+            .and_then(|bank| bank.validate())
+        {
             Ok(_) => panic!("bad scale must fail"),
             Err(e) => e,
         };
@@ -226,10 +232,13 @@ fn malformed_scales_shapes_and_address_spans_fail_with_context() {
             3 => views[1].byte_offset = usize::MAX - 3,
             _ => views[1].shape = &[1, 1, 4],
         }
-        let error = match AffineBank::new(&views[0], &views[1], Some(&views[2]), [1, 2, 4], 2, 7) {
-            Ok(_) => panic!("case {case} must fail"),
-            Err(e) => e,
-        };
+        let error =
+            match AffineBank::prepare(&views[0], &views[1], Some(&views[2]), [1, 2, 4], 2, 7)
+                .and_then(|bank| bank.validate())
+            {
+                Ok(_) => panic!("case {case} must fail"),
+                Err(e) => e,
+            };
         let message = error.to_string();
         assert!(
             message.contains("span") || message.contains("do not match"),
