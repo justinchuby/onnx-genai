@@ -21,7 +21,7 @@ mod wire {
         "/../../tests/fixtures/build_gguf_lora.rs"
     ));
 }
-fn package(format: &str, embedding: bool) -> tempfile::TempDir {
+fn package(format: &str, storage: &str, embedding: bool) -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
     if embedding {
@@ -47,8 +47,9 @@ fn package(format: &str, embedding: bool) -> tempfile::TempDir {
         .unwrap()
         .len();
     let mut b = vec![0f32; width];
-    b[4] = 10000.;
-    b[6] = -10000.;
+    let magnitude = if format == "hf_peft" { 8192.0 } else { 10000.0 };
+    b[4] = magnitude;
+    b[6] = -magnitude;
     // Deterministic actual Native base projection: only appended constant feature
     // contributes, so no adapter always selects token7. +/- scales select4/6.
     let mut projection = vec![0f32; a.len() * width];
@@ -78,10 +79,40 @@ fn package(format: &str, embedding: bool) -> tempfile::TempDir {
     if format == "hf_peft" {
         weight["config_location"] = json!("adapters/red/adapter_config.json");
         std::fs::write(root.path().join("adapters/red/adapter_config.json"),serde_json::to_vec(&json!({"peft_type":"LORA","r":1,"lora_alpha":1,"target_modules":["projection"],"bias":"none","fan_in_fan_out":false})).unwrap()).unwrap();
-        let header=serde_json::to_vec(&json!({format!("{prefix}.lora_A.weight"):{"dtype":"F32","shape":[1,a.len()],"data_offsets":[0,a.len()*4]},format!("{prefix}.lora_B.weight"):{"dtype":"F32","shape":[width,1],"data_offsets":[a.len()*4,(a.len()+b.len())*4]}})).unwrap();
+        artifact["dtype"] = serde_yaml::to_value(match storage {
+            "F32" => "float32",
+            "F16" => "float16",
+            "BF16" => "bfloat16",
+            _ => unreachable!(),
+        })
+        .unwrap();
+        // Independent exact wire patterns for the fixture's 0, 1 and +/-8192.
+        // These are not produced by the runtime's half conversion implementation.
+        let mut payload = Vec::new();
+        let element_bytes = if storage == "F32" { 4 } else { 2 };
+        for value in a.iter().chain(&b) {
+            if storage == "F32" {
+                payload.extend(value.to_le_bytes());
+                continue;
+            }
+            let bits: u16 = match (storage, value.to_bits()) {
+                ("F16", 0) | ("BF16", 0) => 0,
+                ("F16", 0x3f800000) => 0x3c00,
+                ("BF16", 0x3f800000) => 0x3f80,
+                ("F16", 0x46000000) => 0x7000,
+                ("BF16", 0x46000000) => 0x4600,
+                ("F16", 0xc6000000) => 0xf000,
+                ("BF16", 0xc6000000) => 0xc600,
+                _ => panic!(
+                    "fixture requires an independently specified exact half pattern: {storage} {value}"
+                ),
+            };
+            payload.extend(bits.to_le_bytes());
+        }
+        let header=serde_json::to_vec(&json!({format!("{prefix}.lora_A.weight"):{"dtype":storage,"shape":[1,a.len()],"data_offsets":[0,a.len()*element_bytes]},format!("{prefix}.lora_B.weight"):{"dtype":storage,"shape":[width,1],"data_offsets":[a.len()*element_bytes,(a.len()+b.len())*element_bytes]}})).unwrap();
         let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
         bytes.extend(header);
-        bytes.extend(a.iter().chain(&b).flat_map(|v| v.to_le_bytes()));
+        bytes.extend(payload);
         std::fs::write(root.path().join(filename), bytes).unwrap();
     } else {
         let facts = vec![
@@ -146,8 +177,8 @@ async fn call(router: axum::Router, method: &str, path: &str, body: Value) -> (S
 fn generation() -> Value {
     json!({"prompt":[2,4],"n_predict":2,"temperature":0,"ignore_eos":true,"return_tokens":true,"cache_prompt":false})
 }
-async fn exercise(format: &str) {
-    let root = package(format, false);
+async fn exercise(format: &str, storage: &str) {
+    let root = package(format, storage, false);
     let router = app(AppState::load_with_config(
         root.path(),
         Some("containers".into()),
@@ -235,7 +266,7 @@ async fn exercise(format: &str) {
         json!([4, 4]),
         "invalid selection cannot corrupt active default"
     );
-    let embeddings = package(format, true);
+    let embeddings = package(format, storage, true);
     let router = app(AppState::load_with_config(
         embeddings.path(),
         Some("containers".into()),
@@ -260,12 +291,12 @@ async fn exercise(format: &str) {
         assert_eq!(status, StatusCode::OK, "{result}");
         assert_eq!(
             result[0]["embedding"][0][4],
-            json!(scale * 10000.0),
+            json!(scale * if format == "hf_peft" { 8192.0 } else { 10000.0 }),
             "{format}: raw Native embedding positive factor"
         );
         assert_eq!(
             result[0]["embedding"][0][6],
-            json!(-scale * 10000.0),
+            json!(-scale * if format == "hf_peft" { 8192.0 } else { 10000.0 }),
             "{format}: raw Native embedding negative factor"
         );
         assert_eq!(
@@ -277,9 +308,11 @@ async fn exercise(format: &str) {
 }
 #[tokio::test]
 async fn native_http_hf_peft_only_catalogue_defaults_and_request_scales_use_actual_factors() {
-    exercise("hf_peft").await;
+    for storage in ["F32", "F16", "BF16"] {
+        exercise("hf_peft", storage).await;
+    }
 }
 #[tokio::test]
 async fn native_http_gguf_only_catalogue_defaults_and_request_scales_use_actual_factors() {
-    exercise("gguf").await;
+    exercise("gguf", "F32").await;
 }
