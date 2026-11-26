@@ -6575,7 +6575,7 @@ mod tests {
         assert_eq!(engine.native_active_session, Some(failed));
 
         let mut append = tiny_native_cold_request(false);
-        let mut prompt = engine.native_sessions[&failed].tokens.clone();
+        let mut prompt = engine.native_sessions[&failed].tokens.as_slice().to_vec();
         prompt.push(0);
         append.prompt = GeneratePrompt::TokenIds(prompt);
         engine
