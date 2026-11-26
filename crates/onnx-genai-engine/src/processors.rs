@@ -599,7 +599,47 @@ pub(crate) fn device_sampling_plan(
 
 pub(crate) fn load_fim_config_from_model_dir(
     model_dir: &Path,
+    metadata: &onnx_genai_metadata::InferenceMetadata,
+    tokenizer: &Tokenizer,
 ) -> anyhow::Result<Option<FimConfig>> {
+    if let Some(declaration) = metadata
+        .package
+        .as_ref()
+        .and_then(|package| package.infill.as_ref())
+    {
+        for (role, spelling) in [
+            ("prefix_token", &declaration.prefix_token),
+            ("middle_token", &declaration.middle_token),
+            ("suffix_token", &declaration.suffix_token),
+        ]
+        .into_iter()
+        .chain(
+            declaration
+                .additional_stop_tokens
+                .iter()
+                .map(|spelling| ("additional_stop_tokens", spelling)),
+        ) {
+            let id = tokenizer.token_id(spelling).with_context(||format!("package.infill.{role} {spelling:?} is absent from the package tokenizer; declare an exact registered control token"))?;
+            anyhow::ensure!(
+                tokenizer.encode_with_options(
+                    spelling,
+                    onnx_genai_ort::TokenizationOptions {
+                        add_special: false,
+                        parse_special: true
+                    }
+                ).with_context(|| format!("encode package.infill.{role} {spelling:?}; repair the declared tokenizer control token"))? == [id],
+                "package.infill.{role} must encode to its one declared tokenizer ID; register the control token explicitly"
+            );
+        }
+        return Ok(Some(FimConfig {
+            prefix_token: declaration.prefix_token.clone(),
+            middle_token: declaration.middle_token.clone(),
+            suffix_token: declaration.suffix_token.clone(),
+            format: declaration.order,
+            additional_stop_tokens: declaration.additional_stop_tokens.clone(),
+            extra_context_template: declaration.extra_context_template.clone(),
+        }));
+    }
     let tokenizer_config = model_dir.join("tokenizer_config.json");
     if !tokenizer_config.is_file() {
         return Ok(None);

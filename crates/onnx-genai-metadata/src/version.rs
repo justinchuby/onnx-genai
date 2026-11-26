@@ -151,7 +151,7 @@ pub enum SchemaVersionError {
 pub const INITIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 0);
 
 /// The newest version this build can read.
-pub const SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 17);
+pub const SUPPORTED_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 18);
 
 /// Every inference-metadata schema version this build reads.
 pub const SUPPORTED_SCHEMA_VERSIONS: SupportedSchemaVersions = SupportedSchemaVersions {
@@ -215,6 +215,9 @@ pub const AUDIO_FEATURE_INPUT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new
 /// The version introducing graph-scoped keyed weight container declarations.
 pub const GRAPH_WEIGHTS_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 17);
 
+/// The version introducing explicit FIM control and extra-context serialization.
+pub const INFILL_CONTEXT_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 18);
+
 /// A serialized feature whose presence is bounded by one schema version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaFeature {
@@ -230,6 +233,7 @@ pub enum SchemaFeature {
     DecisionAudio,
     AudioFeatureInputs,
     GraphWeights,
+    InfillContext,
 }
 
 impl SchemaFeature {
@@ -247,6 +251,7 @@ impl SchemaFeature {
             Self::DecisionAudio => DECISION_AUDIO_SCHEMA_VERSION,
             Self::AudioFeatureInputs => AUDIO_FEATURE_INPUT_SCHEMA_VERSION,
             Self::GraphWeights => GRAPH_WEIGHTS_SCHEMA_VERSION,
+            Self::InfillContext => INFILL_CONTEXT_SCHEMA_VERSION,
         }
     }
 
@@ -263,6 +268,7 @@ impl SchemaFeature {
             Self::RealtimeSessions => "session-scoped realtime audio/text quanta",
             Self::MultimodalDecisions => "ordered decision image inputs and authoritative usage",
             Self::DecisionAudio => "typed mixed decision media and spoken instructions",
+            Self::InfillContext => "explicit FIM control tokens and caller-supplied file context",
             Self::GraphWeights => "graph-scoped GGUF and SafeTensors initializer bindings",
             Self::AudioFeatureInputs => {
                 "externally executed audio programs bound to feature media inputs"
@@ -286,6 +292,9 @@ impl SchemaFeature {
                  `publication_mode: provisional_revisions`"
             }
             Self::DecisionProfiles => "Declare decision prompting and answer policies explicitly",
+            Self::InfillContext => {
+                "Declare package.infill control tokens and extra-context template explicitly"
+            }
             Self::GraphWeights => {
                 "Declare each graph artifact and its keyed weight paths, formats and explicit renames"
             }
@@ -341,6 +350,9 @@ pub fn gate_feature_use(
              {required}. Remove `pipeline.workflow.publication_mode` to keep a pre-{required} \
              document, or upgrade `schema_version` to \"{required}\" and author a valid mode \
              (`commit_only` or `provisional_revisions`)"
+        )),
+        SchemaFeature::InfillContext => Err(format!(
+            "{path} requires minimum schema version {required}; re-emit with schema_version '{required}' and an explicit FIM declaration, or omit package.infill"
         )),
         SchemaFeature::GraphWeights => Err(format!(
             "{path} requires minimum schema version {required}; re-emit the package with schema_version '{required}' and explicit graph-scoped weight bindings, or use ordinary ONNX external data"
@@ -487,7 +499,7 @@ mod tests {
 
     #[test]
     fn a_canonical_version_prints_the_way_a_document_should_write_it() {
-        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.17");
+        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.18");
         assert_eq!(INITIAL_SCHEMA_VERSION.to_string(), "v1.0");
     }
 
@@ -526,10 +538,10 @@ mod tests {
 
     #[test]
     fn a_newer_minor_is_refused_by_number_rather_than_by_field_name() {
-        let error = gate(Some("1.18")).expect_err("1.18 is newer than this build");
+        let error = gate(Some("1.19")).expect_err("1.19 is newer than this build");
         let error = error.to_string();
         assert!(
-            error.contains("declares unsupported schema version v1.18"),
+            error.contains("declares unsupported schema version v1.19"),
             "{error}"
         );
         assert!(
@@ -592,7 +604,7 @@ mod tests {
             gate(Some("1.16")).expect("1.16"),
             AUDIO_FEATURE_INPUT_SCHEMA_VERSION
         );
-        assert_eq!(gate(Some("1.17")).expect("1.17"), SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(gate(Some("1.18")).expect("1.18"), SUPPORTED_SCHEMA_VERSION);
     }
 
     #[test]

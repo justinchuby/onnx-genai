@@ -8,10 +8,82 @@ struct NativeRequest {
     sampling: Arc<ChatCompletionRequest>,
     prompt: MixedPrompt,
     suffix: Option<String>,
+    input_extra: Vec<InfillFile>,
     return_tokens: bool,
     prefill_only: bool,
     probabilities: NativeProbabilities,
     response_fields: Arc<ResponseFields>,
+}
+
+/// Caller-owned file labels and text, never server filesystem paths.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct InfillFile {
+    #[serde(default = "default_infill_filename")]
+    filename: String,
+    text: String,
+}
+
+fn default_infill_filename() -> String {
+    "tmp".to_owned()
+}
+
+fn validate_infill_files(
+    files: &[InfillFile],
+    config: &crate::ServerConfig,
+) -> Result<(), ApiError> {
+    if files.len() > config.max_infill_files.get() {
+        return Err(ApiError::invalid_request(
+            "input_extra exceeds max_infill_files; send fewer file contexts",
+        ));
+    }
+    let mut bytes = 0usize;
+    for (index, file) in files.iter().enumerate() {
+        if file.filename.len() > config.max_infill_filename_bytes.get() {
+            return Err(ApiError::invalid_request(format!(
+                "input_extra[{index}].filename exceeds max_infill_filename_bytes; shorten this caller-owned label"
+            )));
+        }
+        bytes = bytes
+            .checked_add(file.filename.len())
+            .and_then(|total| total.checked_add(file.text.len()))
+            .ok_or_else(|| {
+                ApiError::invalid_request(
+                    "input_extra UTF-8 byte count overflows; reduce file contexts",
+                )
+            })?;
+        if bytes > config.max_infill_context_bytes.get() {
+            return Err(ApiError::invalid_request(
+                "input_extra exceeds max_infill_context_bytes; shorten the supplied file contexts",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn infill_context(
+    request: &NativeRequest,
+    fim: &onnx_genai_engine::FimConfig,
+    config: &crate::ServerConfig,
+) -> Result<String, ApiError> {
+    let template = match fim.extra_context_template.as_ref() {
+        Some(template) => template,
+        None if request.input_extra.is_empty() => return Ok(String::new()),
+        None => {
+            return Err(ApiError::invalid_request(
+                "input_extra requires package.infill.extra_context_template; select a package declaring file-context serialization or omit input_extra",
+            ));
+        }
+    };
+    validate_infill_files(&request.input_extra, config)?;
+    let kwargs = [(
+        "input_extra".to_owned(),
+        serde_json::to_value(&request.input_extra).map_err(|error| {
+            ApiError::invalid_request(format!("encode input_extra context: {error}"))
+        })?,
+    )]
+    .into_iter()
+    .collect();
+    onnx_genai_ort::ChatTemplate::from_source(template.clone()).render_with_limited_kwargs(&[], None, false, None, &kwargs, onnx_genai_ort::TemplateLimits { max_output_bytes: config.max_infill_context_bytes, max_operations: config.max_infill_template_operations }).map_err(|error| ApiError::invalid_request(format!("render package.infill.extra_context_template: {error:#}; repair the authored template or reduce input_extra")))
 }
 
 /// Pinned paths traverse objects and retain the entire path as the output key.
@@ -41,7 +113,11 @@ struct NativeProbabilities {
     post: bool,
 }
 
-fn parse(mut body: Map<String, Value>, infill: bool) -> Result<NativeRequest, ApiError> {
+fn parse(
+    mut body: Map<String, Value>,
+    infill: bool,
+    config: &crate::ServerConfig,
+) -> Result<NativeRequest, ApiError> {
     let response_fields=Arc::new(ResponseFields(match body.remove("response_fields") {
         None=>Vec::new(),
         Some(value)=>serde_json::from_value::<Vec<String>>(value).map_err(|error| ApiError::invalid_request(format!("response_fields must be an array of string paths; use [] to return every field: {error}")))?,
@@ -77,6 +153,29 @@ fn parse(mut body: Map<String, Value>, infill: bool) -> Result<NativeRequest, Ap
     };
     let prompt = MixedPrompt::parse_completion(prompt)
         .map_err(|error| ApiError::invalid_request(format!("invalid prompt: {error}")))?;
+    let input_extra = if infill {
+        let value = body.remove("input_extra").unwrap_or_else(|| json!([]));
+        let array = value.as_array().ok_or_else(|| {
+            ApiError::invalid_request(
+                "input_extra must be an array of filename/text string objects",
+            )
+        })?;
+        if array.len() > config.max_infill_files.get() {
+            return Err(ApiError::invalid_request(
+                "input_extra exceeds max_infill_files; send fewer file contexts",
+            ));
+        }
+        let files =
+            serde_path_to_error::deserialize::<_, Vec<InfillFile>>(value).map_err(|error| {
+                ApiError::invalid_request(format!(
+                    "input_extra{error}: provide text and optional filename strings"
+                ))
+            })?;
+        validate_infill_files(&files, config)?;
+        files
+    } else {
+        Vec::new()
+    };
     let suffix = if infill {
         let prefix = body
             .remove("input_prefix")
@@ -92,13 +191,6 @@ fn parse(mut body: Map<String, Value>, infill: bool) -> Result<NativeRequest, Ap
             .as_str()
             .ok_or_else(|| ApiError::invalid_request("input_suffix must be a string"))?
             .to_string();
-        if let Some(extra) = body.remove("input_extra")
-            && extra != json!([])
-        {
-            return Err(ApiError::invalid_request(
-                "input_extra is not declared by this model's FIM contract; omit it or send []",
-            ));
-        }
         match &prompt {
             MixedPrompt::Text(text) if text.is_empty() => {}
             _ => {
@@ -159,6 +251,7 @@ fn parse(mut body: Map<String, Value>, infill: bool) -> Result<NativeRequest, Ap
         sampling: Arc::new(sampling),
         prompt,
         suffix,
+        input_extra,
         return_tokens,
         prefill_only,
         probabilities: NativeProbabilities { top, post },
@@ -286,6 +379,7 @@ enum NativeOperation {
     Generate {
         tokens: Vec<u32>,
         options: Box<GenerateOptions>,
+        fim_config: Option<onnx_genai_engine::FimConfig>,
     },
     Prefill(onnx_genai_engine::PrefillRequest),
 }
@@ -303,7 +397,7 @@ pub(crate) async fn completions(
         super::prompt::PromptBatch::parse(prompt, state.config.max_completion_prompts)?;
     let prompts = rest.into_iter();
     body.insert("prompt".into(), first);
-    let first = parse(body, false)?;
+    let first = parse(body, false, &state.config)?;
     let mut requests = Vec::with_capacity(prompts.len() + 1);
     for prompt in prompts {
         requests.push(NativeRequest {
@@ -311,6 +405,7 @@ pub(crate) async fn completions(
             prompt: MixedPrompt::parse_completion(prompt)
                 .map_err(|error| ApiError::invalid_request(format!("invalid prompt: {error}")))?,
             suffix: None,
+            input_extra: Vec::new(),
             return_tokens: first.return_tokens,
             prefill_only: first.prefill_only,
             probabilities: first.probabilities,
@@ -436,7 +531,7 @@ pub(crate) async fn infill(
     State(state): State<AppState>,
     ApiJson(body): ApiJson<Map<String, Value>>,
 ) -> Result<Response, ApiError> {
-    let request = parse(body, true)?;
+    let request = parse(body, true, &state.config)?;
     validate_native_request(&request, &state.config)?;
     let ping = crate::SsePingInterval::resolve(&request.sampling, state.config.sse_ping_interval)?;
     let handle = resolve_model(&state.registry, &request.sampling.model).await?;
@@ -462,12 +557,17 @@ fn prepare(
                     handle.id
                 ))
             })?;
-            handle
-                .tokenizer
-                .encode(&fim.format_prompt(text, request.suffix.as_deref().unwrap_or_default()))
-                .map_err(|err| {
-                    ApiError::invalid_request(format!("infill tokenization failed: {err}"))
-                })?
+            let mut prompt = infill_context(&request, fim, &state.config)?;
+            let framed = fim.format_prompt(text, request.suffix.as_deref().unwrap_or_default());
+            prompt.try_reserve_exact(framed.len()).map_err(|error| {
+                ApiError::invalid_request(format!(
+                    "allocate bounded FIM prompt: {error}; reduce input_extra/prefix/suffix"
+                ))
+            })?;
+            prompt.push_str(&framed);
+            handle.tokenizer.encode(&prompt).map_err(|err| {
+                ApiError::invalid_request(format!("infill tokenization failed: {err}"))
+            })?
         }
         prompt => prompt.encode(
             &handle.tokenizer,
@@ -578,6 +678,7 @@ fn prepare(
             })?;
     }
     let metadata = NativeFinalMetadata::new(&handle, &tokens, &options, &request, output_budget)?;
+    let fim_config = request.suffix.as_ref().and(handle.fim_config.clone());
     Ok(PreparedNative {
         metadata,
         request,
@@ -585,6 +686,7 @@ fn prepare(
         operation: NativeOperation::Generate {
             tokens,
             options: Box::new(options),
+            fim_config,
         },
     })
 }
@@ -609,8 +711,12 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
         metadata,
     } = prepared;
     let response_fields = Arc::clone(&request.response_fields);
-    let (tokens, options) = match operation {
-        NativeOperation::Generate { tokens, options } => (tokens, *options),
+    let (tokens, options, fim_config) = match operation {
+        NativeOperation::Generate {
+            tokens,
+            options,
+            fim_config,
+        } => (tokens, *options, fim_config),
         NativeOperation::Prefill(input) => {
             let mut prefill = handle
                 .engine
@@ -687,22 +793,10 @@ async fn run(prepared: PreparedNative, index: usize) -> Result<NativeOutput, Api
     let minimum_indent = options.minimum_indent;
     let probabilities = ProbabilityOutput::new(request.probabilities, &handle.tokenizer)?;
     let prompt_tokens = tokens.len();
-    let generation = if let Some(suffix) = &request.suffix {
-        let MixedPrompt::Text(prefix) = &request.prompt else {
-            return Err(ApiError::invalid_request(
-                "infill input_prefix must be text",
-            ));
-        };
+    let generation = if let Some(fim_config) = fim_config {
         handle
             .engine
-            .generate_fim(
-                prefix.clone(),
-                suffix.clone(),
-                handle.fim_config.clone().ok_or_else(|| {
-                    ApiError::invalid_request("infill requires a declared FIM contract")
-                })?,
-                options,
-            )
+            .generate_fim(tokens, fim_config, options)
             .await
     } else {
         handle
@@ -1365,6 +1459,7 @@ mod json_schema_tests {
                     .unwrap()
                     .clone(),
                 false,
+                &crate::ServerConfig::default(),
             )
             .unwrap();
             assert_eq!(request.sampling.grammar.as_deref(), Some(grammar));
@@ -1380,6 +1475,7 @@ mod json_schema_tests {
                 .unwrap()
                 .clone(),
             false,
+            &crate::ServerConfig::default(),
         )
         .unwrap();
         assert_eq!(

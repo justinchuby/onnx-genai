@@ -789,7 +789,8 @@ impl Engine {
             Tokenizer::from_file(&model_directory.tokenizer_path)
                 .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?
         };
-        let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
+        let fim_config =
+            load_fim_config_from_model_dir(&model_directory.root, &metadata, &tokenizer)?;
         // Stage: resource governor and batch scheduler.
         let (governor, scheduler) = build_governor_and_scheduler(
             &config,
@@ -984,7 +985,8 @@ impl Engine {
             Tokenizer::from_file(&model_directory.tokenizer_path)
                 .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?
         };
-        let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
+        let fim_config =
+            load_fim_config_from_model_dir(&model_directory.root, &metadata, &tokenizer)?;
         let kv_model = {
             let _span = onnx_genai_ort::prof_span!("engine.native_kv_model_info");
             let decoder_abi = metadata.decoder_io();

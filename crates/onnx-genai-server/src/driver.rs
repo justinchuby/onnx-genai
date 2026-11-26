@@ -206,8 +206,7 @@ pub(crate) enum DriverCommand {
         track_metrics: bool,
     },
     GenerateFim {
-        prefix: String,
-        suffix: String,
+        tokens: Vec<u32>,
         fim_config: FimConfig,
         options: Box<GenerateOptions>,
         admission: oneshot::Sender<Result<(), DriverFailure>>,
@@ -1410,8 +1409,7 @@ impl EngineDriver {
 
     pub(crate) async fn generate_fim(
         &self,
-        prefix: String,
-        suffix: String,
+        tokens: Vec<u32>,
         fim_config: FimConfig,
         options: GenerateOptions,
     ) -> Result<DriverGeneration, GenerateSubmitError> {
@@ -1421,8 +1419,7 @@ impl EngineDriver {
         crate::metrics::generation_queued();
         if commands
             .send(DriverCommand::GenerateFim {
-                prefix,
-                suffix,
+                tokens,
                 fim_config,
                 options: Box::new(options),
                 admission,
@@ -2417,8 +2414,7 @@ fn handle_driver_command(
             },
         ),
         DriverCommand::GenerateFim {
-            prefix,
-            suffix,
+            tokens,
             fim_config,
             options,
             admission,
@@ -2427,8 +2423,7 @@ fn handle_driver_command(
         } => run_fim_generation(
             engine,
             completion,
-            prefix,
-            suffix,
+            tokens,
             fim_config,
             *options,
             (admission, events, permit),
@@ -2865,8 +2860,7 @@ fn run_generation(
 fn run_fim_generation(
     engine: &mut Engine,
     completion: &mut Option<crate::slots::SlotExecution>,
-    prefix: String,
-    suffix: String,
+    tokens: Vec<u32>,
     fim_config: FimConfig,
     options: GenerateOptions,
     delivery: (
@@ -2889,10 +2883,11 @@ fn run_fim_generation(
                 let _ = sender.send(Ok(()));
             }
         };
-        engine.generate_fim_with_config_and_callbacks(
-            prefix,
-            suffix,
-            options,
+        engine.generate_fim_request_with_config_and_callbacks(
+            GenerateRequest {
+                prompt: onnx_genai_engine::GeneratePrompt::TokenIds(tokens),
+                options,
+            },
             &fim_config,
             Some(control),
             Some(&mut admitted),

@@ -2,14 +2,7 @@
 
 use serde_json::Value;
 
-/// Fill-in-the-middle prompt ordering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FimFormat {
-    /// Prefix → Suffix → Middle.
-    PSM,
-    /// Suffix → Prefix → Middle.
-    SPM,
-}
+pub use onnx_genai_metadata::InfillOrder;
 
 /// Fill-in-the-middle special-token configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,7 +10,10 @@ pub struct FimConfig {
     pub prefix_token: String,
     pub middle_token: String,
     pub suffix_token: String,
-    pub format: FimFormat,
+    pub format: InfillOrder,
+    pub additional_stop_tokens: Vec<String>,
+    /// Explicit model-authored serialization of ordered caller file labels/text.
+    pub extra_context_template: Option<String>,
 }
 
 impl FimConfig {
@@ -32,7 +28,12 @@ impl FimConfig {
                     prefix_token: prefix_token.to_string(),
                     middle_token: middle_token.to_string(),
                     suffix_token: suffix_token.to_string(),
-                    format: FimFormat::PSM,
+                    extra_context_template: None,
+                    additional_stop_tokens: ["<|fim_pad|>", "<|endoftext|>", "<|file_sep|>"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                    format: InfillOrder::Psm,
                 });
             }
         }
@@ -42,11 +43,11 @@ impl FimConfig {
     /// Format a FIM prompt for the configured model.
     pub fn format_prompt(&self, prefix: &str, suffix: &str) -> String {
         match self.format {
-            FimFormat::PSM => format!(
+            InfillOrder::Psm => format!(
                 "{}{}{}{}{}",
                 self.prefix_token, prefix, self.suffix_token, suffix, self.middle_token
             ),
-            FimFormat::SPM => format!(
+            InfillOrder::Spm => format!(
                 "{}{}{}{}{}",
                 self.suffix_token, suffix, self.prefix_token, prefix, self.middle_token
             ),
@@ -93,7 +94,7 @@ mod tests {
         assert_eq!(fim.prefix_token, "<|fim_prefix|>");
         assert_eq!(fim.middle_token, "<|fim_middle|>");
         assert_eq!(fim.suffix_token, "<|fim_suffix|>");
-        assert_eq!(fim.format, FimFormat::PSM);
+        assert_eq!(fim.format, InfillOrder::Psm);
     }
 
     #[test]
@@ -107,7 +108,7 @@ mod tests {
         assert_eq!(fim.prefix_token, "<PRE>");
         assert_eq!(fim.middle_token, "<MID>");
         assert_eq!(fim.suffix_token, "<SUF>");
-        assert_eq!(fim.format, FimFormat::PSM);
+        assert_eq!(fim.format, InfillOrder::Psm);
     }
 
     #[test]
@@ -116,7 +117,9 @@ mod tests {
             prefix_token: "<|fim_prefix|>".to_string(),
             middle_token: "<|fim_middle|>".to_string(),
             suffix_token: "<|fim_suffix|>".to_string(),
-            format: FimFormat::PSM,
+            extra_context_template: None,
+            additional_stop_tokens: Vec::new(),
+            format: InfillOrder::Psm,
         };
 
         assert_eq!(
@@ -131,7 +134,9 @@ mod tests {
             prefix_token: "<PRE>".to_string(),
             middle_token: "<MID>".to_string(),
             suffix_token: "<SUF>".to_string(),
-            format: FimFormat::SPM,
+            extra_context_template: None,
+            additional_stop_tokens: Vec::new(),
+            format: InfillOrder::Spm,
         };
 
         assert_eq!(

@@ -4015,7 +4015,9 @@ fn completion_suffix_maps_to_fim_generation() {
             prefix_token: "<PRE>".to_string(),
             middle_token: "<MID>".to_string(),
             suffix_token: "<SUF>".to_string(),
-            format: onnx_genai_engine::FimFormat::PSM,
+            extra_context_template: None,
+            additional_stop_tokens: Vec::new(),
+            format: onnx_genai_engine::InfillOrder::Psm,
         }));
     let handle = state.registry.resolve("").unwrap().unwrap();
     let request: CompletionRequest = serde_json::from_value(json!({
@@ -4031,13 +4033,20 @@ fn completion_suffix_maps_to_fim_generation() {
 
     let prepared = prepare_completion(&request, &handle, 4096).unwrap();
     match prepared.generation {
-        CompletionGeneration::Fim {
-            prefix,
-            suffix,
-            options,
-        } => {
-            assert_eq!(prefix, "prefix");
-            assert_eq!(suffix, "suffix");
+        CompletionGeneration::Fim { tokens, options } => {
+            assert_eq!(
+                tokens,
+                handle
+                    .tokenizer
+                    .encode(
+                        &handle
+                            .fim_config
+                            .as_ref()
+                            .unwrap()
+                            .format_prompt("prefix", "suffix")
+                    )
+                    .unwrap()
+            );
             assert_eq!(options.max_new_tokens, 7);
             assert_eq!(options.min_p, 0.2);
             assert_eq!(options.frequency_penalty, 0.3);
@@ -4056,7 +4065,9 @@ async fn completion_suffix_uses_fim_and_returns_text_completion() {
             prefix_token: "<PRE>".to_string(),
             middle_token: "<MID>".to_string(),
             suffix_token: "<SUF>".to_string(),
-            format: onnx_genai_engine::FimFormat::PSM,
+            extra_context_template: None,
+            additional_stop_tokens: Vec::new(),
+            format: onnx_genai_engine::InfillOrder::Psm,
         }));
 
     let response = app(state)
@@ -4114,7 +4125,9 @@ async fn fim_stream_returns_headers_before_generation_finishes() {
             prefix_token: "<PRE>".to_string(),
             middle_token: "<MID>".to_string(),
             suffix_token: "<SUF>".to_string(),
-            format: onnx_genai_engine::FimFormat::PSM,
+            extra_context_template: None,
+            additional_stop_tokens: Vec::new(),
+            format: onnx_genai_engine::InfillOrder::Psm,
         }));
     let request = Request::builder()
         .method("POST")
@@ -6800,7 +6813,9 @@ async fn a_fim_completion_carrying_a_session_id_opens_no_session() {
             prefix_token: "<PRE>".to_string(),
             middle_token: "<MID>".to_string(),
             suffix_token: "<SUF>".to_string(),
-            format: onnx_genai_engine::FimFormat::PSM,
+            extra_context_template: None,
+            additional_stop_tokens: Vec::new(),
+            format: onnx_genai_engine::InfillOrder::Psm,
         }));
     let router = app(state.clone());
 
@@ -9504,7 +9519,9 @@ mod native_compat {
                 prefix_token: "<PRE>".into(),
                 middle_token: "<MID>".into(),
                 suffix_token: "<SUF>".into(),
-                format: onnx_genai_engine::FimFormat::PSM,
+                extra_context_template: None,
+                additional_stop_tokens: Vec::new(),
+                format: onnx_genai_engine::InfillOrder::Psm,
             })),
         );
         for stream in [false, true] {
@@ -9653,7 +9670,9 @@ mod native_compat {
                 prefix_token: "<PRE>".into(),
                 middle_token: "<MID>".into(),
                 suffix_token: "<SUF>".into(),
-                format: onnx_genai_engine::FimFormat::PSM,
+                extra_context_template: None,
+                additional_stop_tokens: Vec::new(),
+                format: onnx_genai_engine::InfillOrder::Psm,
             })),
         );
         let response=request(fim,"/infill",json!({"input_prefix":"hello","input_suffix":"world","n_predict":1,"response_fields":["tokens_predicted"]})).await;
@@ -10184,7 +10203,9 @@ mod native_compat {
                 prefix_token: "<PRE>".into(),
                 middle_token: "<MID>".into(),
                 suffix_token: "<SUF>".into(),
-                format: onnx_genai_engine::FimFormat::PSM,
+                extra_context_template: None,
+                additional_stop_tokens: Vec::new(),
+                format: onnx_genai_engine::InfillOrder::Psm,
             },
         )));
         for path in [

@@ -453,6 +453,10 @@ pub struct ServerConfig {
 
     /// Maximum completion prompts admitted by one native or OpenAI request.
     pub max_completion_prompts: std::num::NonZeroUsize,
+    pub max_infill_files: std::num::NonZeroUsize,
+    pub max_infill_filename_bytes: std::num::NonZeroUsize,
+    pub max_infill_context_bytes: std::num::NonZeroUsize,
+    pub max_infill_template_operations: std::num::NonZeroU64,
     /// Per query/document pair input budget for non-generative scoring.
     pub max_rerank_input_tokens: std::num::NonZeroUsize,
     /// Maximum document count in one scoring request.
@@ -537,6 +541,13 @@ impl Default for ServerConfig {
             model_downloads: std::num::NonZeroUsize::new(2).unwrap(),
             max_completion_prompts: std::num::NonZeroUsize::new(128)
                 .expect("positive native prompt budget"),
+            max_infill_files: std::num::NonZeroUsize::new(128).expect("positive infill file limit"),
+            max_infill_filename_bytes: std::num::NonZeroUsize::new(4096)
+                .expect("positive infill filename limit"),
+            max_infill_context_bytes: std::num::NonZeroUsize::new(8 * 1024 * 1024)
+                .expect("positive infill context limit"),
+            max_infill_template_operations: std::num::NonZeroU64::new(100_000)
+                .expect("positive infill operation limit"),
             max_rerank_input_tokens: std::num::NonZeroUsize::new(8192)
                 .expect("positive default reranking token budget"),
             max_rerank_documents: std::num::NonZeroUsize::new(128)

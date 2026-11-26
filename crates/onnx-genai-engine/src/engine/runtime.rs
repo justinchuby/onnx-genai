@@ -2213,7 +2213,27 @@ impl Engine {
     ) -> anyhow::Result<GenerateResult> {
         let prompt = fim_config.format_prompt(prefix.as_ref(), suffix.as_ref());
         let mut request = GenerateRequest::new(prompt);
-        request.options = self.fim_options(fim_config, options)?;
+        request.options = options;
+        self.generate_fim_request_with_config_and_callbacks(
+            request,
+            fim_config,
+            control,
+            admission_callback,
+            token_callback,
+        )
+    }
+
+    /// Execute a completely prepared FIM prompt, preserving its exact token IDs
+    /// for native HTTP prompt accounting and actual execution.
+    pub fn generate_fim_request_with_config_and_callbacks(
+        &mut self,
+        mut request: GenerateRequest,
+        fim_config: &FimConfig,
+        control: Option<crate::pipeline::GenerationControl>,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        request.options = self.fim_options(fim_config, request.options)?;
         self.generate_with_tool_policy_callbacks(
             request,
             ToolCallPolicy::Disabled,
@@ -3391,10 +3411,10 @@ impl Engine {
             fim_config.prefix_token.as_str(),
             fim_config.middle_token.as_str(),
             fim_config.suffix_token.as_str(),
-            "<|fim_pad|>",
-            "<|endoftext|>",
-            "<|file_sep|>",
-        ] {
+        ]
+        .into_iter()
+        .chain(fim_config.additional_stop_tokens.iter().map(String::as_str))
+        {
             if let Some(token_id) = self
                 .tokenizer
                 .as_ref()
