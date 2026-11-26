@@ -45,7 +45,8 @@ use super::moe::{
     DenseExpertWeights, ExpertProjection, MoeAttributes, MoeWorkspace, RoutingScratch,
 };
 use super::packed_projection::{PackedProjectionPlan, validate_format};
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use super::{check_arity, write_dense_f32};
+use crate::dtype::to_dense_f32_widen;
 use onnx_runtime_ir::packed_arithmetic::ActivationArithmetic;
 
 #[cfg(test)]
@@ -410,8 +411,8 @@ impl BlockQuantizedMoEKernel {
             fc1_size,
         } = dimensions;
 
-        let input = to_dense_f32(&inputs[0])?;
-        let router_logits = to_dense_f32(&inputs[1])?;
+        let input = to_dense_f32_widen(OP, &inputs[0])?;
+        let router_logits = to_dense_f32_widen(OP, &inputs[1])?;
         let router_weights = optional_dense(inputs, 8)?;
         let fc1_bias = optional_dense(inputs, 3)?;
         let fc2_bias = optional_dense(inputs, 5)?;
@@ -1452,8 +1453,13 @@ fn optional_input<'a>(inputs: &'a [TensorView<'a>], index: usize) -> Option<&'a 
     inputs.get(index).filter(|input| !input.is_absent())
 }
 
-fn optional_dense(inputs: &[TensorView], index: usize) -> Result<Option<Vec<f32>>> {
-    optional_input(inputs, index).map(to_dense_f32).transpose()
+fn optional_dense<'a>(
+    inputs: &'a [TensorView<'_>],
+    index: usize,
+) -> Result<Option<Cow<'a, [f32]>>> {
+    optional_input(inputs, index)
+        .map(|view| to_dense_f32_widen(OP, view))
+        .transpose()
 }
 
 fn checked_product(shape: &[usize], name: &str) -> Result<usize> {
@@ -1480,6 +1486,8 @@ mod numerical;
 
 #[cfg(test)]
 mod tests {
+    mod borrowed_inputs_tests;
+
     use super::*;
     use crate::CpuExecutionProvider;
     use crate::kernels::block_quantized_matmul::packed_for_format;

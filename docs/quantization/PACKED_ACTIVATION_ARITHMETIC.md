@@ -49,9 +49,21 @@ needs `round_up(rows * ceil(K/32) * 34, 4)` activation bytes and, when both rows
 and output channels exceed one, `rows * N * 4` column staging bytes. Empty rows
 or output channels require neither region. MoE reserves the maximum complete
 serial projection demand plus its existing separate FC banks and accumulator.
+Standalone MatMul adds a disjoint `rows * N * 4` final-output staging region to
+that complete projection layout; the two regions are simultaneously live. Dense
+hits initialize only final-output staging, while admission retains enough
+projection capacity for a subsequent streamed fallback.
 No per-token, per-row, per-block or per-expert quota requests are added.
 The existing initialized f32 scratch proof covers the byte loan, including its
 rounded tail; every exposed activation block is overwritten before use.
+
+Contiguous, aligned F32 input, router logits, optional router weights and FC
+biases in BlockQuantizedMoE are borrowed through their final read. Strided or
+unaligned sources still materialize. Runtime metadata validation retains the
+op's F32-only interface; reuse of the widening helper does not enable half or
+F64 MoE inputs. Projection banks and the final accumulator keep publication
+after every source read and successful expert, including when Y overlaps one of
+these sources. These input borrows add no cache, pool or quota operations.
 
 Q8 validates its complete workspace before materializing input payloads.
 Missing, short or misaligned loans fail; precision never changes to recover.
