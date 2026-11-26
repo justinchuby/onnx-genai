@@ -43,8 +43,8 @@ See [`docs/architecture/CRATE_RESERVATION.md`](docs/architecture/CRATE_RESERVATI
 - Optimization and placement decisions flow through explicit, inspectable cost models and capability checks.
 - Eager execution never performs implicit cross-device transfers; users request `.to(device)` explicitly.
 - Unsupported kernels, dtypes, attributes, opsets, or configurations fail clearly rather than silently changing semantics.
-- Dtype admission is capability-driven, not limited by when a schema first listed a dtype. A standalone EP may accept a kernel-supported dtype on an earlier operator revision when the dtype does not change that revision's attributes, shapes, or execution semantics.
-- Version gates must represent a real semantic, representation, or ABI boundary. Preserve schema-accurate advertisement where an external ABI requires it, but do not turn dtype-list chronology into a standalone execution restriction.
+- Standalone runtime dtype admission is capability-based, not gated solely by the opset that first added the dtype to an ONNX schema. The runtime may and generally should accept a later-schema dtype when the runtime/EP implements it correctly and the resolved operator revision's semantics are unchanged.
+- Still enforce real revision differences in inputs, attributes/defaults, type relationships, and semantics; reject genuinely unsupported dtype combinations and honor explicit conformance or validation contracts. A standalone runtime extension does not alter authoritative ONNX conformance or automatically expand shipped ORT/plugin support.
 
 See [`docs/execution/EAGER.md` §1](docs/execution/EAGER.md#1-design-principles) and §13.
 
