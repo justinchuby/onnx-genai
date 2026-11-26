@@ -82,7 +82,7 @@
     "tests/test_stop.rs": "4b3fd99884e1ba2a32af4890593a5b3087dd70b26580238a28bb371c9df62044"
   },
   "patched_file_sha256": {
-    "src/json/compiler.rs": "625588ec417666fa09ae53806bb609e70f1d650e770eafa27a95a21384ac19c6",
+    "src/json/compiler.rs": "cbf71f94598c7bf253d55a104a91ef78ff7a58d9a1dc5f18b0a41df71144a3b2",
     "src/lib.rs": "6f8e8f8fbcd1104bb047fd878fc88877ba3df58dca2e5b0a960c08f69696c662",
     "src/grammar_builder.rs": "f65bb07cf49ad8463d9d4b6ff98b5a6b16dd3f5aec7423c0003c5fdf530e6847"
   },

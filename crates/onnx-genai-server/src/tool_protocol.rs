@@ -1177,7 +1177,7 @@ mod tests {
             )
             .unwrap()
         };
-        let unsupported = serde_json::json!({"oneOf":[{"type":"integer"},{"type":"string"}]});
+        let unsupported = serde_json::json!({"oneOf":[{"type":"number"},{"type":"integer"}]});
         for required in [false, true] {
             for referenced in [false, true] {
                 let mut schema = serde_json::json!({"$id":"https://example.invalid/tool-policy","$defs":{"Value":unsupported},"type":"object","properties":{"":if referenced {serde_json::json!({"$ref":"#/$defs/Value"})} else {unsupported.clone()}},"additionalProperties":false});

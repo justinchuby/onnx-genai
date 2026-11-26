@@ -1735,7 +1735,7 @@ mod root_key_encoding_tests {
     }
     #[test]
     fn root_key_policy_preserves_unsupported_values_before_name_capability_errors() {
-        let unsupported = json!({"oneOf":[{"type":"integer"},{"type":"string"}]});
+        let unsupported = json!({"oneOf":[{"type":"number"},{"type":"integer"}]});
         for required in [false, true] {
             for referenced in [false, true] {
                 let mut schema = json!({"$id":"https://example.invalid/policy-errors","$defs":{"Value":unsupported},"type":"object","properties":{"":if referenced {json!({"$ref":"#/$defs/Value"})} else {unsupported.clone()}},"additionalProperties":false});
@@ -1762,7 +1762,7 @@ mod root_key_encoding_tests {
 
     #[test]
     fn root_key_policy_preserves_dynamic_and_alternative_value_capability_errors() {
-        let unsupported = json!({"oneOf":[{"type":"integer"},{"type":"string"}]});
+        let unsupported = json!({"oneOf":[{"type":"number"},{"type":"integer"}]});
         for schema in [
             json!({"type":"object","additionalProperties":unsupported}),
             json!({"type":"object","patternProperties":{"^a$":unsupported},"additionalProperties":false,"minProperties":1}),
