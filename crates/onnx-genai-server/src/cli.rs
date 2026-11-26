@@ -327,6 +327,7 @@ pub async fn run_serve(mut args: ServeArgs) -> anyhow::Result<()> {
                 .to_string()
         });
         vec![ModelSpec {
+            package_variant: None,
             id: model_id,
             path: model_path,
             eager: true,
