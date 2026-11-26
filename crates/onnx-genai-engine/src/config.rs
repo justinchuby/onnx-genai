@@ -1522,11 +1522,44 @@ pub struct SamplingOverrides {
     pub top_k: Option<usize>,
 }
 
+/// A request's processor configuration failed compilation before execution.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid generation processor configuration: {source:#}")]
+pub struct ProcessorConfigurationError {
+    #[source]
+    source: anyhow::Error,
+}
+impl ProcessorConfigurationError {
+    pub(crate) fn new(source: anyhow::Error) -> Self {
+        Self { source }
+    }
+}
+
+/// Whether compilation owns contextual decoder state which a real serving
+/// worker must reserve before acknowledging stream admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessorAdmissionRequirement {
+    RequestLocal,
+    OwnedContextualDecoder,
+}
+
 impl GenerateOptions {
+    pub fn processor_admission_requirement(
+        &self,
+        tokenizer: &onnx_genai_ort::Tokenizer,
+    ) -> anyhow::Result<ProcessorAdmissionRequirement> {
+        Ok(
+            if crate::byte_stream::ByteStreamContract::requests_literal_stream(tokenizer)? {
+                ProcessorAdmissionRequirement::OwnedContextualDecoder
+            } else {
+                ProcessorAdmissionRequirement::RequestLocal
+            },
+        )
+    }
     /// Resolve request-local processor capabilities before admitting generation.
     /// The decoder builds its own mutable chain when execution starts.
     pub fn validate_processors(&self, tokenizer: &onnx_genai_ort::Tokenizer) -> anyhow::Result<()> {
-        crate::processors::build_processor_chain(self, Some(tokenizer), false).map(drop)
+        crate::processors::build_processor_chain(self, Some(tokenizer), false, None).map(drop)
     }
 
     /// Validate explicit token biases against the admitted model vocabulary.

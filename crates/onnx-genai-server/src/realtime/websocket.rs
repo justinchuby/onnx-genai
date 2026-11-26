@@ -28,10 +28,7 @@ use tokio_tungstenite::{
 };
 type WebSocket = WebSocketStream<hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>>;
 use futures_util::{SinkExt, StreamExt};
-use onnx_genai_engine::{
-    realtime::RealtimeTokenBudget,
-    tokenization::{SpecialTokenHandling, TokenTextDecoder},
-};
+use onnx_genai_engine::{realtime::RealtimeTokenBudget, tokenization::TokenTextDecoder};
 use onnx_genai_metadata::{
     RealtimeMode, ToolCallStream, ToolParseOutcome, realtime::RealtimeContract,
 };
@@ -245,6 +242,7 @@ fn string<'a>(object: &'a Value, key: &str) -> anyhow::Result<&'a str> {
 enum FailureKind {
     Protocol(super::conversation::ProtocolErrorKind),
     Native,
+    Admission,
 }
 struct Failure {
     message: String,
@@ -257,13 +255,25 @@ impl Failure {
     fn error_type(&self) -> &'static str {
         match self.kind {
             FailureKind::Protocol(kind) => kind.error_type(),
-            FailureKind::Native => "server_error",
+            FailureKind::Native | FailureKind::Admission => "server_error",
         }
     }
     fn invalid(error: impl std::fmt::Display) -> Self {
         Self {
             message: error.to_string(),
             kind: FailureKind::Protocol(super::conversation::ProtocolErrorKind::InvalidRequest),
+        }
+    }
+    fn admission(error: anyhow::Error) -> Self {
+        if error
+            .chain()
+            .any(|source| source.is::<onnx_genai_engine::ProcessorConfigurationError>())
+        {
+            return Self::invalid(format!("{error:#}"));
+        }
+        Self {
+            message: format!("{error:#}"),
+            kind: FailureKind::Admission,
         }
     }
     fn native(error: anyhow::Error) -> Self {
@@ -349,13 +359,14 @@ enum Rendered {
 struct Active {
     id: ResponseId,
     renderer: Rendered,
-    decoder: TokenTextDecoder,
     tools: Option<ToolText>,
     tool_arguments: ToolArguments,
     budget: OutputBudget,
     used: u64,
     text_enabled: bool,
     audio_enabled: bool,
+    // Own the publication lease until renderer/tool buffers have dropped.
+    decoder: TokenTextDecoder,
 }
 struct Runner {
     model: Arc<ModelHandle>,
@@ -572,14 +583,49 @@ impl Runner {
             self.limits.native_samples,
         )
     }
-    async fn open_output(&mut self, out: &mpsc::Sender<Outgoing>) -> Result<(), Failure> {
+    async fn admitted_decoder(
+        &mut self,
+        options: &ResponseOptions,
+        realtime: bool,
+    ) -> Result<TokenTextDecoder, Failure> {
+        let mut preserved = BTreeSet::new();
+        if realtime
+            && !self.tool_arguments.definitions().is_empty()
+            && options.tool_choice != crate::types::ToolChoiceMode::None
+        {
+            let protocol = self
+                .model
+                .tool_protocol
+                .as_ref()
+                .context("realtime tools require their admitted package protocol")
+                .map_err(Failure::native)?
+                .parsed();
+            for marker in protocol.syntax_markers() {
+                preserved.extend(
+                    self.model
+                        .tokenizer
+                        .encode_with_options(marker, Default::default())
+                        .map_err(anyhow::Error::new)
+                        .map_err(Failure::native)?,
+                );
+            }
+        }
+        self.native
+            .prepare_decoder(preserved, self.limits.text_bytes)
+            .await
+            .map_err(Failure::admission)
+    }
+    async fn open_output(
+        &mut self,
+        out: &mpsc::Sender<Outgoing>,
+        decoder: TokenTextDecoder,
+    ) -> Result<(), Failure> {
         let active = self
             .conversation
             .active()
             .context("native response has no admitted conversation response")
             .map_err(Failure::native)?
             .clone();
-        let mut preserved = BTreeSet::new();
         let tools = if matches!(active.kind, ResponseKind::Realtime)
             && !self.tool_arguments.definitions().is_empty()
             && active.options.tool_choice != crate::types::ToolChoiceMode::None
@@ -591,15 +637,6 @@ impl Runner {
                 .context("realtime tools need a package.tool_protocol declaration")
                 .map_err(Failure::native)?
                 .parsed();
-            for marker in protocol.syntax_markers() {
-                let ids = self
-                    .model
-                    .tokenizer
-                    .encode_with_options(marker, Default::default())
-                    .map_err(anyhow::Error::new)
-                    .map_err(Failure::native)?;
-                preserved.extend(ids);
-            }
             Some(ToolText {
                 protocol,
                 stream: ToolCallStream::default(),
@@ -629,11 +666,7 @@ impl Runner {
         self.active = Some(Active {
             id: active.id,
             renderer,
-            decoder: if tools.is_some() {
-                TokenTextDecoder::with_preserved_tokens(&preserved)
-            } else {
-                TokenTextDecoder::new(SpecialTokenHandling::Skip)
-            },
+            decoder,
             tools,
             tool_arguments: self.tool_arguments.clone(),
             budget: active.options.budget,
@@ -669,6 +702,12 @@ impl Runner {
                 "input_audio_buffer.commit: duplex models answer while listening; there is no turn to commit",
             ));
         }
+        let response_options = self.settings.response.clone();
+        let decoder = if self.settings.mode == RealtimeMode::Transcription {
+            Some(self.admitted_decoder(&response_options, false).await?)
+        } else {
+            None
+        };
         let item = ItemId::new(id("item_").map_err(Failure::native)?);
         let events = self.conversation.commit_audio(item.clone())?;
         self.configure().await?;
@@ -680,13 +719,13 @@ impl Runner {
             .map_err(Failure::invalid)?;
         self.drain_pcm(out).await?;
         self.pcm = None;
-        if self.settings.mode == RealtimeMode::Transcription {
+        if let Some(decoder) = decoder {
             self.conversation.begin_transcription(
                 ResponseId::new(id("resp_").map_err(Failure::native)?),
                 item,
                 &self.settings,
             )?;
-            self.open_output(out).await?;
+            self.open_output(out, decoder).await?;
         }
         for event in events {
             self.emit(out, event).await.map_err(Failure::native)?;
@@ -767,6 +806,12 @@ impl Runner {
                 } else {
                     None
                 };
+                let response_options = self.settings.response.clone();
+                let decoder = if starts_duplex {
+                    Some(self.admitted_decoder(&response_options, true).await?)
+                } else {
+                    None
+                };
                 if self.pcm.is_none() {
                     self.pcm = Some(self.new_pcm().map_err(Failure::invalid)?);
                 }
@@ -789,7 +834,13 @@ impl Runner {
                         ResponseId::new(id("resp_").map_err(Failure::native)?),
                         &self.settings,
                     )? {
-                        self.open_output(out).await?;
+                        self.open_output(
+                            out,
+                            decoder
+                                .context("duplex publication decoder was not admitted")
+                                .map_err(Failure::native)?,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -893,6 +944,12 @@ impl Runner {
                 }
             }
             "response.create" => {
+                let response_options = self.conversation.response_options(
+                    &self.settings,
+                    event.get("response").unwrap_or(&json!({})),
+                    self.contract.spec().output_sample_rate_hz.is_some(),
+                )?;
+                let decoder = self.admitted_decoder(&response_options, true).await?;
                 let admission = self.conversation.begin_response(
                     ResponseId::new(id("resp_").map_err(Failure::native)?),
                     ItemId::new(id("item_").map_err(Failure::native)?),
@@ -919,7 +976,7 @@ impl Runner {
                 for event in admission.events {
                     self.emit(out, event).await.map_err(Failure::native)?;
                 }
-                self.open_output(out).await?;
+                self.open_output(out, decoder).await?;
                 let mut settings = self.settings.clone();
                 settings.response = self
                     .conversation

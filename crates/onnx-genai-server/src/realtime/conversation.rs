@@ -210,14 +210,12 @@ impl Conversation {
     }
     /// Admit response options and consume any pending input commit atomically.
     /// The runner executes native Commit before Generate and these events.
-    pub(super) fn begin_response(
-        &mut self,
-        id: ResponseId,
-        audio_item: ItemId,
+    pub(super) fn response_options(
+        &self,
         settings: &SessionSettings,
         overrides: &Value,
         audio_output: bool,
-    ) -> Result<ResponseAdmission, ProtocolError> {
+    ) -> Result<ResponseOptions, ProtocolError> {
         if settings.mode == RealtimeMode::Duplex {
             return Err(ProtocolError::invalid(
                 "response.create: duplex models answer while listening; append audio to open a response",
@@ -243,6 +241,17 @@ impl Conversation {
             .response
             .updated(overrides, audio_output)
             .map_err(|error| ProtocolError::invalid(error.to_string()))?;
+        Ok(options)
+    }
+    pub(super) fn begin_response(
+        &mut self,
+        id: ResponseId,
+        audio_item: ItemId,
+        settings: &SessionSettings,
+        overrides: &Value,
+        audio_output: bool,
+    ) -> Result<ResponseAdmission, ProtocolError> {
+        let options = self.response_options(settings, overrides, audio_output)?;
         let needs_commit = self.audio_uncommitted;
         let events = if needs_commit {
             self.commit_audio(audio_item)?

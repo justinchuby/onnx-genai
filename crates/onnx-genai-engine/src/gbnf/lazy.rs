@@ -619,7 +619,7 @@ mod tests {
         }
     }
     fn chain(grammar: &str, triggers: Vec<GrammarTrigger>) -> ProcessorChain {
-        build_processor_chain(&options(grammar, triggers), Some(&tokenizer()), false).unwrap()
+        build_processor_chain(&options(grammar, triggers), Some(&tokenizer()), false, None).unwrap()
     }
     fn allowed(chain: &ProcessorChain, history: &[TokenId]) -> Result<Vec<usize>> {
         let mut logits = vec![0.; 32];
@@ -659,7 +659,7 @@ mod tests {
             greedy: true,
             ..Default::default()
         };
-        build_processor_chain(&options, Some(&tokenizer), false).unwrap()
+        build_processor_chain(&options, Some(&tokenizer), false, None).unwrap()
     }
 
     #[test]
@@ -680,6 +680,7 @@ mod tests {
             4096,
             vec![3],
             &Default::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -707,7 +708,7 @@ mod tests {
             eos_token_id: Some(3),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         assert!(allowed(&chain, &[22]).unwrap().contains(&23));
         assert!(!allowed(&chain, &[22]).unwrap().contains(&24));
         assert!(allowed(&chain, &[22, 23]).unwrap().contains(&22));
@@ -874,12 +875,12 @@ mod tests {
             vec![GrammarTrigger::Word("OPEN".into())],
         );
         let tokenizer = tokenizer();
-        let error = build_processor_chain(&single, Some(&tokenizer), false)
+        let error = build_processor_chain(&single, Some(&tokenizer), false, None)
             .err()
             .unwrap();
         assert!(error.to_string().contains("preserved_tokens"), "{error:#}");
         single.preserved_tokens.insert(25);
-        let single = build_processor_chain(&single, Some(&tokenizer), false).unwrap();
+        let single = build_processor_chain(&single, Some(&tokenizer), false, None).unwrap();
         assert_eq!(allowed(&single, &[25]).unwrap(), [24]);
         let multi = chain(
             r#"root ::= "op enB""#,
@@ -899,7 +900,8 @@ mod tests {
                 build_processor_chain(
                     &options(r#"root ::= "B""#, vec![trigger]),
                     Some(&tokenizer),
-                    false
+                    false,
+                    None,
                 )
                 .is_err()
             );
@@ -909,7 +911,7 @@ mod tests {
             vec![GrammarTrigger::Pattern("NEVER".into())],
         );
         bounded.max_constraint_bytes = 32;
-        let bounded = build_processor_chain(&bounded, Some(&tokenizer), false).unwrap();
+        let bounded = build_processor_chain(&bounded, Some(&tokenizer), false, None).unwrap();
         let error = allowed(&bounded, &[23, 23, 23]).unwrap_err();
         assert!(format!("{error:#}").contains("awaiting-trigger buffer"));
         assert_eq!(allowed(&bounded, &[]).unwrap().len(), 32);
@@ -943,7 +945,7 @@ mod tests {
     #[test]
     fn lazy_chain_hides_triggers_inside_reasoning_then_resumes_after_closer() {
         let options = reasoning_options(r#"root ::= "OPENB""#, false, vec![], None, 25);
-        let chain = build_processor_chain(&options, Some(&tokenizer()), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer()), false, None).unwrap();
         assert_eq!(allowed(&chain, &[29]).unwrap().len(), 32);
         assert_eq!(allowed(&chain, &[29, 25]).unwrap().len(), 32);
         assert_eq!(allowed(&chain, &[29, 25, 28]).unwrap().len(), 32);
@@ -954,18 +956,18 @@ mod tests {
     fn lazy_chain_replays_complete_longest_reasoning_end_sequence() {
         let grammar = r#"root ::= <[30]> <[28]> "B""#;
         let options = reasoning_options(grammar, false, vec![], None, 30);
-        let chain = build_processor_chain(&options, Some(&tokenizer()), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer()), false, None).unwrap();
         assert_eq!(allowed(&chain, &[29, 25, 30]).unwrap().len(), 32);
         assert_eq!(allowed(&chain, &[29, 25, 30, 28]).unwrap(), [24]);
         let prefilled = reasoning_options(grammar, true, vec![30], None, 30);
-        let chain = build_processor_chain(&prefilled, Some(&tokenizer()), false).unwrap();
+        let chain = build_processor_chain(&prefilled, Some(&tokenizer()), false, None).unwrap();
         assert_eq!(allowed(&chain, &[]).unwrap().len(), 32);
         assert_eq!(allowed(&chain, &[28]).unwrap(), [24]);
     }
     #[test]
     fn lazy_chain_budget_forces_closer_without_grammar_conflict_and_rolls_back() {
         let options = reasoning_options(r#"root ::= <[30]> <[28]> "B""#, true, vec![], Some(1), 30);
-        let chain = build_processor_chain(&options, Some(&tokenizer()), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer()), false, None).unwrap();
         assert_eq!(allowed(&chain, &[22]).unwrap(), [30]);
         assert_eq!(allowed(&chain, &[22, 30]).unwrap(), [28]);
         assert_eq!(allowed(&chain, &[22, 30, 28]).unwrap(), [24]);
@@ -976,7 +978,7 @@ mod tests {
     fn lazy_chain_live_control_does_not_reinterpret_past_hidden_tokens() {
         let options = reasoning_options(r#"root ::= <[30]> <[28]> "B""#, true, vec![], None, 30);
         let control = options.reasoning_budget.as_ref().unwrap().control();
-        let chain = build_processor_chain(&options, Some(&tokenizer()), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer()), false, None).unwrap();
         assert_eq!(allowed(&chain, &[22, 25]).unwrap().len(), 32);
         control.request_end().unwrap();
         assert_eq!(allowed(&chain, &[22, 25]).unwrap(), [30]);
@@ -989,7 +991,7 @@ mod tests {
     fn lazy_chain_masks_over_budget_candidates_without_losing_legal_eos() {
         let mut options = options(r#"root ::= "OPEN" "B"*"#, vec![GrammarTrigger::Token(25)]);
         options.max_constraint_bytes = 32;
-        let chain = build_processor_chain(&options, Some(&tokenizer()), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer()), false, None).unwrap();
         let mut history = vec![25];
         history.extend([24; 28]);
         assert_eq!(allowed(&chain, &history).unwrap(), [3]);

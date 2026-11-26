@@ -311,7 +311,7 @@ mod prediction_limit_tests {
             }),
             ..Default::default()
         };
-        let mut chain = crate::processors::build_processor_chain(&options, None, false)?;
+        let mut chain = crate::processors::build_processor_chain(&options, None, false, None)?;
         assert!(native_speculation_plan(&options, &chain).is_some());
         chain.add(Box::new(crate::logits::StopSequenceProcessor::new(vec![
             crate::logits::StopSequence::Text("stop".into()),
