@@ -1073,6 +1073,7 @@ impl Drop for Executor {
     }
 }
 
+mod cpu_workers;
 mod state;
 use state::*;
 pub(crate) use state::{ChildExecutor, ChildExecutorStats, Executor};
