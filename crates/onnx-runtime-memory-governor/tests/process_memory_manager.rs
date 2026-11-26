@@ -2145,3 +2145,161 @@ fn authority_pressure_registry_is_the_existing_physical_admission_registry() {
     drop(registration);
     assert_eq!(fixture.governor.used(Tier::Host), 0);
 }
+
+#[test]
+fn external_capacity_is_admitted_owned_and_rolled_back_without_allocator_facts() {
+    let fixture = Fixture::new(
+        DeviceKey::HOST,
+        16,
+        ProcessMemoryLimits {
+            host_bytes: 12,
+            ..ProcessMemoryLimits::UNLIMITED
+        },
+    );
+    let reserve = |bytes| {
+        fixture.manager.reserve_external_capacity(
+            &fixture.authority,
+            &fixture.holder,
+            Tier::Host,
+            MemoryRole::Weights,
+            bytes,
+        )
+    };
+    let first = reserve(8).expect("external capacity");
+    assert_eq!(fixture.governor.used(Tier::Host), 8);
+    assert_eq!(fixture.manager.process_used(Tier::Host), 8);
+    assert!(
+        reserve(5).is_err(),
+        "process quota must deny before acquiring backing"
+    );
+    assert_eq!(fixture.governor.used(Tier::Host), 8);
+    assert_eq!(fixture.manager.process_used(Tier::Host), 8);
+    let snapshot = fixture.manager.snapshot().expect("snapshot");
+    assert_eq!(snapshot.external_capacities.len(), 1);
+    assert!(
+        snapshot.allocations.is_empty(),
+        "external backing has no allocator identity"
+    );
+    assert!(fixture.manager.unregister_holder(&fixture.holder).is_err());
+    drop(first);
+    assert_eq!(fixture.governor.used(Tier::Host), 0);
+    assert_eq!(fixture.manager.process_used(Tier::Host), 0);
+    let retry = reserve(12).expect("retry after final owner drop");
+    drop(retry);
+    assert!(
+        fixture
+            .manager
+            .snapshot()
+            .unwrap()
+            .external_capacities
+            .is_empty()
+    );
+}
+
+#[test]
+fn external_capacity_authority_denial_refunds_process_and_rejects_foreign_handles() {
+    let fixture = Fixture::new(
+        DeviceKey::HOST,
+        4,
+        ProcessMemoryLimits {
+            host_bytes: 12,
+            ..ProcessMemoryLimits::UNLIMITED
+        },
+    );
+    assert!(
+        fixture
+            .manager
+            .reserve_external_capacity(
+                &fixture.authority,
+                &fixture.holder,
+                Tier::Host,
+                MemoryRole::Weights,
+                5
+            )
+            .is_err()
+    );
+    assert_eq!(fixture.governor.used(Tier::Host), 0);
+    assert_eq!(fixture.manager.process_used(Tier::Host), 0);
+    let foreign = ProcessMemoryManager::new().unwrap();
+    assert!(
+        foreign
+            .reserve_external_capacity(
+                &fixture.authority,
+                &fixture.holder,
+                Tier::Host,
+                MemoryRole::Weights,
+                1
+            )
+            .is_err()
+    );
+    assert!(
+        fixture
+            .manager
+            .reserve_external_capacity(
+                &fixture.authority,
+                &fixture.holder,
+                Tier::Device,
+                MemoryRole::Weights,
+                1
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn external_capacity_honors_delegation_and_checks_arithmetic_before_grant() {
+    let fixture = Fixture::new(
+        DeviceKey::HOST,
+        16,
+        ProcessMemoryLimits {
+            host_bytes: 16,
+            ..ProcessMemoryLimits::UNLIMITED
+        },
+    );
+    fixture
+        .manager
+        .delegate_authority_capacity(&fixture.authority, Tier::Host, 16)
+        .unwrap();
+    let lease = fixture
+        .manager
+        .reserve_external_capacity(
+            &fixture.authority,
+            &fixture.holder,
+            Tier::Host,
+            MemoryRole::Weights,
+            16,
+        )
+        .unwrap();
+    assert_eq!(fixture.manager.process_used(Tier::Host), 16);
+    assert_eq!(
+        fixture.manager.snapshot().unwrap().external_capacities[0].process_reserved_bytes,
+        0
+    );
+    drop(lease);
+    assert_eq!(fixture.governor.used(Tier::Host), 0);
+    let wide = Fixture::new(DeviceKey::HOST, u64::MAX, ProcessMemoryLimits::UNLIMITED);
+    let first = wide
+        .manager
+        .reserve_external_capacity(
+            &wide.authority,
+            &wide.holder,
+            Tier::Host,
+            MemoryRole::Weights,
+            1,
+        )
+        .unwrap();
+    assert!(
+        wide.manager
+            .reserve_external_capacity(
+                &wide.authority,
+                &wide.holder,
+                Tier::Host,
+                MemoryRole::Weights,
+                u64::MAX
+            )
+            .is_err()
+    );
+    assert_eq!(wide.governor.used(Tier::Host), 1);
+    assert_eq!(wide.manager.process_used(Tier::Host), 1);
+    drop(first);
+}
