@@ -15,6 +15,10 @@ const CASES: &[(i64, u64, DataType)] = &[
     (12, 24, DataType::Float8E8M0),
 ];
 
+const EARLIER_SHAPE_CASES: &[(i64, u64, DataType)] =
+    &[(10, 14, DataType::Uint4), (10, 20, DataType::Uint4)];
+const EARLIER_SIZE_CASES: &[(i64, u64, DataType)] = &[(11, 22, DataType::Float4E2M1)];
+
 #[derive(Clone, Copy, Debug)]
 enum MetadataOp {
     Shape,
@@ -145,7 +149,7 @@ fn shape_earlier_opsets_accept_packed_input() {
         MetadataOp::Shape,
         DevicePreference::Cpu,
         DeviceId::cpu(),
-        &[(10, 14, DataType::Uint4), (10, 20, DataType::Uint4)],
+        EARLIER_SHAPE_CASES,
     );
 }
 
@@ -155,18 +159,24 @@ fn size_earlier_opset_accepts_packed_input() {
         MetadataOp::Size,
         DevicePreference::Cpu,
         DeviceId::cpu(),
-        &[(11, 22, DataType::Float4E2M1)],
+        EARLIER_SIZE_CASES,
     );
 }
 
 #[cfg(feature = "cuda")]
 fn check_cuda(op: MetadataOp) {
-    check_cases(
-        op,
-        DevicePreference::Gpu { index: Some(0) },
-        DeviceId::cuda(0),
-        CASES,
-    );
+    let earlier_cases = match op {
+        MetadataOp::Shape => EARLIER_SHAPE_CASES,
+        MetadataOp::Size => EARLIER_SIZE_CASES,
+    };
+    for cases in [CASES, earlier_cases] {
+        check_cases(
+            op,
+            DevicePreference::Gpu { index: Some(0) },
+            DeviceId::cuda(0),
+            cases,
+        );
+    }
 }
 
 #[cfg(feature = "cuda")]
