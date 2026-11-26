@@ -158,7 +158,11 @@ fn native_generative_stdin_and_feature_attachment_enforce_the_selected_pcm_polic
     }
     // This package binds computed features, so no downstream audio adapter can
     // repair a missing frontend admission check. Exercise the actual binary.
-    for (maximum, accepted) in [("16", false), ("4096", true)] {
+    // Symphonia RIFF advertises a 1152-frame packet capacity even for this
+    // 32-frame clip. The PCM policy conservatively charges float32 units for
+    // that capacity plus mono/staging: (1152 + 32 + 32) * 4 = 4864 bytes.
+    // An 8 KiB positive budget covers that normal reservation and stays finite.
+    for (maximum, accepted) in [("16", false), ("8192", true)] {
         let output = Command::new(env!("CARGO_BIN_EXE_onnx-genai"))
             .arg("generate")
             .arg(model("transcription_features"))
