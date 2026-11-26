@@ -19,7 +19,12 @@ pub(crate) fn unsupported_reason_at_opset(
     let result = match node.op_type.as_str() {
         "ScatterElements" | "ScatterND" => scatter(node, opset, input_dtypes),
         "GatherND" => gather_nd(node, opset, input_dtypes),
-        "Mod" if matches!(conv_transpose_contract, super::conv_transpose::Contract::Standalone) => {
+        "Mod"
+            if matches!(
+                conv_transpose_contract,
+                super::conv_transpose::Contract::Standalone
+            ) =>
+        {
             mod_op(node, opset, input_dtypes)
         }
         "QuantizeLinear" | "DequantizeLinear" => {

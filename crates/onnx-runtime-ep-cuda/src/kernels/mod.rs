@@ -1924,7 +1924,10 @@ pub(crate) fn build_cuda_registry_for_contract(
     );
 
     let mod_28 = onnx_runtime_ir::modulo::FLOAT_FLOOR_SINCE;
-    let standalone = matches!(conv_transpose_contract, conv_transpose::Contract::Standalone);
+    let standalone = matches!(
+        conv_transpose_contract,
+        conv_transpose::Contract::Standalone
+    );
     reg.register_through(
         OpKey::new("Mod", "", 10),
         if standalone { mod_28 - 1 } else { u64::MAX },
