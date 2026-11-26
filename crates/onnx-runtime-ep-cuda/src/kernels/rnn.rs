@@ -15,13 +15,11 @@ const SOURCE: &str = include_str!("rnn.cu");
 
 pub struct Factory {
     pub runtime: Arc<CudaRuntime>,
-    pub since: u64,
 }
 
 struct Rnn {
     runtime: Arc<CudaRuntime>,
     config: Config,
-    since: u64,
 }
 
 impl KernelFactory for Factory {
@@ -29,7 +27,6 @@ impl KernelFactory for Factory {
         Ok(Box::new(Rnn {
             runtime: self.runtime.clone(),
             config: Config::parse(node)?,
-            since: self.since,
         }))
     }
 }
@@ -75,7 +72,7 @@ impl Kernel for Rnn {
         outputs: &mut [TensorMut],
         workspace: Option<WorkspaceView>,
     ) -> Result<()> {
-        let g = self.config.validate(self.since, inputs, outputs)?;
+        let g = self.config.validate(inputs, outputs)?;
         if inputs.iter().any(|t| !t.is_absent() && !t.is_contiguous())
             || outputs.iter().any(|t| !t.is_absent() && !t.is_contiguous())
         {

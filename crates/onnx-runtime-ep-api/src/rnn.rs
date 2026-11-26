@@ -4,6 +4,8 @@ use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use crate::{EpError, Result, TensorMut, TensorView};
 
+// RNN-22 added BF16 without changing the RNN-14 computation. Standalone nxrt
+// supports it for both revisions; this does not change ONNX schema conformance.
 pub const DTYPES: &[DataType] = &[
     DataType::Float16,
     DataType::Float32,
@@ -185,22 +187,14 @@ impl Config {
         })
     }
 
-    pub fn validate(
-        &self,
-        opset: u64,
-        inputs: &[TensorView],
-        outputs: &[TensorMut],
-    ) -> Result<Geometry> {
-        validate_types(
-            opset,
-            inputs.iter().map(|t| {
-                if t.is_absent() {
-                    DataType::Undefined
-                } else {
-                    t.dtype
-                }
-            }),
-        )?;
+    pub fn validate(&self, inputs: &[TensorView], outputs: &[TensorMut]) -> Result<Geometry> {
+        validate_types(inputs.iter().map(|t| {
+            if t.is_absent() {
+                DataType::Undefined
+            } else {
+                t.dtype
+            }
+        }))?;
         if outputs.len() > 2 {
             return Err(error("expected at most two output slots (Y and Y_h)"));
         }
@@ -257,17 +251,17 @@ impl Config {
     }
 }
 
-pub fn unsupported_reason(node: &Node, opset: u64, dtypes: &[DataType]) -> Option<String> {
+pub fn unsupported_reason(node: &Node, dtypes: &[DataType]) -> Option<String> {
     if node.op_type != "RNN" || !onnx_runtime_ir::is_default_domain(&node.domain) {
         return None;
     }
     Config::parse(node)
-        .and_then(|_| validate_types(opset, dtypes.iter().copied()))
+        .and_then(|_| validate_types(dtypes.iter().copied()))
         .err()
         .map(|err| err.to_string())
 }
 
-fn validate_types(opset: u64, dtypes: impl ExactSizeIterator<Item = DataType>) -> Result<()> {
+fn validate_types(dtypes: impl ExactSizeIterator<Item = DataType>) -> Result<()> {
     if !(3..=6).contains(&dtypes.len()) {
         return Err(error(
             "expected 3 required inputs (X, W, R) and up to 3 optional inputs",
@@ -277,19 +271,10 @@ fn validate_types(opset: u64, dtypes: impl ExactSizeIterator<Item = DataType>) -
     for (i, dtype) in dtypes.enumerate() {
         if i == 0 {
             x = dtype;
-            match x {
-                DataType::Float16 | DataType::Float32 | DataType::Float64 => {}
-                DataType::BFloat16 if opset >= 22 => {}
-                DataType::BFloat16 => {
-                    return Err(error(format!(
-                        "X uses BFloat16 at opset {opset}; use opset 22 or later"
-                    )));
-                }
-                _ => {
-                    return Err(error(format!(
-                        "X requires a schema floating type; got {x:?}"
-                    )));
-                }
+            if !DTYPES.contains(&x) {
+                return Err(error(format!(
+                    "X must be Float16, BFloat16, Float32, or Float64; got {x:?}"
+                )));
             }
         } else if i < 3 || dtype != DataType::Undefined {
             let expected = if i == 4 { DataType::Int32 } else { x };

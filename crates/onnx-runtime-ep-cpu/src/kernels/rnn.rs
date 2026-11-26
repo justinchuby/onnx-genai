@@ -4,25 +4,23 @@ use onnx_runtime_ir::{DataType, Node};
 
 use crate::dtype::{to_dense, to_dense_f32_widen, write_dense, write_dense_f32_narrow};
 
-pub struct Factory(pub u64);
+pub struct Factory;
 
 struct Rnn {
     config: Config,
-    since: u64,
 }
 
 impl KernelFactory for Factory {
     fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(Rnn {
             config: Config::parse(node)?,
-            since: self.0,
         }))
     }
 }
 
 impl Kernel for Rnn {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        let g = self.config.validate(self.since, inputs, outputs)?;
+        let g = self.config.validate(inputs, outputs)?;
         let lengths = inputs
             .get(4)
             .filter(|t| !t.is_absent())
@@ -339,7 +337,44 @@ mod tests {
     }
 
     #[test]
-    fn rnn_zero_time_and_opset_dtype_gate() {
+    fn rnn_bf16_recurrence_accepts_rnn14() {
+        let ep = CpuExecutionProvider::new();
+        let mut node = node();
+        node.attributes.insert(
+            "activations".into(),
+            Attribute::Strings(vec![b"Relu".to_vec()]),
+        );
+        let shapes = [
+            static_shape([2, 1, 1]),
+            static_shape([1, 1, 1]),
+            static_shape([1, 1, 1]),
+        ];
+        let types = [DataType::BFloat16; 3];
+        assert!(
+            !ep.supports_op(&node, 13, &shapes, &types, &[])
+                .is_supported()
+        );
+        assert!(
+            ep.supports_op(&node, 19, &shapes, &types, &[])
+                .is_supported()
+        );
+        let x = Owned::bf16(&[2, 1, 1], &[1., 2.]);
+        let w = Owned::bf16(&[1, 1, 1], &[1.]);
+        let r = Owned::bf16(&[1, 1, 1], &[0.5]);
+        let mut yh = Owned::zeros(DataType::BFloat16, &[1, 1, 1]);
+        let mut unused = Owned::zeros(DataType::BFloat16, &[2, 1, 1, 1]);
+        ep.get_kernel(&node, &[], 19)
+            .unwrap()
+            .execute(
+                &[x.view(), w.view(), r.view()],
+                &mut [unused.view_mut().mark_absent(), yh.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(yh.bytes, Owned::bf16(&[1, 1, 1], &[2.5]).bytes);
+    }
+
+    #[test]
+    fn rnn_bf16_zero_time_clears_final_state() {
         let ep = CpuExecutionProvider::new();
         let mut node = node();
         node.attributes
@@ -350,8 +385,6 @@ mod tests {
             static_shape([1, 1, 1]),
         ];
         let types = [DataType::BFloat16; 3];
-        let rejected = ep.supports_op(&node, 21, &shapes, &types, &[]);
-        assert!(rejected.reason().unwrap().contains("opset 22"));
         assert!(
             ep.supports_op(&node, 22, &shapes, &types, &[])
                 .is_supported()

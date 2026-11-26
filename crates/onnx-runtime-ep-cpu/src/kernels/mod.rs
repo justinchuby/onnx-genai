@@ -2141,12 +2141,12 @@ pub(crate) fn build_cpu_registry_with_resources(
         OpKey::new("RNN", "", 14),
         21,
         onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(rnn::Factory(14)),
+        Box::new(rnn::Factory),
     );
     rec.register(
         OpKey::new("RNN", "", 22),
         onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(rnn::Factory(22)),
+        Box::new(rnn::Factory),
     );
     rec.register(
         OpKey::new("CumProd", "", 26),

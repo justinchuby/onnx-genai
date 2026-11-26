@@ -54,6 +54,7 @@ fn rnn_bidirectional_lengths_and_clip() {
     let ep = require_cuda();
     for (opset, dtype) in [
         (19, DataType::Float16),
+        (19, DataType::BFloat16),
         (21, DataType::Float32),
         (22, DataType::BFloat16),
         (29, DataType::Float64),

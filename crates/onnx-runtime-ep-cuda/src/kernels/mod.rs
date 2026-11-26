@@ -951,7 +951,6 @@ pub(crate) fn build_cuda_registry_for_contract(
             onnx_runtime_ep_api::WorkspacePlanning::Metadata,
             Box::new(rnn::Factory {
                 runtime: runtime.clone(),
-                since,
             }),
         );
     }
