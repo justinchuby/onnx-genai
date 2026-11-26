@@ -1795,19 +1795,27 @@ pub(crate) fn build_cuda_registry_for_contract(
     );
 
     // Cast / CastLike (NVRTC element-wise dtype conversion).
-    for (op_type, version, float6) in [
-        ("Cast", 1, false),
-        ("CastLike", 1, false),
-        ("Cast", 28, true),
-    ] {
+    for (op_type, version, opset) in [("Cast", 1, 1), ("CastLike", 1, 15), ("Cast", 28, 28)] {
         reg.register(
             OpKey::new(op_type, "", version),
             onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(cast::CastFactory {
                 runtime: runtime.clone(),
-                float6,
+                opset,
             }),
         );
+    }
+    for op_type in ["Cast", "CastLike"] {
+        for opset in [19, 24] {
+            reg.register_native_only(
+                OpKey::new(op_type, "", opset),
+                onnx_runtime_ep_api::WorkspacePlanning::None,
+                Box::new(cast::CastFactory {
+                    runtime: runtime.clone(),
+                    opset,
+                }),
+            );
+        }
     }
 
     // Reductions (sum/mean cuDNN with f32 NVRTC fallback; max/min NVRTC).

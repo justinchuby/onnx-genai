@@ -15,6 +15,7 @@
 //! is written generically over the fixed-width numeric dtypes so it stays
 //! model-agnostic.
 
+use onnx_runtime_ep_api::float8_cast::{self, CastAttributes, Float8};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{
     DataType, Node, Shape,
@@ -106,11 +107,12 @@ num_to_int!(to_u64, u64);
 pub struct CastKernel {
     to: Option<DataType>,
     float6: bool,
+    attributes: CastAttributes,
 }
 
 /// Factory reading the ONNX `to` attribute (a `TensorProto.DataType` integer).
 pub struct CastFactory {
-    pub float6: bool,
+    pub opset: u64,
 }
 
 impl KernelFactory for CastFactory {
@@ -125,13 +127,9 @@ impl KernelFactory for CastFactory {
             .attr("to")
             .and_then(|a| a.as_int())
             .and_then(|raw| DataType::from_onnx(raw as i32));
-        cast_unsupported_reason(
-            "Cast",
-            opset,
-            self.float6,
-            input_dtypes.first().copied(),
-            target,
-        )
+        let source = input_dtypes.first().copied();
+        cast_unsupported_reason("Cast", opset, self.opset >= 28, source, target)
+            .or_else(|| float8_cast::unsupported_reason("Cast", self.opset, source, target))
     }
 
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
@@ -141,17 +139,20 @@ impl KernelFactory for CastFactory {
             .and_then(|raw| DataType::from_onnx(raw as i32));
         Ok(Box::new(CastKernel {
             to,
-            float6: self.float6,
+            float6: self.opset >= 28,
+            attributes: CastAttributes::from_node(node, self.opset),
         }))
     }
 }
 
 /// `CastLike` kernel. Its target dtype is supplied by input 1 rather than an
 /// attribute, but conversion itself is exactly the `Cast` conversion table.
-pub struct CastLikeKernel;
+pub struct CastLikeKernel(CastAttributes);
 
 /// Factory for `CastLike`.
-pub struct CastLikeFactory;
+pub struct CastLikeFactory {
+    pub opset: u64,
+}
 
 impl KernelFactory for CastLikeFactory {
     fn unsupported_reason(
@@ -166,17 +167,16 @@ impl KernelFactory for CastLikeFactory {
                 "CastLike requires opset 15 or newer, got opset {opset}; export the model with a supported CastLike revision"
             ));
         }
-        cast_unsupported_reason(
-            "CastLike",
-            opset,
-            false,
-            input_dtypes.first().copied(),
-            input_dtypes.get(1).copied(),
-        )
+        let source = input_dtypes.first().copied();
+        let target = input_dtypes.get(1).copied();
+        cast_unsupported_reason("CastLike", opset, false, source, target)
+            .or_else(|| float8_cast::unsupported_reason("CastLike", self.opset, source, target))
     }
 
-    fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(CastLikeKernel))
+    fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(CastLikeKernel(CastAttributes::from_node(
+            node, self.opset,
+        ))))
     }
 }
 
@@ -186,7 +186,14 @@ impl Kernel for CastKernel {
         let to = self.to.ok_or_else(|| {
             EpError::KernelFailed("Cast: missing or unsupported `to` attribute".into())
         })?;
-        cast_to("Cast", &inputs[0], &mut outputs[0], to, self.float6)
+        cast_to(
+            "Cast",
+            &inputs[0],
+            &mut outputs[0],
+            to,
+            self.float6,
+            self.attributes,
+        )
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -204,6 +211,7 @@ impl Kernel for CastLikeKernel {
             &mut outputs[0],
             inputs[1].dtype,
             false,
+            self.0,
         )
     }
 
@@ -218,6 +226,7 @@ fn cast_to(
     output: &mut TensorMut,
     to: DataType,
     float6: bool,
+    attributes: CastAttributes,
 ) -> Result<()> {
     // Cast to/from STRING is a real ONNX feature, but the ep-cpu stores
     // string tensors out-of-band (String has no fixed-width raw byte
@@ -246,6 +255,10 @@ fn cast_to(
         }
         return cast_packed_integer(input, output, to);
     }
+    let options = attributes.resolve(op, input.dtype, to)?;
+    if input.dtype == to && Float8::of(to).is_some() {
+        return super::write_dense_bytes(output, &super::to_dense_bytes(input)?);
+    }
     if input.dtype.is_float6() {
         if !float6 {
             return Err(EpError::KernelFailed(format!(
@@ -268,8 +281,20 @@ fn cast_to(
     let src = read_src(input)?;
     let out_esize = elem_size(to)?;
     let mut bytes = Vec::with_capacity(src.len() * out_esize);
-    for &n in &src {
-        write_num(&mut bytes, n, to)?;
+    if let Some(format) = Float8::of(to) {
+        bytes.extend(src.into_iter().map(|n| {
+            // ONNX's E8M0 reference uses f32 for integer inputs.
+            let value = match n {
+                Num::I(i) if format == Float8::E8M0 => f64::from(i as f32),
+                Num::U(u) if format == Float8::E8M0 => f64::from(u as f32),
+                _ => n.to_f64(),
+            };
+            format.encode(value, options)
+        }));
+    } else {
+        for n in src {
+            write_num(&mut bytes, n, to)?;
+        }
     }
     super::write_dense_bytes(output, &bytes)
 }
@@ -947,6 +972,9 @@ fn read_src(view: &TensorView) -> Result<Vec<Num>> {
 
 /// Interpret the little-endian element bytes of `dtype`.
 fn decode(dtype: DataType, buf: &[u8; 8]) -> Result<Num> {
+    if let Some(format) = Float8::of(dtype) {
+        return Ok(Num::F(format.decode(buf[0])));
+    }
     Ok(match dtype {
         DataType::Float32 => Num::F(f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as f64),
         DataType::Float64 => Num::F(f64::from_le_bytes(*buf)),
@@ -1018,6 +1046,7 @@ mod tests {
         CastKernel {
             to: Some(to),
             float6: true,
+            attributes: CastAttributes::defaults(28),
         }
         .execute(&[input.view()], &mut [out.view_mut()])
         .unwrap();
@@ -1035,6 +1064,7 @@ mod tests {
         let legacy = CastKernel {
             to: Some(DataType::Float32),
             float6: false,
+            attributes: CastAttributes::defaults(1),
         };
         let error = legacy
             .execute(&[packed.view()], &mut [out.view_mut()])
@@ -1169,14 +1199,14 @@ mod tests {
         let input = Owned::f32(&[2], &[1.9, -2.5]);
         let target_i32 = Owned::i32(&[], &[0]);
         let mut i32out = Owned::zeros(DataType::Int32, &[2]);
-        CastLikeKernel
+        CastLikeKernel(CastAttributes::defaults(15))
             .execute(&[input.view(), target_i32.view()], &mut [i32out.view_mut()])
             .unwrap();
         assert_eq!(i32out.to_i32(), vec![1, -2]);
 
         let target_f16 = Owned::f16(&[], &[0.]);
         let mut f16out = Owned::zeros(DataType::Float16, &[2]);
-        CastLikeKernel
+        CastLikeKernel(CastAttributes::defaults(15))
             .execute(&[input.view(), target_f16.view()], &mut [f16out.view_mut()])
             .unwrap();
         assert_eq!(f16out.dtype, DataType::Float16);
@@ -1191,6 +1221,7 @@ mod tests {
         CastKernel {
             to: Some(DataType::Uint4),
             float6: false,
+            attributes: CastAttributes::defaults(1),
         }
         .execute(&[input.view()], &mut [output.view_mut()])
         .unwrap();
@@ -1295,6 +1326,7 @@ mod tests {
         CastKernel {
             to: Some(DataType::Int2),
             float6: false,
+            attributes: CastAttributes::defaults(1),
         }
         .execute(&[input.view()], &mut [int2.view_mut()])
         .unwrap();
@@ -1314,6 +1346,7 @@ mod tests {
         CastKernel {
             to: Some(DataType::Int8),
             float6: false,
+            attributes: CastAttributes::defaults(1),
         }
         .execute(&[negative_input], &mut [reversed.view_mut()])
         .unwrap();
@@ -1324,6 +1357,7 @@ mod tests {
         CastKernel {
             to: Some(DataType::Int8),
             float6: false,
+            attributes: CastAttributes::defaults(1),
         }
         .execute(&[strided.view()], &mut [unpacked.view_mut()])
         .unwrap();
@@ -1341,6 +1375,7 @@ mod tests {
         CastKernel {
             to: Some(DataType::Uint4),
             float6: false,
+            attributes: CastAttributes::defaults(1),
         }
         .execute(&[source.view()], &mut [negative_output])
         .unwrap();
@@ -1354,6 +1389,7 @@ mod tests {
         CastKernel {
             to: Some(DataType::Int4),
             float6: false,
+            attributes: CastAttributes::defaults(1),
         }
         .execute(&[input.view()], &mut [output.view_mut()])
         .unwrap();
@@ -1365,7 +1401,7 @@ mod tests {
         let input = Owned::u8(&[5], &[0, 1, 2, 3, 4]);
         let target = Owned::zeros(DataType::Uint2, &[]);
         let mut output = Owned::zeros(DataType::Uint2, &[5]);
-        CastLikeKernel
+        CastLikeKernel(CastAttributes::defaults(24))
             .execute(&[input.view(), target.view()], &mut [output.view_mut()])
             .unwrap();
         assert_eq!(output.bytes, vec![0xe4, 0x00]);
@@ -1414,6 +1450,7 @@ mod tests {
         let err = CastKernel {
             to: None,
             float6: false,
+            attributes: CastAttributes::defaults(1),
         }
         .execute(&[a.view()], &mut [out.view_mut()]);
         assert!(err.is_err());
@@ -1428,6 +1465,7 @@ mod tests {
         let err = CastKernel {
             to: Some(DataType::String),
             float6: false,
+            attributes: CastAttributes::defaults(1),
         }
         .execute(&[a.view()], &mut [out.view_mut()]);
         let msg = format!("{}", err.unwrap_err());
@@ -1443,6 +1481,7 @@ mod tests {
         let err = CastKernel {
             to: Some(DataType::Float32),
             float6: false,
+            attributes: CastAttributes::defaults(1),
         }
         .execute(&[a.view()], &mut [out.view_mut()]);
         let msg = format!("{}", err.unwrap_err());
@@ -1483,6 +1522,7 @@ mod contiguous_fast_path_tests {
         CastKernel {
             to: Some(to),
             float6: false,
+            attributes: CastAttributes::defaults(1),
         }
         .execute(&[input.view()], &mut [output.view_mut()])
         .unwrap();
@@ -1712,6 +1752,7 @@ mod contiguous_fast_path_tests {
         CastKernel {
             to: Some(DataType::Float32),
             float6: false,
+            attributes: CastAttributes::defaults(1),
         }
         .execute(&[input.view()], &mut [output.view_mut()])
         .unwrap();

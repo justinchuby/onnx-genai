@@ -1608,21 +1608,30 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(elementwise::TanhFactory),
     );
-    rec.register(
-        OpKey::new("Cast", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(cast::CastFactory { float6: false }),
-    );
-    rec.register(
-        OpKey::new("Cast", "", 28),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(cast::CastFactory { float6: true }),
-    );
+    for opset in [1, 28] {
+        rec.register(
+            OpKey::new("Cast", "", opset),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(cast::CastFactory { opset }),
+        );
+    }
     rec.register(
         OpKey::new("CastLike", "", 15),
         onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(cast::CastLikeFactory),
+        Box::new(cast::CastLikeFactory { opset: 15 }),
     );
+    for opset in [19, 24] {
+        rec.register_native_only(
+            OpKey::new("Cast", "", opset),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(cast::CastFactory { opset }),
+        );
+        rec.register_native_only(
+            OpKey::new("CastLike", "", opset),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(cast::CastLikeFactory { opset }),
+        );
+    }
     rec.register(
         OpKey::new("BitCast", "", 26),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -3687,10 +3696,11 @@ mod tests {
         // gets a distinct opset 18 registration for max/min.
         // Opset-28 Cast adds one registration.
         // MeanVarianceNormalization-29 adds one registration.
+        // Cast and CastLike each add FP8 registrations at opsets 19 and 24.
         assert_eq!(
             reg.len(),
             PHASE1_OPS.len()
-                + 125
+                + 129
                 + mlas_registrations
                 + onnx_runtime_ir::roi_align::VERSIONS.len()
         );

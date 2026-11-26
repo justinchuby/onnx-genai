@@ -2201,6 +2201,57 @@ mod tests {
         (g, nid)
     }
 
+    #[test]
+    fn resolved_cast_like_declines_fp8_at_the_ort_claim_boundary() {
+        use onnx_runtime_ep_cpu::kernels::{
+            input_dtype_constraints_for_op, output_dtype_constraints_for_op,
+        };
+        use onnx_runtime_ep_cpu::{CpuExecutionProvider, build_cpu_registry_with_descriptors};
+        use onnx_runtime_ir::static_shape;
+
+        let (_, descriptors) = build_cpu_registry_with_descriptors();
+        let cast_like = descriptors
+            .iter()
+            .filter(|d| d.op_type == "CastLike" && d.domain.is_empty() && d.supports_raw_tensor_abi)
+            .collect::<Vec<_>>();
+        let [descriptor] = cast_like.as_slice() else {
+            panic!("expected exactly one shipped CPU CastLike descriptor");
+        };
+        let entries = [KernelRegistryEntry {
+            op_type: "CastLike",
+            domain: "",
+            since_version: i32::try_from(descriptor.since_version).unwrap(),
+            end_version: i32::try_from(descriptor.end_version).unwrap_or(i32::MAX),
+            supported_dtypes: descriptor.supported_dtypes,
+            input_dtype_constraints: input_dtype_constraints_for_op("CastLike", ""),
+            output_dtype_constraints: output_dtype_constraints_for_op("CastLike", ""),
+        }];
+        let provider = CpuExecutionProvider::new();
+        let shapes = [static_shape([2]), static_shape([1])];
+        for (opset, fp8) in [(19, DataType::Float8E4M3FN), (24, DataType::Float8E8M0)] {
+            for (source, target, allowed) in [
+                (DataType::Float32, DataType::Int64, true),
+                (fp8, DataType::Float32, false),
+                (DataType::Float32, fp8, false),
+            ] {
+                let dtypes = [source, target];
+                let (graph, id) = graph_with_node("CastLike", "", &dtypes, &[target]);
+                let node = graph.node(id);
+                assert!(
+                    provider
+                        .supports_op(node, opset, &shapes, &dtypes, &[])
+                        .is_supported(),
+                    "native CastLike-{opset} must accept {source:?} -> {target:?}"
+                );
+                assert_eq!(
+                    super::node_passes_dtype_filter(node, &graph, &entries),
+                    allowed,
+                    "ORT CastLike-{opset} eligibility for {source:?} -> {target:?}"
+                );
+            }
+        }
+    }
+
     /// f32 node with matching registry entry is claimed.
     #[test]
     fn dtype_filter_claims_f32_node() {

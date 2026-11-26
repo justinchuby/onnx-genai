@@ -317,6 +317,42 @@ mod cuda_impl {
             ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
         )]
         #[test]
+        fn cast_keeps_shipped_ort_descriptors() {
+            use onnx_runtime_ir::DataType::*;
+
+            let (_, _, entries, _) = construct_ep_with_stream().expect("CUDA device 0");
+            let mut ranges = Vec::new();
+            for entry in entries
+                .iter()
+                .filter(|e| matches!(e.op_type, "Cast" | "CastLike"))
+            {
+                assert_eq!(entry.domain, "");
+                assert_eq!(
+                    entry.supported_dtypes,
+                    &[
+                        Float32, Float16, BFloat16, Int8, Int16, Int32, Int64, Uint8, Uint16,
+                        Uint32, Uint64, Bool
+                    ]
+                );
+                assert!(entry.input_dtype_constraints.is_empty());
+                assert!(entry.output_dtype_constraints.is_empty());
+                ranges.push((entry.op_type, entry.since_version, entry.end_version));
+            }
+            assert_eq!(
+                ranges,
+                [
+                    ("Cast", 1, 27),
+                    ("Cast", 28, i32::MAX),
+                    ("CastLike", 1, i32::MAX)
+                ]
+            );
+        }
+
+        #[cfg_attr(
+            not(feature = "gpu-tests"),
+            ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+        )]
+        #[test]
         fn conv_transpose_keeps_legacy_advertisement_and_compilation() {
             use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, ValueId};
 
