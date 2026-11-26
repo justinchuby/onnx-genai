@@ -77,91 +77,102 @@ enum StreamTransformSpec {
 }
 
 #[derive(Clone)]
-struct FallbackRun {
-    bytes: Arc<Vec<u8>>,
-    length: usize,
-    invalid: bool,
-    digest: u64,
+enum FallbackRun {
+    Buffered { bytes: Arc<Vec<u8>>, digest: u64 },
+    Invalid { length: NonZeroUsize },
 }
 impl Default for FallbackRun {
     fn default() -> Self {
-        Self {
+        Self::Buffered {
             bytes: Arc::new(Vec::new()),
-            length: 0,
-            invalid: false,
             digest: 14695981039346656037,
         }
     }
 }
 impl FallbackRun {
     fn len(&self) -> usize {
-        self.length
+        match self {
+            Self::Buffered { bytes, .. } => bytes.len(),
+            Self::Invalid { length } => length.get(),
+        }
     }
     fn is_empty(&self) -> bool {
-        self.length == 0
+        self.len() == 0
     }
     fn output_length(&self) -> anyhow::Result<usize> {
-        if !self.invalid && std::str::from_utf8(&self.bytes).is_ok() {
-            Ok(self.length)
-        } else {
-            self.length
-                .checked_mul(3)
-                .context("ByteFallback replacement byte count overflow")
+        if let Self::Buffered { bytes, .. } = self
+            && std::str::from_utf8(bytes).is_ok()
+        {
+            return Ok(bytes.len());
         }
+        self.len()
+            .checked_mul(3)
+            .context("ByteFallback replacement byte count overflow")
     }
     fn appended(&self, bytes: &[u8], limit: usize) -> anyhow::Result<Self> {
         let length = self
-            .length
+            .len()
             .checked_add(bytes.len())
             .context("ByteFallback run size overflow")?;
         ensure!(
             length <= limit,
             "ByteFallback run exceeds its {limit}-byte retained response budget; increase buffer or end the byte run"
         );
-        if self.invalid {
-            return Ok(Self {
-                length,
-                ..self.clone()
-            });
-        }
+        let (previous, digest) = match self {
+            Self::Invalid { length: previous } => {
+                return Ok(Self::Invalid {
+                    length: previous
+                        .checked_add(bytes.len())
+                        .context("ByteFallback invalid run size overflow")?,
+                });
+            }
+            Self::Buffered { bytes, digest } => (bytes, *digest),
+        };
         let mut next = Vec::new();
         next.try_reserve_exact(length).context("reserve bounded ByteFallback run before append; free host memory or shorten generation")?;
-        next.extend_from_slice(&self.bytes);
+        next.extend_from_slice(previous);
         next.extend_from_slice(bytes);
-        // An irreparable invalid run's entire eventual text is U+FFFD per byte;
-        // its original payload is no longer semantically relevant to any future.
-        if std::str::from_utf8(&next).is_err_and(|e| e.error_len().is_some()) {
-            return Ok(Self {
-                bytes: Arc::new(Vec::new()),
-                length,
-                invalid: true,
-                digest: 0,
+        if std::str::from_utf8(&next).is_err_and(|error| error.error_len().is_some()) {
+            return Ok(Self::Invalid {
+                length: NonZeroUsize::new(length)
+                    .context("invalid UTF8 run must contain at least one byte")?,
             });
         }
-        let digest = bytes.iter().fold(self.digest, |hash, byte| {
+        let digest = bytes.iter().fold(digest, |hash, byte| {
             (hash ^ u64::from(*byte)).wrapping_mul(1099511628211)
         });
-        Ok(Self {
+        Ok(Self::Buffered {
             bytes: Arc::new(next),
-            length,
-            invalid: false,
             digest,
         })
     }
 }
 impl PartialEq for FallbackRun {
     fn eq(&self, other: &Self) -> bool {
-        self.length == other.length
-            && self.invalid == other.invalid
-            && (self.invalid
-                || (self.digest == other.digest
-                    && (Arc::ptr_eq(&self.bytes, &other.bytes) || self.bytes == other.bytes)))
+        match (self, other) {
+            (Self::Invalid { length: a }, Self::Invalid { length: b }) => a == b,
+            (
+                Self::Buffered {
+                    bytes: a,
+                    digest: ad,
+                },
+                Self::Buffered {
+                    bytes: b,
+                    digest: bd,
+                },
+            ) => ad == bd && (Arc::ptr_eq(a, b) || a == b),
+            _ => false,
+        }
     }
 }
 impl Eq for FallbackRun {}
 impl std::hash::Hash for FallbackRun {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::hash::Hash::hash(&(self.length, self.invalid, self.digest), state);
+        use std::hash::Hash as _;
+        match self {
+            Self::Buffered { bytes, digest } => (0u8, bytes.len(), digest).hash(state),
+            Self::Invalid { length } => (1u8, length).hash(state),
+        }
     }
 }
 
@@ -176,9 +187,10 @@ enum ProbeMode {
     Root,
     Pattern,
     Text,
+    Content,
 }
 #[derive(Debug)]
-struct ProbeError;
+pub(crate) struct ProbeError;
 impl std::fmt::Display for ProbeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(
@@ -195,6 +207,8 @@ impl serde::ser::Error for ProbeError {
 struct PatternProbe {
     mode: ProbeMode,
     kind: Option<ReplacePatternKind>,
+    pattern_bytes: Option<usize>,
+    content_bytes: Option<usize>,
 }
 impl serde::ser::SerializeStruct for &mut PatternProbe {
     type Ok = ();
@@ -204,9 +218,13 @@ impl serde::ser::SerializeStruct for &mut PatternProbe {
         key: &'static str,
         value: &T,
     ) -> Result<(), ProbeError> {
-        if key == "pattern" {
+        if key == "pattern" || key == "content" {
             let mode = self.mode;
-            self.mode = ProbeMode::Pattern;
+            self.mode = if key == "pattern" {
+                ProbeMode::Pattern
+            } else {
+                ProbeMode::Content
+            };
             let result = value.serialize(&mut **self);
             self.mode = mode;
             result
@@ -236,7 +254,12 @@ impl<'a> serde::Serializer for &'a mut PatternProbe {
         }
     }
     fn serialize_str(self, value: &str) -> Result<(), ProbeError> {
+        if matches!(self.mode, ProbeMode::Content) {
+            self.content_bytes = Some(value.len());
+            return Ok(());
+        }
         if matches!(self.mode, ProbeMode::Text) {
+            self.pattern_bytes = Some(value.len());
             self.kind = Some(if value.is_empty() {
                 ReplacePatternKind::Empty
             } else {
@@ -370,20 +393,135 @@ impl<'a> serde::Serializer for &'a mut PatternProbe {
         Err(ProbeError)
     }
 }
-fn replacement_kind(
+struct ReplacementInfo {
+    kind: ReplacePatternKind,
+    pattern_bytes: usize,
+    content_bytes: usize,
+}
+fn replacement_info(
     replace: &tokenizers::normalizers::replace::Replace,
-) -> anyhow::Result<ReplacePatternKind> {
+) -> anyhow::Result<ReplacementInfo> {
     use serde::Serialize as _;
     let mut probe = PatternProbe {
         mode: ProbeMode::Root,
         kind: None,
+        pattern_bytes: None,
+        content_bytes: None,
     };
-    replace
-        .serialize(&mut probe)
-        .context("inspect canonical Replace pattern kind without allocating a decoder plan")?;
-    probe.kind.context(
+    replace.serialize(&mut probe).context("inspect canonical Replace kind and borrowed string lengths without allocating a decoder plan")?;
+    let kind = probe.kind.context(
         "canonical Replace serializer omitted its pattern; use matching tokenizers dependency",
-    )
+    )?;
+    Ok(ReplacementInfo {
+        kind,
+        pattern_bytes: if kind == ReplacePatternKind::Regex {
+            0
+        } else {
+            probe
+                .pattern_bytes
+                .context("canonical Replace omitted its String pattern length")?
+        },
+        content_bytes: probe
+            .content_bytes
+            .context("canonical Replace omitted replacement content length")?,
+    })
+}
+fn replacement_kind(
+    replace: &tokenizers::normalizers::replace::Replace,
+) -> anyhow::Result<ReplacePatternKind> {
+    Ok(replacement_info(replace)?.kind)
+}
+fn literal_spec_bytes(info: &ReplacementInfo, path_bytes: usize) -> anyhow::Result<usize> {
+    info.pattern_bytes
+        .checked_mul(size_of::<usize>() + 1)
+        .and_then(|n| n.checked_add(info.content_bytes))
+        .and_then(|n| n.checked_add(path_bytes))
+        .and_then(|n| {
+            n.checked_add(
+                size_of::<LiteralReplacement>()
+                    + size_of::<StreamTransformSpec>()
+                    + size_of::<StreamTransformState>()
+                    + 128,
+            )
+        })
+        .context("literal Replace compiled specification size overflow")
+}
+/// Borrowed-only preflight; errors allocate just their bounded diagnostic path.
+fn validate_literal_sizes(tokenizer: &Tokenizer) -> anyhow::Result<()> {
+    const LIMIT: usize = 4 * 1024 * 1024;
+    struct Sizes {
+        byte: bool,
+        remaining: usize,
+        indices: [usize; 128],
+    }
+    fn path(indices: &[usize]) -> String {
+        let mut path = "tokenizer.decoder".to_owned();
+        for index in indices {
+            path.push_str(&format!(".decoders[{index}]"));
+        }
+        path
+    }
+    fn visit(
+        stage: &DecoderWrapper,
+        state: &mut Sizes,
+        depth: usize,
+        path_bytes: usize,
+    ) -> anyhow::Result<()> {
+        if let DecoderWrapper::Sequence(sequence) = stage {
+            ensure!(
+                depth < state.indices.len(),
+                "literal decoder sequence nesting exceeds 128 stages; simplify tokenizer.decoder"
+            );
+            for (index, stage) in sequence.get_decoders().iter().enumerate() {
+                state.indices[depth] = index;
+                let digits = if index == 0 {
+                    1
+                } else {
+                    index.ilog10() as usize + 1
+                };
+                visit(stage, state, depth + 1, path_bytes + 11 + digits)?;
+            }
+            return Ok(());
+        }
+        if matches!(
+            stage,
+            DecoderWrapper::ByteFallback(_) | DecoderWrapper::ByteLevel(_)
+        ) {
+            state.byte = true;
+            return Ok(());
+        }
+        if !state.byte {
+            return Ok(());
+        }
+        let bytes = match stage {
+            DecoderWrapper::Replace(replace) => {
+                let info = replacement_info(replace)?;
+                literal_spec_bytes(&info, path_bytes)?
+            }
+            DecoderWrapper::Strip(strip) => (usize::from(strip.start > 0)
+                + usize::from(strip.stop > 0))
+            .checked_mul(size_of::<StreamTransformSpec>() + size_of::<StreamTransformState>())
+            .context("Strip specification size overflow")?,
+            _ => 0,
+        };
+        ensure!(
+            bytes <= LIMIT && bytes <= state.remaining,
+            "{} compiled decoder specification needs {bytes} bytes with {} bytes remaining in the 4 MiB contract; shorten patterns/content or reduce composed stages",
+            path(&state.indices[..depth]),
+            state.remaining
+        );
+        state.remaining -= bytes;
+        Ok(())
+    }
+    let mut state = Sizes {
+        byte: false,
+        remaining: LIMIT - size_of::<StreamTransformSpec>() - size_of::<StreamTransformState>(),
+        indices: [0; 128],
+    };
+    if let Some(decoder) = tokenizer.inner().get_decoder() {
+        visit(decoder, &mut state, 0, "tokenizer.decoder".len())?;
+    }
+    Ok(())
 }
 
 /// A literal, nonrecursive leftmost replacement resolved from decoder metadata.
@@ -410,6 +548,7 @@ impl LiteralReplacement {
     fn resolve(
         replace: &tokenizers::normalizers::replace::Replace,
         path: &str,
+        remaining: usize,
     ) -> anyhow::Result<Self> {
         match replacement_kind(replace)? {
             ReplacePatternKind::Literal => {}
@@ -420,6 +559,12 @@ impl LiteralReplacement {
                 "{path} regex Replace needs separately resolved streaming support; use a nonempty String pattern"
             ),
         }
+        let info = replacement_info(replace)?;
+        let bytes = literal_spec_bytes(&info, path.len())?;
+        ensure!(
+            bytes <= 4 * 1024 * 1024 && bytes <= remaining,
+            "{path} compiled literal Replace needs {bytes} bytes with {remaining} bytes remaining in its 4 MiB specification budget; shorten pattern/content"
+        );
         #[derive(serde::Deserialize)]
         struct Config {
             pattern: Pattern,
@@ -452,7 +597,11 @@ impl LiteralReplacement {
                 .is_some_and(|n| n <= 4 * 1024 * 1024),
             "{path} literal Replace configuration exceeds its 4 MiB byte/state budget; shorten pattern/content"
         );
-        let mut failure = vec![0; pattern.len()];
+        let mut failure = Vec::new();
+        failure.try_reserve_exact(pattern.len()).with_context(|| {
+            format!("reserve {path} literal prefix table; free host memory or shorten pattern")
+        })?;
+        failure.resize(pattern.len(), 0);
         for i in 1..pattern.len() {
             let mut j = failure[i - 1];
             while j > 0 && pattern[i] != pattern[j] {
@@ -616,6 +765,7 @@ pub(crate) fn reserve_workspace(
     if !ByteStreamContract::requests_literal_stream(tokenizer)? {
         return Ok(None);
     }
+    validate_literal_sizes(tokenizer).map_err(crate::ProcessorConfigurationError::classify)?;
     let map = u64::try_from(literal_catalog_limit(tokenizer)?)?
         .checked_mul(4)
         .context("literal decoder vocabulary reservation overflow")?;
@@ -689,6 +839,9 @@ impl ByteStreamContract {
         else {
             return Ok(None);
         };
+        if Self::requests_literal_stream(tokenizer)? {
+            validate_literal_sizes(tokenizer)?;
+        }
         let mut stages = Vec::new();
         flatten(decoder, "tokenizer.decoder".into(), &mut stages);
         let byte_index = stages
@@ -734,11 +887,16 @@ impl ByteStreamContract {
         let mut fused = byte_level;
         let mut transforms = Vec::new();
         let mut retention = 0usize;
+        let mut remaining_spec =
+            4 * 1024 * 1024 - size_of::<StreamTransformSpec>() - size_of::<StreamTransformState>();
         for (path, stage) in &stages[byte_index + 1..] {
             match stage {
                 DecoderWrapper::Fuse(_) => fused = true,
                 DecoderWrapper::Strip(strip) if strip.start == 0 && strip.stop == 0 => {}
                 DecoderWrapper::Strip(strip) if fused => {
+                    let bytes = (usize::from(strip.start > 0) + usize::from(strip.stop > 0))
+                        * (size_of::<StreamTransformSpec>() + size_of::<StreamTransformState>());
+                    remaining_spec=remaining_spec.checked_sub(bytes).with_context(||format!("{path} exceeds the composed 4 MiB decoder specification budget; reduce decoder stages"))?;
                     if let Some(count) = NonZeroUsize::new(strip.start) {
                         transforms.push(StreamTransformSpec::Initial {
                             character: strip.content,
@@ -766,7 +924,10 @@ impl ByteStreamContract {
                     );
                 }
                 DecoderWrapper::Replace(replace) if fused => {
-                    let spec = LiteralReplacement::resolve(replace, path)?;
+                    let info = replacement_info(replace)?;
+                    let bytes = literal_spec_bytes(&info, path.len())?;
+                    let spec = LiteralReplacement::resolve(replace, path, remaining_spec)?;
+                    remaining_spec -= bytes;
                     retention = retention
                         .checked_add(spec.pattern.len() - 1)
                         .context("literal Replace retention overflow")?;
@@ -794,28 +955,6 @@ impl ByteStreamContract {
                 },
             );
         }
-        let spec_bytes = transforms.iter().try_fold(0usize, |sum, stage| {
-            let bytes = size_of::<StreamTransformSpec>()
-                .checked_add(
-                    match stage {
-                        StreamTransformSpec::Replace(spec) => spec
-                            .pattern
-                            .len()
-                            .checked_mul(size_of::<usize>() + 1)
-                            .and_then(|n| n.checked_add(spec.content.len()))
-                            .and_then(|n| n.checked_add(spec.path.len())),
-                        _ => Some(0),
-                    }
-                    .context("composed decoder specification size overflow")?,
-                )
-                .context("composed decoder specification size overflow")?;
-            sum.checked_add(bytes)
-                .context("composed decoder specification size overflow")
-        })?;
-        ensure!(
-            spec_bytes <= 4 * 1024 * 1024,
-            "tokenizer.decoder composed transform specifications exceed the 4 MiB contract budget; reduce stages, literal patterns or replacement content"
-        );
         let catalog_limit = if transforms
             .iter()
             .any(|s| matches!(s, StreamTransformSpec::Replace(_)))
@@ -1343,10 +1482,12 @@ fn fallback_output(run: &FallbackRun, limit: usize) -> anyhow::Result<Vec<u8>> {
     output.try_reserve_exact(length).context(
         "allocate bounded ByteFallback boundary output; free memory or shorten generation",
     )?;
-    if !run.invalid && std::str::from_utf8(&run.bytes).is_ok() {
-        output.extend_from_slice(&run.bytes);
+    if let FallbackRun::Buffered { bytes, .. } = run
+        && std::str::from_utf8(bytes).is_ok()
+    {
+        output.extend_from_slice(bytes);
     } else {
-        for _ in 0..run.length {
+        for _ in 0..run.len() {
             output.extend_from_slice("�".as_bytes());
         }
     }
@@ -2158,6 +2299,28 @@ mod tests {
                 )
                 .unwrap()
                 .is_empty()
+        );
+    }
+    #[test]
+    fn literal_spec_preflight_bounds_each_stage_and_composed_borrowed_sizes() {
+        let make = |contents: &[usize]| {
+            let mut stages = vec![json!({"type":"ByteFallback"}), json!({"type":"Fuse"})];
+            stages.extend(contents.iter().map(
+                |n| json!({"type":"Replace","pattern":{"String":"a"},"content":"b".repeat(*n)}),
+            ));
+            self::tokenizer(json!({"type":"Sequence","decoders":stages}), &[])
+        };
+        let valid = make(&[1024, 1024]);
+        validate_literal_sizes(&valid).unwrap();
+        let single = make(&[4 * 1024 * 1024]);
+        let error = validate_literal_sizes(&single).unwrap_err();
+        assert!(format!("{error:#}").contains("tokenizer.decoder.decoders[2]"));
+        let composed = make(&[3 * 1024 * 1024, 2 * 1024 * 1024]);
+        let error = validate_literal_sizes(&composed).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("tokenizer.decoder.decoders[3]") && text.contains("remaining"),
+            "{text}"
         );
     }
 }

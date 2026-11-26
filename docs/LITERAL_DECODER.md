@@ -77,3 +77,9 @@ Canonical dependency semantics are defined by tokenizers
 [ByteFallback](https://github.com/huggingface/tokenizers/blob/master/tokenizers/src/decoders/byte_fallback.rs)
 and [ByteLevel](https://github.com/huggingface/tokenizers/blob/master/tokenizers/src/pre_tokenizers/byte_level.rs).
 The implementation audit used the workspace's tokenizers 0.23.2 source.
+
+Declared literal specification sizes are checked using borrowed serialization
+before plan allocation or governor admission, including the composed 4 MiB
+limit. Allocator and memory-governor failures retain their resource/internal
+classification. HTTP host-quota refusals use the existing `429` response,
+`Retry-After: 1`, and sanitized `resource_limit_error` body before SSE opens.

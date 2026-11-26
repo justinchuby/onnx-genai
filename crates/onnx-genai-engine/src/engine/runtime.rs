@@ -1053,9 +1053,9 @@ impl Engine {
             tokenizer,
             &options.effective_preserved_tokens(),
         )
-        .map_err(crate::ProcessorConfigurationError::new)?;
+        .map_err(crate::ProcessorConfigurationError::classify)?;
         let mut chain = build_processor_chain(options, Some(tokenizer), custom_sampler, decoder)
-            .map_err(crate::ProcessorConfigurationError::new)?;
+            .map_err(crate::ProcessorConfigurationError::classify)?;
         chain.retain_decoder_workspace(lease);
         Ok(chain)
     }

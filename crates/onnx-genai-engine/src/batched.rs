@@ -466,9 +466,9 @@ impl<'a> ContinuousBatchManager<'a> {
             self.tokenizer,
             &options.effective_preserved_tokens(),
         )
-        .map_err(crate::ProcessorConfigurationError::new)?;
+        .map_err(crate::ProcessorConfigurationError::classify)?;
         let mut chain = build_processor_chain(&options, Some(self.tokenizer), false, decoder)
-            .map_err(crate::ProcessorConfigurationError::new)?;
+            .map_err(crate::ProcessorConfigurationError::classify)?;
         chain.retain_decoder_workspace(lease);
         if reached_context_limit(prompt_tokens.len(), max_context) {
             self.admissions

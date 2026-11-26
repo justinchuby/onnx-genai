@@ -179,7 +179,7 @@ impl RealtimeSession<'_> {
             .engine
             .reserve_literal_decoder_workspace(tokenizer, &options)?;
         let contract = crate::byte_stream::prepare_literal_output(tokenizer, preserved)
-            .map_err(crate::ProcessorConfigurationError::new)?;
+            .map_err(crate::ProcessorConfigurationError::classify)?;
         let mut decoder = crate::tokenization::TokenTextDecoder::with_preserved_tokens(preserved);
         decoder.set_byte_limit(max_bytes.get());
         if let Some(contract) = contract {
@@ -234,7 +234,7 @@ impl RealtimeSession<'_> {
                 tokenizer,
                 &options.effective_preserved_tokens(),
             )
-            .map_err(crate::ProcessorConfigurationError::new)?;
+            .map_err(crate::ProcessorConfigurationError::classify)?;
             let text = |grammar: &crate::config::TextGrammar, prefix: &str| {
                 crate::response_constraint::ContentConstraint::text(
                     tokenizer,

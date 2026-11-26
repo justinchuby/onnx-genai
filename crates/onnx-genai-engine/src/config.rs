@@ -1530,8 +1530,18 @@ pub struct ProcessorConfigurationError {
     source: anyhow::Error,
 }
 impl ProcessorConfigurationError {
-    pub(crate) fn new(source: anyhow::Error) -> Self {
-        Self { source }
+    pub(crate) fn classify(source: anyhow::Error) -> anyhow::Error {
+        // Preserve allocator/governor failures for serving resource policy; a
+        // valid configuration does not become invalid when capacity is scarce.
+        if source.chain().any(|cause| {
+            cause.is::<std::collections::TryReserveError>()
+                || cause.is::<onnx_runtime_memory_api::MemoryError>()
+                || cause.is::<crate::byte_stream::ProbeError>()
+        }) {
+            source
+        } else {
+            Self { source }.into()
+        }
     }
 }
 
@@ -2688,5 +2698,30 @@ mod generation_contract_tests {
             )
             .expect("no contract to violate");
         assert_eq!(options.temperature, 0.9);
+    }
+}
+
+#[cfg(test)]
+mod processor_error_classification_tests {
+    #[test]
+    fn allocation_failure_retains_its_type_instead_of_becoming_invalid_configuration() {
+        let error = Vec::<u8>::new().try_reserve(usize::MAX).unwrap_err();
+        let classified = super::ProcessorConfigurationError::classify(
+            anyhow::Error::new(error).context("allocate valid compiled processor storage"),
+        );
+        assert!(
+            classified
+                .downcast_ref::<std::collections::TryReserveError>()
+                .is_some()
+        );
+        assert!(
+            classified
+                .downcast_ref::<super::ProcessorConfigurationError>()
+                .is_none()
+        );
+        let configuration = super::ProcessorConfigurationError::classify(anyhow::anyhow!(
+            "unsupported declared pattern"
+        ));
+        assert!(configuration.is::<super::ProcessorConfigurationError>());
     }
 }

@@ -196,7 +196,8 @@ async fn native_literal_workspace_denial_is_json_before_sse_and_valid_independen
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
         assert!(
             !response
                 .headers()
@@ -208,10 +209,7 @@ async fn native_literal_workspace_denial_is_json_before_sse_and_valid_independen
         );
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         let error: Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(
-            error.to_string().contains("contextual literal decoder"),
-            "{error}"
-        );
+        assert!(error["error"]["type"] == "resource_limit_error", "{error}");
     }
     let (status, wire) = request(load(512 * 1024 * 1024), body).await;
     assert_eq!(status, StatusCode::OK, "{wire}");
