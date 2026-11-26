@@ -3068,7 +3068,11 @@ impl WorkflowRuntime {
                     format!("workflow references unknown execution island {id}")
                 })?;
                 telemetry.component_invocations += island.component_count() as u64;
-                island.run(values, component_overrides)?;
+                island.run(
+                    values,
+                    component_overrides,
+                    onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+                )?;
                 telemetry.record_stage(format!("island:{id}"), stage_started.elapsed().as_nanos());
             }
         }
@@ -3419,7 +3423,10 @@ impl WorkflowRuntime {
                         .output_names()
                         .iter()
                         .cloned()
-                        .zip(session.run(resolved)?)
+                        .zip(session.run(
+                            resolved,
+                            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+                        )?)
                         .collect())
                 }
             }
@@ -3469,7 +3476,10 @@ impl WorkflowRuntime {
                 .output_names()
                 .iter()
                 .cloned()
-                .zip(session.run(resolved)?)
+                .zip(session.run(
+                    resolved,
+                    onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+                )?)
                 .collect::<HashMap<_, _>>();
             return selected_outputs
                 .keys()
@@ -3577,7 +3587,10 @@ impl WorkflowRuntime {
                 .output_names()
                 .iter()
                 .cloned()
-                .zip(session.run(resolved)?)
+                .zip(session.run(
+                    resolved,
+                    onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+                )?)
                 .collect::<HashMap<_, _>>();
             if selected_outputs
                 .keys()
@@ -4117,9 +4130,15 @@ impl WorkflowRuntime {
         let encoded_bytes = encoded.as_raw_bytes().with_context(|| format!(
             "read audio component '{component}' input 'encoded' from workflow value '{encoded_ref}'; provide host-readable encoded audio bytes"
         ))?;
+        let audio_headroom = self.plan.audio_memory.as_ref().context("audio preprocessing requires a configured host memory authority; construct the workflow with engine resource limits")?.host_snapshot().headroom;
+        let decode_limits = self
+            .plan
+            .audio_decode_limits
+            .within_host(audio_headroom)
+            .with_context(|| format!("admit decoded audio for component '{component}'"))?;
         let mut tensors = executable
-            .run(&[encoded_bytes])
-            .with_context(|| format!("preprocess audio component '{component}' input 'encoded' from workflow value '{encoded_ref}'; provide a valid PCM16 WAV clip supported by the declared audio program"))?
+            .run(&[encoded_bytes], decode_limits)
+            .with_context(|| format!("preprocess audio component '{component}' input 'encoded' from workflow value '{encoded_ref}'; provide valid supported encoded audio and the declared audio program"))?
             .into_iter()
             .map(|tensor| (tensor.name.clone(), tensor))
             .collect::<HashMap<_, _>>();

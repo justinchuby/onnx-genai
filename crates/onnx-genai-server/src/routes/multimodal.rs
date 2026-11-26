@@ -94,6 +94,14 @@ pub(crate) async fn audio_transcriptions(
                     state.config.max_output_tokens
                 ))
             })?;
+    let decode_limits =
+        crate::audio_input::decode_limits(&handle, state.config.max_decoded_audio_bytes)
+            .await
+            .map_err(|error| {
+                ApiError::invalid_request(format!(
+                    "transcription audio memory admission: {error:#}"
+                ))
+            })?;
     if let Some(contract) = &handle.engine.transcription {
         if language.as_ref().is_some_and(|value| !value.is_empty())
             || prompt.as_ref().is_some_and(|value| !value.is_empty())
@@ -102,7 +110,7 @@ pub(crate) async fn audio_transcriptions(
                 "this frame-decoding transcription profile declares no language/prompt conditioning; omit those fields or select a conditioned speech package",
             ));
         }
-        let bytes=tokio::task::spawn_blocking(move ||onnx_genai_preprocess::audio::decode_audio(&bytes).map(|_|bytes)).await
+        let bytes=tokio::task::spawn_blocking(move ||onnx_genai_preprocess::audio::decode_audio(&bytes, decode_limits).map(|_|bytes)).await
             .map_err(|error|ApiError::internal(format!("validate transcription file: decoding task stopped: {error}; retry or inspect server logs")))?
             .map_err(|error|ApiError::invalid_request(format!("file is not supported audio: {error}; provide a supported encoded audio recording")))?;
         let limits=onnx_genai_engine::transcription::TranscriptionLimits {
@@ -140,7 +148,7 @@ pub(crate) async fn audio_transcriptions(
             ApiError {status:StatusCode::NOT_IMPLEMENTED,kind:"not_supported_error",retry_after_secs:None,message:format!(
                 "What: audio transcription was rejected for model '{}'. Why: its package declares neither a frame-transcription profile nor a generative audio input. How: serve a speech package with an explicit audio input contract.",handle.id)}
         })?;
-    let input = MultimodalInput::from_audio_bytes(spec, &bytes)
+    let input = MultimodalInput::from_audio_bytes(spec, &bytes, decode_limits)
         .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err:#}")))?;
     let max_tokens = output_limit.get();
     let contract = spec.transcription().ok_or_else(||ApiError {status:StatusCode::NOT_IMPLEMENTED,kind:"not_supported_error",retry_after_secs:None,message:format!("model '{}' has no generative transcription contract; author transcription_config.json with its exact decoder prompt and response boundaries",handle.id)})?;

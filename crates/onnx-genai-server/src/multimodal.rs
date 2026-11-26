@@ -128,9 +128,13 @@ impl MultimodalInput {
         })
     }
 
-    pub fn from_audio_bytes(spec: &AudioInputSpec, bytes: &[u8]) -> anyhow::Result<Self> {
+    pub fn from_audio_bytes(
+        spec: &AudioInputSpec,
+        bytes: &[u8],
+        limits: onnx_genai_preprocess::audio::AudioDecodeLimits,
+    ) -> anyhow::Result<Self> {
         if spec.is_encoded() {
-            onnx_genai_preprocess::audio::decode_audio(bytes)
+            onnx_genai_preprocess::audio::decode_audio(bytes, limits)
                 .context("validate encoded audio input before workflow admission")?;
             return Ok(Self {
                 tensors: vec![PreparedTensor::EncodedAudio {
@@ -139,7 +143,7 @@ impl MultimodalInput {
                 }],
             });
         }
-        let tensor = preprocess_audio(bytes, spec)?;
+        let tensor = preprocess_audio(bytes, spec, limits)?;
         Ok(Self {
             tensors: vec![PreparedTensor::Audio {
                 name: tensor.endpoint,
@@ -614,7 +618,10 @@ mod media_binding_tests {
         let encoded = onnx_genai_preprocess::audio::encode_wav_f32(&[0.5; 512], 16000, 1).unwrap();
         let expected = onnx_genai_preprocess::audio::AudioProgram::from_program(&declaration)
             .unwrap()
-            .run(&[&encoded])
+            .run(
+                &[&encoded],
+                onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+            )
             .unwrap();
         let onnx_genai_preprocess::audio::AudioTensorData::Fp32(data) = &expected[0].data else {
             panic!("features")

@@ -401,15 +401,19 @@ pub(super) fn build_pipeline_request(
             .audio
             .as_ref()
             .expect("audio support checked before building the request");
-        let input = MultimodalInput::from_audio_bytes(spec, &read_attachment(path, "audio")?)
-            .with_context(|| {
-                format!(
-                    "What: the audio file {} could not be preprocessed. \
+        let input = MultimodalInput::from_audio_bytes(
+            spec,
+            &read_attachment(path, "audio")?,
+            onnx_genai::preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .with_context(|| {
+            format!(
+                "What: the audio file {} could not be preprocessed. \
                      Why: it is not usable as this model's declared audio input. \
                      How: provide a valid supported encoded audio file.",
-                    path.display()
-                )
-            })?;
+                path.display()
+            )
+        })?;
         // The model's transcription contract owns decoder conditioning; typed
         // text reaches its declared context prompt instead of being discarded.
         let contract=spec.transcription().context("audio generation requires transcription_config.json; declare the model decoder prompt instead of guessing start tokens")?;

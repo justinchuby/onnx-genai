@@ -438,6 +438,8 @@ pub struct ServerConfig {
     pub max_transcription_prompt_bytes: std::num::NonZeroUsize,
     pub max_transcription_template_operations: std::num::NonZeroU64,
     pub max_transcription_frames: std::num::NonZeroUsize,
+    /// Maximum raw decoded PCM work and resident PCM bytes per audio decode.
+    pub max_decoded_audio_bytes: std::num::NonZeroUsize,
     pub max_transcription_text_bytes: std::num::NonZeroUsize,
     pub realtime: crate::realtime::RealtimeLimits,
     /// Enable the upstream POST /props acknowledgement; no mutation schema exists upstream.
@@ -552,6 +554,9 @@ impl Default for ServerConfig {
                 onnx_genai_engine::transcription::generative::PromptLimits::default()
                     .template
                     .max_operations,
+            max_decoded_audio_bytes:
+                onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY
+                    .max_decoded_bytes,
             max_transcription_frames:
                 onnx_genai_engine::transcription::TranscriptionLimits::default().max_frames,
             max_transcription_text_bytes:
@@ -589,6 +594,9 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     fn validate(mut self) -> anyhow::Result<Self> {
+        self.engine_config.audio_decode_limits = onnx_genai_preprocess::audio::AudioDecodeLimits {
+            max_decoded_bytes: self.max_decoded_audio_bytes,
+        };
         anyhow::ensure!(
             self.model_downloads.get() <= tokio::sync::Semaphore::MAX_PERMITS,
             "--model-downloads exceeds the supported concurrency bound {}; choose a smaller positive value",

@@ -769,6 +769,9 @@ impl WorkflowRuntime {
                 movable_emit_values,
                 device_bridge_components,
                 memory_strategy_plan,
+                audio_memory: None,
+                audio_decode_limits:
+                    onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
                 decode_backend,
                 execution_admission,
                 adapter_service: None,
@@ -1198,6 +1201,8 @@ impl WorkflowRuntime {
                     movable_emit_values,
                     device_bridge_components,
                     memory_strategy_plan,
+                    audio_memory: Some(resource_governor.memory_accounting()),
+                    audio_decode_limits: config.audio_decode_limits,
                     decode_backend,
                     execution_admission,
                     adapter_service: directory.adapters,

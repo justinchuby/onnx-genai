@@ -13507,7 +13507,11 @@ mod systemone_audio {
     #[tokio::test]
     async fn systemone_mp3_state_and_spoken_questions_execute_native_audio_preprocessing() {
         let mp3 = include_bytes!("../../../tests/fixtures/audio/stereo-tone.mp3");
-        let decoded = onnx_genai_preprocess::audio::decode_audio(mp3).unwrap();
+        let decoded = onnx_genai_preprocess::audio::decode_audio(
+            mp3,
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .unwrap();
         let wav = onnx_genai_preprocess::audio::encode_wav_pcm16(
             &decoded.samples,
             decoded.sample_rate,
@@ -13550,7 +13554,11 @@ mod systemone_audio {
         for case in manifest["cases"].as_array().unwrap() {
             let file = case["file"].as_str().unwrap();
             let bytes = std::fs::read(fixtures.join(file)).unwrap();
-            let decoded = onnx_genai_preprocess::audio::decode_audio(&bytes).unwrap();
+            let decoded = onnx_genai_preprocess::audio::decode_audio(
+                &bytes,
+                onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+            )
+            .unwrap();
             let reference = onnx_genai_preprocess::audio::encode_wav_f32(
                 &decoded.samples,
                 decoded.sample_rate,
@@ -14099,19 +14107,39 @@ mod ctc_transcription {
                 .join("../../tests/fixtures/onnx_genai_workflows")
                 .join(directory);
             let router = app(AppState::load(&model, Some(name.into())).unwrap());
+            let mut unsupported =
+                onnx_genai_preprocess::audio::encode_wav_pcm16(&[0.5; 8], 8000, 1).unwrap();
+            unsupported[20..22].copy_from_slice(&0xffff_u16.to_le_bytes());
             let (status, error) = send(
                 router.clone(),
                 "/v1/audio/transcriptions",
-                &std::fs::read(fixtures.join("unsupported-opus.ogg")).unwrap(),
+                &unsupported,
                 &[("model", name)],
             )
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
             assert!(error.contains("codec"), "{error}");
+            for opus in ["celt-1", "hybrid-2"] {
+                let bytes = std::fs::read(fixtures.join(format!("../opus/{opus}.ogg"))).unwrap();
+                let (status, body) = send(
+                    router.clone(),
+                    "/v1/audio/transcriptions",
+                    &bytes,
+                    &[("model", name)],
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{name}/{opus}: {body}");
+                let body: Value = serde_json::from_str(&body).unwrap();
+                assert!(body["text"].is_string(), "{name}/{opus}: {body}");
+            }
             for case in manifest["cases"].as_array().unwrap() {
                 let file = case["file"].as_str().unwrap();
                 let bytes = std::fs::read(fixtures.join(file)).unwrap();
-                let decoded = onnx_genai_preprocess::audio::decode_audio(&bytes).unwrap();
+                let decoded = onnx_genai_preprocess::audio::decode_audio(
+                    &bytes,
+                    onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+                )
+                .unwrap();
                 if name == "speech" {
                     use base64::{Engine as _, engine::general_purpose::STANDARD};
                     let request = json!({"model":name,"messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":STANDARD.encode(&bytes),"format":file}}]}],"max_tokens":2,"temperature":0.0});
@@ -14182,7 +14210,11 @@ mod ctc_transcription {
     #[tokio::test]
     async fn mp3_transcription_executes_both_native_speech_paths_and_recovers_after_bad_audio() {
         let mp3 = include_bytes!("../../../tests/fixtures/audio/stereo-tone.mp3");
-        let decoded = onnx_genai_preprocess::audio::decode_audio(mp3).unwrap();
+        let decoded = onnx_genai_preprocess::audio::decode_audio(
+            mp3,
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .unwrap();
         let equivalent = onnx_genai_preprocess::audio::encode_wav_pcm16(
             &decoded.samples,
             decoded.sample_rate,
