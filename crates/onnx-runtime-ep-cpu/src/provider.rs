@@ -114,15 +114,25 @@ impl CpuExecutionProvider {
 
     /// Construct all CPU factories with the same immutable session resources.
     pub fn with_resources(resources: CpuMemoryResources) -> Self {
-        Self::with_celu_mode(resources, true)
+        let mut ep = Self::shared_kernels(resources, true);
+        ep.registry.register(
+            onnx_runtime_ep_api::OpKey::new(
+                onnx_runtime_optimizer::affine_moe::OP,
+                onnx_runtime_ir::RUNTIME_DOMAIN,
+                1,
+            ),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(crate::kernels::affine_moe::Factory),
+        );
+        ep
     }
 
-    /// Construct the CPU EP used by the ORT plugin, retaining legacy Celu routing.
-    pub fn new_for_ort() -> Self {
-        Self::with_celu_mode(CpuMemoryResources::default(), false)
+    /// CPU provider for ORT: retain legacy Celu and omit standalone-only kernels and passes.
+    pub fn for_ort_plugin() -> Self {
+        Self::shared_kernels(CpuMemoryResources::default(), false)
     }
 
-    fn with_celu_mode(resources: CpuMemoryResources, standalone_celu: bool) -> Self {
+    fn shared_kernels(resources: CpuMemoryResources, standalone_celu: bool) -> Self {
         Self {
             device: DeviceId::cpu(),
             initialized: false,
@@ -641,7 +651,18 @@ impl ExecutionProvider for CpuExecutionProvider {
     }
 
     fn custom_passes(&self) -> Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> {
-        cpu_optimization_passes()
+        let mut passes = cpu_optimization_passes();
+        if self.registry.supports(
+            onnx_runtime_optimizer::affine_moe::OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ) {
+            // Run after the affine grouped projection rewrite.
+            passes.push(Box::new(
+                onnx_runtime_optimizer::affine_moe::AffineMoeFusion,
+            ));
+        }
+        passes
     }
 
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {

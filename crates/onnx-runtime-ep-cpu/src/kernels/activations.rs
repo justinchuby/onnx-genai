@@ -786,7 +786,7 @@ mod tests {
         );
         assert!(entry.supports_raw_tensor_abi);
 
-        let ep = crate::CpuExecutionProvider::new_for_ort();
+        let ep = crate::CpuExecutionProvider::for_ort_plugin();
         let node = Node::new(NodeId(0), "Celu", vec![Some(ValueId(0))], vec![ValueId(1)]);
         let x = Owned::f64(&[2], &[-2.0, -0.0]);
         for opset in [12, 27, 28, 29] {
