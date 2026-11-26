@@ -274,6 +274,11 @@ impl HostWorkspacePool {
         Ok(pool)
     }
 
+    /// Whether this domain uses the exact supplied process manager instance.
+    pub fn uses_process_manager(&self, manager: &ProcessMemoryManager) -> bool {
+        self.0.manager.is_same_instance(manager)
+    }
+
     pub fn authority_id(&self) -> Option<MemoryAuthorityId> {
         self.0.authority.memory_authority_id()
     }

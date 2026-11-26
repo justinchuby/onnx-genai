@@ -654,6 +654,10 @@ impl ExecutionProvider for CpuExecutionProvider {
     }
 
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {
+        if let Some(memory) = self.resources.buffer_memory() {
+            return memory.allocate(size, alignment, self.device);
+        }
+
         if alignment == 0 || !alignment.is_power_of_two() {
             return Err(EpError::AlignmentError);
         }
@@ -727,6 +731,28 @@ impl ExecutionProvider for CpuExecutionProvider {
         if buffer.is_borrowed() {
             return Ok(());
         }
+        let buffer = match buffer.into_bound_ownership() {
+            Ok(onnx_runtime_ep_api::BoundBufferOwnership::Managed(owner)) => {
+                let outcome = owner.release_now().map_err(|source| EpError::Backend {
+                    operation: "release CPU ordinary managed Host payload",
+                    source: Box::new(source),
+                })?;
+                return if outcome.is_complete() {
+                    Ok(())
+                } else {
+                    Err(EpError::KernelFailed(format!(
+                        "CPU ordinary Host payload release retained funded ownership: {outcome:?}; inspect the process memory quarantine and resolve the backing release failure"
+                    )))
+                };
+            }
+            Ok(onnx_runtime_ep_api::BoundBufferOwnership::Binding(owner)) => {
+                // This provider never issues bare bound ordinary allocations.
+                // Dropping preserves the binding's unresolved ownership record.
+                drop(owner);
+                return Err(EpError::KernelFailed("CPU ordinary Host payload lacks a managed allocation token; return the complete owner issued by this provider".into()));
+            }
+            Err(buffer) => buffer,
+        };
         let size = buffer.len();
         let align = buffer.alignment();
         let ptr = buffer.into_raw() as *mut u8;
