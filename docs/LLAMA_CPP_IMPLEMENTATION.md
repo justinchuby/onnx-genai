@@ -2603,3 +2603,24 @@ strict server Clippy with `--no-default-features --features metrics,cuda-13000`.
 Formatting/diff checks passed. These are CPU functional checks; device wire
 acceptance and performance remain unclaimed. Broader acceptance rows above stay
 open; this increment does not complete the overall compatibility objective.
+
+
+## Tool parameter object-domain consistency
+
+A real Native constrained-workflow counterexample showed `parameters: true`
+allowing a higher-ranked array-argument token, only for the declared model
+protocol to reject it after selection. Forced envelope grammars and realtime
+parameter admission now share object-domain composition. Missing/null/true
+schemas resolve to objects, while other documents retain their conditions and
+root definitions/references under conjunction with the object requirement.
+Existing object-only schemas stay unchanged; invalid allOf/documents and
+contradictory constraints are not replaced with permissive fallbacks.
+
+The former failing Native case now selects the lower-ranked valid object for
+true, empty, array/object-union and null declarations. Full server validation:
+625 passed, 2 inherited ignores. Grammar tests preserve local root references,
+required/constant/additional-property conditions and impossible-schema failures.
+Strict all-target engine/server Clippy and the explicit ORT reference server
+configuration passed, as did formatting/diff checks. This is CPU functional
+coverage, without device or performance claims; the overall acceptance list
+remains open.

@@ -2,7 +2,7 @@
 use anyhow::{Context, ensure};
 use onnx_genai_engine::byte_grammar::{GrammarByteCursor, GrammarCandidate};
 use onnx_genai_metadata::{ToolCall, ToolCallFragment};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 #[derive(Default)]
@@ -28,9 +28,11 @@ impl ToolArguments {
                 .get("name")
                 .and_then(Value::as_str)
                 .context("realtime function tool requires a name string")?;
-            let default_schema = json!({"type":"object"});
-            let schema = tool.get("parameters").unwrap_or(&default_schema);
-            let cursor = GrammarByteCursor::json_schema(schema, max_bytes)
+            let schema = crate::tool_protocol::object_argument_schema(tool.get("parameters"))
+                .with_context(|| {
+                    format!("resolve realtime tool {name:?} parameters object domain")
+                })?;
+            let cursor = GrammarByteCursor::json_schema(&schema, max_bytes)
                 .with_context(|| format!("compile realtime tool {name:?} parameters; use a schema supported by the constraint backend"))?;
             ensure!(
                 compiled.insert(name.to_owned(), cursor).is_none(),
@@ -117,6 +119,7 @@ impl ToolArguments {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     #[test]
     fn provisional_arguments_require_viable_schema_and_complete_envelopes_require_eof() {
         let tools = ToolArguments::compile(
@@ -157,6 +160,36 @@ mod tests {
             tools.admit_projected(&[forged], &complete).is_err(),
             "a viable projection cannot authorize a different completed value"
         );
+    }
+
+    #[test]
+    fn unconstrained_realtime_parameters_still_require_protocol_objects() {
+        for parameters in [
+            json!(true),
+            json!({}),
+            json!({"type":["array","object"]}),
+            Value::Null,
+        ] {
+            let tools =
+                ToolArguments::compile(&json!([{"name":"lookup","parameters":parameters}]), 4096)
+                    .unwrap();
+            for arguments in ["[]", "1", "null", r#""text""#] {
+                let fragments = [ToolCallFragment {
+                    index: 0,
+                    id: None,
+                    name: "lookup".into(),
+                    arguments: arguments.into(),
+                    envelope_complete: false,
+                }];
+                assert!(tools.admit_fragments(&fragments).is_err(), "{arguments}");
+            }
+            let call = ToolCall {
+                id: "call_0".into(),
+                name: "lookup".into(),
+                arguments: r#"{"x":1}"#.into(),
+            };
+            tools.admit(&[call]).unwrap();
+        }
     }
 
     #[test]
