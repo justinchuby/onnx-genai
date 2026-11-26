@@ -105,7 +105,7 @@ fn reference(kernel: &AffineMoe, inputs: &[TensorView], outputs: &mut [TensorMut
             x.shape, router.shape, out.shape, kernel.k
         )));
     }
-    let first = AffineBank::new(
+    let first = AffineBank::prepare(
         w1,
         s1,
         (!z1.is_absent()).then_some(z1),
@@ -113,8 +113,9 @@ fn reference(kernel: &AffineMoe, inputs: &[TensorView], outputs: &mut [TensorMut
         kernel.first.block,
         kernel.first.zero,
     )
+    .and_then(|bank| bank.validate())
     .map_err(|cause| error(format!("first expert bank (inputs 2..4): {cause}")))?;
-    let down = AffineBank::new(
+    let down = AffineBank::prepare(
         w2,
         s2,
         (!z2.is_absent()).then_some(z2),
@@ -122,6 +123,7 @@ fn reference(kernel: &AffineMoe, inputs: &[TensorView], outputs: &mut [TensorMut
         kernel.down.block,
         kernel.down.zero,
     )
+    .and_then(|bank| bank.validate())
     .map_err(|cause| error(format!("down expert bank (inputs 5..7): {cause}")))?;
     let x = crate::kernels::to_dense_f32(x)?;
     let scores = crate::kernels::to_dense_f32(router)?;
@@ -451,7 +453,7 @@ fn row_borrowing_depends_on_inner_axis_not_whole_tensor_contiguity() {
         &[4, 8, 1],
         DeviceId::cpu(),
     );
-    let rows = Rows::new("X", &view).unwrap();
+    let rows = Rows::new(OP, "X", &view).unwrap();
     assert_eq!(rows.scratch_len(), 0);
     for (row, start) in [0, 8, 4, 12].into_iter().enumerate() {
         assert_eq!(rows.get(row, &mut []).unwrap(), &values[start..start + 4]);
@@ -464,7 +466,7 @@ fn row_borrowing_depends_on_inner_axis_not_whole_tensor_contiguity() {
         DeviceId::cpu(),
     )
     .with_byte_offset(48);
-    let rows = Rows::new("X", &reversed).unwrap();
+    let rows = Rows::new(OP, "X", &reversed).unwrap();
     assert_eq!(rows.scratch_len(), 0);
     for (row, start) in [12, 4, 8, 0].into_iter().enumerate() {
         assert_eq!(rows.get(row, &mut []).unwrap(), &values[start..start + 4]);
