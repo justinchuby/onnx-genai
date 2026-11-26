@@ -2714,3 +2714,22 @@ byte-exact completed replay, induced reader-disconnect recovery, genuinely activ
 API-key onboarding rejected the wrong key, accepted and persisted the valid key,
 and protected replay. Browser evidence records the built binary/driver hashes;
 these fixture results do not close the full model/device/control acceptance list.
+
+
+## Explicit spectrum projections and periodic windows
+
+Standalone audio spectra now admit explicit power/magnitude and periodic
+Hann/Hamming/rectangular selectors. Magnitude projects finite complex FFT values
+with stable hypot, so squared-magnitude overflow does not reject representable
+amplitudes. Log-mel keeps the original power/Hann arithmetic, mel resource
+admission before planning and normalization; geometry/rate/branch/mask guards
+are unchanged. Uncentered/complex and other DSP conventions remain open.
+
+Validation: all 122 preprocessing tests passed, including independent f64 DFT
+for each projection/window, odd/short/length-one windows, and finite-input
+magnitude-vs-power overflow checks. Six Native audio tests passed; the spectrum
+case executes all six combinations at multiple amplitudes/lengths against
+analytic head outputs. Full server library: 629 passed, 2 inherited ignores.
+Strict all-target default preprocess/engine/server and explicit ORT-reference
+server Clippy, formatting and diff checks passed. Functional macOS ARM64 CPU
+coverage only; no device/performance or whole-goal parity claim.

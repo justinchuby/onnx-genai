@@ -29,7 +29,14 @@ fn floats(tensor: &onnx_genai_preprocess::audio::NamedAudioTensor) -> &[f32] {
     data
 }
 /// Slow double-precision DFT with independently constructed reflected indices.
-fn reference(samples: &[f32], fft: usize, hop: usize, window: usize) -> Vec<f64> {
+fn reference(
+    samples: &[f32],
+    fft: usize,
+    hop: usize,
+    window: usize,
+    mode: &str,
+    window_kind: &str,
+) -> Vec<f64> {
     let frames = samples.len() / hop;
     let mut expected = Vec::new();
     for bin in 0..=fft / 2 {
@@ -49,14 +56,23 @@ fn reference(samples: &[f32], fft: usize, hop: usize, window: usize) -> Vec<f64>
                         source = 2 * samples.len() as i64 - 2 - source;
                     }
                 }
-                let hann =
-                    0.5 - 0.5 * (std::f64::consts::TAU * offset as f64 / window as f64).cos();
-                let value = f64::from(samples[source as usize]) * hann;
+                let phase = std::f64::consts::TAU * offset as f64 / window as f64;
+                let coefficient = match window_kind {
+                    "hann" => 0.5 - 0.5 * phase.cos(),
+                    "hamming" => 0.54 - 0.46 * phase.cos(),
+                    "rectangular" => 1.0,
+                    _ => panic!("reference window must be explicit"),
+                };
+                let value = f64::from(samples[source as usize]) * coefficient;
                 let phase = std::f64::consts::TAU * (bin * position) as f64 / fft as f64;
                 real += value * phase.cos();
                 imaginary -= value * phase.sin();
             }
-            expected.push(real * real + imaginary * imaginary);
+            expected.push(match mode {
+                "power" => real * real + imaginary * imaginary,
+                "magnitude" => real.hypot(imaginary),
+                _ => panic!("reference mode must be explicit"),
+            });
         }
     }
     expected
@@ -78,7 +94,7 @@ fn authored_power_spectrogram_matches_independent_dft_for_varied_geometry() {
             result[0].shape,
             [1, (fft / 2 + 1) as i64, (samples.len() / hop) as i64]
         );
-        let expected = reference(&samples, fft, hop, window);
+        let expected = reference(&samples, fft, hop, window, "power", "hann");
         for (actual, expected) in floats(&result[0]).iter().zip(expected) {
             assert!(
                 (f64::from(*actual) - expected).abs() < 1e-5 * (1.0 + expected),
@@ -135,8 +151,18 @@ fn power_branches_frame_validity_masks_and_input_windows_keep_their_sources() {
 #[test]
 fn spectrum_geometry_modes_types_and_analysis_rate_fail_with_context() {
     for (field, value, needle) in [
-        ("mode", json!("magnitude"), "mode: power"),
-        ("window", json!("hamming"), "window: hann"),
+        ("mode", json!("complex"), "mode: power or magnitude"),
+        (
+            "window",
+            json!("blackman"),
+            "window: hann, hamming or rectangular",
+        ),
+        ("mode", json!(null), "mode: power or magnitude"),
+        (
+            "window",
+            json!(null),
+            "window: hann, hamming or rectangular",
+        ),
         ("n_fft", json!(0), "n_fft"),
         ("hop_length", json!(null), "hop_length"),
         ("win_length", json!(100), "win_length"),
@@ -171,7 +197,7 @@ fn empty_and_single_sample_spectra_remain_finite_and_ragged_batches_require_padd
         let result = program.run(&[&encoded(&samples)]).unwrap();
         assert_eq!(result[0].shape, [1, 5, samples.len() as i64]);
         assert!(floats(&result[0]).iter().all(|v| v.is_finite()));
-        let expected = reference(&samples, 8, 1, 8);
+        let expected = reference(&samples, 8, 1, 8, "power", "hann");
         for (actual, expected) in floats(&result[0]).iter().zip(expected) {
             assert!((f64::from(*actual) - expected).abs() < 1e-5);
         }
@@ -181,4 +207,84 @@ fn empty_and_single_sample_spectra_remain_finite_and_ragged_batches_require_padd
         .unwrap_err()
         .to_string();
     assert!(error.contains("ragged") && error.contains("pad"), "{error}");
+}
+
+#[test]
+fn every_explicit_projection_and_window_matches_independent_dft() {
+    let samples = [
+        -0.5, 0.25, 0.5, -0.25, 0.0, 0.5, 0.25, -0.5, 0.25, 0.5, 0.0, -0.5, 0.25, 0.5, -0.25, 0.5,
+        0.0,
+    ];
+    for mode in ["power", "magnitude"] {
+        for window_kind in ["hann", "hamming", "rectangular"] {
+            for (fft, hop, window) in [(3, 2, 3), (8, 3, 5), (12, 4, 10), (6, 1, 1)] {
+                let mut spec = spectrum(fft, hop, window);
+                spec["mode"] = json!(mode);
+                spec["window"] = json!(window_kind);
+                let program = compile(json!([{"op":"decode"},spec]), features_output()).unwrap();
+                let result = program.run(&[&encoded(&samples)]).unwrap();
+                assert_eq!(
+                    result[0].shape,
+                    [1, (fft / 2 + 1) as i64, (samples.len() / hop) as i64]
+                );
+                for (actual, expected) in floats(&result[0]).iter().zip(reference(
+                    &samples,
+                    fft,
+                    hop,
+                    window,
+                    mode,
+                    window_kind,
+                )) {
+                    assert!(
+                        (f64::from(*actual) - expected).abs() < 1e-5 * (1.0 + expected),
+                        "{mode}/{window_kind} geometry {fft}/{hop}/{window}: {actual} != {expected}"
+                    );
+                }
+            }
+        }
+    }
+}
+#[test]
+fn magnitude_remains_finite_when_squared_power_would_overflow() {
+    let build = |mode: &str, scale: f64| {
+        let mut spec = spectrum(8, 1, 8);
+        spec["mode"] = json!(mode);
+        compile(
+            json!([{"op":"decode"},{"op":"rescale","scale":scale},spec]),
+            features_output(),
+        )
+        .unwrap()
+    };
+    let bytes = encoded(&[0.25; 8]);
+    let scale = 1e20;
+    let result = build("magnitude", scale).run(&[&bytes]).unwrap();
+    let values = floats(&result[0]);
+    assert!(values.iter().all(|value| value.is_finite()));
+    // Periodic Hann(8) has DC gain 4, and the encoded 0.25 is exact.
+    let expected = scale as f32;
+    assert!(
+        (values[0] - expected).abs() < expected * 1e-5,
+        "{} != {expected}",
+        values[0]
+    );
+    let error = build("power", scale)
+        .run(&[&bytes])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("power spectrum")
+            && error.contains("nonfinite")
+            && error.contains("rescale"),
+        "{error}"
+    );
+    for mode in ["power", "magnitude"] {
+        let error = build(mode, f64::from(f32::MAX))
+            .run(&[&encoded(&[0.5; 8])])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(mode) && error.contains("nonfinite") && error.contains("rescale"),
+            "{error}"
+        );
+    }
 }
