@@ -5104,8 +5104,8 @@ opset_import {{ version: {opset} }}
 ///
 /// Legal legacy Float32 at opset 21 and BF16 at opset 22 must both reach this
 /// EP's real `GetCapability` assignment. The paired opset-21 BF16 model must be
-/// rejected by ORT's authoritative schema validation before capability, rather
-/// than becoming a standalone backdoor through the plugin compatibility scope.
+/// rejected by ORT's authoritative schema validation before capability. Native
+/// nxrt intentionally accepts that semantically identical dtype extension.
 #[test]
 fn pinned_ort_assigns_schema_legal_lp_normalization_boundaries() {
     let _lock = lock_ort_ep();

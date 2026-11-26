@@ -43,6 +43,7 @@ See [`docs/architecture/CRATE_RESERVATION.md`](docs/architecture/CRATE_RESERVATI
 - Optimization and placement decisions flow through explicit, inspectable cost models and capability checks.
 - Eager execution never performs implicit cross-device transfers; users request `.to(device)` explicitly.
 - Unsupported kernels, dtypes, attributes, opsets, or configurations fail clearly rather than silently changing semantics.
+- A dtype added by a later operator schema may be accepted at earlier opsets when the operator's semantics are unchanged and the runtime can execute that dtype correctly. Native capability should be as permissive as correctness allows; host integrations still honor the host's authoritative schema validation.
 
 See [`docs/execution/EAGER.md` §1](docs/execution/EAGER.md#1-design-principles) and §13.
 

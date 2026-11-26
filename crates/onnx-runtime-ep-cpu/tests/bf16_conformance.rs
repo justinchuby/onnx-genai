@@ -126,7 +126,7 @@ fn assert_bf16_matches_f32(case: &OpCase) {
 }
 
 #[test]
-fn lp_normalization_dtype_admission_changes_at_opset22() {
+fn lp_normalization_supported_dtypes_are_admitted_across_opsets() {
     let ep = CpuExecutionProvider::new();
     let node = Node::new(
         NodeId(0),
@@ -136,7 +136,12 @@ fn lp_normalization_dtype_admission_changes_at_opset22() {
     );
     let shape = static_shape([2, 3]);
 
-    for dtype in [DataType::Float16, DataType::Float32, DataType::Float64] {
+    for dtype in [
+        DataType::BFloat16,
+        DataType::Float16,
+        DataType::Float32,
+        DataType::Float64,
+    ] {
         for opset in [1, 21, 22] {
             let claim = ep.supports_op(&node, opset, std::slice::from_ref(&shape), &[dtype], &[]);
             assert!(
@@ -146,63 +151,14 @@ fn lp_normalization_dtype_admission_changes_at_opset22() {
             );
         }
     }
-
-    let rejected = ep.supports_op(
-        &node,
-        21,
-        std::slice::from_ref(&shape),
-        &[DataType::BFloat16],
-        &[],
-    );
-    assert!(!rejected.is_supported());
-    let reason = rejected.reason().unwrap_or_default();
-    assert!(reason.contains("BFloat16"), "{reason}");
-    assert!(reason.contains("opset 22"), "{reason}");
-
-    let plugin_admitted = unsafe {
-        onnx_runtime_ep_api::schema_authority::with_authoritative_schema_validation(|| {
-            ep.supports_op(
-                &node,
-                21,
-                std::slice::from_ref(&shape),
-                &[DataType::BFloat16],
-                &[],
-            )
-        })
-    };
-    assert!(
-        plugin_admitted.is_supported(),
-        "host-validated plugin capability must preserve the executable BF16 lane: {:?}",
-        plugin_admitted.reason()
-    );
-    assert!(
-        !ep.supports_op(
-            &node,
-            21,
-            std::slice::from_ref(&shape),
-            &[DataType::BFloat16],
-            &[],
-        )
-        .is_supported(),
-        "leaving host-schema scope must restore standalone rejection"
-    );
-
-    let admitted = ep.supports_op(
-        &node,
-        22,
-        std::slice::from_ref(&shape),
-        &[DataType::BFloat16],
-        &[],
-    );
-    assert!(admitted.is_supported(), "{:?}", admitted.reason());
 }
 
 #[test]
-fn lp_normalization_bf16_opset22_matches_independent_golden() {
+fn lp_normalization_bf16_legacy_opset_matches_independent_golden() {
     let case = OpCase {
         op: "LpNormalization",
         domain: "",
-        opset: 22,
+        opset: 1,
         attrs: vec![("axis", Attribute::Int(-1)), ("p", Attribute::Int(2))],
         inputs: vec![Inp::F(vec![2, 3], vec![3.0, 4.0, 0.0, 0.0, 0.0, 5.0])],
         out_shape: vec![2, 3],
@@ -478,7 +434,7 @@ fn cases() -> Vec<OpCase> {
     v.push(OpCase {
         op: "LpNormalization",
         domain: "",
-        opset: 22,
+        opset: 1,
         attrs: vec![("axis", Attribute::Int(-1)), ("p", Attribute::Int(2))],
         inputs: vec![Inp::F(vec![2, 3], sample6())],
         out_shape: vec![2, 3],

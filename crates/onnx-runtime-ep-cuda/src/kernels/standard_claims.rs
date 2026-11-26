@@ -25,7 +25,6 @@ pub(crate) fn unsupported_reason_at_opset(
                 .err()
                 .map(|error| error.to_string());
         }
-        "LpNormalization" => lp_normalization(node, opset, input_dtypes),
         "ConvTranspose" => conv_transpose(
             node,
             opset,
@@ -78,6 +77,7 @@ pub(crate) fn unsupported_reason(
         "DynamicQuantizeLinear" => dynamic_quantize_linear(node, input_dtypes),
         "GlobalAveragePool" | "GlobalMaxPool" => global_pool(node, input_dtypes),
         "GlobalLpPool" => global_lp_pool(node, input_dtypes),
+        "LpNormalization" => lp_normalization(node, input_dtypes),
         "InstanceNormalization" | "GroupNormalization" => normalization(node, input_dtypes),
         "LpPool" => lp_pool(node, input_dtypes),
         "CenterCropPad" => center_crop_pad(node, input_dtypes),
@@ -146,16 +146,8 @@ fn global_lp_pool(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> 
     }
 }
 
-fn lp_normalization(node: &Node, opset: u64, input_dtypes: &[DataType]) -> Result<(), String> {
+fn lp_normalization(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     global_pool(node, input_dtypes)?;
-    if input_dtypes.first() == Some(&DataType::BFloat16)
-        && opset < 22
-        && !onnx_runtime_ep_api::schema_authority::authoritative_schema_validation_active()
-    {
-        return Err(format!(
-            "input 'X' dtype BFloat16 requires ONNX opset 22 or later; export this node at opset 22+, or use Float16 or Float32 at opset {opset}"
-        ));
-    }
     match node.attr("p") {
         None => Ok(()),
         Some(attribute) if matches!(attribute.as_int(), Some(1 | 2)) => Ok(()),
@@ -903,49 +895,4 @@ fn mod_op(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
         return Err("Float32 Mod requires fmod=1".into());
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod lp_normalization_claim_tests {
-    use super::*;
-    use onnx_runtime_ir::{NodeId, ValueId};
-
-    fn node() -> Node {
-        Node::new(
-            NodeId(0),
-            "LpNormalization",
-            vec![Some(ValueId(0))],
-            vec![ValueId(1)],
-        )
-    }
-
-    #[test]
-    fn bf16_boundary_distinguishes_standalone_plugin_and_optimizer_nodes() {
-        let node = node();
-        let dtype = [DataType::BFloat16];
-
-        assert!(lp_normalization(&node, 21, &dtype).is_err());
-        assert!(lp_normalization(&node, 22, &dtype).is_ok());
-
-        let plugin_claim = unsafe {
-            onnx_runtime_ep_api::schema_authority::with_authoritative_schema_validation(|| {
-                lp_normalization(&node, 21, &dtype)
-            })
-        };
-        assert!(plugin_claim.is_ok());
-        assert!(lp_normalization(&node, 21, &dtype).is_err());
-
-        let mut marked_node = node;
-        marked_node
-            .attributes
-            .insert("fused_reduce_chain".into(), Attribute::Int(1));
-        assert!(
-            lp_normalization(&marked_node, 21, &dtype).is_err(),
-            "a model-authored marker must not bypass the schema boundary"
-        );
-        assert!(
-            lp_normalization(&marked_node, 22, &dtype).is_ok(),
-            "the optimizer-created node is admitted through its effective v22 schema"
-        );
-    }
 }

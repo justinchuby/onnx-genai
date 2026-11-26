@@ -366,14 +366,6 @@ unsafe extern "C" fn ep_get_capability(
     result.unwrap_or_else(|_| fail_status("GetCapability: internal panic"))
 }
 
-fn with_host_schema_validation<T>(f: impl FnOnce() -> T) -> T {
-    // SAFETY: ORT invokes GetCapability only after resolving and validating the
-    // graph against its imported operator schemas. This scope covers only the
-    // synchronous provider query and is cleared before partitions are returned
-    // to ORT.
-    unsafe { onnx_runtime_ep_api::schema_authority::with_authoritative_schema_validation(f) }
-}
-
 fn ep_get_capability_inner(
     ep: *mut ort::OrtEp,
     graph: *const ort::OrtGraph,
@@ -442,49 +434,47 @@ fn ep_get_capability_inner(
     // so the deferral cannot be reintroduced by overriding a default — there is
     // nothing left to override.
     let mut graph_kernel_nodes = std::collections::HashSet::new();
-    let claims = with_host_schema_validation(|| {
-        exported.ep.with(|ep| {
-            ort_view.query_capabilities_filtered(ep, |node, graph_kernel| {
-                if graph_kernel {
-                    if ep.executor_kernel_scope(view.node(node))
-                        == onnx_runtime_ep_api::ExecutorKernelScope::Required
-                    {
-                        return false;
-                    }
-                    graph_kernel_nodes.insert(view.node(node).id);
-                    return true;
-                }
-                if is_gpu_ep && !node_inputs_all_routable(&view, node) {
+    let claims = exported.ep.with(|ep| {
+        ort_view.query_capabilities_filtered(ep, |node, graph_kernel| {
+            if graph_kernel {
+                if ep.executor_kernel_scope(view.node(node))
+                    == onnx_runtime_ep_api::ExecutorKernelScope::Required
+                {
                     return false;
                 }
-                if is_gpu_ep {
-                    let ir_node = view.node(node);
-                    let input_shapes: Vec<Vec<Option<usize>>> = view
-                        .node_inputs(node)
-                        .iter()
-                        .map(|input| {
-                            input
-                                .map(|value| {
-                                    view.value(value)
-                                        .shape
-                                        .iter()
-                                        .map(|dimension| dimension.as_static())
-                                        .collect()
-                                })
-                                .unwrap_or_default()
-                        })
-                        .collect();
-                    let strategy = crate::compute::ShapeInference::for_node(
-                        ir_node,
-                        &input_shapes,
-                        ir_node.outputs.len(),
-                    );
-                    if shape_inference_reads_runtime_values(&strategy, ir_node) {
-                        return false;
-                    }
+                graph_kernel_nodes.insert(view.node(node).id);
+                return true;
+            }
+            if is_gpu_ep && !node_inputs_all_routable(&view, node) {
+                return false;
+            }
+            if is_gpu_ep {
+                let ir_node = view.node(node);
+                let input_shapes: Vec<Vec<Option<usize>>> = view
+                    .node_inputs(node)
+                    .iter()
+                    .map(|input| {
+                        input
+                            .map(|value| {
+                                view.value(value)
+                                    .shape
+                                    .iter()
+                                    .map(|dimension| dimension.as_static())
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                let strategy = crate::compute::ShapeInference::for_node(
+                    ir_node,
+                    &input_shapes,
+                    ir_node.outputs.len(),
+                );
+                if shape_inference_reads_runtime_values(&strategy, ir_node) {
+                    return false;
                 }
-                true
-            })
+            }
+            true
         })
     });
 
@@ -1861,17 +1851,6 @@ fn dtype_to_onnx_tensor_elem(dtype: DataType) -> ort::ONNXTensorElementDataType 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn plugin_schema_authority_scope_is_bounded() {
-        assert!(!onnx_runtime_ep_api::schema_authority::authoritative_schema_validation_active());
-        with_host_schema_validation(|| {
-            assert!(
-                onnx_runtime_ep_api::schema_authority::authoritative_schema_validation_active()
-            );
-        });
-        assert!(!onnx_runtime_ep_api::schema_authority::authoritative_schema_validation_active());
-    }
     use std::ptr;
 
     /// ep_get_capability_inner returns a (null) status — not a crash — when

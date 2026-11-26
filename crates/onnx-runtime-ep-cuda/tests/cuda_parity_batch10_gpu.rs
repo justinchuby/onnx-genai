@@ -220,13 +220,14 @@ fn global_lp_pool_matches_cpu_for_nondefault_p() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn lp_normalization_dtype_admission_changes_at_opset22_gpu() {
+fn lp_normalization_supported_dtypes_are_admitted_across_opsets_gpu() {
     let ep = require_cuda();
-    for (dtype, opset, expected) in [
-        (DataType::Float16, 21, true),
-        (DataType::Float32, 21, true),
-        (DataType::BFloat16, 21, false),
-        (DataType::BFloat16, 22, true),
+    for (dtype, opset) in [
+        (DataType::Float16, 21),
+        (DataType::Float32, 21),
+        (DataType::BFloat16, 1),
+        (DataType::BFloat16, 21),
+        (DataType::BFloat16, 22),
     ] {
         let inputs = vec![float_input(dtype, &[2, 3], &[3.0, 4.0, 0.0, 0.0, 0.0, 5.0])];
         let outputs = vec![(dtype, vec![2, 3])];
@@ -239,43 +240,12 @@ fn lp_normalization_dtype_admission_changes_at_opset22_gpu() {
             &[dtype],
             &[],
         );
-        assert_eq!(
+        assert!(
             claim.is_supported(),
-            expected,
-            "{dtype:?} at opset {opset}: {:?}",
+            "{dtype:?} must be admitted at opset {opset}: {:?}",
             claim.reason()
         );
-        if !expected {
-            let reason = claim.reason().unwrap_or_default();
-            assert!(reason.contains("BFloat16"), "{reason}");
-            assert!(reason.contains("opset 22"), "{reason}");
-        }
     }
-
-    let inputs = vec![float_input(
-        DataType::BFloat16,
-        &[2, 3],
-        &[3.0, 4.0, 0.0, 0.0, 0.0, 5.0],
-    )];
-    let outputs = vec![(DataType::BFloat16, vec![2, 3])];
-    let (graph, node_id) = build_graph("LpNormalization", "", 21, &inputs, &outputs, &[]);
-    let model = Model::new(&graph);
-    let plugin_claim = unsafe {
-        onnx_runtime_ep_api::schema_authority::with_authoritative_schema_validation(|| {
-            ep.supports_op(
-                model.graph.node(node_id),
-                21,
-                &[static_shape([2, 3])],
-                &[DataType::BFloat16],
-                &[],
-            )
-        })
-    };
-    assert!(
-        plugin_claim.is_supported(),
-        "host-validated CUDA plugin capability must preserve the executable BF16 lane: {:?}",
-        plugin_claim.reason()
-    );
 
     let inputs = vec![float_input(
         DataType::BFloat16,
@@ -294,34 +264,15 @@ fn lp_normalization_dtype_admission_changes_at_opset22_gpu() {
         &[],
     );
     assert!(
-        !claim.is_supported(),
-        "a model-authored fused marker must not bypass the opset boundary: {:?}",
-        claim.reason()
-    );
-
-    let (mut graph, node_id) = build_graph("LpNormalization", "", 21, &inputs, &outputs, &attrs);
-    graph.node_mut(node_id).version = Some(22);
-    let effective_opset = graph
-        .effective_opset(graph.node(node_id))
-        .expect("optimizer-created node must carry an effective opset");
-    let model = Model::new(&graph);
-    let claim = ep.supports_op(
-        model.graph.node(node_id),
-        effective_opset,
-        &[static_shape([2, 3])],
-        &[DataType::BFloat16],
-        &[],
-    );
-    assert!(
         claim.is_supported(),
-        "optimizer-created BF16 LpNormalization must remain claimable at its node-local schema: {:?}",
+        "optimizer-created BF16 LpNormalization must remain claimable: {:?}",
         claim.reason()
     );
     let cuda = run_cuda(
         &ep,
         "LpNormalization",
         "",
-        effective_opset,
+        21,
         &inputs,
         &outputs,
         &[
@@ -397,7 +348,7 @@ fn lp_normalization_legacy_dtypes_match_independent_golden_gpu() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
-fn lp_normalization_opset22_bf16_matches_independent_golden_gpu() {
+fn lp_normalization_bf16_legacy_opset_matches_independent_golden_gpu() {
     let ep = require_cuda();
     let values = [
         1.0f32, -2.0, 3.0, 4.0, -5.0, 6.0, -7.0, 8.0, 9.0, -10.0, 11.0, 12.0,
@@ -406,7 +357,7 @@ fn lp_normalization_opset22_bf16_matches_independent_golden_gpu() {
         let inputs = vec![float_input(DataType::BFloat16, &[2, 3, 2], &values)];
         let outputs = vec![(DataType::BFloat16, vec![2, 3, 2])];
         let attrs = vec![("axis", Attribute::Int(axis)), ("p", Attribute::Int(p))];
-        let cuda = run_cuda(&ep, "LpNormalization", "", 22, &inputs, &outputs, &attrs);
+        let cuda = run_cuda(&ep, "LpNormalization", "", 1, &inputs, &outputs, &attrs);
         let expected = lp_normalization_reference(&values, [2, 3, 2], normalized_axis, p);
         assert_close(
             "LpNormalization independent golden",

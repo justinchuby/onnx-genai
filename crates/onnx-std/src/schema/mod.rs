@@ -479,7 +479,6 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/is_inf.yaml"),
     include_str!("../../schemas/standard/is_nan.yaml"),
     include_str!("../../schemas/standard/lp_normalization.yaml"),
-    include_str!("../../schemas/standard/lp_normalization_v22.yaml"),
     include_str!("../../schemas/standard/prelu.yaml"),
     include_str!("../../schemas/standard/selu.yaml"),
     include_str!("../../schemas/standard/selu_v22.yaml"),
@@ -763,7 +762,7 @@ type_constraints:
     fn kernel_gap_schemas_match_opset_boundaries_and_catalog_count() {
         let registry = SchemaRegistry::builtins();
         assert_eq!(registry.schemas.len(), 118);
-        assert_eq!(registry.iter().count(), 145);
+        assert_eq!(registry.iter().count(), 144);
         for (op, prior, prior_indices) in [
             ("GatherND", 13, "tensor(int64)"),
             ("ScatterND", 18, "tensor(int64)"),
@@ -806,6 +805,7 @@ type_constraints:
             ("Hardmax", 13),
             ("IsInf", 10),
             ("IsNaN", 9),
+            ("LpNormalization", 1),
             ("PRelu", 16),
             ("Selu", 6),
             ("ThresholdedRelu", 10),
@@ -854,41 +854,6 @@ type_constraints:
         assert_eq!(
             registry.lookup("EyeLike", "", 22).unwrap().since_version,
             22
-        );
-        assert_eq!(
-            registry
-                .lookup("LpNormalization", "", 21)
-                .unwrap()
-                .since_version,
-            1
-        );
-        assert_eq!(
-            registry
-                .lookup("LpNormalization", "", 22)
-                .unwrap()
-                .since_version,
-            22
-        );
-        assert_eq!(
-            registry
-                .lookup("LpNormalization", "", 21)
-                .unwrap()
-                .type_constraints[0]
-                .allowed,
-            [DataType::Float16, DataType::Float32, DataType::Float64]
-        );
-        assert_eq!(
-            registry
-                .lookup("LpNormalization", "", 22)
-                .unwrap()
-                .type_constraints[0]
-                .allowed,
-            [
-                DataType::BFloat16,
-                DataType::Float16,
-                DataType::Float32,
-                DataType::Float64
-            ]
         );
         assert_eq!(
             registry
