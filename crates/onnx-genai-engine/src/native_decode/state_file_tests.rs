@@ -61,7 +61,7 @@ fn assert_state(
     } else {
         assert_eq!(actual.cpu_kv.is_some(), baseline.cpu_kv.is_some());
     }
-    assert_eq!(&(engine.native_sessions[&target].tokens)[..], &(tokens)[..]);
+    assert_eq!(engine.native_sessions[&target].tokens.as_slice(), tokens);
     Ok(())
 }
 
