@@ -57,6 +57,6 @@ def _configure_optional_libraries() -> None:
 # Discovery records optional reference-library hints without importing ORT or MLX.
 _configure_optional_libraries()
 
-from ._onnx_genai import Engine, GenerateResult, __version__  # noqa: E402
+from ._onnx_genai import Engine, GenerateResult, __version__
 
 __all__ = ["Engine", "GenerateResult", "__version__"]
