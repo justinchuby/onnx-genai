@@ -1326,12 +1326,12 @@ mod tests {
         let mut nodes = Vec::new();
         for revision in [27, 29, 28] {
             let y = graph.create_named_value(
-                &format!("y{revision}"),
+                format!("y{revision}"),
                 DataType::Float32,
                 static_shape([1, 2, 4]),
             );
             let state = graph.create_named_value(
-                &format!("state{revision}"),
+                format!("state{revision}"),
                 DataType::Float32,
                 static_shape([1, 1, 4, 4]),
             );
