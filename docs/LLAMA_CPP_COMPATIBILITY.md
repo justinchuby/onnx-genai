@@ -666,7 +666,7 @@ This is a functional Llama Chat integration, not a claim of complete llama-serve
 parity. These upstream capabilities remain incomplete:
 
 - Realtime grammar forcing beyond declared turn-based tagged-json mask workflows,
-  partial function-call fragment projection, broader pressure/overlap acceptance and
+  broader pressure/overlap acceptance and
   device-backed wire acceptance; see [realtime](REALTIME.md) for the implemented
   WebSocket session modes, resource bounds and Native CPU evidence.
 - Video decision inputs, broader audio codecs and additional DSP operations/conventions,
@@ -706,6 +706,15 @@ Docker/Podman/SSH tool runtimes. These are deliberate scope exclusions, not
 pending compatibility work. `/props` reports `server_tools: false` in
 `nxrt_capabilities` and `cors_proxy_enabled: false` in both router and model modes.
 The former tool/MCP/proxy CLI options and library configuration types are removed.
+
+The supplied model tool protocols require object arguments. Forced tool grammars
+and realtime parameter admission share that domain restriction even for `true`,
+empty, omitted/null or union parameter schemas. Existing schema conditions and
+root reference locations are retained; contradictory schemas are not relaxed. Forced
+JSON calls compile parameter documents independently, preserving their standalone
+root URI, dialect, pointers and anchors. Per-tool registries remain separate,
+including tools reusing the same `$id`. References do not fetch external
+resources. This remains the grammar backend's supported schema language.
 
 Chat tool calling remains supported: clients send `tools`/`tool_choice`, consume
 assistant `tool_calls` (including streaming deltas), execute those calls in their
@@ -792,8 +801,14 @@ repetitions above 2,000 are refused and larger upper bounds become unbounded.
 The model must declare a dense, resolved, token-local byte vocabulary. Actual
 raw pieces include special-token spellings; only explicitly declared ending IDs
 receive terminal semantics. Token names and angle brackets do not guess roles.
-Non-byte contextual decoders and stream-initial/trailing stripping currently return an
-actionable capability error before SSE.
+Resolved stream-initial/trailing Strip stages apply to published text; raw
+GBNF/Lark and lazy JSON inspect the vocabulary pieces before those stages.
+For example, a raw piece ` hello ` remains subject to a grammar requiring both
+spaces even when the tokenizer publishes `hello`. This matches the pinned
+[vocabulary cache](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/src/llama-vocab.cpp)
+and [grammar sampler](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/src/llama-grammar.cpp).
+Non-byte and unresolved contextual decoders still return an actionable capability
+error before SSE; ordinary content constraints continue to inspect published content.
 
 Both raw grammar forms conflict with JSON `response_format`, forced `tool_choice`, and
 `ignore_eos=true`. Raw GBNF accepts `grammar_lazy=true` with nonempty

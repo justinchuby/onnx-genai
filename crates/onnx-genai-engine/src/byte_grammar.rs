@@ -17,6 +17,32 @@ pub enum GrammarCandidate {
     Rejected { byte_offset: usize },
 }
 
+/// Compile one standalone schema to distinguish an admitted language from a
+/// branch the backend proves unsatisfiable. This is the same schema compiler
+/// and root options used by `%json`, without constructing a byte-token parser.
+///
+/// Only the backend's typed unsatisfiability result returns `false`. Malformed,
+/// unsupported and resource-limited schemas, or compiler panics, remain errors;
+/// callers must not silently discard those branches. This is not a general
+/// JSON Schema satisfiability solver.
+pub fn json_schema_is_satisfiable(schema: &serde_json::Value) -> anyhow::Result<bool> {
+    use llguidance::{GrammarBuilder, JsonCompileOptions, UnsatisfiableSchemaError};
+
+    let compiled = llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        JsonCompileOptions::default().json_to_llg_with_overrides(
+            GrammarBuilder::new(None, llguidance::api::ParserLimits::default()),
+            schema.clone(),
+        )
+    }));
+    match compiled {
+        Ok(_) => Ok(true),
+        Err(error) if error.downcast_ref::<UnsatisfiableSchemaError>().is_some() => Ok(false),
+        Err(error) => Err(error).context(
+            "compile standalone JSON Schema for satisfiability; repair invalid or unsupported schema constraints",
+        ),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error(
     "grammar byte candidate would exceed the {limit}-byte response budget at committed offset {offset}; shorten the response or increase its explicit budget"
@@ -496,6 +522,21 @@ impl GrammarByteCursor {
         self.empty_fork()?.preview(bytes)
     }
 
+    /// Check a raw JSON spelling, including unfinished Unicode escapes, from
+    /// the root of a JSON Schema cursor. The raw budget is enforced before
+    /// escape/whitespace normalization, independently of canonical byte length.
+    pub fn preview_json_root(&self, text: &str) -> anyhow::Result<GrammarCandidate> {
+        if text.len() > self.max_bytes.get() {
+            return Err(GrammarByteBudgetExceeded {
+                limit: self.max_bytes.get(),
+                offset: 0,
+            }
+            .into());
+        }
+        let normalized = crate::json_prefix::JsonPrefix::parse(text)?;
+        normalized.preview(&mut self.empty_fork()?, "", b"")
+    }
+
     /// Atomically replace the logical prefix after a representation change.
     pub fn replace_prefix(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         let mut fresh = self.empty_fork()?;
@@ -514,6 +555,90 @@ impl GrammarByteCursor {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn json_schema_satisfiability_distinguishes_proven_empty_languages() {
+        for schema in [
+            json!(false),
+            json!({"allOf":[{"type":"object"},{"type":"string"}]}),
+            json!({"type":"object","properties":{"x":false},"required":["x"]}),
+            json!({"anyOf":[false,false]}),
+        ] {
+            assert!(!json_schema_is_satisfiable(&schema).unwrap(), "{schema}");
+        }
+        for schema in [
+            json!(true),
+            json!({"type":"object","properties":{"x":false}}),
+            json!({"anyOf":[false,{"type":"object"}]}),
+            json!({"$defs":{"Args":{"type":"object"}},"$ref":"#/$defs/Args"}),
+            json!({"type":"object","properties":{"next":{"anyOf":[{"type":"null"},{"$ref":"#"}]}}}),
+        ] {
+            assert!(json_schema_is_satisfiable(&schema).unwrap(), "{schema}");
+        }
+    }
+
+    #[test]
+    fn json_schema_satisfiability_preserves_invalid_and_unsupported_errors() {
+        for schema in [
+            json!(3),
+            json!({"allOf":false}),
+            json!({"$ref":"#/$defs/missing"}),
+            json!({"anyOf":[false,{"$ref":"#/$defs/missing"}]}),
+            json!({"oneOf":[{"type":"object"},{"type":"object"}]}),
+            json!({"x-guidance":{"unknown_option":true}}),
+        ] {
+            let error = json_schema_is_satisfiable(&schema).unwrap_err();
+            assert!(
+                error.to_string().contains("compile standalone JSON Schema"),
+                "{schema}: {error:#}"
+            );
+            assert!(
+                error
+                    .downcast_ref::<llguidance::UnsatisfiableSchemaError>()
+                    .is_none(),
+                "invalid/unsupported schema was classified as empty: {schema}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_schema_satisfiability_honors_backend_root_options() {
+        let schema = json!({
+            "oneOf":[{"type":"object"},{"type":"object"}],
+            "x-guidance":{"coerce_one_of":true}
+        });
+        assert!(json_schema_is_satisfiable(&schema).unwrap());
+    }
+
+    #[test]
+    fn json_root_preview_normalizes_partial_escapes_without_losing_raw_budget_or_state() {
+        let mut cursor =
+            GrammarByteCursor::json_schema(&json!({"const":{"city":"Paris"}}), 256).unwrap();
+        cursor.commit(b"{").unwrap();
+        assert!(matches!(
+            cursor
+                .preview_json_root(r#"{"c\u0069ty":"Pa\u007"#)
+                .unwrap(),
+            GrammarCandidate::Viable { complete: false }
+        ));
+        assert!(matches!(
+            cursor
+                .preview_json_root(r#"{"city":"Pa\u0072is"} "#)
+                .unwrap(),
+            GrammarCandidate::Viable { complete: true }
+        ));
+        assert!(matches!(
+            cursor.preview_json_root(r#"{"city":"Ro"#).unwrap(),
+            GrammarCandidate::Rejected { .. }
+        ));
+        assert!(
+            cursor
+                .preview_json_root(&" ".repeat(257))
+                .unwrap_err()
+                .is::<GrammarByteBudgetExceeded>()
+        );
+        assert_eq!(cursor.committed_bytes(), 1);
+    }
 
     #[test]
     fn grammar_byte_cursor_regex_and_lark_preserve_unicode_and_literal_spelling() {

@@ -3036,3 +3036,165 @@ narrowing with exact byte canaries, and short-producer refusal before writes.
 Existing warm governor, peak refusal/reuse/trim, public Session and real ORT
 assignment tests remain in place. These are correctness and allocation results;
 no latency or CUDA-runtime improvement is inferred.
+
+
+### Softmax admits input snapshots within the same single-lane peak
+
+Softmax no longer allocates a tensor-sized f32 Vec for input widening or layout
+materialization. A non-borrowable source now admits its required `4 * numel`
+payload, including when real Y can be written directly. This makes the previous
+owned input copy part of the workspace bound. Metadata can return Ready(full)
+for non-f32 X; only potentially borrowable f32 X with f32 Y remains Deferred.
+Actual-view refinement retains NONE for safely borrowed contiguous aligned f32
+X and eligible disjoint Y. Missing real views retain the complete bound.
+
+The admitted lane first receives every converted source element. Eligible
+contiguous f32 Y then uses the original out-of-place row/interior reducer
+reading that snapshot, including when source tensor storage overlaps Y. Other
+outputs normalize the snapshot in place before streaming narrowed output.
+Borrowable input with an ineligible Y keeps the original out-of-place reducer
+into the lane. Input/output storage conversion, arithmetic order and CPU ISA
+selection are unchanged. The interior-axis loop is shared through static source
+accessors; disjoint reduction groups finish max before overwriting, read each
+original value once for exp, then normalize their own outputs.
+
+Untransformed in-place worker runs now call the existing row kernel once for
+the whole run, matching the out-of-place batching. The scale/mask driver keeps
+its cache tiles when it actually transforms data. A static callback regression
+checks actual call spans above the tile boundary: no-transform batches once,
+while scale-only and mask routes retain both tiles. This avoids increasing
+single-thread row-kernel prologues as a consequence of snapshot reuse; it is not
+a latency measurement.
+
+No additional owner, pool or per-row grant is introduced. One StepScoped f32
+lane replaces the previous separate input/output temporary payloads; scalar
+output conversion uses the shared streaming writer. Tests retain all original
+materialized-source overlap cases, add unfunded/short refusal with unchanged
+backing bytes, compare in-place/borrowed reducer bits at boundary widths with
+NaN/Inf, and verify four storage types, both opset semantics, every axis, strided
+outputs and direct f32 outputs with real allocation positive controls. Existing
+4096 warm iterations also execute a widened source within the same retained
+allocation identity without issuer callbacks, including zero-byte callbacks.
+Rank-sized metadata can still allocate. No CUDA-runtime or latency claim is made.
+
+
+### BatchNormalization uses one storage snapshot and read-only channel parameters
+
+Inference BatchNormalization now has its own ops-cnn module and Metadata
+workspace registration. It replaces the separate storage/Acc copies of five
+inputs and the Acc/storage output Vecs with one StepScoped
+`numel(X) * sizeof(storage T)` lane. The complete X snapshot is normalized in
+place; real Y is published only after all input and parameter reads finish.
+Four private validated rank-one readers consume the original channel parameters
+without copying them. Parameters may overlap X, real Y or one another because
+those tensors remain untouched throughout computation. There is no per-channel
+grant, new owner, pool or public workspace API.
+
+Metadata checks five present same-storage-dtype inputs, parameter shape `[C]`,
+complete Y shape/dtype, rank, checked dense/spatial products and storage capacity.
+N=0 needs no scratch while retaining parameter validation; C=0 or empty spatial
+axes keep the previous refusal. Runtime proves Host access, rank/strides and
+computable address extrema before binding scratch. Channel readers support
+negative strides and unaligned origins, with singleton strides normalized to
+zero. Checked i128 extrema bound pointer arithmetic to an addressable host span;
+actual backing allocation bounds and lifetime remain the owning EP's contract.
+
+Each value keeps the original `(x-mean)/sqrt(variance+epsilon)*scale+bias`
+operation order. Computation stays f64 for f64 storage and f32 otherwise; each
+completed result is converted to storage T exactly once in the snapshot. All
+existing norm-family arithmetic tests remain, now using prepared execution.
+There is no compatibility alias for the old BatchNorm factory/module path.
+
+New tests check four storage types and exact result bits, reversed/strided
+parameters, shifted X/Y overlap and each parameter aliasing both or each other,
+Host/address guards before writes, whole-binding refusal/canaries and fresh
+uninitialized scratch. Real allocator controls observe both former X and
+channel-sized copies; repeated calls admit no tensor/channel-sized payload.
+A retained allocation runs 4096 cycles without issuer callbacks, with positive
+zero-byte controls and exact idle trim/refund. Public encoded-model tests cover
+two nodes sharing one peak, dynamic channel counts, empty batch, one-byte-short
+refusal and trim/readmission. Real ORT fixtures require cpu_ep assignment with
+fallback disabled across dynamic shapes. These establish correctness and
+allocation invariants, not inference latency or CUDA execution.
+
+
+### Affine expert banks borrow validated storage without parameter copies
+
+The standalone affine MoE and affine grouped projection now share one private
+`affine_bank` module. It holds lifetime-bound, validated rank-three readers for
+packed code bytes, f32 scales and optional packed zero-point bytes. Contiguous,
+padded, reversed and unaligned storage are consumed directly; no bank-sized
+scale Vec or non-contiguous codes/zeros materialization remains in this reader.
+The corresponding bank operand slots advertise strided input support so the
+executor does not insert a gather before the reader.
+
+Every bank's dtype, shape, Host access, checked count and address span is
+validated before any scale or packed-byte reads. This fixes the old contiguous
+byte borrowing path's missing Host check. Checked pointer-domain extrema cover
+negative strides and singleton dimensions; actual allocation bounds and lifetime
+remain the owning EP's contract. Positive/finite scale validation retains the
+complete scan, including experts not selected by routing, with row/block/value
+context on failure.
+
+Each dot product resolves its expert/row origin once outside the weight loop.
+The dense route uses a flat row offset; strided storage resolves the two leading
+axes once. Within the loop, nibble order, zero-point subtraction, multiplication
+by scale and `sum + x * weight` order are unchanged. Affine grouped projection
+uses that same dot routine rather than recomputing a flattened expert index per
+weight. Both callers retain full Y staging and publish last, so parameter/X/Y
+alias safety is preserved. No owner, cache, lock or quota request is added.
+
+Bit-exact tests cover optional zeros, odd depths/block counts, padded/reversed
+strides, packed f32 origins and NaN/Inf activation values. Guard-only cases prove
+that even a late non-Host zero-point bank is refused before any scale read.
+A real allocator witness makes each bank much larger than its activation,
+route and output; separate allocating code/scale/zero controls verify the probe,
+then repeated grouped executions allocate no bank-sized copies. This scope does
+not claim zero allocations for the entire kernel or a measured latency gain.
+
+### Affine MoE uses one whole-execution mixed workspace
+
+The standalone affine MoE now advertises metadata workspace planning. Metadata
+validation returns Deferred because row borrowing depends on actual strides and
+pointer alignment. Execution refinement ignores stale cached hints and resolves
+one StepScoped layout containing f32 Y staging, optional X/router row scratch,
+selected logits, probabilities and activated projection, followed by usize
+routing indices with checked alignment padding. For T tokens, hidden width H,
+E experts, intermediate width I and top-k k, the float count is
+`T*H + optional(H) + optional(E) + 2*k + I`, with E usize indices. Missing actual
+views retain both optional rows as a conservative bound.
+
+A row borrows aligned contiguous f32 values even when its outer axes are padded,
+transposed or reversed. Unaligned origins and noncontiguous inner axes copy only
+one row into the admitted scratch; the same regions are reused across all
+tokens. All eight operand slots advertise strided support, avoiding an upstream
+full-tensor gather. Expert banks retain their borrowed readers. Real Y is
+published after all source reads, preserving overlapping X/router/bank bindings.
+
+All Host/address proofs precede workspace binding. Complete capacity/alignment
+validation precedes initialization of either typed sublayout and precedes any
+scale or activation reads. The existing complete positive/finite scale scan and
+routing/threshold/activation arithmetic remain intact. No token/expert request,
+new owner or cache is introduced: the existing retained Host pool supplies the
+whole lane. A recording-governor witness runs 4096 real executions with one
+identity and no additional issuer callbacks, including zero-byte callbacks;
+positive controls observe both zero-byte admission and release. Idle trim refunds
+the complete retained charge. Public Session tests check exact-budget admission,
+one-byte-short refusal, dynamic shrinking/reuse and trim/readmission.
+
+Bitwise reference tests cover ties, nonfinite logits, threshold masking, all
+k/E relationships, row strides and overlapping source/output bindings. A real
+allocator witness independently detects each former payload allocation and
+observes no allocation at least as large as its smallest tested payload during
+execution. Small bookkeeping allocations are outside that assertion. These are
+memory/accounting checks, not latency measurements; CUDA remains untested.
+
+### Packed grouped projections prove Host access before borrowing bytes
+
+The nonempty standalone `PackedGroupedMatMul` route now uses the same numeric
+Host-span validator before reading routing indices, activations or packed bytes.
+Its common metadata contract is device-agnostic, so it does not itself authorize
+a CPU raw slice over a device pointer. Packed bank device access and address
+wrap failures report the operator and `packed weights` input while leaving Y
+unchanged. Contiguous byte offsets remain supported; empty executions keep the
+existing read-free return. This adds no data copy, resource owner or admission.

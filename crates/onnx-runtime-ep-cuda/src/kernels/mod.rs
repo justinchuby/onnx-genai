@@ -53,6 +53,7 @@ pub mod constant;
 pub mod constant_of_shape;
 pub mod conv;
 pub mod conv_transpose;
+mod conv_transpose_ort;
 pub mod csa_checkpoint;
 mod csa_layout;
 pub mod csa_state_group;
@@ -732,15 +733,12 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
 
 /// Derive plugin kernel-registry descriptors from the real CUDA [`OpRegistry`].
 ///
-/// One descriptor per plugin-visible `(op_type, domain, since_version)` key,
-/// with the domain taken verbatim from the registry (so `com.microsoft` kernels
-/// are advertised in `com.microsoft`, not the default domain) and dtypes from
-/// [`cuda_supported_dtypes_for_op`]. Native-only revisions stay dispatchable
-/// without widening the shipped ORT plugin ABI. Building the registry only
-/// constructs factory structs holding `Arc` clones of `runtime` — no
-/// cuBLASLt/NVRTC work — so this is cheap to call once at factory construction.
-pub fn build_cuda_registry_descriptors(runtime: Arc<CudaRuntime>) -> Vec<CudaOpDescriptor> {
-    let registry = build_cuda_registry(runtime);
+/// One descriptor per plugin-eligible `(op_type, domain, since_version)` key, with
+/// the domain taken verbatim from the registry (so `com.microsoft` kernels are
+/// advertised in `com.microsoft`, not the default domain) and dtypes from
+/// [`cuda_supported_dtypes_for_op`]. The caller supplies its actual dispatch
+/// registry so the advertised kernel versions match the constructed provider.
+pub fn build_cuda_registry_descriptors(registry: &OpRegistry) -> Vec<CudaOpDescriptor> {
     let mut descriptors: Vec<CudaOpDescriptor> = registry
         .plugin_keys()
         // RoiAlign is currently supported only in standalone nxrt.
@@ -788,6 +786,20 @@ pub fn build_cuda_registry_with_metrics(
     runtime: Arc<CudaRuntime>,
     csa_metrics: Arc<csa_checkpoint::CsaMetrics>,
     telemetry_registry: Arc<qmoe::RouteTelemetrySourceRegistry>,
+) -> OpRegistry {
+    build_cuda_registry_for_contract(
+        runtime,
+        csa_metrics,
+        telemetry_registry,
+        conv_transpose::Contract::Standalone,
+    )
+}
+
+pub(crate) fn build_cuda_registry_for_contract(
+    runtime: Arc<CudaRuntime>,
+    csa_metrics: Arc<csa_checkpoint::CsaMetrics>,
+    telemetry_registry: Arc<qmoe::RouteTelemetrySourceRegistry>,
+    conv_transpose_contract: conv_transpose::Contract,
 ) -> OpRegistry {
     let mut reg = OpRegistry::new();
     reg.register(
@@ -1145,13 +1157,13 @@ pub fn build_cuda_registry_with_metrics(
             since_version: 11,
         }),
     );
-    reg.register(
-        OpKey::new("ConvTranspose", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(conv_transpose::ConvTransposeFactory {
-            runtime: runtime.clone(),
-        }),
-    );
+    for &since_version in conv_transpose_contract.versions() {
+        reg.register(
+            OpKey::new("ConvTranspose", "", since_version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            conv_transpose_contract.factory(runtime.clone(), since_version),
+        );
+    }
     for version in [19, 22] {
         reg.register(
             OpKey::new("DeformConv", "", version),
@@ -2389,13 +2401,14 @@ mod tests {
             crate::runtime::CudaRuntime::new(0)
                 .expect("CUDA plugin descriptor test requires a usable CUDA device 0"),
         );
+        let registry = build_cuda_registry(runtime);
         assert!(
-            build_cuda_registry(runtime.clone()).keys().any(|key| {
+            registry.keys().any(|key| {
                 key.op_type == "RoiAlign" && matches!(key.domain.as_str(), "" | "ai.onnx")
             }),
             "standalone CUDA registry must contain ONNX RoiAlign before testing plugin exclusion"
         );
-        let descriptors = build_cuda_registry_descriptors(runtime);
+        let descriptors = build_cuda_registry_descriptors(&registry);
         assert!(
             !descriptors.is_empty(),
             "CUDA plugin descriptors unexpectedly empty; exclusion check would be vacuous"
