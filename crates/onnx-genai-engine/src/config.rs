@@ -1820,6 +1820,12 @@ pub enum GenerateConstraint {
         grammar: String,
         activation: Option<GrammarActivation>,
     },
+    /// JSON Schema over newly generated raw bytes after a trigger. Before
+    /// activation output is unconstrained; assistant prefill is not consumed.
+    LazyJsonSchema {
+        schema: String,
+        activation: GrammarActivation,
+    },
     /// Raw llguidance Lark over new model output, without assistant-prefill
     /// consumption or response-content projection. Keep the %llguidance header.
     RawLark { grammar: String },
@@ -1891,7 +1897,11 @@ impl GenerateOptions {
         anyhow::ensure!(
             !matches!(
                 self.constraint,
-                Some(GenerateConstraint::Gbnf { .. } | GenerateConstraint::RawLark { .. })
+                Some(
+                    GenerateConstraint::Gbnf { .. }
+                        | GenerateConstraint::RawLark { .. }
+                        | GenerateConstraint::LazyJsonSchema { .. }
+                )
             ) || self.stop_on_eos,
             "raw grammar requires stop_on_eos=true; allow root completion to terminate the generation"
         );

@@ -2768,10 +2768,9 @@ parameter element counts, dtypes, complete output shapes and total layout
 capacity. Empty groups retain parameter/view/Host/output checks and need no
 scratch. Empty normalized width remains an error; axis==rank is now rejected in
 accordance with the [ONNX axis range](https://onnx.ai/onnx/operators/onnx__LayerNormalization.html).
-Standard LayerNorm's pre-existing full-normalized-parameter element-count rule
-is retained. **Follow-up remains open:** support the broader unidirectional
-Scale/B broadcasting described by that schema; this migration does not claim
-that capability or alter the accepted complete parameter layouts.
+The initial migration retained the full-normalized-parameter element-count
+rule. The affine-broadcast follow-up below replaces that restriction for
+standard LayerNorm; Skip retains its complete-parameter contract.
 
 Regression controls cover exact optional-region bounds, independent beta/bias
 holes, fresh and poisoned backing, prefix canaries, missing/short/misaligned
@@ -2788,3 +2787,65 @@ plugin disables fallback, assigns both nodes to cpu_ep, changes shapes
 Input widening remains outside these four staging regions. This is not complete
 RSS accounting, a zero-total-overhead or inference-speed measurement, or CUDA
 runtime validation.
+
+
+### LayerNorm affine broadcasting without expanded coefficient storage
+
+Standard LayerNorm now validates Scale and B by right-aligned, unidirectional
+broadcast into X. Preparation classifies each operand as a complete normalized
+row, scalar, or general broadcast. The complete-row route preserves direct
+coefficient indexing; the general route derives indices from tensor geometry.
+No expanded coefficient tensor, new staging region, owner, or quota operation
+is introduced. Skip and the existing f32 normalization arithmetic are unchanged.
+
+CPU-scoped decomposition fusion accepts only affine shapes proven not to expand
+X: matching dimensions (including the same symbol) or literal singleton axes.
+Unrelated symbols decline. The complete reduced suffix must be provably
+nonempty, including positive lower bounds for symbolic widths. Immutable scalar
+coefficients and axes resolve through PassContext for inline and mapped weights
+in both matching and application; absent or malformed bytes and overridable
+initializer inputs decline. This also supplies the shared scalar reader used
+by GELU and attention fusion, without materializing mapped weights.
+
+Regression coverage includes 486 independent f64 coordinate cases, equal-size
+cross-group counterexamples, aliases, four float storage types, invalid geometry,
+and a 4,096-cycle governed workspace test spanning complete/scalar/group/Skip
+routes with no warm issuer calls. A public session changes affine shape classes
+while retaining one 112-byte allocation (111 bytes refused); an encoded nine-node
+decomposition fuses to one CPU node and uses 96 bytes (95 refused). Six real ORT
+plugin fixtures disable fallback and check Y and both statistics twice each.
+Mapped scalar/axes success and malformed/missing/overridable refusals have
+optimizer regressions. These checks establish correctness and allocation
+invariants, not measured inference speed or CUDA validation; f32 compute and
+existing stash-type behavior are outside this change.
+
+
+### LogSoftmax uses one admitted output-staging region
+
+Both legacy (opsets 1–12, flattened suffix) and modern (opset 13+, one selected
+axis) LogSoftmax factories now declare metadata workspace planning. The kernel
+replaces its per-execution full-output Vec with FloatWorkspace<1> on the existing
+StepScoped lane. Its bound is exactly four bytes per X element, zero for empty
+input. Unresolved Y metadata derives the same bound from X; resolved Y must
+match the complete input shape. No kernel pool, extra owner or per-slice grant
+is introduced. Input widening remains outside this output-staging region.
+
+Geometry validates arity, floating dtypes, required presence, axis, complete Y
+shape, dense suffix products and addressable f32 layout capacity. Execution
+validates both views and Host accessibility before binding scratch. Missing,
+short or misaligned backing refuses before writes. Empty work still validates
+views and requires no allocation. All X reads complete before publishing Y,
+including overlapping input/output and strided half storage. The f32
+log_softmax_slices function is byte-for-byte unchanged, preserving reduction
+order and both opset semantics.
+
+Regression coverage includes independent f64 coordinates for every positive and
+negative axis under both semantics, all four float storage types, invalid views,
+fresh/poisoned scratch, prefix canaries, geometry overflow, and 4,096 warm pool
+cycles without issuer callbacks (including positive zero-byte observer controls).
+Encoded public sessions cover two nodes sharing one 96-byte peak (95 bytes
+refused), dynamic 2x3x4/1x2x5/2x3x4 shapes, identity reuse, idle trim and
+re-admission for opsets 11 and 13. Real ORT plugin fixtures disable fallback,
+require LogSoftmax assignment to cpu_ep and check both versions numerically
+across those changing shapes. These are correctness and allocation invariants,
+not inference-speed or CUDA-runtime measurements.

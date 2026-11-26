@@ -2557,36 +2557,20 @@ fn validate_sampling_range(value: Option<f32>, field: &str) -> Result<(), ApiErr
 }
 
 fn response_format_constraint(request: &ChatCompletionRequest) -> Option<GenerateConstraint> {
-    match request.response_format.as_ref()? {
-        ResponseFormat::JsonObject => Some(GenerateConstraint::Json {
-            prefix: if request.continue_final_message.is_enabled() {
-                request
-                    .messages
-                    .last()
-                    .and_then(|message| message.content.as_ref())
-                    .map(|content| content.text())
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            },
-        }),
-        ResponseFormat::JsonSchema { json_schema } => serde_json::to_string(&json_schema.schema)
-            .ok()
-            .map(|schema| GenerateConstraint::JsonSchema {
-                schema,
-                prefix: if request.continue_final_message.is_enabled() {
-                    request
-                        .messages
-                        .last()
-                        .and_then(|message| message.content.as_ref())
-                        .map(|content| content.text())
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                },
-            }),
-        ResponseFormat::Text => None,
-    }
+    let schema = request.response_schema()?;
+    Some(GenerateConstraint::JsonSchema {
+        schema: schema.resolved_value().to_string(),
+        prefix: if request.continue_final_message.is_enabled() {
+            request
+                .messages
+                .last()
+                .and_then(|message| message.content.as_ref())
+                .map(|content| content.text())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        },
+    })
 }
 
 pub(super) fn build_generate_options_with_tokenizer(
@@ -2675,7 +2659,18 @@ pub(super) fn build_generate_options_with_tokenizer(
         }
     }
     if let Some(activation) = request.grammar_activation()? {
-        if matches!(options.constraint, Some(GenerateConstraint::Gbnf { .. })) {
+        if request.grammar_lazy
+            && let Some(GenerateConstraint::JsonSchema { schema, .. }) = &options.constraint
+        {
+            options.constraint = Some(GenerateConstraint::LazyJsonSchema {
+                schema: schema.clone(),
+                activation: activation.clone(),
+            });
+        }
+        if matches!(
+            options.constraint,
+            Some(GenerateConstraint::Gbnf { .. } | GenerateConstraint::LazyJsonSchema { .. })
+        ) {
             activation.validate_with_tokenizer(
                 tokenizer,
                 options.max_constraint_bytes,

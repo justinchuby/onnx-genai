@@ -12551,6 +12551,7 @@ mod weight_cache_accounting {
             "Max",
             "MaxPool",
             "Mean",
+            "MeanVarianceNormalization",
             "MelWeightMatrix",
             "Min",
             "Mish",

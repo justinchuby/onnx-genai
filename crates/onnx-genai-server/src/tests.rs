@@ -27,6 +27,546 @@ fn tiny_state() -> AppState {
 }
 
 #[tokio::test]
+async fn json_object_domain_wire_matches_schema_wrappers_in_native_and_ort() {
+    for backend in [
+        onnx_genai_engine::EngineDecodeBackend::Native,
+        onnx_genai_engine::EngineDecodeBackend::Ort,
+    ] {
+        let scratch = tempfile::tempdir().unwrap();
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        copy_tree(&source, scratch.path());
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+        for (id, piece) in [
+            (4, "{\"n\":1}"),
+            (5, "7"),
+            (22, "prefix{\"n\":1}"),
+            (23, "prefix7"),
+        ] {
+            let old = vocab
+                .iter()
+                .find(|(_, value)| value.as_u64() == Some(id))
+                .unwrap()
+                .0
+                .clone();
+            vocab.remove(&old);
+            vocab.insert(piece.into(), json!(id));
+        }
+        tokenizer["decoder"] = json!({"type":"ByteFallback"});
+        tokenizer["added_tokens"] = json!([{"id":3,"content":"<eos>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}]);
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        std::fs::write(
+            scratch.path().join("tokenizer_config.json"),
+            json!({"chat_template":"{% for m in messages %}{{ m.content }} {% endfor %}"})
+                .to_string(),
+        )
+        .unwrap();
+        let router = app(AppState::load_with_config(
+            scratch.path(),
+            Some("json-domain".into()),
+            ServerConfig {
+                engine_config: onnx_genai_engine::EngineConfig {
+                    decode_backend: backend,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap());
+        let formats = [
+            (json!({"json_schema":{}}), true),
+            (json!({"response_format":{"type":"json_object"}}), true),
+            (
+                json!({"response_format":{"type":"json_object","schema":{}}}),
+                true,
+            ),
+            (json!({"response_format":{"type":"json_schema"}}), true),
+            (
+                json!({"response_format":{"type":"json_schema","schema":{}}}),
+                true,
+            ),
+            (
+                json!({"response_format":{"type":"json_schema","json_schema":{"schema":{}}}}),
+                true,
+            ),
+            (json!({"json_schema":true}), false),
+            (
+                json!({"response_format":{"type":"json_object","schema":{"const":7}}}),
+                false,
+            ),
+            (
+                json!({"response_format":{"type":"json_schema","schema":true}}),
+                false,
+            ),
+            (
+                json!({"response_format":{"type":"json_schema","json_schema":{"schema":{"const":7}}}}),
+                false,
+            ),
+            (
+                json!({"json_schema":{"const":7},"response_format":{"type":"json_object"}}),
+                false,
+            ),
+            (
+                json!({"json_schema":{"const":7},"response_format":{"type":"json_object","schema":{}}}),
+                true,
+            ),
+            (
+                json!({"json_schema":true,"response_format":{"type":"text"}}),
+                false,
+            ),
+        ];
+        for path in [
+            "/completion",
+            "/v1/completions",
+            "/v1/chat/completions",
+            "/v1/responses",
+        ] {
+            let responses = path == "/v1/responses";
+            let chat = path.ends_with("/chat/completions");
+            for (format, object) in &formats {
+                for lazy in [false, true] {
+                    for stream in [false, true] {
+                        let mut body = if responses {
+                            json!({"input":"hello"})
+                        } else if chat {
+                            json!({"messages":[{"role":"user","content":"hello"}]})
+                        } else {
+                            json!({"prompt":"hello"})
+                        };
+                        body.as_object_mut()
+                            .unwrap()
+                            .extend(format.as_object().unwrap().clone());
+                        if responses
+                            && let Some(mut format) =
+                                body.as_object_mut().unwrap().remove("response_format")
+                        {
+                            if format["type"] == "json_schema"
+                                && format.get("json_schema").is_some()
+                            {
+                                format = format["json_schema"].clone();
+                                format["type"] = json!("json_schema");
+                            }
+                            body["text"] = json!({"format":format});
+                        }
+                        if responses {
+                            body["max_output_tokens"] = json!(1);
+                        } else {
+                            body["max_tokens"] = json!(1);
+                        }
+
+                        body["temperature"] = json!(0);
+                        body["stream"] = json!(stream);
+                        body["logit_bias"] = if lazy {
+                            if *object {
+                                json!({"22":1000})
+                            } else {
+                                json!({"23":1000})
+                            }
+                        } else {
+                            json!({"5":1000,"4":900})
+                        };
+                        if lazy {
+                            body["grammar_lazy"] = json!(true);
+                            body["grammar_triggers"] = json!([{"type":2,"value":"prefix(.)"}]);
+                        }
+                        let response = router
+                            .clone()
+                            .oneshot(
+                                Request::post(path)
+                                    .header(header::CONTENT_TYPE, "application/json")
+                                    .body(Body::from(body.to_string()))
+                                    .unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        let status = response.status();
+                        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                        assert_eq!(
+                            status,
+                            StatusCode::OK,
+                            "{backend:?} {path}: {body}: {}",
+                            String::from_utf8_lossy(&bytes)
+                        );
+                        let expected = format!(
+                            "{}{}",
+                            if lazy { "prefix" } else { "" },
+                            if *object { "{\"n\":1}" } else { "7" }
+                        );
+                        if stream {
+                            let events = sse_json_events(&bytes);
+                            assert!(
+                                events.iter().all(|event| event.get("error").is_none()),
+                                "{backend:?} {path}: {events:?}"
+                            );
+                            let content = events
+                                .iter()
+                                .filter_map(|event| {
+                                    if responses {
+                                        if event["type"] == "response.output_text.delta" {
+                                            event["delta"].as_str()
+                                        } else {
+                                            None
+                                        }
+                                    } else if path == "/completion" {
+                                        event["content"].as_str()
+                                    } else if chat {
+                                        event["choices"][0]["delta"]["content"].as_str()
+                                    } else {
+                                        event["choices"][0]["text"].as_str()
+                                    }
+                                })
+                                .collect::<String>();
+                            assert_eq!(content, expected, "{backend:?} {path}: {body}");
+                        } else {
+                            let result: Value = serde_json::from_slice(&bytes).unwrap();
+                            let content = if responses {
+                                &result["output"][0]["content"][0]["text"]
+                            } else if path == "/completion" {
+                                &result["content"]
+                            } else if chat {
+                                &result["choices"][0]["message"]["content"]
+                            } else {
+                                &result["choices"][0]["text"]
+                            };
+                            assert_eq!(
+                                content,
+                                &json!(expected),
+                                "{backend:?} {path}: {body}: {result}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for schema in [
+            json!({"json_schema":false}),
+            json!({"response_format":{"type":"json_object","schema":false}}),
+            json!({"response_format":{"type":"json_schema","schema":false}}),
+            json!({"response_format":{"type":"json_schema","json_schema":{"schema":false}}}),
+        ] {
+            let mut body = json!({"messages":[{"role":"user","content":"hello"}],"stream":true,"max_tokens":1});
+            body.as_object_mut()
+                .unwrap()
+                .extend(schema.as_object().unwrap().clone());
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::post("/v1/chat/completions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{backend:?}: false schema must fail before SSE: {body}"
+            );
+            assert!(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("application/json")
+            );
+        }
+        for lazy in [false, true] {
+            let body = json!({"messages":[{"role":"assistant","content":"7"}],"continue_final_message":true,"response_format":{"type":"json_object"},"max_tokens":1,"temperature":0,"grammar_lazy":lazy,"grammar_triggers":if lazy {json!([{"type":2,"value":"prefix(.)"}])} else {json!([])},"logit_bias":{"22":1000}});
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::post("/v1/chat/completions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if lazy {
+                assert_eq!(response.status(), StatusCode::OK);
+                let result = json_body(response).await;
+                assert_eq!(
+                    result["choices"][0]["message"]["content"], "prefix{\"n\":1}",
+                    "{result}"
+                );
+            } else {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            }
+        }
+        for stream in [false, true] {
+            let body = json!({"prompt":"hello","json_schema":{},"grammar_lazy":true,"grammar_triggers":[{"type":2,"value":"prefix(.)"}],"max_tokens":1,"temperature":0,"logit_bias":{"23":1000},"stream":stream});
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::post("/completion")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            if stream {
+                let events = sse_json_events(&bytes);
+                assert!(
+                    events.iter().any(|event| event.get("error").is_some()),
+                    "{events:?}"
+                );
+                assert!(
+                    events
+                        .iter()
+                        .all(|event| event["content"].as_str().is_none_or(str::is_empty)),
+                    "{events:?}"
+                );
+            } else {
+                assert!(!status.is_success(), "{}", String::from_utf8_lossy(&bytes));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn lazy_json_wire_validates_raw_triggers_before_final_token_publication() {
+    for backend in [
+        onnx_genai_engine::EngineDecodeBackend::Native,
+        onnx_genai_engine::EngineDecodeBackend::Ort,
+    ] {
+        let scratch = tempfile::tempdir().unwrap();
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        copy_tree(&source, scratch.path());
+        let path = scratch.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+        for (id, piece) in [
+            (22, "prefix{\"n\":"),
+            (23, "{\"n\":1}"),
+            (24, "1}"),
+            (25, "2}"),
+            (26, "prefix{\"n\":2}"),
+        ] {
+            let old = vocab
+                .iter()
+                .find(|(_, value)| value.as_u64() == Some(id))
+                .unwrap()
+                .0
+                .clone();
+            vocab.remove(&old);
+            vocab.insert(piece.into(), json!(id));
+        }
+        tokenizer["decoder"] = json!({"type":"ByteFallback"});
+        tokenizer["added_tokens"] = json!([{"id":3,"content":"<eos>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}]);
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        std::fs::write(
+            scratch.path().join("tokenizer_config.json"),
+            json!({"chat_template":"{% for m in messages %}{{ m.content }} {% endfor %}"})
+                .to_string(),
+        )
+        .unwrap();
+        let router = app(AppState::load_with_config(
+            scratch.path(),
+            Some("lazy-json".into()),
+            ServerConfig {
+                engine_config: onnx_genai_engine::EngineConfig {
+                    decode_backend: backend,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap());
+        for path in ["/completion", "/v1/completions", "/v1/chat/completions"] {
+            let chat = path.ends_with("/chat/completions");
+            for schema in [false, true] {
+                for kind in [0, 1, 2, 3] {
+                    for stream in [false, true] {
+                        let pattern = kind >= 2;
+                        let trigger = match kind {
+                            0 => json!({"type":0,"token":23,"value":"{\"n\":1}"}),
+                            1 => json!({"type":1,"value":"{\"n\":1}"}),
+                            2 => json!({"type":2,"value":"prefix(\\{)"}),
+                            _ => json!({"type":3,"value":"prefix(\\{)\"n\":"}),
+                        };
+                        let mut body = if chat {
+                            json!({"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"not-json"}],"continue_final_message":true})
+                        } else {
+                            json!({"prompt":"hello"})
+                        };
+                        body["response_format"] = if schema {
+                            json!({"type":"json_schema","json_schema":{"name":"n","schema":{"const":{"n":1}}}})
+                        } else {
+                            json!({"type":"json_object"})
+                        };
+                        if path == "/completion" && schema {
+                            let schema = body["response_format"]["json_schema"]["schema"].clone();
+                            body.as_object_mut().unwrap().remove("response_format");
+                            body["json_schema"] = schema;
+                        }
+                        body["grammar_lazy"] = json!(true);
+                        body["grammar_triggers"] = json!([trigger]);
+                        body["preserved_tokens"] = json!(["{\"n\":1}"]);
+                        body["logit_bias"] = if pattern {
+                            json!({"22":1000,"25":700,"24":500,"3":900})
+                        } else {
+                            json!({"23":1000,"25":700,"24":500,"3":900})
+                        };
+                        body["temperature"] = json!(0);
+                        body["max_tokens"] = json!(4);
+                        body["stream"] = json!(stream);
+                        let response = router
+                            .clone()
+                            .oneshot(
+                                Request::post(path)
+                                    .header(header::CONTENT_TYPE, "application/json")
+                                    .body(Body::from(body.to_string()))
+                                    .unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        let status = response.status();
+                        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                        let expected = format!(
+                            "{}{{\"n\":{}}}",
+                            if pattern { "prefix" } else { "" },
+                            if schema || !pattern { 1 } else { 2 }
+                        );
+                        assert_eq!(
+                            status,
+                            StatusCode::OK,
+                            "{backend:?} {path}: {}",
+                            String::from_utf8_lossy(&bytes)
+                        );
+                        if stream {
+                            let events = sse_json_events(&bytes);
+                            assert!(
+                                events.iter().all(|event| event.get("error").is_none()),
+                                "{backend:?} {path}: {events:?}"
+                            );
+                            let content = events
+                                .iter()
+                                .filter_map(|event| {
+                                    if path == "/completion" {
+                                        event["content"].as_str()
+                                    } else if chat {
+                                        event["choices"][0]["delta"]["content"].as_str()
+                                    } else {
+                                        event["choices"][0]["text"].as_str()
+                                    }
+                                })
+                                .collect::<String>();
+                            assert_eq!(content, expected, "{backend:?} {path}");
+                        } else {
+                            let result: Value = serde_json::from_slice(&bytes).unwrap();
+                            let content = if path == "/completion" {
+                                &result["content"]
+                            } else if chat {
+                                &result["choices"][0]["message"]["content"]
+                            } else {
+                                &result["choices"][0]["text"]
+                            };
+                            assert_eq!(content, &json!(expected), "{backend:?} {path}: {result}");
+                        }
+                    }
+                }
+            }
+        }
+        for extra in [
+            json!({"response_format":{"type":"json_schema","json_schema":{"name":"bad","schema":{"type":42}}}}),
+            json!({"ignore_eos":true}),
+            json!({"grammar_triggers":[{"type":2,"value":"(?<=x)y"}]}),
+        ] {
+            let mut body = json!({"messages":[{"role":"user","content":"hello"}],"response_format":{"type":"json_object"},"grammar_lazy":true,"grammar_triggers":[{"type":2,"value":"prefix(\\{)"}],"stream":true,"max_tokens":1});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::post("/v1/chat/completions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{backend:?}: {body}"
+            );
+            assert!(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("application/json")
+            );
+        }
+        // The only selected token triggers an invalid complete JSON value. No
+        // subsequent mask call is available to catch it at the length limit.
+        for stream in [false, true] {
+            let body = json!({"prompt":"hello","response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{"const":{"n":1}}}},"grammar_lazy":true,"grammar_triggers":[{"type":2,"value":"prefix(\\{)"}],"max_tokens":1,"temperature":0,"logit_bias":{"26":1000},"stream":stream});
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::post("/v1/completions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            if stream {
+                let events = sse_json_events(&bytes);
+                assert!(
+                    events.iter().any(|event| event.get("error").is_some()),
+                    "{events:?}"
+                );
+                assert!(
+                    events.iter().all(|event| event["choices"][0]["text"]
+                        .as_str()
+                        .is_none_or(str::is_empty)),
+                    "{events:?}"
+                );
+            } else {
+                assert!(!status.is_success(), "{}", String::from_utf8_lossy(&bytes));
+            }
+            let mut retry = body.clone();
+            retry["stream"] = json!(false);
+            retry["grammar_triggers"] = json!([{"type":0,"token":23,"value":"{\"n\":1}"}]);
+            retry["logit_bias"] = json!({"23":1000});
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::post("/v1/completions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(retry.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{backend:?}: retry after rejected selected trigger"
+            );
+            let result = json_body(response).await;
+            assert_eq!(result["choices"][0]["text"], "{\"n\":1}", "{result}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn fused_trailing_strip_constrains_real_native_output_before_buffered_and_sse_publication() {
     async fn request(router: axum::Router, path: &str, body: Value) -> axum::response::Response {
         router
@@ -732,7 +1272,7 @@ mod gbnf_wire {
             json!({"grammar_trigger_collation":"unknown"}),
             json!({"grammar_trigger_collation":true}),
             json!({"grammar_trigger_collation":{"libcxx":null}}),
-            json!({"response_format":{"type":"json_object"},"grammar_lazy":true,"grammar_triggers":[{"type":2,"value":"[{]"}]}),
+            json!({"response_format":{"type":"json_object"},"grammar_lazy":true,"grammar_triggers":[{"type":2,"value":"(?<=x)y"}]}),
             json!({"grammar":"%llguidance {}\nstart: <[4]>", "grammar_lazy":true,"grammar_triggers":[{"type":1,"value":"hello"}]}),
             json!({"grammar":"root ::= \"hello\"", "ignore_eos":true}),
             json!({"grammar":"%llguidance {}\nstart: missing"}),

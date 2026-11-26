@@ -1668,12 +1668,12 @@ pub(crate) fn build_cpu_registry_with_resources(
     // through opset 12, then one-axis normalization from opset 13.
     rec.register(
         OpKey::new("LogSoftmax", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(log_softmax::LogSoftmaxLegacyFactory),
     );
     rec.register(
         OpKey::new("LogSoftmax", "", 13),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(log_softmax::LogSoftmaxFactory),
     );
     // Shape / data movement.

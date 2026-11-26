@@ -2389,3 +2389,74 @@ whole-change whitespace checks passed on macOS ARM64 CPU. Both actual compiler
 oracles were regenerated with canonical data formatting. These are functional
 checks, with no Linux/GPU execution or performance claims. Lazy JSON, contextual
 raw grammars and other unchecked goal rows remain required.
+
+### Lazy JSON Schema activation
+
+JSON response formats and the native `json_schema` alias now lower to an explicit
+raw lazy JSON Schema constraint. Admission compiles the existing full llguidance
+schema recognizer and validates triggers before SSE. It retains the raw identity
+byte-decoder requirement rather than guessing contextual token pieces. Activation
+shares GBNF token/word/pattern/full-pattern priority, byte capture offsets,
+reasoning suppression, history bounds and rewind behavior. JSON replay seeds the
+captured raw bytes into the existing normalized content recognizer, preserving
+schema semantics, equivalent escaped spellings and the vocabulary trie mask.
+Assistant prefill and content projection do not become part of this raw value.
+
+An optional selected-token feedback capability on constraints closes the last-step
+activation gap: grammar validation runs before selected output is committed or
+published even when no next mask is requested. An activated ending must complete
+the root. Arbitrary output/EOS before activation remains legal; explicit stops
+and length limits can truncate an activated viable prefix. Lazy JSON rejects
+forced tool choice and `ignore_eos=true`, preserving raw-grammar policy.
+
+Validation on main e645c6662: server library 601 passed with two inherited
+ignores; engine library 1101 passed with one inherited ignore. The new Native/ORT
+wire test covers 96 successful route/format/trigger/stream combinations, non-JSON
+assistant prefill, the native schema alias, pre-SSE schema/trigger/EOS-policy
+errors, final-token rejection without publication and retry on the same server.
+Engine regressions cover selected-token feedback, rewind, root-complete endings,
+equivalent JSON escapes, partial UTF-8 activation and seed byte-budget recovery.
+Default engine/server all-target strict Clippy, no-default engine all-target
+strict Clippy, GenAI Python all-target compilation, formatting and whole-change
+whitespace checks passed. After full tests the only source adjustment was
+Clippy's equivalent direct-Result return. These are functional macOS ARM64 CPU
+checks; no GPU/Linux execution or performance claims. Contextual raw grammars
+and the other unchecked compatibility-goal rows remain open.
+
+### JSON object domains and schema wire forms
+
+Pinned `server-common.cpp:1420-1442` and `server-schema.cpp:270-291` normalize
+empty schema objects to object roots. The transport now resolves that default
+for native, legacy completion, chat and Responses without changing the engine's
+any-value JSON constraint. Boolean and nonempty schemas retain full schema
+semantics. Typed schema documents reject non-object/non-boolean values with an
+argument-specific error.
+
+Response formats accept optional nested metadata, nested/flat schema forms and
+`json_object.schema`; top-level `json_schema` is no longer silently ignored by
+chat/completion requests. A shared selection method encodes pinned precedence
+and feeds both continuation validation and constraint construction. Native
+legacy grammar presence takes precedence, including an empty grammar; chat keeps
+its explicit conflict guard. Lazy activation, EOS policy and forced-tool guards
+consume the selected schema too. The obsolete `JsonSchemaSpec` API was removed
+and all exports/callers updated without aliases.
+
+Validation on main 71ecaa373: server library 608 passed with two inherited
+ignores; the full public HTTP integration suite passed 38 tests. Native/ORT
+coverage includes 416 successful path/format/eager-lazy/stream combinations,
+object-vs-scalar masking, boolean/explicit scalar schemas, all wrappers, prefill,
+false-schema pre-SSE refusal and invalid lazy scalar publication. Defaults and
+precedence also have request-type and native-parser regressions. Public HTTP
+expectations now require object-root schema selection and accept optional
+wrapper metadata while retaining malformed-document rejection.
+
+Default all-target strict Clippy and Native-disabled reference strict Clippy
+(`--no-default-features --features metrics,cuda-13000`) passed, as did CLI/Python
+all-target compilation (`--features python`), formatting and whole-change
+whitespace checks. The CUDA selector supplies the mandatory cudarc test binding
+version; no GPU execution was performed. Metrics-disabled strict Clippy still
+reports eight inherited dead-code diagnostics; the identical errors were
+reproduced on unmodified main 71ecaa373 before restoring this branch. This is
+recorded rather than claimed as a passing configuration. Checks are functional
+macOS ARM64 CPU evidence, with no Linux/GPU or performance claims. The wider
+compatibility goal remains open.
