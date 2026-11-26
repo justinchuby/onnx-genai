@@ -61,7 +61,7 @@ fn dense_hit_does_not_initialize_or_write_the_projection_region() {
     let mut backing =
         vec![0xa5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5u128; (req.bytes as usize).div_ceil(16)];
     let (layout, _) = k
-        .execution_workspace_layout(2, PackedProjectionPlan::for_current_pool(k.arithmetic))
+        .execution_workspace_layout(2, PackedProjectionPlan::for_current_pool(k.arithmetic), 0)
         .unwrap();
     let mut y = Owned::f32(&[2, 2], &[37.; 4]);
     for call in 0..2 {
@@ -124,14 +124,15 @@ fn full_composite_binding_refuses_before_any_source_materialization() {
         let k = kernel(arithmetic, true);
         let f = fixture();
         let mut inputs = f.iter().map(Owned::view).collect::<Vec<_>>();
-        // Any attempted read would fail address validation. Geometry remains
-        // valid so the complete workspace error must have priority instead.
-        for input in &mut inputs {
-            input.byte_offset = usize::MAX;
-        }
+        // The live planner validates the packed descriptor before admission,
+        // but must not read its inaccessible payload. A/bias validation still
+        // follows full binding, so these deliberately invalid offsets are safe.
+        inputs[0].byte_offset = usize::MAX;
+        inputs[1].data = onnx_runtime_ep_api::DevicePtr(std::ptr::without_provenance(4096));
+        inputs[2].byte_offset = usize::MAX;
         let req = prepare(&k, &inputs);
         let (layout, _) = k
-            .execution_workspace_layout(2, PackedProjectionPlan::for_current_pool(arithmetic))
+            .execution_workspace_layout(2, PackedProjectionPlan::for_current_pool(arithmetic), 0)
             .unwrap();
         let mut backing = vec![91u128; (req.bytes as usize).div_ceil(16)];
         let projection_bytes = layout.bind(Some(view(&mut backing))).unwrap()[0].bytes();
@@ -276,7 +277,7 @@ fn checked_result_layout_and_empty_execution_keep_shape_guards() {
         let k = kernel(arithmetic, false);
         let plan = PackedProjectionPlan::for_current_pool(arithmetic);
         for rows in [usize::MAX, usize::MAX / 2] {
-            let error = k.execution_workspace_layout(rows, plan).err().unwrap();
+            let error = k.execution_workspace_layout(rows, plan, 0).err().unwrap();
             assert!(
                 error.to_string().contains("output staging"),
                 "result count/byte overflow must fail before projection sizing: {error}"
@@ -290,6 +291,16 @@ fn checked_result_layout_and_empty_execution_keep_shape_guards() {
         let mut y = Owned::zeros_f32(&[0, 2]);
         k.execute_with_workspace(&inputs, &mut [y.view_mut()], None)
             .unwrap();
+        let mut unreadable = inputs;
+        unreadable[1].data = onnx_runtime_ep_api::DevicePtr(std::ptr::without_provenance(4096));
+        unreadable[1].strides = &[68, 68, 2];
+        assert_eq!(prepare(&k, &unreadable).bytes, 0);
+        k.execute_with_workspace(&unreadable, &mut [y.view_mut()], None)
+            .unwrap();
+        let (base, _) = k.execution_workspace_layout(2, plan, 0).unwrap();
+        let (rounded, _) = k.execution_workspace_layout(2, plan, 69).unwrap();
+        assert_eq!(rounded.bytes() - base.bytes(), 72);
+        assert!(k.execution_workspace_layout(2, plan, usize::MAX).is_err());
 
         // Equal zero element counts do not permit dropping the configured N
         // axis. This must report geometry, rather than a workspace error.
@@ -330,7 +341,7 @@ fn partial_projection_failure_keeps_y_after_staging_was_written() {
         let req = prepare(&k, &inputs);
         let mut backing = vec![u128::MAX; (req.bytes as usize).div_ceil(16)];
         let (layout, _) = k
-            .execution_workspace_layout(1, PackedProjectionPlan::for_current_pool(k.arithmetic))
+            .execution_workspace_layout(1, PackedProjectionPlan::for_current_pool(k.arithmetic), 0)
             .unwrap();
         let regions = layout.bind(Some(view(&mut backing))).unwrap();
         let mut y = Owned::f32(&[1, 2], &[37.; 2]);
@@ -353,4 +364,166 @@ fn partial_projection_failure_keeps_y_after_staging_was_written() {
             .unwrap();
         assert_eq!(y.to_f32(), [4064.; 2]);
     });
+}
+
+#[test]
+fn packed_strides_refine_each_launch_and_dense_hits_leave_byte_lane_untouched() {
+    for (arithmetic, dense) in [
+        (ActivationArithmetic::Float32, false),
+        (ActivationArithmetic::Float32, true),
+        (ActivationArithmetic::Q8_0, false),
+    ] {
+        let k = kernel(arithmetic, dense);
+        let f = fixture();
+        let physical = f[1]
+            .bytes
+            .iter()
+            .flat_map(|&b| [b, 0xa5])
+            .collect::<Vec<_>>();
+        let packed = Owned::u8(&[136], &physical);
+        let mut strided = packed.view();
+        strided.shape = &[2, 1, 34];
+        strided.strides = &[68, 68, 2];
+        let inputs = [f[0].view(), strided, f[2].view()];
+        let facts = inputs
+            .iter()
+            .map(|v| TensorMetadata::new(v.dtype, v.shape, true))
+            .collect::<Vec<_>>();
+        let cached = k.workspace_requirement(&facts, &[]).unwrap();
+        assert!(matches!(
+            cached,
+            onnx_runtime_ep_api::WorkspacePreparation::Deferred
+        ));
+        let mut y = Owned::f32(&[2, 2], &[37.; 4]);
+        let mut contiguous_bytes = None;
+        for (iteration, is_strided) in [false, true, true, false].into_iter().enumerate() {
+            let views = [
+                f[0].view(),
+                if is_strided { strided } else { f[1].view() },
+                f[2].view(),
+            ];
+            let req = k
+                .workspace_requirement_for_execution(&views, &[], &facts, &[], Some(cached))
+                .unwrap()
+                .require_ready()
+                .unwrap();
+            let base = *contiguous_bytes.get_or_insert(req.bytes);
+            assert_eq!(req.bytes, base + if is_strided { 68 } else { 0 });
+            let mut backing =
+                vec![0xa5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5; (req.bytes as usize).div_ceil(16)];
+            let (layout, _) = k
+                .execution_workspace_layout(
+                    2,
+                    PackedProjectionPlan::for_current_pool(arithmetic),
+                    if is_strided { 68 } else { 0 },
+                )
+                .unwrap();
+            let regions = layout.bind(Some(view(&mut backing))).unwrap();
+            let (hits, builds) = k.weight_cache.activity();
+            k.execute_with_workspace(&views, &mut [y.view_mut()], Some(view(&mut backing)))
+                .unwrap();
+            check(&y);
+            if dense && iteration == 2 {
+                assert_eq!(
+                    k.weight_cache.activity().1,
+                    builds,
+                    "repeated strided source must hit"
+                );
+                assert!(k.weight_cache.activity().0 > hits);
+                // SAFETY: the entire backing began initialized and execution ended.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(regions[2].ptr().0.cast::<u8>(), regions[2].bytes())
+                };
+                assert_eq!(bytes, &[0xa5; 68]);
+            }
+        }
+        // A failed refinement must revoke the previous launch plan.
+        prepare(&k, &inputs);
+        assert!(
+            k.workspace_requirement_for_execution(&inputs[..1], &[], &facts, &[], Some(cached))
+                .unwrap_err()
+                .to_string()
+                .contains("packed_B")
+        );
+        assert!(k.prepared_projection.get().is_none());
+    }
+}
+
+#[test]
+fn short_composite_rejects_before_reading_strided_packed_payload() {
+    use onnx_runtime_ep_api::DevicePtr;
+    let k = kernel(ActivationArithmetic::Float32, true);
+    let f = fixture();
+    let mut packed = f[1].view();
+    packed.data = DevicePtr(std::ptr::without_provenance(4096));
+    packed.strides = &[68, 68, 2];
+    let inputs = [f[0].view(), packed, f[2].view()];
+    let req = prepare(&k, &inputs);
+    let mut backing = vec![u128::MAX; (req.bytes as usize).div_ceil(16)];
+    let mut y = Owned::f32(&[2, 2], &[37.; 4]);
+    let workspace = WorkspaceView::new(
+        DevicePtrMut(backing.as_mut_ptr().cast()),
+        req.bytes as usize - 1,
+    );
+    assert!(
+        k.execute_with_workspace(&inputs, &mut [y.view_mut()], Some(workspace))
+            .unwrap_err()
+            .to_string()
+            .contains("workspace binding")
+    );
+    assert_eq!(y.to_f32(), [37.; 4]);
+    assert_eq!(k.weight_cache.activity(), (0, 0));
+    assert!(backing.iter().all(|&v| v == u128::MAX));
+}
+
+#[test]
+fn strided_packed_source_can_overlap_final_output_in_either_direction() {
+    use onnx_runtime_ep_api::DevicePtr;
+    use onnx_runtime_ir::DeviceId;
+    for (arithmetic, dense) in [
+        (ActivationArithmetic::Float32, false),
+        (ActivationArithmetic::Float32, true),
+        (ActivationArithmetic::Q8_0, false),
+    ] {
+        for destination in [12, 16, 20] {
+            let mut k = kernel(arithmetic, dense);
+            k.packed_b_constant = false;
+            let f = fixture();
+            let physical = f[1]
+                .bytes
+                .iter()
+                .flat_map(|&b| [b, 0xa5])
+                .collect::<Vec<_>>();
+            let mut owner = vec![0u128; 16];
+            let base = owner.as_mut_ptr().cast::<u8>();
+            // SAFETY: both full ranges fit the live aligned owner; no typed
+            // source/output references coexist with these raw tensor views.
+            unsafe {
+                std::ptr::copy_nonoverlapping(physical.as_ptr(), base.add(16), physical.len());
+            }
+            let mut packed = f[1].view();
+            packed.data = DevicePtr(unsafe { base.add(16).cast() });
+            packed.strides = &[68, 68, 2];
+            let inputs = [f[0].view(), packed, f[2].view()];
+            let mut y = TensorMut::new(
+                DevicePtrMut(unsafe { base.add(destination).cast() }),
+                DataType::Float32,
+                &[2, 2],
+                &[2, 1],
+                DeviceId::cpu(),
+            );
+            let req = prepare(&k, &inputs);
+            let mut backing = vec![u128::MAX; (req.bytes as usize).div_ceil(16)];
+            k.execute_with_workspace(
+                &inputs,
+                std::slice::from_mut(&mut y),
+                Some(view(&mut backing)),
+            )
+            .unwrap();
+            let actual = std::array::from_fn::<_, 4, _>(|i| unsafe {
+                base.add(destination + i * 4).cast::<f32>().read_unaligned()
+            });
+            assert_eq!(actual, [127.5, 126.75, -126.5, -127.25]);
+        }
+    }
 }

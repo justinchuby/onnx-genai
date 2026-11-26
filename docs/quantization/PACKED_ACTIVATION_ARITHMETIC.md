@@ -50,9 +50,17 @@ and output channels exceed one, `rows * N * 4` column staging bytes. Empty rows
 or output channels require neither region. MoE reserves the maximum complete
 serial projection demand plus its existing separate FC banks and accumulator.
 Standalone MatMul adds a disjoint `rows * N * 4` final-output staging region to
-that complete projection layout; the two regions are simultaneously live. Dense
+that complete projection layout and a separate packed-weight byte lane for
+noncontiguous weights; all three regions are simultaneously live. Dense
 hits initialize only final-output staging, while admission retains enough
-projection capacity for a subsequent streamed fallback.
+projection and packed-byte capacity for a subsequent streamed fallback.
+The byte lane is `round_up(N * ceil(K / block_elements) * block_bytes, 4)`
+when packed_B needs copying, and zero for contiguous weights or empty rows.
+Nonempty metadata preparation is Deferred: each launch resolves actual strides
+before one complete admission. Cold hashing reads the validated logical source
+directly; dense builders and streaming/Q8 consume the same admitted byte lane.
+Dense-cache hits leave that lane untouched. No execution path materializes a
+packed-weight Vec.
 No per-token, per-row, per-block or per-expert quota requests are added.
 The existing initialized f32 scratch proof covers the byte loan, including its
 rounded tail; every exposed activation block is overwritten before use.
