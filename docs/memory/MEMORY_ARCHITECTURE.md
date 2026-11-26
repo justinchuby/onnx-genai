@@ -231,6 +231,17 @@ the other live regions, never the sum of FC payloads or an expert/top-k multiple
 Contiguous expert tails borrow their original bytes even when the outer expert
 stride has padding or is negative; these layouts require no packed copy lane.
 
+The same composite includes conversion regions for input, router logits,
+optional router weights and the three optional FC biases. Their actual views
+select direct aligned F32 borrowing or an exact logical f32 snapshot. All six
+can remain live across experts; capacity is the sum of non-borrowable present
+sources, without a top-k multiplier. Absent optional sources use no region.
+A shared private descriptor serves MatMul and MoE storage validation/borrowing;
+MoE still rejects non-F32 sources. Full binding precedes conversion, routing,
+hashing and compute. Eleven internal regions do not add independent owners,
+pools or quota operations. Rank/index metadata and routing allocations remain;
+this closes payload ownership gaps, not all mallocs or a measured speedup.
+
 For nonempty output, shape-only preparation returns `Deferred`: it cannot know
 strides, and a conservative reservation would retain unused high-water capacity.
 Execution refinement validates actual Host views and admits the precise composite

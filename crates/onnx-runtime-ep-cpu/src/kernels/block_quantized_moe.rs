@@ -48,7 +48,8 @@ use super::moe::{
 use super::packed_bytes::PackedByteSource;
 use super::packed_projection::{PackedProjectionPlan, validate_format};
 use super::{check_arity, write_dense_f32};
-use crate::dtype::to_dense_f32_widen;
+mod input_workspace;
+use input_workspace::{MoeInputValues, MoeInputs};
 use onnx_runtime_ir::packed_arithmetic::ActivationArithmetic;
 
 #[cfg(test)]
@@ -286,7 +287,12 @@ impl Kernel for BlockQuantizedMoEKernel {
         };
         let plan = PackedProjectionPlan::for_current_pool(self.arithmetic);
         let packed_bytes = self.packed_lane_bytes(dims, inputs)?;
-        let layout = self.execution_workspace_layout(dims, plan, packed_bytes)?;
+        let floating_layouts = if dims.rows == 0 || dims.hidden == 0 {
+            [std::alloc::Layout::new::<()>(); 6]
+        } else {
+            MoeInputs::new(inputs, metadata)?.layouts()?
+        };
+        let layout = self.execution_workspace_layout(dims, plan, packed_bytes, floating_layouts)?;
         let requirement = WorkspaceRequirement {
             bytes: layout.bytes() as u64,
             alignment: layout.alignment(),
@@ -328,10 +334,11 @@ impl BlockQuantizedMoEKernel {
         dims: Dimensions,
         plan: PackedProjectionPlan,
         packed_bytes: usize,
-    ) -> Result<WorkspaceLayout<5>> {
+        floating: [std::alloc::Layout; 6],
+    ) -> Result<WorkspaceLayout<11>> {
         // A validated empty final output cannot consume projections or gathers.
         if dims.rows == 0 || dims.hidden == 0 {
-            return WorkspaceLayout::new([std::alloc::Layout::new::<()>(); 5]);
+            return WorkspaceLayout::new([std::alloc::Layout::new::<()>(); 11]);
         }
         // Experts and their projections execute serially. An expert receives a
         // row at most once, so total rows bound every group, independent of k.
@@ -360,7 +367,20 @@ impl BlockQuantizedMoEKernel {
         let packed = std::alloc::Layout::array::<f32>(packed_bytes.div_ceil(4)).map_err(|_| {
             error("packed expert workspace exceeds addressable capacity; reduce projection dimensions")
         })?;
-        WorkspaceLayout::new([projection, bank_a, bank_b, accumulator, packed])
+        let [input, logits, weights, fc1, fc2, fc3] = floating;
+        WorkspaceLayout::new([
+            projection,
+            bank_a,
+            bank_b,
+            accumulator,
+            packed,
+            input,
+            logits,
+            weights,
+            fc1,
+            fc2,
+            fc3,
+        ])
     }
 
     fn packed_lane_bytes(&self, dims: Dimensions, inputs: &[TensorView]) -> Result<usize> {
@@ -423,7 +443,9 @@ impl BlockQuantizedMoEKernel {
             "execution plan is absent or consumed; call workspace_requirement_for_execution in the selected execution context before workspace admission and launch"
         ))?;
         let packed_bytes = self.packed_lane_bytes(dimensions, inputs)?;
-        let layout = self.execution_workspace_layout(dimensions, plan, packed_bytes)?;
+        let floating = MoeInputs::new(inputs, &metadata)?;
+        let layout =
+            self.execution_workspace_layout(dimensions, plan, packed_bytes, floating.layouts()?)?;
         // SAFETY: one checked layout lends disjoint Host regions for this
         // dispatch. Neither short borrow nor a projection output escapes.
         let [
@@ -432,6 +454,12 @@ impl BlockQuantizedMoEKernel {
             bank_b,
             mut accumulator,
             mut packed_lane,
+            input_lane,
+            logits_lane,
+            weights_lane,
+            fc1_lane,
+            fc2_lane,
+            fc3_lane,
         ] = unsafe {
             ProjectionScratch::bind_layout(
                 "BlockQuantizedMoE execution workspace binding",
@@ -451,12 +479,22 @@ impl BlockQuantizedMoEKernel {
             fc1_size,
         } = dimensions;
 
-        let input = to_dense_f32_widen(OP, &inputs[0])?;
-        let router_logits = to_dense_f32_widen(OP, &inputs[1])?;
-        let router_weights = optional_dense(inputs, 8)?;
-        let fc1_bias = optional_dense(inputs, 3)?;
-        let fc2_bias = optional_dense(inputs, 5)?;
-        let fc3_bias = optional_dense(inputs, 7)?;
+        let mut input_lanes = [
+            input_lane,
+            logits_lane,
+            weights_lane,
+            fc1_lane,
+            fc2_lane,
+            fc3_lane,
+        ];
+        let MoeInputValues {
+            input,
+            router_logits,
+            router_weights,
+            fc1_bias,
+            fc2_bias,
+            fc3_bias,
+        } = floating.read(&mut input_lanes)?;
 
         let mut tasks = BTreeMap::<usize, Vec<(usize, f32)>>::new();
         let mut routing = RoutingScratch::default();
@@ -464,9 +502,7 @@ impl BlockQuantizedMoEKernel {
             let range = row * experts..(row + 1) * experts;
             let route = routing.weights(
                 &router_logits[range.clone()],
-                router_weights
-                    .as_deref()
-                    .map(|weights| &weights[range.clone()]),
+                router_weights.map(|weights| &weights[range.clone()]),
                 self.attributes.k,
                 self.attributes.normalize_routing_weights,
             );
@@ -554,21 +590,17 @@ impl BlockQuantizedMoEKernel {
                 let fc2 = &weights[1];
                 let fc3 = weights.get(2);
                 expert_workspace.run_dense_expert(
-                    &input,
+                    input,
                     expert_tasks.iter().map(|&(row, _)| row),
                     DenseExpertWeights {
                         fc1: fc1.as_slice(),
                         fc1_bias: fc1_bias
-                            .as_deref()
                             .map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
                         fc2: fc2.as_slice(),
                         fc2_bias: fc2_bias
-                            .as_deref()
                             .map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
                         fc3: fc3.map(|weight| weight.as_slice()),
-                        fc3_bias: fc3_bias
-                            .as_deref()
-                            .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
+                        fc3_bias: fc3_bias.map(|bias| &bias[expert * inter..(expert + 1) * inter]),
                     },
                     fc1_size,
                     hidden,
@@ -607,20 +639,14 @@ impl BlockQuantizedMoEKernel {
                     })
                     .transpose()?;
                 expert_workspace.run_expert_projections(
-                    &input,
+                    input,
                     expert_tasks.iter().map(|&(row, _)| row),
                     &fc1,
-                    fc1_bias
-                        .as_deref()
-                        .map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
+                    fc1_bias.map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
                     &fc2,
-                    fc2_bias
-                        .as_deref()
-                        .map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
+                    fc2_bias.map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
                     fc3.as_ref(),
-                    fc3_bias
-                        .as_deref()
-                        .map(|bias| &bias[expert * inter..(expert + 1) * inter]),
+                    fc3_bias.map(|bias| &bias[expert * inter..(expert + 1) * inter]),
                     &self.attributes,
                     |projection, input, rows, bias, output| {
                         let packed = projection.source.read(&mut packed_lane)?;
@@ -1423,15 +1449,6 @@ fn optional_metadata<'a>(
 
 fn optional_input<'a>(inputs: &'a [TensorView<'a>], index: usize) -> Option<&'a TensorView<'a>> {
     inputs.get(index).filter(|input| !input.is_absent())
-}
-
-fn optional_dense<'a>(
-    inputs: &'a [TensorView<'_>],
-    index: usize,
-) -> Result<Option<Cow<'a, [f32]>>> {
-    optional_input(inputs, index)
-        .map(|view| to_dense_f32_widen(OP, view))
-        .transpose()
 }
 
 fn checked_product(shape: &[usize], name: &str) -> Result<usize> {
