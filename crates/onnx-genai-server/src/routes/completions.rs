@@ -59,13 +59,14 @@ pub(crate) async fn completions(
         if prepared.generation.options_mut().constraint.is_some()
             || prepared.generation.options_mut().reasoning_budget.is_some()
         {
-            prepared
-                .generation
-                .options_mut()
-                .validate_processors(&handle.tokenizer)
-                .map_err(|error| {
-                    ApiError::invalid_request(format!("invalid completion constraint: {error:#}"))
-                })?;
+            validate_request_processors(
+                prepared.generation.options_mut(),
+                &handle.tokenizer,
+                ProcessorValidation::DriverOwnedBeforeSse,
+            )
+            .map_err(|error| {
+                ApiError::invalid_request(format!("invalid completion constraint: {error:#}"))
+            })?;
         }
         Ok(prepared)
     };
@@ -698,6 +699,7 @@ async fn prepare_chat_input(
         &handle.tokenizer,
         has_session,
         &PromptContext {
+            processor_validation: ProcessorValidation::DriverOwnedBeforeSse,
             chat_template: handle.chat_template.as_deref(),
             response_template: handle.response_template.as_ref(),
             tool_protocol: handle.tool_protocol.as_ref(),
@@ -1559,7 +1561,12 @@ fn prepare_audio_generate_request(
             ApiError::invalid_request(format!("invalid audio reasoning controls: {error:#}"))
         })?;
     if options.reasoning_budget.is_some() {
-        options.validate_processors(tokenizer).map_err(|error| {
+        validate_request_processors(
+            &options,
+            tokenizer,
+            ProcessorValidation::DriverOwnedBeforeSse,
+        )
+        .map_err(|error| {
             ApiError::invalid_request(format!("invalid audio reasoning protocol: {error:#}"))
         })?;
     }
@@ -2266,7 +2273,29 @@ fn positional_image_placeholder(
 /// These travel together to every prompt that is built, and a request that
 /// dropped one of them would render against the wrong defaults rather than
 /// fail, so they are passed as one value instead of four positional arguments.
+/// A real driver acknowledges admission only after owned compilation/reservation.
+/// Pure request builders retain eager standalone validation and never forge this policy.
+#[derive(Clone, Copy)]
+pub(super) enum ProcessorValidation {
+    Standalone,
+    DriverOwnedBeforeSse,
+}
+pub(super) fn validate_request_processors(
+    options: &onnx_genai_engine::GenerateOptions,
+    tokenizer: &Tokenizer,
+    policy: ProcessorValidation,
+) -> anyhow::Result<()> {
+    match (policy, options.processor_admission_requirement(tokenizer)?) {
+        (
+            ProcessorValidation::DriverOwnedBeforeSse,
+            onnx_genai_engine::ProcessorAdmissionRequirement::OwnedContextualDecoder,
+        ) => Ok(()),
+        _ => options.validate_processors(tokenizer),
+    }
+}
+
 struct PromptContext<'a> {
+    processor_validation: ProcessorValidation,
     chat_template: Option<&'a ChatTemplate>,
     response_template: Option<&'a Arc<response_template::ResponseTemplate>>,
     tool_protocol: Option<&'a ToolProtocol>,
@@ -2358,7 +2387,7 @@ fn prepare_generate_request(
         )?;
     }
     if options.constraint.is_some() || options.reasoning_budget.is_some() {
-        options.validate_processors(tokenizer)
+        validate_request_processors(&options,tokenizer,context.processor_validation)
             .context("resolve requested output constraint against the model tokenizer and declared response template")?;
     }
     Ok(PreparedGenerateRequest {
@@ -2776,6 +2805,7 @@ pub(super) fn render_model_prompt(
     render_prompt(
         request,
         &PromptContext {
+            processor_validation: ProcessorValidation::Standalone,
             chat_template: handle.chat_template.as_deref(),
             response_template: handle.response_template.as_ref(),
             tool_protocol: handle.tool_protocol.as_ref(),
@@ -3501,6 +3531,7 @@ mod prompt_rendering_tests {
         default_reasoning_effort: Option<ReasoningEffort>,
     ) -> PromptContext<'a> {
         PromptContext {
+            processor_validation: ProcessorValidation::Standalone,
             chat_template: Some(template),
             response_template: None,
             tool_protocol: None,
@@ -3536,6 +3567,7 @@ mod prompt_rendering_tests {
             &tokenizer,
             false,
             &PromptContext {
+                processor_validation: ProcessorValidation::Standalone,
                 chat_template: None,
                 response_template: None,
                 tool_protocol: Some(&protocol),
@@ -3639,6 +3671,7 @@ mod prompt_rendering_tests {
                 .contains("preserved")
         );
         let builtin = PromptContext {
+            processor_validation: ProcessorValidation::Standalone,
             chat_template: None,
             response_template: None,
             tool_protocol: None,

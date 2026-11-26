@@ -38,6 +38,9 @@ use onnx_runtime_memory_api::{
 use crate::{HolderId, MemoryGovernor, MemoryLease, PressureRegistration, PressureResponder};
 use onnx_runtime_memory_api::{MemoryError, MemoryRole, Tier};
 
+mod context_activity;
+use context_activity::{AdmissionError, ContextActivity, ContextLifecycle};
+
 static NEXT_MANAGER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Provider/context hook for process-wide device-loss publication.
@@ -262,80 +265,41 @@ impl fmt::Debug for AuthorityPin {
 struct ContextRecord {
     registered: RegisteredProviderContext,
     label: Arc<str>,
-    activity: Mutex<ContextActivity>,
-    wake: Condvar,
+    activity: ContextActivity,
 }
 
 impl fmt::Debug for ContextRecord {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let activity = self
-            .activity
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (lifecycle, active_transactions) = self.activity.snapshot();
         formatter
             .debug_struct("ContextRecord")
             .field("registered", &self.registered)
             .field("label", &self.label)
-            .field("lifecycle", &activity.lifecycle)
-            .field("active_transactions", &activity.active_transactions)
+            .field("lifecycle", &lifecycle)
+            .field("active_transactions", &active_transactions)
             .finish()
     }
-}
-
-#[derive(Debug)]
-struct ContextActivity {
-    lifecycle: ContextLifecycle,
-    active_transactions: usize,
-}
-
-impl Default for ContextActivity {
-    fn default() -> Self {
-        Self {
-            lifecycle: ContextLifecycle::Active,
-            active_transactions: 0,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ContextLifecycle {
-    Active,
-    Retiring,
-    Lost,
-    Terminated,
 }
 
 impl ContextRecord {
     fn begin_transaction(
         self: &Arc<Self>,
     ) -> Result<MemoryContextOperation, AllocationTransactionError> {
-        let mut activity = self
-            .activity
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if activity.lifecycle != ContextLifecycle::Active {
-            return Err(AllocationTransactionError::TerminatedContext(
-                self.registered.identity(),
-            ));
-        }
-        activity.active_transactions = activity.active_transactions.checked_add(1).ok_or(
-            AllocationTransactionError::InvalidPublication(
-                "context transaction counter overflowed",
+        self.activity.enter().map_err(|error| match error {
+            AdmissionError::Closed => {
+                AllocationTransactionError::TerminatedContext(self.registered.identity())
+            }
+            AdmissionError::CountExhausted => AllocationTransactionError::InvalidPublication(
+                "context transaction counter exhausted its addressable capacity; finish existing operations before starting more",
             ),
-        )?;
+        })?;
         Ok(MemoryContextOperation {
             context: Arc::clone(self),
         })
     }
 
     fn ensure_active(&self) -> Result<(), AllocationTransactionError> {
-        if self
-            .activity
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .lifecycle
-            != ContextLifecycle::Active
-        {
+        if self.activity.snapshot().0 != ContextLifecycle::Active {
             return Err(AllocationTransactionError::TerminatedContext(
                 self.registered.identity(),
             ));
@@ -344,31 +308,15 @@ impl ContextRecord {
     }
 
     fn mark_retiring(&self) {
-        let mut activity = self
-            .activity
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if activity.lifecycle == ContextLifecycle::Active {
-            activity.lifecycle = ContextLifecycle::Retiring;
-        }
+        self.activity.mark_retiring();
     }
 
     fn mark_lost(&self) {
-        let mut activity = self
-            .activity
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if activity.lifecycle != ContextLifecycle::Terminated {
-            activity.lifecycle = ContextLifecycle::Lost;
-        }
+        self.activity.mark_lost();
     }
 
     fn prepare_confirmation(&self) -> Result<bool, AllocationTransactionError> {
-        let activity = self
-            .activity
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match activity.lifecycle {
+        match self.activity.snapshot().0 {
             ContextLifecycle::Lost => Ok(true),
             ContextLifecycle::Terminated => Ok(false),
             lifecycle => Err(AllocationTransactionError::ContextNotLost {
@@ -384,23 +332,11 @@ impl ContextRecord {
     }
 
     fn mark_terminated(&self) {
-        self.activity
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .lifecycle = ContextLifecycle::Terminated;
+        self.activity.mark_terminated();
     }
 
     fn wait_quiescent(&self) {
-        let mut activity = self
-            .activity
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while activity.active_transactions != 0 {
-            activity = self
-                .wake
-                .wait(activity)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
+        self.activity.wait_quiescent();
     }
 }
 
@@ -419,15 +355,7 @@ impl fmt::Debug for MemoryContextOperation {
 
 impl Drop for MemoryContextOperation {
     fn drop(&mut self) {
-        let mut activity = self
-            .context
-            .activity
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        activity.active_transactions = activity.active_transactions.saturating_sub(1);
-        if activity.active_transactions == 0 {
-            self.context.wake.notify_all();
-        }
+        self.context.activity.leave();
     }
 }
 
@@ -671,8 +599,7 @@ impl ProcessMemoryManager {
         let record = Arc::new(ContextRecord {
             registered,
             label,
-            activity: Mutex::new(ContextActivity::default()),
-            wake: Condvar::new(),
+            activity: ContextActivity::default(),
         });
         self.inner
             .lock_state()
@@ -1688,6 +1615,8 @@ pub struct ScopedMemoryBinding {
 }
 
 /// Cloneable provider-context transaction gate for non-allocation device work.
+/// Normal entry/exit shares one atomic lifecycle/count gate with allocation
+/// transactions; only closing-context quiescence uses its wait mutex.
 #[derive(Clone, Debug)]
 pub struct MemoryContextScope {
     context: Arc<ContextRecord>,

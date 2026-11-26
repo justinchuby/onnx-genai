@@ -1,5 +1,5 @@
-//! Canonical, explicitly mapped positive-alpha unquantized GGUF LoRA factors.
-use super::{Holder, JsonTarget, MemoryGovernor};
+//! Canonical, explicitly mapped and scaled unquantized GGUF LoRA factors.
+use super::{Holder, JsonTarget, MemoryGovernor, factor_storage::FactorStorage};
 use anyhow::{Context, ensure};
 use onnx_genai_metadata::{
     AdapterArtifact, AdapterScaleEncoding, AdapterServiceContract, AdapterWeightArtifact,
@@ -36,16 +36,7 @@ pub(super) fn load(
     weight: &AdapterWeightArtifact,
     bytes: &[u8],
 ) -> anyhow::Result<HashMap<String, JsonTarget>> {
-    ensure!(
-        matches!(artifact.dtype.as_str(), "float32" | "fp32"),
-        "GGUF LoRA adapter {}@{} requires declared F32 storage; F16/BF16 and quantized GGUF factor normalization are not supported",
-        artifact.identity,
-        artifact.version
-    );
-    ensure!(
-        weight.scale_encoding == AdapterScaleEncoding::AlphaOverRank,
-        "GGUF LoRA requires alpha_over_rank; zero/missing alpha or baked scaling requires separate explicit support"
-    );
+    let storage = FactorStorage::declared(artifact)?;
     let views = onnx_runtime_loader::gguf_views(bytes).with_context(|| {
         format!(
             "parse GGUF LoRA {}@{} source {:?}",
@@ -63,18 +54,31 @@ pub(super) fn load(
         "GGUF adapter.type must be 'lora', got {adapter_type:?}; other adapter algorithms require explicit support"
     );
     let alpha = match views.adapter_metadata.get("adapter.lora.alpha") {
-        Some(GgufMetadataValue::Float32(alpha)) => f64::from(*alpha),
+        Some(GgufMetadataValue::Float32(alpha)) => Some(f64::from(*alpha)),
         Some(value) => anyhow::bail!(
-            "GGUF adapter.lora.alpha must have FLOAT32 wire type, got {value:?}; re-export the LoRA alpha explicitly"
+            "GGUF adapter {}@{} adapter.lora.alpha must have FLOAT32 wire type, got {value:?}; re-export a typed alpha or omit it for explicit baked scaling",
+            artifact.identity,
+            artifact.version
         ),
-        None => anyhow::bail!(
-            "GGUF adapter.lora.alpha is missing; this loader requires explicit positive alpha and alpha_over_rank scaling"
-        ),
+        None => None,
     };
-    ensure!(
-        alpha.is_finite() && alpha > 0.0,
-        "GGUF adapter.lora.alpha must be finite and positive, got {alpha}; zero/no-alpha scaling is unsupported, re-export an ordinary positive-alpha adapter"
-    );
+    match weight.scale_encoding {
+        AdapterScaleEncoding::AlphaOverRank => {
+            let alpha=alpha.with_context(||format!("GGUF adapter {}@{} adapter.lora.alpha is missing; alpha_over_rank requires explicit positive FLOAT32 alpha, or declare baked for an upstream unity-scale source",artifact.identity,artifact.version))?;
+            ensure!(
+                alpha.is_finite() && alpha > 0.0,
+                "GGUF adapter {}@{} adapter.lora.alpha must be finite and positive for alpha_over_rank, got {alpha}; use baked only for zero/missing source alpha",
+                artifact.identity,
+                artifact.version
+            );
+        }
+        AdapterScaleEncoding::Baked => ensure!(
+            alpha.is_none_or(|a| a.is_finite() && a == 0.0),
+            "GGUF adapter {}@{} baked scaling requires zero or missing adapter.lora.alpha, got {alpha:?}; use alpha_over_rank with matching positive manifest alpha for nonzero source alpha",
+            artifact.identity,
+            artifact.version
+        ),
+    }
     for key in views.adapter_metadata.keys() {
         ensure!(
             matches!(*key, "general.type" | "adapter.type" | "adapter.lora.alpha"),
@@ -86,8 +90,9 @@ pub(super) fn load(
     for binding in &artifact.bindings {
         let rank = binding.rank.unwrap_or(artifact.rank);
         ensure!(
-            binding.alpha.unwrap_or(artifact.alpha) == alpha,
-            "GGUF adapter.lora.alpha={alpha} disagrees with {}@{} binding {:?} alpha={}; correct the authoritative manifest instead of changing the numeric scale",
+            weight.scale_encoding == AdapterScaleEncoding::Baked
+                || Some(binding.alpha.unwrap_or(artifact.alpha)) == alpha,
+            "GGUF adapter.lora.alpha={alpha:?} disagrees with {}@{} binding {:?} alpha={}; correct the authoritative manifest instead of changing the numeric scale",
             artifact.identity,
             artifact.version,
             binding.target,
@@ -110,10 +115,13 @@ pub(super) fn load(
             );
             let view=views.tensors.get(&name).with_context(||format!("GGUF factor {name:?} is missing; binding.weight_key must be the exact saved parameter prefix for the standard .lora_a/.lora_b pair"))?;
             ensure!(
-                view.dtype == onnx_runtime_ir::DataType::Float32 && view.packed_format.is_none(),
-                "GGUF factor {name:?} dtype {:?}/packing {:?} is unsupported; this loader admits only unquantized F32 factors, not F16/BF16 or quantized blocks",
+                view.dtype == storage.dtype() && view.packed_format.is_none(),
+                "GGUF adapter {}@{} factor {name:?} dtype {:?}/packing {:?} is unsupported; saved A/B factors must exactly match the declared storage dtype {:?}; correct the manifest or export matching unquantized factors; quantized blocks are unsupported",
+                artifact.identity,
+                artifact.version,
                 view.dtype,
-                view.packed_format
+                view.packed_format,
+                storage.dtype()
             );
             ensure!(
                 view.shape == shape,
@@ -121,12 +129,12 @@ pub(super) fn load(
                 view.shape
             );
             let mut factor = Vec::new();
-            factor.try_reserve_exact(view.data.len()/4).with_context(||format!("allocate governed F32 GGUF factor {name:?} from {:?}; free host memory or export smaller factor tensors",weight.location))?;
-            for value in view.data.chunks_exact(4) {
-                let value = f32::from_le_bytes(value.try_into().unwrap());
+            factor.try_reserve_exact(view.data.len()/storage.width()).with_context(||format!("allocate governed F32 GGUF factor {name:?} from {:?}; free host memory or export smaller factor tensors",weight.location))?;
+            for value in view.data.chunks_exact(storage.width()) {
+                let value = storage.decode(value);
                 ensure!(
                     value.is_finite(),
-                    "GGUF factor {name:?} contains nonfinite F32 values; export finite ordinary LoRA factors"
+                    "GGUF factor {name:?} contains nonfinite saved values; export finite ordinary LoRA factors"
                 );
                 factor.push(value);
             }

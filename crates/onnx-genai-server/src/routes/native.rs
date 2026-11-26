@@ -669,13 +669,14 @@ fn prepare(
             ApiError::invalid_request(format!("invalid native reasoning controls: {error:#}"))
         })?;
     if options.constraint.is_some() || options.reasoning_budget.is_some() {
-        options
-            .validate_processors(&handle.tokenizer)
-            .map_err(|error| {
-                ApiError::invalid_request(format!(
-                    "invalid native completion constraint: {error:#}"
-                ))
-            })?;
+        super::completions::validate_request_processors(
+            &options,
+            &handle.tokenizer,
+            super::completions::ProcessorValidation::DriverOwnedBeforeSse,
+        )
+        .map_err(|error| {
+            ApiError::invalid_request(format!("invalid native completion constraint: {error:#}"))
+        })?;
     }
     let metadata = NativeFinalMetadata::new(&handle, &tokens, &options, &request, output_budget)?;
     let fim_config = request.suffix.as_ref().and(handle.fim_config.clone());

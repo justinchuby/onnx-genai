@@ -10,7 +10,6 @@
 
 use super::weight_cache::{WeightCache, WeightCacheStatus, WeightLoad, WeightSpec};
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,11 +25,13 @@ use onnx_runtime_quantization::{
 use rayon::prelude::*;
 
 use super::block_dequant::{decode_e2m1, decode_e8m0_scale};
+use super::check_arity;
 use super::decoded_projection::ProjectionScratch;
 use super::matmul::gemm;
+use super::packed_bytes::{PackedByteDigest, PackedByteSource};
 use super::packed_projection::{PackedProjectionPlan, validate_format};
-use super::{check_arity, to_dense_bytes};
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use super::projection_input::ProjectionInput;
+use crate::dtype::write_dense_f32_narrow;
 use onnx_runtime_ir::packed_arithmetic::ActivationArithmetic;
 
 const OP: &str = "BlockQuantizedMatMul";
@@ -206,6 +207,28 @@ impl BlockFormat {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct InputStaging {
+    activation: usize,
+    bias: usize,
+}
+
+impl InputStaging {
+    fn for_sources(
+        rows: usize,
+        activation: &ProjectionInput<'_>,
+        bias: Option<&ProjectionInput<'_>>,
+    ) -> Self {
+        if rows == 0 {
+            return Self::default();
+        }
+        Self {
+            activation: activation.staging_elements(),
+            bias: bias.map_or(0, ProjectionInput::staging_elements),
+        }
+    }
+}
+
 pub struct BlockQuantizedMatMulKernel {
     k: usize,
     n: usize,
@@ -298,31 +321,38 @@ impl Kernel for BlockQuantizedMatMulKernel {
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
     ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
-        self.plan_workspace(inputs)
-            .map(|(_, requirement)| onnx_runtime_ep_api::WorkspacePreparation::Ready(requirement))
+        #[cfg(test)]
+        WORKSPACE_METADATA_QUERIES.with(|queries| queries.set(queries.get() + 1));
+        let rows = self.metadata_rows(inputs)?;
+        if rows != 0 {
+            return Ok(onnx_runtime_ep_api::WorkspacePreparation::Deferred);
+        }
+        let (_, requirement) = self.plan_workspace(rows, 0, InputStaging::default())?;
+        Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
+            requirement,
+        ))
     }
 
     fn workspace_requirement_for_execution(
         &self,
-        _inputs: &[TensorView],
+        inputs: &[TensorView],
         _outputs: &[TensorMut],
         metadata: &[TensorMetadata<'_>],
         _output_metadata: &[onnx_runtime_ep_api::OutputMetadata<'_>],
-        cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
+        _cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
     ) -> Result<onnx_runtime_ep_api::WorkspaceExecutionPreparation> {
-        // Exclusive kernel ownership spans refinement, admission and launch.
-        // A rejected preparation must never revive an earlier execution plan.
         self.prepared_projection.set(None);
-        // The caller already matched this kernel, tensor metadata and provider
-        // context. A Ready hit needs a new execution plan, not another metadata
-        // query. Deferred/uncached requests still take the checked planner.
-        let (plan, requirement) = match cached {
-            Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(requirement)) => (
-                PackedProjectionPlan::for_current_pool(self.arithmetic),
-                requirement,
-            ),
-            _ => self.plan_workspace(metadata)?,
-        };
+        let rows = self.metadata_rows(metadata)?;
+        let packed_bytes = self.packed_lane_bytes(rows, inputs)?;
+        let activation = inputs.first().filter(|v| !v.is_absent()).ok_or_else(|| error("live workspace planning needs activation A; bind its Host tensor view before admission"))?;
+        let activation = ProjectionInput::new(OP, "A", activation)?;
+        let bias = inputs
+            .get(2)
+            .filter(|v| !v.is_absent())
+            .map(|v| ProjectionInput::new(OP, "bias", v))
+            .transpose()?;
+        let staging = InputStaging::for_sources(rows, &activation, bias.as_ref());
+        let (plan, requirement) = self.plan_workspace(rows, packed_bytes, staging)?;
         self.prepared_projection.set(Some(plan));
         Ok(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready(
             requirement,
@@ -363,20 +393,40 @@ fn require_compute_dtype(name: &str, got: DataType) -> Result<()> {
 }
 
 impl BlockQuantizedMatMulKernel {
-    fn plan_workspace(
-        &self,
-        inputs: &[TensorMetadata<'_>],
-    ) -> Result<(PackedProjectionPlan, WorkspaceRequirement)> {
-        #[cfg(test)]
-        WORKSPACE_METADATA_QUERIES.with(|queries| queries.set(queries.get() + 1));
+    fn metadata_rows(&self, inputs: &[TensorMetadata<'_>]) -> Result<usize> {
         let Some(a) = inputs.first().filter(|a| a.present) else {
             return Err(error(
                 "workspace planning needs present activation A metadata; provide the activation shape",
             ));
         };
-        let rows = self.projection_rows(a.shape)?;
+        self.projection_rows(a.shape)
+    }
+
+    fn packed_lane_bytes(&self, rows: usize, inputs: &[TensorView]) -> Result<usize> {
+        let packed = inputs.get(1).filter(|v| !v.is_absent()).ok_or_else(|| error(
+            "live workspace planning needs present packed_B storage; bind the packed weight view before admission"
+        ))?;
+        require_shape(
+            "packed_B",
+            packed.shape,
+            &[
+                self.n,
+                self.k.div_ceil(self.format.qk()),
+                self.format.block_bytes(),
+            ],
+        )?;
+        let source = PackedByteSource::full(OP, packed)?;
+        Ok(if rows == 0 { 0 } else { source.copy_bytes() })
+    }
+
+    fn plan_workspace(
+        &self,
+        rows: usize,
+        packed_bytes: usize,
+        staging: InputStaging,
+    ) -> Result<(PackedProjectionPlan, WorkspaceRequirement)> {
         let plan = PackedProjectionPlan::for_current_pool(self.arithmetic);
-        let (layout, _) = self.execution_workspace_layout(rows, plan)?;
+        let (layout, _) = self.execution_workspace_layout(rows, plan, packed_bytes, staging)?;
         Ok((
             plan,
             WorkspaceRequirement {
@@ -391,18 +441,37 @@ impl BlockQuantizedMatMulKernel {
         &self,
         rows: usize,
         plan: PackedProjectionPlan,
-    ) -> Result<(WorkspaceLayout<2>, usize)> {
+        packed_bytes: usize,
+        staging: InputStaging,
+    ) -> Result<(WorkspaceLayout<5>, usize)> {
         let result_elements = rows.checked_mul(self.n).ok_or_else(|| error(format!(
             "final output staging element count overflows for rows={rows}, N={}; reduce batch or projection dimensions", self.n
         )))?;
         let result = std::alloc::Layout::array::<f32>(result_elements).map_err(|_| error(format!(
             "final f32 output staging for rows={rows}, N={} exceeds addressable capacity; reduce batch or projection dimensions", self.n
         )))?;
-        // Both regions are live during a projection. Dense-cache hits only
-        // initialize the result region, while the complete admission continues
-        // to cover a later streamed fallback without changing arithmetic.
+        // All regions coexist. Dense hits skip decode and packed staging,
+        // but still consume current activations and bias. Complete admission
+        // covers a streamed fallback without another workspace request.
         let projection = plan.maximum_layout(rows, [(self.k, self.n)])?;
-        Ok((WorkspaceLayout::new([projection, result])?, result_elements))
+        let packed = std::alloc::Layout::array::<f32>(packed_bytes.div_ceil(4)).map_err(|_| error(format!(
+            "packed_B workspace of {packed_bytes} bytes exceeds addressable capacity; reduce projection dimensions"
+        )))?;
+        let input_layout = |elements, name| {
+            std::alloc::Layout::array::<f32>(elements).map_err(|_| error(format!(
+            "{name} conversion workspace for {elements} f32 values exceeds addressable capacity; reduce projection dimensions"
+        )))
+        };
+        Ok((
+            WorkspaceLayout::new([
+                projection,
+                result,
+                packed,
+                input_layout(staging.activation, "A")?,
+                input_layout(staging.bias, "bias")?,
+            ])?,
+            result_elements,
+        ))
     }
 
     fn projection_rows(&self, shape: &[usize]) -> Result<usize> {
@@ -483,22 +552,39 @@ impl BlockQuantizedMatMulKernel {
             }
             require_shape("bias", bias.shape, &[self.n])?;
         }
-        let (layout, result_elements) = self.execution_workspace_layout(m, plan)?;
+        let source = PackedByteSource::full(OP, &inputs[1])?;
+        let packed_bytes = if m == 0 { 0 } else { source.copy_bytes() };
+        let activation_source = ProjectionInput::new(OP, "A", &inputs[0])?;
+        let bias_source = bias_view
+            .map(|v| ProjectionInput::new(OP, "bias", v))
+            .transpose()?;
+        let staging = InputStaging::for_sources(m, &activation_source, bias_source.as_ref());
+        let (layout, result_elements) =
+            self.execution_workspace_layout(m, plan, packed_bytes, staging)?;
         // SAFETY: the executor exclusively lends live Host storage for this
         // dispatch. Complete binding proves capacity, alignment and disjoint
         // regions before materializing any activation, bias or packed payload.
-        let [mut scratch, mut output_staging] = unsafe {
+        let [
+            mut scratch,
+            mut output_staging,
+            mut packed_lane,
+            mut activation_lane,
+            mut bias_lane,
+        ] = unsafe {
             ProjectionScratch::bind_layout(
                 "BlockQuantizedMatMul execution workspace binding",
                 layout,
                 workspace,
             )
         }?;
-        let bias = bias_view
-            .map(|view| to_dense_f32_widen(OP, view))
+        if m == 0 {
+            return write_dense_f32_narrow(OP, &mut outputs[0], &[]);
+        }
+        let bias = bias_source
+            .as_ref()
+            .map(|source| source.read(&mut bias_lane))
             .transpose()?;
-
-        let activations = to_dense_f32_widen(OP, &inputs[0])?;
+        let activations = activation_source.read(&mut activation_lane)?;
         let dense = if self.arithmetic == ActivationArithmetic::Q8_0 {
             None
         } else {
@@ -509,14 +595,10 @@ impl BlockQuantizedMatMulKernel {
             .ok_or_else(|| error(format!(
                 "dense weight byte count overflow for K={}, N={}; supply dimensions whose f32 projection fits the address space", self.k, self.n
             )))?;
-            let cache_budget = if m == 0 {
-                0
-            } else {
-                self.weight_cache.byte_limit()
-            };
+            let cache_budget = self.weight_cache.byte_limit();
             let use_dense = dense_bytes <= cache_budget;
             if use_dense {
-                let resolved = if self.packed_b_constant {
+                let key = if self.packed_b_constant {
                     Some(self.weight_identity.resolve(
                         &inputs[1],
                         self.format,
@@ -524,13 +606,11 @@ impl BlockQuantizedMatMulKernel {
                         self.n,
                         0,
                         None,
-                        || packed_tensor_bytes(&inputs[1]),
+                        || source.digest(),
                     )?)
                 } else {
                     None
                 };
-                let key = resolved.as_ref().map(|resolved| Arc::clone(&resolved.key));
-                let mut resolved_payload = resolved.and_then(|resolved| resolved.payload);
                 match self.weight_cache.load_group(
                     &[match key.as_deref() {
                         Some(key) => WeightSpec::cached(key)?,
@@ -538,15 +618,12 @@ impl BlockQuantizedMatMulKernel {
                     }],
                     |_, output| {
                         BLOCK_QUANT_MATMUL_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
-                        let packed = match resolved_payload.take() {
-                            Some(packed) => packed,
-                            None => packed_tensor_bytes(&inputs[1])?,
-                        };
+                        let packed = source.read(&mut packed_lane)?;
                         decode_dense_weight_into(
                             self.format,
                             self.k,
                             self.n,
-                            &packed,
+                            packed,
                             output,
                             DenseWeightLayout::Kn,
                         )
@@ -576,16 +653,16 @@ impl BlockQuantizedMatMulKernel {
             }
         };
         let Some((dense, dense_bytes, cache_budget)) = dense else {
-            let packed = packed_tensor_bytes(&inputs[1])?;
+            let packed = source.read(&mut packed_lane)?;
             let result = output_staging.initialized_prefix(result_elements)?;
             plan.project(
                 self.format,
-                &packed,
-                &activations,
+                packed,
+                activations,
                 m,
                 self.k,
                 self.n,
-                bias.as_deref(),
+                bias,
                 &mut scratch,
                 result,
             )?;
@@ -601,8 +678,8 @@ impl BlockQuantizedMatMulKernel {
         #[cfg(test)]
         BLOCK_QUANTIZED_MATMUL_DENSE_F32_TEST_HITS
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        gemm(&activations, weight_kn, result, m, self.k, self.n)?;
-        if let Some(bias) = bias.as_deref() {
+        gemm(activations, weight_kn, result, m, self.k, self.n)?;
+        if let Some(bias) = bias {
             for row in result.chunks_exact_mut(self.n) {
                 for (value, bias) in row.iter_mut().zip(bias) {
                     *value += bias;
@@ -614,7 +691,7 @@ impl BlockQuantizedMatMulKernel {
 
     #[cfg(test)]
     fn dequantize_weight_kn(&self, packed: &TensorView) -> Result<Vec<f32>> {
-        let packed = packed_tensor_bytes(packed)?;
+        let packed = PackedByteSource::full(OP, packed)?.owned()?;
         BLOCK_QUANT_MATMUL_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
         dequantize_weight_kn(self.format, self.k, self.n, &packed)
     }
@@ -642,8 +719,6 @@ struct DenseWeightIdentityState {
     keys: HashMap<DenseWeightSubKey, Arc<DenseWeightCacheKey>>,
     #[cfg(test)]
     hashed_bytes: usize,
-    #[cfg(test)]
-    materialized_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -675,25 +750,19 @@ struct DenseWeightSubKey {
     out_features: usize,
 }
 
-pub(super) struct ResolvedDenseWeight<'a> {
-    pub(super) key: Arc<DenseWeightCacheKey>,
-    /// Present only when resolving a new content key. The caller can reuse this
-    /// payload for the cache build, avoiding a second strided materialization.
-    pub(super) payload: Option<Cow<'a, [u8]>>,
-}
-
 impl DenseWeightIdentity {
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn resolve<'a>(
+    pub(super) fn resolve(
         &self,
-        view: &'a TensorView<'_>,
+        view: &TensorView<'_>,
         format: BlockFormat,
         in_features: usize,
         out_features: usize,
         role: u8,
         expert: Option<usize>,
-        payload: impl FnOnce() -> Result<Cow<'a, [u8]>>,
-    ) -> Result<ResolvedDenseWeight<'a>> {
+        digest: impl FnOnce() -> Result<PackedByteDigest>,
+    ) -> Result<Arc<DenseWeightCacheKey>> {
+        crate::strided::validate_host_storage::<u8>(OP, "constant packed weight", view)?;
         let source = DenseWeightSource::from_tensor(view)?;
         let mut inner = self
             .inner
@@ -726,24 +795,18 @@ impl DenseWeightIdentity {
             out_features,
         };
         if let Some(key) = inner.keys.get(&sub_key) {
-            return Ok(ResolvedDenseWeight {
-                key: Arc::clone(key),
-                payload: None,
-            });
+            return Ok(Arc::clone(key));
         }
 
-        let payload = payload()?;
+        let digest = digest()?;
         // The hash is computed once for diagnostics/collision hardening, but it
         // is never the sole identity: the immutable kernel slot generation,
         // source provenance, role/expert, dtype, format, dimensions, and layout
         // all participate in equality.
-        let content_hash = stable_bytes_hash(&payload);
+        let content_hash = digest.hash;
         #[cfg(test)]
         {
-            inner.hashed_bytes = inner.hashed_bytes.saturating_add(payload.len());
-            if matches!(payload, Cow::Owned(_)) {
-                inner.materialized_bytes = inner.materialized_bytes.saturating_add(payload.len());
-            }
+            inner.hashed_bytes = inner.hashed_bytes.saturating_add(digest.bytes);
         }
         let metadata = inner
             .metadata
@@ -759,25 +822,18 @@ impl DenseWeightIdentity {
             expert,
             tensor_shape: Arc::clone(&metadata.shape),
             tensor_strides: Arc::clone(&metadata.strides),
-            byte_len: payload.len(),
+            byte_len: digest.bytes,
             content_hash,
             source,
         });
         inner.keys.insert(sub_key, Arc::clone(&key));
-        Ok(ResolvedDenseWeight {
-            key,
-            payload: Some(payload),
-        })
+        Ok(key)
     }
 
     #[cfg(test)]
-    pub(super) fn stats(&self) -> (usize, usize, usize) {
+    pub(super) fn stats(&self) -> (usize, usize) {
         let inner = self.inner.lock().unwrap();
-        (
-            inner.keys.len(),
-            inner.hashed_bytes,
-            inner.materialized_bytes,
-        )
+        (inner.keys.len(), inner.hashed_bytes)
     }
 }
 
@@ -845,38 +901,6 @@ impl DenseWeightSource {
             }
         })
     }
-}
-
-pub(super) fn packed_tensor_bytes<'a>(view: &'a TensorView<'_>) -> Result<Cow<'a, [u8]>> {
-    view.validate()?;
-    if view.dtype != DataType::Uint8 {
-        return Err(error(format!(
-            "packed weight dtype {:?} unsupported; expected Uint8",
-            view.dtype
-        )));
-    }
-    if view.is_contiguous() {
-        let len = view.byte_size();
-        if len == 0 {
-            return Ok(Cow::Borrowed(&[]));
-        }
-        // SAFETY: `view` is validated, contiguous Uint8 storage, and the
-        // executor has bounds-checked the logical byte extent against the live
-        // backing allocation. The borrow cannot outlive the input view.
-        return Ok(Cow::Borrowed(unsafe {
-            std::slice::from_raw_parts(view.data_ptr::<u8>(), len)
-        }));
-    }
-    Ok(Cow::Owned(to_dense_bytes(view)?))
-}
-
-fn stable_bytes_hash(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for &byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1978,7 +2002,15 @@ mod tests {
                     .map(|v| TensorMetadata::new(v.dtype, v.shape, true))
                     .collect::<Vec<_>>();
                 let cached = kernel.workspace_requirement(&metadata, &[]).unwrap();
-                let req = cached.require_ready().unwrap();
+                assert!(matches!(
+                    cached,
+                    onnx_runtime_ep_api::WorkspacePreparation::Deferred
+                ));
+                let req = kernel
+                    .workspace_requirement_for_execution(&inputs, &[], &metadata, &[], Some(cached))
+                    .unwrap()
+                    .require_ready()
+                    .unwrap();
                 let tile = if super::super::matmul::serial_projection_is_portable() {
                     4
                 } else {
@@ -1992,11 +2024,7 @@ mod tests {
                     onnx_runtime_ep_api::DevicePtrMut(scratch.as_mut_ptr().cast()),
                     expected,
                 );
-                for preparation in [
-                    Some(cached),
-                    Some(onnx_runtime_ep_api::WorkspacePreparation::Deferred),
-                    None,
-                ] {
+                for preparation in [Some(cached), None] {
                     let queries_before = WORKSPACE_METADATA_QUERIES.with(std::cell::Cell::get);
                     assert_eq!(
                         kernel
@@ -2014,11 +2042,8 @@ mod tests {
                     );
                     assert_eq!(
                         WORKSPACE_METADATA_QUERIES.with(std::cell::Cell::get) - queries_before,
-                        usize::from(!matches!(
-                            preparation,
-                            Some(onnx_runtime_ep_api::WorkspacePreparation::Ready(_))
-                        )),
-                        "Ready reuses metadata, while Deferred/None must run the checked planner"
+                        0,
+                        "live refinement must not issue a metadata query"
                     );
                     let selected = kernel.prepared_projection.get().unwrap();
                     let explicit = super::super::decoded_projection::DecodedProjectionPlan::new(
@@ -2953,32 +2978,21 @@ mod tests {
                 prepared_projection: std::cell::Cell::new(None),
                 weight_cache: WeightCache::new(memory, budget),
             };
-            let requirement = kernel
-                .workspace_requirement(
-                    &[
-                        TensorMetadata::new(DataType::Float32, &[m, k], true),
-                        TensorMetadata::new(
-                            DataType::Uint8,
-                            &[n, k.div_ceil(32), block_bytes],
-                            true,
-                        ),
-                    ],
-                    &[],
-                )
-                .unwrap()
-                .require_ready()
-                .unwrap();
-            assert!(requirement.bytes > 0);
             let views = [a.view(), b.view()];
             let metadata = views
                 .iter()
-                .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
+                .map(|v| TensorMetadata::new(v.dtype, v.shape, true))
                 .collect::<Vec<_>>();
-            kernel
+            assert!(matches!(
+                kernel.workspace_requirement(&metadata, &[]).unwrap(),
+                onnx_runtime_ep_api::WorkspacePreparation::Deferred
+            ));
+            let requirement = kernel
                 .workspace_requirement_for_execution(&views, &[y.view_mut()], &metadata, &[], None)
                 .unwrap()
                 .require_ready()
                 .unwrap();
+            assert!(requirement.bytes > 0);
             let error = kernel
                 .execute(&[a.view(), b.view()], &mut [y.view_mut()])
                 .unwrap_err();
@@ -3292,10 +3306,10 @@ mod tests {
         let resolved = concrete
             .weight_identity
             .resolve(&view, BlockFormat::Mxfp4, k, n, 0, None, || {
-                packed_tensor_bytes(&view)
+                PackedByteSource::full(OP, &view)?.digest()
             })
             .unwrap();
-        let active = concrete.weight_cache.test_get(&resolved.key).unwrap();
+        let active = concrete.weight_cache.test_get(&resolved).unwrap();
         second
             .execute_prepared(&[input.view(), weights.view()], &mut [actual.view_mut()])
             .unwrap();
@@ -3420,7 +3434,7 @@ mod tests {
                 }
                 assert_eq!(streamed.weight_cache.stats(), (0, 0));
                 assert_eq!(streamed.weight_cache.activity(), (0, 0));
-                assert_eq!(streamed.weight_identity.stats(), (0, 0, 0));
+                assert_eq!(streamed.weight_identity.stats(), (0, 0));
             }
             assert_eq!(dense.weight_cache.stats(), (1, bytes));
             assert_eq!(dense.weight_cache.activity().1, 1);
@@ -3492,7 +3506,7 @@ mod tests {
                 .execute_prepared(&[a.view(), b, bias.view()], &mut [y.view_mut()])
                 .unwrap();
             assert_eq!(compute_values(&y, dtype), vec![33.5, 31.5, 33.5, 31.5]);
-            assert_eq!(kernel.weight_identity.stats(), (0, 0, 0));
+            assert_eq!(kernel.weight_identity.stats(), (0, 0));
             assert_eq!(kernel.weight_cache.activity(), (0, 0));
         }
     }
@@ -3528,7 +3542,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("bias must have shape [2]"), "{error}");
-        assert_eq!(kernel.weight_identity.stats(), (0, 0, 0));
+        assert_eq!(kernel.weight_identity.stats(), (0, 0));
         assert_eq!(kernel.weight_cache.activity(), (0, 0));
     }
 
@@ -3677,7 +3691,7 @@ mod tests {
         );
         assert_eq!(
             identity_after_first,
-            (1, packed.len(), 0),
+            (1, packed.len()),
             "the initial contiguous weight should be hashed once without materialization"
         );
         assert_eq!(
@@ -3702,16 +3716,14 @@ mod tests {
         let packed2_view = packed2.view();
         let key1 = identity1
             .resolve(&packed1_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&packed1_view)
+                PackedByteSource::full(OP, &packed1_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         let key2 = identity2
             .resolve(&packed2_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&packed2_view)
+                PackedByteSource::full(OP, &packed2_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         let _ = cache
             .test_get_or_insert_with(key1.as_ref(), || Ok(vec![1.0, 2.0, 3.0, 4.0]))
             .unwrap();
@@ -3741,10 +3753,9 @@ mod tests {
         let packed_view = packed.view();
         let key = identity
             .resolve(&packed_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&packed_view)
+                PackedByteSource::full(OP, &packed_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
 
         for limit in [0, 15] {
             let cache = WeightCache::<DenseWeightCacheKey>::with_limit(limit);
@@ -3760,6 +3771,46 @@ mod tests {
     }
 
     #[test]
+    fn dense_weight_identity_failed_digest_is_not_published_and_warm_views_are_validated() {
+        let packed = Owned::u8(&[4], &[1, 2, 3, 4]);
+        let view = packed.view();
+        let identity = DenseWeightIdentity::default();
+        let error = identity
+            .resolve(&view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
+                Err(EpError::KernelFailed(
+                    "digest source unavailable; rebind packed storage".into(),
+                ))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("rebind packed storage"));
+        assert_eq!(identity.stats(), (0, 0));
+        let key = identity
+            .resolve(&view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
+                PackedByteSource::full(OP, &view)?.digest()
+            })
+            .unwrap();
+        assert_eq!(identity.stats(), (1, 4));
+        let mut invalid = view;
+        invalid.dtype = DataType::Float32;
+        let error = identity
+            .resolve(&invalid, BlockFormat::Mxfp4, 4, 1, 0, None, || {
+                unreachable!("invalid warm descriptor cannot request payload")
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Host-accessible Uint8"),
+            "{error}"
+        );
+        let repeated = identity
+            .resolve(&view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
+                unreachable!("failed warm validation cannot evict a valid key")
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(&key, &repeated));
+        assert_eq!(identity.stats(), (1, 4));
+    }
+
+    #[test]
     fn dense_weight_identity_rekeys_when_the_constant_source_changes() {
         let first = Owned::u8(&[4], &[1, 2, 3, 4]);
         let second = Owned::u8(&[4], &[4, 3, 2, 1]);
@@ -3767,29 +3818,26 @@ mod tests {
         let first_view = first.view();
         let first_key = identity
             .resolve(&first_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&first_view)
+                PackedByteSource::full(OP, &first_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         let repeated_key = identity
             .resolve(&first_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
                 unreachable!("stable identity must not request the payload again")
             })
-            .unwrap()
-            .key;
+            .unwrap();
         assert!(Arc::ptr_eq(&first_key, &repeated_key));
 
         let second_view = second.view();
         let second_key = identity
             .resolve(&second_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&second_view)
+                PackedByteSource::full(OP, &second_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         assert_ne!(first_key, second_key);
         assert_eq!(
             identity.stats(),
-            (1, 8, 0),
+            (1, 8),
             "each observable source identity must be hashed exactly once"
         );
     }
@@ -3807,10 +3855,9 @@ mod tests {
         ));
         let first_key = identity
             .resolve(&first_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&first_view)
+                PackedByteSource::full(OP, &first_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         let second_view = packed.view().with_backing(TensorBacking::ExternalMmap(
             onnx_runtime_ep_api::ExternalMmapRegion {
                 mapping_id: 42,
@@ -3820,12 +3867,11 @@ mod tests {
         ));
         let second_key = identity
             .resolve(&second_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&second_view)
+                PackedByteSource::full(OP, &second_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         assert_ne!(first_key, second_key);
-        assert_eq!(identity.stats(), (1, 8, 0));
+        assert_eq!(identity.stats(), (1, 8));
     }
 
     #[test]
@@ -3856,10 +3902,9 @@ mod tests {
         let packed_view = packed.view();
         let key = identity
             .resolve(&packed_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&packed_view)
+                PackedByteSource::full(OP, &packed_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         let builds = std::sync::Arc::new(AtomicUsize::new(0));
         let barrier = std::sync::Arc::new(Barrier::new(4));
         std::thread::scope(|scope| {

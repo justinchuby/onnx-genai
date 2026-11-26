@@ -42,13 +42,16 @@ pub use onnx_runtime_ep_api::DeviceBuffer;
 pub use onnx_runtime_ep_api::DeviceGraphSlot;
 pub use onnx_runtime_ep_api::WorkspaceRequirement;
 pub use workspace::{WorkspaceBounds, WorkspacePreparationReport};
+mod cpu_workers;
 mod workspace;
+pub use cpu_workers::CpuWorkerPlan;
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
 };
 pub use plugin_provider::{PluginExecutionProvider, is_plugin_fused_node};
 pub use tensor::{
-    DeviceBindingTransferStats, DeviceIoBinding, ExternalMemorySpec, Tensor, cpu_allocator,
+    DeviceBindingTransferStats, DeviceIoBinding, ExternalMemorySpec, HostTensorAllocator, Tensor,
+    cpu_allocator,
 };
 /// Device-bound graph outputs, stored inline for the common fixed-output case.
 pub type DeviceBindingOutputs = smallvec::SmallVec<[Option<Tensor>; 16]>;
@@ -166,6 +169,10 @@ mod error {
     /// Errors produced by the session layer.
     #[derive(Debug, thiserror::Error)]
     pub enum SessionError {
+        #[error(
+            "CPU worker plan is unsupported: {reason}; keep a single executor or supply a supported external-mapped CPU graph"
+        )]
+        UnsupportedCpuWorkerPlan { reason: String },
         #[error(
             "fallback_execution_provider '{provider}' is bound to {device:?}; pass a CPU provider initialized with this session's memory resources"
         )]
@@ -2039,6 +2046,13 @@ impl InferenceSession {
         self.exec.max_lazy_weight_working_set_bytes()
     }
 
+    /// Construct owned host tensors through this session's allocation domain.
+    /// Returned tensors retain their provider and allocation owners independently
+    /// of the session lifetime. No implicit cross-device transfer is performed.
+    pub fn host_tensor_allocator(&self) -> Result<HostTensorAllocator> {
+        self.exec.host_tensor_allocator()
+    }
+
     pub fn device_id(&self) -> onnx_runtime_ir::DeviceId {
         self.exec.device_id()
     }
@@ -2969,3 +2983,6 @@ mod option_tests {
         assert_eq!(ctx.embed_mode, 0);
     }
 }
+
+#[cfg(test)]
+mod host_tensor_tests;
