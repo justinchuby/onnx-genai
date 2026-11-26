@@ -1002,7 +1002,7 @@ fn write_num(out: &mut Vec<u8>, n: Num, dtype: DataType) -> Result<()> {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
-    use onnx_runtime_ep_api::ExecutionProvider;
+    use onnx_runtime_ep_api::{DeviceId, DevicePtr, DevicePtrMut, ExecutionProvider};
     use onnx_runtime_ir::{Attribute, NodeId, static_shape};
 
     fn bytes_to_u64(bytes: &[u8]) -> Vec<u64> {
@@ -1310,6 +1310,41 @@ mod tests {
         .execute(&[strided.view()], &mut [unpacked.view_mut()])
         .unwrap();
         assert_eq!(unpacked.bytes, vec![0, 7, 15]);
+
+        let shape = [3];
+        let negative_stride = [-1];
+        let negative_input = TensorView::new(
+            DevicePtr(unsafe { input.bytes.as_ptr().add(1) }.cast()),
+            DataType::Uint4,
+            &shape,
+            &negative_stride,
+            DeviceId::cpu(),
+        );
+        let mut reversed = Owned::zeros(DataType::Int8, &shape);
+        CastKernel {
+            to: Some(DataType::Int8),
+            float6: false,
+        }
+        .execute(&[negative_input], &mut [reversed.view_mut()])
+        .unwrap();
+        assert_eq!(reversed.bytes, vec![7, 1, 0]);
+
+        let source = Owned::u8(&shape, &[4, 5, 6]);
+        let mut negative_output_bytes = [0xaa, 0xaa];
+        let negative_output = TensorMut::new(
+            DevicePtrMut(unsafe { negative_output_bytes.as_mut_ptr().add(1) }.cast()),
+            DataType::Uint4,
+            &shape,
+            &negative_stride,
+            DeviceId::cpu(),
+        );
+        CastKernel {
+            to: Some(DataType::Uint4),
+            float6: false,
+        }
+        .execute(&[source.view()], &mut [negative_output])
+        .unwrap();
+        assert_eq!(negative_output_bytes, [0x56, 0xa4]);
     }
 
     #[test]
