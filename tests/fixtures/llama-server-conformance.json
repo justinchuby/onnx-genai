@@ -780,9 +780,9 @@
       "package_manifest": "crates/onnx-genai-engine/Cargo.toml",
       "source": "crates/onnx-genai-engine/tests/audio_waveform.rs",
       "target": "test:audio_waveform",
-      "test": "native_ogg_opus_presentation_survives_authored_decode_resample_and_head",
-      "execution_contract": "Maintained SILK mono, hybrid/CELT stereo and mapping1 six-channel Ogg Opus fixtures through authored audio preprocessing and actual Native CPU ONNX head; requires native-backend without native-cuda",
-      "assertions": "Four clips preserve 11520 presented mono samples against independent source PCM within 1/32768 after channel averaging; authored resampling/scaling/window reaches finite eight-value features and analytical Native head; explicit 1024-byte decode budget rejects with component context.",
+      "test": "native_opus_presentation_survives_authored_decode_resample_and_head",
+      "execution_contract": "Maintained SILK mono, hybrid/CELT stereo and mapping1 six-channel Ogg and WebM Opus fixtures through authored audio preprocessing and actual Native CPU ONNX head; requires native-backend without native-cuda",
+      "assertions": "Four source clips in each of Ogg and WebM preserve 11520 presented mono samples against independent source PCM within 1/32768 after channel averaging; authored resampling/scaling/window reaches finite eight-value features and analytical Native head; explicit 1024-byte Ogg decode budget rejects with component context.",
       "source_markers": [
         "independent source PCM reference",
         "native head value",
