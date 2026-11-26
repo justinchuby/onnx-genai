@@ -42,7 +42,6 @@ fn gguf_adapter_format_has_explicit_schema_floor_and_exact_loader_contract() {
             json!("adapters/peft/config.json"),
             "other formats forbid",
         ),
-        ("scale_encoding", json!("baked"), "alpha_over_rank"),
     ] {
         let mut bad = doc.clone();
         bad["adapters"]["artifacts"]["peft"]["weights"][0][field] = value;
@@ -51,4 +50,19 @@ fn gguf_adapter_format_has_explicit_schema_floor_and_exact_loader_contract() {
             .join("\n");
         assert!(error.contains(message), "{field}: {error}");
     }
+}
+
+#[test]
+fn gguf_baked_is_explicit_while_manifest_alpha_policies_stay_positive() {
+    let mut doc = document();
+    doc["adapters"]["artifacts"]["peft"]["weights"][0]["scale_encoding"] = json!("baked");
+    validate_metadata(&parse_metadata_json(&doc).unwrap()).unwrap();
+    doc["adapters"]["artifacts"]["peft"]["alpha"] = json!(0);
+    let error = validate_metadata(&parse_metadata_json(&doc).unwrap())
+        .unwrap_err()
+        .join("\n");
+    assert!(
+        error.contains("alpha must be finite and greater than zero"),
+        "{error}"
+    );
 }
