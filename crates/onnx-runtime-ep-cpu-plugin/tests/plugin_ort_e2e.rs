@@ -5157,7 +5157,13 @@ fn pinned_ort_assigns_schema_legal_lp_normalization_boundaries() {
     let invalid = lp_normalization_model_text("bf16_v21_invalid", 21, BFLOAT16);
     let path = write_generated_model("bf16_v21_invalid", &invalid);
     let Some((_lib, api, env, opts, session, domain, custom_op, status)) = (unsafe {
-        conformance_setup_with_session_status("cpu_ep_lpnorm_bf16_v21_invalid", &path, false, None)
+        conformance_setup_with_session_status(
+            "cpu_ep_lpnorm_bf16_v21_invalid",
+            &path,
+            false,
+            None,
+            &[],
+        )
     }) else {
         eprintln!(
             "*** SKIPPED: pinned_ort_assigns_schema_legal_lp_normalization_boundaries — \
