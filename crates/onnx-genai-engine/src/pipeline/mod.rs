@@ -806,8 +806,13 @@ impl WorkflowRuntime {
         let mut decode_backend = validate_pipeline_backend_request(config.decode_backend)?;
         let mut capability_error = None;
         let mut admitted_execution = None;
-        let directory =
-            match PipelineModelDirectory::load_with_metadata_preflight(pipeline_dir, |metadata| {
+        let directory = match PipelineModelDirectory::load_with_metadata_preflight_and_selection(
+            pipeline_dir,
+            &onnx_genai_ort::ModelPackageSelection {
+                variant: config.package_variant.clone(),
+                ..Default::default()
+            },
+            |metadata| {
                 decode_backend =
                     admit_keyed_weight_backend(decode_backend, !metadata.graph_weights.is_empty())
                         .map_err(|error| {
@@ -820,17 +825,18 @@ impl WorkflowRuntime {
                 })?;
                 admitted_execution = Some(admission);
                 Ok(())
-            }) {
-                Ok(directory) => directory,
-                Err(_) if capability_error.is_some() => {
-                    return Err(capability_error.expect("guarded by is_some").into());
-                }
-                Err(error) => {
-                    return Err(anyhow::anyhow!(
-                        "Failed to resolve workflow package: {error}"
-                    ));
-                }
-            };
+            },
+        ) {
+            Ok(directory) => directory,
+            Err(_) if capability_error.is_some() => {
+                return Err(capability_error.expect("guarded by is_some").into());
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to resolve workflow package: {error}"
+                ));
+            }
+        };
         let execution_admission = if directory.metadata.is_some() {
             admitted_execution
                 .expect("metadata preflight stores the typed execution admission before loading")

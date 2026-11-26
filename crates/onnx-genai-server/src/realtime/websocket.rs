@@ -1195,6 +1195,7 @@ mod tests {
         let specs = ["alpha", "beta"]
             .into_iter()
             .map(|id| crate::models_config::ModelSpec {
+                package_variant: None,
                 id: id.into(),
                 path: package.path().to_owned(),
                 eager: true,

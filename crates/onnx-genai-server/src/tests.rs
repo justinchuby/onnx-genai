@@ -4393,12 +4393,14 @@ fn two_model_state() -> AppState {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let specs = vec![
         ModelSpec {
+            package_variant: None,
             id: "model-a".to_string(),
             path: path.clone(),
             eager: true,
             warmup: false,
         },
         ModelSpec {
+            package_variant: None,
             id: "model-b".to_string(),
             path: path.clone(),
             eager: true,
@@ -4603,12 +4605,14 @@ fn lazy_state(config: ServerConfig) -> AppState {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let specs = vec![
         ModelSpec {
+            package_variant: None,
             id: "model-a".to_string(),
             path: path.clone(),
             eager: true,
             warmup: false,
         },
         ModelSpec {
+            package_variant: None,
             id: "model-b".to_string(),
             path: path.clone(),
             eager: false,
@@ -4840,6 +4844,7 @@ async fn configured_warmup_runs_when_an_eager_model_loads() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let state = AppState::load_from_specs(
         vec![ModelSpec {
+            package_variant: None,
             id: "model-a".to_string(),
             path,
             eager: true,
@@ -6254,12 +6259,14 @@ async fn colliding_two_model_sessions(
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let specs = vec![
         ModelSpec {
+            package_variant: None,
             id: "model-a".to_string(),
             path: path.clone(),
             eager: true,
             warmup: false,
         },
         ModelSpec {
+            package_variant: None,
             id: "model-b".to_string(),
             path,
             eager: true,
@@ -12805,6 +12812,7 @@ mod lora_http {
             ["a", "b"]
                 .into_iter()
                 .map(|name| ModelSpec {
+                    package_variant: None,
                     id: name.into(),
                     path: root.path().join(name),
                     eager: name == "a",

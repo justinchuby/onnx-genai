@@ -6,7 +6,7 @@ Self-review and merge tested increments until all acceptance items are complete.
 Tool execution and MCP transport are explicitly excluded by the user's revised
 scope; external harnesses own them. Chat tool-call protocols remain required.
 
-The upstream baseline is pinned in `vendor/llama-chat/UPSTREAM`. A matching route
+The upstream baseline is pinned in `crates/onnx-genai-server/vendor/llama-chat/UPSTREAM`. A matching route
 name or a successful empty response is not an implemented capability.
 
 ## Current goal status
@@ -2493,3 +2493,49 @@ Default engine/server all-target strict Clippy and the Native-disabled server
 reference configuration (`--no-default-features --features metrics,cuda-13000`)
 passed, together with formatting and whole-change whitespace checks. The CUDA
 feature is a compile-time binding selector, not evidence of GPU execution.
+
+
+### Explicit model-package variant installation
+
+Named `repository:variant` identifiers now carry an explicit model-package
+selection through Hub planning, cache publication/restart, registry loading,
+Native/ORT engines and workflow execution. Remote planning and local loading
+share manifest/component selection and shared-asset rules. The planner excludes
+unselected variant directories before applying package quotas; selected index
+JSON is bounded and size/hash checked. Variant-local and shared tokenizer prompt
+assets use one ordered resolution path. `/props` advertises both flat nxrt
+packages and ORT model-package indexes.
+
+Selected loading checks every referenced canonical path without requiring other
+variants to be installed. The explicit validate-all package audit retains its
+all-variant checks, and symlink/traversal guards remain in the shared resolver.
+Cache-manifest version 2 persists repository and variant separately and rejects
+alternative selector spellings or old/future versions; no cache migration shim
+or automatic operator-file rewrite was introduced.
+
+Real local Hub tests prove a selected small package is admitted while an
+unselected one-GB artifact is not requested, including external indexes, shared
+tokenizer/templates, persisted resume/publication and cache reopen. Native and
+ORT generation execute the selected package. Both backends also execute a
+selected composed decision workflow through the real `/v1/systemone` route.
+Unknown variants and twelve corrupt/unsafe index cases fail before model payload
+requests. Bare GGUF graph import, filename quantization resolution and selective
+sidecar operations remain open.
+
+Selected indexes now retain a borrow of their package owner and resolve metadata
+before executable artifacts. Workflow admission therefore still precedes graph
+or tokenizer inspection. Manifest decoder and workflow decoder paths must agree;
+all manifest-backed workflow graph/tokenizer references share canonical package
+containment. Implicit metadata and tokenizer files also reject escaping or broken
+symlinks. Public HTTP tests cover selector-bearing progress, shared-template props,
+load, actual decisions and deletion that leaves another variant executable.
+
+Final validation after rebasing onto main 73f17da8f: all 20 model-package tests,
+200 ORT library tests, 614 server library tests (two inherited ignores), 1108
+engine library tests (one inherited ignore) and 38 public HTTP integration tests
+passed. Strict all-target Clippy passed for all four changed crates and the
+Native-disabled reference server (`metrics,cuda-13000`); CLI/Python all-target
+compilation, formatting and whitespace checks passed. The offline route audit
+remains 51 present / four external-harness contracts, without claiming that
+registration establishes semantic parity. Evidence is functional macOS ARM64
+CPU only, with no Linux/GPU execution or performance claims.
