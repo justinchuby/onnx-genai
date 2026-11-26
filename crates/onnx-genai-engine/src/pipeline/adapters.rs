@@ -1,3 +1,4 @@
+mod factor_storage;
 mod gguf;
 mod peft;
 use super::row_state::{RowScopedState, gather_rows};
