@@ -140,17 +140,19 @@ fn denied(reason: &str) -> Response {
 fn authority(origin: &str) -> Option<&str> {
     origin.split_once("://").map(|(_, authority)| authority)
 }
-fn loopback_or_unspecified(ip: std::net::IpAddr) -> bool {
+fn loopback(ip: std::net::IpAddr) -> bool {
     ip.is_loopback()
-        || ip.is_unspecified()
         || matches!(ip, std::net::IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback()))
+}
+fn loopback_or_unspecified(ip: std::net::IpAddr) -> bool {
+    loopback(ip) || ip.is_unspecified()
 }
 fn host_allowed(policy: &Origins, request: &Request) -> bool {
     let Some(CorsListeningAddress(local)) = request.extensions().get::<CorsListeningAddress>()
     else {
         return true; // In-process routers have no network listener. Network adapters supply the extension.
     };
-    if !local.ip().is_loopback() {
+    if !loopback(local.ip()) {
         return true;
     }
     let Some(host) = request
@@ -495,6 +497,82 @@ mod tests {
                     "POST"
                 );
             }
+        }
+    }
+    #[tokio::test]
+    async fn cors_mapped_loopback_listener_rejects_rebinding_without_restricting_lan() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        for (local, host, origin, expected) in [
+            (
+                "[::ffff:127.0.0.1]:8080",
+                "rebinding.example:8080",
+                "http://rebinding.example:8080",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "[::ffff:127.0.0.2]:8080",
+                "rebinding.example:8080",
+                "http://rebinding.example:8080",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "[::ffff:127.0.0.1]:8080",
+                "localhost:8080",
+                "http://localhost:8080",
+                StatusCode::OK,
+            ),
+            (
+                "0.0.0.0:8080",
+                "proxy.example:8080",
+                "http://proxy.example:8080",
+                StatusCode::OK,
+            ),
+            (
+                "[::]:8080",
+                "proxy.example:8080",
+                "http://proxy.example:8080",
+                StatusCode::OK,
+            ),
+            (
+                "192.0.2.1:8080",
+                "proxy.example:8080",
+                "http://proxy.example:8080",
+                StatusCode::OK,
+            ),
+            (
+                "[::ffff:192.0.2.1]:8080",
+                "proxy.example:8080",
+                "http://proxy.example:8080",
+                StatusCode::OK,
+            ),
+        ] {
+            let counter = calls.clone();
+            let router = Router::new()
+                .route(
+                    "/completion",
+                    post(move || {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        async { "executed" }
+                    }),
+                )
+                .layer(middleware::from_fn_with_state(
+                    CorsPolicy::new("localhost", "POST", "*", true).unwrap(),
+                    enforce,
+                ))
+                .layer(axum::Extension(CorsListeningAddress(
+                    local.parse().unwrap(),
+                )));
+            let before = calls.load(Ordering::SeqCst);
+            let mut req = request("POST", Some(origin)).body(Body::empty()).unwrap();
+            req.headers_mut()
+                .insert(header::HOST, HeaderValue::from_str(host).unwrap());
+            let response = router.oneshot(req).await.unwrap();
+            assert_eq!(response.status(), expected, "listener {local}, host {host}");
+            assert_eq!(
+                calls.load(Ordering::SeqCst) - before,
+                usize::from(expected == StatusCode::OK),
+                "denied rebinding must not enter handler"
+            );
         }
     }
     #[test]
