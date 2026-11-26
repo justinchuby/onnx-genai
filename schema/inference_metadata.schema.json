@@ -338,6 +338,11 @@
           "const": "safetensors",
           "description": "Manifest-keyed safetensors parameter bundle.",
           "type": "string"
+        },
+        {
+          "const": "gguf",
+          "description": "Explicitly bound GGUF LoRA factor container.",
+          "type": "string"
         }
       ]
     },

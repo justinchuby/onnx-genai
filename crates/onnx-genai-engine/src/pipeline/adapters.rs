@@ -1,18 +1,39 @@
+mod gguf;
 mod peft;
 use super::row_state::{RowScopedState, gather_rows};
 use crate::engine::memory_plan::Holder;
 use anyhow::Context;
 use onnx_genai_metadata::{
-    AdapterArtifact, AdapterScaleEncoding, AdapterServiceContract, AdapterWeightFormat,
+    AdapterArtifact, AdapterScaleEncoding, AdapterServiceContract, AdapterWeightArtifact,
+    AdapterWeightFormat,
 };
 use onnx_genai_ort::Value;
 use onnx_runtime_memory_governor::{MemoryGovernor, MemoryLease};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
+
+/// Select the first declared container format implemented by the portable
+/// adapter executor. This does not validate contents or promise device support.
+pub fn select_portable_adapter_source(
+    artifact: &AdapterArtifact,
+) -> anyhow::Result<&AdapterWeightArtifact> {
+    artifact.weights.iter().find(|weight| matches!(weight.format,AdapterWeightFormat::Json|AdapterWeightFormat::HfPeft|AdapterWeightFormat::Gguf))
+        .with_context(||format!("adapter {}@{} has no portable source; declare a supported JSON, HF PEFT or F32 GGUF LoRA artifact, or choose an executor implementing its loader capability",artifact.identity,artifact.version))
+}
+fn content_digest(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+#[derive(Clone, Copy, Serialize)]
+enum AdapterSourceIdentity {
+    Json,
+    PeftConfig([u8; 32]),
+    GgufContainer(gguf::ContainerIdentity),
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdapterActivation {
@@ -258,7 +279,7 @@ pub(super) struct AdapterTargetWeights {
 struct LoadedAdapter {
     targets: HashMap<(String, String), Vec<AdapterTargetWeights>>,
     _lease: MemoryLease,
-    peft_config_identity: Option<[u8; 32]>,
+    source_identity: AdapterSourceIdentity,
 }
 
 #[derive(Debug, Deserialize)]
@@ -428,7 +449,7 @@ impl AdapterCache {
                     scale.to_bits(),
                     self.entries
                         .get(&activation.adapter)
-                        .and_then(|entry| entry.peft_config_identity),
+                        .map(|entry| entry.source_identity),
                 ));
                 resolved.push((activation.adapter, scale));
             }
@@ -458,26 +479,30 @@ impl AdapterCache {
         artifact: &AdapterArtifact,
     ) -> anyhow::Result<()> {
         if let Some(loaded) = self.entries.get(name) {
-            if let Some(expected) = loaded.peft_config_identity {
-                let weight = artifact
-                    .weights
-                    .iter()
-                    .find(|weight| {
-                        matches!(
-                            weight.format,
-                            AdapterWeightFormat::Json | AdapterWeightFormat::HfPeft
-                        )
-                    })
-                    .context("cached adapter source disappeared")?;
-                let authority = self
-                    .authority
-                    .as_deref()
-                    .context("PEFT cache requires host-memory authority")?;
-                let (configuration, _lease) = peft::configuration(root, weight, authority)?;
-                anyhow::ensure!(
-                    peft::identity(&configuration) == expected,
-                    "PEFT adapter {name:?} configuration changed after loading; restore its immutable config or reload the package with a new adapter version before selecting it"
-                );
+            let weight = select_portable_adapter_source(artifact)?;
+            match loaded.source_identity {
+                AdapterSourceIdentity::Json => {}
+                AdapterSourceIdentity::PeftConfig(expected) => {
+                    let authority = self
+                        .authority
+                        .as_deref()
+                        .context("PEFT cache requires host-memory authority")?;
+                    let (configuration, _lease) = peft::configuration(root, weight, authority)?;
+                    anyhow::ensure!(
+                        content_digest(&configuration) == expected,
+                        "PEFT adapter {name:?} configuration changed after loading; restore its immutable config or reload the package with a new adapter version before selecting it"
+                    );
+                }
+                AdapterSourceIdentity::GgufContainer(expected) => {
+                    gguf::verify_identity(
+                        root,
+                        weight,
+                        expected,
+                        self.authority
+                            .as_deref()
+                            .context("GGUF cache requires host-memory authority")?,
+                    )?;
+                }
             }
             self.diagnostic.cache_hits += 1;
             self.touch(name);
@@ -613,23 +638,15 @@ fn load_adapter(
     artifact: &AdapterArtifact,
     authority: &dyn MemoryGovernor,
 ) -> anyhow::Result<LoadedAdapter> {
+    let weight = select_portable_adapter_source(artifact)?;
     anyhow::ensure!(
-        matches!(artifact.dtype.as_str(), "float32" | "fp32"),
-        "portable adapter normalization requires float32, but {}@{} declares {}",
+        weight.format != AdapterWeightFormat::Json
+            || matches!(artifact.dtype.as_str(), "float32" | "fp32"),
+        "portable JSON adapter normalization requires float32, but {}@{} declares {}; use F32 JSON factors or an explicitly typed HF PEFT safetensors artifact",
         artifact.identity,
         artifact.version,
         artifact.dtype
     );
-    let weight = artifact
-        .weights
-        .iter()
-        .find(|weight| matches!(weight.format, AdapterWeightFormat::Json | AdapterWeightFormat::HfPeft))
-        .with_context(|| {
-            format!(
-                "portable adapter fallback has no JSON or HF PEFT artifact for {}@{}; use an execution provider with '{}' support",
-                artifact.identity, artifact.version, service.application_capability
-            )
-        })?;
     let package_root = root
         .canonicalize()
         .with_context(|| format!("failed to resolve package root '{}'", root.display()))?;
@@ -743,17 +760,27 @@ fn load_adapter(
         "adapter artifact '{}' changed size while loading; replace model artifacts atomically between loads",
         path.display()
     );
-    let (bundles, peft_config_identity) = match weight.format {
+    let (bundles, source_identity) = match weight.format {
         AdapterWeightFormat::Json => {
             let bundle: JsonBundle = serde_json::from_slice(&bytes).with_context(|| {
                 format!("adapter artifact '{}' is invalid JSON", path.display())
             })?;
-            (bundle.targets, None)
+            (bundle.targets, AdapterSourceIdentity::Json)
         }
         AdapterWeightFormat::HfPeft => {
             let (targets, identity) =
                 peft::load(root, weight, artifact, service, &bytes, authority)?;
-            (targets, Some(identity))
+            (targets, AdapterSourceIdentity::PeftConfig(identity))
+        }
+        AdapterWeightFormat::Gguf => {
+            let targets = gguf::load(artifact, service, weight, &bytes)?;
+            (
+                targets,
+                AdapterSourceIdentity::GgufContainer(gguf::ContainerIdentity {
+                    digest: content_digest(&bytes),
+                    bytes: bytes.len() as u64,
+                }),
+            )
         }
         _ => unreachable!("supported artifact format selected above"),
     };
@@ -831,7 +858,7 @@ fn load_adapter(
     Ok(LoadedAdapter {
         targets,
         _lease: lease,
-        peft_config_identity,
+        source_identity,
     })
 }
 
