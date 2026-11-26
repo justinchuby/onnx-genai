@@ -5,7 +5,7 @@
       "targets": [
         {
           "id": "projection",
-          "component": "decoder",
+          "component": "model",
           "initializer": "projection",
           "node_name": "projection",
           "output_name": "projection.output",
