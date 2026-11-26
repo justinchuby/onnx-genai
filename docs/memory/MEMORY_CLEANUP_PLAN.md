@@ -3036,3 +3036,43 @@ narrowing with exact byte canaries, and short-producer refusal before writes.
 Existing warm governor, peak refusal/reuse/trim, public Session and real ORT
 assignment tests remain in place. These are correctness and allocation results;
 no latency or CUDA-runtime improvement is inferred.
+
+
+### Softmax admits input snapshots within the same single-lane peak
+
+Softmax no longer allocates a tensor-sized f32 Vec for input widening or layout
+materialization. A non-borrowable source now admits its required `4 * numel`
+payload, including when real Y can be written directly. This makes the previous
+owned input copy part of the workspace bound. Metadata can return Ready(full)
+for non-f32 X; only potentially borrowable f32 X with f32 Y remains Deferred.
+Actual-view refinement retains NONE for safely borrowed contiguous aligned f32
+X and eligible disjoint Y. Missing real views retain the complete bound.
+
+The admitted lane first receives every converted source element. Eligible
+contiguous f32 Y then uses the original out-of-place row/interior reducer
+reading that snapshot, including when source tensor storage overlaps Y. Other
+outputs normalize the snapshot in place before streaming narrowed output.
+Borrowable input with an ineligible Y keeps the original out-of-place reducer
+into the lane. Input/output storage conversion, arithmetic order and CPU ISA
+selection are unchanged. The interior-axis loop is shared through static source
+accessors; disjoint reduction groups finish max before overwriting, read each
+original value once for exp, then normalize their own outputs.
+
+Untransformed in-place worker runs now call the existing row kernel once for
+the whole run, matching the out-of-place batching. The scale/mask driver keeps
+its cache tiles when it actually transforms data. A static callback regression
+checks actual call spans above the tile boundary: no-transform batches once,
+while scale-only and mask routes retain both tiles. This avoids increasing
+single-thread row-kernel prologues as a consequence of snapshot reuse; it is not
+a latency measurement.
+
+No additional owner, pool or per-row grant is introduced. One StepScoped f32
+lane replaces the previous separate input/output temporary payloads; scalar
+output conversion uses the shared streaming writer. Tests retain all original
+materialized-source overlap cases, add unfunded/short refusal with unchanged
+backing bytes, compare in-place/borrowed reducer bits at boundary widths with
+NaN/Inf, and verify four storage types, both opset semantics, every axis, strided
+outputs and direct f32 outputs with real allocation positive controls. Existing
+4096 warm iterations also execute a widened source within the same retained
+allocation identity without issuer callbacks, including zero-byte callbacks.
+Rank-sized metadata can still allocate. No CUDA-runtime or latency claim is made.
