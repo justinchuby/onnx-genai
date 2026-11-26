@@ -515,7 +515,7 @@ impl Kernel for MoEKernel {
             experts,
             self.attributes.k,
             self.attributes.normalize_routing_weights,
-        );
+        )?;
         let driver =
             if use_grouped_driver(&plan, expected_fc1, hidden, inter, self.grouped_min_work) {
                 plan.build_row_slots();
@@ -685,7 +685,19 @@ struct RoutingPlan {
 }
 
 impl RoutingPlan {
-    fn build(router: &[f32], rows: usize, experts: usize, k: usize, normalize: bool) -> Self {
+    fn build(
+        router: &[f32],
+        rows: usize,
+        experts: usize,
+        k: usize,
+        normalize: bool,
+    ) -> Result<Self> {
+        if rows.checked_mul(experts) != Some(router.len()) {
+            return Err(error(format!(
+                "routing planner received {} values for rows={rows}, experts={experts}; bind rows * experts router logits",
+                router.len()
+            )));
+        }
         let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); experts];
         let mut routing = RoutingScratch::default();
         for row in 0..rows {
@@ -695,7 +707,7 @@ impl RoutingPlan {
                     None,
                     k,
                     normalize,
-                )
+                )?
                 .iter()
             {
                 per_expert[expert].push((row as u32, weight));
@@ -722,7 +734,7 @@ impl RoutingPlan {
                 slot_weight.push(weight);
             }
         }
-        Self {
+        Ok(Self {
             rows,
             k,
             slot_row,
@@ -730,7 +742,7 @@ impl RoutingPlan {
             slot_weight,
             row_slots: Vec::new(),
             groups,
-        }
+        })
     }
 
     /// Invert the layout so the final scatter can be a parallel map over
@@ -1712,45 +1724,101 @@ impl RoutingScratch {
         aggregation_weights: Option<&[f32]>,
         k: usize,
         normalize: bool,
-    ) -> &mut [(usize, f32)] {
-        self.indices.clear();
-        self.indices.extend(0..logits.len());
+    ) -> Result<&mut [(usize, f32)]> {
+        let n = logits.len();
+        self.indices.resize(n, 0);
+        self.exponentials
+            .resize(if aggregation_weights.is_none() { n } else { 0 }, 0.);
+        self.selected.resize(k.min(n), (0, 0.));
+        RoutingBuffers::new(
+            &mut self.indices,
+            &mut self.exponentials,
+            &mut self.selected,
+        )
+        .weights(logits, aggregation_weights, k, normalize)
+    }
+}
+
+/// One routing algorithm over caller-owned storage. Owned and admitted callers
+/// share score ordering, denominator order and every floating-point operation.
+pub(super) struct RoutingBuffers<'a> {
+    indices: &'a mut [usize],
+    exponentials: &'a mut [f32],
+    selected: &'a mut [(usize, f32)],
+}
+impl<'a> RoutingBuffers<'a> {
+    pub(super) fn new(
+        indices: &'a mut [usize],
+        exponentials: &'a mut [f32],
+        selected: &'a mut [(usize, f32)],
+    ) -> Self {
+        Self {
+            indices,
+            exponentials,
+            selected,
+        }
+    }
+    pub(super) fn weights(
+        self,
+        logits: &[f32],
+        aggregation_weights: Option<&[f32]>,
+        k: usize,
+        normalize: bool,
+    ) -> Result<&'a mut [(usize, f32)]> {
+        let n = logits.len();
+        let k = k.min(n);
+        let exponentials = if aggregation_weights.is_none() { n } else { 0 };
+        if self.indices.len() != n
+            || self.exponentials.len() != exponentials
+            || self.selected.len() != k
+            || aggregation_weights.is_some_and(|w| w.len() != n)
+        {
+            return Err(error(format!(
+                "routing storage/input lengths disagree: {n} logits, {} indices, {} exponentials (expected {exponentials}), {} selected routes (expected {k}), aggregation length {:?}; prepare complete routing storage and matching router weights before reading logits",
+                self.indices.len(),
+                self.exponentials.len(),
+                self.selected.len(),
+                aggregation_weights.map(<[f32]>::len)
+            )));
+        }
+        for (i, index) in self.indices.iter_mut().enumerate() {
+            *index = i;
+        }
         self.indices
             .sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]).then_with(|| a.cmp(&b)));
-        self.indices.truncate(k);
-        self.selected.clear();
+        let indices = &self.indices[..k];
         if let Some(weights) = aggregation_weights {
             let denominator = if normalize {
-                self.indices.iter().map(|&i| weights[i]).sum()
+                indices.iter().map(|&i| weights[i]).sum()
             } else {
                 1.0
             };
-            self.selected.extend(self.indices.iter().map(|&i| {
-                let weight = if denominator == 0.0 {
-                    0.0
-                } else {
-                    weights[i] / denominator
-                };
-                (i, weight)
-            }));
+            for (out, &i) in self.selected.iter_mut().zip(indices) {
+                *out = (
+                    i,
+                    if denominator == 0.0 {
+                        0.0
+                    } else {
+                        weights[i] / denominator
+                    },
+                );
+            }
         } else {
             let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            self.exponentials.clear();
-            self.exponentials
-                .extend(logits.iter().map(|&v| (v - max).exp()));
+            for (out, &value) in self.exponentials.iter_mut().zip(logits) {
+                *out = (value - max).exp();
+            }
             let all_sum: f32 = self.exponentials.iter().sum();
             let denominator = if normalize {
-                self.indices.iter().map(|&i| self.exponentials[i]).sum()
+                indices.iter().map(|&i| self.exponentials[i]).sum()
             } else {
                 all_sum
             };
-            self.selected.extend(
-                self.indices
-                    .iter()
-                    .map(|&i| (i, self.exponentials[i] / denominator)),
-            );
+            for (out, &i) in self.selected.iter_mut().zip(indices) {
+                *out = (i, self.exponentials[i] / denominator);
+            }
         }
-        &mut self.selected
+        Ok(self.selected)
     }
 }
 
@@ -1818,6 +1886,33 @@ mod routing_scratch_tests {
     }
 
     #[test]
+    fn borrowed_routing_rejects_incomplete_storage_before_mutating_it() {
+        let mut indices = [91usize; 4];
+        let mut exps = [37f32; 4];
+        let mut selected = [(99usize, 13f32); 2];
+        let logits = [f32::NAN; 4];
+        let error = super::RoutingBuffers::new(&mut indices, &mut exps, &mut selected[..1])
+            .weights(&logits, None, 2, true)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("selected routes (expected 2)"),
+            "{error}"
+        );
+        assert_eq!(indices, [91; 4]);
+        assert_eq!(exps, [37.; 4]);
+        assert_eq!(selected, [(99, 13.); 2]);
+        let error = super::RoutingBuffers::new(&mut indices, &mut [], &mut selected)
+            .weights(&logits, Some(&[1.; 3]), 2, true)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("aggregation length Some(3)"),
+            "{error}"
+        );
+        assert_eq!(indices, [91; 4]);
+        assert_eq!(selected, [(99, 13.); 2]);
+    }
+
+    #[test]
     fn reused_routing_preserves_reference_bits_across_geometry_and_special_values() {
         let mut scratch = RoutingScratch::default();
         let patterns = [
@@ -1846,14 +1941,15 @@ mod routing_scratch_tests {
                         {
                             let expected =
                                 reference_routing_weights(&logits, aggregation, k, normalize);
-                            let selected = scratch.weights(&logits, aggregation, k, normalize);
+                            let selected =
+                                scratch.weights(&logits, aggregation, k, normalize).unwrap();
                             assert_eq!(selected.len(), k.min(width));
                             assert_selection_bits(selected, &expected);
                             // BlockQuantizedMoE consumes expert-sorted selections.
                             // That mutation must not leak into the next score order.
                             selected.sort_unstable_by_key(|&(expert, _)| expert);
                             assert_selection_bits(
-                                scratch.weights(&logits, aggregation, k, normalize),
+                                scratch.weights(&logits, aggregation, k, normalize).unwrap(),
                                 &expected,
                             );
                         }
@@ -1896,7 +1992,7 @@ mod routing_scratch_tests {
                     for weights in [None, Some(aggregation.as_slice())] {
                         let expected = reference_routing_weights(&logits, weights, k, normalize);
                         assert_selection_bits(
-                            scratch.weights(&logits, weights, k, normalize),
+                            scratch.weights(&logits, weights, k, normalize).unwrap(),
                             &expected,
                         );
                     }
@@ -1911,11 +2007,11 @@ mod routing_scratch_tests {
         let logits = [2., 2., -0., 0., f32::NEG_INFINITY];
         let weights = [1., -1., 7., -7., 0.];
         assert_selection_bits(
-            scratch.weights(&logits, Some(&weights), 5, false),
+            scratch.weights(&logits, Some(&weights), 5, false).unwrap(),
             &[(0, 1.), (1, -1.), (3, -7.), (2, 7.), (4, 0.)],
         );
         assert_selection_bits(
-            scratch.weights(&logits, Some(&weights), 2, true),
+            scratch.weights(&logits, Some(&weights), 2, true).unwrap(),
             &[(0, 0.), (1, 0.)],
         );
         let logits = [
@@ -1927,7 +2023,7 @@ mod routing_scratch_tests {
             -0.,
         ];
         let ones = [1.; 6];
-        let selected = scratch.weights(&logits, Some(&ones), 6, false);
+        let selected = scratch.weights(&logits, Some(&ones), 6, false).unwrap();
         assert_eq!(
             selected.iter().map(|&(i, _)| i).collect::<Vec<_>>(),
             [0, 1, 4, 5, 2, 3]
@@ -2337,7 +2433,7 @@ mod tests {
                     })
                     .unwrap();
                 assert_eq!(req.bytes, bytes as u64);
-                let plan = RoutingPlan::build(&router_values, ROWS, E, K, true);
+                let plan = RoutingPlan::build(&router_values, ROWS, E, K, true).unwrap();
                 assert!(!one.install(|| use_grouped_driver(&plan, H, H, H, threshold)));
                 assert_eq!(
                     four.install(|| use_grouped_driver(&plan, H, H, H, threshold)),
@@ -3372,7 +3468,7 @@ mod tests {
                     let fc1_bias = bias.then(|| ramp(EXPERTS * fc1_size, 7, 0.15, 0.11));
                     let fc2_bias = bias.then(|| ramp(EXPERTS * HIDDEN, 5, 0.1, 0.07));
                     let fc3_bias = (bias && uses_fc3).then(|| ramp(EXPERTS * INTER, 3, 0.05, 0.05));
-                    let mut plan = RoutingPlan::build(&router, rows, EXPERTS, k, true);
+                    let mut plan = RoutingPlan::build(&router, rows, EXPERTS, k, true).unwrap();
                     let args = (
                         fc1_bias.as_deref(),
                         fc2_bias.as_deref(),
@@ -3456,7 +3552,7 @@ mod tests {
                     router[row * experts + expert] = ((row + expert) % experts) as f32;
                 }
             }
-            let plan = RoutingPlan::build(&router, tokens, experts, k, true);
+            let plan = RoutingPlan::build(&router, tokens, experts, k, true).unwrap();
             let fc1_size = 2 * inter;
             // Asserted on the work estimate rather than on `use_grouped_driver`
             // so the test still means something on a single-core runner, where
@@ -3495,7 +3591,7 @@ mod tests {
             router[row * EXPERTS] = 9.0;
             router[row * EXPERTS + row] = 8.0;
         }
-        let plan = RoutingPlan::build(&router, rows, EXPERTS, 2, true);
+        let plan = RoutingPlan::build(&router, rows, EXPERTS, 2, true).unwrap();
         let largest = plan.groups.iter().map(|g| g.len).max().unwrap();
         let mean = plan.slots() / plan.groups.len();
         assert!(
@@ -3640,7 +3736,7 @@ mod tests {
                         fc3_bias.as_deref(),
                         &attributes,
                     );
-                    let mut plan = RoutingPlan::build(&router, rows, EXPERTS, k, true);
+                    let mut plan = RoutingPlan::build(&router, rows, EXPERTS, k, true).unwrap();
                     plan.build_row_slots();
                     let mut backing = vec![0f32; plan.slots() * (HIDDEN + 3 * INTER) * 2];
                     let mut scratch = test_scratch(&mut backing);
@@ -3687,7 +3783,7 @@ mod tests {
             router[row * EXPERTS + (row % 3)] = 5.0;
             router[row * EXPERTS + ((row + 1) % 3)] = 4.0;
         }
-        let mut plan = RoutingPlan::build(&router, ROWS, EXPERTS, K, true);
+        let mut plan = RoutingPlan::build(&router, ROWS, EXPERTS, K, true).unwrap();
         assert_eq!(plan.slots(), ROWS * K);
         assert_eq!(plan.groups.len(), 3, "only three experts are ever selected");
         let mut expected_start = 0;
@@ -4040,7 +4136,7 @@ mod tests {
         for row in 0..ROWS {
             router[row * EXPERTS + (row % EXPERTS)] = 5.0;
         }
-        let plan = RoutingPlan::build(&router, ROWS, EXPERTS, 1, true);
+        let plan = RoutingPlan::build(&router, ROWS, EXPERTS, 1, true).unwrap();
         let slots = plan.slots();
         let input = ramp(slots * IN, 31, 0.3, 0.05);
         // Expert weights in ORT canonical `[experts][out][in]` layout.
