@@ -1790,10 +1790,10 @@ pub(crate) fn build_cuda_registry_for_contract(
     );
 
     // Cast / CastLike (NVRTC element-wise dtype conversion).
-    for (op_type, version, opset, float6) in [
-        ("Cast", 1, 1, false),
-        ("CastLike", 1, 15, false),
-        ("Cast", 28, 28, true),
+    for (op_type, version, float6) in [
+        ("Cast", 1, false),
+        ("CastLike", 1, false),
+        ("Cast", 28, true),
     ] {
         reg.register(
             OpKey::new(op_type, "", version),
@@ -1801,22 +1801,8 @@ pub(crate) fn build_cuda_registry_for_contract(
             Box::new(cast::CastFactory {
                 runtime: runtime.clone(),
                 float6,
-                opset,
             }),
         );
-    }
-    for opset in [21, 25] {
-        for op_type in ["Cast", "CastLike"] {
-            reg.register_native_only(
-                OpKey::new(op_type, "", opset),
-                onnx_runtime_ep_api::WorkspacePlanning::None,
-                Box::new(cast::CastFactory {
-                    runtime: runtime.clone(),
-                    float6: false,
-                    opset,
-                }),
-            );
-        }
     }
 
     // Reductions (sum/mean cuDNN with f32 NVRTC fallback; max/min NVRTC).
@@ -2433,12 +2419,12 @@ mod tests {
         assert_eq!(
             cast_versions,
             vec![1, 28],
-            "native packed Cast revisions must not change CUDA ORT plugin admission"
+            "standalone packed Cast dtypes must not change CUDA ORT plugin revisions"
         );
         assert_eq!(
             cast_like_versions,
             vec![1],
-            "native packed CastLike revisions must not change CUDA ORT plugin admission"
+            "standalone packed CastLike dtypes must not change CUDA ORT plugin revisions"
         );
         for descriptor in descriptors
             .iter()

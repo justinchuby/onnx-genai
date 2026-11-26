@@ -1,4 +1,4 @@
-//! Shared ONNX packed-integer storage and Cast revision rules.
+//! Shared ONNX packed-integer storage and Cast dtype rules.
 
 use crate::DataType;
 
@@ -7,7 +7,6 @@ use crate::DataType;
 pub struct PackedInteger {
     bits: u8,
     signed: bool,
-    cast_since: u64,
 }
 
 impl PackedInteger {
@@ -21,10 +20,6 @@ impl PackedInteger {
 
     pub const fn mask(self) -> u8 {
         (1_u8 << self.bits) - 1
-    }
-
-    pub const fn cast_since(self) -> u64 {
-        self.cast_since
     }
 
     /// Decode one low-bit-first storage code, sign-extending signed formats.
@@ -52,22 +47,18 @@ pub const fn packed_integer(dtype: DataType) -> Option<PackedInteger> {
         DataType::Uint4 => PackedInteger {
             bits: 4,
             signed: false,
-            cast_since: 21,
         },
         DataType::Int4 => PackedInteger {
             bits: 4,
             signed: true,
-            cast_since: 21,
         },
         DataType::Uint2 => PackedInteger {
             bits: 2,
             signed: false,
-            cast_since: 25,
         },
         DataType::Int2 => PackedInteger {
             bits: 2,
             signed: true,
-            cast_since: 25,
         },
         _ => return None,
     })
@@ -97,28 +88,12 @@ pub const fn packed_cast_peer_supported(dtype: DataType) -> bool {
     )
 }
 
-/// Explain why a Cast/CastLike dtype pair is not legal at `opset`.
+/// Explain why a Cast/CastLike dtype pair is unsupported by the packed kernel.
 pub fn cast_unsupported_reason(
     op: &str,
-    opset: u64,
     source: Option<DataType>,
     target: Option<DataType>,
 ) -> Option<String> {
-    for (role, dtype) in [("source", source), ("target", target)] {
-        let Some(dtype) = dtype else {
-            continue;
-        };
-        let Some(packed) = packed_integer(dtype) else {
-            continue;
-        };
-        if opset < packed.cast_since() {
-            return Some(format!(
-                "{op}: packed {role} dtype {dtype:?} requires opset {} or newer; \
-                 export this node at that opset or cast through an 8-bit integer tensor",
-                packed.cast_since()
-            ));
-        }
-    }
     if source.is_some_and(|dtype| packed_integer(dtype).is_some())
         || target.is_some_and(|dtype| packed_integer(dtype).is_some())
     {
@@ -157,22 +132,19 @@ mod tests {
     }
 
     #[test]
-    fn cast_revisions_follow_the_onnx_schema_history() {
-        assert!(cast_unsupported_reason("Cast", 20, Some(DataType::Uint4), None).is_some());
-        assert!(cast_unsupported_reason("Cast", 21, Some(DataType::Uint4), None).is_none());
-        assert!(cast_unsupported_reason("CastLike", 24, None, Some(DataType::Int2)).is_some());
-        assert!(cast_unsupported_reason("CastLike", 25, None, Some(DataType::Int2)).is_none());
+    fn cast_dtype_admission_is_capability_based() {
+        assert!(cast_unsupported_reason("Cast", Some(DataType::Uint4), None).is_none());
+        assert!(cast_unsupported_reason("CastLike", None, Some(DataType::Int2)).is_none());
         assert!(
             cast_unsupported_reason(
                 "Cast",
-                25,
                 Some(DataType::Uint4),
                 Some(DataType::Float8E4M3FN)
             )
             .is_some()
         );
         assert!(
-            cast_unsupported_reason("Cast", 25, Some(DataType::Float4E2M1), Some(DataType::Int2))
+            cast_unsupported_reason("Cast", Some(DataType::Float4E2M1), Some(DataType::Int2))
                 .is_some()
         );
     }

@@ -32,7 +32,7 @@
 //!
 //! Supported: `Float32`, `Float64`, `Float16`, `BFloat16`, `Int8`, `Uint8`,
 //! `Int16`, `Uint16`, `Int32`, `Uint32`, `Int64`, `Uint64`, `Bool`, plus
-//! `Uint4`/`Int4` from opset 21 and `Uint2`/`Int2` from opset 25. Float8 and
+//! `Uint4`/`Int4` and `Uint2`/`Int2`. Float8 and
 //! unrelated sub-byte floats are rejected, naming the dtype. `Int64`/`Uint64`
 //! values beyond 2⁵³ lose precision when routed through the `double` conversion
 //! lane (documented; the common token-id range is exact); `Uint64` above 2⁶³ is
@@ -268,17 +268,15 @@ fn is_half(dt: DataType) -> bool {
     matches!(dt, DataType::Float16 | DataType::BFloat16)
 }
 
-fn cast_pair_supported(src: DataType, dst: DataType, opset: u64) -> bool {
+fn cast_pair_supported(src: DataType, dst: DataType) -> bool {
     if src.is_float6() {
         matches!(
             dst,
             DataType::Float16 | DataType::BFloat16 | DataType::Float32 | DataType::Float64
         )
     } else {
-        let supported = |dtype| {
-            is_fixed_width_supported(dtype)
-                || packed_integer(dtype).is_some_and(|packed| opset >= packed.cast_since())
-        };
+        let supported =
+            |dtype| is_fixed_width_supported(dtype) || packed_integer(dtype).is_some();
         supported(src) && supported(dst)
     }
 }
@@ -296,7 +294,6 @@ fn grid_for(n: usize) -> u32 {
 pub struct CastFactory {
     pub runtime: Arc<CudaRuntime>,
     pub float6: bool,
-    pub opset: u64,
 }
 
 impl KernelFactory for CastFactory {
@@ -319,14 +316,13 @@ impl KernelFactory for CastFactory {
         } else {
             input_dtypes.get(1).copied()
         };
-        cast_unsupported_reason(&node.op_type, opset, input_dtypes.first().copied(), target)
+        cast_unsupported_reason(&node.op_type, input_dtypes.first().copied(), target)
     }
 
     fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(CastKernel {
             runtime: self.runtime.clone(),
             float6: self.float6,
-            opset: self.opset,
         }))
     }
 }
@@ -336,7 +332,6 @@ impl KernelFactory for CastFactory {
 pub struct CastKernel {
     runtime: Arc<CudaRuntime>,
     float6: bool,
-    opset: u64,
 }
 
 impl CastKernel {
@@ -358,10 +353,9 @@ impl CastKernel {
                 "FLOAT6 widening requires standard Cast at opset 28 or newer",
             ));
         }
-        if !cast_pair_supported(src, dst, self.opset) {
+        if !cast_pair_supported(src, dst) {
             return Err(not_implemented(format!(
-                "Cast {src:?} to {dst:?} at opset {}; use f32/f64/f16/bf16/int8-64/uint8-64/bool, use UINT4/INT4 at opset 21+, UINT2/INT2 at opset 25+, or widen a FLOAT6 source to f16, bf16, f32, or f64",
-                self.opset
+                "Cast {src:?} to {dst:?}; use f32/f64/f16/bf16/int8-64/uint8-64/bool or UINT2/INT2/UINT4/INT4, or widen a FLOAT6 source to f16, bf16, f32, or f64"
             )));
         }
         if !x.is_contiguous() || !outputs[0].is_contiguous() {
@@ -383,7 +377,7 @@ impl CastKernel {
         }
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-        launch_cast_raw_for_opset(&self.runtime, x_ptr, src, y_ptr, dst, n, self.opset)?;
+        launch_cast_raw(&self.runtime, x_ptr, src, y_ptr, dst, n)?;
         if self.runtime.is_capturing()? {
             Ok(())
         } else {
@@ -412,22 +406,10 @@ pub(crate) fn launch_cast_raw(
     dst_dtype: DataType,
     n: usize,
 ) -> Result<()> {
-    launch_cast_raw_for_opset(runtime, src_ptr, src_dtype, dst_ptr, dst_dtype, n, 18)
-}
-
-fn launch_cast_raw_for_opset(
-    runtime: &CudaRuntime,
-    src_ptr: CUdeviceptr,
-    src_dtype: DataType,
-    dst_ptr: CUdeviceptr,
-    dst_dtype: DataType,
-    n: usize,
-    opset: u64,
-) -> Result<()> {
     if n == 0 {
         return Ok(());
     }
-    if !cast_pair_supported(src_dtype, dst_dtype, opset) {
+    if !cast_pair_supported(src_dtype, dst_dtype) {
         return Err(not_implemented(format!(
             "cuda_ep Cast: unsupported dtype pair {src_dtype:?} -> {dst_dtype:?}"
         )));
@@ -529,10 +511,8 @@ mod tests {
 
     #[test]
     fn unsupported_dtypes_are_rejected() {
-        assert!(!cast_pair_supported(DataType::Uint8, DataType::Int4, 20));
-        assert!(cast_pair_supported(DataType::Uint8, DataType::Int4, 21));
-        assert!(!cast_pair_supported(DataType::Int2, DataType::Float32, 24));
-        assert!(cast_pair_supported(DataType::Int2, DataType::Float32, 25));
+        assert!(cast_pair_supported(DataType::Uint8, DataType::Int4));
+        assert!(cast_pair_supported(DataType::Int2, DataType::Float32));
         assert!(is_fixed_width_supported(DataType::Float32));
         assert!(is_fixed_width_supported(DataType::BFloat16));
     }

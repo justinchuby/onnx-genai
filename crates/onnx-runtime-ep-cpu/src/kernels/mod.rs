@@ -1606,41 +1606,18 @@ pub(crate) fn build_cpu_registry_with_resources(
     rec.register(
         OpKey::new("Cast", "", 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(cast::CastFactory {
-            float6: false,
-            opset: 1,
-        }),
+        Box::new(cast::CastFactory { float6: false }),
     );
-    for opset in [21, 25] {
-        rec.register_native_only(
-            OpKey::new("Cast", "", opset),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(cast::CastFactory {
-                float6: false,
-                opset,
-            }),
-        );
-    }
     rec.register(
         OpKey::new("Cast", "", 28),
         onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(cast::CastFactory {
-            float6: true,
-            opset: 28,
-        }),
+        Box::new(cast::CastFactory { float6: true }),
     );
     rec.register(
         OpKey::new("CastLike", "", 15),
         onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(cast::CastLikeFactory { opset: 15 }),
+        Box::new(cast::CastLikeFactory),
     );
-    for opset in [21, 25] {
-        rec.register_native_only(
-            OpKey::new("CastLike", "", opset),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(cast::CastLikeFactory { opset }),
-        );
-    }
     rec.register(
         OpKey::new("BitCast", "", 26),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -3944,7 +3921,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_cast_revisions_are_native_only_in_plugin_descriptors() {
+    fn packed_cast_dtypes_do_not_expand_plugin_descriptors() {
         let (registry, descriptors) = build_cpu_registry_with_descriptors();
         for opset in [21, 25] {
             assert!(registry.supports("Cast", "", opset));
@@ -3974,7 +3951,7 @@ mod tests {
             ] {
                 assert!(
                     !descriptor.supported_dtypes.contains(&packed),
-                    "CPU ORT plugin descriptor {:?} must keep rejecting packed dtype {packed:?}",
+                    "CPU ORT plugin descriptor {:?} must not advertise standalone packed dtype {packed:?}",
                     descriptor.op_type
                 );
             }

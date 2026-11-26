@@ -124,16 +124,14 @@ fn packed_integer_cast_cuda_matches_strict_reference_bytes() {
     let mut node = Node::new(NodeId(0), "Cast", vec![], vec![]);
     node.attributes
         .insert("to".into(), Attribute::Int(DataType::Uint4 as i64));
-    let rejected = ep.supports_op(&node, 20, &[shape.clone()], &[DataType::Uint8], &[]);
     assert!(
-        rejected
-            .reason()
-            .is_some_and(|reason| reason.contains("opset 21")),
-        "UINT4 Cast must be rejected before opset 21: {:?}",
-        rejected.reason()
+        ep.supports_op(&node, 1, &[shape.clone()], &[DataType::Uint8], &[])
+            .is_supported()
     );
+    node.attributes
+        .insert("to".into(), Attribute::Int(DataType::Int2 as i64));
     assert!(
-        ep.supports_op(&node, 21, &[shape], &[DataType::Uint8], &[])
+        ep.supports_op(&node, 1, &[shape], &[DataType::Uint8], &[])
             .is_supported()
     );
     node.attributes
@@ -160,21 +158,21 @@ fn packed_integer_cast_cuda_matches_strict_reference_bytes() {
     let cases = [
         (
             "uint8-to-uint4-codes-and-zero-points",
-            21,
+            1,
             input(DataType::Uint8, &[7], &[0u8, 1, 7, 8, 15, 16, 255]),
             DataType::Uint4,
             vec![0x10, 0x87, 0x0f, 0x0f],
         ),
         (
             "uint4-to-int2-between-packed-types",
-            25,
+            1,
             input(DataType::Uint4, &[5], &[0x10u8, 0x87, 0xff]),
             DataType::Int2,
             vec![0x34, 0x03],
         ),
         (
             "int2-to-int4-sign-extension",
-            25,
+            1,
             input(DataType::Int2, &[5], &[0x34u8, 0x03]),
             DataType::Int4,
             vec![0x10, 0x0f, 0x0f],
@@ -222,7 +220,7 @@ fn packed_integer_cast_cuda_matches_strict_reference_bytes() {
         run_cpu(
             "Cast",
             "",
-            21,
+            1,
             std::slice::from_ref(&floats),
             &outputs,
             &attrs
@@ -230,7 +228,7 @@ fn packed_integer_cast_cuda_matches_strict_reference_bytes() {
         expected
     );
     assert_eq!(
-        run_cuda(&ep, "Cast", "", 21, &[floats], &outputs, &attrs)[0],
+        run_cuda(&ep, "Cast", "", 1, &[floats], &outputs, &attrs)[0],
         expected
     );
 
@@ -242,7 +240,7 @@ fn packed_integer_cast_cuda_matches_strict_reference_bytes() {
         run_cpu(
             "CastLike",
             "",
-            25,
+            15,
             &[source.clone(), target.clone()],
             &outputs,
             &[],
@@ -250,7 +248,7 @@ fn packed_integer_cast_cuda_matches_strict_reference_bytes() {
         expected
     );
     assert_eq!(
-        run_cuda(&ep, "CastLike", "", 25, &[source, target], &outputs, &[])[0],
+        run_cuda(&ep, "CastLike", "", 15, &[source, target], &outputs, &[])[0],
         expected
     );
 }
