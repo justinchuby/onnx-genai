@@ -1161,7 +1161,7 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
 /// Build all factories against one immutable set of session memory resources.
 pub(crate) fn build_cpu_registry_with_resources(
     resources: crate::CpuMemoryResources,
-    native_linear_quantization: bool,
+    standalone: bool,
 ) -> OpRegistry {
     let host_cache = resources.expert_cache().clone();
     let derived_weights = resources.weight_memory().clone();
@@ -1752,7 +1752,7 @@ pub(crate) fn build_cpu_registry_with_resources(
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(gemm::GemmFactory::new(resources.clone())),
     );
-    quantization::register_linear_quantization(&mut rec, native_linear_quantization);
+    quantization::register_linear_quantization(&mut rec, standalone);
     rec.register(
         OpKey::new("DequantizePacked", "", 29),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -1775,11 +1775,26 @@ pub(crate) fn build_cpu_registry_with_resources(
     rec.register(
         OpKey::new("QLinearMatMul", "", 10),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
-        Box::new(qlinear_matmul::QLinearMatMulFactory::new(
-            retain_caches,
-            derived_weights.clone(),
-        )),
+        Box::new(
+            qlinear_matmul::QLinearMatMulFactory::new(retain_caches, derived_weights.clone())
+                .with_scale_support(
+                    onnx_runtime_ir::qlinear_matmul::ScaleSupport::for_standalone(standalone),
+                ),
+        ),
     );
+    if standalone {
+        let version = onnx_runtime_ir::qlinear_matmul::HALF_SCALE_SINCE_VERSION;
+        rec.register(
+            OpKey::new("QLinearMatMul", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+            Box::new(
+                qlinear_matmul::QLinearMatMulFactory::new(retain_caches, derived_weights.clone())
+                    .with_scale_support(
+                        onnx_runtime_ir::qlinear_matmul::ScaleSupport::FloatAndHalf,
+                    ),
+            ),
+        );
+    }
     // --- Additional ep-cpu op coverage (op-coverage wave) ---------------------
     // Elementwise unary math (f32). Additive, default-domain-only registrations.
     rec.register(
@@ -3685,10 +3700,11 @@ mod tests {
         // Opset-28 Cast adds one registration.
         // MeanVarianceNormalization-29 adds one registration.
         // Cast and CastLike each add FP8 registrations at opsets 19 and 24.
+        // Standalone QLinearMatMul-21 adds one registration.
         assert_eq!(
             reg.len(),
             PHASE1_OPS.len()
-                + 129
+                + 130
                 + mlas_registrations
                 + onnx_runtime_ir::roi_align::VERSIONS.len()
         );

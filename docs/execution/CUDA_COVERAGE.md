@@ -270,13 +270,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Mish`, `Celu`, `IsInf`, `IsNaN`, `PRelu`, `LogSoftmax`, `Hardmax` | `` | ✅ | **NVRTC-custom** | Implemented activation, predicate, and softmax-family kernels with dtype/attribute bounds locked by the conformance profile. |
 | `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `BitwiseNot`, `BitShift` | `` | ✅ | **NVRTC-custom** | Integer bitwise family, including broadcasting and CPU-matched over-shift behavior. |
 | `ConstantOfShape`, `OneHot`, `TensorScatter` | `` | ✅ | **NVRTC / device materialization** | Shape-driven construction and fixed-capacity scatter paths with explicit dtype, bounds, and capture checks. |
-| `QuantizeLinear`, `DequantizeLinear`, `QLinearMatMul`, `DynamicQuantizeLinear` | `` | ✅ | **NVRTC quantization** | Per-tensor/per-axis constraints and supported integer storage are enforced by each kernel's claim gate. |
-
-Standalone INT16/UINT16 `QuantizeLinear` and `DequantizeLinear` support scalar
-scales from opset 10, per-axis scales from opset 13, and blocked scales from
-opset 21. Before opset 21, quantization needs a typed zero point to select
-16-bit storage. Opset 23 adds explicit division `precision` and independently
-typed floating dequantization output.
+| `QuantizeLinear`, `DequantizeLinear`, `DynamicQuantizeLinear` | `` | ✅ | **NVRTC quantization** | Per-tensor/per-axis constraints and supported integer storage are enforced by each kernel's claim gate. |
+| `QLinearMatMul` | `` | ✅ | **NVRTC quantization** | Int8/Uint8 operands and output. Standalone nxrt accepts a common scale dtype of Float32, Float16, or BFloat16 at opset 10+. Half scales before opset 21 are an nxrt extension, not ONNX conformance. The ORT plugin still requires Float32 scales. FP8 storage is not supported. |
 | `DequantizePacked` | `` | ✅ | **NVRTC block decode** | All 27 opset-29 GGUF profiles decode directly from device-resident UINT8 payloads into FLOAT, FLOAT16, BFLOAT16, or DOUBLE. |
 | `Dropout`, `NonZero` | `` | ✅ | **NVRTC-custom** | Inference Dropout and bounded dynamic-output coordinate extraction; dynamic metadata paths decline capture where host materialization is required. |
 | `Resize`, `GridSample` | `` | ✅ | **NVRTC-custom** | Implemented interpolation/sampling subsets; unsupported coordinate modes and sampling policies fail closed. |
@@ -285,6 +280,12 @@ typed floating dequantization output.
 | `RoiAlign` | `` | ✅ | **NVRTC-custom** | Standalone nxrt only, opsets 10/16/22. Supports f16/f32/f64 (bf16 from opset 22), Int64 batch indices, average/max pooling, and fixed/adaptive sampling. Device-side index validation requires eager execution; the ORT CUDA plugin does not advertise this op. |
 
 <!-- CUDA_COVERAGE_MATRIX_END -->
+
+Standalone INT16/UINT16 `QuantizeLinear` and `DequantizeLinear` support scalar
+scales from opset 10, per-axis scales from opset 13, and blocked scales from
+opset 21. Before opset 21, quantization needs a typed zero point to select
+16-bit storage. Opset 23 adds explicit division `precision` and independently
+typed floating dequantization output.
 
 ### Exporting quantized expert projections
 

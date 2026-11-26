@@ -60,7 +60,7 @@ use common::{
 };
 use onnx_runtime_ep_api::ExecutionProvider;
 use onnx_runtime_ep_cuda::{CUDA_COVERED_OPS, CudaExecutionProvider};
-use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, static_shape};
+use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, ValueId, static_shape};
 
 #[test]
 #[cfg_attr(
@@ -554,6 +554,173 @@ fn qlinear_matmul_cases() -> Vec<Case> {
             compare: Compare::ExactBytes,
         },
     ]
+}
+
+#[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA")]
+fn qlinear_matmul_scale_types_match_expected_integer_bytes() {
+    let ep = require_cuda();
+    for case in qlinear_matmul_cases() {
+        run_case(&ep, &case);
+    }
+    for (opset, scale_dtype) in [
+        (10, DataType::Float32),
+        (10, DataType::Float16),
+        (10, DataType::BFloat16),
+        (21, DataType::Float16),
+        (21, DataType::BFloat16),
+    ] {
+        let mut case = Case {
+            label: format!("QLinearMatMul-{opset}[{scale_dtype:?},per-row-column,ties]"),
+            op: "QLinearMatMul",
+            domain: "",
+            opset,
+            inputs: vec![
+                input(DataType::Uint8, &[2, 1], &[4u8, 6]),
+                float_input(scale_dtype, &[2], &[0.5, 1.5]),
+                input(DataType::Uint8, &[2], &[3u8, 3]),
+                input(DataType::Int8, &[1, 2], &[2i8, -2]),
+                float_input(scale_dtype, &[2], &[1.0, 0.5]),
+                input(DataType::Int8, &[2], &[1i8, -1]),
+                float_input(scale_dtype, &[], &[1.0]),
+                input(DataType::Uint8, &[], &[10u8]),
+            ],
+            outputs: vec![(DataType::Uint8, vec![2, 2])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        };
+        assert_eq!(
+            run_case(&ep, &case),
+            vec![vec![10, 10, 14, 8]],
+            "{}",
+            case.label
+        );
+        case.inputs[6] = float_input(scale_dtype, &[], &[f32::NAN]);
+        let err = try_run_cuda(
+            &ep,
+            case.op,
+            case.domain,
+            case.opset,
+            &case.inputs,
+            &case.outputs,
+            &case.attrs,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("y_scale values must be finite and positive"),
+            "{err}"
+        );
+    }
+
+    for (dtype, scales, accumulator, output_zero, expected) in [
+        (DataType::Float16, [0.2, 0.75, 0.2], 2u8, 0u8, 1),
+        (DataType::BFloat16, [0.5, 1024.0, 76.0], 2, 0, 14),
+        (DataType::Float16, [256.0; 3], 1, 0, 255),
+        (
+            DataType::BFloat16,
+            [f32::from_bits(0x5f80_0000); 3],
+            1,
+            0,
+            255,
+        ),
+        (DataType::Float16, [256.0; 3], 0, 17, 0),
+        (
+            DataType::BFloat16,
+            [f32::from_bits(0x5f80_0000); 3],
+            0,
+            17,
+            0,
+        ),
+    ] {
+        let [a_scale, b_scale, y_scale] = scales.map(|scale| float_input(dtype, &[], &[scale]));
+        let case = Case {
+            label: format!("QLinearMatMul-21[{dtype:?},scale-arithmetic,{scales:?}]"),
+            op: "QLinearMatMul",
+            domain: "",
+            opset: 21,
+            inputs: vec![
+                input(DataType::Uint8, &[1, 1], &[accumulator]),
+                a_scale,
+                input(DataType::Uint8, &[], &[0u8]),
+                input(DataType::Int8, &[1, 1], &[1i8]),
+                b_scale,
+                input(DataType::Int8, &[], &[0i8]),
+                y_scale,
+                input(DataType::Uint8, &[], &[output_zero]),
+            ],
+            outputs: vec![(DataType::Uint8, vec![1, 1])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        };
+        assert_eq!(run_case(&ep, &case), vec![vec![expected]], "{}", case.label);
+    }
+}
+
+#[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA")]
+fn qlinear_matmul_half_scale_admission_is_native_only() {
+    let native = require_cuda();
+    let legacy = CudaExecutionProvider::new_for_ort_plugin().expect("construct legacy CUDA EP");
+    let node = Node::new(
+        NodeId(0),
+        "QLinearMatMul",
+        (0..8).map(|id| Some(ValueId(id))).collect(),
+        vec![ValueId(8)],
+    );
+    let mut case = qlinear_matmul_cases().remove(0);
+    case.opset = 21;
+    let shapes: Vec<_> = case
+        .inputs
+        .iter()
+        .map(|tensor| static_shape(tensor.shape.iter().copied()))
+        .collect();
+    let mut dtypes: Vec<_> = case.inputs.iter().map(|tensor| tensor.dtype).collect();
+    for dtype in [DataType::Float16, DataType::BFloat16] {
+        for index in [1, 4, 6] {
+            dtypes[index] = dtype;
+        }
+        assert!(
+            native
+                .supports_op(&node, 21, &shapes, &dtypes, &[])
+                .is_supported()
+        );
+        assert!(
+            !native
+                .supports_op(&node, 9, &shapes, &dtypes, &[])
+                .is_supported()
+        );
+        assert!(
+            native
+                .supports_op(&node, 10, &shapes, &dtypes, &[])
+                .is_supported()
+        );
+        assert!(
+            !legacy
+                .supports_op(&node, 10, &shapes, &dtypes, &[])
+                .is_supported()
+        );
+        assert!(
+            !legacy
+                .supports_op(&node, 21, &shapes, &dtypes, &[])
+                .is_supported()
+        );
+    }
+
+    let descriptors = onnx_runtime_ep_cuda::build_cuda_registry_descriptors(legacy.registry());
+    let entries: Vec<_> = descriptors
+        .iter()
+        .filter(|op| op.op_type == "QLinearMatMul" && op.domain.is_empty())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        (entries[0].since_version, entries[0].end_version),
+        (10, u64::MAX)
+    );
+    for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+        assert!(entries[0].supported_dtypes.contains(&dtype));
+    }
+    assert_eq!(run_case(&legacy, &case), run_case(&native, &case));
 }
 
 fn resize_cases() -> Vec<Case> {

@@ -72,6 +72,7 @@ pub mod packed_integer;
 pub mod packed_matmul;
 pub mod packed_routed;
 pub mod pattern;
+pub mod qlinear_matmul;
 pub mod quantized_grouped;
 pub mod quantized_matmul;
 pub mod roi_align;
