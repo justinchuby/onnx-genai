@@ -3375,8 +3375,7 @@ an incorrect empty count). Boundary checks cover both view kinds, zero axes in
 each position, true nonempty/byte overflow, scalar geometry, unsigned stride
 magnitudes and packed counts exceeding i64 without reading device pointers.
 Contiguous stride construction is covered by the following migration; other
-unvalidated geometry helpers, including TensorLayout::storage_size, remain a
-separate audit.
+unvalidated geometry helpers remain a separate audit.
 
 ### Fallible stride construction shares an allocation-free checked plan
 
@@ -3410,3 +3409,18 @@ and high ranks, unchanged buffers on failure, legal reuse, both ORT shape hooks,
 output preflight and the real Compute callback with a fake ABI. A positive-control
 allocator witness checks repeated plan/fill without temporary allocations. This
 is not a latency measurement; CUDA remains compilation-only on this host.
+
+### Remove unused layout storage-size estimation
+
+TensorLayout::storage_size is removed with its sole method-specific test; there
+were no production consumers. Existing transpose/layout tests remain. No
+replacement estimate, alias or compatibility interface is added.
+
+The method mixed logical dense bytes with a strided address span and physical
+allocation capacity, and its independent arithmetic did not handle empty,
+packed, negative-stride and overflow cases consistently. Logical bytes continue
+to use checked_expected_bytes. Strided bounds depend on signed strides,
+byte_offset and actual backing length at existing execution boundaries. Memory
+admission and refund continue to use the real owner's retained capacity, rather
+than estimating it from a layout. This removes unused API surface without adding
+runtime work or changing allocation/grant behavior.
