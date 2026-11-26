@@ -3595,7 +3595,6 @@ fn celu28_native_cuda_matches_typed_schema() {
     // Pinned ONNX 622adf94: Celu-28 expanded through Elu-22, via NumPy
     // with round-to-nearest-even after each typed node (not op_celu.py).
     let x = [-0.001, -0.01, -0.5, 100.125, -0.0, f32::NEG_INFINITY];
-    let node = Node::new(NodeId(0), "Celu", vec![Some(ValueId(0))], vec![ValueId(1)]);
     for (dtype, expected) in [
         (
             DataType::Float16,
@@ -3610,10 +3609,6 @@ fn celu28_native_cuda_matches_typed_schema() {
         assert_eq!(y, common::raw(&expected), "{dtype:?}");
     }
 
-    for dtype in [DataType::Float16, DataType::BFloat16, DataType::Float64] {
-        let old = ep.supports_op(&node, 27, &[static_shape([6])], &[dtype], &[]);
-        assert!(old.reason().unwrap().contains("Float32"), "{dtype:?}");
-    }
     let x = [-0.001, -0.01, -0.5, 100.125, -0.0, f64::INFINITY, f64::NAN];
     let y = run(28, input(DataType::Float64, &[7], &x), Some(1.3));
     let y: Vec<_> = y
@@ -3632,6 +3627,7 @@ fn celu28_native_cuda_matches_typed_schema() {
             "got {got}, want {expected}"
         );
     }
+
     assert_eq!(y[4].to_bits(), (-0.0f64).to_bits());
     assert_eq!(y[5], f64::INFINITY);
     assert!(y[6].is_nan());
@@ -3658,5 +3654,38 @@ fn celu28_native_cuda_matches_typed_schema() {
         } else {
             (y - expected).abs() < 2e-7
         });
+    }
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+#[test]
+fn celu12_native_cuda_preserves_legacy_float_dtypes() {
+    let ep = require_cuda();
+    let node = Node::new(NodeId(0), "Celu", vec![Some(ValueId(0))], vec![ValueId(1)]);
+    for opset in [12, 27] {
+        let double = ep.supports_op(
+            &node,
+            opset,
+            &[static_shape([3])],
+            &[DataType::Float64],
+            &[],
+        );
+        assert!(
+            !double.is_supported(),
+            "legacy CUDA Celu has no double kernel"
+        );
+        for dtype in [DataType::Float16, DataType::BFloat16] {
+            let y = run_cuda(
+                &ep,
+                "Celu",
+                "",
+                opset,
+                &[float_input(dtype, &[3], &[2.0, -2.0, -0.0])],
+                &[(dtype, vec![3])],
+                &[("alpha", Attribute::Float(-2.0))],
+            );
+            let expected = float_input(dtype, &[3], &[2.0, -3.436_563_7, 0.0]);
+            assert_eq!(y[0], expected.bytes, "{dtype:?} at opset {opset}");
+        }
     }
 }

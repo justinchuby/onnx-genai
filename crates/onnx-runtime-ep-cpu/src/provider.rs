@@ -524,7 +524,7 @@ impl ExecutionProvider for CpuExecutionProvider {
             && onnx_runtime_ir::is_default_domain(&op.domain)
             && let Some(&dtype) = input_dtypes.first()
         {
-            let allowed = crate::kernels::celu_dtypes(opset);
+            let allowed = crate::kernels::supported_dtypes_for_op("Celu", "");
             if !allowed.contains(&dtype) {
                 deny!("Celu at opset {opset}: X dtype {dtype:?} is unsupported; use {allowed:?}");
             }

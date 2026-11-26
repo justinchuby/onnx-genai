@@ -453,7 +453,7 @@ fn celu_dtypes(opset: u64) -> &'static [DataType] {
     if opset >= 28 {
         CELU28_DTYPES
     } else {
-        &[DataType::Float32]
+        CUDA_FLOAT_DTYPES
     }
 }
 
@@ -1648,6 +1648,10 @@ pub(crate) fn build_cuda_registry_for_contract(
         }),
     );
     let celu12 = OpKey::new("Celu", "", 12);
+    let legacy = Box::new(ActivationFactory {
+        name: "Celu",
+        runtime: runtime.clone(),
+    });
     if matches!(
         conv_transpose_contract,
         conv_transpose::Contract::Standalone
@@ -1656,28 +1660,17 @@ pub(crate) fn build_cuda_registry_for_contract(
             celu12,
             27,
             onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(activations::NativeCeluFactory {
-                runtime: runtime.clone(),
-                typed: false,
-            }),
+            legacy,
         );
         reg.register(
             OpKey::new("Celu", "", 28),
             onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(activations::NativeCeluFactory {
+            Box::new(activations::Celu28Factory {
                 runtime: runtime.clone(),
-                typed: true,
             }),
         );
     } else {
-        reg.register(
-            celu12,
-            onnx_runtime_ep_api::WorkspacePlanning::None,
-            Box::new(ActivationFactory {
-                name: "Celu",
-                runtime: runtime.clone(),
-            }),
-        );
+        reg.register(celu12, onnx_runtime_ep_api::WorkspacePlanning::None, legacy);
     }
     reg.register(
         OpKey::new("Swish", "", 24),

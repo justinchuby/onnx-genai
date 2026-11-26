@@ -122,7 +122,9 @@ shapes, attributes, opsets, optional inputs, or contrib-domain fused kernels.
 
 The standalone CPU and CUDA EPs register `Celu-28` for Float16, BFloat16,
 Float32, and Float64, with alpha and intermediate results rounded in the
-tensor dtype. Opsets 12–27 retain the legacy Float32 implementation. The
+tensor dtype. Opsets 12–27 retain the legacy implementation and accept
+Float16, BFloat16, and Float32 on both EPs, plus Float64 on CPU. The additional
+pre-28 dtypes are standalone runtime extensions, not ONNX Celu-12 schema types. The
 focused `celu28_native_cpu_matches_typed_schema` and
 `celu28_native_cuda_matches_typed_schema` tests compare against golden results
 from the [pinned ONNX function](https://github.com/onnx/onnx/blob/622adf94d4e720142950aa8178f7357d52e63db0/onnx/defs/math/defs.cc#L398-L422).

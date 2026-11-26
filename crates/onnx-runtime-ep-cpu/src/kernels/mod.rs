@@ -350,10 +350,6 @@ pub fn output_dtype_constraints_for_op(
     }
 }
 
-pub(crate) fn celu_dtypes(opset: u64) -> &'static [DataType] {
-    if opset >= 28 { FLOAT_DTYPES } else { F32_ONLY }
-}
-
 /// Determine the supported dtypes for a given (op_type, domain) based on the
 /// actual kernel dispatch implementation. Fail closed: unknown ops get f32 only.
 pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataType] {
@@ -1906,7 +1902,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     // opset keeps older models routing to whatever handled them before.
     let celu12 = OpKey::new("Celu", "", 12);
     let legacy = Box::new(activations::CeluFactory {
-        f32_only: standalone_celu,
+        require_same_dtype: standalone_celu,
     });
     if standalone_celu {
         rec.register_through(
