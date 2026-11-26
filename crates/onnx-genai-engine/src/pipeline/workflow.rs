@@ -3068,11 +3068,7 @@ impl WorkflowRuntime {
                     format!("workflow references unknown execution island {id}")
                 })?;
                 telemetry.component_invocations += island.component_count() as u64;
-                island.run(
-                    values,
-                    component_overrides,
-                    onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
-                )?;
+                island.run(values, component_overrides)?;
                 telemetry.record_stage(format!("island:{id}"), stage_started.elapsed().as_nanos());
             }
         }
@@ -3423,10 +3419,7 @@ impl WorkflowRuntime {
                         .output_names()
                         .iter()
                         .cloned()
-                        .zip(session.run(
-                            resolved,
-                            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
-                        )?)
+                        .zip(session.run(resolved)?)
                         .collect())
                 }
             }
@@ -3476,10 +3469,7 @@ impl WorkflowRuntime {
                 .output_names()
                 .iter()
                 .cloned()
-                .zip(session.run(
-                    resolved,
-                    onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
-                )?)
+                .zip(session.run(resolved)?)
                 .collect::<HashMap<_, _>>();
             return selected_outputs
                 .keys()
@@ -3587,10 +3577,7 @@ impl WorkflowRuntime {
                 .output_names()
                 .iter()
                 .cloned()
-                .zip(session.run(
-                    resolved,
-                    onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
-                )?)
+                .zip(session.run(resolved)?)
                 .collect::<HashMap<_, _>>();
             if selected_outputs
                 .keys()
