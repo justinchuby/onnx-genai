@@ -22,7 +22,7 @@ mod common;
 
 use common::{FloatDType, PreparedKernel, Tensor};
 use half::bf16;
-use onnx_runtime_ep_api::{ExecutionProvider, OutputMetadata, TensorView};
+use onnx_runtime_ep_api::{ExecutionProvider, TensorView};
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::{Attribute, DataType, Node, NodeId};
 
@@ -79,15 +79,15 @@ fn try_run_case(case: &OpCase, dtype: FloatDType) -> onnx_runtime_ep_api::Result
         })
         .collect();
 
-    let kernel = CpuExecutionProvider::new().get_kernel(&node, &input_shapes, case.opset)?;
+    let cpu = CpuExecutionProvider::new();
+    let kernel = cpu.get_kernel(&node, &input_shapes, case.opset)?;
 
     let inputs = build_tensors(&case.inputs, dtype);
     let mut output = Tensor::zeros(dtype, &case.out_shape);
 
     let views: Vec<TensorView<'_>> = inputs.iter().map(|t| t.view()).collect();
     let mut out_view = [output.view_mut()];
-    let output_metadata = [OutputMetadata::from_view(&out_view[0])];
-    let mut kernel = PreparedKernel::new(kernel, &views, &output_metadata);
+    let mut kernel = PreparedKernel::new(&cpu, kernel, &views, &out_view);
     kernel.execute(&views, &mut out_view)?;
     Ok(output.to_f32())
 }

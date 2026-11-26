@@ -9,18 +9,30 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::{Attribute, DataType, DeviceId, Node, NodeId, compute_contiguous_strides};
 
-/// Benchmark-owned workspace, prepared outside timed loops. Exclusive mutable
-/// access keeps repeated calls on one lane without locks or unsafe Sync claims.
-pub struct PreparedKernel {
+/// Fixed-geometry benchmark workspace. Metadata preparation is cached, but each
+/// launch must refine a fresh execution plan using the current storage origins.
+/// Tensor facts and scratch are allocated once, outside the timed loop.
+/// This adapter owns ordinary benchmark Vec storage, not governed admission.
+pub struct PreparedKernel<'a> {
     kernel: Box<dyn Kernel>,
     scratch: Vec<u128>,
+    metadata: Vec<onnx_runtime_ep_api::TensorMetadata<'a>>,
+    output_metadata: Vec<onnx_runtime_ep_api::OutputMetadata<'static>>,
+    cached: onnx_runtime_ep_api::WorkspacePreparation,
+    context_reader: onnx_runtime_ep_api::WorkspaceContextReader,
+    context_key: onnx_runtime_ep_api::WorkspaceContextKey,
+    // A context callback is not a provider/module keepalive.
+    _provider: &'a dyn ExecutionProvider,
 }
-impl PreparedKernel {
+impl<'a> PreparedKernel<'a> {
     pub fn new(
+        provider: &'a dyn ExecutionProvider,
         kernel: Box<dyn Kernel>,
-        inputs: &[TensorView],
-        outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+        inputs: &[TensorView<'a>],
+        outputs: &[TensorMut],
     ) -> Self {
+        let context_reader = provider.workspace_preparation_context();
+        let context_key = context_reader.read();
         let metadata: Vec<_> = inputs
             .iter()
             .map(|input| {
@@ -31,16 +43,40 @@ impl PreparedKernel {
                 )
             })
             .collect();
+        let output_metadata: Vec<_> = outputs
+            .iter()
+            .map(|output| onnx_runtime_ep_api::OutputMetadata::from_view(output).into_owned())
+            .collect();
+        let cached = kernel
+            .workspace_requirement(&metadata, &output_metadata)
+            .expect("benchmark metadata preparation must succeed");
         let req = kernel
-            .workspace_requirement_for_execution(inputs, &[], &metadata, outputs, None)
-            .expect("benchmark workspace planning must succeed")
+            .workspace_requirement_for_execution(
+                inputs,
+                outputs,
+                &metadata,
+                &output_metadata,
+                Some(cached),
+            )
+            .expect("benchmark execution preparation must succeed")
             .require_ready()
-            .expect("CPU benchmark plan must be ready");
-        assert!(req.alignment <= std::mem::align_of::<u128>());
+            .expect("benchmark requires a complete plan without bound workspace refinement");
+        assert!(
+            req.alignment.is_power_of_two() && req.alignment <= std::mem::align_of::<u128>(),
+            "benchmark workspace alignment {} must be a power of two within the u128 scratch alignment {}; use a valid suitably aligned owner",
+            req.alignment,
+            std::mem::align_of::<u128>()
+        );
         let bytes = usize::try_from(req.bytes).expect("benchmark workspace must be addressable");
         Self {
             kernel,
             scratch: vec![0; bytes.div_ceil(16)],
+            metadata,
+            output_metadata,
+            cached,
+            context_reader,
+            context_key,
+            _provider: provider,
         }
     }
     pub fn execute(
@@ -48,10 +84,58 @@ impl PreparedKernel {
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
     ) -> onnx_runtime_ep_api::Result<()> {
-        let workspace = (!self.scratch.is_empty()).then(|| {
+        let current_context = self.context_reader.read();
+        if current_context != self.context_key {
+            return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                "benchmark provider workspace context changed from {:?} to {current_context:?}; construct PreparedKernel in the selected execution pool before reusing cached metadata",
+                self.context_key
+            )));
+        }
+        if inputs.len() != self.metadata.len()
+            || inputs.iter().zip(&self.metadata).any(|(view, fact)| {
+                view.dtype != fact.dtype
+                    || view.shape != fact.shape
+                    || view.is_absent() == fact.present
+            })
+            || outputs.len() != self.output_metadata.len()
+            || outputs
+                .iter()
+                .zip(&self.output_metadata)
+                .any(|(view, fact)| onnx_runtime_ep_api::OutputMetadata::from_view(view) != *fact)
+        {
+            return Err(onnx_runtime_ep_api::EpError::KernelFailed(
+                "benchmark input/output dtype, shape or presence changed; construct PreparedKernel for the new geometry instead of reusing its cached metadata".into()
+            ));
+        }
+        // Execution plans are dispatch-local and may be consumed by launch.
+        // Cache only metadata preparation; current views decide address/value
+        // refinements again, even after a failed execution.
+        let req = self
+            .kernel
+            .workspace_requirement_for_execution(
+                inputs,
+                outputs,
+                &self.metadata,
+                &self.output_metadata,
+                Some(self.cached),
+            )?
+            .require_ready()?;
+        let capacity = std::mem::size_of_val(self.scratch.as_slice());
+        if req.bytes > capacity as u64
+            || !req.alignment.is_power_of_two()
+            || req.alignment > std::mem::align_of::<u128>()
+        {
+            return Err(onnx_runtime_ep_api::EpError::KernelFailed(format!(
+                "benchmark execution refinement needs {} bytes aligned to {}, but its fixed scratch owner has {capacity} bytes aligned to {}; construct PreparedKernel for the current bindings or use a dynamically admitted executor",
+                req.bytes,
+                req.alignment,
+                std::mem::align_of::<u128>()
+            )));
+        }
+        let workspace = (req.bytes != 0).then(|| {
             onnx_runtime_ep_api::WorkspaceView::new(
                 DevicePtrMut(self.scratch.as_mut_ptr().cast()),
-                self.scratch.len() * 16,
+                capacity,
             )
         });
         self.kernel
