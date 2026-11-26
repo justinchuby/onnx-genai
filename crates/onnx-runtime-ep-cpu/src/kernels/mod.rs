@@ -4087,15 +4087,18 @@ mod tests {
             })
             .map(|k| (k.op_type.as_str(), k.domain.as_str(), k.since_version))
             .collect();
-        #[cfg(feature = "ops-cnn")]
-        let expected: std::collections::BTreeSet<_> = onnx_runtime_ir::roi_align::VERSIONS
-            .into_iter()
-            .map(|version| ("RoiAlign", "", version))
-            .chain([("DepthToSpace", "", 1), ("SpaceToDepth", "", 1)])
-            .chain([("MaxRoiPool", "", 1), ("MaxRoiPool", "", 22)])
-            .collect();
-        #[cfg(not(feature = "ops-cnn"))]
-        let expected = std::collections::BTreeSet::new();
+        let expected: std::collections::BTreeSet<_> =
+            [("Mod", "", onnx_runtime_ir::modulo::FLOAT_FLOOR_SINCE)]
+                .into_iter()
+                .chain(
+                    onnx_runtime_ir::roi_align::VERSIONS
+                        .into_iter()
+                        .map(|version| ("RoiAlign", "", version))
+                        .chain([("DepthToSpace", "", 1), ("SpaceToDepth", "", 1)])
+                        .chain([("MaxRoiPool", "", 1), ("MaxRoiPool", "", 22)])
+                        .filter(|_| cfg!(feature = "ops-cnn")),
+                )
+                .collect();
         assert_eq!(missing, expected);
         assert_eq!(
             descriptors.len() + missing.len(),
