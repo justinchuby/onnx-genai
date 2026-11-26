@@ -1033,12 +1033,17 @@ rebinding; the default `*` mode does not impose this guard. Non-loopback
 listeners do not impose a Host allowlist, preserving reverse-proxy deployments.
 Use an explicit origin list for a separately hosted browser client.
 
-`serve` supplies `CorsListeningAddress` from the actual local listener address.
-Custom network adapters serving the public `app` router must insert that typed
-request extension to obtain the loopback Host guard. In-process router calls
-without it still enforce Origin/Fetch Metadata, but cannot infer a listener
-address or claim DNS-rebinding protection. No forwarded header is trusted to
-supply that address.
+`serve` resolves the local address of **each accepted TCP socket** through
+`CorsConnectionInfo`; a wildcard bind reached through loopback therefore still
+gets the loopback Host guard. Failure to resolve that address returns an
+actionable error before routing or generation. Custom axum TCP adapters can use
+`app(state).into_make_service_with_connect_info::<CorsConnectionInfo>()`.
+Other network adapters must insert `CorsListeningAddress` from their accepted
+socket, not their listener bind address. In-process router calls without either
+context still enforce Origin/Fetch Metadata, but cannot infer a socket address
+or claim DNS-rebinding protection. Actual connection context takes precedence
+over the explicit adapter extension. No forwarded header is trusted to supply
+that address.
 
 The embedded maintained Llama Chat uses same-origin API paths; this change also
 permits independently hosted browser clients to call the API. Its standalone

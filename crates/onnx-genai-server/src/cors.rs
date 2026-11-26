@@ -8,10 +8,43 @@ use axum::{
 };
 use std::{net::SocketAddr, sync::Arc};
 
-/// Actual local listening address, used by restricted policies' DNS-rebinding guard.
-/// `serve` supplies it automatically; custom network adapters must supply it too.
+/// Actual local address of an accepted socket, for custom in-process adapters.
+/// `serve` uses `CorsConnectionInfo` instead, resolving each accepted connection.
 #[derive(Clone, Copy, Debug)]
 pub struct CorsListeningAddress(pub SocketAddr);
+
+/// Accepted TCP connection context. Wildcard listener addresses are deliberately
+/// not used: a socket accepted on 0.0.0.0 can have a loopback local address.
+/// Custom axum TCP adapters can use `into_make_service_with_connect_info` with
+/// this type. Resolution failures are retained and fail closed in middleware.
+#[derive(Clone, Debug)]
+pub struct CorsConnectionInfo(Result<SocketAddr, Arc<str>>);
+impl
+    axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>>
+    for CorsConnectionInfo
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, tokio::net::TcpListener>) -> Self {
+        Self(stream.io().local_addr().map_err(|error| {
+            Arc::from(format!("resolve accepted TCP socket local address for CORS policy: {error}; verify the accepted connection is valid and retry"))
+        }))
+    }
+}
+
+fn local_address(request: &Request) -> Result<Option<SocketAddr>, &str> {
+    if let Some(info) = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<CorsConnectionInfo>>()
+    {
+        return match &info.0.0 {
+            Ok(address) => Ok(Some(*address)),
+            Err(message) => Err(message.as_ref()),
+        };
+    }
+    Ok(request
+        .extensions()
+        .get::<CorsListeningAddress>()
+        .map(|address| address.0))
+}
 
 #[derive(Clone, Debug)]
 enum Origins {
@@ -148,9 +181,10 @@ fn loopback_or_unspecified(ip: std::net::IpAddr) -> bool {
     loopback(ip) || ip.is_unspecified()
 }
 fn host_allowed(policy: &Origins, request: &Request) -> bool {
-    let Some(CorsListeningAddress(local)) = request.extensions().get::<CorsListeningAddress>()
-    else {
-        return true; // In-process routers have no network listener. Network adapters supply the extension.
+    let local = match local_address(request) {
+        Ok(Some(local)) => local,
+        Ok(None) => return true, // In-process routers have no network listener.
+        Err(_) => return false,  // Middleware reports the connection-context failure first.
     };
     if !loopback(local.ip()) {
         return true;
@@ -218,6 +252,15 @@ pub(crate) async fn enforce(
     request: Request,
     next: Next,
 ) -> Response {
+    if let Err(message) = local_address(&request) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"error": {
+                "message": message, "type": "internal_error", "code": 500
+            }})),
+        )
+            .into_response();
+    }
     let policy = &policy.0;
     let origin = request.headers().get(header::ORIGIN).cloned();
     let accepted = allowed(&policy.origins, &request);
@@ -575,6 +618,118 @@ mod tests {
             );
         }
     }
+    #[tokio::test]
+    async fn cors_wildcard_tcp_listener_uses_each_accepted_socket_local_address() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let router = Router::new()
+            .route(
+                "/probe",
+                post(move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    async { "accepted protected origin" }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                CorsPolicy::new("https://frontend.example", "POST", "*", true).unwrap(),
+                enforce,
+            ))
+            // The accepted-socket context must also take precedence over an adapter's
+            // unrelated/non-loopback extension, never weaken it through fallback.
+            .layer(axum::Extension(CorsListeningAddress(
+                "192.0.2.1:8080".parse().unwrap(),
+            )));
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        assert!(bound.ip().is_unspecified());
+        let port = bound.port();
+        let server = tokio::spawn(async move {
+            crate::serve_listener(listener, router).await.unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{port}/probe");
+        // Same Origin/Host would pass the ordinary Origin guard. Only the real
+        // accepted loopback socket's Host guard rejects this rebinding request.
+        let bad_host = format!("rebind.example:{port}");
+        let rejected = client
+            .post(&url)
+            .header(header::HOST, &bad_host)
+            .header(header::ORIGIN, format!("http://{bad_host}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !rejected
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let accepted = client
+            .post(&url)
+            .header(header::ORIGIN, "https://frontend.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert_eq!(
+            accepted.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://frontend.example"
+        );
+        assert_eq!(accepted.text().await.unwrap(), "accepted protected origin");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cors_socket_context_failure_fails_closed_and_nonloopback_does_not_gain_host_guard() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = router(
+            CorsPolicy::new("localhost", "POST", "*", true).unwrap(),
+            calls.clone(),
+        );
+        for (context, expected) in [
+            (
+                CorsConnectionInfo(Err(Arc::from(
+                    "resolve accepted TCP socket local address failed; verify the connection and retry",
+                ))),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                CorsConnectionInfo(Ok("192.0.2.2:8080".parse().unwrap())),
+                StatusCode::OK,
+            ),
+        ] {
+            let mut req = request("POST", Some("http://rebind.example:8080"))
+                .header(header::AUTHORIZATION, "Bearer test-key")
+                .body(Body::empty())
+                .unwrap();
+            req.headers_mut().insert(
+                header::HOST,
+                HeaderValue::from_static("rebind.example:8080"),
+            );
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(context));
+            let response = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::INTERNAL_SERVER_ERROR {
+                let body = to_bytes(response.into_body(), 4096).await.unwrap();
+                let error = String::from_utf8_lossy(&body);
+                assert!(
+                    error.contains("accepted TCP socket local address") && error.contains("retry"),
+                    "{error}"
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn cors_configuration_rejects_invalid_origins_methods_and_headers() {
         for origin in [

@@ -29,7 +29,7 @@ mod auth;
 mod cli;
 mod completion_control;
 mod cors;
-pub use cors::{CorsListeningAddress, CorsPolicy};
+pub use cors::{CorsConnectionInfo, CorsListeningAddress, CorsPolicy};
 mod driver;
 mod image_generation;
 mod lease;
@@ -294,13 +294,21 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
     // Authentication is opt-in through ServerConfig.api_keys. The CLI defaults
     // to loopback; operators choose keys or an authenticated reverse proxy.
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    let local_address = listener.local_addr().map_err(|error| anyhow::anyhow!("resolve local server listener address for CORS policy at {addr}: {error}; verify the listener remains open"))?;
+    serve_listener(listener, app(state)).await?;
+    Ok(())
+}
+
+// Shared by public serving and the real wildcard-bind TCP regression: the test
+// exercises the production connection adapter, not a separately assembled one.
+pub(crate) async fn serve_listener(
+    listener: tokio::net::TcpListener,
+    router: Router,
+) -> std::io::Result<()> {
     axum::serve(
         listener,
-        app(state).layer(axum::Extension(CorsListeningAddress(local_address))),
+        router.into_make_service_with_connect_info::<CorsConnectionInfo>(),
     )
-    .await?;
-    Ok(())
+    .await
 }
 
 #[cfg(test)]
