@@ -147,12 +147,6 @@ impl SharedTensorBuffer {
             .expect("SharedTensorBuffer buffer taken only in Drop")
     }
 
-    pub(crate) fn buffer_mut(&mut self) -> &mut DeviceBuffer {
-        self.buffer
-            .as_mut()
-            .expect("SharedTensorBuffer buffer taken only in Drop")
-    }
-
     pub(crate) fn allocator(&self) -> &Arc<dyn ExecutionProvider> {
         &self.allocator
     }

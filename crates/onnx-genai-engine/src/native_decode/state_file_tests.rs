@@ -691,8 +691,8 @@ fn managed_cpu_snapshot_and_growth_admit_contiguous_live_rows_before_copy() -> a
     let (native, manager, books) = managed_native_file_fixture(limit)?;
     let allocator = native.session.host_tensor_allocator()?;
     let mut binding = native.session.allocate_device_binding(
-        "past_key_values.0.key".into(),
-        Some("present.0.key".into()),
+        "past_key_values.0.key",
+        Some("present.0.key"),
         DataType::Float32,
         vec![1, 2, 8, 2],
         vec![1, 2, 2, 2],
@@ -718,7 +718,8 @@ fn managed_cpu_snapshot_and_growth_admit_contiguous_live_rows_before_copy() -> a
     let used = books.used(Tier::Host);
     let empty = cpu::CpuKvSnapshotRows::new(&allocator, 2, 0)?;
     assert_eq!(books.used(Tier::Host), used);
-    assert_eq!(empty.iter().collect::<Vec<_>>(), vec![&[][..], &[][..]]);
+    let empty_row: &[u8] = &[];
+    assert_eq!(empty.iter().collect::<Vec<_>>(), vec![empty_row, empty_row]);
     drop(empty);
     let blocker = allocator.array::<u8>(usize::try_from(limit - used - 1)?)?;
     let transfers = state.binding_for_test(0).transfer_stats();

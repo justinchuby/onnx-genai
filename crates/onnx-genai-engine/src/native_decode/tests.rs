@@ -4224,9 +4224,7 @@ fn tiny_decoder_matches_across_inplace_env_toggle() {
         let prefill = session.decode(&[1, 2, 3], 0).expect("prefill");
         let step = session.decode(&[4], 3).expect("decode step");
         unsafe { std::env::remove_var("ONNX_GENAI_CPU_INPLACE_KV") };
-        let mut rows = prefill;
-        rows.extend(step);
-        rows
+        LogitsBatch::from_rows(prefill.into_iter().chain(step).collect())
     };
     let on = run("1");
     let off = run("0");
