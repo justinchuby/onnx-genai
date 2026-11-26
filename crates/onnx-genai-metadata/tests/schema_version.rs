@@ -141,7 +141,7 @@ fn a_newer_document_is_refused_by_version_rather_than_by_the_first_field_it_uses
         other => panic!("future schema must be typed unsupported, got {other:?}"),
     };
     assert_eq!(unsupported.family, SchemaFamily::InferenceMetadata);
-    assert_eq!(unsupported.observed, SchemaVersion::new(1, 19));
+    assert_eq!(unsupported.observed, SchemaVersion::new(1, 20));
     assert_eq!(unsupported.supported, SUPPORTED_SCHEMA_VERSIONS);
     assert_eq!(unsupported.document, SchemaDocumentContext::InMemory);
     let error = error.to_string();
