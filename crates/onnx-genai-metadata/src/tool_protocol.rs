@@ -13,6 +13,9 @@ use crate::{
     },
 };
 
+mod canonical_xml;
+pub use canonical_xml::{CanonicalXmlPrefix, canonical_xml_prefix};
+
 mod fragments;
 pub use fragments::ToolCallFragment;
 

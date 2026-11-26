@@ -183,10 +183,14 @@ fn run_model(
         ep.runtime().htod(&b.data, cuptr(b_buf.as_ptr())).unwrap();
     }
 
-    let x_strides = compute_contiguous_strides(&x_shape);
-    let w_strides = compute_contiguous_strides(&w.dims);
-    let b_strides = compute_contiguous_strides(&b.dims);
-    let y_strides = compute_contiguous_strides(&y_shape);
+    let x_strides = compute_contiguous_strides(&x_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let w_strides = compute_contiguous_strides(&w.dims)
+        .expect("fixture shape has representable contiguous strides");
+    let b_strides = compute_contiguous_strides(&b.dims)
+        .expect("fixture shape has representable contiguous strides");
+    let y_strides = compute_contiguous_strides(&y_shape)
+        .expect("fixture shape has representable contiguous strides");
     let dev = ep.device_id();
     let inputs = [
         TensorView::new(DevicePtr(x_buf.as_ptr()), dtype, &x_shape, &x_strides, dev),
@@ -633,10 +637,14 @@ fn cudnn_conv_prepared_workspace_reuses_the_injected_allocator_and_captures() {
                 .unwrap();
         }
 
-        let x_strides = compute_contiguous_strides(&x_shape);
-        let w_strides = compute_contiguous_strides(&w_shape);
-        let b_strides = compute_contiguous_strides(&b_shape);
-        let y_strides = compute_contiguous_strides(&y_shape);
+        let x_strides = compute_contiguous_strides(&x_shape)
+            .expect("fixture shape has representable contiguous strides");
+        let w_strides = compute_contiguous_strides(&w_shape)
+            .expect("fixture shape has representable contiguous strides");
+        let b_strides = compute_contiguous_strides(&b_shape)
+            .expect("fixture shape has representable contiguous strides");
+        let y_strides = compute_contiguous_strides(&y_shape)
+            .expect("fixture shape has representable contiguous strides");
         let device = ep.device_id();
         let inputs = [
             TensorView::new(DevicePtr(x.as_ptr()), dtype, &x_shape, &x_strides, device),

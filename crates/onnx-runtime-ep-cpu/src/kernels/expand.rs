@@ -37,7 +37,7 @@ impl Kernel for ExpandKernel {
 
         // Effective element stride of each output axis into the source (0 where
         // the source axis is broadcast / absent). Right-aligned numpy rule.
-        let src_strides = compute_contiguous_strides(in_shape);
+        let src_strides = compute_contiguous_strides(in_shape)?;
         let mut eff = vec![0i64; out_rank];
         for axis in 0..out_rank {
             let src_axis = axis as isize - (out_rank as isize - in_shape.len() as isize);

@@ -12,4 +12,5 @@ mean. Lossless formats use 1e-7 tolerance. Lossy codecs use 2e-4; IMA ADPCM uses
 Vorbis references end at the declared 1600-sample EOS granule.
 MP4 references disable edit lists: Symphonia 0.6.1 does not apply them, so AAC
 priming remains in that media stream. Packet durations still bound trailing data.
-The Opus fixture pins an actionable unsupported-codec error.
+The additional `opus-short.ogg` fixture predates the focused Opus numerical matrix.
+Ogg Opus is covered by `../opus`; unsupported-codec tests use an explicitly unknown WAV format tag.

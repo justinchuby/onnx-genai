@@ -90,8 +90,10 @@ fn skip_metadata_replacement_and_capture_keep_one_immutable_owner() {
     node.domain = "com.microsoft".into();
     let kernel = ep.get_kernel(&node, &[], 1).unwrap();
     let execute = |shape: &[usize], skip_shape: &[usize]| {
-        let strides = compute_contiguous_strides(shape);
-        let skip_strides = compute_contiguous_strides(skip_shape);
+        let strides = compute_contiguous_strides(shape)
+            .expect("fixture shape has representable contiguous strides");
+        let skip_strides = compute_contiguous_strides(skip_shape)
+            .expect("fixture shape has representable contiguous strides");
         kernel.execute(
             &[
                 TensorView::new(
@@ -343,7 +345,10 @@ fn run(
     }
     let input_strides: Vec<_> = shapes
         .iter()
-        .map(|shape| compute_contiguous_strides(shape))
+        .map(|shape| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let input_views: Vec<_> = input_buffers
         .iter()
@@ -362,7 +367,10 @@ fn run(
     let output_shapes = [input_shape, &stats_shape, &stats_shape, input_shape];
     let output_strides: Vec<_> = output_shapes
         .iter()
-        .map(|shape| compute_contiguous_strides(shape))
+        .map(|shape| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let mut output_buffers = output_shapes
         .iter()
@@ -443,7 +451,8 @@ fn reference(
     epsilon: f32,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let hidden = *input_shape.last().unwrap();
-    let skip_strides = compute_contiguous_strides(skip_shape);
+    let skip_strides = compute_contiguous_strides(skip_shape)
+        .expect("fixture shape has representable contiguous strides");
     let leading = input_shape.len() - skip_shape.len();
     let mut sum = vec![0.0; input.len()];
     for (flat, value) in sum.iter_mut().enumerate() {
@@ -683,7 +692,10 @@ fn skip_simplified_layer_norm_fixed_decode_capture_replays_bit_identically() {
     }
     let input_strides = input_shapes
         .iter()
-        .map(|shape| compute_contiguous_strides(shape))
+        .map(|shape| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let input_views = input_buffers
         .iter()
@@ -700,7 +712,8 @@ fn skip_simplified_layer_norm_fixed_decode_capture_replays_bit_identically() {
         })
         .collect::<Vec<_>>();
     let mut output_buffer = ep.allocate(std::mem::size_of_val(&initial), 256).unwrap();
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     macro_rules! execute {
         () => {{
             let output = TensorMut::new(
@@ -785,7 +798,10 @@ fn skip_simplified_layer_norm_fixed_decode_capture_replays_bit_identically() {
     }
     let prefill_strides = prefill_shapes
         .iter()
-        .map(|shape| compute_contiguous_strides(shape))
+        .map(|shape| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let prefill_views = prefill_buffers
         .iter()
@@ -804,7 +820,8 @@ fn skip_simplified_layer_norm_fixed_decode_capture_replays_bit_identically() {
     let mut prefill_output = ep
         .allocate(std::mem::size_of_val(&prefill_input), 256)
         .unwrap();
-    let prefill_output_strides = compute_contiguous_strides(&prefill_shape);
+    let prefill_output_strides = compute_contiguous_strides(&prefill_shape)
+        .expect("fixture shape has representable contiguous strides");
     let output = TensorMut::new(
         DevicePtrMut(prefill_output.as_mut_ptr()),
         DataType::Float32,

@@ -105,9 +105,12 @@ fn execute_decode(
     let x_shape = [1, HEADS, 1, HEAD_DIM];
     let cache_shape = [CACHE_ROWS, HEAD_DIM / 2];
     let position_shape = [1, 1];
-    let x_strides = compute_contiguous_strides(&x_shape);
-    let cache_strides = compute_contiguous_strides(&cache_shape);
-    let position_strides = compute_contiguous_strides(&position_shape);
+    let x_strides = compute_contiguous_strides(&x_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let cache_strides = compute_contiguous_strides(&cache_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let position_strides = compute_contiguous_strides(&position_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [
         TensorView::new(
             DevicePtr(x.as_ptr()),

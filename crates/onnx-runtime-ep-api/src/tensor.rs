@@ -124,6 +124,18 @@ fn validate_view(
             reason: "String dtype has no fixed-width raw layout".into(),
         });
     }
+    let count = onnx_runtime_ir::checked_numel(shape).ok_or_else(|| EpError::InvalidTensorView {
+        reason: format!("shape {shape:?} has a nonempty element count that overflows usize; reduce tensor dimensions"),
+    })?;
+    if dtype == DataType::Undefined {
+        return Err(EpError::InvalidTensorView {
+            reason: "Undefined dtype has no fixed-width raw layout; bind a concrete numeric dtype"
+                .into(),
+        });
+    }
+    dtype.checked_storage_bytes(count).ok_or_else(|| EpError::InvalidTensorView {
+        reason: format!("dense byte count overflows usize for {dtype:?} shape {shape:?}; reduce tensor dimensions"),
+    })?;
     // For fixed-width (non-sub-byte) types the element origin must land on an
     // element boundary; sub-byte packed types are addressed per byte.
     let esize = dtype.byte_size();
@@ -227,15 +239,29 @@ impl<'a> TensorView<'a> {
         onnx_runtime_ir::is_contiguous(self.shape, self.strides)
     }
 
-    /// Number of elements.
+    /// Number of elements in a validated view. Panics on nonempty overflow;
+    /// untrusted descriptors should use `checked_numel` or `validate` first.
     pub fn numel(&self) -> usize {
-        self.shape.iter().product()
+        self.checked_numel().expect(
+            "tensor view element count overflow; validate the view before querying geometry",
+        )
+    }
+
+    /// Logical element count, including zero for any empty shape.
+    pub fn checked_numel(&self) -> Option<usize> {
+        onnx_runtime_ir::checked_numel(self.shape)
+    }
+
+    /// Dense storage bytes, or `None` for unrepresentable count/byte arithmetic.
+    /// This sizing query does not validate raw dtype, pointers or strides.
+    pub fn checked_byte_size(&self) -> Option<usize> {
+        onnx_runtime_ir::checked_expected_bytes(self.dtype, self.shape)
     }
 
     /// Logical element byte size (dense; ignores stride gaps). Uses
     /// `storage_bytes` so sub-byte (int4/uint4) types are counted correctly.
     pub fn byte_size(&self) -> usize {
-        self.dtype.storage_bytes(self.numel())
+        self.checked_byte_size().expect("tensor view dense byte count overflow or invalid dtype; validate the view before querying geometry")
     }
 
     /// Typed const pointer to the element origin, applying `byte_offset`.
@@ -370,15 +396,29 @@ impl<'a> TensorMut<'a> {
         onnx_runtime_ir::is_contiguous(self.shape, self.strides)
     }
 
-    /// Number of elements.
+    /// Number of elements in a validated view. Panics on nonempty overflow;
+    /// untrusted descriptors should use `checked_numel` or `validate` first.
     pub fn numel(&self) -> usize {
-        self.shape.iter().product()
+        self.checked_numel().expect(
+            "tensor view element count overflow; validate the view before querying geometry",
+        )
+    }
+
+    /// Logical element count, including zero for any empty shape.
+    pub fn checked_numel(&self) -> Option<usize> {
+        onnx_runtime_ir::checked_numel(self.shape)
+    }
+
+    /// Dense storage bytes, or `None` for unrepresentable count/byte arithmetic.
+    /// This sizing query does not validate raw dtype, pointers or strides.
+    pub fn checked_byte_size(&self) -> Option<usize> {
+        onnx_runtime_ir::checked_expected_bytes(self.dtype, self.shape)
     }
 
     /// Logical element byte size (dense; ignores stride gaps). Uses
     /// `storage_bytes` so sub-byte (int4/uint4) types are counted correctly.
     pub fn byte_size(&self) -> usize {
-        self.dtype.storage_bytes(self.numel())
+        self.checked_byte_size().expect("tensor view dense byte count overflow or invalid dtype; validate the view before querying geometry")
     }
 
     /// Typed mutable pointer to the element origin, applying `byte_offset`.
@@ -401,7 +441,8 @@ mod tests {
     fn contiguous_view_roundtrips_invariants() {
         let buf = vec![0u8; 6 * 4];
         let shape = [2usize, 3];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let v = TensorView::new(
             ptr(&buf),
             DataType::Float32,
@@ -534,5 +575,123 @@ mod tests {
         // 5 int4 elements pack into 3 bytes.
         assert_eq!(v.byte_size(), 3);
         v.validate().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod geometry_regression {
+    use super::*;
+    #[test]
+    fn empty_geometry_is_zero_for_every_axis_position_and_both_views() {
+        for shape in [
+            vec![usize::MAX, 2, 0],
+            vec![0, usize::MAX, 2],
+            vec![usize::MAX, 0, 2],
+        ] {
+            for dtype in [DataType::Float32, DataType::Float64, DataType::Uint4] {
+                let view = TensorView::new(
+                    DevicePtr(16usize as *const _),
+                    dtype,
+                    &shape,
+                    &[0, 0, 0],
+                    DeviceId::cuda(0),
+                );
+                let out = TensorMut::new(
+                    DevicePtrMut(16usize as *mut _),
+                    dtype,
+                    &shape,
+                    &[0, 0, 0],
+                    DeviceId::cuda(0),
+                );
+                view.validate().unwrap();
+                out.validate().unwrap();
+                assert_eq!(
+                    (view.checked_numel(), out.checked_numel()),
+                    (Some(0), Some(0))
+                );
+                assert_eq!(
+                    (view.numel(), out.numel(), view.byte_size(), out.byte_size()),
+                    (0, 0, 0, 0)
+                );
+                assert_eq!(
+                    (view.checked_byte_size(), out.checked_byte_size()),
+                    (Some(0), Some(0))
+                );
+            }
+        }
+        let scalar = TensorView::new(
+            DevicePtr(16usize as *const _),
+            DataType::Float64,
+            &[],
+            &[],
+            DeviceId::cpu(),
+        );
+        assert_eq!(
+            (scalar.checked_numel(), scalar.checked_byte_size()),
+            (Some(1), Some(8))
+        );
+    }
+    #[test]
+    fn validation_reports_nonempty_count_byte_overflow_and_unknown_dtype() {
+        for (shape, dtype, detail) in [
+            (vec![usize::MAX, 2], DataType::Float32, "element count"),
+            (vec![usize::MAX / 4], DataType::Float64, "dense byte count"),
+            (vec![0], DataType::Undefined, "concrete numeric dtype"),
+        ] {
+            let strides = vec![1; shape.len()];
+            let view = TensorView::new(
+                DevicePtr(16usize as *const _),
+                dtype,
+                &shape,
+                &strides,
+                DeviceId::cpu(),
+            );
+            let out = TensorMut::new(
+                DevicePtrMut(16usize as *mut _),
+                dtype,
+                &shape,
+                &strides,
+                DeviceId::cuda(0),
+            );
+            for error in [view.validate().unwrap_err(), out.validate().unwrap_err()] {
+                assert!(error.to_string().contains(detail), "{error}");
+            }
+            assert_eq!(
+                (view.checked_byte_size(), out.checked_byte_size()),
+                (None, None)
+            );
+        }
+    }
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn packed_views_can_have_element_totals_beyond_i64() {
+        for (shape, strides, dtype) in [
+            (vec![2, 1usize << 62], vec![1i64 << 62, 1], DataType::Uint4),
+            (vec![usize::MAX], vec![1], DataType::Uint2),
+        ] {
+            let view = TensorView::new(
+                DevicePtr(16usize as *const _),
+                dtype,
+                &shape,
+                &strides,
+                DeviceId::cuda(0),
+            );
+            let out = TensorMut::new(
+                DevicePtrMut(16usize as *mut _),
+                dtype,
+                &shape,
+                &strides,
+                DeviceId::cuda(0),
+            );
+            view.validate().unwrap();
+            out.validate().unwrap();
+            let count = onnx_runtime_ir::checked_numel(&shape).unwrap();
+            assert_eq!((view.numel(), out.numel()), (count, count));
+            assert_eq!(
+                (view.byte_size(), out.byte_size()),
+                (dtype.storage_bytes(count), dtype.storage_bytes(count))
+            );
+            assert!(view.is_contiguous() && out.is_contiguous());
+        }
     }
 }

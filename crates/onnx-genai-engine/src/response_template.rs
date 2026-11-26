@@ -605,7 +605,7 @@ impl ResponseTemplate {
             )
         };
         let decode = |ids: &[u32]| {
-            llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            onnx_genai_llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 tokenizer.decode_with_special_tokens(ids).map_err(anyhow::Error::from)
             })).context("resolve response_template framing through tokenizer.decoder; repair tokenizer.json if decoding failed")
         };

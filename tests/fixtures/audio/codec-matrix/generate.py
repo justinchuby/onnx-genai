@@ -136,7 +136,7 @@ for name, codec, extra in cases:
         file.stat().st_size,
         flush=True,
     )
-# Unsupported codec inside an otherwise supported OGG container.
+# Additional Ogg Opus fixture; focused numerical coverage lives in ../opus.
 subprocess.run(
     [
         "ffmpeg",
@@ -155,7 +155,7 @@ subprocess.run(
         "-c:a",
         "libopus",
         "-y",
-        str(root / "unsupported-opus.ogg"),
+        str(root / "opus-short.ogg"),
     ],
     check=True,
 )

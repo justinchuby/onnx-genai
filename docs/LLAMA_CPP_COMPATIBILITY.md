@@ -3,6 +3,9 @@
 The [generated endpoint registration matrix](LLAMA_CPP_ENDPOINT_MATRIX.md) inventories
 all 55 static upstream method/path contracts, including aliases and conditional routes.
 Its route-presence results are separate from the behavioral evidence below.
+The [behavioral acceptance matrix](LLAMA_CPP_BEHAVIOR_MATRIX.md) links concrete
+test assertions and preserves unfinished requirements. Source links are distinct
+from revision-bound runtime receipts and full upstream parity.
 
 Native execution is enabled and selected by default in the engine, facade, CLI
 and server. ORT is an explicitly selected reference backend for tests and
@@ -928,14 +931,26 @@ logprob delivery and transactional publication. UTF-8 decoder lookbehind remains
 request-local. Raw grammar recognition continues to inspect model bytes and IDs.
 
 Audio preprocessing admits package-authored mel counts, sample rates, FFT/hop
-and Hann-window lengths through the executable log-mel program. Numerical
-acceptance includes an independent direct DFT and Native workflows using
-nonstandard geometry. Feature-tensor serving also executes the model-authored
-audio program, with explicit named output binding and runtime shape checks;
-rank-3 shapes never select a hidden default analysis recipe. Pure-waveform normalization, named transform dataflow and validity publication
-execute as described in [audio preprocessing](AUDIO_PREPROCESSING.md). Additional
-DSP operations, window/mel conventions and codecs remain open; this does not imply
-full audio parity.
+and Hann-window lengths through the executable log-mel program. Standalone
+spectrograms additionally admit explicit power/magnitude and periodic
+Hann/Hamming/rectangular selectors. Numerical acceptance includes an independent
+direct DFT and Native workflows using nonstandard geometry. Feature-tensor
+serving also executes the model-authored audio program, with explicit named
+output binding and runtime shape checks; rank-3 shapes never select a hidden
+default analysis recipe. Pure-waveform normalization, named transform dataflow
+and validity publication execute as described in
+[audio preprocessing](AUDIO_PREPROCESSING.md).
+
+Content-probed encoded audio includes bounded Ogg Opus with canonical channel
+routing and one raw-clock owner for pre-skip/final-granule trimming. CLI file/stdin
+transcription and feature-bound `generate --audio` propagate configured finite PCM
+policies. Engine-backed admission intersects them with a live host-ledger
+snapshot; this is not a PCM memory lease or an atomic concurrent-memory guarantee.
+WebM/MP4 Opus, cropped/nonzero-origin Ogg and code 3 packets with 32–48 frames
+remain explicitly unsupported; see the full
+[encoded-audio contract](AUDIO_PREPROCESSING.md#encoded-audio-formats) for all
+capability and resource limits. Additional DSP operations, window/mel conventions
+and codecs remain open; this does not imply full audio parity.
 
 File transcription now executes declared one-pass CTC/greedy acoustic workflows
 as well as the existing generative speech path. Both aliases expose typed

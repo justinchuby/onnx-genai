@@ -1,6 +1,6 @@
 //! Lossless tokenizer pieces for protocol consumers and byte-oriented tooling.
 use anyhow::{Context, bail, ensure};
-use llguidance::toktrie::TokTrie;
+use onnx_genai_llguidance::toktrie::TokTrie;
 use onnx_genai_ort::Tokenizer;
 use std::{collections::BTreeSet, sync::Arc};
 use tokenizers::Decoder as _;
@@ -63,7 +63,7 @@ impl TokenTextDecoder {
             return Ok(String::new());
         }
 
-        llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        onnx_genai_llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
             tokenizers::tokenizer::step_decode_stream(
                 tokenizer.inner(), vec![id], false, &mut self.ids, &mut self.prefix, &mut self.prefix_index,
             ).map(|text| text.unwrap_or_default()).map_err(|error| {
@@ -78,14 +78,15 @@ impl TokenTextDecoder {
     /// Emit pending bytes at the terminal boundary, including the tokenizer's
     /// replacement text for an incomplete final UTF-8 sequence.
     pub fn finish(&mut self, tokenizer: &Tokenizer) -> anyhow::Result<String> {
-        let decoded = llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tokenizer
-                .decode_with_special_tokens(&self.ids)
-                .map_err(anyhow::Error::from)
-        }))
-        .context(
-            "decode pending terminal token text; repair tokenizer.decoder if decoding panicked",
-        )?;
+        let decoded =
+            onnx_genai_llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokenizer
+                    .decode_with_special_tokens(&self.ids)
+                    .map_err(anyhow::Error::from)
+            }))
+            .context(
+                "decode pending terminal token text; repair tokenizer.decoder if decoding panicked",
+            )?;
         let tail = decoded
             .strip_prefix(&self.prefix)
             .ok_or(NonMonotonicText)?
@@ -102,7 +103,7 @@ pub fn decode_output(
     ids: &[u32],
     preserved: &BTreeSet<u32>,
 ) -> anyhow::Result<String> {
-    llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    onnx_genai_llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
     if preserved.is_empty() {
         return tokenizer.decode(ids).map_err(Into::into);
     }

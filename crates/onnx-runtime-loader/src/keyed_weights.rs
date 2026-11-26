@@ -48,6 +48,38 @@ impl KeyedWeightFile {
     }
 }
 
+/// One borrowed tensor from a fully validated SafeTensors container.
+/// Offsets, shapes, duplicate keys, dtypes and complete payload coverage have
+/// already passed the same parser used for external initializer binding.
+pub struct SafeTensorView<'a> {
+    pub dtype: DataType,
+    pub shape: Vec<usize>,
+    pub data: &'a [u8],
+}
+
+/// Inspect caller-owned SafeTensors bytes without mapping or copying payloads.
+/// The caller remains responsible for its allocation and dtype capabilities.
+pub fn safetensors_views(data: &[u8]) -> Result<BTreeMap<String, SafeTensorView<'_>>, LoaderError> {
+    let entries = safetensors::parse(data).map_err(|detail| {
+        LoaderError::GraphBuild(format!(
+            "SafeTensors: {detail}; provide a complete valid tensor container"
+        ))
+    })?;
+    Ok(entries
+        .into_iter()
+        .map(|(name, entry)| {
+            (
+                name,
+                SafeTensorView {
+                    dtype: entry.dtype,
+                    shape: entry.dims,
+                    data: &data[entry.offset..entry.offset + entry.len],
+                },
+            )
+        })
+        .collect())
+}
+
 struct Entry {
     dtype: DataType,
     packed_format: Option<&'static str>,

@@ -105,6 +105,9 @@ pub struct ServeArgs {
     /// Maximum acoustic frames decoded per file transcription.
     #[arg(long, default_value_t = onnx_genai_engine::transcription::TranscriptionLimits::default().max_frames)]
     pub max_transcription_frames: std::num::NonZeroUsize,
+    /// Maximum raw decoded PCM work and resident PCM bytes per audio decode.
+    #[arg(long, default_value_t = onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY.max_decoded_bytes)]
+    pub max_decoded_audio_bytes: std::num::NonZeroUsize,
     /// Maximum rendered UTF-8 bytes per file transcription.
     #[arg(long, default_value_t = onnx_genai_engine::transcription::TranscriptionLimits::default().max_text_bytes)]
     pub max_transcription_text_bytes: std::num::NonZeroUsize,
@@ -271,6 +274,7 @@ fn server_config_from_args(args: &ServeArgs) -> anyhow::Result<ServerConfig> {
         max_transcription_prompt_bytes: args.max_transcription_prompt_bytes,
         max_transcription_template_operations: args.max_transcription_template_operations,
         max_transcription_frames: args.max_transcription_frames,
+        max_decoded_audio_bytes: args.max_decoded_audio_bytes,
         max_transcription_text_bytes: args.max_transcription_text_bytes,
         realtime: crate::RealtimeLimits::default(),
         endpoint_props: args.props,
