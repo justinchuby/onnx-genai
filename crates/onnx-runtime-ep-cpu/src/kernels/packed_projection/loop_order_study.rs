@@ -181,6 +181,7 @@ impl Fixture {
                 / 4
         ]
     }
+    #[cfg(target_os = "macos")]
     fn check(&self, actual: &[f32]) -> u64 {
         assert_eq!(actual.len(), self.oracle.len());
         let mut digest = 0xcbf29ce484222325u64;
