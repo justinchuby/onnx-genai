@@ -1100,16 +1100,16 @@ pub fn build_cpu_registry() -> OpRegistry {
     build_cpu_registry_with_resources(crate::CpuMemoryResources::default())
 }
 
-/// Build the CPU registry AND return all registered op keys (for kernel-registry
-/// type-constraint advertisement). The keys are derived from the exact same
-/// registration calls — not hand-maintained.
+/// Build the CPU registry AND return its plugin-visible registrations for
+/// kernel-registry type-constraint advertisement. Native-only revisions remain
+/// dispatchable without changing the shipped ORT plugin contract.
 pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor>) {
     let reg = build_cpu_registry();
     let descriptors = descriptors_from_registry(&reg);
     (reg, descriptors)
 }
 
-/// Derive one [`CpuOpDescriptor`] per entry in `reg`.
+/// Derive one [`CpuOpDescriptor`] per plugin-visible entry in `reg`.
 ///
 /// Reads the registry itself rather than a list accumulated during
 /// registration. Those two had drifted: `register_cnn_ops` takes `&mut
@@ -1122,11 +1122,12 @@ pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor
 /// `KernelRegistryEntry` list, and `node_passes_dtype_filter` fails closed on
 /// an op with no entry, so every one of those 18 was claimed by `supports_op`
 /// and then dropped at capability time -- handing it to ORT's CPU EP, which is
-/// exactly what this EP must never do. Deriving from the registry makes the
-/// two sets identical by construction instead of by convention.
+/// exactly what this EP must never do. Deriving from [`OpRegistry::plugin_keys`]
+/// keeps ordinary registrations aligned while allowing explicit native-only
+/// revisions whose storage ABI the shipped plugin must not advertise.
 fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
     let mut descriptors: Vec<CpuOpDescriptor> = reg
-        .keys()
+        .plugin_keys()
         // RoiAlign is currently supported only in standalone nxrt.
         .filter(|key| !(key.op_type == "RoiAlign" && key.domain.is_empty()))
         .map(|key| {
@@ -3048,9 +3049,8 @@ pub(crate) mod testutil {
             let n: usize = shape.iter().product();
             let strides = compute_contiguous_strides(shape)
                 .expect("fixture shape has representable contiguous strides");
-            let esize = dtype.byte_size();
             Self {
-                bytes: vec![0u8; n * esize],
+                bytes: vec![0u8; dtype.storage_bytes(n)],
                 shape: shape.to_vec(),
                 strides,
                 dtype,
@@ -4055,6 +4055,44 @@ mod tests {
             a.iter().map(key).collect::<Vec<_>>(),
             b.iter().map(key).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn packed_cast_dtypes_do_not_expand_plugin_descriptors() {
+        let (registry, descriptors) = build_cpu_registry_with_descriptors();
+        for opset in [21, 25] {
+            assert!(registry.supports("Cast", "", opset));
+            assert!(registry.supports("CastLike", "", opset));
+        }
+        let cast_versions = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.op_type == "Cast")
+            .map(|descriptor| descriptor.since_version)
+            .collect::<Vec<_>>();
+        let cast_like_versions = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.op_type == "CastLike")
+            .map(|descriptor| descriptor.since_version)
+            .collect::<Vec<_>>();
+        assert_eq!(cast_versions, vec![1, 28]);
+        assert_eq!(cast_like_versions, vec![15]);
+        for descriptor in descriptors
+            .iter()
+            .filter(|descriptor| matches!(descriptor.op_type.as_str(), "Cast" | "CastLike"))
+        {
+            for packed in [
+                DataType::Uint4,
+                DataType::Int4,
+                DataType::Uint2,
+                DataType::Int2,
+            ] {
+                assert!(
+                    !descriptor.supported_dtypes.contains(&packed),
+                    "CPU ORT plugin descriptor {:?} must not advertise standalone packed dtype {packed:?}",
+                    descriptor.op_type
+                );
+            }
+        }
     }
 }
 

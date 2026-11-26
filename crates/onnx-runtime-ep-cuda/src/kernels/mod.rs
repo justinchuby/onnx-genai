@@ -728,7 +728,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
 /// registry so the advertised kernel versions match the constructed provider.
 pub fn build_cuda_registry_descriptors(registry: &OpRegistry) -> Vec<CudaOpDescriptor> {
     let mut descriptors: Vec<CudaOpDescriptor> = registry
-        .keys()
+        .plugin_keys()
         // RoiAlign is currently supported only in standalone nxrt.
         .filter(|key| !(key.op_type == "RoiAlign" && key.domain.is_empty()))
         .map(|key| CudaOpDescriptor {
@@ -1795,13 +1795,17 @@ pub(crate) fn build_cuda_registry_for_contract(
     );
 
     // Cast / CastLike (NVRTC element-wise dtype conversion).
-    for (op_type, version) in [("Cast", 1), ("CastLike", 1), ("Cast", 28)] {
+    for (op_type, version, float6) in [
+        ("Cast", 1, false),
+        ("CastLike", 1, false),
+        ("Cast", 28, true),
+    ] {
         reg.register(
             OpKey::new(op_type, "", version),
             onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(cast::CastFactory {
                 runtime: runtime.clone(),
-                float6: version >= 28,
+                float6,
             }),
         );
     }
@@ -2088,6 +2092,8 @@ pub(crate) fn build_cuda_registry_for_contract(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+
+    use onnx_runtime_ir::DataType;
 
     use super::{
         CUDA_COVERED_OPS, CUDA_DFT_DTYPES, CUDA_FLOAT_DTYPES, CUDA_NMS_DTYPES, CUDA_STFT_DTYPES,
@@ -2409,6 +2415,43 @@ mod tests {
             }),
             "standalone-only ONNX RoiAlign must not be advertised by the CUDA ORT plugin"
         );
+        let cast_versions = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.op_type == "Cast")
+            .map(|descriptor| descriptor.since_version)
+            .collect::<Vec<_>>();
+        let cast_like_versions = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.op_type == "CastLike")
+            .map(|descriptor| descriptor.since_version)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cast_versions,
+            vec![1, 28],
+            "standalone packed Cast dtypes must not change CUDA ORT plugin revisions"
+        );
+        assert_eq!(
+            cast_like_versions,
+            vec![1],
+            "standalone packed CastLike dtypes must not change CUDA ORT plugin revisions"
+        );
+        for descriptor in descriptors
+            .iter()
+            .filter(|descriptor| matches!(descriptor.op_type.as_str(), "Cast" | "CastLike"))
+        {
+            for packed in [
+                DataType::Uint4,
+                DataType::Int4,
+                DataType::Uint2,
+                DataType::Int2,
+            ] {
+                assert!(
+                    !descriptor.supported_dtypes.contains(&packed),
+                    "CUDA ORT plugin descriptor {:?} must keep rejecting packed dtype {packed:?}",
+                    descriptor.op_type
+                );
+            }
+        }
     }
 
     #[test]
