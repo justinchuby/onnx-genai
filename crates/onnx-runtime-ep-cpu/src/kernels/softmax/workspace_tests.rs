@@ -115,6 +115,7 @@ fn governed_softmax_staging_reuses_one_lane_without_warm_issuer_callbacks() {
     );
     let calls = (books.claims(), books.releases());
     let mut direct_y = Owned::zeros_f32(&[2, 4]);
+    let widened_x = Owned::f16(&[2, 4], &[1., 2., 3., 4., 2., 4., 6., 8.]);
     for _ in 0..4096 {
         assert_eq!(
             refined(&kernel, &inputs[0], &direct_y.view_mut())
@@ -138,6 +139,19 @@ fn governed_softmax_staging_reuses_one_lane_without_warm_issuer_callbacks() {
         );
         kernel
             .execute_with_workspace(&inputs, &mut [y.view_mut()], Some(workspace))
+            .unwrap();
+        assert_eq!(
+            refined(&kernel, &widened_x.view(), &direct_y.view_mut())
+                .unwrap()
+                .bytes,
+            32
+        );
+        kernel
+            .execute_with_workspace(
+                &[widened_x.view()],
+                &mut [direct_y.view_mut()],
+                Some(workspace),
+            )
             .unwrap();
         provider.deallocate_workspace(allocation).unwrap();
     }
@@ -236,6 +250,20 @@ fn metadata_defers_address_dependent_routes_and_checks_complete_geometry() {
             }
             assert_eq!(
                 k.workspace_requirement_for_execution(&[], &[], &meta, &output, None)
+                    .unwrap()
+                    .require_ready()
+                    .unwrap()
+                    .bytes,
+                96
+            );
+        }
+        for dtype in [DataType::Float16, DataType::BFloat16, DataType::Float64] {
+            let input = [TensorMetadata::new(dtype, &[2, 3, 4], true)];
+            let output = [OutputMetadata::Unresolved {
+                dtype: DataType::Float32,
+            }];
+            assert_eq!(
+                k.workspace_requirement(&input, &output)
                     .unwrap()
                     .require_ready()
                     .unwrap()
@@ -402,7 +430,7 @@ fn actual_views_preserve_zero_scratch_and_admit_alias_strided_and_unaligned_outp
     );
 }
 #[test]
-fn materialized_sources_may_alias_direct_output_without_scratch() {
+fn materialized_sources_use_one_admitted_snapshot_before_aliased_direct_output() {
     let k = kernel();
     let shape = [2, 3];
     for case in 0..3 {
@@ -454,12 +482,103 @@ fn materialized_sources_may_alias_direct_output_without_scratch() {
             &[3, 1],
             onnx_runtime_ir::DeviceId::cpu(),
         );
-        assert_eq!(refined(&k, &x, &y).unwrap().bytes, 0);
-        k.execute(&[x], std::slice::from_mut(&mut y)).unwrap();
+        assert_eq!(refined(&k, &x, &y).unwrap().bytes, 24);
+        let before = backing;
+        assert!(k.execute(&[x], std::slice::from_mut(&mut y)).is_err());
+        assert_eq!(
+            backing, before,
+            "unfunded snapshot cannot touch aliased storage"
+        );
+        let mut scratch = [std::mem::MaybeUninit::<f32>::uninit(); 6];
+        let pointer = scratch.as_mut_ptr().cast();
+        assert!(
+            k.execute_with_workspace(
+                &[x],
+                std::slice::from_mut(&mut y),
+                Some(WorkspaceView::new(
+                    onnx_runtime_ep_api::DevicePtrMut(pointer),
+                    23
+                )),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            backing, before,
+            "short snapshot cannot touch aliased storage"
+        );
+        k.execute_with_workspace(
+            &[x],
+            std::slice::from_mut(&mut y),
+            Some(WorkspaceView::new(
+                onnx_runtime_ep_api::DevicePtrMut(pointer),
+                24,
+            )),
+        )
+        .unwrap();
         for row in backing[..6].chunks_exact(3) {
             for (v, want) in row.iter().zip([0.09003057, 0.24472847, 0.66524096]) {
                 assert!((f32::from_bits(*v) - want).abs() < 1e-6);
             }
         }
+    }
+}
+
+#[test]
+fn snapshot_in_place_reducer_matches_existing_borrowed_reducer_bits() {
+    for width in [1, 2, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 65] {
+        for inner in [1, 2, 3] {
+            let outer = 3;
+            for specials in [false, true] {
+                let source = (0..outer * width * inner)
+                    .map(|i| {
+                        if specials {
+                            [f32::NEG_INFINITY, f32::INFINITY, f32::NAN, -0., 0., 3.][i % 6]
+                        } else {
+                            (i as f32 * 0.175).sin() * 5.
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let mut expected = vec![0.; source.len()];
+                softmax_slices(&source, &mut expected, outer, width, inner);
+                let mut actual = source.clone();
+                softmax_slices_in_place(&mut actual, outer, width, inner);
+                assert_eq!(
+                    actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "width={width} inner={inner} specials={specials}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn untransformed_serial_runs_batch_once_and_transformed_runs_keep_cache_tiles() {
+    use std::cell::RefCell;
+    let shape = [33, 257]; // 33,924 bytes: crosses the 32 KiB tile boundary.
+    let eff = [0, 0];
+    let mask_values = [0.25];
+    for (scale, mask, expected, calls) in [
+        (1., None, 1., vec![33 * 257]),
+        (2., None, 2., vec![31 * 257, 2 * 257]),
+        (
+            1.,
+            Some(MaskPlan {
+                values: &mask_values,
+                eff: &eff,
+                scores_shape: &shape,
+            }),
+            1.25,
+            vec![31 * 257, 2 * 257],
+        ),
+    ] {
+        let mut data = vec![1f32; 33 * 257];
+        let observed = RefCell::new(Vec::new());
+        scale_mask_softmax_serial_with_kernel(&mut data, 0, 257, scale, mask, |rows, width| {
+            assert_eq!(width, 257);
+            assert!(rows.iter().all(|&v| v == expected));
+            observed.borrow_mut().push(rows.len());
+        });
+        assert_eq!(*observed.borrow(), calls);
     }
 }

@@ -792,8 +792,14 @@ repetitions above 2,000 are refused and larger upper bounds become unbounded.
 The model must declare a dense, resolved, token-local byte vocabulary. Actual
 raw pieces include special-token spellings; only explicitly declared ending IDs
 receive terminal semantics. Token names and angle brackets do not guess roles.
-Non-byte contextual decoders and stream-initial/trailing stripping currently return an
-actionable capability error before SSE.
+Resolved stream-initial/trailing Strip stages apply to published text; raw
+GBNF/Lark and lazy JSON inspect the vocabulary pieces before those stages.
+For example, a raw piece ` hello ` remains subject to a grammar requiring both
+spaces even when the tokenizer publishes `hello`. This matches the pinned
+[vocabulary cache](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/src/llama-vocab.cpp)
+and [grammar sampler](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/src/llama-grammar.cpp).
+Non-byte and unresolved contextual decoders still return an actionable capability
+error before SSE; ordinary content constraints continue to inspect published content.
 
 Both raw grammar forms conflict with JSON `response_format`, forced `tool_choice`, and
 `ignore_eos=true`. Raw GBNF accepts `grammar_lazy=true` with nonempty

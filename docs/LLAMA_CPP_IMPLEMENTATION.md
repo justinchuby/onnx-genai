@@ -1319,8 +1319,25 @@ ByteStreamContract proves actual decoder bytes and dense IDs. Raw special-token
 pieces remain available to character literals, matching the pinned upstream
 [vocabulary cache](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/src/llama-vocab.cpp).
 Only explicit ending roles get EOS frames; adapter name-based role guesses and
-decoded-token fallback are excluded. Contextual initial stripping remains an
-explicit unsupported capability on this raw model-token path.
+decoded-token fallback are excluded. Resolved stream-initial and stream-trailing Strip stages affect published text
+but do not alter the raw vocabulary used by GBNF, raw Lark, or lazy JSON.
+Unresolved contextual decoder transforms remain unsupported. Lazy JSON uses
+the same raw identity codec throughout trigger replay and subsequent tokens;
+ordinary projected-content constraints retain publication decoding semantics.
+JSON normalization also ignores trailing JSON whitespace after complete lexemes,
+while retaining string-value spaces and rejecting whitespace-terminated unfinished
+numbers/keywords. The raw response-byte budget remains enforced before logical
+normalization; neither whitespace nor escape normalization bypasses that budget.
+
+Validation for resolved Strip/raw constraints: full engine library 1111 passed
+(1 inherited ignore); full server library 615 passed (2 inherited ignores).
+The added real wire test passed all 48 Native/ORT × native/legacy/chat ×
+buffered/SSE × GBNF/raw-Lark/lazy-GBNF/lazy-JSON combinations. Strict all-target
+engine/server Clippy passed with defaults; strict server Clippy also passed with
+`--no-default-features --features metrics,cuda-13000`. Formatting and diff checks
+passed. Server network tests ran with local loopback access after all 37 failures
+in the restricted run were identified as port permission errors. These are CPU
+functional checks; no GPU or performance claim is made.
 
 Adversarial mask tests exposed two real semantic differences: negated token
 ranges could allow EOS before the root completed, and llguidance canonical
