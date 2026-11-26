@@ -67,6 +67,37 @@ impl SeqTensor {
         Self::new(tensor)
     }
 
+    pub(crate) fn from_shared(
+        storage: Arc<SharedTensorBuffer>,
+        dtype: DataType,
+        shape: Vec<usize>,
+        layout: TensorLayout,
+        byte_offset: usize,
+    ) -> SequenceResult<Self> {
+        let strides =
+            layout
+                .resolved_strides(&shape)
+                .map_err(|source| SequenceError::TensorCreation {
+                    op: "SequenceTensor",
+                    source: source.into(),
+                })?;
+        validate_view_bounds(
+            "SequenceTensor",
+            &shape,
+            &strides,
+            byte_offset,
+            dtype,
+            storage.buffer().len(),
+        )?;
+        Ok(Self {
+            storage,
+            dtype,
+            shape,
+            layout,
+            byte_offset,
+        })
+    }
+
     /// Whether two handles share the same underlying device allocation.
     pub fn shares_storage_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.storage, &other.storage)
