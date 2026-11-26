@@ -2623,7 +2623,7 @@ and per-batch DFT allocations still require their own workspace migration.
 
 DFT's real/imaginary input and output vectors now borrow four transform-length
 regions from the same StepScoped Host execution domain as STFT. A private
-FloatWorkspace<4> descriptor centralizes checked partitioning and initialization;
+TypedWorkspace<f32, 4> descriptor centralizes checked partitioning and initialization;
 it owns neither backing nor quota. Both operators use its closure-scoped Host
 borrows. DFT constructs one existing DftPlan per execution and reuses it across
 all batches, instead of allocating vectors and DSP setup for each transform.
@@ -2713,7 +2713,7 @@ accounting or CUDA execution.
 
 ### One private initialized-float binding contract for CPU kernels
 
-DFT, STFT and both RMS schemas now use `FloatWorkspace<N>` instead of separate
+DFT, STFT and both RMS schemas now use `TypedWorkspace<f32, N>` instead of separate
 Fourier and RMS raw-pointer initialization code. A kernel supplies named f32
 region lengths, keeps its own geometry and declares the same existing
 StepScoped requirement. The descriptor uses fixed-size stack arrays and the
@@ -2748,7 +2748,7 @@ claim is made.
 
 LayerNormalization (default and private fused domain) and SkipLayerNormalization
 now share one explicit schema-kind kernel, checked metadata geometry and
-`FloatWorkspace<4>`. The allocating `layer_norm_dense` return interface and
+`TypedWorkspace<f32, 4>`. The allocating `layer_norm_dense` return interface and
 Skip's residual-sum Vec are removed. The regions are Y, requested mean,
 requested inverse standard deviation, and Skip's full residual sum. Standard
 LayerNorm has no sum region; omitted statistics occupy zero bytes. Skip keeps
@@ -2824,7 +2824,7 @@ existing stash-type behavior are outside this change.
 
 Both legacy (opsets 1–12, flattened suffix) and modern (opset 13+, one selected
 axis) LogSoftmax factories now declare metadata workspace planning. The kernel
-replaces its per-execution full-output Vec with FloatWorkspace<1> on the existing
+replaces its per-execution full-output Vec with TypedWorkspace<f32, 1> on the existing
 StepScoped lane. Its bound is exactly four bytes per X element, zero for empty
 input. Unresolved Y metadata derives the same bound from X; resolved Y must
 match the complete input shape. No kernel pool, extra owner or per-slice grant
@@ -2849,3 +2849,106 @@ re-admission for opsets 11 and 13. Real ORT plugin fixtures disable fallback,
 require LogSoftmax assignment to cpu_ep and check both versions numerically
 across those changing shapes. These are correctness and allocation invariants,
 not inference-speed or CUDA-runtime measurements.
+
+
+### BlockMoE checks actual numerical stages across cache-budget routes
+
+The optional-MLAS mixed-format expert regression used a full-width GEMM as the
+reference for a streamed one-column GEMM, then judged only their final residual.
+On main `4eaa636`, case 0 element 329 was -0.10598877 versus -0.10596141; the
+existing output-relative threshold rejected this cancellation-sensitive result.
+That failure independently reproduced before the CPU output-safety change.
+
+The test now observes actual FC1/optional FC3/FC2 boundaries within the shared
+expert workspace. Every projection is checked against f64 dot+bias arithmetic on
+its actual f32 input, using gamma_(2K+1) times the sum of absolute products plus
+bias. Reference rounding and propagated input uncertainty are explicit. An
+additional full two-projection affine reference propagates those error bounds
+through the identity fixture and routing. The canonical decoder still produces
+f32 weights; arithmetic is independent, while decoding has separate regressions.
+Normal/zero operands are checked before f64 conversion. The fixture's underflow
+allowance is not a general certification of arbitrary hardware DAZ modes.
+
+Identity, ReLU and tanh-GELU activation results are bit-checked from independent
+formulas. SiLU/SwiGLU use a fixed fixture-local eight-ULP contract, separate from
+the GEMM bound; each case logs maximum ULP, position and operands. Expert-order
+scatter is reconstructed bit for bit from observed FC2 outputs and supplied
+normalized routing weights. This oracle deliberately targets the all-experts,
+all-rows fixture; it does not silently assume those properties for arbitrary
+routed models.
+
+Negative controls exercise the actual checker: projection error above its
+computed budget, wrong gather order, wrong bias slice, excessive activation ULP
+(with FC2 recomputed to avoid an unrelated downstream refusal), and a one-bit
+scatter change. Existing streamed/denied byte equality, whole-group admission,
+no partial expansion and no retained streamed weights remain unchanged. Scoped
+thread-local observations are non-Send, clear after unwinding and exist only
+under cfg(test). Production arithmetic, routing, cache owners and grant/refund
+paths are unchanged; no timing or CUDA validation is inferred.
+
+
+### Softmax preserves direct output and admits fallback staging
+
+Softmax and LogSoftmax share checked axis, output-shape and capacity geometry.
+Softmax metadata preparation reports Deferred for nonempty f32 Y because tensor
+metadata cannot prove address alignment or input/output disjointness. Execution
+refinement uses actual Host views without reading tensor values: safe direct
+output needs no scratch; other routes admit one StepScoped `4 * numel` f32 lane.
+Missing actual output views retain the complete conservative staging bound.
+Non-f32 Y has that known bound at metadata preparation; empty shapes need none.
+Deferred preparation is deliberately not a completed zero-byte reservation.
+
+The borrowing predicate is shared with input widening: a source materialized
+into owned storage can alias direct Y because materialization finishes first.
+Borrowed f32 input/output overlap instead uses the admitted lane. This removes
+the ungoverned per-call output Vec without adding a pool, owner, or per-row grant.
+Input widening allocations remain outside this output-staging budget. Reducer
+arithmetic and ISA dispatch remain unchanged. Tests check direct execution under
+zero workspace capacity, fallback refusal/reuse/trim, dynamic shapes in both
+opset families, real ORT assignment with fallback disabled, and 4096 warm cycles
+with no governor callbacks (including zero-byte callbacks). These correctness
+checks do not establish zero latency overhead or CUDA behavior.
+
+
+### Typed workspace and LpNormalization storage staging
+
+The CPU-only borrowed workspace helper is now `TypedWorkspace<T, N>` for
+`Copy + Default` elements. All existing f32 callers use the same checked layout,
+Host lane, HRTB closure and whole-binding validation; no compatibility alias or
+new allocation owner remains. Regions are initialized with valid `T::default()`
+values before constructing typed slices. A generic Default is not assumed to be
+all-zero bits. Zero-sized types are rejected; byte counts and alignment come
+from `Layout::array::<T>`.
+
+LpNormalization now requests one StepScoped `numel * sizeof(storage T)` lane.
+It computes reductions and division in the original accumulator type (f64 for
+f64 storage, f32 otherwise), narrows each completed result directly into staging,
+and publishes after all source reads. The previous accumulator-output Vec and
+converted-output Vec are removed. Input materialization remains outside this
+output budget and preserves arbitrary input/output aliasing. Checked metadata
+planning validates exact dtype/shape, axis and indexing capacity, including empty
+shapes; actual execution validates Host views before binding scratch. This
+introduces no per-slice grants or new public EP API and makes no timing/CUDA claim.
+
+
+### LpNormalization reuses its lane for the complete input snapshot
+
+LpNormalization now copies the original storage elements directly into its
+admitted staging lane, then normalizes that snapshot in place. Every dense
+coordinate belongs to exactly one `(outer, inner)` reduction group. Each group
+finishes its norm before overwriting its own values and cannot read another
+group's outputs. The real output is still published only after the complete
+snapshot and all reductions. Accumulator type, reduction order, TINY floor and
+final storage conversion stay unchanged. The last matrix-sized input Vec is
+removed without adding a lane or changing the `numel * sizeof(T)` peak.
+
+The storage-copy visitor is shared by allocating `to_dense` reads and borrowed
+`to_dense_into` reads. It validates Host access, dtype, view geometry and checked
+capacity before accessing elements; the borrowed route also validates complete
+destination length before writes. Copies preserve raw storage bits, including
+half/f64 and NaN payloads, rather than widening through f32. Rank-sized indexing
+metadata remains separate from tensor payload admission; high-rank indexing may
+still allocate. A real global-allocator probe uses the old allocating copy as a
+positive control and verifies that kernel executions allocate no matrix-sized
+payload for any of the four float storage types. Existing public peak/trim and
+4096-cycle warm governor tests retain their original bounds and callbacks.

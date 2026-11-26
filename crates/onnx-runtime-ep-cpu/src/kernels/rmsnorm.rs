@@ -22,7 +22,7 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::Node;
 
 use super::check_arity;
-use super::float_workspace::FloatWorkspace;
+use super::typed_workspace::TypedWorkspace;
 use crate::dtype::{to_dense_f32_widen, validate_f32_widen_input, write_dense_f32_narrow};
 
 #[derive(Clone, Copy)]
@@ -79,7 +79,7 @@ struct RmsGeometry {
     groups: usize,
     count: usize,
     stats: bool,
-    workspace: FloatWorkspace<2>,
+    workspace: TypedWorkspace<f32, 2>,
 }
 
 impl RmsNormKernel {
@@ -222,7 +222,7 @@ impl RmsNormKernel {
             }
             stats |= i == 1;
         }
-        let workspace = FloatWorkspace::new(
+        let workspace = TypedWorkspace::<f32, _>::new(
             op,
             [
                 ("Y staging", count),

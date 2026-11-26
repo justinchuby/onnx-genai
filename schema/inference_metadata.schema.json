@@ -2468,6 +2468,38 @@
       },
       "type": "object"
     },
+    "KeyedWeightFileSpec": {
+      "additionalProperties": false,
+      "description": "One immutable keyed container supplying external initializers of an ONNX\ngraph. Tensor geometry and element/packed representation come from the\ngraph and container; the runtime never casts, reshapes or guesses a mapping.",
+      "properties": {
+        "format": {
+          "$ref": "#/$defs/KeyedWeightFormat"
+        },
+        "path": {
+          "description": "Package-relative file path, resolved beneath the admitted package root.",
+          "type": "string"
+        },
+        "renames": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Container tensor key -> ONNX initializer name. Unmapped keys retain\ntheir names; the loader rejects ambiguous matches and unmatched renames.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "path",
+        "format"
+      ],
+      "type": "object"
+    },
+    "KeyedWeightFormat": {
+      "enum": [
+        "gguf",
+        "safetensors"
+      ],
+      "type": "string"
+    },
     "LiteralValue": {
       "anyOf": [
         {
@@ -6974,6 +7006,16 @@
         }
       ],
       "description": "Authoritative generation defaults and the structural override surface."
+    },
+    "graph_weights": {
+      "additionalProperties": {
+        "items": {
+          "$ref": "#/$defs/KeyedWeightFileSpec"
+        },
+        "type": "array"
+      },
+      "description": "Keyed GGUF/SafeTensors containers for each package-relative ONNX graph.\nThe graph remains the source of executable semantics and tensor geometry.",
+      "type": "object"
     },
     "hardware_requirements": {
       "anyOf": [
