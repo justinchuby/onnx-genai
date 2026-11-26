@@ -249,7 +249,8 @@ fn strided_sequence_view_copies_directly_into_admitted_backing() {
     element.layout = TensorLayout::strided(vec![1, 2]);
     let copied = context
         .fill(DataType::Float32, vec![2, 2], |bytes| {
-            element.copy_host_contiguous_into(bytes)
+            element.copy_host_contiguous_into(bytes)?;
+            Ok(())
         })
         .unwrap();
     assert_eq!(copied.try_as_slice_f32().unwrap(), &[1.0, 3.0, 2.0, 4.0]);
