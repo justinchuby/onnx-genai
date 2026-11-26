@@ -1,7 +1,6 @@
-//! The [`CudaExecutionProvider`]: a GPU execution provider backed by cudarc +
-//! cuBLASLt (`docs/architecture/ORT2.md` §15). Phase 2a wires standard GEMM (`MatMul`) only;
-//! everything else returns an actionable "not implemented in CUDA EP Phase 2a"
-//! error rather than silently falling back or panicking.
+//! The [`CudaExecutionProvider`]: a GPU execution provider backed by cudarc,
+//! dynamically loaded NVIDIA libraries, and NVRTC kernels. See
+//! `docs/execution/CUDA_COVERAGE.md` for current operator coverage.
 //!
 //! # Memory & safety model
 //!
@@ -1722,7 +1721,7 @@ impl CudaAllocationDomain {
     }
 }
 
-/// CUDA execution provider (Phase 2a: cudarc + cuBLASLt GEMM).
+/// CUDA execution provider.
 ///
 /// Unlike the always-available CPU EP, this provider needs a real device, so
 /// [`CudaExecutionProvider::new`] is **fallible** — it returns an error when no
@@ -1918,7 +1917,7 @@ impl CudaExecutionProvider {
         drop(self.lock_route_executors());
     }
 
-    /// Construct a CUDA EP bound to `CUDA:ordinal` with the Phase-2a kernels
+    /// Construct a CUDA EP bound to `CUDA:ordinal` with the CUDA kernels
     /// registered. Fails if the device or CUDA libraries are unavailable.
     pub fn new(ordinal: u32) -> Result<Self> {
         Self::new_with_offload_policy(ordinal, DeviceOffloadPolicy::from_env())

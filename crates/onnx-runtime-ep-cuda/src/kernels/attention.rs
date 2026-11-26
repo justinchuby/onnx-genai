@@ -1,11 +1,10 @@
-//! Phase-2b scaled-dot-product / grouped-query **attention** on the GPU
+//! Scaled-dot-product / grouped-query **attention** on the GPU
 //! (`docs/architecture/ORT2.md` §13 + §15.5).
 //!
 //! Multi-token prefill uses an NVRTC-compiled tiled online-softmax kernel that
 //! keeps score tiles and softmax state in SRAM/registers. It does not allocate
-//! the `[B,H,Sq,Sk]` score tensor. Single-token decode and head dimensions above
-//! 128 retain the Phase-2a cuBLASLt → softmax → cuBLASLt baseline as a transparent
-//! fallback and correctness oracle.
+//! the `[B,H,Sq,Sk]` score tensor. The unfused cuBLASLt → softmax → cuBLASLt path
+//! serves single-token decode and prefill shapes not selected for fusion.
 //!
 //! ## What it computes
 //!
@@ -16,7 +15,7 @@
 //! with `Q : [B, num_heads, Sq, D]`, `K,V : [B, num_kv_heads, Sk, D]`, and
 //! `O : [B, num_heads, Sq, D]`, all row-major f32/f16/bf16.
 //!
-//! ## Phase-2a fallback — two batched cuBLAS GEMMs around one NVRTC softmax
+//! ## cuBLASLt/softmax fallback — two batched cuBLAS GEMMs around one NVRTC softmax
 //!
 //! 1. **Scores** `S = scale·Q·Kᵀ` via [`blas::gemm_ex`]. cuBLAS is
 //!    column-major; a row-major `X[r,c]` (ld=c) is byte-identically the
@@ -47,10 +46,10 @@
 //! collapsing them into a single strided-batch call (KV stride 0 within a group)
 //! remains a fallback-path throughput optimisation.
 //!
-//! ## Phase-2a limits (all actionable errors, never panics)
+//! ## Input requirements
 //!
-//! * dtype other than f32/f16/bf16 → deferred.
-//! * ranks other than the explicit 4-D `[B, H, S, D]` layout → deferred.
+//! * Q/K/V must use f32, f16, or bf16.
+//! * Q/K/V must use the explicit 4-D `[B, H, S, D]` layout.
 //! * non-contiguous (strided) Q/K/V/O or mask → actionable "materialise" error.
 
 use std::alloc::Layout;
@@ -341,16 +340,16 @@ impl AttentionDtype {
 /// reduction is exact); rows longer than this are handled by the strided loop.
 const SOFTMAX_BLOCK: u32 = 256;
 
-/// Alignment (bytes) of the governed Phase-2a attention scratch blob. cuBLASLt
+/// Alignment (bytes) of the governed cuBLASLt/softmax attention scratch blob. cuBLASLt
 /// requires its workspace at a 256-byte boundary, and the `[B,H,Sq,Sk]` scores
 /// buffer that precedes it is padded to the same boundary so the workspace stays
 /// aligned inside one suballocation.
-pub(super) const PHASE2A_SCRATCH_ALIGN: usize = 256;
+pub(super) const BLAS_SOFTMAX_SCRATCH_ALIGN: usize = 256;
 
 /// The complete scores + cuBLASLt layout is shared by planning and execution.
 /// Checked sizes and binding use the common workspace contract: the kernel
 /// partitions an exclusive loan and never admits or owns scratch here.
-pub(super) fn phase2a_scratch_layout(
+pub(super) fn blas_softmax_scratch_layout(
     dtype: AttentionDtype,
     batch: usize,
     num_heads: usize,
@@ -358,13 +357,13 @@ pub(super) fn phase2a_scratch_layout(
     sk: usize,
 ) -> Result<WorkspaceLayout<2>> {
     WorkspaceLayout::new([
-        phase2a_scores_layout(dtype, batch, num_heads, sq, sk)?,
-        Layout::from_size_align(WORKSPACE_BYTES, PHASE2A_SCRATCH_ALIGN)
+        blas_softmax_scores_layout(dtype, batch, num_heads, sq, sk)?,
+        Layout::from_size_align(WORKSPACE_BYTES, BLAS_SOFTMAX_SCRATCH_ALIGN)
             .expect("fixed cuBLASLt workspace has an addressable 256-byte-aligned layout"),
     ])
 }
 
-fn phase2a_scores_layout(
+fn blas_softmax_scores_layout(
     dtype: AttentionDtype,
     batch: usize,
     num_heads: usize,
@@ -380,21 +379,21 @@ fn phase2a_scores_layout(
         .into_iter()
         .try_fold(1usize, usize::checked_mul)
         .ok_or_else(rejected)?;
-    Layout::from_size_align(scores_bytes, PHASE2A_SCRATCH_ALIGN).map_err(|_| rejected())
+    Layout::from_size_align(scores_bytes, BLAS_SOFTMAX_SCRATCH_ALIGN).map_err(|_| rejected())
 }
 
-/// Resolved device pointers for the Phase-2a scratch, carved from a governed
+/// Resolved device pointers for the cuBLASLt/softmax scratch, carved from a governed
 /// workspace blob. Holding no ownership, it is safe to hand to the compute path
 /// that never frees these pointers (the executor owns the workspace lifetime).
 #[derive(Clone, Copy)]
-pub(super) struct Phase2aScratch {
+pub(super) struct BlasSoftmaxScratch {
     scores: CUdeviceptr,
     scores_bytes: usize,
     workspace: CUdeviceptr,
     workspace_bytes: usize,
 }
 
-impl Phase2aScratch {
+impl BlasSoftmaxScratch {
     fn validate_geometry(
         &self,
         dtype: AttentionDtype,
@@ -403,7 +402,7 @@ impl Phase2aScratch {
         sq: usize,
         sk: usize,
     ) -> Result<()> {
-        let required = phase2a_scores_layout(dtype, batch, heads, sq, sk)?.size();
+        let required = blas_softmax_scores_layout(dtype, batch, heads, sq, sk)?.size();
         if self.scores_bytes < required {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep Attention: borrowed score capacity {} bytes is smaller than {required} bytes for batch={batch}, heads={heads}, seq_q={sq}, seq_k={sk}, dtype={dtype:?}; reprepare caller workspace for this invocation",
@@ -475,7 +474,7 @@ impl KernelFactory for AttentionFactory {
     }
 }
 
-/// Phase-2b SDPA/GQA attention with a fused prefill path and Phase-2a fallback.
+/// SDPA/GQA attention with a fused prefill path and cuBLASLt/softmax fallback.
 #[derive(Debug)]
 pub struct AttentionKernel {
     runtime: Arc<CudaRuntime>,
@@ -493,7 +492,7 @@ pub struct AttentionKernel {
 enum AttentionMode {
     Auto,
     Fused,
-    Phase2a,
+    BlasSoftmax,
 }
 
 impl AttentionKernel {
@@ -531,9 +530,9 @@ impl AttentionKernel {
     /// Construct the memory-efficient fused implementation directly.
     ///
     /// The normal [`Self::new`] constructor applies a measured performance
-    /// heuristic and can choose Phase-2a for long shapes where this first NVRTC
-    /// implementation is not yet faster. This constructor is used by parity and
-    /// memory benchmarks; unsupported shapes still fall back safely.
+    /// heuristic that can choose cuBLASLt/softmax for longer shapes. This
+    /// constructor bypasses that heuristic for parity and memory benchmarks;
+    /// unsupported shapes still fall back safely.
     pub fn new_fused(
         runtime: Arc<CudaRuntime>,
         causal: bool,
@@ -546,11 +545,11 @@ impl AttentionKernel {
         Ok(kernel)
     }
 
-    /// Construct the retained Phase-2a implementation directly.
+    /// Construct the retained cuBLASLt/softmax implementation directly.
     ///
     /// This is primarily a parity/benchmark oracle. Production callers should
     /// use [`Self::new`], which selects fused prefill when supported.
-    pub fn new_phase2a(
+    pub fn new_blas_softmax(
         runtime: Arc<CudaRuntime>,
         causal: bool,
         num_heads: usize,
@@ -558,11 +557,11 @@ impl AttentionKernel {
         scale: Option<f32>,
     ) -> Result<Self> {
         let mut kernel = Self::new(runtime, causal, num_heads, num_kv_heads, scale)?;
-        kernel.mode = AttentionMode::Phase2a;
+        kernel.mode = AttentionMode::BlasSoftmax;
         Ok(kernel)
     }
 
-    /// Select the fused (shared-memory) prefill path over the Phase-2a cuBLASLt
+    /// Select the fused (shared-memory) prefill path over the cuBLASLt/softmax
     /// path. Prepare-only workspace planning and execution both call this so the
     /// reserved scratch (zero for the fused path) matches what runs.
     fn use_fused(&self, dtype: DataType, sq: usize, sk: usize, d: usize) -> bool {
@@ -575,7 +574,7 @@ impl AttentionKernel {
         match self.mode {
             AttentionMode::Auto => fused_supported && measured_fused_win,
             AttentionMode::Fused => fused_supported,
-            AttentionMode::Phase2a => false,
+            AttentionMode::BlasSoftmax => false,
         }
     }
 
@@ -621,7 +620,7 @@ impl AttentionKernel {
         for (name, t) in [("Q", q.shape), ("K", k.shape), ("V", v.shape)] {
             if t.len() != 4 {
                 return Err(not_implemented(format!(
-                    "Attention with {name} rank {} (Phase-2a expects 4-D \
+                    "Attention with {name} rank {} (CUDA Attention expects 4-D \
                      [batch, heads, seq, head_dim]); reshape/transpose upstream",
                     t.len()
                 )));
@@ -722,14 +721,14 @@ impl AttentionKernel {
 
         let fused = self.use_fused(q.dtype, sq, sk, d);
         // #757: keep capture admission truthful. The fused path is capture-safe;
-        // the Phase-2a path performs an unconditional trailing synchronize (see
-        // `run_attention_phase2a`, allowlisted in capture_sync_contract.rs) and
-        // must be refused during capture. §736 governs the Phase-2a scratch for
+        // the cuBLASLt/softmax path performs an unconditional trailing synchronize (see
+        // `run_attention_blas_softmax`, allowlisted in capture_sync_contract.rs) and
+        // must be refused during capture. §736 governs the cuBLASLt/softmax scratch for
         // admission, but that does not make the sync capture-safe.
         self.last_call_capture_safe.store(fused, Ordering::Relaxed);
         if !fused && self.runtime.is_capturing()? {
             return Err(EpError::KernelFailed(
-                "cuda_ep Attention selected the synchronizing Phase-2a path during CUDA graph capture; select a capture-safe fused implementation"
+                "cuda_ep Attention selected the synchronizing cuBLASLt/softmax path during CUDA graph capture; select a capture-safe fused implementation"
                     .into(),
             ));
         }
@@ -776,9 +775,9 @@ impl AttentionKernel {
                 &KvCacheStrides::head_major_bnsh(),
             )
         } else {
-            let layout = phase2a_scratch_layout(dtype, batch, self.num_heads, sq, sk)?;
-            let scratch = Phase2aScratch::bind(&layout, workspace)?;
-            run_attention_phase2a(
+            let layout = blas_softmax_scratch_layout(dtype, batch, self.num_heads, sq, sk)?;
+            let scratch = BlasSoftmaxScratch::bind(&layout, workspace)?;
+            run_attention_blas_softmax(
                 &self.runtime,
                 dtype,
                 self.num_heads,
@@ -811,7 +810,7 @@ impl AttentionKernel {
 /// always accumulates GEMMs in fp32; the softmax kernel likewise widens every
 /// reduction value to fp32 before narrowing probabilities to the IO dtype.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn run_attention_phase2a(
+pub(super) fn run_attention_blas_softmax(
     runtime: &CudaRuntime,
     dtype: AttentionDtype,
     num_heads: usize,
@@ -834,11 +833,11 @@ pub(super) fn run_attention_phase2a(
     past_lengths: CUdeviceptr,
     local_window: i32,
     softcap: f32,
-    scratch: Phase2aScratch,
+    scratch: BlasSoftmaxScratch,
 ) -> Result<()> {
     let elem_size = dtype.element_size();
     scratch.validate_geometry(dtype, batch, num_heads, sq, sk)?;
-    let Phase2aScratch {
+    let BlasSoftmaxScratch {
         scores: scores_buf,
         workspace,
         workspace_bytes,
@@ -955,7 +954,7 @@ pub(super) fn run_attention_phase2a(
 
 impl Kernel for AttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        // Fused execution needs no external scratch. A Phase-2a route requires
+        // Fused execution needs no external scratch. A cuBLASLt/softmax route requires
         // the caller to query its requirement and supply a prepared workspace;
         // missing admission must never become an implicit raw allocation.
         self.run(inputs, outputs, None)
@@ -967,7 +966,7 @@ impl Kernel for AttentionKernel {
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
     ) -> Result<onnx_runtime_ep_api::WorkspacePreparation> {
         // Prepare-only planning (#747): report the exact governed scratch for the
-        // Phase-2a path so the executor reserves it against the device authority
+        // cuBLASLt/softmax path so the executor reserves it against the device authority
         // before request admission. The fused path uses only shared memory and
         // needs no device scratch. On any shape/dtype that `run` would reject we
         // report NONE and let execution raise the precise validation error.
@@ -998,14 +997,14 @@ impl Kernel for AttentionKernel {
                 WorkspaceRequirement::NONE,
             ));
         }
-        let layout = phase2a_scratch_layout(dtype, batch, self.num_heads, sq, sk)?;
+        let layout = blas_softmax_scratch_layout(dtype, batch, self.num_heads, sq, sk)?;
         let bytes = u64::try_from(layout.bytes()).map_err(|_| {
             EpError::KernelFailed("cuda_ep Attention: workspace does not fit u64".into())
         })?;
         Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
             WorkspaceRequirement {
                 bytes,
-                alignment: PHASE2A_SCRATCH_ALIGN,
+                alignment: BLAS_SOFTMAX_SCRATCH_ALIGN,
                 lifetime: WorkspaceLifetime::StepScoped,
             },
         ))
@@ -1021,10 +1020,8 @@ impl Kernel for AttentionKernel {
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
-        // §13.3 binding: the interface advertises strided support so the FA3 /
-        // cuDNN drop-in (Phase 2b) needs no signature change. The Phase-2a
-        // baseline validates contiguity and returns an actionable error for a
-        // strided view rather than silently mis-reading it.
+        // Keep layout validation in the kernel so it can report the rejected
+        // view and how to materialize it.
         true
     }
 
@@ -1033,7 +1030,7 @@ impl Kernel for AttentionKernel {
             onnx_runtime_ep_api::CaptureSupport::Supported
         } else {
             onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "requires a warmed fused-attention path; the Phase-2a fallback synchronizes the CUDA stream",
+                "requires a warmed fused-attention path; the cuBLASLt/softmax fallback synchronizes the CUDA stream",
             )
         }
     }
@@ -1072,19 +1069,20 @@ mod tests {
     }
 
     #[test]
-    fn phase2a_scratch_layout_matches_byte_formula() {
+    fn blas_softmax_scratch_layout_matches_byte_formula() {
         // Regression guard (§736): planning and execution size the governed
-        // Phase-2a scratch through this exact helper, so pin its formula. The
+        // cuBLASLt/softmax scratch through this exact helper, so pin its formula. The
         // scores blob is `batch·heads·sq·sk·elem` padded up to the cuBLASLt
         // alignment, followed by the fixed cuBLASLt workspace.
         let (batch, heads, sq, sk) = (2usize, 4usize, 128usize, 96usize);
-        let layout = phase2a_scratch_layout(AttentionDtype::F16, batch, heads, sq, sk).unwrap();
+        let layout =
+            blas_softmax_scratch_layout(AttentionDtype::F16, batch, heads, sq, sk).unwrap();
         let elem = AttentionDtype::F16.element_size() as usize;
         let scores = batch * heads * sq * sk * elem;
-        assert_eq!(layout.alignment(), PHASE2A_SCRATCH_ALIGN);
-        let storage = [0u8; PHASE2A_SCRATCH_ALIGN];
+        assert_eq!(layout.alignment(), BLAS_SOFTMAX_SCRATCH_ALIGN);
+        let storage = [0u8; BLAS_SOFTMAX_SCRATCH_ALIGN];
         let base = storage.as_ptr() as usize;
-        let aligned = base.next_multiple_of(PHASE2A_SCRATCH_ALIGN);
+        let aligned = base.next_multiple_of(BLAS_SOFTMAX_SCRATCH_ALIGN);
         // Binding only describes raw regions; it does not access the backing.
         let backing = WorkspaceView::new(
             onnx_runtime_ep_api::DevicePtrMut(aligned as *mut _),
@@ -1093,14 +1091,14 @@ mod tests {
         let [scores_view, blas_view] = layout.bind(Some(backing)).unwrap();
         assert_eq!(scores_view.bytes(), scores);
         assert_eq!(scores_view.ptr().0 as usize, aligned);
-        let padded = scores.next_multiple_of(PHASE2A_SCRATCH_ALIGN);
+        let padded = scores.next_multiple_of(BLAS_SOFTMAX_SCRATCH_ALIGN);
         assert_eq!(blas_view.ptr().0 as usize - aligned, padded);
         assert_eq!(layout.bytes(), padded + WORKSPACE_BYTES);
         assert_eq!(blas_view.bytes(), WORKSPACE_BYTES);
     }
 
     #[test]
-    fn phase2a_scratch_rejects_overflow_without_allocating() {
+    fn blas_softmax_scratch_rejects_overflow_without_allocating() {
         for (batch, heads, sq, sk) in [
             (usize::MAX, 2, 1, 1),
             (1, 1, usize::MAX, 2),
@@ -1108,7 +1106,7 @@ mod tests {
             (1, 1, 1, (isize::MAX as usize) / 4),
         ] {
             let error =
-                phase2a_scratch_layout(AttentionDtype::F32, batch, heads, sq, sk).unwrap_err();
+                blas_softmax_scratch_layout(AttentionDtype::F32, batch, heads, sq, sk).unwrap_err();
             let message = error.to_string();
             assert!(
                 message.contains("workspace") && message.contains("reduce the prepared shape"),
@@ -1118,9 +1116,9 @@ mod tests {
     }
 
     #[test]
-    fn phase2a_scratch_binding_requires_prepared_exclusive_capacity() {
+    fn blas_softmax_scratch_binding_requires_prepared_exclusive_capacity() {
         use onnx_runtime_ep_api::DevicePtrMut;
-        let layout = phase2a_scratch_layout(AttentionDtype::F32, 1, 2, 3, 5).unwrap();
+        let layout = blas_softmax_scratch_layout(AttentionDtype::F32, 1, 2, 3, 5).unwrap();
         for workspace in [
             None,
             Some(WorkspaceView::new(
@@ -1140,7 +1138,7 @@ mod tests {
                 layout.bytes(),
             )),
         ] {
-            let message = match Phase2aScratch::bind(&layout, workspace) {
+            let message = match BlasSoftmaxScratch::bind(&layout, workspace) {
                 Ok(_) => panic!("invalid prepared workspace must be rejected"),
                 Err(error) => error.to_string(),
             };
@@ -1150,7 +1148,7 @@ mod tests {
             );
         }
         // These are opaque device addresses: binding must never dereference them.
-        let scratch = Phase2aScratch::bind(
+        let scratch = BlasSoftmaxScratch::bind(
             &layout,
             Some(WorkspaceView::new(
                 DevicePtrMut(256usize as *mut _),
@@ -1164,13 +1162,13 @@ mod tests {
     }
 
     #[test]
-    fn phase2a_borrowed_scores_reject_larger_actual_geometry_without_device_access() {
-        let layout = phase2a_scratch_layout(AttentionDtype::F32, 2, 3, 5, 7).unwrap();
+    fn blas_softmax_borrowed_scores_reject_larger_actual_geometry_without_device_access() {
+        let layout = blas_softmax_scratch_layout(AttentionDtype::F32, 2, 3, 5, 7).unwrap();
         let backing = WorkspaceView::new(
             onnx_runtime_ep_api::DevicePtrMut(0x10000usize as *mut _),
             layout.bytes(),
         );
-        let scratch = Phase2aScratch::bind(&layout, Some(backing)).unwrap();
+        let scratch = BlasSoftmaxScratch::bind(&layout, Some(backing)).unwrap();
         scratch
             .validate_geometry(AttentionDtype::F32, 2, 3, 5, 7)
             .unwrap();
@@ -1198,29 +1196,31 @@ mod tests {
         ignore = "requires CUDA device; enable gpu-tests on a CUDA runner"
     )]
     #[test]
-    fn workspace_requirement_matches_layout_for_phase2a_and_is_none_for_fused() {
+    fn workspace_requirement_matches_layout_for_blas_softmax_and_is_none_for_fused() {
         let Some((_provider, runtime)) = rt() else {
             eprintln!("skip: no CUDA GPU");
             return;
         };
-        // A long shape forces the Phase-2a (cuBLASLt) path: its governed
-        // requirement must equal the shared layout so the executor reserves
+        // The forced cuBLASLt/softmax path's governed requirement must equal
+        // the shared layout so the executor reserves
         // exactly what execution carves — no ungoverned raw allocation remains.
         let (batch, heads, sq, sk, d) = (1usize, 8usize, 512usize, 512usize, 64usize);
-        let phase2a = AttentionKernel::new_phase2a(runtime.clone(), true, heads, heads, None)
-            .expect("phase2a kernel");
+        let blas_softmax =
+            AttentionKernel::new_blas_softmax(runtime.clone(), true, heads, heads, None)
+                .expect("blas_softmax kernel");
         let q_shape = [batch, heads, sq, d];
         let kv_shape = [batch, heads, sk, d];
         let q = TensorMetadata::new(DataType::Float16, &q_shape, true);
         let k = TensorMetadata::new(DataType::Float16, &kv_shape, true);
         let v = TensorMetadata::new(DataType::Float16, &kv_shape, true);
-        let req = phase2a
+        let req = blas_softmax
             .workspace_requirement(&[q, k, v], &[])
             .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)
             .expect("workspace requirement");
-        let layout = phase2a_scratch_layout(AttentionDtype::F16, batch, heads, sq, sk).unwrap();
+        let layout =
+            blas_softmax_scratch_layout(AttentionDtype::F16, batch, heads, sq, sk).unwrap();
         assert_eq!(req.bytes, layout.bytes() as u64);
-        assert_eq!(req.alignment, PHASE2A_SCRATCH_ALIGN);
+        assert_eq!(req.alignment, BLAS_SOFTMAX_SCRATCH_ALIGN);
         assert_eq!(req.lifetime, WorkspaceLifetime::StepScoped);
         assert!(matches!(
             req.role(),
