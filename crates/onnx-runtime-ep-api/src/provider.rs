@@ -1221,14 +1221,14 @@ pub trait SealedDeviceAllocation: Send + Sync {
 /// This proves buffer funding only, not complete session/worker ownership.
 #[derive(Clone, Debug)]
 pub struct HostPayloadFunding {
-    authority: onnx_runtime_memory_api::MemoryAuthorityId,
+    authority: onnx_runtime_memory_governor::MemoryAuthorityId,
     manager: onnx_runtime_memory_governor::ProcessMemoryManager,
 }
 impl HostPayloadFunding {
     /// Providers must supply the authority and manager retained by their actual
     /// ordinary-buffer owner, rather than a separately configured budget.
     pub fn new(
-        authority: onnx_runtime_memory_api::MemoryAuthorityId,
+        authority: onnx_runtime_memory_governor::MemoryAuthorityId,
         manager: onnx_runtime_memory_governor::ProcessMemoryManager,
     ) -> Self {
         Self { authority, manager }
@@ -1236,7 +1236,7 @@ impl HostPayloadFunding {
     /// Both identities must match; either alone is insufficient funding proof.
     pub fn matches(
         &self,
-        authority: onnx_runtime_memory_api::MemoryAuthorityId,
+        authority: onnx_runtime_memory_governor::MemoryAuthorityId,
         manager: &onnx_runtime_memory_governor::ProcessMemoryManager,
     ) -> bool {
         self.authority == authority && self.manager.is_same_instance(manager)
