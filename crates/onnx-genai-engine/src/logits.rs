@@ -79,6 +79,18 @@ pub trait Constraint: Send + Sync {
         candidates: &[TokenCandidate],
     ) -> anyhow::Result<Vec<bool>>;
 
+    /// Whether accepting a selected token can change constraint validity before
+    /// another mask is requested (for example, lazy grammar activation).
+    fn needs_selection_feedback(&self) -> bool {
+        false
+    }
+
+    /// Validate selected output before it is committed or published. Context
+    /// contains the history preceding `token`; errors abort the selection.
+    fn on_selected(&self, _token: TokenId, _context: &ProcessorContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn name(&self) -> &str;
 }
 
@@ -537,6 +549,14 @@ impl LogitProcessor for ConstraintProcessor {
             context.generated_tokens.len()
         );
         Ok(())
+    }
+
+    fn needs_selection_feedback(&self) -> bool {
+        self.constraint.needs_selection_feedback()
+    }
+
+    fn on_selected(&self, token: TokenId, context: &ProcessorContext) -> anyhow::Result<()> {
+        self.constraint.on_selected(token, context)
     }
 
     fn name(&self) -> &str {

@@ -374,7 +374,7 @@ pub fn write_dense_float<T: FloatElem>(out: &mut TensorMut, data: &[T]) -> Resul
 }
 
 fn write_strided<T: Copy>(out: &mut TensorMut, data: &[T], want: DataType) -> Result<()> {
-    out.validate()?;
+    validate_host_output("CPU output", out)?;
     if out.dtype != want {
         return Err(EpError::InvalidTensorView {
             reason: format!("expected {want:?} output, got {:?}", out.dtype),
@@ -995,9 +995,26 @@ pub(crate) fn to_dense_f32_widen_into(
     })
 }
 
+/// Validate a CPU output before either typed borrowing or byte-wise stores.
+pub(crate) fn validate_host_output(op: &str, out: &TensorMut) -> Result<()> {
+    out.validate().map_err(|error| {
+        EpError::KernelFailed(format!(
+            "{op}: output view is invalid: {error}; bind valid Host-accessible storage"
+        ))
+    })?;
+    if !out.device.is_host_accessible() {
+        return Err(EpError::KernelFailed(format!(
+            "{op}: output on {:?} is not Host-accessible; explicitly transfer it before CPU execution",
+            out.device
+        )));
+    }
+    Ok(())
+}
+
 /// Narrow a dense `Vec<f32>` result into `out`, rounding to `out`'s float dtype
 /// (`f32`/`f16`/`bf16`/`f64`). Counterpart to [`to_dense_f32_widen`].
 pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Result<()> {
+    validate_host_output(op, out)?;
     // F16C bulk narrow for a contiguous f16 output (the KV-cache decode hot path).
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if out.dtype == DataType::Float16
@@ -1005,7 +1022,6 @@ pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Re
         && out.data_ptr_mut::<u16>().is_aligned()
         && f16c::available()
     {
-        out.validate()?;
         let n = out.numel();
         if data.len() != n {
             return Err(EpError::KernelFailed(format!(
@@ -1031,7 +1047,6 @@ pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Re
         && out.data_ptr_mut::<u16>().is_aligned()
         && bf16x::available()
     {
-        out.validate()?;
         let n = out.numel();
         if data.len() != n {
             return Err(EpError::KernelFailed(format!(
@@ -1057,7 +1072,6 @@ pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Re
         && out.is_contiguous()
         && out.data_ptr_mut::<u16>().is_aligned()
     {
-        out.validate()?;
         let n = out.numel();
         if data.len() != n {
             return Err(EpError::KernelFailed(format!(
@@ -1079,7 +1093,6 @@ pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Re
         && out.is_contiguous()
         && out.data_ptr_mut::<f32>().is_aligned()
     {
-        out.validate()?;
         let n = out.numel();
         if data.len() != n {
             return Err(EpError::KernelFailed(format!(
@@ -1158,7 +1171,11 @@ pub fn output_direct_write_eligible(
     {
         return false;
     }
-    let start = output.data_ptr_mut::<f32>() as usize;
+    let pointer = output.data_ptr_mut::<f32>();
+    if pointer.is_null() || !pointer.is_aligned() {
+        return false;
+    }
+    let start = pointer as usize;
     let out_range = start..start.saturating_add(len * std::mem::size_of::<f32>());
     read_ranges
         .iter()
@@ -1540,7 +1557,7 @@ mod tests {
         use onnx_runtime_ep_api::DevicePtrMut;
         use onnx_runtime_ir::{DeviceId, compute_contiguous_strides};
 
-        let mut buf = vec![0.0f32; 8];
+        let mut buf = vec![0.0f32; 10];
         let base = buf.as_ptr() as usize;
         let shape = [2usize, 4];
         let strides = compute_contiguous_strides(&shape);
@@ -1562,6 +1579,16 @@ mod tests {
 
         // Wrong element count -> reject even with no aliasing input.
         assert!(!output_direct_write_eligible(&mut out, 7, &[]));
+
+        // A packed backing may be byte-addressable yet not aligned for f32.
+        out.data = DevicePtrMut(unsafe { buf.as_mut_ptr().cast::<u8>().add(1).cast() });
+        out.validate().unwrap();
+        assert!(!output_direct_write_eligible(&mut out, 8, &[]));
+        out.byte_offset = 4;
+        assert!(!output_direct_write_eligible(&mut out, 8, &[]));
+        out.data = DevicePtrMut(std::ptr::null_mut());
+        out.byte_offset = 0;
+        assert!(!output_direct_write_eligible(&mut out, 8, &[]));
 
         // Range helpers.
         let s = [0.0f32; 4];
@@ -1796,5 +1823,107 @@ mod tests {
                 "{error}"
             );
         }
+    }
+    #[test]
+    fn mapped_half_output_checks_alignment_and_live_input_aliases() {
+        use onnx_runtime_ep_api::DevicePtrMut;
+        use onnx_runtime_ir::DeviceId;
+        let values = (0..64).map(|i| i as f32 * 0.25 - 4.).collect::<Vec<_>>();
+        let map = |x: &[f32], y: &mut [f32]| {
+            for (x, y) in x.iter().zip(y) {
+                *y = *x * 2.;
+            }
+        };
+        for dtype in [DataType::Float16, DataType::BFloat16] {
+            let narrow = |v: f32| {
+                if dtype == DataType::Float16 {
+                    half::f16::from_f32(v).to_bits()
+                } else {
+                    half::bf16::from_f32(v).to_bits()
+                }
+            };
+            let mut backing = [0xa5a5u16; 66];
+            let pointer = backing.as_mut_ptr().cast::<u8>();
+            let mut out = TensorMut::new(
+                DevicePtrMut(unsafe { pointer.add(1).cast() }),
+                dtype,
+                &[64],
+                &[1],
+                DeviceId::cpu(),
+            );
+            out.validate().unwrap();
+            crate::kernels::simd_activations::write_mapped("test", &mut out, &values, map).unwrap();
+            for (i, &v) in values.iter().enumerate() {
+                assert_eq!(
+                    unsafe { pointer.add(1 + i * 2).cast::<u16>().read_unaligned() },
+                    narrow(v * 2.)
+                );
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(pointer, 132) };
+            assert_eq!(bytes[0], 0xa5);
+            assert!(bytes[129..].iter().all(|&b| b == 0xa5));
+            let mut shared = values.clone();
+            let pointer = shared.as_mut_ptr();
+            let input = unsafe { std::slice::from_raw_parts(pointer, 64) };
+            let mut out = TensorMut::new(
+                DevicePtrMut(pointer.cast()),
+                dtype,
+                &[64],
+                &[1],
+                DeviceId::cpu(),
+            );
+            crate::kernels::simd_activations::write_mapped("test", &mut out, input, map).unwrap();
+            for (i, &v) in values.iter().enumerate() {
+                assert_eq!(
+                    unsafe { pointer.cast::<u16>().add(i).read_unaligned() },
+                    narrow(v * 2.)
+                );
+            }
+            assert_eq!(&shared[32..], &values[32..]);
+        }
+    }
+    #[test]
+    fn output_writers_refuse_device_only_storage_before_any_access() {
+        use onnx_runtime_ep_api::DevicePtrMut;
+        use onnx_runtime_ir::DeviceId;
+        let pointer = DevicePtrMut(std::ptr::NonNull::<u8>::dangling().as_ptr().cast());
+        for dtype in [
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Float32,
+            DataType::Float64,
+        ] {
+            let mut out = TensorMut::new(pointer, dtype, &[2], &[1], DeviceId::cuda(0));
+            let error = write_dense_f32_narrow("probe", &mut out, &[1., 2.])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("probe")
+                    && error.contains("Host-accessible")
+                    && error.contains("transfer"),
+                "{error}"
+            );
+            let called = std::cell::Cell::new(false);
+            let error = crate::kernels::simd_activations::write_mapped(
+                "mapped probe",
+                &mut out,
+                &[1., 2.],
+                |_, _| called.set(true),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(!called.get());
+            assert!(
+                error.contains("mapped probe") && error.contains("Host-accessible"),
+                "{error}"
+            );
+        }
+        let mut out = TensorMut::new(pointer, DataType::Int32, &[2], &[1], DeviceId::cuda(0));
+        assert!(
+            write_dense(&mut out, &[1i32, 2])
+                .unwrap_err()
+                .to_string()
+                .contains("Host-accessible")
+        );
     }
 }

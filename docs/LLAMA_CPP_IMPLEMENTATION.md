@@ -2389,3 +2389,36 @@ whole-change whitespace checks passed on macOS ARM64 CPU. Both actual compiler
 oracles were regenerated with canonical data formatting. These are functional
 checks, with no Linux/GPU execution or performance claims. Lazy JSON, contextual
 raw grammars and other unchecked goal rows remain required.
+
+### Lazy JSON Schema activation
+
+JSON response formats and the native `json_schema` alias now lower to an explicit
+raw lazy JSON Schema constraint. Admission compiles the existing full llguidance
+schema recognizer and validates triggers before SSE. It retains the raw identity
+byte-decoder requirement rather than guessing contextual token pieces. Activation
+shares GBNF token/word/pattern/full-pattern priority, byte capture offsets,
+reasoning suppression, history bounds and rewind behavior. JSON replay seeds the
+captured raw bytes into the existing normalized content recognizer, preserving
+schema semantics, equivalent escaped spellings and the vocabulary trie mask.
+Assistant prefill and content projection do not become part of this raw value.
+
+An optional selected-token feedback capability on constraints closes the last-step
+activation gap: grammar validation runs before selected output is committed or
+published even when no next mask is requested. An activated ending must complete
+the root. Arbitrary output/EOS before activation remains legal; explicit stops
+and length limits can truncate an activated viable prefix. Lazy JSON rejects
+forced tool choice and `ignore_eos=true`, preserving raw-grammar policy.
+
+Validation on main e645c6662: server library 601 passed with two inherited
+ignores; engine library 1101 passed with one inherited ignore. The new Native/ORT
+wire test covers 96 successful route/format/trigger/stream combinations, non-JSON
+assistant prefill, the native schema alias, pre-SSE schema/trigger/EOS-policy
+errors, final-token rejection without publication and retry on the same server.
+Engine regressions cover selected-token feedback, rewind, root-complete endings,
+equivalent JSON escapes, partial UTF-8 activation and seed byte-budget recovery.
+Default engine/server all-target strict Clippy, no-default engine all-target
+strict Clippy, GenAI Python all-target compilation, formatting and whole-change
+whitespace checks passed. After full tests the only source adjustment was
+Clippy's equivalent direct-Result return. These are functional macOS ARM64 CPU
+checks; no GPU/Linux execution or performance claims. Contextual raw grammars
+and the other unchecked compatibility-goal rows remain open.

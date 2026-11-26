@@ -1884,4 +1884,41 @@ mod native_row_boundaries {
         assert!(checked_row_width(usize::MAX, 2).is_err());
         assert!(checked_row_width(1, 0).is_err());
     }
+    #[test]
+    fn packed_unaligned_float_output_uses_safe_staging() {
+        use crate::kernels::testutil::Owned;
+        use onnx_runtime_ep_api::DevicePtrMut;
+        use onnx_runtime_ir::{DataType, DeviceId};
+        let x = Owned::f32(&[2, 4], &[1., 2., 3., 4., -1., -2., 2., 3.]);
+        let mut expected = Owned::zeros_f32(&[2, 4]);
+        let kernel = SoftmaxKernel {
+            axis: -1,
+            coerce_2d: false,
+        };
+        kernel
+            .execute(&[x.view()], &mut [expected.view_mut()])
+            .unwrap();
+        let mut backing = [0xa5a5a5a5u32; 10];
+        let base = backing.as_mut_ptr().cast::<u8>();
+        let mut output = TensorMut::new(
+            DevicePtrMut(unsafe { base.add(1).cast() }),
+            DataType::Float32,
+            &[2, 4],
+            &[4, 1],
+            DeviceId::cpu(),
+        );
+        output.validate().unwrap();
+        kernel
+            .execute(&[x.view()], std::slice::from_mut(&mut output))
+            .unwrap();
+        for (i, want) in expected.to_f32().into_iter().enumerate() {
+            assert_eq!(
+                unsafe { base.add(1 + i * 4).cast::<f32>().read_unaligned() },
+                want
+            );
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(base, 40) };
+        assert_eq!(bytes[0], 0xa5);
+        assert!(bytes[33..].iter().all(|&b| b == 0xa5));
+    }
 }

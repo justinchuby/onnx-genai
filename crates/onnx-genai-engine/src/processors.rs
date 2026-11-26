@@ -77,7 +77,9 @@ pub(crate) fn build_processor_chain(
             | GenerateConstraint::JsonSchema { prefix, .. }
             | GenerateConstraint::Regex { prefix, .. }
             | GenerateConstraint::Lark { prefix, .. } => prefix.as_str(),
-            GenerateConstraint::Gbnf { .. } | GenerateConstraint::RawLark { .. } => "",
+            GenerateConstraint::Gbnf { .. }
+            | GenerateConstraint::RawLark { .. }
+            | GenerateConstraint::LazyJsonSchema { .. } => "",
         };
         anyhow::ensure!(
             projection.is_none() || plain_prefix.is_empty(),
@@ -128,7 +130,7 @@ pub(crate) fn build_processor_chain(
                     ..
                 } = constraint
                 {
-                    Box::new(crate::gbnf::lazy::LazyGbnfConstraint::new(
+                    Box::new(crate::gbnf::lazy::LazyGrammarConstraint::new(
                         grammar,
                         tokenizer,
                         options,
@@ -161,6 +163,25 @@ pub(crate) fn build_processor_chain(
                     ).context("compile raw grammar against the resolved model byte vocabulary; repair the grammar or tokenizer.decoder")?;
                     Box::new(constraint.with_completion_only_eos(endings))
                 }
+            }
+
+            GenerateConstraint::LazyJsonSchema { schema, activation } => {
+                let contract = crate::byte_stream::ByteStreamContract::resolve(
+                    tokenizer, crate::tokenization::SpecialTokenHandling::Preserve,
+                ).context("resolve tokenizer.decoder byte contract for lazy JSON")?
+                    .context("lazy JSON requires a resolved lossless tokenizer.decoder byte contract; use a supported raw byte decoder")?;
+                anyhow::ensure!(
+                    contract.new_state().is_identity(),
+                    "lazy JSON cannot interpret stream-initial or trailing stripping; use a context-free byte decoder or disable grammar_lazy"
+                );
+                Box::new(crate::gbnf::lazy::LazyGrammarConstraint::json_schema(
+                    schema,
+                    tokenizer,
+                    options,
+                    contract.pieces,
+                    terminal_token_ids(options),
+                    activation,
+                )?)
             }
 
             GenerateConstraint::Json { prefix: plain } => {
