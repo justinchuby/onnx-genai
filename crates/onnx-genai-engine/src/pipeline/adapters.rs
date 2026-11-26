@@ -613,13 +613,6 @@ fn load_adapter(
     artifact: &AdapterArtifact,
     authority: &dyn MemoryGovernor,
 ) -> anyhow::Result<LoadedAdapter> {
-    anyhow::ensure!(
-        matches!(artifact.dtype.as_str(), "float32" | "fp32"),
-        "portable adapter normalization requires float32, but {}@{} declares {}",
-        artifact.identity,
-        artifact.version,
-        artifact.dtype
-    );
     let weight = artifact
         .weights
         .iter()
@@ -630,6 +623,14 @@ fn load_adapter(
                 artifact.identity, artifact.version, service.application_capability
             )
         })?;
+    anyhow::ensure!(
+        weight.format == AdapterWeightFormat::HfPeft
+            || matches!(artifact.dtype.as_str(), "float32" | "fp32"),
+        "portable JSON adapter normalization requires float32, but {}@{} declares {}; use F32 JSON factors or an explicitly typed HF PEFT safetensors artifact",
+        artifact.identity,
+        artifact.version,
+        artifact.dtype
+    );
     let package_root = root
         .canonicalize()
         .with_context(|| format!("failed to resolve package root '{}'", root.display()))?;

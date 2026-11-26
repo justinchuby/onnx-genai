@@ -116,7 +116,7 @@
         "peft_native_governor"
       ],
       "remaining": [
-        "Device/multi-sequence persistence; generic GGUF import; PEFT discovery/import without explicit target metadata, F16/BF16 factors, nonordinary variants and device-fused LoRA remain open. The linked PEFT fixtures exercise engine loading/inference, not HTTP PEFT import or catalogue transactions."
+        "Device/multi-sequence persistence; generic GGUF import; PEFT discovery/import without explicit target metadata, the full storage/computation dtype cross-product, nonordinary variants and device-fused LoRA remain open. The linked PEFT fixtures exercise engine loading/inference, not HTTP PEFT import or catalogue transactions."
       ]
     },
     {
@@ -825,10 +825,10 @@
       "target": "test:peft_lora",
       "test": "native_peft_rejects_variants_rank_mismatch_and_unmapped_tensors_without_partial_overlay",
       "execution_contract": "Real F32 SafeTensors saved factors with explicit metadata target mapping through a synthetic nonidentity Native CPU ONNX MatMul and parameter overlay; no architecture discovery, large-model/device-fused or HTTP import proof",
-      "assertions": "DoRA/RSLoRA, patterns, manifest rank/alpha mismatch, saved modules, variant initialization and unknown numeric config reject; baked encoding rejects at metadata admission, F16/malformed/unmapped/nonfinite containers reject, and base/valid-request recovery is checked.",
+      "assertions": "DoRA/RSLoRA, patterns, manifest rank/alpha mismatch, saved modules, variant initialization and unknown numeric config reject; baked encoding rejects at metadata admission, F16 storage contradicting the declared F32 dtype and malformed/unmapped/nonfinite containers reject, and base/valid-request recovery is checked.",
       "source_markers": [
         "baked PEFT must be rejected during metadata admission",
-        "export F32",
+        "declared dtype Float32",
         "subsequent valid selection recovers"
       ]
     },
