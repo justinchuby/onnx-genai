@@ -2373,7 +2373,11 @@ fn external_capacity_close_wins_during_reentrant_pressure_and_refunds_before_ret
             resume: Arc::clone(&resume),
         });
         let holder = manager
-            .register_holder(&authority, "external admitting owner", Some(callback))
+            .register_holder(
+                &authority,
+                "external admitting owner",
+                Some(callback.clone()),
+            )
             .unwrap();
         let task = {
             let manager = manager.clone();
