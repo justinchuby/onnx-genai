@@ -1,9 +1,8 @@
 //! Explicit HF PEFT saved linear LoRA factors; graph targets remain manifest-owned.
-use super::{JsonTarget, MemoryGovernor, MemoryLease};
+use super::{JsonTarget, MemoryGovernor, MemoryLease, factor_storage::FactorStorage};
 use anyhow::{Context, ensure};
 use onnx_genai_metadata::{AdapterArtifact, AdapterServiceContract, AdapterWeightArtifact};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     io::Read,
@@ -73,9 +72,6 @@ pub(super) fn configuration(
     );
     Ok((bytes, lease))
 }
-pub(super) fn identity(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
-}
 
 pub(super) fn load(
     root: &Path,
@@ -92,6 +88,7 @@ pub(super) fn load(
         ),
         "HF PEFT ordinary saved factors require scale_encoding alpha_over_rank; baked scales are a different artifact format and cannot be inferred"
     );
+    let storage = FactorStorage::declared(artifact)?;
     let (config_bytes, _config_lease) = configuration(root, weight, authority)?;
     let config: Value = serde_json::from_slice(&config_bytes).with_context(|| {
         format!(
@@ -224,9 +221,12 @@ pub(super) fn load(
             );
             let view=views.get(&name).with_context(||format!("PEFT tensor {name:?} is missing; embedding/Conv or named-adapter tensor spellings are not supported"))?;
             ensure!(
-                view.dtype == onnx_runtime_ir::DataType::Float32,
-                "PEFT tensor {name:?} dtype {:?} is unsupported; export F32 ordinary LoRA factors",
-                view.dtype
+                view.dtype == storage.dtype(),
+                "PEFT tensor {name:?} storage dtype {:?} disagrees with adapter {}@{} declared dtype {:?}; export both A/B in the declared F32/F16/BF16 storage dtype or correct the manifest",
+                view.dtype,
+                artifact.identity,
+                artifact.version,
+                storage.dtype()
             );
             ensure!(
                 view.shape == shape,
@@ -235,13 +235,14 @@ pub(super) fn load(
             );
             let mut factor = Vec::new();
             factor
-                .try_reserve_exact(view.data.len() / 4)
+                .try_reserve_exact(view.data.len() / storage.width())
                 .context("allocate governed normalized PEFT factor")?;
-            for value in view.data.chunks_exact(4) {
-                let value = f32::from_le_bytes(value.try_into().unwrap());
+            for value in view.data.chunks_exact(storage.width()) {
+                let value = storage.decode(value);
                 ensure!(
                     value.is_finite(),
-                    "PEFT tensor {name:?} contains nonfinite F32 values"
+                    "PEFT tensor {name:?} contains nonfinite {:?} factors after F32 normalization; export finite ordinary linear factors",
+                    storage.dtype()
                 );
                 factor.push(value);
             }
@@ -255,5 +256,5 @@ pub(super) fn load(
         views.keys().all(|name| used.contains(name)),
         "PEFT safetensors contains tensors without exact manifest bindings; map every saved linear module and reject modules_to_save/embedding/unknown tensor semantics"
     );
-    Ok((targets, identity(&config_bytes)))
+    Ok((targets, super::content_digest(&config_bytes)))
 }

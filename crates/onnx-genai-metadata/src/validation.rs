@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::extensions::{
-    ADAPTERS_HF_PEFT_V1, ADAPTERS_JSON_V1, ADAPTERS_SAFETENSORS_V1, ADAPTERS_V1,
+    ADAPTERS_GGUF_V1, ADAPTERS_HF_PEFT_V1, ADAPTERS_JSON_V1, ADAPTERS_SAFETENSORS_V1, ADAPTERS_V1,
     DFLASH_FLAT_BLOCK_V1, DFLASH_FLAT_BLOCK_V2, ExtensionConsumerSupport, ExtensionSurface,
     GRAMMAR_GUIDANCE_V1, ORT_LORA_ADAPTER_V1, PARAMETER_OVERLAY_V1, SPECULATIVE_V1, TELEMETRY_V1,
     TOKEN_CONTEXT_V1, admit_exact,
@@ -163,6 +163,19 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
         errors.extend(error.errors);
     }
     if let Some(service) = &metadata.adapters {
+        for (name, artifact) in &service.artifacts {
+            for (index, weight) in artifact.weights.iter().enumerate() {
+                if weight.format == crate::schema::AdapterWeightFormat::Gguf
+                    && let Err(error) = crate::version::gate_feature_use(
+                        version,
+                        crate::version::SchemaFeature::GgufAdapter,
+                        &format!("adapters.artifacts.{name}.weights[{index}].format"),
+                    )
+                {
+                    errors.push(error);
+                }
+            }
+        }
         validate_adapter_service(
             service,
             metadata.pipeline.as_ref().map(|p| &p.workflow),
@@ -1922,6 +1935,7 @@ fn validate_adapter_service(
                 crate::schema::AdapterWeightFormat::Json => ADAPTERS_JSON_V1,
                 crate::schema::AdapterWeightFormat::OrtGenai => ORT_LORA_ADAPTER_V1,
                 crate::schema::AdapterWeightFormat::HfPeft => ADAPTERS_HF_PEFT_V1,
+                crate::schema::AdapterWeightFormat::Gguf => ADAPTERS_GGUF_V1,
                 crate::schema::AdapterWeightFormat::Safetensors => ADAPTERS_SAFETENSORS_V1,
             };
             if !expected_loader.matches_wire_name(&weight.loader_capability) {
@@ -1933,13 +1947,15 @@ fn validate_adapter_service(
             }
             match (&weight.format, &weight.scale_encoding) {
                 (
-                    crate::schema::AdapterWeightFormat::HfPeft,
+                    crate::schema::AdapterWeightFormat::HfPeft
+                    | crate::schema::AdapterWeightFormat::Gguf,
                     crate::schema::AdapterScaleEncoding::AlphaOverRank,
                 )
                 | (
                     crate::schema::AdapterWeightFormat::OrtGenai,
                     crate::schema::AdapterScaleEncoding::Baked,
                 )
+                | (crate::schema::AdapterWeightFormat::Gguf, _)
                 | (crate::schema::AdapterWeightFormat::Json, _)
                 | (crate::schema::AdapterWeightFormat::Safetensors, _) => {}
                 (crate::schema::AdapterWeightFormat::HfPeft, _) => errors.push(format!(

@@ -305,6 +305,32 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
         )
         .map_err(crate::MetadataError::Parse)?;
     }
+    if let Some(artifacts) = document
+        .get("adapters")
+        .and_then(|v| v.get("artifacts"))
+        .and_then(serde_yaml::Value::as_mapping)
+    {
+        for (name, artifact) in artifacts {
+            if let Some(weights) = artifact
+                .get("weights")
+                .and_then(serde_yaml::Value::as_sequence)
+            {
+                for (index, weight) in weights.iter().enumerate() {
+                    if weight.get("format").and_then(serde_yaml::Value::as_str) == Some("gguf") {
+                        crate::version::gate_feature_use(
+                            version,
+                            crate::version::SchemaFeature::GgufAdapter,
+                            &format!(
+                                "adapters.artifacts.{}.weights[{index}].format",
+                                name.as_str().unwrap_or("<invalid-name>")
+                            ),
+                        )
+                        .map_err(crate::MetadataError::Parse)?;
+                    }
+                }
+            }
+        }
+    }
     if document.get("graph_weights").is_some() {
         crate::version::gate_feature_use(
             version,

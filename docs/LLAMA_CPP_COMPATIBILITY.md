@@ -999,3 +999,59 @@ and [filename default](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619
 including an empty list. OpenAI completion `suffix` and engine FIM convenience
 methods use the declared control roles without this wire-specific template.
 Prepared-token FIM execution can carry the already rendered context.
+
+### Browser origins and preflight
+
+`--cors-origins`, `--cors-methods`, `--cors-headers`, and
+`--cors-credentials` / `--no-cors-credentials` configure browser transport.
+Their defaults match llama-server: `*`, `GET, POST, DELETE, OPTIONS`, `*`,
+and credentials enabled. The corresponding `LLAMA_ARG_CORS_ORIGINS`,
+`LLAMA_ARG_CORS_METHODS`, `LLAMA_ARG_CORS_HEADERS`,
+`LLAMA_ARG_CORS_CREDENTIALS`, and `LLAMA_ARG_NO_CORS_CREDENTIALS` environment
+variables are supported. These options do not enable the excluded CORS proxy,
+MCP, tool execution, or server-side remote-media fetching.
+
+With credentials enabled, an allowed browser Origin is reflected rather than
+sending the incompatible `Access-Control-Allow-Origin: *`. A comma-separated
+origin list selects the requesting allowed origin. Wildcard request headers
+reflect the requested names so `Authorization` and credentialed JSON requests
+work in browsers. Responses vary by Origin; wildcard-header preflights also vary
+by requested headers and method. Credential permission is present on actual
+responses as well as preflights, including readable authentication/validation
+errors. Preflights bypass API-key admission, replay, routing, and generation;
+actual requests still require the configured key. Allowed methods and headers
+are browser preflight permissions, not changes to the server's HTTP routes.
+
+`--cors-origins localhost` means **same origin**, including the port; it does not
+allow arbitrary localhost applications. Explicit origin lists and this mode
+reject disallowed actual browser requests, including cross-site simple requests
+that browsers might otherwise send without a preflight. Requests without Origin
+remain available to native clients unless their browser Fetch Metadata marks
+them cross-site; navigation to a shipped frontend asset is allowed. As in
+upstream, restricted modes check Host for loopback listeners to prevent DNS
+rebinding; the default `*` mode does not impose this guard. Non-loopback
+listeners do not impose a Host allowlist, preserving reverse-proxy deployments.
+Use an explicit origin list for a separately hosted browser client.
+
+`serve` resolves the local address of **each accepted TCP socket** through
+`CorsConnectionInfo`; a wildcard bind reached through loopback therefore still
+gets the loopback Host guard. Failure to resolve that address returns an
+actionable error before routing or generation. Custom axum TCP adapters can use
+`app(state).into_make_service_with_connect_info::<CorsConnectionInfo>()`.
+Other network adapters must insert `CorsListeningAddress` from their accepted
+socket, not their listener bind address. In-process router calls without either
+context still enforce Origin/Fetch Metadata, but cannot infer a socket address
+or claim DNS-rebinding protection. Actual connection context takes precedence
+over the explicit adapter extension. No forwarded header is trusted to supply
+that address.
+
+The embedded maintained Llama Chat uses same-origin API paths; this change also
+permits independently hosted browser clients to call the API. Its standalone
+Chrome check is `scripts/test_llama_cors.mjs`: two page origins, an authenticated
+Native CPU fixture server, actual JSON and incremental SSE bodies, readable
+401/400 errors, forbidden-origin browser rejection, and an embedded-UI load.
+The driver is maintained acceptance code; its presence alone is not evidence
+that a particular revision, browser, platform or execution provider passed.
+
+Upstream policy and flags: [HTTP middleware](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/server-http.cpp)
+and [argument definitions](https://github.com/ggml-org/llama.cpp/blob/master/common/arg.cpp).
