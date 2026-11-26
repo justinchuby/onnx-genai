@@ -779,9 +779,11 @@ mod tests {
         use onnx_runtime_ir::{DataType, DeviceId, compute_contiguous_strides};
 
         let shape = [1, 0, 2];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let states_shape = [1, 0, 1, 2, 2];
-        let states_strides = compute_contiguous_strides(&states_shape);
+        let states_strides = compute_contiguous_strides(&states_shape)
+            .expect("fixture shape has representable contiguous strides");
         let empty = Owned::f32(&shape, &[]);
         let past = [1.0, -2.0, 3.0, -4.0];
         let past_state = Owned::f32(&[1, 1, 2, 2], &past);

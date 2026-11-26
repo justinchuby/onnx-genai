@@ -579,8 +579,10 @@ fn check_opset29_rejects_aliased_trajectory(ep: &CudaExecutionProvider) {
     let kernel = ep.get_kernel(graph.node(id), &input_shapes, 29).unwrap();
     let mut buffer = ep.allocate(6 * 256, 256).unwrap();
     let ptr = buffer.as_mut_ptr();
-    let [qkv_stride, present_stride, states_stride] =
-        [&qkv[..], &present, &states].map(compute_contiguous_strides);
+    let [qkv_stride, present_stride, states_stride] = [&qkv[..], &present, &states].map(|shape| {
+        compute_contiguous_strides(shape)
+            .expect("fixture shape has representable contiguous strides")
+    });
     let views = [0, 256, 512].map(|offset| {
         TensorView::new(
             DevicePtr(ptr.cast_const()),
