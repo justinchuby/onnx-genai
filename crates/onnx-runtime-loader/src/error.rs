@@ -73,20 +73,6 @@ pub enum LoaderError {
     InvalidTopK { node: String, detail: String },
 
     #[error(
-        "illegal ONNX {op} at node {node}: input {input} has dtype {dtype:?}, which is not \
-         admitted at opset {opset}; export with opset {since} or newer, or use an input dtype \
-         supported at opset {opset}"
-    )]
-    ShapeSizeDtypeBeforeOpset {
-        op: String,
-        node: String,
-        input: String,
-        dtype: onnx_runtime_ir::DataType,
-        opset: u64,
-        since: u64,
-    },
-
-    #[error(
         "illegal ONNX {op} at node {node}: {slot} dtype {dtype:?} is not valid at opset \
          {opset}; use opset {since} or newer"
     )]
