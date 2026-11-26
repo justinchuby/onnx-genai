@@ -1844,6 +1844,53 @@ mod tests {
         }
     }
 
+    async fn assert_tool_parameter_schema_masks_arrays(parameters: Value) {
+        let package = tool_package_from(
+            "realtime-constrained",
+            "<tool_call>\n{\"name\":\"lookup\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>",
+        );
+        let path = package.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let bad = "<tool_call>\n{\"name\":\"lookup\",\"arguments\":[]}\n</tool_call>";
+        tokenizer["model"]["vocab"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tok17");
+        tokenizer["model"]["vocab"][bad] = json!(17);
+        tokenizer["added_tokens"].as_array_mut().unwrap().push(json!({"id":17,"content":bad,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}));
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let (state, address, task) = server_for_package(package.path()).await;
+        let mut client = connect(address).await;
+        assert_eq!(event(&mut client).await["type"], "session.created");
+        send(&mut client,json!({"type":"session.update","session":{"output_modalities":["text"],"tools":[{"type":"function","name":"lookup","parameters":parameters}],"tool_choice":"required"}})).await;
+        assert_eq!(event(&mut client).await["type"], "session.updated");
+        send(&mut client,json!({"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}})).await;
+        assert_eq!(event(&mut client).await["type"], "conversation.item.added");
+        assert_eq!(event(&mut client).await["type"], "conversation.item.done");
+        send(&mut client, json!({"type":"response.create"})).await;
+        loop {
+            let output = event(&mut client).await;
+            assert_ne!(
+                output["type"], "error",
+                "native mask must exclude higher-ranked array arguments: {output}"
+            );
+            if output["type"] == "response.done" {
+                assert_eq!(
+                    output["response"]["output"][0]["arguments"],
+                    r#"{"city":"Paris"}"#
+                );
+                break;
+            }
+        }
+        drop(client);
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn websocket_unconstrained_tool_schema_masks_nonobject_protocol_arguments() {
         for parameters in [
@@ -1852,51 +1899,19 @@ mod tests {
             json!({"type":["array","object"]}),
             Value::Null,
         ] {
-            let package = tool_package_from(
-                "realtime-constrained",
-                "<tool_call>\n{\"name\":\"lookup\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>",
-            );
-            let path = package.path().join("tokenizer.json");
-            let mut tokenizer: Value =
-                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            let bad = "<tool_call>\n{\"name\":\"lookup\",\"arguments\":[]}\n</tool_call>";
-            tokenizer["model"]["vocab"]
-                .as_object_mut()
-                .unwrap()
-                .remove("tok17");
-            tokenizer["model"]["vocab"][bad] = json!(17);
-            tokenizer["added_tokens"].as_array_mut().unwrap().push(json!({"id":17,"content":bad,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}));
-            std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
-            let (state, address, task) = server_for_package(package.path()).await;
-            let mut client = connect(address).await;
-            assert_eq!(event(&mut client).await["type"], "session.created");
-            send(&mut client,json!({"type":"session.update","session":{"output_modalities":["text"],"tools":[{"type":"function","name":"lookup","parameters":parameters}],"tool_choice":"required"}})).await;
-            assert_eq!(event(&mut client).await["type"], "session.updated");
-            send(&mut client,json!({"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}})).await;
-            assert_eq!(event(&mut client).await["type"], "conversation.item.added");
-            assert_eq!(event(&mut client).await["type"], "conversation.item.done");
-            send(&mut client, json!({"type":"response.create"})).await;
-            loop {
-                let output = event(&mut client).await;
-                assert_ne!(
-                    output["type"], "error",
-                    "native mask must exclude higher-ranked array arguments: {output}"
-                );
-                if output["type"] == "response.done" {
-                    assert_eq!(
-                        output["response"]["output"][0]["arguments"],
-                        r#"{"city":"Paris"}"#
-                    );
-                    break;
-                }
-            }
-            drop(client);
-            let model = state.registry.resolve("native-realtime").unwrap().unwrap();
-            tokio::task::spawn_blocking(move || model.engine.shutdown())
-                .await
-                .unwrap();
-            task.abort();
-            let _ = task.await;
+            assert_tool_parameter_schema_masks_arrays(parameters).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_tool_schema_root_references_survive_forced_envelope_scope() {
+        for parameters in [
+            json!({"$defs":{"Args":{"type":"object","properties":{"city":{"const":"Paris"}},"required":["city"],"additionalProperties":false}},"$ref":"#/$defs/Args"}),
+            json!({"$defs":{"Args":{"type":"object","properties":{"city":{"const":"Paris"}},"required":["city"],"additionalProperties":false}},"$ref":"json-schema:///#/$defs/Args"}),
+            json!({"$id":"https://example.invalid/args","$defs":{"a/b~c":{"type":"object","properties":{"city":{"const":"Paris"}},"required":["city"],"additionalProperties":false}},"$ref":"#/$defs/a~1b~0c"}),
+            json!({"$schema":"http://json-schema.org/draft-04/schema#","definitions":{"Args":{"type":"object","properties":{"city":{"enum":["Paris"]}},"required":["city"],"additionalProperties":false}},"$ref":"#/definitions/Args"}),
+        ] {
+            assert_tool_parameter_schema_masks_arrays(parameters).await;
         }
     }
 
