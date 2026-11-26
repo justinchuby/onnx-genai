@@ -12408,6 +12408,9 @@ mod weight_cache_accounting {
             "DeformConv" => NoWeightCache(
                 "samples into execution-local panels and consumes weights without retaining them",
             ),
+            "RoiAlign" => NoWeightCache(
+                "retains only parsed attributes; tensor copies and pooled output staging are per execution",
+            ),
             "GroupedMatMul" => NoWeightCache(
                 "indexes weight layouts directly using execution-local dense views or copies",
             ),
@@ -12548,6 +12551,7 @@ mod weight_cache_accounting {
             "Max",
             "MaxPool",
             "Mean",
+            "MeanVarianceNormalization",
             "MelWeightMatrix",
             "Min",
             "Mish",

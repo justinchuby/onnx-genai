@@ -1,3 +1,4 @@
+use super::affine_bank::AffineBank;
 use crate::dtype::{to_dense, to_dense_f32_widen, write_dense, write_dense_f32_narrow};
 use onnx_runtime_ep_api::packed_routed::{
     GroupLayout, fail, group_layout, packed_group_layout, validate,
@@ -163,10 +164,16 @@ impl Kernel for Packed {
                 "PackedGroupedMatMul: inputs and output must use contiguous storage".into(),
             ));
         }
+        crate::strided::validate_host_storage::<u8>(
+            "PackedGroupedMatMul",
+            "packed weights",
+            &x[1],
+        )?;
         let routes = route_indices(Op::GroupedMatMul { transposed: true }, &x[2], l.groups)?;
         let activation = super::to_dense_f32(&x[0])?;
         // SAFETY: packed_group_layout validated the one-dimensional UINT8
-        // extent, and the contiguous CPU tensor remains live for this call.
+        // extent, and the Host span proof validated representable addresses.
+        // The owning EP guarantees live backing for this contiguous byte view.
         let packed = unsafe {
             std::slice::from_raw_parts(x[1].data_ptr::<u8>(), self.metadata.packed_bytes())
         };
@@ -198,52 +205,130 @@ impl Kernel for Packed {
 }
 
 impl Kernel for Affine {
+    fn supports_strided_input(&self, index: usize) -> bool {
+        matches!(index, 1 | 3 | 4)
+    }
     fn execute(&self, x: &[TensorView], y: &mut [TensorMut]) -> Result<()> {
         let l = self.0.layout(x, y)?;
         let op = Op::GroupedMatMul { transposed: true };
         let routes = route_indices(op, &x[2], l.groups)?;
-        let scales = super::to_dense_f32(&x[3])?;
-        if scales.iter().any(|&v| v <= 0.0 || !v.is_finite()) {
-            return Err(fail(
-                op,
-                "DequantizeLinear scales must be positive and finite",
-            ));
-        }
+        let bank = AffineBank::new(
+            &x[1],
+            &x[3],
+            x.get(4),
+            [l.groups, l.n, l.k],
+            self.0.block,
+            self.0.zero,
+        )?;
         if l.lanes == 0 {
             return Ok(());
         }
-        fn read<'a>(view: &'a TensorView<'_>) -> Result<std::borrow::Cow<'a, [u8]>> {
-            if !view.is_contiguous() {
-                return super::to_dense_bytes(view).map(std::borrow::Cow::Owned);
+        let activation = super::to_dense_f32(&x[0])?;
+        let mut data = vec![0f32; l.lanes];
+        for (route, output) in data.chunks_exact_mut(l.n).enumerate() {
+            let token = route / l.selections;
+            let input = &activation[token * l.k..(token + 1) * l.k];
+            for (column, value) in output.iter_mut().enumerate() {
+                *value = bank.dot(routes[route] * l.n + column, input);
             }
-            // SAFETY: layout validated a one-byte tensor spanning `numel` bytes.
-            Ok(std::borrow::Cow::Borrowed(unsafe {
-                std::slice::from_raw_parts(view.data_ptr::<u8>(), view.numel())
-            }))
         }
-        let codes = read(&x[1])?;
-        let zeros = x.get(4).map(read).transpose()?;
-        let blocks = l.k / self.0.block;
-        let nibble = |bytes: &[u8], row, col: usize, width: usize| {
-            (bytes[row * width.div_ceil(2) + col / 2] >> ((col % 2) * 4)) & 15
-        };
-        let weight = |i| {
-            let (row, col) = (i / l.k, i % l.k);
-            let p = col / self.0.block;
-            let z = zeros
-                .as_ref()
-                .map_or(self.0.zero, |z| nibble(z, row, p, blocks));
-            f32::from(i16::from(nibble(&codes, row, col, l.k)) - i16::from(z))
-                * scales[row * blocks + p]
-        };
-        let data = grouped(
-            l,
-            &super::to_dense_f32(&x[0])?,
-            weight,
-            &routes,
-            None,
-            |v| v,
-        );
         write_dense(&mut y[0], &data)
+    }
+}
+
+#[cfg(test)]
+mod packed_host_tests {
+    use super::*;
+    use crate::kernels::testutil::Owned;
+    use onnx_runtime_ep_api::DevicePtr;
+    use onnx_runtime_ir::{Attribute, DeviceId, NodeId};
+
+    fn kernel() -> Packed {
+        let mut node = Node::new(NodeId(0), "PackedGroupedMatMul", vec![], vec![]);
+        node.attributes
+            .insert("format".into(), Attribute::String("gguf:q4_0".into()));
+        node.attributes
+            .insert("shape".into(), Attribute::Ints(vec![1, 1, 32]));
+        Packed {
+            metadata: Metadata::from_node(&node).unwrap(),
+        }
+    }
+    #[test]
+    fn rejects_unreadable_packed_storage_before_any_route_or_activation_read() {
+        let k = kernel();
+        let x = Owned::f32(&[1, 32], &[1.; 32]);
+        let packed = Owned::u8(&[18], &[0; 18]);
+        let indices = Owned::i64(&[1, 1], &[0]);
+        let mut inputs = [x.view(), packed.view(), indices.view()];
+        // These Host descriptors are valid metadata but deliberately unreadable;
+        // refusing the bank must precede any activation or index dereference.
+        inputs[0].data = DevicePtr(4usize as *const std::ffi::c_void);
+        inputs[2].data = DevicePtr(8usize as *const std::ffi::c_void);
+        let mut output = Owned::f32(&[1, 1, 1], &[123.]);
+        for kind in 0..3 {
+            inputs[1] = packed.view();
+            match kind {
+                0 => {
+                    inputs[1].device = DeviceId::cuda(0);
+                    inputs[1].data = DevicePtr(std::ptr::dangling());
+                }
+                1 => inputs[1].data = DevicePtr((usize::MAX - 8) as *const std::ffi::c_void),
+                _ => {
+                    inputs[1].data = DevicePtr((usize::MAX - 3) as *const std::ffi::c_void);
+                    inputs[1].byte_offset = 8;
+                }
+            }
+            let message = k
+                .execute(&inputs, &mut [output.view_mut()])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains("PackedGroupedMatMul") && message.contains("packed weights"),
+                "{message}"
+            );
+            assert!(
+                message.contains(if kind == 0 {
+                    "Host-accessible"
+                } else {
+                    "unaddressable span"
+                }),
+                "{message}"
+            );
+            assert_eq!(output.to_f32(), [123.]);
+        }
+    }
+    #[test]
+    fn packed_host_storage_supports_byte_offsets_and_empty_execution_remains_read_free() {
+        let k = kernel();
+        let x = Owned::f32(&[1, 32], &[1.; 32]);
+        let indices = Owned::i64(&[1, 1], &[0]);
+        // Q4_0: scale one, all encoded values nine => every weight is one.
+        let mut bytes = vec![0xcc, 0, 0x3c];
+        bytes.extend_from_slice(&[0x99; 16]);
+        let packed = Owned::u8(&[bytes.len()], &bytes);
+        let view = TensorView::new(
+            packed.view().data,
+            DataType::Uint8,
+            &[18],
+            &[1],
+            DeviceId::cpu(),
+        )
+        .with_byte_offset(1);
+        let mut out = Owned::zeros_f32(&[1, 1, 1]);
+        k.execute(&[x.view(), view, indices.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(out.to_f32(), [32.]);
+        let x = Owned::f32(&[0, 32], &[]);
+        let indices = Owned::i64(&[0, 1], &[]);
+        let mut out = Owned::zeros_f32(&[0, 1, 1]);
+        let view = TensorView::new(
+            DevicePtr(std::ptr::dangling()),
+            DataType::Uint8,
+            &[18],
+            &[1],
+            DeviceId::cuda(0),
+        );
+        k.execute(&[x.view(), view, indices.view()], &mut [out.view_mut()])
+            .unwrap();
     }
 }

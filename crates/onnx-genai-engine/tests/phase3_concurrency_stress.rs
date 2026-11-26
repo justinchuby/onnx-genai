@@ -1,4 +1,6 @@
-use onnx_genai_engine::{Engine, EngineConfig, FinishReason, GeneratePrompt, GenerateRequest};
+use onnx_genai_engine::{
+    Engine, EngineConfig, EngineDecodeBackend, FinishReason, GeneratePrompt, GenerateRequest,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -28,6 +30,7 @@ fn ten_plus_interleaved_sessions_complete_under_kv_page_pressure() -> anyhow::Re
     // what makes pages scarce -- and it exercises the same derivation a real
     // deployment uses, instead of a knob only tests could set.
     let config = EngineConfig {
+        decode_backend: EngineDecodeBackend::Ort,
         page_size: 2,
         limits: onnx_genai_scheduler::ResourceLimits {
             vram_limit: onnx_genai_scheduler::ResourceLimit::Bytes(64 * 1024),

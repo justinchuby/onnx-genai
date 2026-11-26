@@ -139,9 +139,11 @@ pub(crate) struct RealtimeCommand {
     ready: oneshot::Sender<anyhow::Result<RealtimeOutput>>,
     steps: mpsc::Receiver<Step>,
     cancelled: Arc<AtomicBool>,
-    guard: WorkerRealtimeGuard,
+    // Release admission before publishing the worker as idle. Fields drop in
+    // declaration order, including initialization failures and disconnects.
     _admission: OwnedSemaphorePermit,
     runtime: tokio::runtime::Handle,
+    guard: WorkerRealtimeGuard,
 }
 impl EngineDriver {
     pub(crate) async fn open_realtime(

@@ -1,5 +1,5 @@
 ir_version: 11
-opset_import { version: 21 }
+opset_import { version: 24 }
 graph {
 name: "growing_mtp"
 node { op_type: "Add" input: "inputs_embeds" input: "hidden_states" output: "mtp_hidden" }

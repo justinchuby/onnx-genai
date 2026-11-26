@@ -253,6 +253,7 @@ impl PreprocessingOutputScope {
 }
 pub const VIDEO_PREPROCESS_V1: ExtensionId = ExtensionId::new("onnx-genai.video-preprocess", "1");
 pub const AUDIO_PREPROCESS_V1: ExtensionId = ExtensionId::new("onnx-genai.audio-preprocess", "1");
+pub const AUDIO_PREPROCESS_V2: ExtensionId = ExtensionId::new("onnx-genai.audio-preprocess", "2");
 pub const TEXT_ASSEMBLY_V1: ExtensionId = ExtensionId::new("onnx-genai.text-assembly", "1");
 pub const ADAPTERS_V1: ExtensionId = ExtensionId::new("onnx-genai.adapters", "1");
 pub const ADAPTERS_JSON_V1: ExtensionId = ExtensionId::new("onnx-genai.adapters.json", "1");
@@ -399,6 +400,16 @@ pub const BUILTIN_EXTENSIONS: &[ExtensionDescriptor] = &[
         status: SupportStatus::Implemented,
     },
     ExtensionDescriptor {
+        id: AUDIO_PREPROCESS_V2,
+        surface: ExtensionSurface::ComponentAdapter,
+        schema_floor: V1,
+        declaration: "pipeline.workflow.components.<name>.implementation { kind: adapter }",
+        normative_reference: "§10.8, §15",
+        admission_consumer: "onnx_genai_engine::pipeline::workflow",
+        fallback: FallbackClass::SemanticRequired,
+        status: SupportStatus::Implemented,
+    },
+    ExtensionDescriptor {
         id: TEXT_ASSEMBLY_V1,
         surface: ExtensionSurface::ComponentAdapter,
         schema_floor: V1,
@@ -527,6 +538,22 @@ pub const CORE_CONFORMANCE: &[(SchemaVersion, &str)] = &[
     (
         crate::version::REALTIME_SCHEMA_VERSION,
         "Realtime v1 profiles declare session-owned bounded audio/text quanta, native rates, frame bounds, control operations and actual per-quantum usage.",
+    ),
+    (
+        crate::version::MULTIMODAL_DECISION_SCHEMA_VERSION,
+        "Decision v2 profiles declare ordered encoded-image inputs and authoritative text/media token usage; decision v1 remains text-only.",
+    ),
+    (
+        crate::version::DECISION_AUDIO_SCHEMA_VERSION,
+        "Decision v3 profiles declare typed mixed state-media inputs and an explicit spoken-question audio endpoint with authoritative per-variant usage.",
+    ),
+    (
+        crate::version::AUDIO_FEATURE_INPUT_SCHEMA_VERSION,
+        "Externally executed audio programs bind explicitly named float32 feature media inputs; analysis semantics and clip bounds come from the selected program output.",
+    ),
+    (
+        crate::version::GRAPH_WEIGHTS_SCHEMA_VERSION,
+        "Each ONNX graph can declare immutable GGUF/SafeTensors containers with explicit tensor-key mappings; geometry and executable semantics stay in the graph.",
     ),
 ];
 

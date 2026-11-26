@@ -29,6 +29,7 @@ pub mod session_state;
 mod state_plan;
 pub mod task_profiles;
 pub mod tool_protocol;
+pub mod transcription;
 pub mod validation;
 pub mod version;
 
@@ -59,20 +60,22 @@ pub use state_plan::{
 };
 pub use tool_protocol::{
     MAX_TOOL_CALL_ID_BYTES, MAX_TOOL_CALLS, MAX_TOOL_NAME_BYTES, MAX_TOOL_PAYLOAD_BYTES, ToolCall,
-    ToolCallStream, ToolParseOutcome, ToolProtocol, ToolProtocolError,
+    ToolCallFragment, ToolCallStream, ToolParseOutcome, ToolProtocol, ToolProtocolError,
     resolve as resolve_tool_protocol,
 };
 pub use validation::{
     PipelineValidationError, validate, validate_metadata, validate_pipeline_spec,
 };
 pub use version::{
-    BATCHING_SCHEMA_VERSION, CANONICAL_SPECULATION_SCHEMA_VERSION, COMPRESSED_STATE_SCHEMA_VERSION,
-    DECISION_INPUT_SCHEMA_VERSION, DECISION_SCHEMA_VERSION, DFLASH_SCHEMA_VERSION,
-    INITIAL_SCHEMA_VERSION, MULTIMODAL_RERANKING_SCHEMA_VERSION, OUTPUT_PROTOCOL_SCHEMA_VERSION,
-    PUBLICATION_MODE_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS,
-    SchemaDocumentContext, SchemaFamily, SchemaVersion, SchemaVersionError,
-    SupportedSchemaVersions, TOKEN_AUTHORITY_SCHEMA_VERSION, TOOL_PROTOCOL_SCHEMA_VERSION,
-    UnsupportedSchemaVersion,
+    AUDIO_FEATURE_INPUT_SCHEMA_VERSION, BATCHING_SCHEMA_VERSION,
+    CANONICAL_SPECULATION_SCHEMA_VERSION, COMPRESSED_STATE_SCHEMA_VERSION,
+    DECISION_AUDIO_SCHEMA_VERSION, DECISION_INPUT_SCHEMA_VERSION, DECISION_SCHEMA_VERSION,
+    DFLASH_SCHEMA_VERSION, GRAPH_WEIGHTS_SCHEMA_VERSION, INITIAL_SCHEMA_VERSION,
+    MULTIMODAL_DECISION_SCHEMA_VERSION, MULTIMODAL_RERANKING_SCHEMA_VERSION,
+    OUTPUT_PROTOCOL_SCHEMA_VERSION, PUBLICATION_MODE_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION,
+    SUPPORTED_SCHEMA_VERSIONS, SchemaDocumentContext, SchemaFamily, SchemaVersion,
+    SchemaVersionError, SupportedSchemaVersions, TOKEN_AUTHORITY_SCHEMA_VERSION,
+    TOOL_PROTOCOL_SCHEMA_VERSION, UnsupportedSchemaVersion,
 };
 
 /// Generates the inference-metadata JSON Schema with deterministic object-key ordering.

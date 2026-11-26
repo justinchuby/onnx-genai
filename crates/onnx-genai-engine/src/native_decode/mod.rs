@@ -2,7 +2,7 @@
 
 use crate::config::{GenerateOptions, GenerateResult, GenerateTokenCallback, SessionId};
 use crate::decode::DecodeBackend;
-use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState};
+use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, PreparedPrompt};
 use crate::logits::{ProcessorChain, TokenId};
 use crate::pipeline::generation::GenerationRequest;
 use crate::sampling::sample_greedy;
@@ -2233,9 +2233,10 @@ impl NativeDecodeSession {
         }
     }
 
-    /// Generate incrementally: reuse KV state up to `resume_from` and only
-    /// prefill `prompt_tokens[resume_from..]`. The caller must ensure that
-    /// `prompt_tokens[..resume_from]` matches the tokens already in the KV cache.
+    /// Generate from an authoritative physical prefix. Its provenance records
+    /// whether those tokens were reused or evaluated earlier in this request,
+    /// so input-reuse counters and progress never infer reuse from a cursor.
+    /// The caller must prove the prefix matches the currently materialized state.
     ///
     /// If `resume_from > current_len`, behaves like full generation from 0.
     /// If `resume_from < current_len`, rewinds the KV cache to `resume_from`.
@@ -2243,7 +2244,7 @@ impl NativeDecodeSession {
     pub(crate) fn generate_incremental_with_callback_and_staged_observer(
         &mut self,
         prompt_tokens: &[TokenId],
-        resume_from: usize,
+        prefix: PreparedPrompt,
         options: &GenerateOptions,
         chain: &ProcessorChain,
         tokenizer: &Tokenizer,
@@ -2255,7 +2256,7 @@ impl NativeDecodeSession {
         if prompt_tokens.is_empty() {
             bail!("native generation requires at least one prompt token");
         }
-        let resume_from = resume_from.min(prompt_tokens.len());
+        let resume_from = prefix.tokens().min(prompt_tokens.len());
         if resume_from == 0 || resume_from > self.current_len {
             // Full reset path — no valid KV prefix to reuse.
             return self.generate_with_callback_and_staged_observer(
@@ -2289,7 +2290,9 @@ impl NativeDecodeSession {
             device_loop_k,
             lookahead: std::collections::VecDeque::new(),
         };
-        let mut state = DecodeLoopState::new(resume_from, options.seed, options.top_logprobs);
+        let mut state =
+            DecodeLoopState::new(prefix.cached_tokens(), options.seed, options.top_logprobs);
+        state.clock.prepare_prompt(prefix);
         crate::pipeline::generation::generate_with_decode_core_and_staged_observer(
             runtime,
             &mut backend,

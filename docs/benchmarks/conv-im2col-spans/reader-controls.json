@@ -1,0 +1,67 @@
+[
+  {
+    "name": "complete_real_data",
+    "synthetic": false,
+    "accepted": true
+  },
+  {
+    "name": "missing_process",
+    "synthetic": true,
+    "rejected": true
+  },
+  {
+    "name": "duplicate_identity",
+    "synthetic": true,
+    "rejected": true
+  },
+  {
+    "name": "zero_calls_in_work",
+    "synthetic": true,
+    "rejected": true
+  },
+  {
+    "name": "impossible_cpu",
+    "synthetic": true,
+    "rejected": true
+  },
+  {
+    "name": "missing_native_gemm",
+    "synthetic": true,
+    "rejected": true
+  },
+  {
+    "name": "mlas_routes_in_default",
+    "synthetic": true,
+    "rejected": true
+  },
+  {
+    "name": "output_bytes_changed",
+    "synthetic": true,
+    "rejected": true
+  },
+  {
+    "name": "stdout_bytes_changed",
+    "synthetic": true,
+    "rejected": true
+  },
+  {
+    "name": "aa",
+    "synthetic": true,
+    "qualified": false
+  },
+  {
+    "name": "setup",
+    "synthetic": true,
+    "qualified": false
+  },
+  {
+    "name": "double",
+    "synthetic": true,
+    "qualified": false
+  },
+  {
+    "name": "nonpositive",
+    "synthetic": true,
+    "qualified": false
+  }
+]

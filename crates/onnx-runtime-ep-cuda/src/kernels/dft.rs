@@ -87,6 +87,7 @@ pub(crate) struct DftFactory {
 
 impl KernelFactory for DftFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        reject_real_inverse(node).map_err(EpError::KernelFailed)?;
         let inverse = bool_attr(node, "inverse")?;
         let onesided = bool_attr(node, "onesided")?;
         let default_axis = if node.local_opset().unwrap_or(17) >= 20 {
@@ -103,6 +104,14 @@ impl KernelFactory for DftFactory {
             default_axis,
             prepared_plan: Mutex::new(None),
         }))
+    }
+}
+
+fn reject_real_inverse(node: &Node) -> std::result::Result<(), String> {
+    if onnx_runtime_ir::dft::DftMode::parse(node)? == onnx_runtime_ir::dft::DftMode::RealInverse {
+        Err("CUDA DFT: inverse=1, onesided=1 (IRFFT) needs Hermitian spectrum reconstruction and real output, which this cuFFT adapter does not implement; select the CPU EP for IRFFT".into())
+    } else {
+        Ok(())
     }
 }
 
@@ -661,6 +670,7 @@ pub(crate) fn unsupported_reason(
     input_layouts: &[TensorLayout],
 ) -> Option<String> {
     let reject = || -> std::result::Result<(), String> {
+        reject_real_inverse(node)?;
         if node.outputs.len() != 1 || node.inputs.is_empty() || node.inputs.len() > 3 {
             return Err("requires 1..=3 inputs and exactly 1 output".into());
         }
@@ -740,6 +750,37 @@ pub(crate) fn unsupported_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_inverse_is_declined_before_any_cuda_runtime_access() {
+        let mut node = Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "DFT",
+            vec![Some(onnx_runtime_ir::ValueId(0))],
+            vec![onnx_runtime_ir::ValueId(1)],
+        );
+        node.attributes
+            .insert("inverse".into(), onnx_runtime_ir::Attribute::Int(1));
+        node.attributes
+            .insert("onesided".into(), onnx_runtime_ir::Attribute::Int(1));
+        let error = reject_real_inverse(&node).unwrap_err();
+        assert!(
+            error.contains("IRFFT") && error.contains("CPU EP"),
+            "{error}"
+        );
+        let reason = unsupported_reason(
+            &node,
+            20,
+            &[onnx_runtime_ir::static_shape([1, 3, 2])],
+            &[DataType::Float32],
+            &[],
+        )
+        .unwrap();
+        assert!(
+            reason.contains("Hermitian spectrum reconstruction"),
+            "{reason}"
+        );
+    }
 
     #[test]
     fn workspace_layout_is_aligned_and_contains_all_regions() {

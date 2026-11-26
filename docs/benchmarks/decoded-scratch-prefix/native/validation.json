@@ -1,0 +1,169 @@
+{
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/decoded_projection.rs": "ce76aabaa6dce9b7c843d232146f163196de1afa50595d0a702029bce8be1854",
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs": "3bba3e5020f58621c041edf105c71a24db3bb3ba1e8c7d7c477f14bb225e7b1d",
+    "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs": "53597034cb68e08ec6ec7188f2660efce873d42b662a4e5fd238e417942c35ef",
+    "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs": "06fc7ec0d3ed24c6101adb9599e8a6f05e2257c24261fced12b89a4b4917ca8b",
+    "crates/onnx-runtime-ep-cpu/tests/decoded_projection_layout.rs": "07b99ef664d48894a6b5b43ea8d4996664ba9eac032342b4816591e959a718a1"
+  },
+  "results": [
+    {
+      "name": "list",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::decoded_projection::tests::",
+        "--",
+        "--list"
+      ],
+      "exit": 0,
+      "log_sha256": "f6d9c363b1eaf47b16aec5b18325ebb8679ab54b82f9ee6b923fa8eb11d7104e"
+    },
+    {
+      "name": "projection",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::decoded_projection::tests::"
+      ],
+      "exit": 0,
+      "log_sha256": "68871bba3676afc953c340820c13b5ec8b297499d23012e849da3c7b3a993529",
+      "counts": [
+        [
+          "8",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "block-matmul",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::block_quantized_matmul::tests::"
+      ],
+      "exit": 0,
+      "log_sha256": "c60a9ac0445f266f9723c662967cf0c9aa4be826d9a984ed4a45d65635acc81d",
+      "counts": [
+        [
+          "39",
+          "0",
+          "1"
+        ]
+      ]
+    },
+    {
+      "name": "block-moe",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::block_quantized_moe::tests::"
+      ],
+      "exit": 0,
+      "log_sha256": "92fac278064de40a61b7a47bcf758c47cedf7928933a3facb647e6efa5526640",
+      "counts": [
+        [
+          "31",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "qmoe",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::qmoe::tests::"
+      ],
+      "exit": 0,
+      "log_sha256": "59484f30fc658341510b7a268d65ec51aaec650164433b648f5ddf45449ea7ae",
+      "counts": [
+        [
+          "68",
+          "0",
+          "1"
+        ]
+      ]
+    },
+    {
+      "name": "layout",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--test",
+        "decoded_projection_layout"
+      ],
+      "exit": 0,
+      "log_sha256": "8700751faa37bcf739c672a7e1eec8da45bf7bd9e55f0f5206f1b12918254794",
+      "counts": [
+        [
+          "17",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "oracle",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cuda",
+        "--test",
+        "qmoe_cpu_oracle"
+      ],
+      "exit": 0,
+      "log_sha256": "0961ee4d04b37a50112ffa685cf22504812a5ac03145be08d351ad0a9f183e70",
+      "counts": [
+        [
+          "1",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit": 0,
+      "log_sha256": "216270d9e168d9c6bd3237dd92c45375c31ab7ef8b06d481fecbf4337ecb1a4c"
+    }
+  ]
+}

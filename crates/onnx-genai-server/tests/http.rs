@@ -1145,7 +1145,8 @@ fn response_format_maps_to_the_requested_generate_constraint() {
             .unwrap()
             .options
             .constraint,
-        Some(GenerateConstraint::Json {
+        Some(GenerateConstraint::JsonSchema {
+            schema: json!({"type":"object"}).to_string(),
             prefix: String::new()
         })
     );
@@ -1159,6 +1160,27 @@ fn response_format_maps_to_the_requested_generate_constraint() {
             prefix: String::new()
         })
     );
+    for (format, expected) in [
+        (
+            json!({"type":"json_schema","json_schema":{"name":"answer"}}),
+            json!({"type":"object"}),
+        ),
+        (json!({"type":"json_schema","schema":true}), json!(true)),
+    ] {
+        let request = chat_request(
+            json!({"messages":[{"role":"user","content":"hello"}],"response_format":format}),
+        );
+        assert_eq!(
+            build_generate_request(&request, &fixture_tokenizer())
+                .unwrap()
+                .options
+                .constraint,
+            Some(GenerateConstraint::JsonSchema {
+                schema: expected.to_string(),
+                prefix: String::new()
+            })
+        );
+    }
     assert_eq!(
         build_generate_request(&text_request, &fixture_tokenizer())
             .unwrap()
@@ -1179,7 +1201,7 @@ fn response_format_maps_to_the_requested_generate_constraint() {
 async fn chat_completions_rejects_malformed_json_schema() {
     let app = test_app().await;
     for json_schema in [
-        json!({"name": "answer"}),
+        json!({"name": "answer", "schema": []}),
         json!({"name": "answer", "schema": "not an object"}),
     ] {
         let response = app
@@ -1212,6 +1234,64 @@ async fn chat_completions_rejects_malformed_json_schema() {
             "{error}"
         );
     }
+}
+
+#[cfg(feature = "native-backend")]
+#[tokio::test]
+async fn native_required_tool_choice_skips_an_impossible_alternative() {
+    let package = tempfile::tempdir().unwrap();
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-tool-call");
+    copy_tree(&source, package.path());
+    let path = package.path().join("tokenizer.json");
+    let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+    let previous = vocab
+        .iter()
+        .find(|(_, id)| id.as_u64() == Some(22))
+        .unwrap()
+        .0
+        .clone();
+    vocab.remove(&previous);
+    vocab.insert(
+        "<tool_call>\n{\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>"
+            .into(),
+        json!(22),
+    );
+    std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+    std::fs::write(
+        package.path().join("tokenizer_config.json"),
+        r#"{"chat_template":"assistant"}"#,
+    )
+    .unwrap();
+    let config = ServerConfig {
+        engine_config: onnx_genai_engine::EngineConfig {
+            decode_backend: onnx_genai_engine::EngineDecodeBackend::Native,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let router =
+        app(
+            AppState::load_with_config(package.path(), Some("native-tools".into()), config)
+                .unwrap(),
+        );
+    let response=post_json(router,"/v1/chat/completions",json!({
+        "messages":[{"role":"user","content":"hello"}],"max_tokens":1,"temperature":0,"logit_bias":{"22":1000},"tool_choice":"required",
+        "tools":[{"type":"function","function":{"name":"impossible","parameters":false}},
+                 {"type":"function","function":{"name":"weather","parameters":{"type":"object","properties":{"city":{"const":"Paris"}},"required":["city"],"additionalProperties":false}}}]
+    })).await;
+    let status = response.status();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let call = &body["choices"][0]["message"]["tool_calls"][0]["function"];
+    assert_eq!(call["name"], "weather", "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(call["arguments"].as_str().unwrap()).unwrap(),
+        json!({"city":"Paris"})
+    );
+    assert_eq!(body["usage"]["completion_tokens"], 1);
 }
 
 #[test]
@@ -1253,19 +1333,41 @@ fn forced_specific_tool_choice_builds_lark_tool_call_constraint() {
         panic!("expected forced tool_choice to build a Lark constraint");
     };
     assert!(prefix.is_empty());
-    assert!(
-        grammar.contains("start: \"<tool_call>\\n\" tool \"\\n</tool_call>\""),
-        "{grammar}"
-    );
-    assert!(grammar.contains("tool: %json"), "{grammar}");
-    let schema_text = grammar.split_once("tool: %json ").unwrap().1.trim();
-    let schema: Value = serde_json::from_str(schema_text).unwrap();
-    assert_eq!(schema["properties"]["name"]["enum"][0], "get_weather");
-    assert_eq!(schema["properties"]["arguments"]["required"][0], "location");
-    assert_eq!(
-        schema["properties"]["arguments"]["properties"]["location"]["type"],
-        "string"
-    );
+    use onnx_genai_engine::byte_grammar::{GrammarByteCursor, GrammarCandidate};
+    let cursor = GrammarByteCursor::lark(&grammar, 4096).unwrap();
+    for (body, valid) in [
+        (
+            r#"{"name":"get_weather","arguments":{"location":"Paris"}}"#,
+            true,
+        ),
+        (
+            r#"{"arguments":{"location":"Paris"},"id":"call_1","name":"get_weather"}"#,
+            true,
+        ),
+        (
+            r#"{"name":"get_time","arguments":{"location":"Paris"}}"#,
+            false,
+        ),
+        (r#"{"name":"get_weather","arguments":{}}"#, false),
+        (
+            r#"{"name":"get_weather","arguments":{"location":3}}"#,
+            false,
+        ),
+        (
+            r#"{"name":"get_weather","arguments":{"location":"Paris"},"extra":1}"#,
+            false,
+        ),
+    ] {
+        let text = format!("<tool_call>\n{body}\n</tool_call>");
+        assert_eq!(
+            matches!(
+                cursor.preview_root(text.as_bytes()).unwrap(),
+                GrammarCandidate::Viable { complete: true }
+            ),
+            valid,
+            "{text}"
+        );
+    }
 }
 
 #[test]
@@ -1304,12 +1406,33 @@ fn required_tool_choice_with_multiple_tools_allows_any_tool_schema() {
         panic!("expected forced tool_choice to build a Lark constraint");
     };
     assert!(prefix.is_empty());
-    let schema_text = grammar.split_once("tool: %json ").unwrap().1.trim();
-    let schema: Value = serde_json::from_str(schema_text).unwrap();
-    let any_of = schema["anyOf"].as_array().unwrap();
-    assert_eq!(any_of.len(), 2);
-    assert_eq!(any_of[0]["properties"]["name"]["enum"][0], "get_weather");
-    assert_eq!(any_of[1]["properties"]["name"]["enum"][0], "get_time");
+    use onnx_genai_engine::byte_grammar::{GrammarByteCursor, GrammarCandidate};
+    let cursor = GrammarByteCursor::lark(&grammar, 4096).unwrap();
+    for (body, valid) in [
+        (
+            r#"{"name":"get_weather","arguments":{"location":"Paris"}}"#,
+            true,
+        ),
+        (r#"{"name":"get_time","arguments":{"zone":"UTC"}}"#, true),
+        (
+            r#"{"name":"get_weather","arguments":{"zone":"UTC"}}"#,
+            false,
+        ),
+        (
+            r#"{"name":"get_time","arguments":{"location":"Paris"}}"#,
+            false,
+        ),
+    ] {
+        let text = format!("<tool_call>\n{body}\n</tool_call>");
+        assert_eq!(
+            matches!(
+                cursor.preview_root(text.as_bytes()).unwrap(),
+                GrammarCandidate::Viable { complete: true }
+            ),
+            valid,
+            "{text}"
+        );
+    }
 }
 
 #[test]
