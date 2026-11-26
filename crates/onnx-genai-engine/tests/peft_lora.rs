@@ -221,13 +221,22 @@ fn native_peft_rejects_variants_rank_mismatch_and_unmapped_tensors_without_parti
     metadata["adapters"]["artifacts"]["peft"]["weights"][0]["scale_encoding"] =
         serde_yaml::Value::String("baked".into());
     std::fs::write(metadata_path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
-    let mut native = engine(root.path());
-    let error = run(&mut native, Some(1.0)).unwrap_err();
+    let error = Engine::from_dir(
+        root.path(),
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            native_device: Some(NativeDecodeDevice::Cpu),
+            ..Default::default()
+        },
+    )
+    .err()
+    .expect("baked PEFT must be rejected during metadata admission");
+    let text = format!("{error:#}");
     assert!(
-        format!("{error:#}").contains("require scale_encoding alpha_over_rank"),
-        "{error:#}"
+        text.contains("adapters.artifacts.peft.weights[0].scale_encoding")
+            && text.contains("must be alpha_over_rank for hf_peft"),
+        "{text}"
     );
-    assert_eq!(run(&mut native, None).unwrap(), [4.0, 15.0]);
     let f16_header = serde_json::to_vec(&json!({
         format!("{MODULE}.lora_A.weight"):{"dtype":"F16","shape":[1,2],"data_offsets":[0,4]},
         format!("{MODULE}.lora_B.weight"):{"dtype":"F16","shape":[2,1],"data_offsets":[4,8]}
@@ -284,6 +293,16 @@ fn native_peft_rank_two_preserves_independent_row_compositions() {
     let metadata_path = root.path().join("inference_metadata.yaml");
     let mut metadata: serde_yaml::Value =
         serde_yaml::from_str(&std::fs::read_to_string(&metadata_path).unwrap()).unwrap();
+    let capacity = json!({"budgets":[{"dimensions":["batch"],"max_total":2}]});
+    metadata["pipeline"]["workflow"]["components"]["decoder"]["batch_capacity"] =
+        serde_yaml::to_value(&capacity).unwrap();
+    metadata["pipeline"]["workflow"]["components"]["overlay"]["batch_capacity"] =
+        serde_yaml::to_value(&capacity).unwrap();
+    let port = json!({"dtype":"float32","shape":["batch",2],"batch_layout":{"kind":"request_aligned","axis":0}});
+    metadata["pipeline"]["workflow"]["components"]["decoder"]["ports"] = serde_yaml::to_value(
+        json!({"inputs":{"activations":port.clone()},"outputs":{"projection.output":port}}),
+    )
+    .unwrap();
     metadata["adapters"]["artifacts"]["peft"]["rank"] = serde_yaml::to_value(2).unwrap();
     metadata["adapters"]["artifacts"]["peft"]["alpha"] = serde_yaml::to_value(4.0).unwrap();
     metadata["adapters"]["target_manifest"]["targets"][0]["rank"] =
