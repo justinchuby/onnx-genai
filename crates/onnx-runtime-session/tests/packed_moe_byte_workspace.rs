@@ -59,9 +59,17 @@ fn native_packed_moe_defers_metadata_and_admits_exact_layout_then_reuses_one_own
         .collect::<Vec<_>>();
     for float_strided in [false, true] {
         for strided in [false, true] {
-            let exact = (base
+            let existing = base
                 + if strided { packed } else { 0 }
-                + if float_strided { 3 * 32 * 4 } else { 0 }) as u64;
+                + if float_strided { 3 * 32 * 4 } else { 0 };
+            // Routing: row-major decisions plus bucket indices; expert counts,
+            // prefixes and TopK indices; optional softmax; selected weights.
+            let index = std::mem::size_of::<usize>();
+            let selected = std::mem::size_of::<(usize, f32)>();
+            let routing = (3 * (selected + index) + (3 * 2 + 1) * index + 2 * 4)
+                .next_multiple_of(std::mem::align_of::<(usize, f32)>())
+                + selected;
+            let exact = (existing.next_multiple_of(std::mem::align_of::<usize>()) + routing) as u64;
             for budget in [exact - 1, exact] {
                 let books = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
                     DeviceKey::HOST,

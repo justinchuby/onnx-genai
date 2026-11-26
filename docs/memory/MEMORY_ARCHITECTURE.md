@@ -238,9 +238,25 @@ can remain live across experts; capacity is the sum of non-borrowable present
 sources, without a top-k multiplier. Absent optional sources use no region.
 A shared private descriptor serves MatMul and MoE storage validation/borrowing;
 MoE still rejects non-F32 sources. Full binding precedes conversion, routing,
-hashing and compute. Eleven internal regions do not add independent owners,
-pools or quota operations. Rank/index metadata and routing allocations remain;
-this closes payload ownership gaps, not all mallocs or a measured speedup.
+hashing and compute. A twelfth outer region contains the private typed routing
+arena, so internal partitioning adds no independent owner, pool or quota call.
+
+The routing arena holds `rows * min(k, experts)` decisions and stable bucket
+indices, expert cursors/prefixes, TopK indices/selected weights, and softmax
+storage only without aggregation weights. Checked typed layouts preserve their
+maximum alignment, including padding in whole-operation admission. Decisions and
+bucket indices stay uninitialized until every logical entry is written; a
+published plan borrows immutable typed slices through the dispatch. Counts and
+prefixes group routes in O(experts + routes), preserving expert order and each
+expert's token order. TopK comparisons, special float handling and normalization
+retain one shared slice-based numerical implementation; grouping starts only
+after score-order denominators are complete. The existing owned routing helper
+for other CPU MoE paths delegates to that same checked implementation.
+
+BlockQuantizedMoE no longer creates routing payload Vecs or per-expert task Vecs.
+Rank/index conversion metadata and other operators' owned routing plans remain.
+Counts/prefix initialization and index indirection have costs; this proves
+ownership and accounting, not zero mallocs or a measured latency improvement.
 
 For nonempty output, shape-only preparation returns `Deferred`: it cannot know
 strides, and a conservative reservation would retain unused high-water capacity.

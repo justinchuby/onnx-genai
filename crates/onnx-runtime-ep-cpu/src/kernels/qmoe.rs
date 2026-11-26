@@ -563,7 +563,7 @@ impl Kernel for QMoEKernel {
                 aggregation.as_deref().map(|weights| &weights[router_range]),
                 self.attributes.k,
                 self.attributes.normalize_routing_weights,
-            );
+            )?;
             // Investigation probe (default-OFF): mirror of the CUDA route dump so
             // a CPU-vs-CUDA run can be diffed for benign borderline-argmax
             // reassociation vs a real router top-k divergence.
