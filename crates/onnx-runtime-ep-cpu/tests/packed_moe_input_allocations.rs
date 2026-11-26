@@ -16,7 +16,7 @@ use std::sync::atomic::Ordering;
 static COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
-fn packed_moe_borrows_contiguous_payloads_and_materializes_strided_sources() {
+fn packed_moe_inputs_borrow_or_convert_inside_admitted_regions() {
     let _guard = COUNTER_TEST_LOCK.lock().unwrap();
     const R: usize = 3;
     const H: usize = 96;
@@ -82,18 +82,16 @@ fn packed_moe_borrows_contiguous_payloads_and_materializes_strided_sources() {
                 kernel.set_constant_inputs(&[false,false,true,false,true,false,true,false,false]);
                 let mut y=Tensor::zeros(FloatDType::F32,&[R,H]);
                 let mut prepared=PreparedKernel::new(&cpu,kernel,&inputs,&[y.view_mut()]);
-                prepared.execute(&inputs,&mut [y.view_mut()]).unwrap();
-                assert!(y.f32s().iter().all(|&v|v==2.));
-                let expanded = BLOCK_QUANT_MOE_DENSE_EXPANSIONS.load(Ordering::Relaxed);
-                assert_eq!(expanded-before.0, if arithmetic=="float32" && !streamed {3} else {0});
-                for (pair, expected) in sizes.into_iter().zip([[1,2],[2,1]]) {
+                for pair in sizes {
                     for _ in 0..3 {
                         let (result,counts)=watched(pair,||prepared.execute(&inputs,&mut [y.view_mut()]));
                         result.unwrap();
-                        assert_eq!(counts,if strided {expected}else{[0;2]},"{arithmetic} streamed={streamed} strided={strided} payload sizes={pair:?}");
+                        assert_eq!(counts,[0;2],"{arithmetic} streamed={streamed} strided={strided} payload sizes={pair:?}");
                         assert!(y.f32s().iter().all(|&v|v==2.));
                     }
                 }
+                let expanded = BLOCK_QUANT_MOE_DENSE_EXPANSIONS.load(Ordering::Relaxed);
+                assert_eq!(expanded-before.0, if arithmetic=="float32" && !streamed {3} else {0});
                 if arithmetic=="float32" && !streamed { assert!(BLOCK_QUANT_MOE_CACHED_DENSE_TEST_HITS.load(Ordering::Relaxed)>before.1); }
             }
         }
