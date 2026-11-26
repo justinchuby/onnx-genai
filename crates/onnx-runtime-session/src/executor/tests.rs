@@ -75,7 +75,13 @@ fn count_host_allocations<T>(operation: impl FnOnce() -> T) -> (T, u64) {
     (result, HOST_ALLOCATION_COUNT.with(Cell::get))
 }
 
+#[derive(Clone, Copy)]
+enum TestWorkspaceDemand {
+    FixedBound(usize),
+    Runtime,
+}
 struct DeferredValidationKernel {
+    workspace_demand: TestWorkspaceDemand,
     workspace_lifetime: WorkspaceLifetime,
     workspace_scale: usize,
     workspace_bytes: Arc<AtomicUsize>,
@@ -92,10 +98,45 @@ impl Kernel for DeferredValidationKernel {
         inputs: &[TensorMetadata<'_>],
         _outputs: &[onnx_runtime_ep_api::OutputMetadata<'_>],
     ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspacePreparation> {
+        let bytes = match self.workspace_demand {
+            TestWorkspaceDemand::Runtime => {
+                return Ok(onnx_runtime_ep_api::WorkspacePreparation::Deferred);
+            }
+            TestWorkspaceDemand::FixedBound(bytes) => bytes,
+        };
         Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
             WorkspaceRequirement {
-                bytes: (self.workspace_bytes.load(Ordering::Relaxed)
+                bytes: (bytes
                     * inputs
+                        .first()
+                        .map_or(0, |input| input.shape.iter().product::<usize>())
+                    * self.workspace_scale) as u64,
+                alignment: 64,
+                lifetime: self.workspace_lifetime,
+            },
+        ))
+    }
+
+    fn workspace_requirement_for_execution(
+        &self,
+        _inputs: &[TensorView],
+        _outputs: &[TensorMut],
+        metadata: &[TensorMetadata<'_>],
+        _facts: &[OutputMetadata<'_>],
+        _cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspaceExecutionPreparation> {
+        let bytes = self.workspace_bytes.load(Ordering::Relaxed);
+        if let TestWorkspaceDemand::FixedBound(bound) = self.workspace_demand
+            && bytes > bound
+        {
+            return Err(EpError::KernelFailed(format!(
+                "test workspace demand {bytes} exceeds static bound {bound}; use the runtime-demand fixture for same-shape growth"
+            )));
+        }
+        Ok(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready(
+            WorkspaceRequirement {
+                bytes: (bytes
+                    * metadata
                         .first()
                         .map_or(0, |input| input.shape.iter().product::<usize>())
                     * self.workspace_scale) as u64,
@@ -165,6 +206,7 @@ impl Kernel for DeferredValidationKernel {
 type WorkspaceReleaseHook = Arc<dyn Fn(usize) + Send + Sync>;
 
 struct DeferredValidationEp {
+    runtime_workspace_demand: bool,
     workspace_bytes: Arc<AtomicUsize>,
     workspace_registry: Option<onnx_runtime_memory_governor::PressureRegistry>,
     workspace_allocations: AtomicUsize,
@@ -272,6 +314,7 @@ impl DeferredValidationEp {
             cpu,
             workspace_bytes: Arc::new(AtomicUsize::new(0)),
             workspace_registry: None,
+            runtime_workspace_demand: false,
             workspace_allocations: AtomicUsize::new(0),
             workspace_releases: AtomicUsize::new(0),
             workspace_registry_calls: AtomicUsize::new(0),
@@ -407,6 +450,11 @@ impl ExecutionProvider for DeferredValidationEp {
         _opset: u64,
     ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
         Ok(Box::new(DeferredValidationKernel {
+            workspace_demand: if self.runtime_workspace_demand {
+                TestWorkspaceDemand::Runtime
+            } else {
+                TestWorkspaceDemand::FixedBound(self.workspace_bytes.load(Ordering::Relaxed))
+            },
             workspace_lifetime: if op.attr("persistent_workspace").and_then(Attribute::as_int)
                 == Some(1)
             {
@@ -2444,10 +2492,10 @@ fn classifier_disqualified_node_is_vetoed_despite_supported_kernel() {
 
     // The kernel alone would admit capture (unconditional Supported, no flag
     // override) — exactly the bypass path Harry called out.
-    executor
-        .cache
-        .entries
-        .insert(keys[0].clone(), Box::new(UnconditionalCaptureKernel));
+    executor.cache.entries.insert(
+        keys[0].clone(),
+        CachedKernel::new(Box::new(UnconditionalCaptureKernel)),
+    );
 
     let decline = executor
         .node_capture_reason(0, &resolved)
@@ -2468,10 +2516,10 @@ fn classifier_qualified_node_with_supported_kernel_is_admitted() {
     let (mut executor, keys, resolved) = build_identity_capture_fixture();
 
     // No growing symbol touches this node's edges; the classifier qualifies it.
-    executor
-        .cache
-        .entries
-        .insert(keys[0].clone(), Box::new(UnconditionalCaptureKernel));
+    executor.cache.entries.insert(
+        keys[0].clone(),
+        CachedKernel::new(Box::new(UnconditionalCaptureKernel)),
+    );
 
     assert!(
         executor.node_capture_reason(0, &resolved).is_none(),
@@ -2521,10 +2569,10 @@ fn disqualified_control_flow_node_reports_host_seam_not_device_seam() {
 
     // A warmed unconditional-`Supported` kernel is present too; it must not matter
     // because structural host classification precedes both the veto and the kernel.
-    executor
-        .cache
-        .entries
-        .insert(keys[0].clone(), Box::new(UnconditionalCaptureKernel));
+    executor.cache.entries.insert(
+        keys[0].clone(),
+        CachedKernel::new(Box::new(UnconditionalCaptureKernel)),
+    );
 
     let decline = executor
         .node_capture_reason(0, &resolved)
@@ -2672,7 +2720,7 @@ fn ep_structural_plan_plus_executor_kernel_checks_matches_legacy_declines() {
                 "kernel has not been warmed for the requested capture shape",
             ));
         };
-        kernel_capture_decline(plan.node_id, node, kernel.as_ref())
+        kernel_capture_decline(plan.node_id, node, kernel.kernel.as_ref())
     }
 
     let mut graph = Graph::new();
@@ -2741,10 +2789,10 @@ fn ep_structural_plan_plus_executor_kernel_checks_matches_legacy_declines() {
     resolved.remove(&executor.plan[1].inputs[0].expect("present input"));
     resolved.remove(&executor.plan[2].inputs[0].expect("present input"));
     executor.cache.entries.remove(&keys[3]);
-    executor
-        .cache
-        .entries
-        .insert(keys[4].clone(), Box::new(CaptureDecliningKernel));
+    executor.cache.entries.insert(
+        keys[4].clone(),
+        CachedKernel::new(Box::new(CaptureDecliningKernel)),
+    );
 
     let legacy = executor
         .plan
@@ -17318,6 +17366,27 @@ fn completed_workspace_fixture(
     Arc<WorkspaceCountingAuthority>,
     onnx_runtime_memory_governor::ProcessMemoryManager,
 ) {
+    completed_workspace_fixture_with_demand(expose_registry, false)
+}
+fn completed_dynamic_workspace_fixture(
+    expose_registry: bool,
+) -> (
+    Executor,
+    Arc<DeferredValidationEp>,
+    Arc<WorkspaceCountingAuthority>,
+    onnx_runtime_memory_governor::ProcessMemoryManager,
+) {
+    completed_workspace_fixture_with_demand(expose_registry, true)
+}
+fn completed_workspace_fixture_with_demand(
+    expose_registry: bool,
+    runtime_workspace_demand: bool,
+) -> (
+    Executor,
+    Arc<DeferredValidationEp>,
+    Arc<WorkspaceCountingAuthority>,
+    onnx_runtime_memory_governor::ProcessMemoryManager,
+) {
     use onnx_runtime_memory_api::DeviceKey;
     use onnx_runtime_memory_governor::{
         HolderId, HostWorkspacePool, LeaseLedger, LedgerGovernor, MemoryGovernor,
@@ -17339,6 +17408,7 @@ fn completed_workspace_fixture(
     .with_workspace_pool(pool)
     .unwrap();
     let mut ep = DeferredValidationEp::new();
+    ep.runtime_workspace_demand = runtime_workspace_demand;
     ep.cpu = CpuExecutionProvider::initialized_with_resources(resources).unwrap();
     ep.workspace_bytes.store(32, Ordering::Relaxed);
     ep.workspace_registry = expose_registry.then(|| books.pressure_registry(Tier::Host).unwrap());
