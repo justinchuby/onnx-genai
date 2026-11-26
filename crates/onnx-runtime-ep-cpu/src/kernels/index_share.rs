@@ -1,4 +1,4 @@
-//! CPU reference kernel for frozen `pkg.nxrt::IndexShare` v1.
+//! CPU reference kernel for frozen `pkg.nxrt._private::IndexShare` v1.
 
 use std::borrow::Cow;
 
@@ -984,7 +984,7 @@ mod tests {
 
     fn node(case: Case, with_past: bool, with_bias: bool, outputs: usize) -> (Graph, NodeId) {
         let mut graph = Graph::new();
-        graph.opset_imports.insert("pkg.nxrt".into(), 1);
+        graph.opset_imports.insert("pkg.nxrt._private".into(), 1);
         let specs = [
             Some((
                 DataType::Float32,
@@ -1057,7 +1057,7 @@ mod tests {
             }
         }
         let mut node = Node::new(NodeId(0), OP, inputs, node_outputs);
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes
             .insert("num_heads".into(), Attribute::Int(case.q_heads as i64));
         node.attributes
@@ -1542,7 +1542,7 @@ mod tests {
         bias: &[f32],
     ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         let mut graph = Graph::new();
-        graph.opset_imports.insert("pkg.nxrt".into(), 1);
+        graph.opset_imports.insert("pkg.nxrt._private".into(), 1);
         let specs = [
             (
                 DataType::Float32,
@@ -1599,7 +1599,7 @@ mod tests {
             ));
         }
         let mut node = Node::new(NodeId(0), OP, inputs, node_outputs);
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes
             .insert("num_heads".into(), Attribute::Int(case.q_heads as i64));
         node.attributes

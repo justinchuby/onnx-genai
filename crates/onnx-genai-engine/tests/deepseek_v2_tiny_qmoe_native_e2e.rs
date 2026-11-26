@@ -104,7 +104,7 @@ fn assert_current_emission(dir: &Path) -> anyhow::Result<()> {
         !graph
             .nodes
             .values()
-            .any(|node| node.domain == "pkg.nxrt" && node.op_type == "IndexShare"),
+            .any(|node| node.domain == "pkg.nxrt._private" && node.op_type == "IndexShare"),
         "{} should lock the DeepSeek path, not the GLM IndexShare path",
         model.display()
     );

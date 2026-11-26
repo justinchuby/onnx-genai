@@ -1,7 +1,7 @@
 # IndexShare selected-token attention — frozen v1
 
 **Status:** frozen v1
-**Operator:** `pkg.nxrt::IndexShare`, version 1
+**Operator:** `pkg.nxrt._private::IndexShare`, version 1
 
 ## Boundary and schema
 
@@ -83,6 +83,6 @@ they are unknown. Runtime validates concrete shapes and all index values.
 
 ## Exporter reconciliation
 
-The exact private `pkg.nxrt` operator name and version must be reconciled with
+The exact private `pkg.nxrt._private` operator name and version must be reconciled with
 Mobius PR #404 when that exporter change merges. This document freezes the
 runtime v1 contract; reconciliation must not silently change its semantics.

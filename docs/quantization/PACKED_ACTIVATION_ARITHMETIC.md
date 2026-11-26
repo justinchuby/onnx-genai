@@ -1,6 +1,6 @@
 # Packed activation arithmetic
 
-`pkg.nxrt::BlockQuantizedMatMul` and `pkg.nxrt::BlockQuantizedMoE` carry
+`pkg.nxrt._private::BlockQuantizedMatMul` and `pkg.nxrt._private::BlockQuantizedMoE` carry
 `activation_arithmetic` independently of their compressed weight formats.
 This is graph numerical semantics: it cannot change when a resource grant is
 refused or when a dense weight cache becomes available.

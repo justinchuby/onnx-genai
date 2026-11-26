@@ -10,7 +10,11 @@ use crate::shape::Shape;
 use crate::tensor::{SparseTensorData, TensorData, TypeProto};
 use crate::value::ValueId;
 
-/// The operator domain for operators this runtime defines itself.
+/// EP-private operator domain for runtime-owned lowering and fusion targets.
+///
+/// Source models keep standard ONNX and vendor domains. Providers recognize
+/// their supported patterns during claim/compile and may lower them here. This
+/// private, pre-release set has no alias for the former runtime-owned domain.
 ///
 /// Anything we invent goes here, and nothing we invent goes in `com.microsoft`
 /// or the default ONNX domain: those namespaces belong to their owners, and an
@@ -18,7 +22,7 @@ use crate::value::ValueId;
 /// does not have. Consumers reading a graph use the domain to decide whose
 /// definition applies, so getting it wrong is a factual error about the model,
 /// not a naming preference.
-pub const RUNTIME_DOMAIN: &str = "pkg.nxrt";
+pub const RUNTIME_DOMAIN: &str = "pkg.nxrt._private";
 
 /// Unique identifier for a [`Node`] within a [`Graph`](crate::Graph).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]

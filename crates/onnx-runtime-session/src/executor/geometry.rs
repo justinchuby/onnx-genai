@@ -435,7 +435,7 @@ pub(super) fn kernel_input_uses_physical_capacity(node: &Node, input_index: usiz
         && onnx_runtime_ep_api::attention_window::AttentionWindow::from_node(node, 25)
             .is_ok_and(|window| !window.is_active())
         || (
-            // `pkg.nxrt::IndexShare` mirrors the mask-driven Attention treatment.
+            // `pkg.nxrt._private::IndexShare` mirrors the mask-driven Attention treatment.
             // Its capacity form emits the 3-output present that ALIASES the
             // fixed-capacity past bindings in place (past_key=input 3, past_value=
             // input 4) instead of a growing `past ⧺ current`, and carries the valid
@@ -445,14 +445,14 @@ pub(super) fn kernel_input_uses_physical_capacity(node: &Node, input_index: usiz
             // capture shape-static. Gated on the 3-output present + present bias so
             // the growing-concat form (1 output, or bias-less) still reads the cache
             // extent as the valid length.
-            node.domain == "pkg.nxrt"
+            node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
                 && node.op_type == "IndexShare"
                 && matches!(input_index, 3 | 4)
                 && node.outputs.len() == 3
                 && node.inputs.get(6).is_some_and(Option::is_some)
         )
         || (
-            // `pkg.nxrt::KvCacheCapacityAppend` (the CUDA-only rewritten form of a
+            // `pkg.nxrt._private::KvCacheCapacityAppend` (the CUDA-only rewritten form of a
             // decomposed-attention KV-cache growth `Concat`, see
             // `is_kv_cache_growth_concat`) writes `current` into a fixed-capacity
             // `past` in place at the offset(s) carried by its third operand
@@ -582,11 +582,11 @@ pub(super) fn is_capacity_form_attention_mask_input(node: &Node, input_index: us
 /// replaces an eligible growth `Concat` with this op so the KV cache is
 /// updated as an in-place capacity write instead of a growing concatenation,
 /// which is what lets whole-step CUDA-graph capture stay shape-static across
-/// decode steps. Kept as a bare literal (matching how `pkg.nxrt::IndexShare`
+/// decode steps. Kept as a bare literal (matching how `pkg.nxrt._private::IndexShare`
 /// is already spelled independently in each crate that touches it) rather
 /// than a cross-crate constant, since the rewrite and the kernel that
 /// executes it live in different crates with no shared dependency edge.
-pub(super) const KV_CAPACITY_APPEND_DOMAIN: &str = "pkg.nxrt";
+pub(super) const KV_CAPACITY_APPEND_DOMAIN: &str = onnx_runtime_ir::RUNTIME_DOMAIN;
 /// Op type of the native-only S3 capacity-write append; see
 /// [`KV_CAPACITY_APPEND_DOMAIN`].
 pub(super) const KV_CAPACITY_APPEND_OP: &str = "KvCacheCapacityAppend";
@@ -601,7 +601,7 @@ pub(super) const KV_CAPACITY_APPEND_OP: &str = "KvCacheCapacityAppend";
 /// input/output *role* alone — not by name, axis, or tensor shape — so it
 /// matches any decomposed self-attention export that grows its cache with a
 /// plain `Concat` rather than an in-op cache (`Attention` /
-/// `GroupQueryAttention` / `pkg.nxrt::IndexShare`), and continues to match
+/// `GroupQueryAttention` / `pkg.nxrt._private::IndexShare`), and continues to match
 /// after the CUDA-only rewrite swaps the node for its capacity-write form —
 /// otherwise the mask-cone walk's `Add`-rule provenance check
 /// ([`derives_from_kv_cache_growth`]) would stop recognizing its own

@@ -97,7 +97,7 @@ pub enum ShapeInference {
         /// The `N` attribute: the dequantized weight's column count.
         n: usize,
     },
-    /// `pkg.nxrt::DsaIndexSelect` v1: `[B,S,H,D]` query plus indexer inputs
+    /// `pkg.nxrt._private::DsaIndexSelect` v1: `[B,S,H,D]` query plus indexer inputs
     /// produces fixed-width indices `[B,1,S,top_k]`.
     DsaIndexSelect {
         /// Required positive `top_k` attribute, which fixes the output width.
@@ -566,7 +566,7 @@ impl ShapeInference {
                     reason: DeclineReason::NodeNotShapeable("MatMulNBits without a usable N attribute"),
                 },
             },
-            "DsaIndexSelect" if domain == "pkg.nxrt" => {
+            "DsaIndexSelect" if domain == "pkg.nxrt._private" => {
                 let Some(build) = resolve_shape_schema(opset, DSA_INDEX_SELECT_SCHEMAS) else {
                     return Self::Declined {
                         op_type: op.to_string(),
@@ -7022,7 +7022,8 @@ fn after() {}
     #[test]
     fn dsa_index_select_resolves_v1_schema_for_later_imports() {
         for imported_opset in [1, 2, 17] {
-            let node = dsa_index_select_node("pkg.nxrt", imported_opset, Attribute::Int(5));
+            let node =
+                dsa_index_select_node("pkg.nxrt._private", imported_opset, Attribute::Int(5));
             let strategy = ShapeInference::for_node(&node, &dsa_input_shapes(), 1);
             assert!(
                 matches!(strategy, ShapeInference::DsaIndexSelect { top_k: 5 }),
@@ -7042,7 +7043,7 @@ fn after() {}
 
     #[test]
     fn dsa_index_select_preserves_unknown_batch_and_sequence_at_capability_time() {
-        let node = dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(7));
+        let node = dsa_index_select_node("pkg.nxrt._private", 1, Attribute::Int(7));
         let shapes = vec![
             vec![None, None, Some(4), Some(8)],
             vec![None, Some(16), Some(8)],
@@ -7066,23 +7067,23 @@ fn after() {}
             ),
             (
                 "no compatible schema",
-                dsa_index_select_node("pkg.nxrt", 0, Attribute::Int(4)),
+                dsa_index_select_node("pkg.nxrt._private", 0, Attribute::Int(4)),
                 valid.clone(),
             ),
             (
                 "non-integer top_k",
-                dsa_index_select_node("pkg.nxrt", 1, Attribute::Float(4.0)),
+                dsa_index_select_node("pkg.nxrt._private", 1, Attribute::Float(4.0)),
                 valid.clone(),
             ),
             (
                 "zero top_k",
-                dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(0)),
+                dsa_index_select_node("pkg.nxrt._private", 1, Attribute::Int(0)),
                 valid.clone(),
             ),
             (
                 "missing scale",
                 {
-                    let mut node = dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(4));
+                    let mut node = dsa_index_select_node("pkg.nxrt._private", 1, Attribute::Int(4));
                     node.attributes.remove("scale");
                     node
                 },
@@ -7091,7 +7092,7 @@ fn after() {}
             (
                 "unknown attribute",
                 {
-                    let mut node = dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(4));
+                    let mut node = dsa_index_select_node("pkg.nxrt._private", 1, Attribute::Int(4));
                     node.attributes.insert("axis".into(), Attribute::Int(-1));
                     node
                 },
@@ -7099,7 +7100,7 @@ fn after() {}
             ),
             (
                 "wrong rank",
-                dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(4)),
+                dsa_index_select_node("pkg.nxrt._private", 1, Attribute::Int(4)),
                 vec![
                     vec![Some(2), Some(3), Some(32)],
                     valid[1].clone(),
@@ -7109,7 +7110,7 @@ fn after() {}
             ),
             (
                 "static mismatch",
-                dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(4)),
+                dsa_index_select_node("pkg.nxrt._private", 1, Attribute::Int(4)),
                 vec![
                     valid[0].clone(),
                     vec![Some(9), Some(16), Some(8)],

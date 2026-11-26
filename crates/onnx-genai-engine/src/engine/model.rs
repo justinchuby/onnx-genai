@@ -235,7 +235,7 @@ pub(crate) struct NativePrefixSnapshot {
 #[cfg(feature = "native-backend")]
 pub(crate) struct NativeSessionState {
     /// Full token history of this session (prompt + generated tokens from all turns).
-    pub(crate) tokens: Vec<TokenId>,
+    pub(crate) tokens: NativeTokenHistory,
     /// Monotonically increasing access stamp, used to pick an LRU victim.
     pub(crate) last_access: u64,
     /// Reset advances this generation while retaining the public session id.

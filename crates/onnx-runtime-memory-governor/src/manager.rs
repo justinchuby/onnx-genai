@@ -402,6 +402,7 @@ struct ManagerState {
     device_loss_listeners: HashMap<DeviceKey, Vec<Weak<dyn DeviceLossListener>>>,
     device_loss_generation: HashMap<DeviceKey, u64>,
     lost_devices: HashSet<DeviceKey>,
+    external_capacities: HashMap<u64, ExternalCapacitySnapshot>,
 }
 
 impl fmt::Debug for ManagerState {
@@ -563,6 +564,97 @@ impl ProcessMemoryManager {
 
     pub fn process_limit(&self, tier: Tier) -> u64 {
         self.inner.book.quota.limit(tier)
+    }
+
+    /// Admit an externally owned payload before its backing is acquired.
+    /// The returned owner must outlive that payload. These are conservative
+    /// addressable-capacity allowances, not allocator/physical/RSS claims.
+    pub fn reserve_external_capacity(
+        &self,
+        authority: &RegisteredMemoryAuthority,
+        holder: &RegisteredMemoryHolder,
+        tier: Tier,
+        role: MemoryRole,
+        bytes: u64,
+    ) -> Result<ExternalCapacityReservation, AllocationTransactionError> {
+        self.ensure_manager(authority.manager, "authority")?;
+        self.ensure_manager(holder.manager, "holder")?;
+        if holder.record.authority != authority.record.id {
+            return Err(AllocationTransactionError::HolderAuthorityMismatch {
+                holder: holder.record.id,
+                holder_authority: holder.record.authority,
+                binding_authority: authority.record.id,
+            });
+        }
+        if tier != authority.device().tier {
+            return Err(AllocationTransactionError::TierMismatch {
+                expected: authority.device().tier,
+                actual: tier,
+            });
+        }
+        if !self.inner.lock_state().holders.contains_key(&holder.id()) {
+            return Err(AllocationTransactionError::Unregistered("holder"));
+        }
+        let id = self.inner.next()?;
+        let mut request = AllocationRequest::managed(0, 1, tier, role, holder.clone(), bytes);
+        if authority.has_process_delegation(tier) {
+            request.process_reserve_bytes = 0;
+        }
+        validate_capacity_request(&self.inner, &authority.record, &request)?;
+        let (process, grant) = reserve_capacity(&self.inner, &authority.record, &request)?;
+        let record = ExternalCapacitySnapshot {
+            id,
+            authority: authority.identity(),
+            holder: holder.id(),
+            tier,
+            role,
+            bytes,
+            process_reserved_bytes: request.process_reserve_bytes,
+        };
+        // Pressure/admission callbacks above run without registration/state
+        // locks. Closing a registration may win there; no backing has been
+        // acquired yet because this API has not returned its owner.
+        let registration = self
+            .inner
+            .registration_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let published = {
+            let mut state = self.inner.lock_state();
+            let closed = if !state
+                .authority_views
+                .contains_key(&authority.binding_identity())
+            {
+                Some("authority")
+            } else if !state.holders.contains_key(&holder.id()) {
+                Some("holder")
+            } else {
+                None
+            };
+            if let Some(registration) = closed {
+                Err(AllocationTransactionError::ExternalRegistrationClosed {
+                    authority: authority.identity(),
+                    holder: holder.id(),
+                    registration,
+                })
+            } else {
+                state.external_capacities.insert(id, record);
+                Ok(())
+            }
+        };
+        // A rejected publication refunds both local grants after every lock
+        // is released, including for reentrant governor settlement callbacks.
+        drop(registration);
+        published?;
+        Ok(ExternalCapacityReservation {
+            id,
+            bytes,
+            _grant: grant,
+            _process: process,
+            _authority: authority.clone(),
+            _holder: holder.clone(),
+            manager: self.clone(),
+        })
     }
 
     pub fn process_used(&self, tier: Tier) -> u64 {
@@ -1103,12 +1195,23 @@ impl ProcessMemoryManager {
         holder: &RegisteredMemoryHolder,
     ) -> Result<(), AllocationTransactionError> {
         self.ensure_manager(holder.manager, "holder")?;
+        let _registration = self
+            .inner
+            .registration_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self
             .inner
             .book
             .snapshots()
             .iter()
             .any(|allocation| allocation.holder == holder.record.id)
+            || self
+                .inner
+                .lock_state()
+                .external_capacities
+                .values()
+                .any(|reservation| reservation.holder == holder.record.id)
         {
             return Err(AllocationTransactionError::HolderInUse(holder.record.id));
         }
@@ -1170,6 +1273,17 @@ impl ProcessMemoryManager {
             .registration_gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self
+            .inner
+            .lock_state()
+            .external_capacities
+            .values()
+            .any(|reservation| reservation.authority == authority.identity())
+        {
+            return Err(AllocationTransactionError::Binding(
+                BindingError::AuthorityInUse(authority.binding_identity()),
+            ));
+        }
         self.inner
             .registry
             .remove_authority(authority.record.registered)
@@ -1336,9 +1450,19 @@ impl ProcessMemoryManager {
             })
             .collect::<Vec<_>>();
         let allocations = self.inner.book.snapshots();
+        let mut external_capacities = self
+            .inner
+            .lock_state()
+            .external_capacities
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        external_capacities.sort_by_key(|record| record.id);
         let mut physical = HashMap::<SharedPhysicalIdentity, u64>::new();
         let mut attributed_allocation_charged_bytes = 0_u64;
-        let mut process_reserved_bytes = 0_u64;
+        let mut process_reserved_bytes = external_capacities.iter().fold(0_u64, |total, record| {
+            total.saturating_add(record.process_reserved_bytes)
+        });
         let mut mapped_bytes = 0_u64;
         let mut unattributed_bytes = 0_u64;
         let mut unknown_physical_allocations = 0_usize;
@@ -1370,6 +1494,7 @@ impl ProcessMemoryManager {
                 self.process_used(Tier::Host),
                 self.process_used(Tier::Disk),
             ],
+            external_capacities,
             authority_count: authorities.len(),
             charged_bytes: authority_snapshots.iter().fold(0_u64, |total, authority| {
                 total.saturating_add(authority.used.iter().copied().sum::<u64>())
@@ -1867,82 +1992,7 @@ impl ScopedMemoryBinding {
         &self,
         request: &AllocationRequest,
     ) -> Result<(), AllocationTransactionError> {
-        if request.holder.manager != self.manager.id {
-            return Err(AllocationTransactionError::ForeignHandle("holder"));
-        }
-        if request.holder.record.authority != self.authority.id {
-            return Err(AllocationTransactionError::HolderAuthorityMismatch {
-                holder: request.holder.record.id,
-                holder_authority: request.holder.record.authority,
-                binding_authority: self.authority.id,
-            });
-        }
-        if request.tier != self.identity().device().tier {
-            return Err(AllocationTransactionError::TierMismatch {
-                expected: self.identity().device().tier,
-                actual: request.tier,
-            });
-        }
-        if request.alignment == 0 || !request.alignment.is_power_of_two() {
-            return Err(AllocationTransactionError::InvalidPublication(
-                "allocation alignment must be a non-zero power of two",
-            ));
-        }
-        let delegated_bytes = self
-            .authority
-            .process_delegations
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&request.tier)
-            .map(|lease| lease.bytes);
-        if let (Some(delegated), Some(governor)) =
-            (delegated_bytes, self.authority.governor.as_ref())
-        {
-            let used = governor.used(request.tier);
-            let oversubscribed = governor.oversubscribed_bytes(request.tier);
-            let local_extent = used.checked_add(governor.available(request.tier)).ok_or(
-                MemoryError::InvalidRequest {
-                    tier: request.tier.name(),
-                    requested: request.authority_reserve_bytes,
-                    reason: "the local authority extent overflows its byte counter",
-                },
-            )?;
-            if oversubscribed != 0 || local_extent > delegated {
-                return Err(AllocationTransactionError::StaleProcessDelegation {
-                    authority: self.authority.id,
-                    tier: request.tier,
-                    delegated,
-                    local_extent: local_extent.saturating_add(oversubscribed),
-                });
-            }
-        }
-        match request.charge_mode {
-            AllocationChargeMode::Managed if self.authority.governor.is_none() => Err(
-                AllocationTransactionError::MissingGovernor(self.authority.id),
-            ),
-            AllocationChargeMode::AuthorityManaged if self.authority.governor.is_none() => Err(
-                AllocationTransactionError::MissingGovernor(self.authority.id),
-            ),
-            AllocationChargeMode::Managed | AllocationChargeMode::AuthorityManaged
-                if request.authority_reserve_bytes != 0
-                    && self.manager.book.quota.limit(request.tier) != u64::MAX
-                    && delegated_bytes.is_none()
-                    && request.process_reserve_bytes < request.authority_reserve_bytes =>
-            {
-                Err(AllocationTransactionError::InsufficientProcessCoverage {
-                    authority: self.authority.id,
-                    tier: request.tier,
-                    required: request.authority_reserve_bytes,
-                    reserved: request.process_reserve_bytes,
-                })
-            }
-            AllocationChargeMode::Compatibility if request.authority_reserve_bytes != 0 => {
-                Err(AllocationTransactionError::InvalidPublication(
-                    "compatibility transactions cannot claim authority-charged bytes",
-                ))
-            }
-            _ => Ok(()),
-        }
+        validate_capacity_request(&self.manager, &self.authority, request)
     }
 
     fn validate_publication(
@@ -1998,112 +2048,7 @@ impl ScopedMemoryBinding {
         &self,
         request: &AllocationRequest,
     ) -> Result<(Option<ProcessQuotaLease>, Option<MemoryLease>), AllocationTransactionError> {
-        let authority = self.manager.authority(self.authority.id)?;
-        let authority_handles_pressure = authority
-            .governor
-            .as_ref()
-            .and_then(|governor| governor.pressure_registry(request.tier))
-            .is_some();
-        let mut pressured = false;
-        loop {
-            // A pressure-capable governor owns its physical admission round;
-            // do not pre-drive it or repeat it after its bounded refusal.
-            let authority_shortfall = if request.charge_mode == AllocationChargeMode::Managed
-                && !authority_handles_pressure
-            {
-                authority.governor.as_ref().map_or(0, |governor| {
-                    request
-                        .authority_reserve_bytes
-                        .saturating_sub(governor.available(request.tier))
-                })
-            } else {
-                0
-            };
-            let process_possible =
-                request.process_reserve_bytes <= self.manager.book.quota.limit(request.tier);
-            let process_shortfall = request
-                .process_reserve_bytes
-                .saturating_sub(self.manager.book.quota.available(request.tier));
-            if !pressured
-                && process_possible
-                && (authority_shortfall != 0 || process_shortfall != 0)
-            {
-                self.manager
-                    .pressure(
-                        authority.id,
-                        request.tier,
-                        authority_shortfall.max(process_shortfall),
-                    )
-                    .map_err(AllocationTransactionError::Memory)?;
-                pressured = true;
-            }
-
-            let process_lease = if request.process_reserve_bytes == 0 {
-                None
-            } else {
-                match self.manager.book.quota.reserve(
-                    request.tier,
-                    request.process_reserve_bytes,
-                    request.role,
-                ) {
-                    Ok(lease) => Some(lease),
-                    Err(error) if !pressured && process_possible && is_capacity_error(&error) => {
-                        let shortfall = request
-                            .process_reserve_bytes
-                            .saturating_sub(self.manager.book.quota.available(request.tier));
-                        self.manager
-                            .pressure(authority.id, request.tier, shortfall)
-                            .map_err(AllocationTransactionError::Memory)?;
-                        pressured = true;
-                        continue;
-                    }
-                    Err(error) => return Err(AllocationTransactionError::Memory(error)),
-                }
-            };
-
-            let authority_lease = match request.charge_mode {
-                AllocationChargeMode::Managed => {
-                    let governor = authority
-                        .governor
-                        .as_ref()
-                        .ok_or(AllocationTransactionError::MissingGovernor(authority.id))?;
-                    match governor.reserve(
-                        request.tier,
-                        request.authority_reserve_bytes,
-                        request.role,
-                        request.holder.record.id,
-                    ) {
-                        Ok(lease) => Some(lease),
-                        Err(error)
-                            if !pressured
-                                && !authority_handles_pressure
-                                && is_capacity_error(&error) =>
-                        {
-                            drop(process_lease);
-                            self.manager
-                                .pressure(
-                                    authority.id,
-                                    request.tier,
-                                    request
-                                        .authority_reserve_bytes
-                                        .saturating_sub(governor.available(request.tier)),
-                                )
-                                .map_err(AllocationTransactionError::Memory)?;
-                            pressured = true;
-                            continue;
-                        }
-                        Err(error) => {
-                            drop(process_lease);
-                            return Err(AllocationTransactionError::Memory(error));
-                        }
-                    }
-                }
-                AllocationChargeMode::AuthorityManaged | AllocationChargeMode::Compatibility => {
-                    None
-                }
-            };
-            return Ok((process_lease, authority_lease));
-        }
+        reserve_capacity(&self.manager, &self.authority, request)
     }
 
     fn rollback_after_failure(
@@ -2168,6 +2113,197 @@ impl ScopedMemoryBinding {
                 rollback: Arc::from(error.to_string()),
             },
         }
+    }
+}
+
+fn validate_capacity_request(
+    manager: &Arc<ManagerInner>,
+    authority: &Arc<AuthorityRecord>,
+    request: &AllocationRequest,
+) -> Result<(), AllocationTransactionError> {
+    if request.holder.manager != manager.id {
+        return Err(AllocationTransactionError::ForeignHandle("holder"));
+    }
+    if request.holder.record.authority != authority.id {
+        return Err(AllocationTransactionError::HolderAuthorityMismatch {
+            holder: request.holder.record.id,
+            holder_authority: request.holder.record.authority,
+            binding_authority: authority.id,
+        });
+    }
+    if request.tier != authority.registered.device().tier {
+        return Err(AllocationTransactionError::TierMismatch {
+            expected: authority.registered.device().tier,
+            actual: request.tier,
+        });
+    }
+    if request.alignment == 0 || !request.alignment.is_power_of_two() {
+        return Err(AllocationTransactionError::InvalidPublication(
+            "allocation alignment must be a non-zero power of two",
+        ));
+    }
+    let delegated_bytes = authority
+        .process_delegations
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&request.tier)
+        .map(|lease| lease.bytes);
+    if let (Some(delegated), Some(governor)) = (delegated_bytes, authority.governor.as_ref()) {
+        let used = governor.used(request.tier);
+        let oversubscribed = governor.oversubscribed_bytes(request.tier);
+        let local_extent = used.checked_add(governor.available(request.tier)).ok_or(
+            MemoryError::InvalidRequest {
+                tier: request.tier.name(),
+                requested: request.authority_reserve_bytes,
+                reason: "the local authority extent overflows its byte counter",
+            },
+        )?;
+        if oversubscribed != 0 || local_extent > delegated {
+            return Err(AllocationTransactionError::StaleProcessDelegation {
+                authority: authority.id,
+                tier: request.tier,
+                delegated,
+                local_extent: local_extent.saturating_add(oversubscribed),
+            });
+        }
+    }
+    match request.charge_mode {
+        AllocationChargeMode::Managed if authority.governor.is_none() => {
+            Err(AllocationTransactionError::MissingGovernor(authority.id))
+        }
+        AllocationChargeMode::AuthorityManaged if authority.governor.is_none() => {
+            Err(AllocationTransactionError::MissingGovernor(authority.id))
+        }
+        AllocationChargeMode::Managed | AllocationChargeMode::AuthorityManaged
+            if request.authority_reserve_bytes != 0
+                && manager.book.quota.limit(request.tier) != u64::MAX
+                && delegated_bytes.is_none()
+                && request.process_reserve_bytes < request.authority_reserve_bytes =>
+        {
+            Err(AllocationTransactionError::InsufficientProcessCoverage {
+                authority: authority.id,
+                tier: request.tier,
+                required: request.authority_reserve_bytes,
+                reserved: request.process_reserve_bytes,
+            })
+        }
+        AllocationChargeMode::Compatibility if request.authority_reserve_bytes != 0 => {
+            Err(AllocationTransactionError::InvalidPublication(
+                "compatibility transactions cannot claim authority-charged bytes",
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+// One pressure/admission implementation for allocator transactions and
+// external payload owners. The latter reserve capacity but never claim an
+// allocator or measured resident-page identity.
+fn reserve_capacity(
+    manager: &Arc<ManagerInner>,
+    authority: &Arc<AuthorityRecord>,
+    request: &AllocationRequest,
+) -> Result<(Option<ProcessQuotaLease>, Option<MemoryLease>), AllocationTransactionError> {
+    let authority = manager.authority(authority.id)?;
+    let authority_handles_pressure = authority
+        .governor
+        .as_ref()
+        .and_then(|governor| governor.pressure_registry(request.tier))
+        .is_some();
+    let mut pressured = false;
+    loop {
+        // A pressure-capable governor owns its physical admission round;
+        // do not pre-drive it or repeat it after its bounded refusal.
+        let authority_shortfall = if request.charge_mode == AllocationChargeMode::Managed
+            && !authority_handles_pressure
+        {
+            authority.governor.as_ref().map_or(0, |governor| {
+                request
+                    .authority_reserve_bytes
+                    .saturating_sub(governor.available(request.tier))
+            })
+        } else {
+            0
+        };
+        let process_possible =
+            request.process_reserve_bytes <= manager.book.quota.limit(request.tier);
+        let process_shortfall = request
+            .process_reserve_bytes
+            .saturating_sub(manager.book.quota.available(request.tier));
+        if !pressured && process_possible && (authority_shortfall != 0 || process_shortfall != 0) {
+            manager
+                .pressure(
+                    authority.id,
+                    request.tier,
+                    authority_shortfall.max(process_shortfall),
+                )
+                .map_err(AllocationTransactionError::Memory)?;
+            pressured = true;
+        }
+
+        let process_lease = if request.process_reserve_bytes == 0 {
+            None
+        } else {
+            match manager.book.quota.reserve(
+                request.tier,
+                request.process_reserve_bytes,
+                request.role,
+            ) {
+                Ok(lease) => Some(lease),
+                Err(error) if !pressured && process_possible && is_capacity_error(&error) => {
+                    let shortfall = request
+                        .process_reserve_bytes
+                        .saturating_sub(manager.book.quota.available(request.tier));
+                    manager
+                        .pressure(authority.id, request.tier, shortfall)
+                        .map_err(AllocationTransactionError::Memory)?;
+                    pressured = true;
+                    continue;
+                }
+                Err(error) => return Err(AllocationTransactionError::Memory(error)),
+            }
+        };
+
+        let authority_lease = match request.charge_mode {
+            AllocationChargeMode::Managed => {
+                let governor = authority
+                    .governor
+                    .as_ref()
+                    .ok_or(AllocationTransactionError::MissingGovernor(authority.id))?;
+                match governor.reserve(
+                    request.tier,
+                    request.authority_reserve_bytes,
+                    request.role,
+                    request.holder.record.id,
+                ) {
+                    Ok(lease) => Some(lease),
+                    Err(error)
+                        if !pressured
+                            && !authority_handles_pressure
+                            && is_capacity_error(&error) =>
+                    {
+                        drop(process_lease);
+                        manager
+                            .pressure(
+                                authority.id,
+                                request.tier,
+                                request
+                                    .authority_reserve_bytes
+                                    .saturating_sub(governor.available(request.tier)),
+                            )
+                            .map_err(AllocationTransactionError::Memory)?;
+                        pressured = true;
+                        continue;
+                    }
+                    Err(error) => {
+                        drop(process_lease);
+                        return Err(AllocationTransactionError::Memory(error));
+                    }
+                }
+            }
+            AllocationChargeMode::AuthorityManaged | AllocationChargeMode::Compatibility => None,
+        };
+        return Ok((process_lease, authority_lease));
     }
 }
 
@@ -2375,6 +2511,14 @@ pub enum AllocationTransactionError {
     },
     #[error("{0} still owns a manager-published allocation")]
     HolderInUse(HolderId),
+    #[error(
+        "cannot publish external capacity for authority {authority:?}, holder {holder}: {registration} registration closed during admission; keep registrations live through payload acquisition or register again and retry"
+    )]
+    ExternalRegistrationClosed {
+        authority: ProcessAuthorityId,
+        holder: HolderId,
+        registration: &'static str,
+    },
     #[error("authority is registered for {actual:?}, not {expected:?}")]
     AuthorityDeviceMismatch {
         expected: DeviceKey,
@@ -2470,7 +2614,7 @@ pub enum AllocationTransactionError {
     },
     #[error(transparent)]
     Binding(#[from] BindingError),
-    #[error(transparent)]
+    #[error("memory capacity admission failed: {0}")]
     Memory(#[from] MemoryError),
 }
 
@@ -3477,6 +3621,51 @@ pub struct AuthorityMemorySnapshot {
     pub oversubscribed: [u64; 3],
 }
 
+/// A conservative allowance for backing acquired outside registered allocators.
+#[derive(Clone, Debug)]
+pub struct ExternalCapacitySnapshot {
+    pub process_reserved_bytes: u64,
+    pub id: u64,
+    pub authority: ProcessAuthorityId,
+    pub holder: HolderId,
+    pub tier: Tier,
+    pub role: MemoryRole,
+    pub bytes: u64,
+}
+/// Owns both actual authority and process-policy reservations until payload drop.
+pub struct ExternalCapacityReservation {
+    id: u64,
+    bytes: u64,
+    _grant: Option<MemoryLease>,
+    _process: Option<ProcessQuotaLease>,
+    _authority: RegisteredMemoryAuthority,
+    _holder: RegisteredMemoryHolder,
+    // Last: registrations remain live while every reservation settles.
+    manager: ProcessMemoryManager,
+}
+impl ExternalCapacityReservation {
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+impl fmt::Debug for ExternalCapacityReservation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExternalCapacityReservation")
+            .field("id", &self.id)
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+impl Drop for ExternalCapacityReservation {
+    fn drop(&mut self) {
+        self.manager
+            .inner
+            .lock_state()
+            .external_capacities
+            .remove(&self.id);
+    }
+}
+
 /// Process snapshot. `charged`, `physical`, and `mapped` are separate axes.
 #[derive(Clone, Debug)]
 pub struct ProcessMemorySnapshot {
@@ -3487,6 +3676,8 @@ pub struct ProcessMemorySnapshot {
     pub authority_snapshots: Vec<AuthorityMemorySnapshot>,
     pub mechanism_snapshots: Vec<MechanismSnapshot>,
     pub allocations: Vec<ManagedAllocationSnapshot>,
+    /// Capacity allowances held by externally owned payloads, not physical RSS.
+    pub external_capacities: Vec<ExternalCapacitySnapshot>,
     /// Sum of canonical authority usage; never inferred from residency.
     pub charged_bytes: u64,
     /// Charges attributable to currently manager-published allocations. This can

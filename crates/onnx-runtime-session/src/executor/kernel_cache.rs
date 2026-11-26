@@ -98,10 +98,10 @@ impl KernelKey {
 /// the authoritative structural list in
 /// [`kernel_input_uses_physical_capacity`](super::geometry::kernel_input_uses_physical_capacity):
 /// GQA past_key/value = inputs 3,4; default-domain `Attention` = inputs 4,5;
-/// `pkg.nxrt::IndexShare` = inputs 3,4. `present_key`/`present_value` are the
+/// `pkg.nxrt._private::IndexShare` = inputs 3,4. `present_key`/`present_value` are the
 /// GQA-family `outputs[1]`/`outputs[2]`.
 ///
-/// `pkg.nxrt`/`com.microsoft`::`CompressedSparseAttention` (CSA) has no separate
+/// `pkg.nxrt._private`/`com.microsoft`::`CompressedSparseAttention` (CSA) has no separate
 /// past-KV inputs (its cache is stateful device state); instead its
 /// total-sequence-length-derived cache records land on `outputs[1]`/`outputs[3]`
 /// (`[query[0], records, width]`, penultimate = `records`). Dynamic ratio-4 CSA
@@ -141,14 +141,14 @@ fn attention_kv_cache_slots(node: &Node) -> Option<KvCacheSlots> {
             last_axis_outputs: &[],
         });
     }
-    if node.domain == "pkg.nxrt" && node.op_type == "IndexShare" {
+    if node.domain == "pkg.nxrt._private" && node.op_type == "IndexShare" {
         return Some(KvCacheSlots {
             past_inputs: &[3, 4],
             present_outputs: &[1, 2],
             last_axis_outputs: &[],
         });
     }
-    if (node.domain == "pkg.nxrt" || node.domain == "com.microsoft")
+    if (node.domain == "pkg.nxrt._private" || node.domain == "com.microsoft")
         && node.op_type == "CompressedSparseAttention"
     {
         // CSA cache records (derived from total_sequence_length) live on the

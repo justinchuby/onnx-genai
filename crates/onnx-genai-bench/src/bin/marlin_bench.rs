@@ -256,7 +256,7 @@ fn prime_to_past(
     sess: &mut NativeDecodeSession,
     prompt: &[TokenId],
     past: usize,
-) -> Result<Vec<f32>> {
+) -> Result<onnx_genai_engine::LogitsRow> {
     let mut logits = sess
         .decode(prompt, 0)?
         .pop()
