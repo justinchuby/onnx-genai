@@ -1,7 +1,7 @@
 //! Numerically stable `LogSoftmax` with ONNX-versioned axis semantics.
 
 use crate::dtype::{
-    can_borrow_dense_f32, to_dense_f32_widen, to_dense_f32_widen_into, validate_f32_widen_input,
+    can_borrow_dense, to_dense_f32_widen, to_dense_f32_widen_into, validate_f32_widen_input,
     write_dense_f32_narrow,
 };
 use onnx_runtime_ep_api::{
@@ -122,7 +122,7 @@ impl LogSoftmaxKernel {
                 if geometry.count == 0 {
                     return Ok(());
                 }
-                if can_borrow_dense_f32(&inputs[0]) {
+                if can_borrow_dense::<f32>(&inputs[0]) {
                     // Keep the existing zero-copy source path. Y is exclusive
                     // workspace, disjoint from X even when the real output aliases X.
                     let x = to_dense_f32_widen("LogSoftmax", &inputs[0])?;

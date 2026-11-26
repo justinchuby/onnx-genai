@@ -42,7 +42,10 @@ fn packed_validation_nodes_share_one_governed_flag_without_private_allocations()
             .collect::<Vec<_>>();
         let strides = shapes
             .iter()
-            .map(|shape| compute_contiguous_strides(shape))
+            .map(|shape| {
+                compute_contiguous_strides(shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
             .collect::<Vec<_>>();
         let views = inputs
             .iter()
@@ -59,7 +62,8 @@ fn packed_validation_nodes_share_one_governed_flag_without_private_allocations()
             })
             .collect::<Vec<_>>();
         let mut output = ep.allocate(expected.len().max(1), 256).unwrap();
-        let output_strides = compute_contiguous_strides(&shape);
+        let output_strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let mut outputs = [TensorMut::new(
             DevicePtrMut(output.as_mut_ptr()),
             dtype,

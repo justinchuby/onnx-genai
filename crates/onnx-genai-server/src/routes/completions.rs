@@ -734,7 +734,7 @@ async fn prepare_chat_input(
             .await?,
         )
     } else if let Some(audio) = input_audio.first() {
-        Some(preprocess_chat_audio(audio, handle)?)
+        Some(preprocess_chat_audio(audio, handle, config.max_decoded_audio_bytes).await?)
     } else {
         None
     };
@@ -1487,9 +1487,10 @@ async fn collect_generation_with_publications(
     ))
 }
 
-fn preprocess_chat_audio(
+async fn preprocess_chat_audio(
     input: &InputAudio,
     handle: &ModelHandle,
+    max_decoded_bytes: std::num::NonZeroUsize,
 ) -> Result<MultimodalInput, ApiError> {
     let bytes = crate::audio_input::decode_chat_audio(input)
         .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err:#}")))?;
@@ -1500,7 +1501,10 @@ fn preprocess_chat_audio(
         .ok_or_else(|| {
             ApiError::invalid_request("audio input requires a model with a declared audio input")
         })?;
-    MultimodalInput::from_audio_bytes(spec, &bytes)
+    let limits = crate::audio_input::decode_limits(handle, max_decoded_bytes)
+        .await
+        .map_err(|error| ApiError::invalid_request(format!("audio memory admission: {error:#}")))?;
+    MultimodalInput::from_audio_bytes(spec, &bytes, limits)
         .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err:#}")))
 }
 
@@ -2157,13 +2161,14 @@ pub(crate) fn prepare_completion(
             ));
         };
         let prompt = fim_config.format_prompt(prefix, suffix);
-        let prompt_tokens = tokenize_prompt(&handle.tokenizer, &prompt)?;
+        let tokens = handle.tokenizer.encode(&prompt).map_err(|error| {
+            ApiError::invalid_request(format!(
+                "FIM tokenization failed: {error}; repair the package tokenizer"
+            ))
+        })?;
+        let prompt_tokens = tokens.len();
         Ok(PreparedCompletion {
-            generation: CompletionGeneration::Fim {
-                prefix: prefix.clone(),
-                suffix: suffix.clone(),
-                options,
-            },
+            generation: CompletionGeneration::Fim { tokens, options },
             prompt_tokens,
         })
     } else {
@@ -2206,29 +2211,18 @@ async fn submit_completion(
             )
             .await
             .map_err(map_generate_submit_error),
-        CompletionGeneration::Fim {
-            prefix,
-            suffix,
-            options,
-        } => {
+        CompletionGeneration::Fim { tokens, options } => {
             let fim_config = handle
                 .fim_config
                 .clone()
                 .ok_or_else(|| ApiError::invalid_request("FIM is not supported by this model"))?;
             handle
                 .engine
-                .generate_fim(prefix, suffix, fim_config, options)
+                .generate_fim(tokens, fim_config, options)
                 .await
                 .map_err(map_generate_submit_error)
         }
     }
-}
-
-fn tokenize_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<usize, ApiError> {
-    tokenizer
-        .encode(prompt)
-        .map(|tokens| tokens.len())
-        .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))
 }
 
 /// The text spelling of this model's image placeholder, if it declares one.
@@ -2332,7 +2326,8 @@ fn prepare_generate_request(
             GenerateConstraint::Json { prefix }
             | GenerateConstraint::JsonSchema { prefix, .. }
             | GenerateConstraint::Regex { prefix, .. }
-            | GenerateConstraint::Lark { prefix, .. },
+            | GenerateConstraint::Lark { prefix, .. }
+            | GenerateConstraint::XmlToolCall { prefix, .. },
         ) = options.constraint.as_mut()
         {
             prefix.clear();
@@ -3553,7 +3548,10 @@ mod prompt_rendering_tests {
         )
         .expect("production preparation");
 
-        assert_eq!(prepared.request.options.constraint, None);
+        assert!(matches!(
+            prepared.request.options.constraint,
+            Some(GenerateConstraint::XmlToolCall { .. })
+        ));
         assert_eq!(
             tool_protocol::request_policy(&request),
             onnx_genai_engine::ToolCallPolicy::Required

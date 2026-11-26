@@ -162,6 +162,77 @@ does not refund those bytes. Idle capacity can be reclaimed under pressure.
 Pending asynchronous work, active readers and capture pins prevent reuse, and
 quarantined backing retains its charge until physical release is settled.
 
+For the native CPU provider, a fitting Step workspace owner is shared by the
+sequential nodes of one execution. At completion the executor returns it to the
+CPU pool; the next run checks it out again. CPU does not expose the executor
+`workspace_pressure_registry` capability: its `deallocate_workspace` recycles
+into its own reclaimable pool, whereas that capability requires actual backing
+retirement. The executor's generic pressure-parked lane must not be mistaken for
+an enabled CPU fast path. Each fitting CPU checkout/return still locks the pool,
+and each kernel still performs live execution refinement and backing validation.
+
+The `cpu_three_node_runs_share_one_checkout_and_warm_calls_keep_the_original_grant`
+regression wraps the real CPU provider only to count boundary calls. After one
+cold run, 64 warm runs of three real packed projections perform 192 refinements
+but only 64 provider checkouts and 64 returns, with zero additional issuer
+callbacks and one unchanged physical owner. Trimming the completed pool owner
+releases its charge; the following execution must fund a new owner. This tests
+call granularity and accounting, not nanoseconds or lock contention. Likewise,
+the 1,036,816 calls in the historical packed-activation study are the aggregate
+of 136 processes and 320 windows, including setup controls, not one inference.
+That study did not qualify its timing cells and cannot establish negligible
+checkout overhead.
+
+Native metadata workspace preparation is memoized by the compiled kernel entry,
+not a raw kernel address or an executor-wide identity table. Each entry retains
+at most its latest provider-context key and canonical input/output dtype, shape
+and presence facts; absent, unresolved and scalar outputs remain distinct.
+Successful `Ready` and `Deferred` answers are both reusable. Failed metadata
+queries do not replace a valid answer. Evicting or reconfiguring a kernel drops
+its memo. Prepare-only traversal of cached entries and their actual dispatch
+share this same memo; cold nested-bound collection that creates temporary kernels
+still queries those temporary kernels directly.
+
+Every launch still calls execution refinement with the current views, including
+after a metadata hit, backing trim, address/stride change, or previous execution
+failure. Execution plans, pointers, owners and final runtime-value requirements
+are never memoized here. Operators declaring no workspace keep the original
+uncached live path, including rejection of an undeclared nonzero request; they
+pay no memo geometry comparison or context read. Warm metadata comparisons use
+borrowed facts and allocate no Host storage. The three-projection regression
+queries metadata three times at cold start and zero times during its 64 warm
+runs, while all 192 live refinements remain. A native MoE regression switches
+contiguous/strided packed input layouts through the same compiled kernel and
+cached Deferred answer, and checks the precise changed staging demand each time.
+These counts establish avoided queries, not a measured latency improvement.
+
+CPU `BlockQuantizedMoE` includes strided compressed-weight staging in the
+same whole-operation workspace as decode scratch, FC activation banks and the
+output accumulator. One serial byte lane holds the maximum non-borrowable FC
+payload for a single expert, rounded to f32 storage alignment. It is additive to
+the other live regions, never the sum of FC payloads or an expert/top-k multiple.
+Contiguous expert tails borrow their original bytes even when the outer expert
+stride has padding or is negative; these layouts require no packed copy lane.
+
+For nonempty output, shape-only preparation returns `Deferred`: it cannot know
+strides, and a conservative reservation would retain unused high-water capacity.
+Execution refinement validates actual Host views and admits the precise composite
+before payload reads. A logically present but unresolved packed bank must be bound
+to readable storage first. Cached metadata still reuses its preparation result;
+actual layout changes are refined on every dispatch. Empty output requires no
+workspace or payload access after geometry validation.
+
+Constant identity hashes logical bytes directly without retaining a materialized
+copy, preserving content hash, source/mmap provenance, layout, role and expert
+identity. Dense cache construction copies a strided FC only after the complete
+expert group has a grant; streamed FCs use the same serial lane. Dense hits do not
+touch it. Arbitrary byte loans revoke the lane's f32 initialization proof, and a
+subsequent float loan must initialize its prefix again. Standalone packed MatMul
+still materializes strided compressed input on its existing fallback; this change
+does not claim all CPU temporary allocations are governed. Host numerical,
+allocation-observer and Native Session admission tests establish these boundaries;
+no CUDA execution or inference-latency improvement is inferred.
+
 CPU derived-weight payloads also treat zero bytes as an explicit empty grant.
 An empty grant cannot split off positive bytes; a zero-byte split of any grant
 produces another empty value without cloning an accountant lease. Positive
@@ -982,6 +1053,12 @@ admission may decline, so the bound always covers streamed fallback. The same
 provider context key used by integer QMoE guards native/ORT preparation caches;
 no new public API, allocator, per-shard quota or provider lock is introduced.
 The existing architecture-dependent tile and serial arithmetic are unchanged.
+BlockQuantizedMoE borrows aligned contiguous F32 activations, router logits,
+optional router weights and FC biases instead of copying their complete payloads
+on each launch. Its runtime F32 dtype restriction and final-output publication
+remain unchanged; strided/unaligned payloads still materialize through the
+existing conversion helper. These are caller-input borrows, not new governed
+storage or persistent cached views.
 The [adoption record and matched-owner diagnostic](../benchmarks/block-projection-paired-owner/README.md)
 retain the earlier noisy results and distinguish measured warm wall time from
 unresolved per-arm CPU cost.
@@ -1010,9 +1087,22 @@ allocated outside the lane. The conservative physical bound can be larger than
 the previous declared workspace; it is not an RSS-saving claim. Admission may
 refuse a cap that previously omitted those intermediates. Routing, tensor
 widening, strided compressed copies, final tensor storage and GEMM internals
-remain separate; this is not a process-memory cap. Standalone MatMul retains
-its caller-owned output staging. Dense weight residency keeps its existing
-weight-cache authority. No allocator, pool or public EP API is added.
+remain separate; this is not a process-memory cap. Dense weight residency keeps
+its existing weight-cache authority. No allocator, pool or public EP API is added.
+
+Standalone `BlockQuantizedMatMul` composes two simultaneously live regions in
+the same admission: the complete projection layout plus R*N f32 output values.
+Both dense and streamed routes validate this whole backing before materializing
+activation, bias or packed payloads. Dense hits initialize only the output region;
+the projection region remains available for streamed fallback. Arithmetic errors
+leave Y unchanged because publication follows the complete projection and bias
+epilogue. Contiguous F32 bias is borrowed through that epilogue; half or strided
+bias still requires widening/materialization. This moves the former final-output
+Vec into retained, charged workspace and removes its per-dispatch allocation. It
+increases the declared workspace bound; it does not establish an RSS reduction
+or an inference latency improvement. The allocator regression test observes the
+removed payload sizes at the real CPU kernel seam, with positive controls; it
+does not claim the entire launch is allocation-free.
 
 [Public-session evidence](../benchmarks/block-moe-projection-banks/README.md)
 retains the initial measured gated regression and the inline-hint refinement,

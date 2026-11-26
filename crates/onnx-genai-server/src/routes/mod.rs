@@ -441,8 +441,7 @@ pub(crate) struct PreparedCompletion {
 pub(crate) enum CompletionGeneration {
     Plain(GenerateRequest),
     Fim {
-        prefix: String,
-        suffix: String,
+        tokens: Vec<u32>,
         options: GenerateOptions,
     },
 }

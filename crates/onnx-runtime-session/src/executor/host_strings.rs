@@ -177,7 +177,7 @@ impl Executor {
             self.kernel_bindings[pi] = Some(key);
             kernel
         };
-        let outputs = kernel.execute_managed_host(&inputs)?;
+        let outputs = kernel.kernel.execute_managed_host(&inputs)?;
         drop(inputs);
         if outputs.len() != plan.outputs.len() {
             return Err(fail(
@@ -255,10 +255,10 @@ impl Executor {
         let Some(binding) = external.inputs.get(&value) else {
             return self.contiguous_bytes(value, shape, DataType::Bool);
         };
-        let strides = binding
-            .strides
-            .as_deref()
-            .map_or_else(|| compute_contiguous_strides(shape), <[i64]>::to_vec);
+        let strides = match binding.strides.as_deref() {
+            Some(strides) => strides.to_vec(),
+            None => compute_contiguous_strides(shape)?,
+        };
         view_bounds(shape, &strides, 0, DataType::Bool, binding.len).map_err(|cause| {
             SessionError::Internal(format!(
                 "managed host BOOL input value#{} cannot read shape {shape:?} from its external binding: {cause}; bind storage that covers the input layout",

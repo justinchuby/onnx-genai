@@ -71,10 +71,14 @@ fn immutable_interleave_pins_replay_and_dynamic_weights_bypass_cached_copies() {
     let shapes = [vec![1, k], vec![n, blocks, blob], vec![n, blocks]];
     let strides: Vec<_> = shapes
         .iter()
-        .map(|shape| compute_contiguous_strides(shape))
+        .map(|shape| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let out_shape = [1, n];
-    let out_strides = compute_contiguous_strides(&out_shape);
+    let out_strides = compute_contiguous_strides(&out_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut graph = Graph::new();
     graph.opset_imports.insert("com.microsoft".into(), 1);
     let values: Vec<_> = shapes

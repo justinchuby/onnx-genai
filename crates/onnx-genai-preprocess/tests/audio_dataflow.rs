@@ -38,7 +38,12 @@ fn waveform_branches_and_implicit_previous_values_are_independent() {
         ]),
     )
     .unwrap();
-    let actual = p.run(&[&wav(&[-0.5, 0.0, 0.5])]).unwrap();
+    let actual = p
+        .run(
+            &[&wav(&[-0.5, 0.0, 0.5])],
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .unwrap();
     assert_eq!(floats(&actual[0]), [-0.5, 0.0, 0.5]);
     assert_eq!(floats(&actual[1]), [-1.0, 0.0, 1.0]);
     assert_eq!(floats(&actual[2]), [-0.25, 0.0, 0.25]);
@@ -62,7 +67,10 @@ fn batch_maximum_left_padding_keeps_masks_and_sample_lengths_aligned() {
     )
     .unwrap();
     let actual = p
-        .run(&[&wav(&[0.25, 0.5]), &wav(&[-0.5, 0.0, 0.25, 0.5, 0.75])])
+        .run(
+            &[&wav(&[0.25, 0.5]), &wav(&[-0.5, 0.0, 0.25, 0.5, 0.75])],
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
         .unwrap();
     assert_eq!(actual[0].shape, [2, 5]);
     assert_eq!(
@@ -86,7 +94,12 @@ fn batch_maximum_left_padding_keeps_masks_and_sample_lengths_aligned() {
     );
     assert_eq!(actual[2].data, AudioTensorData::Int64(vec![2, 5]));
     assert_eq!(actual[3].data, AudioTensorData::Int64(vec![1, 2]));
-    let empty = p.run(&[&wav(&[]), &wav(&[0.5, 0.5])]).unwrap();
+    let empty = p
+        .run(
+            &[&wav(&[]), &wav(&[0.5, 0.5])],
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .unwrap();
     assert_eq!(empty[2].data, AudioTensorData::Int64(vec![0, 2]));
     assert_eq!(empty[3].data, AudioTensorData::Int64(vec![0, 1]));
 }
@@ -108,7 +121,12 @@ fn normalization_uses_valid_samples_and_preserves_padding() {
         ]),
     )
     .unwrap();
-    let tensors = p.run(&[&wav(&[-0.5, 0.5])]).unwrap();
+    let tensors = p
+        .run(
+            &[&wav(&[-0.5, 0.5])],
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .unwrap();
     assert_eq!(floats(&tensors[0]), [-0.5, 0.5, 0.75, 0.75, 0.75]);
     assert!((floats(&tensors[1])[0] + 1.0).abs() < 1e-6);
     assert!((floats(&tensors[1])[1] - 1.0).abs() < 1e-6);
@@ -127,9 +145,18 @@ fn raw_log_mel_and_explicit_normalization_publish_different_sources() {
         .map(|i| (i as f32 * 0.31).sin() * 0.3)
         .collect::<Vec<_>>();
     let encoded = wav(&samples);
-    let tensors = p.run(&[&encoded]).unwrap();
+    let tensors = p
+        .run(
+            &[&encoded],
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .unwrap();
     assert_ne!(floats(&tensors[0]), floats(&tensors[1]));
-    let decoded = onnx_genai_preprocess::audio::decode_audio(&encoded).unwrap();
+    let decoded = onnx_genai_preprocess::audio::decode_audio(
+        &encoded,
+        onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+    )
+    .unwrap();
     let expected = LogMelExtractor::from_config(LogMelConfig {
         n_mels: 4,
         sample_rate: 8000,
@@ -158,7 +185,12 @@ fn resampling_branches_keep_their_own_lengths() {
         ]),
     )
     .unwrap();
-    let tensors = p.run(&[&wav(&[0.0, 0.25, 0.5, 0.75])]).unwrap();
+    let tensors = p
+        .run(
+            &[&wav(&[0.0, 0.25, 0.5, 0.75])],
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .unwrap();
     assert_eq!(tensors[0].shape, [1, 8]);
     assert_eq!(tensors[1].data, AudioTensorData::Int64(vec![8]));
     assert_eq!(tensors[2].data, AudioTensorData::Int64(vec![4]));
@@ -196,7 +228,12 @@ fn wrong_sources_types_lengths_and_parameters_fail_before_execution() {
 #[test]
 fn log_mel_does_not_silently_change_input_sample_rate() {
     let p=program(json!([{"op":"decode","outputs":["wave"]},{"op":"log_mel","sample_rate":16000,"num_mel_bins":4,"outputs":["mel"]}]),json!([output("mel","mel","audio_features","float32")])).unwrap();
-    let error = p.run(&[&wav(&[0.5; 400])]).unwrap_err();
+    let error = p
+        .run(
+            &[&wav(&[0.5; 400])],
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .unwrap_err();
     assert!(
         error.to_string().contains("insert") || error.to_string().contains("declare resample"),
         "{error}"
@@ -218,7 +255,12 @@ fn resampling_an_empty_real_interval_keeps_it_empty_after_left_padding() {
         ]),
     )
     .unwrap();
-    let tensors = p.run(&[&wav(&[])]).unwrap();
+    let tensors = p
+        .run(
+            &[&wav(&[])],
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .unwrap();
     assert_eq!(tensors[0].data, AudioTensorData::Int64(vec![0]));
     let AudioTensorData::Int64(mask) = &tensors[1].data else {
         panic!("expected mask")
@@ -236,7 +278,12 @@ fn nonfinite_rescale_results_are_actionable_runtime_errors() {
         json!([output("out", "overflow", "waveform", "float32")]),
     )
     .unwrap();
-    let error = p.run(&[&wav(&[0.5])]).unwrap_err();
+    let error = p
+        .run(
+            &[&wav(&[0.5])],
+            onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+        )
+        .unwrap_err();
     assert!(
         error.to_string().contains("transform[2]") && error.to_string().contains("reduce scale"),
         "{error}"
@@ -257,6 +304,10 @@ fn empty_output_names_and_zero_rate_wav_are_rejected() {
     // PCM WAV fmt chunk: zero sample and byte rates are malformed metadata.
     encoded[24..28].copy_from_slice(&0u32.to_le_bytes());
     encoded[28..32].copy_from_slice(&0u32.to_le_bytes());
-    let error = onnx_genai_preprocess::audio::decode_audio(&encoded).unwrap_err();
+    let error = onnx_genai_preprocess::audio::decode_audio(
+        &encoded,
+        onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("sample rate"), "{error}");
 }

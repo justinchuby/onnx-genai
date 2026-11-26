@@ -235,13 +235,19 @@ fn seq_major_decode_is_bit_identical_to_head_major() {
     let cache_shape = [BATCH, KV_HEADS, CACHE_CAPACITY, HEAD_DIM];
     let seqlens_shape = [BATCH];
     let scalar_shape: [usize; 0] = [];
-    let query_strides = compute_contiguous_strides(&query_shape);
-    let current_strides = compute_contiguous_strides(&current_shape);
-    let cache_strides = compute_contiguous_strides(&cache_shape);
-    let seqlens_strides = compute_contiguous_strides(&seqlens_shape);
-    let scalar_strides = compute_contiguous_strides(&scalar_shape);
+    let query_strides = compute_contiguous_strides(&query_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let current_strides = compute_contiguous_strides(&current_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let cache_strides = compute_contiguous_strides(&cache_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let seqlens_strides = compute_contiguous_strides(&seqlens_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let scalar_strides = compute_contiguous_strides(&scalar_shape)
+        .expect("fixture shape has representable contiguous strides");
     let output_shape = query_shape;
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let device = ep.device_id();
 
     let query_buffer = upload(&ep, typed_bytes(&query)).unwrap();
@@ -526,11 +532,16 @@ fn seq_major_full_generation_prefill_and_decode_is_bit_identical() {
     let cache_shape = [BATCH, KV_HEADS, CACHE_CAPACITY, HEAD_DIM];
     let seqlens_shape = [BATCH];
     let scalar_shape: [usize; 0] = [];
-    let prefill_query_strides = compute_contiguous_strides(&prefill_query_shape);
-    let prefill_current_strides = compute_contiguous_strides(&prefill_current_shape);
-    let cache_strides = compute_contiguous_strides(&cache_shape);
-    let seqlens_strides = compute_contiguous_strides(&seqlens_shape);
-    let scalar_strides = compute_contiguous_strides(&scalar_shape);
+    let prefill_query_strides = compute_contiguous_strides(&prefill_query_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let prefill_current_strides = compute_contiguous_strides(&prefill_current_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let cache_strides = compute_contiguous_strides(&cache_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let seqlens_strides = compute_contiguous_strides(&seqlens_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let scalar_strides = compute_contiguous_strides(&scalar_shape)
+        .expect("fixture shape has representable contiguous strides");
 
     let prefill_query_buffer = upload(&ep, typed_bytes(&prefill_query)).unwrap();
     let prefill_key_buffer = upload(&ep, typed_bytes(&prefill_key)).unwrap();
@@ -656,8 +667,10 @@ fn seq_major_full_generation_prefill_and_decode_is_bit_identical() {
         }
 
         {
-            let decode_query_strides = compute_contiguous_strides(&decode_query_shape);
-            let decode_current_strides = compute_contiguous_strides(&decode_current_shape);
+            let decode_query_strides = compute_contiguous_strides(&decode_query_shape)
+                .expect("fixture shape has representable contiguous strides");
+            let decode_current_strides = compute_contiguous_strides(&decode_current_shape)
+                .expect("fixture shape has representable contiguous strides");
             let decode_inputs = [
                 TensorView::new(
                     DevicePtr(decode_query_buffer.as_ptr()),

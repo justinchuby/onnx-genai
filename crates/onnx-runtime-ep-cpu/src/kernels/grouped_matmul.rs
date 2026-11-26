@@ -1,11 +1,13 @@
-use super::affine_bank::AffineBank;
-use crate::dtype::{to_dense, to_dense_f32_widen, write_dense, write_dense_f32_narrow};
-use onnx_runtime_ep_api::packed_routed::{
-    GroupLayout, fail, group_layout, packed_group_layout, validate,
-};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+mod affine;
+mod native;
+mod packed;
+use affine::Affine;
+use native::Native;
+use onnx_runtime_ep_api::packed_routed::fail;
+use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorView};
 use onnx_runtime_ir::dequantize_packed::Metadata;
 use onnx_runtime_ir::{DataType, Node, packed_routed::Op};
+use packed::Packed;
 
 pub(super) struct Factory;
 
@@ -17,112 +19,76 @@ impl KernelFactory for Factory {
     }
 }
 
-struct Native(Op);
-
-fn route_indices(op: Op, idx: &TensorView, groups: usize) -> Result<Vec<usize>> {
-    let convert = |i, value| {
-        usize::try_from(value)
-            .ok()
-            .filter(|&g| g < groups)
-            .ok_or_else(|| {
-                fail(
-                    op,
-                    format!("group_indices[{i}] is {value}; select a group in [0, {groups})"),
-                )
-            })
-    };
-    if idx.dtype == DataType::Int32 {
-        to_dense::<i32>(idx)?
-            .into_iter()
-            .enumerate()
-            .map(|(i, v)| convert(i, i64::from(v)))
-            .collect()
-    } else {
-        to_dense::<i64>(idx)?
-            .into_iter()
-            .enumerate()
-            .map(|(i, v)| convert(i, v))
-            .collect()
-    }
+struct RouteSource<'view, 'storage> {
+    op: Op,
+    view: &'view TensorView<'storage>,
+    count: usize,
 }
-
-fn grouped<F>(
-    l: GroupLayout,
-    x: &[F],
-    weight: impl Fn(usize) -> F,
-    groups: &[usize],
-    b: Option<&[F]>,
-    round: impl Fn(F) -> F,
-) -> Vec<F>
-where
-    F: Copy + Default + std::ops::Add<Output = F> + std::ops::Mul<Output = F>,
-{
-    let mut y = vec![F::default(); l.lanes];
-    for (route, row) in y.chunks_exact_mut(l.n).enumerate() {
-        let g = groups[route];
-        let token = route / l.selections;
-        for (n, out) in row.iter_mut().enumerate() {
-            let mut sum = F::default();
-            for k in 0..l.k {
-                let i = if l.transposed {
-                    n * l.k + k
-                } else {
-                    k * l.n + n
-                };
-                sum = sum + x[token * l.k + k] * weight(g * l.k * l.n + i);
+impl<'view, 'storage> RouteSource<'view, 'storage> {
+    fn new(op: Op, view: &'view TensorView<'storage>) -> Result<Self> {
+        let count = match view.dtype {
+            DataType::Int32 => {
+                crate::strided::validate_host_storage::<i32>(op.name(), "group_indices", view)?
             }
-            // The ONNX function applies Add after the MatMul result is stored.
-            *out = if let Some(b) = b {
-                round(sum) + b[g * l.n + n]
-            } else {
-                sum
-            };
-        }
+            DataType::Int64 => {
+                crate::strided::validate_host_storage::<i64>(op.name(), "group_indices", view)?
+            }
+            dtype => {
+                return Err(fail(
+                    op,
+                    format!(
+                        "group_indices must be INT32/INT64, got {dtype:?}; bind integer routes"
+                    ),
+                ));
+            }
+        };
+        std::alloc::Layout::array::<usize>(count).map_err(|_| {
+            fail(
+                op,
+                "group_indices exceed addressable route storage; reduce route dimensions",
+            )
+        })?;
+        Ok(Self { op, view, count })
     }
-    y
-}
-
-impl Kernel for Native {
-    fn execute(&self, x: &[TensorView], y: &mut [TensorMut]) -> Result<()> {
-        let op = self.0;
-        validate(op, x, y)?;
-        let l = group_layout(op, x, &y[0])?;
-        let groups = route_indices(op, &x[2], l.groups)?;
-        if l.lanes == 0 {
-            return Ok(());
+    fn copy_into(&self, groups: usize, out: &mut [usize]) -> Result<()> {
+        let op = self.op;
+        if out.len() != self.count {
+            return Err(fail(
+                op,
+                format!(
+                    "group_indices workspace has {} elements, expected {}; bind the complete route workspace",
+                    out.len(),
+                    self.count
+                ),
+            ));
         }
-        let b = l.bias.then(|| &x[3]);
-        if x[0].dtype == DataType::Float64 {
-            let bias = b.map(to_dense::<f64>).transpose()?;
-            let weights = to_dense::<f64>(&x[1])?;
-            let data = grouped(
-                l,
-                &to_dense::<f64>(&x[0])?,
-                |i| weights[i],
-                &groups,
-                bias.as_deref(),
-                |v| v,
-            );
-            write_dense(&mut y[0], &data)
+        let mut convert = |i, value| {
+            out[i] = usize::try_from(value)
+                .ok()
+                .filter(|&g| g < groups)
+                .ok_or_else(|| {
+                    fail(
+                        op,
+                        format!("group_indices[{i}] is {value}; select a group in [0, {groups})"),
+                    )
+                })?;
+            Ok(())
+        };
+        if self.view.dtype == DataType::Int32 {
+            crate::dtype::try_visit_storage::<i32>(op.name(), self.view, |i, v| {
+                convert(i, i64::from(v))
+            })
         } else {
-            let widen = |t| to_dense_f32_widen(op.name(), t);
-            let bias = b.map(widen).transpose()?;
-            let weights = widen(&x[1])?;
-            let data = grouped(
-                l,
-                &widen(&x[0])?,
-                |i| weights[i],
-                &groups,
-                bias.as_deref(),
-                |v| match x[0].dtype {
-                    DataType::Float16 => half::f16::from_f32(v).to_f32(),
-                    DataType::BFloat16 => half::bf16::from_f32(v).to_f32(),
-                    _ => v,
-                },
-            );
-            write_dense_f32_narrow(op.name(), &mut y[0], &data)
+            crate::dtype::try_visit_storage::<i64>(op.name(), self.view, convert)
         }
     }
+}
+#[cfg(test)]
+fn route_indices(op: Op, idx: &TensorView, groups: usize) -> Result<Vec<usize>> {
+    let source = RouteSource::new(op, idx)?;
+    let mut routes = vec![0usize; source.count];
+    source.copy_into(groups, &mut routes)?;
+    Ok(routes)
 }
 
 pub(super) struct AffineFactory;
@@ -134,8 +100,6 @@ impl KernelFactory for AffineFactory {
         ))
     }
 }
-
-struct Affine(onnx_runtime_ep_api::packed_routed::AffineGrouped);
 
 pub(super) struct PackedFactory;
 
@@ -149,97 +113,10 @@ impl KernelFactory for PackedFactory {
     }
 }
 
-struct Packed {
-    metadata: Metadata,
-}
-
-impl Kernel for Packed {
-    fn execute(&self, x: &[TensorView], y: &mut [TensorMut]) -> Result<()> {
-        let l = packed_group_layout(&self.metadata, x, y)?;
-        if l.lanes == 0 {
-            return Ok(());
-        }
-        if x.iter().any(|tensor| !tensor.is_contiguous()) || !y[0].is_contiguous() {
-            return Err(EpError::KernelFailed(
-                "PackedGroupedMatMul: inputs and output must use contiguous storage".into(),
-            ));
-        }
-        crate::strided::validate_host_storage::<u8>(
-            "PackedGroupedMatMul",
-            "packed weights",
-            &x[1],
-        )?;
-        let routes = route_indices(Op::GroupedMatMul { transposed: true }, &x[2], l.groups)?;
-        let activation = super::to_dense_f32(&x[0])?;
-        // SAFETY: packed_group_layout validated the one-dimensional UINT8
-        // extent, and the Host span proof validated representable addresses.
-        // The owning EP guarantees live backing for this contiguous byte view.
-        let packed = unsafe {
-            std::slice::from_raw_parts(x[1].data_ptr::<u8>(), self.metadata.packed_bytes())
-        };
-        let (width, bytes) = self.metadata.format().block();
-        let blocks = l.k / width;
-        let decode = super::dequantize_packed::decoder(self.metadata.format());
-        let mut values = [0.0f32; 256];
-        let mut output = vec![0.0f32; l.lanes];
-        for (route, row) in output.chunks_exact_mut(l.n).enumerate() {
-            let expert = routes[route];
-            let token = route / l.selections;
-            for (column, out) in row.iter_mut().enumerate() {
-                let packed_row = (expert * l.n + column) * blocks * bytes;
-                let mut sum = 0.0f32;
-                for block in 0..blocks {
-                    let source = packed_row + block * bytes;
-                    decode(&packed[source..source + bytes], &mut values[..width]);
-                    let activation =
-                        &activation[token * l.k + block * width..token * l.k + (block + 1) * width];
-                    for (&a, &weight) in activation.iter().zip(&values[..width]) {
-                        sum += a * weight;
-                    }
-                }
-                *out = sum;
-            }
-        }
-        write_dense(&mut y[0], &output)
-    }
-}
-
-impl Kernel for Affine {
-    fn supports_strided_input(&self, index: usize) -> bool {
-        matches!(index, 1 | 3 | 4)
-    }
-    fn execute(&self, x: &[TensorView], y: &mut [TensorMut]) -> Result<()> {
-        let l = self.0.layout(x, y)?;
-        let op = Op::GroupedMatMul { transposed: true };
-        let routes = route_indices(op, &x[2], l.groups)?;
-        let bank = AffineBank::new(
-            &x[1],
-            &x[3],
-            x.get(4),
-            [l.groups, l.n, l.k],
-            self.0.block,
-            self.0.zero,
-        )?;
-        if l.lanes == 0 {
-            return Ok(());
-        }
-        let activation = super::to_dense_f32(&x[0])?;
-        let mut data = vec![0f32; l.lanes];
-        for (route, output) in data.chunks_exact_mut(l.n).enumerate() {
-            let token = route / l.selections;
-            let input = &activation[token * l.k..(token + 1) * l.k];
-            for (column, value) in output.iter_mut().enumerate() {
-                *value = bank.dot(routes[route] * l.n + column, input);
-            }
-        }
-        write_dense(&mut y[0], &data)
-    }
-}
-
 #[cfg(test)]
 mod packed_host_tests {
     use super::*;
-    use crate::kernels::testutil::Owned;
+    use crate::kernels::testutil::{Owned, PreparedTestKernel};
     use onnx_runtime_ep_api::DevicePtr;
     use onnx_runtime_ir::{Attribute, DeviceId, NodeId};
 
@@ -315,7 +192,7 @@ mod packed_host_tests {
         )
         .with_byte_offset(1);
         let mut out = Owned::zeros_f32(&[1, 1, 1]);
-        k.execute(&[x.view(), view, indices.view()], &mut [out.view_mut()])
+        k.execute_prepared(&[x.view(), view, indices.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_f32(), [32.]);
         let x = Owned::f32(&[0, 32], &[]);

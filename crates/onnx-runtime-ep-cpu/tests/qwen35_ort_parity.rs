@@ -22,7 +22,10 @@ fn run_f32(
 ) -> Vec<Vec<f32>> {
     let input_strides: Vec<_> = input_shapes
         .iter()
-        .map(|shape| compute_contiguous_strides(shape))
+        .map(|shape| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let inputs: Vec<_> = input_data
         .iter()
@@ -45,7 +48,10 @@ fn run_f32(
         .collect();
     let output_strides: Vec<_> = output_shapes
         .iter()
-        .map(|shape| compute_contiguous_strides(shape))
+        .map(|shape| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let mut outputs: Vec<_> = output_data
         .iter_mut()
@@ -79,7 +85,10 @@ fn run_u16(
 ) -> Vec<Vec<u16>> {
     let input_strides: Vec<_> = input_shapes
         .iter()
-        .map(|shape| compute_contiguous_strides(shape))
+        .map(|shape| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let inputs: Vec<_> = input_data
         .iter()
@@ -102,7 +111,10 @@ fn run_u16(
         .collect();
     let output_strides: Vec<_> = output_shapes
         .iter()
-        .map(|shape| compute_contiguous_strides(shape))
+        .map(|shape| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let mut outputs: Vec<_> = output_data
         .iter_mut()

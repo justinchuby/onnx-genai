@@ -46,7 +46,9 @@ mod tool_protocol;
 mod turn_transaction;
 mod workflow;
 
-pub use adapters::{AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection};
+pub use adapters::{
+    AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection, select_portable_adapter_source,
+};
 pub use arg_reduce::{ArgReduceRewrites, WideArgReduceLowering, lower_degenerate_arg_reductions};
 pub use audio::{
     AudioOutputFormat, EncodedAudio, StreamingResampler, encode_pcm16_wav, resample_planar,
@@ -769,6 +771,9 @@ impl WorkflowRuntime {
                 movable_emit_values,
                 device_bridge_components,
                 memory_strategy_plan,
+                audio_memory: None,
+                audio_decode_limits:
+                    onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
                 decode_backend,
                 execution_admission,
                 adapter_service: None,
@@ -1198,6 +1203,8 @@ impl WorkflowRuntime {
                     movable_emit_values,
                     device_bridge_components,
                     memory_strategy_plan,
+                    audio_memory: Some(resource_governor.memory_accounting()),
+                    audio_decode_limits: config.audio_decode_limits,
                     decode_backend,
                     execution_admission,
                     adapter_service: directory.adapters,

@@ -262,16 +262,23 @@ fn run_gpu_attention_with_backend(
     let out_len: usize = out_shape.iter().product();
     let mut out_buf = ep.allocate(out_len * element_size, 256).unwrap();
 
-    let q_str = compute_contiguous_strides(q_shape);
-    let k_str = compute_contiguous_strides(k_shape);
-    let v_str = compute_contiguous_strides(v_shape);
-    let o_str = compute_contiguous_strides(out_shape);
+    let q_str = compute_contiguous_strides(q_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let k_str = compute_contiguous_strides(k_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let v_str = compute_contiguous_strides(v_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let o_str = compute_contiguous_strides(out_shape)
+        .expect("fixture shape has representable contiguous strides");
 
     let qv = TensorView::new(DevicePtr(q_buf.0.as_ptr()), dtype, q_shape, &q_str, dev);
     let kv = TensorView::new(DevicePtr(k_buf.0.as_ptr()), dtype, k_shape, &k_str, dev);
     let vv = TensorView::new(DevicePtr(v_buf.0.as_ptr()), dtype, v_shape, &v_str, dev);
 
-    let mask_str = mask_shape.map(compute_contiguous_strides);
+    let mask_str = mask_shape.map(|shape| {
+        compute_contiguous_strides(shape)
+            .expect("fixture shape has representable contiguous strides")
+    });
     let mut inputs = vec![qv, kv, vv];
     if let (Some(mb), Some(ms), Some(mstr)) = (&mask_buf, mask_shape, &mask_str) {
         inputs.push(TensorView::new(
@@ -796,7 +803,8 @@ fn attention_prefill_h200_benchmark() {
     for (s, iterations) in [(512usize, 10usize), (2048usize, 3usize)] {
         let (b, h, d) = (1usize, 32usize, 128usize);
         let shape = [b, h, s, d];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let scale = 1.0 / (d as f32).sqrt();
         let upload = |values: Vec<f32>| {
             let bytes = encode(&values, DataType::Float16);
@@ -920,7 +928,8 @@ fn attention_rejects_unsupported_dtype_and_rank() {
     }
     let mut out = ep.allocate(256, 256).unwrap();
     let shape3 = [1usize, 4, 16];
-    let s3 = compute_contiguous_strides(&shape3);
+    let s3 = compute_contiguous_strides(&shape3)
+        .expect("fixture shape has representable contiguous strides");
     let qv = TensorView::new(
         DevicePtr(buf.as_ptr()),
         DataType::Float32,
@@ -963,7 +972,8 @@ fn attention_rejects_unsupported_dtype_and_rank() {
     // The explicit Phase-2a route must reject a missing prepared owner even
     // with valid geometry. It must not silently allocate scores/cuBLASLt scratch.
     let shape4 = [1usize, 4, 4, 4];
-    let strides4 = compute_contiguous_strides(&shape4);
+    let strides4 = compute_contiguous_strides(&shape4)
+        .expect("fixture shape has representable contiguous strides");
     let inputs4 = [TensorView::new(
         DevicePtr(buf.as_ptr()),
         DataType::Float32,

@@ -177,9 +177,13 @@ impl BackendAdapter for CudaAdapter<'_> {
         let input_strides = case
             .input_shapes
             .iter()
-            .map(|shape| compute_contiguous_strides(shape))
+            .map(|shape| {
+                compute_contiguous_strides(shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
             .collect::<Vec<_>>();
-        let output_strides = compute_contiguous_strides(&output_shape);
+        let output_strides = compute_contiguous_strides(&output_shape)
+            .expect("fixture shape has representable contiguous strides");
         let views = input_buffers
             .iter()
             .zip(&case.input_shapes)

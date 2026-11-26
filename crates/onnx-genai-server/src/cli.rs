@@ -37,6 +37,26 @@ pub struct ServeArgs {
     #[arg(long, env = "LLAMA_ARG_API_KEY_FILE")]
     pub api_key_file: Option<PathBuf>,
 
+    /// Allowed browser origins: *, localhost (same origin only), or a comma-separated list.
+    #[arg(long, env = "LLAMA_ARG_CORS_ORIGINS", default_value = "*")]
+    pub cors_origins: String,
+    /// Comma-separated browser preflight methods.
+    #[arg(
+        long,
+        env = "LLAMA_ARG_CORS_METHODS",
+        default_value = "GET, POST, DELETE, OPTIONS"
+    )]
+    pub cors_methods: String,
+    /// Browser preflight request headers, or * to allow the requested names.
+    #[arg(long, env = "LLAMA_ARG_CORS_HEADERS", default_value = "*")]
+    pub cors_headers: String,
+    /// Permit browser credentials (enabled by default).
+    #[arg(long, env = "LLAMA_ARG_CORS_CREDENTIALS", action = clap::ArgAction::SetTrue, default_value_t = true, overrides_with = "no_cors_credentials")]
+    pub cors_credentials: bool,
+    /// Disable browser credentials, allowing literal wildcard origin responses.
+    #[arg(long, env = "LLAMA_ARG_NO_CORS_CREDENTIALS", action = clap::ArgAction::SetTrue, overrides_with = "cors_credentials")]
+    pub no_cors_credentials: bool,
+
     /// Single-model mode: path to a model directory containing the ONNX model
     /// and tokenizer, given positionally as every other subcommand takes it.
     /// Mutually exclusive with --models-dir and --models-config.
@@ -105,12 +125,27 @@ pub struct ServeArgs {
     /// Maximum acoustic frames decoded per file transcription.
     #[arg(long, default_value_t = onnx_genai_engine::transcription::TranscriptionLimits::default().max_frames)]
     pub max_transcription_frames: std::num::NonZeroUsize,
+    /// Maximum raw decoded PCM work and resident PCM bytes per audio decode.
+    #[arg(long, default_value_t = onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY.max_decoded_bytes)]
+    pub max_decoded_audio_bytes: std::num::NonZeroUsize,
     /// Maximum rendered UTF-8 bytes per file transcription.
     #[arg(long, default_value_t = onnx_genai_engine::transcription::TranscriptionLimits::default().max_text_bytes)]
     pub max_transcription_text_bytes: std::num::NonZeroUsize,
     /// Maximum completion prompts in one native or OpenAI request.
     #[arg(long, default_value = "128")]
     pub max_completion_prompts: std::num::NonZeroUsize,
+    /// Maximum caller-owned files in one native infill request.
+    #[arg(long, default_value_t = ServerConfig::default().max_infill_files)]
+    pub max_infill_files: std::num::NonZeroUsize,
+    /// Maximum UTF-8 bytes in one infill filename label.
+    #[arg(long, default_value_t = ServerConfig::default().max_infill_filename_bytes)]
+    pub max_infill_filename_bytes: std::num::NonZeroUsize,
+    /// Maximum aggregate input and rendered context bytes per infill request.
+    #[arg(long, default_value_t = ServerConfig::default().max_infill_context_bytes)]
+    pub max_infill_context_bytes: std::num::NonZeroUsize,
+    /// Maximum template operations per infill context render.
+    #[arg(long, default_value_t = ServerConfig::default().max_infill_template_operations)]
+    pub max_infill_template_operations: std::num::NonZeroU64,
     /// Maximum tokens in one reranking query/document pair.
     #[arg(long, default_value = "8192")]
     pub max_rerank_input_tokens: std::num::NonZeroUsize,
@@ -265,12 +300,19 @@ fn server_config_from_args(args: &ServeArgs) -> anyhow::Result<ServerConfig> {
 
     Ok(ServerConfig {
         api_keys: crate::ApiKeys::from_sources(&args.api_key, args.api_key_file.as_deref())?,
+        cors: crate::CorsPolicy::new(
+            &args.cors_origins,
+            &args.cors_methods,
+            &args.cors_headers,
+            args.cors_credentials && !args.no_cors_credentials,
+        )?,
         node_id: args.node_id.clone().unwrap_or_else(default_node_id),
         max_output_tokens: args.max_output_tokens,
         max_transcription_input_tokens: args.max_transcription_input_tokens,
         max_transcription_prompt_bytes: args.max_transcription_prompt_bytes,
         max_transcription_template_operations: args.max_transcription_template_operations,
         max_transcription_frames: args.max_transcription_frames,
+        max_decoded_audio_bytes: args.max_decoded_audio_bytes,
         max_transcription_text_bytes: args.max_transcription_text_bytes,
         realtime: crate::RealtimeLimits::default(),
         endpoint_props: args.props,
@@ -280,6 +322,10 @@ fn server_config_from_args(args: &ServeArgs) -> anyhow::Result<ServerConfig> {
         model_cache_max_models: args.model_cache_max_models,
         model_downloads: args.model_downloads,
         max_completion_prompts: args.max_completion_prompts,
+        max_infill_files: args.max_infill_files,
+        max_infill_filename_bytes: args.max_infill_filename_bytes,
+        max_infill_context_bytes: args.max_infill_context_bytes,
+        max_infill_template_operations: args.max_infill_template_operations,
         max_rerank_input_tokens: args.max_rerank_input_tokens,
         max_rerank_documents: args.max_rerank_documents,
         max_rerank_media_bytes: args.max_rerank_media_bytes,
@@ -366,6 +412,28 @@ mod tests {
     struct TestCli {
         #[command(flatten)]
         serve: ServeArgs,
+    }
+
+    #[test]
+    fn cors_cli_defaults_overrides_and_invalid_policy_are_explicit() {
+        for (flags, expected) in [
+            (vec![], true),
+            (vec!["--no-cors-credentials"], false),
+            (vec!["--no-cors-credentials", "--cors-credentials"], true),
+            (vec!["--cors-credentials", "--no-cors-credentials"], false),
+        ] {
+            let args = TestCli::try_parse_from([vec!["test", "model"], flags].concat()).unwrap();
+            let config = server_config_from_args(&args.serve).unwrap();
+            assert_eq!(config.cors.credentials_enabled(), expected);
+        }
+        let args =
+            TestCli::try_parse_from(["test", "model", "--cors-origins", "not-an-origin"]).unwrap();
+        assert!(
+            server_config_from_args(&args.serve)
+                .unwrap_err()
+                .to_string()
+                .contains("--cors-origins")
+        );
     }
 
     #[test]
@@ -715,6 +783,51 @@ mod tests {
         let error = TestCli::try_parse_from(["test", "model-dir", "--max-completion-prompts", "0"])
             .unwrap_err();
         assert!(error.to_string().contains("--max-completion-prompts"));
+    }
+    #[test]
+    fn infill_resource_limits_have_shared_defaults_and_positive_overrides() {
+        let defaults = ServerConfig::default();
+        let parsed = TestCli::parse_from(["test", "model-dir"]);
+        let configured = server_config_from_args(&parsed.serve).unwrap();
+        assert_eq!(configured.max_infill_files, defaults.max_infill_files);
+        assert_eq!(
+            configured.max_infill_filename_bytes,
+            defaults.max_infill_filename_bytes
+        );
+        assert_eq!(
+            configured.max_infill_context_bytes,
+            defaults.max_infill_context_bytes
+        );
+        assert_eq!(
+            configured.max_infill_template_operations,
+            defaults.max_infill_template_operations
+        );
+        let parsed = TestCli::parse_from([
+            "test",
+            "model-dir",
+            "--max-infill-files",
+            "3",
+            "--max-infill-filename-bytes",
+            "17",
+            "--max-infill-context-bytes",
+            "1024",
+            "--max-infill-template-operations",
+            "200",
+        ]);
+        let configured = server_config_from_args(&parsed.serve).unwrap();
+        assert_eq!(configured.max_infill_files.get(), 3);
+        assert_eq!(configured.max_infill_filename_bytes.get(), 17);
+        assert_eq!(configured.max_infill_context_bytes.get(), 1024);
+        assert_eq!(configured.max_infill_template_operations.get(), 200);
+        for flag in [
+            "--max-infill-files",
+            "--max-infill-filename-bytes",
+            "--max-infill-context-bytes",
+            "--max-infill-template-operations",
+        ] {
+            let error = TestCli::try_parse_from(["test", "model-dir", flag, "0"]).unwrap_err();
+            assert!(error.to_string().contains(flag), "{error}");
+        }
     }
     #[test]
     fn transcription_resource_limits_are_positive_and_forwarded() {

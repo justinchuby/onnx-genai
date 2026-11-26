@@ -258,6 +258,7 @@ pub const TEXT_ASSEMBLY_V1: ExtensionId = ExtensionId::new("onnx-genai.text-asse
 pub const ADAPTERS_V1: ExtensionId = ExtensionId::new("onnx-genai.adapters", "1");
 pub const ADAPTERS_JSON_V1: ExtensionId = ExtensionId::new("onnx-genai.adapters.json", "1");
 pub const ORT_LORA_ADAPTER_V1: ExtensionId = ExtensionId::new("onnxruntime.lora-adapter", "1");
+pub const ADAPTERS_GGUF_V1: ExtensionId = ExtensionId::new("onnx-genai.adapters.gguf", "1");
 pub const ADAPTERS_HF_PEFT_V1: ExtensionId = ExtensionId::new("onnx-genai.adapters.hf-peft", "1");
 pub const ADAPTERS_SAFETENSORS_V1: ExtensionId =
     ExtensionId::new("onnx-genai.adapters.safetensors", "1");
@@ -450,6 +451,16 @@ pub const BUILTIN_EXTENSIONS: &[ExtensionDescriptor] = &[
         status: SupportStatus::Implemented,
     },
     ExtensionDescriptor {
+        id: ADAPTERS_GGUF_V1,
+        surface: ExtensionSurface::AdapterLoader,
+        schema_floor: crate::version::GGUF_ADAPTER_SCHEMA_VERSION,
+        declaration: "adapters.artifacts.<name>.weights[].loader_capability",
+        normative_reference: "§9",
+        admission_consumer: "onnx_genai_metadata::validate_adapter_service",
+        fallback: FallbackClass::SemanticRequired,
+        status: SupportStatus::Implemented,
+    },
+    ExtensionDescriptor {
         id: ADAPTERS_HF_PEFT_V1,
         surface: ExtensionSurface::AdapterLoader,
         schema_floor: V1,
@@ -554,6 +565,14 @@ pub const CORE_CONFORMANCE: &[(SchemaVersion, &str)] = &[
     (
         crate::version::GRAPH_WEIGHTS_SCHEMA_VERSION,
         "Each ONNX graph can declare immutable GGUF/SafeTensors containers with explicit tensor-key mappings; geometry and executable semantics stay in the graph.",
+    ),
+    (
+        crate::version::INFILL_CONTEXT_SCHEMA_VERSION,
+        "Explicit infill control roles, ordering and additional terminators are package facts; native /infill renders authored ordered file context even for an empty list, with no filesystem lookup or guessed separators.",
+    ),
+    (
+        crate::version::GGUF_ADAPTER_SCHEMA_VERSION,
+        "GGUF LoRA sources declare exact source/target bindings, factor storage and explicit alpha/rank composition; the loader is a semantic-required extension and unsupported adapter variants fail closed.",
     ),
 ];
 

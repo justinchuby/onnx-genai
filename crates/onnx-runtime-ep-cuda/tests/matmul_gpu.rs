@@ -134,9 +134,12 @@ fn run_gpu_matmul_f32(
         rt.htod(f32_bytes(b), cuptr(b_buf.as_ptr())).unwrap();
     }
 
-    let a_strides = compute_contiguous_strides(a_shape);
-    let b_strides = compute_contiguous_strides(b_shape);
-    let out_strides = compute_contiguous_strides(out_shape);
+    let a_strides = compute_contiguous_strides(a_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let b_strides = compute_contiguous_strides(b_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let out_strides = compute_contiguous_strides(out_shape)
+        .expect("fixture shape has representable contiguous strides");
 
     let a_view = TensorView::new(
         DevicePtr(a_buf.as_ptr()),
@@ -398,9 +401,12 @@ fn matmul_f32_gemv_is_capture_safe_after_warmup_gpu() {
     let a_shape = [1, k];
     let b_shape = [k, n];
     let c_shape = [1, n];
-    let a_strides = compute_contiguous_strides(&a_shape);
-    let b_strides = compute_contiguous_strides(&b_shape);
-    let c_strides = compute_contiguous_strides(&c_shape);
+    let a_strides = compute_contiguous_strides(&a_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let b_strides = compute_contiguous_strides(&b_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let c_strides = compute_contiguous_strides(&c_shape)
+        .expect("fixture shape has representable contiguous strides");
     let a_view = TensorView::new(
         DevicePtr(a_buf.as_ptr()),
         DataType::Float32,
@@ -456,8 +462,10 @@ fn matmul_f32_gemv_is_capture_safe_after_warmup_gpu() {
     }
     let b_a_shape = [b_m, k];
     let b_c_shape = [b_m, n];
-    let b_a_strides = compute_contiguous_strides(&b_a_shape);
-    let b_c_strides = compute_contiguous_strides(&b_c_shape);
+    let b_a_strides = compute_contiguous_strides(&b_a_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let b_c_strides = compute_contiguous_strides(&b_c_shape)
+        .expect("fixture shape has representable contiguous strides");
     let b_a_view = TensorView::new(
         DevicePtr(b_a_buf.as_ptr()),
         DataType::Float32,
@@ -596,9 +604,12 @@ fn matmul_dense_plans_borrow_one_caller_workspace_gpu() {
             .htod(f32_bytes(&b), cuptr(b_buffer.as_ptr()))
             .unwrap();
     }
-    let a_strides = compute_contiguous_strides(&a_shape);
-    let b_strides = compute_contiguous_strides(&b_shape);
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let a_strides = compute_contiguous_strides(&a_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let b_strides = compute_contiguous_strides(&b_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [
         TensorView::new(
             DevicePtr(a_buffer.as_ptr()),
@@ -869,9 +880,12 @@ fn run_gpu_matmul_f16(
         rt.htod(b_bytes, cuptr(b_buf.as_ptr())).unwrap();
     }
 
-    let a_strides = compute_contiguous_strides(a_shape);
-    let b_strides = compute_contiguous_strides(b_shape);
-    let out_strides = compute_contiguous_strides(out_shape);
+    let a_strides = compute_contiguous_strides(a_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let b_strides = compute_contiguous_strides(b_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let out_strides = compute_contiguous_strides(out_shape)
+        .expect("fixture shape has representable contiguous strides");
 
     let a_view = TensorView::new(
         DevicePtr(a_buf.as_ptr()),
@@ -1013,7 +1027,8 @@ fn matmul_rejects_unsupported_rank_and_dtype() {
     let b_buf = ep.allocate(8, 256).unwrap();
     let mut c_buf = ep.allocate(8, 256).unwrap();
     let shape = [1usize, 1];
-    let strides = compute_contiguous_strides(&shape);
+    let strides = compute_contiguous_strides(&shape)
+        .expect("fixture shape has representable contiguous strides");
     let av = TensorView::new(
         DevicePtr(a_buf.as_ptr()),
         DataType::Int64,

@@ -546,37 +546,43 @@ fn validate_nd_indices(
     Ok(())
 }
 
-fn scatter_elements_metadata_bytes(data_shape: &[usize], indices_shape: &[usize]) -> Vec<u8> {
-    let mut values = compute_contiguous_strides(indices_shape)
+fn scatter_elements_metadata_bytes(
+    data_shape: &[usize],
+    indices_shape: &[usize],
+) -> Result<Vec<u8>> {
+    let mut values = compute_contiguous_strides(indices_shape)?
         .into_iter()
         .map(|value| value as u64)
         .collect::<Vec<_>>();
     values.extend(
-        compute_contiguous_strides(data_shape)
+        compute_contiguous_strides(data_shape)?
             .into_iter()
             .map(|value| value as u64),
     );
     values.extend(data_shape.iter().map(|&value| value as u64));
-    u64_bytes(&values).to_vec()
+    Ok(u64_bytes(&values).to_vec())
 }
 
-fn gather_elements_metadata_bytes(data_shape: &[usize], indices_shape: &[usize]) -> Vec<u8> {
+fn gather_elements_metadata_bytes(
+    data_shape: &[usize],
+    indices_shape: &[usize],
+) -> Result<Vec<u8>> {
     let mut values = indices_shape
         .iter()
         .map(|&value| value as u64)
         .collect::<Vec<_>>();
     values.extend(
-        compute_contiguous_strides(indices_shape)
+        compute_contiguous_strides(indices_shape)?
             .into_iter()
             .map(|value| value as u64),
     );
     values.extend(
-        compute_contiguous_strides(data_shape)
+        compute_contiguous_strides(data_shape)?
             .into_iter()
             .map(|value| value as u64),
     );
     values.extend(data_shape.iter().map(|&value| value as u64));
-    u64_bytes(&values).to_vec()
+    Ok(u64_bytes(&values).to_vec())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -607,7 +613,7 @@ impl ScatterMetadataCache {
                         data_shape: data_shape.to_vec(),
                         indices_shape: indices_shape.to_vec(),
                     },
-                    scatter_elements_metadata_bytes(data_shape, indices_shape),
+                    scatter_elements_metadata_bytes(data_shape, indices_shape)?,
                 ))
             },
         )
@@ -663,7 +669,7 @@ impl GatherElementsMetadataCache {
                         data_shape: data_shape.to_vec(),
                         indices_shape: indices_shape.to_vec(),
                     },
-                    gather_elements_metadata_bytes(data_shape, indices_shape),
+                    gather_elements_metadata_bytes(data_shape, indices_shape)?,
                 ))
             },
         )
@@ -1155,7 +1161,7 @@ impl ScatterNdKernel {
             return Ok(());
         }
 
-        let mut metadata_values = compute_contiguous_strides(data.shape)
+        let mut metadata_values = compute_contiguous_strides(data.shape)?
             .into_iter()
             .map(|value| value as u64)
             .collect::<Vec<_>>();
@@ -1541,13 +1547,19 @@ mod workspace_tests {
                 .map(|bytes| u64::from_ne_bytes(bytes.try_into().unwrap()))
                 .collect::<Vec<_>>()
         };
-        let scatter = decode(scatter_elements_metadata_bytes(&[2, 3], &[1, 2]));
+        let scatter = decode(
+            scatter_elements_metadata_bytes(&[2, 3], &[1, 2])
+                .expect("fixture shape has representable contiguous strides"),
+        );
         assert_eq!(
             scatter,
             [2, 1, 3, 1, 2, 3],
             "ScatterElements consumes index strides, data strides, data dimensions"
         );
-        let gather = decode(gather_elements_metadata_bytes(&[2, 3], &[1, 2]));
+        let gather = decode(
+            gather_elements_metadata_bytes(&[2, 3], &[1, 2])
+                .expect("fixture shape has representable contiguous strides"),
+        );
         assert_eq!(
             gather,
             [1, 2, 2, 1, 3, 1, 2, 3],

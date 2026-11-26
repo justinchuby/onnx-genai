@@ -1,5 +1,9 @@
 # `pkg.nxrt::BlockQuantizedMoE` — Operator Design Note (mixed-projection ABI)
 
+The default arithmetic described here is `float32`. The explicit CPU Q8
+activation mode, its version-2 numerical contract and whole-operation workspace
+are documented in [Packed activation arithmetic](PACKED_ACTIVATION_ARITHMETIC.md).
+
 **Status:** Mixed-projection ABI — CPU oracle and native CUDA decode/prefill
 execution implemented for the verified GLM-5.2 UD-IQ1_S formats. This
 supersedes the frozen single-`format` v1 ABI: each projection (`fc1`/`fc2`/`fc3`)

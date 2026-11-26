@@ -474,7 +474,7 @@ fn materialized_sources_use_one_admitted_snapshot_before_aliased_direct_output()
                 }
             }
         }
-        assert!(!can_borrow_dense_f32(&x));
+        assert!(!can_borrow_dense::<f32>(&x));
         let mut y = onnx_runtime_ep_api::TensorMut::new(
             onnx_runtime_ep_api::DevicePtrMut(origin.cast()),
             DataType::Float32,

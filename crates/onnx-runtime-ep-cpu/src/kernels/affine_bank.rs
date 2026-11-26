@@ -210,16 +210,6 @@ pub(super) struct AffineBank<'a> {
     zero: u8,
 }
 impl<'a> AffineBank<'a> {
-    pub(super) fn new(
-        codes: &'a TensorView<'_>,
-        scales: &'a TensorView<'_>,
-        zeros: Option<&'a TensorView<'_>>,
-        [experts, width, depth]: [usize; 3],
-        block: usize,
-        zero: u8,
-    ) -> Result<Self> {
-        Self::prepare(codes, scales, zeros, [experts, width, depth], block, zero)?.validate()
-    }
     /// Validate metadata and Host address proofs without reading scale values.
     pub(super) fn prepare(
         codes: &'a TensorView<'_>,

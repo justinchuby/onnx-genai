@@ -387,7 +387,8 @@ mod tests {
         let idx = Owned::i64(&[2], &[2, 0]);
         let mut out = Owned::f32(&[4, 2], &[9.; 8]);
         out.shape = vec![1, 2];
-        out.strides = compute_contiguous_strides(&out.shape);
+        out.strides = compute_contiguous_strides(&out.shape)
+            .expect("fixture shape has representable contiguous strides");
 
         let err = run_result(0, &data, &idx, &mut out).unwrap_err();
         assert!(

@@ -104,6 +104,7 @@ enum SpeechExecution {
 }
 struct Transcriber {
     engine: Engine,
+    audio_decode_limits: onnx_genai::preprocess::audio::AudioDecodeLimits,
     execution: SpeechExecution,
     language: Option<String>,
     prompt: Option<String>,
@@ -113,7 +114,12 @@ struct Transcriber {
 impl Transcriber {
     fn load(model_dir: &Path, args: &TranscribeArgs) -> anyhow::Result<Self> {
         let max_new_tokens=args.max_new_tokens.map(|value|std::num::NonZeroUsize::new(value).context("--max-new-tokens must be positive for transcription; use at least one committed output token")).transpose()?;
-        let engine = Engine::from_dir(model_dir, args.engine.to_config())?;
+        let mut config = args.engine.to_config();
+        config.audio_decode_limits = onnx_genai::preprocess::audio::AudioDecodeLimits {
+            max_decoded_bytes: args.max_decoded_audio_bytes,
+        };
+        let audio_decode_limits = config.audio_decode_limits;
+        let engine = Engine::from_dir(model_dir, config)?;
         let execution = if let Some(contract) =
             onnx_genai::metadata::transcription::transcription_contract(engine.metadata())
                 .map_err(anyhow::Error::msg)?
@@ -155,6 +161,7 @@ impl Transcriber {
         };
         Ok(Self {
             engine,
+            audio_decode_limits,
             execution,
             language: args.language.clone(),
             prompt: args.prompt.clone(),
@@ -188,6 +195,7 @@ impl Transcriber {
         INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
         GENERATING.store(true, Ordering::SeqCst);
         let result = (|| -> anyhow::Result<String> {
+            let audio_limits = self.audio_decode_limits.within_host(self.engine.resource_snapshot().host_ram.headroom).context("admit transcription segment under configured PCM policy and current host headroom")?;
             match &self.execution {
                 SpeechExecution::Frames { contract, .. } => {
                     use onnx_genai::engine::transcription::{
@@ -215,8 +223,12 @@ impl Transcriber {
                     Ok(result.text)
                 }
                 SpeechExecution::Generative { tokenizer, spec } => {
-                    let input =
-                        multimodal::MultimodalInput::from_samples(spec, samples, sample_rate)?;
+                    let input = multimodal::MultimodalInput::from_samples(
+                        spec,
+                        samples,
+                        sample_rate,
+                        audio_limits,
+                    )?;
                     let prepared=spec.transcription().context("generative transcription contract is absent; declare transcription_config.json")?
                         .prepare(tokenizer,self.language.as_deref(),self.prompt.as_deref(),self.prompt_limits)?;
                     let mut output = prepared.output;
@@ -427,7 +439,14 @@ fn transcribe_file(
             path.display()
         )
     })?;
-    let audio = decode_audio(&bytes).map_err(|error| {
+    let audio = decode_audio(
+        &bytes,
+        onnx_genai::preprocess::audio::AudioDecodeLimits {
+            max_decoded_bytes: args.max_decoded_audio_bytes,
+        }
+        .within_host(transcriber.engine.resource_snapshot().host_ram.headroom)?,
+    )
+    .map_err(|error| {
         anyhow::anyhow!(
             "What: the audio file {} could not be decoded. \
              Why: {error}. \
