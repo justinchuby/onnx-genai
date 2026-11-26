@@ -57,6 +57,23 @@ impl<'a> ProjectionScratch<'a> {
         Ok(scratch)
     }
 
+    /// Lend an exact bounded byte prefix without reading or clearing backing.
+    /// Arbitrary byte writes can invalidate every previous f32 initialization
+    /// proof, so the next float borrow must initialize its prefix anew. The
+    /// caller must fill all bytes before publishing an initialized byte slice.
+    pub(super) fn byte_storage(&mut self, bytes: usize) -> Result<&mut [MaybeUninit<u8>]> {
+        let capacity = std::mem::size_of_val(self.storage);
+        if bytes > capacity {
+            return Err(EpError::KernelFailed(format!(
+                "packed byte lane needs {bytes} bytes, but its admitted region has {capacity}; prepare and admit the complete projection workspace before reading packed weights"
+            )));
+        }
+        self.initialized_prefix = 0;
+        // SAFETY: MaybeUninit permits arbitrary initialized/uninitialized bytes.
+        // This exclusive short borrow covers exactly the checked live prefix.
+        Ok(unsafe { std::slice::from_raw_parts_mut(self.storage.as_mut_ptr().cast(), bytes) })
+    }
+
     /// Bind one checked composite layout, validating f32 regions before any
     /// typed references are formed. No region is initialized by binding.
     ///
@@ -783,6 +800,37 @@ mod tests {
                 .iter()
                 .all(|&x| x == 0.)
         );
+    }
+
+    #[test]
+    fn packed_byte_loan_invalidates_float_proof_and_short_loan_is_transactional() {
+        let mut backing = [37.0f32; 8];
+        let mut scratch = ProjectionScratch::test_binding(&mut backing);
+        scratch.initialized_prefix(4).unwrap().fill(7.0);
+        let message = scratch.byte_storage(33).unwrap_err().to_string();
+        assert!(
+            message.contains("33 bytes") && message.contains("32"),
+            "{message}"
+        );
+        assert_eq!(scratch.initialized_prefix(4).unwrap(), &[7.0; 4]);
+        // A partial float's bytes may become arbitrary or uninitialized. No
+        // prior float proof may survive even a byte loan left partly unwritten.
+        let bytes = scratch.byte_storage(5).unwrap();
+        bytes[0].write(0xff);
+        bytes[4] = MaybeUninit::uninit();
+        assert_eq!(scratch.initialized_prefix, 0);
+        assert_eq!(scratch.initialized_prefix(4).unwrap(), &[0.0; 4]);
+        assert_eq!(
+            scratch.storage[4..]
+                .iter()
+                .map(|n| unsafe { n.assume_init() })
+                .collect::<Vec<_>>(),
+            vec![37.0; 4]
+        );
+        scratch.initialized_prefix(4).unwrap().fill(9.0);
+        assert!(scratch.byte_storage(0).unwrap().is_empty());
+        assert_eq!(scratch.initialized_prefix, 0);
+        assert_eq!(scratch.initialized_prefix(4).unwrap(), &[0.0; 4]);
     }
 
     #[test]

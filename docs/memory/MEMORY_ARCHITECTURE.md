@@ -162,6 +162,33 @@ does not refund those bytes. Idle capacity can be reclaimed under pressure.
 Pending asynchronous work, active readers and capture pins prevent reuse, and
 quarantined backing retains its charge until physical release is settled.
 
+CPU `BlockQuantizedMoE` includes strided compressed-weight staging in the
+same whole-operation workspace as decode scratch, FC activation banks and the
+output accumulator. One serial byte lane holds the maximum non-borrowable FC
+payload for a single expert, rounded to f32 storage alignment. It is additive to
+the other live regions, never the sum of FC payloads or an expert/top-k multiple.
+Contiguous expert tails borrow their original bytes even when the outer expert
+stride has padding or is negative; these layouts require no packed copy lane.
+
+For nonempty output, shape-only preparation returns `Deferred`: it cannot know
+strides, and a conservative reservation would retain unused high-water capacity.
+Execution refinement validates actual Host views and admits the precise composite
+before payload reads. A logically present but unresolved packed bank must be bound
+to readable storage first. Cached metadata still reuses its preparation result;
+actual layout changes are refined on every dispatch. Empty output requires no
+workspace or payload access after geometry validation.
+
+Constant identity hashes logical bytes directly without retaining a materialized
+copy, preserving content hash, source/mmap provenance, layout, role and expert
+identity. Dense cache construction copies a strided FC only after the complete
+expert group has a grant; streamed FCs use the same serial lane. Dense hits do not
+touch it. Arbitrary byte loans revoke the lane's f32 initialization proof, and a
+subsequent float loan must initialize its prefix again. Standalone packed MatMul
+still materializes strided compressed input on its existing fallback; this change
+does not claim all CPU temporary allocations are governed. Host numerical,
+allocation-observer and Native Session admission tests establish these boundaries;
+no CUDA execution or inference-latency improvement is inferred.
+
 CPU derived-weight payloads also treat zero bytes as an explicit empty grant.
 An empty grant cannot split off positive bytes; a zero-byte split of any grant
 produces another empty value without cloning an accountant lease. Positive
