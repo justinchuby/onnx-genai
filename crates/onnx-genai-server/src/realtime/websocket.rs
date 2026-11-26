@@ -1858,6 +1858,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn websocket_xml_parameter_streams_before_invoke_end_in_a_waiting_native_workflow() {
         let prefix = r#"<atem:invoke name="lookup"><atem:parameter name="city">&quot;Paris&quot;</atem:parameter>"#;
+        // Deliberately no closing-invoke token exists in this vocabulary.
+        // Cancellation must execute without requiring another generation token.
         let package = tool_package_from("realtime-constrained", prefix);
         let path = package.path().join("inference_metadata.yaml");
         let mut metadata: serde_yaml::Value =

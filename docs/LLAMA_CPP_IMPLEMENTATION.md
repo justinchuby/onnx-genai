@@ -2867,3 +2867,8 @@ unsatisfiability and can be pruned normally; a language emptied only by the name
 parameter policy remains a distinct capability error. The caller's actual
 compiler resource limits apply to both stages; schema references are not
 retrieved a second time and no additional byte-token parser is built.
+
+Constrained native cancellation is a terminal control: it executes with a full
+all-false vocabulary mask rather than requiring another grammar continuation.
+This preserves cancellation and rearming of incomplete envelopes without allowing
+text/EOS to escape the existing Native output checks.
