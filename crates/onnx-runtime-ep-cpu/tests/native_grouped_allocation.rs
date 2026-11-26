@@ -240,7 +240,7 @@ fn admitted_native_snapshots_keep_float_borrows_and_replace_payload_allocations(
                 .unwrap()
                 .require_ready()
                 .unwrap();
-            let snapshots = if dt == DataType::Float32 && mode == 0 {
+            let snapshots = if matches!(dt, DataType::Float32 | DataType::Float64) && mode == 0 {
                 0
             } else {
                 m * k + e * k * n + e * n
