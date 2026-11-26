@@ -138,8 +138,9 @@ fn packed_copy_bound_is_one_projection_maximum_not_a_sum_or_route_multiplier() {
             for (slot, source) in [2, 4, 6].into_iter().zip(&repacked) {
                 inputs[slot] = source.view();
             }
-            assert_eq!(k.packed_lane_bytes(dims, &inputs).unwrap(), H * 34);
-            assert!(H * 34 < H * (18 + 34 + 18));
+            let copy_bound = k.packed_lane_bytes(dims, &inputs).unwrap();
+            assert_eq!(copy_bound, H * 34);
+            assert!(copy_bound < H * (18 + 34 + 18));
             let req = refine(&k, &inputs, &metadata);
             let base = k
                 .execution_workspace_layout(
