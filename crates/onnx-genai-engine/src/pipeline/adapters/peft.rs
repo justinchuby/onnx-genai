@@ -3,7 +3,6 @@ use super::{JsonTarget, MemoryGovernor, MemoryLease};
 use anyhow::{Context, ensure};
 use onnx_genai_metadata::{AdapterArtifact, AdapterServiceContract, AdapterWeightArtifact};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     io::Read,
@@ -120,9 +119,6 @@ pub(super) fn configuration(
         path.display()
     );
     Ok((bytes, lease))
-}
-pub(super) fn identity(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
 }
 
 pub(super) fn load(
@@ -308,5 +304,5 @@ pub(super) fn load(
         views.keys().all(|name| used.contains(name)),
         "PEFT safetensors contains tensors without exact manifest bindings; map every saved linear module and reject modules_to_save/embedding/unknown tensor semantics"
     );
-    Ok((targets, identity(&config_bytes)))
+    Ok((targets, super::content_digest(&config_bytes)))
 }

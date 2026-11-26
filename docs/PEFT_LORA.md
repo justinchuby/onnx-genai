@@ -3,7 +3,7 @@
 A package can supply `format: hf_peft`, loader capability
 `onnx-genai.adapters.hf-peft@1`, `config_location` and `scale_encoding:
 alpha_over_rank` in its existing adapter artifact manifest. The runtime selects
-the first declared supported JSON/HF PEFT source; it never retries another
+the first declared supported JSON/HF PEFT/GGUF source; it never retries another
 format after a selected source fails validation.
 
 Each `bindings[].weight_key` is the exact full module prefix in the saved PEFT
@@ -63,3 +63,7 @@ patterns have independent dyadic expected results for rank-two/multiple-row
 Native inference, opposite and zero scales, declared/mixed/unsupported storage,
 NaN/Inf, staging-budget refusal and cached-valid-adapter recovery. These fixtures do not prove
 large-model, CUDA-fused, distributed or packaged importer acceptance.
+
+The HTTP catalogue shares the engine's portable container selector; a PEFT-only
+artifact no longer needs a JSON duplicate. Explicit GGUF LoRA support and its
+separate bounded F32 capability are described in [GGUF LoRA](GGUF_LORA.md).

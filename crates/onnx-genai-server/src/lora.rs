@@ -1,7 +1,7 @@
 //! Model-bound adapter defaults; every generation receives an immutable selection.
 use anyhow::Context;
 use onnx_genai_engine::{AdapterActivation, AdapterSelection, GenerateOptions};
-use onnx_genai_metadata::{AdapterServiceContract, AdapterWeightFormat};
+use onnx_genai_metadata::AdapterServiceContract;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 
@@ -68,8 +68,8 @@ impl LoraState {
     ) -> anyhow::Result<Arc<Self>> {
         let mut entries = Vec::new();
         for (alias, artifact) in &contract.artifacts {
-            let weight=artifact.weights.iter().find(|w| w.format == AdapterWeightFormat::Json)
-                .with_context(||format!("adapter '{alias}' has no source supported by this executor; supply a declared portable JSON artifact"))?;
+            let weight = onnx_genai_engine::select_portable_adapter_source(artifact)
+                .with_context(|| format!("select catalogue source for adapter {alias:?}"))?;
             entries.push(Entry {
                 id: artifact.index,
                 alias: alias.clone(),

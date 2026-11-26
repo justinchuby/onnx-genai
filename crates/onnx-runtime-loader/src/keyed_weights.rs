@@ -48,18 +48,21 @@ impl KeyedWeightFile {
     }
 }
 
-/// One borrowed tensor from a fully validated SafeTensors container.
-/// Offsets, shapes, duplicate keys, dtypes and complete payload coverage have
-/// already passed the same parser used for external initializer binding.
-pub struct SafeTensorView<'a> {
+/// One borrowed tensor from a fully validated keyed weight container.
+/// Offsets, shapes, keys and dtypes pass the canonical initializer-binding parser.
+pub struct KeyedTensorView<'a> {
     pub dtype: DataType,
     pub shape: Vec<usize>,
+    /// GGML block encoding when the bytes are packed rather than native scalars.
+    pub packed_format: Option<&'static str>,
     pub data: &'a [u8],
 }
 
 /// Inspect caller-owned SafeTensors bytes without mapping or copying payloads.
 /// The caller remains responsible for its allocation and dtype capabilities.
-pub fn safetensors_views(data: &[u8]) -> Result<BTreeMap<String, SafeTensorView<'_>>, LoaderError> {
+pub fn safetensors_views(
+    data: &[u8],
+) -> Result<BTreeMap<String, KeyedTensorView<'_>>, LoaderError> {
     let entries = safetensors::parse(data).map_err(|detail| {
         LoaderError::GraphBuild(format!(
             "SafeTensors: {detail}; provide a complete valid tensor container"
@@ -70,14 +73,55 @@ pub fn safetensors_views(data: &[u8]) -> Result<BTreeMap<String, SafeTensorView<
         .map(|(name, entry)| {
             (
                 name,
-                SafeTensorView {
+                KeyedTensorView {
                     dtype: entry.dtype,
                     shape: entry.dims,
+                    packed_format: entry.packed_format,
                     data: &data[entry.offset..entry.offset + entry.len],
                 },
             )
         })
         .collect())
+}
+
+/// Selected GGUF metadata retains its wire type; absent and wrong-type facts
+/// are distinct. Unused values are validated/skipped by the canonical reader.
+#[derive(Debug, Clone, Copy)]
+pub enum GgufMetadataValue<'a> {
+    String(&'a str),
+    Float32(f32),
+    Other { kind: u32 },
+}
+/// A validated container and its borrowed adapter metadata. Harmless general
+/// provenance is not interpreted as a model architecture or graph target map.
+pub struct GgufViews<'a> {
+    pub tensors: BTreeMap<String, KeyedTensorView<'a>>,
+    pub adapter_metadata: BTreeMap<&'a str, GgufMetadataValue<'a>>,
+}
+pub fn gguf_views(data: &[u8]) -> Result<GgufViews<'_>, LoaderError> {
+    let (entries, adapter_metadata) = gguf::parse_with_metadata(data).map_err(|detail| {
+        LoaderError::GraphBuild(format!(
+            "GGUF: {detail}; provide a complete valid tensor container"
+        ))
+    })?;
+    let tensors = entries
+        .into_iter()
+        .map(|(name, entry)| {
+            (
+                name,
+                KeyedTensorView {
+                    dtype: entry.dtype,
+                    shape: entry.dims,
+                    packed_format: entry.packed_format,
+                    data: &data[entry.offset..entry.offset + entry.len],
+                },
+            )
+        })
+        .collect();
+    Ok(GgufViews {
+        tensors,
+        adapter_metadata,
+    })
 }
 
 struct Entry {
