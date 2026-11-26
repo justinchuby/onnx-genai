@@ -517,6 +517,22 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "Equal"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && input_dtypes.contains(&DataType::String)
+        {
+            let since = crate::kernels::logical::EQUAL_STRING_SINCE;
+            if opset < since {
+                deny!(
+                    "Equal does not accept tensor(string) at opset {opset}; export at opset {since} or later, or supply matching non-string operands"
+                );
+            }
+            if input_dtypes != [DataType::String, DataType::String] {
+                deny!(
+                    "Equal requires two tensor(string) operands when either operand is String; got {input_dtypes:?}"
+                );
+            }
+        }
         if let Some(reason) =
             onnx_runtime_ep_api::standard_activation::unsupported_reason(op, opset, input_dtypes)
         {
