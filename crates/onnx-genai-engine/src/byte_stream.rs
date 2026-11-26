@@ -168,7 +168,6 @@ impl PartialEq for FallbackRun {
 impl Eq for FallbackRun {}
 impl std::hash::Hash for FallbackRun {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        use std::hash::Hash as _;
         match self {
             Self::Buffered { bytes, digest } => (0u8, bytes.len(), digest).hash(state),
             Self::Invalid { length } => (1u8, length).hash(state),
