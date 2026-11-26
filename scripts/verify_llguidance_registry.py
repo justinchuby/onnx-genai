@@ -106,9 +106,10 @@ def positive_tests(output: str) -> None:
     expected = [
         "public_unsatisfiability_remains_distinct_from_invalid_schema_errors",
         "registry_compiler_preserves_known_key_lexeme_ownership",
+        "registry_root_key_policy_keeps_semantic_and_encoding_failures_distinct",
     ]
-    if re.findall(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;", output) != [("2", "0", "0")]:
-        raise ValueError("registry consumer requires exactly two passed, zero failed/ignored tests; inspect consumer-test.log")
+    if re.findall(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;", output) != [("3", "0", "0")]:
+        raise ValueError("registry consumer requires exactly three passed, zero failed/ignored tests; inspect consumer-test.log")
     for name in expected:
         if not re.search(r"^test " + re.escape(name) + r" \.\.\. ok$", output, re.MULTILINE):
             raise ValueError(f"registry consumer did not execute required test {name}")
@@ -209,7 +210,7 @@ def run(args: argparse.Namespace) -> None:
         verify_cached_contents(selected, Path(context["cargo_home"]), extracted)
         if digest(consumer / "Cargo.lock") != lock_hash:
             raise ValueError("registry consumer lockfile changed after resolution")
-        receipt.update(status="passed", consumer_lock_sha256=lock_hash, tests_passed=2, tests_failed=0, tests_ignored=0)
+        receipt.update(status="passed", consumer_lock_sha256=lock_hash, tests_passed=3, tests_failed=0, tests_ignored=0)
     except BaseException as error:
         receipt.update(status="failed", error=f"{type(error).__name__}: {error}")
         raise
@@ -218,7 +219,7 @@ def run(args: argparse.Namespace) -> None:
         server.server_close()
         server_thread.join()
         save()
-    print(json.dumps({"status":receipt["status"],"receipt":str(receipt_file),"tests_passed":2}))
+    print(json.dumps({"status":receipt["status"],"receipt":str(receipt_file),"tests_passed":3}))
 
 
 def main() -> None:
