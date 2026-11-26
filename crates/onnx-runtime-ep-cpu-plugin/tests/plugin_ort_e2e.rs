@@ -10468,3 +10468,98 @@ graph {
         conformance_teardown_with_custom_domain(api, env, options, session, name, domain);
     }
 }
+
+#[test]
+fn batchnorm_workspace_tracks_dynamic_channels_through_real_plugin() {
+    let _lock = lock_ort_ep();
+    for opset in [7, 15] {
+        let name = format!("batchnorm_workspace_{opset}");
+        let model=r#"ir_version:10
+opset_import:[{version:OPSET}]
+graph {
+ name:"batchnorm_workspace"
+ node:[{input:["X","scale","B","mean","variance"] output:["Y"] op_type:"BatchNormalization" attribute:[{name:"epsilon" f:0.125 type:FLOAT}]}]
+ input:[
+ {name:"X" type{tensor_type{elem_type:1 shape{dim:[{dim_param:"batch"},{dim_param:"channels"},{dim_param:"spatial"}]}}}},
+ {name:"scale" type{tensor_type{elem_type:1 shape{dim:[{dim_param:"channels"}]}}}},
+ {name:"B" type{tensor_type{elem_type:1 shape{dim:[{dim_param:"channels"}]}}}},
+ {name:"mean" type{tensor_type{elem_type:1 shape{dim:[{dim_param:"channels"}]}}}},
+ {name:"variance" type{tensor_type{elem_type:1 shape{dim:[{dim_param:"channels"}]}}}}
+ ]
+ output:[{name:"Y" type{tensor_type{elem_type:1 shape{dim:[{dim_param:"batch"},{dim_param:"channels"},{dim_param:"spatial"}]}}}}]
+}
+"#.replace("OPSET",&opset.to_string());
+        let path = write_generated_model(&name, &model);
+        let (_library, api, env, options, session) = skip_if_missing!(
+            unsafe { conformance_setup(&name, &path, true) },
+            "BatchNormalization workspace: ORT/plugin unavailable"
+        );
+        unsafe {
+            let assignment = query_ep_assignment(api, session);
+            assert_eq!(
+                assignment.ops_on_our_ep(),
+                ["BatchNormalization"],
+                "{:?}",
+                assignment.assignments
+            );
+            assert!(assignment.ops_not_on_our_ep().is_empty());
+            for (iteration, [batch, channels, spatial]) in [[2usize, 3, 4], [1, 2, 5], [2, 3, 4]]
+                .into_iter()
+                .enumerate()
+            {
+                let mut values = (0..batch * channels * spatial)
+                    .map(|i| (i as f32 - 9.) * 0.25 + iteration as f32 * 0.125)
+                    .collect::<Vec<_>>();
+                let mut scale = (0..channels)
+                    .map(|c| 1. + c as f32 * 0.25)
+                    .collect::<Vec<_>>();
+                let mut bias = (0..channels).map(|c| -0.25 * c as f32).collect::<Vec<_>>();
+                let mut mean = (0..channels).map(|c| 0.5 * c as f32).collect::<Vec<_>>();
+                let mut variance = (0..channels)
+                    .map(|c| 1. + 0.25 * c as f32)
+                    .collect::<Vec<_>>();
+                let expected = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| {
+                        let c = (i / spatial) % channels;
+                        ((f64::from(v) - f64::from(mean[c]))
+                            / (f64::from(variance[c]) + 0.125).sqrt())
+                            * f64::from(scale[c])
+                            + f64::from(bias[c])
+                    })
+                    .collect::<Vec<_>>();
+                let x = make_float_tensor(
+                    api,
+                    &mut values,
+                    &[batch as i64, channels as i64, spatial as i64],
+                );
+                let p = [&mut scale, &mut bias, &mut mean, &mut variance]
+                    .map(|values| make_float_tensor(api, values, &[channels as i64]));
+                let inputs = [x, p[0], p[1], p[2], p[3]];
+                let outputs = run_and_collect_f32(
+                    api,
+                    session,
+                    &["X", "scale", "B", "mean", "variance"],
+                    &inputs,
+                    &["Y"],
+                );
+                for input in inputs {
+                    ((*api).ReleaseValue.unwrap())(input);
+                }
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(outputs[0].len(), expected.len());
+                for (&actual, want) in outputs[0].iter().zip(expected) {
+                    assert!(
+                        (f64::from(actual) - want).abs() < 3e-6,
+                        "{name} shape={batch}x{channels}x{spatial}: {actual} vs {want}"
+                    );
+                }
+            }
+            eprintln!(
+                "[{name}] BatchNormalization assigned to cpu_ep; dynamic 2x3x4/1x2x5/2x3x4 outputs passed"
+            );
+            conformance_teardown(api, env, options, session, &name);
+        }
+    }
+}

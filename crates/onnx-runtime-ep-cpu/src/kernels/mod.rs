@@ -753,6 +753,7 @@ macro_rules! operator_group_modules {
 operator_group_modules!(
     "ops-cnn";
     affine_grid,
+    batch_normalization,
     center_crop_pad,
     col2im,
     conv_transpose,
@@ -1060,8 +1061,8 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
     // the legacy `is_test` attribute was removed.
     registry.register(
         OpKey::new("BatchNormalization", "", 7),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(norm_ops::BatchNormFactory),
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+        Box::new(batch_normalization::BatchNormalizationFactory),
     );
     registry.register(
         OpKey::new("InstanceNormalization", "", 6),
