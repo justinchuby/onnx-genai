@@ -1,5 +1,7 @@
 //! Shared token-generation loop used by direct, session, priority, pipeline, and speculative paths.
 
+use crate::logits_batch::LogitsRow;
+
 use anyhow::Context as _;
 
 use crate::config::{
@@ -207,7 +209,7 @@ impl DecodeLoopState {
 pub(crate) trait DecodeLoopBackend {
     fn context_len(&self) -> usize;
     fn processor_prompt_tokens(&self) -> &[TokenId];
-    fn next_logits(&mut self) -> anyhow::Result<Vec<f32>>;
+    fn next_logits(&mut self) -> anyhow::Result<LogitsRow>;
     fn commit_token(&mut self, token_id: TokenId) -> anyhow::Result<()>;
     /// Whether the backend can select the greedy (argmax) token internally,
     /// skipping host logits materialization. Only consulted for greedy
@@ -257,7 +259,7 @@ pub(crate) struct ForwardOutcome {
     /// Token the device picked, when a fast path applied.
     pub(crate) device_token: Option<TokenId>,
     /// Host logits, when no fast path applied. Moved into the caller.
-    pub(crate) logits: Option<Vec<f32>>,
+    pub(crate) logits: Option<LogitsRow>,
     /// RNG draw already consumed by an attempted device sample, reused by the
     /// host fallback so a seeded run samples identically either way.
     pub(crate) rng_value: Option<f32>,
@@ -381,16 +383,28 @@ pub(crate) fn select_and_commit_step<B: DecodeLoopBackend + ?Sized>(
             let mut logits = forward
                 .logits
                 .context("a forward pass produced neither a device token nor host logits")?;
-            let probabilities = ProbabilitySnapshot::capture(options, &logits);
+            let probabilities = ProbabilitySnapshot::capture(options, &logits)?;
             let token_id = {
                 let _span = onnx_genai_ort::prof_span!("loop.sampling");
-                if let Some(sampler) = state.custom_sampler.as_deref_mut() {
-                    select_next_token_with_sampler(&mut logits, &context, chain, sampler)?
+                if chain.is_empty() {
+                    let token = if let Some(sampler) = state.custom_sampler.as_deref_mut() {
+                        sampler.sample(&logits, &context)
+                    } else {
+                        let value = forward
+                            .rng_value
+                            .unwrap_or_else(|| state.rng.value_for(options));
+                        crate::sampling::default_sampler_for_options(options, value)
+                            .sample(&logits, &context)
+                    };
+                    chain.on_selected(token, &context)?;
+                    token
+                } else if let Some(sampler) = state.custom_sampler.as_deref_mut() {
+                    select_next_token_with_sampler(logits.try_mut()?, &context, chain, sampler)?
                 } else if let Some(rng_value) = forward.rng_value {
-                    select_next_token(&mut logits, &context, options, chain, rng_value)?
+                    select_next_token(logits.try_mut()?, &context, options, chain, rng_value)?
                 } else {
                     select_next_token_with_rng(
-                        &mut logits,
+                        logits.try_mut()?,
                         &context,
                         options,
                         chain,
@@ -546,19 +560,20 @@ pub(crate) fn finish_result(
 /// Retain model logits only when probability reporting requests them. Sampling
 /// mutates its own logits; the selected token is scored against this snapshot.
 pub(crate) struct ProbabilitySnapshot {
-    model: Option<Vec<f32>>,
+    model: Option<LogitsRow>,
     greedy: bool,
 }
 
 impl ProbabilitySnapshot {
-    pub(crate) fn capture(options: &GenerateOptions, logits: &[f32]) -> Self {
-        Self {
+    pub(crate) fn capture(options: &GenerateOptions, logits: &LogitsRow) -> anyhow::Result<Self> {
+        Ok(Self {
             model: (options.top_logprobs.is_some()
                 && options.logprob_source == crate::config::LogprobSource::Model)
-                .then(|| logits.to_vec()),
+                .then(|| logits.try_clone())
+                .transpose()?,
             greedy: options.logprob_source == crate::config::LogprobSource::Sampling
                 && options.selects_greedily(),
-        }
+        })
     }
 
     pub(crate) fn for_token(&self, processed: &[f32], token: TokenId, top: usize) -> TokenLogprob {
@@ -645,13 +660,13 @@ pub(crate) fn exceeded_context_limit(
 mod tests {
     #[test]
     fn model_probability_snapshot_precedes_bias_and_preserves_selected_metadata() {
-        let model = vec![1.0, 2.0, 3.0];
+        let model = LogitsRow::from_host_row(vec![1.0, 2.0, 3.0]);
         let options = crate::GenerateOptions {
             top_logprobs: Some(1),
             logprob_source: crate::LogprobSource::Model,
             ..Default::default()
         };
-        let snapshot = super::ProbabilitySnapshot::capture(&options, &model);
+        let snapshot = super::ProbabilitySnapshot::capture(&options, &model).unwrap();
         let processed = vec![1000.0, f32::NEG_INFINITY, f32::NEG_INFINITY];
         let actual = snapshot.for_token(&processed, 0, 1);
         assert_eq!(actual, super::logprob_for_token(&model, 0, 1));
@@ -662,7 +677,7 @@ mod tests {
             logprob_source: crate::LogprobSource::Processed,
             ..options.clone()
         };
-        let snapshot = super::ProbabilitySnapshot::capture(&processed_options, &model);
+        let snapshot = super::ProbabilitySnapshot::capture(&processed_options, &model).unwrap();
         assert!(snapshot.model.is_none());
         assert_eq!(snapshot.for_token(&processed, 0, 1).logprob, 0.0);
         let disabled = crate::GenerateOptions {
@@ -671,6 +686,7 @@ mod tests {
         };
         assert!(
             super::ProbabilitySnapshot::capture(&disabled, &model)
+                .unwrap()
                 .model
                 .is_none()
         );
@@ -751,10 +767,10 @@ mod tests {
             &[0]
         }
 
-        fn next_logits(&mut self) -> anyhow::Result<Vec<f32>> {
+        fn next_logits(&mut self) -> anyhow::Result<LogitsRow> {
             let logits = self.logits[self.next_logits].clone();
             self.next_logits += 1;
-            Ok(logits)
+            Ok(LogitsRow::from_host_row(logits))
         }
 
         fn commit_token(&mut self, token_id: TokenId) -> anyhow::Result<()> {

@@ -3397,11 +3397,7 @@ impl NativeDecodeSession {
     /// path stays byte-identical. Greedy is the target regime, but returning raw
     /// logits also lets a driver fall back to host sampling for non-greedy
     /// requests. `past` must equal the committed length (`current_len`).
-    pub fn decode_verify(
-        &mut self,
-        draft: &[TokenId],
-        past: usize,
-    ) -> anyhow::Result<Vec<Vec<f32>>> {
+    pub fn decode_verify(&mut self, draft: &[TokenId], past: usize) -> anyhow::Result<LogitsBatch> {
         if draft.is_empty() {
             bail!("native decode_verify requires at least one draft token");
         }
@@ -3412,7 +3408,9 @@ impl NativeDecodeSession {
             );
         }
         if self.cuda.is_some() {
-            return self.decode_cuda_eager(draft, past);
+            return self
+                .decode_cuda_eager(draft, past)
+                .map(LogitsBatch::from_host_rows);
         }
         // CPU sessions already run any M>1 forward eagerly through the shared
         // decode path, which returns the full [K, vocab] rows verify needs.

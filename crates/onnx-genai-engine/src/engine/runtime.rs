@@ -4314,7 +4314,7 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
         &self.state.tokens
     }
 
-    fn next_logits(&mut self) -> anyhow::Result<Vec<f32>> {
+    fn next_logits(&mut self) -> anyhow::Result<crate::LogitsRow> {
         next_session_token_logits(
             self.session,
             self.kv_model,

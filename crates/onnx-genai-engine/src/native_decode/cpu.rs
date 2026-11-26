@@ -1,7 +1,7 @@
 use super::*;
 
 pub(crate) enum NativeCpuDecodeResult {
-    Logits(Vec<Vec<f32>>),
+    Logits(LogitsBatch),
     Token(TokenId),
 }
 
@@ -532,7 +532,10 @@ impl NativeDecodeSession {
             let _sampling_span = onnx_genai_ort::prof_span!("native.sampling");
             NativeCpuDecodeResult::Token(argmax_logits_tensor(&logits)?)
         } else {
-            let logits = extract_logits(&logits)?;
+            let logits = tensor::extract_owned_logits(
+                logits,
+                &tensor::host_tensors_for_session(&self.session)?,
+            )?;
             if logits.iter().flatten().any(|value| !value.is_finite()) {
                 bail!("native decoder produced non-finite logits");
             }

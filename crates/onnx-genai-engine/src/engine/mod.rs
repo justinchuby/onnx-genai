@@ -194,7 +194,7 @@ mod tests {
         Ok(())
     }
 
-    fn model_free_rewind_test_engine(
+    pub(super) fn model_free_rewind_test_engine(
         kv_cache: PagedKvCache,
         sessions: HashMap<SessionId, EngineSession>,
     ) -> anyhow::Result<Engine> {
@@ -484,7 +484,7 @@ mod tests {
     }
 
     #[cfg(feature = "native-backend")]
-    fn tiny_dense_native_decoder() -> onnx_runtime_session::InferenceSession {
+    pub(super) fn tiny_dense_native_decoder() -> onnx_runtime_session::InferenceSession {
         let mut graph = Graph::new();
         graph.opset_imports.insert(String::new(), 11);
         let batch = graph.intern_symbol("batch");
@@ -601,7 +601,7 @@ mod tests {
     }
 
     #[cfg(feature = "native-backend")]
-    fn tiny_dense_decoder_io() -> DecoderAbi {
+    pub(super) fn tiny_dense_decoder_io() -> DecoderAbi {
         DecoderAbi {
             sequence_source: Some(SequenceInputKind::TokenIds),
             kv_ownership: Some(KvOwnership::Owned),
@@ -2739,3 +2739,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(all(test, feature = "native-backend"))]
+mod owned_logits_tests;

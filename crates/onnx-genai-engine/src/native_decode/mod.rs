@@ -1,5 +1,7 @@
 //! Native nxrt adapter for the engine's existing decode loop.
 
+use crate::logits_batch::{LogitsBatch, LogitsRow};
+
 use crate::config::{GenerateOptions, GenerateResult, GenerateTokenCallback, SessionId};
 use crate::decode::DecodeBackend;
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, PreparedPrompt};
@@ -651,7 +653,7 @@ impl NativeDecodeSession {
     pub fn run_fused_batch_prefill(
         &mut self,
         token_ids: &[TokenId],
-    ) -> anyhow::Result<Vec<Vec<f32>>> {
+    ) -> anyhow::Result<LogitsBatch> {
         self.run_fused_batch_forward(token_ids, 0)
     }
 
@@ -679,7 +681,7 @@ impl NativeDecodeSession {
         &mut self,
         token_ids: &[TokenId],
         past_len: usize,
-    ) -> anyhow::Result<Vec<Vec<f32>>> {
+    ) -> anyhow::Result<LogitsBatch> {
         if token_ids.is_empty() {
             bail!("run_fused_batch_forward requires at least one token");
         }
@@ -763,7 +765,11 @@ impl NativeDecodeSession {
             .find(|(meta, _)| meta.name == self.logits)
             .map(|(_, tensor)| tensor)
             .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
-        let rows = extract_batch_row_logits(&logits, batch)?;
+        let rows = tensor::extract_owned_batch_row_logits(
+            logits,
+            batch,
+            &tensor::host_tensors_for_session(&self.session)?,
+        )?;
         if rows.iter().flatten().any(|value| !value.is_finite()) {
             bail!("native fused batch forward produced non-finite logits");
         }
@@ -1739,7 +1745,7 @@ impl NativeDecodeSession {
         &mut self,
         token_ids: &[TokenId],
         past_len: usize,
-    ) -> anyhow::Result<Vec<Vec<f32>>> {
+    ) -> anyhow::Result<LogitsBatch> {
         <Self as DecodeBackend>::decode(self, token_ids, past_len)
     }
 
@@ -1942,7 +1948,7 @@ impl NativeDecodeSession {
         token_ids: &[TokenId],
         past_len: usize,
         step_inputs: &[(String, Tensor)],
-    ) -> anyhow::Result<Vec<Vec<f32>>> {
+    ) -> anyhow::Result<LogitsBatch> {
         if let Some(cuda) = &self.cuda {
             cuda.ensure_state_restore_healthy()?;
         }
@@ -1972,7 +1978,7 @@ impl NativeDecodeSession {
         };
         // Only the final chunk's logits continue the prompt; the earlier
         // forwards exist to populate KV.
-        let mut logits = Vec::new();
+        let mut logits = LogitsBatch::empty();
         let mut offset = 0usize;
         for slice in token_ids.chunks(chunk) {
             let past_len = self.current_len;
@@ -1994,10 +2000,12 @@ impl NativeDecodeSession {
         token_ids: &[TokenId],
         past_len: usize,
         step_inputs: &[(String, Tensor)],
-    ) -> anyhow::Result<Vec<Vec<f32>>> {
+    ) -> anyhow::Result<LogitsBatch> {
         self.maybe_enable_decode_inline(token_ids);
         if self.cuda.is_some() {
-            return self.decode_cuda(token_ids, past_len, step_inputs);
+            return self
+                .decode_cuda(token_ids, past_len, step_inputs)
+                .map(LogitsBatch::from_host_rows);
         }
         if self.cpu_kv.is_some() {
             return match self.decode_cpu_inplace(token_ids, past_len, false, step_inputs)? {

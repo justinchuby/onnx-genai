@@ -2280,8 +2280,8 @@ fn native_cuda_fixed_state_restore_is_atomic_at_every_copy_stage() -> anyhow::Re
 
     const PROMPT: [TokenId; 3] = [5, 7, 9];
     let advance =
-        |session: &mut NativeDecodeSession, tokens: &[TokenId]| -> anyhow::Result<Vec<Vec<f32>>> {
-            let mut logits = Vec::new();
+        |session: &mut NativeDecodeSession, tokens: &[TokenId]| -> anyhow::Result<LogitsBatch> {
+            let mut logits = LogitsBatch::empty();
             for &token in tokens {
                 logits = session.decode(&[token], session.current_len())?;
             }
@@ -2630,8 +2630,8 @@ fn native_cuda_compressed_state_group_restore_is_atomic_first_middle_last() -> a
     fn advance(
         session: &mut NativeDecodeSession,
         tokens: &[TokenId],
-    ) -> anyhow::Result<Vec<Vec<f32>>> {
-        let mut logits = Vec::new();
+    ) -> anyhow::Result<LogitsBatch> {
+        let mut logits = LogitsBatch::empty();
         for &token in tokens {
             logits = session.decode(&[token], session.current_len())?;
         }
@@ -2924,7 +2924,10 @@ fn native_target_step_preserves_token_driven_binding() {
     );
 
     let logits = session.decode(&[3, 5], 0).expect("token target step");
-    assert_eq!(logits, vec![vec![3.0], vec![5.0]]);
+    assert_eq!(
+        logits,
+        LogitsBatch::from_host_rows(vec![vec![3.0], vec![5.0]])
+    );
 }
 
 #[test]
@@ -2950,7 +2953,10 @@ fn native_target_step_binds_declared_inputs_embeds_instead_of_tokens() {
     let logits = session
         .decode_with_step_inputs(&[101, 102], 0, &[("embedded_sequence".into(), embeddings)])
         .expect("embedding target step");
-    assert_eq!(logits, vec![vec![1.25], vec![2.5]]);
+    assert_eq!(
+        logits,
+        LogitsBatch::from_host_rows(vec![vec![1.25], vec![2.5]])
+    );
 }
 
 #[test]
@@ -2983,7 +2989,10 @@ fn native_target_step_resolves_routed_component_output_by_declared_port() {
             ],
         )
         .expect("routed target step");
-    assert_eq!(logits, vec![vec![11.0], vec![22.0]]);
+    assert_eq!(
+        logits,
+        LogitsBatch::from_host_rows(vec![vec![11.0], vec![22.0]])
+    );
 }
 
 #[test]
@@ -3718,11 +3727,11 @@ fn native_decode_accepts_last_token_only_logits_and_advances_kv() {
     .expect("load decoder");
 
     let logits = session.decode(&[1, 2, 3], 0).expect("prefill");
-    assert_eq!(logits, vec![vec![10.0, 20.0]]);
+    assert_eq!(logits, LogitsBatch::from_host_rows(vec![vec![10.0, 20.0]]));
     assert_eq!(session.current_len(), 3);
 
     let logits = session.decode(&[4], 3).expect("decode");
-    assert_eq!(logits, vec![vec![10.0, 20.0]]);
+    assert_eq!(logits, LogitsBatch::from_host_rows(vec![vec![10.0, 20.0]]));
     assert_eq!(session.current_len(), 4);
 }
 
@@ -4203,7 +4212,7 @@ fn tiny_decoder_matches_across_inplace_env_toggle() {
     let _guard = env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let run = |value: &str| -> Vec<Vec<f32>> {
+    let run = |value: &str| -> LogitsBatch {
         // SAFETY: serialized by `env_lock`; restored below.
         unsafe { std::env::set_var("ONNX_GENAI_CPU_INPLACE_KV", value) };
         let mut session = NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(

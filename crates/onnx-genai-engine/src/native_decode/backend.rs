@@ -26,7 +26,7 @@ pub(super) fn stage_host_prefix_rewind(
 }
 
 impl DecodeBackend for NativeDecodeSession {
-    fn decode(&mut self, token_ids: &[TokenId], past_len: usize) -> anyhow::Result<Vec<Vec<f32>>> {
+    fn decode(&mut self, token_ids: &[TokenId], past_len: usize) -> anyhow::Result<LogitsBatch> {
         self.decode_with_step_inputs(token_ids, past_len, &[])
     }
 
@@ -310,7 +310,7 @@ impl DecodeLoopBackend for NativeLoopAdapter<'_> {
         &self.prompt_tokens
     }
 
-    fn next_logits(&mut self) -> anyhow::Result<Vec<f32>> {
+    fn next_logits(&mut self) -> anyhow::Result<LogitsRow> {
         let past_len = self.session.current_len();
         self.session
             .decode(&self.pending_tokens, past_len)?

@@ -28,6 +28,8 @@ mod keyed_weights_tests;
 pub(crate) mod kv_bridge;
 pub(crate) mod kv_sizing;
 pub mod logits;
+pub mod logits_batch;
+pub use logits_batch::{LogitsBatch, LogitsRow};
 mod memory_authority;
 #[cfg(feature = "native-backend")]
 pub mod native_decode;

@@ -8,6 +8,8 @@
 //! selection, stopping, constraints, and KV-management policy remain in the
 //! engine.
 
+use crate::logits_batch::{LogitsBatch, LogitsRow};
+
 use crate::config::{GenerateOptions, SessionId};
 use crate::kv_bridge::{KvModelInfo, mirror_present_kv_to_pages};
 use crate::logits::{ProcessorChain, ProcessorContext, TokenId};
@@ -133,7 +135,7 @@ impl ModelDecodePath {
 /// cursor. Callers decide which tokens to feed, when to stop, and how logical
 /// KV state participates in generation.
 pub(crate) trait DecodeBackend {
-    fn decode(&mut self, token_ids: &[TokenId], past_len: usize) -> anyhow::Result<Vec<Vec<f32>>>;
+    fn decode(&mut self, token_ids: &[TokenId], past_len: usize) -> anyhow::Result<LogitsBatch>;
     /// Greedy fast path: run the decode step and return only the argmax token
     /// id of the final position, or `None` when this backend cannot select the
     /// token internally (the caller then falls back to [`Self::decode`] plus
@@ -215,7 +217,7 @@ impl DecodeRunner {
 }
 
 impl DecodeBackend for DecodeSession<'static> {
-    fn decode(&mut self, token_ids: &[TokenId], past_len: usize) -> anyhow::Result<Vec<Vec<f32>>> {
+    fn decode(&mut self, token_ids: &[TokenId], past_len: usize) -> anyhow::Result<LogitsBatch> {
         let total_len = past_len + token_ids.len();
         let input_ids = token_ids
             .iter()
@@ -227,7 +229,7 @@ impl DecodeBackend for DecodeSession<'static> {
             .collect::<anyhow::Result<Vec<_>>>()?;
         let logits = self.step(&input_ids, &attention_mask, &position_ids)?;
         let _extract = onnx_genai_ort::prof_span!("engine.logits_to_vec");
-        extract_logits_value_sequence(&logits)
+        extract_logits_value_sequence(&logits).map(LogitsBatch::from_host_rows)
     }
 
     fn decode_argmax(
@@ -283,7 +285,7 @@ impl DecodeBackend for DecodeSession<'static> {
 }
 
 impl DecodeBackend for StaticCacheDecodeSession<'static> {
-    fn decode(&mut self, token_ids: &[TokenId], _past_len: usize) -> anyhow::Result<Vec<Vec<f32>>> {
+    fn decode(&mut self, token_ids: &[TokenId], _past_len: usize) -> anyhow::Result<LogitsBatch> {
         let input_ids = token_ids
             .iter()
             .map(|&id| i64::from(id))
@@ -293,7 +295,7 @@ impl DecodeBackend for StaticCacheDecodeSession<'static> {
                 .map(|pos| i64::try_from(pos).context("position id exceeds i64 range"))
                 .collect::<anyhow::Result<Vec<_>>>()?;
             let logits = self.prefill(&input_ids, &position_ids)?;
-            extract_logits_value_sequence(&logits)
+            extract_logits_value_sequence(&logits).map(LogitsBatch::from_host_rows)
         } else {
             let mut logits = Vec::with_capacity(input_ids.len());
             for &token in &input_ids {
@@ -302,7 +304,7 @@ impl DecodeBackend for StaticCacheDecodeSession<'static> {
                 let value = self.step(&[token], &[pos])?;
                 logits.push(extract_logits_value_next(&value)?);
             }
-            Ok(logits)
+            Ok(LogitsBatch::from_host_rows(logits))
         }
     }
 }

@@ -40,6 +40,63 @@ pub(super) fn i64_tensor_with(
     })?)
 }
 
+fn owned_f32_values(
+    tensor: Tensor,
+    allocator: &onnx_runtime_session::HostTensorAllocator,
+) -> anyhow::Result<onnx_runtime_session::OwnedHostArray<f32>> {
+    anyhow::ensure!(
+        tensor.layout.is_contiguous(&tensor.shape),
+        "Native owned logits require contiguous output storage; gather the declared output layout first"
+    );
+    if tensor.dtype == DataType::Float32 {
+        return Ok(onnx_runtime_session::OwnedHostArray::from_tensor(tensor)?);
+    }
+    anyhow::ensure!(
+        matches!(tensor.dtype, DataType::Float16 | DataType::BFloat16),
+        "native logits must be Float32, Float16, or BFloat16, got {:?}",
+        tensor.dtype
+    );
+    let count = onnx_runtime_ir::checked_numel(&tensor.shape)
+        .context("native owned logits shape overflows")?;
+    let mut output = allocator.array::<f32>(count)?;
+    let source = tensor.as_bytes();
+    for (target, bytes) in output.as_mut_slice().iter_mut().zip(source.chunks_exact(2)) {
+        let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+        *target = if tensor.dtype == DataType::Float16 {
+            f16_to_f32(bits)
+        } else {
+            f32::from_bits(u32::from(bits) << 16)
+        };
+    }
+    Ok(output)
+}
+pub(super) fn extract_owned_logits(
+    tensor: Tensor,
+    allocator: &onnx_runtime_session::HostTensorAllocator,
+) -> anyhow::Result<LogitsBatch> {
+    let (rows, width) = match tensor.shape.as_slice() {
+        [vocab] if *vocab > 0 => (1, *vocab),
+        [seq, vocab] if *seq > 0 && *vocab > 0 => (*seq, *vocab),
+        [batch, seq, vocab] if *batch > 0 && *seq > 0 && *vocab > 0 => (*seq, *vocab),
+        shape => bail!("unsupported logits tensor shape: {shape:?}"),
+    };
+    LogitsBatch::from_array(owned_f32_values(tensor, allocator)?, rows, width)
+}
+pub(super) fn extract_owned_batch_row_logits(
+    tensor: Tensor,
+    batch: usize,
+    allocator: &onnx_runtime_session::HostTensorAllocator,
+) -> anyhow::Result<LogitsBatch> {
+    let width = match tensor.shape.as_slice() {
+        [b, seq, vocab] if *b == batch && *seq == 1 && *vocab > 0 => *vocab,
+        [b, vocab] if *b == batch && *vocab > 0 => *vocab,
+        shape => bail!(
+            "unsupported batched logits tensor shape {shape:?} for batch {batch}; expected [{batch}, 1, vocab] or [{batch}, vocab]"
+        ),
+    };
+    LogitsBatch::from_array(owned_f32_values(tensor, allocator)?, batch, width)
+}
+
 pub(crate) fn extract_logits(tensor: &Tensor) -> anyhow::Result<Vec<Vec<f32>>> {
     let values = tensor_to_f32(tensor)?;
     match tensor.shape.as_slice() {
@@ -238,14 +295,36 @@ pub(crate) fn extract_last_row(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
     if width == 0 {
         bail!("tensor final feature dimension must be positive");
     }
-    let values = tensor_to_f32(tensor)?;
-    if values.len() < width || !values.len().is_multiple_of(width) {
+    let count = onnx_runtime_ir::checked_numel(&tensor.shape)
+        .context("native hidden output shape overflows")?;
+    if count < width || !count.is_multiple_of(width) {
         bail!(
-            "tensor element count {} is not a positive multiple of final feature width {width}",
-            values.len()
+            "tensor element count {count} is not a positive multiple of final feature width {width}"
         );
     }
-    Ok(values[values.len() - width..].to_vec())
+    let element_bytes = match tensor.dtype {
+        DataType::Float32 => 4,
+        DataType::Float16 | DataType::BFloat16 => 2,
+        dtype => bail!("native logits must be Float32, Float16, or BFloat16, got {dtype:?}"),
+    };
+    let start = (count - width)
+        .checked_mul(element_bytes)
+        .context("native final row offset overflows")?;
+    let row = tensor
+        .as_bytes()
+        .get(start..)
+        .context("native final row exceeds output backing")?;
+    Ok(row
+        .chunks_exact(element_bytes)
+        .map(|bytes| match tensor.dtype {
+            DataType::Float32 => f32::from_le_bytes(bytes.try_into().expect("f32 row element")),
+            DataType::Float16 => f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]])),
+            DataType::BFloat16 => {
+                f32::from_bits(u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) << 16)
+            }
+            _ => unreachable!("dtype checked above"),
+        })
+        .collect())
 }
 
 pub(super) fn tensor_to_f32(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
