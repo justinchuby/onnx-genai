@@ -9,21 +9,21 @@ pub(super) enum NativeHidden {
     Cpu(Arc<OwnedHostArray<f32>>),
     // CUDA retains its existing explicit Host allocation boundary. This does
     // not assert that CUDA staging has joined the CPU managed-payload domain.
-    #[cfg(feature = "native-cuda")]
+    #[cfg(any(feature = "native-cuda", test))]
     Host(Arc<Vec<f32>>),
 }
 impl NativeHidden {
     pub(super) fn from_cpu(values: OwnedHostArray<f32>) -> Self {
         Self::Cpu(Arc::new(values))
     }
-    #[cfg(feature = "native-cuda")]
+    #[cfg(any(feature = "native-cuda", test))]
     pub(super) fn from_host(values: Vec<f32>) -> Self {
         Self::Host(Arc::new(values))
     }
     pub(super) fn as_slice(&self) -> &[f32] {
         match self {
             Self::Cpu(values) => values.as_slice(),
-            #[cfg(feature = "native-cuda")]
+            #[cfg(any(feature = "native-cuda", test))]
             Self::Host(values) => values.as_slice(),
         }
     }
