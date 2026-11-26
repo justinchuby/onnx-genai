@@ -2314,3 +2314,182 @@ passed with one inherited ignore, full server library 593 passed with two
 inherited ignores. Default engine/server all-target strict Clippy, no-default
 engine strict Clippy, formatting and diff checks passed on macOS ARM64 CPU.
 The unchecked goal acceptance rows remain required.
+
+
+## Authored workflow output stops
+
+The shared output observer now applies ordinary text/token stop sequences to
+candidate-tree, DFlash and generic authored loops as well as prediction time.
+The shared processor builder preserves observer priority. Token-only controls
+work without a tokenizer; text controls require one explicitly. Generic loops
+also enforce request-wide token budgets and EOS independently of authored loop
+iteration bounds. Their current body finishes atomically before the next body
+is suppressed; over-budget atomic emission rejects the whole turn.
+
+Specialized drivers retain the accepted prefix before state recomputation.
+Terminal decoder flushing occurs before semantic commit, allowing pending UTF-8
+to trigger a text stop and preserving rollback if its byte budget fails.
+Tests compare real specialized state continuations with budgeted references,
+exercise a real ONNX generic recurrence, and check buffered/callback publication,
+EOF decoding, EOS priority, missing-tokenizer admission and failed-turn retry.
+Validation: full DFlash 26, candidate-tree 32 and workflow policy 28 tests
+passed. After rebasing onto main 1ef2439da, full engine library 1086 passed
+with one inherited ignore and full server library 593 passed with two inherited
+ignores. Default engine/server all-target strict Clippy, no-default engine
+all-target strict Clippy, formatting and diff checks passed on macOS ARM64 CPU.
+The general goal remains incomplete; indentation stopping and unchecked
+acceptance rows remain required.
+
+
+## Indentation stopping
+
+`n_indent` is parsed with the pinned numeric domain, mapped
+into the shared output-observer chain and ordinary, batched, speculative and
+authored workflow result construction. Its stateful scan distinguishes full
+stop-word removal from partially held stop prefixes and handles repeated/EOF
+observations without advancing a selected token twice. Text clipping is replayed
+independently of the final stop label, preserving EOS/time priority. Native
+stopping-word diagnostics use raw token text before indentation clipping.
+
+SSE gates publish safe line prefixes and withhold potentially retracted bodies,
+then resolve against committed final text. This deliberately avoids the pinned
+server's partial-response send occurring before its indentation truncation.
+Validation on main b07048488: full DFlash 27, candidate-tree 33 and workflow
+policy 30 tests passed; engine library 1095 passed with one inherited ignore,
+and server library 599 passed with two inherited ignores. Default engine/server
+all-target strict Clippy, no-default engine all-target strict Clippy, GenAI Python
+all-target compilation, formatting and diff checks passed on macOS ARM64 CPU.
+Real Native ordinary/speculative and ORT reference prefixes, EOS override,
+tokenizer admission, HTTP numeric bounds and buffered/SSE equality are covered.
+There are no performance or GPU claims. Unchecked goal acceptance rows remain
+required; this increment does not complete the broader compatibility goal.
+
+
+## C-locale collating and equivalence trigger classes
+
+Trigger brackets support collating elements and standalone
+equivalence/POSIX classes, including named characters and scalar range endpoints.
+Real C++ checks exposed distinct libc++ and libstdc++ classic-locale name and
+primary-equivalence behavior. A typed `GrammarCollation` travels with immutable
+activation configuration; the request extension `grammar_trigger_collation`
+selects `libcxx` (omitted/null default) or `libstdcxx`. Properties advertise both.
+Production matching does not depend on the host's compiler or locale.
+
+Paired actual-compiler fixtures cover the same 504 patterns, every one-byte
+input for each valid expression, named aliases/controls, negation, range roles,
+NUL and primary-key edge cases. Runtime observers retain existing source, input,
+program, class-item and VM work bounds. Real Native/ORT HTTP tests exercise both
+profiles through pattern/full-pattern activation, captures within model tokens,
+framing, buffered/SSE projection and pre-SSE error admission. The 33 GBNF and
+5 wire tests passed. Final validation on main 6d9898009: engine library 1096
+passed with one inherited ignore; server library 600 passed with two inherited
+ignores. Default engine/server all-target strict Clippy, no-default engine
+all-target strict Clippy, GenAI Python all-target compilation, formatting and
+whole-change whitespace checks passed on macOS ARM64 CPU. Both actual compiler
+oracles were regenerated with canonical data formatting. These are functional
+checks, with no Linux/GPU execution or performance claims. Lazy JSON, contextual
+raw grammars and other unchecked goal rows remain required.
+
+### Lazy JSON Schema activation
+
+JSON response formats and the native `json_schema` alias now lower to an explicit
+raw lazy JSON Schema constraint. Admission compiles the existing full llguidance
+schema recognizer and validates triggers before SSE. It retains the raw identity
+byte-decoder requirement rather than guessing contextual token pieces. Activation
+shares GBNF token/word/pattern/full-pattern priority, byte capture offsets,
+reasoning suppression, history bounds and rewind behavior. JSON replay seeds the
+captured raw bytes into the existing normalized content recognizer, preserving
+schema semantics, equivalent escaped spellings and the vocabulary trie mask.
+Assistant prefill and content projection do not become part of this raw value.
+
+An optional selected-token feedback capability on constraints closes the last-step
+activation gap: grammar validation runs before selected output is committed or
+published even when no next mask is requested. An activated ending must complete
+the root. Arbitrary output/EOS before activation remains legal; explicit stops
+and length limits can truncate an activated viable prefix. Lazy JSON rejects
+forced tool choice and `ignore_eos=true`, preserving raw-grammar policy.
+
+Validation on main e645c6662: server library 601 passed with two inherited
+ignores; engine library 1101 passed with one inherited ignore. The new Native/ORT
+wire test covers 96 successful route/format/trigger/stream combinations, non-JSON
+assistant prefill, the native schema alias, pre-SSE schema/trigger/EOS-policy
+errors, final-token rejection without publication and retry on the same server.
+Engine regressions cover selected-token feedback, rewind, root-complete endings,
+equivalent JSON escapes, partial UTF-8 activation and seed byte-budget recovery.
+Default engine/server all-target strict Clippy, no-default engine all-target
+strict Clippy, GenAI Python all-target compilation, formatting and whole-change
+whitespace checks passed. After full tests the only source adjustment was
+Clippy's equivalent direct-Result return. These are functional macOS ARM64 CPU
+checks; no GPU/Linux execution or performance claims. Contextual raw grammars
+and the other unchecked compatibility-goal rows remain open.
+
+### JSON object domains and schema wire forms
+
+Pinned `server-common.cpp:1420-1442` and `server-schema.cpp:270-291` normalize
+empty schema objects to object roots. The transport now resolves that default
+for native, legacy completion, chat and Responses without changing the engine's
+any-value JSON constraint. Boolean and nonempty schemas retain full schema
+semantics. Typed schema documents reject non-object/non-boolean values with an
+argument-specific error.
+
+Response formats accept optional nested metadata, nested/flat schema forms and
+`json_object.schema`; top-level `json_schema` is no longer silently ignored by
+chat/completion requests. A shared selection method encodes pinned precedence
+and feeds both continuation validation and constraint construction. Native
+legacy grammar presence takes precedence, including an empty grammar; chat keeps
+its explicit conflict guard. Lazy activation, EOS policy and forced-tool guards
+consume the selected schema too. The obsolete `JsonSchemaSpec` API was removed
+and all exports/callers updated without aliases.
+
+Validation on main 71ecaa373: server library 608 passed with two inherited
+ignores; the full public HTTP integration suite passed 38 tests. Native/ORT
+coverage includes 416 successful path/format/eager-lazy/stream combinations,
+object-vs-scalar masking, boolean/explicit scalar schemas, all wrappers, prefill,
+false-schema pre-SSE refusal and invalid lazy scalar publication. Defaults and
+precedence also have request-type and native-parser regressions. Public HTTP
+expectations now require object-root schema selection and accept optional
+wrapper metadata while retaining malformed-document rejection.
+
+Default all-target strict Clippy and Native-disabled reference strict Clippy
+(`--no-default-features --features metrics,cuda-13000`) passed, as did CLI/Python
+all-target compilation (`--features python`), formatting and whole-change
+whitespace checks. The CUDA selector supplies the mandatory cudarc test binding
+version; no GPU execution was performed. Metrics-disabled strict Clippy still
+reports eight inherited dead-code diagnostics; the identical errors were
+reproduced on unmodified main 71ecaa373 before restoring this branch. This is
+recorded rather than claimed as a passing configuration. Checks are functional
+macOS ARM64 CPU evidence, with no Linux/GPU or performance claims. The wider
+compatibility goal remains open.
+
+### Graph-scoped keyed container weights
+
+Schema v1.17 adds explicit `graph_weights` entries for ONNX graphs, with
+package-relative GGUF/SafeTensors paths and container-key renames. One canonical
+resolver admits regular files beneath the package root and rejects escaping
+symlinks, missing artifacts and aliases that ambiguously bind the same graph.
+Decoder sessions, workflow components, MTP heads and target-initializer reuse
+consume the same bindings. Auto selects Native for this capability; explicit ORT
+and builds lacking Native fail with a configuration remedy.
+
+Execution retains the loader's exact dtype/shape and external-length checks.
+There is no inferred architecture, cast, transpose or quantization conversion.
+Memory evidence loads the actual keyed graph, and keyed placeholders use tensor
+geometry for byte estimates. Native portable state hashes declared container
+contents with portable package-relative labels, so relocation preserves identity
+and a changed container invalidates existing state before restoration publishes.
+
+Real GGUF and SafeTensors fixtures execute the decoder, a stateless workflow and
+three recurrent MTP steps. Decoder generation matches the original ONNX/ORT
+reference; saved-state continuation survives package relocation, while altered
+container contents are rejected without populating the destination session.
+Shape coercion, explicit ORT, missing files, graph aliases and escaping symlinks
+have refusal coverage. The complete engine library passed 1108 tests with one
+inherited ignore; metadata passed 484 tests, including generated-schema and
+extension-registry conformance. Evidence is functional macOS ARM64 CPU only.
+Bare GGUF executable-graph import, quantization selection and selective sidecar
+management remain open; this increment requires an authored ONNX graph/package.
+
+Default engine/server all-target strict Clippy and the Native-disabled server
+reference configuration (`--no-default-features --features metrics,cuda-13000`)
+passed, together with formatting and whole-change whitespace checks. The CUDA
+feature is a compile-time binding selector, not evidence of GPU execution.

@@ -337,6 +337,28 @@ The old public character-based `JsonConstraint` was removed; pure request syntax
 preflight uses `validate_json_prefix`, while generation uses the shared schema
 recognizer.
 
+JSON object defaults follow the pinned [chat conversion](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-common.cpp#L1420)
+and [native schema handler](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-schema.cpp#L270).
+`json_schema: {}` and implicit/empty response-format schemas constrain the root
+to an object. Explicit nonempty schemas and boolean schemas keep their JSON
+Schema meaning. This applies to eager and lazy generation. The engine's generic
+`GenerateConstraint::Json` remains an any-value constraint; the transport selects
+the appropriate schema explicitly.
+
+Accepted forms include top-level `json_schema`, `json_object.schema`, flat
+`json_schema.schema`, and the OpenAI nested `json_schema.json_schema.schema`
+wrapper. Nested wrappers take precedence over a flat schema. An implicit
+`json_object` keeps a supplied top-level schema; its explicit `schema` overrides
+that field. `text` preserves an explicitly supplied top-level schema. In native
+requests, presence of `grammar` takes precedence over legacy `json_schema`, even
+for an empty grammar; chat rejects conflicting grammar/schema constraints.
+Responses `text.format` uses the same schema selection after wire conversion.
+For example, an explicit schema can allow a scalar despite the format label:
+
+```json
+{"response_format":{"type":"json_object","schema":{"const":7}}}
+```
+
 Without explicit continuation, declared content/reasoning text in the template
 prefill is included in the response, matching upstream session projection.
 The same include/exclude policy governs buffered, SSE and logprob replay; only
@@ -393,8 +415,41 @@ toward zero before checking the signed 64-bit millisecond range; for example,
 Native, OpenAI completion/chat, Responses and Anthropic generation share this
 request field. Native speculative, candidate-tree and DFlash execution stop at
 the accepted token prefix and finalize physical state before publication.
-Generic authored workflows observe their declared emitted units and stop before
-the next unit; an already emitted unit is retained atomically.
+Generic authored workflows observe emitted tokens and stop before entering the
+next loop body. The current body finishes atomically, including its declared
+state updates. The request token budget bounds all emitted output even when an
+authored loop declares a larger iteration count; a body that would exceed that
+budget fails and rolls back the turn before publication.
+
+Text and token-ID stop sequences also apply to generic authored workflows,
+candidate-tree and DFlash execution. Specialized drivers truncate the accepted
+prefix before repairing state. Text stops and prediction-time limits require a
+package tokenizer; token-ID stops, EOS and token budgets do not. Empty stop
+sequences are inert. Pending decoder bytes are finalized before semantic commit,
+so an EOF text stop receives its actual stop reason, and a decoding or byte-bound
+failure leaves session state and callbacks uncommitted.
+
+`n_indent` requests a minimum number of space or tab characters after generated
+newlines. Each tab counts once. Omission, `null` and zero disable the control;
+numeric fractions truncate toward zero and the resulting value must fit
+0 through INT32_MAX. It requires a package tokenizer. The request is shared by
+native and OpenAI completion/chat, Responses and Anthropic generation.
+
+Indentation checks follow the pinned server's token-observation order: the first
+visible newline arms a later observation, and subsequent observations advance
+the newline scan. An insufficiently indented line stops generation normally;
+its leading whitespace remains in final text while its body is removed. EOS and
+prediction-time labels can take precedence without undoing that text clipping.
+The triggering token remains committed and counted. Native reports `limit`;
+OpenAI reports `length`. Generic workflows finish the current loop body
+atomically; specialized execution repairs the accepted prefix before commit.
+
+SSE publishes text whose indentation is already safe, withholding potentially
+retractable line content until the final boundary is known. A request that ends
+before the delayed indentation check releases any retained valid suffix. This
+avoids the pinned implementation's send-before-truncate ordering producing a
+streamed body that disagrees with final text. Token IDs and usage still account
+for every committed token.
 
 Ordinary runtime-owned decoder generation returns llama.cpp `timings` in native,
 OpenAI completion and chat buffered results and final SSE chunks. Setting
@@ -617,7 +672,11 @@ parity. These upstream capabilities remain incomplete:
 - Video decision inputs, broader audio codecs and additional DSP operations/conventions,
   joint/packed decision heads and shared generation/decision entry points.
 - Device-state/multi-sequence slot persistence; arbitrary GGUF/PEFT LoRA imports and device-fused LoRA.
-- GGUF package import, quantization selectors and selective sidecar management.
+- Bare GGUF graph import, quantization selectors and selective sidecar management.
+  Native nxrt packages can explicitly bind GGUF or SafeTensors weights to their
+  ONNX graphs through schema `v1.17` `graph_weights`; decoder, workflow and MTP
+  loading share the bindings. Exact tensor dtype/shape matching is required.
+  See [inference metadata](genai/MODEL_METADATA.md#components-and-graph).
   Hugging Face nxrt-package download, resume and deletion are supported.
 
 `/v1/systemone` executes text/structured-state decision profiles, with explicit
@@ -768,9 +827,45 @@ answer (alongside the route's normal prompt/messages fields):
 
 As in the pinned upstream sampler, raw `%llguidance` Lark remains eager and
 ignores lazy token/pattern effects, while tokenizer-level word preservation is
-still validated. Lazy JSON `response_format` without a raw GBNF grammar is still
-unsupported and returns a pre-SSE error. Collating/equivalence bracket forms are
-also explicitly unsupported. Trigger source/input bytes, combined translated
+still validated. JSON `response_format` and native `json_schema` also accept
+lazy activation. They use the same trigger ordering, raw newly generated bytes,
+reasoning gate and ending roles as GBNF; assistant prefill and declared content
+projection do not feed the activated JSON value. The complete JSON Schema
+recognizer and equivalent JSON escape handling are shared with eager JSON.
+Before a trigger, arbitrary text and EOS remain legal. After activation the
+captured suffix must be a viable schema prefix and EOS requires a complete value;
+length limits and explicit stops may still truncate it. Selected triggers are
+validated before publication even on the final generation step. A JSON trigger
+therefore normally captures the opening brace rather than an answer label:
+
+```json
+{
+  "response_format": {"type": "json_object"},
+  "grammar_lazy": true,
+  "grammar_triggers": [{"type": 2, "value": "ANSWER: (\\{)"}]
+}
+```
+
+Lazy JSON requires the same identity raw byte decoder capability as raw GBNF,
+a positive source/output byte budget and `ignore_eos=false`; it conflicts with
+forced tool choice. Schema/trigger compilation happens before SSE. Collating symbols (`[[.a.]]`,
+`[[.space.]]`) and equivalence classes (`[[=a=]]`) have explicit classic-locale
+byte semantics. Because C++ libraries disagree, nxrt accepts the request extension
+`grammar_trigger_collation`: omission/null or `"libcxx"` preserves the existing
+libc++ contract; `"libstdcxx"` selects GNU collating names and ASCII-case primary
+equivalence. For example, `[[=a=]]` matches a in the former and a/A in the latter.
+There is no ambient-locale or host-compiler inference, or Unicode/accent folding.
+Model properties advertise both choices and the fixed default.
+
+Named punctuation, controls and digits follow the selected library; accepted
+names and legacy NUL behavior are covered by paired C++ reference fixtures.
+Unsupported names and malformed delimiters fail before SSE with profile and byte
+location. The default profile permits collating symbols at both range ends and
+independent equivalence/POSIX terms followed by a hyphen: `[[.a.]-[.c.]]` matches
+a through c, while `[[=a=]-c]` matches a, hyphen or c. GNU requires a literal
+right endpoint (`[[.a.]-c]`) and rejects a class as a range start. Its otherwise
+unmatched closing bracket is literal; the default profile rejects it.
+Trigger source/input bytes, combined translated
 program size, captures, nesting, repetitions, character-class items, history
 length and backtracking have declared bounds; exhaustion is an actionable error.
 Neutral `grammar_lazy=false`, `grammar_triggers=[]` and `preserved_tokens=[]`

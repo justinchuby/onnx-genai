@@ -71,6 +71,8 @@ pub(crate) async fn props(
             "params": {
                 "n_predict": state.config.max_output_tokens,
                 "t_max_predict_ms": -1,
+                "n_indent": options.minimum_indent,
+                "grammar_trigger_collation": onnx_genai_engine::GrammarCollation::default(),
                 "seed": -1,
                 "temperature": if options.greedy { 0.0 } else { options.temperature },
                 "top_k": options.top_k, "top_p": options.top_p, "min_p": options.min_p,
@@ -101,6 +103,7 @@ pub(crate) async fn props(
         "cors_proxy_enabled": false,
         "build_info": concat!("nxrt ", env!("CARGO_PKG_VERSION")),
         "nxrt_capabilities": {
+            "grammar_trigger_collations": [onnx_genai_engine::GrammarCollation::Libcxx,onnx_genai_engine::GrammarCollation::Libstdcxx],
             "server_tools": false,
             "model_management": state.model_manager.is_some(), "managed_model_formats": if state.model_manager.is_some() {vec!["nxrt_package"]} else {Vec::<&str>::new()},
             "resumable_streams": true, "reasoning_control": true,

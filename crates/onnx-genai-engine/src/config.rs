@@ -1335,6 +1335,8 @@ pub struct GenerateOptions {
     /// Normal stop on a newly generated newline after this wall-clock prediction
     /// budget, measured from the first selected token. None/zero disables it.
     pub max_prediction_time: Option<std::time::Duration>,
+    /// Minimum space/tab characters after a generated newline; zero disables it.
+    pub minimum_indent: usize,
     /// Declared adapter composition per request row. Absence selects the base model.
     pub adapter_selection: Option<crate::pipeline::AdapterSelection>,
     /// Maximum tokens to produce after the prompt.
@@ -1438,6 +1440,7 @@ impl Default for GenerateOptions {
     fn default() -> Self {
         Self {
             max_prediction_time: None,
+            minimum_indent: 0,
             adapter_selection: None,
             max_new_tokens: 128,
             max_constraint_bytes: 4 * 1024 * 1024,
@@ -1741,13 +1744,34 @@ pub enum GrammarTrigger {
     PatternFull(String),
 }
 
+/// Explicit C++ classic-locale bracket collation, independent of the host.
+/// This selects bracket traits/range rules, not a different overall regex grammar.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GrammarCollation {
+    /// Preserve the existing libc++ classic-locale trigger contract.
+    #[default]
+    Libcxx,
+    /// Match libstdc++ classic-locale element names and primary equivalence.
+    Libstdcxx,
+}
+impl GrammarCollation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Libcxx => "libcxx",
+            Self::Libstdcxx => "libstdcxx",
+        }
+    }
+}
+
 /// A nonempty, bounded set of lazy activation conditions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrammarActivation {
     triggers: Vec<GrammarTrigger>,
+    collation: GrammarCollation,
 }
 impl GrammarActivation {
-    pub fn new(triggers: Vec<GrammarTrigger>) -> anyhow::Result<Self> {
+    pub fn new(triggers: Vec<GrammarTrigger>, collation: GrammarCollation) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !triggers.is_empty(),
             "lazy grammar has no triggers; provide at least one token, word or pattern trigger"
@@ -1756,7 +1780,10 @@ impl GrammarActivation {
             triggers.len() <= 1024,
             "lazy grammar exceeds 1024 triggers; combine patterns or use fewer triggers"
         );
-        Ok(Self { triggers })
+        Ok(Self {
+            triggers,
+            collation,
+        })
     }
     pub fn validate_with_tokenizer(
         &self,
@@ -1775,6 +1802,9 @@ impl GrammarActivation {
     ) -> anyhow::Result<()> {
         crate::gbnf::lazy::validate_words(tokenizer, self, preserved)
     }
+    pub fn collation(&self) -> GrammarCollation {
+        self.collation
+    }
     pub fn triggers(&self) -> &[GrammarTrigger] {
         &self.triggers
     }
@@ -1789,6 +1819,12 @@ pub enum GenerateConstraint {
     Gbnf {
         grammar: String,
         activation: Option<GrammarActivation>,
+    },
+    /// JSON Schema over newly generated raw bytes after a trigger. Before
+    /// activation output is unconstrained; assistant prefill is not consumed.
+    LazyJsonSchema {
+        schema: String,
+        activation: GrammarActivation,
     },
     /// Raw llguidance Lark over new model output, without assistant-prefill
     /// consumption or response-content projection. Keep the %llguidance header.
@@ -1861,7 +1897,11 @@ impl GenerateOptions {
         anyhow::ensure!(
             !matches!(
                 self.constraint,
-                Some(GenerateConstraint::Gbnf { .. } | GenerateConstraint::RawLark { .. })
+                Some(
+                    GenerateConstraint::Gbnf { .. }
+                        | GenerateConstraint::RawLark { .. }
+                        | GenerateConstraint::LazyJsonSchema { .. }
+                )
             ) || self.stop_on_eos,
             "raw grammar requires stop_on_eos=true; allow root completion to terminate the generation"
         );
@@ -2219,6 +2259,8 @@ pub struct PrioritizedGenerateResult {
 /// Why generation stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinishReason {
+    /// A generated line failed its requested minimum indentation.
+    IndentationLimit,
     /// Prediction time elapsed and a new newline was committed.
     PredictionTimeLimit,
     /// The configured maximum number of new tokens was reached.

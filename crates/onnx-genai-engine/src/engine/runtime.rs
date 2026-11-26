@@ -3887,7 +3887,7 @@ impl Engine {
                 finish_reason,
                 loop_state.prefix_cache_hit_len,
                 loop_state.logprobs.as_deref(),
-                &active.options.effective_preserved_tokens(),
+                &active.options,
             )?)
         } else {
             // Borrowed before the disjoint mutable borrows the backend takes.
@@ -3950,7 +3950,7 @@ impl Engine {
                     finish_reason,
                     loop_state.prefix_cache_hit_len,
                     loop_state.logprobs.as_deref(),
-                    &active.options.effective_preserved_tokens(),
+                    &active.options,
                 )?),
                 None => None,
             }
@@ -3974,7 +3974,7 @@ impl Engine {
                     FinishReason::MaxTokens,
                     active.prefix_cache_hit_len,
                     active.logprobs.as_deref(),
-                    &active.options.effective_preserved_tokens(),
+                    &active.options,
                 )
                 .map(|mut result| {
                     result.timings = active.clock.snapshot();
@@ -4235,17 +4235,17 @@ impl Engine {
         finish_reason: FinishReason,
         prefix_cache_hit_len: usize,
         logprobs: Option<&[crate::config::TokenLogprob]>,
-        preserved_tokens: &std::collections::BTreeSet<TokenId>,
+        options: &GenerateOptions,
     ) -> anyhow::Result<GenerateResult> {
         Ok(GenerateResult {
             timings: None,
             retained_cache_tokens: 0,
-            text: crate::tokenization::decode_output(
+            text: crate::tokenization::decode_generation_output(
                 self.require_tokenizer()?,
                 generated_tokens,
-                preserved_tokens,
+                options,
             )?,
-            preserved_tokens: preserved_tokens.clone(),
+            preserved_tokens: options.effective_preserved_tokens(),
             token_ids: generated_tokens.to_vec(),
             finish_reason,
             tool_calls: Vec::new(),
@@ -4905,6 +4905,110 @@ mod tests {
                 ..EngineConfig::default()
             },
         )
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn indentation_stops_commit_real_native_and_reference_decoder_prefixes() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        drop(native_speculative_per_position_fixture(directory.path())?);
+        let path = directory.path().join("tokenizer.json");
+        let mut tokenizer: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let vocabulary = tokenizer["model"]["vocab"]
+            .as_object_mut()
+            .context("fixture vocabulary")?;
+        let original = vocabulary
+            .iter()
+            .find(|(_, id)| **id == serde_json::json!(1))
+            .map(|(word, _)| word.clone())
+            .context("fixture token 1")?;
+        vocabulary.remove(&original);
+        vocabulary.insert("head\n bad".into(), serde_json::json!(1));
+        if tokenizer["model"]["unk_token"] == original {
+            tokenizer["model"]["unk_token"] = serde_json::json!("head\n bad");
+        }
+        if let Some(tokens) = tokenizer["added_tokens"].as_array_mut() {
+            tokens.retain(|token| token["id"] != 1);
+        }
+        std::fs::write(path, serde_json::to_vec(&tokenizer)?)?;
+        for (backend, speculative) in [
+            (EngineDecodeBackend::Native, false),
+            (EngineDecodeBackend::Native, true),
+            (EngineDecodeBackend::Ort, false),
+        ] {
+            for streaming in [false, true] {
+                let mut engine = Engine::from_dir(
+                    directory.path(),
+                    EngineConfig {
+                        decode_backend: backend,
+                        native_device: Some(crate::NativeDecodeDevice::Cpu),
+                        ..Default::default()
+                    },
+                )?;
+                let mut request = tiny_native_cold_request(speculative);
+                request.prompt = GeneratePrompt::TokenIds(vec![0, 1, 1, 1, 0]);
+                request.options.max_new_tokens = 8;
+                request.options.minimum_indent = 2;
+                request.options.cold_start = true;
+                request.options.num_speculative_tokens = speculative.then_some(4);
+                let mut reference = Engine::from_dir(
+                    directory.path(),
+                    EngineConfig {
+                        decode_backend: backend,
+                        native_device: Some(crate::NativeDecodeDevice::Cpu),
+                        ..Default::default()
+                    },
+                )?;
+                let mut reference_request = request.clone();
+                reference_request.options.minimum_indent = 0;
+                reference_request.options.max_new_tokens = 3;
+                let reference_result = reference.generate(reference_request)?;
+                assert_eq!(reference_result.token_ids, [1, 1, 1]);
+                let mut delivered = Vec::new();
+                let mut callback = |token| {
+                    delivered.push(token);
+                    Ok(())
+                };
+                let result = engine.generate_with_callbacks(
+                    request.clone(),
+                    None,
+                    if streaming { Some(&mut callback) } else { None },
+                )?;
+                assert_eq!(
+                    result.token_ids,
+                    [1, 1, 1],
+                    "{backend:?} speculative={speculative}"
+                );
+                assert_eq!(result.text, "head\n ");
+                assert_eq!(result.finish_reason, FinishReason::IndentationLimit);
+                if backend == EngineDecodeBackend::Native {
+                    assert_eq!(
+                        result.retained_cache_tokens,
+                        reference_result.retained_cache_tokens
+                    );
+                    assert_eq!(
+                        engine
+                            .native_slot_state()
+                            .context("Native indentation prefix")?
+                            .materialized_tokens,
+                        reference_result.retained_cache_tokens
+                    );
+                }
+                if streaming {
+                    assert_eq!(delivered.len(), 3);
+                    assert_eq!(
+                        delivered.last().unwrap().finish_reason,
+                        Some(FinishReason::IndentationLimit)
+                    );
+                }
+                request.options.minimum_indent = 0;
+                request.options.max_new_tokens = 2;
+                request.options.speculative_mode = None;
+                request.options.num_speculative_tokens = None;
+                assert_eq!(engine.generate(request)?.token_ids, [1, 1]);
+            }
+        }
+        Ok(())
     }
 
     #[cfg(feature = "native-backend")]

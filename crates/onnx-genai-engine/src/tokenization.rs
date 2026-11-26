@@ -129,6 +129,40 @@ pub fn decode_output(
     })).context("decode generated token text; repair tokenizer.decoder or its vocabulary if decoding failed")
 }
 
+/// Decode final text with request-owned indentation clipping. This replay is
+/// independent of the finish label so an EOS/time override keeps the boundary.
+pub(crate) fn decode_generation_output(
+    tokenizer: &Tokenizer,
+    ids: &[u32],
+    options: &crate::GenerateOptions,
+) -> anyhow::Result<String> {
+    let preserved = options.effective_preserved_tokens();
+    if options.minimum_indent == 0 {
+        return decode_output(tokenizer, ids, &preserved);
+    }
+    let mut decoder = TokenTextDecoder::with_preserved_tokens(&preserved);
+    let mut projection = crate::indentation::IndentationProjection::new(options.minimum_indent);
+    let mut text = String::new();
+    let mut cutoff = None;
+    for (index, &id) in ids.iter().enumerate() {
+        text.push_str(&decoder.step(tokenizer, id)?);
+        if index + 1 == ids.len() {
+            text.push_str(&decoder.finish(tokenizer)?);
+        }
+        if let Some(boundary) = projection.observe(&text, &options.stop_sequences) {
+            cutoff.get_or_insert(boundary);
+        }
+    }
+    if let Some(cutoff) = cutoff {
+        anyhow::ensure!(
+            text.is_char_boundary(cutoff),
+            "indentation output boundary {cutoff} is not a UTF-8 boundary; repair output observer/tokenizer consistency"
+        );
+        text.truncate(cutoff);
+    }
+    Ok(text)
+}
+
 /// Decode committed token boundaries using the same request policy as live output.
 pub fn token_texts(
     tokenizer: Option<&Tokenizer>,

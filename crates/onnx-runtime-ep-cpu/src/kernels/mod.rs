@@ -157,6 +157,17 @@ static I64_ONLY: &[DataType] = &[DataType::Int64];
 /// Integer index/length inputs, matching `to_dense_i64`'s acceptance set.
 static INDEX_DTYPES: &[DataType] = &[DataType::Int64, DataType::Int32];
 
+/// DFT storage floats plus integer transform-length/axis controls. Per-slot
+/// constraints prevent integer signals or outputs from entering the float kernel.
+static DFT_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Float64,
+    DataType::Int32,
+    DataType::Int64,
+];
+
 /// STFT edges mix f32-compute signal/output tensors with integer scalar inputs.
 static STFT_DTYPES: &[DataType] = &[
     DataType::Float32,
@@ -269,6 +280,9 @@ pub fn input_dtype_constraints_for_op(
         (12, U8_ONLY),
         (13, U8_ONLY),
     ];
+    // signal, dft_length?, axis? (DFT-20 axis is strictly int64).
+    static DFT_SLOTS: &[(usize, &[DataType])] =
+        &[(0, FLOAT_DTYPES), (1, INDEX_DTYPES), (2, I64_ONLY)];
     // signal, frame_step, window?, frame_length?
     static STFT_SLOTS: &[(usize, &[DataType])] = &[
         (0, FLOAT_COMPUTE_DTYPES),
@@ -303,6 +317,7 @@ pub fn input_dtype_constraints_for_op(
         ("Attention", "com.microsoft") => MSFT_ATTENTION_SLOTS,
         ("PackedMultiHeadAttention", "com.microsoft") => PACKED_MHA_SLOTS,
         ("QMoE", "com.microsoft") => QMOE_SLOTS,
+        ("DFT", "") => DFT_SLOTS,
         ("STFT", "") => STFT_SLOTS,
         ("CumProd", "") => onnx_runtime_ir::opset26::CUM_PROD_INPUT_TYPES,
         ("NonMaxSuppression", "") => NMS_SLOTS,
@@ -321,10 +336,12 @@ pub fn output_dtype_constraints_for_op(
     op_type: &str,
     domain: &str,
 ) -> &'static [(usize, &'static [DataType])] {
+    static DFT_OUTPUTS: &[(usize, &[DataType])] = &[(0, FLOAT_DTYPES)];
     static DSA_INDEX_SELECT_OUTPUTS: &[(usize, &[DataType])] = &[(0, I64_ONLY)];
     static REGEX_OUTPUTS: &[(usize, &[DataType])] = &[(0, &[DataType::Bool])];
     static STRING_SPLIT_OUTPUTS: &[(usize, &[DataType])] = &[(0, STRING_ONLY), (1, I64_ONLY)];
     match (op_type, domain) {
+        ("DFT", "") => DFT_OUTPUTS,
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::OUTPUT_DTYPES,
         ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_OUTPUTS,
         ("RegexFullMatch", "") => REGEX_OUTPUTS,
@@ -535,9 +552,8 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         ("BitCast", "") => BIT_CAST_TYPES,
 
         // Window functions.
-        ("HannWindow", "") | ("HammingWindow", "") | ("BlackmanWindow", "") | ("DFT", "") => {
-            FLOAT_DTYPES
-        }
+        ("HannWindow", "") | ("HammingWindow", "") | ("BlackmanWindow", "") => FLOAT_DTYPES,
+        ("DFT", "") => DFT_DTYPES,
         ("STFT", "") => STFT_DTYPES,
 
         // com.microsoft contrib ops.
@@ -704,12 +720,14 @@ pub mod simd_sumsq;
 pub mod skip_simplified_layernorm;
 pub mod slice;
 pub mod softmax;
+mod softmax_geometry;
 pub mod sparse_kv_gather;
 pub mod split;
 pub mod stft;
 pub mod tensor_scatter;
 pub mod text;
 pub mod transpose;
+mod typed_workspace;
 pub mod unary_math;
 pub mod unique;
 pub mod unsqueeze;
@@ -1289,7 +1307,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("LayerNormalization", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(layernorm::LayerNormFactory),
     );
     // The optimizer emits fused `LayerNormalization` in the private contrib
@@ -1298,7 +1316,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     // still serves standard ONNX `LayerNormalization`.
     rec.register(
         OpKey::new("LayerNormalization", "com.microsoft", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(layernorm::LayerNormFactory),
     );
     // The optimizer's `MatMul + Add(bias)` fusion emits `FusedMatMulBias` in the
@@ -1433,17 +1451,17 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("SkipLayerNormalization", "com.microsoft", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(contrib_fused::SkipLayerNormFactory),
     );
     rec.register(
         OpKey::new("SimplifiedLayerNormalization", "com.microsoft", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(contrib_fused::SimplifiedLayerNormFactory),
     );
     rec.register(
         OpKey::new("SimplifiedLayerNormalization", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(contrib_fused::SimplifiedLayerNormFactory),
     );
     rec.register(
@@ -1476,12 +1494,12 @@ pub(crate) fn build_cpu_registry_with_resources(
     // `ai.onnx::RMSNormalization` added at opset 23.
     rec.register(
         OpKey::new("RMSNormalization", "", 23),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(rmsnorm::RmsNormFactory),
     );
     rec.register(
         OpKey::new("LpNormalization", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(lp_normalization::LpNormalizationFactory),
     );
     // `ai.onnx::RotaryEmbedding` added at opset 23.
@@ -1615,24 +1633,24 @@ pub(crate) fn build_cpu_registry_with_resources(
     // provider's opset-aware lookup selects the version-correct kernel.
     rec.register(
         OpKey::new("Softmax", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(softmax::SoftmaxLegacyFactory),
     );
     rec.register(
         OpKey::new("Softmax", "", 13),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(softmax::SoftmaxFactory),
     );
     // LogSoftmax shares Softmax's opset split: legacy flattened trailing axes
     // through opset 12, then one-axis normalization from opset 13.
     rec.register(
         OpKey::new("LogSoftmax", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(log_softmax::LogSoftmaxLegacyFactory),
     );
     rec.register(
         OpKey::new("LogSoftmax", "", 13),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(log_softmax::LogSoftmaxFactory),
     );
     // Shape / data movement.
@@ -2134,7 +2152,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("DFT", "", 17),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(dft::DftFactory),
     );
     rec.register(
@@ -3105,6 +3123,19 @@ mod tests {
                 "QLinearMatMul must advertise {required:?}"
             );
         }
+    }
+
+    #[test]
+    fn dft_advertises_floating_signal_output_and_integer_control_roles() {
+        assert_eq!(supported_dtypes_for_op("DFT", ""), DFT_DTYPES);
+        assert_eq!(
+            input_dtype_constraints_for_op("DFT", ""),
+            [(0, FLOAT_DTYPES), (1, INDEX_DTYPES), (2, I64_ONLY),]
+        );
+        assert_eq!(
+            output_dtype_constraints_for_op("DFT", ""),
+            [(0, FLOAT_DTYPES)]
+        );
     }
 
     #[test]
