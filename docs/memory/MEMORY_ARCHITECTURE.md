@@ -170,6 +170,15 @@ into its own reclaimable pool, whereas that capability requires actual backing
 retirement. The executor's generic pressure-parked lane must not be mistaken for
 an enabled CPU fast path. Each fitting CPU checkout/return still locks the pool,
 and each kernel still performs live execution refinement and backing validation.
+The provider-context transaction gate uses one atomic word for lifecycle and
+in-flight count. Normal Active entry/exit takes no context wait mutex; closure
+updates the same word to reject new entrants while preserving admitted guards.
+Only a closing context's last guard and quiescence waiters coordinate through a
+mutex/condition variable. This removes the two context-gate mutex acquisitions
+from a fitting checkout, not the pool mutex, atomic contention, owner validation
+or execution refinement. It is a structural cost reduction, not a measured
+latency claim. Completed CPU storage remains globally reclaimable in its pool;
+no new cross-run lease or untracked retained owner is introduced.
 
 The `cpu_three_node_runs_share_one_checkout_and_warm_calls_keep_the_original_grant`
 regression wraps the real CPU provider only to count boundary calls. After one
