@@ -268,6 +268,19 @@ remain.
 Counts/prefix initialization and index indirection have costs; this proves
 ownership and accounting, not zero mallocs or a measured latency improvement.
 
+Plain floating `MoE` includes eight named source regions beside its two FC
+banks and output accumulator in one eleven-region operation workspace. Aligned
+contiguous F32 sources borrow their original storage; half, strided and unaligned
+sources snapshot to exact f32 regions, including expert weights and optional
+biases. Shape-only nonempty preparation is Deferred because strides and addresses
+are not metadata facts; live refinement computes the current bound without
+repeating the metadata hook. Complete binding precedes every floating payload
+read, including bias conversion. All source snapshots remain live until final
+output publication, preserving input/output overlap. Empty output still validates
+source descriptors and shapes but reads no payload and reserves no conversions.
+Plain MoE's owned routing/grouping plan and optional MLAS batch metadata remain;
+this change removes floating source payload Vecs, not every allocation.
+
 ONNX integer `QMoE` now uses the same arena and immutable task views. Its two FC
 banks, score-order contribution storage, decoder scratch and routing arena form
 one five-region operation workspace. Shape-only bounds include FC2's expert axis
