@@ -1145,7 +1145,8 @@ fn response_format_maps_to_the_requested_generate_constraint() {
             .unwrap()
             .options
             .constraint,
-        Some(GenerateConstraint::Json {
+        Some(GenerateConstraint::JsonSchema {
+            schema: json!({"type":"object"}).to_string(),
             prefix: String::new()
         })
     );
@@ -1159,6 +1160,27 @@ fn response_format_maps_to_the_requested_generate_constraint() {
             prefix: String::new()
         })
     );
+    for (format, expected) in [
+        (
+            json!({"type":"json_schema","json_schema":{"name":"answer"}}),
+            json!({"type":"object"}),
+        ),
+        (json!({"type":"json_schema","schema":true}), json!(true)),
+    ] {
+        let request = chat_request(
+            json!({"messages":[{"role":"user","content":"hello"}],"response_format":format}),
+        );
+        assert_eq!(
+            build_generate_request(&request, &fixture_tokenizer())
+                .unwrap()
+                .options
+                .constraint,
+            Some(GenerateConstraint::JsonSchema {
+                schema: expected.to_string(),
+                prefix: String::new()
+            })
+        );
+    }
     assert_eq!(
         build_generate_request(&text_request, &fixture_tokenizer())
             .unwrap()
@@ -1179,7 +1201,7 @@ fn response_format_maps_to_the_requested_generate_constraint() {
 async fn chat_completions_rejects_malformed_json_schema() {
     let app = test_app().await;
     for json_schema in [
-        json!({"name": "answer"}),
+        json!({"name": "answer", "schema": []}),
         json!({"name": "answer", "schema": "not an object"}),
     ] {
         let response = app
