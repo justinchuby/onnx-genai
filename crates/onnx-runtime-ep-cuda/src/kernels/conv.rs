@@ -438,8 +438,8 @@ impl ConvKernel {
             return Ok(WorkspaceRequirement::NONE);
         }
 
-        let x_strides = compute_contiguous_strides(x.shape);
-        let y_strides = compute_contiguous_strides(&plan.output_shape);
+        let x_strides = compute_contiguous_strides(x.shape)?;
+        let y_strides = compute_contiguous_strides(&plan.output_shape)?;
         let spec = CudnnConvSpec {
             dtype: CudnnTensorType::from_onnx(x.dtype)?,
             input_dims: dims4(x.shape, "input")?,

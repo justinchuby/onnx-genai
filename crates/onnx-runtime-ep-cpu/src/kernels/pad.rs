@@ -209,7 +209,7 @@ impl Kernel for PadKernel {
             vec![0u8; esize]
         };
 
-        let in_strides = compute_contiguous_strides(&in_shape);
+        let in_strides = compute_contiguous_strides(&in_shape)?;
         let n_out = numel(&out_shape);
         let mut out = vec![0u8; n_out * esize];
         if n_out == 0 {

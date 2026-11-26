@@ -3374,6 +3374,39 @@ Three regressions fail on the previous implementation (two overflow panics and
 an incorrect empty count). Boundary checks cover both view kinds, zero axes in
 each position, true nonempty/byte overflow, scalar geometry, unsigned stride
 magnitudes and packed counts exceeding i64 without reading device pointers.
-Infallible compute_contiguous_strides and its production callers still need a
-separate fallible API migration for unrepresentable suffix strides; this change
-does not claim to fix stride construction or every unvalidated geometry caller.
+Contiguous stride construction is covered by the following migration; other
+unvalidated geometry helpers, including TensorLayout::storage_size, remain a
+separate audit.
+
+### Fallible stride construction shares an allocation-free checked plan
+
+compute_contiguous_strides, TensorLayout::resolved_strides and transpose now
+return Result. All runtime callers propagate layout failures; bounded fixtures
+assert their geometry explicitly. There is no compatibility constructor or
+wrapped/saturated fallback. Only stored suffix strides must fit signed i64;
+logical count and physical byte admission remain separate checks. Session's
+contextual count wrapper also delegates to IR so a zero after an overflowing
+prefix is still empty; Scan continues to reject genuine stacking row-count
+overflow. Bounds and gather paths recognize a zero axis before multiplying
+extents, preserving rank checks and scalar behavior without touching an empty
+backing. Even an empty
+shape cannot fabricate a suffix that is unrepresentable.
+
+ContiguousStridePlan borrows immutable shape metadata, validates the complete
+suffix recurrence, then fills caller-owned storage. A wrong output rank fails
+before writes. Session validates before resizing reused stride storage or
+publishing input descriptor fields. Plugin metadata uses the same plan and keeps
+its inline ordinary-rank storage and existing high-rank spill. No extra owner,
+cache, governor request or per-element check is introduced; the added work is a
+rank-sized validation pass.
+
+Plugin output bytes, strides and ORT signed dimension conversion are checked
+before GetOutput; dynamic device intermediates check before scratch allocation.
+Input stride failure precedes data access. Absent-output metadata reports the
+slot and cause rather than substituting empty strides. Compute converts failures
+to ORT status and preserves failed-state retirement. Eager preflights input/output
+strides before output allocation. Tests exercise boundary suffixes, zeros, scalar
+and high ranks, unchanged buffers on failure, legal reuse, both ORT shape hooks,
+output preflight and the real Compute callback with a fake ABI. A positive-control
+allocator witness checks repeated plan/fill without temporary allocations. This
+is not a latency measurement; CUDA remains compilation-only on this host.

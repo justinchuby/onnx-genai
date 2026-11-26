@@ -54,7 +54,9 @@ impl Kernel for ReshapeKernel {
         let shape = resolve_shape(data.shape, &requested, self.allowzero)?;
         Some(vec![ViewOutput {
             input_index: 0,
-            strides: compute_contiguous_strides(&shape),
+            // Decline only this alias optimization; normal output construction
+            // remains responsible for returning any layout error to the caller.
+            strides: compute_contiguous_strides(&shape).ok()?,
             shape,
             byte_offset: data.byte_offset,
         }])

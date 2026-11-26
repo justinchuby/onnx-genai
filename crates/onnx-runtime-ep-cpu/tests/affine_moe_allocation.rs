@@ -108,7 +108,10 @@ fn moe_payload_allocations_are_funded_by_one_workspace() {
     ];
     let strides = shapes
         .iter()
-        .map(|s| onnx_runtime_ir::compute_contiguous_strides(s))
+        .map(|s| {
+            onnx_runtime_ir::compute_contiguous_strides(s)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let pointers = [
         x.as_ptr().cast(),

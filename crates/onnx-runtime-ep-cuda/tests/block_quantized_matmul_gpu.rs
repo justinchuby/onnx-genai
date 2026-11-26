@@ -124,7 +124,10 @@ fn run_cpu(graph: &Graph, node: NodeId, inputs: &[HostTensor], output_shape: &[u
     let kernel = ep.get_kernel(model.graph.node(node), &[], 1).unwrap();
     let strides: Vec<_> = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let views: Vec<_> = inputs
         .iter()
@@ -139,7 +142,8 @@ fn run_cpu(graph: &Graph, node: NodeId, inputs: &[HostTensor], output_shape: &[u
             )
         })
         .collect();
-    let output_strides = compute_contiguous_strides(output_shape);
+    let output_strides = compute_contiguous_strides(output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut output = vec![0u8; output_shape.iter().product::<usize>() * 4];
     let output_view = TensorMut::new(
         DevicePtrMut(output.as_mut_ptr().cast()),
@@ -175,7 +179,10 @@ fn run_gpu(
     }
     let strides: Vec<_> = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let views: Vec<_> = inputs
         .iter()
@@ -193,7 +200,8 @@ fn run_gpu(
         .collect();
     let output_len = output_shape.iter().product::<usize>();
     let mut output_buffer = ep.allocate(output_len * 4, 256)?;
-    let output_strides = compute_contiguous_strides(output_shape);
+    let output_strides = compute_contiguous_strides(output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let output_view = TensorMut::new(
         DevicePtrMut(output_buffer.as_mut_ptr()),
         DataType::Float32,

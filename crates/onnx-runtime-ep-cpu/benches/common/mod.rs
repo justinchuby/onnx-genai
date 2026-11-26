@@ -163,7 +163,8 @@ impl Tensor {
         Self {
             storage,
             shape: shape.to_vec(),
-            strides: compute_contiguous_strides(shape),
+            strides: compute_contiguous_strides(shape)
+                .expect("fixed benchmark fixture dimensions fit signed 64-bit strides"),
             dtype,
         }
     }

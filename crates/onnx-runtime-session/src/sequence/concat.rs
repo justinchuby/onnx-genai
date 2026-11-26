@@ -77,7 +77,13 @@ impl ConcatPlan {
             validate_view_bounds(
                 OP,
                 &item.shape,
-                &item.layout.resolved_strides(&item.shape),
+                &item
+                    .layout
+                    .resolved_strides(&item.shape)
+                    .map_err(|source| SequenceError::TensorCreation {
+                        op: OP,
+                        source: source.into(),
+                    })?,
                 item.byte_offset,
                 item.dtype,
                 item.root_len(),

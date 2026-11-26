@@ -162,7 +162,10 @@ fn run_matmul_nbits_f16(ep: &CudaExecutionProvider, p: &Int4Problem) -> Vec<f32>
     }
     let strides: Vec<Vec<i64>> = inputs
         .iter()
-        .map(|(_, shape, _)| compute_contiguous_strides(shape))
+        .map(|(_, shape, _)| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let views: Vec<TensorView> = inputs
         .iter()
@@ -176,7 +179,8 @@ fn run_matmul_nbits_f16(ep: &CudaExecutionProvider, p: &Int4Problem) -> Vec<f32>
     let output_len = p.m * p.n;
     let mut output_buffer = ep.allocate(output_len * 2, 256).expect("allocate output");
     let output_shape = [p.m, p.n];
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let output_view = TensorMut::new(
         DevicePtrMut(output_buffer.as_mut_ptr()),
         DataType::Float16,

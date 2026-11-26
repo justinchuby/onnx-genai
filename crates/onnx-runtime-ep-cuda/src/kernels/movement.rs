@@ -507,6 +507,8 @@ impl Kernel for ReshapeKernel {
         if out_numel != data.numel() {
             return None;
         }
+        // Only commit capture metadata after the alias layout is representable.
+        let strides = compute_contiguous_strides(&shape).ok()?;
         if let Ok(mut warmed) = self.warmed_signature.lock() {
             *warmed = Some(ReshapeCaptureSignature {
                 dtype: data.dtype,
@@ -516,7 +518,7 @@ impl Kernel for ReshapeKernel {
         }
         Some(vec![ViewOutput {
             input_index: 0,
-            strides: compute_contiguous_strides(&shape),
+            strides,
             shape,
             byte_offset: data.byte_offset,
         }])
@@ -728,7 +730,7 @@ impl Kernel for ExpandKernel {
             ));
         }
         let mut metadata = out_shape.iter().map(|&v| v as u64).collect::<Vec<_>>();
-        metadata.extend(broadcast_strides(inputs[0].shape, &out_shape));
+        metadata.extend(broadcast_strides(inputs[0].shape, &out_shape)?);
         let mut metadata_cache = self.metadata.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep Expand: metadata lock was poisoned".into())
         })?;
@@ -821,7 +823,7 @@ impl Kernel for TransposeKernel {
                 "cuda_ep Transpose: perm rank mismatch".into(),
             ));
         }
-        let in_strides = compute_contiguous_strides(inputs[0].shape);
+        let in_strides = compute_contiguous_strides(inputs[0].shape)?;
         let mut seen = vec![false; rank];
         let mut expected = Vec::with_capacity(rank);
         let mut metadata = outputs[0]
@@ -1161,7 +1163,7 @@ impl Kernel for SliceKernel {
             }
             return Ok(());
         }
-        let contiguous = compute_contiguous_strides(inputs[0].shape);
+        let contiguous = compute_contiguous_strides(inputs[0].shape)?;
         let strides = plan
             .iter()
             .zip(&contiguous)
@@ -1320,7 +1322,7 @@ impl Kernel for TileKernel {
             .collect::<Vec<_>>();
         metadata.extend(inputs[0].shape.iter().map(|&v| v as u64));
         metadata.extend(
-            compute_contiguous_strides(inputs[0].shape)
+            compute_contiguous_strides(inputs[0].shape)?
                 .iter()
                 .map(|&v| v as u64),
         );

@@ -99,10 +99,13 @@ fn run(
         runtime.htod(f32_bytes(scale), cuptr(scale_buffer.as_ptr()))?;
     }
 
-    let input_strides = compute_contiguous_strides(shape);
+    let input_strides = compute_contiguous_strides(shape)
+        .expect("fixture shape has representable contiguous strides");
     let scale_shape = [scale.len()];
-    let scale_strides = compute_contiguous_strides(&scale_shape);
-    let stats_strides = compute_contiguous_strides(&stats_shape);
+    let scale_strides = compute_contiguous_strides(&scale_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let stats_strides = compute_contiguous_strides(&stats_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [
         TensorView::new(
             DevicePtr(input_buffer.as_ptr()),
