@@ -2248,7 +2248,7 @@ mod tests {
         }
     }
 
-    fn check_bitshift_plugin_admission(opset: u64) {
+    fn check_bitshift_plugin_admission(opset: i64) {
         use onnx_runtime_ep_api::abi::OrtGraphView;
         use onnx_runtime_ep_cpu::CpuExecutionProvider;
         use onnx_runtime_ir::{Attribute, Graph, GraphView, GraphViewCache, Node, NodeId, Shape};
