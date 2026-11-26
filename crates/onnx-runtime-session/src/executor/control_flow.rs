@@ -330,6 +330,17 @@ impl ChildExecutor {
 // session/graph context) cannot do. Each body is compiled to a child
 // [`Executor`] once and **reused across iterations** (see [`ChildExecutor`]).
 impl Executor {
+    // Graph outputs already promise host materialization on the copy path.
+    // CPU sessions preserve their own allocator; device sessions retain the
+    // existing explicit device-to-host output-copy destination.
+    fn output_host_allocator(&self) -> Arc<dyn ExecutionProvider> {
+        if self.ep.device_id().is_host_accessible() {
+            Arc::clone(&self.ep)
+        } else {
+            crate::tensor::cpu_allocator()
+        }
+    }
+
     /// Materialize value `vid`'s current bytes into an owned host [`Tensor`],
     /// using its resolved concrete shape and recorded dtype.
     pub(super) fn value_tensor(
@@ -368,13 +379,18 @@ impl Executor {
                 )));
             }
             let buffer = value.readable_buffer()?;
-            let mut bytes = vec![0_u8; n];
-            self.ep.copy_to_host(&buffer, &mut bytes)?;
-            return Tensor::from_raw(dtype, shape, &bytes);
+            return crate::tensor::HostTensorAllocator::new(self.output_host_allocator())?.fill(
+                dtype,
+                shape,
+                |bytes| {
+                    self.ep
+                        .copy_to_host(&buffer, bytes)
+                        .map_err(SessionError::from)
+                },
+            );
         }
-        // A view value owns no buffer; materialize its strided bytes contiguous.
-        let bytes = self.contiguous_bytes(vid, &shape, dtype)?;
-        Tensor::from_raw(dtype, shape, &bytes)
+        self.contiguous_output_tensor(vid, &shape, dtype)
+            .map(|(tensor, _)| tensor)
     }
 
     /// The buffer-owning (root) value backing `vid`: `vid` itself if it owns a
@@ -486,6 +502,21 @@ impl Executor {
         shape: &[usize],
         dtype: DataType,
     ) -> Result<(Tensor, usize)> {
+        if let Some(element) = self.seq_elem_values.get(&vid)
+            && element.device().is_host_accessible()
+        {
+            let n = checked_storage_bytes(
+                dtype,
+                checked_numel(shape, || format!("value#{}", vid.0))?,
+                || format!("value#{}", vid.0),
+                shape,
+            )?;
+            let tensor = crate::tensor::HostTensorAllocator::new(self.output_host_allocator())?
+                .fill(dtype, shape.to_vec(), |bytes| {
+                    element.copy_host_contiguous_into(bytes)
+                })?;
+            return Ok((tensor, n));
+        }
         let esize = dtype.byte_size();
         if esize > 0
             && !self.seq_elem_values.contains_key(&vid)
@@ -502,21 +533,44 @@ impl Executor {
             // invalid bit patterns. The gather only reads, and the destination
             // is a freshly allocated tensor that cannot alias it.
             let src = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len()) };
-            let tensor = Tensor::from_host_fill(dtype, shape.to_vec(), |dst| {
-                gather_view_into(
-                    dst,
-                    src,
-                    &view.shape,
-                    &view.strides,
-                    view.byte_offset,
-                    esize,
-                );
+            let tensor = crate::tensor::HostTensorAllocator::new(self.output_host_allocator())?
+                .fill(dtype, shape.to_vec(), |dst| {
+                    gather_view_into(
+                        dst,
+                        src,
+                        &view.shape,
+                        &view.strides,
+                        view.byte_offset,
+                        esize,
+                    );
+                    Ok(())
+                })?;
+            return Ok((tensor, n));
+        }
+        if !self.seq_elem_values.contains_key(&vid) && !self.views.contains_key(&vid) {
+            let n = checked_storage_bytes(
+                dtype,
+                checked_numel(shape, || format!("value#{}", vid.0))?,
+                || format!("value#{}", vid.0),
+                shape,
+            )?;
+            let source = self.buffers.get(&vid).ok_or_else(|| {
+                SessionError::Internal(format!("value#{} has no produced backing", vid.0))
             })?;
+            let tensor = crate::tensor::HostTensorAllocator::new(self.output_host_allocator())?
+                .fill(dtype, shape.to_vec(), |bytes| {
+                    self.ep
+                        .copy_to_host(source, bytes)
+                        .map_err(SessionError::from)
+                })?;
             return Ok((tensor, n));
         }
         let bytes = self.contiguous_bytes(vid, shape, dtype)?;
         let n = bytes.len();
-        Ok((Tensor::from_raw(dtype, shape.to_vec(), &bytes)?, n))
+        Ok((
+            Tensor::from_raw_in(self.output_host_allocator(), dtype, shape.to_vec(), &bytes)?,
+            n,
+        ))
     }
 
     pub(super) fn contiguous_bytes(
@@ -1511,7 +1565,12 @@ impl Executor {
             {
                 let source_index = if direction == 0 { 0 } else { trip_count - 1 };
                 let (shape, bytes) = scan_slice(input, axis, source_index, index)?;
-                scan_slices.push(Tensor::from_raw(input.dtype, shape, &bytes)?);
+                scan_slices.push(Tensor::from_raw_in(
+                    self.output_host_allocator(),
+                    input.dtype,
+                    shape,
+                    &bytes,
+                )?);
             }
         }
         // Runtime dual-path (slice 1a). A single-trip Scan — trip_count == 1, the

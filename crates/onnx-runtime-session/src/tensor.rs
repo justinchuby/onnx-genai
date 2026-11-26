@@ -1200,6 +1200,116 @@ impl Drop for DeviceIoBinding {
     }
 }
 
+/// Host tensor construction retaining the session's actual allocation owner.
+///
+/// Payload allocation is governed when the supplying session provider has a
+/// managed ordinary-buffer domain. This context does not create a new budget.
+#[derive(Clone)]
+pub struct HostTensorAllocator {
+    allocator: Arc<dyn ExecutionProvider>,
+}
+impl HostTensorAllocator {
+    pub(crate) fn new(allocator: Arc<dyn ExecutionProvider>) -> Result<Self> {
+        if !allocator.device_id().is_host_accessible() {
+            return Err(SessionError::Internal(format!(
+                "host tensor construction requires a host-accessible provider, got {:?}; use a CPU session or explicit device transfer",
+                allocator.device_id()
+            )));
+        }
+        Ok(Self { allocator })
+    }
+    pub fn from_raw(&self, dtype: DataType, shape: Vec<usize>, bytes: &[u8]) -> Result<Tensor> {
+        Tensor::from_raw_in(Arc::clone(&self.allocator), dtype, shape, bytes)
+    }
+    /// Write f32 values directly into admitted backing, without a payload Vec.
+    pub fn from_f32(&self, shape: &[usize], values: &[f32]) -> Result<Tensor> {
+        self.from_values(DataType::Float32, shape, values.len(), |bytes| {
+            for (target, value) in bytes.chunks_exact_mut(4).zip(values) {
+                target.copy_from_slice(&value.to_le_bytes());
+            }
+        })
+    }
+    /// Write i64 values directly into admitted backing, without a payload Vec.
+    pub fn from_i64(&self, shape: &[usize], values: &[i64]) -> Result<Tensor> {
+        self.from_values(DataType::Int64, shape, values.len(), |bytes| {
+            for (target, value) in bytes.chunks_exact_mut(8).zip(values) {
+                target.copy_from_slice(&value.to_le_bytes());
+            }
+        })
+    }
+    fn from_values(
+        &self,
+        dtype: DataType,
+        shape: &[usize],
+        count: usize,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Result<Tensor> {
+        let expected =
+            checked_expected_bytes(dtype, shape).ok_or_else(|| SessionError::ShapeOverflow {
+                value: "HostTensorAllocator::from_values".into(),
+                dims: shape.to_vec(),
+            })?;
+        if count.checked_mul(dtype.byte_size()) != Some(expected) {
+            return Err(SessionError::Internal(format!(
+                "host tensor {:?} {shape:?} requires {expected} bytes but got {count} values; match the declared element count",
+                dtype
+            )));
+        }
+        self.fill(dtype, shape.to_vec(), |bytes| {
+            fill(bytes);
+            Ok(())
+        })
+    }
+    /// Allocate initialized bytes before exposing any safe readable slice.
+    pub fn zeros(&self, dtype: DataType, shape: Vec<usize>) -> Result<Tensor> {
+        Tensor::require_raw_dtype(dtype)?;
+        let expected =
+            checked_expected_bytes(dtype, &shape).ok_or_else(|| SessionError::ShapeOverflow {
+                value: "HostTensorAllocator::zeros".into(),
+                dims: shape.clone(),
+            })?;
+        let buffer = self
+            .allocator
+            .allocate(expected.max(1), TensorLayout::contiguous().alignment)?;
+        // Install RAII ownership before host validation or any user fill/copy.
+        let mut tensor =
+            Tensor::from_owned_buffer(Arc::clone(&self.allocator), dtype, shape, buffer);
+        if !tensor.device.is_host_accessible() {
+            return Err(SessionError::Internal("host tensor allocator returned non-host backing; fix the provider's device/allocation contract".into()));
+        }
+        let buffer = tensor
+            .storage
+            .raw_mut()
+            .expect("new raw tensor owns backing");
+        // SAFETY: uniquely owned host backing, with checked logical length.
+        // Initialize with raw writes before constructing a readable byte slice.
+        unsafe {
+            std::ptr::write_bytes(buffer.as_mut_ptr().cast::<u8>(), 0, expected.max(1));
+        }
+        Ok(tensor)
+    }
+    /// Fill initialized bytes; errors and panics release the RAII tensor owner.
+    /// A failed physical release remains funded through the manager quarantine.
+    pub fn fill(
+        &self,
+        dtype: DataType,
+        shape: Vec<usize>,
+        fill: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Result<Tensor> {
+        let mut tensor = self.zeros(dtype, shape)?;
+        let expected = tensor.as_bytes().len();
+        let buffer = tensor
+            .storage
+            .raw_mut()
+            .expect("new raw tensor owns backing");
+        // SAFETY: zeros initialized the whole uniquely borrowed logical range.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<u8>(), expected) };
+        fill(bytes)?;
+        Ok(tensor)
+    }
+}
+
 impl Tensor {
     pub(crate) fn copy_from_device_buffer(
         source_allocator: &Arc<dyn ExecutionProvider>,
@@ -1228,31 +1338,7 @@ impl Tensor {
     }
 
     pub(crate) fn allocate_cpu(dtype: DataType, shape: Vec<usize>) -> Result<Self> {
-        Self::require_raw_dtype(dtype)?;
-        let numel = shape.iter().try_fold(1usize, |product, &dim| {
-            product.checked_mul(dim).ok_or_else(|| {
-                SessionError::Internal(format!(
-                    "Tensor::allocate_cpu: element count overflows for shape {shape:?}"
-                ))
-            })
-        })?;
-        let bytes = dtype.checked_storage_bytes(numel).ok_or_else(|| {
-            SessionError::Internal(format!(
-                "Tensor::allocate_cpu: byte count overflows for shape {shape:?} dtype {dtype:?}"
-            ))
-        })?;
-        let allocator: Arc<dyn ExecutionProvider> = shared_cpu_ep();
-        let layout = TensorLayout::contiguous();
-        let buffer = allocator.allocate(bytes.max(1), layout.alignment)?;
-        Ok(Self {
-            dtype,
-            shape,
-            layout,
-            device: buffer.device(),
-            storage: TensorStorage::Raw(Some(buffer)),
-            allocator,
-            import_guard: None,
-        })
+        HostTensorAllocator::new(shared_cpu_ep())?.zeros(dtype, shape)
     }
 
     pub(crate) fn copy_from_host_at(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
@@ -1285,19 +1371,16 @@ impl Tensor {
                 bytes.len()
             )));
         }
-        let layout = TensorLayout::contiguous();
-        let align = layout.alignment;
-        let mut buffer = allocator.allocate(expected.max(1), align)?;
-        allocator.copy_from_host(bytes, &mut buffer)?;
-        Ok(Self {
-            dtype,
-            shape,
-            layout,
-            device: buffer.device(),
-            storage: TensorStorage::Raw(Some(buffer)),
-            allocator,
-            import_guard: None,
-        })
+        let buffer = allocator.allocate(expected.max(1), TensorLayout::contiguous().alignment)?;
+        let mut tensor = Self::from_owned_buffer(Arc::clone(&allocator), dtype, shape, buffer);
+        allocator.copy_from_host(
+            bytes,
+            tensor
+                .storage
+                .raw_mut()
+                .expect("new raw tensor owns backing"),
+        )?;
+        Ok(tensor)
     }
 
     /// Build a tensor from raw little-endian bytes on the shared CPU device.
@@ -1311,82 +1394,7 @@ impl Tensor {
     /// these bytes twice and memcpys between them, which on a hybrid decoder's
     /// per-layer `conv_state`/`recurrent_state` is the whole cost of the call.
     pub fn zeros(dtype: DataType, shape: Vec<usize>) -> Result<Self> {
-        Self::require_raw_dtype(dtype)?;
-        let allocator = shared_cpu_ep();
-        let numel: usize = shape.iter().product();
-        let expected = dtype.storage_bytes(numel);
-        let layout = TensorLayout::contiguous();
-        let mut buffer = allocator.allocate(expected.max(1), layout.alignment)?;
-        assert!(
-            buffer.device().is_host_accessible(),
-            "zeros on non-host device {:?}",
-            buffer.device()
-        );
-        if expected > 0 {
-            let dst = buffer.as_mut_ptr() as *mut u8;
-            // SAFETY: host-accessible device (asserted); `dst` is a unique
-            // writable host pointer obtained via `&mut buffer` with no alias,
-            // and the allocation is at least `expected` bytes because that is
-            // what was requested.
-            unsafe { std::ptr::write_bytes(dst, 0, expected) };
-        }
-        Ok(Self::from_owned_buffer(allocator, dtype, shape, buffer))
-    }
-
-    /// Allocate a host tensor and let `fill` write its bytes in place.
-    ///
-    /// The alternative is to build the bytes in a `Vec` and hand them to
-    /// [`from_raw`], which allocates the same bytes twice and memcpys between
-    /// them -- the objection [`zeros`] already records, and the reason `zeros`
-    /// exists. It matters most on the view-graph-output path, where the producer
-    /// is a strided gather whose result is the tensor and nothing else: there
-    /// the second allocation and copy are the entire remaining overhead of
-    /// materializing the output.
-    ///
-    /// `fill` receives exactly `storage_bytes(numel)` bytes of **uninitialized**
-    /// memory as a `&mut [u8]` and **must write every one of them**. Reading an
-    /// uninitialized `u8` is undefined behaviour -- Miri rejects it -- so this
-    /// is a hard obligation on the caller, not a "you get arbitrary bytes"
-    /// convenience. The only caller is the view-materialization path, whose
-    /// gather writes `numel * esize` bytes in disjoint blocks covering the whole
-    /// destination; `gather_view_into`'s falsifiers (`no_output_byte_is_left_
-    /// unwritten`, and the parallel-vs-serial bit-identity test) exist to keep
-    /// that true.
-    ///
-    /// If `fill` panics the buffer is dropped without reaching
-    /// [`ExecutionProvider::deallocate`], which per the ep-api contract leaks it
-    /// rather than double-freeing. That is the same behaviour as any other
-    /// panic between `allocate` and tensor construction, and is why `fill`
-    /// should stay a straight-line writer.
-    pub(crate) fn from_host_fill(
-        dtype: DataType,
-        shape: Vec<usize>,
-        fill: impl FnOnce(&mut [u8]),
-    ) -> Result<Self> {
-        let expected =
-            checked_expected_bytes(dtype, &shape).ok_or_else(|| SessionError::ShapeOverflow {
-                value: "Tensor::from_host_fill".to_string(),
-                dims: shape.clone(),
-            })?;
-        let allocator = shared_cpu_ep();
-        let layout = TensorLayout::contiguous();
-        let mut buffer = allocator.allocate(expected.max(1), layout.alignment)?;
-        assert!(
-            buffer.device().is_host_accessible(),
-            "from_host_fill on non-host device {:?}",
-            buffer.device()
-        );
-        if expected > 0 {
-            // SAFETY: host-accessible device (asserted); `as_mut_ptr` comes from
-            // a unique `&mut buffer` with no alias, and the allocation is at
-            // least `expected` bytes because that is what was requested. `u8` has
-            // no invalid bit patterns, so a `&mut [u8]` over it is valid before
-            // it is written.
-            let dst =
-                unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr() as *mut u8, expected) };
-            fill(dst);
-        }
-        Ok(Self::from_owned_buffer(allocator, dtype, shape, buffer))
+        HostTensorAllocator::new(shared_cpu_ep())?.zeros(dtype, shape)
     }
 
     /// Take ownership of an already-allocated, contiguous `buffer` (allocated by
