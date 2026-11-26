@@ -271,7 +271,10 @@ fn validate_types(dtypes: impl ExactSizeIterator<Item = DataType>) -> Result<()>
     for (i, dtype) in dtypes.enumerate() {
         if i == 0 {
             x = dtype;
-            if !DTYPES.contains(&x) {
+            if !matches!(
+                x,
+                DataType::Float16 | DataType::BFloat16 | DataType::Float32 | DataType::Float64
+            ) {
                 return Err(error(format!(
                     "X must be Float16, BFloat16, Float32, or Float64; got {x:?}"
                 )));

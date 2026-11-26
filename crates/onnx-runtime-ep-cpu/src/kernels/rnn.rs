@@ -374,6 +374,18 @@ mod tests {
     }
 
     #[test]
+    fn rnn_rejects_int32_data_inputs() {
+        let ep = CpuExecutionProvider::new();
+        let shapes = [
+            static_shape([1, 1, 1]),
+            static_shape([1, 1, 1]),
+            static_shape([1, 1, 1]),
+        ];
+        let claim = ep.supports_op(&node(), 19, &shapes, &[DataType::Int32; 3], &[]);
+        assert!(claim.reason().unwrap().contains("X must be Float16"));
+    }
+
+    #[test]
     fn rnn_bf16_zero_time_clears_final_state() {
         let ep = CpuExecutionProvider::new();
         let mut node = node();
