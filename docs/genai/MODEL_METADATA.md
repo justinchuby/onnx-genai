@@ -137,8 +137,10 @@ package:
 The example spellings are placeholders for exact registered package tokens,
 not defaults. The authored template receives ordered filename/text strings and
 renders only text; filenames never authorize filesystem access. Rendered context
-is prepended before either PSM or SPM framing. Missing extra context does not
-render the template or add an implicit header.
+is prepended before either PSM or SPM framing on native `/infill`. A declared
+template renders the ordered file-context list even when that list is empty.
+Without a declared template, an absent or empty list preserves ordinary framing;
+a nonempty list requires an authored template.
 
 Explicit infill control roles terminate generated FIM output. Extra terminators
 come only from `additional_stop_tokens` and the package EOS facts; token spellings
