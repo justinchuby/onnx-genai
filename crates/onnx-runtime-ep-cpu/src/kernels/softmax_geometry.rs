@@ -80,7 +80,7 @@ impl SoftmaxGeometry {
             inner,
             count,
             output_dtype: dtype,
-            workspace: TypedWorkspace::<f32, _>::new(op, [("Y staging", count)])?,
+            workspace: TypedWorkspace::<f32, _>::new(op, [("f32 staging", count)])?,
         })
     }
 }

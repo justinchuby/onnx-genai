@@ -23,7 +23,8 @@
 
 use crate::dtype::{
     can_borrow_dense_f32, output_direct_write_eligible, to_dense_f32_widen,
-    validate_f32_widen_input, validate_host_output, write_dense_f32_narrow,
+    to_dense_f32_widen_into, validate_f32_widen_input, validate_host_output,
+    write_dense_f32_narrow,
 };
 use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
@@ -182,8 +183,28 @@ fn scale_mask_softmax_serial(
     scale: f32,
     mask: Option<MaskPlan<'_>>,
 ) {
+    scale_mask_softmax_serial_with_kernel(data, first_row, d, scale, mask, softmax_rows_serial);
+}
+
+// Static callback exposes actual row batching to correctness tests. Production
+// supplies the same row kernel as before, with no per-tile dynamic dispatch.
+fn scale_mask_softmax_serial_with_kernel(
+    data: &mut [f32],
+    first_row: usize,
+    d: usize,
+    scale: f32,
+    mask: Option<MaskPlan<'_>>,
+    softmax: impl Fn(&mut [f32], usize),
+) {
     let rows = data.len() / d;
     if rows == 0 {
+        return;
+    }
+    // Cache tiling serves the preceding scale/mask writes. With no transform,
+    // there are no such writes to retain: batch the complete worker run once,
+    // matching the out-of-place driver's row-kernel call count.
+    if scale == 1.0 && mask.is_none() {
+        softmax(data, d);
         return;
     }
     let rows_per_tile = (ROW_TILE_BYTES / (d * size_of::<f32>())).clamp(1, rows);
@@ -237,7 +258,7 @@ fn scale_mask_softmax_serial(
             }
             None => {}
         }
-        softmax_rows_serial(tile, d);
+        softmax(tile, d);
         row0 += tile_rows;
     }
 }
@@ -966,19 +987,42 @@ pub(crate) fn softmax_slices(
         softmax_rows(&x[..len], &mut out[..len], outer, axis_dim);
         return;
     }
+    softmax_strided_slices(out, |_, index| x[index], outer, axis_dim, inner);
+}
+
+/// The admitted snapshot is dense; reduction groups are disjoint and finish
+/// their maximum before overwriting any source element. Each exponential then
+/// reads only its own original input, followed by normalization of that group.
+fn softmax_slices_in_place(data: &mut [f32], outer: usize, axis_dim: usize, inner: usize) {
+    if inner == 1 {
+        scale_mask_softmax_rows(data, outer, axis_dim, 1.0, None);
+    } else {
+        softmax_strided_slices(data, |lane, index| lane[index], outer, axis_dim, inner);
+    }
+}
+
+// Share the exact original arithmetic with borrowed-input execution. Static
+// accessors avoid shared/mutable slice aliasing and per-element dynamic calls.
+fn softmax_strided_slices(
+    out: &mut [f32],
+    read: impl Fn(&[f32], usize) -> f32,
+    outer: usize,
+    axis_dim: usize,
+    inner: usize,
+) {
     for o in 0..outer {
         for i in 0..inner {
             let base = o * axis_dim * inner + i;
             let mut max = f32::NEG_INFINITY;
             for a in 0..axis_dim {
-                let v = x[base + a * inner];
+                let v = read(out, base + a * inner);
                 if v > max {
                     max = v;
                 }
             }
             let mut sum = 0.0f32;
             for a in 0..axis_dim {
-                let e = (x[base + a * inner] - max).exp();
+                let e = (read(out, base + a * inner) - max).exp();
                 out[base + a * inner] = e;
                 sum += e;
             }
@@ -1045,9 +1089,9 @@ impl SoftmaxKernel {
                 std::slice::from_ref(&range),
             ))
         } else {
-            // Widening/materialization finishes into owned storage before Y is
-            // borrowed. No source tensor range remains live during the reducer.
-            Ok(output_direct_write_eligible(output, count, &[]))
+            // Materialization needs one full f32 payload even with direct Y.
+            // Admit that payload instead of allocating an ungoverned input Vec.
+            Ok(false)
         }
     }
     fn run(
@@ -1076,9 +1120,8 @@ impl SoftmaxKernel {
         }
         if Self::direct(&inputs[0], &outputs[0], geometry.count)? {
             let x = to_dense_f32_widen("Softmax", &inputs[0])?;
-            // SAFETY: the common classifier proves complete aligned contiguous
-            // Host f32 output, disjoint from borrowed X. Owned widening above
-            // completes before this mutable slice is formed.
+            // SAFETY: the classifier proves borrowed contiguous aligned f32 X
+            // and complete aligned contiguous Host f32 Y, with disjoint ranges.
             let y = unsafe {
                 std::slice::from_raw_parts_mut(outputs[0].data_ptr_mut::<f32>(), geometry.count)
             };
@@ -1089,8 +1132,31 @@ impl SoftmaxKernel {
             // Complete binding validation precedes all input reads/output writes.
             unsafe {
                 geometry.workspace.with_buffers(workspace, |[y]| {
-                    let x = to_dense_f32_widen("Softmax", &inputs[0])?;
-                    softmax_slices(&x, y, geometry.outer, geometry.width, geometry.inner);
+                    if can_borrow_dense_f32(&inputs[0]) {
+                        let x = to_dense_f32_widen("Softmax", &inputs[0])?;
+                        softmax_slices(&x, y, geometry.outer, geometry.width, geometry.inner);
+                    } else {
+                        // Finish the complete snapshot before touching real Y,
+                        // preserving arbitrary input/output overlap and conversion.
+                        to_dense_f32_widen_into("Softmax", &inputs[0], y)?;
+                        if output_direct_write_eligible(&outputs[0], geometry.count, &[]) {
+                            // SAFETY: the classifier proves complete aligned Host
+                            // f32 Y. Its backing is disjoint from exclusive scratch.
+                            let output = std::slice::from_raw_parts_mut(
+                                outputs[0].data_ptr_mut::<f32>(),
+                                geometry.count,
+                            );
+                            softmax_slices(
+                                y,
+                                output,
+                                geometry.outer,
+                                geometry.width,
+                                geometry.inner,
+                            );
+                            return Ok(());
+                        }
+                        softmax_slices_in_place(y, geometry.outer, geometry.width, geometry.inner);
+                    }
                     write_dense_f32_narrow("Softmax", &mut outputs[0], y)
                 })
             }
@@ -1107,7 +1173,9 @@ impl Kernel for SoftmaxKernel {
         let geometry = self.geometry(inputs, outputs)?;
         if geometry.count == 0 {
             Ok(WorkspacePreparation::Ready(WorkspaceRequirement::NONE))
-        } else if geometry.output_dtype == onnx_runtime_ir::DataType::Float32 {
+        } else if geometry.output_dtype == onnx_runtime_ir::DataType::Float32
+            && inputs[0].dtype == onnx_runtime_ir::DataType::Float32
+        {
             Ok(WorkspacePreparation::Deferred)
         } else {
             Ok(WorkspacePreparation::Ready(
