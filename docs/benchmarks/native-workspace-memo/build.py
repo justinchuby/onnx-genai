@@ -47,7 +47,7 @@ def main():
     original = {p: (ROOT / p).read_bytes() for p in RUNTIME}
     inputs = ['probe/Cargo.toml', 'probe/Cargo.lock', 'probe/src/main.rs']
     sources = {p: digest(HERE / p) for p in inputs}
-    env = {k:v for k,v in os.environ.items() if not k.startswith(('CARGO_PROFILE_', 'NXRT_', 'ONNX_GENAI_', 'RAYON_', 'VECLIB_', 'MLAS_', 'OMP_')) and k not in ['RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS']}
+    env = {k:v for k,v in os.environ.items() if not k.startswith(('CARGO_PROFILE_', 'NXRT_', 'ONNX_', 'RAYON_', 'VECLIB_', 'MLAS_', 'OMP_')) and k not in ['RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS']}
     env.update(CARGO_TARGET_DIR=str(target), CARGO_INCREMENTAL='0', CARGO_BUILD_JOBS='1', CARGO_PROFILE_RELEASE_DEBUG='0')
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(SystemExit('terminated; restoring candidate source')))
     with LOCK.open('r+') as lock:

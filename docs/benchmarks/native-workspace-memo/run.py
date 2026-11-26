@@ -51,7 +51,7 @@ def main():
     host=sampler.HostCPU()
     scripts=['protocol.json','run.py','analyze.py','verify.py','../packed-activation-study/run.py']
     hashes={p:build.digest(HERE/p) for p in scripts}
-    env={k:v for k,v in os.environ.items() if not k.startswith(('NXRT_','ONNX_GENAI_','RAYON_','VECLIB_','MLAS_','OMP_'))}
+    env={k:v for k,v in os.environ.items() if not k.startswith(('NXRT_','ONNX_','RAYON_','VECLIB_','MLAS_','OMP_'))}
     env.update(RAYON_NUM_THREADS='1',ONNX_GENAI_CPU_DECODE_THREADS='1',VECLIB_MAXIMUM_THREADS='1')
     with LOCK.open('r+') as lock:
         print(json.dumps({'status':'queued','pid':os.getpid(),'inode':os.fstat(lock.fileno()).st_ino}),flush=True)
