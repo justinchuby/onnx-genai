@@ -6859,11 +6859,13 @@ fn public_block_moe_accepts_preserved_trailing_optional_inputs() {
             let router = Tensor::from_f32(&[1, 2], &[4., -4.]).unwrap();
             let bindings = [("data", &data), ("router", &router)];
             if prepared {
-                session
+                let report = session
                     .prepare_with_device_bindings(&bindings, &mut [])
-                    .unwrap()
-                    .require_complete()
                     .unwrap();
+                assert!(
+                    matches!(report, crate::WorkspacePreparationReport::Deferred { .. }),
+                    "shape-only preparation cannot infer packed expert strides"
+                );
             }
             let output = session.run(&bindings).unwrap();
             let values = output[0].to_vec_f32();
@@ -16876,7 +16878,7 @@ fn streamed_projection_strict_prepare_and_run_use_the_declared_step_workspace() 
 }
 
 #[test]
-fn streamed_moe_strict_prepare_funds_one_reused_workspace_across_shapes() {
+fn streamed_moe_deferred_prepare_and_live_admission_reuse_workspace_across_shapes() {
     use onnx_runtime_ir::{Attribute, TensorData};
     use onnx_runtime_memory_api::{DeviceKey, Tier};
     use onnx_runtime_memory_governor::{
@@ -16982,14 +16984,21 @@ fn streamed_moe_strict_prepare_funds_one_reused_workspace_across_shapes() {
         // normalized route weights exactly 0.5, preserving an exact oracle.
         let router = Tensor::from_f32(&[rows, 4], &[4., 4., -4., -5.].repeat(rows)).unwrap();
         let inputs = [("a", &input), ("router", &router)];
-        let req = executor
+        let before_prepare = books.used(Tier::Host);
+        let report = executor
             .prepare_with_device_bindings(&inputs, &mut [])
-            .unwrap()
-            .require_complete()
             .unwrap();
-        assert!(req.step().bytes > 0);
-        assert_eq!(req.step().lifetime, WorkspaceLifetime::StepScoped);
-        let funded = books.used(Tier::Host);
+        assert!(matches!(
+            report,
+            crate::WorkspacePreparationReport::Deferred { .. }
+        ));
+        assert_eq!(
+            books.used(Tier::Host),
+            before_prepare,
+            "metadata-only preparation must not charge guessed packed storage"
+        );
+        let mut funded = None;
+        let mut owner = None;
         for _ in 0..8 {
             let output = executor.run(&inputs).unwrap();
             assert_eq!(output[0].shape, [rows, 32]);
@@ -16997,7 +17006,15 @@ fn streamed_moe_strict_prepare_funds_one_reused_workspace_across_shapes() {
                 output[0].as_bytes(),
                 &[256.0f32.to_le_bytes(); 32].repeat(rows).concat()
             );
-            assert_eq!(books.used(Tier::Host), funded);
+            let used = books.used(Tier::Host);
+            assert!(used > 0, "live execution must admit its complete workspace");
+            assert_eq!(used, *funded.get_or_insert(used));
+            let allocations = manager.snapshot().unwrap().allocations;
+            assert_eq!(allocations.len(), 1);
+            assert_eq!(
+                allocations[0].identity,
+                *owner.get_or_insert(allocations[0].identity)
+            );
             assert_eq!(
                 books.used(Tier::Host),
                 manager.process_used(Tier::Host),
