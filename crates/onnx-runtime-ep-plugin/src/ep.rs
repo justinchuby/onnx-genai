@@ -953,7 +953,7 @@ fn ep_compile_inner(
             if !plugin_bitshift_is_admissible(node, ir_graph, &exported.registry_entries) {
                 return fail_status(&format!(
                     "Compile: node '{}' (BitShift) does not match the ORT plugin's unsigned integer \
-                     dtype contract; use unsigned inputs and output, or run signed BitShift-28 in standalone nxrt",
+                     dtype contract; use unsigned inputs and output, or run signed BitShift in standalone nxrt",
                     node.name
                 ));
             }
@@ -2242,7 +2242,13 @@ mod tests {
     }
 
     #[test]
-    fn bitshift_plugin_admission_preserves_unsigned_partition_at_opset_28() {
+    fn bitshift_plugin_admission_preserves_unsigned_partition() {
+        for opset in [11, 28] {
+            check_bitshift_plugin_admission(opset);
+        }
+    }
+
+    fn check_bitshift_plugin_admission(opset: u64) {
         use onnx_runtime_ep_api::abi::OrtGraphView;
         use onnx_runtime_ep_cpu::CpuExecutionProvider;
         use onnx_runtime_ir::{Attribute, Graph, GraphView, GraphViewCache, Node, NodeId, Shape};
@@ -2278,14 +2284,14 @@ mod tests {
 
         let bitshift = |inputs, output| {
             let mut node = Node::new(NodeId(0), "BitShift", inputs, vec![output]);
-            node.version = Some(28);
+            node.version = Some(opset);
             node.attributes
                 .insert("direction".into(), Attribute::String(b"RIGHT".to_vec()));
             node
         };
         let signed_id = graph.insert_node(bitshift(vec![Some(x), Some(count)], signed));
         let mut cast = Node::new(NodeId(0), "Cast", vec![Some(signed)], vec![converted]);
-        cast.version = Some(19);
+        cast.version = Some(if opset == 11 { 9 } else { 19 });
         cast.attributes.insert("to".into(), Attribute::Int(2)); // UINT8
         let cast_id = graph.insert_node(cast);
         let unsigned_id =

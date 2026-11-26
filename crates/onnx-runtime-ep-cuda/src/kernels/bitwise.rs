@@ -13,7 +13,7 @@
 //! * **Bitwise unary** (`BitwiseNot`): one integer input → same-dtype output,
 //!   bitwise complement (`~x`).
 //! * **BitShift** (`direction` = `LEFT`/`RIGHT`): two broadcast-compatible
-//!   integer inputs (unsigned since opset 11, signed since opset 28).
+//!   integer inputs in standalone nxrt from opset 11.
 //!
 //! Each op is one thread-per-element grid-stride kernel (bandwidth-bound).
 
@@ -22,7 +22,6 @@ use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
-use onnx_runtime_ep_api::bitshift::BitShiftTypes;
 use onnx_runtime_ep_api::{
     DeviceGraphResource, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
 };
@@ -205,7 +204,7 @@ impl ShiftDirection {
 enum BinaryKind {
     /// Bitwise `&`/`|`/`^` across every integer dtype.
     Bitwise(BitwiseBinaryOp),
-    Shift(ShiftDirection, BitShiftTypes),
+    Shift(ShiftDirection),
 }
 
 impl BinaryKind {
@@ -224,8 +223,7 @@ impl BinaryKind {
                 let (_, suffix) = integer_type_suffix(dtype)?;
                 Some(format!("{}_{suffix}", op.stem()))
             }
-            BinaryKind::Shift(dir, types) => {
-                types.validate_dtype(dtype).ok()?;
+            BinaryKind::Shift(dir) => {
                 let (_, suffix) = integer_type_suffix(dtype)?;
                 Some(format!("{}_{suffix}", dir.stem()))
             }
@@ -269,7 +267,6 @@ impl KernelFactory for BitwiseBinaryFactory {
 /// Factory for the versioned `BitShift` kernel.
 pub struct BitShiftFactory {
     pub runtime: Arc<CudaRuntime>,
-    pub types: BitShiftTypes,
 }
 
 impl KernelFactory for BitShiftFactory {
@@ -289,7 +286,7 @@ impl KernelFactory for BitShiftFactory {
             }
         };
         Ok(Box::new(BinaryIntKernel {
-            kind: BinaryKind::Shift(direction, self.types),
+            kind: BinaryKind::Shift(direction),
             runtime: self.runtime.clone(),
             warm: Mutex::new(WarmMetadata::new(BroadcastMetadataCache::new(
                 self.runtime.clone(),
@@ -338,9 +335,6 @@ impl BinaryIntKernel {
         let a = &inputs[0];
         let b = &inputs[1];
         let Some(entry) = self.kind.entry(a.dtype) else {
-            if let BinaryKind::Shift(_, types) = self.kind {
-                types.validate_dtype(a.dtype).map_err(not_implemented)?;
-            }
             return Err(not_implemented(format!(
                 "{op}: operand dtype {:?} not supported on CUDA EP",
                 a.dtype
@@ -593,20 +587,12 @@ impl Kernel for BitwiseNotKernel {
 /// Claim-time rejection reason for the bitwise/shift dtype contract, so the
 /// partitioner routes an unsupported dtype to another EP instead of failing at
 /// kernel time.
-pub(crate) fn unsupported_reason(
-    op: &str,
-    opset: u64,
-    input_dtypes: &[DataType],
-) -> Option<String> {
+pub(crate) fn unsupported_reason(op: &str, input_dtypes: &[DataType]) -> Option<String> {
     let unary = op == "BitwiseNot";
     let Some(&a) = input_dtypes.first() else {
         return Some(format!("{op}: missing operand dtype for CUDA EP"));
     };
-    if op == "BitShift" {
-        if let Err(reason) = BitShiftTypes::for_opset(opset).validate_dtype(a) {
-            return Some(reason);
-        }
-    } else if integer_type_suffix(a).is_none() {
+    if integer_type_suffix(a).is_none() {
         return Some(format!(
             "{op}: operand dtype {a:?} not supported on CUDA EP"
         ));
@@ -651,22 +637,17 @@ mod tests {
     }
 
     #[test]
-    fn shift_entry_points_track_the_opset() {
-        use BitShiftTypes::{SignedAndUnsigned, UnsignedOnly};
+    fn shift_entry_points_cover_signed_and_unsigned() {
         assert_eq!(
-            BinaryKind::Shift(ShiftDirection::Left, UnsignedOnly).entry(DataType::Uint32),
+            BinaryKind::Shift(ShiftDirection::Left).entry(DataType::Uint32),
             Some("shl_u32".to_string())
         );
         assert_eq!(
-            BinaryKind::Shift(ShiftDirection::Right, SignedAndUnsigned).entry(DataType::Uint8),
+            BinaryKind::Shift(ShiftDirection::Right).entry(DataType::Uint8),
             Some("shr_u8".to_string())
         );
         assert_eq!(
-            BinaryKind::Shift(ShiftDirection::Left, UnsignedOnly).entry(DataType::Int32),
-            None
-        );
-        assert_eq!(
-            BinaryKind::Shift(ShiftDirection::Left, SignedAndUnsigned).entry(DataType::Int32),
+            BinaryKind::Shift(ShiftDirection::Left).entry(DataType::Int32),
             Some("shl_i32".to_string())
         );
     }
@@ -701,29 +682,28 @@ mod tests {
             BinaryKind::Bitwise(BitwiseBinaryOp::And).entry(DataType::Float32),
             None
         );
-        let reason =
-            unsupported_reason("BitwiseAnd", 18, &[DataType::Int32, DataType::Int64]).unwrap();
+        let reason = unsupported_reason("BitwiseAnd", &[DataType::Int32, DataType::Int64]).unwrap();
         assert!(reason.contains("same dtype"), "{reason}");
         let reason =
-            unsupported_reason("BitwiseAnd", 18, &[DataType::Float32, DataType::Float32]).unwrap();
+            unsupported_reason("BitwiseAnd", &[DataType::Float32, DataType::Float32]).unwrap();
         assert!(reason.contains("not supported"), "{reason}");
         assert_eq!(
-            unsupported_reason("BitwiseAnd", 18, &[DataType::Uint8, DataType::Uint8]),
+            unsupported_reason("BitwiseAnd", &[DataType::Uint8, DataType::Uint8]),
             None
         );
     }
 
     #[test]
-    fn bitshift_claim_gates_signed_operands_by_opset() {
+    fn bitshift_claim_accepts_matching_integer_operands() {
         let signed = [DataType::Int32; 2];
         assert!(
-            unsupported_reason("BitShift", 27, &signed)
+            unsupported_reason("BitShift", &[DataType::Int32, DataType::Uint32])
                 .unwrap()
-                .contains("opset 28")
+                .contains("same dtype")
         );
-        assert_eq!(unsupported_reason("BitShift", 28, &signed), None);
+        assert_eq!(unsupported_reason("BitShift", &signed), None);
         assert_eq!(
-            unsupported_reason("BitShift", 11, &[DataType::Uint16, DataType::Uint16]),
+            unsupported_reason("BitShift", &[DataType::Uint16, DataType::Uint16]),
             None
         );
     }
@@ -731,11 +711,11 @@ mod tests {
     #[test]
     fn bitwise_not_claim_is_unary() {
         assert_eq!(
-            unsupported_reason("BitwiseNot", 18, &[DataType::Int8]),
+            unsupported_reason("BitwiseNot", &[DataType::Int8]),
             None,
             "unary op must not require a second operand"
         );
-        assert!(unsupported_reason("BitwiseNot", 18, &[DataType::Float64]).is_some());
+        assert!(unsupported_reason("BitwiseNot", &[DataType::Float64]).is_some());
     }
 
     #[test]

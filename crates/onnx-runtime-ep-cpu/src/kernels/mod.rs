@@ -1128,7 +1128,6 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
         .keys()
         // RoiAlign is currently supported only in standalone nxrt.
         .filter(|key| !(key.op_type == "RoiAlign" && key.domain.is_empty()))
-        .filter(|key| !onnx_runtime_ep_api::bitshift::standalone_only_registration(key))
         .map(|key| {
             let supports_raw_tensor_abi = input_dtype_constraints_for_op(&key.op_type, &key.domain)
                 .iter()
@@ -1144,7 +1143,7 @@ fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
                 since_version: key.since_version,
                 end_version: reg.explicit_end_version(key),
                 supported_dtypes: if key.op_type == "BitShift" && key.domain.is_empty() {
-                    onnx_runtime_ep_api::bitshift::BitShiftTypes::UnsignedOnly.dtypes()
+                    onnx_runtime_ep_api::bitshift::ORT_DTYPES
                 } else {
                     supported_dtypes_for_op(&key.op_type, &key.domain)
                 },
@@ -2109,18 +2108,9 @@ pub(crate) fn build_cpu_registry_with_resources(
         Box::new(onehot::OneHotFactory),
     );
     rec.register(
-        OpKey::new("BitShift", "", 11),
+        OpKey::new("BitShift", "", onnx_runtime_ep_api::bitshift::SINCE_VERSION),
         onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(bitshift::BitShiftFactory(
-            onnx_runtime_ep_api::bitshift::BitShiftTypes::UnsignedOnly,
-        )),
-    );
-    rec.register(
-        OpKey::new("BitShift", "", onnx_runtime_ep_api::bitshift::SIGNED_SINCE),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(bitshift::BitShiftFactory(
-            onnx_runtime_ep_api::bitshift::BitShiftTypes::SignedAndUnsigned,
-        )),
+        Box::new(bitshift::BitShiftFactory),
     );
     rec.register(
         OpKey::new("Compress", "", 11),
@@ -3602,11 +3592,10 @@ mod tests {
         // gets a distinct opset 18 registration for max/min.
         // Opset-28 Cast adds one registration.
         // MeanVarianceNormalization-29 adds one registration.
-        // BitShift-28 adds one registration.
         assert_eq!(
             reg.len(),
             PHASE1_OPS.len()
-                + 126
+                + 125
                 + mlas_registrations
                 + onnx_runtime_ir::roi_align::VERSIONS.len()
         );
@@ -3879,18 +3868,13 @@ mod tests {
             })
             .map(|k| (k.op_type.as_str(), k.domain.as_str(), k.since_version))
             .collect();
-        let mut expected = std::collections::BTreeSet::from([(
-            "BitShift",
-            "",
-            onnx_runtime_ep_api::bitshift::SIGNED_SINCE,
-        )]);
-        if cfg!(feature = "ops-cnn") {
-            expected.extend(
-                onnx_runtime_ir::roi_align::VERSIONS
-                    .into_iter()
-                    .map(|version| ("RoiAlign", "", version)),
-            );
-        }
+        #[cfg(feature = "ops-cnn")]
+        let expected: std::collections::BTreeSet<_> = onnx_runtime_ir::roi_align::VERSIONS
+            .into_iter()
+            .map(|version| ("RoiAlign", "", version))
+            .collect();
+        #[cfg(not(feature = "ops-cnn"))]
+        let expected = std::collections::BTreeSet::new();
         assert_eq!(missing, expected);
         assert_eq!(
             descriptors.len() + missing.len(),

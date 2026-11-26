@@ -43,8 +43,10 @@ fn json_dumps(target: &serde_json::Value) -> String {
     serde_json::to_string(target).unwrap()
 }
 
+/// The compiler proved that a JSON Schema branch has no admitted instances.
+/// Malformed or unsupported schemas use other error types.
 #[derive(Debug)]
-struct UnsatisfiableSchemaError {
+pub struct UnsatisfiableSchemaError {
     message: String,
 }
 

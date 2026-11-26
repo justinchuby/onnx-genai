@@ -4598,7 +4598,7 @@ impl ExecutionProvider for CudaExecutionProvider {
             "BitwiseAnd" | "BitwiseOr" | "BitwiseXor" | "BitwiseNot" | "BitShift"
         ) && (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(reason) =
-                crate::kernels::bitwise::unsupported_reason(&op.op_type, opset, input_dtypes)
+                crate::kernels::bitwise::unsupported_reason(&op.op_type, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }

@@ -1,6 +1,6 @@
-//! Integer `BitShift` with NumPy-style broadcasting (signed since opset 28).
+//! Native integer `BitShift` with NumPy-style broadcasting.
 
-use onnx_runtime_ep_api::bitshift::BitShiftTypes;
+use onnx_runtime_ep_api::bitshift::{native_supports_dtype, unsupported_dtype_reason};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{Attribute, DataType, Node, Shape};
 
@@ -17,10 +17,9 @@ enum Direction {
 
 pub struct BitShiftKernel {
     direction: Direction,
-    types: BitShiftTypes,
 }
 
-pub struct BitShiftFactory(pub BitShiftTypes);
+pub struct BitShiftFactory;
 
 impl KernelFactory for BitShiftFactory {
     fn unsupported_reason(
@@ -31,8 +30,8 @@ impl KernelFactory for BitShiftFactory {
         input_dtypes: &[DataType],
     ) -> Option<String> {
         let &dtype = input_dtypes.first()?;
-        if let Err(reason) = self.0.validate_dtype(dtype) {
-            return Some(reason);
+        if !native_supports_dtype(dtype) {
+            return Some(unsupported_dtype_reason(dtype));
         }
         if let Some(&rhs) = input_dtypes.get(1)
             && dtype != rhs
@@ -59,10 +58,7 @@ impl KernelFactory for BitShiftFactory {
                 ));
             }
         };
-        Ok(Box::new(BitShiftKernel {
-            direction,
-            types: self.0,
-        }))
+        Ok(Box::new(BitShiftKernel { direction }))
     }
 }
 
@@ -114,9 +110,6 @@ impl_signed_shiftable!(i8, i16, i32, i64);
 impl Kernel for BitShiftKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("BitShift", inputs, outputs, 2, 2, 1)?;
-        self.types
-            .validate_dtype(inputs[0].dtype)
-            .map_err(EpError::KernelFailed)?;
         macro_rules! dispatch {
             ($t:ty) => {
                 bitshift_typed::<$t>(self.direction, inputs, outputs)
@@ -213,7 +206,6 @@ mod tests {
             let mut left = Owned::zeros(dtype, &[2, 3]);
             BitShiftKernel {
                 direction: Direction::Left,
-                types: BitShiftTypes::UnsignedOnly,
             }
             .execute(&[input.view(), shifts.view()], &mut [left.view_mut()])
             .unwrap();
@@ -222,7 +214,6 @@ mod tests {
             let mut right = Owned::zeros(dtype, &[2, 3]);
             BitShiftKernel {
                 direction: Direction::Right,
-                types: BitShiftTypes::UnsignedOnly,
             }
             .execute(&[left.view(), shifts.view()], &mut [right.view_mut()])
             .unwrap();
@@ -237,7 +228,6 @@ mod tests {
         let mut out = Owned::zeros(DataType::Uint8, &[1]);
         BitShiftKernel {
             direction: Direction::Right,
-            types: BitShiftTypes::UnsignedOnly,
         }
         .execute(&[input.view(), shifts.view()], &mut [out.view_mut()])
         .unwrap();
@@ -247,15 +237,11 @@ mod tests {
     #[test]
     fn missing_direction_attribute_errors() {
         let node = Node::new(NodeId(0), "BitShift", vec![], vec![]);
-        assert!(
-            BitShiftFactory(BitShiftTypes::UnsignedOnly)
-                .create(&node, &[])
-                .is_err()
-        );
+        assert!(BitShiftFactory.create(&node, &[]).is_err());
     }
 
     #[test]
-    fn bitshift_claim_follows_factory_revision_in_both_default_domains() {
+    fn bitshift_claim_accepts_signed_from_introduction_in_both_default_domains() {
         let cpu = crate::CpuExecutionProvider::new();
         let mut node = Node::new(onnx_runtime_ir::NodeId(0), "BitShift", vec![], vec![]);
         for domain in ["", "ai.onnx"] {
@@ -263,7 +249,8 @@ mod tests {
             let claim =
                 |opset, dtypes: &[DataType]| cpu.supports_op(&node, opset, &[], dtypes, &[]);
             let signed = &[DataType::Int32; 2];
-            assert!(claim(27, signed).reason().unwrap().contains("opset 28"));
+            assert!(!claim(10, signed).is_supported());
+            assert!(claim(11, signed).is_supported());
             assert!(claim(28, signed).is_supported());
             assert!(claim(28, &[DataType::Uint32; 2]).is_supported());
             assert!(
@@ -321,19 +308,12 @@ mod tests {
                     Attribute::String(direction.as_bytes().to_vec()),
                 );
                 let dtypes = [dtype; 2];
-                let declined = cpu.supports_op(&node, 27, &[], &dtypes, &[]);
-                assert!(declined.reason().unwrap().contains("opset 28"), "{dtype:?}");
                 assert!(
                     cpu.supports_op(&node, 28, &[], &dtypes, &[]).is_supported(),
                     "{dtype:?}"
                 );
 
                 let mut out = Owned::zeros(dtype, &out_shape);
-                let previous = cpu.get_kernel(&node, &shapes, 27).unwrap();
-                let error = previous
-                    .execute(&[x.view(), y.view()], &mut [out.view_mut()])
-                    .unwrap_err();
-                assert!(error.to_string().contains("opset 28"), "{error}");
                 let current = cpu.get_kernel(&node, &shapes, 28).unwrap();
                 current
                     .execute(&[x.view(), y.view()], &mut [out.view_mut()])
@@ -345,5 +325,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn signed_bitshift_opset_11_executes_arithmetic_right_shift() {
+        let cpu = crate::CpuExecutionProvider::new();
+        let dtype = DataType::Int32;
+        let x = from_bits(&[1], dtype, &[(-8i64) as u64]);
+        let y = from_bits(&[4], dtype, &[1, 31, 32, u64::MAX]);
+        let mut out = Owned::zeros(dtype, &[4]);
+        let mut node = Node::new(NodeId(0), "BitShift", vec![], vec![]);
+        node.attributes
+            .insert("direction".into(), Attribute::String(b"RIGHT".to_vec()));
+        cpu.get_kernel(&node, &[vec![1], vec![4]], 11)
+            .unwrap()
+            .execute(&[x.view(), y.view()], &mut [out.view_mut()])
+            .unwrap();
+        assert_eq!(
+            values(&out),
+            [0xffff_fffc, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff]
+        );
     }
 }

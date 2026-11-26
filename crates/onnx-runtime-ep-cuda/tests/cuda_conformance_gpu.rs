@@ -1798,19 +1798,26 @@ fn signed_bitshift_cases() -> Vec<(Case, Vec<u8>)> {
                     .chain(std::iter::repeat_n(negative_fill, 3 + extra))
                     .flat_map(<$ty>::to_le_bytes)
                     .collect();
-                cases.push((Case {
-                    label: format!("BitShift-28[{dtype:?},{direction}]"),
-                    op: "BitShift",
-                    domain: "",
-                    opset: 28,
-                    inputs: vec![
-                        input(dtype, &[2, 1], &[1 as $ty, -8]),
-                        input(dtype, &[1, counts.len()], &counts),
-                    ],
-                    outputs: vec![(dtype, vec![2, counts.len()])],
-                    attrs: vec![("direction", Attribute::String(direction.as_bytes().to_vec()))],
-                    compare: Compare::ExactBytes,
-                }, expected));
+                let opsets: &[u64] = if dtype == DataType::Int32 && direction == "RIGHT" {
+                    &[11, 28]
+                } else {
+                    &[28]
+                };
+                for &opset in opsets {
+                    cases.push((Case {
+                        label: format!("BitShift-{opset}[{dtype:?},{direction}]"),
+                        op: "BitShift",
+                        domain: "",
+                        opset,
+                        inputs: vec![
+                            input(dtype, &[2, 1], &[1 as $ty, -8]),
+                            input(dtype, &[1, counts.len()], &counts),
+                        ],
+                        outputs: vec![(dtype, vec![2, counts.len()])],
+                        attrs: vec![("direction", Attribute::String(direction.as_bytes().to_vec()))],
+                        compare: Compare::ExactBytes,
+                    }, expected.clone()));
+                }
             }
         }};
     }

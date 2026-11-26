@@ -195,8 +195,8 @@ use pointwise::{
 /// * **Modulo** — `Mod` (f32 with `fmod=1`, plus i32/i64 truncated and
 ///   floor modulo).
 /// * **Bitwise** — `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `BitwiseNot`
-///   (all integer dtypes, broadcasting) and `BitShift` (unsigned since opset
-///   11, signed since opset 28), matched to the CPU EP.
+///   (all integer dtypes, broadcasting) and native integer `BitShift` from
+///   opset 11, matched to the CPU EP.
 /// * **LogSoftmax / Hardmax** — numerically-stable axis-reduction ops
 ///   (f32/f16/bf16), matched to the CPU EP; `LogSoftmax` uses the stable
 ///   shifted-logsumexp formulation.
@@ -743,14 +743,13 @@ pub fn build_cuda_registry_descriptors(registry: &OpRegistry) -> Vec<CudaOpDescr
         .keys()
         // RoiAlign is currently supported only in standalone nxrt.
         .filter(|key| !(key.op_type == "RoiAlign" && key.domain.is_empty()))
-        .filter(|key| !onnx_runtime_ep_api::bitshift::standalone_only_registration(key))
         .map(|key| CudaOpDescriptor {
             op_type: key.op_type.clone(),
             domain: key.domain.clone(),
             since_version: key.since_version,
             end_version: registry.explicit_end_version(key),
             supported_dtypes: if key.op_type == "BitShift" && key.domain.is_empty() {
-                onnx_runtime_ep_api::bitshift::BitShiftTypes::UnsignedOnly.dtypes()
+                onnx_runtime_ep_api::bitshift::ORT_DTYPES
             } else {
                 cuda_supported_dtypes_for_op(&key.op_type, &key.domain)
             },
@@ -2046,19 +2045,10 @@ pub(crate) fn build_cuda_registry_for_contract(
         }),
     );
     reg.register(
-        OpKey::new("BitShift", "", 11),
+        OpKey::new("BitShift", "", onnx_runtime_ep_api::bitshift::SINCE_VERSION),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(bitwise::BitShiftFactory {
             runtime: runtime.clone(),
-            types: onnx_runtime_ep_api::bitshift::BitShiftTypes::UnsignedOnly,
-        }),
-    );
-    reg.register(
-        OpKey::new("BitShift", "", onnx_runtime_ep_api::bitshift::SIGNED_SINCE),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(bitwise::BitShiftFactory {
-            runtime: runtime.clone(),
-            types: onnx_runtime_ep_api::bitshift::BitShiftTypes::SignedAndUnsigned,
         }),
     );
 
