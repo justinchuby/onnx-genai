@@ -23,10 +23,14 @@ pub enum GrammarCandidate {
 ///
 /// Only the backend's typed unsatisfiability result returns `false`. Malformed,
 /// unsupported and resource-limited schemas, or compiler panics, remain errors;
-/// callers must not silently discard those branches. This is not a general
+/// callers must not silently discard those branches. Generation-policy
+/// capability failures also remain typed errors rather than semantic `false`.
+/// This is not a general
 /// JSON Schema satisfiability solver.
 pub fn json_schema_is_satisfiable(schema: &serde_json::Value) -> anyhow::Result<bool> {
-    use onnx_genai_llguidance::{GrammarBuilder, JsonCompileOptions, UnsatisfiableSchemaError};
+    use onnx_genai_llguidance::{
+        GrammarBuilder, JsonCompileOptions, RootObjectKeyPolicyError, UnsatisfiableSchemaError,
+    };
 
     let compiled =
         onnx_genai_llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -37,6 +41,9 @@ pub fn json_schema_is_satisfiable(schema: &serde_json::Value) -> anyhow::Result<
         }));
     match compiled {
         Ok(_) => Ok(true),
+        Err(error) if error.is::<RootObjectKeyPolicyError>() => Err(error).context(
+            "root generation key-encoding capability cannot represent this schema; revise declared names or choose a different generation policy",
+        ),
         Err(error) if error.downcast_ref::<UnsatisfiableSchemaError>().is_some() => Ok(false),
         Err(error) => Err(error).context(
             "compile standalone JSON Schema for satisfiability; repair invalid or unsupported schema constraints",
@@ -599,6 +606,38 @@ mod tests {
                 "invalid/unsupported schema was classified as empty: {schema}: {error:#}"
             );
         }
+    }
+
+    #[test]
+    fn json_schema_satisfiability_propagates_generation_policy_capability_errors() {
+        let schema = serde_json::json!({"type":"object","properties":{"":{"type":"integer"}},"required":[""],"additionalProperties":false,"x-guidance":{"root_object_key_policy":{"min":1,"max":256}}});
+        let error = json_schema_is_satisfiable(&schema).unwrap_err();
+        assert!(error.is::<onnx_genai_llguidance::RootObjectKeyPolicyError>());
+        assert!(!error.is::<onnx_genai_llguidance::UnsatisfiableSchemaError>());
+    }
+
+    #[test]
+    fn json_schema_satisfiability_preserves_original_empty_cardinality_under_policy() {
+        for mut schema in [
+            serde_json::json!({"type":"object","additionalProperties":false,"minProperties":1}),
+            serde_json::json!({"type":"object","properties":{"ok":false},"additionalProperties":false,"minProperties":1}),
+            serde_json::json!({"type":"object","minProperties":2,"maxProperties":1}),
+            serde_json::json!({"anyOf":[false,{"type":"object","additionalProperties":false,"minProperties":1}]}),
+        ] {
+            assert!(!json_schema_is_satisfiable(&schema).unwrap());
+            schema["x-guidance"] =
+                serde_json::json!({"root_object_key_policy":{"min":1,"max":256}});
+            assert!(!json_schema_is_satisfiable(&schema).unwrap());
+        }
+    }
+
+    #[test]
+    fn json_schema_satisfiability_rejects_invalid_policy_before_false_schema() {
+        let schema = serde_json::json!({"allOf":[false],"x-guidance":{"root_object_key_policy":{"min":2,"max":1}}});
+        let error = json_schema_is_satisfiable(&schema).unwrap_err();
+        assert!(!error.is::<onnx_genai_llguidance::UnsatisfiableSchemaError>());
+        assert!(!error.is::<onnx_genai_llguidance::RootObjectKeyPolicyError>());
+        assert!(error.to_string().contains("compile standalone JSON Schema"));
     }
 
     #[test]

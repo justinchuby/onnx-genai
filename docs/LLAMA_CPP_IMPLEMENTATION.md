@@ -2810,3 +2810,65 @@ This proves the artifact surface, not a crates.io publication. The standalone
 key-ownership regression uses legal raw DEL spelling; the engine normalizes
 arbitrary JSON Unicode escapes before backend recognition. See
 [compiler checks](GRAMMAR_COMPILER.md) for reproducible artifact evidence.
+
+### Canonical named-parameter XML generation wire strategy
+
+Forced `atem-xml@v1` generation uses exactly one canonical invoke envelope with
+double-quoted `name` attributes and parameter bodies containing serialized JSON.
+The five named entities `amp`, `quot`, `apos`, `lt`, and `gt` escape XML syntax;
+numeric entities are not assumed to decode. Strings use JSON quotes, for example
+`&quot;1&quot;` and `&quot;Paris&quot;`. Raw `1` denotes a number and is never
+reinterpreted as a string. Existing unforced inbound XML parsing still accepts
+its broader spelling, including raw `1x` as the string `"1x"`.
+
+The prefix projector translates canonical XML into the existing logical tool
+grammar. It retains the independent standalone parameter-schema roots. Partial
+XML delimiters/entities represent a bounded union of possible logical prefixes,
+checked using forks of the already-compiled byte cursor. Closing a parameter
+requires actual JSON and immediately checks its permitted object successors;
+`1</atem:parameter>` cannot continue a schema that requires the number `12`.
+Every completed canonical envelope is also checked by the authoritative inbound
+XML scanner. Generation does not promise every inbound raw-text spelling,
+optional XML attribute, whitespace spelling, or multi-invoke sequence.
+
+The compiler's opt-in root key policy generates only names explicitly declared
+in the normalized root object's `properties` or `required`, with nonempty names
+up to the inbound parser's UTF-8 byte limit. It follows normalized references at the
+same root and leaves nested JSON keys unchanged. Schemas with no instances under this declared-name generation policy receive
+a capability error only after the backend proves that restricted language empty;
+this does not assert semantic unsatisfiability of the original schema; invalid/unsupported/resource errors remain distinct.
+Controls and Unicode use the existing parser's actual string/entity semantics,
+rather than imposing a new standard XML parser. Existing explicit output stops
+and resource/token limits can still truncate a viable stream.
+
+Custom `x-guidance` item/key separator regexes and custom whitespace regexes are
+outside this canonical XML generation spelling and receive an explicit
+capability error. The default JSON lexical language and other supported compiler
+options remain attached to the original schema root.
+
+Dynamic root-name XML forcing remains open. Inbound unforced XML continues to
+accept dynamic parameter names under its existing admission rules. Nested JSON
+objects inside declared parameters retain their original dynamic-key semantics.
+
+Named parameter generation follows the compiler's existing schema-property
+ordering. Inbound XML parameter ordering is unchanged. This generation spelling
+preserves supported declared-field values without promising all inbound orders.
+
+Policy-only absence of encodable declared fields uses a distinct typed backend
+capability error. It cannot be mistaken for semantic schema unsatisfiability or
+used to silently discard a selected tool. Unsupported original value schemas,
+including optional/dynamic fields and referenced definitions, remain errors
+before policy filtering.
+
+The original normalized schema and pending definitions receive a complete
+original-compiler preflight on the same builder before root generation policy
+compilation. Thus an originally empty cardinality language remains semantic
+unsatisfiability and can be pruned normally; a language emptied only by the named
+parameter policy remains a distinct capability error. The caller's actual
+compiler resource limits apply to both stages; schema references are not
+retrieved a second time and no additional byte-token parser is built.
+
+Constrained native cancellation is a terminal control: it executes with a full
+all-false vocabulary mask rather than requiring another grammar continuation.
+This preserves cancellation and rearming of incomplete envelopes without allowing
+text/EOS to escape the existing Native output checks.

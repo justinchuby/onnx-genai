@@ -143,6 +143,12 @@ Logical text constraints check the decoded text directly for completion. Raw
 token grammars require declared EOS IDs. After a text ending, an all-false mask
 permits codec-only quanta to finish without admitting further text.
 
+Cancellation under an active text constraint sends a full vocabulary-sized
+all-false token mask. Native cancellation must remain executable even when an
+incomplete grammar has no tokenizer continuation; it cannot generate text or
+EOS. Output shape, usage, PCM and token-mask guards still apply. A successful
+terminal quantum clears the grammar; a failed quantum still requires reset.
+
 ## Response termination
 
 A token-limited response ends with upstream-compatible `status: completed`;

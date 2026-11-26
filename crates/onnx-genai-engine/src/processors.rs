@@ -84,7 +84,8 @@ pub(crate) fn build_processor_chain(
             GenerateConstraint::Json { prefix }
             | GenerateConstraint::JsonSchema { prefix, .. }
             | GenerateConstraint::Regex { prefix, .. }
-            | GenerateConstraint::Lark { prefix, .. } => prefix.as_str(),
+            | GenerateConstraint::Lark { prefix, .. }
+            | GenerateConstraint::XmlToolCall { prefix, .. } => prefix.as_str(),
             GenerateConstraint::Gbnf { .. }
             | GenerateConstraint::RawLark { .. }
             | GenerateConstraint::LazyJsonSchema { .. } => "",
@@ -238,6 +239,35 @@ pub(crate) fn build_processor_chain(
                         &terminal_token_ids(options),
                     )?
                 }
+            }
+            GenerateConstraint::XmlToolCall {
+                grammar,
+                prefix: plain,
+            } => {
+                let (kind, prefix) = if let Some(projection) = projection {
+                    (
+                        crate::text_projection::ProjectionKind::Declared(
+                            projection.template().clone(),
+                        ),
+                        projection.prefix(),
+                    )
+                } else {
+                    (
+                        crate::text_projection::ProjectionKind::Plain,
+                        plain.as_str(),
+                    )
+                };
+                Box::new(
+                    crate::response_constraint::ContentConstraint::xml_tool_call(
+                        tokenizer,
+                        grammar,
+                        kind,
+                        prefix,
+                        max_bytes,
+                        endings(),
+                        &options.effective_preserved_tokens(),
+                    )?,
+                )
             }
             GenerateConstraint::Lark {
                 grammar,
