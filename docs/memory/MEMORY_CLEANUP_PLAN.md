@@ -3263,3 +3263,44 @@ the same overlap-safe semantics because distinct borrowed buffer descriptors may
 name overlapping ranges. Exact/two-direction shifted overlaps, non-Host/wrapping
 pointers and a real same-backing Identity Session binding are covered without
 introducing workspace or quota requests.
+
+### Packed grouped projection reuses the whole-operation workspace
+
+For nonempty output, CPU PackedGroupedMatMul now admits one StepScoped mixed
+lane for f32 Y staging, one conservative K-element X row and usize routes, with
+checked alignment padding. Metadata returns Ready. It reuses the existing
+FloatIndexWorkspace, Host Rows and validated RouteSource helpers: no new owner,
+pool or per-token/expert/block grant is introduced. Aligned inner-contiguous X
+rows borrow even with padded/reversed outer axes; other X rows and INT32/INT64
+routes stream into admitted storage. Packed bytes remain a borrowed contiguous
+bank, and the existing 256-float block decoder buffer stays on the stack. This
+change does not add strided packed-bank support or claim that upstream gathers
+for unsupported layouts are governed by this kernel lane.
+
+Complete Host/view/address proofs and mixed binding precede all value reads.
+The positive-K decoder and accumulation order remain unchanged, and true Y is
+published after every X/route/packed read, including overlapping I/O bindings.
+Strided Y publication visits logical elements without touching padding. Shared
+packed metadata geometry derives concrete/unresolved output shapes while the
+existing live wrapper keeps descriptor validation and CUDA device independence.
+
+Packed retains its read-free return when output lanes are zero, with requirement
+NONE even if routes are nonempty. This differs intentionally from Affine's data
+validation on empty output. For K=0 with nonempty Y, the kernel still validates
+Host backing and every route before publishing initialized +0. It neither forms
+a zero-length packed slice nor computes an unnecessary expert*N intermediate;
+large expert geometry cannot overflow a row offset for an empty reduction. Null
+views still fail the existing descriptor contract.
+
+Bitwise tests cover every supported packed format, INT32/INT64 routes,
+padded/reversed/unaligned X/routes and contiguous packed-bank origins, all three
+source/Y shifted overlaps, strided Y padding, zero lanes and zero K, invalid
+routes and refusal before scratch initialization or data reads. A retained-owner
+witness exercises 4096 real executions with no additional issuer callbacks,
+including zero-byte controls, and exact trim refunds. Public Session checks use
+exact/one-byte-short budgets, dynamic shrinking/empty/trim/readmission and fixed
+physical strides with logical prefixes. Independent allocator controls detect
+former X/route/output payload sizes; repeated executions allocate no tested
+payload-sized buffers. Small bookkeeping allocations are outside that claim.
+These checks establish memory/accounting behavior, not measured latency or CUDA
+hardware performance.
