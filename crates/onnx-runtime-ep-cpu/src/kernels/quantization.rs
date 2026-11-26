@@ -11,11 +11,11 @@ pub struct QuantizeLinearKernel {
     block_size: Option<usize>,
     output_dtype: Option<DataType>,
     precision: std::result::Result<Option<DataType>, String>,
-    int16: bool,
+    int16: Option<(u64, Node)>,
 }
 
 struct QuantizeLinearFactory {
-    int16: bool,
+    int16_revision: Option<u64>,
 }
 
 pub(crate) fn register_linear_quantization(
@@ -24,16 +24,16 @@ pub(crate) fn register_linear_quantization(
 ) {
     use onnx_runtime_ep_api::{OpKey, WorkspacePlanning};
     for version in [10, 13, 19, 21, 23, 25] {
-        let int16 = native;
+        let int16_revision = native.then_some(version);
         registry.register(
             OpKey::new("QuantizeLinear", "", version),
             WorkspacePlanning::None,
-            Box::new(QuantizeLinearFactory { int16 }),
+            Box::new(QuantizeLinearFactory { int16_revision }),
         );
         registry.register(
             OpKey::new("DequantizeLinear", "", version),
             WorkspacePlanning::None,
-            Box::new(DequantizeLinearFactory { int16 }),
+            Box::new(DequantizeLinearFactory { int16_revision }),
         );
     }
 }
@@ -41,7 +41,7 @@ pub(crate) fn register_linear_quantization(
 impl KernelFactory for QuantizeLinearFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(QuantizeLinearKernel {
-            int16: self.int16,
+            int16: self.int16_revision.map(|revision| (revision, node.clone())),
             output_dtype: q16::attribute_dtype(node, "output_dtype")
                 .ok()
                 .flatten()
@@ -61,17 +61,17 @@ pub struct DequantizeLinearKernel {
     axis: i64,
     block_size: Option<usize>,
     output_dtype: Option<DataType>,
-    int16: bool,
+    int16: Option<(u64, Node)>,
 }
 
 struct DequantizeLinearFactory {
-    int16: bool,
+    int16_revision: Option<u64>,
 }
 
 impl KernelFactory for DequantizeLinearFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(DequantizeLinearKernel {
-            int16: self.int16,
+            int16: self.int16_revision.map(|revision| (revision, node.clone())),
             axis: node.attr("axis").and_then(|a| a.as_int()).unwrap_or(1),
             block_size: node
                 .attr("block_size")
@@ -109,8 +109,10 @@ impl KernelFactory for DynamicQuantizeLinearFactory {
 impl Kernel for QuantizeLinearKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("QuantizeLinear", inputs, outputs, 2, 3, 1)?;
-        if self.int16 && q16::is_code(outputs[0].dtype) {
-            return self.quantize_int16(inputs, &mut outputs[0]);
+        if let Some((revision, node)) = &self.int16
+            && q16::is_code(outputs[0].dtype)
+        {
+            return self.quantize_int16(*revision, node, inputs, &mut outputs[0]);
         }
         let x = read_floats("QuantizeLinear", &inputs[0])?;
         let scale = read_floats("QuantizeLinear", &inputs[1])?;
@@ -156,9 +158,18 @@ impl Kernel for QuantizeLinearKernel {
 }
 
 impl QuantizeLinearKernel {
-    fn quantize_int16(&self, inputs: &[TensorView], out: &mut TensorMut) -> Result<()> {
+    fn quantize_int16(
+        &self,
+        revision: u64,
+        node: &Node,
+        inputs: &[TensorView],
+        out: &mut TensorMut,
+    ) -> Result<()> {
         let op = "QuantizeLinear";
         let invalid = |detail| EpError::KernelFailed(format!("{op}: {detail}"));
+        q16::validate_revision(node, revision, Some(inputs[1].shape.len())).map_err(invalid)?;
+        q16::validate_quantize_types(revision, inputs[0].dtype, inputs[1].dtype)
+            .map_err(invalid)?;
         let zp = inputs.get(2).filter(|v| !v.is_absent());
         let expected = zp
             .map(|z| z.dtype)
@@ -228,7 +239,16 @@ impl QuantizeLinearKernel {
 impl Kernel for DequantizeLinearKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("DequantizeLinear", inputs, outputs, 2, 3, 1)?;
-        let x = read_integers("DequantizeLinear", &inputs[0], self.int16)?;
+        let accepts_int16 = self.int16.is_some();
+        if let Some((revision, node)) = &self.int16
+            && q16::is_code(inputs[0].dtype)
+        {
+            let invalid = |detail| EpError::KernelFailed(format!("DequantizeLinear: {detail}"));
+            q16::validate_revision(node, *revision, Some(inputs[1].shape.len()))
+                .map_err(invalid)?;
+            q16::validate_dequantize_scale(*revision, inputs[1].dtype).map_err(invalid)?;
+        }
+        let x = read_integers("DequantizeLinear", &inputs[0], accepts_int16)?;
         let scale = read_floats("DequantizeLinear", &inputs[1])?;
         let output_dtype = self.output_dtype.unwrap_or(inputs[1].dtype);
         if outputs[0].dtype != output_dtype {
@@ -244,7 +264,7 @@ impl Kernel for DequantizeLinearKernel {
                     inputs[2].dtype, inputs[0].dtype
                 )));
             }
-            read_integers("DequantizeLinear", &inputs[2], self.int16)?
+            read_integers("DequantizeLinear", &inputs[2], accepts_int16)?
         } else {
             vec![0]
         };
@@ -572,7 +592,8 @@ mod tests {
             let zp = Owned::zeros(dtype, &[]);
             for (provider, opset, accepts_int16) in [
                 (&plugin, 21, false),
-                (&native, 19, false),
+                (&native, 10, true),
+                (&native, 19, true),
                 (&native, 21, true),
             ] {
                 let accepted = dtype == DataType::Uint8 || accepts_int16;
@@ -603,6 +624,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn int16_factories_validate_runtime_rank_without_compile_shapes() {
+        let provider = crate::CpuExecutionProvider::new();
+        let x = Owned::f32(&[2, 2], &[1.; 4]);
+        let scale = Owned::f32(&[2], &[0.5; 2]);
+        let zp = Owned::zeros(DataType::Int16, &[2]);
+        let mut codes = Owned::zeros(DataType::Int16, &[2, 2]);
+        let mut values = Owned::zeros_f32(&[2, 2]);
+        let q = Node::new(onnx_runtime_ir::NodeId(0), "QuantizeLinear", vec![], vec![]);
+        let dq = Node::new(
+            onnx_runtime_ir::NodeId(1),
+            "DequantizeLinear",
+            vec![],
+            vec![],
+        );
+        let result = provider.get_kernel(&q, &[], 10).unwrap().execute(
+            &[x.view(), scale.view(), zp.view()],
+            &mut [codes.view_mut()],
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("requires a scalar scale")
+        );
+        let result = provider.get_kernel(&dq, &[], 10).unwrap().execute(
+            &[codes.view(), scale.view(), zp.view()],
+            &mut [values.view_mut()],
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("requires a scalar scale")
+        );
+    }
+
     fn i8(shape: &[usize], data: &[i8]) -> Owned {
         Owned {
             bytes: data.iter().map(|&v| v as u8).collect(),
@@ -618,7 +676,7 @@ mod tests {
         let scale = Owned::f32(&[], &[0.5]);
         let mut out = Owned::zeros_f32(&[3]);
         DequantizeLinearKernel {
-            int16: false,
+            int16: None,
             output_dtype: None,
             axis: 1,
             block_size: None,
@@ -635,7 +693,7 @@ mod tests {
         let zp = Owned::u8(&[2], &[2, 4]);
         let mut out = Owned::zeros_f32(&[2, 2]);
         DequantizeLinearKernel {
-            int16: false,
+            int16: None,
             output_dtype: None,
             axis: 1,
             block_size: None,
@@ -651,7 +709,7 @@ mod tests {
         let scale = Owned::f32(&[], &[1.0]);
         let mut out = Owned::zeros(DataType::Uint8, &[6]);
         QuantizeLinearKernel {
-            int16: false,
+            int16: None,
             output_dtype: None,
             precision: Ok(None),
             axis: 1,
@@ -669,7 +727,7 @@ mod tests {
         let zp = Owned::u8(&[2], &[2, 4]);
         let mut q = Owned::zeros(DataType::Uint8, &[2, 2]);
         QuantizeLinearKernel {
-            int16: false,
+            int16: None,
             output_dtype: None,
             precision: Ok(None),
             axis: 1,
@@ -680,7 +738,7 @@ mod tests {
         assert_eq!(q.to_u8(), vec![4, 8, 6, 12]);
         let mut round_trip = Owned::zeros_f32(&[2, 2]);
         DequantizeLinearKernel {
-            int16: false,
+            int16: None,
             output_dtype: None,
             axis: 1,
             block_size: None,
@@ -700,7 +758,7 @@ mod tests {
         let zp = Owned::u8(&[1, 2], &[2, 4]);
         let mut out = Owned::zeros_f32(&[1, 4]);
         DequantizeLinearKernel {
-            int16: false,
+            int16: None,
             output_dtype: None,
             axis: 1,
             block_size: Some(2),
@@ -721,7 +779,7 @@ mod tests {
             let zero_point = Owned::u8(&[], &[113]);
             let mut output = Owned::zeros(DataType::Uint8, &[rows, 8]);
             QuantizeLinearKernel {
-                int16: false,
+                int16: None,
                 output_dtype: None,
                 precision: Ok(None),
                 axis: 1,
@@ -753,7 +811,7 @@ mod tests {
             let zero_point = Owned::u8(&[], &[113]);
             let mut output = Owned::zeros(DataType::BFloat16, &[rows, 8]);
             DequantizeLinearKernel {
-                int16: false,
+                int16: None,
                 output_dtype: None,
                 axis: 1,
                 block_size: None,

@@ -42,6 +42,7 @@ fn bytes(dtype: DataType, values: &[f32]) -> Vec<u8> {
         .collect()
 }
 
+#[derive(Clone, Copy)]
 struct Case<'a> {
     opset: i64,
     code: DataType,
@@ -188,7 +189,23 @@ impl Case<'_> {
     }
 }
 
-fn cases() -> [Case<'static>; 6] {
+fn cases() -> [Case<'static>; 8] {
+    let blocked = Case {
+        opset: 29,
+        code: DataType::Int16,
+        shape: &[2, 3, 2],
+        input: &[4.; 12],
+        scale_shape: &[2, 2, 2],
+        scale: &[1., 2., 4., 8., 2., 1., 8., 4.],
+        scale_type: DataType::Float16,
+        zero: None,
+        axis: 1,
+        block: 2,
+        precision: None,
+        output: Some(DataType::BFloat16),
+        q: &[4., 2., 4., 2., 1., 0., 2., 4., 2., 4., 0., 1.],
+        y: &[4., 4., 4., 4., 4., 0., 4., 4., 4., 4., 0., 4.],
+    };
     [
         Case {
             opset: 10,
@@ -238,22 +255,7 @@ fn cases() -> [Case<'static>; 6] {
             q: &[65532., 65534., 65535., 1., 3., 5.],
             y: &[-2., 0., 1., -4., 0., 4.],
         },
-        Case {
-            opset: 29,
-            code: DataType::Int16,
-            shape: &[2, 3, 2],
-            input: &[4.; 12],
-            scale_shape: &[2, 2, 2],
-            scale: &[1., 2., 4., 8., 2., 1., 8., 4.],
-            scale_type: DataType::Float16,
-            zero: None,
-            axis: 1,
-            block: 2,
-            precision: None,
-            output: Some(DataType::BFloat16),
-            q: &[4., 2., 4., 2., 1., 0., 2., 4., 2., 4., 0., 1.],
-            y: &[4., 4., 4., 4., 4., 0., 4., 4., 4., 4., 0., 4.],
-        },
+        blocked,
         Case {
             opset: 23,
             code: DataType::Uint16,
@@ -286,6 +288,28 @@ fn cases() -> [Case<'static>; 6] {
             q: &[1., 3.],
             y: &[1., 3.],
         },
+        Case {
+            opset: 19,
+            code: DataType::Uint16,
+            shape: &[2],
+            input: &[0.5, 1.5],
+            scale_shape: &[],
+            scale: &[1.],
+            scale_type: DataType::Float32,
+            zero: Some(&[1.]),
+            axis: 1,
+            block: 0,
+            precision: None,
+            output: None,
+            q: &[1., 3.],
+            y: &[0., 2.],
+        },
+        Case {
+            opset: 21,
+            scale_type: DataType::Float32,
+            output: None,
+            ..blocked
+        },
     ]
 }
 
@@ -298,7 +322,7 @@ fn int16_quantization_cpu() {
 
 #[test]
 fn int16_quantization_rejects_newer_revision_features() {
-    let [_, attr, axis, blocked, _, precision] = cases();
+    let [_, attr, axis, _, _, precision, _, blocked] = cases();
     for (model, expected) in [
         (axis.model(10), "axis requires opset 13"),
         (attr.model(20), "output_dtype requires opset 21"),

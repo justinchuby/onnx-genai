@@ -224,7 +224,7 @@ enum LinearQuantOp {
 struct LinearQuantFactory {
     op: LinearQuantOp,
     runtime: Arc<CudaRuntime>,
-    int16: bool,
+    int16_revision: Option<u64>,
 }
 
 pub(crate) fn register_linear_quantization(
@@ -244,7 +244,7 @@ pub(crate) fn register_linear_quantization(
                 Box::new(LinearQuantFactory {
                     op,
                     runtime: runtime.clone(),
-                    int16: native,
+                    int16_revision: native.then_some(version),
                 }),
             );
         }
@@ -254,7 +254,7 @@ pub(crate) fn register_linear_quantization(
 impl KernelFactory for LinearQuantFactory {
     fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(LinearQuantKernel {
-            int16: self.int16,
+            int16_revision: self.int16_revision,
             op: self.op,
             runtime: self.runtime.clone(),
             node: node.clone(),
@@ -273,7 +273,7 @@ struct LinearQuantKernel {
     node: Node,
     axis: i64,
     block: i64,
-    int16: bool,
+    int16_revision: Option<u64>,
 }
 
 impl Kernel for LinearQuantKernel {
@@ -301,8 +301,11 @@ impl Kernel for LinearQuantKernel {
             LinearQuantOp::Quantize => outputs[0].dtype,
             LinearQuantOp::Dequantize => x.dtype,
         };
-        if self.int16 && q16::is_code(quant_dtype) {
+        if let Some(revision) = self.int16_revision
+            && q16::is_code(quant_dtype)
+        {
             return self.execute_int16(
+                revision,
                 name,
                 quant_dtype,
                 x,
@@ -399,6 +402,7 @@ impl LinearQuantKernel {
     #[allow(clippy::too_many_arguments)]
     fn execute_int16(
         &self,
+        revision: u64,
         name: &str,
         code: DataType,
         x: &TensorView,
@@ -407,6 +411,7 @@ impl LinearQuantKernel {
         y: &mut TensorMut,
     ) -> Result<()> {
         let invalid = |detail| EpError::KernelFailed(format!("cuda_ep {name}: {detail}"));
+        q16::validate_revision(&self.node, revision, Some(scale.shape.len())).map_err(invalid)?;
         if y.shape != x.shape || zp.is_some_and(|z| z.dtype != code || z.shape != scale.shape) {
             return Err(invalid(format!(
                 "output shape {:?} must match x {:?}; zero_point must be {code:?} of scale shape {:?}",
@@ -415,6 +420,7 @@ impl LinearQuantKernel {
         }
         let (stem, precision) = match self.op {
             LinearQuantOp::Quantize => {
+                q16::validate_quantize_types(revision, x.dtype, scale.dtype).map_err(invalid)?;
                 let expected = q16::attribute_dtype(&self.node, "output_dtype").map_err(invalid)?;
                 if expected.is_some_and(|dtype| dtype != code) || expected.is_none() && zp.is_none()
                 {
@@ -428,6 +434,7 @@ impl LinearQuantKernel {
                 ("quantize16", precision)
             }
             LinearQuantOp::Dequantize => {
+                q16::validate_dequantize_scale(revision, scale.dtype).map_err(invalid)?;
                 let expected = q16::dequantize_output(&self.node, scale.dtype).map_err(invalid)?;
                 if y.dtype != expected {
                     return Err(invalid(format!(
