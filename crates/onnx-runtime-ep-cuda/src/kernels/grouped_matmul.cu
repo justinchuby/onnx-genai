@@ -47,10 +47,6 @@ extern "C" __global__ void NAME(const B* x, const B* w, const B* idx, const B* b
 GROUP_TYPE(float,float,f32)
 GROUP_TYPE(double,double,f64)
 
-__device__ int affine_nibble(const B* codes, U row, U col, U width) {
-    return (codes[row * ((width + 1) / 2) + col / 2] >> ((col % 2) * 4)) & 15;
-}
-
 template<typename I>
 __device__ void affine_grouped(const B* x, const B* w, const B* indices, const B* scales,
     const B* zeros, B* y, unsigned* status, U routes, U lanes, U groups, U selections,
@@ -70,15 +66,7 @@ __device__ void affine_grouped(const B* x, const B* w, const B* indices, const B
         if (n == 0) continue;
         const U row = (U)group * n + i % n;
         const U token = route / selections;
-        float sum = 0.0f;
-        for (U j = 0; j < k; ++j) {
-            const U p = j / block_size;
-            const int z = zeros ? affine_nibble(zeros, row, p, blocks) : zero;
-            const float decoded = __fmul_rn(affine_nibble(w, row, j, k) - z,
-                                             read<float>(scales, row * blocks + p));
-            sum += read<float>(x, token * k + j) * decoded;
-        }
-        write<float>(y, i, sum);
+        write<float>(y, i, affine_grouped_dot(x, w, scales, zeros, row, token, k, block_size, zero));
     }
 }
 

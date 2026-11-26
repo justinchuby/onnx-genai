@@ -672,8 +672,19 @@ opset-29 routing, clipped interleaved SwiGLU, and weighted reduction region
 emitted by Mobius QMoE. Admission requires static FLOAT activation and router
 geometry, selected-logit Softmax after reverse-axis TopK, unbiased projections,
 and the original inactive-route mask. Graph outputs and lexical captures of
-intermediates prevent the full rewrite. CUDA decode and prefill keep the
-separate routing and activation operations; the ORT plugin does not opt in.
+intermediates prevent the full rewrite.
+
+Standalone CUDA recognizes a different Mobius opset-29 grouped lowering: full
+expert-axis FLOAT Softmax, largest sorted TopK with lower-ID ties, split
+gate/up affine banks and FLOAT SiLU, followed by multiplication and an
+unmasked ReduceSum. The native kernel consumes the already-rounded Softmax
+output and reuses the affine packed dot product. Workspace scales with
+selected routes, their intermediate width, and one staged FLOAT output, not
+the size of the expert banks. The caller output is published only after both
+banks' scales validate, after all reads from potentially aliased inputs.
+The combine admits at most one warp of routes per token. Wider TopK,
+selected-weight renormalization, route masks, and non-FLOAT activation paths
+remain decomposed. Neither rewrite opts in to the shipped ORT plugin.
 
 LayerNorm eligibility proves a square with immutable exponent 2, exact scalar
 coefficient payloads, rank-preserving broadcasts, and matching kept-dimension
