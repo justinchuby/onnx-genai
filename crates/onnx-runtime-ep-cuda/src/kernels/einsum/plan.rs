@@ -975,14 +975,14 @@ fn dense_layout(
     dtype: DataType,
     axes: Vec<EinsumAxis>,
     shape: Vec<usize>,
-) -> ValueLayout {
-    ValueLayout {
+) -> Result<ValueLayout> {
+    Ok(ValueLayout {
         pointer,
         dtype,
-        strides: compute_contiguous_strides(&shape),
+        strides: compute_contiguous_strides(&shape)?,
         axes,
         shape,
-    }
+    })
 }
 
 fn leaf_layout(
@@ -1277,7 +1277,7 @@ fn tree_step_specs(
         let shape = axes_shape(plan, temporary.axes(), dimensions)?;
         values.insert(
             temporary.value().index(),
-            dense_layout(0, intermediate_dtype, temporary.axes().to_vec(), shape),
+            dense_layout(0, intermediate_dtype, temporary.axes().to_vec(), shape)?,
         );
     }
     let final_layout = ValueLayout {
@@ -1733,7 +1733,8 @@ mod tests {
             effective_pointer: pointer,
             dtype: DataType::Float32,
             shape: shape.to_vec(),
-            strides: compute_contiguous_strides(shape),
+            strides: compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides"),
         };
         let signature = ArithmeticExecutionSignature {
             inputs: shapes
@@ -1765,7 +1766,8 @@ mod tests {
             effective_pointer: pointer,
             dtype: DataType::Float32,
             shape: shape.to_vec(),
-            strides: compute_contiguous_strides(shape),
+            strides: compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides"),
         };
         let signature = ArithmeticExecutionSignature {
             inputs: shapes

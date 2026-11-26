@@ -77,9 +77,13 @@ fn deform_conv_release_latency() {
             .insert("pads".into(), Attribute::Ints(vec![1; 4]));
         let strides = shapes
             .iter()
-            .map(|s| compute_contiguous_strides(s))
+            .map(|s| {
+                compute_contiguous_strides(s)
+                    .expect("fixture shape has representable contiguous strides")
+            })
             .collect::<Vec<_>>();
-        let out_strides = compute_contiguous_strides(&out_shape);
+        let out_strides = compute_contiguous_strides(&out_shape)
+            .expect("fixture shape has representable contiguous strides");
         let cpu_kernel = cpu.get_kernel(&node, &shapes, 22).unwrap();
         let gpu_kernel = cuda.get_kernel(&node, &shapes, 22).unwrap();
         let dtype = DataType::Float32;

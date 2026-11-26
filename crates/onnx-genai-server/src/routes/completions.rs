@@ -734,7 +734,7 @@ async fn prepare_chat_input(
             .await?,
         )
     } else if let Some(audio) = input_audio.first() {
-        Some(preprocess_chat_audio(audio, handle)?)
+        Some(preprocess_chat_audio(audio, handle, config.max_decoded_audio_bytes).await?)
     } else {
         None
     };
@@ -1487,9 +1487,10 @@ async fn collect_generation_with_publications(
     ))
 }
 
-fn preprocess_chat_audio(
+async fn preprocess_chat_audio(
     input: &InputAudio,
     handle: &ModelHandle,
+    max_decoded_bytes: std::num::NonZeroUsize,
 ) -> Result<MultimodalInput, ApiError> {
     let bytes = crate::audio_input::decode_chat_audio(input)
         .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err:#}")))?;
@@ -1500,7 +1501,10 @@ fn preprocess_chat_audio(
         .ok_or_else(|| {
             ApiError::invalid_request("audio input requires a model with a declared audio input")
         })?;
-    MultimodalInput::from_audio_bytes(spec, &bytes)
+    let limits = crate::audio_input::decode_limits(handle, max_decoded_bytes)
+        .await
+        .map_err(|error| ApiError::invalid_request(format!("audio memory admission: {error:#}")))?;
+    MultimodalInput::from_audio_bytes(spec, &bytes, limits)
         .map_err(|err| ApiError::invalid_request(format!("invalid audio input: {err:#}")))
 }
 
@@ -2332,7 +2336,8 @@ fn prepare_generate_request(
             GenerateConstraint::Json { prefix }
             | GenerateConstraint::JsonSchema { prefix, .. }
             | GenerateConstraint::Regex { prefix, .. }
-            | GenerateConstraint::Lark { prefix, .. },
+            | GenerateConstraint::Lark { prefix, .. }
+            | GenerateConstraint::XmlToolCall { prefix, .. },
         ) = options.constraint.as_mut()
         {
             prefix.clear();
@@ -3553,7 +3558,10 @@ mod prompt_rendering_tests {
         )
         .expect("production preparation");
 
-        assert_eq!(prepared.request.options.constraint, None);
+        assert!(matches!(
+            prepared.request.options.constraint,
+            Some(GenerateConstraint::XmlToolCall { .. })
+        ));
         assert_eq!(
             tool_protocol::request_policy(&request),
             onnx_genai_engine::ToolCallPolicy::Required

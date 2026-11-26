@@ -1682,7 +1682,8 @@ mod tests {
         let mut buf = vec![0.0f32; 10];
         let base = buf.as_ptr() as usize;
         let shape = [2usize, 4];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let mut out = TensorMut::new(
             DevicePtrMut(buf.as_mut_ptr() as *mut std::ffi::c_void),
             DataType::Float32,

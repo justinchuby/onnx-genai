@@ -1867,7 +1867,7 @@ impl Executor {
                     dispatch::refill_contiguous_strides(
                         value.strides.get_or_insert_default(),
                         physical_shape,
-                    );
+                    )?;
                     let stable_shape = value.fixed_stride_shape.get_or_insert_default();
                     stable_shape.clear();
                     stable_shape.extend_from_slice(physical_shape);
@@ -1929,7 +1929,7 @@ impl Executor {
                     dispatch::refill_contiguous_strides(
                         value.strides.get_or_insert_default(),
                         physical_shape,
-                    );
+                    )?;
                     let stable_shape = value.fixed_stride_shape.get_or_insert_default();
                     stable_shape.clear();
                     stable_shape.extend_from_slice(physical_shape);

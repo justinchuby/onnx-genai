@@ -374,7 +374,8 @@ fn bench_gqa_half_kv_append(c: &mut Criterion) {
                 .map(|&x| half::f16::from_f32(x).to_bits())
                 .collect();
             let cap_shape = vec![1, kv_num_heads, total, head_size];
-            let cap_strides = compute_contiguous_strides(&cap_shape);
+            let cap_strides = compute_contiguous_strides(&cap_shape)
+                .expect("bounded benchmark fixture dimensions fit signed 64-bit strides");
             let kp = cap_k.as_mut_ptr().cast::<std::ffi::c_void>();
             let vp = cap_v.as_mut_ptr().cast::<std::ffi::c_void>();
             let cap_shapes: Vec<Vec<usize>> = vec![

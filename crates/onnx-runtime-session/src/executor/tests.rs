@@ -10914,7 +10914,8 @@ fn sequence_executor_preserves_element_arc_identity() {
 fn view_bounds_rejects_out_of_bounds_view() {
     // A [2, 3] f32 view needs 24 bytes; give it a 16-byte backing length.
     let shape = [2usize, 3];
-    let strides = compute_contiguous_strides(&shape);
+    let strides = compute_contiguous_strides(&shape)
+        .expect("fixture shape has representable contiguous strides");
     let err = view_bounds(&shape, &strides, 0, DataType::Float32, 16);
     assert!(err.is_err(), "gate must reject an oversized view");
 
@@ -10927,7 +10928,8 @@ fn view_bounds_rejects_out_of_bounds_view() {
 #[test]
 fn view_bounds_rejects_offset_overrun() {
     let shape = [4usize];
-    let strides = compute_contiguous_strides(&shape);
+    let strides = compute_contiguous_strides(&shape)
+        .expect("fixture shape has representable contiguous strides");
     // 4 f32 = 16 bytes; origin at byte 8 leaves only 8 bytes → overrun.
     assert!(view_bounds(&shape, &strides, 8, DataType::Float32, 16).is_err());
     assert!(view_bounds(&shape, &strides, 0, DataType::Float32, 16).is_ok());
@@ -10936,7 +10938,8 @@ fn view_bounds_rejects_offset_overrun() {
 #[test]
 fn sub_byte_view_bounds_rejects_geometry_overflow() {
     let shape = [usize::MAX, 2];
-    let strides = compute_contiguous_strides(&shape);
+    let strides = compute_contiguous_strides(&shape)
+        .expect("fixture shape has representable contiguous strides");
     let error = view_bounds(&shape, &strides, 0, DataType::Int4, usize::MAX);
     assert!(matches!(error, Err(SessionError::ShapeOverflow { .. })));
 }
@@ -10944,7 +10947,8 @@ fn sub_byte_view_bounds_rejects_geometry_overflow() {
 #[test]
 fn sub_byte_view_bounds_rejects_offset_overflow() {
     let shape = [1usize];
-    let strides = compute_contiguous_strides(&shape);
+    let strides = compute_contiguous_strides(&shape)
+        .expect("fixture shape has representable contiguous strides");
     let error = view_bounds(&shape, &strides, usize::MAX, DataType::Int4, usize::MAX);
     assert!(matches!(error, Err(SessionError::ShapeOverflow { .. })));
 }
@@ -10982,6 +10986,20 @@ fn checked_numel_detects_overflow() {
     let huge = [usize::MAX, 2];
     let err = checked_numel(&huge, || "value#9".into());
     assert!(matches!(err, Err(SessionError::ShapeOverflow { .. })));
+}
+
+#[test]
+fn checked_numel_empty_axes_override_an_overflowing_prefix() {
+    for shape in [[0, usize::MAX, 2], [usize::MAX, 0, 2], [usize::MAX, 2, 0]] {
+        assert_eq!(
+            checked_numel(&shape, || panic!(
+                "empty geometry must not format an overflow error"
+            ))
+            .unwrap(),
+            0,
+            "{shape:?}"
+        );
+    }
 }
 
 /// H-D1 (byte layer): even when the element *count* fits in `usize`, the

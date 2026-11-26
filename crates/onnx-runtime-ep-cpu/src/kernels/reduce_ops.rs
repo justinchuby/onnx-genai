@@ -182,8 +182,8 @@ impl Kernel for ReduceKernel {
             .collect();
         let kept_count = numel(&kept_shape);
 
-        let in_strides = compute_contiguous_strides(in_shape);
-        let kept_out_strides = compute_contiguous_strides(&kept_shape);
+        let in_strides = compute_contiguous_strides(in_shape)?;
+        let kept_out_strides = compute_contiguous_strides(&kept_shape)?;
 
         let mut acc = vec![self.op.init(); kept_count.max(1)];
         // `log(sum(exp(x)))` must avoid overflowing for large finite inputs.
@@ -261,8 +261,8 @@ impl ReduceKernel {
             .map(|axis| in_shape[axis])
             .collect::<Vec<_>>();
         let kept_count = numel(&kept_shape);
-        let in_strides = compute_contiguous_strides(in_shape);
-        let kept_strides = compute_contiguous_strides(&kept_shape);
+        let in_strides = compute_contiguous_strides(in_shape)?;
+        let kept_strides = compute_contiguous_strides(&kept_shape)?;
         let mut acc = vec![0.0f64; kept_count.max(1)];
         let mut logsumexp_max = vec![f64::NEG_INFINITY; kept_count.max(1)];
 
@@ -377,8 +377,8 @@ impl ReduceKernel {
             .filter(|&axis| !reduce[axis])
             .map(|axis| in_shape[axis])
             .collect::<Vec<_>>();
-        let in_strides = compute_contiguous_strides(in_shape);
-        let kept_strides = compute_contiguous_strides(&kept_shape);
+        let in_strides = compute_contiguous_strides(in_shape)?;
+        let kept_strides = compute_contiguous_strides(&kept_shape)?;
         let seed = match self.op {
             ReduceOp::Sum => 0,
             ReduceOp::Prod => 1,
@@ -447,8 +447,8 @@ impl ReduceKernel {
             .map(|axis| in_shape[axis])
             .collect::<Vec<_>>();
         let kept_count = numel(&kept_shape);
-        let in_strides = compute_contiguous_strides(in_shape);
-        let kept_strides = compute_contiguous_strides(&kept_shape);
+        let in_strides = compute_contiguous_strides(in_shape)?;
+        let kept_strides = compute_contiguous_strides(&kept_shape)?;
         let identity = matches!(self.op, ReduceOp::Min);
         let mut values = vec![identity; kept_count];
 

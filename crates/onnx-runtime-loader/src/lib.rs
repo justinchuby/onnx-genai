@@ -66,7 +66,7 @@ pub use epcontext::{
     is_ep_context_op, resolve_ep_context,
 };
 pub use error::LoaderError;
-pub use keyed_weights::KeyedWeightFile;
+pub use keyed_weights::{KeyedWeightFile, SafeTensorView, safetensors_views};
 pub use weights::{
     ExpertQuantization, ExpertStorageOrder, ExpertTensorLayout, ExpertWeightRegion,
     NonPageableReason, Pageability, WeightRegionCatalog, WeightStore, qmoe_expert_tensor_layout,

@@ -130,9 +130,12 @@ fn execute_decode(
     let q_shape = [1, HEADS, 1, HEAD_DIM];
     let past_shape = [1, HEADS, past_seq, HEAD_DIM];
     let present_shape = [1, HEADS, past_seq + 1, HEAD_DIM];
-    let q_strides = compute_contiguous_strides(&q_shape);
-    let past_strides = compute_contiguous_strides(&past_shape);
-    let present_strides = compute_contiguous_strides(&present_shape);
+    let q_strides = compute_contiguous_strides(&q_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let past_strides = compute_contiguous_strides(&past_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let present_strides = compute_contiguous_strides(&present_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [
         TensorView::new(
             DevicePtr(q.as_ptr()),

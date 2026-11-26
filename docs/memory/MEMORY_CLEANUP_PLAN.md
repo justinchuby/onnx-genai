@@ -3350,3 +3350,77 @@ snapshots. Final-origin alignment (base plus byte_offset), signed zeros, subnorm
 infinity and NaN storage bits, source/Y aliases and same-shape layout changes are
 covered explicitly. Neither removal of copies nor callback counts is a latency
 measurement.
+
+### Shared logical geometry handles empty and packed extents
+
+IR checked_numel now treats any zero extent as an empty tensor, including a zero
+following an overflowing prefix. Scalar count stays one; true nonempty overflow
+stays None. Both EP view kinds share this count and checked dense-byte queries.
+Their structural validation rejects nonempty count/byte overflow and an Undefined
+raw dtype with contextual errors, while preserving byte-offset, null and dtype
+checks. Identity consumes the validated shared byte size instead of repeating a
+private geometry checker. Bounds, Host accessibility and ownership remain separate
+proofs.
+
+Contiguity and the positive-extent density shortcut share a checked unsigned
+stride-relation walk. The general density walk uses unsigned absolute strides,
+including i64::MIN, and neither walk computes an unused final element total.
+This permits representable stride relations for large packed element counts
+without confusing signed stride capacity with logical count or physical bytes.
+The prior distinctions for empty layouts remain covered by differential tests;
+ordinary-rank density still uses stack storage. No payload or governor is added.
+
+Three regressions fail on the previous implementation (two overflow panics and
+an incorrect empty count). Boundary checks cover both view kinds, zero axes in
+each position, true nonempty/byte overflow, scalar geometry, unsigned stride
+magnitudes and packed counts exceeding i64 without reading device pointers.
+Contiguous stride construction is covered by the following migration; other
+unvalidated geometry helpers remain a separate audit.
+
+### Fallible stride construction shares an allocation-free checked plan
+
+compute_contiguous_strides, TensorLayout::resolved_strides and transpose now
+return Result. All runtime callers propagate layout failures; bounded fixtures
+assert their geometry explicitly. There is no compatibility constructor or
+wrapped/saturated fallback. Only stored suffix strides must fit signed i64;
+logical count and physical byte admission remain separate checks. Session's
+contextual count wrapper also delegates to IR so a zero after an overflowing
+prefix is still empty; Scan continues to reject genuine stacking row-count
+overflow. Bounds and gather paths recognize a zero axis before multiplying
+extents, preserving rank checks and scalar behavior without touching an empty
+backing. Even an empty
+shape cannot fabricate a suffix that is unrepresentable.
+
+ContiguousStridePlan borrows immutable shape metadata, validates the complete
+suffix recurrence, then fills caller-owned storage. A wrong output rank fails
+before writes. Session validates before resizing reused stride storage or
+publishing input descriptor fields. Plugin metadata uses the same plan and keeps
+its inline ordinary-rank storage and existing high-rank spill. No extra owner,
+cache, governor request or per-element check is introduced; the added work is a
+rank-sized validation pass.
+
+Plugin output bytes, strides and ORT signed dimension conversion are checked
+before GetOutput; dynamic device intermediates check before scratch allocation.
+Input stride failure precedes data access. Absent-output metadata reports the
+slot and cause rather than substituting empty strides. Compute converts failures
+to ORT status and preserves failed-state retirement. Eager preflights input/output
+strides before output allocation. Tests exercise boundary suffixes, zeros, scalar
+and high ranks, unchanged buffers on failure, legal reuse, both ORT shape hooks,
+output preflight and the real Compute callback with a fake ABI. A positive-control
+allocator witness checks repeated plan/fill without temporary allocations. This
+is not a latency measurement; CUDA remains compilation-only on this host.
+
+### Remove unused layout storage-size estimation
+
+TensorLayout::storage_size is removed with its sole method-specific test; there
+were no production consumers. Existing transpose/layout tests remain. No
+replacement estimate, alias or compatibility interface is added.
+
+The method mixed logical dense bytes with a strided address span and physical
+allocation capacity, and its independent arithmetic did not handle empty,
+packed, negative-stride and overflow cases consistently. Logical bytes continue
+to use checked_expected_bytes. Strided bounds depend on signed strides,
+byte_offset and actual backing length at existing execution boundaries. Memory
+admission and refund continue to use the real owner's retained capacity, rather
+than estimating it from a layout. This removes unused API surface without adding
+runtime work or changing allocation/grant behavior.

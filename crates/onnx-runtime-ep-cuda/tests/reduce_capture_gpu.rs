@@ -141,10 +141,13 @@ fn execute_reduce(
     out_shape: &[usize],
     workspace: &mut Option<WorkspaceAllocation>,
 ) {
-    let data_strides = compute_contiguous_strides(data_shape);
+    let data_strides = compute_contiguous_strides(data_shape)
+        .expect("fixture shape has representable contiguous strides");
     let axes_shape = [n_axes];
-    let axes_strides = compute_contiguous_strides(&axes_shape);
-    let out_strides = compute_contiguous_strides(out_shape);
+    let axes_strides = compute_contiguous_strides(&axes_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let out_strides = compute_contiguous_strides(out_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [
         TensorView::new(
             DevicePtr(data.as_ptr()),
@@ -185,10 +188,13 @@ fn try_execute_reduce(
     out_shape: &[usize],
     workspace: &mut Option<WorkspaceAllocation>,
 ) -> onnx_runtime_ep_api::Result<()> {
-    let data_strides = compute_contiguous_strides(data_shape);
+    let data_strides = compute_contiguous_strides(data_shape)
+        .expect("fixture shape has representable contiguous strides");
     let axes_shape = [n_axes];
-    let axes_strides = compute_contiguous_strides(&axes_shape);
-    let out_strides = compute_contiguous_strides(out_shape);
+    let axes_strides = compute_contiguous_strides(&axes_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let out_strides = compute_contiguous_strides(out_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [
         TensorView::new(
             DevicePtr(data.as_ptr()),
@@ -678,9 +684,11 @@ fn cudnn_rewarm_failure_preserves_a(mode: CudnnRewarmFailure) {
         "successful cuDNN signature A must publish a capture snapshot"
     );
 
-    let b_strides = compute_contiguous_strides(&b_in);
+    let b_strides = compute_contiguous_strides(&b_in)
+        .expect("fixture shape has representable contiguous strides");
     let axes_shape = [1usize];
-    let axes_strides = compute_contiguous_strides(&axes_shape);
+    let axes_strides = compute_contiguous_strides(&axes_shape)
+        .expect("fixture shape has representable contiguous strides");
     let b_inputs = [
         TensorView::new(
             DevicePtr(b_data.as_ptr()),
@@ -1244,7 +1252,8 @@ fn nvrtc_reduce_uses_one_metadata_payload_upload_and_capture_owner() {
             .htod(&bytes(&input_values), cuptr(input.as_ptr()))
             .unwrap();
     }
-    let input_strides = compute_contiguous_strides(&shape);
+    let input_strides = compute_contiguous_strides(&shape)
+        .expect("fixture shape has representable contiguous strides");
     let input_view = TensorView::new(
         DevicePtr(input.as_ptr()),
         DataType::Int64,
@@ -1278,7 +1287,8 @@ fn nvrtc_reduce_uses_one_metadata_payload_upload_and_capture_owner() {
         let kernel = ep
             .get_kernel(model.graph.node(node), &[shape.to_vec()], 11)
             .unwrap();
-        let out_strides = compute_contiguous_strides(&out_shape);
+        let out_strides = compute_contiguous_strides(&out_shape)
+            .expect("fixture shape has representable contiguous strides");
         let execute = || {
             kernel.execute(
                 std::slice::from_ref(&input_view),

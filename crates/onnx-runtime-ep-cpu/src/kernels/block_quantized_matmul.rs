@@ -3103,6 +3103,7 @@ mod tests {
                                 packed.iter().flat_map(|&byte| [byte, 0xa5]).collect();
                             let strides: Vec<_> =
                                 onnx_runtime_ir::compute_contiguous_strides(&shape)
+                                    .expect("fixture shape has representable contiguous strides")
                                     .into_iter()
                                     .map(|stride| stride * if strided { 2 } else { 1 })
                                     .collect();
@@ -3849,3 +3850,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod packed_dot_contract;

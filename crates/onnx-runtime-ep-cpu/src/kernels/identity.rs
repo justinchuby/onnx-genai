@@ -60,11 +60,10 @@ impl Kernel for IdentityKernel {
                 input.strides, output.strides
             )));
         }
-        let size = |name: &str, dtype, shape: &[usize]| {
-            onnx_runtime_ir::checked_expected_bytes(dtype,shape).ok_or_else(||EpError::KernelFailed(format!("Identity: {name} dtype {dtype:?}, shape {shape:?} has an unrepresentable raw byte count; bind a supported raw dtype and smaller valid dimensions")))
-        };
-        let in_bytes = size("input", input.dtype, input.shape)?;
-        let out_bytes = size("output", output.dtype, output.shape)?;
+        // Shared view validation already proves concrete raw dtype and complete
+        // dense count/byte arithmetic, including packed storage and empty shapes.
+        let in_bytes = input.byte_size();
+        let out_bytes = output.byte_size();
         if in_bytes != out_bytes {
             return Err(EpError::KernelFailed(format!(
                 "Identity: input has {in_bytes} bytes but output has {out_bytes} \
@@ -134,7 +133,8 @@ mod tests {
         Owned {
             bytes: bytes.to_vec(),
             shape: shape.to_vec(),
-            strides: compute_contiguous_strides(shape),
+            strides: compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides"),
             dtype,
         }
     }
@@ -296,7 +296,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            text.contains("input") && text.contains("unrepresentable raw byte count"),
+            text.contains("input")
+                && text.contains("dense byte count overflows usize")
+                && text.contains("Float64")
+                && text.contains(&usize::MAX.to_string()),
             "{text}"
         );
     }

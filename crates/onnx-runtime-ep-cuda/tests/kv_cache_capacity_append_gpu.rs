@@ -158,9 +158,12 @@ fn try_execute_step(
     let past_shape = [BATCH, HEADS, CAPACITY, HEAD_DIM];
     let current_shape = [BATCH, HEADS, 1, HEAD_DIM];
     let position_shape = [BATCH, 1];
-    let past_strides = compute_contiguous_strides(&past_shape);
-    let current_strides = compute_contiguous_strides(&current_shape);
-    let position_strides = compute_contiguous_strides(&position_shape);
+    let past_strides = compute_contiguous_strides(&past_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let current_strides = compute_contiguous_strides(&current_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let position_strides = compute_contiguous_strides(&position_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [
         TensorView::new(
             DevicePtr(past_present.as_ptr()),
@@ -633,9 +636,12 @@ fn kv_capacity_append_handles_multi_batch_multi_token_current_without_cross_talk
     let past_shape = [MB_BATCH, HEADS, CAPACITY, HEAD_DIM];
     let current_shape = [MB_BATCH, HEADS, MB_CURRENT_LEN, HEAD_DIM];
     let position_shape = [MB_BATCH, MB_CURRENT_LEN];
-    let past_strides = compute_contiguous_strides(&past_shape);
-    let current_strides = compute_contiguous_strides(&current_shape);
-    let position_strides = compute_contiguous_strides(&position_shape);
+    let past_strides = compute_contiguous_strides(&past_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let current_strides = compute_contiguous_strides(&current_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let position_strides = compute_contiguous_strides(&position_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [
         TensorView::new(
             DevicePtr(past_present.as_ptr()),

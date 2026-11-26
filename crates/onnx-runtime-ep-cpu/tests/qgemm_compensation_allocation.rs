@@ -82,13 +82,17 @@ fn native_qgemm_compensation_allocations_do_not_scale_with_batches() {
         let mut counts = Vec::new();
         for batches in [1, 2, 17] {
             let a_shape = [batches, 3, 7];
-            let a_strides = compute_contiguous_strides(&a_shape);
+            let a_strides = compute_contiguous_strides(&a_shape)
+                .expect("fixture shape has representable contiguous strides");
             let b_shape = [7, 9];
-            let b_strides = compute_contiguous_strides(&b_shape);
+            let b_strides = compute_contiguous_strides(&b_shape)
+                .expect("fixture shape has representable contiguous strides");
             let quant_shape = [batches, 3, 1];
-            let quant_strides = compute_contiguous_strides(&quant_shape);
+            let quant_strides = compute_contiguous_strides(&quant_shape)
+                .expect("fixture shape has representable contiguous strides");
             let y_shape = [batches, 3, 9];
-            let y_strides = compute_contiguous_strides(&y_shape);
+            let y_strides = compute_contiguous_strides(&y_shape)
+                .expect("fixture shape has representable contiguous strides");
             let a = vec![129u8; batches * 3 * 7];
             let b = [2u8; 7 * 9];
             let a_scale: Vec<f32> = (0..batches).flat_map(|_| [1., 2., 3.]).collect();
