@@ -426,6 +426,7 @@ async fn serve(
     protocol: Protocol,
 ) -> Result<Response, ApiError> {
     let streaming = request.stream;
+    let ping = crate::SsePingInterval::resolve(&request, state.config.sse_ping_interval)?;
     request.stream_options.include_usage = true;
     let response =
         super::completions::chat_completions(State(state), headers, ApiJson(request)).await?;
@@ -437,7 +438,7 @@ async fn serve(
             .map_err(|err| ApiError::internal(format!("chat response JSON was invalid: {err}")))?;
         return Ok(Json(buffered(&body, protocol)?).into_response());
     }
-    Ok(stream_response(response, protocol))
+    Ok(stream_response(response, protocol, ping))
 }
 fn buffered(chat: &Value, protocol: Protocol) -> Result<Value, ApiError> {
     let message = &chat["choices"][0]["message"];
@@ -804,7 +805,11 @@ impl From<&str> for AdaptedStreamFailure {
     }
 }
 
-fn stream_response(response: Response, protocol: Protocol) -> Response {
+fn stream_response(
+    response: Response,
+    protocol: Protocol,
+    ping: crate::SsePingInterval,
+) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(16);
     tokio::spawn(async move {
         let mut source = response.into_body().into_data_stream();
@@ -870,7 +875,7 @@ fn stream_response(response: Response, protocol: Protocol) -> Response {
             let _ = tx.send(Ok(event)).await;
         }
     });
-    Sse::new(ReceiverStream::new(rx)).into_response()
+    ping.response(ReceiverStream::new(rx))
 }
 
 #[cfg(test)]
@@ -989,7 +994,7 @@ mod transport_tests {
             let source = Response::new(Body::from(
                 "event: error\ndata: {\"error\":{\"code\":429,\"type\":\"resource_limit_error\",\"message\":\"capacity exhausted\"}}\n\n",
             ));
-            let response = stream_response(source, protocol);
+            let response = stream_response(source, protocol, crate::SsePingInterval::default());
             let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
             let text = std::str::from_utf8(&bytes).unwrap();
             let value: Value = serde_json::from_str(

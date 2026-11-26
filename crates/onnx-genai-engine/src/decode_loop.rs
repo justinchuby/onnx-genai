@@ -98,6 +98,7 @@ impl GenerationClock {
     ) {
         self.step_started = Some(now);
         self.sample.get_or_insert(crate::config::GenerationTimings {
+            speculative: None,
             prompt_tokens: prompt_tokens.saturating_sub(cached_prompt_tokens),
             cached_prompt_tokens,
             generated_tokens: 0,
@@ -145,6 +146,12 @@ impl GenerationClock {
     fn pause_work_at(&mut self, now: std::time::Instant) {
         if let (Some(start), Some(sample)) = (self.step_started.take(), self.sample.as_mut()) {
             sample.generation_elapsed += now.duration_since(start);
+        }
+    }
+    #[cfg(feature = "native-backend")]
+    pub(crate) fn record_speculative(&mut self, stats: crate::SpeculativeStats) {
+        if let Some(sample) = self.sample.as_mut() {
+            sample.speculative = Some(stats);
         }
     }
     pub(crate) fn snapshot(&self) -> Option<crate::config::GenerationTimings> {
@@ -412,10 +419,17 @@ pub(crate) fn select_and_commit_step<B: DecodeLoopBackend + ?Sized>(
         chain,
         tokenizer,
         callback,
+        None,
     )?;
     Ok((token_id, finish))
 }
 
+pub(crate) type SelectedTokenFinalizer<'a> =
+    dyn FnMut(Option<&FinishReason>) -> anyhow::Result<()> + 'a;
+
+// Physical finalization must run after stop selection and before publication;
+// keep its fallible hook explicit at this shared commit boundary.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn commit_selected_token(
     state: &mut DecodeLoopState,
     prompt_tokens: &[TokenId],
@@ -424,6 +438,7 @@ pub(crate) fn commit_selected_token(
     chain: &ProcessorChain,
     tokenizer: &Tokenizer,
     callback: Option<&mut GenerateTokenCallback<'_>>,
+    before_publish: Option<&mut SelectedTokenFinalizer<'_>>,
 ) -> anyhow::Result<Option<FinishReason>> {
     if state.step == 0 {
         state.text_decoder = crate::tokenization::TokenTextDecoder::with_preserved_tokens(
@@ -469,6 +484,11 @@ pub(crate) fn commit_selected_token(
             finish_reason = finish_reason_after_token(token_id, options, chain, &context);
         }
     }
+    if let Some(finalize) = before_publish {
+        finalize(finish_reason.as_ref()).with_context(|| {
+            format!("finalize selected token {token_id} physical state before publication")
+        })?;
+    }
     state.clock.token_selected(state.generated_tokens.len());
     if let Some(callback) = callback {
         callback(GenerateToken {
@@ -493,13 +513,13 @@ pub(crate) fn finish_result(
     finish_reason: FinishReason,
     prefix_cache_hit_len: usize,
     logprobs: Option<&[TokenLogprob]>,
-    preserved_tokens: &std::collections::BTreeSet<TokenId>,
+    options: &GenerateOptions,
 ) -> anyhow::Result<GenerateResult> {
     Ok(GenerateResult {
         timings: None,
         retained_cache_tokens: 0,
-        text: crate::tokenization::decode_output(tokenizer, generated_tokens, preserved_tokens)?,
-        preserved_tokens: preserved_tokens.clone(),
+        text: crate::tokenization::decode_generation_output(tokenizer, generated_tokens, options)?,
+        preserved_tokens: options.effective_preserved_tokens(),
         token_ids: generated_tokens.to_vec(),
         finish_reason,
         tool_calls: Vec::new(),
@@ -817,6 +837,7 @@ mod tests {
                     &ProcessorChain::new(),
                     &tokenizer,
                     Some(&mut callback),
+                    None,
                 )?;
                 assert_eq!(finish, stop_on_eos.then_some(FinishReason::EosToken));
                 assert_eq!(state.generated_tokens, [3]);
@@ -839,7 +860,7 @@ mod tests {
                         finish,
                         0,
                         None,
-                        &options.effective_preserved_tokens(),
+                        &options,
                     )?;
                     assert_eq!(result.token_ids, [3]);
                     assert_eq!(result.text, text);
@@ -872,7 +893,8 @@ mod tests {
                 &options,
                 &chain,
                 &tokenizer,
-                Some(&mut callback)
+                Some(&mut callback),
+                None
             )?,
             None
         );
@@ -884,7 +906,8 @@ mod tests {
                 &options,
                 &chain,
                 &tokenizer,
-                Some(&mut callback)
+                Some(&mut callback),
+                None
             )?,
             Some(FinishReason::StopSequence { index: 0 })
         );

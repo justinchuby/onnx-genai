@@ -1,0 +1,67 @@
+{
+  "base": "c8ef3f34f7bc4f920d16a38c45f8686f2a1620ba",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs": "56b5bf1de760e2d366dcac344d51f1c81a43dd32c1626ac5cf6bdd9d7bc95c53",
+    "crates/onnx-runtime-ep-cpu/src/kernels/conv.rs": "ab9e0049fa7db55fad4b139ad4e63221e33efb21466b2d359479d1029ed72a17",
+    "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs": "4f828718b37b8dca29f03bdca3ac9d315bb7d5affbc08b114c60757669871677",
+    "crates/onnx-runtime-ep-cpu/src/backend_ab.rs": "085185ee8924c85c002840dd89d2b5953de9dfcb8d469a3502e5ef77fd894707",
+    "crates/onnx-runtime-ep-cpu/src/kernels/mod.rs": "d789d04a9b1c4d2a1057d531292ff55734df24787ffa830befb9dcf216e29865",
+    "crates/onnx-runtime-ep-cpu/Cargo.toml": "6f791cc4639d4c25e3a850b18b66050c3d382278571aa50776c979a75ed2e3f8",
+    "Cargo.toml": "3c6d69ed0ec2272ac2154782c4319b7fd6865ef4a8539d746ebb154613dcbcf3",
+    "Cargo.lock": "3f06790b20a6f4c370eb4b9fc01f6548dfd70d34eb923ffc109a5dbda20fbdda"
+  },
+  "probe_sha256": "70a96cdeb2c19d1d9569374ae1e98b7448451bfd0c9e82507231a30c7698bcc4",
+  "compiler": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "shared_lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "lock_inode": 339651569,
+  "inherited_lock_fd": 3,
+  "parent_pid": 95774,
+  "binaries": {
+    "default": {
+      "sha256": "7234ae6c69f92cf7c1006263e0da94cbac5d8c32c0b5ca9bea195fe2bc974bf7",
+      "path": "/tmp/nxrt-conv-gap-study/default-probe",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--release",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--example",
+        "nxrt_conv_gap",
+        "--message-format=json-render-diagnostics"
+      ],
+      "mlas_symbols": 0,
+      "symbol_lines": 1744
+    },
+    "linked": {
+      "sha256": "6d546c47436301dd2d5536a8be913928507c795e9240587abb13c2a13271216c",
+      "path": "/tmp/nxrt-conv-gap-study/linked-probe",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--release",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--example",
+        "nxrt_conv_gap",
+        "--features",
+        "mlas",
+        "--message-format=json-render-diagnostics"
+      ],
+      "mlas_symbols": 106,
+      "symbol_lines": 3372
+    }
+  },
+  "environment_overrides": {
+    "RAYON_NUM_THREADS": "1",
+    "ONNX_GENAI_MLAS_THREADPOOL_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+    "CARGO_TARGET_DIR": "/tmp/nxrt-erf-nan-target",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_BUILD_JOBS": "1"
+  },
+  "temporary_example_removed": true
+}

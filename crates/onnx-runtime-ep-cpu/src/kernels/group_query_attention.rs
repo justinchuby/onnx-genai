@@ -625,7 +625,7 @@ pub struct GroupQueryAttentionFactory;
 /// be added to [`attributes_from_node`] without appearing here too. These are
 /// capability answers, not performance ones: each is a kernel we owe, and none
 /// of them is a range where we are merely slower.
-pub(crate) fn unsupported_reason(node: &Node) -> Option<String> {
+fn unsupported_reason(node: &Node) -> Option<String> {
     attributes_from_node(node).err().map(|e| e.to_string())
 }
 
@@ -735,6 +735,16 @@ fn attributes_from_node(node: &Node) -> Result<GroupQueryAttentionKernel> {
 }
 
 impl KernelFactory for GroupQueryAttentionFactory {
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        _opset: u64,
+        _shapes: &[onnx_runtime_ir::Shape],
+        _input_dtypes: &[onnx_runtime_ir::DataType],
+    ) -> Option<String> {
+        unsupported_reason(node)
+    }
+
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(attributes_from_node(node)?))
     }

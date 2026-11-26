@@ -1612,6 +1612,7 @@ impl Engine {
                         }
                         Ok(PrefillResult {
                             timings: crate::GenerationTimings {
+                                speculative: None,
                                 prompt_tokens: tokens.len() - prefix_cache_hit_len,
                                 cached_prompt_tokens: prefix_cache_hit_len,
                                 generated_tokens: 0,
@@ -1752,6 +1753,7 @@ impl Engine {
                 }
                 Ok(PrefillResult {
                     timings: crate::GenerationTimings {
+                        speculative: None,
                         prompt_tokens: tokens.len() - reused,
                         cached_prompt_tokens: reused,
                         generated_tokens: 0,
@@ -3885,7 +3887,7 @@ impl Engine {
                 finish_reason,
                 loop_state.prefix_cache_hit_len,
                 loop_state.logprobs.as_deref(),
-                &active.options.effective_preserved_tokens(),
+                &active.options,
             )?)
         } else {
             // Borrowed before the disjoint mutable borrows the backend takes.
@@ -3948,7 +3950,7 @@ impl Engine {
                     finish_reason,
                     loop_state.prefix_cache_hit_len,
                     loop_state.logprobs.as_deref(),
-                    &active.options.effective_preserved_tokens(),
+                    &active.options,
                 )?),
                 None => None,
             }
@@ -3972,7 +3974,7 @@ impl Engine {
                     FinishReason::MaxTokens,
                     active.prefix_cache_hit_len,
                     active.logprobs.as_deref(),
-                    &active.options.effective_preserved_tokens(),
+                    &active.options,
                 )
                 .map(|mut result| {
                     result.timings = active.clock.snapshot();
@@ -4233,17 +4235,17 @@ impl Engine {
         finish_reason: FinishReason,
         prefix_cache_hit_len: usize,
         logprobs: Option<&[crate::config::TokenLogprob]>,
-        preserved_tokens: &std::collections::BTreeSet<TokenId>,
+        options: &GenerateOptions,
     ) -> anyhow::Result<GenerateResult> {
         Ok(GenerateResult {
             timings: None,
             retained_cache_tokens: 0,
-            text: crate::tokenization::decode_output(
+            text: crate::tokenization::decode_generation_output(
                 self.require_tokenizer()?,
                 generated_tokens,
-                preserved_tokens,
+                options,
             )?,
-            preserved_tokens: preserved_tokens.clone(),
+            preserved_tokens: options.effective_preserved_tokens(),
             token_ids: generated_tokens.to_vec(),
             finish_reason,
             tool_calls: Vec::new(),
@@ -4903,6 +4905,298 @@ mod tests {
                 ..EngineConfig::default()
             },
         )
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn indentation_stops_commit_real_native_and_reference_decoder_prefixes() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        drop(native_speculative_per_position_fixture(directory.path())?);
+        let path = directory.path().join("tokenizer.json");
+        let mut tokenizer: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let vocabulary = tokenizer["model"]["vocab"]
+            .as_object_mut()
+            .context("fixture vocabulary")?;
+        let original = vocabulary
+            .iter()
+            .find(|(_, id)| **id == serde_json::json!(1))
+            .map(|(word, _)| word.clone())
+            .context("fixture token 1")?;
+        vocabulary.remove(&original);
+        vocabulary.insert("head\n bad".into(), serde_json::json!(1));
+        if tokenizer["model"]["unk_token"] == original {
+            tokenizer["model"]["unk_token"] = serde_json::json!("head\n bad");
+        }
+        if let Some(tokens) = tokenizer["added_tokens"].as_array_mut() {
+            tokens.retain(|token| token["id"] != 1);
+        }
+        std::fs::write(path, serde_json::to_vec(&tokenizer)?)?;
+        for (backend, speculative) in [
+            (EngineDecodeBackend::Native, false),
+            (EngineDecodeBackend::Native, true),
+            (EngineDecodeBackend::Ort, false),
+        ] {
+            for streaming in [false, true] {
+                let mut engine = Engine::from_dir(
+                    directory.path(),
+                    EngineConfig {
+                        decode_backend: backend,
+                        native_device: Some(crate::NativeDecodeDevice::Cpu),
+                        ..Default::default()
+                    },
+                )?;
+                let mut request = tiny_native_cold_request(speculative);
+                request.prompt = GeneratePrompt::TokenIds(vec![0, 1, 1, 1, 0]);
+                request.options.max_new_tokens = 8;
+                request.options.minimum_indent = 2;
+                request.options.cold_start = true;
+                request.options.num_speculative_tokens = speculative.then_some(4);
+                let mut reference = Engine::from_dir(
+                    directory.path(),
+                    EngineConfig {
+                        decode_backend: backend,
+                        native_device: Some(crate::NativeDecodeDevice::Cpu),
+                        ..Default::default()
+                    },
+                )?;
+                let mut reference_request = request.clone();
+                reference_request.options.minimum_indent = 0;
+                reference_request.options.max_new_tokens = 3;
+                let reference_result = reference.generate(reference_request)?;
+                assert_eq!(reference_result.token_ids, [1, 1, 1]);
+                let mut delivered = Vec::new();
+                let mut callback = |token| {
+                    delivered.push(token);
+                    Ok(())
+                };
+                let result = engine.generate_with_callbacks(
+                    request.clone(),
+                    None,
+                    if streaming { Some(&mut callback) } else { None },
+                )?;
+                assert_eq!(
+                    result.token_ids,
+                    [1, 1, 1],
+                    "{backend:?} speculative={speculative}"
+                );
+                assert_eq!(result.text, "head\n ");
+                assert_eq!(result.finish_reason, FinishReason::IndentationLimit);
+                if backend == EngineDecodeBackend::Native {
+                    assert_eq!(
+                        result.retained_cache_tokens,
+                        reference_result.retained_cache_tokens
+                    );
+                    assert_eq!(
+                        engine
+                            .native_slot_state()
+                            .context("Native indentation prefix")?
+                            .materialized_tokens,
+                        reference_result.retained_cache_tokens
+                    );
+                }
+                if streaming {
+                    assert_eq!(delivered.len(), 3);
+                    assert_eq!(
+                        delivered.last().unwrap().finish_reason,
+                        Some(FinishReason::IndentationLimit)
+                    );
+                }
+                request.options.minimum_indent = 0;
+                request.options.max_new_tokens = 2;
+                request.options.speculative_mode = None;
+                request.options.num_speculative_tokens = None;
+                assert_eq!(engine.generate(request)?.token_ids, [1, 1]);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prediction_time_limit_commits_real_decoder_output_and_preserves_retry_state()
+    -> anyhow::Result<()> {
+        use std::time::Duration;
+        let directory = tempfile::tempdir()?;
+        drop(native_speculative_per_position_fixture(directory.path())?);
+        let tokenizer_path = directory.path().join("tokenizer.json");
+        let mut tokenizer: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&tokenizer_path)?)?;
+        let vocabulary = tokenizer["model"]["vocab"]
+            .as_object_mut()
+            .context("test WordLevel vocabulary")?;
+        let original = vocabulary
+            .iter()
+            .find(|(_, id)| **id == serde_json::json!(1))
+            .map(|(token, _)| token.clone())
+            .context("fixture target token 1")?;
+        vocabulary.remove(&original);
+        vocabulary.insert("\n".into(), serde_json::json!(1));
+        if tokenizer["model"]["unk_token"] == original {
+            tokenizer["model"]["unk_token"] = serde_json::json!("\n");
+        }
+        if let Some(tokens) = tokenizer["added_tokens"].as_array_mut() {
+            tokens.retain(|token| token["id"] != 1);
+        }
+        std::fs::write(&tokenizer_path, serde_json::to_vec(&tokenizer)?)?;
+        for (backend, speculative) in [
+            (EngineDecodeBackend::Native, false),
+            (EngineDecodeBackend::Native, true),
+            (EngineDecodeBackend::Ort, false),
+        ] {
+            for streaming in [false, true] {
+                let mut engine = Engine::from_dir(
+                    directory.path(),
+                    EngineConfig {
+                        decode_backend: backend,
+                        native_device: Some(crate::NativeDecodeDevice::Cpu),
+                        ..Default::default()
+                    },
+                )?;
+                let mut request = tiny_native_cold_request(speculative);
+                request.prompt = GeneratePrompt::TokenIds(vec![0, 1, 1, 1, 0]);
+                request.options.max_new_tokens = 8;
+                request.options.cold_start = true;
+                request.options.num_speculative_tokens = speculative.then_some(2);
+                request.options.max_prediction_time =
+                    Some(Duration::from_millis(if speculative { 50 } else { 1 }));
+                let delay = Duration::from_millis(if speculative { 60 } else { 10 });
+                let control = crate::GenerationControl::new().with_checkpoint(move |boundary| {
+                    if matches!(
+                        boundary,
+                        crate::GenerationBoundary::AfterDecoderForward
+                            | crate::GenerationBoundary::BeforeProposer
+                    ) {
+                        std::thread::sleep(delay);
+                    }
+                    Ok(())
+                });
+                let mut events = Vec::new();
+                let mut callback = |token| {
+                    events.push(token);
+                    Ok(())
+                };
+                let result = engine.generate_with_control_callbacks(
+                    request.clone(),
+                    control,
+                    None,
+                    if streaming { Some(&mut callback) } else { None },
+                )?;
+                assert_eq!(
+                    result.finish_reason,
+                    FinishReason::PredictionTimeLimit,
+                    "{backend:?}, speculative={speculative}"
+                );
+                assert!(
+                    result.token_ids.len() >= 2 && result.token_ids.len() < 8,
+                    "{result:?}"
+                );
+                assert!(result.text.contains('\n'));
+                assert!(result.token_ids.iter().all(|id| *id == 1));
+                assert_eq!(engine.scheduler.running_count(), 0);
+                if speculative {
+                    assert!(
+                        engine.last_speculative_stats().multi_token_accepts > 0,
+                        "{:?}",
+                        engine.last_speculative_stats()
+                    );
+                }
+
+                if backend == EngineDecodeBackend::Native {
+                    assert_eq!(
+                        result.retained_cache_tokens,
+                        engine
+                            .native_slot_state()
+                            .context("Native slot after timed commit")?
+                            .materialized_tokens
+                    );
+                }
+                if streaming {
+                    assert_eq!(
+                        events
+                            .iter()
+                            .map(|token: &crate::GenerateToken| token.token_id)
+                            .collect::<Vec<_>>(),
+                        result.token_ids
+                    );
+                    assert_eq!(
+                        events.last().unwrap().finish_reason,
+                        Some(FinishReason::PredictionTimeLimit)
+                    );
+                }
+                request.options.max_prediction_time = None;
+                request.options.max_new_tokens = 2;
+                request.options.speculative_mode = None;
+                request.options.num_speculative_tokens = None;
+                assert_eq!(engine.generate(request)?.token_ids, vec![1, 1]);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prediction_time_limit_stop_observers_trim_unpublished_speculative_kv_before_commit()
+    -> anyhow::Result<()> {
+        use crate::logits::StopSequence;
+        for (stop, fail_repair) in [
+            (StopSequence::Tokens(vec![1]), false),
+            (StopSequence::Tokens(vec![1]), true),
+            (StopSequence::Text("unk".into()), false),
+            (StopSequence::Text("unk".into()), true),
+        ] {
+            let directory = tempfile::tempdir()?;
+            let mut engine = native_speculative_per_position_fixture(directory.path())?;
+            let mut request = tiny_native_cold_request(true);
+            request.prompt = GeneratePrompt::TokenIds(vec![0, 1, 1, 1, 0]);
+            request.options.max_new_tokens = 8;
+            request.options.num_speculative_tokens = Some(2);
+            request.options.stop_sequences = vec![stop];
+            if fail_repair {
+                engine
+                    .native_session
+                    .as_mut()
+                    .context("Native decoder")?
+                    .fail_rewind_after_for_test(2);
+            }
+            let mut events = Vec::new();
+            let result = engine.generate_with_callbacks(
+                request.clone(),
+                None,
+                Some(&mut |token| {
+                    events.push(token);
+                    Ok(())
+                }),
+            );
+            if fail_repair {
+                let error =
+                    result.expect_err("the stop-prefix rewind must encounter the injected failure");
+                assert!(
+                    format!("{error:#}").contains("injected native decoder rewind failure"),
+                    "{error:#}"
+                );
+                assert!(events.is_empty());
+                assert_eq!(engine.scheduler.running_count(), 0);
+                let retry = engine.generate(request)?;
+                assert_eq!(retry.token_ids, vec![1]);
+                assert_eq!(retry.retained_cache_tokens, 6);
+            } else {
+                let result = result?;
+                assert_eq!(result.token_ids, vec![1]);
+                assert_eq!(
+                    result.finish_reason,
+                    FinishReason::StopSequence { index: 0 }
+                );
+                assert!(engine.last_speculative_stats().multi_token_accepts > 0);
+                assert_eq!(
+                    result.retained_cache_tokens, 6,
+                    "only five prompt tokens and the one published accepted token may remain materialized"
+                );
+                assert_eq!(engine.native_slot_state().unwrap().materialized_tokens, 6);
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].timings, result.timings);
+            }
+        }
+        Ok(())
     }
 
     #[cfg(feature = "native-backend")]
@@ -5859,12 +6153,24 @@ mod tests {
         assert_eq!(timing.prompt_tokens, 5);
         assert_eq!(timing.cached_prompt_tokens, 0);
         assert_eq!(timing.generated_tokens, 8);
+        assert_eq!(timing.speculative, Some(engine.last_speculative_stats()));
+        assert!(timing.speculative.unwrap().proposed_tokens > 0);
         assert_eq!(timing.prompt_elapsed, updates[1].elapsed);
         assert!(!timing.prompt_elapsed.is_zero());
         assert!(!timing.generation_elapsed.is_zero());
         for (index, token) in tokens.iter().enumerate() {
             let sample = token.timings.context("native speculative token timing")?;
             assert_eq!(sample.generated_tokens, index + 1);
+            let stats = sample
+                .speculative
+                .context("committed speculative counters")?;
+            assert!(stats.proposed_tokens >= stats.accepted_tokens);
+            assert!(stats.proposed_tokens <= timing.speculative.unwrap().proposed_tokens);
+            if index > 0 {
+                let previous = tokens[index - 1].timings.unwrap().speculative.unwrap();
+                assert!(stats.proposed_tokens >= previous.proposed_tokens);
+                assert!(stats.accepted_tokens >= previous.accepted_tokens);
+            }
             assert_eq!(sample.prompt_elapsed, timing.prompt_elapsed);
             if index > 0 {
                 assert!(
@@ -5920,9 +6226,12 @@ mod tests {
                 } else {
                     assert!(format!("{error:#}").contains("injected speculative progress failure"));
                 }
+                let retry = engine.generate(request.clone())?;
+                let clean = tiny_native_cold_engine()?.generate(request)?;
+                assert_eq!(retry.token_ids, clean.token_ids);
                 assert_eq!(
-                    engine.generate(request.clone())?.token_ids,
-                    tiny_native_cold_engine()?.generate(request)?.token_ids
+                    retry.timings.unwrap().speculative,
+                    clean.timings.unwrap().speculative
                 );
             }
         }
@@ -5959,9 +6268,12 @@ mod tests {
             );
             assert!(output.is_empty());
             assert_eq!(engine.scheduler.running_count(), 0);
+            let retry = engine.generate(request.clone())?;
+            let clean = tiny_native_cold_engine()?.generate(request)?;
+            assert_eq!(retry.token_ids, clean.token_ids);
             assert_eq!(
-                engine.generate(request.clone())?.token_ids,
-                tiny_native_cold_engine()?.generate(request)?.token_ids
+                retry.timings.unwrap().speculative,
+                clean.timings.unwrap().speculative
             );
         }
         Ok(())

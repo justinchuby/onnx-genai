@@ -15,6 +15,9 @@ use onnx_runtime_ir::{DataType, Node};
 #[cfg(any(feature = "mlas", test))]
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+pub(super) mod numerical_trace;
+
 use super::check_arity;
 use super::decoded_projection::ProjectionScratch;
 use super::gelu::tanh_gelu;
@@ -173,11 +176,21 @@ fn float_moe_attributes(node: &Node) -> Result<MoeAttributes> {
 ///
 /// Implemented by running the factory's own attribute parse, so a limit cannot
 /// be added to `create` without appearing here too.
-pub(crate) fn unsupported_reason(node: &Node) -> Option<String> {
+fn unsupported_reason(node: &Node) -> Option<String> {
     float_moe_attributes(node).err().map(|e| e.to_string())
 }
 
 impl KernelFactory for MoEFactory {
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        _opset: u64,
+        _shapes: &[onnx_runtime_ir::Shape],
+        _input_dtypes: &[onnx_runtime_ir::DataType],
+    ) -> Option<String> {
+        unsupported_reason(node)
+    }
+
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(MoEKernel {
             attributes: float_moe_attributes(node)?,
@@ -1301,6 +1314,8 @@ impl MoeWorkspace<'_> {
             .zeroed_prefix(rows * (fc1_size + if separate { inter } else { 0 }))?;
         let (fc1, fc3_output) = projections.split_at_mut(rows * fc1_size);
         apply(fc1_projection, input, rows, fc1_bias, fc1)?;
+        #[cfg(test)]
+        numerical_trace::record("fc1", input, rows, fc1_bias, fc1);
         let fc3 = if separate {
             apply(
                 fc3.expect("validated separate FC3"),
@@ -1309,6 +1324,8 @@ impl MoeWorkspace<'_> {
                 fc3_bias,
                 fc3_output,
             )?;
+            #[cfg(test)]
+            numerical_trace::record("fc3", input, rows, fc3_bias, fc3_output);
             Some(&*fc3_output)
         } else {
             None
@@ -1330,6 +1347,8 @@ impl MoeWorkspace<'_> {
             }
             let output = self.projection.zeroed_prefix(rows * hidden)?;
             apply(fc2, activated, rows, fc2_bias, output)?;
+            #[cfg(test)]
+            numerical_trace::record("fc2", activated, rows, fc2_bias, output);
             Ok(output)
         } else {
             for value in fc1.iter_mut() {
@@ -1337,6 +1356,8 @@ impl MoeWorkspace<'_> {
             }
             let output = self.input.zeroed_prefix(rows * hidden)?;
             apply(fc2, fc1, rows, fc2_bias, output)?;
+            #[cfg(test)]
+            numerical_trace::record("fc2", fc1, rows, fc2_bias, output);
             Ok(output)
         }
     }

@@ -264,6 +264,7 @@ fn index_completion_publications(
         .collect()
 }
 struct StartedCompletion {
+    minimum_indent: usize,
     return_progress: bool,
     timings_per_token: bool,
     _registration: crate::completion_control::Registration,
@@ -336,6 +337,7 @@ async fn start_completion(
     await_driver_admission(generation.admission).await?;
     crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
     Ok(StartedCompletion {
+        minimum_indent: request.sampling.minimum_indent,
         return_progress: request
             .sampling
             .extensions
@@ -412,7 +414,8 @@ async fn deliver_completion(
     is_batch: bool,
 ) -> anyhow::Result<CompletionDelivery> {
     let (id, created, model, index) = response;
-    let mut stop_buffer = StopBoundaryBuffer::new(stops.to_vec());
+    let mut stop_buffer =
+        StopBoundaryBuffer::new(stops.to_vec()).with_minimum_indent(started.minimum_indent);
     let mut emitted = false;
     let result = loop {
         match tokio::select! { _=tx.closed()=>return Ok(CompletionDelivery::Disconnected),event=started.events.recv()=>event }
@@ -482,8 +485,8 @@ async fn deliver_completion(
             )
             .await?;
         }
-    } else if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
-        let text = stop_buffer.flush();
+    } else {
+        let text = stop_buffer.finish(&result.text)?;
         if !text.is_empty() {
             send_completion_stream_chunk(
                 tx,
@@ -526,9 +529,10 @@ async fn stream_completions(
     first: (CompletionRequest, PreparedCompletion),
     rest: Vec<(CompletionRequest, PreparedCompletion)>,
     client_session_id: Option<String>,
-) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
+) -> Result<Response, ApiError> {
     let is_batch = !rest.is_empty();
     let (request, prepared) = first;
+    let ping = crate::SsePingInterval::resolve(&request.sampling, state.config.sse_ping_interval)?;
     let id = text_completion_id()?;
     let started = start_completion(
         &state,
@@ -630,7 +634,7 @@ async fn stream_completions(
             .context("completion receiver closed")?;
         Ok::<(), anyhow::Error>(())
     });
-    Ok(Sse::new(ReceiverStream::new(rx)))
+    Ok(ping.response(ReceiverStream::new(rx)))
 }
 
 pub(crate) async fn chat_completions(
@@ -912,7 +916,8 @@ async fn stream_chat_completion(
     handle: Arc<ModelHandle>,
     request: ChatCompletionRequest,
     client_session_id: Option<String>,
-) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
+) -> Result<Response, ApiError> {
+    let ping = crate::SsePingInterval::resolve(&request, state.config.sse_ping_interval)?;
     let id = completion_id()?;
     let created = now_unix();
     let model = request.model.clone();
@@ -1183,7 +1188,7 @@ async fn stream_chat_completion(
         Ok::<(), anyhow::Error>(())
     });
 
-    Ok(Sse::new(ReceiverStream::new(rx)))
+    Ok(ping.response(ReceiverStream::new(rx)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2394,6 +2399,8 @@ fn build_generate_options(
     // stochastic controls as an explicit request to sample.
     let stochastic_sampling_requested = requests_stochastic_sampling(request);
     let mut options = GenerateOptions {
+        max_prediction_time: request.prediction_time_limit,
+        minimum_indent: request.minimum_indent,
         max_new_tokens: output_budget,
         temperature: request.temperature.unwrap_or(NEUTRAL_SAMPLING),
         sampler_order: request.samplers.clone(),
@@ -2550,36 +2557,20 @@ fn validate_sampling_range(value: Option<f32>, field: &str) -> Result<(), ApiErr
 }
 
 fn response_format_constraint(request: &ChatCompletionRequest) -> Option<GenerateConstraint> {
-    match request.response_format.as_ref()? {
-        ResponseFormat::JsonObject => Some(GenerateConstraint::Json {
-            prefix: if request.continue_final_message.is_enabled() {
-                request
-                    .messages
-                    .last()
-                    .and_then(|message| message.content.as_ref())
-                    .map(|content| content.text())
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            },
-        }),
-        ResponseFormat::JsonSchema { json_schema } => serde_json::to_string(&json_schema.schema)
-            .ok()
-            .map(|schema| GenerateConstraint::JsonSchema {
-                schema,
-                prefix: if request.continue_final_message.is_enabled() {
-                    request
-                        .messages
-                        .last()
-                        .and_then(|message| message.content.as_ref())
-                        .map(|content| content.text())
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                },
-            }),
-        ResponseFormat::Text => None,
-    }
+    let schema = request.response_schema()?;
+    Some(GenerateConstraint::JsonSchema {
+        schema: schema.resolved_value().to_string(),
+        prefix: if request.continue_final_message.is_enabled() {
+            request
+                .messages
+                .last()
+                .and_then(|message| message.content.as_ref())
+                .map(|content| content.text())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        },
+    })
 }
 
 pub(super) fn build_generate_options_with_tokenizer(
@@ -2668,7 +2659,18 @@ pub(super) fn build_generate_options_with_tokenizer(
         }
     }
     if let Some(activation) = request.grammar_activation()? {
-        if matches!(options.constraint, Some(GenerateConstraint::Gbnf { .. })) {
+        if request.grammar_lazy
+            && let Some(GenerateConstraint::JsonSchema { schema, .. }) = &options.constraint
+        {
+            options.constraint = Some(GenerateConstraint::LazyJsonSchema {
+                schema: schema.clone(),
+                activation: activation.clone(),
+            });
+        }
+        if matches!(
+            options.constraint,
+            Some(GenerateConstraint::Gbnf { .. } | GenerateConstraint::LazyJsonSchema { .. })
+        ) {
             activation.validate_with_tokenizer(
                 tokenizer,
                 options.max_constraint_bytes,
@@ -3002,6 +3004,7 @@ fn committed_chat_tool_calls(result: &GenerateResult) -> Option<Vec<ChatMessageT
 /// A resolved declaration plus the exact prompt that was actually rendered.
 #[derive(Clone)]
 struct ChatProjection {
+    minimum_indent: usize,
     template: Option<Arc<response_template::ResponseTemplate>>,
     prefix: Arc<str>,
     prefix_output: response_template::PrefixOutput,
@@ -3021,6 +3024,7 @@ impl ChatProjection {
             ""
         };
         Ok(Self {
+            minimum_indent: request.minimum_indent,
             template: handle.response_template.clone(),
             prefix: Arc::from(prefix),
             prefix_output: if request.continue_final_message.is_enabled() {
@@ -3055,8 +3059,8 @@ impl ChatProjection {
                     )
                 })
                 .transpose()?,
-            stop_buffer: StopBoundaryBuffer::new(self.stop_sequences.clone()),
-            generated: String::new(),
+            stop_buffer: StopBoundaryBuffer::new(self.stop_sequences.clone())
+                .with_minimum_indent(self.minimum_indent),
         })
     }
     fn buffered(&self, result: &GenerateResult) -> anyhow::Result<ChannelDelta> {
@@ -3083,7 +3087,6 @@ impl ChatProjection {
 struct ChannelGate {
     stop_buffer: StopBoundaryBuffer,
     parser: Option<response_template::ResponseParser>,
-    generated: String,
 }
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ChannelDelta {
@@ -3092,7 +3095,6 @@ struct ChannelDelta {
 }
 impl ChannelGate {
     fn push_text(&mut self, text: &str) -> anyhow::Result<ChannelDelta> {
-        self.generated.push_str(text);
         let safe = self.stop_buffer.push(text);
         let Some(parser) = &mut self.parser else {
             return Ok(ChannelDelta {
@@ -3107,9 +3109,7 @@ impl ChannelGate {
         })
     }
     fn finish(mut self, final_text: &str) -> anyhow::Result<ChannelDelta> {
-        let tail=final_text.strip_prefix(&self.generated).context("committed response text does not extend its published token text; repair the tokenizer's incremental output contract")?;
-        let mut safe = self.stop_buffer.push(tail);
-        safe.push_str(&self.stop_buffer.flush());
+        let safe = self.stop_buffer.finish(final_text)?;
         let Some(mut parser) = self.parser.take() else {
             return Ok(ChannelDelta {
                 content: safe,
@@ -3372,7 +3372,10 @@ fn truncate_tokens_at_stop(tokens: &[String], stop_sequences: &[String]) -> Vec<
 
 fn finish_reason_label(reason: &FinishReason) -> &'static str {
     match reason {
-        FinishReason::MaxTokens | FinishReason::Length => "length",
+        FinishReason::MaxTokens
+        | FinishReason::Length
+        | FinishReason::IndentationLimit
+        | FinishReason::PredictionTimeLimit => "length",
         FinishReason::EosToken | FinishReason::StopSequence { .. } => "stop",
         FinishReason::ToolCalls => "tool_calls",
     }
@@ -3763,6 +3766,76 @@ mod sampling_resolution_tests {
     }
 
     #[test]
+    fn indentation_control_matches_pinned_numeric_bounds() {
+        for (value, expected) in [
+            (json!(null), 0),
+            (json!(0), 0),
+            (json!(-0.5), 0),
+            (json!(2.9), 2),
+            (json!(i32::MAX), i32::MAX as usize),
+        ] {
+            let request = chat_request(json!({"n_indent":value}));
+            assert_eq!(
+                build_generate_options(&request, 10).minimum_indent,
+                expected
+            );
+        }
+        for value in [
+            json!(-1),
+            json!(-2.0),
+            json!(2147483648_u64),
+            json!("2"),
+            json!(true),
+            json!([]),
+        ] {
+            let error = serde_json::from_value::<ChatCompletionRequest>(
+                json!({"messages":[],"n_indent":value}),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("n_indent"), "{error}");
+            assert!(
+                error.to_string().contains("0 through 2147483647"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn prediction_time_limit_maps_wire_milliseconds_without_counting_disabled_values() {
+        for milliseconds in [-1, 0, 1, i64::MAX] {
+            let request = chat_request(json!({"t_max_predict_ms":milliseconds}));
+            let expected =
+                (milliseconds > 0).then(|| std::time::Duration::from_millis(milliseconds as u64));
+            assert_eq!(
+                build_generate_options(&request, 4).max_prediction_time,
+                expected
+            );
+        }
+        for value in [json!(null), json!(0.5), json!(-1.9)] {
+            let request = chat_request(json!({"t_max_predict_ms":value}));
+            assert_eq!(
+                build_generate_options(&request, 4).max_prediction_time,
+                None
+            );
+        }
+        let request = chat_request(json!({"t_max_predict_ms":1.5}));
+        assert_eq!(
+            build_generate_options(&request, 4).max_prediction_time,
+            Some(std::time::Duration::from_millis(1))
+        );
+        for value in [
+            json!(-2),
+            json!(-2.1),
+            json!(true),
+            json!("1"),
+            json!(u64::MAX),
+        ] {
+            let body = json!({"messages":[],"t_max_predict_ms":value});
+            assert!(serde_json::from_value::<ChatCompletionRequest>(body).is_err());
+        }
+    }
+
+    #[test]
     fn dynamic_temperature_controls_request_sampling_at_zero_base_temperature() {
         let request = chat_request(json!({"dynatemp_range":0.4,"dynatemp_exponent":2.0}));
         let mut options = build_generate_options(&request, 4);
@@ -4087,6 +4160,7 @@ mod channel_gate_tests {
         }))
         .unwrap();
         let projection = ChatProjection {
+            minimum_indent: 0,
             template: Some(template),
             prefix: Arc::from("[a]<c>old"),
             prefix_output: response_template::PrefixOutput::Include,
@@ -4114,6 +4188,7 @@ mod channel_gate_tests {
     #[test]
     fn undeclared_protocol_is_not_interpreted() {
         let projection = ChatProjection {
+            minimum_indent: 0,
             template: None,
             prefix: Arc::from(""),
             prefix_output: response_template::PrefixOutput::Include,
@@ -4203,6 +4278,7 @@ mod completion_delivery_tests {
                 StartedCompletion {
                     return_progress: false,
                     timings_per_token: false,
+                    minimum_indent: 0,
                     _registration: controls
                         .register(
                             "id",
@@ -4253,6 +4329,7 @@ mod completion_delivery_tests {
             StartedCompletion {
                 return_progress: false,
                 timings_per_token: false,
+                minimum_indent: 0,
                 _registration: controls
                     .register(
                         "id",

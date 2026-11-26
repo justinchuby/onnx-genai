@@ -1865,3 +1865,57 @@ kernels, preserve registry selection and witness actual Native GEMM dispatch.
 Factory-alias and backend-override mutations must fail those guards. This creates
 an inspectable comparison boundary; it measures no performance gap, graduates no
 family and removes none of the outstanding optional reference capabilities.
+
+
+## Conv gap study distinguishes production auto from Generic
+
+The [M1 Max complete-operator study](../benchmarks/conv-reference-gap/README.md)
+uses terminal parent wait4 CPU and setup/work/double/A/A controls. Ten of twelve
+production/reference comparisons qualify; both dilated production cells fail
+A/A and are retained without a performance conclusion. Qualified default
+ordinary 3x3 and large-weight 1x1 use less CPU than MLAS. Grouped and depthwise
+retain reuse CPU ratios about 1.83 and 2.37, respectively. Rank3 changes direction
+between reused and freshly constructed kernels, so lifecycle is part of the cost.
+
+The 1x1 research Generic/reference ratio is about 12.50, while actual production
+on the same geometry uses less CPU than reference. Generic is not a proxy for
+production auto selection. Frozen-binary inspection also finds NCHWc block size
+one, so this ARM64 reference uses fallback ConvPlan; NCHWc packed-filter reuse is
+not an explanation of these observations. Boundary/tail work and grouped im2col
+are candidates for separate profiling, not established causal attributions.
+No runtime policy, quota, cache, graduation verdict or whole-model claim changes.
+
+
+## im2col classifies contiguous sampling spans once
+
+The native Conv im2col helper now derives one valid horizontal output interval
+per kernel column and reuses it across rows. Horizontal stride one copies the
+valid input span directly, including dilated kernels; other strides sample the
+same interval. Padding is still +0 and every copied sample keeps its bits. No
+new retained workspace, allocation, quota, API or GEMM arithmetic is introduced.
+
+The [same-executable before/after study](../benchmarks/conv-im2col-spans/README.md)
+finds about 26% less complete-operator CPU for the dilated fixture and 14% less
+for the grouped fixture on M1 Max, with three controlled repetitions. Other
+qualified fixture ranges overlap; the depthwise cell fails A/A and is retained
+without inference. The independent 6912-case byte matrix, implementation mutants,
+existing Conv/allocation tests and strict lint pin correctness. These findings
+apply to the recorded small warm fixtures, not whole-model throughput or family
+graduation; the optional MLAS reference remains available.
+
+
+## Conv consumes factory-resolved physical geometry
+
+The native Conv factory admits matching rank-3 NCL or rank-4 NCHW inputs. It now
+resolves their physical NCHW shapes, strides, dilation and padding into fixed-size
+arrays once, while preserving logical tensor shapes for run-time validation.
+Execution consumes that geometry directly; it neither repeats rank-3 lifting nor
+carries an unreachable general N-D scalar branch. The general scalar implementation
+remains a test-only oracle, with its existing generic-rank numerical check.
+
+Factory tests cover unsupported/mismatched ranks and both prepared geometries,
+including groups, nonunit strides/dilation and asymmetric padding. Existing 1D/2D
+accelerated-path guards, numerical comparisons and actual allocation tests remain.
+BNNS/NEON/GEMM selection and math, output staging, dtype checks and resources are
+unchanged. This removes redundant production state and decisions; it establishes
+no new N-D capability, inference latency, memory saving or family graduation.

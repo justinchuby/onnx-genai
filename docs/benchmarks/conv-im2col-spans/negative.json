@@ -1,0 +1,47 @@
+{
+  "source_restored_sha256": "03c927d43acc16c7f1adc52de3df8476225d172a2ddd29f2bc5271ffcecd103f",
+  "results": [
+    {
+      "name": "negative_zero_padding",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::conv::tests::im2col_spans_preserve_every_sample_bit_and_overwrite_padding",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "exit": 101,
+      "selected": 1,
+      "passed": 0,
+      "failed": 1,
+      "mutant_source_sha256": "107179892340d76178af2a79e20b3232db5f1a6da266316742276c7499510cd3",
+      "log_sha256": "4e3995c9fe2a5eba2b03cd7d5aa76043ab49f4354e15e2b4800ffd6d191166b8"
+    },
+    {
+      "name": "vacuity_no_writes",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::conv::tests::im2col_spans_preserve_every_sample_bit_and_overwrite_padding",
+        "--",
+        "--exact",
+        "--nocapture"
+      ],
+      "exit": 101,
+      "selected": 1,
+      "passed": 0,
+      "failed": 1,
+      "mutant_source_sha256": "36ea15c0f311514754ad96a7dd43cde671cf4c5802caf3434c01b68c1aed5593",
+      "log_sha256": "1e8ead9d9e1c89e57cfaa457762369558fe1f364f5c900435b68a415ec0f8aba"
+    }
+  ]
+}

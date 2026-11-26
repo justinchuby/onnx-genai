@@ -16,6 +16,27 @@ use anyhow::Context;
 use onnx_genai_ort::Tokenizer;
 use std::path::Path;
 
+/// Preserve one output-stop priority for ordinary and authored generation.
+pub(crate) fn append_output_observers(chain: &mut ProcessorChain, options: &GenerateOptions) {
+    if let Some(limit) = options.max_prediction_time.filter(|limit| !limit.is_zero()) {
+        chain.add(Box::new(crate::prediction_limit::PredictionTimeLimit::new(
+            limit,
+            options.stop_sequences.clone(),
+        )));
+    }
+    if options.minimum_indent > 0 {
+        chain.add(Box::new(crate::indentation::IndentationLimit::new(
+            options.minimum_indent,
+            options.stop_sequences.clone(),
+        )));
+    }
+    if !options.stop_sequences.is_empty() {
+        chain.add(Box::new(StopSequenceProcessor::new(
+            options.stop_sequences.clone(),
+        )));
+    }
+}
+
 /// Build mandatory safety processors and the effective ordered sampler list.
 /// An explicit greedy policy bypasses stochastic warpers; a temperature-zero
 /// stage instead creates its point mass at the requested position. Hard bias,
@@ -26,6 +47,10 @@ pub(crate) fn build_processor_chain(
     tokenizer: Option<&Tokenizer>,
     has_custom_sampler: bool,
 ) -> anyhow::Result<ProcessorChain> {
+    anyhow::ensure!(
+        options.minimum_indent == 0 || tokenizer.is_some(),
+        "minimum_indent requires the model tokenizer; declare a tokenizer before requesting indentation stopping"
+    );
     let mut chain = ProcessorChain::new();
     // A temperature-zero stage still runs at its requested position. Only an
     // explicit greedy policy bypasses stochastic warpers before terminal selection.
@@ -41,11 +66,7 @@ pub(crate) fn build_processor_chain(
             biases: options.logit_bias.clone(),
         }));
     }
-    if !options.stop_sequences.is_empty() {
-        chain.add(Box::new(StopSequenceProcessor::new(
-            options.stop_sequences.clone(),
-        )));
-    }
+    append_output_observers(&mut chain, options);
 
     if let Some(constraint) = &options.constraint {
         let tokenizer = tokenizer.context("constrained decoding requires a tokenizer")?;
@@ -56,7 +77,9 @@ pub(crate) fn build_processor_chain(
             | GenerateConstraint::JsonSchema { prefix, .. }
             | GenerateConstraint::Regex { prefix, .. }
             | GenerateConstraint::Lark { prefix, .. } => prefix.as_str(),
-            GenerateConstraint::Gbnf { .. } | GenerateConstraint::RawLark { .. } => "",
+            GenerateConstraint::Gbnf { .. }
+            | GenerateConstraint::RawLark { .. }
+            | GenerateConstraint::LazyJsonSchema { .. } => "",
         };
         anyhow::ensure!(
             projection.is_none() || plain_prefix.is_empty(),
@@ -95,7 +118,7 @@ pub(crate) fn build_processor_chain(
                 ).context("resolve tokenizer.decoder byte contract for raw grammar")?.context("raw grammar requires a resolved lossless tokenizer.decoder byte contract; use a tokenizer with supported byte decoding instead of contextual decoded-token guesses")?;
                 anyhow::ensure!(
                     contract.new_state().is_identity(),
-                    "raw grammar cannot yet interpret tokenizer.decoder stream-initial stripping with model-token references; use a context-free byte decoder or a content-only response_format constraint"
+                    "raw grammar cannot yet interpret tokenizer.decoder stream-initial stripping or trailing stripping with model-token references; use a context-free byte decoder or a content-only response_format constraint"
                 );
                 // GBNF inspects raw pieces, including declared special tokens.
                 // Only explicitly resolved ending roles receive an EOS frame.
@@ -107,7 +130,7 @@ pub(crate) fn build_processor_chain(
                     ..
                 } = constraint
                 {
-                    Box::new(crate::gbnf::lazy::LazyGbnfConstraint::new(
+                    Box::new(crate::gbnf::lazy::LazyGrammarConstraint::new(
                         grammar,
                         tokenizer,
                         options,
@@ -140,6 +163,25 @@ pub(crate) fn build_processor_chain(
                     ).context("compile raw grammar against the resolved model byte vocabulary; repair the grammar or tokenizer.decoder")?;
                     Box::new(constraint.with_completion_only_eos(endings))
                 }
+            }
+
+            GenerateConstraint::LazyJsonSchema { schema, activation } => {
+                let contract = crate::byte_stream::ByteStreamContract::resolve(
+                    tokenizer, crate::tokenization::SpecialTokenHandling::Preserve,
+                ).context("resolve tokenizer.decoder byte contract for lazy JSON")?
+                    .context("lazy JSON requires a resolved lossless tokenizer.decoder byte contract; use a supported raw byte decoder")?;
+                anyhow::ensure!(
+                    contract.new_state().is_identity(),
+                    "lazy JSON cannot interpret stream-initial or trailing stripping; use a context-free byte decoder or disable grammar_lazy"
+                );
+                Box::new(crate::gbnf::lazy::LazyGrammarConstraint::json_schema(
+                    schema,
+                    tokenizer,
+                    options,
+                    contract.pieces,
+                    terminal_token_ids(options),
+                    activation,
+                )?)
             }
 
             GenerateConstraint::Json { prefix: plain } => {
@@ -652,13 +694,16 @@ pub(crate) fn finish_reason_after_token(
     chain: &ProcessorChain,
     context: &ProcessorContext,
 ) -> Option<FinishReason> {
+    let signal = chain.signal(context);
     if options.terminates(token_id) {
         return Some(FinishReason::EosToken);
     }
 
-    chain
-        .signal(context)
-        .map(|ProcessorSignal::StopSequence { index }| FinishReason::StopSequence { index })
+    signal.map(|signal| match signal {
+        ProcessorSignal::StopSequence { index } => FinishReason::StopSequence { index },
+        ProcessorSignal::PredictionTimeLimit => FinishReason::PredictionTimeLimit,
+        ProcessorSignal::IndentationLimit { .. } => FinishReason::IndentationLimit,
+    })
 }
 
 #[cfg(test)]

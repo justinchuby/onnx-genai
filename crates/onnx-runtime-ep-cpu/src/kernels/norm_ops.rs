@@ -14,7 +14,7 @@ use crate::dispatch_float;
 use crate::dtype::{ComputeDomain, NumericElem, to_dense, write_dense};
 use crate::strided::numel;
 
-trait NormAcc: ComputeDomain + PartialOrd {
+pub(super) trait NormAcc: ComputeDomain + PartialOrd {
     fn from_f32(value: f32) -> Self;
     fn sqrt(self) -> Self;
 }

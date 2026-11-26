@@ -195,6 +195,7 @@ pub(crate) enum DriverCommand {
     SynthesizeSpeech {
         request: Box<GenerateRequest>,
         audio_output: String,
+        format: onnx_genai_engine::AudioOutputFormat,
         reply: oneshot::Sender<anyhow::Result<EncodedAudio>>,
         permit: WorkerPermit,
     },
@@ -1308,6 +1309,7 @@ impl EngineDriver {
         &self,
         request: GenerateRequest,
         audio_output: String,
+        format: onnx_genai_engine::AudioOutputFormat,
     ) -> Result<EncodedAudio, GenerateSubmitError> {
         let (commands, permit) = self.reserve_stateless_command()?;
         let (reply, response) = oneshot::channel();
@@ -1316,6 +1318,7 @@ impl EngineDriver {
             .send(DriverCommand::SynthesizeSpeech {
                 request: Box::new(request),
                 audio_output,
+                format,
                 reply,
                 permit,
             })
@@ -2437,13 +2440,14 @@ fn handle_driver_command(
         DriverCommand::SynthesizeSpeech {
             request,
             audio_output,
+            format,
             reply,
             permit,
         } => {
             let _permit = permit;
             let result = engine
                 .run_pipeline_outputs(PipelineGenerateRequest::new(*request))
-                .and_then(|outputs| engine.encode_audio_output(&outputs, &audio_output));
+                .and_then(|outputs| engine.encode_audio_output(&outputs, &audio_output, format));
             complete_driver_reply(engine, completion, reply, result, _permit);
         }
         DriverCommand::GenerateImage {
@@ -3853,6 +3857,25 @@ mod admission_tests {
                 vec![1, 2, 3]
             );
             assert_eq!(finished.timings, samples.last().copied());
+            let timing = finished.timings.unwrap();
+            let wire = crate::timings::render(timing);
+            if speculative {
+                let stats = timing.speculative.expect("verified prompt-lookup counters");
+                assert_eq!(stats, engine.last_speculative_stats());
+                assert!(stats.proposed_tokens > 0);
+                assert_eq!(wire["draft_n"], stats.proposed_tokens);
+                assert_eq!(wire["draft_n_accepted"], stats.accepted_tokens);
+                assert!(
+                    samples
+                        .iter()
+                        .filter_map(|sample| sample.speculative)
+                        .all(|sample| sample.proposed_tokens <= stats.proposed_tokens)
+                );
+            } else {
+                assert!(timing.speculative.is_none());
+                assert!(wire.get("draft_n").is_none());
+                assert!(wire.get("draft_n_accepted").is_none());
+            }
             assert_eq!(
                 finished.timings.unwrap().prompt_elapsed,
                 progress[1].elapsed

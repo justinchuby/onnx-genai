@@ -251,7 +251,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 FinishReason::MaxTokens,
                 0,
                 block.state.logprobs.as_deref(),
-                &options.effective_preserved_tokens(),
+                options,
             ),
         };
         result.map(|mut result| {
@@ -309,7 +309,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 FinishReason::MaxTokens,
                 0,
                 state.logprobs.as_deref(),
-                &options.effective_preserved_tokens(),
+                options,
             )?));
         }
         let context_len = prompt_len + state.generated_tokens.len();
@@ -320,7 +320,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 FinishReason::Length,
                 0,
                 state.logprobs.as_deref(),
-                &options.effective_preserved_tokens(),
+                options,
             )?));
         }
 
@@ -458,6 +458,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 chain,
                 tokenizer,
                 callback.as_deref_mut(),
+                None,
             )? {
                 return Ok(Some(finish_result(
                     tokenizer,
@@ -465,7 +466,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                     reason,
                     0,
                     state.logprobs.as_deref(),
-                    &options.effective_preserved_tokens(),
+                    options,
                 )?));
             }
             pending.push(token);
@@ -545,6 +546,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
         if accepted >= 2 {
             stats.multi_token_accepts += 1;
         }
+        state.clock.record_speculative(*stats);
 
         // Roll the device KV back to the committed length: accepted draft
         // columns stay resident, unaccepted columns are dropped, and the bonus
@@ -613,6 +615,29 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 }
             }
             state.clock.resume_work();
+            let mut finalize_stop_prefix = |reason: Option<&FinishReason>| -> anyhow::Result<()> {
+                if reason.is_some() && !is_bonus && idx + 1 < accepted {
+                    let keep = idx + 1;
+                    let result = match recurrent_snapshot.as_ref() {
+                        Some(snapshot) => self.session.commit_recurrent_state_to_accepted(
+                            snapshot,
+                            base,
+                            &draft[..keep],
+                        ),
+                        None => {
+                            // Refresh the last retained token too: merely slicing
+                            // KV would leave hidden conditioning from a later row.
+                            self.session.rewind(base + idx).and_then(|()| {
+                                self.session
+                                    .decode(&draft[idx..keep], base + idx)
+                                    .map(|_| ())
+                            })
+                        }
+                    };
+                    result.with_context(||format!("restore Native speculative stop prefix {keep}/{accepted} before publication"))?;
+                }
+                Ok(())
+            };
             if let Some(reason) = commit_selected_token(
                 state,
                 prompt_tokens,
@@ -621,6 +646,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 chain,
                 tokenizer,
                 callback.as_deref_mut(),
+                Some(&mut finalize_stop_prefix),
             )? {
                 return Ok(Some(finish_result(
                     tokenizer,
@@ -628,7 +654,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                     reason,
                     0,
                     state.logprobs.as_deref(),
-                    &options.effective_preserved_tokens(),
+                    options,
                 )?));
             }
             if is_bonus {

@@ -28863,10 +28863,12 @@ mod tests {
     #[test]
     fn a_deferred_wide_fan_out_runs_on_the_decode_pool() {
         let (n, k) = (6144usize, 4096usize);
-        assert!(output_chunk_len(n, k) < n);
         let mut result = vec![0.0f32; n];
         {
             let _deferred = DeferredDecodeGuard::enter(MIN_ROUTED_FAN_OUT_WIDTH - 1);
+            // Partition against the deferred executor, not an ambient pool
+            // which may intentionally have only one worker.
+            assert!(output_chunk_len(n, k) < n);
             parallel_output_rows(&mut result, k, |start, outputs| {
                 for (offset, output) in outputs.iter_mut().enumerate() {
                     *output = (start + offset) as f32;
