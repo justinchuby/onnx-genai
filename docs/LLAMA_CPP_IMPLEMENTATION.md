@@ -6,7 +6,7 @@ Self-review and merge tested increments until all acceptance items are complete.
 Tool execution and MCP transport are explicitly excluded by the user's revised
 scope; external harnesses own them. Chat tool-call protocols remain required.
 
-The upstream baseline is pinned in `vendor/llama-chat/UPSTREAM`. A matching route
+The upstream baseline is pinned in `crates/onnx-genai-server/vendor/llama-chat/UPSTREAM`. A matching route
 name or a successful empty response is not an implemented capability.
 
 ## Current goal status
@@ -2422,3 +2422,120 @@ whitespace checks passed. After full tests the only source adjustment was
 Clippy's equivalent direct-Result return. These are functional macOS ARM64 CPU
 checks; no GPU/Linux execution or performance claims. Contextual raw grammars
 and the other unchecked compatibility-goal rows remain open.
+
+### JSON object domains and schema wire forms
+
+Pinned `server-common.cpp:1420-1442` and `server-schema.cpp:270-291` normalize
+empty schema objects to object roots. The transport now resolves that default
+for native, legacy completion, chat and Responses without changing the engine's
+any-value JSON constraint. Boolean and nonempty schemas retain full schema
+semantics. Typed schema documents reject non-object/non-boolean values with an
+argument-specific error.
+
+Response formats accept optional nested metadata, nested/flat schema forms and
+`json_object.schema`; top-level `json_schema` is no longer silently ignored by
+chat/completion requests. A shared selection method encodes pinned precedence
+and feeds both continuation validation and constraint construction. Native
+legacy grammar presence takes precedence, including an empty grammar; chat keeps
+its explicit conflict guard. Lazy activation, EOS policy and forced-tool guards
+consume the selected schema too. The obsolete `JsonSchemaSpec` API was removed
+and all exports/callers updated without aliases.
+
+Validation on main 71ecaa373: server library 608 passed with two inherited
+ignores; the full public HTTP integration suite passed 38 tests. Native/ORT
+coverage includes 416 successful path/format/eager-lazy/stream combinations,
+object-vs-scalar masking, boolean/explicit scalar schemas, all wrappers, prefill,
+false-schema pre-SSE refusal and invalid lazy scalar publication. Defaults and
+precedence also have request-type and native-parser regressions. Public HTTP
+expectations now require object-root schema selection and accept optional
+wrapper metadata while retaining malformed-document rejection.
+
+Default all-target strict Clippy and Native-disabled reference strict Clippy
+(`--no-default-features --features metrics,cuda-13000`) passed, as did CLI/Python
+all-target compilation (`--features python`), formatting and whole-change
+whitespace checks. The CUDA selector supplies the mandatory cudarc test binding
+version; no GPU execution was performed. Metrics-disabled strict Clippy still
+reports eight inherited dead-code diagnostics; the identical errors were
+reproduced on unmodified main 71ecaa373 before restoring this branch. This is
+recorded rather than claimed as a passing configuration. Checks are functional
+macOS ARM64 CPU evidence, with no Linux/GPU or performance claims. The wider
+compatibility goal remains open.
+
+### Graph-scoped keyed container weights
+
+Schema v1.17 adds explicit `graph_weights` entries for ONNX graphs, with
+package-relative GGUF/SafeTensors paths and container-key renames. One canonical
+resolver admits regular files beneath the package root and rejects escaping
+symlinks, missing artifacts and aliases that ambiguously bind the same graph.
+Decoder sessions, workflow components, MTP heads and target-initializer reuse
+consume the same bindings. Auto selects Native for this capability; explicit ORT
+and builds lacking Native fail with a configuration remedy.
+
+Execution retains the loader's exact dtype/shape and external-length checks.
+There is no inferred architecture, cast, transpose or quantization conversion.
+Memory evidence loads the actual keyed graph, and keyed placeholders use tensor
+geometry for byte estimates. Native portable state hashes declared container
+contents with portable package-relative labels, so relocation preserves identity
+and a changed container invalidates existing state before restoration publishes.
+
+Real GGUF and SafeTensors fixtures execute the decoder, a stateless workflow and
+three recurrent MTP steps. Decoder generation matches the original ONNX/ORT
+reference; saved-state continuation survives package relocation, while altered
+container contents are rejected without populating the destination session.
+Shape coercion, explicit ORT, missing files, graph aliases and escaping symlinks
+have refusal coverage. The complete engine library passed 1108 tests with one
+inherited ignore; metadata passed 484 tests, including generated-schema and
+extension-registry conformance. Evidence is functional macOS ARM64 CPU only.
+Bare GGUF executable-graph import, quantization selection and selective sidecar
+management remain open; this increment requires an authored ONNX graph/package.
+
+Default engine/server all-target strict Clippy and the Native-disabled server
+reference configuration (`--no-default-features --features metrics,cuda-13000`)
+passed, together with formatting and whole-change whitespace checks. The CUDA
+feature is a compile-time binding selector, not evidence of GPU execution.
+
+
+### Explicit model-package variant installation
+
+Named `repository:variant` identifiers now carry an explicit model-package
+selection through Hub planning, cache publication/restart, registry loading,
+Native/ORT engines and workflow execution. Remote planning and local loading
+share manifest/component selection and shared-asset rules. The planner excludes
+unselected variant directories before applying package quotas; selected index
+JSON is bounded and size/hash checked. Variant-local and shared tokenizer prompt
+assets use one ordered resolution path. `/props` advertises both flat nxrt
+packages and ORT model-package indexes.
+
+Selected loading checks every referenced canonical path without requiring other
+variants to be installed. The explicit validate-all package audit retains its
+all-variant checks, and symlink/traversal guards remain in the shared resolver.
+Cache-manifest version 2 persists repository and variant separately and rejects
+alternative selector spellings or old/future versions; no cache migration shim
+or automatic operator-file rewrite was introduced.
+
+Real local Hub tests prove a selected small package is admitted while an
+unselected one-GB artifact is not requested, including external indexes, shared
+tokenizer/templates, persisted resume/publication and cache reopen. Native and
+ORT generation execute the selected package. Both backends also execute a
+selected composed decision workflow through the real `/v1/systemone` route.
+Unknown variants and twelve corrupt/unsafe index cases fail before model payload
+requests. Bare GGUF graph import, filename quantization resolution and selective
+sidecar operations remain open.
+
+Selected indexes now retain a borrow of their package owner and resolve metadata
+before executable artifacts. Workflow admission therefore still precedes graph
+or tokenizer inspection. Manifest decoder and workflow decoder paths must agree;
+all manifest-backed workflow graph/tokenizer references share canonical package
+containment. Implicit metadata and tokenizer files also reject escaping or broken
+symlinks. Public HTTP tests cover selector-bearing progress, shared-template props,
+load, actual decisions and deletion that leaves another variant executable.
+
+Final validation after rebasing onto main 73f17da8f: all 20 model-package tests,
+200 ORT library tests, 614 server library tests (two inherited ignores), 1108
+engine library tests (one inherited ignore) and 38 public HTTP integration tests
+passed. Strict all-target Clippy passed for all four changed crates and the
+Native-disabled reference server (`metrics,cuda-13000`); CLI/Python all-target
+compilation, formatting and whitespace checks passed. The offline route audit
+remains 51 present / four external-harness contracts, without claiming that
+registration establishes semantic parity. Evidence is functional macOS ARM64
+CPU only, with no Linux/GPU execution or performance claims.

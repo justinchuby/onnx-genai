@@ -1,27 +1,38 @@
-//! Borrowed initialized f32 regions within one existing Host execution lane.
+//! Borrowed initialized typed regions within one existing Host execution lane.
 //! No backing owner, pool, admission policy or kernel geometry lives here.
 
-use std::alloc::Layout;
+use std::{alloc::Layout, marker::PhantomData};
 
 use onnx_runtime_ep_api::{EpError, Result, WorkspaceLayout, WorkspaceRequirement, WorkspaceView};
 
-pub(super) struct FloatWorkspace<const N: usize> {
+pub(super) struct TypedWorkspace<T: Copy + Default, const N: usize> {
     op: &'static str,
     layout: WorkspaceLayout<N>,
+    element: PhantomData<T>,
 }
 
-impl<const N: usize> FloatWorkspace<N> {
+impl<T: Copy + Default, const N: usize> TypedWorkspace<T, N> {
     pub(super) fn new(op: &'static str, buffers: [(&str, usize); N]) -> Result<Self> {
-        let mut regions = [Layout::new::<[f32; 0]>(); N];
+        if std::mem::size_of::<T>() == 0 {
+            return Err(EpError::KernelFailed(format!(
+                "{op}: zero-sized workspace element {} is unsupported; use a nonzero-sized storage type",
+                std::any::type_name::<T>()
+            )));
+        }
+        let mut regions = [Layout::new::<[T; 0]>(); N];
         for (region, (name, len)) in regions.iter_mut().zip(buffers) {
-            *region = Layout::array::<f32>(len).map_err(|_| EpError::KernelFailed(format!(
-                "{op}: `{name}` workspace buffer of {len} f32 elements exceeds addressable capacity; reduce the requested buffer length"
+            *region = Layout::array::<T>(len).map_err(|_| EpError::KernelFailed(format!(
+                "{op}: `{name}` workspace buffer of {len} {} elements exceeds addressable capacity; reduce the requested buffer length", std::any::type_name::<T>()
             )))?;
         }
         let layout = WorkspaceLayout::new(regions).map_err(|error| {
-            EpError::KernelFailed(format!("{op}: cannot plan f32 workspace: {error}"))
+            EpError::KernelFailed(format!("{op}: cannot plan typed workspace: {error}"))
         })?;
-        Ok(Self { op, layout })
+        Ok(Self {
+            op,
+            layout,
+            element: PhantomData,
+        })
     }
 
     pub(super) fn requirement(&self) -> WorkspaceRequirement {
@@ -40,7 +51,7 @@ impl<const N: usize> FloatWorkspace<N> {
     pub(super) unsafe fn with_buffers<R>(
         &self,
         workspace: Option<WorkspaceView>,
-        execute: impl for<'scratch> FnOnce([&'scratch mut [f32]; N]) -> Result<R>,
+        execute: impl for<'scratch> FnOnce([&'scratch mut [T]; N]) -> Result<R>,
     ) -> Result<R> {
         // Validate the whole layout before touching any bytes or calling user code.
         let regions = self
@@ -48,18 +59,20 @@ impl<const N: usize> FloatWorkspace<N> {
             .bind(workspace)
             .map_err(|error| EpError::KernelFailed(format!("{}: {error}", self.op)))?;
         let buffers = regions.map(|region| {
-            // Length is derived from the checked f32 layout, never duplicated state.
-            let len = region.bytes() / std::mem::size_of::<f32>();
+            // Length is derived from the checked typed layout, never duplicated state.
+            let len = region.bytes() / std::mem::size_of::<T>();
             let pointer = if len == 0 {
-                std::ptr::NonNull::<f32>::dangling().as_ptr()
+                std::ptr::NonNull::<T>::dangling().as_ptr()
             } else {
-                region.ptr().0.cast::<f32>()
+                region.ptr().0.cast::<T>()
             };
             // SAFETY: caller proves exclusive live Host storage; checked layout
             // proves alignment and disjointness. Initialize fresh raw backing
-            // before forming float references. Empty slices use aligned dangling.
+            // before forming typed references. Empty slices use aligned dangling.
             unsafe {
-                pointer.write_bytes(0, len);
+                for index in 0..len {
+                    pointer.add(index).write(T::default());
+                }
                 std::slice::from_raw_parts_mut(pointer, len)
             }
         });
@@ -75,7 +88,7 @@ mod tests {
 
     #[test]
     fn initializes_fresh_regions_and_touches_only_the_declared_prefix() {
-        let plan = FloatWorkspace::new("DFT", [("Fourier", 3); 4]).unwrap();
+        let plan = TypedWorkspace::<f32, _>::new("DFT", [("Fourier", 3); 4]).unwrap();
         assert_eq!(plan.requirement().bytes, 48);
         let mut fresh = [MaybeUninit::<f32>::uninit(); 12];
         let workspace = WorkspaceView::new(DevicePtrMut(fresh.as_mut_ptr().cast()), 48);
@@ -121,7 +134,7 @@ mod tests {
 
     #[test]
     fn zero_work_and_overflow_do_not_require_an_allocation() {
-        let plan = FloatWorkspace::new("STFT", [("inactive Fourier", 0); 4]).unwrap();
+        let plan = TypedWorkspace::<f32, _>::new("STFT", [("inactive Fourier", 0); 4]).unwrap();
         assert_eq!(plan.requirement().bytes, 0);
         // SAFETY: no memory is accessed for empty regions.
         unsafe {
@@ -131,14 +144,15 @@ mod tests {
             })
             .unwrap();
         }
-        assert!(FloatWorkspace::new("DFT", [("Fourier", usize::MAX); 4]).is_err());
+        assert!(TypedWorkspace::<f32, _>::new("DFT", [("Fourier", usize::MAX); 4]).is_err());
         assert!(
-            FloatWorkspace::new("DFT", [("Fourier", isize::MAX as usize / 16 + 1); 4]).is_err()
+            TypedWorkspace::<f32, _>::new("DFT", [("Fourier", isize::MAX as usize / 16 + 1); 4])
+                .is_err()
         );
     }
     #[test]
     fn unequal_regions_and_empty_holes_share_one_exact_prefix() {
-        let plan = FloatWorkspace::new(
+        let plan = TypedWorkspace::<f32, _>::new(
             "normalization",
             [("Y", 3), ("omitted stats", 0), ("inv", 2)],
         )
@@ -179,7 +193,7 @@ mod tests {
 
     #[test]
     fn refuses_all_bad_backing_before_initialization_or_callback() {
-        let plan = FloatWorkspace::new("test op", [("first", 1), ("second", 3)]).unwrap();
+        let plan = TypedWorkspace::<f32, _>::new("test op", [("first", 1), ("second", 3)]).unwrap();
         let mut backing = [0x7fc0_1234u32; 8];
         let ptr = backing.as_mut_ptr().cast::<u8>();
         for bad in [
@@ -215,7 +229,7 @@ mod tests {
 
     #[test]
     fn failed_consumer_does_not_retain_contents_or_borrows() {
-        let plan = FloatWorkspace::new("test op", [("Y", 2)]).unwrap();
+        let plan = TypedWorkspace::<f32, _>::new("test op", [("Y", 2)]).unwrap();
         let mut backing = [123f32; 2];
         let view = WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr().cast()), 8);
         // SAFETY: the exclusive Host backing outlives both synchronous borrows.
@@ -239,11 +253,84 @@ mod tests {
             .unwrap();
         }
         assert_eq!(backing, [789.; 2]);
-        let empty = FloatWorkspace::new("empty", []).unwrap();
+        let empty = TypedWorkspace::<f32, _>::new("empty", []).unwrap();
         assert_eq!(empty.requirement(), WorkspaceRequirement::NONE);
         // SAFETY: a zero-region plan accesses no backing.
         unsafe {
             empty.with_buffers(None, |[]| Ok(())).unwrap();
         }
+    }
+    #[test]
+    fn f64_regions_preserve_eight_byte_layout_and_fresh_initialization() {
+        let plan =
+            TypedWorkspace::<f64, 2>::new("LpNormalization", [("Y", 3), ("empty", 0)]).unwrap();
+        assert_eq!(
+            (plan.requirement().bytes, plan.requirement().alignment),
+            (24, 8)
+        );
+        let mut fresh = [MaybeUninit::<f64>::uninit(); 3];
+        let view = WorkspaceView::new(DevicePtrMut(fresh.as_mut_ptr().cast()), 24);
+        unsafe {
+            plan.with_buffers(Some(view), |[y, empty]| {
+                assert_eq!(y, &[0.; 3]);
+                assert!(empty.is_empty());
+                y.copy_from_slice(&[1.0000000000000002, 2., 3.]);
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(unsafe { fresh[0].assume_init() }, 1.0000000000000002);
+        let mut backing = [0x7ff8123456789012u64; 5];
+        let view = WorkspaceView::new(
+            DevicePtrMut(unsafe { backing.as_mut_ptr().add(1).cast() }),
+            24,
+        );
+        unsafe {
+            plan.with_buffers(Some(view), |[y, _]| {
+                y.fill(4.);
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(backing[0], 0x7ff8123456789012);
+        assert_eq!(backing[4], backing[0]);
+        assert_eq!(&backing[1..4], &[4f64.to_bits(); 3]);
+    }
+    #[test]
+    fn typed_initialization_uses_default_instead_of_assuming_zero_bits() {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        #[repr(C, align(16))]
+        struct Element(u64, u64);
+        impl Default for Element {
+            fn default() -> Self {
+                Self(7, 11)
+            }
+        }
+        let plan = TypedWorkspace::<Element, 1>::new("typed test", [("data", 2)]).unwrap();
+        assert_eq!(
+            (plan.requirement().bytes, plan.requirement().alignment),
+            (32, 16)
+        );
+        let mut fresh = [MaybeUninit::<Element>::uninit(); 2];
+        unsafe {
+            plan.with_buffers(
+                Some(WorkspaceView::new(
+                    DevicePtrMut(fresh.as_mut_ptr().cast()),
+                    32,
+                )),
+                |[data]| {
+                    assert_eq!(data, &[Element(7, 11); 2]);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        assert!(
+            TypedWorkspace::<(), 1>::new("typed test", [("data", 3)])
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("zero-sized")
+        );
     }
 }

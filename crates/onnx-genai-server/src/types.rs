@@ -288,6 +288,9 @@ pub struct ChatCompletionRequest {
     pub stop: Option<StopInput>,
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
+    /// Legacy llama.cpp JSON Schema field, shared by chat and completion routes.
+    #[serde(default)]
+    pub json_schema: Option<JsonSchemaDocument>,
     /// llama.cpp GBNF over the raw newly generated stream.
     #[serde(default)]
     pub grammar: Option<String>,
@@ -525,22 +528,17 @@ impl ChatCompletionRequest {
     }
     pub(crate) fn validate_grammar(&self) -> anyhow::Result<()> {
         self.grammar_activation()?;
-        if self.grammar_lazy
-            && self
-                .response_format
-                .as_ref()
-                .is_some_and(|format| !matches!(format, ResponseFormat::Text))
-        {
+        if self.grammar_lazy && self.response_schema().is_some() {
             anyhow::ensure!(
                 !matches!(
                     self.tool_choice,
                     Some(ToolChoice::Mode(ToolChoiceMode::Required) | ToolChoice::Specific(_))
                 ),
-                "grammar_lazy JSON response_format conflicts with forced tool_choice; use tool_choice auto/none or disable lazy JSON"
+                "grammar_lazy JSON constraint (response_format/json_schema) conflicts with forced tool_choice; use tool_choice auto/none or disable lazy JSON"
             );
             anyhow::ensure!(
                 self.extensions.get("ignore_eos") != Some(&serde_json::Value::Bool(true)),
-                "grammar_lazy JSON response_format cannot be combined with ignore_eos=true; allow JSON completion to terminate generation"
+                "grammar_lazy JSON constraint (response_format/json_schema) cannot be combined with ignore_eos=true; allow JSON completion to terminate generation"
             );
         }
         let Some(grammar) = self
@@ -551,10 +549,8 @@ impl ChatCompletionRequest {
             return Ok(());
         };
         anyhow::ensure!(
-            self.response_format
-                .as_ref()
-                .is_none_or(|format| matches!(format, ResponseFormat::Text)),
-            "grammar conflicts with response_format; supply only a grammar or a JSON response format"
+            self.response_schema().is_none(),
+            "grammar conflicts with response_format or json_schema; supply only a grammar or a JSON response constraint"
         );
         anyhow::ensure!(
             !matches!(
@@ -686,12 +682,27 @@ impl ChatCompletionRequest {
             .or_else(|| self.max_tokens.map(|budget| ("max_tokens", budget)))
     }
 
+    pub(crate) fn response_schema(&self) -> Option<std::borrow::Cow<'_, JsonSchemaDocument>> {
+        use std::borrow::Cow;
+        match self.response_format.as_ref() {
+            Some(
+                ResponseFormat::JsonSchema { schema }
+                | ResponseFormat::JsonObject {
+                    schema: Some(schema),
+                },
+            ) => Some(Cow::Borrowed(schema)),
+            Some(ResponseFormat::JsonObject { schema: None }) => {
+                Some(self.json_schema.as_ref().map_or_else(
+                    || Cow::Owned(JsonSchemaDocument::Object(Default::default())),
+                    Cow::Borrowed,
+                ))
+            }
+            None | Some(ResponseFormat::Text) => self.json_schema.as_ref().map(Cow::Borrowed),
+        }
+    }
+
     pub(crate) fn consumes_json_prefill(&self) -> bool {
-        !self.grammar_lazy
-            && matches!(
-                self.response_format.as_ref(),
-                Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
-            )
+        !self.grammar_lazy && self.response_schema().is_some()
     }
 
     pub(crate) fn has_tool_context(&self) -> bool {
@@ -1013,20 +1024,98 @@ pub struct ToolChoiceFunction {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+/// Resolved response constraint; wire wrappers do not change schema semantics.
+#[derive(Debug, Clone)]
 pub enum ResponseFormat {
     Text,
-    JsonObject,
-    JsonSchema { json_schema: JsonSchemaSpec },
+    JsonObject { schema: Option<JsonSchemaDocument> },
+    JsonSchema { schema: JsonSchemaDocument },
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct JsonSchemaSpec {
-    pub name: String,
-    pub schema: serde_json::Map<String, serde_json::Value>,
-    #[serde(default)]
-    pub strict: Option<bool>,
+/// JSON Schema documents are objects or booleans, never arbitrary JSON values.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(untagged)]
+pub enum JsonSchemaDocument {
+    Boolean(bool),
+    Object(serde_json::Map<String, serde_json::Value>),
+}
+
+impl<'de> Deserialize<'de> for JsonSchemaDocument {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        Self::from_value(serde_json::Value::deserialize(deserializer)?)
+            .map_err(|error| D::Error::custom(format!("json_schema: {error}")))
+    }
+}
+
+impl JsonSchemaDocument {
+    fn from_value(value: serde_json::Value) -> Result<Self, &'static str> {
+        match value {
+            serde_json::Value::Bool(value) => Ok(Self::Boolean(value)),
+            serde_json::Value::Object(object) => Ok(Self::Object(object)),
+            _ => Err("JSON Schema must be an object or boolean; supply a JSON Schema document"),
+        }
+    }
+
+    pub(crate) fn resolved_value(&self) -> serde_json::Value {
+        match self {
+            Self::Boolean(value) => serde_json::Value::Bool(*value),
+            Self::Object(object) if object.is_empty() => serde_json::json!({"type":"object"}),
+            Self::Object(object) => serde_json::Value::Object(object.clone()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ResponseFormat {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        use serde_json::Value;
+        let mut object = serde_json::Map::<String, Value>::deserialize(deserializer)?;
+        let kind = match object.remove("type") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(kind)) => kind,
+            Some(_) => {
+                return Err(D::Error::custom(
+                    "response_format.type must be a string; choose text, json_object or json_schema",
+                ));
+            }
+        };
+        let is_object = kind == "json_object";
+        let schema = match kind.as_str() {
+            "" | "text" => return Ok(Self::Text),
+            "json_object" => object.remove("schema"),
+            "json_schema" => match object.remove("json_schema") {
+                Some(Value::Object(mut wrapper)) => wrapper.remove("schema"),
+                Some(Value::Null) => None,
+                Some(_) => {
+                    return Err(D::Error::custom(
+                        "response_format.json_schema must be an object containing schema; use the nested wrapper or response_format.schema",
+                    ));
+                }
+                None => object.remove("schema"),
+            },
+            _ => {
+                return Err(D::Error::custom(format!(
+                    "unsupported response_format.type {kind:?}; choose text, json_object or json_schema"
+                )));
+            }
+        };
+        if is_object && schema.is_none() {
+            return Ok(Self::JsonObject { schema: None });
+        }
+        let schema = match schema {
+            None | Some(Value::Null) => JsonSchemaDocument::Object(Default::default()),
+            Some(value) => JsonSchemaDocument::from_value(value)
+                .map_err(|error| D::Error::custom(format!("response_format schema: {error}")))?,
+        };
+        Ok(if is_object {
+            Self::JsonObject {
+                schema: Some(schema),
+            }
+        } else {
+            Self::JsonSchema { schema }
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1171,6 +1260,132 @@ fn default_mirostat_eta() -> f32 {
 }
 fn default_xtc_threshold() -> f32 {
     0.1
+}
+
+#[cfg(test)]
+mod response_format_tests {
+    use super::*;
+    use serde_json::{Value, json};
+    fn request(fields: Value) -> ChatCompletionRequest {
+        let mut value = json!({"messages":[]});
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        serde_json::from_value(value).unwrap()
+    }
+    fn schema(fields: Value) -> Option<Value> {
+        request(fields)
+            .response_schema()
+            .map(|schema| schema.resolved_value())
+    }
+    #[test]
+    fn response_format_empty_schemas_resolve_to_objects_in_every_wrapper() {
+        for fields in [
+            json!({"json_schema":{}}),
+            json!({"response_format":{"type":"json_object"}}),
+            json!({"response_format":{"type":"json_object","schema":{}}}),
+            json!({"response_format":{"type":"json_schema"}}),
+            json!({"response_format":{"type":"json_schema","schema":{}}}),
+            json!({"response_format":{"type":"json_schema","json_schema":{}}}),
+            json!({"response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{},"strict":true}}}),
+        ] {
+            assert_eq!(
+                schema(fields.clone()),
+                Some(json!({"type":"object"})),
+                "{fields}"
+            );
+        }
+        for fields in [
+            json!({}),
+            json!({"response_format":{}}),
+            json!({"response_format":{"type":"text"}}),
+        ] {
+            assert_eq!(schema(fields), None);
+        }
+    }
+    #[test]
+    fn response_format_keeps_boolean_and_explicit_scalar_schemas() {
+        for document in [
+            json!(true),
+            json!(false),
+            json!({"type":"integer"}),
+            json!({"const":[1,2]}),
+        ] {
+            for fields in [
+                json!({"json_schema":document}),
+                json!({"response_format":{"type":"json_object","schema":document}}),
+                json!({"response_format":{"type":"json_schema","schema":document}}),
+                json!({"response_format":{"type":"json_schema","json_schema":{"schema":document}}}),
+            ] {
+                assert_eq!(schema(fields.clone()), Some(document.clone()), "{fields}");
+            }
+        }
+    }
+    #[test]
+    fn response_format_schema_precedence_matches_pinned_chat_conversion() {
+        let number = json!({"type":"integer"});
+        assert_eq!(
+            schema(json!({"json_schema":number,"response_format":{"type":"json_object"}})),
+            Some(number.clone())
+        );
+        assert_eq!(
+            schema(json!({"json_schema":number,"response_format":{"type":"text"}})),
+            Some(number.clone())
+        );
+        assert_eq!(
+            schema(
+                json!({"json_schema":number,"response_format":{"type":"json_object","schema":null}})
+            ),
+            Some(json!({"type":"object"}))
+        );
+        assert_eq!(
+            schema(
+                json!({"json_schema":number,"response_format":{"type":"json_schema","schema":false,"json_schema":{"schema":true}}})
+            ),
+            Some(json!(true))
+        );
+        assert_eq!(
+            schema(json!({"json_schema":number,"response_format":{"type":"json_schema"}})),
+            Some(json!({"type":"object"}))
+        );
+    }
+    #[test]
+    fn response_format_rejects_invalid_documents_and_preserves_grammar_guards() {
+        for fields in [
+            json!({"json_schema":[]}),
+            json!({"response_format":{"type":"json_object","schema":1}}),
+            json!({"response_format":{"type":"json_schema","schema":"bad"}}),
+            json!({"response_format":{"type":"json_schema","json_schema":false}}),
+            json!({"response_format":{"type":1}}),
+        ] {
+            let mut value = json!({"messages":[]});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            assert!(
+                serde_json::from_value::<ChatCompletionRequest>(value).is_err(),
+                "{fields}"
+            );
+        }
+        let raw = request(json!({"json_schema":true,"grammar":"root ::= \"x\""}));
+        assert!(
+            raw.validate_grammar()
+                .unwrap_err()
+                .to_string()
+                .contains("json_schema")
+        );
+        let lazy = request(
+            json!({"json_schema":true,"grammar_lazy":true,"grammar_triggers":[{"type":2,"value":"x"}],"ignore_eos":true}),
+        );
+        assert!(
+            lazy.validate_grammar()
+                .unwrap_err()
+                .to_string()
+                .contains("ignore_eos")
+        );
+    }
 }
 
 #[cfg(test)]

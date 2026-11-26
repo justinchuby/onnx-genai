@@ -100,6 +100,7 @@ impl PublishedPackage {
     }
     pub(crate) fn spec(&self) -> ModelSpec {
         ModelSpec {
+            package_variant: self.plan.model().variant().map(str::to_owned),
             id: self.id().into(),
             path: self.root.path.join(&self.directory),
             eager: false,
@@ -692,8 +693,13 @@ fn verify_files(directory: &Dir, plan: &DownloadPlan, partial: bool) -> anyhow::
 impl Stage {
     fn publish(self) -> Result<Arc<PublishedPackage>, TransferFailure> {
         let result = (|| -> anyhow::Result<()> {
-            if onnx_genai_ort::PipelineModelDirectory::load_if_declared(&self.path)?.is_none() {
-                onnx_genai_ort::ModelDirectory::load(&self.path)
+            let selection = self.plan.model().package_selection();
+            if onnx_genai_ort::PipelineModelDirectory::load_if_declared_with_selection(
+                &self.path, &selection,
+            )?
+            .is_none()
+            {
+                onnx_genai_ort::ModelDirectory::load_with_package_selection(&self.path, &selection)
                     .context("validate downloaded model package before publication")?;
             }
             let dir = self.root.directory.open_dir(&self.directory)?;

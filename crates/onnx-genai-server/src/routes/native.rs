@@ -134,9 +134,10 @@ fn parse(mut body: Map<String, Value>, infill: bool) -> Result<NativeRequest, Ap
         Some(Value::Bool(value)) => value,
         Some(_) => return Err(ApiError::invalid_request("return_tokens must be a boolean")),
     };
-    if let Some(schema) = body.remove("json_schema")
-        && body.insert("response_format".into(), json!({"type": "json_schema", "json_schema": {"name":"completion", "schema":schema}})).is_some() {
-            return Err(ApiError::invalid_request("send json_schema or response_format, not both"));
+    // The pinned native sampler chooses the grammar field when it is present,
+    // including an empty grammar; chat instead rejects conflicting constraints.
+    if body.contains_key("grammar") {
+        body.remove("json_schema");
     }
     body.insert("messages".into(), json!([{"role":"user","content":""}]));
     let sampling: ChatCompletionRequest = serde_path_to_error::deserialize(Value::Object(body))
@@ -1349,5 +1350,41 @@ mod response_field_tests {
             json!({"a/b/c":1,"x":3,"a/b":{"c":1},"a/":2,"":5,"tilde~1key":6})
         );
         assert_eq!(ResponseFields::default().project(source.clone()), source);
+    }
+}
+
+#[cfg(test)]
+mod json_schema_tests {
+    use super::*;
+    #[test]
+    fn native_grammar_presence_takes_precedence_over_legacy_schema() {
+        for grammar in ["", "root ::= \"hello\""] {
+            let request = parse(
+                json!({"prompt":"hello","grammar":grammar,"json_schema":["ignored"]})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                false,
+            )
+            .unwrap();
+            assert_eq!(request.sampling.grammar.as_deref(), Some(grammar));
+            assert!(request.sampling.response_schema().is_none());
+            request.sampling.validate_grammar().unwrap();
+        }
+    }
+    #[test]
+    fn native_empty_schema_uses_shared_object_domain_without_grammar() {
+        let request = parse(
+            json!({"prompt":"hello","json_schema":{}})
+                .as_object()
+                .unwrap()
+                .clone(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            request.sampling.response_schema().unwrap().resolved_value(),
+            json!({"type":"object"})
+        );
     }
 }

@@ -505,6 +505,7 @@ impl ShapeInference {
             | "Hardmax"
             | "BatchNormalization"
             | "InstanceNormalization"
+            | "MeanVarianceNormalization"
             | "GroupNormalization"
             | "LpNormalization"
             // Shape-preserving attention / MoE / KV-cache ops. Absent from this
@@ -9194,7 +9195,14 @@ fn after() {}
 
     #[test]
     fn for_node_unary_coverage() {
-        for op in ["Relu", "Sigmoid", "Cast", "Identity", "Softmax"] {
+        for op in [
+            "Relu",
+            "Sigmoid",
+            "Cast",
+            "Identity",
+            "Softmax",
+            "MeanVarianceNormalization",
+        ] {
             assert!(
                 matches!(
                     ShapeInference::for_node(&bare_node(op), &[], 1),
