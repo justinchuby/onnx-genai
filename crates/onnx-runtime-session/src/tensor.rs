@@ -921,7 +921,7 @@ impl DeviceIoBinding {
         Ok(())
     }
 
-    pub fn read_bytes_range(&mut self, byte_offset: usize, byte_len: usize) -> Result<Vec<u8>> {
+    fn validate_read_range(&self, byte_offset: usize, byte_len: usize) -> Result<()> {
         let end =
             byte_offset
                 .checked_add(byte_len)
@@ -941,11 +941,26 @@ impl DeviceIoBinding {
                 ),
             });
         }
+        Ok(())
+    }
+
+    pub fn read_bytes_range(&mut self, byte_offset: usize, byte_len: usize) -> Result<Vec<u8>> {
+        self.validate_read_range(byte_offset, byte_len)?;
         let mut bytes = vec![0; byte_len];
+        self.read_bytes_range_into(byte_offset, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Copy a checked device range into an already-owned destination without
+    /// allocating an intermediate payload. The caller retains destination funding.
+    pub fn read_bytes_range_into(&mut self, byte_offset: usize, bytes: &mut [u8]) -> Result<()> {
+        let byte_len = bytes.len();
+        self.validate_read_range(byte_offset, byte_len)?;
+        let buffer = self.buffer();
         if byte_len == 0 {
             self.allocator.sync()?;
             self.check_and_reset_device_validation()?;
-            return Ok(bytes);
+            return Ok(());
         }
         // SAFETY: the offset range is checked inside the live allocation above;
         // the borrowed handle owns nothing and `DeviceBuffer` has no destructor.
@@ -957,11 +972,11 @@ impl DeviceIoBinding {
                 buffer.alignment(),
             )
         };
-        self.allocator.copy_to_host(&alias, &mut bytes)?;
+        self.allocator.copy_to_host(&alias, bytes)?;
         self.check_and_reset_device_validation()?;
         self.transfer_stats.host_download_calls += 1;
         self.transfer_stats.host_download_bytes += bytes.len() as u64;
-        Ok(bytes)
+        Ok(())
     }
 
     pub fn device_argmax_supported(&self) -> bool {

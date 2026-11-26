@@ -57,7 +57,14 @@ impl Engine {
             native.empty_snapshot_memory_bytes()?,
         )?;
         let empty = native.empty_past_snapshot()?;
-        let bytes = empty.write_file(&[], identity, writer, limits, self.governor.memory())?;
+        let bytes = empty.write_file(
+            &[],
+            identity,
+            writer,
+            limits,
+            self.governor.memory(),
+            &native.inference_session().host_tensor_allocator()?,
+        )?;
         Ok(NativeStateFileSummary {
             logical_tokens: 0,
             materialized_tokens: 0,

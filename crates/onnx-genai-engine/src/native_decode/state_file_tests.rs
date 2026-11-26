@@ -551,3 +551,209 @@ fn state_file_configuration_rejects_unsupported_execution_paths_at_load() -> any
     );
     Ok(())
 }
+
+fn managed_native_file_fixture(
+    limit: u64,
+) -> anyhow::Result<(
+    NativeDecodeSession,
+    onnx_runtime_memory_governor::ProcessMemoryManager,
+    Arc<onnx_runtime_memory_governor::LedgerGovernor>,
+)> {
+    use onnx_runtime_ep_cpu::{CpuBufferMemory, CpuExecutionProvider, CpuMemoryResources};
+    use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor, ProcessMemoryManager};
+    let manager = ProcessMemoryManager::new()?;
+    let books = Arc::new(LedgerGovernor::new(LeaseLedger::new_for_device(
+        onnx_runtime_memory_api::DeviceKey::HOST,
+        0,
+        limit,
+        0,
+    )));
+    let provider = Arc::new(CpuExecutionProvider::initialized_with_resources(
+        CpuMemoryResources::default()
+            .with_buffer_memory(CpuBufferMemory::governed(&manager, books.clone())?)?,
+    )?);
+    let original = super::super::tests::tiny_decoder(false);
+    let graph = original.graph().clone();
+    drop(original);
+    let session = InferenceSession::from_graph_with_provider(
+        graph,
+        Arc::new(onnx_runtime_loader::WeightStore::new()),
+        Path::new("."),
+        provider,
+        None,
+    )?;
+    let mut native = NativeDecodeSession::from_session_with_io(
+        session,
+        &super::super::tests::tiny_decoder_io(),
+    )?;
+    native.state_identity = Some([17; 32]);
+    Ok((native, manager, books))
+}
+
+#[test]
+fn managed_state_file_owned_payload_survives_source_drop_and_pressure_retry() -> anyhow::Result<()>
+{
+    let limit = 1024 * 1024;
+    let (mut native, manager, books) = managed_native_file_fixture(limit)?;
+    let _ = native.decode(&[2, 3], 0)?;
+    let allocator = native.session.host_tensor_allocator()?;
+    let snapshot = native.snapshot_past()?;
+    for tensor in snapshot.past.values() {
+        assert_eq!(tensor.to_vec_f32(), vec![2., 3.]);
+    }
+    let mut file = Vec::new();
+    snapshot.write_file(
+        &[2, 3],
+        [17; 32],
+        &mut file,
+        NativeStateFileLimits::default(),
+        books.as_ref(),
+        &allocator,
+    )?;
+    let before = native.snapshot_past()?;
+    let used = books.used(Tier::Host);
+    let blocker = allocator.array::<u8>(usize::try_from(limit - used - 1)?)?;
+    let mut input = std::io::Cursor::new(file.as_slice());
+    let refused =
+        native.read_state_file(&mut input, NativeStateFileLimits::default(), books.as_ref());
+    assert_eq!(
+        input.position(),
+        HEADER,
+        "refused admission must precede reading manifest/payload bytes"
+    );
+    let mut refused_output = Vec::new();
+    assert!(
+        snapshot
+            .write_file(
+                &[2, 3],
+                [17; 32],
+                &mut refused_output,
+                NativeStateFileLimits::default(),
+                books.as_ref(),
+                &allocator
+            )
+            .is_err()
+    );
+    assert!(
+        refused_output.is_empty(),
+        "refused serialization admission must not publish a partial file"
+    );
+    assert!(
+        refused.is_err(),
+        "state file read must refuse exhausted actual Host authority"
+    );
+    assert_eq!(native.current_len(), 2);
+    assert!(
+        native.snapshot_past().is_err(),
+        "snapshot copy must also require real additional headroom"
+    );
+    assert_eq!(native.past.len(), before.past.len());
+    for (name, tensor) in &native.past {
+        assert_eq!(tensor.as_bytes(), before.past[name].as_bytes());
+    }
+    drop(blocker);
+    let decoded = native.read_state_file(
+        &mut file.as_slice(),
+        NativeStateFileLimits::default(),
+        books.as_ref(),
+    )?;
+    assert_eq!(decoded.tokens.as_slice(), [2, 3]);
+    assert_eq!(decoded.state.len, 2);
+    for tensor in decoded.state.past.values() {
+        assert_eq!(tensor.to_vec_f32(), vec![2., 3.]);
+    }
+    native.restore_past_snapshot(&decoded.state)?;
+    let _ = native.decode(&[5], 2)?;
+    for tensor in native.past.values() {
+        assert_eq!(tensor.to_vec_f32(), vec![2., 3., 5.]);
+    }
+    drop(before);
+    drop(snapshot);
+    drop(allocator);
+    drop(native);
+    assert!(
+        manager.process_used(Tier::Host) > 0,
+        "decoded tensor backing must retain its real manager owner after source session drop"
+    );
+    for tensor in decoded.state.past.values() {
+        assert_eq!(tensor.to_vec_f32(), vec![2., 3.]);
+    }
+    drop(decoded);
+    assert_eq!(books.used(Tier::Host), 0);
+    assert_eq!(manager.process_used(Tier::Host), 0);
+    assert!(manager.snapshot()?.allocations.is_empty());
+    Ok(())
+}
+
+#[test]
+fn managed_cpu_snapshot_and_growth_admit_contiguous_live_rows_before_copy() -> anyhow::Result<()> {
+    let limit = 4096;
+    let (native, manager, books) = managed_native_file_fixture(limit)?;
+    let allocator = native.session.host_tensor_allocator()?;
+    let mut binding = native.session.allocate_device_binding(
+        "past_key_values.0.key".into(),
+        Some("present.0.key".into()),
+        DataType::Float32,
+        vec![1, 2, 8, 2],
+        vec![1, 2, 2, 2],
+    )?;
+    let mut expected = vec![0u8; 128];
+    for (block, values) in [[1f32, 2., 3., 4.], [11., 12., 13., 14.]]
+        .iter()
+        .enumerate()
+    {
+        for (index, value) in values.iter().enumerate() {
+            expected[block * 64 + index * 4..block * 64 + (index + 1) * 4]
+                .copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    binding.write_bytes(0, &expected)?;
+    let mut state = DecodeCpuKvState::from_parts_for_test(
+        vec![binding],
+        vec![("present.0.key".into(), "past_key_values.0.key".into())],
+        DataType::Float32,
+        8,
+        2,
+    );
+    let used = books.used(Tier::Host);
+    let empty = cpu::CpuKvSnapshotRows::new(&allocator, 2, 0)?;
+    assert_eq!(books.used(Tier::Host), used);
+    assert_eq!(empty.iter().collect::<Vec<_>>(), vec![&[][..], &[][..]]);
+    drop(empty);
+    let blocker = allocator.array::<u8>(usize::try_from(limit - used - 1)?)?;
+    let transfers = state.binding_for_test(0).transfer_stats();
+    assert!(state.snapshot(&allocator).is_err());
+    assert_eq!(
+        state.binding_for_test(0).transfer_stats(),
+        transfers,
+        "snapshot must admit destination before any source copy"
+    );
+    assert_eq!(state.binding_for_test(0).read_bytes()?, expected);
+    drop(blocker);
+    let snapshot = state.snapshot(&allocator)?;
+    assert_eq!(
+        snapshot.entries[0].rows.iter().collect::<Vec<_>>(),
+        vec![&expected[..16], &expected[64..80]]
+    );
+    // Old cache, live staging and replacement must all fit simultaneously.
+    let used = books.used(Tier::Host);
+    let blocker = allocator.array::<u8>(usize::try_from(limit - used - (32 + 256 - 1))?)?;
+    assert!(state.grow_to(&native.session, 16, 2).is_err());
+    assert_eq!(state.max_len, 8);
+    assert_eq!(state.binding_for_test(0).read_bytes()?, expected);
+    drop(blocker);
+    state.grow_to(&native.session, 16, 2)?;
+    state.restore_snapshot(&snapshot)?;
+    let restored = state.snapshot(&allocator)?;
+    assert_eq!(restored.logical_len, snapshot.logical_len);
+    assert_eq!(restored.entries[0].rows, snapshot.entries[0].rows);
+    drop(restored);
+    drop(snapshot);
+    drop(state);
+    drop(allocator);
+    drop(native);
+    assert_eq!(books.used(Tier::Host), 0);
+    assert_eq!(manager.process_used(Tier::Host), 0);
+    assert!(manager.snapshot()?.allocations.is_empty());
+    Ok(())
+}

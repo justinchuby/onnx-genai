@@ -865,22 +865,15 @@ impl NativeDecodeSession {
         let mut result = 0_u64;
         if let Some(cpu) = &self.cpu_kv {
             for (pair, shape, _) in cpu.state_layout() {
-                let blocks = shape[0]
-                    .checked_mul(shape[1])
-                    .context("empty CPU KV snapshot block count overflow")?;
                 result = result
-                    .checked_add(
-                        u64::try_from(blocks)?
-                            .checked_mul(std::mem::size_of::<Vec<u8>>() as u64)
-                            .context("empty CPU KV snapshot metadata size overflow")?,
-                    )
-                    .and_then(|n| {
-                        n.checked_add(
-                            (pair.0.len() + pair.1.len() + std::mem::size_of_val(shape) + 128)
-                                as u64,
-                        )
-                    })
-                    .context("empty CPU KV snapshot memory size overflow")?;
+                    .checked_add(u64::try_from(
+                        std::mem::size_of::<cpu::CpuKvSnapshotEntry>()
+                            + pair.0.len()
+                            + pair.1.len()
+                            + std::mem::size_of_val(shape)
+                            + 128,
+                    )?)
+                    .context("empty CPU KV snapshot metadata size overflow")?;
             }
         }
         Ok(result)
@@ -905,7 +898,11 @@ impl NativeDecodeSession {
                         pair: pair.clone(),
                         shape,
                         dtype,
-                        rows: vec![Vec::new(); blocks],
+                        rows: cpu::CpuKvSnapshotRows::new(
+                            &self.session.host_tensor_allocator()?,
+                            blocks,
+                            0,
+                        )?,
                     });
                 }
                 Ok(cpu::CpuKvSnapshot {
@@ -934,10 +931,11 @@ impl NativeDecodeSession {
             bail!("cannot snapshot recurrent prefix before all recurrent tensors are materialized");
         }
         let bytes = self.past_snapshot_bytes()?;
+        let allocator = self.session.host_tensor_allocator()?;
         let cpu_kv = self
             .cpu_kv
             .as_mut()
-            .map(DecodeCpuKvState::snapshot)
+            .map(|cpu| cpu.snapshot(&allocator))
             .transpose()?;
         let mut past = HashMap::with_capacity(self.past.len());
         for (name, tensor) in &self.past {

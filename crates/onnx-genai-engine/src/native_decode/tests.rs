@@ -5015,7 +5015,7 @@ fn cpu_kv_snapshot_restores_live_rows_after_overwrite_and_growth() -> anyhow::Re
         bytes,
         "snapshot only owns live rows, not capacity"
     );
-    let snapshot = state.snapshot()?;
+    let snapshot = state.snapshot(&session.host_tensor_allocator()?)?;
     for index in 0..2 {
         state.binding_for_test(index).write_bytes(
             0,
@@ -5071,7 +5071,7 @@ fn cpu_kv_snapshot_preflights_every_binding_before_writing() -> anyhow::Result<(
         capacity,
         live,
     )
-    .snapshot()?;
+    .snapshot(&session.host_tensor_allocator()?)?;
     let mut different = pairs;
     different[1] = ("present.other".to_string(), "past.other".to_string());
     let bindings = different

@@ -238,6 +238,12 @@ impl Engine {
             writer,
             limits,
             self.governor.memory(),
+            &self
+                .native_session
+                .as_ref()
+                .context("Native decoder disappeared during state capture; reload the model")?
+                .inference_session()
+                .host_tensor_allocator()?,
         )?;
         Ok(NativeStateFileSummary {
             logical_tokens: capture.tokens.len(),
