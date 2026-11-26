@@ -22,7 +22,7 @@
       ],
       "remaining": [
         "Fresh complete browser acceptance on the final revision; source-linked drivers are not current results.",
-        "CLI runtime links exercise maintained synthetic Native CPU fixtures through the Cargo-built executable, not the packaged console launcher. Fresh final-revision runs, broader model/device/format/config permutations and installed wheel/console launcher acceptance remain open."
+        "CLI Cargo-built runtime fixtures and maintained [binding wheel smoke](../crates/onnx-genai-python/tests/python_wheel_smoke.py) / [installed console smoke](../crates/onnx-genai-cli/tests/python_wheel_smoke.py) cover synthetic Native CPU workflows without ORT. Remaining installed-artifact acceptance includes release/LTO builds, free-threaded wheels, Linux/Windows, other interpreter versions and broader model/device/format/config permutations; fresh final-revision runs remain required."
       ]
     },
     {

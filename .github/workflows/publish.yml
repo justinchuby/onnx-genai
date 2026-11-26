@@ -356,6 +356,8 @@ jobs:
         run: maturin sdist --manifest-path crates/onnx-genai-python/Cargo.toml --out dist
       - name: Build onnx-genai-server source distribution
         run: maturin sdist --manifest-path crates/onnx-genai-cli/Cargo.toml --out dist
+      - name: Check GenAI source distribution notices and corresponding reader source
+        run: python crates/onnx-genai-symphonia-mkv/verify_distribution.py --source-root . --directory dist
       - name: Publish onnx-genai source distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
@@ -458,6 +460,9 @@ jobs:
         with:
           package-dir: ${{ matrix.package_dir }}
           output-dir: wheelhouse
+
+      - name: Check wheel notices and corresponding reader source
+        run: python crates/onnx-genai-symphonia-mkv/verify_distribution.py --source-root . --directory wheelhouse
 
       - name: Upload wheel
         uses: actions/upload-artifact@v7

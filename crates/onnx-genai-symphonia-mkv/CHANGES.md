@@ -13,3 +13,9 @@
 - Reject Opus seeking; unchanged legacy codecs retain their existing seek behavior.
 
 - Apply workspace Clippy style to inherited EBML bounds and lacing divisibility checks without changing their admission conditions.
+- Stage exact version-bound covered source and redistribution notices using a
+  standard-library-only build script. Maturin copies that dependency OUT_DIR
+  snapshot into both GenAI wheels; source distributions retain the canonical crate.
+- Normalize inherited source to workspace Rustfmt conventions; byte-level changes
+  also occur in otherwise functionally unchanged codecs/tags/library modules.
+  Published Symphonia core/common remain unchanged external dependencies.

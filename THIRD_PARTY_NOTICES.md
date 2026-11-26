@@ -42,3 +42,11 @@ local modifications, and all modified covered source is distributed in the crate
 Binary redistributors must preserve these notices and make the covered maintained
 source available under MPL-2.0, including their changes to covered source files.
 The repository's MIT license does not replace the reader's MPL-2.0 license.
+
+GenAI Python and CLI wheels carry this notice and the reader's complete maintained
+covered source under `<python-package>/_third_party/onnx-genai-symphonia-mkv-<version>/`.
+That versioned snapshot includes the license, original source archive/provenance,
+change notes and build script. Source distributions carry the canonical reader
+crate, including an identical `NOTICE.md`; wheel staging never maintains a second
+copy of the reader source. The bundled snapshot identifies the exact covered
+source used by that artifact; the repository URL above is additional discovery.

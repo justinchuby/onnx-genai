@@ -38,3 +38,36 @@ hashes; the exact 50 KiB source archive is included under `upstream/`. Run
 in this package and at the repository URL in Cargo.toml. Distributors must preserve
 MPL notices and provide the covered source as required by MPL-2.0. No external
 ffmpeg executable or C codec runtime is required by this reader.
+
+## Binary source availability
+
+`NOTICE.md` reproduces the repository's redistribution notice. The packaging
+checker enforces that it matches `THIRD_PARTY_NOTICES.md` in a workspace build.
+The reader build script uses only its own manifest directory and Cargo OUT_DIR,
+so a normal registry consumer needs no enclosing repository or external command.
+It copies canonical files, never a separately maintained source tree, into
+`onnx-genai-symphonia-mkv-<version>/` beneath OUT_DIR; Cargo registry builds retain
+both normalized `Cargo.toml` and authored `Cargo.toml.orig` when present.
+
+Both GenAI pyprojects require Maturin 1.14.1+ and include this dependency output
+under their Python package's `_third_party` directory. Cargo/Maturin source
+distributions carry this canonical crate including notices, covered source,
+provenance, original archive and build script. No runtime network access is used.
+
+After building actual wheels and source distributions, inspect each artifact:
+
+```sh
+python3 crates/onnx-genai-symphonia-mkv/verify_distribution.py \
+  --source-root /path/to/matching/checkout --directory wheelhouse
+python3 crates/onnx-genai-symphonia-mkv/verify_distribution.py \
+  --source-root /path/to/matching/checkout --directory dist
+```
+
+The checker reads archives without extracting them and compares every staged
+covered file to the matching source, requires the notice/license and records
+per-file and artifact SHA-256 values. It accepts Cargo's normalized manifest only
+when package/dependency facts agree; normalized wheel manifests must also carry
+the exact authored original. The scope is this maintained reader and the shipped
+repository notice, not a claim that every third-party redistribution concern has
+been audited. Source/link validation is separate from Rust or installed-wheel
+execution acceptance.
