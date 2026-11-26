@@ -152,10 +152,20 @@ pub fn raw<T: Copy>(values: &[T]) -> Vec<u8> {
 
 /// Build a [`Tensor`] from typed scalar values.
 pub fn input<T: Copy>(dtype: DataType, shape: &[usize], values: &[T]) -> Tensor {
+    let bytes = raw(values);
+    let expected = dtype.storage_bytes(shape.iter().product());
+    assert_eq!(
+        bytes.len(),
+        expected,
+        "input fixture for {dtype:?} with shape {shape:?} must provide exactly {expected} storage bytes, got {} bytes from {} values of {}",
+        bytes.len(),
+        values.len(),
+        std::any::type_name::<T>(),
+    );
     Tensor {
         dtype,
         shape: shape.to_vec(),
-        bytes: raw(values),
+        bytes,
         absent: false,
     }
 }

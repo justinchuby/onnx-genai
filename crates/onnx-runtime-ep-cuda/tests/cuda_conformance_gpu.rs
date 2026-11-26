@@ -161,21 +161,21 @@ fn packed_integer_cast_cuda_matches_strict_reference_bytes() {
         (
             "uint8-to-uint4-codes-and-zero-points",
             21,
-            input(DataType::Uint8, &[7], &[0, 1, 7, 8, 15, 16, 255]),
+            input(DataType::Uint8, &[7], &[0u8, 1, 7, 8, 15, 16, 255]),
             DataType::Uint4,
             vec![0x10, 0x87, 0x0f, 0x0f],
         ),
         (
             "uint4-to-int2-between-packed-types",
             25,
-            input(DataType::Uint4, &[5], &[0x10, 0x87, 0xff]),
+            input(DataType::Uint4, &[5], &[0x10u8, 0x87, 0xff]),
             DataType::Int2,
             vec![0x34, 0x03],
         ),
         (
             "int2-to-int4-sign-extension",
             25,
-            input(DataType::Int2, &[5], &[0x34, 0x03]),
+            input(DataType::Int2, &[5], &[0x34u8, 0x03]),
             DataType::Int4,
             vec![0x10, 0x0f, 0x0f],
         ),
@@ -234,8 +234,8 @@ fn packed_integer_cast_cuda_matches_strict_reference_bytes() {
         expected
     );
 
-    let source = input(DataType::Uint8, &[5], &[0, 1, 2, 3, 4]);
-    let target = input(DataType::Uint2, &[1], &[0]);
+    let source = input(DataType::Uint8, &[5], &[0u8, 1, 2, 3, 4]);
+    let target = input(DataType::Uint2, &[1], &[0u8]);
     let outputs = [(DataType::Uint2, vec![5])];
     let expected = vec![0xe4, 0x00];
     assert_eq!(
