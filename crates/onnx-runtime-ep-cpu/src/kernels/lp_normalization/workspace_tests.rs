@@ -293,3 +293,116 @@ fn aliased_and_strided_output_preserves_complete_source_reads() {
     assert_eq!(data[7], -99.);
     assert_eq!(data[11], -99.);
 }
+
+#[test]
+fn inplace_snapshot_matches_immutable_coordinate_reference_for_every_axis_and_storage() {
+    fn check<T: NumericElem + Default>(values: Vec<T>)
+    where
+        T::Acc: LpAcc,
+    {
+        let shape = [2, 3, 4];
+        let strides = [12, 4, 1];
+        let view = TensorView::new(
+            onnx_runtime_ep_api::DevicePtr(values.as_ptr().cast()),
+            T::DTYPE,
+            &shape,
+            &strides,
+            onnx_runtime_ir::DeviceId::cpu(),
+        );
+        for axis in 0..3 {
+            let coords = |j: usize| [j / 12, (j / 4) % 3, j % 4];
+            for p in [1, 2] {
+                // Immutable coordinate grouping recomputes each reference norm;
+                // it cannot accidentally read already normalized other groups.
+                let expected = (0..24)
+                    .map(|i| {
+                        let c = coords(i);
+                        let norm = (0..24)
+                            .filter(|&j| {
+                                let other = coords(j);
+                                (0..3).all(|d| d == axis || c[d] == other[d])
+                            })
+                            .fold(T::Acc::default(), |sum, j| {
+                                let value = values[j].to_acc().abs();
+                                sum.c_add(if p == 1 { value } else { value.c_mul(value) })
+                            });
+                        let norm = if p == 2 { norm.sqrt() } else { norm };
+                        let norm = if norm < T::Acc::TINY {
+                            T::Acc::TINY
+                        } else {
+                            norm
+                        };
+                        T::from_acc(values[i].to_acc().c_div(norm))
+                    })
+                    .collect::<Vec<_>>();
+                let mut actual = vec![T::default(); 24];
+                let mut out = TensorMut::new(
+                    onnx_runtime_ep_api::DevicePtrMut(actual.as_mut_ptr().cast()),
+                    T::DTYPE,
+                    &shape,
+                    &strides,
+                    onnx_runtime_ir::DeviceId::cpu(),
+                );
+                LpNormalizationKernel {
+                    axis: axis as i64,
+                    p,
+                }
+                .execute_prepared(&[view], std::slice::from_mut(&mut out))
+                .unwrap();
+                let bytes = 24 * size_of::<T>();
+                assert_eq!(
+                    unsafe { std::slice::from_raw_parts(actual.as_ptr().cast::<u8>(), bytes) },
+                    unsafe { std::slice::from_raw_parts(expected.as_ptr().cast::<u8>(), bytes) },
+                    "axis={axis} p={p}"
+                );
+            }
+        }
+    }
+    let values = (0..24)
+        .map(|i| {
+            if i % 5 == 0 {
+                -0.
+            } else {
+                (i as f32 - 7.25) * 0.375
+            }
+        })
+        .collect::<Vec<_>>();
+    check(values.clone());
+    check(values.iter().map(|&v| f64::from(v)).collect());
+    check(values.iter().copied().map(half::f16::from_f32).collect());
+    check(values.iter().copied().map(half::bf16::from_f32).collect());
+}
+
+#[test]
+fn reversed_input_shifted_output_overlap_and_special_values_keep_snapshot_semantics() {
+    let k = LpNormalizationKernel { axis: 1, p: 2 };
+    let owner = Owned::f32(&[2, 3], &[0.; 6]);
+    let mut backing = [3f32, 4., 0., 0., 5., 12., -99.];
+    let mut x = owner.view();
+    x.data = onnx_runtime_ep_api::DevicePtr(backing.as_ptr().cast());
+    x.byte_offset = 12;
+    x.strides = &[-3, 1];
+    let mut y = Owned::zeros_f32(&[2, 3]);
+    let mut output = y.view_mut();
+    output.data = onnx_runtime_ep_api::DevicePtrMut(unsafe { backing.as_mut_ptr().add(1).cast() });
+    k.execute_prepared(&[x], &mut [output]).unwrap();
+    for (got, want) in backing[1..]
+        .iter()
+        .zip([0., 5. / 13., 12. / 13., 0.6, 0.8, 0.])
+    {
+        assert!((got - want).abs() < 1e-6);
+    }
+    assert_eq!(backing[0], 3.);
+    for p in [1, 2] {
+        let x = Owned::f32(&[3, 2], &[f32::NAN, 1., f32::INFINITY, 1., -0., 0.]);
+        let mut y = Owned::zeros_f32(&[3, 2]);
+        LpNormalizationKernel { axis: 1, p }
+            .execute_prepared(&[x.view()], &mut [y.view_mut()])
+            .unwrap();
+        let got = y.to_f32();
+        assert!(got[0].is_nan() && got[1].is_nan() && got[2].is_nan());
+        assert_eq!(got[3], 0.);
+        assert_eq!(got[4].to_bits(), (-0f32).to_bits());
+        assert_eq!(got[5].to_bits(), 0);
+    }
+}

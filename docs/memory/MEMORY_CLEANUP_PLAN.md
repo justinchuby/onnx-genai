@@ -2929,3 +2929,26 @@ output budget and preserves arbitrary input/output aliasing. Checked metadata
 planning validates exact dtype/shape, axis and indexing capacity, including empty
 shapes; actual execution validates Host views before binding scratch. This
 introduces no per-slice grants or new public EP API and makes no timing/CUDA claim.
+
+
+### LpNormalization reuses its lane for the complete input snapshot
+
+LpNormalization now copies the original storage elements directly into its
+admitted staging lane, then normalizes that snapshot in place. Every dense
+coordinate belongs to exactly one `(outer, inner)` reduction group. Each group
+finishes its norm before overwriting its own values and cannot read another
+group's outputs. The real output is still published only after the complete
+snapshot and all reductions. Accumulator type, reduction order, TINY floor and
+final storage conversion stay unchanged. The last matrix-sized input Vec is
+removed without adding a lane or changing the `numel * sizeof(T)` peak.
+
+The storage-copy visitor is shared by allocating `to_dense` reads and borrowed
+`to_dense_into` reads. It validates Host access, dtype, view geometry and checked
+capacity before accessing elements; the borrowed route also validates complete
+destination length before writes. Copies preserve raw storage bits, including
+half/f64 and NaN payloads, rather than widening through f32. Rank-sized indexing
+metadata remains separate from tensor payload admission; high-rank indexing may
+still allocate. A real global-allocator probe uses the old allocating copy as a
+positive control and verifies that kernel executions allocate no matrix-sized
+payload for any of the four float storage types. Existing public peak/trim and
+4096-cycle warm governor tests retain their original bounds and callbacks.
