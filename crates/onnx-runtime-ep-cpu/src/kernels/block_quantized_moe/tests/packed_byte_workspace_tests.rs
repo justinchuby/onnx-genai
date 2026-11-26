@@ -148,12 +148,13 @@ fn packed_copy_bound_is_one_projection_maximum_not_a_sum_or_route_multiplier() {
                     PackedProjectionPlan::for_current_pool(k.arithmetic),
                     0,
                     [std::alloc::Layout::new::<()>(); 6],
+                    true,
                 )
                 .unwrap();
             assert_eq!(req.bytes as usize - base.bytes(), H * 34);
             assert_eq!(
-                *common.get_or_insert(req.bytes),
-                req.bytes,
+                *common.get_or_insert(copy_bound),
+                copy_bound,
                 "expert count and top-k do not multiply this lane"
             );
             inputs[4] = f[4].view();
@@ -327,6 +328,7 @@ fn dense_cache_hits_leave_the_noncontiguous_copy_lane_untouched() {
             PackedProjectionPlan::for_current_pool(k.arithmetic),
             H * 34,
             [std::alloc::Layout::new::<()>(); 6],
+            true,
         )
         .unwrap();
     let mut backing =
@@ -459,6 +461,7 @@ fn incomplete_composite_refuses_before_any_packed_hash_or_copy() {
                 PackedProjectionPlan::for_current_pool(arithmetic),
                 0,
                 [std::alloc::Layout::new::<()>(); 6],
+                true,
             )
             .unwrap()
             .bytes();
