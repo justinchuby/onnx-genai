@@ -277,3 +277,103 @@ fn native_peft_malformed_custom_config_names_the_source_and_adapter() {
         assert_eq!(run(&mut native, None).unwrap(), [4.0, 15.0]);
     }
 }
+
+#[test]
+fn native_peft_rank_two_preserves_independent_row_compositions() {
+    let root = package();
+    let metadata_path = root.path().join("inference_metadata.yaml");
+    let mut metadata: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&metadata_path).unwrap()).unwrap();
+    metadata["adapters"]["artifacts"]["peft"]["rank"] = serde_yaml::to_value(2).unwrap();
+    metadata["adapters"]["artifacts"]["peft"]["alpha"] = serde_yaml::to_value(4.0).unwrap();
+    metadata["adapters"]["target_manifest"]["targets"][0]["rank"] =
+        serde_yaml::to_value(2).unwrap();
+    metadata["adapters"]["target_manifest"]["targets"][0]["alpha"] =
+        serde_yaml::to_value(4.0).unwrap();
+    std::fs::write(metadata_path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
+    let mut cfg = config();
+    cfg["r"] = json!(2);
+    cfg["lora_alpha"] = json!(4);
+    std::fs::write(config_path(root.path()), serde_json::to_vec(&cfg).unwrap()).unwrap();
+    let header = serde_json::to_vec(&json!({
+        format!("{MODULE}.lora_A.weight"):{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]},
+        format!("{MODULE}.lora_B.weight"):{"dtype":"F32","shape":[2,2],"data_offsets":[16,32]}
+    }))
+    .unwrap();
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend(header);
+    for value in [1_f32, 0.0, 0.0, 1.0, 3.0, 0.0, 0.0, 4.0] {
+        bytes.extend(value.to_le_bytes());
+    }
+    std::fs::write(tensor_path(root.path()), bytes).unwrap();
+    let selection = AdapterSelection::default()
+        .with_row([AdapterActivation::new("peft", 0.5)])
+        .with_row([AdapterActivation::new("peft", -0.25)]);
+    let request = PipelineGenerateRequest::new(GenerateRequest {
+        prompt: GeneratePrompt::TokenIds(vec![]),
+        options: GenerateOptions {
+            adapter_selection: Some(selection),
+            ..Default::default()
+        },
+    })
+    .with_input(
+        "activations",
+        Value::from_slice_f32(&[2.0, 5.0, 7.0, 11.0], &[2, 2]).unwrap(),
+    );
+    let mut native = engine(root.path());
+    assert_eq!(
+        native.run_pipeline(request).unwrap()["result"]
+            .to_vec_f32()
+            .unwrap(),
+        [10.0, 35.0, 3.5, 11.0]
+    );
+    assert_eq!(run(&mut native, None).unwrap(), [4.0, 15.0]);
+}
+#[test]
+fn native_peft_governor_denies_staging_before_safetensors_decode_and_recovers() {
+    let root = package();
+    let original = std::fs::read(tensor_path(root.path())).unwrap();
+    let old_header = u64::from_le_bytes(original[..8].try_into().unwrap()) as usize;
+    // Whitespace is valid SafeTensors header padding: retain the same actual
+    // factors while making the required governed staging exceed the host cap.
+    let padded_header = 8 * 1024 * 1024;
+    let file = std::fs::File::create(tensor_path(root.path())).unwrap();
+    use std::io::Write;
+    let mut writer = std::io::BufWriter::new(file);
+    writer
+        .write_all(&(padded_header as u64).to_le_bytes())
+        .unwrap();
+    writer.write_all(&original[8..8 + old_header]).unwrap();
+    let padding = vec![b' '; padded_header - old_header];
+    writer.write_all(&padding).unwrap();
+    writer.write_all(&original[8 + old_header..]).unwrap();
+    writer.flush().unwrap();
+    drop(writer);
+    let mut native = Engine::from_dir(
+        root.path(),
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            native_device: Some(NativeDecodeDevice::Cpu),
+            limits: onnx_genai_engine::ResourceLimits {
+                host_ram_limit: onnx_genai_engine::ResourceLimit::Bytes(64 * 1024 * 1024),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(run(&mut native, None).unwrap(), [4.0, 15.0]);
+    let error = run(&mut native, Some(1.0)).unwrap_err();
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("reserve adapter container parsing memory"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("parse HF PEFT safetensors"),
+        "container must be rejected before decode: {text}"
+    );
+    assert_eq!(run(&mut native, None).unwrap(), [4.0, 15.0]);
+    std::fs::write(tensor_path(root.path()), original).unwrap();
+    assert_eq!(run(&mut native, Some(0.5)).unwrap(), [40.0, 63.0]);
+}
