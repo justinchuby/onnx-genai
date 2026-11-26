@@ -270,7 +270,7 @@ pub(crate) fn extract_frames(
         Lacing::FixedSize => {
             let num_frames = reader.read_byte()? as usize + 1;
             let total_size = block.len() - reader.pos() as usize;
-            if total_size % num_frames != 0 {
+            if !total_size.is_multiple_of(num_frames) {
                 return decode_error("mkv: invalid block size");
             }
 

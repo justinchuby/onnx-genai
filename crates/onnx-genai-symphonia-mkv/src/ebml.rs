@@ -582,14 +582,14 @@ impl<R: ReadEbml, S: EbmlSchema> EbmlIterator<R, S> {
 
             // It is invalid for a child element's end position to exceed its parent's end position.
             // The element may be discarded in such cases.
-            if let Some(child_end) = header.end() {
-                if child_end > parent_end {
-                    // TODO: Maybe scan for other elements instead of skipping to the end of the
-                    // parent?
-                    log::debug!("element out-of-bounds, ignoring");
-                    self.reader.ignore_bytes(parent_end - pos)?;
-                    return Ok(None);
-                }
+            if let Some(child_end) = header.end()
+                && child_end > parent_end
+            {
+                // TODO: Maybe scan for other elements instead of skipping to the end of the
+                // parent?
+                log::debug!("element out-of-bounds, ignoring");
+                self.reader.ignore_bytes(parent_end - pos)?;
+                return Ok(None);
             }
         }
 

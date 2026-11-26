@@ -11,3 +11,5 @@
 - Added one shared public RFC packet/header helper, authored reader/clock tests,
   real stream-copy WebM fixture and upstream provenance verification.
 - Reject Opus seeking; unchanged legacy codecs retain their existing seek behavior.
+
+- Apply workspace Clippy style to inherited EBML bounds and lacing divisibility checks without changing their admission conditions.
