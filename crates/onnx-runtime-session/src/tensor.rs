@@ -1223,7 +1223,7 @@ impl HostTensorAllocator {
     }
     /// Write f32 values directly into admitted backing, without a payload Vec.
     pub fn from_f32(&self, shape: &[usize], values: &[f32]) -> Result<Tensor> {
-        self.from_values(DataType::Float32, shape, values.len(), |bytes| {
+        self.allocate_values(DataType::Float32, shape, values.len(), |bytes| {
             for (target, value) in bytes.chunks_exact_mut(4).zip(values) {
                 target.copy_from_slice(&value.to_le_bytes());
             }
@@ -1231,13 +1231,13 @@ impl HostTensorAllocator {
     }
     /// Write i64 values directly into admitted backing, without a payload Vec.
     pub fn from_i64(&self, shape: &[usize], values: &[i64]) -> Result<Tensor> {
-        self.from_values(DataType::Int64, shape, values.len(), |bytes| {
+        self.allocate_values(DataType::Int64, shape, values.len(), |bytes| {
             for (target, value) in bytes.chunks_exact_mut(8).zip(values) {
                 target.copy_from_slice(&value.to_le_bytes());
             }
         })
     }
-    fn from_values(
+    fn allocate_values(
         &self,
         dtype: DataType,
         shape: &[usize],
@@ -1246,13 +1246,12 @@ impl HostTensorAllocator {
     ) -> Result<Tensor> {
         let expected =
             checked_expected_bytes(dtype, shape).ok_or_else(|| SessionError::ShapeOverflow {
-                value: "HostTensorAllocator::from_values".into(),
+                value: "HostTensorAllocator::allocate_values".into(),
                 dims: shape.to_vec(),
             })?;
         if count.checked_mul(dtype.byte_size()) != Some(expected) {
             return Err(SessionError::Internal(format!(
-                "host tensor {:?} {shape:?} requires {expected} bytes but got {count} values; match the declared element count",
-                dtype
+                "host tensor {dtype:?} {shape:?} requires {expected} bytes but got {count} values; match the declared element count"
             )));
         }
         self.fill(dtype, shape.to_vec(), |bytes| {
