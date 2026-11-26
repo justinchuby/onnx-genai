@@ -8,6 +8,8 @@ import unittest
 import zipfile
 from pathlib import Path
 
+import tomllib
+
 CRATE = Path(__file__).resolve().parents[1]
 ROOT = CRATE.parents[1]
 specification = importlib.util.spec_from_file_location(
@@ -51,6 +53,30 @@ class DistributionTests(unittest.TestCase):
                     info.size = len(value)
                     archive.addfile(info, io.BytesIO(value))
         return path
+
+    def test_maturin_dependency_out_dir_uses_actual_untagged_wire_field(self):
+        # Maturin v1.14.1 GlobPattern::WithOutDir has no serde rename_all.
+        # Its public guide's crate-name spelling is silently ignored by serde;
+        # the resulting root-crate fallback already failed an actual wheel build.
+        # https://github.com/PyO3/maturin/blob/v1.14.1/src/pyproject_toml.rs#L52-L81
+        for package, module in [
+            ("onnx-genai-python", "onnx_genai"),
+            ("onnx-genai-cli", "onnx_genai_server"),
+        ]:
+            project = tomllib.loads(
+                (ROOT / "crates" / package / "pyproject.toml").read_text()
+            )
+            includes = project["tool"]["maturin"]["include"]
+            selected = [
+                entry
+                for entry in includes
+                if isinstance(entry, dict) and entry.get("from") == "out-dir"
+            ]
+            self.assertEqual(len(selected), 1, package)
+            entry = selected[0]
+            self.assertEqual(set(entry), {"path", "from", "to", "crate_name"}, package)
+            self.assertEqual(entry["crate_name"], distribution.PACKAGE, package)
+            self.assertEqual(entry["to"], f"{module}/_third_party", package)
 
     def test_complete_wheel_and_sdist_preserve_exact_source_and_notices(self):
         with tempfile.TemporaryDirectory() as directory:

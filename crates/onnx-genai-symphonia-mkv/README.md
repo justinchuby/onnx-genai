@@ -71,3 +71,9 @@ the exact authored original. The scope is this maintained reader and the shipped
 repository notice, not a claim that every third-party redistribution concern has
 been audited. Source/link validation is separate from Rust or installed-wheel
 execution acceptance.
+
+Maturin 1.14.1's untagged `GlobPattern::WithOutDir` uses the literal TOML field
+`crate_name` (underscore), despite the guide's `crate-name` spelling. The enum
+has no Serde rename attribute; an unknown kebab-case field is ignored and selects
+the root crate instead. Both GenAI pyprojects use `crate_name` explicitly, and a
+configuration regression checks that exact upstream wire schema.

@@ -35,7 +35,7 @@ repository = "https://github.com/justinchuby/onnx-genai"
 
 [tool.maturin]
 # Embed the maintained MPL reader's exact build-source snapshot, not a second source tree.
-include = [{ path = "onnx-genai-symphonia-mkv-*/**/*", from = "out-dir", to = "onnx_genai/_third_party", crate-name = "onnx-genai-symphonia-mkv" }]
+include = [{ path = "onnx-genai-symphonia-mkv-*/**/*", from = "out-dir", to = "onnx_genai/_third_party", crate_name = "onnx-genai-symphonia-mkv" }]
 # Mixed layout: the Python package lives in python/onnx_genai and the compiled
 # extension is installed as its private `_onnx_genai` submodule.
 python-source = "python"
