@@ -49,6 +49,97 @@ def source_path(root: Path, name: str) -> Path:
     return path
 
 
+def package_target(root: Path, case: dict, identity: str) -> Path:
+    package = case.get("package")
+    manifest_name = case.get("package_manifest")
+    if (
+        not isinstance(package, str)
+        or not re.fullmatch(r"[a-z][a-z0-9_-]+", package)
+        or not isinstance(manifest_name, str)
+    ):
+        raise ValueError(
+            f"{identity}: Rust evidence requires explicit package and package_manifest fields"
+        )
+    manifest = source_path(root, manifest_name)
+    if manifest.name != "Cargo.toml":
+        raise ValueError(f"{identity}: package_manifest must name a local Cargo.toml")
+    package_root = manifest.parent.resolve()
+    document = tomllib.loads(manifest.read_text())
+    if document.get("package", {}).get("name") != package:
+        raise ValueError(
+            f"{identity}: package {package!r} does not match {manifest_name}"
+        )
+    workspace = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]
+    members = {
+        path.resolve()
+        for pattern in workspace["members"]
+        for path in root.glob(pattern)
+    }
+    excluded = {
+        path.resolve()
+        for pattern in workspace.get("exclude", [])
+        for path in root.glob(pattern)
+    }
+    if package_root not in members or package_root in excluded:
+        raise ValueError(
+            f"{identity}: {manifest_name} is not a selected workspace member; Cargo -p must select this actual package"
+        )
+    source = source_path(root, case["source"]).resolve()
+    if not source.is_relative_to(package_root):
+        raise ValueError(f"{identity}: evidence source is outside its declared package")
+    target = case["target"]
+    if target == "lib":
+        library = document.get("lib", {})
+        if library.get("harness") is False:
+            raise ValueError(
+                f"{identity}: custom lib test harness cannot provide the exact libtest evidence contract"
+            )
+        if library.get("test") is False or (
+            "lib" not in document and document["package"].get("autolib") is False
+        ):
+            raise ValueError(f"{identity}: package has no enabled lib test target")
+        entry = package_root / library.get("path", "src/lib.rs")
+        if not entry.is_file() or not source.is_relative_to(entry.parent.resolve()):
+            raise ValueError(
+                f"{identity}: source does not belong to the declared lib test target directory"
+            )
+    elif re.fullmatch(r"test:[a-z0-9_]+", target):
+        name = target.split(":", 1)[1]
+        declared = [
+            item for item in document.get("test", []) if item.get("name") == name
+        ]
+        if len(declared) > 1:
+            raise ValueError(f"{identity}: duplicate integration test target {name}")
+        if declared:
+            if declared[0].get("harness") is False:
+                raise ValueError(
+                    f"{identity}: custom test harness cannot provide the exact libtest evidence contract"
+                )
+            entries = [package_root / declared[0].get("path", f"tests/{name}.rs")]
+        elif document["package"].get("autotests", True):
+            entries = [
+                path
+                for path in [
+                    package_root / f"tests/{name}.rs",
+                    package_root / f"tests/{name}/main.rs",
+                ]
+                if path.is_file()
+            ]
+        else:
+            entries = []
+        if (
+            len(entries) != 1
+            or not entries[0].is_file()
+            or source != entries[0].resolve()
+        ):
+            raise ValueError(
+                f"{identity}: evidence must name the existing declared/automatic integration test entrypoint for {name}"
+            )
+    else:
+        raise ValueError(f"{identity}: invalid Rust target; use lib or test:NAME")
+    return manifest
+
+
 def validate(root: Path, inventory: dict) -> dict:
     fixture = json.loads((root / "tests/fixtures/llama-server-routes.json").read_text())
     if (
@@ -77,12 +168,7 @@ def validate(root: Path, inventory: dict) -> dict:
                 f"{identity}: describe assertions and the execution contract"
             )
         if case["kind"] == "rust":
-            if case["target"] != "lib" and not re.fullmatch(
-                r"test:[a-z0-9_]+", case["target"]
-            ):
-                raise ValueError(
-                    f"{identity}: invalid Rust target; use lib or test:NAME"
-                )
+            package_target(root, case, identity)
             leaf = case["test"].split("::")[-1]
             functions = list(
                 re.finditer(
@@ -199,15 +285,15 @@ def render(inventory: dict) -> str:
         "",
         "## Executable evidence definitions",
         "",
-        "Rust cases name one exact lib/integration test. Browser evidence is linked to its actual",
+        "Rust cases name an explicit local package/manifest and one exact lib/integration test. Browser evidence is linked to its actual",
         "driver and must be run separately; the Rust runner rejects it instead of inventing a pass.",
         "",
-        "| ID | Source/test | Execution contract | Assertions |",
-        "| --- | --- | --- | --- |",
+        "| ID | Package | Source/test | Execution contract | Assertions |",
+        "| --- | --- | --- | --- | --- |",
     ]
     for identity, case in sorted(inventory["evidence"].items()):
         lines.append(
-            f"| `{identity}` | {link(case)} | {case['execution_contract']} | {case['assertions']} |"
+            f"| `{identity}` | {case.get('package', 'separate browser driver')} | {link(case)} | {case['execution_contract']} | {case['assertions']} |"
         )
     lines += [
         "",
@@ -224,7 +310,10 @@ def render(inventory: dict) -> str:
         "then requires exactly one passed / zero failed / zero ignored test. Renamed, filtered-out,",
         "ignored, failed or ambiguous tests cannot produce a passing receipt. A partial/failed run",
         "is recorded as such. Receipts/logs must be outside the repository and include the inventory",
-        "hash, HEAD/tree, source hashes, feature configuration, Rust/Cargo versions and exact commands.",
+        "hash, HEAD/tree, source hashes, each selected package manifest, feature configuration,",
+        "Rust/Cargo versions and exact per-package commands. Static checks verify manifest name,",
+        "workspace membership, source containment and lib/integration target layout; exact runtime",
+        "discovery still proves the compiled test identity. Build flags apply to each case's package.",
         "Cargo config discovery records the selected CARGO_HOME (or HOME), each cwd ancestor,",
         "both config/config.toml candidates (including missing sentinels), legacy-name precedence,",
         "explicit config, recursive include paths and their content hashes/path contexts. The",
@@ -550,11 +639,11 @@ def run(inventory: dict, args: argparse.Namespace, root: Path = ROOT) -> None:
         "scripts/audit_llama_server_conformance.py",
         "Cargo.lock",
         "Cargo.toml",
-        "crates/onnx-genai-server/Cargo.toml",
     }
     sources.update(case["source"] for _, case in cases)
+    sources.update(case["package_manifest"] for _, case in cases)
     hashes = {name: digest(root / name) for name in sorted(sources)}
-    command = ["cargo", "test", "-p", "onnx-genai-server", "-j", str(args.jobs)]
+    command = ["cargo", "test", "-j", str(args.jobs)]
     if args.offline:
         command.append("--offline")
     if args.no_default_features:
@@ -612,6 +701,9 @@ def run(inventory: dict, args: argparse.Namespace, root: Path = ROOT) -> None:
             entry = {
                 "id": identity,
                 "test": case["test"],
+                "package": case["package"],
+                "package_manifest": case["package_manifest"],
+                "target": case["target"],
                 "execution_contract": case["execution_contract"],
                 "status": "running",
             }
@@ -621,7 +713,15 @@ def run(inventory: dict, args: argparse.Namespace, root: Path = ROOT) -> None:
                 ("list", ["--exact", "--list"], listed_test),
                 ("run", ["--exact", "--test-threads=1"], passed_test),
             ]:
-                invocation = [*command, *target_args(case), case["test"], "--", *tail]
+                invocation = [
+                    *command,
+                    "-p",
+                    case["package"],
+                    *target_args(case),
+                    case["test"],
+                    "--",
+                    *tail,
+                ]
                 log = receipt.with_name(receipt.stem + f".{identity}.{phase}.log")
                 entry[phase] = {"command": invocation, "log": str(log)}
                 save()

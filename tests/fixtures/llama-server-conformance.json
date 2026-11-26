@@ -6,11 +6,16 @@
       "id": "frontend_cli",
       "requirement": "Official frontend embedding, REPL removal and retained noninteractive commands",
       "evidence": [
-        "browser"
+        "browser",
+        "cli_removed_repl",
+        "cli_generate_controls",
+        "cli_native_default",
+        "cli_transcribe_controls",
+        "cli_profiling_flags"
       ],
       "remaining": [
-        "Fresh complete browser acceptance on final revision; source-linked driver is not a current run.",
-        "Executable CLI evidence for REPL removal and retained generate/transcribe/profiling commands is not linked; browser coverage alone cannot prove those requirements."
+        "Fresh complete browser acceptance on the final revision; source-linked drivers are not current results.",
+        "CLI evidence establishes parser removal/defaults/retained flags only. End-to-end generation/transcription, emitted profile JSON/trace files and packaged console launcher behavior still require runtime acceptance."
       ]
     },
     {
@@ -133,7 +138,9 @@
       "test": "tests::llama_compat::discovery_and_properties_describe_the_admitted_model",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Both health aliases return ok; model/props metadata and no-load polling preserve registry/LRU state.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "router_lifecycle": {
       "kind": "rust",
@@ -142,7 +149,9 @@
       "test": "tests::llama_router_compat::router_discovery_lifecycle_and_events_follow_registry_state",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "v1 model list, status SSE, synchronous load/unload, no autoload on discovery, invalid extra_args rejection.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "props_ack": {
       "kind": "rust",
@@ -151,7 +160,9 @@
       "test": "tests::llama_router_compat::props_acknowledgement_matches_upstream_without_loading_or_mutation",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "POST props opt-in gate, acknowledgement-only behavior and no model/settings mutation.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "harness_exclusion": {
       "kind": "rust",
@@ -160,7 +171,9 @@
       "test": "tests::llama_router_compat::tools_are_owned_by_external_harnesses_not_server_routes",
       "execution_contract": "HTTP routing/admission; no tool execution",
       "assertions": "GET/POST tools/proxy return 404; no CORS wildcard; props advertises server_tools false.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "tokenizer": {
       "kind": "rust",
@@ -169,7 +182,9 @@
       "test": "tests::llama_compat::tokenizer_round_trip_and_invalid_ids_are_explicit",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Encode/decode round trip, token pieces, actionable unknown token ID.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "templates": {
       "kind": "rust",
@@ -178,7 +193,9 @@
       "test": "tests::llama_compat::template_endpoint_renders_model_template_and_protects_structural_variables",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Actual model template rendering and protected template variables.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "chat": {
       "kind": "rust",
@@ -187,7 +204,9 @@
       "test": "tests::llama_compat::upstream_chat_payload_streams_usage_and_rejects_unsupported_controls",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Upstream chat payload, streamed usage and explicit unsupported-control rejection.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "counts_media": {
       "kind": "rust",
@@ -196,7 +215,9 @@
       "test": "tests::native_compat::media_input_token_counts_match_real_multimodal_inference",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Chat/Responses/Messages counters equal inference prompt usage including actual image expansion.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "native_completion": {
       "kind": "rust",
@@ -205,7 +226,9 @@
       "test": "tests::native_compat::native_completion_aliases_return_real_counts_tokens_and_stop_state",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "completion/completions aliases execute generation; token IDs/counts and stop state match actual output.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "legacy_completion": {
       "kind": "rust",
@@ -214,7 +237,9 @@
       "test": "tests::native_compat::legacy_completion_batches_preserve_indices_token_inputs_and_total_usage",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Text/token prompt batches preserve result indices, stream framing and aggregate usage.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "infill": {
       "kind": "rust",
@@ -223,7 +248,9 @@
       "test": "tests::native_compat::native_response_fields_project_actual_results_and_preserve_stream_batch_completion",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Response-field selection preserves required stream batch completion and executes declared FIM.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "openai_embeddings": {
       "kind": "rust",
@@ -232,7 +259,9 @@
       "test": "tests::embeddings_success_path_returns_openai_compatible_response",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Actual embedding output shape, batching and float/base64 serialization on tiny-mtp-full.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "rerank": {
       "kind": "rust",
@@ -241,7 +270,9 @@
       "test": "tests::native_compat::reranking_aliases_execute_real_pairs_and_return_native_jina_and_tei_shapes",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "All four rerank aliases execute pair scores/order/top_n, native/Jina/TEI shapes and prompt usage.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "alternate_protocols": {
       "kind": "rust",
@@ -250,7 +281,9 @@
       "test": "tests::native_compat::alternate_protocols_use_real_generation_and_usage",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Responses/Messages buffered generation, positive usage, typed streamed terminal events and counters.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "messages_errors": {
       "kind": "rust",
@@ -259,7 +292,9 @@
       "test": "tests::native_compat::messages_errors_include_anthropic_envelopes_for_handlers_and_extractors",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Anthropic handler/extractor failures use protocol-specific error envelopes.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "replay": {
       "kind": "rust",
@@ -268,7 +303,9 @@
       "test": "tests::native_compat::conversation_replay_http_contract_is_byte_exact_and_non_enumerable",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Replay bytes equal original events; lookup is model-qualified/non-enumerable and DELETE removes retained history.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "control": {
       "kind": "rust",
@@ -277,7 +314,9 @@
       "test": "completion_control::tests::canonical_control_routes_model_scopes_without_loading_idle_models",
       "execution_contract": "HTTP control service and registry admission",
       "assertions": "Control targets the correct loaded model, reports missing/busy IDs and does not autoload.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "slot_status": {
       "kind": "rust",
@@ -286,7 +325,9 @@
       "test": "tests::native_slots_http::busy_slot_is_visible_and_save_waits_for_owner",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Real Native busy status and serialized save owner ordering.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "slot_roundtrip": {
       "kind": "rust",
@@ -295,7 +336,9 @@
       "test": "tests::native_slots_http::generated_cache_round_trips_and_resumes",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Generated CPU cache save/restore round trip and continued generation use real state files.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "slot_errors": {
       "kind": "rust",
@@ -304,7 +347,9 @@
       "test": "tests::native_slots_http::rejects_invalid_actions_paths_and_missing_or_corrupt_files",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Malformed actions, traversal, missing/corrupt files fail before unsafe publication.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "lora": {
       "kind": "rust",
@@ -313,7 +358,9 @@
       "test": "tests::lora_http::global_defaults_and_request_override_execute_selected_adapters",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Catalog/default scale selection changes actual generation; request overrides select authored weights.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "lora_atomic": {
       "kind": "rust",
@@ -322,7 +369,9 @@
       "test": "tests::lora_http::empty_selection_disables_all_and_invalid_updates_are_atomic",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Empty selection disables adapters; invalid global updates leave defaults unchanged.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "decision": {
       "kind": "rust",
@@ -331,7 +380,9 @@
       "test": "tests::systemone_decisions::systemone_evaluates_choice_score_and_noul_without_generated_tokens",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Native non-generative choice/score/noul outputs and zero generated-token accounting.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "decision_media": {
       "kind": "rust",
@@ -340,7 +391,9 @@
       "test": "tests::systemone_audio::systemone_codec_matrix_preserves_state_and_spoken_question_results",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Supported encoded audio codecs preserve Native decision state and spoken-question results.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "transcription": {
       "kind": "rust",
@@ -349,7 +402,9 @@
       "test": "tests::ctc_transcription::ctc_http_transcription_is_native_audio_dependent_and_supports_both_aliases",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Both transcription aliases depend on actual Native waveform input and return counted transcripts.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "transcription_stream": {
       "kind": "rust",
@@ -358,7 +413,9 @@
       "test": "tests::ctc_transcription::ctc_transcription_streams_typed_events_and_honors_per_request_output_limits",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Transcription emits typed SSE and obeys per-request output limits.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "speech": {
       "kind": "rust",
@@ -367,7 +424,9 @@
       "test": "tests::native_compat::speech_pcm_formats_preserve_declared_rate_channels_and_sample_values",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Speech aliases emit declared PCM types/rates/channels and expected sample values.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "tts": {
       "kind": "rust",
@@ -376,7 +435,9 @@
       "test": "tests::native_compat::native_tts_executes_declared_speech_and_rejects_ignored_controls",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "tts input/prompt/raw-prompt produces actual WAV; unsupported controls fail clearly.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "model_download": {
       "kind": "rust",
@@ -385,7 +446,9 @@
       "test": "model_management::tests::http_download_stream_load_native_inference_and_delete_form_one_workflow",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Immutable local-hub package download reports per-file progress, loads Native inference and deletes only owned artifacts.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "model_resume": {
       "kind": "rust",
@@ -394,7 +457,9 @@
       "test": "model_management::tests::http_pause_restart_and_resume_preserve_incomplete_downloads",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Paused downloads retain reserved bounds across restart and resume their original transfer.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "model_gates": {
       "kind": "rust",
@@ -403,7 +468,9 @@
       "test": "model_management::tests::http_cache_opt_in_and_unsupported_sources_fail_before_work",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Cache is opt-in and unsupported source selectors fail before filesystem/network transfer.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "metrics": {
       "kind": "rust",
@@ -412,7 +479,9 @@
       "test": "tests::metrics_exposes_prometheus_families_and_request_counter_increments",
       "execution_contract": "Server metrics feature and HTTP fixture",
       "assertions": "Prometheus families exist and request counters change after actual requests.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "realtime": {
       "kind": "rust",
@@ -421,7 +490,9 @@
       "test": "realtime::websocket::tests::websocket_runs_native_text_with_exact_budget_and_preserves_nonfatal_errors",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Real websocket Native text output budgets, nonfatal errors and session recovery.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "realtime_duplex": {
       "kind": "rust",
@@ -430,7 +501,9 @@
       "test": "realtime::websocket::tests::websocket_duplex_publishes_audio_before_commit_and_acknowledges_native_cancel",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Native duplex audio is published before commit and cancellation acknowledged.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "sampling": {
       "kind": "rust",
@@ -439,7 +512,9 @@
       "test": "tests::native_compat::native_sampler_order_changes_actual_generation_across_protocols",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Sampler ordering changes real Native selected tokens consistently across generation protocols.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "progress": {
       "kind": "rust",
@@ -448,7 +523,9 @@
       "test": "tests::native_compat::prompt_progress_is_opt_in_and_reports_real_cold_and_cached_prompt_work",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Opt-in progress describes real cold/cached prompt execution, not synthetic percentages.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "grammar_native": {
       "kind": "rust",
@@ -457,7 +534,9 @@
       "test": "tests::gbnf_wire::gbnf_wire_native_preserves_raw_framing_and_validates_before_sse",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Native GBNF wire keeps raw grammar framing and rejects invalid controls before stream admission.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "tool_roundtrip": {
       "kind": "rust",
@@ -466,7 +545,9 @@
       "test": "tool_result_chain_commits_typed_calls_and_accepts_reordered_results_over_http",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Typed tool-call results commit and reordered harness tool results match the original call IDs.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "aliases_responses": {
       "kind": "rust",
@@ -475,7 +556,9 @@
       "test": "responses_alias_executes_native_generation_and_preserves_usage_and_errors",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Responses alias/canonical execute explicit Native CPU generation with equal text/status/positive usage and malformed-field errors.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "aliases_stream": {
       "kind": "rust",
@@ -484,7 +567,9 @@
       "test": "response_alias_stream_preserves_typed_events_text_and_terminal_usage",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Responses alias/canonical SSE preserve the same complete typed-event sequence, contiguous sequence numbers, stable response/item IDs, output/content indices, generated text and terminal usage; only repeated adjacent text-delta chunks may collapse.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "aliases_counts": {
       "kind": "rust",
@@ -493,7 +578,9 @@
       "test": "input_count_aliases_match_native_inference_and_reject_malformed_input",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Both shortened counter aliases equal actual Native inference prompt usage and reject malformed messages/input.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "aliases_embeddings": {
       "kind": "rust",
@@ -502,7 +589,9 @@
       "test": "native_embedding_aliases_execute_pooled_values_and_normalization",
       "execution_contract": "Native CPU fixture through in-process HTTP router",
       "assertions": "Both native embedding aliases execute nonzero finite pooled values, equal results and unit L2 normalization; invalid norm rejected.",
-      "source_markers": []
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
     },
     "browser": {
       "kind": "browser",
@@ -513,6 +602,61 @@
         "activeReload:",
         "browser replay changed the original streamed bytes"
       ]
+    },
+    "cli_removed_repl": {
+      "kind": "rust",
+      "package": "onnx-genai-cli",
+      "package_manifest": "crates/onnx-genai-cli/Cargo.toml",
+      "source": "crates/onnx-genai-cli/src/lib.rs",
+      "target": "lib",
+      "test": "webui_cli_tests::removed_repl_is_not_a_cli_command",
+      "execution_contract": "Public Clap parser/unit test only; no model loading, runtime inference or profile output files",
+      "assertions": "The public CLI parser rejects the removed run REPL subcommand.",
+      "source_markers": []
+    },
+    "cli_generate_controls": {
+      "kind": "rust",
+      "package": "onnx-genai-cli",
+      "package_manifest": "crates/onnx-genai-cli/Cargo.toml",
+      "source": "crates/onnx-genai-cli/src/lib.rs",
+      "target": "lib",
+      "test": "webui_cli_tests::noninteractive_commands_keep_cpu_and_context_controls",
+      "execution_contract": "Public Clap parser/unit test only; no model loading, runtime inference or profile output files",
+      "assertions": "Retained generate accepts and preserves explicit CPU core and context-window controls.",
+      "source_markers": []
+    },
+    "cli_native_default": {
+      "kind": "rust",
+      "package": "onnx-genai-cli",
+      "package_manifest": "crates/onnx-genai-cli/Cargo.toml",
+      "source": "crates/onnx-genai-cli/src/lib.rs",
+      "target": "lib",
+      "test": "tests::backend_defaults_to_native",
+      "execution_contract": "Public Clap parser/unit test only; no model loading, runtime inference or profile output files",
+      "assertions": "Generate defaults and lowered EngineConfig both select Native; no inference is executed.",
+      "source_markers": []
+    },
+    "cli_transcribe_controls": {
+      "kind": "rust",
+      "package": "onnx-genai-cli",
+      "package_manifest": "crates/onnx-genai-cli/Cargo.toml",
+      "source": "crates/onnx-genai-cli/src/lib.rs",
+      "target": "lib",
+      "test": "webui_cli_tests::transcribe_files_keep_format_conditioning_and_cpu_controls",
+      "execution_contract": "Public Clap parser/unit test only; no model loading, runtime inference or profile output files",
+      "assertions": "Retained transcribe parses multiple encoded files, format/language/prompt/PCM controls, CPU cores and explicit Native backend.",
+      "source_markers": []
+    },
+    "cli_profiling_flags": {
+      "kind": "rust",
+      "package": "onnx-genai-cli",
+      "package_manifest": "crates/onnx-genai-cli/Cargo.toml",
+      "source": "crates/onnx-genai-cli/src/lib.rs",
+      "target": "lib",
+      "test": "webui_cli_tests::global_profiling_flags_are_retained_for_noninteractive_commands",
+      "execution_contract": "Public Clap parser/unit test only; no model loading, runtime inference or profile output files",
+      "assertions": "Top-level profiling/report/trace arguments survive generate and transcribe parsing without installing tracing or writing files.",
+      "source_markers": []
     }
   },
   "routes": [

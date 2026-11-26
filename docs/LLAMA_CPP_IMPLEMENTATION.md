@@ -2733,3 +2733,24 @@ analytic head outputs. Full server library: 629 passed, 2 inherited ignores.
 Strict all-target default preprocess/engine/server and explicit ORT-reference
 server Clippy, formatting and diff checks passed. Functional macOS ARM64 CPU
 coverage only; no device/performance or whole-goal parity claim.
+
+
+## Package-bound CLI behavioral evidence
+
+The behavioral inventory now binds each Rust case to an explicit workspace
+package manifest and enabled lib/integration target. The checker rejects
+mismatched package identities, excluded packages, escaped source paths and
+custom test harnesses; execution records the chosen package and target and
+binds the package manifests into its receipt. The inventory contains 47 Rust
+cases plus one browser case across the existing 55 contracts/nine categories.
+
+Five CLI cases establish removed REPL rejection, the Native default, retained
+generation CPU/context controls, transcription input/format/conditioning controls
+and global profiling flag parsing. These parser assertions do not establish
+end-to-end inference, emitted profiling files or packaged launcher behavior.
+
+Validation: all 78 CLI library tests and 29 Python checker/runner regressions
+passed. Strict all-target default CLI/server and explicit ORT-reference CLI
+(`--no-default-features --features onnx-genai-server/metrics,cuda-13000`)
+Clippy, inventory, Python lint, formatting and diff checks passed. No hardware
+performance claim or broader acceptance completion is implied.
