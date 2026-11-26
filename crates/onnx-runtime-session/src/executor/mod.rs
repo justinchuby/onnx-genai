@@ -1120,4 +1120,7 @@ pub use prefetch::{PrefetchStep, drive_double_buffer, plan_double_buffer};
 mod tests;
 
 #[cfg(test)]
+mod resize_recovery_tests;
+
+#[cfg(test)]
 mod graph_kernel_tests;
