@@ -12,6 +12,7 @@ use crate::thread_owned::{CallError, SpawnError, ThreadOwned};
 
 fn finish_reason_name(reason: &FinishReason) -> String {
     match reason {
+        FinishReason::IndentationLimit => "indentation_limit".to_string(),
         FinishReason::PredictionTimeLimit => "prediction_time_limit".to_string(),
         FinishReason::MaxTokens => "max_tokens".to_string(),
         FinishReason::EosToken => "eos_token".to_string(),
@@ -347,8 +348,28 @@ mod tests {
     use std::marker::PhantomData;
     use std::rc::Rc;
 
-    use super::{ENGINE_IN_USE, ENGINE_LOST, Engine, build_options, call_error};
+    use super::{
+        ENGINE_IN_USE, ENGINE_LOST, Engine, FinishReason, GenerateResult, RustGenerateResult,
+        build_options, call_error,
+    };
     use crate::thread_owned::CallError;
+
+    #[test]
+    fn generation_result_reports_indentation_limit() {
+        let result = GenerateResult::from(RustGenerateResult {
+            timings: None,
+            text: String::new(),
+            preserved_tokens: Default::default(),
+            token_ids: vec![],
+            finish_reason: FinishReason::IndentationLimit,
+            tool_calls: vec![],
+            prefix_cache_hit_len: 0,
+            retained_cache_tokens: 0,
+            logprobs: None,
+            budget_cap: None,
+        });
+        assert_eq!(result.finish_reason, "indentation_limit");
+    }
 
     #[test]
     fn generation_options_match_python_arguments() {
