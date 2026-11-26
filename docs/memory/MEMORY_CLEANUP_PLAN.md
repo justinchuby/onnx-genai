@@ -3188,3 +3188,13 @@ allocator witness independently detects each former payload allocation and
 observes no allocation at least as large as its smallest tested payload during
 execution. Small bookkeeping allocations are outside that assertion. These are
 memory/accounting checks, not latency measurements; CUDA remains untested.
+
+### Packed grouped projections prove Host access before borrowing bytes
+
+The nonempty standalone `PackedGroupedMatMul` route now uses the same numeric
+Host-span validator before reading routing indices, activations or packed bytes.
+Its common metadata contract is device-agnostic, so it does not itself authorize
+a CPU raw slice over a device pointer. Packed bank device access and address
+wrap failures report the operator and `packed weights` input while leaving Y
+unchanged. Contiguous byte offsets remain supported; empty executions keep the
+existing read-free return. This adds no data copy, resource owner or admission.
