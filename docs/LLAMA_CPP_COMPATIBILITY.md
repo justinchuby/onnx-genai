@@ -337,6 +337,28 @@ The old public character-based `JsonConstraint` was removed; pure request syntax
 preflight uses `validate_json_prefix`, while generation uses the shared schema
 recognizer.
 
+JSON object defaults follow the pinned [chat conversion](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-common.cpp#L1420)
+and [native schema handler](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-schema.cpp#L270).
+`json_schema: {}` and implicit/empty response-format schemas constrain the root
+to an object. Explicit nonempty schemas and boolean schemas keep their JSON
+Schema meaning. This applies to eager and lazy generation. The engine's generic
+`GenerateConstraint::Json` remains an any-value constraint; the transport selects
+the appropriate schema explicitly.
+
+Accepted forms include top-level `json_schema`, `json_object.schema`, flat
+`json_schema.schema`, and the OpenAI nested `json_schema.json_schema.schema`
+wrapper. Nested wrappers take precedence over a flat schema. An implicit
+`json_object` keeps a supplied top-level schema; its explicit `schema` overrides
+that field. `text` preserves an explicitly supplied top-level schema. In native
+requests, presence of `grammar` takes precedence over legacy `json_schema`, even
+for an empty grammar; chat rejects conflicting grammar/schema constraints.
+Responses `text.format` uses the same schema selection after wire conversion.
+For example, an explicit schema can allow a scalar despite the format label:
+
+```json
+{"response_format":{"type":"json_object","schema":{"const":7}}}
+```
+
 Without explicit continuation, declared content/reasoning text in the template
 prefill is included in the response, matching upstream session projection.
 The same include/exclude policy governs buffered, SSE and logprob replay; only

@@ -2422,3 +2422,41 @@ whitespace checks passed. After full tests the only source adjustment was
 Clippy's equivalent direct-Result return. These are functional macOS ARM64 CPU
 checks; no GPU/Linux execution or performance claims. Contextual raw grammars
 and the other unchecked compatibility-goal rows remain open.
+
+### JSON object domains and schema wire forms
+
+Pinned `server-common.cpp:1420-1442` and `server-schema.cpp:270-291` normalize
+empty schema objects to object roots. The transport now resolves that default
+for native, legacy completion, chat and Responses without changing the engine's
+any-value JSON constraint. Boolean and nonempty schemas retain full schema
+semantics. Typed schema documents reject non-object/non-boolean values with an
+argument-specific error.
+
+Response formats accept optional nested metadata, nested/flat schema forms and
+`json_object.schema`; top-level `json_schema` is no longer silently ignored by
+chat/completion requests. A shared selection method encodes pinned precedence
+and feeds both continuation validation and constraint construction. Native
+legacy grammar presence takes precedence, including an empty grammar; chat keeps
+its explicit conflict guard. Lazy activation, EOS policy and forced-tool guards
+consume the selected schema too. The obsolete `JsonSchemaSpec` API was removed
+and all exports/callers updated without aliases.
+
+Validation on main 71ecaa373: server library 608 passed with two inherited
+ignores; the full public HTTP integration suite passed 38 tests. Native/ORT
+coverage includes 416 successful path/format/eager-lazy/stream combinations,
+object-vs-scalar masking, boolean/explicit scalar schemas, all wrappers, prefill,
+false-schema pre-SSE refusal and invalid lazy scalar publication. Defaults and
+precedence also have request-type and native-parser regressions. Public HTTP
+expectations now require object-root schema selection and accept optional
+wrapper metadata while retaining malformed-document rejection.
+
+Default all-target strict Clippy and Native-disabled reference strict Clippy
+(`--no-default-features --features metrics,cuda-13000`) passed, as did CLI/Python
+all-target compilation (`--features python`), formatting and whole-change
+whitespace checks. The CUDA selector supplies the mandatory cudarc test binding
+version; no GPU execution was performed. Metrics-disabled strict Clippy still
+reports eight inherited dead-code diagnostics; the identical errors were
+reproduced on unmodified main 71ecaa373 before restoring this branch. This is
+recorded rather than claimed as a passing configuration. Checks are functional
+macOS ARM64 CPU evidence, with no Linux/GPU or performance claims. The wider
+compatibility goal remains open.
