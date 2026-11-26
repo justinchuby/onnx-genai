@@ -226,7 +226,17 @@ fn qmoe_context_graph() -> Graph {
 
 #[test]
 fn same_shapes_reprepare_workspace_when_selected_pool_changes() {
-    check_context_repreparation(qmoe_context_graph(), &[3, 16], 512., Some((1408, 1664)));
+    let index = std::mem::size_of::<usize>();
+    let selection = std::mem::size_of::<(usize, f32)>();
+    let routing = (6 * (selection + index) + 13 * index + 16)
+        .next_multiple_of(std::mem::align_of::<(usize, f32)>())
+        + 2 * selection;
+    check_context_repreparation(
+        qmoe_context_graph(),
+        &[3, 16],
+        512.,
+        Some((1408 + routing as u64, 1664 + routing as u64)),
+    );
 }
 
 fn check_context_repreparation(

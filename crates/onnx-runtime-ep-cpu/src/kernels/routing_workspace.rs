@@ -1,6 +1,9 @@
 //! One admitted arena for routing scratch and stable expert grouping.
-use super::super::{decoded_projection::ProjectionScratch, moe::RoutingBuffers};
-use super::error;
+use super::{decoded_projection::ProjectionScratch, moe::RoutingBuffers};
+use onnx_runtime_ep_api::EpError;
+fn error(message: impl Into<String>) -> EpError {
+    EpError::KernelFailed(format!("MoE routing workspace: {}", message.into()))
+}
 use onnx_runtime_ep_api::{DevicePtrMut, Result, WorkspaceLayout, WorkspaceView};
 use std::{alloc::Layout, mem::MaybeUninit, num::NonZeroUsize};
 
@@ -176,9 +179,8 @@ impl<'a> RoutingArena<'a> {
                 g.fanout.get(),
                 normalize,
             )?;
-            // Normalization already used score order. Preserve the old local
-            // selection order before stable bucketing; never reorder its sum.
-            route.sort_unstable_by_key(|&(expert, _)| expert);
+            // Preserve score-order decision indices as contribution slots.
+            // Stable bucketing changes access order, never slot identity.
             for &(expert, weight) in route.iter() {
                 self.decisions[written].write(Decision { expert, weight });
                 self.cursors[expert] += 1;
@@ -194,7 +196,13 @@ impl<'a> RoutingArena<'a> {
         // SAFETY: each exact-prefix entry was written once above; failed builds
         // never publish a plan. The arena cannot be reused while this plan lives.
         let decisions = unsafe { assume_init(self.decisions) };
+        let mut active = 0;
         for expert in 0..g.experts {
+            if self.cursors[expert] != 0 {
+                // TopK indices are dead after every row has been routed.
+                self.indices[active] = expert;
+                active += 1;
+            }
             self.starts[expert + 1] = self.starts[expert]
                 .checked_add(self.cursors[expert])
                 .ok_or_else(|| error("routing prefix overflow; reduce batch or k"))?;
@@ -213,11 +221,68 @@ impl<'a> RoutingArena<'a> {
         // SAFETY: counts partition [0,routes). Every decision advances exactly
         // one cursor, writing every slot of every bucket once, in row order.
         let order = unsafe { assume_init(self.order) };
+        // Bucket cursors are now dead. Publish counts from immutable prefixes,
+        // not from the cursors that advanced while writing bucket indices.
+        for (ordinal, &expert) in self.indices[..active].iter().enumerate() {
+            self.cursors[ordinal] = self.starts[expert + 1] - self.starts[expert];
+        }
+        let counts = ExpertGroupCounts {
+            experts: &self.indices[..active],
+            counts: &self.cursors[..active],
+            assignments: g.routes,
+        };
         Ok(ExpertRoutes {
             decisions,
             order,
             starts: self.starts,
             fanout: g.fanout,
+            counts,
+        })
+    }
+}
+
+/// Distinct ascending expert membership and assignment counts. Private fields
+/// make production construction exclusive to a completed arena build. Zero-count
+/// membership is supported by the checked test constructor for metrics fixtures.
+pub(crate) struct ExpertGroupCounts<'a> {
+    experts: &'a [usize],
+    counts: &'a [usize],
+    assignments: usize,
+}
+impl ExpertGroupCounts<'_> {
+    pub(crate) fn len(&self) -> usize {
+        self.experts.len()
+    }
+    pub(crate) fn assignments(&self) -> usize {
+        self.assignments
+    }
+    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (usize, usize)> + Clone {
+        self.experts
+            .iter()
+            .copied()
+            .zip(self.counts.iter().copied())
+    }
+    pub(crate) fn expert_ids(&self) -> impl ExactSizeIterator<Item = usize> + Clone {
+        self.experts.iter().copied()
+    }
+    #[cfg(test)]
+    pub(crate) fn checked<'a>(
+        experts: &'a [usize],
+        counts: &'a [usize],
+    ) -> Result<ExpertGroupCounts<'a>> {
+        if experts.len() != counts.len() || experts.windows(2).any(|p| p[0] >= p[1]) {
+            return Err(error(
+                "expert count membership must be distinct, ascending and match count lengths; supply one count per expert",
+            ));
+        }
+        let assignments = counts
+            .iter()
+            .try_fold(0usize, |n, &c| n.checked_add(c))
+            .ok_or_else(|| error("expert assignment count overflow"))?;
+        Ok(ExpertGroupCounts {
+            experts,
+            counts,
+            assignments,
         })
     }
 }
@@ -227,37 +292,81 @@ pub(super) struct ExpertRoutes<'a> {
     order: &'a [usize],
     starts: &'a [usize],
     fanout: NonZeroUsize,
+    counts: ExpertGroupCounts<'a>,
 }
 impl ExpertRoutes<'_> {
+    pub(super) fn empty(k: usize) -> Result<Self> {
+        let fanout = NonZeroUsize::new(k).ok_or_else(|| error("routing k must be positive"))?;
+        Ok(Self {
+            decisions: &[],
+            order: &[],
+            starts: &[0],
+            fanout,
+            counts: ExpertGroupCounts {
+                experts: &[],
+                counts: &[],
+                assignments: 0,
+            },
+        })
+    }
     pub(super) fn is_empty(&self) -> bool {
         self.order.is_empty()
     }
-    pub(super) fn groups(&self) -> impl Iterator<Item = (usize, ExpertTasks<'_>)> {
-        self.starts
-            .windows(2)
-            .enumerate()
-            .filter_map(move |(expert, range)| {
-                (range[0] != range[1]).then_some((
-                    expert,
-                    ExpertTasks {
-                        decisions: self.decisions,
-                        order: &self.order[range[0]..range[1]],
-                        fanout: self.fanout,
-                    },
-                ))
-            })
+    pub(super) fn route_count(&self) -> usize {
+        self.order.len()
+    }
+    pub(super) fn counts(&self) -> &ExpertGroupCounts<'_> {
+        &self.counts
+    }
+    pub(super) fn row_selections(
+        &self,
+        row: usize,
+    ) -> Result<impl ExactSizeIterator<Item = (usize, f32)> + Clone> {
+        let start = row
+            .checked_mul(self.fanout.get())
+            .ok_or_else(|| error("routing row offset overflow"))?;
+        let end = start
+            .checked_add(self.fanout.get())
+            .ok_or_else(|| error("routing row end overflow"))?;
+        let decisions = self.decisions.get(start..end).ok_or_else(|| {
+            error(format!(
+                "routing row {row} is outside the prepared decision plan; use a valid input row"
+            ))
+        })?;
+        Ok(decisions.iter().map(|d| (d.expert, d.weight)))
+    }
+    pub(super) fn groups(&self) -> impl ExactSizeIterator<Item = (usize, ExpertTasks<'_>)> + Clone {
+        self.counts.expert_ids().map(move |expert| {
+            (
+                expert,
+                ExpertTasks {
+                    decisions: self.decisions,
+                    order: &self.order[self.starts[expert]..self.starts[expert + 1]],
+                    fanout: self.fanout,
+                },
+            )
+        })
     }
 }
+#[derive(Clone, Copy)]
+pub(super) struct RoutedTask {
+    pub(super) row: usize,
+    pub(super) slot: usize,
+    pub(super) weight: f32,
+}
+#[derive(Clone, Copy)]
 pub(super) struct ExpertTasks<'a> {
     decisions: &'a [Decision],
     order: &'a [usize],
     fanout: NonZeroUsize,
 }
 impl ExpertTasks<'_> {
-    pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = (usize, f32)> + '_ {
-        self.order
-            .iter()
-            .map(|&index| (index / self.fanout.get(), self.decisions[index].weight))
+    pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = RoutedTask> + Clone + '_ {
+        self.order.iter().map(move |&slot| RoutedTask {
+            row: slot / self.fanout.get(),
+            slot,
+            weight: self.decisions[slot].weight,
+        })
     }
 }
 
@@ -308,21 +417,21 @@ mod tests {
                             })
                             .collect::<Vec<_>>();
                         let weights = aggregation.then_some(weights.as_slice());
-                        let mut expected = BTreeMap::<usize, Vec<(usize, u32)>>::new();
+                        let mut expected = BTreeMap::<usize, Vec<(usize, usize, u32)>>::new();
                         for row in 0..rows {
                             let range = row * experts..(row + 1) * experts;
-                            let mut routes = reference_routing_weights(
+                            let routes = reference_routing_weights(
                                 &logits[range.clone()],
                                 weights.map(|w| &w[range]),
                                 k,
                                 normalize,
                             );
-                            routes.sort_unstable_by_key(|&(expert, _)| expert);
-                            for (expert, weight) in routes {
-                                expected
-                                    .entry(expert)
-                                    .or_default()
-                                    .push((row, weight.to_bits()));
+                            for (rank, (expert, weight)) in routes.into_iter().enumerate() {
+                                expected.entry(expert).or_default().push((
+                                    row,
+                                    row * k.min(experts) + rank,
+                                    weight.to_bits(),
+                                ));
                             }
                         }
                         let layout = RoutingArena::layout(rows, experts, k, aggregation).unwrap();
@@ -347,6 +456,34 @@ mod tests {
                                 .build(&logits, weights, normalize)
                                 .unwrap();
                             assert!(!plan.is_empty());
+                            assert_eq!(plan.route_count(), rows * k.min(experts));
+                            assert_eq!(plan.groups().len(), expected.len());
+                            assert_eq!(plan.counts().len(), expected.len());
+                            assert_eq!(plan.counts().assignments(), rows * k.min(experts));
+                            assert_eq!(
+                                plan.groups().clone().map(|(id, _)| id).collect::<Vec<_>>(),
+                                expected.keys().copied().collect::<Vec<_>>()
+                            );
+                            for row in 0..rows {
+                                let range = row * experts..(row + 1) * experts;
+                                let old = reference_routing_weights(
+                                    &logits[range.clone()],
+                                    weights.map(|w| &w[range]),
+                                    k,
+                                    normalize,
+                                );
+                                let actual = plan
+                                    .row_selections(row)
+                                    .unwrap()
+                                    .map(|(id, w)| (id, w.to_bits()))
+                                    .collect::<Vec<_>>();
+                                assert_eq!(
+                                    actual,
+                                    old.into_iter()
+                                        .map(|(id, w)| (id, w.to_bits()))
+                                        .collect::<Vec<_>>()
+                                );
+                            }
                             let actual = plan
                                 .groups()
                                 .map(|(expert, tasks)| {
@@ -354,7 +491,9 @@ mod tests {
                                         expert,
                                         tasks
                                             .iter()
-                                            .map(|(row, weight)| (row, weight.to_bits()))
+                                            .map(|task| {
+                                                (task.row, task.slot, task.weight.to_bits())
+                                            })
                                             .collect::<Vec<_>>(),
                                     )
                                 })
@@ -368,6 +507,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn expert_count_views_reject_ambiguous_membership_and_preserve_zero_counts() {
+        assert!(ExpertGroupCounts::checked(&[3, 3], &[1, 1]).is_err());
+        assert!(ExpertGroupCounts::checked(&[9, 3], &[1, 1]).is_err());
+        assert!(ExpertGroupCounts::checked(&[3], &[1, 2]).is_err());
+        assert!(ExpertGroupCounts::checked(&[3, 9], &[usize::MAX, 1]).is_err());
+        let counts = ExpertGroupCounts::checked(&[3, 9], &[3, 0]).unwrap();
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts.assignments(), 3);
+        assert_eq!(counts.iter().collect::<Vec<_>>(), [(3, 3), (9, 0)]);
+        let empty = ExpertRoutes::empty(3).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.groups().len(), 0);
+        assert!(empty.row_selections(0).is_err());
     }
 
     #[test]

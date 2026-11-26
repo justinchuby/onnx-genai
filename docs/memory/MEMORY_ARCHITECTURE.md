@@ -254,9 +254,33 @@ after score-order denominators are complete. The existing owned routing helper
 for other CPU MoE paths delegates to that same checked implementation.
 
 BlockQuantizedMoE no longer creates routing payload Vecs or per-expert task Vecs.
-Rank/index conversion metadata and other operators' owned routing plans remain.
+Rank/index conversion metadata and the plain MoE operator's owned grouping plan
+remain.
 Counts/prefix initialization and index indirection have costs; this proves
 ownership and accounting, not zero mallocs or a measured latency improvement.
+
+ONNX integer `QMoE` now uses the same arena and immutable task views. Its two FC
+banks, score-order contribution storage, decoder scratch and routing arena form
+one five-region operation workspace. Shape-only bounds include FC2's expert axis
+and aggregation presence; the existing Ready memo path remains reusable. X/router
+copies and routing follow complete binding. Other quantized input materialization
+and weight-admission metadata retain their existing paths.
+
+Routing decisions preserve original score order and retain that decision index
+as the contribution slot. Stable expert bucketing never renumbers slots; QMoE's
+final +0, row-major, score-order `+=` scatter remains unchanged. After routing,
+dead TopK index storage becomes the ascending active-expert list. After bucket
+writes complete, dead cursors become counts derived from immutable prefixes.
+A private-field `ExpertGroupCounts` view publishes unique membership and counts
+without another map, mapping closure or raw-iterator uniqueness contract. Metrics
+retain their zero-count membership semantics in checked fixtures and preserve
+lock order, atomics and saturated accumulated fields.
+
+Prefetch still checks eligibility before consuming selected IDs, taking payload
+locks, pinning entries or requesting grants. Only expert IDs and weight loading
+cross to the worker; borrowed task views and workspace remain on the main thread
+through scope join, including failures. Zero-row execution uses an empty immutable
+plan and retains the prior metrics path without reserving routing storage.
 
 For nonempty output, shape-only preparation returns `Deferred`: it cannot know
 strides, and a conservative reservation would retain unused high-water capacity.
