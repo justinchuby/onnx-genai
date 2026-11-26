@@ -8,7 +8,7 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::Node;
 
 use super::check_arity;
-use super::float_workspace::FloatWorkspace;
+use super::softmax_geometry::SoftmaxGeometry;
 
 /// `LogSoftmax` kernel carrying its axis and whether it uses the pre-opset-13
 /// coerce-to-2D definition.
@@ -65,73 +65,13 @@ fn log_softmax_slices(x: &[f32], out: &mut [f32], outer: usize, axis_dim: usize,
     }
 }
 
-struct LogSoftmaxGeometry {
-    outer: usize,
-    width: usize,
-    inner: usize,
-    count: usize,
-    workspace: FloatWorkspace<1>,
-}
-
 impl LogSoftmaxKernel {
     fn geometry(
         &self,
         inputs: &[TensorMetadata<'_>],
         outputs: &[OutputMetadata<'_>],
-    ) -> Result<LogSoftmaxGeometry> {
-        let [input] = inputs else {
-            return Err(EpError::KernelFailed(format!(
-                "LogSoftmax: provide exactly one present X input, got {} slots",
-                inputs.len()
-            )));
-        };
-        if !input.present || !super::FLOAT_DTYPES.contains(&input.dtype) {
-            return Err(EpError::KernelFailed(format!(
-                "LogSoftmax: X must be a present floating tensor, got present={} dtype {:?}",
-                input.present, input.dtype
-            )));
-        }
-        let shape = input.shape;
-        let rank = shape.len();
-        let axis = if self.axis < 0 { self.axis.checked_add(rank as i64) } else { Some(self.axis) }
-            .filter(|&axis| axis >= 0 && (axis as usize) < rank)
-            .ok_or_else(|| EpError::KernelFailed(format!("LogSoftmax: axis {} out of range for rank {rank}; provide rank >= 1 and axis in [-rank, rank)", self.axis)))? as usize;
-        let [output] = outputs else {
-            return Err(EpError::KernelFailed(format!(
-                "LogSoftmax: provide exactly one Y output, got {} slots",
-                outputs.len()
-            )));
-        };
-        let dtype = match output {
-            OutputMetadata::Tensor {dtype, shape: output_shape} => {
-                if output_shape.as_ref() != shape { return Err(EpError::KernelFailed(format!("LogSoftmax: Y shape {output_shape:?} must match X shape {shape:?}"))); }
-                *dtype
-            }
-            OutputMetadata::Unresolved {dtype} => *dtype,
-            OutputMetadata::Absent => return Err(EpError::KernelFailed("LogSoftmax: required Y output is absent; bind one floating output matching X shape".into())),
-        };
-        if !super::FLOAT_DTYPES.contains(&dtype) {
-            return Err(EpError::KernelFailed(format!(
-                "LogSoftmax: Y dtype {dtype:?} must be floating point"
-            )));
-        }
-        let product = |dims: &[usize]| {
-            dims.iter().rev().try_fold(1usize, |n, &d| n.checked_mul(d)).ok_or_else(|| EpError::KernelFailed(format!("LogSoftmax: shape {shape:?} has overflowing dense strides; reduce the tensor dimensions")))
-        };
-        let count = product(shape)?;
-        let outer = product(&shape[..axis])?;
-        let (width, inner) = if self.coerce_2d {
-            (product(&shape[axis..])?, 1)
-        } else {
-            (shape[axis], product(&shape[axis + 1..])?)
-        };
-        Ok(LogSoftmaxGeometry {
-            outer,
-            width,
-            inner,
-            count,
-            workspace: FloatWorkspace::new("LogSoftmax", [("Y staging", count)])?,
-        })
+    ) -> Result<SoftmaxGeometry> {
+        SoftmaxGeometry::new("LogSoftmax", self.axis, self.coerce_2d, inputs, outputs)
     }
 
     fn run(

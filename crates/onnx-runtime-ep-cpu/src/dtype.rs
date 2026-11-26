@@ -857,16 +857,20 @@ pub fn narrow_bf16_slice_into(src: &[f32], dst: &mut [u16]) {
     }
 }
 
+/// Storage geometry used by widening and address-only execution refinement.
+/// Callers separately validate view geometry and Host accessibility.
+#[inline]
+pub(crate) fn can_borrow_dense_f32(view: &TensorView<'_>) -> bool {
+    view.dtype == DataType::Float32 && view.is_contiguous() && view.data_ptr::<f32>().is_aligned()
+}
+
 /// Borrow a contiguous f32 view zero-copy, or materialize/widen any other
 /// supported float view (`f16`/`bf16`/`f64` or strided f32) into dense f32.
 /// Rejects non-float dtypes with a RULE #1 error.
 pub fn to_dense_f32_widen<'a>(op: &str, view: &'a TensorView<'_>) -> Result<Cow<'a, [f32]>> {
     validate_f32_widen_input(op, view)?;
     let len = view.numel();
-    if view.dtype == DataType::Float32
-        && view.is_contiguous()
-        && view.data_ptr::<f32>().is_aligned()
-    {
+    if can_borrow_dense_f32(view) {
         if len == 0 {
             return Ok(Cow::Borrowed(&[]));
         }
@@ -1160,7 +1164,7 @@ pub fn byte_ranges_overlap(a: &core::ops::Range<usize>, b: &core::ops::Range<usi
 /// the caller's `unsafe` slice, so the element-count match here is what makes
 /// that slice in-bounds. No hardcoded dimensions — usable by any kernel.
 pub fn output_direct_write_eligible(
-    output: &mut TensorMut,
+    output: &TensorMut,
     len: usize,
     read_ranges: &[core::ops::Range<usize>],
 ) -> bool {
@@ -1171,12 +1175,23 @@ pub fn output_direct_write_eligible(
     {
         return false;
     }
-    let pointer = output.data_ptr_mut::<f32>();
+    let pointer = output
+        .data
+        .0
+        .cast::<u8>()
+        .wrapping_add(output.byte_offset)
+        .cast::<f32>();
     if pointer.is_null() || !pointer.is_aligned() {
         return false;
     }
     let start = pointer as usize;
-    let out_range = start..start.saturating_add(len * std::mem::size_of::<f32>());
+    let Some(end) = len
+        .checked_mul(size_of::<f32>())
+        .and_then(|bytes| start.checked_add(bytes))
+    else {
+        return false;
+    };
+    let out_range = start..end;
     read_ranges
         .iter()
         .all(|r| !byte_ranges_overlap(&out_range, r))
@@ -1571,24 +1586,24 @@ mod tests {
 
         // Disjoint input range -> eligible for the direct path.
         let disjoint = (base + 8 * 4)..(base + 8 * 4 + 16);
-        assert!(output_direct_write_eligible(&mut out, 8, &[disjoint]));
+        assert!(output_direct_write_eligible(&out, 8, &[disjoint]));
 
         // Overlapping input range -> must reject (fall back to owned buffer).
         let overlap = (base + 4)..(base + 4 + 16);
-        assert!(!output_direct_write_eligible(&mut out, 8, &[overlap]));
+        assert!(!output_direct_write_eligible(&out, 8, &[overlap]));
 
         // Wrong element count -> reject even with no aliasing input.
-        assert!(!output_direct_write_eligible(&mut out, 7, &[]));
+        assert!(!output_direct_write_eligible(&out, 7, &[]));
 
         // A packed backing may be byte-addressable yet not aligned for f32.
         out.data = DevicePtrMut(unsafe { buf.as_mut_ptr().cast::<u8>().add(1).cast() });
         out.validate().unwrap();
-        assert!(!output_direct_write_eligible(&mut out, 8, &[]));
+        assert!(!output_direct_write_eligible(&out, 8, &[]));
         out.byte_offset = 4;
-        assert!(!output_direct_write_eligible(&mut out, 8, &[]));
+        assert!(!output_direct_write_eligible(&out, 8, &[]));
         out.data = DevicePtrMut(std::ptr::null_mut());
         out.byte_offset = 0;
-        assert!(!output_direct_write_eligible(&mut out, 8, &[]));
+        assert!(!output_direct_write_eligible(&out, 8, &[]));
 
         // Range helpers.
         let s = [0.0f32; 4];

@@ -721,6 +721,7 @@ pub mod simd_sumsq;
 pub mod skip_simplified_layernorm;
 pub mod slice;
 pub mod softmax;
+mod softmax_geometry;
 pub mod sparse_kv_gather;
 pub mod split;
 pub mod stft;
@@ -1632,12 +1633,12 @@ pub(crate) fn build_cpu_registry_with_resources(
     // provider's opset-aware lookup selects the version-correct kernel.
     rec.register(
         OpKey::new("Softmax", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(softmax::SoftmaxLegacyFactory),
     );
     rec.register(
         OpKey::new("Softmax", "", 13),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(softmax::SoftmaxFactory),
     );
     // LogSoftmax shares Softmax's opset split: legacy flattened trailing axes
