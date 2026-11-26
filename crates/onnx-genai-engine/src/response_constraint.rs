@@ -120,6 +120,7 @@ struct State {
 }
 
 struct ConstraintTokens {
+    raw: Option<ByteStreamContract>,
     endings: Vec<TokenId>,
     preserved: std::collections::BTreeSet<u32>,
 }
@@ -155,11 +156,33 @@ impl ContentConstraint {
             prefix,
             max_bytes,
             ConstraintTokens {
+                raw: None,
                 endings,
                 preserved: preserved.clone(),
             },
         )
     }
+    pub(crate) fn raw_json_schema(
+        tokenizer: &Tokenizer,
+        schema: &serde_json::Value,
+        max_bytes: usize,
+        contract: ByteStreamContract,
+    ) -> anyhow::Result<Self> {
+        Self::new(
+            tokenizer,
+            GrammarByteCursor::json_schema(schema, max_bytes)?,
+            Normalization::Json,
+            ProjectionKind::Plain,
+            "",
+            max_bytes,
+            ConstraintTokens {
+                raw: Some(contract.into_raw()),
+                endings: Vec::new(),
+                preserved: Default::default(),
+            },
+        )
+    }
+
     pub(crate) fn text(
         tokenizer: &Tokenizer,
         grammar: &crate::config::TextGrammar,
@@ -183,6 +206,7 @@ impl ContentConstraint {
             prefix,
             max_bytes,
             ConstraintTokens {
+                raw: None,
                 endings,
                 preserved: preserved.clone(),
             },
@@ -197,14 +221,22 @@ impl ContentConstraint {
         max_bytes: usize,
         tokens: ConstraintTokens,
     ) -> anyhow::Result<Self> {
-        let ConstraintTokens { endings, preserved } = tokens;
+        let ConstraintTokens {
+            endings,
+            preserved,
+            raw,
+        } = tokens;
         let vocabulary = tokenizer
             .inner()
             .get_vocab(true)
             .values()
             .copied()
             .collect::<HashSet<_>>();
-        let codec = match ByteStreamContract::resolve_output(tokenizer, &preserved)? {
+        let contract = match raw {
+            Some(contract) => Some(contract),
+            None => ByteStreamContract::resolve_output(tokenizer, &preserved)?,
+        };
+        let codec = match contract {
             Some(contract) => Codec::Bytes(contract),
             None => Codec::Canonical(Box::new(tokenizer.clone())),
         };
@@ -668,6 +700,11 @@ impl Constraint for ContentConstraint {
                 (&self.plain_vocabulary, &self.codec)
                 && state.decoder.is_identity()
                 && !state.normalized.has_pending_escape()
+                // A removed whitespace suffix closes the raw JSON lexeme.
+                // Extending its canonical bytes directly could admit `1 e2`.
+                && !(matches!(self.normalization, Normalization::Json)
+                    && state.raw.ends_with([' ', '\t', '\r', '\n'])
+                    && !state.normalized.canonical().ends_with([' ', '\t', '\r', '\n']))
             {
                 let pending = state
                     .projection
@@ -687,6 +724,10 @@ impl Constraint for ContentConstraint {
                             && let Some(piece) = piece.filter(|piece| {
                                 !piece.is_empty()
                                     && !piece.iter().any(|&byte| matches!(byte, b'\\' | 0x7f))
+                                    && !(matches!(self.normalization, Normalization::Json)
+                                        && piece.last().is_some_and(|byte| {
+                                            matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+                                        }))
                             })
                             && !(state.normalized.canonical().is_empty()
                                 && piece.first().is_some_and(u8::is_ascii_whitespace))
@@ -1482,6 +1523,9 @@ mod tests {
             .collect::<Vec<_>>();
         for history in [
             vec![],
+            vec![25],
+            vec![25, 26],
+            vec![25, 26, 26],
             vec![22],
             vec![22, 24],
             vec![22, 24, 25],

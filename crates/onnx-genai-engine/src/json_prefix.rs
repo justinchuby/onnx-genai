@@ -197,6 +197,19 @@ impl JsonPrefix {
         canonical.push_str(&text[segment_start..stable_end]);
         let leading = canonical.len() - canonical.trim_start_matches([' ', '\t', '\r', '\n']).len();
         canonical.drain(..leading);
+        // Only complete JSON lexemes can be followed by ignorable whitespace.
+        // Do not turn an impossible prefix such as `1e ` or `tru ` into a
+        // viable unfinished lexeme by removing its terminating whitespace.
+        let trimmed = canonical.trim_end_matches([' ', '\t', '\r', '\n']);
+        let complete_lexeme = matches!(
+            trimmed.as_bytes().last(),
+            Some(b'"' | b']' | b'}' | b'0'..=b'9')
+        ) || ["true", "false", "null"]
+            .iter()
+            .any(|literal| trimmed.ends_with(literal));
+        if !in_string && complete_lexeme {
+            canonical.truncate(trimmed.len());
+        }
         Ok(Self {
             canonical,
             pending: pending.map(|(_, ranges)| PendingEscape {
@@ -324,6 +337,23 @@ mod tests {
             prefix.preview(&mut cursor, "", b"").unwrap(),
             GrammarCandidate::Viable { .. }
         )
+    }
+
+    #[test]
+    fn json_prefix_trailing_whitespace_preserves_string_values_and_rejects_second_values() {
+        let schema = json!({"const":"A "});
+        for text in ["\"A \"", " \t\"A \" \r\n", "\"A "] {
+            assert!(accepts(&schema, text), "{text:?}");
+        }
+        assert!(!accepts(&schema, "\"A\" "));
+        assert!(!accepts(&schema, "\"A \" \"second\""));
+        assert_eq!(JsonPrefix::parse("\"A ").unwrap().canonical, "\"A ");
+        assert_eq!(JsonPrefix::parse("{\"a\": ").unwrap().canonical, "{\"a\": ");
+        assert!(!accepts(&json!({"const":1}), "1 2 "));
+        assert!(accepts(&json!({"const":1}), "1 \n"));
+        for invalid in ["1e ", "1. ", "1e- ", "tru ", "nul ", "fals "] {
+            assert!(!accepts(&json!({}), invalid), "{invalid:?}");
+        }
     }
 
     #[test]
