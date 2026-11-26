@@ -23,6 +23,13 @@ fn model_dir_missing_err(root: &Path) -> OrtError {
     ))
 }
 
+/// Native metadata location discovered before executable payload admission.
+#[derive(Debug, Clone)]
+pub struct ModelPackageMetadata {
+    pub root: PathBuf,
+    pub metadata_path: Option<PathBuf>,
+}
+
 /// Resolved files needed to load a single ONNX text-generation model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelDirectory {
@@ -39,16 +46,7 @@ impl ModelDirectory {
     /// Resolve `decoder.onnx` (or a single `.onnx` fallback), `tokenizer.json`,
     /// and optional `inference_metadata.{yaml,yml,json}` under `root`.
     pub fn load(root: impl AsRef<Path>) -> Result<Self> {
-        let root = root.as_ref();
-        if !root.is_dir() {
-            return Err(model_dir_missing_err(root));
-        }
-
-        if is_model_package_directory(root) {
-            return Self::load_package(root, &SelectionRequest::default());
-        }
-
-        Self::load_flat(root)
+        Self::load_with_package_selection(root, &SelectionRequest::default())
     }
 
     /// Resolve a flat model directory or select a variant from an ORT package.
@@ -57,10 +55,9 @@ impl ModelDirectory {
         selection: &SelectionRequest,
     ) -> Result<Self> {
         let root = root.as_ref();
-        if is_model_package_directory(root) {
-            Self::load_package(root, selection)
-        } else {
-            Self::load_flat(root)
+        match open_package_for_selection(root, selection)? {
+            Some(package) => Self::load_package(package, selection),
+            None => Self::load_flat(root),
         }
     }
 
@@ -86,50 +83,51 @@ impl ModelDirectory {
         })
     }
 
-    fn load_package(root: &Path, selection: &SelectionRequest) -> Result<Self> {
-        let package = ModelPackage::open(root)
-            .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
-        package
-            .validate()
-            .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
-        let component_name = if package.manifest().components.contains_key("model") {
-            "model"
-        } else if package.manifest().components.len() == 1 {
-            package
-                .manifest()
-                .components
-                .first()
-                .map(|(name, _)| name.as_str())
-                .expect("non-empty components validated by ModelPackage::open")
-        } else {
-            return Err(OrtError::InvalidArgument(
-                "model package must contain a 'model' component when multiple components exist"
-                    .to_string(),
-            ));
+    /// Discover a selected package's native metadata without touching its graph.
+    pub fn package_metadata(
+        root: &Path,
+        selection: &SelectionRequest,
+    ) -> Result<Option<ModelPackageMetadata>> {
+        let Some(package) = open_package_for_selection(root, selection)? else {
+            return Ok(None);
         };
-        let selected = package
-            .select(component_name, selection)
+        let name = package
+            .manifest()
+            .model_component_name()
             .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
-        let tokenizer_directory = selected
-            .tokenizer_directory
-            .clone()
-            .unwrap_or_else(|| selected.variant_directory.clone());
-        let tokenizer_path = tokenizer_directory.join("tokenizer.json");
-        if !tokenizer_path.is_file() {
-            return Err(OrtError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "tokenizer.json not found in resolved tokenizer directory {}",
-                    tokenizer_directory.display()
-                ),
-            )));
-        }
-        let metadata_path = selected
-            .inference_metadata_path
-            .or_else(|| find_metadata_path(&selected.variant_directory));
-        let genai_config_path = selected
-            .genai_config_path
-            .or_else(|| onnx_genai_genai_config::find_in_dir(&selected.variant_directory));
+        let index = package
+            .select_index(name, selection)
+            .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
+        let root = index.variant_directory().to_path_buf();
+        let metadata_path = selected_native_metadata(&index)?;
+        Ok(Some(ModelPackageMetadata {
+            root,
+            metadata_path,
+        }))
+    }
+
+    fn load_package(package: ModelPackage, selection: &SelectionRequest) -> Result<Self> {
+        // A package index can describe variants that are not installed. The
+        // selected variant still resolves every reference with the package's
+        // confined path checks; validate-all remains an explicit package audit.
+        let component_name = package
+            .manifest()
+            .model_component_name()
+            .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
+        let index = package
+            .select_index(component_name, selection)
+            .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
+        Self::from_selected_index(&index)
+    }
+
+    fn from_selected_index(index: &onnx_model_package::SelectedVariantIndex<'_>) -> Result<Self> {
+        let selected = index
+            .resolve()
+            .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
+        let tokenizer_path = index.tokenizer_artifact("tokenizer.json")
+            .map_err(|error| OrtError::InvalidArgument(format!("resolve selected package tokenizer.json: {error}; restore its declared tokenizer assets")))?;
+        let metadata_path = selected_native_metadata(index)?;
+        let genai_config_path = selected_genai_config(index)?;
         Ok(Self {
             root: selected.variant_directory,
             model_path: selected.model_path,
@@ -138,6 +136,63 @@ impl ModelDirectory {
             genai_config_path,
         })
     }
+}
+
+fn selected_native_metadata(
+    index: &onnx_model_package::SelectedVariantIndex<'_>,
+) -> Result<Option<PathBuf>> {
+    if let Some(path) = index
+        .inference_metadata_path()
+        .map_err(|error| OrtError::InvalidArgument(error.to_string()))?
+    {
+        return Ok(Some(path));
+    }
+    for name in onnx_genai_metadata::METADATA_FILE_NAMES {
+        if let Some(path) = index
+            .optional_adjacent_file(name)
+            .map_err(|error| OrtError::InvalidArgument(error.to_string()))?
+        {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+fn selected_genai_config(
+    index: &onnx_model_package::SelectedVariantIndex<'_>,
+) -> Result<Option<PathBuf>> {
+    let declared = index
+        .genai_config_path()
+        .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
+    match declared {
+        Some(path) => Ok(Some(path)),
+        None => index
+            .optional_adjacent_file("genai_config.json")
+            .map_err(|error| OrtError::InvalidArgument(error.to_string())),
+    }
+}
+
+fn open_package_for_selection(
+    root: &Path,
+    selection: &SelectionRequest,
+) -> Result<Option<ModelPackage>> {
+    if !root.is_dir() {
+        return Err(model_dir_missing_err(root));
+    }
+    if is_model_package_directory(root)
+        || selection.variant.is_some() && root.join("manifest.json").is_file()
+    {
+        return ModelPackage::open(root)
+            .map(Some)
+            .map_err(|error| OrtError::InvalidArgument(error.to_string()));
+    }
+    if let Some(variant) = &selection.variant {
+        return Err(OrtError::InvalidArgument(format!(
+            "variant {variant:?} requires a model package manifest.json in {}; publish an explicit package variant or omit the variant selector for a flat model directory",
+            root.display()
+        )));
+    }
+    Ok(None)
 }
 
 /// Bytes the model's weights actually occupy.
@@ -280,20 +335,49 @@ impl PipelineModelDirectory {
     /// embedding components) or an encoder-decoder model (an `model.encoder`
     /// section feeding a cross-attention decoder, e.g. Whisper).
     pub fn load_if_declared(root: impl AsRef<Path>) -> Result<Option<Self>> {
-        let root = root.as_ref();
-        if !root.is_dir() {
-            return Err(model_dir_missing_err(root));
-        }
-        if let Some(metadata_path) = find_metadata_path(root) {
+        Self::load_if_declared_with_selection(root, &SelectionRequest::default())
+    }
+
+    /// Discover the workflow belonging to the selected package variant.
+    pub fn load_if_declared_with_selection(
+        root: impl AsRef<Path>,
+        selection: &SelectionRequest,
+    ) -> Result<Option<Self>> {
+        let original_root = root.as_ref();
+        let package = open_package_for_selection(original_root, selection)?;
+        let index = package
+            .as_ref()
+            .map(|package| {
+                let name = package.manifest().model_component_name()?;
+                package.select_index(name, selection)
+            })
+            .transpose()
+            .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
+        let selected_root = index
+            .as_ref()
+            .map(|index| index.variant_directory().to_path_buf());
+        let root = selected_root.as_deref().unwrap_or(original_root);
+        let metadata_path = match &index {
+            Some(index) => selected_native_metadata(index)?,
+            None => find_metadata_path(root),
+        };
+        if let Some(metadata_path) = metadata_path {
             let metadata = load_metadata(&metadata_path)
                 .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
             return if metadata.pipeline.is_some() {
-                Self::load(root).map(Some)
+                Self::load_with_metadata_preflight_and_selection(original_root, selection, |_| {
+                    Ok(())
+                })
+                .map(Some)
             } else {
                 Ok(None)
             };
         }
-        let Some(genai_path) = onnx_genai_genai_config::find_in_dir(root) else {
+        let genai_path = match &index {
+            Some(index) => selected_genai_config(index)?,
+            None => onnx_genai_genai_config::find_in_dir(root),
+        };
+        let Some(genai_path) = genai_path else {
             return Ok(None);
         };
         let config = onnx_genai_genai_config::load(&genai_path)
@@ -307,7 +391,8 @@ impl PipelineModelDirectory {
         if !is_vision_language && !is_encoder_decoder {
             return Ok(None);
         }
-        Self::load(root).map(Some)
+        Self::load_with_metadata_preflight_and_selection(original_root, selection, |_| Ok(()))
+            .map(Some)
     }
 
     /// Resolve the validated pipeline spec and all referenced model/tokenizer files.
@@ -325,18 +410,39 @@ impl PipelineModelDirectory {
         root: impl AsRef<Path>,
         preflight: impl FnOnce(&InferenceMetadata) -> Result<()>,
     ) -> Result<Self> {
-        let root = root.as_ref();
-        if !root.is_dir() {
-            return Err(model_dir_missing_err(root));
-        }
+        Self::load_with_metadata_preflight_and_selection(
+            root,
+            &SelectionRequest::default(),
+            preflight,
+        )
+    }
 
-        let metadata_path = find_metadata_path(root).ok_or_else(|| {
-            OrtError::InvalidArgument(format!(
-                "pipeline package '{}' must contain inference_metadata.yaml or \
-                 inference_metadata.json with pipeline.workflow",
-                root.display()
-            ))
-        })?;
+    /// Resolve only the selected workflow with the same admission callback.
+    pub fn load_with_metadata_preflight_and_selection(
+        root: impl AsRef<Path>,
+        selection: &SelectionRequest,
+        preflight: impl FnOnce(&InferenceMetadata) -> Result<()>,
+    ) -> Result<Self> {
+        let original_root = root.as_ref();
+        let package = open_package_for_selection(original_root, selection)?;
+        let index = package
+            .as_ref()
+            .map(|package| {
+                let name = package.manifest().model_component_name()?;
+                package.select_index(name, selection)
+            })
+            .transpose()
+            .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
+        let selected_root = index
+            .as_ref()
+            .map(|index| index.variant_directory().to_path_buf());
+        let root = selected_root.as_deref().unwrap_or(original_root);
+        let metadata_path = match &index {
+            Some(index) => selected_native_metadata(index)?,
+            None => find_metadata_path(root),
+        };
+        let metadata_path = metadata_path.ok_or_else(|| OrtError::InvalidArgument(format!(
+            "pipeline package '{}' must contain inference_metadata.yaml or inference_metadata.json with pipeline.workflow",root.display())))?;
         let metadata = load_metadata(&metadata_path)
             .map_err(|err| OrtError::InvalidArgument(err.to_string()))?;
         let spec = metadata.pipeline.clone().ok_or_else(|| {
@@ -346,29 +452,55 @@ impl PipelineModelDirectory {
             OrtError::InvalidArgument(format!("Invalid inference metadata: {}", errors.join("; ")))
         })?;
         preflight(&metadata)?;
+        let selected = index
+            .as_ref()
+            .map(ModelDirectory::from_selected_index)
+            .transpose()?;
         let preprocessing = metadata.preprocessing.clone();
         let adapters = metadata.adapters.clone();
 
+        let resolve_artifact = |reference: &str, field: &str| -> Result<PathBuf> {
+            match &index {
+                Some(index) => index
+                    .resolve_artifact(reference)
+                    .map_err(|error| OrtError::InvalidArgument(format!("{field}: {error}"))),
+                None => resolve_relative_file(root, reference, field),
+            }
+        };
         let mut model_paths = BTreeMap::new();
         for (name, component) in &spec.workflow.components {
             match &component.implementation {
                 onnx_genai_metadata::ComponentImplementation::Onnx { artifact } => {
                     model_paths.insert(
                         name.clone(),
-                        resolve_relative_file(root, artifact, "workflow ONNX component")?,
+                        resolve_artifact(artifact, "workflow ONNX component")?,
                     );
                 }
                 onnx_genai_metadata::ComponentImplementation::Adapter {
                     artifact: Some(artifact),
                     ..
                 } => {
-                    let _ = resolve_relative_file(root, artifact, "workflow adapter artifact")?;
+                    let _ = resolve_artifact(artifact, "workflow adapter artifact")?;
                 }
                 onnx_genai_metadata::ComponentImplementation::Adapter {
                     artifact: None, ..
                 }
                 | onnx_genai_metadata::ComponentImplementation::Binding => {}
             }
+        }
+
+        if let Some(selected) = &selected
+            && let Some(decoder) =
+                onnx_genai_metadata::classify_workflow(&spec.workflow).contracted_single_decoder()
+            && model_paths
+                .get(decoder)
+                .is_some_and(|path| path != &selected.model_path)
+        {
+            return Err(OrtError::InvalidArgument(format!(
+                "selected model-package graph '{}' conflicts with workflow decoder {decoder:?} artifact '{}'; declare the same canonical executable graph in the manifest and workflow",
+                selected.model_path.display(),
+                model_paths[decoder].display()
+            )));
         }
 
         let declared_tokenizer = metadata
@@ -379,14 +511,19 @@ impl PipelineModelDirectory {
         let shared_tokenizer = if let Some(tokenizer) = declared_tokenizer {
             let mut resolved = Vec::with_capacity(tokenizer.artifacts.len());
             for artifact in &tokenizer.artifacts {
-                resolved.push(
-                    onnx_genai_metadata::resolve_package_artifact(
+                resolved.push(match &index {
+                    Some(index) => index
+                        .resolve_artifact(&artifact.location)
+                        .map_err(|error| {
+                            OrtError::InvalidArgument(format!("package tokenizer: {error}"))
+                        })?,
+                    None => onnx_genai_metadata::resolve_package_artifact(
                         root,
                         &artifact.location,
                         "package tokenizer",
                     )
                     .map_err(|error| OrtError::InvalidArgument(error.to_string()))?,
-                );
+                });
             }
             let canonical = resolved
                 .iter()
@@ -403,10 +540,21 @@ impl PipelineModelDirectory {
                     )
                 })?;
             Some(canonical.clone())
+        } else if let Some(selected) = &selected {
+            Some(selected.tokenizer_path.clone())
         } else {
             let legacy = root.join("tokenizer.json");
             legacy.is_file().then_some(legacy)
         };
+        if let (Some(selected), Some(shared)) = (&selected, &shared_tokenizer)
+            && shared.canonicalize()? != selected.tokenizer_path.canonicalize()?
+        {
+            return Err(OrtError::InvalidArgument(format!(
+                "selected model-package tokenizer '{}' conflicts with workflow tokenizer '{}'; declare one canonical tokenizer in both contracts",
+                selected.tokenizer_path.display(),
+                shared.display()
+            )));
+        }
         let tokenizer_paths = PipelineTokenizerPaths {
             shared: shared_tokenizer,
             per_component: BTreeMap::new(),
@@ -988,6 +1136,294 @@ mod model_package_tests {
                 "shared_assets/sha256-{}/tokenizer.json",
                 "a".repeat(64)
             ))
+        );
+    }
+
+    #[test]
+    fn selected_package_variant_does_not_require_uninstalled_variants() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("installed")).unwrap();
+        std::fs::write(root.path().join("installed/model.onnx"), b"graph").unwrap();
+        std::fs::write(root.path().join("installed/tokenizer.json"), b"{}").unwrap();
+        let index = serde_json::json!({"schema_version":"1.0","components":{"model":{
+            "component_name":"model","variants":{
+                "selected":{"variant_directory":"installed","executor_info":{"nxrt":{"model_file":"model.onnx"}}},
+                "other":{"variant_directory":"not-installed","executor_info":{"nxrt":{"model_file":"model.onnx"}}}
+            }
+        }}});
+        std::fs::write(
+            root.path().join("manifest.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        let selected = ModelDirectory::load_with_package_selection(
+            root.path(),
+            &SelectionRequest::named("selected"),
+        )
+        .unwrap();
+        assert_eq!(
+            selected.model_path,
+            root.path()
+                .canonicalize()
+                .unwrap()
+                .join("installed/model.onnx")
+        );
+        let error = ModelDirectory::load_with_package_selection(
+            root.path(),
+            &SelectionRequest::named("other"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not-installed"), "{error}");
+        // A full package audit still requires every declared variant.
+        assert!(ModelPackage::open(root.path()).unwrap().validate().is_err());
+    }
+
+    #[test]
+    fn selected_package_workflow_admission_precedes_missing_graph_and_tokenizer_checks() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("selected")).unwrap();
+        let metadata = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-native-engine/inference_metadata.yaml");
+        std::fs::copy(
+            metadata,
+            root.path().join("selected/inference_metadata.yaml"),
+        )
+        .unwrap();
+        let manifest = serde_json::json!({"schema_version":"1.0","components":{"model":{
+            "component_name":"model","variants":{"selected":{"variant_directory":"selected","executor_info":{"nxrt":{
+                "model_file":"missing-model.onnx","tokenizer":"missing-tokenizer","inference_metadata":"inference_metadata.yaml"
+            }}}}
+        }}});
+        std::fs::write(
+            root.path().join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let selection = SelectionRequest::named("selected");
+        let discovered = ModelDirectory::package_metadata(root.path(), &selection)
+            .unwrap()
+            .unwrap();
+        assert!(
+            discovered
+                .metadata_path
+                .unwrap()
+                .ends_with("selected/inference_metadata.yaml")
+        );
+        let mut called = false;
+        let error = PipelineModelDirectory::load_with_metadata_preflight_and_selection(
+            root.path(),
+            &selection,
+            |_| {
+                called = true;
+                Err(OrtError::InvalidArgument(
+                    "intentional preflight refusal".into(),
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(called);
+        assert!(
+            error.to_string().contains("intentional preflight refusal"),
+            "{error}"
+        );
+        let error = PipelineModelDirectory::load_with_metadata_preflight_and_selection(
+            root.path(),
+            &selection,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("missing-model.onnx"), "{error}");
+        assert!(ModelDirectory::load_with_package_selection(root.path(), &selection).is_err());
+    }
+
+    #[test]
+    fn manifest_graph_must_agree_with_the_contracted_workflow_decoder() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+        std::fs::create_dir(root.path().join("selected")).unwrap();
+        for file in [
+            "inference_metadata.yaml",
+            "tokenizer.json",
+            "model.onnx.textproto",
+        ] {
+            std::fs::copy(fixture.join(file), root.path().join("selected").join(file)).unwrap();
+        }
+        std::fs::write(
+            root.path().join("selected/other.onnx"),
+            b"not the workflow graph",
+        )
+        .unwrap();
+        let manifest = serde_json::json!({"schema_version":"1.0","components":{"model":{
+            "component_name":"model","variants":{"selected":{"variant_directory":"selected","executor_info":{"nxrt":{
+                "model_file":"other.onnx","inference_metadata":"inference_metadata.yaml"
+            }}}}
+        }}});
+        std::fs::write(
+            root.path().join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error = PipelineModelDirectory::load_with_metadata_preflight_and_selection(
+            root.path(),
+            &SelectionRequest::named("selected"),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with workflow decoder"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_composed_workflow_rejects_symlinked_graphs_outside_the_package() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/onnx_genai_workflows/decision");
+        std::fs::create_dir(root.path().join("selected")).unwrap();
+        for file in ["tokenizer.json", "model.onnx.textproto"] {
+            std::fs::copy(fixture.join(file), root.path().join("selected").join(file)).unwrap();
+        }
+        std::fs::copy(
+            fixture.join("model.onnx.textproto"),
+            outside.path().join("outside.onnx.textproto"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("outside.onnx.textproto"),
+            root.path().join("selected/escaping.onnx.textproto"),
+        )
+        .unwrap();
+        let mut metadata: serde_json::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(fixture.join("inference_metadata.yaml")).unwrap(),
+        )
+        .unwrap();
+        metadata["pipeline"]["workflow"]["components"]["classifier"]["implementation"]["artifact"] =
+            serde_json::json!("escaping.onnx.textproto");
+        std::fs::write(
+            root.path().join("selected/inference_metadata.yaml"),
+            serde_yaml::to_string(&metadata).unwrap(),
+        )
+        .unwrap();
+        let manifest = serde_json::json!({"schema_version":"1.0","components":{"model":{
+            "component_name":"model","variants":{"selected":{"variant_directory":"selected","executor_info":{"nxrt":{
+                "model_file":"model.onnx.textproto","inference_metadata":"inference_metadata.yaml"
+            }}}}
+        }}});
+        std::fs::write(
+            root.path().join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error = PipelineModelDirectory::load_with_metadata_preflight_and_selection(
+            root.path(),
+            &SelectionRequest::named("selected"),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("outside package root"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_implicit_metadata_and_tokenizer_files_cannot_escape_or_hide_broken_links() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+        for (name, dangling) in [
+            ("tokenizer.json", false),
+            ("inference_metadata.yaml", false),
+            ("inference_metadata.yaml", true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("selected")).unwrap();
+            for file in [
+                "inference_metadata.yaml",
+                "tokenizer.json",
+                "model.onnx.textproto",
+            ] {
+                if file != name {
+                    std::fs::copy(fixture.join(file), root.path().join("selected").join(file))
+                        .unwrap();
+                }
+            }
+            if !dangling {
+                std::fs::copy(fixture.join(name), outside.path().join(name)).unwrap();
+            }
+            std::os::unix::fs::symlink(
+                outside.path().join(name),
+                root.path().join("selected").join(name),
+            )
+            .unwrap();
+            if dangling {
+                let metadata: serde_json::Value = serde_yaml::from_str(
+                    &std::fs::read_to_string(fixture.join("inference_metadata.yaml")).unwrap(),
+                )
+                .unwrap();
+                std::fs::write(
+                    root.path().join("selected/inference_metadata.json"),
+                    serde_json::to_vec(&metadata).unwrap(),
+                )
+                .unwrap();
+            }
+            let manifest = serde_json::json!({"schema_version":"1.0","components":{"model":{
+                "component_name":"model","variants":{"selected":{"variant_directory":"selected","executor_info":{"nxrt":{"model_file":"model.onnx.textproto"}}}}
+            }}});
+            std::fs::write(
+                root.path().join("manifest.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            let selection = SelectionRequest::named("selected");
+            let error =
+                ModelDirectory::load_with_package_selection(root.path(), &selection).unwrap_err();
+            assert!(
+                error.to_string().contains(if dangling {
+                    "does not exist"
+                } else {
+                    "outside package root"
+                }),
+                "{name}: {error}"
+            );
+            let error = PipelineModelDirectory::load_with_metadata_preflight_and_selection(
+                root.path(),
+                &selection,
+                |_| Ok(()),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(if dangling {
+                    "does not exist"
+                } else {
+                    "outside package root"
+                }),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn flat_directory_refuses_an_explicit_package_variant() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+        let error = ModelDirectory::load_with_package_selection(
+            &root,
+            &SelectionRequest::named("selected"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires a model package manifest.json"),
+            "{error}"
         );
     }
 

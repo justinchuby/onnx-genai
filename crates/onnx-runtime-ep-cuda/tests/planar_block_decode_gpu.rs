@@ -735,10 +735,16 @@ fn sealed_admission_rejects_externally_controlled_allocator() {
         )
         .unwrap(),
     );
+    drop(provider);
     let provider = Arc::new(
-        provider
-            .with_memory(Arc::clone(&external) as Arc<_>)
-            .unwrap(),
+        CudaExecutionProvider::from_config(
+            runtime.ordinal(),
+            onnx_runtime_ep_cuda::CudaProviderConfig {
+                memory: Some(Arc::clone(&external) as Arc<_>),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
     );
     let before = (
         external.committed_and_reserved().0,

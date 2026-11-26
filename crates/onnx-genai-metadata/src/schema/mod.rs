@@ -22,6 +22,7 @@ mod hardware;
 mod ir;
 mod package;
 mod pipeline;
+mod weights;
 
 pub use schema_vocabulary::{LENGTH_CONTENT_ROLES, PACK_OFFSETS_CONTENT, PACK_OWNER_CONTENT};
 
@@ -31,6 +32,7 @@ pub use hardware::*;
 pub use ir::*;
 pub use package::*;
 pub use pipeline::*;
+pub use weights::*;
 
 /// ONNX inference metadata consumed by runtimes and emitted by model builders.
 ///
@@ -95,6 +97,11 @@ pub struct InferenceMetadata {
     /// Model weight quantization intent, independent of the packed representation.
     #[serde(default)]
     pub quantization: Option<QuantizationIntent>,
+
+    /// Keyed GGUF/SafeTensors containers for each package-relative ONNX graph.
+    /// The graph remains the source of executable semantics and tensor geometry.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub graph_weights: BTreeMap<String, Vec<KeyedWeightFileSpec>>,
 
     /// Declarative multi-model pipeline and its dataflow graph.
     #[serde(default)]

@@ -16,7 +16,7 @@ pub(super) fn workspace_planning_for_node(
         return WorkspacePlanning::Metadata;
     }
     if is_control_flow_op(&node.op_type, &node.domain)
-        || is_sequence_op(&node.op_type, &node.domain)
+        || is_container_op(&node.op_type, &node.domain)
     {
         return WorkspacePlanning::None;
     }
@@ -621,11 +621,13 @@ impl Executor {
         let external = self.prepare_external_bindings_mode(bindings, true)?;
         let symbols = self.bind_symbols(inputs, &external)?;
         let stats = self.cache.stats();
+        let workspace_context = self.ep.workspace_preparation_context().read();
         // Input/external-binding validation above always runs. The immutable
         // graph and weights plus this exact symbol map determine every planned
         // shape (including nested shapes and capacity bounds). New/evicted
         // specializations conservatively invalidate the metadata-only plan.
         if let Some(memo) = &self.workspace_preparation_memo
+            && memo.context == workspace_context
             && memo.symbols == symbols
             && memo.output_bindings.matches(&external)
             && memo.growing_symbols == self.capture_growing_symbols
@@ -694,9 +696,10 @@ impl Executor {
             // Preparation uses the same specialization binding as dispatch.
             // Reuse it before resolving constants or constructing a cache key:
             // both are cold-path work when concrete metadata has not changed.
-            let prebound = self.kernel_bindings[pi]
-                .as_ref()
-                .is_some_and(|binding| self.cache.has_prebound(binding, &input_shapes));
+            let shape_facts = self.kernel_shape_facts[pi];
+            let prebound = self.kernel_bindings[pi].as_ref().is_some_and(|binding| {
+                self.cache.has_prebound(binding, &input_shapes, shape_facts)
+            });
             if !prebound {
                 let constant_inputs = self.plan[pi]
                     .inputs
@@ -714,8 +717,6 @@ impl Executor {
                 let opset = effective_opset(&self.graph, node);
                 // Must match what dispatch computes for this node, or prepare-only
                 // planning would key a different kernel than execution uses.
-                let seq_independent =
-                    node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols);
                 let graph_tokens = std::array::from_fn(|index| {
                     let capture = &self.slot_capture[index];
                     capture
@@ -737,7 +738,7 @@ impl Executor {
                     &constant_inputs,
                     &constant_values,
                     opset,
-                    seq_independent,
+                    shape_facts,
                     self.artifact_config,
                     &mut self.provider_artifact_readiness,
                     self.ep.as_ref(),
@@ -765,6 +766,7 @@ impl Executor {
                         .as_ref()
                         .expect("workspace kernel binding installed"),
                     &input_shapes,
+                    shape_facts,
                 )
                 .expect("workspace kernel resolved immediately before lookup");
             let metadata = input_shapes
@@ -830,6 +832,7 @@ impl Executor {
         }
         let stats = self.cache.stats();
         self.workspace_preparation_memo = Some(WorkspacePreparationMemo {
+            context: workspace_context,
             output_bindings: WorkspaceOutputBindings::from_external(&external),
             symbols,
             growing_symbols: self.capture_growing_symbols.clone(),
@@ -1089,6 +1092,15 @@ impl Executor {
                 .ok_or_else(|| SessionError::InputNotFound {
                     name: (*name).to_string(),
                 })?;
+            // Ordinary host uploads borrow/copy a contiguous byte prefix. A
+            // custom strided Tensor must never be silently reinterpreted as
+            // dense storage; explicit fixed-stride bindings carry that layout.
+            if !tensor.layout.is_contiguous(&tensor.shape) {
+                return Err(SessionError::Internal(format!(
+                    "host input '{name}' has non-contiguous strides {:?} for {:?} shape {:?}; ordinary Tensor uploads require contiguous storage: materialize a contiguous host tensor or use allocate_device_binding_fixed_strides to preserve a physical layout",
+                    tensor.layout.strides, tensor.dtype, tensor.shape
+                )));
+            }
             self.bind_input_shape(name, vid, tensor.dtype, &tensor.shape, &mut bindings)?;
         }
         for (&vid, value) in &external.inputs {
@@ -1276,6 +1288,13 @@ impl Executor {
         if self.heterogeneous.is_some() {
             return Err(heterogeneous_api_error(
                 "mixed-provider device-graph capture",
+            ));
+        }
+        if optional_ops::graph_uses_optional_ops(&self.graph) {
+            return Ok(DeviceGraphCaptureResult::NotCapturable(
+                CaptureDeclineReport::one(CaptureDecline::graph(
+                    "Optional operators use host orchestration and may alias run-scoped payload storage; run this graph eagerly",
+                )),
             ));
         }
         if self.cap().device_graph_token.is_some() {

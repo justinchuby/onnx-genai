@@ -1312,6 +1312,86 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn linear_attention_factory_excludes_schema_29_before_ort_partitioning() {
+        use onnx_runtime_ep_api::abi::OrtGraphView;
+        use onnx_runtime_ep_cpu::CpuExecutionProvider;
+        use onnx_runtime_ir::{Attribute, Graph, GraphView, GraphViewCache, NodeId, static_shape};
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 29);
+        let x = graph.create_named_value("x", DataType::Float32, static_shape([1, 2, 4]));
+        graph.add_input(x);
+        let mut q = x;
+        let mut nodes = Vec::new();
+        for revision in [27, 29, 28] {
+            let y = graph.create_named_value(
+                &format!("y{revision}"),
+                DataType::Float32,
+                static_shape([1, 2, 4]),
+            );
+            let state = graph.create_named_value(
+                &format!("state{revision}"),
+                DataType::Float32,
+                static_shape([1, 1, 4, 4]),
+            );
+            let mut node = onnx_runtime_ir::Node::new(
+                NodeId(0),
+                "LinearAttention",
+                vec![Some(q), Some(x), Some(x)],
+                vec![y, state],
+            );
+            node.version = Some(revision);
+            node.attributes
+                .insert("q_num_heads".into(), Attribute::Int(1));
+            node.attributes
+                .insert("kv_num_heads".into(), Attribute::Int(1));
+            node.attributes
+                .insert("update_rule".into(), Attribute::String(b"linear".to_vec()));
+            nodes.push(graph.insert_node(node));
+            q = y;
+        }
+        graph.add_output(q);
+        let cache = GraphViewCache::build(&graph).unwrap();
+        let view = GraphView::new(&graph, &cache);
+        let ort_view = OrtGraphView::new(&view);
+
+        let mut native = CpuExecutionProvider::new();
+        native.initialize(&EpConfig::default()).unwrap();
+        let native_claims = ort_view.query_capabilities(&native).unwrap();
+        assert_eq!(native_claims.len(), 1);
+        assert_eq!(native_claims[0].node_ids, nodes);
+
+        let mut factory = build_factory(
+            CString::new("linear_attention_scope_test").unwrap(),
+            Box::new(|| Box::new(CpuExecutionProvider::for_ort_plugin())),
+        );
+        let factory_ptr = std::ptr::from_mut(factory.as_mut()).cast::<ort::OrtEpFactory>();
+        let mut raw_ep = std::ptr::null_mut();
+        // SAFETY: this test uses a live factory with no host registry to build.
+        let status = unsafe {
+            ((*factory_ptr).CreateEp.unwrap())(
+                factory_ptr,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut raw_ep,
+            )
+        };
+        assert!(status.is_null() && !raw_ep.is_null());
+        // SAFETY: CreateEp returns a boxed ExportedEp owned by this test.
+        let exported = unsafe { Box::from_raw(raw_ep.cast::<ExportedEp>()) };
+        let claims = exported
+            .ep
+            .with(|ep| ort_view.query_capabilities(ep))
+            .unwrap();
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims[0].node_ids, [nodes[0]]);
+        assert_eq!(claims[1].node_ids, [nodes[2]]);
+    }
+
     /// Counts `shutdown()` and `Drop` so a test can tell the explicit teardown
     /// path apart from the Drop-only fallback, and can catch a double shutdown.
     struct CountingEp {

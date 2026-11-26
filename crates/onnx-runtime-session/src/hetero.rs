@@ -147,6 +147,10 @@ struct AssignedOracle<'a> {
 }
 
 impl ExecutionProvider for AssignedOracle<'_> {
+    fn workspace_preparation_context(&self) -> onnx_runtime_ep_api::WorkspaceContextReader {
+        self.inner.workspace_preparation_context()
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -866,10 +870,10 @@ pub(crate) fn validate_top_level_tensor_graph(graph: &Graph) -> Result<()> {
                 ),
             });
         }
-        if crate::executor::is_sequence_op(&node.op_type, &node.domain) {
+        if crate::executor::is_container_op(&node.op_type, &node.domain) {
             return Err(SessionError::HeterogeneousExecutionUnsupported {
                 placement_summary: format!(
-                    "node {} ({domain}::{}@{opset}) consumes or produces a sequence; the first \
+                    "node {} ({domain}::{}@{opset}) uses a structural container operator; the first \
                      execution slice supports tensor values only",
                     node_id.0, node.op_type
                 ),
@@ -1420,7 +1424,12 @@ impl HeterogeneousExecutor {
                     ),
                 });
             }
-            if kernel.may_produce_views() {
+            let input_dtypes = node
+                .inputs
+                .iter()
+                .map(|input| input.map_or(DataType::Undefined, |value| graph.value(value).dtype))
+                .collect::<Vec<_>>();
+            if kernel.may_produce_views(&input_dtypes) {
                 let domain = if node.domain.is_empty() {
                     "ai.onnx"
                 } else {

@@ -101,7 +101,9 @@ mod tests {
             let waiter_value = Arc::clone(&value);
             let waiter = thread::spawn(move || {
                 armed_tx.send(()).unwrap();
-                wait(&waiter_value, 0);
+                while waiter_value.load(Ordering::Acquire) == 0 {
+                    wait(&waiter_value, 0);
+                }
                 assert_eq!(waiter_value.load(Ordering::Acquire), 1);
                 done_tx.send(()).unwrap();
             });
@@ -134,7 +136,9 @@ mod tests {
                 let done_tx = done_tx.clone();
                 thread::spawn(move || {
                     armed_tx.send(()).unwrap();
-                    wait(&value, 0);
+                    while value.load(Ordering::Acquire) == 0 {
+                        wait(&value, 0);
+                    }
                     assert_eq!(value.load(Ordering::Acquire), 1);
                     done_tx.send(()).unwrap();
                 })

@@ -66,7 +66,7 @@ use crate::cudnn::{
     governed_workspace_requirement,
 };
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, GraphDeviceAllocation, cuptr};
+use crate::runtime::{CudaRuntime, NativeDeviceAllocation, cuptr};
 
 /// NVRTC source: one block per output element, reducing over its group of
 /// `reduce_count` elements addressed by `base_off[o] + delta_off[r]`.
@@ -863,7 +863,7 @@ struct ReductionMetadataCache {
 #[derive(Clone, Debug)]
 struct PreparedReductionMetadata {
     key: ReductionMetadataKey,
-    payload: Arc<GraphDeviceAllocation>,
+    payload: Arc<NativeDeviceAllocation>,
     base: CUdeviceptr,
     delta: CUdeviceptr,
     axes: CUdeviceptr,
@@ -874,7 +874,7 @@ impl PreparedReductionMetadata {
         (self.base, self.delta, self.axes)
     }
     fn resources(&self) -> Vec<DeviceGraphResource> {
-        vec![GraphDeviceAllocation::device_graph_resource(&self.payload)]
+        vec![NativeDeviceAllocation::device_graph_resource(&self.payload)]
     }
 }
 
@@ -1029,7 +1029,11 @@ impl ReductionMetadataCache {
         // base/delta vectors; cold plans retain all checked geometry guards.
         let plan = build_plan(op, input_shape, reduce, keepdims, geometry)?;
         let payload = ReductionMetadataPayload::new(&plan.base, &plan.delta, axes)?;
-        let allocation = GraphDeviceAllocation::allocate(&self.runtime, payload.bytes.len())?;
+        let allocation = NativeDeviceAllocation::allocate_shared(
+            &self.runtime,
+            payload.bytes.len(),
+            onnx_runtime_memory_api::MemoryRole::Workspace { step_scoped: false },
+        )?;
         let [base, delta, axes] = payload.layout.bind(Some(WorkspaceView::new(
             DevicePtrMut(allocation.ptr() as *mut c_void),
             allocation.bytes(),
@@ -2351,8 +2355,8 @@ mod claim_probes {
     use super::{ReduceKernel, ReduceOp, ReductionMetadataCache};
     use crate::runtime::CudaRuntime;
 
-    fn maybe_runtime() -> Option<Arc<CudaRuntime>> {
-        crate::test_support::maybe_runtime()
+    fn maybe_runtime() -> Option<crate::test_support::NativeRuntimeFixture> {
+        crate::test_support::maybe_native_runtime()
     }
 
     fn kernel(runtime: &Arc<CudaRuntime>, op: ReduceOp) -> ReduceKernel {
@@ -2458,7 +2462,7 @@ mod claim_probes {
 
     #[test]
     fn i32_i64_reduce_sum_max_min_over_last_axis_on_gpu() {
-        let Some(runtime) = maybe_runtime() else {
+        let Some((_provider, runtime)) = maybe_runtime() else {
             eprintln!("skipping i32/i64 reduce GPU probe: CUDA runtime unavailable");
             return;
         };

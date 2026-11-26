@@ -871,6 +871,8 @@ pub struct EngineConfig {
     /// or `native` instead. An explicit `Ort` or `Native` value always takes
     /// precedence over the environment variable.
     pub decode_backend: EngineDecodeBackend,
+    /// Explicit authored model-package variant. Flat directories reject a selector.
+    pub package_variant: Option<String>,
     /// Native decoder device override. `None` follows the execution provider in
     /// [`onnx_genai_ort::SessionOptions`], including `ONNX_GENAI_EP`.
     pub native_device: Option<crate::native_decode_device::NativeDecodeDevice>,
@@ -945,6 +947,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             decode_backend: EngineDecodeBackend::Native,
+            package_variant: None,
             native_device: None,
             native_decode_batch: None,
             native_state_files: NativeStateFilePolicy::Disabled,
@@ -1332,6 +1335,11 @@ impl From<SamplerSequence> for Vec<SamplerStage> {
 /// User-controllable decoding options for Phase 1 generation.
 #[derive(Debug, Clone)]
 pub struct GenerateOptions {
+    /// Normal stop on a newly generated newline after this wall-clock prediction
+    /// budget, measured from the first selected token. None/zero disables it.
+    pub max_prediction_time: Option<std::time::Duration>,
+    /// Minimum space/tab characters after a generated newline; zero disables it.
+    pub minimum_indent: usize,
     /// Declared adapter composition per request row. Absence selects the base model.
     pub adapter_selection: Option<crate::pipeline::AdapterSelection>,
     /// Maximum tokens to produce after the prompt.
@@ -1434,6 +1442,8 @@ pub struct GenerateOptions {
 impl Default for GenerateOptions {
     fn default() -> Self {
         Self {
+            max_prediction_time: None,
+            minimum_indent: 0,
             adapter_selection: None,
             max_new_tokens: 128,
             max_constraint_bytes: 4 * 1024 * 1024,
@@ -1737,13 +1747,34 @@ pub enum GrammarTrigger {
     PatternFull(String),
 }
 
+/// Explicit C++ classic-locale bracket collation, independent of the host.
+/// This selects bracket traits/range rules, not a different overall regex grammar.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GrammarCollation {
+    /// Preserve the existing libc++ classic-locale trigger contract.
+    #[default]
+    Libcxx,
+    /// Match libstdc++ classic-locale element names and primary equivalence.
+    Libstdcxx,
+}
+impl GrammarCollation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Libcxx => "libcxx",
+            Self::Libstdcxx => "libstdcxx",
+        }
+    }
+}
+
 /// A nonempty, bounded set of lazy activation conditions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrammarActivation {
     triggers: Vec<GrammarTrigger>,
+    collation: GrammarCollation,
 }
 impl GrammarActivation {
-    pub fn new(triggers: Vec<GrammarTrigger>) -> anyhow::Result<Self> {
+    pub fn new(triggers: Vec<GrammarTrigger>, collation: GrammarCollation) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !triggers.is_empty(),
             "lazy grammar has no triggers; provide at least one token, word or pattern trigger"
@@ -1752,7 +1783,10 @@ impl GrammarActivation {
             triggers.len() <= 1024,
             "lazy grammar exceeds 1024 triggers; combine patterns or use fewer triggers"
         );
-        Ok(Self { triggers })
+        Ok(Self {
+            triggers,
+            collation,
+        })
     }
     pub fn validate_with_tokenizer(
         &self,
@@ -1771,6 +1805,9 @@ impl GrammarActivation {
     ) -> anyhow::Result<()> {
         crate::gbnf::lazy::validate_words(tokenizer, self, preserved)
     }
+    pub fn collation(&self) -> GrammarCollation {
+        self.collation
+    }
     pub fn triggers(&self) -> &[GrammarTrigger] {
         &self.triggers
     }
@@ -1785,6 +1822,12 @@ pub enum GenerateConstraint {
     Gbnf {
         grammar: String,
         activation: Option<GrammarActivation>,
+    },
+    /// JSON Schema over newly generated raw bytes after a trigger. Before
+    /// activation output is unconstrained; assistant prefill is not consumed.
+    LazyJsonSchema {
+        schema: String,
+        activation: GrammarActivation,
     },
     /// Raw llguidance Lark over new model output, without assistant-prefill
     /// consumption or response-content projection. Keep the %llguidance header.
@@ -1857,7 +1900,11 @@ impl GenerateOptions {
         anyhow::ensure!(
             !matches!(
                 self.constraint,
-                Some(GenerateConstraint::Gbnf { .. } | GenerateConstraint::RawLark { .. })
+                Some(
+                    GenerateConstraint::Gbnf { .. }
+                        | GenerateConstraint::RawLark { .. }
+                        | GenerateConstraint::LazyJsonSchema { .. }
+                )
             ) || self.stop_on_eos,
             "raw grammar requires stop_on_eos=true; allow root completion to terminate the generation"
         );
@@ -2140,8 +2187,12 @@ pub struct PrefillRequest {
 /// Actual prompt evaluation and the prefix reused from an earlier request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrefillResult {
+    /// Actual prompt work; generation counts and duration remain zero.
+    pub timings: GenerationTimings,
     pub prompt_tokens: usize,
     pub prefix_cache_hit_len: usize,
+    /// Materialized cache retained after commit, independent of input reuse.
+    pub retained_cache_tokens: usize,
 }
 
 /// A single generation request.
@@ -2211,6 +2262,10 @@ pub struct PrioritizedGenerateResult {
 /// Why generation stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinishReason {
+    /// A generated line failed its requested minimum indentation.
+    IndentationLimit,
+    /// Prediction time elapsed and a new newline was committed.
+    PredictionTimeLimit,
     /// The configured maximum number of new tokens was reached.
     MaxTokens,
     /// The configured EOS token was generated.
@@ -2237,6 +2292,8 @@ pub struct GenerationBudgetCap {
 /// Final generation output.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerateResult {
+    /// Measured decoder work, absent when the executor has no timing contract.
+    pub timings: Option<GenerationTimings>,
     /// Detokenized generated text.
     pub text: String,
     /// Resolved output policy used when reconstructing per-token publication.
@@ -2251,6 +2308,9 @@ pub struct GenerateResult {
     pub tool_calls: Vec<onnx_genai_metadata::ToolCall>,
     /// Number of prompt/context tokens whose KV state was reused from the prefix cache.
     pub prefix_cache_hit_len: usize,
+    /// Materialized token state retained after this transaction. Zero when the
+    /// executor exposes no retained token-cache contract; never input reuse.
+    pub retained_cache_tokens: usize,
     /// Per-generated-token log probabilities, or `None` when not requested.
     pub logprobs: Option<Vec<TokenLogprob>>,
     /// Present when scheduler admission capped `max_new_tokens` below the
@@ -2281,9 +2341,29 @@ pub struct TokenLogprob {
     pub top: Vec<(TokenId, f32)>,
 }
 
+/// Cumulative decoder measurements at a committed token boundary.
+///
+/// Prompt time ends at the first forward's logits. Generation time counts
+/// token selection and subsequent forward/policy work; callback delivery and
+/// scheduler suspension are excluded. The first generated token consumes no
+/// additional generation forward, matching llama.cpp's rate denominator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationTimings {
+    /// Actual speculative verification counters at this committed boundary.
+    /// Absent when no speculative verification has run.
+    pub speculative: Option<crate::SpeculativeStats>,
+    pub prompt_tokens: usize,
+    pub cached_prompt_tokens: usize,
+    pub generated_tokens: usize,
+    pub prompt_elapsed: std::time::Duration,
+    pub generation_elapsed: std::time::Duration,
+}
+
 /// Per-token streaming event shape for future callback/iterator APIs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerateToken {
+    /// Cumulative measurements taken before external publication of this token.
+    pub timings: Option<GenerationTimings>,
     /// Probability for this committed token, when requested.
     pub logprob: Option<TokenLogprob>,
     pub token_id: TokenId,

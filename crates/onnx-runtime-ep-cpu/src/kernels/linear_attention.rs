@@ -340,6 +340,8 @@ impl Kernel for LinearAttentionKernel {
         let (primary_output, present_outputs) = outputs.split_at_mut(1);
         let output_len = batch * seq * output_hidden;
 
+        // Empty outputs can have a byte-aligned dangling pointer. Use the
+        // writeback path for them rather than forming a typed slice.
         // In-place-aliasing guard (see `dtype::output_direct_write_eligible`):
         // the present state and the primary output are written directly into
         // their executor buffers, but a persistent DeviceIoBinding may bind an
@@ -372,7 +374,8 @@ impl Kernel for LinearAttentionKernel {
         let mut owned_state;
         let (state, state_is_direct): (&mut [f32], bool) =
             if present_outputs.first_mut().is_some_and(|present| {
-                output_direct_write_eligible(present, total_state, &input_ranges)
+                total_state != 0
+                    && output_direct_write_eligible(present, total_state, &input_ranges)
             }) {
                 let present = present_outputs.first_mut().unwrap();
                 // SAFETY: the guard proved a host-accessible contiguous Float32
@@ -400,7 +403,7 @@ impl Kernel for LinearAttentionKernel {
         let direct_output = {
             let mut ranges = input_ranges;
             ranges.push(slice_byte_range(state));
-            output_direct_write_eligible(&mut primary_output[0], output_len, &ranges)
+            output_len != 0 && output_direct_write_eligible(&primary_output[0], output_len, &ranges)
         };
         let mut owned_output;
         let output: &mut [f32] = if direct_output {
@@ -768,6 +771,65 @@ mod tests {
         let ins = [q.view(), kk.view(), v.view(), st.view(), gd.view()];
         let mut outs = [out.view_mut(), present.view_mut()];
         assert!(k.execute(&ins, &mut outs).is_err());
+    }
+
+    #[test]
+    fn zero_tokens_preserve_state_with_empty_byte_backed_outputs() {
+        use onnx_runtime_ep_api::DevicePtrMut;
+        use onnx_runtime_ir::{DataType, DeviceId, compute_contiguous_strides};
+
+        let shape = [1, 0, 2];
+        let strides = compute_contiguous_strides(&shape);
+        let states_shape = [1, 0, 1, 2, 2];
+        let states_strides = compute_contiguous_strides(&states_shape);
+        let empty = Owned::f32(&shape, &[]);
+        let past = [1.0, -2.0, 3.0, -4.0];
+        let past_state = Owned::f32(&[1, 1, 2, 2], &past);
+        let inputs = [empty.view(), empty.view(), empty.view(), past_state.view()];
+
+        for opset in [27, 29] {
+            let mut node = Node::new(NodeId(0), "LinearAttention", vec![], vec![]);
+            node.version = Some(opset);
+            node.attributes
+                .insert("q_num_heads".into(), Attribute::Int(1));
+            node.attributes
+                .insert("kv_num_heads".into(), Attribute::Int(1));
+            node.attributes
+                .insert("update_rule".into(), Attribute::String(b"linear".to_vec()));
+
+            let mut output = Vec::<u8>::new();
+            let mut states = Vec::<u8>::new();
+            let mut present_state = Owned::zeros_f32(&[1, 1, 2, 2]);
+            let mut outputs = vec![
+                TensorMut::new(
+                    DevicePtrMut(output.as_mut_ptr().cast()),
+                    DataType::Float32,
+                    &shape,
+                    &strides,
+                    DeviceId::cpu(),
+                ),
+                present_state.view_mut(),
+            ];
+            if opset == 29 {
+                outputs.push(TensorMut::new(
+                    DevicePtrMut(states.as_mut_ptr().cast()),
+                    DataType::Float32,
+                    &states_shape,
+                    &states_strides,
+                    DeviceId::cpu(),
+                ));
+            }
+            LinearAttentionFactory
+                .create(&node, &[])
+                .unwrap()
+                .execute(&inputs, &mut outputs)
+                .unwrap();
+            assert_eq!(outputs[0].numel(), 0);
+            if opset == 29 {
+                assert_eq!(outputs[2].numel(), 0);
+            }
+            assert_eq!(present_state.to_f32(), past);
+        }
     }
 
     /// Persistent DeviceIoBindings may alias an input buffer onto an output

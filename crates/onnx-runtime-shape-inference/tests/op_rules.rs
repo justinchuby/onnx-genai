@@ -429,6 +429,33 @@ fn out_dtype(outs: &[NodeIo]) -> DataType {
 }
 
 #[test]
+fn roi_align_22_infers_symbolic_shape_and_checks_schema() {
+    let n = with_attr(node("RoiAlign", 3, 1), "output_width", Attribute::Int(3));
+    let inputs = |count, index_type| {
+        vec![
+            NodeIo::typed(TypeInfo::new(
+                DataType::BFloat16,
+                vec![c(2), sym(1), c(5), c(5)],
+            )),
+            NodeIo::typed(TypeInfo::new(DataType::BFloat16, vec![sym(2), c(4)])),
+            NodeIo::typed(TypeInfo::new(index_type, vec![count])),
+        ]
+    };
+    let outs = run(&n, inputs(sym(3), DataType::Int64), 22);
+    assert_eq!(out_dtype(&outs), DataType::BFloat16);
+    assert_eq!(out_shape(&outs), vec![sym(2), sym(1), c(1), c(3)]);
+    let outs = run(&n, inputs(c(0), DataType::Int64), 22);
+    assert_eq!(out_shape(&outs), vec![c(0), sym(1), c(1), c(3)]);
+    for (opset, indices, message) in [
+        (16, DataType::Int64, "requires opset 22"),
+        (22, DataType::Int32, "must be Int64"),
+    ] {
+        let err = try_run(&n, inputs(sym(2), indices), opset).unwrap_err();
+        assert!(err.to_string().contains(message), "{err}");
+    }
+}
+
+#[test]
 fn opset26_bitcast_and_cumprod_validate_while_preserving_shape() {
     let mut cast = node("BitCast", 1, 1);
     cast.attributes.insert(
@@ -475,6 +502,38 @@ fn text_ops_infer_broadcast_match_and_dynamic_split_shapes() {
     assert_ne!(parts[2], sym(0));
     assert_eq!(out_dtype(&split[1..]), DataType::Int64);
     assert_eq!(out_shape(&split[1..]), [sym(0), c(3)]);
+}
+
+#[test]
+fn trig_bf16_requires_opset_22() {
+    for (name, original) in [
+        ("Sin", 7),
+        ("Cos", 7),
+        ("Tan", 7),
+        ("Asin", 7),
+        ("Acos", 7),
+        ("Atan", 7),
+        ("Sinh", 9),
+        ("Cosh", 9),
+        ("Asinh", 9),
+        ("Acosh", 9),
+        ("Atanh", 9),
+    ] {
+        let n = node(name, 1, 1);
+        let inputs = |dtype| vec![tin(dtype, vec![c(2), c(3)])];
+        let error = try_run(&n, inputs(DataType::BFloat16), 21).unwrap_err();
+        assert_invalid(error, name, "does not accept BF16 (BFloat16) at opset 21");
+        let out = run(&n, inputs(DataType::BFloat16), 22);
+        assert_eq!(out_dtype(&out), DataType::BFloat16, "{name}");
+        assert_eq!(out_shape(&out), vec![c(2), c(3)], "{name}");
+        for opset in [original, 21, 22] {
+            for dtype in [DataType::Float16, DataType::Float32, DataType::Float64] {
+                let out = run(&n, inputs(dtype), opset);
+                assert_eq!(out_dtype(&out), dtype, "{name} at opset {opset}");
+                assert_eq!(out_shape(&out), vec![c(2), c(3)], "{name} at opset {opset}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -611,7 +670,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
     assert_eq!(
         registry.operator_count(),
-        240,
+        244,
         "shape-inference operator count moved: `left` is the live registry, `right` is this \
          pin. If you added or removed a handler, repin to `left` in the same commit and cover \
          the rule with a test (RULES.md §8); if you did not, a registration changed by \
@@ -620,7 +679,7 @@ fn expanded_registry_catalog_count_is_pinned() {
     );
     assert_eq!(
         registry.entry_count(),
-        291,
+        298,
         "shape-inference entry count moved: `left` is the live registry, `right` is this pin. \
          One operator can carry several opset-versioned entries, so this count does not always \
          move in step with the operator count -- read both numbers off the failure rather than \
@@ -5544,6 +5603,15 @@ fn lrn_mvn_reverse_sequence_are_shape_preserving() {
 }
 
 #[test]
+fn mean_variance_normalization_29_preserves_symbolic_shape_and_bfloat16() {
+    let n = with_attr(node("MeanVarianceNormalization", 1, 1), "axes", ints(&[-1]));
+    let shape = vec![sym(7), c(5)];
+    let out = run(&n, vec![tin(DataType::BFloat16, shape.clone())], 29);
+    assert_eq!(out_shape(&out), shape);
+    assert_eq!(out_dtype(&out), DataType::BFloat16);
+}
+
+#[test]
 fn random_generators_shape_and_dtype() {
     // RandomNormal/RandomUniform: shape from attr, dtype override.
     let n = with_attr(
@@ -6770,6 +6838,35 @@ fn seq_in(dtype: DataType, shape: Option<Vec<DimExpr>>) -> NodeIo {
 }
 
 #[test]
+fn optional_operand_forms_follow_opset() {
+    let constructed = run(&node("Optional", 1, 1), vec![f32in(vec![c(2)])], 15);
+    assert_eq!(
+        out_value_type(&constructed),
+        &ValueType::Optional(Box::new(ValueType::tensor(DataType::Float32, vec![c(2)])))
+    );
+    for op in ["OptionalHasElement", "OptionalGetElement"] {
+        let n = node(op, 1, 1);
+        assert!(try_run(&n, vec![f32in(vec![c(2)])], 15).is_err());
+        let direct = run(&n, vec![f32in(vec![c(2)])], 18);
+        let wrapped = run(
+            &n,
+            vec![NodeIo::container(ValueType::Optional(Box::new(
+                ValueType::tensor(DataType::Float32, vec![c(2)]),
+            )))],
+            15,
+        );
+        assert_eq!(direct[0].type_info, wrapped[0].type_info);
+    }
+    let omitted = node("OptionalHasElement", 0, 1);
+    assert!(try_run(&omitted, vec![], 15).is_err());
+    let result = run(&omitted, vec![], 28);
+    assert_eq!(
+        result[0].type_info,
+        Some(TypeInfo::new(DataType::Bool, vec![]))
+    );
+}
+
+#[test]
 fn sequence_empty_element_dtype_follows_attr_and_defaults_to_float32() {
     // Default (no `dtype` attr) is Float32, per the ONNX spec.
     let default = run(&node("SequenceEmpty", 0, 1), vec![], 13);
@@ -7402,7 +7499,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "ConstantOfShape", 1),
     ("", "Conv", 1),
     ("", "ConvTranspose", 1),
-    ("", "Cos", 1),
+    ("", "Cos", 7),
     ("", "Cosh", 9),
     ("", "CumProd", 26),
     ("", "CumSum", 11),
@@ -7472,6 +7569,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Less", 1),
     ("", "LessOrEqual", 12),
     ("", "LinearAttention", 27),
+    ("", "LinearAttention", 29),
     ("", "Log", 1),
     ("", "Log1p", 29),
     ("", "LogCumSumExp", 29),
@@ -7499,6 +7597,9 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Not", 1),
     ("", "OneHot", 9),
     ("", "OneHot", 11),
+    ("", "Optional", 15),
+    ("", "OptionalGetElement", 15),
+    ("", "OptionalHasElement", 15),
     ("", "Or", 1),
     ("", "PRelu", 16),
     ("", "Pack", 29),
@@ -7537,6 +7638,9 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Resize", 10),
     ("", "Resize", 11),
     ("", "ReverseSequence", 10),
+    ("", "RoiAlign", 10),
+    ("", "RoiAlign", 16),
+    ("", "RoiAlign", 22),
     ("", "RotaryEmbedding", 23),
     ("", "Round", 1),
     ("", "STFT", 17),
@@ -7563,7 +7667,7 @@ const PINNED_CATALOG: &[(&str, &str, u64)] = &[
     ("", "Sigmoid", 1),
     ("", "Sign", 1),
     ("", "SimplifiedLayerNormalization", 1),
-    ("", "Sin", 1),
+    ("", "Sin", 7),
     ("", "Sinh", 9),
     ("", "Size", 1),
     ("", "Slice", 1),
@@ -7715,5 +7819,58 @@ fn expanded_registry_catalog_is_pinned() {
          rejected.",
         render(&added),
         render(&removed),
+    );
+}
+
+#[test]
+fn dft_real_inverse_shapes_match_implicit_explicit_and_unknown_controls() {
+    for opset in [17, 20] {
+        let n = with_attr(
+            with_attr(node("DFT", 1, 1), "inverse", Attribute::Int(1)),
+            "onesided",
+            Attribute::Int(1),
+        );
+        let implicit = run(&n, vec![f32in(vec![c(2), c(4), c(2)])], opset);
+        assert_eq!(out_shape(&implicit), vec![c(2), c(6), c(1)]);
+        let n = with_attr(
+            with_attr(node("DFT", 2, 1), "inverse", Attribute::Int(1)),
+            "onesided",
+            Attribute::Int(1),
+        );
+        let explicit = run(
+            &n,
+            vec![f32in(vec![c(2), c(4), c(2)]), i64_scalar(5)],
+            opset,
+        );
+        assert_eq!(out_shape(&explicit), vec![c(2), c(5), c(1)]);
+        assert!(
+            try_run(
+                &n,
+                vec![f32in(vec![c(2), c(4), c(1)]), i64_scalar(5)],
+                opset
+            )
+            .is_err()
+        );
+    }
+    let mut n = with_attr(
+        with_attr(node("DFT", 3, 1), "inverse", Attribute::Int(1)),
+        "onesided",
+        Attribute::Int(1),
+    );
+    n.inputs[1] = None;
+    let unknown = run(
+        &n,
+        vec![
+            f32in(vec![c(2), c(4), c(3), c(2)]),
+            NodeIo::default(),
+            NodeIo::default(),
+        ],
+        20,
+    );
+    assert_eq!(out_shape(&unknown).last(), Some(&c(1)));
+    assert!(
+        out_shape(&unknown)[..3]
+            .iter()
+            .all(|d| d.as_const().is_none())
     );
 }

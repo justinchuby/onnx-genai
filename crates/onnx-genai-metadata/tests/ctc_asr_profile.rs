@@ -587,3 +587,31 @@ fn padding_a_non_time_dimension_does_not_require_ctc_lengths() {
     validate_metadata(&parse(&document))
         .expect("padding outside the decoded time axis does not require frame lengths");
 }
+
+#[test]
+fn reusable_audio_preprocessing_names_ports_and_rejects_legacy_reuse() {
+    let source = include_str!(
+        "../../../tests/fixtures/onnx_genai_workflows/audio_reuse/inference_metadata.yaml"
+    );
+    let metadata = onnx_genai_metadata::parse_metadata(source, Some("yaml")).unwrap();
+    validate_metadata(&metadata).unwrap();
+    let legacy = source
+        .replace(
+            "\"onnx-genai.audio-preprocess\": \"2\"",
+            "\"onnx-genai.audio-preprocess\": \"1\"",
+        )
+        .replace("\"version\": \"2\"", "\"version\": \"1\"");
+    assert!(
+        errors(&legacy)
+            .join("; ")
+            .contains("exactly one invocation")
+    );
+    let unbound = source.replacen(
+        "\"name\": \"features\"",
+        "\"name\": \"unbound_features\"",
+        1,
+    );
+    assert!(errors(&unbound).join("; ").contains("unbound_features"));
+    let unsupported = source.replace("\"version\": \"2\"", "\"version\": \"3\"");
+    assert!(errors(&unsupported).join("; ").contains("version '3'"));
+}

@@ -36,6 +36,7 @@
 #![forbid(unsafe_code)]
 
 pub mod affine_gather;
+pub mod affine_moe;
 mod constant_folding;
 mod dead_node;
 pub mod dequantize_packed_gather;

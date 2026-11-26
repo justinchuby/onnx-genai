@@ -6,14 +6,32 @@ use std::mem::MaybeUninit;
 
 /// One dispatch's exclusive f32 scratch lane. Binding does not initialize or
 /// touch backing: dense-cache hits pay no streamed-scratch clearing cost.
-/// Only the first streamed projection initializes the entire admitted lane;
-/// subsequent projections borrow initialized values without re-clearing them.
+/// Streamed projections initialize only their required prefix. Later projections
+/// extend that initialized prefix as needed, without re-clearing prior values.
 pub(super) struct ProjectionScratch<'a> {
     storage: &'a mut [MaybeUninit<f32>],
-    initialized: bool,
+    initialized_prefix: usize,
 }
 
 impl<'a> ProjectionScratch<'a> {
+    #[cfg(test)]
+    pub(super) fn test_binding(storage: &'a mut [f32]) -> Self {
+        let view = WorkspaceView::new(
+            onnx_runtime_ep_api::DevicePtrMut(storage.as_mut_ptr().cast()),
+            std::mem::size_of_val(storage),
+        );
+        // SAFETY: this test adapter exclusively borrows live aligned Host
+        // backing. The returned owner's lifetime cannot outlive that borrow.
+        unsafe {
+            Self::bind(
+                "test projection scratch",
+                std::mem::size_of_val(storage),
+                Some(view),
+            )
+        }
+        .unwrap()
+    }
+
     /// # Safety
     /// Nonempty workspace must be valid, Host-accessible, writable storage,
     /// exclusively lent for `'a`. It must outlive this dispatch and every
@@ -81,7 +99,7 @@ impl<'a> ProjectionScratch<'a> {
             };
             Self {
                 storage,
-                initialized: false,
+                initialized_prefix: 0,
             }
         }))
     }
@@ -181,18 +199,29 @@ impl<'a> ProjectionScratch<'a> {
         Ok(unsafe { std::slice::from_raw_parts_mut(target.as_mut_ptr().cast(), elements) })
     }
 
-    pub(super) fn initialized(&mut self) -> &mut [f32] {
-        if !self.initialized {
-            // SAFETY: binding exclusively lends every element. All-zero bytes
-            // initialize valid f32 values before any f32 references are made.
-            unsafe { self.storage.as_mut_ptr().write_bytes(0, self.storage.len()) };
-            self.initialized = true;
+    /// Borrow an initialized prefix, clearing only a previously uninitialized
+    /// suffix. The proof describes valid f32 values, not their current contents.
+    /// A fresh binding never inherits this dispatch-local proof from the pool.
+    pub(super) fn initialized_prefix(&mut self, elements: usize) -> Result<&mut [f32]> {
+        let capacity = self.storage.len();
+        let target = self.storage.get_mut(..elements).ok_or_else(|| EpError::KernelFailed(
+            format!("projection scratch needs {elements} initialized f32 values, workspace has {capacity}; prepare the complete projection bound")
+        ))?;
+        if elements > self.initialized_prefix {
+            // SAFETY: binding exclusively lends every element. The old prefix
+            // already contains valid f32 values; zero bytes initialize exactly
+            // the new suffix before any f32 reference to it is formed.
+            unsafe {
+                target
+                    .as_mut_ptr()
+                    .add(self.initialized_prefix)
+                    .write_bytes(0, elements - self.initialized_prefix);
+            }
+            self.initialized_prefix = elements;
         }
-        // SAFETY: first use initialized the entire lane; the only mutable views
-        // subsequently exposed are initialized f32 values with this short borrow.
-        unsafe {
-            std::slice::from_raw_parts_mut(self.storage.as_mut_ptr().cast(), self.storage.len())
-        }
+        // SAFETY: every value in this prefix is initialized. The short mutable
+        // borrow prevents access through the owner until the slice is retired.
+        Ok(unsafe { std::slice::from_raw_parts_mut(target.as_mut_ptr().cast(), elements) })
     }
 }
 
@@ -200,18 +229,22 @@ impl<'a> ProjectionScratch<'a> {
 /// FEATURE_TILE is a compute tile, not a model dimension. Each worker owns at
 /// most FEATURE_TILE decoded rows and one decoder state, reused across tiles.
 /// The serial projection callback overwrites a complete column-major tile.
+/// The initialized destination is caller-owned staging: geometry failures leave
+/// it untouched, while a later decoder/dispatch failure may modify it. Callers
+/// publish actual tensor outputs only after successful computation.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn linear_decoded_grouped<const FEATURE_TILE: usize, D>(
+pub(super) fn linear_decoded_grouped_into<const FEATURE_TILE: usize, D>(
     context: &str,
     input: &[f32],
     rows: usize,
     in_features: usize,
     out_features: usize,
     bias: Option<&[f32]>,
+    output: &mut [f32],
     make_decoder: impl Fn() -> D + Sync,
     project: impl Fn(&[f32], &[f32], &mut [f32], usize, usize, usize) -> Result<()> + Sync,
     dispatch: impl FnOnce(&mut [f32], usize, &DecodedShard<'_>) -> Result<()>,
-) -> Result<Vec<f32>>
+) -> Result<()>
 where
     D: FnMut(usize, &mut [f32]) -> Result<()>,
 {
@@ -223,7 +256,7 @@ where
     }
     let invalid = |reason: &str| {
         EpError::KernelFailed(format!(
-            "{context} row-decoded projection [{rows},{in_features}] -> [{rows},{out_features}]: {reason}; supply addressable dimensions and matching input/bias storage"
+            "{context} row-decoded projection [{rows},{in_features}] -> [{rows},{out_features}]: {reason}; supply addressable dimensions and matching input/output/bias storage"
         ))
     };
     if rows.checked_mul(in_features) != Some(input.len())
@@ -236,10 +269,15 @@ where
     let elements = rows
         .checked_mul(out_features)
         .ok_or_else(|| invalid("output element count overflow"))?;
-    if elements == 0 {
-        return Ok(Vec::new());
+    if output.len() != elements {
+        return Err(invalid(&format!(
+            "destination has {} elements, expected {elements}",
+            output.len()
+        )));
     }
-    let mut column_major = zeroed_f32(context, "column-major output", elements)?;
+    if elements == 0 {
+        return Ok(());
+    }
     let compute = |column_start: usize, columns: &mut [f32]| -> Result<()> {
         if !columns.len().is_multiple_of(rows) {
             return Err(invalid(
@@ -267,18 +305,19 @@ where
         )?;
         Ok(())
     };
-    dispatch(&mut column_major, rows, &compute)?;
     // A unit axis makes column-major and row-major storage identical.
+    // The caller's staging is already initialized and receives complete writes.
     if rows == 1 || out_features == 1 {
-        return Ok(column_major);
+        return dispatch(output, rows, &compute);
     }
-    let mut output = zeroed_f32(context, "row-major output", elements)?;
+    let mut column_major = zeroed_f32(context, "column-major output", elements)?;
+    dispatch(&mut column_major, rows, &compute)?;
     for (row, target) in output.chunks_exact_mut(out_features).enumerate() {
         for (column, value) in target.iter_mut().enumerate() {
             *value = column_major[column * rows + row];
         }
     }
-    Ok(output)
+    Ok(())
 }
 
 /// A contiguous set of complete decoded output columns. `start` counts
@@ -425,24 +464,45 @@ impl DecodedProjectionPlan {
         ])
     }
 
+    /// Serial projections reuse one complete layout. Keep each projection's
+    /// internal offsets intact rather than taking separate region maxima.
+    pub(super) fn maximum_layout(
+        self,
+        rows: usize,
+        projections: impl IntoIterator<Item = (usize, usize)>,
+    ) -> Result<std::alloc::Layout> {
+        let mut bytes = 0;
+        let mut alignment = 1;
+        for (k, n) in projections {
+            let layout = self.layout(rows, k, n)?;
+            bytes = bytes.max(layout.bytes());
+            alignment = alignment.max(layout.alignment());
+        }
+        std::alloc::Layout::from_size_align(bytes, alignment).map_err(|_| {
+            EpError::KernelFailed("serial decoded projection workspace exceeds addressable capacity; reduce batch or projection dimensions".into())
+        })
+    }
+
     /// Partition only this projection's prefix, leaving the rest of a larger
     /// shared lane untouched. Safe slice borrowing enforces non-overlap.
-    pub(super) fn split_scratch(
+    pub(super) fn split_scratch<'s>(
         self,
         rows: usize,
         k: usize,
         n: usize,
-        scratch: &mut [f32],
-    ) -> Result<(&mut [f32], &mut [f32])> {
+        scratch: &'s mut ProjectionScratch<'_>,
+    ) -> Result<(&'s mut [f32], &'s mut [f32])> {
         let [columns, decoded] = self.workspace_elements(rows, k, n)?;
         let elements = columns.checked_add(decoded).ok_or_else(|| EpError::KernelFailed(format!(
             "decoded projection workspace element count overflows for rows={rows}, K={k}, N={n}; reduce projection dimensions"
         )))?;
-        let available = scratch.len();
-        let scratch = scratch.get_mut(..elements).ok_or_else(|| EpError::KernelFailed(format!(
-            "decoded projection needs {elements} initialized scratch f32 values for rows={rows}, K={k}, N={n}, received {available}; prepare and pass the matching projection workspace"
-        )))?;
-        Ok(scratch.split_at_mut(columns))
+        let available = scratch.storage.len();
+        if elements > available {
+            return Err(EpError::KernelFailed(format!(
+                "decoded projection needs {elements} initialized scratch f32 values for rows={rows}, K={k}, N={n}, received {available}; prepare and pass the matching projection workspace"
+            )));
+        }
+        Ok(scratch.initialized_prefix(elements)?.split_at_mut(columns))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -543,6 +603,26 @@ mod tests {
     use std::num::NonZeroUsize;
 
     #[test]
+    fn serial_projection_layout_uses_maximum_complete_phase() {
+        let plan = DecodedProjectionPlan::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        );
+        let fc1 = plan.layout(3, 16, 32).unwrap();
+        let fc2 = plan.layout(3, 32, 16).unwrap();
+        assert_eq!(fc1.bytes(), (96 + 32) * 4);
+        assert_eq!(fc2.bytes(), (48 + 64) * 4);
+        let maximum = plan.maximum_layout(3, [(16, 32), (32, 16)]).unwrap();
+        assert_eq!(maximum.size(), 128 * 4);
+        assert_eq!(maximum.align(), 4);
+        assert_eq!(plan.maximum_layout(3, []).unwrap().size(), 0);
+        assert_eq!(
+            plan.maximum_layout(0, [(16, 32), (32, 16)]).unwrap().size(),
+            0
+        );
+    }
+
+    #[test]
     fn composite_scratch_binds_disjoint_f32_regions_and_rejects_untyped_geometry() {
         let mut backing = [MaybeUninit::new(29.0f32); 16];
         let view = WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr().cast()), 16 * 4);
@@ -562,13 +642,13 @@ mod tests {
                     .unwrap(),
                 &[1., 2., 3.]
             );
-            projection.initialized().fill(7.);
+            projection.initialized_prefix(4).unwrap().fill(7.);
             assert_eq!(
-                gathered.initialized(),
+                gathered.initialized_prefix(3).unwrap(),
                 &[0.; 3],
                 "a prefix copy does not initialize the entire owner"
             );
-            assert_eq!(projection.initialized(), &[7.; 4]);
+            assert_eq!(projection.initialized_prefix(4).unwrap(), &[7.; 4]);
         }
         // SAFETY: this fixture initialized the entire backing before binding.
         assert!(
@@ -619,9 +699,9 @@ mod tests {
                 .unwrap(),
             &[5., 6., 1., 2., 5., 6.]
         );
-        assert!(
-            !scratch.initialized,
-            "a valid prefix is not a whole-lane initialization proof"
+        assert_eq!(
+            scratch.initialized_prefix, 0,
+            "gather does not grant the lazy-clear proof"
         );
         assert_eq!(
             scratch.gather_rows(&input, 2, [1].into_iter()).unwrap(),
@@ -670,8 +750,179 @@ mod tests {
         );
         // A partially written failure never grants a whole-lane proof. The
         // ordinary initialized path must still establish every remaining value.
-        assert!(!scratch.initialized);
-        assert!(scratch.initialized().iter().all(|&x| x == 0.));
+        assert_eq!(scratch.initialized_prefix, 0);
+        assert!(
+            scratch
+                .initialized_prefix(scratch.storage.len())
+                .unwrap()
+                .iter()
+                .all(|&x| x == 0.)
+        );
+    }
+
+    #[test]
+    fn scratch_initialization_extends_only_the_live_prefix_and_refusal_is_transactional() {
+        let mut backing = [MaybeUninit::new(37.0f32); 32];
+        let view = WorkspaceView::new(DevicePtrMut(backing.as_mut_ptr().cast()), 32 * 4);
+        {
+            // SAFETY: the exclusively borrowed backing is live aligned Host storage.
+            let mut scratch =
+                unsafe { ProjectionScratch::bind("prefix test", 32 * 4, Some(view)) }.unwrap();
+            assert!(scratch.initialized_prefix(0).unwrap().is_empty());
+            assert_eq!(scratch.initialized_prefix, 0);
+            assert!(
+                scratch
+                    .storage
+                    .iter()
+                    .all(|x| unsafe { x.assume_init() } == 37.)
+            );
+            assert_eq!(scratch.initialized_prefix(4).unwrap(), &[0.; 4]);
+            scratch.initialized_prefix(4).unwrap().fill(7.);
+            assert_eq!(scratch.initialized_prefix(2).unwrap(), &[7.; 2]);
+            assert_eq!(scratch.initialized_prefix, 4);
+            assert_eq!(
+                scratch.initialized_prefix(9).unwrap(),
+                &[7., 7., 7., 7., 0., 0., 0., 0., 0.]
+            );
+            let before: Vec<_> = scratch
+                .storage
+                .iter()
+                .map(|x| unsafe { x.assume_init() }.to_bits())
+                .collect();
+            let message = scratch.initialized_prefix(33).unwrap_err().to_string();
+            assert!(
+                message.contains("33 initialized f32 values")
+                    && message.contains("workspace has 32"),
+                "{message}"
+            );
+            assert_eq!(scratch.initialized_prefix, 9);
+            assert_eq!(
+                scratch
+                    .storage
+                    .iter()
+                    .map(|x| unsafe { x.assume_init() }.to_bits())
+                    .collect::<Vec<_>>(),
+                before
+            );
+            assert_eq!(scratch.initialized_prefix(1).unwrap(), &[7.]);
+            assert!(
+                scratch.storage[9..]
+                    .iter()
+                    .all(|x| unsafe { x.assume_init() } == 37.)
+            );
+        }
+        {
+            // SAFETY: the previous owner and all its views have retired.
+            let mut fresh =
+                unsafe { ProjectionScratch::bind("new dispatch", 32 * 4, Some(view)) }.unwrap();
+            assert_eq!(fresh.initialized_prefix, 0);
+            assert_eq!(fresh.initialized_prefix(2).unwrap(), &[0.; 2]);
+            assert!(
+                fresh.storage[2..4]
+                    .iter()
+                    .all(|x| unsafe { x.assume_init() } == 7.)
+            );
+            assert!(
+                fresh.storage[9..]
+                    .iter()
+                    .all(|x| unsafe { x.assume_init() } == 37.)
+            );
+        }
+    }
+
+    #[test]
+    fn projection_prefix_tracks_actual_group_rows_and_survives_decoder_error() {
+        let plan = DecodedProjectionPlan::new(
+            NonZeroUsize::new(4).unwrap(),
+            NonZeroUsize::new(4).unwrap(),
+        );
+        let elements = plan.layout(64, 32, 17).unwrap().bytes() / 4;
+        let mut backing = vec![37.0f32; elements + 7];
+        let mut scratch = ProjectionScratch::test_binding(&mut backing[..elements]);
+        let mut peak = 0;
+        for (rows, k, n) in [
+            (1, 32, 17),
+            (3, 32, 13),
+            (2, 16, 17),
+            (7, 32, 17),
+            (0, 32, 17),
+            (1, 32, 1),
+            (2, 0, 17),
+        ] {
+            let count = plan.layout(rows, k, n).unwrap().bytes() / 4;
+            peak = peak.max(count);
+            let input = vec![0.25; rows * k];
+            let bias = vec![0.5; n];
+            let mut output = vec![f32::NAN; rows * n];
+            if rows == 3 {
+                let (columns, decoded) = plan.split_scratch(rows, k, n, &mut scratch).unwrap();
+                let failure = plan
+                    .project::<4, _>(
+                        &input,
+                        rows,
+                        k,
+                        n,
+                        Some(&bias),
+                        &mut output,
+                        columns,
+                        decoded,
+                        || {
+                            |_, _: &mut [f32]| {
+                                Err(EpError::KernelFailed("injected decoder failure".into()))
+                            }
+                        },
+                        |_, _, _, _, _, _| unreachable!("decoder must fail before projection"),
+                    )
+                    .unwrap_err();
+                assert!(failure.to_string().contains("injected decoder failure"));
+            }
+            let (columns, decoded) = plan.split_scratch(rows, k, n, &mut scratch).unwrap();
+            plan.project::<4, _>(
+                &input,
+                rows,
+                k,
+                n,
+                Some(&bias),
+                &mut output,
+                columns,
+                decoded,
+                || {
+                    |feature, row: &mut [f32]| {
+                        row.fill((feature + 1) as f32);
+                        Ok(())
+                    }
+                },
+                |input, weights, target, rows, k, features| {
+                    for f in 0..features {
+                        for row in 0..rows {
+                            let mut sum = 0.;
+                            for p in 0..k {
+                                sum += input[row * k + p] * weights[f * k + p];
+                            }
+                            target[f * rows + row] = sum;
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            for row in output.chunks(n) {
+                for (feature, &value) in row.iter().enumerate() {
+                    assert_eq!(value, k as f32 * 0.25 * (feature + 1) as f32 + 0.5);
+                }
+            }
+            assert_eq!(scratch.initialized_prefix, peak);
+            assert!(
+                peak < elements,
+                "actual groups must use less than the declared whole-batch lane"
+            );
+            assert!(
+                scratch.storage[peak..]
+                    .iter()
+                    .all(|x| unsafe { x.assume_init() } == 37.)
+            );
+        }
+        assert!(backing[elements..].iter().all(|&x| x == 37.));
     }
 
     #[test]
@@ -687,7 +938,7 @@ mod tests {
             let mut scratch =
                 unsafe { ProjectionScratch::bind("test projection binding", 16 * 4, Some(view)) }
                     .unwrap();
-            assert!(!scratch.initialized);
+            assert_eq!(scratch.initialized_prefix, 0);
             assert_eq!(scratch.storage.len(), 16);
             // SAFETY: the test populated every MaybeUninit with 37.0.
             assert!(
@@ -699,13 +950,21 @@ mod tests {
             );
             assert!(
                 scratch
-                    .initialized()
+                    .initialized_prefix(16)
+                    .unwrap()
                     .iter()
                     .all(|&value| value.to_bits() == 0)
             );
-            scratch.initialized().fill(19.0);
+            scratch
+                .initialized_prefix(scratch.storage.len())
+                .unwrap()
+                .fill(19.0);
             assert!(
-                scratch.initialized().iter().all(|&value| value == 19.0),
+                scratch
+                    .initialized_prefix(scratch.storage.len())
+                    .unwrap()
+                    .iter()
+                    .all(|&value| value == 19.0),
                 "a later FC must reuse initialized storage without resetting it"
             );
         }
@@ -724,7 +983,8 @@ mod tests {
                     .unwrap();
             assert!(
                 scratch
-                    .initialized()
+                    .initialized_prefix(16)
+                    .unwrap()
                     .iter()
                     .all(|&value| value.to_bits() == 0)
             );
@@ -766,7 +1026,7 @@ mod tests {
         }
         // SAFETY: an empty owner dereferences no backing.
         let mut scratch = unsafe { ProjectionScratch::bind("empty", 0, None) }.unwrap();
-        assert!(scratch.initialized().is_empty());
+        assert!(scratch.initialized_prefix(0).unwrap().is_empty());
     }
 
     #[test]
@@ -783,8 +1043,9 @@ mod tests {
                             let layout = plan.layout(rows, k, n).unwrap();
                             let elements = layout.bytes() / 4;
                             let mut storage = vec![13.0f32; elements + 7];
+                            let mut scratch = ProjectionScratch::test_binding(&mut storage);
                             let (columns, decoded) =
-                                plan.split_scratch(rows, k, n, &mut storage).unwrap();
+                                plan.split_scratch(rows, k, n, &mut scratch).unwrap();
                             assert_eq!(columns.len(), if rows > 1 && n > 1 { rows * n } else { 0 });
                             assert_eq!(columns.len() + decoded.len(), elements);
                             columns.fill(2.0);
@@ -793,7 +1054,14 @@ mod tests {
                             assert!(storage[elements..].iter().all(|&value| value == 13.0));
                             if elements > 0 {
                                 let error = plan
-                                    .split_scratch(rows, k, n, &mut storage[..elements - 1])
+                                    .split_scratch(
+                                        rows,
+                                        k,
+                                        n,
+                                        &mut ProjectionScratch::test_binding(
+                                            &mut storage[..elements - 1],
+                                        ),
+                                    )
                                     .unwrap_err();
                                 assert!(
                                     error.to_string().contains("initialized scratch f32 values"),

@@ -47,10 +47,34 @@ pub fn buffered_pcm16_wav_output_names(workflow: &WorkflowSpec) -> Vec<String> {
         .collect()
 }
 
+/// Transport encoding of the selected declared audio output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioOutputFormat {
+    Wav,
+    PcmS16Le,
+    PcmF32Le,
+}
+impl AudioOutputFormat {
+    fn content_type(self, sample_rate: u32, channels: u16) -> String {
+        if self == Self::Wav {
+            return "audio/wav".into();
+        }
+        let mut content = format!("audio/pcm;rate={sample_rate}");
+        if channels > 1 {
+            content.push_str(&format!(";channels={channels}"));
+        }
+        content.push_str(match self {
+            Self::PcmF32Le => ";encoding=float;bits=32",
+            _ => ";encoding=signed-int;bits=16",
+        });
+        content
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedAudio {
     pub bytes: Vec<u8>,
-    pub content_type: &'static str,
+    pub content_type: String,
     pub sample_rate_hz: u32,
     pub channels: u16,
 }
@@ -67,6 +91,7 @@ impl WorkflowRuntime {
         &self,
         outputs: &PipelineOutputs,
         output_name: &str,
+        format: AudioOutputFormat,
     ) -> anyhow::Result<EncodedAudio> {
         let declaration = self
             .plan
@@ -90,16 +115,25 @@ impl WorkflowRuntime {
             .sample_rate_hz
             .context("audio output has no sample_rate_hz")?;
         let channels = media.channels.context("audio output has no channels")?;
+        anyhow::ensure!(
+            target_rate > 0 && channels > 0,
+            "audio output '{output_name}' must declare positive sample_rate_hz and channels"
+        );
         let value = self
             .structured_output_for_name(outputs, output_name)
             .with_context(|| format!("workflow did not emit audio output '{output_name}'"))?;
 
         if declaration.stage == OutputStage::PostAdapter {
             let bytes = value.to_raw_bytes()?;
-            validate_wav_header(&bytes, target_rate, channels)?;
+            let source = validate_wav_header(&bytes, target_rate, channels)?;
+            let encoded = match format {
+                AudioOutputFormat::Wav => bytes,
+                AudioOutputFormat::PcmS16Le => source.payload.to_vec(),
+                AudioOutputFormat::PcmF32Le => source.float_pcm()?,
+            };
             return Ok(EncodedAudio {
-                bytes,
-                content_type: "audio/wav",
+                bytes: encoded,
+                content_type: format.content_type(target_rate, channels),
                 sample_rate_hz: target_rate,
                 channels,
             });
@@ -122,10 +156,16 @@ impl WorkflowRuntime {
             source_rate,
             target_rate,
         )?;
-        let bytes = encode_pcm16_wav(&resampled, usize::from(channels), target_rate)?;
+        let bytes = match format {
+            AudioOutputFormat::Wav => {
+                encode_pcm16_wav(&resampled, usize::from(channels), target_rate)
+            }
+            _ => encode_planar_pcm(&resampled, usize::from(channels), format),
+        }
+        .with_context(|| format!("encode workflow audio output '{output_name}' as {format:?}"))?;
         Ok(EncodedAudio {
             bytes,
-            content_type: "audio/wav",
+            content_type: format.content_type(target_rate, channels),
             sample_rate_hz: target_rate,
             channels,
         })
@@ -160,25 +200,110 @@ pub fn resample_planar(
     if source_rate == target_rate {
         return Ok(input.to_vec());
     }
-    let target_samples = ((source_samples as u128 * target_rate as u128 + source_rate as u128 / 2)
-        / source_rate as u128) as usize;
-    let mut output = vec![0.0f32; channels * target_samples];
-    let ratio = source_rate as f64 / target_rate as f64;
-    let cutoff = (target_rate as f64 / source_rate as f64).min(1.0);
-
+    let mut output = Vec::new();
     for channel in 0..channels {
         let source = &input[channel * source_samples..(channel + 1) * source_samples];
-        let destination = &mut output[channel * target_samples..(channel + 1) * target_samples];
-        for (index, sample) in destination.iter_mut().enumerate() {
-            let position = index as f64 * ratio;
-            let center = position.floor() as isize;
+        let mut resampler = StreamingResampler::new(
+            std::num::NonZeroU32::new(source_rate).context("source rate must be positive")?,
+            std::num::NonZeroU32::new(target_rate).context("target rate must be positive")?,
+        );
+        output.extend(resampler.push(source)?);
+        output.extend(resampler.finish()?);
+    }
+    Ok(output)
+}
+
+/// A mono PCM stream resampler with a persistent rational sampling clock.
+///
+/// `push` retains only the filter's lookbehind/lookahead window after emitting
+/// ready samples. `finish` consumes the stream and emits its rounded-length
+/// tail. A new audio turn must use a new instance; message boundaries must not.
+/// Rates are supplied by the admitted audio contract, never a model identity.
+pub struct StreamingResampler {
+    source_rate: std::num::NonZeroU32,
+    target_rate: std::num::NonZeroU32,
+    samples: std::collections::VecDeque<f32>,
+    first_sample: usize,
+    received: usize,
+    emitted: usize,
+}
+
+impl StreamingResampler {
+    pub fn new(source_rate: std::num::NonZeroU32, target_rate: std::num::NonZeroU32) -> Self {
+        Self {
+            source_rate,
+            target_rate,
+            samples: std::collections::VecDeque::new(),
+            first_sample: 0,
+            received: 0,
+            emitted: 0,
+        }
+    }
+
+    /// Upper bound on output still owed after accepting additional source
+    /// samples, including filter lookahead. Callers can admit an expansion
+    /// budget before `push` or `finish` allocates an output chunk.
+    pub fn remaining_output_samples(&self, additional: usize) -> anyhow::Result<usize> {
+        let received = self
+            .received
+            .checked_add(additional)
+            .context("audio stream sample count overflow; start a new audio turn")?;
+        self.output_len(received)?
+            .checked_sub(self.emitted)
+            .context("audio resampling clock emitted beyond its admitted source length")
+    }
+
+    pub fn push(&mut self, samples: &[f32]) -> anyhow::Result<Vec<f32>> {
+        let received = self
+            .received
+            .checked_add(samples.len())
+            .context("audio stream sample count overflow; start a new audio turn")?;
+        // Validate the eventual output count before changing the stream.
+        self.output_len(received)?;
+        self.received = received;
+        if self.source_rate == self.target_rate {
+            self.emitted = received;
+            self.first_sample = received;
+            return Ok(samples.to_vec());
+        }
+        self.samples.extend(samples);
+        self.drain(false)
+    }
+
+    pub fn finish(mut self) -> anyhow::Result<Vec<f32>> {
+        self.drain(true)
+    }
+
+    fn output_len(&self, received: usize) -> anyhow::Result<usize> {
+        usize::try_from(
+            (received as u128 * u128::from(self.target_rate.get())
+                + u128::from(self.source_rate.get()) / 2)
+                / u128::from(self.source_rate.get()),
+        )
+        .context("resampled audio length exceeds host address space; use a shorter audio turn")
+    }
+
+    fn drain(&mut self, finishing: bool) -> anyhow::Result<Vec<f32>> {
+        let limit = self.output_len(self.received)?;
+        let cutoff =
+            (f64::from(self.target_rate.get()) / f64::from(self.source_rate.get())).min(1.0);
+        let mut output = Vec::new();
+        while self.emitted < limit {
+            let clock = self.emitted as u128 * u128::from(self.source_rate.get());
+            let center = clock / u128::from(self.target_rate.get());
+            if !finishing && center + RESAMPLE_RADIUS as u128 >= self.received as u128 {
+                break;
+            }
+            let center = i128::try_from(center).context("audio sampling clock overflow")?;
+            let fraction = (clock % u128::from(self.target_rate.get())) as f64
+                / f64::from(self.target_rate.get());
             let mut weighted = 0.0;
             let mut weight_sum = 0.0;
-            for source_index in center - RESAMPLE_RADIUS + 1..=center + RESAMPLE_RADIUS {
-                if source_index < 0 || source_index >= source_samples as isize {
+            for index in center - RESAMPLE_RADIUS as i128 + 1..=center + RESAMPLE_RADIUS as i128 {
+                if index < 0 || index >= self.received as i128 {
                     continue;
                 }
-                let distance = position - source_index as f64;
+                let distance = (center - index) as f64 + fraction;
                 let normalized = distance / RESAMPLE_RADIUS as f64;
                 if normalized.abs() >= 1.0 {
                     continue;
@@ -191,17 +316,92 @@ pub fn resample_planar(
                     (std::f64::consts::PI * argument).sin() / (std::f64::consts::PI * argument)
                 };
                 let weight = cutoff * sinc * window;
-                weighted += source[source_index as usize] as f64 * weight;
+                let offset = usize::try_from(index)
+                    .context("audio sample index overflow")?
+                    .checked_sub(self.first_sample)
+                    .context("audio resampling lookbehind was released before use")?;
+                let sample = self
+                    .samples
+                    .get(offset)
+                    .context("audio resampling window does not contain the required sample")?;
+                weighted += f64::from(*sample) * weight;
                 weight_sum += weight;
             }
-            *sample = if weight_sum.abs() > 1e-12 {
+            output.push(if weight_sum.abs() > 1e-12 {
                 (weighted / weight_sum) as f32
             } else {
                 0.0
-            };
+            });
+            self.emitted += 1;
+        }
+        let next_center = self.emitted as u128 * u128::from(self.source_rate.get())
+            / u128::from(self.target_rate.get());
+        let keep_from = next_center
+            .saturating_sub(RESAMPLE_RADIUS as u128 - 1)
+            .min(self.received as u128) as usize;
+        let release = keep_from
+            .saturating_sub(self.first_sample)
+            .min(self.samples.len());
+        self.samples.drain(..release);
+        self.first_sample += release;
+        // A large network message must not leave its allocation resident for
+        // the lifetime of the connection after the filter window is drained.
+        self.samples.shrink_to(2 * RESAMPLE_RADIUS as usize);
+        Ok(output)
+    }
+}
+
+fn encode_planar_pcm(
+    planar: &[f32],
+    channels: usize,
+    format: AudioOutputFormat,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        channels > 0 && channels <= u16::MAX as usize,
+        "PCM channel count must be between 1 and {}",
+        u16::MAX
+    );
+    anyhow::ensure!(
+        planar.len().is_multiple_of(channels),
+        "planar audio length {} is not divisible by channel count {channels}",
+        planar.len()
+    );
+    if let Some((index, value)) = planar
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        bail!(
+            "audio sample {index} is not finite ({value}); repair the workflow waveform output before encoding"
+        );
+    }
+    let width = if format == AudioOutputFormat::PcmF32Le {
+        4
+    } else {
+        2
+    };
+    let length = planar
+        .len()
+        .checked_mul(width)
+        .context("PCM output byte length overflows")?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .context("reserve interleaved PCM output bytes")?;
+    let samples = planar.len() / channels;
+    for sample in 0..samples {
+        for channel in 0..channels {
+            let value = planar[channel * samples + sample];
+            if format == AudioOutputFormat::PcmF32Le {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            } else {
+                // Match llama-server's rounded symmetric PCM16 conversion.
+                let value = (value.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
         }
     }
-    Ok(output)
+    Ok(bytes)
 }
 
 pub fn encode_pcm16_wav(
@@ -234,7 +434,10 @@ pub fn encode_pcm16_wav(
         .checked_mul(2)
         .context("WAV block align overflow")?;
 
-    let mut wav = Vec::with_capacity(44 + data_len);
+    let pcm = encode_planar_pcm(planar, channels, AudioOutputFormat::PcmS16Le)?;
+    let mut wav = Vec::new();
+    wav.try_reserve_exact(44 + data_len)
+        .context("reserve PCM16 WAV output bytes")?;
     wav.extend_from_slice(b"RIFF");
     wav.extend_from_slice(&riff_len_u32.to_le_bytes());
     wav.extend_from_slice(b"WAVEfmt ");
@@ -247,21 +450,40 @@ pub fn encode_pcm16_wav(
     wav.extend_from_slice(&16u16.to_le_bytes());
     wav.extend_from_slice(b"data");
     wav.extend_from_slice(&data_len_u32.to_le_bytes());
-    for sample in 0..samples {
-        for channel in 0..channels {
-            let value = planar[channel * samples + sample].clamp(-1.0, 1.0);
-            let pcm = if value <= -1.0 {
-                i16::MIN
-            } else {
-                (value * i16::MAX as f32).round() as i16
-            };
-            wav.extend_from_slice(&pcm.to_le_bytes());
-        }
-    }
+    wav.extend(pcm);
     Ok(wav)
 }
 
-fn validate_wav_header(bytes: &[u8], sample_rate: u32, channels: u16) -> anyhow::Result<()> {
+struct ValidatedPcm16Wav<'a> {
+    payload: &'a [u8],
+}
+impl ValidatedPcm16Wav<'_> {
+    fn float_pcm(&self) -> anyhow::Result<Vec<u8>> {
+        let length = self
+            .payload
+            .len()
+            .checked_mul(2)
+            .context("float PCM output byte length overflows")?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(length)
+            .context("reserve float PCM bytes from the validated PCM16 audio output")?;
+        for sample in self.payload.chunks_exact(2) {
+            let sample = f32::from(i16::from_le_bytes([sample[0], sample[1]])) / 32768.0;
+            output.extend_from_slice(&sample.to_le_bytes());
+        }
+        Ok(output)
+    }
+}
+fn validate_wav_header(
+    bytes: &[u8],
+    sample_rate: u32,
+    channels: u16,
+) -> anyhow::Result<ValidatedPcm16Wav<'_>> {
+    anyhow::ensure!(
+        channels > 0 && sample_rate > 0,
+        "declared PCM16 WAV sample rate and channels must be positive"
+    );
     if bytes.len() < 44
         || &bytes[0..4] != b"RIFF"
         || &bytes[8..12] != b"WAVE"
@@ -292,6 +514,7 @@ fn validate_wav_header(bytes: &[u8], sample_rate: u32, channels: u16) -> anyhow:
         || byte_rate != expected_byte_rate
         || usize::try_from(riff_size).ok() != bytes.len().checked_sub(8)
         || usize::try_from(data_size).ok() != bytes.len().checked_sub(44)
+        || !data_size.is_multiple_of(u32::from(expected_block_align))
     {
         bail!("post-adapter WAV must contain canonical PCM16 fmt and data chunks");
     }
@@ -300,7 +523,9 @@ fn validate_wav_header(bytes: &[u8], sample_rate: u32, channels: u16) -> anyhow:
             "WAV header declares {actual_channels} channels at {actual_rate} Hz; metadata declares {channels} channels at {sample_rate} Hz"
         );
     }
-    Ok(())
+    Ok(ValidatedPcm16Wav {
+        payload: &bytes[44..],
+    })
 }
 
 #[cfg(test)]
@@ -323,6 +548,74 @@ mod tests {
             .sum::<f64>()
             / values.len() as f64)
             .sqrt()
+    }
+
+    #[test]
+    fn streaming_resampling_is_independent_of_message_boundaries() {
+        for (source, target) in [
+            (44_100, 32_000),
+            (8_000, 48_000),
+            (48_000, 8_000),
+            (24_000, 24_000),
+        ] {
+            let input = sine(source, 751.0, 0.13);
+            let expected = resample_planar(&input, 1, input.len(), source, target).unwrap();
+            for chunk_size in [1, 7, 31, 257, 1024] {
+                let mut stream = StreamingResampler::new(
+                    std::num::NonZeroU32::new(source).unwrap(),
+                    std::num::NonZeroU32::new(target).unwrap(),
+                );
+                let mut actual = Vec::new();
+                for chunk in input.chunks(chunk_size) {
+                    actual.extend(stream.push(chunk).unwrap());
+                    assert!(stream.push(&[]).unwrap().is_empty());
+                    assert!(stream.samples.len() <= 2 * RESAMPLE_RADIUS as usize);
+                }
+                actual.extend(stream.finish().unwrap());
+                assert_eq!(
+                    actual, expected,
+                    "{source}->{target}, chunk size {chunk_size}"
+                );
+                assert_eq!(
+                    actual.len(),
+                    (input.len() * target as usize + source as usize / 2) / source as usize
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_resampling_emits_before_finish_and_preserves_constant_signal() {
+        let mut stream = StreamingResampler::new(
+            std::num::NonZeroU32::new(48_000).unwrap(),
+            std::num::NonZeroU32::new(44_100).unwrap(),
+        );
+        let ready = stream.push(&[0.25; 1024]).unwrap();
+        assert!(ready.len() > 900);
+        let tail = stream.finish().unwrap();
+        assert!(!tail.is_empty());
+        assert!(
+            ready
+                .iter()
+                .chain(&tail)
+                .all(|sample| (*sample - 0.25).abs() < 1e-6)
+        );
+        assert_eq!(ready.len() + tail.len(), 941);
+    }
+
+    #[test]
+    fn streaming_resampling_empty_and_sub_filter_turns_have_exact_lengths() {
+        for size in 0..32 {
+            for (source, target) in [(192_000, 8_000), (8_000, 192_000)] {
+                let input = vec![1.0; size];
+                let output = resample_planar(&input, 1, size, source, target).unwrap();
+                assert_eq!(
+                    output.len(),
+                    (size * target as usize + source as usize / 2) / source as usize
+                );
+                assert!(output.iter().all(|sample| (*sample - 1.0).abs() < 1e-6));
+            }
+        }
     }
 
     #[test]
@@ -360,10 +653,79 @@ mod tests {
         assert_eq!(
             &wav[44..],
             &[
-                0, 0, 0, 128, // L0=0, R0=-1
+                0, 0, 1, 128, // L0=0, R0=-1 (symmetric PCM16)
                 255, 127, 0, 64, // L1=1, R1=0.5
             ]
         );
+    }
+
+    #[test]
+    fn raw_pcm_preserves_float_precision_and_interleaves_channels() {
+        let planar = [0.1234567, -1.25, 0.75, 1.5];
+        let bytes = encode_planar_pcm(&planar, 2, AudioOutputFormat::PcmF32Le).unwrap();
+        let actual: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        assert_eq!(actual, [0.1234567, 0.75, -1.25, 1.5]);
+        let bytes = encode_planar_pcm(&planar, 2, AudioOutputFormat::PcmS16Le).unwrap();
+        let actual: Vec<i16> = bytes
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        assert_eq!(actual, [4045, 24575, -32767, 32767]);
+        assert_eq!(
+            AudioOutputFormat::PcmF32Le.content_type(24000, 2),
+            "audio/pcm;rate=24000;channels=2;encoding=float;bits=32"
+        );
+        assert_eq!(
+            AudioOutputFormat::PcmS16Le.content_type(44100, 1),
+            "audio/pcm;rate=44100;encoding=signed-int;bits=16"
+        );
+    }
+
+    #[test]
+    fn raw_pcm_rejects_invalid_shapes_and_nonfinite_samples() {
+        for format in [AudioOutputFormat::PcmS16Le, AudioOutputFormat::PcmF32Le] {
+            assert!(encode_planar_pcm(&[], 0, format).is_err());
+            assert!(encode_planar_pcm(&[0.0], 2, format).is_err());
+            assert!(encode_planar_pcm(&[], 2, format).unwrap().is_empty());
+            for sample in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let error = encode_planar_pcm(&[0.0, sample], 1, format)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains("sample 1") && error.contains("not finite"),
+                    "{error}"
+                );
+            }
+        }
+        assert!(encode_pcm16_wav(&[f32::NAN], 1, 24000).is_err());
+    }
+
+    #[test]
+    fn validated_post_adapter_pcm_preserves_full_signed_range_and_rejects_partial_frames() {
+        let mut wav = encode_pcm16_wav(&[0.0, 0.0, 0.0, 0.0], 2, 24000).unwrap();
+        let source: Vec<u8> = [i16::MIN, -1, 0, i16::MAX]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        wav[44..].copy_from_slice(&source);
+        let validated = validate_wav_header(&wav, 24000, 2).unwrap();
+        assert_eq!(validated.payload, source);
+        let floats: Vec<f32> = validated
+            .float_pcm()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        assert_eq!(floats, [-1.0, -1.0 / 32768.0, 0.0, 32767.0 / 32768.0]);
+        wav.pop();
+        let riff_size = u32::try_from(wav.len() - 8).unwrap();
+        let data_size = u32::try_from(wav.len() - 44).unwrap();
+        wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        wav[40..44].copy_from_slice(&data_size.to_le_bytes());
+        assert!(validate_wav_header(&wav, 24000, 2).is_err());
     }
 
     #[test]

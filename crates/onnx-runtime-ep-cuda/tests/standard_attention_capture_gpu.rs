@@ -320,8 +320,9 @@ fn default_attention_aliased_dense_kv_growth_captures_and_matches_eager_gpu() {
                 !warmed_resources.is_empty(),
                 "capture-eligible Attention must publish its private workspace owners"
             );
+            ep.wait_for_deferred_releases().unwrap();
             let counts_before_failure = runtime.allocation_counts();
-            let pooled_before_failure = runtime.raw_pool_retained_bytes();
+
             runtime.fail_warm_transaction_at_for_test(1);
             let failure = execute_decode(
                 kernel.as_ref(),
@@ -352,10 +353,10 @@ fn default_attention_aliased_dense_kv_growth_captures_and_matches_eager_gpu() {
                 warmed_resources,
                 "Attention capture eligibility and resources must remain one successful snapshot"
             );
+            ep.wait_for_deferred_releases().unwrap();
             let counts_after_failure = runtime.allocation_counts();
             assert!(
-                counts_after_failure.frees > counts_before_failure.frees
-                    || runtime.raw_pool_retained_bytes() > pooled_before_failure,
+                counts_after_failure.frees > counts_before_failure.frees,
                 "the rejected Attention workspace candidate must return each allocation exactly once"
             );
         }

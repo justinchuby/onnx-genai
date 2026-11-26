@@ -26,6 +26,34 @@ post-adapter.
 
 ## Components and graph
 
+Schema `v1.17` adds `graph_weights`, an explicit mapping from package-relative
+ONNX graph paths to immutable GGUF or SafeTensors containers:
+
+```yaml
+schema_version: v1.17
+graph_weights:
+  decoder.onnx:
+    - path: weights/decoder.gguf
+      format: gguf
+      renames:
+        container.parameter: decoder.parameter
+```
+
+Use `format: safetensors` for SafeTensors. Container keys retain their names
+unless `renames` maps them to ONNX initializer names. The ONNX graph declares
+external initializers with an omitted or empty `external_data.location`; their
+dtype and shape must match the container exactly. An optional external length
+must also match. Loading does not cast, transpose, reshape, or infer an architecture.
+Packed quantized tensors require the graph's declared storage representation and
+supported operators. A container alone does not supply an executable ONNX graph.
+
+These bindings require the Native backend; explicit ORT selection is rejected.
+All declared paths must resolve to regular files beneath the package root.
+Bindings apply to decoder graphs, workflow components and MTP heads. Native
+portable session state includes the declared containers' contents in its model
+identity: relocating an unchanged package preserves identity, while changing a
+container invalidates saved state.
+
 `workflow.components` declares ONNX artifacts, native implementations, runtime bindings,
 or manifest-pinned adapter ABIs with typed ports. Each contract declares an equivalence
 class (`bitwise | distribution_preserving | semantic`, defaulting to `semantic`) that
@@ -76,3 +104,14 @@ unsupported, unresolved, unordered, or ill-typed documents fail before execution
 Policy artifact port contracts and minimal workflows are specified in
 [WORKFLOW_POLICY_COMPONENTS.md](WORKFLOW_POLICY_COMPONENTS.md). The normative contract
 is [INFERENCE_METADATA_DECISIONS.md](INFERENCE_METADATA_DECISIONS.md).
+
+## Non-generative decision profiles (v1.10)
+
+`profiles.<name>.decision` declares the prompt, option bound, variant ensemble,
+confidence formulas and score policy for a `kind: decision`, `version: '1'`
+profile. This core field requires schema v1.10; unknown required profiles and
+unsupported versions fail before execution. The workflow supplies calibrated
+floating probabilities, independent of model architecture or execution provider.
+See [the SystemOne contract](../SYSTEMONE.md) and the executable
+`tests/fixtures/onnx_genai_workflows/decision` package for precise input/output
+roles, shape/resource admission, and remaining multimodal/entry-point work.

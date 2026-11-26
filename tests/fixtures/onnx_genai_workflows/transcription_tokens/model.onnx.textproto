@@ -1,0 +1,20 @@
+ir_version: 11
+opset_import { domain: "" version: 24 }
+graph { name: "audio_prompt_token_head"
+node { input: "features" output: "audio.mean" op_type: "ReduceMean" attribute { name: "keepdims" i: 0 type: INT } }
+node { input: "prompt" output: "prompt.float" op_type: "Cast" attribute { name: "to" i: 1 type: INT } }
+node { input: "prompt.float" output: "prompt.mean" op_type: "ReduceMean" attribute { name: "keepdims" i: 0 type: INT } }
+node { input: "prompt.mean" input: "prompt_scale" output: "prompt.bias" op_type: "Mul" }
+node { input: "audio.mean" input: "prompt.bias" output: "score" op_type: "Add" }
+node { input: "score" input: "threshold" output: "is_silent" op_type: "Less" }
+node { input: "is_silent" output: "offset" op_type: "Cast" attribute { name: "to" i: 7 type: INT } }
+node { input: "offset" input: "hello_id" output: "token" op_type: "Add" }
+node { input: "token" input: "axes" output: "tokens" op_type: "Unsqueeze" }
+initializer { name: "prompt_scale" data_type: 1 float_data: 0.001 }
+initializer { name: "threshold" data_type: 1 float_data: -9 }
+initializer { name: "hello_id" data_type: 7 int64_data: 4 }
+initializer { name: "axes" data_type: 7 dims: 2 int64_data: 0 int64_data: 1 }
+input { name: "features" type { tensor_type { elem_type: 1 shape { dim { dim_value: 1 } dim { dim_value: 7 } dim { dim_value: 4 } } } } }
+input { name: "prompt" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_param: "prompt_tokens" } } } } }
+output { name: "tokens" type { tensor_type { elem_type: 7 shape { dim { dim_value: 1 } dim { dim_value: 1 } } } } }
+}

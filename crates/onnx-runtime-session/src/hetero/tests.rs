@@ -1253,6 +1253,168 @@ fn ordered_session_can_select_a_whole_provider_for_symbolic_shapes() {
 }
 
 #[test]
+fn ordered_session_selects_a_host_provider_for_the_whole_string_graph() {
+    let mut secondary = AcceleratorEp::new(vec!["Neg", "StringConcat"]);
+    secondary.device.index = 1;
+    let order = crate::ExecutionProviderOrder::new(accel_slot(0, vec!["Neg"]).provider)
+        .then(Arc::new(secondary));
+    let mut session = crate::InferenceSession::from_graph_with_providers(
+        string_then_numeric_graph(),
+        weights(),
+        Path::new("."),
+        order,
+        Some(cpu_slot(2).provider),
+    )
+    .unwrap();
+    assert_eq!(session.device_id(), DeviceId::new(DeviceType::Mlx, 1));
+    assert!(session.heterogeneous_placement_report().is_none());
+    let x = Tensor::from_f32(&[4], &[1., 2., 3., 4.]).unwrap();
+    let text =
+        Tensor::from_strings(vec![4], ["a", "b", "", "z"].map(String::from).to_vec()).unwrap();
+    let output = session.run(&[("x", &x), ("text", &text)]).unwrap();
+    assert_eq!(output[0].to_vec_f32(), vec![-1., -2., -3., -4.]);
+    assert_eq!(output[1].as_strings().unwrap(), &["aa", "bb", "", "zz"]);
+}
+
+#[test]
+fn ordered_executor_keeps_automatic_cuda_string_split_but_not_in_strict_mode() {
+    let order = || {
+        let mut cuda = AcceleratorEp::new(vec!["Neg"]);
+        cuda.device = DeviceId::new(DeviceType::Cuda, 0);
+        crate::ExecutionProviderOrder::new(Arc::new(cuda))
+            .then(accel_slot(1, vec!["StringConcat"]).provider)
+    };
+    let graph = string_then_numeric_graph();
+    let exec = Executor::build_ordered_with_mode(
+        graph.clone(),
+        weights(),
+        order(),
+        false,
+        false,
+        Some(cpu_slot(2).provider),
+    )
+    .unwrap();
+    let report = exec.heterogeneous_placement_report().unwrap();
+    assert!(report.contains("1 node(s) on cpu_ep"), "{report}");
+    assert!(report.contains("1 node(s) on accel_ep"), "{report}");
+    let error = Executor::build_ordered_with_mode(
+        graph,
+        weights(),
+        order(),
+        true,
+        false,
+        Some(cpu_slot(2).provider),
+    )
+    .err()
+    .expect("strict CUDA must reject managed strings instead of probing host providers");
+    assert!(matches!(
+        error,
+        crate::error::SessionError::HeterogeneousPlacementRequired { .. }
+    ));
+}
+
+fn if_with_captured_inputs(cond_name: &str, then_branch: Graph, else_branch: Graph) -> Graph {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([4]));
+    let cond = graph.create_named_value(cond_name, DataType::Bool, vec![]);
+    let output = graph.create_named_value("y", DataType::Float32, static_shape([4]));
+    graph.add_input(x);
+    graph.add_input(cond);
+    graph.add_output(output);
+    let node = graph.insert_node(Node::new(NodeId(0), "If", vec![Some(cond)], vec![output]));
+    for (attribute, mut branch) in [("then_branch", then_branch), ("else_branch", else_branch)] {
+        branch.set_inputs(vec![]);
+        branch.opset_imports.clear();
+        graph.subgraphs.insert((node, attribute.into()), branch);
+    }
+    graph
+}
+
+#[test]
+fn ordered_session_probes_even_the_unselected_nested_branch() {
+    let mut graph = if_with_captured_inputs(
+        "outer",
+        if_with_captured_inputs("inner", build_chain(&["Abs"]), build_chain(&["Neg"])),
+        build_chain(&["Abs"]),
+    );
+    let inner = graph.create_named_value("inner", DataType::Bool, vec![]);
+    graph.add_input(inner);
+    let mut secondary = AcceleratorEp::new(vec!["Abs", "Neg"]);
+    secondary.device.index = 1;
+    let order = crate::ExecutionProviderOrder::new(accel_slot(0, vec!["Abs"]).provider)
+        .then(Arc::new(secondary));
+    let mut session = crate::InferenceSession::from_graph_with_providers(
+        graph,
+        weights(),
+        Path::new("."),
+        order,
+        None,
+    )
+    .unwrap();
+    assert_eq!(session.device_id(), DeviceId::new(DeviceType::Mlx, 1));
+    assert!(session.heterogeneous_placement_report().is_none());
+    let x = Tensor::from_f32(&[4], &[-1., 2., -3., 4.]).unwrap();
+    let outer = Tensor::from_raw(DataType::Bool, vec![], &[1]).unwrap();
+    for (inner, expected) in [(1, [1., 2., 3., 4.]), (0, [1., -2., 3., -4.])] {
+        let inner = Tensor::from_raw(DataType::Bool, vec![], &[inner]).unwrap();
+        let output = session
+            .run(&[("x", &x), ("outer", &outer), ("inner", &inner)])
+            .unwrap();
+        assert_eq!(output[0].to_vec_f32(), expected);
+    }
+}
+
+#[test]
+fn ordered_executor_uses_explicit_fallback_for_an_unsplittable_sequence_graph() {
+    let mut graph = build_chain(&["Neg"]);
+    let value = graph.outputs[0];
+    let sequence = graph.create_value(DataType::Float32, vec![]);
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "SequenceConstruct",
+        vec![Some(value)],
+        vec![sequence],
+    ));
+    let output = graph.create_named_value("len", DataType::Int64, vec![]);
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "SequenceLength",
+        vec![Some(sequence)],
+        vec![output],
+    ));
+    graph.set_outputs(vec![output]);
+    let order = || {
+        crate::ExecutionProviderOrder::new(accel_slot(0, vec![]).provider)
+            .then(accel_slot(1, vec![]).provider)
+    };
+    let error =
+        Executor::build_ordered_with_mode(graph.clone(), weights(), order(), false, true, None)
+            .err()
+            .expect("an ineligible split must not introduce an implicit CPU provider");
+    assert!(matches!(
+        error,
+        crate::error::SessionError::OrderedProviderDeclined { .. }
+    ));
+    let mut executor = Executor::build_ordered_with_mode(
+        graph,
+        weights(),
+        order(),
+        false,
+        true,
+        Some(cpu_slot(2).provider),
+    )
+    .unwrap();
+    assert_eq!(executor.device_id(), DeviceId::cpu());
+    assert!(executor.heterogeneous_placement_report().is_none());
+    let x = Tensor::from_f32(&[4], &[1., 2., 3., 4.]).unwrap();
+    assert_eq!(
+        executor.run(&[("x", &x)]).unwrap()[0].as_bytes(),
+        &1_i64.to_ne_bytes()
+    );
+}
+
+#[test]
 fn ordered_executor_splits_across_explicit_providers_and_cpu_only_when_enabled() {
     use crate::ExecutionProviderOrder;
 
@@ -1657,7 +1819,7 @@ fn control_flow_and_sequence_fail_during_planning() {
 
     let sequence = build_chain(&["SequenceEmpty"]);
     let error = plan(&sequence, &providers).unwrap_err().to_string();
-    assert!(error.contains("sequence"), "{error}");
+    assert!(error.contains("structural container operator"), "{error}");
     assert!(error.contains("SequenceEmpty"), "{error}");
 }
 
@@ -1672,6 +1834,22 @@ fn view_producing_kernel_is_rejected_before_partition_execution() {
         .to_string();
     assert!(error.contains("Transpose"), "{error}");
     assert!(error.contains("aliased/view output"), "{error}");
+}
+
+#[test]
+fn transpose_packed_cpu_is_admitted_by_heterogeneous_preflight() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 25);
+    let x = graph.create_named_value("x", DataType::Uint2, static_shape([3, 5]));
+    let y = graph.create_named_value("y", DataType::Uint2, static_shape([5, 3]));
+    graph.add_input(x);
+    graph.insert_node(Node::new(NodeId(0), "Transpose", vec![Some(x)], vec![y]));
+    graph.add_output(y);
+    let providers = vec![cpu_slot(0)];
+    let packed = Tensor::from_raw(DataType::Uint2, vec![3, 5], &[0xac, 0xc1, 0x1a, 0xec]).unwrap();
+    let plan = plan(&graph, &providers).unwrap();
+    let outputs = execute(&plan, &graph, &weights(), &providers, &[("x", &packed)]).unwrap();
+    assert_eq!(outputs[0].as_bytes(), &[0xd0, 0xe0, 0xe8, 0x29]);
 }
 
 #[test]

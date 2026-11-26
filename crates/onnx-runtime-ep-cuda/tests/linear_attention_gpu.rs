@@ -27,6 +27,8 @@
 //! unless `gpu-tests` is enabled.
 
 mod common;
+#[path = "fixtures/linear_attention29.rs"]
+mod linear_attention29;
 
 use common::{
     Tensor, assert_close, build_graph, decode_floats, encode_floats, float_input, require_cuda,
@@ -368,6 +370,51 @@ fn configs() -> Vec<Config> {
             beta_shared: false,
             with_past: true,
         },
+        Config {
+            label: "gated_delta/caller-state-dk257",
+            batch: 1,
+            seq: 2,
+            d_k: 257,
+            d_v: 7,
+            q_num_heads: 2,
+            kv_num_heads: 2,
+            n_k_heads: 2,
+            update_rule: "gated_delta",
+            scale: 0.1,
+            decay_per_key_dim: false,
+            beta_shared: false,
+            with_past: true,
+        },
+        Config {
+            label: "linear/caller-state-no-past-dk321",
+            batch: 1,
+            seq: 1,
+            d_k: 321,
+            d_v: 5,
+            q_num_heads: 2,
+            kv_num_heads: 2,
+            n_k_heads: 2,
+            update_rule: "linear",
+            scale: 0.1,
+            decay_per_key_dim: false,
+            beta_shared: false,
+            with_past: false,
+        },
+        Config {
+            label: "linear/zero-sequence-caller-state",
+            batch: 1,
+            seq: 0,
+            d_k: 257,
+            d_v: 3,
+            q_num_heads: 2,
+            kv_num_heads: 2,
+            n_k_heads: 2,
+            update_rule: "linear",
+            scale: 0.1,
+            decay_per_key_dim: false,
+            beta_shared: false,
+            with_past: true,
+        },
     ]
 }
 
@@ -469,152 +516,46 @@ fn opset27_linear_attention_optional_slots_and_mixed_state() {
     }
 }
 
-fn check_opset29_cases(
-    run: impl Fn(&[Tensor], &[(DataType, Vec<usize>)], &[(&str, Attribute)]) -> Vec<Vec<u8>>,
-) {
-    // Frozen upstream ONNX input/output vectors; regeneration lives next to the fixture.
-    let mut bytes = include_bytes!("fixtures/linear_attention29.bin").as_slice();
-    let mut count = 0;
-    while !bytes.is_empty() {
-        let (&[name_len, rule_len, num_outputs], rest) = bytes.split_first_chunk().unwrap();
-        let (name, rest) = rest.split_at(name_len.into());
-        let label = std::str::from_utf8(name).unwrap();
-        let (rule, rest) = rest.split_at(rule_len.into());
-        let (&[hq, hk, hv], rest) = rest.split_first_chunk().unwrap();
-        bytes = rest;
-        let attrs = [
-            ("q_num_heads", Attribute::Int(hq.into())),
-            ("kv_num_heads", Attribute::Int(hk.into())),
-            ("v_num_heads", Attribute::Int(hv.into())),
-            ("update_rule", Attribute::String(rule.to_vec())),
-        ];
-        let mut read_tensor = || {
-            let (&rank, rest) = bytes.split_first().unwrap();
-            if rank == 0 {
-                bytes = rest;
-                return common::absent_input(DataType::Float16);
-            }
-            let (&width, rest) = rest.split_first().unwrap();
-            let dtype = match width {
-                2 => DataType::Float16,
-                4 => DataType::Float32,
-                _ => panic!("invalid fixture element width {width}"),
-            };
-            let (shape, rest) = rest.split_at(rank.into());
-            let shape = shape.iter().map(|&d| usize::from(d)).collect::<Vec<_>>();
-            let (data, rest) = rest.split_at(dtype.storage_bytes(shape.iter().product()));
-            bytes = rest;
-            Tensor {
-                dtype,
-                shape,
-                bytes: data.to_vec(),
-                absent: false,
-            }
-        };
-        let inputs = (0..6).map(|_| read_tensor()).collect::<Vec<_>>();
-        let expected = (0..num_outputs).map(|_| read_tensor()).collect::<Vec<_>>();
-        let outputs = expected
-            .iter()
-            .map(|t| (t.dtype, t.shape.clone()))
-            .collect::<Vec<_>>();
-        let got = run(&inputs, &outputs, &attrs);
-        assert_eq!(got.len(), expected.len(), "{label}");
-        for (i, (actual, expected)) in got.iter().zip(&expected).enumerate() {
-            let tol = if expected.dtype == DataType::Float16 {
-                2e-3
-            } else {
-                5e-6
-            };
-            assert_close(
-                &format!("{label} output {i}"),
-                expected.dtype,
-                &decode_floats(actual, expected.dtype),
-                &decode_floats(&expected.bytes, expected.dtype),
-                tol,
-            );
-        }
-        if let [_, present, states] = got.as_slice() {
-            let [batch, seq, ..] = expected[2].shape.as_slice() else {
-                unreachable!()
-            };
-            if *seq > 0 {
-                let per_batch = present.len() / batch;
-                for (b, state) in present.chunks_exact(per_batch).enumerate() {
-                    let end = (b + 1) * seq * per_batch;
-                    assert_eq!(
-                        &states[end - per_batch..end],
-                        state,
-                        "{label}: final snapshot"
-                    );
-                }
-            }
-        }
-        count += 1;
-    }
-    assert_eq!(count, 11);
-
-    // V29 also supports legacy GQA, per-key decay, broadcast beta, no past
-    // state, and tracks snapshots in the activation dtype when S is omitted.
-    let dtype = DataType::BFloat16;
-    let inputs = [
-        float_input(
-            dtype,
-            &[1, 2, 8],
-            &[
-                1., 0., 0., 1., 1., 0., 0., 1., 1., 1., 2., 1., 1., 1., 1., 2.,
-            ],
-        ),
-        float_input(dtype, &[1, 2, 4], &[1., 0., 1., 0., 0., 1., 0., 1.]),
-        float_input(dtype, &[1, 2, 2], &[4., 6., 8., 10.]),
-        common::absent_input(dtype),
-        float_input(
-            dtype,
-            &[1, 2, 4],
-            &[0., 0., 0., 0., f32::NEG_INFINITY, 0., 0., 0.],
-        ),
-        float_input(dtype, &[1, 2, 1], &[0.5, 0.5]),
-    ];
-    let outputs = [
-        (dtype, vec![1, 2, 4]),
-        (dtype, vec![1, 2, 2, 1]),
-        (dtype, vec![1, 2, 2, 2, 1]),
-    ];
-    let attrs = [
-        ("q_num_heads", Attribute::Int(4)),
-        ("kv_num_heads", Attribute::Int(2)),
-        ("v_num_heads", Attribute::Int(0)),
-        ("scale", Attribute::Float(1.0)),
-        ("chunk_size", Attribute::Int(1)),
-    ];
-    let got = run(&inputs, &outputs, &attrs);
-    for (bytes, expected) in got.iter().zip([
-        &[2., 0., 3., 0., 4., 4., 8., 13.][..],
-        &[0., 4., 3., 5.],
-        &[2., 0., 3., 0., 0., 4., 3., 5.],
-    ]) {
-        assert_eq!(decode_floats(bytes, dtype), expected);
-    }
-}
-
-#[cfg_attr(
-    not(feature = "gpu-tests"),
-    ignore = "CUDA suite; this case runs on CPU"
-)]
-#[test]
-fn linear_attention_29_cpu_onnx_conformance() {
-    check_opset29_cases(|inputs, outputs, attrs| {
-        run_cpu("LinearAttention", "", 29, inputs, outputs, attrs)
-    });
-}
-
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA")]
 #[test]
 fn linear_attention_29_cuda_onnx_conformance() {
     let ep = require_cuda();
-    check_opset29_cases(|inputs, outputs, attrs| {
+    linear_attention29::check_opset29_cases(|inputs, outputs, attrs| {
         run_cuda(&ep, "LinearAttention", "", 29, inputs, outputs, attrs)
     });
     check_opset29_rejects_aliased_trajectory(&ep);
+    check_opset29_trajectory_with_caller_workspace(&ep);
+}
+
+fn check_opset29_trajectory_with_caller_workspace(ep: &CudaExecutionProvider) {
+    let dtype = DataType::Float32;
+    let d_k = 257;
+    let mut basis = vec![0.0; d_k];
+    basis[d_k - 1] = 1.0;
+    let inputs = [
+        float_input(dtype, &[1, 1, d_k], &basis),
+        float_input(dtype, &[1, 1, d_k], &basis),
+        float_input(dtype, &[1, 1, 2], &[2., 3.]),
+    ];
+    let outputs = [
+        (dtype, vec![1, 1, 2]),
+        (dtype, vec![1, 2, d_k, 1]),
+        (dtype, vec![1, 1, 2, d_k, 1]),
+    ];
+    let attrs = [
+        ("q_num_heads", Attribute::Int(1)),
+        ("kv_num_heads", Attribute::Int(1)),
+        ("v_num_heads", Attribute::Int(2)),
+        ("scale", Attribute::Float(1.0)),
+        ("update_rule", Attribute::String(b"linear".to_vec())),
+    ];
+    let got = run_cuda(ep, "LinearAttention", "", 29, &inputs, &outputs, &attrs);
+    let mut state = vec![0.0; 2 * d_k];
+    state[d_k - 1] = 2.0;
+    state[2 * d_k - 1] = 3.0;
+    assert_eq!(decode_floats(&got[0], dtype), [2., 3.]);
+    assert_eq!(decode_floats(&got[1], dtype), state);
+    assert_eq!(got[2], got[1]);
 }
 
 fn check_opset29_rejects_aliased_trajectory(ep: &CudaExecutionProvider) {
@@ -1107,13 +1048,19 @@ fn linear_attention_state_carry_matches_chained() {
 )]
 #[test]
 fn linear_attention_capture_replay_preserves_in_place_recurrent_state() {
+    for d_k in [5, 257] {
+        capture_recurrent_state_with_workspace(d_k);
+    }
+}
+
+fn capture_recurrent_state_with_workspace(d_k: usize) {
     let ep = require_cuda();
     let runtime = ep.runtime();
     let cfg = Config {
         label: "capture-in-place-state",
         batch: 1,
         seq: 1,
-        d_k: 5,
+        d_k,
         d_v: 4,
         q_num_heads: 2,
         kv_num_heads: 2,
@@ -1243,12 +1190,24 @@ fn linear_attention_capture_replay_preserves_in_place_recurrent_state() {
         runtime.htod(bytes, cuptr(buffer.as_ptr())).unwrap();
     };
 
-    kernel
-        .execute(&captured_views, &mut captured_outputs)
-        .unwrap();
-    eager_kernel
-        .execute(&eager_views, &mut eager_outputs)
-        .unwrap();
+    let mut captured_workspace = None;
+    let mut eager_workspace = None;
+    common::execute_kernel(
+        &ep,
+        kernel.as_ref(),
+        &captured_views,
+        &mut captured_outputs,
+        &mut captured_workspace,
+    )
+    .unwrap();
+    common::execute_kernel(
+        &ep,
+        eager_kernel.as_ref(),
+        &eager_views,
+        &mut eager_outputs,
+        &mut eager_workspace,
+    )
+    .unwrap();
     assert_eq!(
         read(&captured_inputs[3], state_bytes),
         read(&eager_inputs[3], state_bytes),
@@ -1257,9 +1216,24 @@ fn linear_attention_capture_replay_preserves_in_place_recurrent_state() {
 
     let allocation_counts = runtime.allocation_counts();
     let kernels = [kernel.as_ref()];
-    runtime.begin_graph_capture(&kernels).unwrap();
+    let resources = captured_workspace
+        .as_ref()
+        .map(|owner| {
+            owner
+                .device_graph_resource()
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let workspace = captured_workspace.as_mut().map(|owner| {
+        onnx_runtime_ep_api::WorkspaceView::new(DevicePtrMut(owner.as_mut_ptr()), owner.len())
+    });
+    runtime
+        .begin_graph_capture_with_resources(&kernels, resources)
+        .unwrap();
     kernel
-        .execute(&captured_views, &mut captured_outputs)
+        .execute_with_workspace(&captured_views, &mut captured_outputs, workspace)
         .unwrap();
     runtime.end_graph_capture().unwrap();
 
@@ -1274,9 +1248,14 @@ fn linear_attention_capture_replay_preserves_in_place_recurrent_state() {
             overwrite(&captured_inputs[index], &replacement.bytes);
             overwrite(&eager_inputs[index], &replacement.bytes);
         }
-        eager_kernel
-            .execute(&eager_views, &mut eager_outputs)
-            .unwrap();
+        common::execute_kernel(
+            &ep,
+            eager_kernel.as_ref(),
+            &eager_views,
+            &mut eager_outputs,
+            &mut eager_workspace,
+        )
+        .unwrap();
         runtime.replay_graph().unwrap();
         assert_eq!(
             read(&captured_output, output_bytes),
@@ -1294,6 +1273,9 @@ fn linear_attention_capture_replay_preserves_in_place_recurrent_state() {
     assert!(runtime.reset_graph().unwrap());
     drop(captured_outputs);
     drop(eager_outputs);
+    for workspace in [captured_workspace, eager_workspace].into_iter().flatten() {
+        ep.deallocate_workspace(workspace).unwrap();
+    }
     for buffer in captured_inputs {
         ep.deallocate(buffer).unwrap();
     }

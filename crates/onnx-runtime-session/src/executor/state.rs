@@ -575,6 +575,8 @@ pub(crate) struct Executor {
     /// non-growing, not unified with a growing one) is absent from this set, so
     /// ops carrying it stay capturable — preserving the 154→34 collapse.
     pub(super) capture_growing_symbols: HashSet<SymbolId>,
+    /// Independent positive growth evidence, refreshed with capacity pinning.
+    pub(super) kernel_shape_facts: Vec<KernelShapeFacts>,
     /// KV sequence-axis symbols pinned CONSTANT to their bound physical capacity
     /// by [`Self::pin_fixed_capacity_kv_capture_symbols`] once the engine has
     /// bound fixed-capacity, device-valid-length KV (see
@@ -602,6 +604,8 @@ pub(crate) struct Executor {
     /// build; these values own no [`DeviceBuffer`] and are skipped by buffer
     /// sizing — their storage lives in [`Self::sequences`] at run time.
     pub(super) sequence_values: HashSet<ValueId>,
+    pub(super) optional_values: HashMap<ValueId, super::optional_ops::PayloadKind>,
+    pub(super) optionals: HashMap<ValueId, Option<super::optional_ops::OptionalPayload>>,
     /// Most recent activation-memory planner result from a measured top-level
     /// eager run once shapes and view aliases are concrete. Stage-2 replay and
     /// nested runs skip re-planning and leave this as the last measured top-level
@@ -778,10 +782,12 @@ pub(crate) struct Executor {
 }
 
 /// One successful metadata-only plan, scoped to this immutable executor graph.
-/// Shapes are derived solely from graph/weight metadata and these symbols;
+/// Bounds also depend on the provider execution context. Shapes are derived
+/// from graph/weight metadata and these symbols;
 /// growing-symbol classification supplies the remaining capacity-bound input.
 /// Store peaks, never borrowed addresses or admission/ownership proofs.
 pub(super) struct WorkspacePreparationMemo {
+    pub(super) context: onnx_runtime_ep_api::WorkspaceContextKey,
     pub(super) output_bindings: WorkspaceOutputBindings,
     pub(super) symbols: HashMap<SymbolId, usize>,
     pub(super) growing_symbols: HashSet<SymbolId>,

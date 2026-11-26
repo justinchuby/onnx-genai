@@ -1,0 +1,33 @@
+{
+  "base": "ea255b9be1bb9937b86ff27d54c89c5193021643",
+  "command": [
+    "cargo",
+    "build",
+    "--offline",
+    "--release",
+    "-p",
+    "onnx-runtime-ep-cpu",
+    "--example",
+    "nxrt_im2col_spans",
+    "--message-format=json-render-diagnostics"
+  ],
+  "compiler": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "source_sha256": {
+    "before.rs": "56b5bf1de760e2d366dcac344d51f1c81a43dd32c1626ac5cf6bdd9d7bc95c53",
+    "after.rs": "03c927d43acc16c7f1adc52de3df8476225d172a2ddd29f2bc5271ffcecd103f",
+    "probe.rs": "6114311d3977eb2d526ca7a6d29be2f0feffa022b57fd02b20afcea554a1dfd1"
+  },
+  "binary_sha256": "27a359ad1b2e8b00fe269c2bb64ea4cca564a294882b8ee03c537f3dfe925bf7",
+  "module_before_sha256": "d789d04a9b1c4d2a1057d531292ff55734df24787ffa830befb9dcf216e29865",
+  "temporary_registration": "pub module compiles frozen pre-change source alongside production after source; default backend for both",
+  "environment_overrides": {
+    "RAYON_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+    "CARGO_TARGET_DIR": "/tmp/nxrt-erf-nan-target"
+  },
+  "temporary_module_and_example_removed": true,
+  "pre_measurement_harness_repairs": [
+    "Hardware sysctl collected separately after sandbox denial; no child launched.",
+    "Copied probe mode corrected to 0755; binary SHA unchanged; no child launched."
+  ]
+}

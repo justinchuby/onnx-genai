@@ -50,8 +50,10 @@
 //! That is a statement about the *built-in* mechanism only. The
 //! [`DeviceAllocator`] contract is untouched: a caller who wants `cuMemAlloc`,
 //! a BFC arena, or anything else writes it and injects it through
-//! `CudaExecutionProvider::with_memory`, exactly as the CPU EP and ONNX
-//! Runtime's governed allocator already allow.
+//! construction input `CudaProviderConfig::memory`. The selected allocator is
+//! registered once; no spare built-in arena is created and the completed
+//! provider cannot replace it. CPU and ONNX Runtime allocators also use the
+//! same `DeviceAllocator` contract.
 //!
 //! [`DeviceAllocator`]: onnx_runtime_memory_api::DeviceAllocator
 //!

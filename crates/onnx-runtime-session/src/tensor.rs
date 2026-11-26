@@ -35,6 +35,55 @@ use onnx_runtime_ir::{DataType, DeviceId, TensorLayout, checked_expected_bytes, 
 use crate::error::{Result, SessionError};
 use crate::sequence::{SequenceError, SequenceResult, clone_shape};
 
+/// Copy a validated range of fixed-width elements between contiguous buffers.
+/// Packed elements are low-bit first, and bits outside the destination range
+/// (including its padding) are left intact.
+pub(crate) fn copy_storage_elements(
+    dtype: DataType,
+    src: &[u8],
+    src_start: usize,
+    dst: &mut [u8],
+    dst_start: usize,
+    count: usize,
+) {
+    if count == 0 {
+        return;
+    }
+    let width = dtype.byte_size();
+    if width != 0 {
+        let src_start = src_start * width;
+        let dst_start = dst_start * width;
+        let n = count * width;
+        dst[dst_start..dst_start + n].copy_from_slice(&src[src_start..src_start + n]);
+        return;
+    }
+
+    let bits = dtype.bit_size();
+    debug_assert!((1..8).contains(&bits));
+    // Split the offset to avoid multiplying a potentially large element index
+    // by the bit width before dividing by eight.
+    let position = |index: usize| {
+        let partial = (index % 8) * bits;
+        (index / 8 * bits + partial / 8, partial % 8)
+    };
+    let mask = (1u16 << bits) - 1;
+    for offset in 0..count {
+        let (source, shift) = position(src_start + offset);
+        let mut word = u16::from(src[source]);
+        if shift + bits > 8 {
+            word |= u16::from(src[source + 1]) << 8;
+        }
+        let lane = (word >> shift) & mask;
+        let (target, shift) = position(dst_start + offset);
+        let target_mask = mask << shift;
+        let value = lane << shift;
+        dst[target] = (dst[target] & !(target_mask as u8)) | value as u8;
+        if shift + bits > 8 {
+            dst[target + 1] = (dst[target + 1] & !((target_mask >> 8) as u8)) | (value >> 8) as u8;
+        }
+    }
+}
+
 /// A process-wide, already-initialized CPU execution provider used to back
 /// user-constructed [`Tensor`]s (host `malloc`/`free` is global, so any
 /// `CpuExecutionProvider` can free any other's CPU allocation).

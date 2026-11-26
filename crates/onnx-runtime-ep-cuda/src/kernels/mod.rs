@@ -53,6 +53,7 @@ pub mod constant;
 pub mod constant_of_shape;
 pub mod conv;
 pub mod conv_transpose;
+mod conv_transpose_ort;
 pub mod csa_checkpoint;
 mod csa_layout;
 pub mod csa_state_group;
@@ -95,6 +96,7 @@ pub mod log_softmax;
 pub mod marlin_gemm;
 pub mod matmul;
 pub mod matmul_nbits;
+mod mean_variance_normalization;
 mod metadata_workspace;
 pub mod mod_op;
 pub mod movement;
@@ -121,6 +123,7 @@ pub mod quantization;
 pub mod range;
 pub mod reduce;
 pub mod resize;
+mod roi_align;
 pub mod rotary_embedding;
 pub mod shape;
 pub mod size;
@@ -170,7 +173,8 @@ use pointwise::{
 ///   fallback) plus NVRTC `ReduceMax`/`ReduceMin`, and the f32 NVRTC family
 ///   `ReduceProd`, `ReduceSumSquare`, `ReduceL1`, `ReduceL2`, `ReduceLogSum`,
 ///   `ReduceLogSumExp`; arbitrary axes and keepdims.
-/// * **Pooling** — cuDNN `MaxPool`/`AveragePool` for 2-D NCHW f32/f16/bf16.
+/// * **Pooling** — cuDNN `MaxPool`/undilated `AveragePool` for 2-D NCHW;
+///   NVRTC for dilated N-D `AveragePool` and `LpPool`.
 /// * **Pointwise unary math** — `Abs`, `Neg`, `Reciprocal`, `Exp`, `Log`,
 ///   `Sign`, `Floor`, `Ceil`, `Round`, `Sin`, `Cos`, `Softplus`, and the
 ///   trigonometric/hyperbolic family `Tan`, `Sinh`, `Cosh`, `Asin`, `Acos`,
@@ -390,6 +394,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "LpNormalization",
     "InstanceNormalization",
     "GroupNormalization",
+    "MeanVarianceNormalization",
     "CenterCropPad",
     "Col2Im",
     "QLinearMatMul",
@@ -397,6 +402,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "ConvTranspose",
     "DeformConv",
     "GridSample",
+    "RoiAlign",
     "GatherBlockQuantized",
     "CausalConvWithState",
     "LinearAttention",
@@ -532,8 +538,8 @@ static CUDA_ATTENTION_DTYPES: &[DataType] = &[
     DataType::Int64,
 ];
 
-/// Bounded CUDA Unique consumes f32 and returns f32 Y plus i64 metadata.
-static CUDA_UNIQUE_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
+/// Bounded CUDA Unique preserves the input dtype and produces i64 metadata.
+static CUDA_UNIQUE_DTYPES: &[DataType] = &[DataType::Float32, DataType::BFloat16, DataType::Int64];
 static CUDA_NMS_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
 static CUDA_EINSUM_DTYPES: &[DataType] = &[
     DataType::Float16,
@@ -571,6 +577,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
         ("Einsum", "") => CUDA_EINSUM_DTYPES,
         ("DeformConv", "") => onnx_runtime_ir::deform_conv::DTYPES,
+        ("RoiAlign", "") => onnx_runtime_ir::roi_align::DTYPES,
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::DTYPES,
         ("DequantizePackedGather", onnx_runtime_ir::RUNTIME_DOMAIN) => &[
             DataType::Uint8,
@@ -631,6 +638,8 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("DsaIndexSelect", _)
         | ("LinearAttention", _) => CUDA_ATTENTION_DTYPES,
 
+        ("Transpose", "") => onnx_runtime_ir::transpose::DTYPES,
+
         // Byte-mover / structural ops: dtype-agnostic (copy/select, no
         // arithmetic on the values). Must advertise the full set so an integer
         // `Cast`/`Gather`/`Shape` in a partition does not sink it.
@@ -643,7 +652,6 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("Concat", _)
         | ("Slice", _)
         | ("Split", _)
-        | ("Transpose", _)
         | ("Gather", _)
         | ("GatherElements", _)
         | ("GatherND", _)
@@ -668,6 +676,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("CastLike", _)
         | ("TopK", _)
         | ("EyeLike", _) => CUDA_ALL_DTYPES,
+        ("MeanVarianceNormalization", "") => onnx_runtime_ep_api::mean_variance_normalization::DTYPES,
         ("Range", "") => &[
             DataType::Float32, DataType::Float64, DataType::Float16, DataType::BFloat16,
             DataType::Int16, DataType::Int32, DataType::Int64,
@@ -724,16 +733,16 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
 
 /// Derive plugin kernel-registry descriptors from the real CUDA [`OpRegistry`].
 ///
-/// One descriptor per registered `(op_type, domain, since_version)` key, with
+/// One descriptor per plugin-eligible `(op_type, domain, since_version)` key, with
 /// the domain taken verbatim from the registry (so `com.microsoft` kernels are
 /// advertised in `com.microsoft`, not the default domain) and dtypes from
-/// [`cuda_supported_dtypes_for_op`]. Building the registry only constructs
-/// factory structs holding `Arc` clones of `runtime` — no cuBLASLt/NVRTC work —
-/// so this is cheap to call once at factory construction.
-pub fn build_cuda_registry_descriptors(runtime: Arc<CudaRuntime>) -> Vec<CudaOpDescriptor> {
-    let registry = build_cuda_registry(runtime);
+/// [`cuda_supported_dtypes_for_op`]. The caller supplies its actual dispatch
+/// registry so the advertised kernel versions match the constructed provider.
+pub fn build_cuda_registry_descriptors(registry: &OpRegistry) -> Vec<CudaOpDescriptor> {
     let mut descriptors: Vec<CudaOpDescriptor> = registry
         .keys()
+        // RoiAlign is currently supported only in standalone nxrt.
+        .filter(|key| !(key.op_type == "RoiAlign" && key.domain.is_empty()))
         .map(|key| CudaOpDescriptor {
             op_type: key.op_type.clone(),
             domain: key.domain.clone(),
@@ -777,6 +786,20 @@ pub fn build_cuda_registry_with_metrics(
     runtime: Arc<CudaRuntime>,
     csa_metrics: Arc<csa_checkpoint::CsaMetrics>,
     telemetry_registry: Arc<qmoe::RouteTelemetrySourceRegistry>,
+) -> OpRegistry {
+    build_cuda_registry_for_contract(
+        runtime,
+        csa_metrics,
+        telemetry_registry,
+        conv_transpose::Contract::Standalone,
+    )
+}
+
+pub(crate) fn build_cuda_registry_for_contract(
+    runtime: Arc<CudaRuntime>,
+    csa_metrics: Arc<csa_checkpoint::CsaMetrics>,
+    telemetry_registry: Arc<qmoe::RouteTelemetrySourceRegistry>,
+    conv_transpose_contract: conv_transpose::Contract,
 ) -> OpRegistry {
     let mut reg = OpRegistry::new();
     reg.register(
@@ -1005,6 +1028,15 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
+    reg.register(
+        OpKey::new("MeanVarianceNormalization", "", 29),
+        onnx_runtime_ep_api::WorkspacePlanning::None,
+        Box::new(
+            mean_variance_normalization::MeanVarianceNormalizationFactory {
+                runtime: runtime.clone(),
+            },
+        ),
+    );
     for since_version in [18, 21] {
         reg.register(
             OpKey::new("GroupNormalization", "", since_version),
@@ -1125,13 +1157,13 @@ pub fn build_cuda_registry_with_metrics(
             since_version: 11,
         }),
     );
-    reg.register(
-        OpKey::new("ConvTranspose", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(conv_transpose::ConvTransposeFactory {
-            runtime: runtime.clone(),
-        }),
-    );
+    for &since_version in conv_transpose_contract.versions() {
+        reg.register(
+            OpKey::new("ConvTranspose", "", since_version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            conv_transpose_contract.factory(runtime.clone(), since_version),
+        );
+    }
     for version in [19, 22] {
         reg.register(
             OpKey::new("DeformConv", "", version),
@@ -1152,12 +1184,20 @@ pub fn build_cuda_registry_with_metrics(
             }),
         );
     }
+    for version in onnx_runtime_ir::roi_align::VERSIONS {
+        reg.register(
+            OpKey::new("RoiAlign", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+            Box::new(roi_align::Factory(runtime.clone(), version)),
+        );
+    }
     for version in [13, 22] {
         reg.register(
             OpKey::new("Dropout", "", version),
             onnx_runtime_ep_api::WorkspacePlanning::None,
             Box::new(dropout::DropoutFactory {
                 runtime: runtime.clone(),
+                opset: version,
             }),
         );
     }
@@ -1361,7 +1401,7 @@ pub fn build_cuda_registry_with_metrics(
     );
     reg.register(
         OpKey::new("LinearAttention", "com.microsoft", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(linear_attention::LinearAttentionFactory {
             runtime: runtime.clone(),
         }),
@@ -1369,18 +1409,24 @@ pub fn build_cuda_registry_with_metrics(
     reg.register_through(
         OpKey::new("LinearAttention", "", 27),
         28,
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(linear_attention::LinearAttentionFactory {
             runtime: runtime.clone(),
         }),
     );
-    reg.register(
-        OpKey::new("LinearAttention", "", 29),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(linear_attention::LinearAttentionFactory {
-            runtime: runtime.clone(),
-        }),
-    );
+    // Both operators use the registry profile selected by the CUDA provider constructor.
+    if matches!(
+        conv_transpose_contract,
+        conv_transpose::Contract::Standalone
+    ) {
+        reg.register(
+            OpKey::new("LinearAttention", "", 29),
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+            Box::new(linear_attention::LinearAttentionFactory {
+                runtime: runtime.clone(),
+            }),
+        );
+    }
     reg.register(
         OpKey::new("QMoE", "com.microsoft", 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
@@ -1493,9 +1539,19 @@ pub fn build_cuda_registry_with_metrics(
             Box::new(pooling::PoolFactory {
                 kind,
                 runtime: runtime.clone(),
+                average_supports_dilation: false,
             }),
         );
     }
+    reg.register(
+        OpKey::new("AveragePool", "", 19),
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+        Box::new(pooling::PoolFactory {
+            kind: pooling::PoolKind::Average,
+            runtime: runtime.clone(),
+            average_supports_dilation: true,
+        }),
+    );
     reg.register(
         OpKey::new("LpPool", "", 18),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
@@ -2043,7 +2099,7 @@ mod tests {
 
     use super::{
         CUDA_COVERED_OPS, CUDA_DFT_DTYPES, CUDA_FLOAT_DTYPES, CUDA_NMS_DTYPES, CUDA_STFT_DTYPES,
-        build_cuda_registry_descriptors, cuda_supported_dtypes_for_op,
+        build_cuda_registry, build_cuda_registry_descriptors, cuda_supported_dtypes_for_op,
     };
 
     fn coverage_matrix(doc: &str) -> &str {
@@ -2186,7 +2242,7 @@ mod tests {
         );
     }
 
-    /// Every advertised CUDA name must appear in the current matrix, not only
+    /// Every standalone CUDA name must appear in the current matrix, not only
     /// in a historical wave note elsewhere in the document.
     #[test]
     fn every_cuda_covered_op_is_named_in_current_coverage_matrix() {
@@ -2247,10 +2303,10 @@ mod tests {
             crate::runtime::CudaRuntime::new(0)
                 .expect("CUDA registry census requires a usable CUDA device 0"),
         );
-        let descriptors = build_cuda_registry_descriptors(runtime);
-        let pairs: BTreeSet<(String, String)> = descriptors
-            .into_iter()
-            .map(|descriptor| (descriptor.domain, descriptor.op_type))
+        let registry = build_cuda_registry(runtime);
+        let pairs: BTreeSet<(String, String)> = registry
+            .keys()
+            .map(|key| (key.domain.clone(), key.op_type.clone()))
             .collect();
         assert!(
             !pairs.is_empty(),
@@ -2325,6 +2381,37 @@ mod tests {
             dual_domain.len(),
             dual_domain,
             cpu_only
+        );
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn cuda_plugin_descriptors_exclude_standalone_roi_align() {
+        let runtime = std::sync::Arc::new(
+            crate::runtime::CudaRuntime::new(0)
+                .expect("CUDA plugin descriptor test requires a usable CUDA device 0"),
+        );
+        let registry = build_cuda_registry(runtime);
+        assert!(
+            registry.keys().any(|key| {
+                key.op_type == "RoiAlign" && matches!(key.domain.as_str(), "" | "ai.onnx")
+            }),
+            "standalone CUDA registry must contain ONNX RoiAlign before testing plugin exclusion"
+        );
+        let descriptors = build_cuda_registry_descriptors(&registry);
+        assert!(
+            !descriptors.is_empty(),
+            "CUDA plugin descriptors unexpectedly empty; exclusion check would be vacuous"
+        );
+        assert!(
+            !descriptors.iter().any(|descriptor| {
+                descriptor.op_type == "RoiAlign"
+                    && matches!(descriptor.domain.as_str(), "" | "ai.onnx")
+            }),
+            "standalone-only ONNX RoiAlign must not be advertised by the CUDA ORT plugin"
         );
     }
 

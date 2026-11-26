@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use onnx_genai_engine::PipelineGenerateRequest;
 use onnx_genai_metadata::{RuntimeInputRole, SemanticInputRole, TensorDimension};
-use onnx_genai_ort::{DataType, PipelineModelDirectory, PipelineModels, Tokenizer, Value};
+use onnx_genai_ort::{DataType, PipelineModelDirectory, PipelineModels, Value};
 
-pub use crate::audio_input::{AudioInputSpec, AudioTensor, preprocess_samples, preprocess_wav};
-pub use crate::image_input::MAX_EXPANDED_PROMPT_TOKENS;
+pub use crate::audio_input::{AudioInputSpec, AudioTensor, preprocess_audio, preprocess_samples};
+pub use crate::media_input::MAX_EXPANDED_PROMPT_TOKENS;
 
 #[derive(Debug, Clone)]
 pub struct VisionInputSpec {
@@ -128,8 +128,10 @@ impl MultimodalInput {
         })
     }
 
-    pub fn from_wav(spec: &AudioInputSpec, bytes: &[u8]) -> anyhow::Result<Self> {
-        if spec.encoded {
+    pub fn from_audio_bytes(spec: &AudioInputSpec, bytes: &[u8]) -> anyhow::Result<Self> {
+        if spec.is_encoded() {
+            onnx_genai_preprocess::audio::decode_audio(bytes)
+                .context("validate encoded audio input before workflow admission")?;
             return Ok(Self {
                 tensors: vec![PreparedTensor::EncodedAudio {
                     name: spec.endpoint.clone(),
@@ -137,7 +139,7 @@ impl MultimodalInput {
                 }],
             });
         }
-        let tensor = preprocess_wav(bytes, spec)?;
+        let tensor = preprocess_audio(bytes, spec)?;
         Ok(Self {
             tensors: vec![PreparedTensor::Audio {
                 name: tensor.endpoint,
@@ -152,7 +154,7 @@ impl MultimodalInput {
         samples: &[f32],
         sample_rate: u32,
     ) -> anyhow::Result<Self> {
-        if spec.encoded {
+        if spec.is_encoded() {
             // The package's own program decodes a container, so a caller that
             // holds bare samples has to hand one back.
             let bytes = crate::audio_input::encode_samples_wav(samples, sample_rate)?;
@@ -199,10 +201,6 @@ impl MultimodalInput {
         }
         Ok(request)
     }
-}
-
-pub fn audio_window_seconds(spec: &AudioInputSpec) -> f32 {
-    spec.n_frames as f32 * 160.0 / 16_000.0
 }
 
 pub fn expansion_token_budget(
@@ -293,37 +291,31 @@ pub fn tokenizer_path(
         .context("workflow package requires tokenizer.json for text convenience APIs")
 }
 
-pub fn audio_decoder_prompt(
-    tokenizer: &Tokenizer,
-    language: Option<&str>,
-) -> anyhow::Result<Vec<u32>> {
-    let mut tokens = vec![
-        tokenizer
-            .token_id("<|startoftranscript|>")
-            .context("tokenizer is missing required '<|startoftranscript|>' token")?,
-    ];
-    if let Some(language) = language.filter(|value| !value.is_empty()) {
-        let token = format!("<|{}|>", language.to_ascii_lowercase());
-        tokens.push(
-            tokenizer
-                .token_id(&token)
-                .with_context(|| format!("missing token '{token}'"))?,
-        );
-    }
-    for token in ["<|transcribe|>", "<|notimestamps|>"] {
-        if let Some(id) = tokenizer.token_id(token) {
-            tokens.push(id);
-        }
-    }
-    Ok(tokens)
-}
-
 pub fn build(directory: &PipelineModelDirectory) -> anyhow::Result<MultimodalSpecs> {
-    derive_specs(
+    if let Some(metadata) = directory.metadata.as_ref()
+        && onnx_genai_metadata::transcription::transcription_contract(metadata)
+            .map_err(anyhow::Error::msg)?
+            .is_some()
+    {
+        // A frame-decoding task owns this encoded input. It is not permission
+        // to feed audio into the generative chat convenience path.
+        return Ok(MultimodalSpecs {
+            vision: None,
+            audio: None,
+        });
+    }
+    let mut specs = derive_specs(
         &directory.spec.workflow,
         directory.preprocessing.as_ref(),
         image_placeholder_token_id(directory.metadata.as_ref()),
-    )
+    )?;
+    if let Some(audio) = &mut specs.audio {
+        audio.transcription =
+            onnx_genai_engine::transcription::generative::GenerativeTranscription::load(
+                &directory.root,
+            )?;
+    }
+    Ok(specs)
 }
 
 /// The token a package declares as its expandable image placeholder.
@@ -441,6 +433,15 @@ fn derive_specs(
             )
         })
         .collect::<Vec<_>>();
+    // A preprocessing program is executable workflow data, not authority for
+    // the chat/audio frontends. Task profiles may own application-sourced
+    // images independently; only runtime Media roles grant these bindings.
+    if media_inputs.is_empty() {
+        return Ok(MultimodalSpecs {
+            vision: None,
+            audio: None,
+        });
+    }
     let encoded_media = media_inputs
         .iter()
         .find(|(_, input)| input.contract.dtype == "uint8" && input.contract.rank() == 1);
@@ -455,75 +456,45 @@ fn derive_specs(
     } else {
         None
     };
-    // Audio binds from whatever the package declares, in one of two shapes.
-    //
-    // A package that owns its own feature extraction declares a
-    // `preprocessing.audio` program and takes rank-1 encoded bytes; the
-    // program's feature output contract states the mel geometry, so the server
-    // reads the bins and window length off it rather than guessing them.
-    //
-    // A package that hands the server an already-featurized log-mel tensor
-    // declares a rank-3 float32 media input instead and no audio program;
-    // there the contract's own shape states the geometry. Either way the
-    // distinguishing fact is a declared contract, never a port name.
-    let audio = match preprocessing.and_then(|p| p.audio.as_ref()) {
-        Some(program) if vision.is_none() => {
-            let (name, _input) = encoded_media
-                .context("preprocessing.audio requires a uint8 rank-1 media workflow input")?;
-            let features = program
-                .outputs
-                .iter()
-                .find(|output| output.content == "audio_features")
-                .context("preprocessing.audio must declare an audio_features output")?;
-            let contract = features.contract.as_ref().with_context(|| {
-                format!(
-                    "preprocessing.audio output '{}' must declare a TensorContract",
-                    features.name
-                )
-            })?;
-            if contract.rank() != 3 {
-                anyhow::bail!(
-                    "preprocessing.audio output '{}' must be rank 3 [batch, mel, frames]",
-                    features.name
-                );
-            }
-            let dimension = |index: usize| {
-                contract.shape.get(index).and_then(|value| match value {
-                    TensorDimension::Fixed(size) => usize::try_from(*size).ok(),
-                    TensorDimension::Symbol(_) | TensorDimension::Any => None,
-                })
-            };
-            let n_mels = dimension(1).context(
-                "preprocessing.audio must declare a concrete mel-bin count in its feature contract",
-            )?;
-            let n_frames = dimension(2).context(
-                "preprocessing.audio must declare a concrete frame count in output \
-                 `audio_features` shape [batch, mel, frames]; symbolic or Any frames cannot \
-                 size the feature tensor",
-            )?;
-            Some(AudioInputSpec::from_encoded_input(
-                (*name).clone(),
-                n_mels,
-                n_frames,
-                None,
-            ))
-        }
-        _ => media_inputs
+    // Encoded input programs execute inside the workflow; feature input programs
+    // execute at this boundary. Both use the same authored DSP and clip admission.
+    let feature_inputs = media_inputs
+        .iter()
+        .filter(|(_, input)| input.contract.dtype == "float32" && input.contract.rank() == 3)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        feature_inputs.len() <= 1,
+        "multiple rank-3 float32 media inputs are ambiguous for one audio attachment; declare one audio feature endpoint or bind media explicitly"
+    );
+    let audio = if let Some((name, input)) = feature_inputs.first() {
+        let program = preprocessing.and_then(|p|p.audio.as_ref()).with_context(||
+            format!("audio feature input '{name}' requires preprocessing.audio; declare its sample rate, analysis transforms and named output instead of relying on a default recipe"))?;
+        let shape = input
+            .contract
+            .shape
             .iter()
-            .find(|(_, input)| input.contract.dtype == "float32" && input.contract.rank() == 3)
-            .map(|(name, input)| {
-                let shape = input
-                    .contract
-                    .shape
-                    .iter()
-                    .map(|dim| match dim {
-                        TensorDimension::Fixed(value) => *value,
-                        TensorDimension::Symbol(_) | TensorDimension::Any => -1,
-                    })
-                    .collect::<Vec<_>>();
-                AudioInputSpec::from_input((*name).clone(), &shape, None)
+            .map(|dim| match dim {
+                TensorDimension::Fixed(value) => *value,
+                _ => -1,
             })
-            .transpose()?,
+            .collect::<Vec<_>>();
+        Some(AudioInputSpec::from_input(
+            (*name).clone(),
+            &shape,
+            program,
+        )?)
+    } else if let Some(program) = preprocessing.and_then(|p| p.audio.as_ref()) {
+        anyhow::ensure!(
+            vision.is_none(),
+            "one encoded media endpoint cannot own both image and audio preprocessing; declare unambiguous inputs"
+        );
+        let (name, _) = encoded_media.context("preprocessing.audio requires a uint8 rank-1 media input or a declared float32 feature input")?;
+        Some(AudioInputSpec::from_encoded_input(
+            (*name).clone(),
+            program,
+        )?)
+    } else {
+        None
     };
 
     Ok(MultimodalSpecs { vision, audio })
@@ -555,6 +526,15 @@ mod media_binding_tests {
         })
     }
 
+    fn feature_program(endpoint: &str, bins: usize, frames: usize) -> PreprocessingSpec {
+        serde_json::from_value(serde_json::json!({"audio":{
+            "transforms":[{"op":"decode","outputs":["raw"]},
+                {"op":"resample","sample_rate":8000,"outputs":["resampled"]},
+                {"op":"pad","mode":"fixed_window","target_length":frames*64,"outputs":["padded"]},
+                {"op":"log_mel","sample_rate":8000,"num_mel_bins":bins,"n_fft":128,"hop_length":64,"win_length":96,"outputs":["mel"]}],
+            "outputs":[{"name":endpoint,"source":"mel","content":"audio_features","dtype":"float32"}]
+        }})).unwrap()
+    }
     #[test]
     fn image_placeholder_comes_from_package_tokenizer_facts() {
         let metadata: InferenceMetadata = serde_json::from_value(serde_json::json!({
@@ -574,23 +554,119 @@ mod media_binding_tests {
 
     #[test]
     fn a_rank_3_float_media_input_binds_the_audio_front_end() {
-        // Whisper-shaped packages take an already-featurized log-mel tensor. The
-        // server owns mel extraction, so the contract's own shape is what states
-        // the geometry it must produce.
+        // Shape binds the result; the authored program owns the analysis math.
         let workflow = workflow(serde_json::json!({
             "audio_features": media(serde_json::json!({
                 "dtype": "float32",
                 "shape": [1, 80, 3000],
             })),
         }));
-        let specs = derive_specs(&workflow, None, None).expect("specs");
+        let specs = derive_specs(
+            &workflow,
+            Some(&feature_program("audio_features", 80, 3000)),
+            None,
+        )
+        .expect("specs");
+        assert!(
+            derive_specs(&workflow, None, None)
+                .unwrap_err()
+                .to_string()
+                .contains("preprocessing.audio")
+        );
         let audio = specs.audio.expect("audio spec");
         assert_eq!(audio.endpoint, "audio_features");
-        assert_eq!(audio.n_mels, 80);
-        assert_eq!(audio.n_frames, 3000);
+        assert_eq!(audio.feature_shape(), Some([1, 80, 3000]));
         assert!(specs.vision.is_none());
     }
 
+    #[test]
+    fn encoded_audio_admission_accepts_waveform_outputs_and_uses_program_windows() {
+        let workflow = workflow(
+            serde_json::json!({"recording":media(serde_json::json!({"dtype":"uint8","shape":["bytes"]}))}),
+        );
+        let preprocessing:PreprocessingSpec=serde_json::from_value(serde_json::json!({"audio":{"transforms":[{"op":"decode","outputs":["raw"]},{"op":"resample","sample_rate":8000,"outputs":["resampled"]},{"op":"trim","target_length":256,"outputs":["wave"]}],"outputs":[{"name":"wave","source":"wave","content":"waveform","dtype":"float32"}]}})).unwrap();
+        let audio = derive_specs(&workflow, Some(&preprocessing), None)
+            .unwrap()
+            .audio
+            .unwrap();
+        assert!(audio.is_encoded());
+        assert!(audio.feature_shape().is_none());
+        assert_eq!(
+            audio.maximum_input_samples(16000).unwrap().unwrap().get(),
+            512
+        );
+    }
+    #[test]
+    fn feature_audio_accepts_arbitrary_positive_mel_counts_and_rejects_missing_geometry() {
+        let declaration = feature_program("features", 7, 4).audio.unwrap();
+        let spec =
+            super::AudioInputSpec::from_input("features".into(), &[1, 7, 4], &declaration).unwrap();
+        let silent = super::preprocess_samples(&[0.0; 512], 16000, &spec).unwrap();
+        let tone = super::preprocess_samples(&[0.5; 512], 16000, &spec).unwrap();
+        assert_eq!(tone.shape, [1, 7, 4]);
+        assert_eq!(tone.data.len(), 28);
+        assert_eq!(
+            spec.maximum_input_samples(44100).unwrap().unwrap().get(),
+            1413
+        );
+        assert!(tone.data.iter().all(|v| v.is_finite()));
+        assert_ne!(tone.data, silent.data);
+        let encoded = onnx_genai_preprocess::audio::encode_wav_f32(&[0.5; 512], 16000, 1).unwrap();
+        let expected = onnx_genai_preprocess::audio::AudioProgram::from_program(&declaration)
+            .unwrap()
+            .run(&[&encoded])
+            .unwrap();
+        let onnx_genai_preprocess::audio::AudioTensorData::Fp32(data) = &expected[0].data else {
+            panic!("features")
+        };
+        assert_eq!(&tone.data, data);
+        let mut wrong = declaration.clone();
+        wrong.outputs[0].name = "unbound".into();
+        assert!(
+            super::AudioInputSpec::from_input("features".into(), &[1, 7, 4], &wrong)
+                .unwrap_err()
+                .to_string()
+                .contains("same name")
+        );
+        let mut wrong = declaration.clone();
+        wrong.outputs[0].content = "waveform".into();
+        assert!(super::AudioInputSpec::from_input("features".into(), &[1, 7, 4], &wrong).is_err());
+        let mut wrong = declaration.clone();
+        wrong.transforms[2].target_length = Some(384);
+        let wrong =
+            super::AudioInputSpec::from_input("features".into(), &[1, 7, 4], &wrong).unwrap();
+        let error = super::preprocess_samples(&[0.5; 512], 16000, &wrong)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("features") && error.contains("shape") && error.contains("geometry"),
+            "{error}"
+        );
+        let mut branched = declaration.clone();
+        branched.transforms.push(serde_json::from_value(serde_json::json!({"op":"trim","target_length":8,"inputs":["resampled"],"outputs":["short"]})).unwrap());
+        branched.outputs.push(serde_json::from_value(serde_json::json!({"name":"unused","source":"short","content":"waveform","dtype":"float32"})).unwrap());
+        let branched =
+            super::AudioInputSpec::from_input("features".into(), &[1, 7, 4], &branched).unwrap();
+        assert_eq!(
+            branched
+                .maximum_input_samples(44100)
+                .unwrap()
+                .unwrap()
+                .get(),
+            1413
+        );
+        assert_eq!(
+            super::preprocess_samples(&[0.5; 512], 16000, &branched)
+                .unwrap()
+                .data,
+            tone.data
+        );
+        for shape in [[1, 0, 4], [1, 7, -1], [2, 7, 4]] {
+            assert!(
+                super::AudioInputSpec::from_input("features".into(), &shape, &declaration).is_err()
+            );
+        }
+    }
     #[test]
     fn capability_free_media_workflow_parses_with_crlf() {
         let authored = workflow(serde_json::json!({
@@ -609,10 +685,14 @@ mod media_binding_tests {
         let reparsed: WorkflowSpec =
             serde_yaml::from_str(&crlf).expect("CRLF capability-free workflow parses");
         assert!(
-            derive_specs(&reparsed, None, None)
-                .expect("media contract is sufficient")
-                .audio
-                .is_some(),
+            derive_specs(
+                &reparsed,
+                Some(&feature_program("audio_features", 80, 3000)),
+                None
+            )
+            .expect("media contract is sufficient")
+            .audio
+            .is_some(),
             "the runtime media input and tensor contract, not a list flag, select audio"
         );
     }
@@ -627,11 +707,16 @@ mod media_binding_tests {
                 "shape": ["Any", "Any", "Any"],
             })),
         }));
-        let error = derive_specs(&workflow, None, None).expect_err("must refuse");
+        let error = derive_specs(
+            &workflow,
+            Some(&feature_program("audio_features", 7, 4)),
+            None,
+        )
+        .expect_err("must refuse");
         let message = format!("{error:#}");
         assert!(
             message.contains("audio_features")
-                && message.contains("80 or 128 mel bins")
+                && message.contains("positive concrete feature dimension")
                 && message.contains("-1"),
             "{message}"
         );

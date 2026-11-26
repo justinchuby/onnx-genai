@@ -305,6 +305,16 @@ impl Default for QLinearMatMulKernel {
 }
 
 impl KernelFactory for QLinearMatMulFactory {
+    fn unsupported_reason(
+        &self,
+        _node: &Node,
+        _opset: u64,
+        shapes: &[onnx_runtime_ir::Shape],
+        input_dtypes: &[DataType],
+    ) -> Option<String> {
+        unsupported_reason(input_dtypes, shapes)
+    }
+
     fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(QLinearMatMulKernel::new(
             self.retain_caches,
@@ -444,10 +454,7 @@ impl QLinearMatMulKernel {
 }
 
 /// Return a claim-time denial for metadata the CPU reference kernel cannot run.
-pub(crate) fn unsupported_reason(
-    input_dtypes: &[DataType],
-    input_shapes: &[Shape],
-) -> Option<String> {
+fn unsupported_reason(input_dtypes: &[DataType], input_shapes: &[Shape]) -> Option<String> {
     if !input_dtypes.is_empty() {
         if input_dtypes.len() != 8 {
             return Some(format!(
