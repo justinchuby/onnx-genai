@@ -7,6 +7,8 @@ use onnx_runtime_ir::{
 
 use crate::{OptimizationPass, PassContext, Result, quantized_grouped::literal};
 
+pub mod softmax_first;
+
 pub const OP: &str = "AffineRoutedMoE";
 pub const THRESHOLD: f32 = 1e-8;
 

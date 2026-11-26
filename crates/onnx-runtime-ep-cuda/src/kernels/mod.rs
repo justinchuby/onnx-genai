@@ -1,19 +1,6 @@
-//! CUDA kernels for the Phase-2a slice (`docs/architecture/ORT2.md` §15). Standard **GEMM**
-//! (`MatMul`, cuBLASLt) plus the SDPA/GQA **Attention** baseline (`Attention` in
-//! the `com.microsoft` domain — cuBLAS batched GEMM + NVRTC softmax). One
-//! [`Kernel`] per op, keyed purely by (op type, domain) — there are **no**
-//! model-specific shapes or constants anywhere in this crate (the §15.1
-//! model-agnostic hard rule; attention dims are runtime data / attributes).
-//!
-//! ## Deferred to later slices (Phase 2b+)
-//!
-//! Custom fused norm/RoPE kernels, cuDNN-fused SDPA / FlashAttention-3 behind
-//! the same [`attention::AttentionKernel`] binding (§13.3), paged-KV (§13.4),
-//! and FP8 GEMM are **not** implemented here. Ops we don't cover are simply not
-//! registered, so [`crate::CudaExecutionProvider::supports_op`] reports them
-//! Unsupported and the session routes them to another EP (e.g. CPU). A direct
-//! [`crate::CudaExecutionProvider::get_kernel`] for an unregistered op returns
-//! an actionable [`onnx_runtime_ep_api::EpError`] — never a panic.
+//! CUDA operator kernels keyed by op type and domain. Kernels use runtime
+//! shapes and node attributes, not model-specific constants.
+//! See `docs/execution/CUDA_COVERAGE.md` for supported operators and backends.
 
 use std::sync::Arc;
 
@@ -37,6 +24,7 @@ impl SealedLaunchAccess {
 }
 
 pub mod activations;
+mod affine_moe;
 pub mod argreduce;
 pub mod attention;
 pub mod batch_normalization;
@@ -772,6 +760,19 @@ pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
         Arc::new(csa_checkpoint::CsaMetrics::default()),
         Arc::new(qmoe::RouteTelemetrySourceRegistry::default()),
     )
+}
+
+// Internal standalone rewrite targets must not enter the ORT registry descriptor projection.
+pub(crate) fn register_standalone_kernels(reg: &mut OpRegistry, runtime: Arc<CudaRuntime>) {
+    reg.register(
+        OpKey::new(
+            onnx_runtime_optimizer::affine_moe::softmax_first::OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+        Box::new(affine_moe::Factory(runtime)),
+    );
 }
 
 /// Like [`build_cuda_registry`] but threads a shared [`CsaMetrics`] telemetry
@@ -1672,7 +1673,7 @@ pub(crate) fn build_cuda_registry_for_contract(
         );
     }
 
-    // Attention (Phase-2b fused prefill with a Phase-2a fallback).
+    // Attention (fused prefill with a cuBLASLt/softmax fallback).
     reg.register(
         OpKey::new("Attention", "com.microsoft", 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,

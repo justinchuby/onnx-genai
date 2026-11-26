@@ -1,7 +1,6 @@
-//! The [`CudaExecutionProvider`]: a GPU execution provider backed by cudarc +
-//! cuBLASLt (`docs/architecture/ORT2.md` §15). Phase 2a wires standard GEMM (`MatMul`) only;
-//! everything else returns an actionable "not implemented in CUDA EP Phase 2a"
-//! error rather than silently falling back or panicking.
+//! The [`CudaExecutionProvider`]: a GPU execution provider backed by cudarc,
+//! dynamically loaded NVIDIA libraries, and NVRTC kernels. See
+//! `docs/execution/CUDA_COVERAGE.md` for current operator coverage.
 //!
 //! # Memory & safety model
 //!
@@ -1722,7 +1721,7 @@ impl CudaAllocationDomain {
     }
 }
 
-/// CUDA execution provider (Phase 2a: cudarc + cuBLASLt GEMM).
+/// CUDA execution provider.
 ///
 /// Unlike the always-available CPU EP, this provider needs a real device, so
 /// [`CudaExecutionProvider::new`] is **fallible** — it returns an error when no
@@ -1918,7 +1917,7 @@ impl CudaExecutionProvider {
         drop(self.lock_route_executors());
     }
 
-    /// Construct a CUDA EP bound to `CUDA:ordinal` with the Phase-2a kernels
+    /// Construct a CUDA EP bound to `CUDA:ordinal` with the CUDA kernels
     /// registered. Fails if the device or CUDA libraries are unavailable.
     pub fn new(ordinal: u32) -> Result<Self> {
         Self::new_with_offload_policy(ordinal, DeviceOffloadPolicy::from_env())
@@ -2060,12 +2059,15 @@ impl CudaExecutionProvider {
         let route_telemetry_registry = Arc::new(
             crate::kernels::qmoe::RouteTelemetrySourceRegistry::new(route_residency_config),
         );
-        let registry = build_cuda_registry_for_contract(
+        let mut registry = build_cuda_registry_for_contract(
             runtime.clone(),
             csa_metrics.clone(),
             Arc::clone(&route_telemetry_registry),
             conv_transpose_contract,
         );
+        if matches!(conv_transpose_contract, ConvTransposeContract::Standalone) {
+            crate::kernels::register_standalone_kernels(&mut registry, runtime.clone());
+        }
         let auto_dynamic_lending = auto_dynamic_lending_for(
             governor.is_some(),
             &offload_policy,
@@ -4631,9 +4633,16 @@ impl ExecutionProvider for CudaExecutionProvider {
                 .workspace_planning(&op.op_type, &op.domain, opset)
                 .expect("supported kernel has a versioned registration"),
             cost,
-            required_input_layouts: (op.op_type
-                == onnx_runtime_ep_api::mean_variance_normalization::OP)
-                .then(|| vec![TensorLayout::contiguous()]),
+            required_input_layouts: match (op.domain.as_str(), op.op_type.as_str()) {
+                (
+                    onnx_runtime_ir::RUNTIME_DOMAIN,
+                    onnx_runtime_optimizer::affine_moe::softmax_first::OP,
+                ) => Some(vec![TensorLayout::contiguous(); op.inputs.len()]),
+                (_, onnx_runtime_ep_api::mean_variance_normalization::OP) => {
+                    Some(vec![TensorLayout::contiguous()])
+                }
+                _ => None,
+            },
             output_layouts,
         }
     }
@@ -4684,7 +4693,23 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn custom_passes(&self) -> Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> {
-        cuda_optimization_passes(Some(self.runtime.capabilities()))
+        let caps = self.runtime.capabilities();
+        let mut passes = cuda_optimization_passes(Some(caps));
+        if self.registry.supports(
+            onnx_runtime_optimizer::affine_moe::softmax_first::OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ) && caps.max_grid_dim_x() > 0
+            && caps.max_threads_per_block()
+                >= onnx_runtime_optimizer::affine_moe::softmax_first::MAX_ROUTES_PER_TOKEN as u32
+        {
+            // Before other passes rewrite the explicit SiLU and identity casts.
+            passes.insert(
+                1,
+                Box::new(onnx_runtime_optimizer::affine_moe::softmax_first::Fusion),
+            );
+        }
+        passes
     }
 
     fn mapped_bytes_for_allocation(&self, bytes: usize, alignment: usize) -> Result<u64> {

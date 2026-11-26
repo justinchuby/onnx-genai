@@ -420,10 +420,10 @@ fn reviewed_dynamic_output_syncs() -> [ReviewedDynamicOutputSync; 2] {
 /// `every_allowlisted_file_can_decline_capture` now does.
 fn allowlisted_unconditional_syncs() -> BTreeSet<String> {
     BTreeSet::from([
-        "attention.rs::run_attention_phase2a".to_string(),
+        "attention.rs::run_attention_blas_softmax".to_string(),
         "fused_gemm.rs::run".to_string(),
         "gemm.rs::run".to_string(),
-        // MHA declares CaptureSupport::unsupported for the existing Phase-2a,
+        // MHA declares CaptureSupport::unsupported for the existing cuBLASLt/softmax,
         // padding and output-transpose sync policy. A deferred policy success
         // is not a completion witness; prepared backing is not capture proof.
         "multi_head_attention.rs::synchronize_runtime".to_string(),

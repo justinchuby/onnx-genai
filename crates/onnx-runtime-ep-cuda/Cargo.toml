@@ -1,6 +1,6 @@
 [package]
 name = "onnx-runtime-ep-cuda"
-description = "CUDA execution provider for the ORT 2.0 runtime (Phase 2a: cudarc + cuBLASLt MatMul; custom fused kernels deferred)"
+description = "CUDA execution provider for the ONNX runtime using dynamically loaded NVIDIA libraries and NVRTC kernels"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
