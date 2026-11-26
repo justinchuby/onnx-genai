@@ -347,7 +347,7 @@ fn opus_other_containers_chaining_and_truncated_end_fail_explicitly() {
             decode_audio(&bytes, limit(1024))
                 .unwrap_err()
                 .to_string()
-                .contains("limit")
+                .contains("max_decoded_bytes=1024")
         );
     }
     let bytes = std::fs::read(root().join("celt-1.ogg")).unwrap();
