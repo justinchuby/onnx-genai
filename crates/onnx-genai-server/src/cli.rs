@@ -37,6 +37,26 @@ pub struct ServeArgs {
     #[arg(long, env = "LLAMA_ARG_API_KEY_FILE")]
     pub api_key_file: Option<PathBuf>,
 
+    /// Allowed browser origins: *, localhost (same origin only), or a comma-separated list.
+    #[arg(long, env = "LLAMA_ARG_CORS_ORIGINS", default_value = "*")]
+    pub cors_origins: String,
+    /// Comma-separated browser preflight methods.
+    #[arg(
+        long,
+        env = "LLAMA_ARG_CORS_METHODS",
+        default_value = "GET, POST, DELETE, OPTIONS"
+    )]
+    pub cors_methods: String,
+    /// Browser preflight request headers, or * to allow the requested names.
+    #[arg(long, env = "LLAMA_ARG_CORS_HEADERS", default_value = "*")]
+    pub cors_headers: String,
+    /// Permit browser credentials (enabled by default).
+    #[arg(long, env = "LLAMA_ARG_CORS_CREDENTIALS", action = clap::ArgAction::SetTrue, default_value_t = true, overrides_with = "no_cors_credentials")]
+    pub cors_credentials: bool,
+    /// Disable browser credentials, allowing literal wildcard origin responses.
+    #[arg(long, env = "LLAMA_ARG_NO_CORS_CREDENTIALS", action = clap::ArgAction::SetTrue, overrides_with = "cors_credentials")]
+    pub no_cors_credentials: bool,
+
     /// Single-model mode: path to a model directory containing the ONNX model
     /// and tokenizer, given positionally as every other subcommand takes it.
     /// Mutually exclusive with --models-dir and --models-config.
@@ -280,6 +300,12 @@ fn server_config_from_args(args: &ServeArgs) -> anyhow::Result<ServerConfig> {
 
     Ok(ServerConfig {
         api_keys: crate::ApiKeys::from_sources(&args.api_key, args.api_key_file.as_deref())?,
+        cors: crate::CorsPolicy::new(
+            &args.cors_origins,
+            &args.cors_methods,
+            &args.cors_headers,
+            args.cors_credentials && !args.no_cors_credentials,
+        )?,
         node_id: args.node_id.clone().unwrap_or_else(default_node_id),
         max_output_tokens: args.max_output_tokens,
         max_transcription_input_tokens: args.max_transcription_input_tokens,
@@ -386,6 +412,28 @@ mod tests {
     struct TestCli {
         #[command(flatten)]
         serve: ServeArgs,
+    }
+
+    #[test]
+    fn cors_cli_defaults_overrides_and_invalid_policy_are_explicit() {
+        for (flags, expected) in [
+            (vec![], true),
+            (vec!["--no-cors-credentials"], false),
+            (vec!["--no-cors-credentials", "--cors-credentials"], true),
+            (vec!["--cors-credentials", "--no-cors-credentials"], false),
+        ] {
+            let args = TestCli::try_parse_from([vec!["test", "model"], flags].concat()).unwrap();
+            let config = server_config_from_args(&args.serve).unwrap();
+            assert_eq!(config.cors.credentials_enabled(), expected);
+        }
+        let args =
+            TestCli::try_parse_from(["test", "model", "--cors-origins", "not-an-origin"]).unwrap();
+        assert!(
+            server_config_from_args(&args.serve)
+                .unwrap_err()
+                .to_string()
+                .contains("--cors-origins")
+        );
     }
 
     #[test]
