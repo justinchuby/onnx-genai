@@ -65,6 +65,7 @@ struct RealtimeGrammar {
     vocabulary: usize,
     endings: Vec<u32>,
     text_ended: bool,
+    _decoder_workspace: Option<onnx_runtime_memory_governor::MemoryLease>,
 }
 enum RealtimeConstraint {
     Logical(Box<crate::response_constraint::ContentConstraint>),
@@ -157,6 +158,37 @@ impl Engine {
 }
 
 impl RealtimeSession<'_> {
+    /// Prepare transport publication on the native owner without consuming a quantum.
+    /// The returned decoder owns its admitted workspace through all publication forks.
+    pub fn prepare_text_decoder(
+        &self,
+        preserved: &std::collections::BTreeSet<u32>,
+        max_bytes: std::num::NonZeroUsize,
+    ) -> anyhow::Result<crate::tokenization::TokenTextDecoder> {
+        let tokenizer = self
+            .engine
+            .workflow_runtime()
+            .package_tokenizer()
+            .context("realtime text output requires the admitted package tokenizer")?;
+        let options = GenerateOptions {
+            max_constraint_bytes: max_bytes.get(),
+            preserved_tokens: preserved.clone(),
+            ..Default::default()
+        };
+        let lease = self
+            .engine
+            .reserve_literal_decoder_workspace(tokenizer, &options)?;
+        let contract = crate::byte_stream::prepare_literal_output(tokenizer, preserved)
+            .map_err(crate::ProcessorConfigurationError::classify)?;
+        let mut decoder = crate::tokenization::TokenTextDecoder::with_preserved_tokens(preserved);
+        decoder.set_byte_limit(max_bytes.get());
+        if let Some(contract) = contract {
+            decoder.bind_literal_decoder(contract, max_bytes.get());
+        }
+        decoder.retain_workspace(lease);
+        Ok(decoder)
+    }
+
     /// Install a fresh response-local grammar before Generate. Native graphs
     /// must explicitly consume the declared token mask before selecting tokens.
     pub fn set_constraint(
@@ -195,6 +227,14 @@ impl RealtimeSession<'_> {
             // Realtime publishes canonical streaming decoder text. Token-local
             // byte approximations cannot model contextual whitespace or prove
             // completion, so text grammars use the shared logical cursor.
+            let decoder_workspace = self
+                .engine
+                .reserve_literal_decoder_workspace(tokenizer, &options)?;
+            let decoder = crate::byte_stream::prepare_literal_output(
+                tokenizer,
+                &options.effective_preserved_tokens(),
+            )
+            .map_err(crate::ProcessorConfigurationError::classify)?;
             let text = |grammar: &crate::config::TextGrammar, prefix: &str| {
                 crate::response_constraint::ContentConstraint::text(
                     tokenizer,
@@ -202,8 +242,11 @@ impl RealtimeSession<'_> {
                     crate::text_projection::ProjectionKind::Plain,
                     prefix,
                     options.max_constraint_bytes,
-                    endings.clone(),
-                    &options.effective_preserved_tokens(),
+                    crate::response_constraint::ConstraintTokens::decoded(
+                        endings.clone(),
+                        &options.effective_preserved_tokens(),
+                        decoder.clone(),
+                    ),
                 )
             };
             let json = |schema: &serde_json::Value, prefix: &str| {
@@ -213,8 +256,11 @@ impl RealtimeSession<'_> {
                     crate::text_projection::ProjectionKind::Plain,
                     prefix,
                     options.max_constraint_bytes,
-                    endings.clone(),
-                    &options.effective_preserved_tokens(),
+                    crate::response_constraint::ConstraintTokens::decoded(
+                        endings.clone(),
+                        &options.effective_preserved_tokens(),
+                        decoder.clone(),
+                    ),
                 )
             };
             let logical = match options.constraint.as_ref() {
@@ -225,8 +271,11 @@ impl RealtimeSession<'_> {
                         crate::text_projection::ProjectionKind::Plain,
                         prefix,
                         options.max_constraint_bytes,
-                        endings.clone(),
-                        &options.effective_preserved_tokens(),
+                        crate::response_constraint::ConstraintTokens::decoded(
+                            endings.clone(),
+                            &options.effective_preserved_tokens(),
+                            decoder.clone(),
+                        ),
                     )?,
                 ),
                 Some(crate::GenerateConstraint::Regex { pattern, prefix }) => Some(text(
@@ -259,9 +308,11 @@ impl RealtimeSession<'_> {
                     &options,
                     Some(tokenizer),
                     false,
+                    None,
                 )?)
             };
             let grammar = RealtimeGrammar {
+                _decoder_workspace: decoder_workspace,
                 constraint,
                 context: Default::default(),
                 vocabulary: usize::try_from(
