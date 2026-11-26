@@ -1,6 +1,4 @@
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use onnx_genai_metadata::{load_metadata_package, parse_metadata, validate_metadata};
 
@@ -35,13 +33,6 @@ fn validation_message(adapter: &str, version: &str) -> String {
     validate_metadata(&metadata)
         .expect_err("checkpoint extension must fail closed")
         .join("; ")
-}
-
-fn fixture_root(name: &str) -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target-extension-registry/checkpoint-tests")
-        .join(format!("{name}-{}", NEXT.fetch_add(1, Ordering::Relaxed)))
 }
 
 #[test]
@@ -119,14 +110,14 @@ fn checkpoint_identity_version_and_availability_fail_differently() {
 #[test]
 fn package_loading_rejects_checkpoint_before_artifact_resolution()
 -> Result<(), Box<dyn std::error::Error>> {
-    let root = fixture_root("pre-artifact");
-    fs::create_dir_all(&root)?;
+    let scratch = tempfile::tempdir()?;
+    let root = scratch.path();
     fs::write(
         root.join("inference_metadata.yaml"),
         with_checkpoint("onnx-genai.kv-checkpoint", "1"),
     )?;
 
-    let error = load_metadata_package(&root)
+    let error = load_metadata_package(root)
         .expect_err("checkpoint admission must precede missing component artifacts")
         .to_string();
     assert!(
