@@ -1,7 +1,7 @@
 use onnx_genai_metadata::{parse_metadata_json, validate_metadata};
 use serde_json::json;
 fn document() -> serde_json::Value {
-    json!({"schema_version":"1.18","package":{"infill":{"prefix_token":"<P>","middle_token":"<M>","suffix_token":"<S>","order":"spm","extra_context_template":"{% for file in input_extra %}{{file.filename}}:{{file.text}}{% endfor %}"}}})
+    serde_json::from_str(include_str!("fixtures/infill_context_v1_18.json")).unwrap()
 }
 #[test]
 fn infill_contract_requires_its_version_and_preserves_explicit_order_and_template() {
@@ -9,6 +9,7 @@ fn infill_contract_requires_its_version_and_preserves_explicit_order_and_templat
     validate_metadata(&metadata).unwrap();
     let spec = metadata.package.as_ref().unwrap().infill.as_ref().unwrap();
     assert_eq!(spec.order, onnx_genai_metadata::InfillOrder::Spm);
+    assert_eq!(spec.additional_stop_tokens, vec!["<END>"]);
     assert!(
         spec.extra_context_template
             .as_ref()

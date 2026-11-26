@@ -137,6 +137,37 @@ fn core_conformance_covers_every_supported_schema_floor() {
 }
 
 #[test]
+fn explicit_infill_is_mandatory_core_conformance_with_a_valid_fixture() {
+    let obligations = CORE_CONFORMANCE
+        .iter()
+        .find_map(|(version, obligations)| {
+            (*version == onnx_genai_metadata::INFILL_CONTEXT_SCHEMA_VERSION).then_some(*obligations)
+        })
+        .expect("infill schema floor has a core-conformance row");
+    for required in [
+        "control roles",
+        "additional terminators",
+        "empty list",
+        "no filesystem lookup",
+        "guessed separators",
+    ] {
+        assert!(
+            obligations.contains(required),
+            "missing {required}: {obligations}"
+        );
+    }
+    let metadata = parse_metadata(
+        include_str!("fixtures/infill_context_v1_18.json"),
+        Some("json"),
+    )
+    .unwrap();
+    onnx_genai_metadata::validate_metadata(&metadata).unwrap();
+    let infill = metadata.package.unwrap().infill.unwrap();
+    assert_eq!(infill.order, onnx_genai_metadata::InfillOrder::Spm);
+    assert_eq!(infill.additional_stop_tokens, vec!["<END>"]);
+}
+
+#[test]
 fn publication_mode_is_mandatory_core_conformance() {
     let obligation = CORE_CONFORMANCE
         .iter()
