@@ -1,4 +1,4 @@
-//! Correctness-first reference paths for `pkg.nxrt::CompressedSparseAttention`
+//! Correctness-first reference paths for `pkg.nxrt._private::CompressedSparseAttention`
 //! v1.
 //!
 //! The registered operator exposes the complete frozen stateful v1 boundary.
@@ -149,8 +149,17 @@ impl CacheFormat {
 }
 
 impl KernelFactory for CompressedSparseAttentionFactory {
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        _opset: u64,
+        shapes: &[onnx_runtime_ir::Shape],
+        input_dtypes: &[DataType],
+    ) -> Option<String> {
+        unsupported_reason(node, shapes, input_dtypes).map(|reason| reason.into_owned())
+    }
+
     fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        validate_frozen_v1_schema(node)?;
         self.create_impl(node, input_shapes, false)
     }
 }
@@ -162,6 +171,90 @@ impl CompressedSparseAttentionFactory {
         input_shapes: &[Vec<usize>],
         assembled_cache_reference: bool,
     ) -> Result<Box<dyn Kernel>> {
+        #[cfg(test)]
+        CSA_FACTORY_CREATES.with(|count| count.set(count.get() + 1));
+        let CsaAttributes {
+            num_heads,
+            head_dim,
+            qk_rope_head_dim,
+            compression_ratio,
+            index_num_heads,
+            index_head_dim,
+            index_topk,
+            scale,
+            cache_format,
+        } = CsaAttributes::parse(node, assembled_cache_reference)?;
+
+        if assembled_cache_reference && input_shapes.len() >= 4 {
+            infer_output_shape_for_format(
+                &input_shapes[0],
+                &input_shapes[1],
+                &input_shapes[2],
+                &input_shapes[3],
+                num_heads,
+                head_dim,
+                qk_rope_head_dim,
+                cache_format,
+            )?;
+        }
+        if assembled_cache_reference {
+            Ok(Box::new(CompressedSparseAttentionKernel {
+                num_heads,
+                head_dim,
+                qk_rope_head_dim,
+                compression_ratio,
+                index_num_heads,
+                scale,
+                cache_format,
+            }))
+        } else {
+            Ok(Box::new(StatefulCompressedSparseAttentionKernel {
+                num_heads,
+                head_dim,
+                qk_rope_head_dim,
+                compression_ratio,
+                index_num_heads,
+                index_head_dim,
+                index_topk,
+                scale,
+                cache_format,
+            }))
+        }
+    }
+
+    #[cfg(test)]
+    fn create_assembled_cache_reference(
+        &self,
+        node: &Node,
+        input_shapes: &[Vec<usize>],
+    ) -> Result<Box<dyn Kernel>> {
+        self.create_impl(node, input_shapes, true)
+    }
+}
+
+/// Parsed metadata carries no execution buffers, cache ownership or grants.
+struct CsaAttributes {
+    num_heads: usize,
+    head_dim: usize,
+    qk_rope_head_dim: usize,
+    compression_ratio: usize,
+    index_num_heads: usize,
+    index_head_dim: usize,
+    index_topk: usize,
+    scale: f32,
+    cache_format: CacheFormat,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CSA_FACTORY_CREATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl CsaAttributes {
+    fn parse(node: &Node, assembled_cache_reference: bool) -> Result<Self> {
+        if !assembled_cache_reference {
+            validate_frozen_v1_schema(node)?;
+        }
         let num_heads = required_positive_int(node, "num_heads")?;
         let head_dim = required_positive_int(node, "head_dim")?;
         let qk_rope_head_dim = optional_nonnegative_int(node, "qk_rope_head_dim", 0)?;
@@ -233,71 +326,34 @@ impl CompressedSparseAttentionFactory {
             return Err(error("scale must be finite and non-negative"));
         }
 
-        if assembled_cache_reference && input_shapes.len() >= 4 {
-            infer_output_shape_for_format(
-                &input_shapes[0],
-                &input_shapes[1],
-                &input_shapes[2],
-                &input_shapes[3],
-                num_heads,
-                head_dim,
-                qk_rope_head_dim,
-                cache_format,
-            )?;
-        }
-        if assembled_cache_reference {
-            Ok(Box::new(CompressedSparseAttentionKernel {
-                num_heads,
-                head_dim,
-                qk_rope_head_dim,
-                compression_ratio,
-                index_num_heads,
-                scale,
-                cache_format,
-            }))
-        } else {
-            Ok(Box::new(StatefulCompressedSparseAttentionKernel {
-                num_heads,
-                head_dim,
-                qk_rope_head_dim,
-                compression_ratio,
-                index_num_heads,
-                index_head_dim,
-                index_topk,
-                scale,
-                cache_format,
-            }))
-        }
-    }
-
-    #[cfg(test)]
-    fn create_assembled_cache_reference(
-        &self,
-        node: &Node,
-        input_shapes: &[Vec<usize>],
-    ) -> Result<Box<dyn Kernel>> {
-        self.create_impl(node, input_shapes, true)
+        Ok(Self {
+            num_heads,
+            head_dim,
+            qk_rope_head_dim,
+            compression_ratio,
+            index_num_heads,
+            index_head_dim,
+            index_topk,
+            scale,
+            cache_format,
+        })
     }
 }
 
 /// Claim-time denial for the frozen stateful CSA contract.
 ///
-/// The factory dry-run is the source of truth for attribute and positional
-/// arity validation. The remaining checks mirror the dtype and shape
+/// The same attribute parser as construction validates positional arity and
+/// attributes without creating a kernel. The remaining checks mirror the dtype and shape
 /// requirements enforced by the stateful kernels before execution.
-pub(crate) fn unsupported_reason(
+fn unsupported_reason(
     node: &Node,
     shapes: &[Shape],
     input_dtypes: &[DataType],
 ) -> Option<Cow<'static, str>> {
-    let concrete_shapes = shapes
-        .iter()
-        .map(|shape| as_static_shape(shape))
-        .collect::<Option<Vec<_>>>()
-        .unwrap_or_default();
-    if let Err(error) = CompressedSparseAttentionFactory.create(node, &concrete_shapes) {
-        return Some(Cow::Owned(error.to_string()));
-    }
+    let attributes = match CsaAttributes::parse(node, false) {
+        Ok(attributes) => attributes,
+        Err(error) => return Some(Cow::Owned(error.to_string())),
+    };
 
     if shapes.len() != node.inputs.len() || input_dtypes.len() != node.inputs.len() {
         return Some(Cow::Owned(format!(
@@ -308,12 +364,7 @@ pub(crate) fn unsupported_reason(
         )));
     }
 
-    let ratio = usize::try_from(
-        node.attr("compression_ratio")
-            .and_then(|attribute| attribute.as_int())
-            .expect("CPU factory accepted compression_ratio"),
-    )
-    .expect("CPU factory accepted positive compression_ratio");
+    let ratio = attributes.compression_ratio;
     let cache_format = node
         .attr("cache_format")
         .and_then(|attribute| attribute.as_str())
@@ -3427,7 +3478,7 @@ mod tests {
         shapes: &[Vec<usize>],
     ) -> Result<Box<dyn Kernel>> {
         let mut graph = Graph::new();
-        graph.opset_imports.insert("pkg.nxrt".into(), 1);
+        graph.opset_imports.insert("pkg.nxrt._private".into(), 1);
         let cache_dtype = if cache_format.unwrap_or("f32") == "f32" {
             DataType::Float32
         } else {
@@ -3452,7 +3503,7 @@ mod tests {
             static_shape(shapes[0].iter().copied()),
         );
         let mut node = onnx_runtime_ir::Node::new(NodeId(0), OP, inputs, vec![output]);
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes
             .insert("num_heads".into(), Attribute::Int(shapes[0][2] as i64));
         node.attributes
@@ -3503,7 +3554,7 @@ mod tests {
             })
             .collect();
         let mut node = Node::new(NodeId(0), OP, inputs, outputs);
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes
             .insert("num_heads".into(), Attribute::Int(1));
         node.attributes
@@ -3591,7 +3642,7 @@ mod tests {
             sink,
         ];
         let mut graph = Graph::new();
-        graph.opset_imports.insert("pkg.nxrt".into(), 1);
+        graph.opset_imports.insert("pkg.nxrt._private".into(), 1);
         let node_inputs = FROZEN_V1_REQUIRED_INPUT_NAMES
             .iter()
             .zip(inputs)
@@ -3622,7 +3673,7 @@ mod tests {
             ),
         ];
         let mut node = Node::new(NodeId(0), OP, node_inputs, outputs.to_vec());
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes
             .insert("num_heads".into(), Attribute::Int(query.shape[2] as i64));
         node.attributes
@@ -3709,7 +3760,7 @@ mod tests {
             past_index_carry,
         ];
         let mut graph = Graph::new();
-        graph.opset_imports.insert("pkg.nxrt".into(), 1);
+        graph.opset_imports.insert("pkg.nxrt._private".into(), 1);
         let names = [
             "query",
             "current_kv",
@@ -3782,7 +3833,7 @@ mod tests {
             ),
         ];
         let mut node = Node::new(NodeId(0), OP, node_inputs, outputs.to_vec());
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes
             .insert("num_heads".into(), Attribute::Int(query.shape[2] as i64));
         node.attributes
@@ -3932,6 +3983,46 @@ mod tests {
         assert!(message.contains("Metadata `sink_tokens`"));
         assert!(message.contains("retained prefix tokens"));
         assert!(message.contains("unrelated"));
+    }
+
+    #[test]
+    fn claim_queries_parse_attributes_without_constructing_a_kernel() {
+        let mut graph = Graph::new();
+        let mut node = stateful_node(&mut graph, 128, 11, 3);
+        let shapes = vec![
+            static_shape([1, 1, 1, 512]),
+            static_shape([1, 1, 512]),
+            static_shape([1, 1, 512]),
+            static_shape([1, 1, 512]),
+            static_shape([128, 512]),
+            static_shape([512]),
+            static_shape([1, 0, 512]),
+            static_shape([1, 128, 2, 512]),
+            static_shape([1]),
+            static_shape([]),
+            static_shape([1]),
+        ];
+        let mut dtypes = vec![DataType::Float32; 11];
+        dtypes[8] = DataType::Int32;
+        dtypes[9] = DataType::Int64;
+        let before = CSA_FACTORY_CREATES.with(std::cell::Cell::get);
+        let reason =
+            CompressedSparseAttentionFactory.unsupported_reason(&node, 1, &shapes, &dtypes);
+        assert!(reason.is_none(), "valid metadata was rejected: {reason:?}");
+        assert_eq!(CSA_FACTORY_CREATES.with(std::cell::Cell::get), before);
+        // Positive control proves that the constructor observer is live.
+        drop(CompressedSparseAttentionFactory.create(&node, &[]).unwrap());
+        assert_eq!(CSA_FACTORY_CREATES.with(std::cell::Cell::get), before + 1);
+        node.attributes
+            .insert("compression_ratio".into(), Attribute::Int(7));
+        let reason = CompressedSparseAttentionFactory
+            .unsupported_reason(&node, 1, &shapes, &dtypes)
+            .expect("invalid attributes must be rejected without a constructor dry-run");
+        assert!(
+            reason.contains("compression_ratio must be exactly 4 or 128"),
+            "{reason}"
+        );
+        assert_eq!(CSA_FACTORY_CREATES.with(std::cell::Cell::get), before + 1);
     }
 
     #[test]

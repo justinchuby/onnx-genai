@@ -1211,6 +1211,7 @@ mod tests {
         std::fs::write(root.path().join("operator-data"), "keep").unwrap();
         let registry = ModelRegistry::from_sources(
             &[ModelSpec {
+                package_variant: None,
                 id: "configured".into(),
                 path: root.path().into(),
                 eager: false,
@@ -1251,6 +1252,7 @@ mod tests {
         registry.write().unwrap().available.insert(
             "removed".into(),
             Registration::Configured(ModelSpec {
+                package_variant: None,
                 id: "removed".into(),
                 path: PathBuf::from("must-not-be-opened"),
                 eager: false,
@@ -1419,12 +1421,14 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
         let specs = vec![
             ModelSpec {
+                package_variant: None,
                 id: "first".to_string(),
                 path: model_dir.clone(),
                 eager: true,
                 warmup: false,
             },
             ModelSpec {
+                package_variant: None,
                 id: "second".to_string(),
                 path: model_dir,
                 eager: true,
@@ -1484,12 +1488,14 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
         let specs = vec![
             ModelSpec {
+                package_variant: None,
                 id: "eager".to_string(),
                 path: model_dir.clone(),
                 eager: true,
                 warmup: false,
             },
             ModelSpec {
+                package_variant: None,
                 id: "lazy".to_string(),
                 path: model_dir,
                 eager: false,
@@ -1519,6 +1525,7 @@ mod tests {
         let model_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
         let specs = vec![ModelSpec {
+            package_variant: None,
             id: "model".to_string(),
             path: model_dir,
             eager: true,
@@ -1555,12 +1562,14 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
         let specs = vec![
             ModelSpec {
+                package_variant: None,
                 id: "eager".to_string(),
                 path: model_dir.clone(),
                 eager: true,
                 warmup: false,
             },
             ModelSpec {
+                package_variant: None,
                 id: "lazy".to_string(),
                 path: model_dir,
                 eager: false,
@@ -1654,6 +1663,7 @@ mod tests {
         let model_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
         let specs = vec![ModelSpec {
+            package_variant: None,
             id: "tiny".to_string(),
             path: model_dir,
             eager: true,
@@ -1686,6 +1696,7 @@ mod tests {
         let model_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
         let specs = vec![ModelSpec {
+            package_variant: None,
             id: "tiny".to_string(),
             path: model_dir,
             eager: true,
@@ -1714,6 +1725,7 @@ mod tests {
         let model_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
         let specs = vec![ModelSpec {
+            package_variant: None,
             id: "tiny".to_string(),
             path: model_dir,
             eager: true,

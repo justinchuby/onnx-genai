@@ -194,9 +194,13 @@ impl<'a> SemanticIdentityFixture<'a> {
         }
         let input_strides = inputs
             .iter()
-            .map(|input| compute_contiguous_strides(&input.shape))
+            .map(|input| {
+                compute_contiguous_strides(&input.shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
             .collect();
-        let output_strides = compute_contiguous_strides(&output_shape);
+        let output_strides = compute_contiguous_strides(&output_shape)
+            .expect("fixture shape has representable contiguous strides");
         Self {
             caller: common::EinsumCallerLane::new(ep),
             kernel,
@@ -359,7 +363,7 @@ fn registry_reachability_and_claim_declines_are_intentional() {
         onnx_runtime_ep_cuda::CUDA_COVERED_OPS.contains(&"Einsum"),
         "coverage census must expose Einsum"
     );
-    let descriptors = build_cuda_registry_descriptors(ep.runtime().clone());
+    let descriptors = build_cuda_registry_descriptors(ep.registry());
     let entries = descriptors
         .iter()
         .filter(|descriptor| descriptor.domain.is_empty() && descriptor.op_type == "Einsum")
@@ -804,8 +808,10 @@ fn integer_generic_multiply_is_exact_width_without_signed_overflow() {
             runtime.htod(&a_bytes, cuptr(a.as_ptr())).unwrap();
             runtime.htod(&b_bytes, cuptr(b.as_ptr())).unwrap();
         }
-        let input_strides = compute_contiguous_strides(input_shape);
-        let output_strides = compute_contiguous_strides(output_shape);
+        let input_strides = compute_contiguous_strides(input_shape)
+            .expect("fixture shape has representable contiguous strides");
+        let output_strides = compute_contiguous_strides(output_shape)
+            .expect("fixture shape has representable contiguous strides");
         caller
             .execute(
                 kernel.as_ref(),
@@ -911,9 +917,12 @@ fn misaligned_contiguous_subviews_use_a_proven_cublaslt_alignment_contract() {
         runtime.htod(&a_payload, cuptr(a.as_ptr())).unwrap();
         runtime.htod(&b_payload, cuptr(b.as_ptr())).unwrap();
     }
-    let a_strides = compute_contiguous_strides(&a_shape);
-    let b_strides = compute_contiguous_strides(&b_shape);
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let a_strides = compute_contiguous_strides(&a_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let b_strides = compute_contiguous_strides(&b_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let views = [
         TensorView::new(
             DevicePtr(a.as_ptr()),
@@ -1028,9 +1037,12 @@ fn forced_f16_cublaslt_narrows_once_and_rejects_unregistered_workspace_capture()
         runtime.htod(&a_bytes, cuptr(a.as_ptr())).unwrap();
         runtime.htod(&b_bytes, cuptr(b.as_ptr())).unwrap();
     }
-    let a_strides = compute_contiguous_strides(&a_shape);
-    let b_strides = compute_contiguous_strides(&b_shape);
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let a_strides = compute_contiguous_strides(&a_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let b_strides = compute_contiguous_strides(&b_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let views = [
         TensorView::new(
             DevicePtr(a.as_ptr()),
@@ -1250,9 +1262,13 @@ fn auto_fallback_snapshot_is_reused_for_capture_and_replay_gpu() {
         make_direct_kernel(&ep, "ik,kj->ij", &input_shapes, &output_shape);
     let input_strides = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let views = inputs
         .iter()
         .zip(&buffers)
@@ -1364,7 +1380,8 @@ fn execute_layout_matrix(
     let a_shape = [2usize, 3];
     let b_shape = [3usize, 2];
     let output_shape = [2usize, 2];
-    let b_strides = compute_contiguous_strides(&b_shape);
+    let b_strides = compute_contiguous_strides(&b_shape)
+        .expect("fixture shape has representable contiguous strides");
     caller.execute_auto(
         kernel,
         &[
@@ -1413,8 +1430,10 @@ fn assert_auto_reselects_for_input_layout(
         &[a_shape.to_vec(), b_shape.to_vec()],
         &output_shape,
     );
-    let a_contiguous_strides = compute_contiguous_strides(&a_shape);
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let a_contiguous_strides = compute_contiguous_strides(&a_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
 
     reset_einsum_execution_stats();
     execute_layout_matrix(
@@ -1549,10 +1568,13 @@ fn direct_snapshot_reselects_semantic_for_output_layout_change() {
         &output_shape,
     );
     let input_strides = [
-        compute_contiguous_strides(&a_shape),
-        compute_contiguous_strides(&b_shape),
+        compute_contiguous_strides(&a_shape)
+            .expect("fixture shape has representable contiguous strides"),
+        compute_contiguous_strides(&b_shape)
+            .expect("fixture shape has representable contiguous strides"),
     ];
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
 
     reset_einsum_execution_stats();
     execute_layout_matrix(
@@ -1658,9 +1680,12 @@ fn direct_zero_fill_snapshot_reselects_semantic_for_output_layout_change() {
         &[a_shape.to_vec(), b_shape.to_vec()],
         &output_shape,
     );
-    let a_strides = compute_contiguous_strides(&a_shape);
-    let b_strides = compute_contiguous_strides(&b_shape);
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let a_strides = compute_contiguous_strides(&a_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let b_strides = compute_contiguous_strides(&b_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
 
     reset_einsum_execution_stats();
     caller
@@ -1787,8 +1812,10 @@ fn direct_snapshot_layout_mismatch_fails_closed_during_capture() {
         &[a_shape.to_vec(), b_shape.to_vec()],
         &output_shape,
     );
-    let contiguous_a_strides = compute_contiguous_strides(&a_shape);
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let contiguous_a_strides = compute_contiguous_strides(&a_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let strided_bytes = common::raw(&[
         1.0f32, 91.0, 2.0, 92.0, 3.0, 93.0, 4.0, 94.0, 5.0, 95.0, 6.0,
     ]);
@@ -1884,8 +1911,10 @@ fn failed_layout_rewarm_preserves_complete_direct_snapshot() {
         &[a_shape.to_vec(), b_shape.to_vec()],
         &output_shape,
     );
-    let contiguous_a_strides = compute_contiguous_strides(&a_shape);
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let contiguous_a_strides = compute_contiguous_strides(&a_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let strided_bytes = common::raw(&[
         1.0f32, 91.0, 2.0, 92.0, 3.0, 93.0, 4.0, 94.0, 5.0, 95.0, 6.0,
     ]);
@@ -2007,9 +2036,13 @@ fn optimizer_memory_ceiling_selects_generic_native_without_intermediates() {
         make_direct_kernel(&ep, "i,ij,j->", &shapes, &output_shape);
     let strides = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let views = inputs
         .iter()
         .zip(&buffers)
@@ -2069,7 +2102,8 @@ fn generic_native_consumes_strided_and_negative_stride_views() {
     let (reverse, reverse_inputs, reverse_buffers, mut reverse_output) =
         make_direct_kernel(&ep, "i->i", &[vector_shape.to_vec()], &vector_output_shape);
     let reverse_stride = [-1i64];
-    let output_strides = compute_contiguous_strides(&vector_output_shape);
+    let output_strides = compute_contiguous_strides(&vector_output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let reverse_view = TensorView::new(
         DevicePtr(reverse_buffers[0].as_ptr()),
         DataType::Float32,
@@ -2131,7 +2165,8 @@ fn generic_native_consumes_strided_and_negative_stride_views() {
             .unwrap()
     };
     let diagonal_strides = [3i64, 1];
-    let diagonal_output_strides = compute_contiguous_strides(&diagonal_output_shape);
+    let diagonal_output_strides = compute_contiguous_strides(&diagonal_output_shape)
+        .expect("fixture shape has representable contiguous strides");
     caller
         .execute(
             diagonal.as_ref(),
@@ -2202,7 +2237,8 @@ fn permutation_and_diagonal_use_zero_copy_views_and_materialize_correctly() {
             .htod(&input.bytes, cuptr(buffer.as_ptr()))
             .unwrap()
     };
-    let input_strides = compute_contiguous_strides(&input.shape);
+    let input_strides = compute_contiguous_strides(&input.shape)
+        .expect("fixture shape has representable contiguous strides");
     let view = TensorView::new(
         DevicePtr(buffer.as_ptr()),
         input.dtype,
@@ -2367,9 +2403,13 @@ fn warm_plan_is_allocation_free_with_stable_workspace_through_capture_and_replay
     assert!(kernel.capture_support().reason().unwrap().contains("warm"));
     let input_strides = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let views = inputs
         .iter()
         .zip(&buffers)
@@ -2482,9 +2522,13 @@ fn captured_einsum_resources_outlive_kernel_and_caller_owners() {
         make_direct_kernel(&ep, "mk,...kn->...mn", &gemm_shapes, &gemm_output_shape);
     let gemm_input_strides = gemm_inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
-    let gemm_output_strides = compute_contiguous_strides(&gemm_output_shape);
+    let gemm_output_strides = compute_contiguous_strides(&gemm_output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let gemm_views = gemm_inputs
         .iter()
         .zip(&gemm_buffers)
@@ -2520,8 +2564,10 @@ fn captured_einsum_resources_outlive_kernel_and_caller_owners() {
     let view_output_shape = [3, 2];
     let (view, view_inputs, view_buffers, mut view_output) =
         make_direct_kernel(&ep, "ij->ji", &[view_shape.to_vec()], &view_output_shape);
-    let view_input_strides = compute_contiguous_strides(&view_shape);
-    let view_output_strides = compute_contiguous_strides(&view_output_shape);
+    let view_input_strides = compute_contiguous_strides(&view_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let view_output_strides = compute_contiguous_strides(&view_output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let view_input = TensorView::new(
         DevicePtr(view_buffers[0].as_ptr()),
         DataType::Float32,
@@ -2664,8 +2710,10 @@ fn materialized_view_failed_rewarm_preserves_capture_ready_snapshot_gpu() {
     let output_shape = [3usize, 2];
     let (kernel, inputs, buffers, mut a_output) =
         make_direct_kernel(&ep, "ij->ji", &[shape.to_vec()], &output_shape);
-    let a_strides = compute_contiguous_strides(&shape);
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let a_strides = compute_contiguous_strides(&shape)
+        .expect("fixture shape has representable contiguous strides");
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let a_view = TensorView::new(
         DevicePtr(buffers[0].as_ptr()),
         DataType::Float32,
@@ -2796,8 +2844,10 @@ fn generic_failed_rewarm_preserves_capture_ready_snapshot() {
     let output_shape = [2usize];
     let (kernel, inputs, buffers, mut a_output) =
         make_direct_kernel(&ep, "ij->i", &[shape.to_vec()], &output_shape);
-    let strides = compute_contiguous_strides(&shape);
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let strides = compute_contiguous_strides(&shape)
+        .expect("fixture shape has representable contiguous strides");
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let a_view = TensorView::new(
         DevicePtr(buffers[0].as_ptr()),
         DataType::Float32,
@@ -3204,8 +3254,10 @@ fn captured_generic_resources_outlive_dropped_kernel() {
     let output_shape = [2usize];
     let (kernel, inputs, buffers, mut output) =
         make_direct_kernel(&ep, "ij->i", &[shape.to_vec()], &output_shape);
-    let strides = compute_contiguous_strides(&shape);
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let strides = compute_contiguous_strides(&shape)
+        .expect("fixture shape has representable contiguous strides");
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let input = TensorView::new(
         DevicePtr(buffers[0].as_ptr()),
         DataType::Float32,
@@ -3275,9 +3327,13 @@ fn captured_optimized_plan_resources_outlive_dropped_kernel() {
         make_direct_kernel(&ep, "i,ij,j->", &shapes, &output_shape);
     let strides = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let views = inputs
         .iter()
         .zip(&buffers)
@@ -3377,7 +3433,8 @@ fn contraction_rejects_output_alias_before_launch() {
     let (kernel, inputs, mut buffers, output) =
         make_direct_kernel(&ep, "ik,kj->ij", &input_shapes, &output_shape);
     ep.deallocate(output).unwrap();
-    let strides = compute_contiguous_strides(&[2, 2]);
+    let strides = compute_contiguous_strides(&[2, 2])
+        .expect("fixture shape has representable contiguous strides");
     let a = TensorView::new(
         DevicePtr(buffers[0].as_ptr()),
         DataType::Float32,
@@ -3444,8 +3501,10 @@ fn materialized_view_rejects_partial_offset_overlap_before_mutation() {
             )
             .unwrap()
     };
-    let input_strides = compute_contiguous_strides(&input_shape);
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let input_strides = compute_contiguous_strides(&input_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let input = TensorView::new(
         DevicePtr(shared.as_ptr()),
         DataType::Float32,
@@ -3540,8 +3599,10 @@ fn materialized_view_address_overflow_is_actionable_and_pre_mutation() {
     let output_shape = [3, 2];
     let (kernel, _inputs, buffers, mut output) =
         make_direct_kernel(&ep, "ij->ji", &[input_shape.to_vec()], &output_shape);
-    let input_strides = compute_contiguous_strides(&input_shape);
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let input_strides = compute_contiguous_strides(&input_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let invalid_offset = usize::MAX - (usize::MAX % DataType::Float32.byte_size());
     let input = TensorView::new(
         DevicePtr(buffers[0].as_ptr()),
@@ -3650,9 +3711,12 @@ impl BenchFixture {
     }
 
     fn execute(&self, ep: &CudaExecutionProvider) {
-        let a_strides = compute_contiguous_strides(&self.a.shape);
-        let b_strides = compute_contiguous_strides(&self.b.shape);
-        let output_strides = compute_contiguous_strides(&self.output_shape);
+        let a_strides = compute_contiguous_strides(&self.a.shape)
+            .expect("fixture shape has representable contiguous strides");
+        let b_strides = compute_contiguous_strides(&self.b.shape)
+            .expect("fixture shape has representable contiguous strides");
+        let output_strides = compute_contiguous_strides(&self.output_shape)
+            .expect("fixture shape has representable contiguous strides");
         let a = TensorView::new(
             DevicePtr(self.a_buffer.as_ptr()),
             self.a.dtype,
@@ -3691,7 +3755,8 @@ impl BenchFixture {
             BenchMode::Materialized { transpose, einsum } => {
                 let temporary = self.temporary.as_ref().unwrap();
                 let temporary_shape = [self.a.shape[1], self.a.shape[0]];
-                let temporary_strides = compute_contiguous_strides(&temporary_shape);
+                let temporary_strides = compute_contiguous_strides(&temporary_shape)
+                    .expect("fixture shape has representable contiguous strides");
                 transpose
                     .execute(
                         std::slice::from_ref(&a),
@@ -4738,7 +4803,10 @@ fn semantic_einsum_caller_workspace_gpu() {
         .collect::<Vec<_>>();
     let strides = shapes
         .iter()
-        .map(|shape| compute_contiguous_strides(shape))
+        .map(|shape| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let views = buffers
         .iter()
@@ -4755,7 +4823,8 @@ fn semantic_einsum_caller_workspace_gpu() {
         })
         .collect::<Vec<_>>();
     let output = ep.allocate(m * p * 4, 256).unwrap();
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     macro_rules! output {
         () => {
             TensorMut::new(

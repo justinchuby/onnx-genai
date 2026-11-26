@@ -1,4 +1,4 @@
-//! Float32 reference kernel for ORT 1.27 `com.microsoft::MoE`.
+//! Floating-point reference kernel for ORT 1.27 `com.microsoft::MoE`.
 //!
 //! The positional inputs are:
 //! `input`, `router_probs`, `fc1_experts_weights`, `fc1_experts_bias?`,
@@ -15,12 +15,18 @@ use onnx_runtime_ir::{DataType, Node};
 #[cfg(any(feature = "mlas", test))]
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+pub(super) mod numerical_trace;
+
 use super::check_arity;
 use super::decoded_projection::ProjectionScratch;
 use super::gelu::tanh_gelu;
 #[cfg(not(feature = "mlas"))]
 use super::matmul::gemm_bt;
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use crate::dtype::write_dense_f32_narrow;
+
+mod input_workspace;
+use input_workspace::MoeInputs;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Activation {
@@ -173,11 +179,21 @@ fn float_moe_attributes(node: &Node) -> Result<MoeAttributes> {
 ///
 /// Implemented by running the factory's own attribute parse, so a limit cannot
 /// be added to `create` without appearing here too.
-pub(crate) fn unsupported_reason(node: &Node) -> Option<String> {
+fn unsupported_reason(node: &Node) -> Option<String> {
     float_moe_attributes(node).err().map(|e| e.to_string())
 }
 
 impl KernelFactory for MoEFactory {
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        _opset: u64,
+        _shapes: &[onnx_runtime_ir::Shape],
+        _input_dtypes: &[onnx_runtime_ir::DataType],
+    ) -> Option<String> {
+        unsupported_reason(node)
+    }
+
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(MoEKernel {
             attributes: float_moe_attributes(node)?,
@@ -248,7 +264,8 @@ impl MoEKernel {
         shape: &[usize],
         inter: usize,
         has_fc3: bool,
-    ) -> Result<WorkspaceLayout<3>> {
+        conversions: [std::alloc::Layout; 8],
+    ) -> Result<WorkspaceLayout<11>> {
         if !matches!(shape.len(), 2 | 3) {
             return Err(error(format!(
                 "input must be 2-D [rows, hidden] or 3-D [batch, sequence, hidden], got {shape:?}"
@@ -279,7 +296,8 @@ impl MoEKernel {
             rows
         };
         let [a, b] = MoeWorkspace::bank_layouts(bound, hidden, inter, &self.attributes, has_fc3)?;
-        WorkspaceLayout::new([a, b, accumulator])
+        let [x, router, fc1, b1, fc2, b2, fc3, b3] = conversions;
+        WorkspaceLayout::new([a, b, accumulator, x, router, fc1, b1, fc2, b2, fc3, b3])
     }
 }
 
@@ -311,16 +329,46 @@ impl Kernel for MoEKernel {
         }
         let fc2 = required(4, "fc2_experts_weights")?;
         require_shape("fc2_experts_weights", fc2.shape, 3)?;
+        let layout = self.workspace_layout(
+            input.shape,
+            fc2.shape[2],
+            inputs.get(6).is_some_and(|v| v.present),
+            [std::alloc::Layout::new::<()>(); 8],
+        )?;
+        if layout.bytes() != 0 {
+            // Metadata cannot decide whether a floating source can be borrowed.
+            return Ok(onnx_runtime_ep_api::WorkspacePreparation::Deferred);
+        }
         Ok(onnx_runtime_ep_api::WorkspacePreparation::Ready(
             WorkspaceRequirement {
-                bytes: self
-                    .workspace_layout(
-                        input.shape,
-                        fc2.shape[2],
-                        inputs.get(6).is_some_and(|v| v.present),
-                    )?
-                    .bytes() as u64,
-                alignment: std::mem::align_of::<f32>(),
+                bytes: 0,
+                alignment: layout.alignment(),
+                ..WorkspaceRequirement::NONE
+            },
+        ))
+    }
+
+    fn workspace_requirement_for_execution(
+        &self,
+        inputs: &[TensorView],
+        _outputs: &[TensorMut],
+        metadata: &[TensorMetadata<'_>],
+        _output_metadata: &[onnx_runtime_ep_api::OutputMetadata<'_>],
+        _cached: Option<onnx_runtime_ep_api::WorkspacePreparation>,
+    ) -> Result<onnx_runtime_ep_api::WorkspaceExecutionPreparation> {
+        let sources = MoeInputs::new(inputs, metadata)?;
+        require_shape("fc2_experts_weights", inputs[4].shape, 3)?;
+        let empty = inputs[0].shape.contains(&0);
+        let layout = self.workspace_layout(
+            inputs[0].shape,
+            inputs[4].shape[2],
+            inputs.get(6).is_some_and(|v| !v.is_absent()),
+            sources.layouts(empty)?,
+        )?;
+        Ok(onnx_runtime_ep_api::WorkspaceExecutionPreparation::Ready(
+            WorkspaceRequirement {
+                bytes: layout.bytes() as u64,
+                alignment: layout.alignment(),
                 ..WorkspaceRequirement::NONE
             },
         ))
@@ -447,24 +495,18 @@ impl Kernel for MoEKernel {
             )));
         }
 
-        let fc1_bias = optional_dense(inputs, 3)?;
-        let fc2_bias = optional_dense(inputs, 5)?;
         validate_bias("fc1_experts_bias", inputs, 3, experts, expected_fc1)?;
         validate_bias("fc2_experts_bias", inputs, 5, experts, hidden)?;
 
         let has_fc3 = inputs.get(6).is_some_and(|v| !v.is_absent());
         let uses_separate_gate = self.attributes.uses_separate_gate(has_fc3);
-        let (fc3, fc3_bias) = if uses_separate_gate {
+        if uses_separate_gate {
             let view = inputs
                 .get(6)
                 .filter(|v| !v.is_absent())
                 .ok_or_else(|| error("unfused swiglu requires input 6 fc3_experts_weights"))?;
             require_exact_shape("fc3_experts_weights", view.shape, &[experts, inter, hidden])?;
             validate_bias("fc3_experts_bias", inputs, 7, experts, inter)?;
-            (
-                Some(to_dense_f32_widen("MoE", view)?),
-                optional_dense(inputs, 7)?,
-            )
         } else {
             if has_fc3 {
                 return Err(error(
@@ -476,33 +518,42 @@ impl Kernel for MoEKernel {
                     "fc3_experts_bias requires fc3_experts_weights in unfused swiglu or silu gated-GLU",
                 ));
             }
-            (None, None)
-        };
+        }
 
-        let layout = self.workspace_layout(x_shape, inter, has_fc3)?;
+        let sources = MoeInputs::new(inputs, &[])?;
+        let empty = rows == 0 || hidden == 0;
+        let layout = self.workspace_layout(x_shape, inter, has_fc3, sources.layouts(empty)?)?;
         // SAFETY: exclusive Host backing lives through this synchronous call.
-        let [input, projection, mut accumulator] = unsafe {
+        let [
+            input,
+            projection,
+            mut accumulator,
+            x,
+            router,
+            fc1,
+            b1,
+            fc2,
+            b2,
+            fc3,
+            b3,
+        ] = unsafe {
             ProjectionScratch::bind_layout("MoE execution workspace", layout, workspace)?
         };
         let mut scratch = MoeWorkspace { input, projection };
 
-        // Borrow rather than `into_owned()`. Expert weights are the largest
-        // tensors in the graph - a Mixtral-shaped `fc1` + `fc2` pair is 352 MiB
-        // - and they are contiguous f32 initializers in every real model, so
-        // owning them copied a third of a gigabyte on every single forward.
-        // `to_dense_f32_widen` still allocates for half-precision or strided
-        // sources, which is the only case that actually needs a copy.
-        let x = to_dense_f32_widen("MoE", &inputs[0])?;
-        let router = to_dense_f32_widen("MoE", &inputs[1])?;
-        let fc1 = to_dense_f32_widen("MoE", &inputs[2])?;
-        let fc2 = to_dense_f32_widen("MoE", &inputs[4])?;
+        if empty {
+            return write_dense_f32_narrow("MoE", &mut outputs[0], &[]);
+        }
+        // Every non-borrowable source shares this operation's one admitted owner.
+        let mut conversions = [x, router, fc1, b1, fc2, b2, fc3, b3];
+        let values = sources.read(&mut conversions)?;
         let mut plan = RoutingPlan::build(
-            &router,
+            values.router,
             rows,
             experts,
             self.attributes.k,
             self.attributes.normalize_routing_weights,
-        );
+        )?;
         let driver =
             if use_grouped_driver(&plan, expected_fc1, hidden, inter, self.grouped_min_work) {
                 plan.build_row_slots();
@@ -512,13 +563,13 @@ impl Kernel for MoEKernel {
             };
         let output = driver(
             &plan,
-            &x,
-            &fc1,
-            fc1_bias.as_deref(),
-            &fc2,
-            fc2_bias.as_deref(),
-            fc3.as_deref(),
-            fc3_bias.as_deref(),
+            values.input,
+            values.fc1,
+            values.fc1_bias,
+            values.fc2,
+            values.fc2_bias,
+            values.fc3,
+            values.fc3_bias,
             expected_fc1,
             hidden,
             inter,
@@ -672,7 +723,19 @@ struct RoutingPlan {
 }
 
 impl RoutingPlan {
-    fn build(router: &[f32], rows: usize, experts: usize, k: usize, normalize: bool) -> Self {
+    fn build(
+        router: &[f32],
+        rows: usize,
+        experts: usize,
+        k: usize,
+        normalize: bool,
+    ) -> Result<Self> {
+        if rows.checked_mul(experts) != Some(router.len()) {
+            return Err(error(format!(
+                "routing planner received {} values for rows={rows}, experts={experts}; bind rows * experts router logits",
+                router.len()
+            )));
+        }
         let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); experts];
         let mut routing = RoutingScratch::default();
         for row in 0..rows {
@@ -682,7 +745,7 @@ impl RoutingPlan {
                     None,
                     k,
                     normalize,
-                )
+                )?
                 .iter()
             {
                 per_expert[expert].push((row as u32, weight));
@@ -709,7 +772,7 @@ impl RoutingPlan {
                 slot_weight.push(weight);
             }
         }
-        Self {
+        Ok(Self {
             rows,
             k,
             slot_row,
@@ -717,7 +780,7 @@ impl RoutingPlan {
             slot_weight,
             row_slots: Vec::new(),
             groups,
-        }
+        })
     }
 
     /// Invert the layout so the final scatter can be a parallel map over
@@ -1301,6 +1364,8 @@ impl MoeWorkspace<'_> {
             .zeroed_prefix(rows * (fc1_size + if separate { inter } else { 0 }))?;
         let (fc1, fc3_output) = projections.split_at_mut(rows * fc1_size);
         apply(fc1_projection, input, rows, fc1_bias, fc1)?;
+        #[cfg(test)]
+        numerical_trace::record("fc1", input, rows, fc1_bias, fc1);
         let fc3 = if separate {
             apply(
                 fc3.expect("validated separate FC3"),
@@ -1309,6 +1374,8 @@ impl MoeWorkspace<'_> {
                 fc3_bias,
                 fc3_output,
             )?;
+            #[cfg(test)]
+            numerical_trace::record("fc3", input, rows, fc3_bias, fc3_output);
             Some(&*fc3_output)
         } else {
             None
@@ -1330,6 +1397,8 @@ impl MoeWorkspace<'_> {
             }
             let output = self.projection.zeroed_prefix(rows * hidden)?;
             apply(fc2, activated, rows, fc2_bias, output)?;
+            #[cfg(test)]
+            numerical_trace::record("fc2", activated, rows, fc2_bias, output);
             Ok(output)
         } else {
             for value in fc1.iter_mut() {
@@ -1337,6 +1406,8 @@ impl MoeWorkspace<'_> {
             }
             let output = self.input.zeroed_prefix(rows * hidden)?;
             apply(fc2, fc1, rows, fc2_bias, output)?;
+            #[cfg(test)]
+            numerical_trace::record("fc2", fc1, rows, fc2_bias, output);
             Ok(output)
         }
     }
@@ -1691,45 +1762,101 @@ impl RoutingScratch {
         aggregation_weights: Option<&[f32]>,
         k: usize,
         normalize: bool,
-    ) -> &mut [(usize, f32)] {
-        self.indices.clear();
-        self.indices.extend(0..logits.len());
+    ) -> Result<&mut [(usize, f32)]> {
+        let n = logits.len();
+        self.indices.resize(n, 0);
+        self.exponentials
+            .resize(if aggregation_weights.is_none() { n } else { 0 }, 0.);
+        self.selected.resize(k.min(n), (0, 0.));
+        RoutingBuffers::new(
+            &mut self.indices,
+            &mut self.exponentials,
+            &mut self.selected,
+        )
+        .weights(logits, aggregation_weights, k, normalize)
+    }
+}
+
+/// One routing algorithm over caller-owned storage. Owned and admitted callers
+/// share score ordering, denominator order and every floating-point operation.
+pub(super) struct RoutingBuffers<'a> {
+    indices: &'a mut [usize],
+    exponentials: &'a mut [f32],
+    selected: &'a mut [(usize, f32)],
+}
+impl<'a> RoutingBuffers<'a> {
+    pub(super) fn new(
+        indices: &'a mut [usize],
+        exponentials: &'a mut [f32],
+        selected: &'a mut [(usize, f32)],
+    ) -> Self {
+        Self {
+            indices,
+            exponentials,
+            selected,
+        }
+    }
+    pub(super) fn weights(
+        self,
+        logits: &[f32],
+        aggregation_weights: Option<&[f32]>,
+        k: usize,
+        normalize: bool,
+    ) -> Result<&'a mut [(usize, f32)]> {
+        let n = logits.len();
+        let k = k.min(n);
+        let exponentials = if aggregation_weights.is_none() { n } else { 0 };
+        if self.indices.len() != n
+            || self.exponentials.len() != exponentials
+            || self.selected.len() != k
+            || aggregation_weights.is_some_and(|w| w.len() != n)
+        {
+            return Err(error(format!(
+                "routing storage/input lengths disagree: {n} logits, {} indices, {} exponentials (expected {exponentials}), {} selected routes (expected {k}), aggregation length {:?}; prepare complete routing storage and matching router weights before reading logits",
+                self.indices.len(),
+                self.exponentials.len(),
+                self.selected.len(),
+                aggregation_weights.map(<[f32]>::len)
+            )));
+        }
+        for (i, index) in self.indices.iter_mut().enumerate() {
+            *index = i;
+        }
         self.indices
             .sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]).then_with(|| a.cmp(&b)));
-        self.indices.truncate(k);
-        self.selected.clear();
+        let indices = &self.indices[..k];
         if let Some(weights) = aggregation_weights {
             let denominator = if normalize {
-                self.indices.iter().map(|&i| weights[i]).sum()
+                indices.iter().map(|&i| weights[i]).sum()
             } else {
                 1.0
             };
-            self.selected.extend(self.indices.iter().map(|&i| {
-                let weight = if denominator == 0.0 {
-                    0.0
-                } else {
-                    weights[i] / denominator
-                };
-                (i, weight)
-            }));
+            for (out, &i) in self.selected.iter_mut().zip(indices) {
+                *out = (
+                    i,
+                    if denominator == 0.0 {
+                        0.0
+                    } else {
+                        weights[i] / denominator
+                    },
+                );
+            }
         } else {
             let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            self.exponentials.clear();
-            self.exponentials
-                .extend(logits.iter().map(|&v| (v - max).exp()));
+            for (out, &value) in self.exponentials.iter_mut().zip(logits) {
+                *out = (value - max).exp();
+            }
             let all_sum: f32 = self.exponentials.iter().sum();
             let denominator = if normalize {
-                self.indices.iter().map(|&i| self.exponentials[i]).sum()
+                indices.iter().map(|&i| self.exponentials[i]).sum()
             } else {
                 all_sum
             };
-            self.selected.extend(
-                self.indices
-                    .iter()
-                    .map(|&i| (i, self.exponentials[i] / denominator)),
-            );
+            for (out, &i) in self.selected.iter_mut().zip(indices) {
+                *out = (i, self.exponentials[i] / denominator);
+            }
         }
-        &mut self.selected
+        Ok(self.selected)
     }
 }
 
@@ -1797,6 +1924,33 @@ mod routing_scratch_tests {
     }
 
     #[test]
+    fn borrowed_routing_rejects_incomplete_storage_before_mutating_it() {
+        let mut indices = [91usize; 4];
+        let mut exps = [37f32; 4];
+        let mut selected = [(99usize, 13f32); 2];
+        let logits = [f32::NAN; 4];
+        let error = super::RoutingBuffers::new(&mut indices, &mut exps, &mut selected[..1])
+            .weights(&logits, None, 2, true)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("selected routes (expected 2)"),
+            "{error}"
+        );
+        assert_eq!(indices, [91; 4]);
+        assert_eq!(exps, [37.; 4]);
+        assert_eq!(selected, [(99, 13.); 2]);
+        let error = super::RoutingBuffers::new(&mut indices, &mut [], &mut selected)
+            .weights(&logits, Some(&[1.; 3]), 2, true)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("aggregation length Some(3)"),
+            "{error}"
+        );
+        assert_eq!(indices, [91; 4]);
+        assert_eq!(selected, [(99, 13.); 2]);
+    }
+
+    #[test]
     fn reused_routing_preserves_reference_bits_across_geometry_and_special_values() {
         let mut scratch = RoutingScratch::default();
         let patterns = [
@@ -1825,14 +1979,15 @@ mod routing_scratch_tests {
                         {
                             let expected =
                                 reference_routing_weights(&logits, aggregation, k, normalize);
-                            let selected = scratch.weights(&logits, aggregation, k, normalize);
+                            let selected =
+                                scratch.weights(&logits, aggregation, k, normalize).unwrap();
                             assert_eq!(selected.len(), k.min(width));
                             assert_selection_bits(selected, &expected);
                             // BlockQuantizedMoE consumes expert-sorted selections.
                             // That mutation must not leak into the next score order.
                             selected.sort_unstable_by_key(|&(expert, _)| expert);
                             assert_selection_bits(
-                                scratch.weights(&logits, aggregation, k, normalize),
+                                scratch.weights(&logits, aggregation, k, normalize).unwrap(),
                                 &expected,
                             );
                         }
@@ -1875,7 +2030,7 @@ mod routing_scratch_tests {
                     for weights in [None, Some(aggregation.as_slice())] {
                         let expected = reference_routing_weights(&logits, weights, k, normalize);
                         assert_selection_bits(
-                            scratch.weights(&logits, weights, k, normalize),
+                            scratch.weights(&logits, weights, k, normalize).unwrap(),
                             &expected,
                         );
                     }
@@ -1890,11 +2045,11 @@ mod routing_scratch_tests {
         let logits = [2., 2., -0., 0., f32::NEG_INFINITY];
         let weights = [1., -1., 7., -7., 0.];
         assert_selection_bits(
-            scratch.weights(&logits, Some(&weights), 5, false),
+            scratch.weights(&logits, Some(&weights), 5, false).unwrap(),
             &[(0, 1.), (1, -1.), (3, -7.), (2, 7.), (4, 0.)],
         );
         assert_selection_bits(
-            scratch.weights(&logits, Some(&weights), 2, true),
+            scratch.weights(&logits, Some(&weights), 2, true).unwrap(),
             &[(0, 0.), (1, 0.)],
         );
         let logits = [
@@ -1906,7 +2061,7 @@ mod routing_scratch_tests {
             -0.,
         ];
         let ones = [1.; 6];
-        let selected = scratch.weights(&logits, Some(&ones), 6, false);
+        let selected = scratch.weights(&logits, Some(&ones), 6, false).unwrap();
         assert_eq!(
             selected.iter().map(|&(i, _)| i).collect::<Vec<_>>(),
             [0, 1, 4, 5, 2, 3]
@@ -1959,14 +2114,6 @@ fn float_attr(node: &Node, name: &str, default: f32) -> Result<f32> {
             .ok_or_else(|| error(format!("attribute {name} must be a float"))),
         None => Ok(default),
     }
-}
-
-fn optional_dense(inputs: &[TensorView], index: usize) -> Result<Option<Vec<f32>>> {
-    inputs
-        .get(index)
-        .filter(|v| !v.is_absent())
-        .map(|v| to_dense_f32_widen("MoE", v).map(|c| c.into_owned()))
-        .transpose()
 }
 
 fn validate_bias(
@@ -2252,6 +2399,267 @@ mod tests {
     }
 
     #[test]
+    fn output_can_overlap_each_borrowed_source_in_both_directions() {
+        let mut kernel = workspace_kernel(u64::MAX);
+        kernel.attributes.activation = Activation::Silu;
+        let shapes = [
+            vec![3, 4],
+            vec![3, 4],
+            vec![4, 5, 4],
+            vec![4, 5],
+            vec![4, 4, 5],
+            vec![4, 4],
+            vec![4, 5, 4],
+            vec![4, 5],
+        ];
+        let tensors = shapes
+            .iter()
+            .enumerate()
+            .map(|(slot, s)| {
+                Owned::f32(
+                    s,
+                    &vec![if slot == 1 { 0. } else { 1. }; s.iter().product()],
+                )
+            })
+            .collect::<Vec<_>>();
+        let inputs = tensors.iter().map(Owned::view).collect::<Vec<_>>();
+        let mut reference = Owned::zeros_f32(&[3, 4]);
+        kernel
+            .execute_prepared(&inputs, &mut [reference.view_mut()])
+            .unwrap();
+        let expected = reference
+            .to_f32()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>();
+        let metadata = inputs
+            .iter()
+            .map(|v| TensorMetadata::new(v.dtype, v.shape, true))
+            .collect::<Vec<_>>();
+        let req = kernel
+            .workspace_requirement_for_execution(&inputs, &[], &metadata, &[], None)
+            .unwrap()
+            .require_ready()
+            .unwrap();
+        let mut workspace = vec![0u128; (req.bytes as usize).div_ceil(16)];
+        for slot in 0..8 {
+            for shift in [-1isize, 0, 1] {
+                let mut aliased = vec![-37.; tensors[slot].to_f32().len() + 2];
+                let len = aliased.len();
+                aliased[1..len - 1].copy_from_slice(&tensors[slot].to_f32());
+                let mut views = inputs.clone();
+                views[slot].data =
+                    onnx_runtime_ep_api::DevicePtr(aliased.as_ptr().wrapping_add(1).cast());
+                let mut output = reference.view_mut();
+                output.data = onnx_runtime_ep_api::DevicePtrMut(
+                    aliased
+                        .as_mut_ptr()
+                        .wrapping_add((1 + shift) as usize)
+                        .cast(),
+                );
+                kernel
+                    .execute_with_workspace(
+                        &views,
+                        &mut [output],
+                        Some(WorkspaceView::new(
+                            onnx_runtime_ep_api::DevicePtrMut(workspace.as_mut_ptr().cast()),
+                            req.bytes as usize,
+                        )),
+                    )
+                    .unwrap();
+                let start = (1 + shift) as usize;
+                let actual = aliased[start..start + 12]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected, "borrowed input {slot}, shift {shift}");
+            }
+        }
+    }
+
+    #[test]
+    fn empty_output_validates_sources_without_reading_or_staging_them() {
+        let mut kernel = workspace_kernel(u64::MAX);
+        kernel.attributes.activation = Activation::Silu;
+        for (rows, hidden) in [(0, 4), (3, 0)] {
+            let shapes = [
+                vec![rows, hidden],
+                vec![rows, 4],
+                vec![4, 5, hidden],
+                vec![4, 5],
+                vec![4, hidden, 5],
+                vec![4, hidden],
+                vec![4, 5, hidden],
+                vec![4, 5],
+            ];
+            let owners = shapes
+                .iter()
+                .map(|s| Owned::f16(s, &vec![0.; s.iter().product()]))
+                .collect::<Vec<_>>();
+            let inputs = owners
+                .iter()
+                .map(|t| {
+                    let mut v = t.view();
+                    v.data = onnx_runtime_ep_api::DevicePtr(std::ptr::without_provenance(4096));
+                    v
+                })
+                .collect::<Vec<_>>();
+            let metadata = inputs
+                .iter()
+                .map(|v| TensorMetadata::new(v.dtype, v.shape, true))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                kernel
+                    .workspace_requirement(&metadata, &[])
+                    .unwrap()
+                    .require_ready()
+                    .unwrap()
+                    .bytes,
+                0
+            );
+            assert_eq!(
+                kernel
+                    .workspace_requirement_for_execution(&inputs, &[], &metadata, &[], None)
+                    .unwrap()
+                    .require_ready()
+                    .unwrap()
+                    .bytes,
+                0
+            );
+            let mut y = Owned::zeros_f32(&[rows, hidden]);
+            kernel
+                .execute_with_workspace(&inputs, &mut [y.view_mut()], None)
+                .unwrap();
+            let mut invalid = inputs.clone();
+            invalid[3].strides = &[i64::MAX, i64::MAX];
+            assert!(
+                kernel
+                    .execute_with_workspace(&invalid, &mut [y.view_mut()], None)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn conversion_budget_binds_before_any_floating_source_is_read() {
+        use crate::kernels::testutil::RecordingGovernor;
+        use onnx_runtime_memory_api::Tier;
+        use onnx_runtime_memory_governor::{
+            HostWorkspacePool, MemoryGovernor, ProcessMemoryManager,
+        };
+        const R: usize = 3;
+        const H: usize = 4;
+        const I: usize = 5;
+        const E: usize = 4;
+        let shapes = [
+            vec![R, H],
+            vec![R, E],
+            vec![E, I, H],
+            vec![E, I],
+            vec![E, H, I],
+            vec![E, H],
+            vec![E, I, H],
+            vec![E, I],
+        ];
+        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            let mut kernel = workspace_kernel(u64::MAX);
+            kernel.attributes.activation = Activation::Silu;
+            let tensors = shapes
+                .iter()
+                .enumerate()
+                .map(|(slot, shape)| {
+                    let values = vec![if slot == 5 { 2. } else { 0. }; shape.iter().product()];
+                    match dtype {
+                        DataType::Float32 => Owned::f32(shape, &values),
+                        DataType::Float16 => Owned::f16(shape, &values),
+                        _ => Owned::bf16(shape, &values),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let inputs = tensors.iter().map(Owned::view).collect::<Vec<_>>();
+            let metadata = inputs
+                .iter()
+                .map(|v| TensorMetadata::new(v.dtype, v.shape, true))
+                .collect::<Vec<_>>();
+            let cached = kernel.workspace_requirement(&metadata, &[]).unwrap();
+            assert!(matches!(
+                cached,
+                onnx_runtime_ep_api::WorkspacePreparation::Deferred
+            ));
+            let req = kernel
+                .workspace_requirement_for_execution(&inputs, &[], &metadata, &[], Some(cached))
+                .unwrap()
+                .require_ready()
+                .unwrap();
+            let base = (R * (H.max(I) + (I + I).max(H)) + R * H) * 4;
+            let copies = if dtype == DataType::Float32 {
+                0
+            } else {
+                shapes.iter().map(|s| s.iter().product::<usize>() * 4).sum()
+            };
+            assert_eq!(req.bytes as usize, base + copies);
+            let mut backing = vec![91u128; (req.bytes as usize).div_ceil(16)];
+            let mut y = Owned::f32(&[R, H], &[37.; R * H]);
+            for slot in 0..8 {
+                let mut inaccessible = inputs.clone();
+                inaccessible[slot].data =
+                    onnx_runtime_ep_api::DevicePtr(std::ptr::without_provenance(4096));
+                let short = WorkspaceView::new(
+                    onnx_runtime_ep_api::DevicePtrMut(backing.as_mut_ptr().cast()),
+                    req.bytes as usize - 1,
+                );
+                let error = kernel
+                    .execute_with_workspace(&inaccessible, &mut [y.view_mut()], Some(short))
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("workspace"), "slot {slot}: {error}");
+                assert_eq!(y.to_f32(), [37.; R * H]);
+                assert!(backing.iter().all(|v| *v == 91));
+            }
+            let books = RecordingGovernor::new_host(req.bytes);
+            let pool = HostWorkspacePool::governed(
+                &ProcessMemoryManager::new().unwrap(),
+                std::sync::Arc::new(books.clone()),
+            )
+            .unwrap();
+            let cpu = CpuExecutionProvider::with_resources(
+                crate::CpuMemoryResources::default()
+                    .with_workspace_pool(pool.clone())
+                    .unwrap(),
+            );
+            let mut identity = None;
+            for _ in 0..3 {
+                let mut owner = cpu
+                    .allocate_workspace(req.bytes as usize, req.alignment, req.role())
+                    .unwrap();
+                let current = owner.bound_owner().unwrap().identity();
+                assert_eq!(*identity.get_or_insert(current), current);
+                let full = WorkspaceView::new(
+                    onnx_runtime_ep_api::DevicePtrMut(owner.as_mut_ptr()),
+                    req.bytes as usize,
+                );
+                kernel
+                    .execute_with_workspace(&inputs, &mut [y.view_mut()], Some(full))
+                    .unwrap();
+                cpu.deallocate_workspace(owner).unwrap();
+                assert_eq!(y.to_f32(), [2.; R * H]);
+                assert_eq!(books.used(Tier::Host), req.bytes);
+            }
+            assert_eq!((books.claims(), books.releases()), (1, 0));
+            pool.trim_idle(u64::MAX).unwrap();
+            assert_eq!(books.used(Tier::Host), 0);
+            let missing = &inputs[..7];
+            assert!(
+                kernel
+                    .workspace_requirement_for_execution(missing, &[], &metadata, &[], Some(cached))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("fc3_experts_bias")
+            );
+        }
+    }
+
+    #[test]
     fn execution_workspace_bounds_cover_threshold_skew_and_pool_changes() {
         use crate::kernels::testutil::RecordingGovernor;
         use onnx_runtime_ep_api::DevicePtrMut;
@@ -2310,13 +2718,22 @@ mod tests {
                     .collect();
                 let req = one
                     .install(|| {
+                        let inputs = [
+                            input.view(),
+                            router.view(),
+                            fc1.view(),
+                            TensorView::absent(DataType::Float32),
+                            fc2.view(),
+                        ];
                         kernel
-                            .workspace_requirement(&metadata, &[])
-                            .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)
+                            .workspace_requirement_for_execution(&inputs, &[], &metadata, &[], None)
+                            .and_then(
+                                onnx_runtime_ep_api::WorkspaceExecutionPreparation::require_ready,
+                            )
                     })
                     .unwrap();
                 assert_eq!(req.bytes, bytes as u64);
-                let plan = RoutingPlan::build(&router_values, ROWS, E, K, true);
+                let plan = RoutingPlan::build(&router_values, ROWS, E, K, true).unwrap();
                 assert!(!one.install(|| use_grouped_driver(&plan, H, H, H, threshold)));
                 assert_eq!(
                     four.install(|| use_grouped_driver(&plan, H, H, H, threshold)),
@@ -2400,23 +2817,32 @@ mod tests {
     fn execution_workspace_metadata_checks_empty_singleton_dtype_and_overflow() {
         let kernel = workspace_kernel(MOE_GROUPED_MIN_WORK);
         let requirement = |shape: &[usize], dtype, present| {
-            kernel
-                .workspace_requirement(
-                    &[
-                        TensorMetadata::new(dtype, shape, present),
-                        TensorMetadata::new(dtype, &[], false),
-                        TensorMetadata::new(dtype, &[], false),
-                        TensorMetadata::new(dtype, &[], false),
-                        TensorMetadata::new(dtype, &[4, 4, 4], true),
-                    ],
-                    &[],
-                )
-                .and_then(onnx_runtime_ep_api::WorkspacePreparation::require_ready)
+            kernel.workspace_requirement(
+                &[
+                    TensorMetadata::new(dtype, shape, present),
+                    TensorMetadata::new(dtype, &[], false),
+                    TensorMetadata::new(dtype, &[], false),
+                    TensorMetadata::new(dtype, &[], false),
+                    TensorMetadata::new(dtype, &[4, 4, 4], true),
+                ],
+                &[],
+            )
         };
         for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
-            assert_eq!(requirement(&[0, 4], dtype, true).unwrap().bytes, 0);
-            assert_eq!(requirement(&[1, 4], dtype, true).unwrap().bytes, 48);
-            assert_eq!(requirement(&[2, 3, 4], dtype, true).unwrap().bytes, 288);
+            assert_eq!(
+                requirement(&[0, 4], dtype, true)
+                    .unwrap()
+                    .require_ready()
+                    .unwrap()
+                    .bytes,
+                0
+            );
+            for shape in [&[1, 4][..], &[2, 3, 4]] {
+                assert!(matches!(
+                    requirement(shape, dtype, true).unwrap(),
+                    onnx_runtime_ep_api::WorkspacePreparation::Deferred
+                ));
+            }
         }
         for shape in [
             &[][..],
@@ -2453,12 +2879,20 @@ mod tests {
         );
         let grouped = workspace_kernel(0);
         assert_eq!(
-            grouped.workspace_layout(&[1, 4], 4, false).unwrap().bytes(),
+            grouped
+                .workspace_layout(&[1, 4], 4, false, [std::alloc::Layout::new::<()>(); 8])
+                .unwrap()
+                .bytes(),
             80
         );
         assert!(
             grouped
-                .workspace_layout(&[isize::MAX as usize / 8, 2], 4, false)
+                .workspace_layout(
+                    &[isize::MAX as usize / 8, 2],
+                    4,
+                    false,
+                    [std::alloc::Layout::new::<()>(); 8]
+                )
                 .is_err()
         );
     }
@@ -2557,7 +2991,7 @@ mod tests {
                             .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
                             .collect();
                         let req = kernel
-                            .workspace_requirement(&metadata, &[])
+                            .workspace_requirement_for_execution(&inputs, &[], &metadata, &[], None)
                             .unwrap()
                             .require_ready()
                             .unwrap();
@@ -3351,7 +3785,7 @@ mod tests {
                     let fc1_bias = bias.then(|| ramp(EXPERTS * fc1_size, 7, 0.15, 0.11));
                     let fc2_bias = bias.then(|| ramp(EXPERTS * HIDDEN, 5, 0.1, 0.07));
                     let fc3_bias = (bias && uses_fc3).then(|| ramp(EXPERTS * INTER, 3, 0.05, 0.05));
-                    let mut plan = RoutingPlan::build(&router, rows, EXPERTS, k, true);
+                    let mut plan = RoutingPlan::build(&router, rows, EXPERTS, k, true).unwrap();
                     let args = (
                         fc1_bias.as_deref(),
                         fc2_bias.as_deref(),
@@ -3435,7 +3869,7 @@ mod tests {
                     router[row * experts + expert] = ((row + expert) % experts) as f32;
                 }
             }
-            let plan = RoutingPlan::build(&router, tokens, experts, k, true);
+            let plan = RoutingPlan::build(&router, tokens, experts, k, true).unwrap();
             let fc1_size = 2 * inter;
             // Asserted on the work estimate rather than on `use_grouped_driver`
             // so the test still means something on a single-core runner, where
@@ -3474,7 +3908,7 @@ mod tests {
             router[row * EXPERTS] = 9.0;
             router[row * EXPERTS + row] = 8.0;
         }
-        let plan = RoutingPlan::build(&router, rows, EXPERTS, 2, true);
+        let plan = RoutingPlan::build(&router, rows, EXPERTS, 2, true).unwrap();
         let largest = plan.groups.iter().map(|g| g.len).max().unwrap();
         let mean = plan.slots() / plan.groups.len();
         assert!(
@@ -3619,7 +4053,7 @@ mod tests {
                         fc3_bias.as_deref(),
                         &attributes,
                     );
-                    let mut plan = RoutingPlan::build(&router, rows, EXPERTS, k, true);
+                    let mut plan = RoutingPlan::build(&router, rows, EXPERTS, k, true).unwrap();
                     plan.build_row_slots();
                     let mut backing = vec![0f32; plan.slots() * (HIDDEN + 3 * INTER) * 2];
                     let mut scratch = test_scratch(&mut backing);
@@ -3666,7 +4100,7 @@ mod tests {
             router[row * EXPERTS + (row % 3)] = 5.0;
             router[row * EXPERTS + ((row + 1) % 3)] = 4.0;
         }
-        let mut plan = RoutingPlan::build(&router, ROWS, EXPERTS, K, true);
+        let mut plan = RoutingPlan::build(&router, ROWS, EXPERTS, K, true).unwrap();
         assert_eq!(plan.slots(), ROWS * K);
         assert_eq!(plan.groups.len(), 3, "only three experts are ever selected");
         let mut expected_start = 0;
@@ -3914,7 +4348,7 @@ mod tests {
 
         // The same values laid out with a gap after every element, exposed
         // through a stride-2 view. Identical logical tensor, non-contiguous
-        // storage, so `to_dense_f32_widen` has to materialize it.
+        // storage, so the admitted conversion region must snapshot it.
         let spread = |values: &[f32]| -> Vec<f32> {
             let mut out = vec![0.0f32; values.len() * 2];
             for (index, &value) in values.iter().enumerate() {
@@ -4019,7 +4453,7 @@ mod tests {
         for row in 0..ROWS {
             router[row * EXPERTS + (row % EXPERTS)] = 5.0;
         }
-        let plan = RoutingPlan::build(&router, ROWS, EXPERTS, 1, true);
+        let plan = RoutingPlan::build(&router, ROWS, EXPERTS, 1, true).unwrap();
         let slots = plan.slots();
         let input = ramp(slots * IN, 31, 0.3, 0.05);
         // Expert weights in ORT canonical `[experts][out][in]` layout.

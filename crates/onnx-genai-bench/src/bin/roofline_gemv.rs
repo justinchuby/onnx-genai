@@ -111,30 +111,34 @@ struct HostTensor {
 }
 
 impl HostTensor {
-    fn from_f32(shape: &[usize], data: Vec<f32>) -> Self {
+    fn from_f32(shape: &[usize], data: Vec<f32>) -> Result<Self> {
         let mut bytes = Vec::with_capacity(data.len() * 4);
         for v in &data {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
-        Self {
+        Ok(Self {
             bytes,
             shape: shape.to_vec(),
-            strides: compute_contiguous_strides(shape),
+            strides: compute_contiguous_strides(shape)?,
             dtype: DataType::Float32,
-        }
+        })
     }
 
-    fn from_u8(shape: &[usize], bytes: Vec<u8>) -> Self {
-        Self {
+    fn from_u8(shape: &[usize], bytes: Vec<u8>) -> Result<Self> {
+        Ok(Self {
             bytes,
             shape: shape.to_vec(),
-            strides: compute_contiguous_strides(shape),
+            strides: compute_contiguous_strides(shape)?,
             dtype: DataType::Uint8,
-        }
+        })
     }
 
-    fn zeros_f32(shape: &[usize]) -> Self {
-        let n: usize = shape.iter().product();
+    fn zeros_f32(shape: &[usize]) -> Result<Self> {
+        onnx_runtime_ir::ContiguousStridePlan::new(shape)?;
+        let n = onnx_runtime_ir::checked_numel(shape)
+            .context("benchmark output element count overflow")?;
+        std::alloc::Layout::array::<f32>(n)
+            .context("benchmark output exceeds addressable f32 capacity")?;
         Self::from_f32(shape, vec![0.0; n])
     }
 
@@ -251,10 +255,10 @@ fn main() -> Result<()> {
         .collect();
     let act_vec: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 6.0).collect();
 
-    let a = HostTensor::from_f32(&[1, k], act_vec);
-    let b = HostTensor::from_u8(&[n, k_blocks, blob], b_bytes);
-    let scales = HostTensor::from_f32(&[n, k_blocks], scales_vec);
-    let mut y = HostTensor::zeros_f32(&[1, n]);
+    let a = HostTensor::from_f32(&[1, k], act_vec)?;
+    let b = HostTensor::from_u8(&[n, k_blocks, blob], b_bytes)?;
+    let scales = HostTensor::from_f32(&[n, k_blocks], scales_vec)?;
+    let mut y = HostTensor::zeros_f32(&[1, n])?;
 
     let input_shapes = vec![vec![1, k], vec![n, k_blocks, blob], vec![n, k_blocks]];
     let (graph, node_id) = build_matmulnbits_graph(k, n, block_size, k_blocks, blob);

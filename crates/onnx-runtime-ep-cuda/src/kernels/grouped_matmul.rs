@@ -18,6 +18,7 @@ use crate::runtime::{CudaRuntime, cuptr};
 
 const SOURCE: &str = concat!(
     include_str!("packed_kernel_prelude.cuh"),
+    include_str!("affine_grouped_dot.cuh"),
     include_str!("grouped_matmul.cu")
 );
 const PACKED_ENTRY_I32: &str = "packed_grouped_i32";

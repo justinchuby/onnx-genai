@@ -1,4 +1,4 @@
-//! CPU reference kernel for `pkg.nxrt::VarlenAttention` v1.
+//! CPU reference kernel for `pkg.nxrt._private::VarlenAttention` v1.
 //!
 //! Q/K/V use token-major packed layouts (`[total_tokens, heads, dim]`).
 //! `cu_seqlens_q` and `cu_seqlens_kv` delimit each sequence, so the shared SDPA
@@ -43,6 +43,16 @@ pub(super) struct PackedAttentionSpec<'a> {
 }
 
 impl KernelFactory for VarlenAttentionFactory {
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        _opset: u64,
+        shapes: &[onnx_runtime_ir::Shape],
+        input_dtypes: &[DataType],
+    ) -> Option<String> {
+        unsupported_reason(node, shapes, input_dtypes).map(|reason| reason.into_owned())
+    }
+
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let softcap = node
             .attr("softcap")

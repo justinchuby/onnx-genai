@@ -495,7 +495,7 @@ impl Kernel for RotaryEmbeddingKernel {
             .into_iter()
             .map(slice_byte_range)
             .collect();
-        let direct = output_direct_write_eligible(&mut outputs[0], x.len(), &read_ranges);
+        let direct = output_direct_write_eligible(&outputs[0], x.len(), &read_ranges);
         let mut owned;
         let y: &mut [f32] = if direct {
             // SAFETY: `output_direct_write_eligible` proved the buffer is a
@@ -1177,7 +1177,8 @@ mod parallel_tests {
         let shape = [batch, seq, heads * head_size];
         let f32c = DataType::Float32;
         let cpu = DeviceId::cpu();
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
 
         // Full rotation is elementwise alias-safe on its own; partial rotary
         // adds a pass-through `copy_from_slice`, which is only sound when the

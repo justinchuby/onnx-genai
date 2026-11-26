@@ -1794,7 +1794,8 @@ mod dense_broadcast_equivalence_tests {
             padded.push(f32::NAN);
         }
         let strides: Vec<i64> = {
-            let mut s = onnx_runtime_ir::compute_contiguous_strides(shape);
+            let mut s = onnx_runtime_ir::compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             for v in &mut s {
                 *v *= 2;
             }
@@ -1810,7 +1811,8 @@ mod dense_broadcast_equivalence_tests {
             padded.push(f32::NAN);
         }
         let strides: Vec<i64> = {
-            let mut s = onnx_runtime_ir::compute_contiguous_strides(shape);
+            let mut s = onnx_runtime_ir::compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             for v in &mut s {
                 *v *= 2;
             }

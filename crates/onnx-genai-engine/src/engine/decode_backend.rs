@@ -2,11 +2,37 @@
 
 use super::*;
 
+/// A declared keyed container is a Native execution requirement, not a hint.
+pub(crate) fn admit_keyed_weight_backend(
+    requested: EngineDecodeBackend,
+    declared: bool,
+) -> anyhow::Result<EngineDecodeBackend> {
+    if !declared {
+        return Ok(requested);
+    }
+    anyhow::ensure!(
+        requested != EngineDecodeBackend::Ort,
+        "graph_weights requires the Native backend; select --backend native or materialize ordinary ONNX external data for the ORT reference backend"
+    );
+    #[cfg(feature = "native-backend")]
+    {
+        Ok(EngineDecodeBackend::Native)
+    }
+    #[cfg(not(feature = "native-backend"))]
+    {
+        anyhow::bail!(
+            "graph_weights requires the native-backend build feature; rebuild with Native support or export ordinary ONNX external data"
+        )
+    }
+}
+
 pub(crate) fn resolve_decode_backend(
     model_path: &Path,
     requested: EngineDecodeBackend,
+    keyed_weights: bool,
 ) -> anyhow::Result<EngineDecodeBackend> {
-    let requested = requested_decode_backend(requested)?;
+    let requested =
+        admit_keyed_weight_backend(requested_decode_backend(requested)?, keyed_weights)?;
     match requested {
         EngineDecodeBackend::Ort => Ok(EngineDecodeBackend::Ort),
         EngineDecodeBackend::Native => {
@@ -36,7 +62,7 @@ pub(crate) fn resolve_decode_backend(
                 #[cfg(not(feature = "native-backend"))]
                 {
                     anyhow::bail!(
-                        "model contains native-only operators (pkg.nxrt::BlockQuantizedMatMul); \
+                        "model contains native-only operators (pkg.nxrt._private::BlockQuantizedMatMul); \
                          rebuild the CLI with --features native-backend (or --features \
                          native-cuda for the native CUDA EP) and select \
                          decode_backend = EngineDecodeBackend::Native \
@@ -92,7 +118,8 @@ pub(crate) fn ort_to_native_hint() -> &'static str {
 pub(crate) fn native_to_ort_hint() -> &'static str {
     "if this model uses operators unsupported by the native backend, \
      set decode_backend = EngineDecodeBackend::Ort (or ONNX_GENAI_BACKEND=ort) \
-     to run this model on ONNX Runtime"
+     to run this model on ONNX Runtime; packages declaring graph_weights first \
+     require an export with ordinary ONNX external data and no graph_weights bindings"
 }
 
 pub(crate) fn augment_backend_error<T>(
@@ -133,7 +160,7 @@ pub(crate) fn model_requires_native_backend(model_path: &Path) -> anyhow::Result
 pub(crate) fn model_proto_requires_native_backend(
     model: &onnx_runtime_loader::proto::ModelProto,
 ) -> bool {
-    const DOMAIN: &str = "pkg.nxrt";
+    const DOMAIN: &str = "pkg.nxrt._private";
     const OP_TYPE: &str = "BlockQuantizedMatMul";
     const OPSET_VERSION: i64 = 1;
 
@@ -197,9 +224,10 @@ pub(crate) enum NativeSpeculationKind {
 /// Decide whether a native request should run through the speculative driver.
 ///
 /// Returns `Some` only for an implemented, greedy prompt-lookup request with no
-/// processor chain and no logprobs — the exact regime in which host-argmax
-/// acceptance reproduces plain greedy selection. Every other request (including
-/// non-greedy, processor-chain, logprobs, or the default `None` mode) returns
+/// logits-changing processors and no logprobs — the regime in which host-argmax
+/// acceptance reproduces plain greedy selection. Output-only stop observers run
+/// at each accepted token boundary. Every other request (including non-greedy,
+/// logits processors, logprobs, or the default `None` mode) returns
 /// `None` and stays on the untouched plain fast path.
 #[cfg(feature = "native-backend")]
 pub(crate) fn native_speculation_plan(
@@ -221,7 +249,7 @@ pub(crate) fn native_speculation_plan(
         _ => return None,
     };
     let greedy = options.selects_greedily();
-    if !greedy || !chain.is_empty() || options.top_logprobs.is_some() {
+    if !greedy || !chain.only_observes_committed_output() || options.top_logprobs.is_some() {
         return None;
     }
     let width = options
@@ -230,4 +258,71 @@ pub(crate) fn native_speculation_plan(
         .unwrap_or(default_width)
         .max(1);
     Some(NativeSpeculationPlan { kind, width })
+}
+
+#[cfg(all(test, feature = "native-backend"))]
+mod prediction_limit_tests {
+    use super::*;
+    #[test]
+    fn prediction_time_limit_keeps_observation_only_speculation_but_not_logit_transforms()
+    -> anyhow::Result<()> {
+        let options = GenerateOptions {
+            max_prediction_time: Some(std::time::Duration::from_millis(1)),
+            speculative_mode: Some(SpeculativeMode::PromptLookup {
+                ngram: 1,
+                max_tokens: 2,
+            }),
+            ..Default::default()
+        };
+        let mut chain = crate::processors::build_processor_chain(&options, None, false, None)?;
+        assert!(native_speculation_plan(&options, &chain).is_some());
+        chain.add(Box::new(crate::logits::StopSequenceProcessor::new(vec![
+            crate::logits::StopSequence::Text("stop".into()),
+        ])));
+        assert!(native_speculation_plan(&options, &chain).is_some());
+        chain.add(Box::new(crate::logits::TopKProcessor { top_k: 1 }));
+        assert!(chain.preserves_argmax());
+        assert!(
+            native_speculation_plan(&options, &chain).is_none(),
+            "rank preservation alone must not admit speculative logit transforms"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod keyed_backend_tests {
+    use super::*;
+
+    #[test]
+    fn keyed_declarations_require_native_capability_and_preserve_explicit_selection() {
+        for requested in [
+            EngineDecodeBackend::Auto,
+            EngineDecodeBackend::Native,
+            EngineDecodeBackend::Ort,
+        ] {
+            assert_eq!(
+                admit_keyed_weight_backend(requested, false).unwrap(),
+                requested
+            );
+        }
+        let error = admit_keyed_weight_backend(EngineDecodeBackend::Ort, true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("graph_weights requires the Native backend")
+        );
+        for requested in [EngineDecodeBackend::Auto, EngineDecodeBackend::Native] {
+            let result = admit_keyed_weight_backend(requested, true);
+            #[cfg(feature = "native-backend")]
+            assert_eq!(result.unwrap(), EngineDecodeBackend::Native);
+            #[cfg(not(feature = "native-backend"))]
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("native-backend build feature")
+            );
+        }
+    }
 }

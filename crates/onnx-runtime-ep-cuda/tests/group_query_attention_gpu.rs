@@ -269,10 +269,10 @@ fn run_with_backend(
         .iter()
         .map(|input| {
             input.as_ref().map(|tensor| {
-                tensor
-                    .strides
-                    .clone()
-                    .unwrap_or_else(|| compute_contiguous_strides(&tensor.shape))
+                tensor.strides.clone().unwrap_or_else(|| {
+                    compute_contiguous_strides(&tensor.shape)
+                        .expect("fixture shape has representable contiguous strides")
+                })
             })
         })
         .collect();
@@ -300,7 +300,10 @@ fn run_with_backend(
         .collect::<onnx_runtime_ep_api::Result<Vec<_>>>()?;
     let output_strides: Vec<_> = output_shapes
         .iter()
-        .map(|shape| compute_contiguous_strides(shape))
+        .map(|shape| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let mut workspace = None;
     let execution = {
@@ -507,13 +510,20 @@ fn execute_in_place_packed_f32_gqa_with_seqlens_shape(
     let total_shape = [1];
     let rotary_cache_shape = [5, 1];
     let positions_shape = [1, query_sequence_length];
-    let packed_strides = compute_contiguous_strides(&packed_shape);
-    let output_strides = compute_contiguous_strides(&output_shape);
-    let cache_strides = compute_contiguous_strides(&cache_shape);
-    let seqlens_strides = compute_contiguous_strides(seqlens_shape);
-    let total_strides = compute_contiguous_strides(&total_shape);
-    let rotary_cache_strides = compute_contiguous_strides(&rotary_cache_shape);
-    let positions_strides = compute_contiguous_strides(&positions_shape);
+    let packed_strides = compute_contiguous_strides(&packed_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let cache_strides = compute_contiguous_strides(&cache_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let seqlens_strides = compute_contiguous_strides(seqlens_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let total_strides = compute_contiguous_strides(&total_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let rotary_cache_strides = compute_contiguous_strides(&rotary_cache_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let positions_strides = compute_contiguous_strides(&positions_shape)
+        .expect("fixture shape has representable contiguous strides");
     let cache_k_input = DevicePtr(cache_k.as_ptr());
     let cache_v_input = DevicePtr(cache_v.as_ptr());
     let cache_k_output = DevicePtrMut(cache_k.as_mut_ptr());
@@ -733,7 +743,8 @@ fn run_packed_step(
     let kernel = ep.get_kernel(model.graph.node(node_id), &[], 1)?;
 
     let device = ep.device_id();
-    let cache_strides = compute_contiguous_strides(&cache_shape);
+    let cache_strides = compute_contiguous_strides(&cache_shape)
+        .expect("fixture shape has representable contiguous strides");
     let transient_shapes = [
         &[1, seq, PACKED_WIDTH][..],
         &[1][..],
@@ -752,7 +763,10 @@ fn run_packed_step(
     ];
     let transient_strides: Vec<_> = transient_shapes
         .iter()
-        .map(|shape| compute_contiguous_strides(shape))
+        .map(|shape| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let transient_views: Vec<_> = transient
         .iter()
@@ -806,7 +820,8 @@ fn run_packed_step(
     ];
 
     let output_shape = &output_shapes[0];
-    let output_strides = compute_contiguous_strides(output_shape);
+    let output_strides = compute_contiguous_strides(output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut output = ep.allocate(output_shape.iter().product::<usize>() * 4, 256)?;
     let mut workspace = None;
     let execution = common::execute_kernel(
@@ -1266,7 +1281,7 @@ fn run_forced_parity_case(ep: &CudaExecutionProvider, case: &ParityCase) {
         &attrs,
         &inputs,
         &output_shapes,
-        Some(GroupQueryAttentionBackend::Phase2a),
+        Some(GroupQueryAttentionBackend::NoFlashPrefill),
     ))
     .unwrap();
     let (atol, rtol) = parity_tolerances(case.dtype);
@@ -1484,7 +1499,7 @@ fn gqa_gpu_fp16_decode_split_k_long_context_is_deterministic_and_matches_baselin
         &attrs,
         &inputs,
         &output_shapes,
-        Some(GroupQueryAttentionBackend::Phase2a),
+        Some(GroupQueryAttentionBackend::NoFlashPrefill),
     ))
     .unwrap();
     assert_eq!(first, second, "fp16 split-K decode must be deterministic");
@@ -1558,7 +1573,7 @@ fn gqa_gpu_auto_fallback_matches_baseline_and_reports_selected_backend() {
                 *case.totals.iter().max().unwrap(),
                 case.dim,
             ),
-            GroupQueryAttentionBackend::Phase2a,
+            GroupQueryAttentionBackend::NoFlashPrefill,
             "{} must select the baseline",
             case.name
         );
@@ -1575,7 +1590,7 @@ fn gqa_gpu_auto_fallback_matches_baseline_and_reports_selected_backend() {
             &attrs,
             &inputs,
             &output_shapes,
-            Some(GroupQueryAttentionBackend::Phase2a),
+            Some(GroupQueryAttentionBackend::NoFlashPrefill),
         ))
         .unwrap();
         let (atol, rtol) = parity_tolerances(case.dtype);
@@ -1622,12 +1637,18 @@ fn benchmark_gqa_case(
     let q_shape = [batch, q_seq, heads * dim];
     let kv_shape = [batch, q_seq, kv_heads * dim];
     let cache_shape = [batch, kv_heads, capacity, dim];
-    let q_strides = compute_contiguous_strides(&q_shape);
-    let kv_strides = compute_contiguous_strides(&kv_shape);
-    let cache_strides = compute_contiguous_strides(&cache_shape);
-    let scalar_strides = compute_contiguous_strides(&[]);
-    let seqlens_strides = compute_contiguous_strides(&[1]);
-    let output_strides = compute_contiguous_strides(&q_shape);
+    let q_strides = compute_contiguous_strides(&q_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let kv_strides = compute_contiguous_strides(&kv_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let cache_strides = compute_contiguous_strides(&cache_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let scalar_strides = compute_contiguous_strides(&[])
+        .expect("fixture shape has representable contiguous strides");
+    let seqlens_strides = compute_contiguous_strides(&[1])
+        .expect("fixture shape has representable contiguous strides");
+    let output_strides = compute_contiguous_strides(&q_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = vec![
         TensorView::new(DevicePtr(q.as_ptr()), dtype, &q_shape, &q_strides, device),
         TensorView::new(DevicePtr(k.as_ptr()), dtype, &kv_shape, &kv_strides, device),
@@ -1777,7 +1798,7 @@ fn gqa_prefill_h200_benchmark() {
                 &ep,
                 q_seq,
                 past_len,
-                GroupQueryAttentionBackend::Phase2a,
+                GroupQueryAttentionBackend::NoFlashPrefill,
                 iterations,
             );
             let total = q_seq + past_len;
@@ -3784,7 +3805,7 @@ fn gqa_gpu_prepared_reference_scores_ignore_present_cache_padding() {
                     vec![1, 2, capacity, 2],
                     vec![1, 2, capacity, 2],
                 ],
-                Some(GroupQueryAttentionBackend::Phase2a),
+                Some(GroupQueryAttentionBackend::NoFlashPrefill),
             )
             .unwrap();
             close(&outputs[0], &expected_row.repeat(2));
@@ -3838,7 +3859,7 @@ fn gqa_gpu_prepared_general_half_uses_arbitrary_head_dim_and_padded_cache() {
                 vec![1, kv_heads, capacity, dim],
                 vec![1, kv_heads, capacity, dim],
             ],
-            Some(GroupQueryAttentionBackend::Phase2a),
+            Some(GroupQueryAttentionBackend::NoFlashPrefill),
         )
         .unwrap();
         assert_close(&outputs[0], &expected, 0.002, 0.002);
@@ -3882,7 +3903,7 @@ fn gqa_gpu_hidden_present_scratch_matches_visible_padded_cache_outputs() {
         &attrs(&[]),
         &inputs,
         &output_shapes,
-        Some(GroupQueryAttentionBackend::Phase2a),
+        Some(GroupQueryAttentionBackend::NoFlashPrefill),
     )
     .unwrap();
     for outputs in [1, 2] {
@@ -3891,7 +3912,7 @@ fn gqa_gpu_hidden_present_scratch_matches_visible_padded_cache_outputs() {
             &attrs(&[]),
             &inputs,
             &output_shapes[..outputs],
-            Some(GroupQueryAttentionBackend::Phase2a),
+            Some(GroupQueryAttentionBackend::NoFlashPrefill),
         )
         .unwrap();
         close(&hidden[0], &all[0]);

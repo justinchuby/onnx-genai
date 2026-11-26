@@ -209,7 +209,7 @@ mod tests {
             .unwrap()
             .replace("op_type: \"Sigmoid\"", "op_type: \"Identity\"");
         std::fs::write(package.path().join("model.onnx.textproto"), graph).unwrap();
-        let mut engine = Engine::from_dir(package.path(), crate::EngineConfig::default()).unwrap();
+        let mut engine = Engine::from_dir(package.path(), crate::fixture_engine_config()).unwrap();
         let contract = reranking_contract(engine.metadata()).unwrap().unwrap();
         let tokenizer = Tokenizer::from_file(package.path().join("tokenizer.json")).unwrap();
         let pair = PreparedRerankingPair::prepare(
@@ -229,7 +229,7 @@ mod tests {
     fn declared_cross_encoder_scores_query_document_pairs_and_reports_usage() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/onnx_genai_workflows/reranking");
-        let mut engine = Engine::from_dir(&root, crate::EngineConfig::default()).unwrap();
+        let mut engine = Engine::from_dir(&root, crate::fixture_engine_config()).unwrap();
         let contract = reranking_contract(engine.metadata()).unwrap().unwrap();
         let tokenizer = Tokenizer::from_file(root.join("tokenizer.json")).unwrap();
         for (query, matching, other) in [("hello", "hello", "world"), ("world", "world", "hello")] {
@@ -271,7 +271,7 @@ mod tests {
     fn multimodal_pairs_decode_images_and_preserve_query_document_order() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/onnx_genai_workflows/reranking_multimodal");
-        let mut engine = Engine::from_dir(&root, crate::EngineConfig::default()).unwrap();
+        let mut engine = Engine::from_dir(&root, crate::fixture_engine_config()).unwrap();
         let contract = reranking_contract(engine.metadata()).unwrap().unwrap();
         let tokenizer = Tokenizer::from_file(root.join("tokenizer.json")).unwrap();
         let white: Arc<[u8]> = std::fs::read(root.join("white.png")).unwrap().into();
@@ -381,7 +381,7 @@ graph {
             serde_yaml::to_string(&metadata).unwrap(),
         )
         .unwrap();
-        let mut engine = Engine::from_dir(root.path(), crate::EngineConfig::default()).unwrap();
+        let mut engine = Engine::from_dir(root.path(), crate::fixture_engine_config()).unwrap();
         let contract = reranking_contract(engine.metadata()).unwrap().unwrap();
         let tokenizer = Tokenizer::from_file(root.path().join("tokenizer.json")).unwrap();
         let white: Arc<[u8]> = std::fs::read(source.join("white.png")).unwrap().into();
@@ -426,7 +426,7 @@ graph {
         );
         assert!(graph.contains("int64_data: -1"));
         std::fs::write(root.path().join("model.onnx.textproto"), graph).unwrap();
-        let mut engine = Engine::from_dir(root.path(), crate::EngineConfig::default()).unwrap();
+        let mut engine = Engine::from_dir(root.path(), crate::fixture_engine_config()).unwrap();
         let contract = reranking_contract(engine.metadata()).unwrap().unwrap();
         let tokenizer = Tokenizer::from_file(root.path().join("tokenizer.json")).unwrap();
         let white: Arc<[u8]> = std::fs::read(source.join("white.png")).unwrap().into();

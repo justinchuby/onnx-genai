@@ -268,12 +268,12 @@ impl Kernel for TensorScatterKernel {
             return Ok(());
         }
 
-        let mut metadata_values = compute_contiguous_strides(past.shape)
+        let mut metadata_values = compute_contiguous_strides(past.shape)?
             .into_iter()
             .map(|value| value as u64)
             .collect::<Vec<_>>();
         metadata_values.extend(
-            compute_contiguous_strides(update.shape)
+            compute_contiguous_strides(update.shape)?
                 .into_iter()
                 .map(|value| value as u64),
         );

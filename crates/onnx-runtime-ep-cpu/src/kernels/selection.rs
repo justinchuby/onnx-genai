@@ -1000,7 +1000,8 @@ mod tests {
         let f64_owned = |shape: &[usize], data: &[f64]| Owned {
             bytes: data.iter().flat_map(|v| v.to_le_bytes()).collect(),
             shape: shape.to_vec(),
-            strides: onnx_runtime_ir::compute_contiguous_strides(shape),
+            strides: onnx_runtime_ir::compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides"),
             dtype: DataType::Float64,
         };
         let x = f64_owned(&[5], &[-3.5, -1.0, 0.5, 2.0, 8.5]);
@@ -1595,7 +1596,8 @@ mod tests {
 
         NMS_SELECTION_RUNS.with(|runs| runs.set(0));
         let shape = [1, 1, 4];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let view = TensorView::new(
             DevicePtr(std::ptr::dangling()),
             DataType::Float32,

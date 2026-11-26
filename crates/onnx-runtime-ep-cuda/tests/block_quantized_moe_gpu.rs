@@ -12,7 +12,7 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
-//! GPU parity regressions for the mixed-projection `pkg.nxrt::BlockQuantizedMoE` op.
+//! GPU parity regressions for the mixed-projection `pkg.nxrt._private::BlockQuantizedMoE` op.
 //!
 //! Synthetic cases cover every supported mixed GLM projection pair and use the
 //! CPU kernel as the independent oracle. Opt-in tests also read official
@@ -90,7 +90,7 @@ fn count_host_allocations<T>(operation: impl FnOnce() -> T) -> (T, u64) {
     (result, allocations)
 }
 
-const DOMAIN: &str = "pkg.nxrt";
+const DOMAIN: &str = "pkg.nxrt._private";
 const FORMAT: &str = "mxfp4";
 
 #[derive(Clone)]
@@ -485,14 +485,16 @@ fn run_cpu_node(
     let strides: Vec<_> = inputs
         .iter()
         .map(|input| {
-            input
-                .as_ref()
-                .map(|input| compute_contiguous_strides(&input.shape))
+            input.as_ref().map(|input| {
+                compute_contiguous_strides(&input.shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
         })
         .collect();
     let views = build_views(inputs, &strides, None, DeviceId::cpu());
     let output_shape = [config.rows, config.hidden];
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut output = vec![0u8; config.rows * config.hidden * 4];
     let output_view = TensorMut::new(
         DevicePtrMut(output.as_mut_ptr().cast()),
@@ -615,16 +617,18 @@ fn run_gpu_node(
     let strides: Vec<_> = inputs
         .iter()
         .map(|input| {
-            input
-                .as_ref()
-                .map(|input| compute_contiguous_strides(&input.shape))
+            input.as_ref().map(|input| {
+                compute_contiguous_strides(&input.shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
         })
         .collect();
     let views = build_gpu_views(kernel.as_ref(), inputs, &strides, &buffers, ep.device_id());
     let output_shape = [config.rows, config.hidden];
     let output_len = config.rows * config.hidden;
     let mut output_buffer = ep.allocate(output_len * 4, 256)?;
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let output_view = TensorMut::new(
         DevicePtrMut(output_buffer.as_mut_ptr()),
         DataType::Float32,
@@ -867,9 +871,10 @@ fn block_quantized_moe_rejects_raw_substituted_and_mutated_projection_views() {
     let strides = inputs
         .iter()
         .map(|input| {
-            input
-                .as_ref()
-                .map(|input| compute_contiguous_strides(&input.shape))
+            input.as_ref().map(|input| {
+                compute_contiguous_strides(&input.shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
         })
         .collect::<Vec<_>>();
     let views = build_gpu_views(kernel.as_ref(), &inputs, &strides, &buffers, ep.device_id());
@@ -889,7 +894,8 @@ fn block_quantized_moe_rejects_raw_substituted_and_mutated_projection_views() {
     let output_ptr_mut = output.as_mut_ptr();
     let output_ptr = cuptr(output.as_ptr());
     let output_shape = [1, 32];
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let run = |candidate: &[TensorView]| {
         kernel.execute_with_workspace(
             candidate,
@@ -1075,14 +1081,16 @@ fn block_quantized_moe_mixed_decode_capture_replays_without_fallback() {
     let strides: Vec<_> = inputs
         .iter()
         .map(|input| {
-            input
-                .as_ref()
-                .map(|input| compute_contiguous_strides(&input.shape))
+            input.as_ref().map(|input| {
+                compute_contiguous_strides(&input.shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
         })
         .collect();
     let views = build_gpu_views(kernel.as_ref(), &inputs, &strides, &buffers, ep.device_id());
     let output_shape = [config.rows, config.hidden];
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut output_buffer = ep.allocate(config.hidden * 4, 256).unwrap();
     let output_ptr_mut = output_buffer.as_mut_ptr();
     let output_ptr = cuptr(output_buffer.as_ptr());
@@ -1382,14 +1390,16 @@ fn measure_captured_moe(
     let strides: Vec<_> = inputs
         .iter()
         .map(|input| {
-            input
-                .as_ref()
-                .map(|input| compute_contiguous_strides(&input.shape))
+            input.as_ref().map(|input| {
+                compute_contiguous_strides(&input.shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
         })
         .collect();
     let views = build_gpu_views(kernel.as_ref(), inputs, &strides, &buffers, ep.device_id());
     let output_shape = [config.rows, config.hidden];
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut output_buffer = ep.allocate(config.rows * config.hidden * 4, 256).unwrap();
     let output_ptr_mut = output_buffer.as_mut_ptr();
     let output_view = || {
@@ -2030,16 +2040,18 @@ mod route_telemetry_impl {
         let strides: Vec<_> = inputs
             .iter()
             .map(|input| {
-                input
-                    .as_ref()
-                    .map(|input| compute_contiguous_strides(&input.shape))
+                input.as_ref().map(|input| {
+                    compute_contiguous_strides(&input.shape)
+                        .expect("fixture shape has representable contiguous strides")
+                })
             })
             .collect();
         let views = build_gpu_views(kernel, inputs, &strides, &buffers, ep.device_id());
         let output_shape = [config.rows, config.hidden];
         let output_len = config.rows * config.hidden;
         let mut output_buffer = ep.allocate(output_len * 4, 256)?;
-        let output_strides = compute_contiguous_strides(&output_shape);
+        let output_strides = compute_contiguous_strides(&output_shape)
+            .expect("fixture shape has representable contiguous strides");
         let output_view = TensorMut::new(
             DevicePtrMut(output_buffer.as_mut_ptr()),
             DataType::Float32,

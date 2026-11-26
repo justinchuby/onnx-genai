@@ -201,14 +201,14 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 
 | Op | Domain | Status | Backend | Notes |
 |----|--------|--------|---------|-------|
-| `Attention` | `com.microsoft` | ✅ | **NVRTC tiled online-softmax + Phase-2a fallback** | Phase-2b fused f32/f16/bf16 prefill, including GQA and additive masks; measured auto-gate retains the cuBLAS baseline where faster. See `CUDA_FLASH_ATTENTION.md`. |
+| `Attention` | `com.microsoft` | ✅ | **NVRTC tiled online-softmax + cuBLASLt/softmax fallback** | Fused f32/f16/bf16 prefill, including GQA and additive masks; measured auto-gate retains the cuBLAS baseline where faster. See `CUDA_FLASH_ATTENTION.md`. |
 | `Attention` (opset 23/24/25) | `` | ✅ | **CUDA row kernel; split-KV on eligible unwindowed decode** | Standard ONNX SDPA with 3D/4D layouts, GQA, bool/additive masks, and KV cache. Opset 25 windows bound the score and value loops; windowed calls retain logical KV extents rather than using mask-derived frozen capacity. f32/f16/bf16. |
 | `RotaryEmbedding` (opset 23) | `` | ✅ | **deterministic CUDA EP fallback** | f32 interleaved/non-interleaved RoPE, partial rotary dimensions, and optional position-id gathering. |
 | `RotaryEmbedding` | `com.microsoft` | ✅ | **NVRTC-custom** | Contrib-domain RoPE registration with shape/dtype/attribute validation in `rotary_embedding.rs`. |
-| `MultiHeadAttention` | `com.microsoft` | ✅ | **cuBLASLt Phase-2a SDPA + NVRTC layout adapters** | Contiguous f32/f16/bf16 separate Q/K/V. Query is BSH; K/V may be BSH or BNSH. Supports optional same-dtype projection bias, broadcast additive attention bias, Int32/Int64 key-padding mask, causal mode, and paired BNSH past/present KV. Q/K/V head sizes must match. Packed QKV/KV, DecoderMaskedMHA inputs, unequal V head size, and mixed float dtypes fail closed. Per-call scratch, a host-resolved padding mask, and a trailing synchronization make graph capture unsupported (`multi_head_attention.rs`). |
+| `MultiHeadAttention` | `com.microsoft` | ✅ | **cuBLASLt/softmax SDPA + NVRTC layout adapters** | Contiguous f32/f16/bf16 separate Q/K/V. Query is BSH; K/V may be BSH or BNSH. Supports optional same-dtype projection bias, broadcast additive attention bias, Int32/Int64 key-padding mask, causal mode, and paired BNSH past/present KV. Q/K/V head sizes must match. Packed QKV/KV, DecoderMaskedMHA inputs, unequal V head size, and mixed float dtypes fail closed. Per-call scratch, a host-resolved padding mask, and a trailing synchronization make graph capture unsupported (`multi_head_attention.rs`). |
 | `GroupQueryAttention`, `PagedAttention` | `com.microsoft` | ✅ | **shared tiled attention cores** | Registered attention/KV variants with f32/f16/bf16 compute and integer sequence metadata; each variant's shape, cache, and capture bounds are enforced by its claim gate and dedicated GPU suite. |
-| `VarlenAttention`, `PackedVarlenAttention` | `pkg.nxrt` | ✅ | **shared tiled attention cores** | Runtime-owned variable-length attention variants over the shared tiled cores. |
-| `CompressedSparseAttention`, `SparseKvGather`, `DsaIndexSelect`, `IndexShare`, `KvCacheCapacityAppend` | `pkg.nxrt` | ✅ | **NVRTC sparse/KV kernels** | Runtime-owned sparse-attention and stable-KV primitives. `KvCacheCapacityAppend` and `IndexShare` have explicit capture-safe device-error paths; see their dedicated GPU suites. |
+| `VarlenAttention`, `PackedVarlenAttention` | `pkg.nxrt._private` | ✅ | **shared tiled attention cores** | Runtime-owned variable-length attention variants over the shared tiled cores. |
+| `CompressedSparseAttention`, `SparseKvGather`, `DsaIndexSelect`, `IndexShare`, `KvCacheCapacityAppend` | `pkg.nxrt._private` | ✅ | **NVRTC sparse/KV kernels** | Runtime-owned sparse-attention and stable-KV primitives. `KvCacheCapacityAppend` and `IndexShare` have explicit capture-safe device-error paths; see their dedicated GPU suites. |
 | `LinearAttention`, `CausalConvWithState` | `` | ✅ | **NVRTC recurrent kernels** | Standard-domain f32/f16/bf16 hybrid-decoder state kernels. `LinearAttention` supports the four update rules and fails closed for unsupported geometry; `CausalConvWithState` implements depthwise causal state carry. |
 | `LinearAttention`, `CausalConvWithState` | `com.microsoft` | ✅ | **NVRTC recurrent kernels** | Contrib-domain registrations of the same recurrent kernels. |
 | `FusedAttention` | `com.microsoft` | 🔬 | **fusion rewrite to `Attention`** | The fused kernel exists behind `AttentionKernel`; registering/lowering this op name remains. |
@@ -217,8 +217,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 
 | Op | Domain | Status | Backend | Notes |
 |----|--------|--------|---------|-------|
-| `Cast` | `` | ✅ | **NVRTC-custom** | Element-wise dtype conversion; f32/f64/f16/bf16/int8-64/uint8-64/bool, ONNX saturating float→int. Two NVRTC modules keep f16/bf16 (which need NVRTC's built-in `cuda_fp16.h`/`cuda_bf16.h`) out of the common integer/f32 path (`cast.rs`). |
-| `CastLike` | `` | ✅ | **NVRTC-custom** | Same kernel as `Cast`; target dtype taken from the output tensor. |
+| `Cast` | `` | ✅ | **NVRTC-custom** | Element-wise conversion for f32/f64/f16/bf16, bool, and signed/unsigned 2-, 4-, 8-, 16-, 32-, and 64-bit integers. Native signed FP8 conversion supports `saturate` from opset 19; E8M0 adds `round_mode` from opset 24. Direct FP8/packed-integer conversion is not supported. Packed FLOAT6 supports widening only, from opset 28. |
+| `CastLike` | `` | ✅ | **NVRTC-custom** | Same conversions as `Cast` except FLOAT6 widening; the second input supplies the target dtype. |
 | `BitCast` (v26) | `` | ✅ | **Device copy** | Preserves exact bytes for equal-width dtypes, including dense packed 2- and 4-bit tensors. Uses an asynchronous stream copy when storage cannot be reused. |
 | `Identity` | `` | ✅ | **memcpy** (D2D) | Straight dtype-agnostic device copy into the pre-shaped output (`movement.rs`). |
 | `Flatten` | `` | ✅ | **memcpy** (D2D) | Dtype-agnostic D2D copy; the 2-D output shape is metadata-only, so the bytes are copied unchanged (`movement.rs`). |
@@ -226,10 +226,10 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Reshape`, `Squeeze`, `Unsqueeze` | `` | ✅ | **memcpy** | Dtype-agnostic D2D copy into the executor's pre-shaped output; modern axes inputs and legacy attributes are accepted. |
 | `Transpose` | `` | ✅ | **NVRTC-custom** | Indexed byte copy or bit-exact 4-/2-bit packed permutation, including odd element counts. Explicit permutation or default axis reversal. |
 | `Gather` | `` | ✅ | **NVRTC-custom** | Axis-parametric contiguous indexed copy; Int32/Int64 indices, negative index wrap, arbitrary index rank. |
-| `AffineQuantizedGather` | `pkg.nxrt` | ✅ | **NVRTC-custom** | EP fusion for single-use per-tensor FLOAT `DequantizeLinear` on INT8/UINT8 data feeding `Gather`; decodes only selected elements. |
-| `AffineQuantizedGroupedMatMul` | `pkg.nxrt` | ✅ | **NVRTC-custom** | Eager fusion of row-packed unsigned 4-bit affine weights into `GroupedMatMul`; only selected experts are decoded. Routing and intervening MoE operations stay separate. |
-| `PackedGroupedMatMul` | `pkg.nxrt` | ✅ | **NVRTC-custom** | Eager fusion of row-aligned GGUF weights into unbiased FLOAT `GroupedMatMul`; only selected experts are decoded. |
-| `DequantizePackedGather` | `pkg.nxrt` | ✅ | **NVRTC-custom** | Fusion of GGUF `DequantizePacked` into axis-0 Gather with block-aligned slices; only selected slices are decoded. |
+| `AffineQuantizedGather` | `pkg.nxrt._private` | ✅ | **NVRTC-custom** | EP fusion for single-use per-tensor FLOAT `DequantizeLinear` on INT8/UINT8 data feeding `Gather`; decodes only selected elements. |
+| `AffineQuantizedGroupedMatMul` | `pkg.nxrt._private` | ✅ | **NVRTC-custom** | Eager fusion of row-packed unsigned 4-bit affine weights into `GroupedMatMul`; only selected experts are decoded. Routing and intervening MoE operations stay separate. |
+| `PackedGroupedMatMul` | `pkg.nxrt._private` | ✅ | **NVRTC-custom** | Eager fusion of row-aligned GGUF weights into unbiased FLOAT `GroupedMatMul`; only selected experts are decoded. |
+| `DequantizePackedGather` | `pkg.nxrt._private` | ✅ | **NVRTC-custom** | Fusion of GGUF `DequantizePacked` into axis-0 Gather with block-aligned slices; only selected slices are decoded. |
 | `GatherElements` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic contiguous element gather with Int64 indices, negative axes/indices, and CPU-matched rank/dimension validation. |
 | `ScatterElements` | `` | ✅ | **NVRTC-custom** | f32/f16/bf16/Int64 values with Int32/Int64 indices. Assignment and opset 16 `add`/`mul` and opset 18 `min`/`max` preserve row-major ordering; opset 29 `mean` uses parallel accumulation and includes the original data. |
 | `TopK` (v10) | `` | ✅ | **NVRTC-custom** | Deterministic f32 per-slice selection with input `K`, arbitrary/negative axis, largest/smallest modes, and CPU tie-breaking by lower source index. |
@@ -259,13 +259,13 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Range` | `` | ✅ | **NVRTC-custom** | FP32/FP64, FP16/BF16, and Int16/32/64; opset 27 supports FLOAT and DOUBLE stash precision. CUDA graph capture cannot resolve a scalar-dependent output length. The ORT CUDA plugin declines runtime-valued shape reads rather than claiming them. |
 | `ScatterND` | `` | ✅ | **NVRTC-custom** | f32/f16/bf16/Int64 slice updates with negative index wrapping and ordered assignment/legacy reductions. Opset 29 adds Int32 indices and parallel `mean` including the original data, with exact integer sums and truncation toward zero (`indexing.rs`). |
 | `HannWindow`, `HammingWindow`, `BlackmanWindow` (v17) | `` | ✅ | **NVRTC-custom** | Periodic or symmetric signal windows generated directly on device in f16/bf16/f32/f64, with the scalar size and `output_datatype` contract matched to the CPU EP (`window.rs`). |
-| `DFT` (v17/v20) | `` | ✅ | **cuFFT + NVRTC pack/unpack** | f32 real/complex input, forward/inverse, full/onesided output, arbitrary signal axis, and truncating/zero-padding `dft_length`. A bounded 16-entry plan cache reuses stream-bound C2C plans; execution scratch and packed data use governed EP workspace. Plan selection and scalar staging deliberately decline CUDA-graph capture (`dft.rs`, `cufft.rs`). |
+| `DFT` (v17/v20) | `` | ✅ | **cuFFT + NVRTC pack/unpack** | f32 full forward/inverse transforms and real-input forward onesided output (RFFT), arbitrary signal axis, and truncating/zero-padding `dft_length`. **IRFFT (`inverse=1, onesided=1`) is declined at claim and construction; use the CPU EP for its Hermitian reconstruction and real output.** A bounded 16-entry plan cache reuses stream-bound C2C plans; execution scratch and packed data use governed EP workspace. Plan selection and scalar staging deliberately decline CUDA-graph capture (`dft.rs`, `cufft.rs`). |
 | `NonMaxSuppression` (v10) | `` | ✅ | **NVRTC bounded sort/suppress + DeviceWorkspace** | Static contiguous f32 boxes `[B,N,4]` and scores `[B,C,N]`, with `N <= 256` and `B*C <= 256`. One block per batch/class filters and bitonic-sorts scores deterministically, then performs bounded sequential suppression; a second metadata launch reduces per-group counts. Only the 8-byte selected count crosses D2H before one device materialization launch writes exact Int64 rows. Optional scalar inputs remain device-resident. |
 | `STFT` (v17) | `` | ✅ | **cuFFT + fused NVRTC frame/window pack + unpack** | Contiguous f32 `[batch, signal, 1|2]`, dynamic Int32/Int64 `frame_step` and optional `frame_length`, optional matching f32 window, complete unpadded frames, full spectrum or real-input onesided output. All frames across the signal batch execute in one PlanMany call through DFT's shared 16-entry plan cache and governed workspace. Runtime scalar reads/plan selection deliberately decline CUDA-graph capture (`stft.rs`, `cufft.rs`). |
 | `CenterCropPad` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic fixed-width centered crop/zero-pad over all or selected axes, including negative axes and CPU-matched odd-difference placement (`index_transform.rs`). |
 | `Col2Im` | `` | ✅ | **NVRTC-custom** | Arbitrary spatial-rank f32/f16/bf16 inverse image-column transform with overlap accumulation, dilation, strides, and padding; accumulation is widened to f32 (`index_transform.rs`). |
 | `Unique` | `` | ✅ | **bounded NVRTC sort/group + governed workspace** | Flattened, contiguous, statically shaped Float32 only; `sorted=0|1`; 1–4 positional outputs; at most `min(1024, device max threads/block)` elements. Axis mode, other dtypes, symbolic shapes, strided input, and larger tensors fail closed. It copies only the 8-byte output count to host before device materialization, so CUDA graph capture is explicitly unsupported (`unique.rs`). |
-| `BlockQuantizedMatMul`, `BlockQuantizedMoE` | `pkg.nxrt` | ✅ | **NVRTC quantized kernels** | Runtime block-quantized dense and expert paths; packed formats, scales, auxiliary indices, and device geometry are validated by their claim gates. |
+| `BlockQuantizedMatMul`, `BlockQuantizedMoE` | `pkg.nxrt._private` | ✅ | **NVRTC quantized kernels** | Runtime block-quantized dense and expert paths; packed formats, scales, auxiliary indices, and device geometry are validated by their claim gates. |
 | `GatherBlockQuantized` | `com.microsoft` | ✅ | **NVRTC quantized kernel** | Block-quantized embedding gather; packed formats, scales, indices, and device geometry are validated by its claim gate. |
 | `Mish`, `Celu`, `IsInf`, `IsNaN`, `PRelu`, `LogSoftmax`, `Hardmax` | `` | ✅ | **NVRTC-custom** | Implemented activation, predicate, and softmax-family kernels with dtype/attribute bounds locked by the conformance profile. |
 | `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `BitwiseNot`, `BitShift` | `` | ✅ | **NVRTC-custom** | Integer bitwise family, including broadcasting and CPU-matched over-shift behavior. |
@@ -273,8 +273,10 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `QuantizeLinear`, `DequantizeLinear`, `QLinearMatMul`, `DynamicQuantizeLinear` | `` | ✅ | **NVRTC quantization** | Per-tensor/per-axis constraints and supported integer storage are enforced by each kernel's claim gate. |
 | `DequantizePacked` | `` | ✅ | **NVRTC block decode** | All 27 opset-29 GGUF profiles decode directly from device-resident UINT8 payloads into FLOAT, FLOAT16, BFLOAT16, or DOUBLE. |
 | `Dropout`, `NonZero` | `` | ✅ | **NVRTC-custom** | Inference Dropout and bounded dynamic-output coordinate extraction; dynamic metadata paths decline capture where host materialization is required. |
-| `Resize`, `GridSample`, `ConvTranspose` | `` | ✅ | **NVRTC-custom** | Implemented interpolation/sampling and transposed-convolution subsets; unsupported coordinate modes, cubic/volumetric cases, and output-shape policies fail closed. |
+| `Resize`, `GridSample` | `` | ✅ | **NVRTC-custom** | Implemented interpolation/sampling subsets; unsupported coordinate modes and sampling policies fail closed. |
+| `ConvTranspose` | `` | ✅ | **NVRTC-custom** | Standalone: 1-D/2-D/3-D f16/f32/f64 and opset-22+ bf16; explicit pads, SAME_UPPER/SAME_LOWER, VALID, and explicit output shape. ORT plugin: existing v1 registration and 1-D/2-D f16/f32/bf16 subset. |
 | `DeformConv` | `` | ✅ | **NVRTC-custom** | Opsets 19 and 22; fused N-D interpolation and grouped accumulation, with a specialized 2-D kernel. Supports up to 32 spatial axes on contiguous tensors. |
+| `RoiAlign` | `` | ✅ | **NVRTC-custom** | Standalone nxrt only, opsets 10/16/22. Supports f16/f32/f64 (bf16 from opset 22), Int64 batch indices, average/max pooling, and fixed/adaptive sampling. Device-side index validation requires eager execution; the ORT CUDA plugin does not advertise this op. |
 
 <!-- CUDA_COVERAGE_MATRIX_END -->
 
@@ -305,7 +307,7 @@ surfaces on every host:
   subtracts `CUDA_COVERED_OPS`, and rejects an undocumented gap.
 - `every_cuda_covered_op_is_named_in_current_coverage_matrix` parses
   `(domain, name)` pairs between the matrix markers above and requires every
-  advertised name to use an unambiguous domain.
+  standalone CUDA name to use an unambiguous domain.
 
 The exact pair comparison needs the real CUDA registry, whose factories hold a
 CUDA runtime. Run its source-derived census on a CUDA host:
@@ -390,7 +392,7 @@ strings.
 weight tensors) is present in the CPU EP but is **not a real CUDA gap**: no
 Mobius-exported model fixture emits it — every MoE model we target uses
 `com.microsoft::QMoE` (INT4/INT8 packed weights, covered by `qmoe.rs`) or
-`pkg.nxrt::BlockQuantizedMoE`. The only `MoE` producers in the repo are synthetic
+`pkg.nxrt._private::BlockQuantizedMoE`. The only `MoE` producers in the repo are synthetic
 benchmark harnesses (`scripts/ort_ab/gen_moe.py`) and CPU-EP-only e2e test
 fixtures. Registering a CUDA `MoE` kernel would be dead code for current targets;
 this non-gap is explicitly recorded here to prevent future re-investigation.
@@ -418,7 +420,7 @@ worth stating precisely:
   `*.textproto` fixture in the repo the attention ops are `Attention`,
   `GroupQueryAttention` and `MultiHeadAttention` — never the packed variant.
   This project's own packed variable-length attention is the runtime-invented
-  `pkg.nxrt::PackedVarlenAttention` (already CUDA-covered,
+  `pkg.nxrt._private::PackedVarlenAttention` (already CUDA-covered,
   `packed_varlen_attention.rs`) — the exact analogue of `MoE`→`QMoE` /
   `BlockQuantizedMoE`. The only producer of `com.microsoft::PackedMultiHeadAttention`
   in the repo is one synthetic CPU-EP e2e fixture
@@ -457,7 +459,9 @@ worth stating precisely:
   prevent future re-investigation.
 
 `ai.onnx::DFT` and `ai.onnx::STFT` are implemented for CUDA in `kernels/dft.rs`
-and `kernels/stft.rs`. The DFT path
+and `kernels/stft.rs`. The CUDA adapter does not implement IRFFT
+(`inverse=1, onesided=1`); it rejects that mode explicitly before plan creation,
+and the CPU EP supplies the real-inverse path. The DFT path
 packs arbitrary ONNX signal axes into contiguous complex f32 batches, executes
 cuFFT C2C, and unpacks to the requested full or half spectrum. This common
 packed-batch/plan-cache seam is reused by STFT, whose fused pack kernel extracts
@@ -653,12 +657,13 @@ Historical snapshot after batch 13: **159** advertised CUDA op names, **164**
 CUDA `(domain, op_type)` pairs, and **141 / 145** CPU standard-domain op types.
 
 The issue #67 operator-coverage batch 14 adds `ConvTranspose` and `GridSample`.
-`ConvTranspose` covers 1-D/2-D f32/f16/bf16 overlap-add with strides, asymmetric
-pads, dilations, output padding, bias, groups, and depthwise geometry.
+Standalone `ConvTranspose` covers 1-D/2-D/3-D f16/f32/f64 and opset-22+ bf16
+overlap-add with strides, asymmetric pads, dilations, output padding, bias, groups,
+and depthwise geometry. SAME_UPPER and SAME_LOWER target `input * stride`;
+explicit `output_shape` overrides `pads`.
 `GridSample` covers 4-D bilinear/nearest sampling for zeros, border, and
-reflection padding with either `align_corners` setting. ConvTranspose
-`SAME_UPPER`/`SAME_LOWER` and output-shape-driven padding, plus cubic/bicubic and
-volumetric GridSample, remain explicitly fail-closed. GPU parity covers the
+reflection padding with either `align_corners` setting. Cubic/bicubic and
+volumetric GridSample remain explicitly fail-closed. GPU parity covers the
 supported narrow storage types and out-of-bounds sampling. Historical snapshot after batch 14: **163** advertised CUDA op names, **168**
 CUDA `(domain, op_type)` pairs, and **143 / 145** CPU standard-domain op types.
 
@@ -694,7 +699,7 @@ expected impact for transformer inference.
    implemented)* — tiled online-softmax now removes the `[B,H,Sq,Sk]` HBM tensor
    for f32/f16/bf16 prefill and is 1.53x faster for H200 f16 S=512. Long-context
    tuning and the `FusedAttention` graph rewrite remain; automatic dispatch keeps
-   Phase-2a at measured slower shapes. See `CUDA_FLASH_ATTENTION.md`.
+   cuBLASLt/softmax at measured slower shapes. See `CUDA_FLASH_ATTENTION.md`.
 2. **`LayerNormalization` / RMSNorm (fused)** — mean+variance reduction, the
    normalize, and the affine (`γ·x̂+β`) in **one** kernel over one HBM read.
    A library path is a reduction + several pointwise passes; the fused kernel

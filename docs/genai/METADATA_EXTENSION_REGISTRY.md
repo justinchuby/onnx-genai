@@ -25,6 +25,9 @@ A reader that accepts a schema version must implement that version's typed SSA/d
 | `v1.14` | Decision v2 profiles declare ordered encoded-image inputs and authoritative text/media token usage; decision v1 remains text-only. |
 | `v1.15` | Decision v3 profiles declare typed mixed state-media inputs and an explicit spoken-question audio endpoint with authoritative per-variant usage. |
 | `v1.16` | Externally executed audio programs bind explicitly named float32 feature media inputs; analysis semantics and clip bounds come from the selected program output. |
+| `v1.17` | Each ONNX graph can declare immutable GGUF/SafeTensors containers with explicit tensor-key mappings; geometry and executable semantics stay in the graph. |
+| `v1.18` | Explicit infill control roles, ordering and additional terminators are package facts; native /infill renders authored ordered file context even for an empty list, with no filesystem lookup or guessed separators. |
+| `v1.19` | GGUF LoRA sources declare exact source/target bindings, factor storage and explicit alpha/rank composition; the loader is a semantic-required extension and unsupported adapter variants fail closed. |
 
 ## Optional semantic extensions
 
@@ -50,6 +53,7 @@ Packages declare an extension only through its typed declaration location. The r
 | `onnx-genai.adapters@1` | package adapter service | `v1.0` | `adapters.application_capability` | §9 | `onnx_genai_metadata::validate_adapter_service` | semantic-required (fail closed) | implemented |
 | `onnx-genai.adapters.json@1` | adapter artifact loader | `v1.0` | `adapters.artifacts.<name>.weights[].loader_capability` | §9 | `onnx_genai_metadata::validate_adapter_service` | semantic-required (fail closed) | implemented |
 | `onnxruntime.lora-adapter@1` | adapter artifact loader | `v1.0` | `adapters.artifacts.<name>.weights[].loader_capability` | §9 | `onnx_genai_metadata::validate_adapter_service` | semantic-required (fail closed) | implemented |
+| `onnx-genai.adapters.gguf@1` | adapter artifact loader | `v1.19` | `adapters.artifacts.<name>.weights[].loader_capability` | §9 | `onnx_genai_metadata::validate_adapter_service` | semantic-required (fail closed) | implemented |
 | `onnx-genai.adapters.hf-peft@1` | adapter artifact loader | `v1.0` | `adapters.artifacts.<name>.weights[].loader_capability` | §9 | `onnx_genai_metadata::validate_adapter_service` | semantic-required (fail closed) | implemented |
 | `onnx-genai.adapters.safetensors@1` | adapter artifact loader | `v1.0` | `adapters.artifacts.<name>.weights[].loader_capability` | §9 | `onnx_genai_metadata::validate_adapter_service` | semantic-required (fail closed) | implemented |
 | `onnx-genai.kv-checkpoint@1` | state checkpoint adapter | `v1.0` | `pipeline.workflow.serving.state_service.groups.<name>.checkpoint` | §12.6 | `onnx_genai_metadata::validation::validate_checkpoint_extension` | semantic-required (fail closed) | known, but unavailable (fail closed) |

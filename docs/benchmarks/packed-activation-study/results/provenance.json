@@ -1,0 +1,29 @@
+{
+  "runtime_commit": "7a012a5fc7dda0dd214932a27fa54e8f115e7f30",
+  "runtime_changes": "crates/onnx-runtime-cpuinfo/vendor/cpuinfo",
+  "binary": "/private/tmp/nxrt-q8-study-target/release/packed-activation-study",
+  "binary_sha256": "556621dbad80baae203de3186fbf34dc59ebde574fd1e96e69ad41519a79dfbb",
+  "probe_sha256": "0d5895a6ded38cedf8e001dbc3d49dbe34026f66d49c352c543a1f342db7b10a",
+  "runner_sha256": "18a462aa0d47444d4ef45822564a044ac6b5c333cb4c98bf5cfe5ef415243976",
+  "manifest_sha256": "f91794833aa275223c53ca6e6c21995fc8fbc3627157f4f1be1e4332f5cd912d",
+  "lockfile_sha256": "933f14b5d672e0c0b5371b552879018193f043d45ddfbafabe088f5a60c8c5fd",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8",
+  "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+  "os": "ProductName:\t\tmacOS\nProductVersion:\t\t27.0.1\nBuildVersion:\t\t26A434",
+  "hardware": "hw.model: MacBookPro18,2\nmachdep.cpu.brand_string: Apple M1 Max\nhw.physicalcpu: 10\nhw.logicalcpu: 10\nhw.memsize: 34359738368",
+  "lock_path": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "lock_inode": 344052582,
+  "lock_wrapper_pid": 25398,
+  "runner_pid": 25408,
+  "environment": {
+    "RAYON_NUM_THREADS": "1",
+    "ONNX_GENAI_CPU_DECODE_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+    "ONNX_GENAI_MLAS_THREADPOOL_THREADS": "1",
+    "ONNX_GENAI_HOST_ALLOC_CACHE_FLOOR_BYTES": "1048576",
+    "ONNX_GENAI_CPU_DENSE_WEIGHT_CACHE_BYTES": "2097152"
+  },
+  "sampler": "host_processor_info per-CPU ticks aggregated over whole process including untimed idle tail; no affinity or window-level contention bound; complete child CPU subtracted",
+  "public_export_note": "Host nodename omitted; processes.json embeds every original JSON stdout in result. Per-process console-file SHA256 hashes are recorded separately; private process inventories stay local.",
+  "raw_local_provenance_sha256": "7fe846b6ea036a2de8387157eeaa72aa8452b224059342fb4cb2e7df007468aa"
+}

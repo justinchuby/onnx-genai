@@ -83,6 +83,7 @@ plugin EPs (via C ABI bridge) handle them.
 | CausalConvWithState | 27 | Depthwise causal convolution with optional bias and input carry; emits the last `K−1` samples. |
 | CausalConvWithState | 29 | Standalone nxrt CPU/CUDA with positive `dilation` (default 1), retaining `(K−1) * dilation` raw samples across chunks; an empty chunk preserves state. ORT plugins retain the opset-27 and contrib schemas only. |
 | LinearAttention | 27 | Packed recurrent attention, all four update rules, forward GQA, and a separately typed state. Contrib behavior is unchanged. |
+| LinearAttention | 29 | Adds compact Q/K with independent value and state heads, plus optional post-update state snapshots for every token on native CPU and CUDA. |
 | CumSum | 11 | Position computation. |
 | NonZero | 9 | Sparse operations. |
 | ScatterElements | 11 | Native CPU/CUDA; opset 29 adds mean reduction. |
@@ -114,7 +115,7 @@ rounding. The CUDA plugin declines runtime-valued shape reads for `Range`.
 | Scatter | 9 | |
 | Unique | 11 | |
 | NMS (NonMaxSuppression) | 10 | Detection models. |
-| RoiAlign | 10 | |
+| RoiAlign | 10, 16, 22 | Standalone CPU and CUDA. Opset 22 adds bfloat16; CUDA runs eagerly to report invalid device-side ROI indices. |
 
 ---
 

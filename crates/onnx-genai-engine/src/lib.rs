@@ -19,10 +19,21 @@ pub mod embedding;
 pub mod engine;
 pub mod fim;
 pub mod gbnf;
+pub mod indentation;
 mod json_prefix;
+#[cfg(feature = "native-backend")]
+mod keyed_weights;
+#[cfg(all(test, feature = "native-backend"))]
+mod keyed_weights_tests;
 pub(crate) mod kv_bridge;
 pub(crate) mod kv_sizing;
 pub mod logits;
+pub mod logits_batch;
+pub mod processor_memory;
+pub use logits_batch::{LogitsBatch, LogitsRow};
+pub use processor_memory::{
+    ProcessorAllocationRole, ProcessorAllocationScope, ProcessorArray, ProcessorElement,
+};
 mod memory_authority;
 #[cfg(feature = "native-backend")]
 pub mod native_decode;
@@ -32,6 +43,7 @@ pub(crate) mod native_speculative;
 pub mod pipeline;
 pub mod pipeline_cache;
 pub(crate) mod platform_capacity;
+mod prediction_limit;
 pub(crate) mod processors;
 pub mod ranking;
 pub mod realtime;
@@ -55,7 +67,9 @@ pub use engine::{
 #[cfg(feature = "native-backend")]
 pub use native_decode::NativeStateFileLimits;
 
-pub use config::NativeStateFilePolicy;
+pub use config::{
+    NativeStateFilePolicy, ProcessorAdmissionRequirement, ProcessorConfigurationError,
+};
 pub use onnx_genai_scheduler::SchedulerAdmissionError;
 
 pub use batched::{
@@ -72,8 +86,8 @@ pub use engine::{
     EngineDecodeBackend, EngineGovernorError, EngineResourceGovernor, FinishReason,
     GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
     GenerateToken, GenerateTokenCallback, GenerationBudgetCap, GenerationTimings,
-    GrammarActivation, GrammarTrigger, KvConnectorBackend, KvConnectorConfig, LayerWeightBytes,
-    LimitParseError, LogprobSource, MemoryPolicyApplication, MemoryStrategy,
+    GrammarActivation, GrammarCollation, GrammarTrigger, KvConnectorBackend, KvConnectorConfig,
+    LayerWeightBytes, LimitParseError, LogprobSource, MemoryPolicyApplication, MemoryStrategy,
     MemoryStrategyDecision, MemoryStrategyPlan, MirostatConfig, MirostatVersion, MtpCacheScope,
     MtpConfig, MtpHiddenLayout, MtpWeightSource, OrtEngineWorkerFactory, OrtSessionWorkerLoadError,
     PackageExecutionError, PrefillRequest, PrefillResult, PrioritizedGenerateRequest,
@@ -84,7 +98,7 @@ pub use engine::{
     XtcConfig, package_execution_error, parse_device_policy, parse_resource_limit,
     resolve_device_vram_limit_bytes,
 };
-pub use fim::{FimConfig, FimFormat};
+pub use fim::{FimConfig, InfillOrder};
 pub use logits::{
     Constraint, ConstraintPrefixError, ConstraintProcessor, LogitProcessor, ProcessorChain,
     ProcessorChainBuilder, ProcessorContext, ProcessorSignal, StopSequence, TokenId,
@@ -209,7 +223,7 @@ pub use pipeline::{
     PipelineGenerateRequest, PipelineTensors, RowPlan, RowScopedState, RowTable,
     StagedOutputCheckpoint, StagedOutputObservation, StagedOutputObservationError,
     ToolCallStagedOutputObserver, WorkflowSessionCheckpoint, is_missing_required_input,
-    validate_pipeline_backend_request,
+    select_portable_adapter_source, validate_pipeline_backend_request,
 };
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{
@@ -217,3 +231,16 @@ pub use speculative::{
     SpeculativeAcceptContext, SpeculativeProposal, SpeculativeProposer, SpeculativeProposerContext,
     SpeculativeStats, TokenEmbedder, argmax,
 };
+
+/// Test fixtures run Native when compiled in, and explicitly select ORT in the
+/// reference-only build. Production defaults and backend refusal are unchanged.
+#[cfg(test)]
+pub(crate) fn fixture_engine_config() -> EngineConfig {
+    EngineConfig {
+        #[cfg(feature = "native-backend")]
+        decode_backend: EngineDecodeBackend::Native,
+        #[cfg(not(feature = "native-backend"))]
+        decode_backend: EngineDecodeBackend::Ort,
+        ..EngineConfig::default()
+    }
+}

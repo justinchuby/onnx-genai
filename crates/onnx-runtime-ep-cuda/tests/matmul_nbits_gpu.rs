@@ -306,7 +306,10 @@ fn run_case_with_bits(
     }
     let input_strides: Vec<_> = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let input_views: Vec<_> = inputs
         .iter()
@@ -325,7 +328,8 @@ fn run_case_with_bits(
 
     let output_len = output_shape.iter().product::<usize>();
     let mut output_buffer = ep.allocate(output_len * 4, 256)?;
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let output_view = TensorMut::new(
         DevicePtrMut(output_buffer.as_mut_ptr()),
         DataType::Float32,
@@ -527,7 +531,10 @@ fn run_f16_case_with_bits_and_shape(
     }
     let input_strides: Vec<_> = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let input_views: Vec<_> = inputs
         .iter()
@@ -545,7 +552,8 @@ fn run_f16_case_with_bits_and_shape(
         .collect();
     let output_len = m * n;
     let mut output_buffer = ep.allocate(output_len * 2, 256)?;
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     kernel.execute(
         &input_views,
         &mut [TensorMut::new(
@@ -692,7 +700,10 @@ fn run_cpu_case_with_bits(
     }
     let input_strides: Vec<_> = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let input_views: Vec<_> = inputs
         .iter()
@@ -708,7 +719,8 @@ fn run_cpu_case_with_bits(
         })
         .collect();
     let mut output_bytes = vec![0u8; output_shape.iter().product::<usize>() * 4];
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let output_view = TensorMut::new(
         DevicePtrMut(output_bytes.as_mut_ptr().cast()),
         DataType::Float32,
@@ -1083,7 +1095,10 @@ fn matmul_nbits_gpu_int8_block32_capture_replay_is_bit_exact() {
     }
     let input_strides: Vec<_> = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
     let input_views: Vec<_> = inputs
         .iter()
@@ -1101,7 +1116,8 @@ fn matmul_nbits_gpu_int8_block32_capture_replay_is_bit_exact() {
         .collect();
     let mut output_buffer = ep.allocate(n * 4, 256).unwrap();
     let output_shape = [1, n];
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     macro_rules! execute {
         () => {
             kernel
@@ -1306,7 +1322,10 @@ fn matmul_nbits_gpu_accuracy4_m1_capture_replay_is_bit_exact() {
         }
         let input_strides: Vec<_> = inputs
             .iter()
-            .map(|input| compute_contiguous_strides(&input.shape))
+            .map(|input| {
+                compute_contiguous_strides(&input.shape)
+                    .expect("fixture shape has representable contiguous strides")
+            })
             .collect();
         let input_views: Vec<_> = inputs
             .iter()
@@ -1324,7 +1343,8 @@ fn matmul_nbits_gpu_accuracy4_m1_capture_replay_is_bit_exact() {
             .collect();
         let mut output_buffer = ep.allocate(n * 4, 256).unwrap();
         let output_shape = [1, n];
-        let output_strides = compute_contiguous_strides(&output_shape);
+        let output_strides = compute_contiguous_strides(&output_shape)
+            .expect("fixture shape has representable contiguous strides");
         let output_metadata = [onnx_runtime_ep_api::OutputMetadata::tensor(
             DataType::Float32,
             &output_shape,

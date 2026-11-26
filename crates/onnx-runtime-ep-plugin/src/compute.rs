@@ -97,7 +97,7 @@ pub enum ShapeInference {
         /// The `N` attribute: the dequantized weight's column count.
         n: usize,
     },
-    /// `pkg.nxrt::DsaIndexSelect` v1: `[B,S,H,D]` query plus indexer inputs
+    /// `pkg.nxrt._private::DsaIndexSelect` v1: `[B,S,H,D]` query plus indexer inputs
     /// produces fixed-width indices `[B,1,S,top_k]`.
     DsaIndexSelect {
         /// Required positive `top_k` attribute, which fixes the output width.
@@ -254,14 +254,15 @@ pub enum ShapeInference {
     Window,
     /// `ai.onnx::DFT`: discrete Fourier transform along a signal axis.
     ///
-    /// Output shape is the input's, with the last dimension forced to 2 (the
-    /// complex component pair, even for real input) and the signal axis set to
-    /// `dft_length` — halved to `n / 2 + 1` when `onesided`.
+    /// The signal axis follows `dft_length`. Full/RFFT output has two complex
+    /// components; IRFFT expands the half-spectrum to a full real signal with
+    /// one component.
     ///
     /// Both `dft_length` (input 1) and, from opset 20, `axis` (input 2) arrive
     /// as *inputs*, so like [`Self::Compress`] this resolves at Compute time by
     /// reading values. `axis_attr` carries the pre-opset-20 spelling.
     Dft {
+        inverse: bool,
         onesided: bool,
         axis_attr: Option<i64>,
         default_axis: i64,
@@ -394,6 +395,11 @@ impl ShapeInference {
             let fallback = match rule {
                 SharedNativeShapeRule::ConstantOfShape => Self::ConstantOfShape,
                 SharedNativeShapeRule::Dft => Self::Dft {
+                    inverse: node
+                        .attr("inverse")
+                        .and_then(onnx_runtime_ir::Attribute::as_int)
+                        .unwrap_or(0)
+                        != 0,
                     onesided: node
                         .attr("onesided")
                         .and_then(onnx_runtime_ir::Attribute::as_int)
@@ -508,6 +514,7 @@ impl ShapeInference {
             | "Hardmax"
             | "BatchNormalization"
             | "InstanceNormalization"
+            | "MeanVarianceNormalization"
             | "GroupNormalization"
             | "LpNormalization"
             // Shape-preserving attention / MoE / KV-cache ops. Absent from this
@@ -568,7 +575,7 @@ impl ShapeInference {
                     reason: DeclineReason::NodeNotShapeable("MatMulNBits without a usable N attribute"),
                 },
             },
-            "DsaIndexSelect" if domain == "pkg.nxrt" => {
+            "DsaIndexSelect" if domain == "pkg.nxrt._private" => {
                 let Some(build) = resolve_shape_schema(opset, DSA_INDEX_SELECT_SCHEMAS) else {
                     return Self::Declined {
                         op_type: op.to_string(),
@@ -773,6 +780,7 @@ impl ShapeInference {
             // opset 20 it is input 2. Both are modelled, so neither reaches
             // `Unmodelled`.
             "DFT" => Self::Dft {
+                inverse: int_attr("inverse").unwrap_or(0) != 0,
                 onesided: int_attr("onesided").unwrap_or(0) != 0,
                 axis_attr: int_attr("axis"),
                 default_axis: if opset >= 20 { -2 } else { 1 },
@@ -3044,30 +3052,26 @@ unsafe extern "C" fn compute_execute(
                                                 );
                                             }
                                         };
-                                        let numel = match output
-                                            .shape
-                                            .iter()
-                                            .try_fold(1usize, |product, &extent| {
-                                                product.checked_mul(extent)
-                                            }) {
-                                            Some(numel) => numel,
+                                        let bytes = match onnx_runtime_ir::checked_expected_bytes(
+                                            output.dtype,
+                                            &output.shape,
+                                        ) {
+                                            Some(v) => v,
                                             None => {
-                                                return fail_status(
-                                                    "Compute: device kernel-sized intermediate \
-                                                     shape overflow",
-                                                );
+                                                return fail_status(&format!(
+                                                    "Compute: node {node_idx} dynamic output dtype {:?} shape {:?} has unrepresentable storage bytes; reduce output dimensions",
+                                                    output.dtype, output.shape
+                                                ));
                                             }
                                         };
-                                        let bytes =
-                                            match numel.checked_mul(output.dtype.byte_size()) {
-                                                Some(bytes) => bytes,
-                                                None => {
-                                                    return fail_status(
-                                                        "Compute: device kernel-sized intermediate \
-                                                     byte length overflow",
-                                                    );
-                                                }
-                                            };
+                                        let strides = match contiguous_strides(&output.shape) {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                return fail_status(&format!(
+                                                    "Compute: node {node_idx} dynamic output: {e}"
+                                                ));
+                                            }
+                                        };
                                         let scratch = match unsafe {
                                             alloc_scratch(
                                                 api_ref,
@@ -3104,7 +3108,7 @@ unsafe extern "C" fn compute_execute(
                                                 shape: crate::dim_vec::DimVec::from_slice(
                                                     &output.shape,
                                                 ),
-                                                strides: contiguous_strides(&output.shape),
+                                                strides,
                                                 dtype: output.dtype,
                                                 device,
                                             },
@@ -3276,7 +3280,14 @@ unsafe extern "C" fn compute_execute(
                                     ort_outputs.push(ort_output);
                                 }
                                 NodeOutputSink::Buffer(buf_idx) => {
-                                    let strides = contiguous_strides(&output.shape);
+                                    let strides = match contiguous_strides(&output.shape) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            return fail_status(&format!(
+                                                "Compute: node {node_idx} output: {e}"
+                                            ));
+                                        }
+                                    };
                                     new_bufs.push((
                                         *buf_idx,
                                         IntermediateBuf {
@@ -3457,9 +3468,22 @@ unsafe extern "C" fn compute_execute(
                     new_bufs.clear();
                     for &(buf_idx, out_slot, dtype) in &buf_writes {
                         let shape = &output_shapes[out_slot];
-                        let numel: usize = shape.iter().product();
-                        let byte_len = dtype.byte_size() * numel;
-                        let strides = contiguous_strides(shape);
+                        let byte_len = match onnx_runtime_ir::checked_expected_bytes(dtype, shape) {
+                            Some(v) => v,
+                            None => {
+                                return fail_status(&format!(
+                                    "Compute: node {node_idx} output {out_slot} dtype {dtype:?} shape {shape:?} has unrepresentable storage bytes; reduce output dimensions"
+                                ));
+                            }
+                        };
+                        let strides = match contiguous_strides(shape) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                return fail_status(&format!(
+                                    "Compute: node {node_idx} output {out_slot}: {e}"
+                                ));
+                            }
+                        };
                         let (data, scratch_ptr, device) = match intermediate_scratch {
                             Some(mem_info) => {
                                 match unsafe {
@@ -3518,10 +3542,15 @@ unsafe extern "C" fn compute_execute(
                     // is keyed by the same index that keys `absent_scratch`, where
                     // the slot it belongs to is recorded -- so this stays aligned by
                     // construction rather than by an invariant about emptiness.
-                    let absent_strides_storage = absent_slot_strides(
+                    let absent_strides_storage = match absent_slot_strides(
                         absent_scratch.iter().map(|(slot, _, _)| *slot),
                         absent_shapes,
-                    );
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return fail_status(&format!("Compute: absent output strides: {e}"));
+                        }
+                    };
                     // Same stack storage as the single-node path's output views
                     // below, for the same reason and with the same seed. On the
                     // routed path it is paid once per *node* rather than once per
@@ -4033,12 +4062,15 @@ unsafe extern "C" fn compute_execute(
                 // See the routed path. `slot_map` pushes `Absent(idx)` with
                 // increasing `idx`, so filtering it in slot order yields the strides
                 // in absent-index order.
-                let absent_strides_storage = absent_slot_strides(
+                let absent_strides_storage = match absent_slot_strides(
                     slot_map.iter().enumerate().filter_map(|(slot_idx, kind)| {
                         matches!(kind, SlotKind::Absent(_)).then_some(slot_idx)
                     }),
                     absent_shapes,
-                );
+                ) {
+                    Ok(v) => v,
+                    Err(e) => return fail_status(&format!("Compute: absent output strides: {e}")),
+                };
                 // Views of the ORT outputs, in order, taken lazily: collecting them
                 // into a `Vec` first and immediately draining it allocated a second
                 // vector of views per call for nothing.
@@ -4763,28 +4795,19 @@ fn retirements_per_node(
 fn absent_slot_strides(
     absent_slots: impl Iterator<Item = usize>,
     shapes: &[crate::dim_vec::DimVec<usize>],
-) -> Vec<crate::dim_vec::DimVec<i64>> {
-    absent_slots
-        .map(|slot| match shapes.get(slot) {
-            Some(shape) => contiguous_strides(shape),
-            None => crate::dim_vec::DimVec::new(),
-        })
-        .collect()
+) -> Result<Vec<crate::dim_vec::DimVec<i64>>, String> {
+    absent_slots.map(|slot| {
+        let shape=shapes.get(slot).ok_or_else(||format!("absent output slot {slot} has no shape metadata; rebuild the complete output signature"))?;
+        contiguous_strides(shape).map_err(|e|format!("absent output slot {slot}: {e}"))
+    }).collect()
 }
 
-fn contiguous_strides(shape: &[usize]) -> crate::dim_vec::DimVec<i64> {
-    // `zeroed` then set the last element, rather than filling with 1: every
-    // element except the last is overwritten by the loop below, so seeding all
-    // of them costs a pass that is immediately thrown away. A rank-0 shape has
-    // no last element and correctly yields an empty result.
-    let mut strides = crate::dim_vec::DimVec::<i64>::zeroed(shape.len());
-    if let Some(last) = strides.last_mut() {
-        *last = 1;
-    }
-    for i in (0..shape.len().saturating_sub(1)).rev() {
-        strides[i] = strides[i + 1] * shape[i + 1] as i64;
-    }
-    strides
+fn contiguous_strides(shape: &[usize]) -> Result<crate::dim_vec::DimVec<i64>, String> {
+    let plan = onnx_runtime_ir::ContiguousStridePlan::new(shape).map_err(|e| e.to_string())?;
+    let mut strides = crate::dim_vec::DimVec::zeroed(shape.len());
+    plan.write(strides.as_mut_slice())
+        .map_err(|e| e.to_string())?;
+    Ok(strides)
 }
 
 /// Build a mutable TensorView from an IntermediateBuf (unsafe: caller ensures
@@ -5943,6 +5966,7 @@ fn infer_shapes(
         }
 
         ShapeInference::Dft {
+            inverse,
             onesided,
             axis_attr,
             default_axis,
@@ -5966,6 +5990,8 @@ fn infer_shapes(
                 ));
             }
 
+            let mode = onnx_runtime_ir::dft::DftMode::from_flags(*inverse, *onesided);
+            mode.validate_components(complex_dim)?;
             // opset 20 moves `axis` into input 2; before that it is an
             // attribute defaulting to -2.
             let axis_raw = match inputs.get(2) {
@@ -5981,24 +6007,19 @@ fn infer_shapes(
                 );
             }
 
-            // `dft_length` (input 1) overrides the signal extent when present.
             let signal_len = match inputs.get(1) {
-                Some(t) if !t.is_absent() && t.shape.iter().product::<usize>() > 0 => {
+                Some(t) if !t.is_absent() => {
                     let n = read_scalar_i64(t, "DFT dft_length")?;
-                    usize::try_from(n)
-                        .map_err(|_| format!("DFT: dft_length must be non-negative, got {n}"))?
+                    let n = usize::try_from(n)
+                        .map_err(|_| format!("DFT: dft_length must be positive, got {n}"))?;
+                    onnx_runtime_ir::dft::DftMode::validate_length(n)?;
+                    n
                 }
-                _ => input.shape[axis],
+                _ => mode.default_length(input.shape[axis])?,
             };
-
             let mut shape = input.shape.to_vec();
-            shape[axis] = if *onesided {
-                signal_len / 2 + 1
-            } else {
-                signal_len
-            };
-            // Always complex out, even for real input.
-            shape[last] = 2;
+            shape[axis] = mode.output_length(signal_len);
+            shape[last] = mode.output_components();
             Ok(vec![shape])
         }
 
@@ -7010,7 +7031,8 @@ fn after() {}
     #[test]
     fn dsa_index_select_resolves_v1_schema_for_later_imports() {
         for imported_opset in [1, 2, 17] {
-            let node = dsa_index_select_node("pkg.nxrt", imported_opset, Attribute::Int(5));
+            let node =
+                dsa_index_select_node("pkg.nxrt._private", imported_opset, Attribute::Int(5));
             let strategy = ShapeInference::for_node(&node, &dsa_input_shapes(), 1);
             assert!(
                 matches!(strategy, ShapeInference::DsaIndexSelect { top_k: 5 }),
@@ -7030,7 +7052,7 @@ fn after() {}
 
     #[test]
     fn dsa_index_select_preserves_unknown_batch_and_sequence_at_capability_time() {
-        let node = dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(7));
+        let node = dsa_index_select_node("pkg.nxrt._private", 1, Attribute::Int(7));
         let shapes = vec![
             vec![None, None, Some(4), Some(8)],
             vec![None, Some(16), Some(8)],
@@ -7054,23 +7076,23 @@ fn after() {}
             ),
             (
                 "no compatible schema",
-                dsa_index_select_node("pkg.nxrt", 0, Attribute::Int(4)),
+                dsa_index_select_node("pkg.nxrt._private", 0, Attribute::Int(4)),
                 valid.clone(),
             ),
             (
                 "non-integer top_k",
-                dsa_index_select_node("pkg.nxrt", 1, Attribute::Float(4.0)),
+                dsa_index_select_node("pkg.nxrt._private", 1, Attribute::Float(4.0)),
                 valid.clone(),
             ),
             (
                 "zero top_k",
-                dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(0)),
+                dsa_index_select_node("pkg.nxrt._private", 1, Attribute::Int(0)),
                 valid.clone(),
             ),
             (
                 "missing scale",
                 {
-                    let mut node = dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(4));
+                    let mut node = dsa_index_select_node("pkg.nxrt._private", 1, Attribute::Int(4));
                     node.attributes.remove("scale");
                     node
                 },
@@ -7079,7 +7101,7 @@ fn after() {}
             (
                 "unknown attribute",
                 {
-                    let mut node = dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(4));
+                    let mut node = dsa_index_select_node("pkg.nxrt._private", 1, Attribute::Int(4));
                     node.attributes.insert("axis".into(), Attribute::Int(-1));
                     node
                 },
@@ -7087,7 +7109,7 @@ fn after() {}
             ),
             (
                 "wrong rank",
-                dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(4)),
+                dsa_index_select_node("pkg.nxrt._private", 1, Attribute::Int(4)),
                 vec![
                     vec![Some(2), Some(3), Some(32)],
                     valid[1].clone(),
@@ -7097,7 +7119,7 @@ fn after() {}
             ),
             (
                 "static mismatch",
-                dsa_index_select_node("pkg.nxrt", 1, Attribute::Int(4)),
+                dsa_index_select_node("pkg.nxrt._private", 1, Attribute::Int(4)),
                 vec![
                     valid[0].clone(),
                     vec![Some(9), Some(16), Some(8)],
@@ -7507,6 +7529,7 @@ fn after() {}
         assert_eq!(
             infer(
                 &ShapeInference::Dft {
+                    inverse: false,
                     onesided: false,
                     axis_attr: Some(1),
                     default_axis: 1,
@@ -7527,6 +7550,7 @@ fn after() {}
         assert_eq!(
             infer(
                 &ShapeInference::Dft {
+                    inverse: false,
                     onesided: true,
                     axis_attr: Some(1),
                     default_axis: 1,
@@ -7549,6 +7573,7 @@ fn after() {}
         assert_eq!(
             infer(
                 &ShapeInference::Dft {
+                    inverse: false,
                     onesided: false,
                     axis_attr: Some(1),
                     default_axis: 1,
@@ -7564,15 +7589,15 @@ fn after() {}
     fn dft_opset20_reads_the_axis_from_input_two() {
         // The axis input must win over the attribute. Attribute says 1, input
         // says 0 — a rule that ignored the input would resize the wrong axis.
-        let buf = vec![0.0f32; 24];
-        let x = f32_data(&[3, 4, 2], &[8, 2, 1], &buf);
-        let empty: [i64; 0] = [];
-        let no_len = i64_scalar(&empty, &[0], &[1]);
+        let buf = vec![0.0f32; 12];
+        let x = f32_data(&[3, 4, 1], &[4, 1, 1], &buf);
+        let no_len = TensorView::absent(DataType::Int64);
         let a = [0i64];
         let axis_in = i64_scalar(&a, &[1], &[1]);
         assert_eq!(
             infer(
                 &ShapeInference::Dft {
+                    inverse: false,
                     onesided: true,
                     axis_attr: Some(1),
                     default_axis: 1,
@@ -7586,11 +7611,54 @@ fn after() {}
     }
 
     #[test]
+    fn dft_real_inverse_shared_and_fallback_shapes_are_full_and_real() {
+        let buf = [0f32; 12];
+        let x = f32_data(&[2, 3, 2], &[6, 2, 1], &buf);
+        let strategy = ShapeInference::Dft {
+            inverse: true,
+            onesided: true,
+            axis_attr: None,
+            default_axis: -2,
+        };
+        assert_eq!(
+            infer(&strategy, std::slice::from_ref(&x)).unwrap(),
+            vec![vec![2, 4, 1]]
+        );
+        let length = [5i64];
+        let len = i64_scalar(&length, &[], &[]);
+        assert_eq!(infer(&strategy, &[x, len]).unwrap(), vec![vec![2, 5, 1]]);
+        for version in [17, 20] {
+            let mut node = Node::new(
+                onnx_runtime_ir::NodeId(0),
+                "DFT",
+                vec![
+                    Some(onnx_runtime_ir::ValueId(0)),
+                    Some(onnx_runtime_ir::ValueId(1)),
+                ],
+                vec![onnx_runtime_ir::ValueId(2)],
+            );
+            node.version = Some(version);
+            node.attributes
+                .insert("inverse".into(), onnx_runtime_ir::Attribute::Int(1));
+            node.attributes
+                .insert("onesided".into(), onnx_runtime_ir::Attribute::Int(1));
+            if version < 20 {
+                node.attributes
+                    .insert("axis".into(), onnx_runtime_ir::Attribute::Int(-2));
+            }
+            let shared =
+                ShapeInference::for_node(&node, &[vec![Some(2), Some(3), Some(2)], vec![]], 1);
+            assert_eq!(infer(&shared, &[x, len]).unwrap(), vec![vec![2, 5, 1]]);
+        }
+    }
+
+    #[test]
     fn dft_refuses_the_complex_dim_as_the_signal_axis() {
         let buf = vec![0.0f32; 16];
         let x = f32_data(&[2, 8, 1], &[8, 1, 1], &buf);
         let err = infer(
             &ShapeInference::Dft {
+                inverse: false,
                 onesided: false,
                 axis_attr: Some(-1),
                 default_axis: 1,
@@ -8736,7 +8804,8 @@ fn after() {}
     fn intermediate_buf_view_roundtrip() {
         let data = vec![0u8; 12 * 4]; // 12 f32 elements
         let shape = vec![3usize, 4];
-        let strides = onnx_runtime_ir::compute_contiguous_strides(&shape);
+        let strides = onnx_runtime_ir::compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let buf = IntermediateBuf {
             data,
             scratch_ptr: std::ptr::null_mut(),
@@ -8965,13 +9034,23 @@ fn after() {}
         let shapes = dim_shapes(&[&[2, 3, 4], &[5, 6], &[7, 8, 9], &[10]]);
         // Slots 1 and 3 are absent, so absent index 0 is slot 1 and absent
         // index 1 is slot 3.
-        let got = super::absent_slot_strides([1usize, 3].into_iter(), &shapes);
+        let got = super::absent_slot_strides([1usize, 3].into_iter(), &shapes)
+            .expect("fixture shape has representable contiguous strides");
         assert_eq!(got.len(), 2, "one entry per absent slot, not per output");
-        assert_eq!(got[0], super::contiguous_strides(&shapes[1]));
-        assert_eq!(got[1], super::contiguous_strides(&shapes[3]));
+        assert_eq!(
+            got[0],
+            super::contiguous_strides(&shapes[1])
+                .expect("fixture shape has representable contiguous strides")
+        );
+        assert_eq!(
+            got[1],
+            super::contiguous_strides(&shapes[3])
+                .expect("fixture shape has representable contiguous strides")
+        );
         assert_ne!(
             got[0],
-            super::contiguous_strides(&shapes[0]),
+            super::contiguous_strides(&shapes[0])
+                .expect("fixture shape has representable contiguous strides"),
             "keying by slot index would have produced this"
         );
     }
@@ -8979,17 +9058,40 @@ fn after() {}
     #[test]
     fn a_node_with_no_absent_outputs_builds_no_absent_strides() {
         let shapes = dim_shapes(&[&[2, 3], &[4, 5]]);
-        assert!(super::absent_slot_strides(std::iter::empty(), &shapes).is_empty());
+        assert!(
+            super::absent_slot_strides(std::iter::empty(), &shapes)
+                .expect("fixture shape has representable contiguous strides")
+                .is_empty()
+        );
     }
 
     /// An out-of-range slot must not panic in the middle of a `Run`. It cannot
     /// arise from a well-formed slot map, but this runs inside ORT's callback
     /// where a panic crosses an FFI boundary.
     #[test]
-    fn an_out_of_range_absent_slot_yields_empty_strides() {
+    fn an_out_of_range_absent_slot_reports_an_error_without_panicking() {
         let shapes = dim_shapes(&[&[2, 3]]);
-        let got = super::absent_slot_strides([9usize].into_iter(), &shapes);
-        assert_eq!(got, vec![Vec::<i64>::new()]);
+        let error = super::absent_slot_strides([9usize].into_iter(), &shapes).unwrap_err();
+        assert!(
+            error.contains("slot 9") && error.contains("shape metadata"),
+            "{error}"
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn absent_suffix_failure_is_not_published_as_empty_strides_and_recovers() {
+        let shapes = dim_shapes(&[&[2, 3], &[0, i64::MAX as usize, i64::MAX as usize]]);
+        let error = super::absent_slot_strides([0, 1].into_iter(), &shapes).unwrap_err();
+        assert!(
+            error.contains("slot 1")
+                && error.contains("axis 0")
+                && error.contains("suffix product"),
+            "{error}"
+        );
+        let good = super::absent_slot_strides([0].into_iter(), &shapes)
+            .expect("legal absent shape after failure");
+        assert_eq!(&good[0][..], &[3, 1]);
     }
 
     #[test]
@@ -9152,7 +9254,14 @@ fn after() {}
 
     #[test]
     fn for_node_unary_coverage() {
-        for op in ["Relu", "Sigmoid", "Cast", "Identity", "Softmax"] {
+        for op in [
+            "Relu",
+            "Sigmoid",
+            "Cast",
+            "Identity",
+            "Softmax",
+            "MeanVarianceNormalization",
+        ] {
             assert!(
                 matches!(
                     ShapeInference::for_node(&bare_node(op), &[], 1),
@@ -9283,13 +9392,15 @@ fn after() {}
 
     #[test]
     fn contiguous_strides_empty_shape() {
-        let s = super::contiguous_strides(&[]);
+        let s = super::contiguous_strides(&[])
+            .expect("fixture shape has representable contiguous strides");
         assert_eq!(s, Vec::<i64>::new());
     }
 
     #[test]
     fn contiguous_strides_scalar() {
-        let s = super::contiguous_strides(&[1]);
+        let s = super::contiguous_strides(&[1])
+            .expect("fixture shape has representable contiguous strides");
         assert_eq!(s, vec![1i64]);
     }
 
@@ -9331,8 +9442,10 @@ fn after() {}
         let mut saw_spilled = false;
         let mut saw_interior_unit = false;
         for shape in &shapes {
-            let got = super::contiguous_strides(shape);
-            let want = onnx_runtime_ir::compute_contiguous_strides(shape);
+            let got = super::contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
+            let want = onnx_runtime_ir::compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides");
             assert_eq!(
                 got.as_slice(),
                 want.as_slice(),
@@ -9372,7 +9485,8 @@ fn after() {}
     fn contiguous_strides_spills_rather_than_truncating() {
         let rank = crate::dim_vec::INLINE_RANK + 2;
         let shape: Vec<usize> = vec![2; rank];
-        let got = super::contiguous_strides(&shape);
+        let got = super::contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         assert_eq!(got.len(), rank, "a spilled shape lost dimensions");
         assert_eq!(got[rank - 1], 1, "the innermost stride must be 1");
         assert_eq!(got[0], 1i64 << (rank - 1), "outermost stride is wrong");
@@ -9391,7 +9505,8 @@ fn after() {}
     fn a_spilled_intermediate_buf_view_reports_every_dimension() {
         let rank = crate::dim_vec::INLINE_RANK + 2;
         let dims: Vec<usize> = (0..rank).map(|i| i + 2).collect();
-        let strides = super::contiguous_strides(&dims);
+        let strides = super::contiguous_strides(&dims)
+            .expect("fixture shape has representable contiguous strides");
         let numel: usize = dims.iter().product();
         let buf = IntermediateBuf {
             data: vec![0u8; numel * 4],
@@ -9406,7 +9521,9 @@ fn after() {}
         assert_eq!(v.shape, &dims[..], "view truncated the spilled shape");
         assert_eq!(
             v.strides,
-            onnx_runtime_ir::compute_contiguous_strides(&dims).as_slice(),
+            onnx_runtime_ir::compute_contiguous_strides(&dims)
+                .expect("fixture shape has representable contiguous strides")
+                .as_slice(),
             "view truncated the spilled strides"
         );
     }

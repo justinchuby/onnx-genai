@@ -1,5 +1,6 @@
 //! Realtime wire events over already decoded, policy-admitted model output.
 //! This module neither parses model tool syntax nor executes tools.
+use super::tools::AdmittedFragment;
 use anyhow::{Context, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use onnx_genai_metadata::{MAX_TOOL_CALLS, ToolCall};
@@ -28,6 +29,11 @@ impl ResponseEnd {
 
 /// Consuming `finish` makes publishing a second terminal event impossible.
 /// Event IDs are stamped once by the connection's common event sender.
+struct CallItem {
+    index: usize,
+    admitted: bool,
+}
+
 pub(super) struct ResponseEvents {
     id: String,
     message_id: String,
@@ -36,7 +42,7 @@ pub(super) struct ResponseEvents {
     audio_index: Option<usize>,
     parts: Vec<Value>,
     output: Vec<Value>,
-    calls: BTreeMap<String, usize>,
+    calls: BTreeMap<String, CallItem>,
     retained_bytes: usize,
     limit: NonZeroUsize,
     max_audio_samples: NonZeroUsize,
@@ -168,51 +174,107 @@ impl ResponseEvents {
         events.push(json!({"type":"response.output_audio.delta","response_id":self.id,"item_id":self.message_id,"output_index":self.message_index,"content_index":index,"delta":STANDARD.encode(pcm)}));
         Ok(events)
     }
-    /// The shared model protocol parser returns complete calls. Repeated
-    /// cumulative snapshots emit no duplicate call items or argument bytes.
+    /// Publish a schema-admitted cumulative prefix, never a completed call.
+    pub(super) fn tool_fragment(
+        &mut self,
+        admitted: &AdmittedFragment<'_>,
+        wire_id: &str,
+        item_id: &str,
+    ) -> anyhow::Result<Vec<Value>> {
+        let fragment = admitted.fragment();
+        self.call_prefix(&fragment.name, wire_id, &fragment.arguments, item_id, false)
+    }
+
+    /// Complete batch admission precedes this operation. Preserve the raw
+    /// spelling already streamed; canonical model parsing may reorder keys or
+    /// normalize string escapes without changing their JSON value.
     pub(super) fn tool_call(
         &mut self,
         call: &ToolCall,
         item_id: String,
     ) -> anyhow::Result<Vec<Value>> {
-        if let Some(index) = self.calls.get(&call.id) {
-            let item = &self.output[*index];
+        let arguments: Value = serde_json::from_str(&call.arguments)
+            .context("realtime completed tool arguments must be valid JSON")?;
+        ensure!(
+            arguments.is_object(),
+            "realtime tool call arguments must be a JSON object"
+        );
+        if let Some(entry) = self.calls.get_mut(&call.id) {
+            let item = &self.output[entry.index];
+            let published: Value = serde_json::from_str(
+                item["arguments"]
+                    .as_str()
+                    .context("realtime call item lost argument text")?,
+            )
+            .context("realtime completed call still has an unfinished argument prefix")?;
             ensure!(
-                item["name"] == call.name && item["arguments"] == call.arguments,
-                "realtime tool call '{}' changed an already published name or argument object; repair the model tool protocol",
+                item["name"] == call.name && published == arguments,
+                "realtime tool call {:?} changed its published name or argument value; repair the model tool protocol",
                 call.id
             );
+            entry.admitted = true;
             return Ok(Vec::new());
+        }
+        self.call_prefix(&call.name, &call.id, &call.arguments, &item_id, true)
+    }
+
+    fn call_prefix(
+        &mut self,
+        name: &str,
+        wire_id: &str,
+        arguments: &str,
+        item_id: &str,
+        admitted: bool,
+    ) -> anyhow::Result<Vec<Value>> {
+        if let Some(entry) = self.calls.get(wire_id) {
+            let index = entry.index;
+            let item = &self.output[index];
+            let previous = item["arguments"]
+                .as_str()
+                .context("realtime call item lost argument text")?;
+            ensure!(
+                item["name"] == name
+                    && arguments.starts_with(previous)
+                    && (!entry.admitted || previous == arguments),
+                "realtime tool call {wire_id:?} changed its published identity or argument prefix; repair the model tool protocol"
+            );
+            let delta = &arguments[previous.len()..];
+            if delta.is_empty() {
+                return Ok(Vec::new());
+            }
+            self.reserve_text(delta.len())?;
+            self.output[index]["arguments"] = json!(arguments);
+            return Ok(vec![
+                json!({"type":"response.function_call_arguments.delta","response_id":self.id,"item_id":self.output[index]["id"],"output_index":index,"call_id":wire_id,"delta":delta}),
+            ]);
         }
         ensure!(
             self.calls.len() < MAX_TOOL_CALLS,
             "realtime response exceeds the {MAX_TOOL_CALLS}-call tool protocol limit; split the response"
         );
         ensure!(
-            !call.id.is_empty() && !call.name.is_empty(),
-            "realtime tool call requires a nonempty call ID and name; use the shared model tool protocol parser"
-        );
-        let arguments: Value = serde_json::from_str(&call.arguments).context("realtime tool call arguments are not valid JSON; admit the complete call through the declared protocol parser before publishing")?;
-        ensure!(
-            arguments.is_object(),
-            "realtime tool call arguments must be a JSON object"
+            !wire_id.is_empty() && !name.is_empty() && !item_id.is_empty(),
+            "realtime function item requires nonempty call, item and function identities"
         );
         self.reserve_text(
-            call.arguments
+            arguments
                 .len()
-                .checked_add(call.name.len())
-                .and_then(|n| n.checked_add(call.id.len()))
+                .checked_add(name.len())
+                .and_then(|size| size.checked_add(wire_id.len()))
                 .context("realtime tool call size overflow")?,
         )?;
         let index = self.output.len();
-        let item = json!({"id":item_id,"object":"realtime.item","type":"function_call","status":"in_progress","name":call.name,"call_id":call.id,"arguments":""});
+        let item = json!({"id":item_id,"object":"realtime.item","type":"function_call","status":"in_progress","name":name,"call_id":wire_id,"arguments":""});
         let mut events = vec![
             json!({"type":"response.output_item.added","response_id":self.id,"output_index":index,"item":item}),
         ];
-        events.push(json!({"type":"response.function_call_arguments.delta","response_id":self.id,"item_id":item_id,"output_index":index,"call_id":call.id,"delta":call.arguments}));
-        self.calls.insert(call.id.clone(), index);
+        if !arguments.is_empty() {
+            events.push(json!({"type":"response.function_call_arguments.delta","response_id":self.id,"item_id":item_id,"output_index":index,"call_id":wire_id,"delta":arguments}));
+        }
+        self.calls
+            .insert(wire_id.into(), CallItem { index, admitted });
         self.output.push(item);
-        self.output[index]["arguments"] = json!(call.arguments);
+        self.output[index]["arguments"] = json!(arguments);
         Ok(events)
     }
     pub(super) fn finish(mut self, end: ResponseEnd) -> Vec<Value> {
@@ -240,12 +302,26 @@ impl ResponseEvents {
         }
         // Output index order is the wire order, independent of call ID sort.
         for (index, item) in self.output.iter().enumerate() {
-            if item["type"] == "function_call" {
+            if item["type"] == "function_call"
+                && self
+                    .calls
+                    .get(item["call_id"].as_str().unwrap_or(""))
+                    .is_some_and(|call| call.admitted)
+            {
                 events.push(json!({"type":"response.function_call_arguments.done","response_id":self.id,"item_id":item["id"],"output_index":index,"call_id":item["call_id"],"name":item["name"],"arguments":item["arguments"]}));
             }
         }
         for (index, item) in self.output.iter_mut().enumerate() {
-            item["status"] = json!(status);
+            let unfinished = item["type"] == "function_call"
+                && !self
+                    .calls
+                    .get(item["call_id"].as_str().unwrap_or(""))
+                    .is_some_and(|call| call.admitted);
+            item["status"] = json!(if unfinished && !matches!(end, ResponseEnd::Cancelled) {
+                "incomplete"
+            } else {
+                status
+            });
             events.push(json!({"type":"response.output_item.done","response_id":self.id,"output_index":index,"item":item}));
         }
         events.push(json!({"type":"response.done","response":{"id":self.id,"object":"realtime.response","status":status,"output":self.output,"usage":{"output_tokens":self.output_tokens}}}));
@@ -288,6 +364,129 @@ impl TranscriptionEvents {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn provisional_call_prefixes_stream_once_and_preserve_raw_spelling_after_batch_admission() {
+        let tools = super::super::tools::ToolArguments::compile(
+            &json!([{"name":"lookup","parameters":{"const":{"z":1,"city":"Paris"}}}]),
+            4096,
+        )
+        .unwrap();
+        let mut response = response(4096);
+        let mut joined = String::new();
+        for (step, arguments) in [r#"{"z":1,"city":"Pa"#, r#"{"z":1,"city":"Pa\u0072is"}"#]
+            .into_iter()
+            .enumerate()
+        {
+            let fragments = [onnx_genai_metadata::ToolCallFragment {
+                index: 0,
+                id: None,
+                name: "lookup".into(),
+                arguments: arguments.into(),
+                envelope_complete: step == 1,
+            }];
+            let admitted = tools.admit_fragments(&fragments).unwrap();
+            let events = response
+                .tool_fragment(&admitted[0], "wire_call", "item_call")
+                .unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["type"] == "response.output_item.added")
+                    .count(),
+                usize::from(step == 0)
+            );
+            for event in events {
+                if event["type"] == "response.function_call_arguments.delta" {
+                    joined.push_str(event["delta"].as_str().unwrap());
+                }
+            }
+            assert!(
+                response
+                    .tool_fragment(&admitted[0], "wire_call", "item_call")
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let call = ToolCall {
+            id: "wire_call".into(),
+            name: "lookup".into(),
+            arguments: r#"{"city":"Paris","z":1}"#.into(),
+        };
+        let final_fragment = onnx_genai_metadata::ToolCallFragment {
+            index: 0,
+            id: Some(call.id.clone()),
+            name: call.name.clone(),
+            arguments: joined.clone(),
+            envelope_complete: true,
+        };
+        tools
+            .admit_projected(std::slice::from_ref(&call), &[final_fragment])
+            .unwrap();
+        assert!(
+            response
+                .tool_call(&call, "unused".into())
+                .unwrap()
+                .is_empty()
+        );
+        let terminal = response.finish(ResponseEnd::Model);
+        let done = terminal
+            .iter()
+            .find(|event| event["type"] == "response.function_call_arguments.done")
+            .unwrap();
+        assert_eq!(done["arguments"], joined);
+        assert_eq!(
+            terminal.last().unwrap()["response"]["output"][0]["arguments"],
+            joined
+        );
+    }
+
+    #[test]
+    fn unfinished_calls_never_publish_argument_done_and_quota_failure_publishes_nothing() {
+        let tools = super::super::tools::ToolArguments::compile(
+            &json!([{"name":"lookup","parameters":{"type":"object"}}]),
+            4096,
+        )
+        .unwrap();
+        let fragments = [onnx_genai_metadata::ToolCallFragment {
+            index: 0,
+            id: None,
+            name: "lookup".into(),
+            arguments: "{".into(),
+            envelope_complete: false,
+        }];
+        let admitted = tools.admit_fragments(&fragments).unwrap();
+        for end in [ResponseEnd::TokenLimit, ResponseEnd::Cancelled] {
+            let mut response = response(4096);
+            response
+                .tool_fragment(&admitted[0], "wire_call", "item_call")
+                .unwrap();
+            let terminal = response.finish(end);
+            assert!(
+                !terminal
+                    .iter()
+                    .any(|event| event["type"] == "response.function_call_arguments.done")
+            );
+            assert_eq!(
+                terminal.last().unwrap()["response"]["output"][0]["status"],
+                if matches!(end, ResponseEnd::Cancelled) {
+                    "cancelled"
+                } else {
+                    "incomplete"
+                }
+            );
+        }
+        let mut small = response(1);
+        assert!(
+            small
+                .tool_fragment(&admitted[0], "wire_call", "item_call")
+                .is_err()
+        );
+        assert_eq!(
+            small.finish(ResponseEnd::TokenLimit).last().unwrap()["response"]["output"],
+            json!([])
+        );
+    }
+
     fn response(limit: usize) -> ResponseEvents {
         let (response, created) = ResponseEvents::new(
             "resp_test".into(),

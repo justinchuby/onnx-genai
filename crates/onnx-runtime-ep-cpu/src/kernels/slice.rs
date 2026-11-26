@@ -195,7 +195,7 @@ impl Kernel for SliceKernel {
         let inner_elems = numel(&in_shape[contiguous_suffix..]);
         let inner_bytes = inner_elems * esize;
         let outer_shape = &out_shape[..contiguous_suffix];
-        let in_strides = compute_contiguous_strides(in_shape);
+        let in_strides = compute_contiguous_strides(in_shape)?;
         let mut idx = vec![0usize; contiguous_suffix];
         let mut w = 0usize;
         loop {

@@ -136,9 +136,14 @@ fn string_compress_requires_a_rank_one_bool_condition() {
     );
 
     let bad_condition = Tensor::from_i64(&[2], &[0, 1]).unwrap();
-    let result = InferenceSession::from_graph(compress_graph(28, None, DataType::Int64, &[2]))
-        .and_then(|mut session| session.run(&[("X", &x), ("condition", &bad_condition)]));
-    let detail = result.unwrap_err().to_string();
+    let detail = match InferenceSession::from_graph(compress_graph(28, None, DataType::Int64, &[2]))
+    {
+        Ok(mut session) => session
+            .run(&[("X", &x), ("condition", &bad_condition)])
+            .unwrap_err()
+            .to_string(),
+        Err(error) => error.to_string(),
+    };
     assert!(
         detail.contains("Compress") && detail.to_ascii_lowercase().contains("bool"),
         "{detail}"
@@ -193,6 +198,56 @@ fn string_compress_requested_cuda_reports_host_placement() {
     let mask = Tensor::from_raw(DataType::Bool, vec![2], &[0, 1]).unwrap();
     let outputs = session.run(&[("X", &x), ("condition", &mask)]).unwrap();
     assert_strings(&outputs[0], &[2, 1], &["猫", "e\0"]);
+}
+
+fn equal_graph(opset: u64, dtype: DataType) -> Graph {
+    let mut graph = graph(opset);
+    let x = graph.create_named_value("X", dtype, static_shape([3, 1]));
+    let y = graph.create_named_value("Y", dtype, static_shape([4]));
+    graph.add_input(x);
+    graph.add_input(y);
+    let z = graph.create_named_value("Z", DataType::Bool, static_shape([3, 4]));
+    node(&mut graph, "Equal", &[x, y], &[z], &[]);
+    graph.add_output(z);
+    graph
+}
+
+#[test]
+fn equal_string_broadcasts_exact_values_to_bool_at_opset_19_and_later() {
+    let lhs = strings(&[3, 1], &["caf\u{e9}", "", "a\0b"]);
+    let rhs = strings(&[4], &["cafe\u{301}", "", "a\0b", "caf\u{e9}"]);
+    for opset in [19, 20] {
+        let mut session = InferenceSession::from_graph(equal_graph(opset, DataType::String))
+            .unwrap_or_else(|error| panic!("Equal at opset {opset}: {error}"));
+        let output = session.run(&[("X", &lhs), ("Y", &rhs)]).unwrap();
+        assert_eq!(output[0].dtype, DataType::Bool);
+        assert_eq!(output[0].shape, [3, 4]);
+        assert_eq!(output[0].as_bytes(), [0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0]);
+    }
+}
+
+#[test]
+fn equal_string_requires_opset_19_without_changing_pre_19_numeric_equal() {
+    let error = InferenceSession::from_graph(equal_graph(18, DataType::String))
+        .err()
+        .expect("opset 18 must not admit string Equal");
+    let message = error.to_string();
+    assert!(
+        message.contains("Equal") && message.contains("opset 18"),
+        "{message}"
+    );
+    assert!(message.contains("opset 19"), "{message}");
+
+    for opset in [18, 19] {
+        let mut session = InferenceSession::from_graph(equal_graph(opset, DataType::Float32))
+            .unwrap_or_else(|error| panic!("Equal at opset {opset}: {error}"));
+        let lhs = Tensor::from_f32(&[3, 1], &[0.0, 1.0, f32::NAN]).unwrap();
+        let rhs = Tensor::from_f32(&[4], &[-0.0, 1.0, f32::NAN, 2.0]).unwrap();
+        let output = session.run(&[("X", &lhs), ("Y", &rhs)]).unwrap();
+        assert_eq!(output[0].dtype, DataType::Bool);
+        assert_eq!(output[0].shape, [3, 4]);
+        assert_eq!(output[0].as_bytes(), [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+    }
 }
 
 fn regex_graph(opset: u64, dims: &[usize], pattern: &str) -> Graph {

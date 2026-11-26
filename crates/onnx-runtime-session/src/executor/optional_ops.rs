@@ -216,7 +216,7 @@ impl Executor {
             if value
                 .strides
                 .as_ref()
-                .is_some_and(|strides| *strides != compute_contiguous_strides(shape))
+                .is_some_and(|strides| !onnx_runtime_ir::is_contiguous(shape, strides))
             {
                 return Err(error(
                     op,
@@ -332,10 +332,12 @@ impl Executor {
                                 &elem.shape,
                             )?;
                             if elem.byte_offset() != 0
-                                || elem.layout.resolved_strides(&elem.shape)
-                                    != compute_contiguous_strides(&elem.shape)
+                                || !onnx_runtime_ir::is_contiguous(
+                                    &elem.shape,
+                                    &elem.layout.resolved_strides(&elem.shape)?,
+                                )
                                 || binding.strides.as_ref().is_some_and(|strides| {
-                                    *strides != compute_contiguous_strides(&elem.shape)
+                                    !onnx_runtime_ir::is_contiguous(&elem.shape, strides)
                                 })
                             {
                                 return Err(error(

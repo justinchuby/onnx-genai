@@ -65,7 +65,7 @@ mod cuda_impl {
         _context: *mut ort::OrtKernelContext,
     ) -> *mut ort::OrtStatus {
         onnx_runtime_ep_plugin::status::fail_status(
-            "pkg.nxrt::DsaIndexSelect schema fallback executed; cuda_ep must compile this node",
+            "pkg.nxrt._private::DsaIndexSelect schema fallback executed; cuda_ep must compile this node",
         )
     }
 
@@ -183,7 +183,7 @@ mod cuda_impl {
             );
         };
         let mut domain = ptr::null_mut();
-        let status = unsafe { create_domain(c"pkg.nxrt".as_ptr(), &mut domain) };
+        let status = unsafe { create_domain(c"pkg.nxrt._private".as_ptr(), &mut domain) };
         if !status.is_null() {
             return status;
         }
@@ -209,9 +209,8 @@ mod cuda_impl {
     /// node (MatMulNBits, GroupQueryAttention, SkipSimplifiedLayerNormalization,
     /// GatherBlockQuantized — 61% of a real decoder) could ever match.
     ///
-    /// Requires the constructed EP's `CudaRuntime`; at factory-construction time
-    /// this is available from the already-built `CudaExecutionProvider`
-    /// (`ep.runtime()`), so no separate GPU context is needed.
+    /// Read the constructed provider's registry so advertisement cannot
+    /// accidentally use a different contract than capability and compilation.
     ///
     /// The registry is derived from the real `OpRegistry`, not a hand-maintained
     /// list, so it cannot drift from the kernels. Advertising the real domains
@@ -220,9 +219,9 @@ mod cuda_impl {
     /// (see `onnx-runtime-ep-plugin`'s partial-GPU-claim gate, off by default
     /// because executing an interspersed CPU/GPU partition currently hits #982).
     pub(crate) fn build_kernel_registry_entries(
-        runtime: std::sync::Arc<onnx_runtime_ep_cuda::CudaRuntime>,
+        ep: &CudaExecutionProvider,
     ) -> Vec<KernelRegistryEntry> {
-        let descriptors = onnx_runtime_ep_cuda::build_cuda_registry_descriptors(runtime);
+        let descriptors = onnx_runtime_ep_cuda::build_cuda_registry_descriptors(ep.registry());
         descriptors
             .iter()
             .enumerate()
@@ -292,11 +291,11 @@ mod cuda_impl {
     /// EP's real registry so the caller advertises each kernel under its true
     /// domain.
     pub(crate) fn construct_ep_with_stream() -> Result<ConstructedEp, String> {
-        let ep = CudaExecutionProvider::new_default().map_err(|e| {
+        let ep = CudaExecutionProvider::new_for_ort_plugin().map_err(|e| {
             format!("CUDA EP construction failed (no GPU or driver unavailable): {e}")
         })?;
         let stream_handle = ep.runtime().stream_ptr() as *mut std::os::raw::c_void;
-        let entries = build_kernel_registry_entries(ep.runtime().clone());
+        let entries = build_kernel_registry_entries(&ep);
         let runtime = ep.runtime().clone();
         let preflight: onnx_runtime_ep_plugin::factory::WorkspaceExecutionGuard =
             std::sync::Arc::new(move || {
@@ -312,6 +311,91 @@ mod cuda_impl {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[cfg_attr(
+            not(feature = "gpu-tests"),
+            ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+        )]
+        #[test]
+        fn cast_keeps_shipped_ort_descriptors() {
+            use onnx_runtime_ir::DataType::*;
+
+            let (_, _, entries, _) = construct_ep_with_stream().expect("CUDA device 0");
+            let mut ranges = Vec::new();
+            for entry in entries
+                .iter()
+                .filter(|e| matches!(e.op_type, "Cast" | "CastLike"))
+            {
+                assert_eq!(entry.domain, "");
+                assert_eq!(
+                    entry.supported_dtypes,
+                    &[
+                        Float32, Float16, BFloat16, Int8, Int16, Int32, Int64, Uint8, Uint16,
+                        Uint32, Uint64, Bool
+                    ]
+                );
+                assert!(entry.input_dtype_constraints.is_empty());
+                assert!(entry.output_dtype_constraints.is_empty());
+                ranges.push((entry.op_type, entry.since_version, entry.end_version));
+            }
+            assert_eq!(
+                ranges,
+                [
+                    ("Cast", 1, 27),
+                    ("Cast", 28, i32::MAX),
+                    ("CastLike", 1, i32::MAX)
+                ]
+            );
+        }
+
+        #[cfg_attr(
+            not(feature = "gpu-tests"),
+            ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+        )]
+        #[test]
+        fn conv_transpose_keeps_legacy_advertisement_and_compilation() {
+            use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, ValueId};
+
+            let (ep, _, entries, _) = construct_ep_with_stream().expect("CUDA device 0");
+            let conv_transpose: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry.op_type == "ConvTranspose" && entry.domain.is_empty())
+                .collect();
+            let [entry] = conv_transpose.as_slice() else {
+                panic!("expected exactly one ConvTranspose advertisement")
+            };
+            assert_eq!(entry.since_version, 1);
+            assert_eq!(entry.end_version, i32::MAX);
+            assert!(entry.supported_dtypes.contains(&DataType::Float16));
+            assert!(entry.supported_dtypes.contains(&DataType::Float32));
+            assert!(entry.supported_dtypes.contains(&DataType::BFloat16));
+            assert!(!entry.supported_dtypes.contains(&DataType::Float64));
+
+            let mut node = Node::new(
+                NodeId(0),
+                "ConvTranspose",
+                vec![Some(ValueId(0)), Some(ValueId(1))],
+                vec![ValueId(2)],
+            );
+            let shapes_2d = [vec![1, 1, 2, 2], vec![1, 1, 2, 2]];
+            let shapes_3d = [vec![1, 1, 2, 2, 2], vec![1, 1, 2, 2, 2]];
+            let claim_shapes = shapes_2d
+                .each_ref()
+                .map(|shape| onnx_runtime_ir::static_shape(shape.iter().copied()));
+            assert!(
+                ep.supports_op(&node, 11, &claim_shapes, &[DataType::BFloat16; 2], &[])
+                    .is_supported()
+            );
+            assert!(
+                !ep.supports_op(&node, 11, &claim_shapes, &[DataType::Float64; 2], &[])
+                    .is_supported()
+            );
+            assert!(ep.get_kernel(&node, &shapes_2d, 11).is_ok());
+            assert!(ep.get_kernel(&node, &shapes_3d, 11).is_err());
+            node.attributes
+                .insert("auto_pad".into(), Attribute::String(b"SAME_UPPER".to_vec()));
+            assert!(ep.get_kernel(&node, &shapes_2d, 11).is_err());
+        }
 
         fn descriptor(
             op_type: &str,
@@ -330,9 +414,9 @@ mod cuda_impl {
         #[test]
         fn advertised_schema_ranges_end_before_the_next_registered_version() {
             let mut descriptors = vec![
-                descriptor("DsaIndexSelect", "pkg.nxrt", 1),
-                descriptor("DsaIndexSelect", "pkg.nxrt", 3),
-                descriptor("Other", "pkg.nxrt", 1),
+                descriptor("DsaIndexSelect", "pkg.nxrt._private", 1),
+                descriptor("DsaIndexSelect", "pkg.nxrt._private", 3),
+                descriptor("Other", "pkg.nxrt._private", 1),
             ];
 
             assert_eq!(schema_end_version(&descriptors, 0), 2);
@@ -794,9 +878,8 @@ mod tests {
 
     #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
     #[test]
-    fn causal_conv_factory_advertises_only_legacy_schemas() {
+    fn cuda_factory_advertises_linear_attention_only_through_28() {
         use onnx_genai_ort_sys as ort;
-        use onnx_runtime_ep_plugin::factory::ExportedFactory;
         use std::ptr;
 
         let host = onnx_runtime_ort_testkit::ort_test_process().expect("pinned ORT test host");
@@ -814,17 +897,32 @@ mod tests {
                 &mut count,
             )
         };
-        assert!(status.is_null() && count == 1 && !factory.is_null());
-        let mut ranges: Vec<_> = unsafe { &*factory.cast::<ExportedFactory>() }
-            .kernel_registry_entries
+        assert!(status.is_null(), "CUDA factory creation must succeed");
+        assert_eq!(count, 1, "the test requires a real CUDA factory");
+        assert!(!factory.is_null());
+        // The Rust-linked export returns this adapter's ExportedFactory.
+        let entries = unsafe {
+            &(*factory.cast::<onnx_runtime_ep_plugin::factory::ExportedFactory>())
+                .kernel_registry_entries
+        };
+        let ranges: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.domain.is_empty() && entry.op_type == "LinearAttention")
+            .map(|entry| (entry.since_version, entry.end_version))
+            .collect();
+        let mut causal_ranges: Vec<_> = entries
             .iter()
             .filter(|entry| entry.op_type == "CausalConvWithState")
             .map(|entry| (entry.domain, entry.since_version, entry.end_version))
             .collect();
-        assert!(unsafe { super::ReleaseEpFactory(factory) }.is_null());
-
-        ranges.sort_unstable();
-        assert_eq!(ranges, [("", 27, 28), ("com.microsoft", 1, i32::MAX)]);
+        let status = unsafe { super::ReleaseEpFactory(factory) };
+        assert!(status.is_null());
+        assert_eq!(ranges, [(27, 28)]);
+        causal_ranges.sort_unstable();
+        assert_eq!(
+            causal_ranges,
+            [("", 27, 28), ("com.microsoft", 1, i32::MAX)]
+        );
     }
 
     /// Verify that a panicking constructor is caught at the macro guard boundary.

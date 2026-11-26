@@ -28,7 +28,7 @@ impl KernelFactory for WhereFactory {
 /// `out_shape` (0 where the axis is broadcast). Errors on an incompatible axis.
 fn effective_strides(src_shape: &[usize], out_shape: &[usize]) -> Result<Vec<i64>> {
     let out_rank = out_shape.len();
-    let src_strides = compute_contiguous_strides(src_shape);
+    let src_strides = compute_contiguous_strides(src_shape)?;
     let mut eff = vec![0i64; out_rank];
     for (axis, e) in eff.iter_mut().enumerate() {
         let src_axis = axis as isize - (out_rank as isize - src_shape.len() as isize);

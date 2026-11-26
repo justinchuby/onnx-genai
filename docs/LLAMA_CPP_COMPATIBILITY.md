@@ -3,6 +3,9 @@
 The [generated endpoint registration matrix](LLAMA_CPP_ENDPOINT_MATRIX.md) inventories
 all 55 static upstream method/path contracts, including aliases and conditional routes.
 Its route-presence results are separate from the behavioral evidence below.
+The [behavioral acceptance matrix](LLAMA_CPP_BEHAVIOR_MATRIX.md) links concrete
+test assertions and preserves unfinished requirements. Source links are distinct
+from revision-bound runtime receipts and full upstream parity.
 
 Native execution is enabled and selected by default in the engine, facade, CLI
 and server. ORT is an explicitly selected reference backend for tests and
@@ -337,6 +340,28 @@ The old public character-based `JsonConstraint` was removed; pure request syntax
 preflight uses `validate_json_prefix`, while generation uses the shared schema
 recognizer.
 
+JSON object defaults follow the pinned [chat conversion](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-common.cpp#L1420)
+and [native schema handler](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-schema.cpp#L270).
+`json_schema: {}` and implicit/empty response-format schemas constrain the root
+to an object. Explicit nonempty schemas and boolean schemas keep their JSON
+Schema meaning. This applies to eager and lazy generation. The engine's generic
+`GenerateConstraint::Json` remains an any-value constraint; the transport selects
+the appropriate schema explicitly.
+
+Accepted forms include top-level `json_schema`, `json_object.schema`, flat
+`json_schema.schema`, and the OpenAI nested `json_schema.json_schema.schema`
+wrapper. Nested wrappers take precedence over a flat schema. An implicit
+`json_object` keeps a supplied top-level schema; its explicit `schema` overrides
+that field. `text` preserves an explicitly supplied top-level schema. In native
+requests, presence of `grammar` takes precedence over legacy `json_schema`, even
+for an empty grammar; chat rejects conflicting grammar/schema constraints.
+Responses `text.format` uses the same schema selection after wire conversion.
+For example, an explicit schema can allow a scalar despite the format label:
+
+```json
+{"response_format":{"type":"json_object","schema":{"const":7}}}
+```
+
 Without explicit continuation, declared content/reasoning text in the template
 prefill is included in the response, matching upstream session projection.
 The same include/exclude policy governs buffered, SSE and logprob replay; only
@@ -353,6 +378,16 @@ JSON generation failures propagate as buffered errors or SSE error events; they
 are never replaced with an ungenerated `{}` and a successful stop. Stopping
 strings are removed before declared response-channel projection, consistently
 for buffered, live and logprob SSE output, including reasoning channels.
+Text stops match the earliest occurrence in generated output, including inside
+one token's decoded fragment and across token boundaries. Configured order
+resolves equal-position matches. The selected token remains counted and
+committed, while the stop string and following text are hidden. Native
+`stopping_word`, finish reasons and usage reflect that actual decoder stop.
+The matched word remains reported when EOS or prediction time takes priority
+over the final stop type, matching the pinned server's diagnostic behavior.
+Token-ID stop sequences retain their token-suffix semantics. Prediction-time
+checks use the same visible text boundary as delivery, including held partial
+stop prefixes, so hidden newlines do not trigger time expiry.
 Continuation intent follows the pinned upstream wire forms: `false`/`null` disable
 explicit continuation, `true` selects content unless the final message contains
 only reasoning, and `"content"` / `"reasoning_content"` select their named fields.
@@ -368,6 +403,57 @@ are canonicalized only for schema recognition; prompt bytes retain the original
 spelling. Literal escaped backslashes keep their meaning. Grammar-only byte chunks
 may still split UTF-8 scalars. Invalid schema prefixes return a typed 400 error. Tokenizers without an interpretable
 lossless byte codec fail explicitly rather than using lossy token decoding.
+`t_max_predict_ms` limits prediction wall time starting with the first generated
+token, excluding prefill. Like the pinned upstream server, it stops only when a
+newly emitted text fragment contains a newline and elapsed time is strictly
+greater than the limit. A newline removed as part of a matched stop word does
+not trigger this limit. This is a normal generation stop: accepted output and
+its session state commit, with OpenAI `finish_reason: "length"` and native
+`stop_type: "limit"`; it does not cancel or roll back the request. Scheduler gaps
+count toward this wall limit, unlike the active-work timing counters below.
+
+Omission, `null`, `-1` and `0` disable the limit. Numeric fractions truncate
+toward zero before checking the signed 64-bit millisecond range; for example,
+`1.5` becomes one millisecond. Unsafe overflow representations are rejected.
+Native, OpenAI completion/chat, Responses and Anthropic generation share this
+request field. Native speculative, candidate-tree and DFlash execution stop at
+the accepted token prefix and finalize physical state before publication.
+Generic authored workflows observe emitted tokens and stop before entering the
+next loop body. The current body finishes atomically, including its declared
+state updates. The request token budget bounds all emitted output even when an
+authored loop declares a larger iteration count; a body that would exceed that
+budget fails and rolls back the turn before publication.
+
+Text and token-ID stop sequences also apply to generic authored workflows,
+candidate-tree and DFlash execution. Specialized drivers truncate the accepted
+prefix before repairing state. Text stops and prediction-time limits require a
+package tokenizer; token-ID stops, EOS and token budgets do not. Empty stop
+sequences are inert. Pending decoder bytes are finalized before semantic commit,
+so an EOF text stop receives its actual stop reason, and a decoding or byte-bound
+failure leaves session state and callbacks uncommitted.
+
+`n_indent` requests a minimum number of space or tab characters after generated
+newlines. Each tab counts once. Omission, `null` and zero disable the control;
+numeric fractions truncate toward zero and the resulting value must fit
+0 through INT32_MAX. It requires a package tokenizer. The request is shared by
+native and OpenAI completion/chat, Responses and Anthropic generation.
+
+Indentation checks follow the pinned server's token-observation order: the first
+visible newline arms a later observation, and subsequent observations advance
+the newline scan. An insufficiently indented line stops generation normally;
+its leading whitespace remains in final text while its body is removed. EOS and
+prediction-time labels can take precedence without undoing that text clipping.
+The triggering token remains committed and counted. Native reports `limit`;
+OpenAI reports `length`. Generic workflows finish the current loop body
+atomically; specialized execution repairs the accepted prefix before commit.
+
+SSE publishes text whose indentation is already safe, withholding potentially
+retractable line content until the final boundary is known. A request that ends
+before the delayed indentation check releases any retained valid suffix. This
+avoids the pinned implementation's send-before-truncate ordering producing a
+streamed body that disagrees with final text. Token IDs and usage still account
+for every committed token.
+
 Ordinary runtime-owned decoder generation returns llama.cpp `timings` in native,
 OpenAI completion and chat buffered results and final SSE chunks. Setting
 `timings_per_token=true` adds cumulative token-boundary measurements to SSE,
@@ -422,8 +508,12 @@ history expiring after five minutes. Old offsets fail explicitly once evicted.
 Requests without a conversation ID close their driver reader on disconnect.
 SSE generation streams use a 30-second idle comment ping interval by default,
 matching the pinned server. `--sse-ping-interval SECONDS` sets the server default;
-request `sse_ping_interval` overrides it. Values are integer seconds from -1
-through 2147483647; -1 and 0 disable pings. Data resets the idle timer, and EOF
+request `sse_ping_interval` overrides it. JSON numbers truncate toward zero to
+integer seconds from -1 through 2147483647; for example, `1.9` selects one second
+and `0.5` disables pings. Omission or `null` inherits the configured server
+interval, including a disabled default. Values -1 and 0 disable pings. Unsafe
+overflow representations, booleans and strings are rejected. The CLI accepts
+integer seconds. Data resets the idle timer, and EOF
 ends the timer with the source. This applies to native completion/infill,
 OpenAI completion/chat, Responses and Anthropic streams. Pings are SSE comments,
 not generation events. Resumable streams retain their actual comment bytes,
@@ -446,6 +536,18 @@ support for those remaining backends is still an implementation item.
 Complete compressed-state checkpoints restore saved record cursors and partial
 carries; they do not imply arbitrary token-prefix rewind or permission to ignore
 the package's prefix-reuse policy.
+
+Native completion/infill final results include the actual detokenized prompt
+(with special tokens), `has_new_line` for visible generated text, and the matched
+text `stopping_word`. Prompt-only evaluation reports an empty stopping word and
+no generated newline. A serial Native executor reports its real `id_slot: 0`.
+`generation_settings` reports the admitted output cap and resolved sampling
+configuration: sampler order, temperature and probability filters, penalties,
+stop strings, explicit seed, EOS policy, preserved tokens, probability reporting
+and cache policy. Active dynamic-temperature, DRY, XTC and Mirostat controls
+include their resolved parameters. Randomized generation omits an unspecified
+seed. Budgets reflect the admitted cap, including model context bounds and zero
+for prompt-only evaluation. Batch results retain their own prompt and cap.
 
 Native completion/infill `response_fields` selects fields from the final result.
 An omitted or empty array returns the full result; otherwise missing paths are
@@ -503,8 +605,9 @@ completion, so a later request cannot change an earlier response's count.
 The count comes from the materialized cursor, not prompt-plus-output token
 arithmetic: the final sampled token may not yet have been consumed by a forward.
 OpenAI cached-prompt usage continues to report input reuse separately.
-Native multimodal prompt objects and infill extra files still require further
-engine support. Native embedding normalization supports -1, 0 and positive integer p-norms; zero vectors
+Native multimodal prompt objects still require further engine support.
+`/infill` extra file context is supported for packages declaring the explicit
+`package.infill` control roles and extra-context template (schema v1.18). Native embedding normalization supports -1, 0 and positive integer p-norms; zero vectors
 remain zero. Token-counting routes use the same prompt renderer and declared media expansion
 as generation. They validate attachments and tool capability without executing a
 generation. Anthropic streaming receives
@@ -566,15 +669,22 @@ including actual native image preprocessing and model-owned token usage. See
 This is a functional Llama Chat integration, not a claim of complete llama-server
 parity. These upstream capabilities remain incomplete:
 
-- Realtime grammar forcing beyond declared turn-based tagged-json mask workflows,
-  partial function-call fragment projection, broader pressure/overlap acceptance and
-  device-backed wire acceptance; see [realtime](REALTIME.md) for the implemented
+- Broader realtime pressure/overlap and device-backed wire acceptance;
+  declared turn-based/duplex tagged-json forcing and canonical named-parameter
+  XML forcing are implemented; see [realtime](REALTIME.md) for the implemented
   WebSocket session modes, resource bounds and Native CPU evidence.
 - Video decision inputs, broader audio codecs and additional DSP operations/conventions,
   joint/packed decision heads and shared generation/decision entry points.
 - Device-state/multi-sequence slot persistence; arbitrary GGUF/PEFT LoRA imports and device-fused LoRA.
-- GGUF package import, quantization selectors and selective sidecar management.
-  Hugging Face nxrt-package download, resume and deletion are supported.
+- Bare GGUF graph import, filename-based GGUF quantization selection and selective sidecar management.
+  Native nxrt packages can explicitly bind GGUF or SafeTensors weights to their
+  ONNX graphs through schema `v1.17` `graph_weights`; decoder, workflow and MTP
+  loading share the bindings. Exact tensor dtype/shape matching is required.
+  See [inference metadata](genai/MODEL_METADATA.md#components-and-graph).
+  Hugging Face nxrt-package download, resume and deletion are supported. Explicit
+  `repository:variant` selection supports authored model-package variants,
+  including selective installation and shared tokenizer assets; this does not
+  infer an executable graph from a bare GGUF repository.
 
 `/v1/systemone` executes text/structured-state decision profiles, with explicit
 model-authored prompting, calibration outputs, variants and answer policies.
@@ -600,6 +710,15 @@ Docker/Podman/SSH tool runtimes. These are deliberate scope exclusions, not
 pending compatibility work. `/props` reports `server_tools: false` in
 `nxrt_capabilities` and `cors_proxy_enabled: false` in both router and model modes.
 The former tool/MCP/proxy CLI options and library configuration types are removed.
+
+The supplied model tool protocols require object arguments. Forced tool grammars
+and realtime parameter admission share that domain restriction even for `true`,
+empty, omitted/null or union parameter schemas. Existing schema conditions and
+root reference locations are retained; contradictory schemas are not relaxed. Forced
+JSON calls compile parameter documents independently, preserving their standalone
+root URI, dialect, pointers and anchors. Per-tool registries remain separate,
+including tools reusing the same `$id`. References do not fetch external
+resources. This remains the grammar backend's supported schema language.
 
 Chat tool calling remains supported: clients send `tools`/`tool_choice`, consume
 assistant `tool_calls` (including streaming deltas), execute those calls in their
@@ -686,8 +805,14 @@ repetitions above 2,000 are refused and larger upper bounds become unbounded.
 The model must declare a dense, resolved, token-local byte vocabulary. Actual
 raw pieces include special-token spellings; only explicitly declared ending IDs
 receive terminal semantics. Token names and angle brackets do not guess roles.
-Non-byte contextual decoders and stream-initial/trailing stripping currently return an
-actionable capability error before SSE.
+Resolved stream-initial/trailing Strip stages apply to published text; raw
+GBNF/Lark and lazy JSON inspect the vocabulary pieces before those stages.
+For example, a raw piece ` hello ` remains subject to a grammar requiring both
+spaces even when the tokenizer publishes `hello`. This matches the pinned
+[vocabulary cache](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/src/llama-vocab.cpp)
+and [grammar sampler](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/src/llama-grammar.cpp).
+Non-byte and unresolved contextual decoders still return an actionable capability
+error before SSE; ordinary content constraints continue to inspect published content.
 
 Both raw grammar forms conflict with JSON `response_format`, forced `tool_choice`, and
 `ignore_eos=true`. Raw GBNF accepts `grammar_lazy=true` with nonempty
@@ -724,9 +849,45 @@ answer (alongside the route's normal prompt/messages fields):
 
 As in the pinned upstream sampler, raw `%llguidance` Lark remains eager and
 ignores lazy token/pattern effects, while tokenizer-level word preservation is
-still validated. Lazy JSON `response_format` without a raw GBNF grammar is still
-unsupported and returns a pre-SSE error. Collating/equivalence bracket forms are
-also explicitly unsupported. Trigger source/input bytes, combined translated
+still validated. JSON `response_format` and native `json_schema` also accept
+lazy activation. They use the same trigger ordering, raw newly generated bytes,
+reasoning gate and ending roles as GBNF; assistant prefill and declared content
+projection do not feed the activated JSON value. The complete JSON Schema
+recognizer and equivalent JSON escape handling are shared with eager JSON.
+Before a trigger, arbitrary text and EOS remain legal. After activation the
+captured suffix must be a viable schema prefix and EOS requires a complete value;
+length limits and explicit stops may still truncate it. Selected triggers are
+validated before publication even on the final generation step. A JSON trigger
+therefore normally captures the opening brace rather than an answer label:
+
+```json
+{
+  "response_format": {"type": "json_object"},
+  "grammar_lazy": true,
+  "grammar_triggers": [{"type": 2, "value": "ANSWER: (\\{)"}]
+}
+```
+
+Lazy JSON requires the same identity raw byte decoder capability as raw GBNF,
+a positive source/output byte budget and `ignore_eos=false`; it conflicts with
+forced tool choice. Schema/trigger compilation happens before SSE. Collating symbols (`[[.a.]]`,
+`[[.space.]]`) and equivalence classes (`[[=a=]]`) have explicit classic-locale
+byte semantics. Because C++ libraries disagree, nxrt accepts the request extension
+`grammar_trigger_collation`: omission/null or `"libcxx"` preserves the existing
+libc++ contract; `"libstdcxx"` selects GNU collating names and ASCII-case primary
+equivalence. For example, `[[=a=]]` matches a in the former and a/A in the latter.
+There is no ambient-locale or host-compiler inference, or Unicode/accent folding.
+Model properties advertise both choices and the fixed default.
+
+Named punctuation, controls and digits follow the selected library; accepted
+names and legacy NUL behavior are covered by paired C++ reference fixtures.
+Unsupported names and malformed delimiters fail before SSE with profile and byte
+location. The default profile permits collating symbols at both range ends and
+independent equivalence/POSIX terms followed by a hyphen: `[[.a.]-[.c.]]` matches
+a through c, while `[[=a=]-c]` matches a, hyphen or c. GNU requires a literal
+right endpoint (`[[.a.]-c]`) and rejects a class as a range start. Its otherwise
+unmatched closing bracket is literal; the default profile rejects it.
+Trigger source/input bytes, combined translated
 program size, captures, nesting, repetitions, character-class items, history
 length and backtracking have declared bounds; exhaustion is an actionable error.
 Neutral `grammar_lazy=false`, `grammar_triggers=[]` and `preserved_tokens=[]`
@@ -771,14 +932,26 @@ logprob delivery and transactional publication. UTF-8 decoder lookbehind remains
 request-local. Raw grammar recognition continues to inspect model bytes and IDs.
 
 Audio preprocessing admits package-authored mel counts, sample rates, FFT/hop
-and Hann-window lengths through the executable log-mel program. Numerical
-acceptance includes an independent direct DFT and Native workflows using
-nonstandard geometry. Feature-tensor serving also executes the model-authored
-audio program, with explicit named output binding and runtime shape checks;
-rank-3 shapes never select a hidden default analysis recipe. Pure-waveform normalization, named transform dataflow and validity publication
-execute as described in [audio preprocessing](AUDIO_PREPROCESSING.md). Additional
-DSP operations, window/mel conventions and codecs remain open; this does not imply
-full audio parity.
+and Hann-window lengths through the executable log-mel program. Standalone
+spectrograms additionally admit explicit power/magnitude and periodic
+Hann/Hamming/rectangular selectors. Numerical acceptance includes an independent
+direct DFT and Native workflows using nonstandard geometry. Feature-tensor
+serving also executes the model-authored audio program, with explicit named
+output binding and runtime shape checks; rank-3 shapes never select a hidden
+default analysis recipe. Pure-waveform normalization, named transform dataflow
+and validity publication execute as described in
+[audio preprocessing](AUDIO_PREPROCESSING.md).
+
+Content-probed encoded audio includes bounded Ogg Opus with canonical channel
+routing and one raw-clock owner for pre-skip/final-granule trimming. CLI file/stdin
+transcription and feature-bound `generate --audio` propagate configured finite PCM
+policies. Engine-backed admission intersects them with a live host-ledger
+snapshot; this is not a PCM memory lease or an atomic concurrent-memory guarantee.
+WebM/MP4 Opus, cropped/nonzero-origin Ogg and code 3 packets with 32–48 frames
+remain explicitly unsupported; see the full
+[encoded-audio contract](AUDIO_PREPROCESSING.md#encoded-audio-formats) for all
+capability and resource limits. Additional DSP operations, window/mel conventions
+and codecs remain open; this does not imply full audio parity.
 
 File transcription now executes declared one-pass CTC/greedy acoustic workflows
 as well as the existing generative speech path. Both aliases expose typed
@@ -795,3 +968,90 @@ serving accepts waveform outputs without a mel shape. See [transcription](TRANSC
 
 Encoded audio support and decoder limitations are documented in
 [audio preprocessing](AUDIO_PREPROCESSING.md#encoded-audio-formats).
+
+## Infill file context
+
+`/infill` accepts `input_extra: [{"filename":"helpers.rs","text":"..."}]`
+when the package declares `package.infill.extra_context_template`. File order,
+filenames and text are passed to this bounded model-authored Jinja template as
+`input_extra`; its output precedes the FIM control envelope. A filename is a
+caller-owned label: the server never opens or resolves that name. No repository
+or file separator token is inferred. Without a declared template, an absent/empty
+list leaves ordinary FIM prompts unchanged. A declared template also renders the
+empty list. A nonempty list without a template fails before streaming.
+
+The package explicitly declares `prefix_token`, `middle_token`, `suffix_token`
+and `order` (`psm` or `spm`); each spelling must resolve to one registered model
+token. The declaration takes precedence over the existing tokenizer-only FIM
+detection. Request file count, filename bytes, total filename/text UTF-8 bytes,
+template output bytes and interpreter operations have configurable server
+bounds (`ServerConfig.max_infill_*`). Token count, context admission, prefill-only and actual
+FIM execution share the same prepared token IDs, including BOS/EOS handling and
+the extra context. Existing FIM sampling and ending-role behavior is retained.
+
+The file-context wire shape follows the pinned llama.cpp implementation: `text`
+is required and may be empty; `filename` is optional (default `tmp`) and may
+be empty. Additional object fields are ignored. Supplied filenames must remain
+within the configured byte limit. See the [upstream request checks](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-context.cpp#L5394-L5411)
+and [filename default](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-common.cpp#L1904-L1905).
+
+`extra_context_template` serializes the native `/infill` file-context list,
+including an empty list. OpenAI completion `suffix` and engine FIM convenience
+methods use the declared control roles without this wire-specific template.
+Prepared-token FIM execution can carry the already rendered context.
+
+### Browser origins and preflight
+
+`--cors-origins`, `--cors-methods`, `--cors-headers`, and
+`--cors-credentials` / `--no-cors-credentials` configure browser transport.
+Their defaults match llama-server: `*`, `GET, POST, DELETE, OPTIONS`, `*`,
+and credentials enabled. The corresponding `LLAMA_ARG_CORS_ORIGINS`,
+`LLAMA_ARG_CORS_METHODS`, `LLAMA_ARG_CORS_HEADERS`,
+`LLAMA_ARG_CORS_CREDENTIALS`, and `LLAMA_ARG_NO_CORS_CREDENTIALS` environment
+variables are supported. These options do not enable the excluded CORS proxy,
+MCP, tool execution, or server-side remote-media fetching.
+
+With credentials enabled, an allowed browser Origin is reflected rather than
+sending the incompatible `Access-Control-Allow-Origin: *`. A comma-separated
+origin list selects the requesting allowed origin. Wildcard request headers
+reflect the requested names so `Authorization` and credentialed JSON requests
+work in browsers. Responses vary by Origin; wildcard-header preflights also vary
+by requested headers and method. Credential permission is present on actual
+responses as well as preflights, including readable authentication/validation
+errors. Preflights bypass API-key admission, replay, routing, and generation;
+actual requests still require the configured key. Allowed methods and headers
+are browser preflight permissions, not changes to the server's HTTP routes.
+
+`--cors-origins localhost` means **same origin**, including the port; it does not
+allow arbitrary localhost applications. Explicit origin lists and this mode
+reject disallowed actual browser requests, including cross-site simple requests
+that browsers might otherwise send without a preflight. Requests without Origin
+remain available to native clients unless their browser Fetch Metadata marks
+them cross-site; navigation to a shipped frontend asset is allowed. As in
+upstream, restricted modes check Host for loopback listeners to prevent DNS
+rebinding; the default `*` mode does not impose this guard. Non-loopback
+listeners do not impose a Host allowlist, preserving reverse-proxy deployments.
+Use an explicit origin list for a separately hosted browser client.
+
+`serve` resolves the local address of **each accepted TCP socket** through
+`CorsConnectionInfo`; a wildcard bind reached through loopback therefore still
+gets the loopback Host guard. Failure to resolve that address returns an
+actionable error before routing or generation. Custom axum TCP adapters can use
+`app(state).into_make_service_with_connect_info::<CorsConnectionInfo>()`.
+Other network adapters must insert `CorsListeningAddress` from their accepted
+socket, not their listener bind address. In-process router calls without either
+context still enforce Origin/Fetch Metadata, but cannot infer a socket address
+or claim DNS-rebinding protection. Actual connection context takes precedence
+over the explicit adapter extension. No forwarded header is trusted to supply
+that address.
+
+The embedded maintained Llama Chat uses same-origin API paths; this change also
+permits independently hosted browser clients to call the API. Its standalone
+Chrome check is `scripts/test_llama_cors.mjs`: two page origins, an authenticated
+Native CPU fixture server, actual JSON and incremental SSE bodies, readable
+401/400 errors, forbidden-origin browser rejection, and an embedded-UI load.
+The driver is maintained acceptance code; its presence alone is not evidence
+that a particular revision, browser, platform or execution provider passed.
+
+Upstream policy and flags: [HTTP middleware](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/server-http.cpp)
+and [argument definitions](https://github.com/ggml-org/llama.cpp/blob/master/common/arg.cpp).

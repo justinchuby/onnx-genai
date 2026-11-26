@@ -27,6 +27,8 @@
 //! unless `gpu-tests` is enabled.
 
 mod common;
+#[path = "fixtures/linear_attention29.rs"]
+mod linear_attention29;
 
 use common::{
     Tensor, assert_close, build_graph, decode_floats, encode_floats, float_input, require_cuda,
@@ -516,6 +518,113 @@ fn opset27_linear_attention_optional_slots_and_mixed_state() {
 
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA")]
 #[test]
+fn linear_attention_29_cuda_onnx_conformance() {
+    let ep = require_cuda();
+    linear_attention29::check_opset29_cases(|inputs, outputs, attrs| {
+        run_cuda(&ep, "LinearAttention", "", 29, inputs, outputs, attrs)
+    });
+    check_opset29_rejects_aliased_trajectory(&ep);
+    check_opset29_trajectory_with_caller_workspace(&ep);
+}
+
+fn check_opset29_trajectory_with_caller_workspace(ep: &CudaExecutionProvider) {
+    let dtype = DataType::Float32;
+    let d_k = 257;
+    let mut basis = vec![0.0; d_k];
+    basis[d_k - 1] = 1.0;
+    let inputs = [
+        float_input(dtype, &[1, 1, d_k], &basis),
+        float_input(dtype, &[1, 1, d_k], &basis),
+        float_input(dtype, &[1, 1, 2], &[2., 3.]),
+    ];
+    let outputs = [
+        (dtype, vec![1, 1, 2]),
+        (dtype, vec![1, 2, d_k, 1]),
+        (dtype, vec![1, 1, 2, d_k, 1]),
+    ];
+    let attrs = [
+        ("q_num_heads", Attribute::Int(1)),
+        ("kv_num_heads", Attribute::Int(1)),
+        ("v_num_heads", Attribute::Int(2)),
+        ("scale", Attribute::Float(1.0)),
+        ("update_rule", Attribute::String(b"linear".to_vec())),
+    ];
+    let got = run_cuda(ep, "LinearAttention", "", 29, &inputs, &outputs, &attrs);
+    let mut state = vec![0.0; 2 * d_k];
+    state[d_k - 1] = 2.0;
+    state[2 * d_k - 1] = 3.0;
+    assert_eq!(decode_floats(&got[0], dtype), [2., 3.]);
+    assert_eq!(decode_floats(&got[1], dtype), state);
+    assert_eq!(got[2], got[1]);
+}
+
+fn check_opset29_rejects_aliased_trajectory(ep: &CudaExecutionProvider) {
+    let dtype = DataType::Float32;
+    let qkv = [1, 2, 1];
+    let present = [1, 1, 1, 1];
+    let states = [1, 2, 1, 1, 1];
+    let inputs = [0; 3].map(|_| float_input(dtype, &qkv, &[1., 2.]));
+    let outputs = [
+        (dtype, qkv.to_vec()),
+        (dtype, present.to_vec()),
+        (dtype, states.to_vec()),
+    ];
+    let attrs = [
+        ("q_num_heads", Attribute::Int(1)),
+        ("kv_num_heads", Attribute::Int(1)),
+        ("update_rule", Attribute::String(b"linear".to_vec())),
+    ];
+    let (graph, id) = build_graph("LinearAttention", "", 29, &inputs, &outputs, &attrs);
+    let input_shapes = inputs.each_ref().map(|t| t.shape.clone());
+    let kernel = ep.get_kernel(graph.node(id), &input_shapes, 29).unwrap();
+    let mut buffer = ep.allocate(6 * 256, 256).unwrap();
+    let ptr = buffer.as_mut_ptr();
+    let [qkv_stride, present_stride, states_stride] = [&qkv[..], &present, &states].map(|shape| {
+        compute_contiguous_strides(shape)
+            .expect("fixture shape has representable contiguous strides")
+    });
+    let views = [0, 256, 512].map(|offset| {
+        TensorView::new(
+            DevicePtr(ptr.cast_const()),
+            dtype,
+            &qkv,
+            &qkv_stride,
+            ep.device_id(),
+        )
+        .with_byte_offset(offset)
+    });
+    let mut outputs = [
+        TensorMut::new(DevicePtrMut(ptr), dtype, &qkv, &qkv_stride, ep.device_id())
+            .with_byte_offset(768),
+        TensorMut::new(
+            DevicePtrMut(ptr),
+            dtype,
+            &present,
+            &present_stride,
+            ep.device_id(),
+        )
+        .with_byte_offset(1024),
+        // The first snapshot would overwrite V for token 1.
+        TensorMut::new(
+            DevicePtrMut(ptr),
+            dtype,
+            &states,
+            &states_stride,
+            ep.device_id(),
+        )
+        .with_byte_offset(516),
+    ];
+    let result = kernel.execute(&views, &mut outputs);
+    ep.deallocate(buffer).unwrap();
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("states overlaps value") && err.contains("non-overlapping device buffer"),
+        "{err}"
+    );
+}
+
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA")]
+#[test]
 fn opset27_range_half_stash_matches_expected() {
     let ep = require_cuda();
     for dtype in [DataType::Float16, DataType::BFloat16] {
@@ -599,11 +708,17 @@ fn opset27_recurrent_and_range_release_ab() {
                 .collect();
             let in_strides: Vec<_> = shapes
                 .iter()
-                .map(|s| compute_contiguous_strides(s))
+                .map(|s| {
+                    compute_contiguous_strides(s)
+                        .expect("fixture shape has representable contiguous strides")
+                })
                 .collect();
             let out_strides: Vec<_> = outputs
                 .iter()
-                .map(|(_, s)| compute_contiguous_strides(s))
+                .map(|(_, s)| {
+                    compute_contiguous_strides(s)
+                        .expect("fixture shape has representable contiguous strides")
+                })
                 .collect();
             let input_views: Vec<_> = inputs
                 .iter()
@@ -1002,7 +1117,10 @@ fn capture_recurrent_state_with_workspace(d_k: usize) {
     let mut eager_inputs = upload_inputs();
     let input_strides = inputs
         .iter()
-        .map(|tensor| compute_contiguous_strides(&tensor.shape))
+        .map(|tensor| {
+            compute_contiguous_strides(&tensor.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let captured_views = inputs
         .iter()
@@ -1034,7 +1152,10 @@ fn capture_recurrent_state_with_workspace(d_k: usize) {
         .collect::<Vec<_>>();
     let output_strides = outputs
         .iter()
-        .map(|(_, shape)| compute_contiguous_strides(shape))
+        .map(|(_, shape)| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let output_bytes = outputs[0].0.storage_bytes(outputs[0].1.iter().product());
     let state_bytes = inputs[3].bytes.len();

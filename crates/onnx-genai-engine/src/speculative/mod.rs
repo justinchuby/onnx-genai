@@ -4,6 +4,8 @@
 //! model-free prompt lookup. All sources feed the same target verification,
 //! longest-prefix acceptance, correction-token, and KV rewind path.
 
+use crate::logits_batch::{LogitsBatch, LogitsRow};
+
 use crate::TokenId;
 use crate::config::MtpCacheScope;
 use crate::decode::{
@@ -387,14 +389,16 @@ pub(crate) fn load_target_initializer_adapters(
     lm_head_name: &str,
     hidden_size: usize,
     projection: Option<DraftProjectionDevice>,
+    keyed_weight_files: &[onnx_runtime_loader::KeyedWeightFile],
 ) -> anyhow::Result<(MtpEmbedder, MtpLmHead, usize)> {
     let (graph, store) =
-        onnx_runtime_loader::load_model_with_weights(model_path).with_context(|| {
-            format!(
-                "Failed to load target initializers from '{}'",
-                model_path.display()
-            )
-        })?;
+        onnx_runtime_loader::load_model_with_keyed_weights(model_path, keyed_weight_files)
+            .with_context(|| {
+                format!(
+                    "Failed to load target initializers from '{}'",
+                    model_path.display()
+                )
+            })?;
     let find_weight = |name: &str| -> anyhow::Result<WeightRef> {
         graph
             .initializers
@@ -1595,7 +1599,7 @@ fn block_flag(value: bool) -> anyhow::Result<onnx_genai_ort::Value> {
 /// logits, any hidden state(s) the active proposer consumes, and the target's
 /// unprocessed greedy next token (used by hidden-state proposers).
 struct TargetPrediction {
-    base_logits: Vec<f32>,
+    base_logits: LogitsRow,
     target_hidden: Option<Vec<f32>>,
     target_hidden_layers: Option<Vec<Vec<f32>>>,
     guaranteed_token: Option<TokenId>,
@@ -1793,7 +1797,7 @@ impl Engine {
                     FinishReason::MaxTokens,
                     prefix_cache_hit_len,
                     logprobs.as_deref(),
-                    &options.effective_preserved_tokens(),
+                    options,
                 )
             }
         }
@@ -2042,7 +2046,7 @@ impl Engine {
                 FinishReason::MaxTokens,
                 prefix_cache_hit_len,
                 generated_logprobs.as_deref(),
-                &options.effective_preserved_tokens(),
+                options,
             )?));
         }
         if reached_context_limit(token_count, max_context) {
@@ -2051,7 +2055,7 @@ impl Engine {
                 FinishReason::Length,
                 prefix_cache_hit_len,
                 generated_logprobs.as_deref(),
-                &options.effective_preserved_tokens(),
+                options,
             )?));
         }
         Ok(None)
@@ -2214,13 +2218,13 @@ impl Engine {
         state: &mut EngineSession,
         draft_tokens: &[TokenId],
         base_len: usize,
-    ) -> anyhow::Result<Vec<Vec<f32>>> {
+    ) -> anyhow::Result<LogitsBatch> {
         self.last_speculative_stats.verification_steps += 1;
         self.last_speculative_stats.proposed_tokens += draft_tokens.len();
 
         state.tokens.extend_from_slice(draft_tokens);
         let verified_logits = if draft_tokens.is_empty() {
-            Vec::new()
+            LogitsBatch::empty()
         } else if state.decode_state.has_runner() {
             let logits =
                 run_decode_session_logits(&mut state.decode_state, draft_tokens, base_len)?;
@@ -2273,7 +2277,8 @@ impl Engine {
                     .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
                 outputs,
                 state.decode_state.io.logits_output.as_deref(),
-            )?
+            )
+            .map(LogitsBatch::from_host_rows)?
         };
         Ok(verified_logits)
     }
@@ -2322,7 +2327,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn choose_accepted_prefix(
         &mut self,
-        target_logits: &mut [Vec<f32>],
+        target_logits: &mut [LogitsRow],
         draft_tokens: &[TokenId],
         base_len: usize,
         state: &EngineSession,
@@ -2355,9 +2360,14 @@ impl Engine {
                 .context("decode speculative output history with preserved_tokens")?,
                 step: step + idx,
             };
-            let probabilities = ProbabilitySnapshot::capture(options, &target_logits[idx]);
-            let target_token =
-                select_next_token_with_rng(&mut target_logits[idx], &context, options, chain, rng)?;
+            let probabilities = ProbabilitySnapshot::capture(options, &target_logits[idx])?;
+            let target_token = select_next_token_with_rng(
+                target_logits[idx].try_mut()?,
+                &context,
+                options,
+                chain,
+                rng,
+            )?;
             if let (Some(top_logprobs), Some(logprobs)) =
                 (options.top_logprobs, candidate_logprobs.as_mut())
             {
@@ -2398,7 +2408,7 @@ impl Engine {
         draft_tokens: &[TokenId],
         base_len: usize,
         state: &mut EngineSession,
-        target_logits: &mut [Vec<f32>],
+        target_logits: &mut [LogitsRow],
         generated_tokens: &[TokenId],
         options: &GenerateOptions,
         chain: &ProcessorChain,
@@ -2456,11 +2466,12 @@ impl Engine {
                 target_logits
                     .last()
                     .context("target verification did not produce next-token logits")?,
-            );
+            )?;
             let token = select_next_token_with_rng(
                 target_logits
                     .last_mut()
-                    .context("target verification did not produce next-token logits")?,
+                    .context("target verification did not produce next-token logits")?
+                    .try_mut()?,
                 &context,
                 options,
                 chain,
@@ -2546,6 +2557,7 @@ impl Engine {
                 chain,
                 self.require_tokenizer()?,
                 callback.as_deref_mut(),
+                None,
             )?;
             *generated_tokens = commit_state.generated_tokens;
             *generated_text = commit_state.generated_text;
@@ -2571,7 +2583,7 @@ impl Engine {
                     finish_reason,
                     prefix_cache_hit_len,
                     generated_logprobs.as_deref(),
-                    &options.effective_preserved_tokens(),
+                    options,
                 )?));
             }
         }
@@ -3084,6 +3096,7 @@ mod tests {
             "lm_head.weight_t",
             16,
             None,
+            &[],
         )?;
         assert_eq!(vocab_size, 32);
 

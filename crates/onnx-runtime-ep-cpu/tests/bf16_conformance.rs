@@ -20,9 +20,9 @@
 #[path = "../benches/common/mod.rs"]
 mod common;
 
-use common::{FloatDType, Tensor};
+use common::{FloatDType, PreparedKernel, Tensor};
 use half::bf16;
-use onnx_runtime_ep_api::{ExecutionProvider, TensorMut, TensorView};
+use onnx_runtime_ep_api::{ExecutionProvider, TensorView};
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ir::{Attribute, DataType, Node, NodeId};
 
@@ -79,13 +79,15 @@ fn try_run_case(case: &OpCase, dtype: FloatDType) -> onnx_runtime_ep_api::Result
         })
         .collect();
 
-    let kernel = CpuExecutionProvider::new().get_kernel(&node, &input_shapes, case.opset)?;
+    let cpu = CpuExecutionProvider::new();
+    let kernel = cpu.get_kernel(&node, &input_shapes, case.opset)?;
 
     let inputs = build_tensors(&case.inputs, dtype);
     let mut output = Tensor::zeros(dtype, &case.out_shape);
 
     let views: Vec<TensorView<'_>> = inputs.iter().map(|t| t.view()).collect();
-    let mut out_view: [TensorMut<'_>; 1] = [output.view_mut()];
+    let mut out_view = [output.view_mut()];
+    let mut kernel = PreparedKernel::new(&cpu, kernel, &views, &out_view);
     kernel.execute(&views, &mut out_view)?;
     Ok(output.to_f32())
 }
@@ -613,7 +615,7 @@ fn _dtype_marker() -> DataType {
     DataType::BFloat16
 }
 
-/// `VarlenAttention` (`pkg.nxrt`) reads Q/K/V through `to_dense_f32_widen` and
+/// `VarlenAttention` (`pkg.nxrt._private`) reads Q/K/V through `to_dense_f32_widen` and
 /// writes through `write_dense_f32_narrow`, so it is natively bf16-capable — its
 /// claim/execute gates previously rejected non-f32 spuriously. This covers the
 /// packed varlen-attention path (single sequence, causal-off) in both dtypes.
@@ -621,7 +623,7 @@ fn varlen_case() -> OpCase {
     // 2 tokens, 1 head, head_size 2; one sequence => cu_seqlens = [0, 2].
     OpCase {
         op: "VarlenAttention",
-        domain: "pkg.nxrt",
+        domain: "pkg.nxrt._private",
         opset: 1,
         attrs: vec![],
         inputs: vec![

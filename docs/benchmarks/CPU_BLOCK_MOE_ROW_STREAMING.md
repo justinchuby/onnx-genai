@@ -6,6 +6,15 @@ rows per worker, sized to the actual shard; AVX2/MLAS retain one. The measuremen
 and one-row scratch formula below describe the historical version, not that
 later implementation.
 
+Current benchmark reproduction also uses the dispatch-local execution contract:
+`common::PreparedKernel` caches metadata preparation and refines a fresh plan
+before every launch using the live input/output views. Its fixed scratch Vec is
+benchmark-owned storage, not a governor admission measurement. This repairs
+repeated launches after kernels began consuming execution plans; it does not
+remeasure or update the historical timings below.
+Cached preparation is scoped to the originating provider's workspace context;
+changing the selected pool width requires rebuilding the benchmark adapter.
+
 The complete f32 projection set of one selected expert must fit
 `ONNX_GENAI_CPU_DENSE_WEIGHT_CACHE_BYTES` to use dense execution. Otherwise the
 CPU EP decodes one row per worker shard and reuses it for all grouped tokens.

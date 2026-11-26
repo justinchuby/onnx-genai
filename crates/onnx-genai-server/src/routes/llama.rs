@@ -3,6 +3,14 @@ use super::*;
 use axum::extract::Query;
 use serde_json::{Value, json};
 
+fn managed_model_formats(state: &AppState) -> &'static [&'static str] {
+    if state.model_manager.is_some() {
+        &["nxrt_package", "ort_model_package"]
+    } else {
+        &[]
+    }
+}
+
 #[derive(Default, Deserialize)]
 pub(crate) struct ModelQuery {
     #[serde(default)]
@@ -50,7 +58,7 @@ pub(crate) async fn props(
     {
         return Ok(Json(json!({
             "role": "router", "ui": true, "ui_settings": {},
-            "nxrt_capabilities": {"tool_protocol_per_model": true, "reasoning_control": true, "resumable_streams": true, "server_tools": false, "model_management": state.model_manager.is_some(), "managed_model_formats": if state.model_manager.is_some() {vec!["nxrt_package"]} else {Vec::<&str>::new()}},
+            "nxrt_capabilities": {"tool_protocol_per_model": true, "reasoning_control": true, "resumable_streams": true, "server_tools": false, "model_management": state.model_manager.is_some(), "managed_model_formats": managed_model_formats(&state)},
             "cors_proxy_enabled": false, "endpoint_slots": true,
             "endpoint_props": state.config.endpoint_props, "endpoint_metrics": cfg!(feature = "metrics"),
             "build_info": concat!("nxrt ", env!("CARGO_PKG_VERSION"))
@@ -70,6 +78,9 @@ pub(crate) async fn props(
             "n_ctx": handle.model_max_context,
             "params": {
                 "n_predict": state.config.max_output_tokens,
+                "t_max_predict_ms": -1,
+                "n_indent": options.minimum_indent,
+                "grammar_trigger_collation": onnx_genai_engine::GrammarCollation::default(),
                 "seed": -1,
                 "temperature": if options.greedy { 0.0 } else { options.temperature },
                 "top_k": options.top_k, "top_p": options.top_p, "min_p": options.min_p,
@@ -100,8 +111,9 @@ pub(crate) async fn props(
         "cors_proxy_enabled": false,
         "build_info": concat!("nxrt ", env!("CARGO_PKG_VERSION")),
         "nxrt_capabilities": {
+            "grammar_trigger_collations": [onnx_genai_engine::GrammarCollation::Libcxx,onnx_genai_engine::GrammarCollation::Libstdcxx],
             "server_tools": false,
-            "model_management": state.model_manager.is_some(), "managed_model_formats": if state.model_manager.is_some() {vec!["nxrt_package"]} else {Vec::<&str>::new()},
+            "model_management": state.model_manager.is_some(), "managed_model_formats": managed_model_formats(&state),
             "resumable_streams": true, "reasoning_control": true,
             "tools": handle.tool_protocol.is_some(), "custom_sampler_order": handle.engine.runtime_sampling,
             "lora": handle.engine.adapters.is_some(),
@@ -260,7 +272,7 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
             // These opt into optional progress/control facilities, not a different decoding algorithm.
             "return_progress" | "timings_per_token" => value.is_boolean(),
             "sse_ping_interval" => {
-                crate::SsePingInterval::parse(value)?;
+                let _ = crate::SsePingInterval::parse(value)?;
                 true
             }
             "cache_prompt" | "ignore_eos" => value.is_boolean(),

@@ -97,7 +97,7 @@ pub(super) fn run_ep_scoped_passes(
 /// The S3 capacity-emission gate: rewrite every KV-cache-growth `Concat` the
 /// mask-cone classifier proves safe
 /// ([`geometry::kv_capacity_write_eligible_concats`]) into the
-/// CUDA-graph-capture-safe `pkg.nxrt::KvCacheCapacityAppend` op, so a
+/// CUDA-graph-capture-safe `pkg.nxrt._private::KvCacheCapacityAppend` op, so a
 /// decomposed-attention decode step becomes capture/replay-eligible instead of
 /// being permanently pinned to `captures == 0` — see that function's doc
 /// comment, and [`geometry::KV_CAPACITY_APPEND_OP`], for the full derivation
@@ -145,8 +145,8 @@ pub(super) fn rewrite_kv_capacity_appends(graph: &mut Graph, ep: &dyn ExecutionP
     // The op's registered version (see `onnx-runtime-shape-inference`'s
     // `custom_ops::kv_cache_capacity_append` registration and the CUDA kernel
     // factory's `OpKey`). Queried as a literal rather than via
-    // `effective_opset`, since `pkg.nxrt` may not yet be a graph opset-import
-    // for a decomposed-attention export that uses no other `pkg.nxrt` op —
+    // `effective_opset`, since `pkg.nxrt._private` may not yet be a graph opset-import
+    // for a decomposed-attention export that uses no other `pkg.nxrt._private` op —
     // exactly the case this rewrite exists to upgrade.
     const KV_CAPACITY_APPEND_OPSET: u64 = 1;
 
@@ -1001,6 +1001,13 @@ struct BuildPlacement {
 }
 
 impl Executor {
+    pub(crate) fn host_tensor_allocator(&self) -> Result<crate::tensor::HostTensorAllocator> {
+        if self.heterogeneous.is_some() {
+            return Err(SessionError::Internal("host tensor allocation requires an explicit single host provider; mixed-provider sessions must select their host allocation owner explicitly".into()));
+        }
+        crate::tensor::HostTensorAllocator::new(Arc::clone(&self.ep))
+    }
+
     /// Per-expert region candidates recorded for `com.microsoft::QMoE` lazy
     /// weights, keyed by initializer [`ValueId`]. See
     /// [`Executor::expert_region_candidates`](state) for the additive,
@@ -2253,20 +2260,35 @@ impl Executor {
         dtype: DataType,
         dims: &[usize],
     ) -> Result<()> {
-        if self.buffer_shapes.get(&vid).map(|s| s.as_slice()) == Some(dims) {
-            return Ok(()); // identical shape → reuse allocation
-        }
-        if let Some(old) = self.buffers.remove(&vid) {
-            self.ep.deallocate(old)?;
-        }
-        self.shared_buffers.remove(&vid);
         let numel = checked_numel(dims, || format!("value#{}", vid.0))?;
         let size = checked_storage_bytes(dtype, numel, || format!("value#{}", vid.0), dims)?;
-        let buf = self
+        let allocation_bytes = size.max(1);
+        if self.buffer_shapes.get(&vid).map(|s| s.as_slice()) == Some(dims)
+            && self
+                .buffers
+                .get(&vid)
+                .is_some_and(|buffer| buffer.len() >= allocation_bytes)
+        {
+            return Ok(()); // shape metadata alone is not evidence of live backing
+        }
+        let replacement_shape = dims.to_vec();
+        // Admission must cover the real old+new peak. In particular, a failed
+        // growth must not discard the old backing, shared owner or shape and
+        // then treat stale shape metadata as a live allocation on retry.
+        let replacement = self
             .ep
-            .allocate(size.max(1), TensorLayout::contiguous().alignment)?;
-        self.buffers.insert(vid, buf);
-        self.buffer_shapes.insert(vid, dims.to_vec());
+            .allocate(allocation_bytes, TensorLayout::contiguous().alignment)?;
+        let old = self.buffers.insert(vid, replacement);
+        self.buffer_shapes.insert(vid, replacement_shape);
+        // Keep a former alias's actual owner alive through deallocation of its
+        // borrowed descriptor. External views retain their own Arc as before.
+        let _old_shared = self.shared_buffers.remove(&vid);
+        if let Some(old) = old {
+            // This consumes old ownership. A provider may quarantine it on
+            // failure, so restoring its descriptor would be unsound. The new
+            // allocation and shape are already coherent even if release errs.
+            self.ep.deallocate(old)?;
+        }
         Ok(())
     }
 

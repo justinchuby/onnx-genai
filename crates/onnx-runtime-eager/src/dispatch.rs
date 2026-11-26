@@ -173,23 +173,23 @@ impl EagerContext {
         // 5. Infer output shapes/dtypes for every requested output slot.
         let output_meta = self.infer_output_meta(&node, op_type, domain, opset, inputs)?;
 
-        // 6. Allocate output tensors on the target device.
-        let mut outputs: Vec<Tensor> = Vec::with_capacity(output_meta.len());
-        for (dtype, shape) in &output_meta {
-            outputs.push(Tensor::zeros_in(ep.clone(), *dtype, shape.clone())?);
-        }
-
-        // 7. Build zero-copy views over the raw device buffers and execute.
+        // 6. Preflight every raw view layout before allocating outputs.
         // Stride/shape holders must outlive the views that borrow them.
         let in_strides: Vec<Vec<i64>> = input_shapes
             .iter()
             .map(|s| compute_contiguous_strides(s))
-            .collect();
+            .collect::<std::result::Result<_, _>>()?;
         let out_shapes: Vec<Vec<usize>> = output_meta.iter().map(|(_, s)| s.clone()).collect();
         let out_strides: Vec<Vec<i64>> = out_shapes
             .iter()
             .map(|s| compute_contiguous_strides(s))
-            .collect();
+            .collect::<std::result::Result<_, _>>()?;
+
+        // Allocate only after complete input/output stride preflight.
+        let mut outputs: Vec<Tensor> = Vec::with_capacity(output_meta.len());
+        for (dtype, shape) in &output_meta {
+            outputs.push(Tensor::zeros_in(ep.clone(), *dtype, shape.clone())?);
+        }
 
         let in_ptrs: Vec<*const c_void> = inputs.iter().map(|t| t.device_ptr()).collect();
         let out_ptrs: Vec<*mut c_void> = outputs.iter_mut().map(|t| t.device_ptr_mut()).collect();

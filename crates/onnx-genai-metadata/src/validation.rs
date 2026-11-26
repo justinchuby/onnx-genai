@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::extensions::{
-    ADAPTERS_HF_PEFT_V1, ADAPTERS_JSON_V1, ADAPTERS_SAFETENSORS_V1, ADAPTERS_V1,
+    ADAPTERS_GGUF_V1, ADAPTERS_HF_PEFT_V1, ADAPTERS_JSON_V1, ADAPTERS_SAFETENSORS_V1, ADAPTERS_V1,
     DFLASH_FLAT_BLOCK_V1, DFLASH_FLAT_BLOCK_V2, ExtensionConsumerSupport, ExtensionSurface,
     GRAMMAR_GUIDANCE_V1, ORT_LORA_ADAPTER_V1, PARAMETER_OVERLAY_V1, SPECULATIVE_V1, TELEMETRY_V1,
     TOKEN_CONTEXT_V1, admit_exact,
@@ -110,12 +110,72 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
     // derived complaint about the same missing fact.
     let version = crate::version::normalize(metadata.schema_version.as_deref())
         .unwrap_or(crate::version::INITIAL_SCHEMA_VERSION);
+    if let Some(infill) = metadata
+        .package
+        .as_ref()
+        .and_then(|package| package.infill.as_ref())
+    {
+        if let Err(error) = crate::version::gate_feature_use(
+            version,
+            crate::version::SchemaFeature::InfillContext,
+            "package.infill",
+        ) {
+            errors.push(error);
+        }
+        let tokens = [
+            &infill.prefix_token,
+            &infill.middle_token,
+            &infill.suffix_token,
+        ];
+        if tokens.iter().any(|token| token.is_empty())
+            || tokens
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != 3
+        {
+            errors.push("package.infill requires three distinct nonempty control token spellings; use the package tokenizer's exact registered roles".into());
+        }
+        if infill.additional_stop_tokens.iter().any(String::is_empty) {
+            errors.push("package.infill.additional_stop_tokens contains an empty spelling; declare exact registered tokenizer tokens or omit the list".into());
+        }
+        if infill
+            .extra_context_template
+            .as_ref()
+            .is_some_and(|template| template.trim().is_empty())
+        {
+            errors.push("package.infill.extra_context_template must be nonempty; author the file context serialization or omit the capability".into());
+        }
+    }
+    crate::schema::validate_graph_weights(&metadata.graph_weights, &mut errors);
+    if !metadata.graph_weights.is_empty()
+        && let Err(error) = crate::version::gate_feature_use(
+            version,
+            crate::version::SchemaFeature::GraphWeights,
+            "graph_weights",
+        )
+    {
+        errors.push(error);
+    }
     if let Some(pipeline) = &metadata.pipeline
         && let Err(error) = validate_pipeline_spec(pipeline, version)
     {
         errors.extend(error.errors);
     }
     if let Some(service) = &metadata.adapters {
+        for (name, artifact) in &service.artifacts {
+            for (index, weight) in artifact.weights.iter().enumerate() {
+                if weight.format == crate::schema::AdapterWeightFormat::Gguf
+                    && let Err(error) = crate::version::gate_feature_use(
+                        version,
+                        crate::version::SchemaFeature::GgufAdapter,
+                        &format!("adapters.artifacts.{name}.weights[{index}].format"),
+                    )
+                {
+                    errors.push(error);
+                }
+            }
+        }
         validate_adapter_service(
             service,
             metadata.pipeline.as_ref().map(|p| &p.workflow),
@@ -1875,6 +1935,7 @@ fn validate_adapter_service(
                 crate::schema::AdapterWeightFormat::Json => ADAPTERS_JSON_V1,
                 crate::schema::AdapterWeightFormat::OrtGenai => ORT_LORA_ADAPTER_V1,
                 crate::schema::AdapterWeightFormat::HfPeft => ADAPTERS_HF_PEFT_V1,
+                crate::schema::AdapterWeightFormat::Gguf => ADAPTERS_GGUF_V1,
                 crate::schema::AdapterWeightFormat::Safetensors => ADAPTERS_SAFETENSORS_V1,
             };
             if !expected_loader.matches_wire_name(&weight.loader_capability) {
@@ -1886,13 +1947,15 @@ fn validate_adapter_service(
             }
             match (&weight.format, &weight.scale_encoding) {
                 (
-                    crate::schema::AdapterWeightFormat::HfPeft,
+                    crate::schema::AdapterWeightFormat::HfPeft
+                    | crate::schema::AdapterWeightFormat::Gguf,
                     crate::schema::AdapterScaleEncoding::AlphaOverRank,
                 )
                 | (
                     crate::schema::AdapterWeightFormat::OrtGenai,
                     crate::schema::AdapterScaleEncoding::Baked,
                 )
+                | (crate::schema::AdapterWeightFormat::Gguf, _)
                 | (crate::schema::AdapterWeightFormat::Json, _)
                 | (crate::schema::AdapterWeightFormat::Safetensors, _) => {}
                 (crate::schema::AdapterWeightFormat::HfPeft, _) => errors.push(format!(
