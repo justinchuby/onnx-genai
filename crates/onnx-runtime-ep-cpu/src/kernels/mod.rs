@@ -182,7 +182,7 @@ static NMS_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
 static STRING_ONLY: &[DataType] = &[DataType::String];
 static STRING_BOOL_DTYPES: &[DataType] = &[DataType::String, DataType::Bool];
 static STRING_I64_DTYPES: &[DataType] = &[DataType::String, DataType::Int64];
-/// Exact dtype union for `pkg.nxrt::DsaIndexSelect` edges.
+/// Exact dtype union for `pkg.nxrt._private::DsaIndexSelect` edges.
 ///
 /// Inputs 0..=2 accept the three compute floats, input 3 is f32, and the sole
 /// output is int64. Per-slot constraints below keep the input union from
@@ -321,7 +321,7 @@ pub fn input_dtype_constraints_for_op(
         ("STFT", "") => STFT_SLOTS,
         ("CumProd", "") => onnx_runtime_ir::opset26::CUM_PROD_INPUT_TYPES,
         ("NonMaxSuppression", "") => NMS_SLOTS,
-        ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_SLOTS,
+        ("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN) => DSA_INDEX_SELECT_SLOTS,
         ("RegexFullMatch", "") | ("StringSplit", "") => TEXT_STRING_INPUT,
         ("StringConcat", "") => STRING_CONCAT_INPUTS,
         _ => &[],
@@ -343,7 +343,7 @@ pub fn output_dtype_constraints_for_op(
     match (op_type, domain) {
         ("DFT", "") => DFT_OUTPUTS,
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::OUTPUT_DTYPES,
-        ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_OUTPUTS,
+        ("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN) => DSA_INDEX_SELECT_OUTPUTS,
         ("RegexFullMatch", "") => REGEX_OUTPUTS,
         ("StringSplit", "") => STRING_SPLIT_OUTPUTS,
         _ => &[],
@@ -589,10 +589,10 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         ("MoE", "com.microsoft") => FLOAT_COMPUTE_DTYPES,
         ("QMoE", "com.microsoft") => F32_ONLY,
 
-        ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_DTYPES,
+        ("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN) => DSA_INDEX_SELECT_DTYPES,
 
-        // Remaining pkg.nxrt custom ops: f32-only (fail closed).
-        (_, "pkg.nxrt") => F32_ONLY,
+        // Remaining pkg.nxrt._private custom ops: f32-only (fail closed).
+        (_, onnx_runtime_ir::RUNTIME_DOMAIN) => F32_ONLY,
 
         // CNN ops (feature-gated). `Conv` computes through MLAS in f32 and
         // rejects f64 in `ConvKernel::execute`, so it must not advertise it.
@@ -1235,7 +1235,7 @@ pub(crate) fn build_cpu_registry_with_resources(
         Box::new(matmul_nbits::MatMulNBitsFactory::new(resources.clone())),
     );
     rec.register(
-        OpKey::new("BlockQuantizedMatMul", "pkg.nxrt", 1),
+        OpKey::new("BlockQuantizedMatMul", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(block_quantized_matmul::BlockQuantizedMatMulFactory::new(
             derived_weights.clone(),
@@ -1243,7 +1243,7 @@ pub(crate) fn build_cpu_registry_with_resources(
         )),
     );
     rec.register(
-        OpKey::new("BlockQuantizedMoE", "pkg.nxrt", 1),
+        OpKey::new("BlockQuantizedMoE", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(block_quantized_moe::BlockQuantizedMoEFactory::new(
             derived_weights.clone(),
@@ -1251,22 +1251,22 @@ pub(crate) fn build_cpu_registry_with_resources(
         )),
     );
     rec.register(
-        OpKey::new("IndexShare", "pkg.nxrt", 1),
+        OpKey::new("IndexShare", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(index_share::IndexShareFactory),
     );
     rec.register(
-        OpKey::new("DsaIndexSelect", "pkg.nxrt", 1),
+        OpKey::new("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(dsa_index_select::DsaIndexSelectFactory),
     );
     rec.register(
-        OpKey::new("VarlenAttention", "pkg.nxrt", 1),
+        OpKey::new("VarlenAttention", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(varlen_attention::VarlenAttentionFactory),
     );
     rec.register(
-        OpKey::new("PackedVarlenAttention", "pkg.nxrt", 1),
+        OpKey::new("PackedVarlenAttention", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(packed_varlen_attention::PackedVarlenAttentionFactory),
     );
@@ -1276,12 +1276,16 @@ pub(crate) fn build_cpu_registry_with_resources(
         Box::new(packed_multi_head_attention::PackedMultiHeadAttentionFactory),
     );
     rec.register(
-        OpKey::new("SparseKvGather", "pkg.nxrt", 1),
+        OpKey::new("SparseKvGather", onnx_runtime_ir::RUNTIME_DOMAIN, 1),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(sparse_kv_gather::SparseKvGatherFactory),
     );
     rec.register(
-        OpKey::new("CompressedSparseAttention", "pkg.nxrt", 1),
+        OpKey::new(
+            "CompressedSparseAttention",
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ),
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(compressed_sparse_attention::CompressedSparseAttentionFactory),
     );
@@ -3163,7 +3167,7 @@ mod tests {
 
     #[test]
     fn dsa_index_select_advertises_exact_mixed_edge_dtypes() {
-        let dtypes = supported_dtypes_for_op("DsaIndexSelect", "pkg.nxrt");
+        let dtypes = supported_dtypes_for_op("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN);
         assert_eq!(
             dtypes,
             &[
@@ -3174,7 +3178,8 @@ mod tests {
             ]
         );
 
-        let constraints = input_dtype_constraints_for_op("DsaIndexSelect", "pkg.nxrt");
+        let constraints =
+            input_dtype_constraints_for_op("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN);
         assert_eq!(constraints.len(), 4);
         assert_eq!(constraints[0], (0, FLOAT_COMPUTE_DTYPES));
         assert_eq!(constraints[1], (1, FLOAT_COMPUTE_DTYPES));
@@ -3182,7 +3187,7 @@ mod tests {
         assert_eq!(constraints[3], (3, F32_ONLY));
 
         assert_eq!(
-            output_dtype_constraints_for_op("DsaIndexSelect", "pkg.nxrt"),
+            output_dtype_constraints_for_op("DsaIndexSelect", onnx_runtime_ir::RUNTIME_DOMAIN),
             &[(0, I64_ONLY)]
         );
     }
@@ -3664,7 +3669,7 @@ mod tests {
         // the `com.microsoft::RotaryEmbedding` contrib alias adds one,
         // `com.microsoft::MultiHeadAttention` (separate-QKV SDPA) adds one, and
         // `com.microsoft::Attention` (packed-QKV SDPA) adds one.
-        // The six `pkg.nxrt` NCHWc blocked-layout ops (reorder to/from blocked,
+        // The six `pkg.nxrt._private` NCHWc blocked-layout ops (reorder to/from blocked,
         // blocked Conv, blocked Max/Average/GlobalAverage pool) emitted by the
         // NCHWc layout-propagation pass add six more entries, but only when the
         // `mlas` feature is enabled (the NCHWc kernels are MLAS-backed). Standard
@@ -3732,19 +3737,56 @@ mod tests {
         assert!(reg.lookup("QLinearMatMul", "", 10).is_some());
         assert!(reg.lookup("MatMulNBits", "com.microsoft", 1).is_some());
         assert!(reg.lookup("QMoE", "com.microsoft", 1).is_some());
-        assert!(reg.lookup("BlockQuantizedMatMul", "pkg.nxrt", 1).is_some());
-        assert!(reg.lookup("BlockQuantizedMoE", "pkg.nxrt", 1).is_some());
-        assert!(reg.lookup("IndexShare", "pkg.nxrt", 1).is_some());
-        assert!(reg.lookup("VarlenAttention", "pkg.nxrt", 1).is_some());
-        assert!(reg.lookup("PackedVarlenAttention", "pkg.nxrt", 1).is_some());
+        assert_eq!(onnx_runtime_ir::RUNTIME_DOMAIN, "pkg.nxrt._private");
+        for key in reg
+            .keys()
+            .filter(|key| key.domain == onnx_runtime_ir::RUNTIME_DOMAIN)
+        {
+            assert!(
+                reg.lookup(&key.op_type, "pkg.nxrt", key.since_version)
+                    .is_none(),
+                "old private domain must not alias {} at opset {}",
+                key.op_type,
+                key.since_version
+            );
+        }
+        assert!(reg.lookup("MoE", "com.microsoft", 1).is_some());
+        assert!(reg.lookup("GroupedMatMul", "", 29).is_some());
+        assert!(
+            reg.lookup("BlockQuantizedMatMul", onnx_runtime_ir::RUNTIME_DOMAIN, 1)
+                .is_some()
+        );
+        assert!(
+            reg.lookup("BlockQuantizedMoE", onnx_runtime_ir::RUNTIME_DOMAIN, 1)
+                .is_some()
+        );
+        assert!(
+            reg.lookup("IndexShare", onnx_runtime_ir::RUNTIME_DOMAIN, 1)
+                .is_some()
+        );
+        assert!(
+            reg.lookup("VarlenAttention", onnx_runtime_ir::RUNTIME_DOMAIN, 1)
+                .is_some()
+        );
+        assert!(
+            reg.lookup("PackedVarlenAttention", onnx_runtime_ir::RUNTIME_DOMAIN, 1)
+                .is_some()
+        );
         assert!(
             reg.lookup("PackedMultiHeadAttention", "com.microsoft", 1)
                 .is_some()
         );
-        assert!(reg.lookup("SparseKvGather", "pkg.nxrt", 1).is_some());
         assert!(
-            reg.lookup("CompressedSparseAttention", "pkg.nxrt", 1)
+            reg.lookup("SparseKvGather", onnx_runtime_ir::RUNTIME_DOMAIN, 1)
                 .is_some()
+        );
+        assert!(
+            reg.lookup(
+                "CompressedSparseAttention",
+                onnx_runtime_ir::RUNTIME_DOMAIN,
+                1
+            )
+            .is_some()
         );
         assert!(reg.lookup("Conv", "", 21).is_some());
         assert!(
@@ -3928,7 +3970,8 @@ mod tests {
 
     #[test]
     fn fail_closed_pkg_nxrt_ops_get_f32_only() {
-        let dtypes = supported_dtypes_for_op("BlockQuantizedMatMul", "pkg.nxrt");
+        let dtypes =
+            supported_dtypes_for_op("BlockQuantizedMatMul", onnx_runtime_ir::RUNTIME_DOMAIN);
         assert_eq!(dtypes, &[DataType::Float32]);
     }
 
@@ -4019,4 +4062,5 @@ mod decoded_projection;
 mod packed_bytes;
 mod packed_projection;
 mod projection_input;
+pub(crate) mod routing_workspace;
 pub(crate) mod weight_cache;

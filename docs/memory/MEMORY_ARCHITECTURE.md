@@ -170,6 +170,15 @@ into its own reclaimable pool, whereas that capability requires actual backing
 retirement. The executor's generic pressure-parked lane must not be mistaken for
 an enabled CPU fast path. Each fitting CPU checkout/return still locks the pool,
 and each kernel still performs live execution refinement and backing validation.
+The provider-context transaction gate uses one atomic word for lifecycle and
+in-flight count. Normal Active entry/exit takes no context wait mutex; closure
+updates the same word to reject new entrants while preserving admitted guards.
+Only a closing context's last guard and quiescence waiters coordinate through a
+mutex/condition variable. This removes the two context-gate mutex acquisitions
+from a fitting checkout, not the pool mutex, atomic contention, owner validation
+or execution refinement. It is a structural cost reduction, not a measured
+latency claim. Completed CPU storage remains globally reclaimable in its pool;
+no new cross-run lease or untracked retained owner is introduced.
 
 The `cpu_three_node_runs_share_one_checkout_and_warm_calls_keep_the_original_grant`
 regression wraps the real CPU provider only to count boundary calls. After one
@@ -254,9 +263,46 @@ after score-order denominators are complete. The existing owned routing helper
 for other CPU MoE paths delegates to that same checked implementation.
 
 BlockQuantizedMoE no longer creates routing payload Vecs or per-expert task Vecs.
-Rank/index conversion metadata and other operators' owned routing plans remain.
+Rank/index conversion metadata and the plain MoE operator's owned grouping plan
+remain.
 Counts/prefix initialization and index indirection have costs; this proves
 ownership and accounting, not zero mallocs or a measured latency improvement.
+
+Plain floating `MoE` includes eight named source regions beside its two FC
+banks and output accumulator in one eleven-region operation workspace. Aligned
+contiguous F32 sources borrow their original storage; half, strided and unaligned
+sources snapshot to exact f32 regions, including expert weights and optional
+biases. Shape-only nonempty preparation is Deferred because strides and addresses
+are not metadata facts; live refinement computes the current bound without
+repeating the metadata hook. Complete binding precedes every floating payload
+read, including bias conversion. All source snapshots remain live until final
+output publication, preserving input/output overlap. Empty output still validates
+source descriptors and shapes but reads no payload and reserves no conversions.
+Plain MoE's owned routing/grouping plan and optional MLAS batch metadata remain;
+this change removes floating source payload Vecs, not every allocation.
+
+ONNX integer `QMoE` now uses the same arena and immutable task views. Its two FC
+banks, score-order contribution storage, decoder scratch and routing arena form
+one five-region operation workspace. Shape-only bounds include FC2's expert axis
+and aggregation presence; the existing Ready memo path remains reusable. X/router
+copies and routing follow complete binding. Other quantized input materialization
+and weight-admission metadata retain their existing paths.
+
+Routing decisions preserve original score order and retain that decision index
+as the contribution slot. Stable expert bucketing never renumbers slots; QMoE's
+final +0, row-major, score-order `+=` scatter remains unchanged. After routing,
+dead TopK index storage becomes the ascending active-expert list. After bucket
+writes complete, dead cursors become counts derived from immutable prefixes.
+A private-field `ExpertGroupCounts` view publishes unique membership and counts
+without another map, mapping closure or raw-iterator uniqueness contract. Metrics
+retain their zero-count membership semantics in checked fixtures and preserve
+lock order, atomics and saturated accumulated fields.
+
+Prefetch still checks eligibility before consuming selected IDs, taking payload
+locks, pinning entries or requesting grants. Only expert IDs and weight loading
+cross to the worker; borrowed task views and workspace remain on the main thread
+through scope join, including failures. Zero-row execution uses an empty immutable
+plan and retains the prior metrics path without reserving routing storage.
 
 For nonempty output, shape-only preparation returns `Deferred`: it cannot know
 strides, and a conservative reservation would retain unused high-water capacity.
@@ -2035,7 +2081,7 @@ route-submission mutex interval still needs device validation.
 
 ### Variable-length attention borrows one exact caller composite
 
-`pkg.nxrt::VarlenAttention` and `PackedVarlenAttention` register
+`pkg.nxrt._private::VarlenAttention` and `PackedVarlenAttention` register
 `WorkspacePlanning::Metadata`. Metadata-only planning returns Deferred because
 actual valid KV lengths determine scores. Execution-time preparation first
 clears any old invocation and rejects real stream capture, then reads each
@@ -2479,7 +2525,7 @@ call; it owns the governed workspace preparation path
 | `kernels/group_query_attention.rs` `workspace_requirement` (packed Q/K/V staging region) | `GroupQueryAttention` packed QKV-projection staging | `align256(B·sq·num_heads·head_dim·elem) + 2·align256(B·sq·kv_num_heads·head_dim·elem)`, only when a packed QKV tensor is split | prompt-dependent (`sq`), elem = `dtype.byte_size()` (f32=4, f16/bf16=2) | session-persistent | **governed by #736** via `workspace_requirement` + prepared composite workspace, sized through the shared `gqa_workspace_layout`/`gqa_packed_staging_bytes` helpers; reserved only on the packed-input split route, `NONE` when Q/K/V arrive separately |
 | `kernels/group_query_attention.rs` `gqa_transpose_scratch` + `gqa_workspace_layout` (`WS_Q_BNSH` / `WS_OUT_BNSH`) | `GroupQueryAttention` Q/output BNSH transpose scratch | Q: `align256(B·sq·num_heads·head_dim·elem)` when `sq>1`, packed input, or RoPE; output: the same aligned bytes only when `sq>1` | prompt/dtype/route dependent | session-persistent | **governed by #736** in the existing GQA composite; unpacked non-RoPE `sq==1` uses Q/output directly and charges `NONE` absent another region; packed `sq==1` overlays Q extraction with packed-Q staging |
 | `kernels/group_query_attention.rs` `GqaWorkspace::reserve` | `GroupQueryAttention` remaining pooled slots (present K/V / metadata) | slot-specific `bytes.max(1)` | cache/batch dependent, then reused | session-persistent growable state | raw bypass; scores, packed Q/K/V staging, and BNSH transpose slots are excluded — carved from the prepared composite on governed execution |
-| `kernels/index_share.rs:708` | `pkg.nxrt::IndexShare` selected-token attention workspace | aligned sum of reachable present staging, `B * q_heads * q_seq * selected_width * 4`, and optional `2 * B * sizeof(i64)` | prompt/cache dependent | session-persistent | **governed by #751** via `workspace_requirement` + prepared workspace |
+| `kernels/index_share.rs:708` | `pkg.nxrt._private::IndexShare` selected-token attention workspace | aligned sum of reachable present staging, `B * q_heads * q_seq * selected_width * 4`, and optional `2 * B * sizeof(i64)` | prompt/cache dependent | session-persistent | **governed by #751** via `workspace_requirement` + prepared workspace |
 | `kernels/einsum.rs`, `einsum/plan.rs` | direct and multilinear arithmetic/BLAS temporary regions | exact direct plan or checked arithmetic prefix plus max serial BLAS tail | shape/dtype/actual-address algorithm | SessionPersistent shared caller peak | Ready or one bound prefix phase; actual used-span capture pin; no private scratch owner |
 | `kernels/einsum/plan.rs` | immutable final-address launch metadata | exact encoded generic-step program | complete I/O identity and final used-span binding | independently pinned immutable device artifact | fresh candidate published only after successful execution; installed graphs retain older metadata |
 | `kernels/index_transform.rs` | CenterCropPad/Col2Im descriptors | respectively `4 * rank * 8` and `6 * control_elements * 8` | input rank / checked image-shape control length | SessionPersistent caller peak | complete bind before existing D2H; exact borrowed upload |
@@ -2528,7 +2574,7 @@ helper: the three-output path reserves only scores (and optional frontier
 metadata), while the one-output path retains staging because execution uses it
 (`kernels/index_share.rs:603-631`, `:867-910`). In decode `q_seq == 1` with a
 sparse `selected_width`, so the live bytes are small. `IndexShare` is also a
-`pkg.nxrt` custom op used only by GLM/DSA sparse-attention families, so it is not
+`pkg.nxrt._private` custom op used only by GLM/DSA sparse-attention families, so it is not
 on the hot path for dense models (#751).
 
 The **`GroupQueryAttention` `WS_SCORES` slot** is governed by #795: the f32
@@ -4594,7 +4640,7 @@ without summing sequential users of the same slot (#753).
 | kernel / node | file · site | byte formula | size class | lifetime | mechanism |
 |---|---|---|---|---|---|
 | `BlockQuantizedMoE` (QMoE) | `block_quantized_moe.rs` `workspace_requirement` | routing + dequant + GEMM staging over `tokens × experts × hidden` | config-derived (static per model) | session-persistent | #747 prepare-only + #748 grant |
-| `pkg.nxrt::IndexShare` | `index_share.rs` `workspace_requirement` | selected-token scores plus only the staging actually reachable for the path | prompt/cache dependent | session-persistent | #751 + prepared workspace |
+| `pkg.nxrt._private::IndexShare` | `index_share.rs` `workspace_requirement` | selected-token scores plus only the staging actually reachable for the path | prompt/cache dependent | session-persistent | #751 + prepared workspace |
 | `com.microsoft::Attention` cuBLASLt/softmax | `attention.rs` `run_attention_blas_softmax` | `align256(batch·num_heads·sq·sk·elem) + 32 MiB` cuBLASLt workspace | prompt-dependent; score matrix is ~256–512 MiB at B=1/H=32/S=2048 | step-scoped | #753 + prepared workspace |
 | `com.microsoft::GroupQueryAttention` f32 reference scores | `group_query_attention.rs` `workspace_requirement` | `batch·heads·sq·present_capacity·sizeof(f32)` only on the path that materializes scores | prompt/cache dependent | session-persistent | #795 + prepared workspace |
 | `com.microsoft::GroupQueryAttention` packed QKV staging | `group_query_attention.rs` `workspace_requirement` | `align256(B·sq·num_heads·head_dim·elem) + 2·align256(B·sq·kv_num_heads·head_dim·elem)` only when a packed QKV tensor is split | prompt-dependent; ~24 MiB (f32) / 12 MiB (fp16) at B=1/H=32/hd=128/Hkv=8/sq=1024; `NONE` on unpacked/fused-decode routes | session-persistent | #736 + prepared composite workspace (shares the `WS_SCORES` slot) |

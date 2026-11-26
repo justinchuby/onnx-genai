@@ -7,6 +7,8 @@ use std::sync::{Mutex, OnceLock};
 
 use onnx_runtime_ep_api::ExternalMmapRegion;
 
+use crate::kernels::routing_workspace::ExpertGroupCounts;
+
 pub mod placement;
 
 /// Environment switch for the route-first mmap MoE path.
@@ -237,11 +239,10 @@ impl WeightOffloadMetrics {
         subtract_gauge_saturating(&self.host_cache_budget_bytes, budget_bytes);
     }
 
-    /// Observe the existing task groups. Map keys guarantee distinct experts;
-    /// vector lengths supply counts without a second diagnostic index. Task
-    /// payloads are neither inspected, cloned nor moved.
-    pub fn record_routes<T>(&self, layer: u32, groups: &BTreeMap<usize, Vec<T>>) {
-        let active = groups.values().map(Vec::len).sum::<usize>();
+    /// Observe the completed arena's distinct expert membership and counts.
+    /// No mapping closure, diagnostic index or task payload copy is needed.
+    pub(crate) fn record_routes(&self, layer: u32, groups: &ExpertGroupCounts<'_>) {
+        let active = groups.assignments();
         let unique = groups.len();
         self.layer_executions.fetch_add(1, Ordering::Relaxed);
         self.active_experts
@@ -254,8 +255,7 @@ impl WeightOffloadMetrics {
             .tokens_per_expert
             .lock()
             .expect("weight-offload metrics lock poisoned");
-        for (&expert, assignments) in groups {
-            let tokens = assignments.len();
+        for (expert, tokens) in groups.iter() {
             let total = totals.entry(expert).or_default();
             *total = total.saturating_add(tokens as u64);
         }
@@ -270,8 +270,7 @@ impl WeightOffloadMetrics {
         layer_stats.executions = layer_stats.executions.saturating_add(1);
         layer_stats.active_experts = layer_stats.active_experts.saturating_add(active as u64);
         layer_stats.unique_experts = layer_stats.unique_experts.saturating_add(unique as u64);
-        for (&expert, assignments) in groups {
-            let tokens = assignments.len();
+        for (expert, tokens) in groups.iter() {
             let total = layer_stats.tokens_per_expert.entry(expert).or_default();
             *total = total.saturating_add(tokens as u64);
         }
@@ -473,7 +472,9 @@ mod tests {
         let third = BTreeMap::from([(9, vec![(); 4])]);
         let empty = BTreeMap::<usize, Vec<()>>::new();
         for (layer, groups) in [(5, &first), (5, &second), (8, &third), (8, &empty)] {
-            metrics.record_routes(layer, groups);
+            let ids = groups.keys().copied().collect::<Vec<_>>();
+            let counts = groups.values().map(Vec::len).collect::<Vec<_>>();
+            metrics.record_routes(layer, &ExpertGroupCounts::checked(&ids, &counts).unwrap());
         }
         let actual = metrics.snapshot();
         let expected = WeightOffloadStats {
@@ -526,7 +527,7 @@ mod tests {
                 tokens_per_expert: BTreeMap::from([(3, u64::MAX - 1)]),
             },
         );
-        metrics.record_routes(7, &BTreeMap::from([(3, vec![(); 3]), (9, Vec::new())]));
+        metrics.record_routes(7, &ExpertGroupCounts::checked(&[3, 9], &[3, 0]).unwrap());
         let actual = metrics.snapshot();
         let expected = WeightOffloadStats {
             layer_executions: 1,

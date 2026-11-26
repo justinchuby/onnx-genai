@@ -147,7 +147,7 @@ pub(crate) struct CsaStateGroupDescriptor {
 }
 
 impl CsaStateGroupDescriptor {
-    /// Parse the property set from a `pkg.nxrt::CompressedSparseAttention` node.
+    /// Parse the property set from a `pkg.nxrt._private::CompressedSparseAttention` node.
     ///
     /// Only the presence/values of declared attributes and the state input
     /// edges are read; numerics stay in the kernel. Returns a typed refusal if
@@ -272,7 +272,7 @@ mod tests {
             .map(|_| Some(onnx_runtime_ir::ValueId(0)))
             .collect();
         let mut node = Node::new(NodeId(0), "CompressedSparseAttention", inputs, vec![]);
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes
             .insert("compression_ratio".into(), Attribute::Int(128));
         node.attributes

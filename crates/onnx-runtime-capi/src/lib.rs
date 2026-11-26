@@ -134,7 +134,9 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         // not a runtime fault.
         | E::ExternalBuffer { .. } => OrtErrorCode::InvalidArgument,
         E::NoModelSource => OrtErrorCode::NoModel,
-        E::UnsupportedOp { .. } | E::UnsupportedModel { .. } => OrtErrorCode::NotImplemented,
+        E::UnsupportedCpuWorkerPlan { .. }
+        | E::UnsupportedOp { .. }
+        | E::UnsupportedModel { .. } => OrtErrorCode::NotImplemented,
         E::Ep(_)
         | E::CudaKernelCreationFailed { .. }
         | E::ExecutionProviderUnavailable(_)
@@ -938,6 +940,21 @@ mod tests {
         assert_eq!(code, OrtErrorCode::Fail);
         assert!(
             message.contains(op) && message.contains(reason),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn unsupported_cpu_worker_plan_preserves_actionable_status() {
+        let reason =
+            "decode-inline siblings have separate mutable execution state; disable that mode";
+        let (code, message) = session_err(SessionError::UnsupportedCpuWorkerPlan {
+            reason: reason.into(),
+        });
+
+        assert_eq!(code, OrtErrorCode::NotImplemented);
+        assert!(
+            message.contains(reason) && message.contains("keep a single executor"),
             "{message}"
         );
     }

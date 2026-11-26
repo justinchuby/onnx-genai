@@ -6,7 +6,7 @@ use crate::{
 };
 use onnx_runtime_ep_api::{
     DevicePtr, EpError, Kernel, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
-    WorkspacePreparation, WorkspaceRequirement, WorkspaceView,
+    WorkspaceExecutionPreparation, WorkspacePreparation, WorkspaceRequirement, WorkspaceView,
     packed_routed::{GroupLayout, packed_group_layout, packed_group_metadata_layout},
 };
 use onnx_runtime_ir::{
@@ -19,10 +19,10 @@ fn error(detail: impl std::fmt::Display) -> EpError {
     EpError::KernelFailed(format!("{PACKED_OP}: {detail}"))
 }
 impl Packed {
-    fn plan(l: GroupLayout) -> Result<ValueIndexWorkspace<f32, 2>> {
+    fn plan(l: GroupLayout, row_elements: usize) -> Result<ValueIndexWorkspace<f32, 2>> {
         ValueIndexWorkspace::new(
             PACKED_OP,
-            [("Y staging", l.lanes), ("activation row", l.k)],
+            [("Y staging", l.lanes), ("activation row", row_elements)],
             ("routing indices", l.routes),
         )
     }
@@ -62,7 +62,7 @@ impl Packed {
         } else {
             Some(Rows::new(PACKED_OP, "X", &x[0])?)
         };
-        let plan = Self::plan(l)?;
+        let plan = Self::plan(l, rows.as_ref().map_or(0, Rows::scratch_len))?;
         // SAFETY: the execution owner lends exclusive Host backing disjoint
         // from tensors. Complete binding/initialization precedes value reads.
         unsafe {
@@ -81,10 +81,9 @@ impl Packed {
                     let blocks = l.k / width;
                     let decode = crate::kernels::dequantize_packed::decoder(self.metadata.format());
                     let mut values = [0f32; 256];
-                    let scratch = &mut row_scratch[..rows.scratch_len()];
                     for (token, outputs) in output.chunks_exact_mut(l.selections * l.n).enumerate()
                     {
-                        let activation = rows.get(token, scratch)?;
+                        let activation = rows.get(token, row_scratch)?;
                         for (selection, row) in outputs.chunks_exact_mut(l.n).enumerate() {
                             let expert = routes[token * l.selections + selection];
                             for (column, out) in row.iter_mut().enumerate() {
@@ -122,11 +121,53 @@ impl Kernel for Packed {
         outputs: &[OutputMetadata<'_>],
     ) -> Result<WorkspacePreparation> {
         let l = packed_group_metadata_layout(&self.metadata, inputs, outputs)?;
-        Ok(WorkspacePreparation::Ready(if l.lanes == 0 {
-            WorkspaceRequirement::NONE
+        if l.lanes == 0 {
+            Ok(WorkspacePreparation::Ready(WorkspaceRequirement::NONE))
+        } else if l.k == 0 {
+            Ok(WorkspacePreparation::Ready(Self::plan(l, 0)?.requirement()))
         } else {
-            Self::plan(l)?.requirement()
-        }))
+            // Shape/dtype cannot prove final-origin alignment or row strides.
+            Self::plan(l, l.k)?;
+            Ok(WorkspacePreparation::Deferred)
+        }
+    }
+    fn workspace_requirement_for_execution(
+        &self,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+        metadata: &[TensorMetadata<'_>],
+        facts: &[OutputMetadata<'_>],
+        _: Option<WorkspacePreparation>,
+    ) -> Result<WorkspaceExecutionPreparation> {
+        let l = packed_group_metadata_layout(&self.metadata, metadata, facts)?;
+        if inputs.len() != metadata.len()
+            || inputs.iter().zip(metadata).any(|(view, meta)| {
+                view.dtype != meta.dtype
+                    || view.shape != meta.shape
+                    || (!view.is_absent() != meta.present && !view.shape.contains(&0))
+            })
+        {
+            return Err(error(
+                "input views differ from workspace metadata; refresh metadata for the actual bindings",
+            ));
+        }
+        if !outputs.is_empty() {
+            packed_group_layout(&self.metadata, inputs, outputs)?;
+        }
+        if l.lanes == 0 {
+            return Ok(WorkspaceExecutionPreparation::Ready(
+                WorkspaceRequirement::NONE,
+            ));
+        }
+        let row_elements = if l.k == 0 {
+            validate_host_storage::<f32>(PACKED_OP, "X", &inputs[0])?;
+            0
+        } else {
+            Rows::new(PACKED_OP, "X", &inputs[0])?.scratch_len()
+        };
+        Ok(WorkspaceExecutionPreparation::Ready(
+            Self::plan(l, row_elements)?.requirement(),
+        ))
     }
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         self.run(inputs, outputs, None)

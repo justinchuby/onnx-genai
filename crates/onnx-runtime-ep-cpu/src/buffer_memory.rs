@@ -117,6 +117,9 @@ impl CpuBufferMemory {
             authority_id,
         })))
     }
+    pub(crate) fn host_payload_funding(&self) -> onnx_runtime_ep_api::HostPayloadFunding {
+        onnx_runtime_ep_api::HostPayloadFunding::new(self.0.authority_id, self.0.manager.clone())
+    }
     pub fn authority_id(&self) -> MemoryAuthorityId {
         self.0.authority_id
     }

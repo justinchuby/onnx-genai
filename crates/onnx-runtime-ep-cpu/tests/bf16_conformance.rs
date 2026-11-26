@@ -615,7 +615,7 @@ fn _dtype_marker() -> DataType {
     DataType::BFloat16
 }
 
-/// `VarlenAttention` (`pkg.nxrt`) reads Q/K/V through `to_dense_f32_widen` and
+/// `VarlenAttention` (`pkg.nxrt._private`) reads Q/K/V through `to_dense_f32_widen` and
 /// writes through `write_dense_f32_narrow`, so it is natively bf16-capable — its
 /// claim/execute gates previously rejected non-f32 spuriously. This covers the
 /// packed varlen-attention path (single sequence, causal-off) in both dtypes.
@@ -623,7 +623,7 @@ fn varlen_case() -> OpCase {
     // 2 tokens, 1 head, head_size 2; one sequence => cu_seqlens = [0, 2].
     OpCase {
         op: "VarlenAttention",
-        domain: "pkg.nxrt",
+        domain: "pkg.nxrt._private",
         opset: 1,
         attrs: vec![],
         inputs: vec![

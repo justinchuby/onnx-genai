@@ -32,7 +32,7 @@ mod tests {
     fn encoded_image_lease_survives_tensor_aliases() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/onnx_genai_workflows/decision_images");
-        let engine = Engine::from_dir(&root, crate::EngineConfig::default()).unwrap();
+        let engine = Engine::from_dir(&root, crate::fixture_engine_config()).unwrap();
         let bytes = std::fs::read(root.join("white.png")).unwrap();
         let tier = onnx_runtime_memory_api::Tier::Host;
         let before = engine.governor().leased_bytes_on(tier);

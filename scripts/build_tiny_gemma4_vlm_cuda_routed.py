@@ -169,7 +169,7 @@ def build_decoder_routed(path: Path) -> None:
         "qmoe_fc2_bias", np.zeros((1, qmoe_hidden), dtype=np.float32)
     )
     qmoe = ir.Node(
-        "pkg.nxrt",
+        "pkg.nxrt._private",
         "BlockQuantizedMoE",
         [
             qmoe_input.outputs[0],
@@ -271,7 +271,7 @@ def build_decoder_routed(path: Path) -> None:
             router_zero,
             value_offset,
         ],
-        opset_imports={"": 13, "pkg.nxrt": 1},
+        opset_imports={"": 13, "pkg.nxrt._private": 1},
         name="tiny_gemma4_decoder_routed",
     )
     save_model(

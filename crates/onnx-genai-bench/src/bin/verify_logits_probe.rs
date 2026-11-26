@@ -183,15 +183,15 @@ fn main() -> Result<()> {
 
     let prefill = session.decode(&prompt_tokens, 0)?;
     let mut logits = prefill
+        .into_iter()
         .last()
-        .context("prefill produced no logits")?
-        .clone();
+        .context("prefill produced no logits")?;
     let mut greedy_tokens: Vec<u32> = Vec::with_capacity(args.tokens);
-    let mut greedy_logits: Vec<Vec<f32>> = Vec::with_capacity(args.tokens);
+    let mut greedy_logits: Vec<onnx_genai_engine::LogitsRow> = Vec::with_capacity(args.tokens);
     for _ in 0..args.tokens {
         let tok = argmax(&logits) as u32;
         greedy_tokens.push(tok);
-        greedy_logits.push(logits.clone());
+        greedy_logits.push(logits.try_clone()?);
         let past = session.current_len();
         // Snapshot S_base for every base a verify will start from (base in
         // [prompt_len, prompt_len + last_p - 1]); this is the state BEFORE the
@@ -202,9 +202,9 @@ fn main() -> Result<()> {
         }
         logits = session
             .decode(std::slice::from_ref(&tok), past)?
+            .into_iter()
             .last()
-            .context("greedy decode produced no logits")?
-            .clone();
+            .context("greedy decode produced no logits")?;
     }
     println!("verify_probe: greedy_token_ids={greedy_tokens:?}");
     if track_recurrent {

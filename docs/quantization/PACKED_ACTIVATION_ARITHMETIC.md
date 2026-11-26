@@ -1,6 +1,6 @@
 # Packed activation arithmetic
 
-`pkg.nxrt::BlockQuantizedMatMul` and `pkg.nxrt::BlockQuantizedMoE` carry
+`pkg.nxrt._private::BlockQuantizedMatMul` and `pkg.nxrt._private::BlockQuantizedMoE` carry
 `activation_arithmetic` independently of their compressed weight formats.
 This is graph numerical semantics: it cannot change when a resource grant is
 refused or when a dense weight cache becomes available.
@@ -88,7 +88,13 @@ from this kernel's execution path. Rank metadata allocations remain.
 Score ordering and normalization finish before grouping. Stable buckets preserve
 expert and token order without another router evaluation or global route sort.
 Counts/prefix work and indirect indices have costs; no latency win is inferred
-from allocation removal. Runtime metadata validation retains the
+from allocation removal.
+The arena is shared with ONNX integer QMoE. Decisions remain in score order;
+expert grouping changes access indices only. QMoE retains each original decision
+index as its contribution slot and keeps its final score-order accumulation.
+A typed unique-expert/count view serves metrics and prefetch policy without
+rebuilding a map or exporting workspace references to the loader worker.
+ Runtime metadata validation retains the
 op's F32-only interface; reuse of the widening helper does not enable half or
 F64 MoE inputs. Projection banks and the final accumulator keep publication
 after every source read and successful expert, including when Y overlaps one of

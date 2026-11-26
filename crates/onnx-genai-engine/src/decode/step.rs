@@ -13,7 +13,7 @@ pub(crate) fn run_decode_session_logits(
     decode_state: &mut DecodeState,
     token_ids: &[TokenId],
     past_len: usize,
-) -> anyhow::Result<Vec<Vec<f32>>> {
+) -> anyhow::Result<LogitsBatch> {
     align_runner_cursor(decode_state, token_ids, past_len)?;
     decode_state
         .runner

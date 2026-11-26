@@ -12,7 +12,7 @@
     clippy::err_expect,
     clippy::clone_on_copy
 )]
-//! GPU correctness tests for `pkg.nxrt::VarlenAttention` v1.
+//! GPU correctness tests for `pkg.nxrt._private::VarlenAttention` v1.
 //!
 //! `VarlenAttention` consumes the ONNX Attention-24 `nonpad_kv_seqlen` per-batch
 //! valid-KV-token count over a padded rectangular batch and runs attention over
@@ -40,7 +40,7 @@ use onnx_runtime_ir::{
 };
 use onnx_runtime_loader::Model;
 
-const DOMAIN: &str = "pkg.nxrt";
+const DOMAIN: &str = "pkg.nxrt._private";
 
 #[derive(Clone)]
 struct Tensor {

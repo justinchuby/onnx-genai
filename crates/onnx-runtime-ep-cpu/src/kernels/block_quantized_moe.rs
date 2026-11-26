@@ -1,4 +1,4 @@
-//! CPU parity oracle for `pkg.nxrt::BlockQuantizedMoE` (mixed-projection ABI).
+//! CPU parity oracle for `pkg.nxrt._private::BlockQuantizedMoE` (mixed-projection ABI).
 //!
 //! Each routed expert carries an independent native block-quantized format for
 //! every projection: `fc1_format` (gate/up), `fc2_format` (down), and
@@ -46,10 +46,9 @@ use super::packed_bytes::PackedByteSource;
 use super::packed_projection::{PackedProjectionPlan, validate_format};
 use super::{check_arity, write_dense_f32};
 mod input_workspace;
-mod routing_workspace;
+use super::routing_workspace::RoutingArena;
 use input_workspace::{MoeInputValues, MoeInputs};
 use onnx_runtime_ir::packed_arithmetic::ActivationArithmetic;
-use routing_workspace::RoutingArena;
 
 #[cfg(test)]
 use super::moe::run_expert_grouped;
@@ -604,7 +603,7 @@ impl BlockQuantizedMoEKernel {
                 let fc3 = weights.get(2);
                 expert_workspace.run_dense_expert(
                     input,
-                    expert_tasks.iter().map(|(row, _)| row),
+                    expert_tasks.iter().map(|task| task.row),
                     DenseExpertWeights {
                         fc1: fc1.as_slice(),
                         fc1_bias: fc1_bias
@@ -653,7 +652,7 @@ impl BlockQuantizedMoEKernel {
                     .transpose()?;
                 expert_workspace.run_expert_projections(
                     input,
-                    expert_tasks.iter().map(|(row, _)| row),
+                    expert_tasks.iter().map(|task| task.row),
                     &fc1,
                     fc1_bias.map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
                     &fc2,
@@ -677,10 +676,10 @@ impl BlockQuantizedMoEKernel {
                     },
                 )?
             };
-            for (grouped_row, (row, route_weight)) in expert_tasks.iter().enumerate() {
+            for (grouped_row, task) in expert_tasks.iter().enumerate() {
                 for feature in 0..hidden {
-                    output[row * hidden + feature] +=
-                        route_weight * expert_output[grouped_row * hidden + feature];
+                    output[task.row * hidden + feature] +=
+                        task.weight * expert_output[grouped_row * hidden + feature];
                 }
             }
         }
@@ -1640,7 +1639,7 @@ mod tests {
         attrs: &[(&str, Attribute)],
     ) -> (Graph, NodeId) {
         let mut graph = Graph::new();
-        graph.opset_imports.insert("pkg.nxrt".into(), 1);
+        graph.opset_imports.insert("pkg.nxrt._private".into(), 1);
         let inputs = shapes
             .iter()
             .enumerate()
@@ -1658,7 +1657,7 @@ mod tests {
             .collect();
         let output = graph.create_named_value("output", DataType::Float32, static_shape([1, H]));
         let mut node = Node::new(NodeId(0), OP, inputs, vec![output]);
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         for (name, value) in attrs {
             node.attributes.insert((*name).into(), value.clone());
         }
