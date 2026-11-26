@@ -452,3 +452,97 @@ fn native_gguf_half_invalid_storage_nonfinite_and_staging_denial_recover() {
         }
     }
 }
+
+fn unity_package(storage: &str, alpha: Option<f32>) -> tempfile::TempDir {
+    let root = if storage == "float32" {
+        package()
+    } else {
+        half_package(storage)
+    };
+    let metadata = root.path().join("inference_metadata.yaml");
+    let mut doc: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&metadata).unwrap()).unwrap();
+    // Manifest alpha remains4/rank2 deliberately: baked explicitly bypasses it.
+    doc["adapters"]["artifacts"]["gguf"]["weights"][0]["scale_encoding"] =
+        serde_yaml::to_value("baked").unwrap();
+    std::fs::write(metadata, serde_yaml::to_string(&doc).unwrap()).unwrap();
+    let mut f = facts();
+    if let Some(alpha) = alpha {
+        f[2].2 = alpha.to_le_bytes().to_vec();
+    } else {
+        f.remove(2);
+    }
+    let t = if storage == "float32" {
+        tensors()
+    } else {
+        half_tensors(storage)
+    };
+    std::fs::write(path(root.path()), wire::container(&f, &t)).unwrap();
+    root
+}
+#[test]
+fn native_gguf_explicit_baked_zero_or_missing_alpha_uses_unity_across_storage() {
+    for storage in ["float32", "float16", "bfloat16"] {
+        for alpha in [Some(0.0), Some(-0.0), None] {
+            let root = unity_package(storage, alpha);
+            let mut native = engine(root.path());
+            assert_eq!(
+                run(&mut native, &[Some(0.5), Some(-0.25)]).unwrap(),
+                [10.5, 14.25, 6.9375, 32.625]
+            );
+            assert_eq!(
+                run(&mut native, &[Some(0.0), None]).unwrap(),
+                [4., 15., 14., 33.]
+            );
+            let original = std::fs::read(path(root.path())).unwrap();
+            let mut changed = facts();
+            changed[2].2 = 0f32.to_le_bytes().to_vec();
+            if alpha.is_some() {
+                changed.remove(2);
+            }
+            let t = if storage == "float32" {
+                tensors()
+            } else {
+                half_tensors(storage)
+            };
+            std::fs::write(path(root.path()), wire::container(&changed, &t)).unwrap();
+            let error = run(&mut native, &[Some(0.5)]).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("changed after loading"),
+                "{error:#}"
+            );
+            assert_eq!(run(&mut native, &[None]).unwrap(), [4., 15.]);
+            std::fs::write(path(root.path()), original).unwrap();
+            assert_eq!(run(&mut native, &[Some(0.5)]).unwrap(), [10.5, 14.25]);
+        }
+    }
+}
+#[test]
+fn native_gguf_baked_rejects_nonzero_nonfinite_and_wrong_type_then_recovers() {
+    for storage in ["float32", "float16", "bfloat16"] {
+        for (kind, bytes, message) in [
+            (6, 4f32.to_le_bytes().to_vec(), "baked scaling requires"),
+            (6, (-4f32).to_le_bytes().to_vec(), "baked scaling requires"),
+            (6, f32::NAN.to_le_bytes().to_vec(), "baked scaling requires"),
+            (4, 0u32.to_le_bytes().to_vec(), "FLOAT32 wire type"),
+        ] {
+            let root = unity_package(storage, None);
+            let original = std::fs::read(path(root.path())).unwrap();
+            let mut f = facts();
+            f[2].1 = kind;
+            f[2].2 = bytes;
+            let t = if storage == "float32" {
+                tensors()
+            } else {
+                half_tensors(storage)
+            };
+            std::fs::write(path(root.path()), wire::container(&f, &t)).unwrap();
+            let mut native = engine(root.path());
+            let error = run(&mut native, &[Some(0.5)]).unwrap_err();
+            assert!(format!("{error:#}").contains(message), "{error:#}");
+            assert_eq!(run(&mut native, &[None]).unwrap(), [4., 15.]);
+            std::fs::write(path(root.path()), original).unwrap();
+            assert_eq!(run(&mut native, &[Some(0.5)]).unwrap(), [10.5, 14.25]);
+        }
+    }
+}

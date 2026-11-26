@@ -2,7 +2,8 @@
 
 Schema `v1.19` adds `format: gguf` with loader capability
 `onnx-genai.adapters.gguf@1`. A package declares the source beneath its adapter
-root and uses `scale_encoding: alpha_over_rank`. No `config_location` is used.
+root and explicitly selects `scale_encoding: alpha_over_rank` or `baked`.
+No `config_location` is used.
 Each `bindings[].weight_key` is the exact saved parameter prefix: the loader
 selects only its standard `.lora_a` and `.lora_b` tensors. The existing target
 manifest names the actual ONNX component, initializer, node/output and optional
@@ -21,21 +22,36 @@ finite and every saved tensor must have an exact manifest binding. Embedding,
 norm and other extra tensors cannot silently disappear.
 
 Required typed metadata is `general.type: STRING = adapter`, `adapter.type:
-STRING = lora` and `adapter.lora.alpha: FLOAT32`. Alpha must be finite, positive
+STRING = lora`. For `alpha_over_rank`, `adapter.lora.alpha: FLOAT32`
+is required. Alpha must be finite, positive
 and exactly agree with every effective manifest/binding alpha. Re-export or
 correct the explicit manifest when these facts disagree; the runtime does not
 infer or override numeric semantics. The existing portable overlay computes
 `request_scale * alpha/rank * B(Ax)` using host F32 inputs, base outputs, factors
 and arithmetic. Negative and zero request scales are supported.
 
+For an upstream unity-scale source, `scale_encoding: baked` must be explicitly
+declared: the header alpha must be missing or finite FLOAT32 zero (including
+negative zero). The existing Baked contract applies no static alpha/rank factor;
+positive manifest alpha/target policies remain validated but do not participate
+in Baked arithmetic. The loader never infers Baked from a header or rewrites
+factors/manifest alpha. Nonzero alpha with Baked, zero/missing alpha with
+AlphaOverRank and wrong wire types reject. Negative source alpha is unsupported.
+
 Missing, wrong-type and duplicate metadata are distinct errors. Other
 `adapter.*` fields are rejected, including aLoRA activation semantics. General
 provenance fields can be present; a `general.architecture` label does not choose
 or construct an executable graph. The package author owns the exact source-to-
-graph mapping, including feature ordering. Zero/missing alpha, baked scaling,
+graph mapping, including feature ordering. Negative source alpha,
 DoRA/aLoRA, quantized factors, arbitrary embedding/norm
 adapters, automatic target/base-model discovery and device-fused execution
 remain unsupported. This is not bare-GGUF model import.
+
+Native unity-scale tests cover all three storage types, independently calculated
+rank-two signed/zero row outputs, zero/missing header cache changes and rejection
+recovery; HTTP tests cover actual generation and raw embedding without applying
+the deliberately nonunity manifest alpha. These definitions still require fresh
+execution on the final source revision.
 
 The wire facts and suffix convention follow the upstream
 [GGUF LoRA reader](https://github.com/ggml-org/llama.cpp/blob/master/src/llama-adapter.cpp)

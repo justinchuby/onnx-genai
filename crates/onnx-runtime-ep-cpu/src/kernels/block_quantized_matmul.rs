@@ -26,10 +26,11 @@ use onnx_runtime_quantization::{
 use rayon::prelude::*;
 
 use super::block_dequant::{decode_e2m1, decode_e8m0_scale};
+use super::check_arity;
 use super::decoded_projection::ProjectionScratch;
 use super::matmul::gemm;
+use super::packed_bytes::{PackedByteDigest, PackedByteSource};
 use super::packed_projection::{PackedProjectionPlan, validate_format};
-use super::{check_arity, to_dense_bytes};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use onnx_runtime_ir::packed_arithmetic::ActivationArithmetic;
 
@@ -516,7 +517,7 @@ impl BlockQuantizedMatMulKernel {
             };
             let use_dense = dense_bytes <= cache_budget;
             if use_dense {
-                let resolved = if self.packed_b_constant {
+                let key = if self.packed_b_constant {
                     Some(self.weight_identity.resolve(
                         &inputs[1],
                         self.format,
@@ -524,13 +525,11 @@ impl BlockQuantizedMatMulKernel {
                         self.n,
                         0,
                         None,
-                        || packed_tensor_bytes(&inputs[1]),
+                        || PackedByteSource::full(OP, &inputs[1])?.digest(),
                     )?)
                 } else {
                     None
                 };
-                let key = resolved.as_ref().map(|resolved| Arc::clone(&resolved.key));
-                let mut resolved_payload = resolved.and_then(|resolved| resolved.payload);
                 match self.weight_cache.load_group(
                     &[match key.as_deref() {
                         Some(key) => WeightSpec::cached(key)?,
@@ -538,10 +537,7 @@ impl BlockQuantizedMatMulKernel {
                     }],
                     |_, output| {
                         BLOCK_QUANT_MATMUL_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
-                        let packed = match resolved_payload.take() {
-                            Some(packed) => packed,
-                            None => packed_tensor_bytes(&inputs[1])?,
-                        };
+                        let packed = packed_tensor_bytes(&inputs[1])?;
                         decode_dense_weight_into(
                             self.format,
                             self.k,
@@ -642,8 +638,6 @@ struct DenseWeightIdentityState {
     keys: HashMap<DenseWeightSubKey, Arc<DenseWeightCacheKey>>,
     #[cfg(test)]
     hashed_bytes: usize,
-    #[cfg(test)]
-    materialized_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -675,25 +669,19 @@ struct DenseWeightSubKey {
     out_features: usize,
 }
 
-pub(super) struct ResolvedDenseWeight<'a> {
-    pub(super) key: Arc<DenseWeightCacheKey>,
-    /// Present only when resolving a new content key. The caller can reuse this
-    /// payload for the cache build, avoiding a second strided materialization.
-    pub(super) payload: Option<Cow<'a, [u8]>>,
-}
-
 impl DenseWeightIdentity {
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn resolve<'a>(
+    pub(super) fn resolve(
         &self,
-        view: &'a TensorView<'_>,
+        view: &TensorView<'_>,
         format: BlockFormat,
         in_features: usize,
         out_features: usize,
         role: u8,
         expert: Option<usize>,
-        payload: impl FnOnce() -> Result<Cow<'a, [u8]>>,
-    ) -> Result<ResolvedDenseWeight<'a>> {
+        digest: impl FnOnce() -> Result<PackedByteDigest>,
+    ) -> Result<Arc<DenseWeightCacheKey>> {
+        crate::strided::validate_host_storage::<u8>(OP, "constant packed weight", view)?;
         let source = DenseWeightSource::from_tensor(view)?;
         let mut inner = self
             .inner
@@ -726,24 +714,18 @@ impl DenseWeightIdentity {
             out_features,
         };
         if let Some(key) = inner.keys.get(&sub_key) {
-            return Ok(ResolvedDenseWeight {
-                key: Arc::clone(key),
-                payload: None,
-            });
+            return Ok(Arc::clone(key));
         }
 
-        let payload = payload()?;
+        let digest = digest()?;
         // The hash is computed once for diagnostics/collision hardening, but it
         // is never the sole identity: the immutable kernel slot generation,
         // source provenance, role/expert, dtype, format, dimensions, and layout
         // all participate in equality.
-        let content_hash = stable_bytes_hash(&payload);
+        let content_hash = digest.hash;
         #[cfg(test)]
         {
-            inner.hashed_bytes = inner.hashed_bytes.saturating_add(payload.len());
-            if matches!(payload, Cow::Owned(_)) {
-                inner.materialized_bytes = inner.materialized_bytes.saturating_add(payload.len());
-            }
+            inner.hashed_bytes = inner.hashed_bytes.saturating_add(digest.bytes);
         }
         let metadata = inner
             .metadata
@@ -759,25 +741,18 @@ impl DenseWeightIdentity {
             expert,
             tensor_shape: Arc::clone(&metadata.shape),
             tensor_strides: Arc::clone(&metadata.strides),
-            byte_len: payload.len(),
+            byte_len: digest.bytes,
             content_hash,
             source,
         });
         inner.keys.insert(sub_key, Arc::clone(&key));
-        Ok(ResolvedDenseWeight {
-            key,
-            payload: Some(payload),
-        })
+        Ok(key)
     }
 
     #[cfg(test)]
-    pub(super) fn stats(&self) -> (usize, usize, usize) {
+    pub(super) fn stats(&self) -> (usize, usize) {
         let inner = self.inner.lock().unwrap();
-        (
-            inner.keys.len(),
-            inner.hashed_bytes,
-            inner.materialized_bytes,
-        )
+        (inner.keys.len(), inner.hashed_bytes)
     }
 }
 
@@ -847,36 +822,12 @@ impl DenseWeightSource {
     }
 }
 
-pub(super) fn packed_tensor_bytes<'a>(view: &'a TensorView<'_>) -> Result<Cow<'a, [u8]>> {
-    view.validate()?;
-    if view.dtype != DataType::Uint8 {
-        return Err(error(format!(
-            "packed weight dtype {:?} unsupported; expected Uint8",
-            view.dtype
-        )));
-    }
-    if view.is_contiguous() {
-        let len = view.byte_size();
-        if len == 0 {
-            return Ok(Cow::Borrowed(&[]));
-        }
-        // SAFETY: `view` is validated, contiguous Uint8 storage, and the
-        // executor has bounds-checked the logical byte extent against the live
-        // backing allocation. The borrow cannot outlive the input view.
-        return Ok(Cow::Borrowed(unsafe {
-            std::slice::from_raw_parts(view.data_ptr::<u8>(), len)
-        }));
-    }
-    Ok(Cow::Owned(to_dense_bytes(view)?))
-}
-
-fn stable_bytes_hash(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for &byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+fn packed_tensor_bytes<'a>(view: &'a TensorView<'_>) -> Result<Cow<'a, [u8]>> {
+    let source = PackedByteSource::full(OP, view)?;
+    Ok(match source.borrowed() {
+        Some(bytes) => Cow::Borrowed(bytes),
+        None => Cow::Owned(source.owned()?),
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3292,10 +3243,10 @@ mod tests {
         let resolved = concrete
             .weight_identity
             .resolve(&view, BlockFormat::Mxfp4, k, n, 0, None, || {
-                packed_tensor_bytes(&view)
+                PackedByteSource::full(OP, &view)?.digest()
             })
             .unwrap();
-        let active = concrete.weight_cache.test_get(&resolved.key).unwrap();
+        let active = concrete.weight_cache.test_get(&resolved).unwrap();
         second
             .execute_prepared(&[input.view(), weights.view()], &mut [actual.view_mut()])
             .unwrap();
@@ -3420,7 +3371,7 @@ mod tests {
                 }
                 assert_eq!(streamed.weight_cache.stats(), (0, 0));
                 assert_eq!(streamed.weight_cache.activity(), (0, 0));
-                assert_eq!(streamed.weight_identity.stats(), (0, 0, 0));
+                assert_eq!(streamed.weight_identity.stats(), (0, 0));
             }
             assert_eq!(dense.weight_cache.stats(), (1, bytes));
             assert_eq!(dense.weight_cache.activity().1, 1);
@@ -3492,7 +3443,7 @@ mod tests {
                 .execute_prepared(&[a.view(), b, bias.view()], &mut [y.view_mut()])
                 .unwrap();
             assert_eq!(compute_values(&y, dtype), vec![33.5, 31.5, 33.5, 31.5]);
-            assert_eq!(kernel.weight_identity.stats(), (0, 0, 0));
+            assert_eq!(kernel.weight_identity.stats(), (0, 0));
             assert_eq!(kernel.weight_cache.activity(), (0, 0));
         }
     }
@@ -3528,7 +3479,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("bias must have shape [2]"), "{error}");
-        assert_eq!(kernel.weight_identity.stats(), (0, 0, 0));
+        assert_eq!(kernel.weight_identity.stats(), (0, 0));
         assert_eq!(kernel.weight_cache.activity(), (0, 0));
     }
 
@@ -3677,7 +3628,7 @@ mod tests {
         );
         assert_eq!(
             identity_after_first,
-            (1, packed.len(), 0),
+            (1, packed.len()),
             "the initial contiguous weight should be hashed once without materialization"
         );
         assert_eq!(
@@ -3702,16 +3653,14 @@ mod tests {
         let packed2_view = packed2.view();
         let key1 = identity1
             .resolve(&packed1_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&packed1_view)
+                PackedByteSource::full(OP, &packed1_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         let key2 = identity2
             .resolve(&packed2_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&packed2_view)
+                PackedByteSource::full(OP, &packed2_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         let _ = cache
             .test_get_or_insert_with(key1.as_ref(), || Ok(vec![1.0, 2.0, 3.0, 4.0]))
             .unwrap();
@@ -3741,10 +3690,9 @@ mod tests {
         let packed_view = packed.view();
         let key = identity
             .resolve(&packed_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&packed_view)
+                PackedByteSource::full(OP, &packed_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
 
         for limit in [0, 15] {
             let cache = WeightCache::<DenseWeightCacheKey>::with_limit(limit);
@@ -3760,6 +3708,46 @@ mod tests {
     }
 
     #[test]
+    fn dense_weight_identity_failed_digest_is_not_published_and_warm_views_are_validated() {
+        let packed = Owned::u8(&[4], &[1, 2, 3, 4]);
+        let view = packed.view();
+        let identity = DenseWeightIdentity::default();
+        let error = identity
+            .resolve(&view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
+                Err(EpError::KernelFailed(
+                    "digest source unavailable; rebind packed storage".into(),
+                ))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("rebind packed storage"));
+        assert_eq!(identity.stats(), (0, 0));
+        let key = identity
+            .resolve(&view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
+                PackedByteSource::full(OP, &view)?.digest()
+            })
+            .unwrap();
+        assert_eq!(identity.stats(), (1, 4));
+        let mut invalid = view;
+        invalid.dtype = DataType::Float32;
+        let error = identity
+            .resolve(&invalid, BlockFormat::Mxfp4, 4, 1, 0, None, || {
+                unreachable!("invalid warm descriptor cannot request payload")
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Host-accessible Uint8"),
+            "{error}"
+        );
+        let repeated = identity
+            .resolve(&view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
+                unreachable!("failed warm validation cannot evict a valid key")
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(&key, &repeated));
+        assert_eq!(identity.stats(), (1, 4));
+    }
+
+    #[test]
     fn dense_weight_identity_rekeys_when_the_constant_source_changes() {
         let first = Owned::u8(&[4], &[1, 2, 3, 4]);
         let second = Owned::u8(&[4], &[4, 3, 2, 1]);
@@ -3767,29 +3755,26 @@ mod tests {
         let first_view = first.view();
         let first_key = identity
             .resolve(&first_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&first_view)
+                PackedByteSource::full(OP, &first_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         let repeated_key = identity
             .resolve(&first_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
                 unreachable!("stable identity must not request the payload again")
             })
-            .unwrap()
-            .key;
+            .unwrap();
         assert!(Arc::ptr_eq(&first_key, &repeated_key));
 
         let second_view = second.view();
         let second_key = identity
             .resolve(&second_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&second_view)
+                PackedByteSource::full(OP, &second_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         assert_ne!(first_key, second_key);
         assert_eq!(
             identity.stats(),
-            (1, 8, 0),
+            (1, 8),
             "each observable source identity must be hashed exactly once"
         );
     }
@@ -3807,10 +3792,9 @@ mod tests {
         ));
         let first_key = identity
             .resolve(&first_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&first_view)
+                PackedByteSource::full(OP, &first_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         let second_view = packed.view().with_backing(TensorBacking::ExternalMmap(
             onnx_runtime_ep_api::ExternalMmapRegion {
                 mapping_id: 42,
@@ -3820,12 +3804,11 @@ mod tests {
         ));
         let second_key = identity
             .resolve(&second_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&second_view)
+                PackedByteSource::full(OP, &second_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         assert_ne!(first_key, second_key);
-        assert_eq!(identity.stats(), (1, 8, 0));
+        assert_eq!(identity.stats(), (1, 8));
     }
 
     #[test]
@@ -3856,10 +3839,9 @@ mod tests {
         let packed_view = packed.view();
         let key = identity
             .resolve(&packed_view, BlockFormat::Mxfp4, 4, 1, 0, None, || {
-                packed_tensor_bytes(&packed_view)
+                PackedByteSource::full(OP, &packed_view)?.digest()
             })
-            .unwrap()
-            .key;
+            .unwrap();
         let builds = std::sync::Arc::new(AtomicUsize::new(0));
         let barrier = std::sync::Arc::new(Barrier::new(4));
         std::thread::scope(|scope| {

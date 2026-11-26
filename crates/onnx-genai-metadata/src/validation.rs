@@ -1947,17 +1947,19 @@ fn validate_adapter_service(
             }
             match (&weight.format, &weight.scale_encoding) {
                 (
-                    crate::schema::AdapterWeightFormat::HfPeft | crate::schema::AdapterWeightFormat::Gguf,
+                    crate::schema::AdapterWeightFormat::HfPeft
+                    | crate::schema::AdapterWeightFormat::Gguf,
                     crate::schema::AdapterScaleEncoding::AlphaOverRank,
                 )
                 | (
                     crate::schema::AdapterWeightFormat::OrtGenai,
                     crate::schema::AdapterScaleEncoding::Baked,
                 )
+                | (crate::schema::AdapterWeightFormat::Gguf, _)
                 | (crate::schema::AdapterWeightFormat::Json, _)
                 | (crate::schema::AdapterWeightFormat::Safetensors, _) => {}
-                (crate::schema::AdapterWeightFormat::HfPeft | crate::schema::AdapterWeightFormat::Gguf, _) => errors.push(format!(
-                    "{path}.weights[{index}].scale_encoding must be alpha_over_rank for hf_peft or gguf"
+                (crate::schema::AdapterWeightFormat::HfPeft, _) => errors.push(format!(
+                    "{path}.weights[{index}].scale_encoding must be alpha_over_rank for hf_peft"
                 )),
                 (crate::schema::AdapterWeightFormat::OrtGenai, _) => errors.push(format!(
                     "{path}.weights[{index}].scale_encoding must be baked for ort_genai"
