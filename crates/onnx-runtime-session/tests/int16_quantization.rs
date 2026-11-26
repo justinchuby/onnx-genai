@@ -68,7 +68,9 @@ impl Case<'_> {
             ..Default::default()
         };
         let node = |op: &str, data: &str, output: &str, mut attrs: Vec<onnx::AttributeProto>| {
-            attrs.push(attr("axis", self.axis));
+            if self.opset >= 13 {
+                attrs.push(attr("axis", self.axis));
+            }
             if self.block != 0 {
                 attrs.push(attr("block_size", self.block));
             }
@@ -186,8 +188,24 @@ impl Case<'_> {
     }
 }
 
-fn cases() -> [Case<'static>; 5] {
+fn cases() -> [Case<'static>; 6] {
     [
+        Case {
+            opset: 10,
+            code: DataType::Int16,
+            shape: &[3],
+            input: &[-1.5, 0.5, 1.5],
+            scale_shape: &[],
+            scale: &[1.],
+            scale_type: DataType::Float32,
+            zero: Some(&[-2.]),
+            axis: 1,
+            block: 0,
+            precision: None,
+            output: None,
+            q: &[-4., -2., 0.],
+            y: &[-2., 0., 2.],
+        },
         Case {
             opset: 21,
             code: DataType::Int16,
@@ -205,7 +223,7 @@ fn cases() -> [Case<'static>; 5] {
             y: &[-32768., -2., 0., 0., 2., 32767.],
         },
         Case {
-            opset: 21,
+            opset: 13,
             code: DataType::Uint16,
             shape: &[2, 3],
             input: &[-1.5, 0.5, 1e30, -3., 1., 3.],
@@ -279,19 +297,23 @@ fn int16_quantization_cpu() {
 }
 
 #[test]
-fn int16_quantization_rejects_opset_20() {
-    let bytes = cases()[1].model(20);
-    let error = InferenceSession::builder()
-        .model_bytes(&bytes)
-        .device(DevicePreference::Cpu)
-        .build()
-        .err()
-        .expect("opset 20 does not define 16-bit integer quantization");
-    let message = format!("{error:#}");
-    assert!(
-        message.contains("opset 21") || message.contains("uint16") || message.contains("UINT16"),
-        "{message}"
-    );
+fn int16_quantization_rejects_newer_revision_features() {
+    let [_, attr, axis, blocked, _, precision] = cases();
+    for (model, expected) in [
+        (axis.model(10), "axis requires opset 13"),
+        (attr.model(20), "output_dtype requires opset 21"),
+        (blocked.model(20), "block_size requires opset 21"),
+        (precision.model(21), "precision requires opset 23"),
+    ] {
+        let error = InferenceSession::builder()
+            .model_bytes(&model)
+            .device(DevicePreference::Cpu)
+            .build()
+            .err()
+            .expect("operation should reject attributes from a newer revision");
+        let message = format!("{error:#}");
+        assert!(message.contains(expected), "{message}");
+    }
 }
 
 #[cfg(feature = "cuda")]

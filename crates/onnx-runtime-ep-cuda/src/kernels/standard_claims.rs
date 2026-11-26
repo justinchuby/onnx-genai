@@ -21,7 +21,8 @@ pub(crate) fn unsupported_reason_at_opset(
             if matches!(
                 conv_transpose_contract,
                 super::conv_transpose::Contract::Standalone
-            ) && let Some(result) = super::quantization::claim_int16(node, opset, input_dtypes)
+            ) && let Some(result) =
+                super::quantization::claim_int16(node, opset, input_shapes, input_dtypes)
             {
                 return result
                     .err()
@@ -405,7 +406,7 @@ mod linear_quantization_tests {
     }
 
     #[test]
-    fn int16_codes_are_admitted_only_for_native_opset_21_plus() {
+    fn int16_codes_are_admitted_for_standalone_revision_compatible_forms() {
         for code in [DataType::Int16, DataType::Uint16] {
             for (op, dtypes) in [
                 (
@@ -416,15 +417,50 @@ mod linear_quantization_tests {
             ] {
                 let node = node(op, Some(ValueId(2)));
                 let shapes = [vec![Dim::Static(2)], vec![], vec![]];
+                for opset in [10, 13, 19, 20, 21] {
+                    assert!(
+                        unsupported_reason_at_opset(&node, opset, &shapes, &dtypes, Standalone)
+                            .is_none()
+                    );
+                    assert!(
+                        unsupported_reason_at_opset(&node, opset, &shapes, &dtypes, OrtPlugin)
+                            .is_some()
+                    );
+                }
+                let per_axis = vec![vec![Dim::Static(2)]; 3];
                 assert!(
-                    unsupported_reason_at_opset(&node, 21, &shapes, &dtypes, Standalone).is_none()
+                    unsupported_reason_at_opset(&node, 10, &per_axis, &dtypes, Standalone)
+                        .is_some_and(|reason| reason.contains("requires a scalar scale"))
+                );
+                let mut half_types = dtypes;
+                half_types[1] = DataType::Float16;
+                if op == "QuantizeLinear" {
+                    half_types[0] = DataType::Float16;
+                }
+                assert!(
+                    unsupported_reason_at_opset(&node, 13, &shapes, &half_types, Standalone)
+                        .is_some_and(|reason| reason.contains("FLOAT scale"))
                 );
                 assert!(
-                    unsupported_reason_at_opset(&node, 20, &shapes, &dtypes, Standalone)
-                        .is_some_and(|reason| reason.contains("require opset 21"))
+                    unsupported_reason_at_opset(&node, 19, &shapes, &half_types, Standalone)
+                        .is_none()
+                );
+                let mut newer = node;
+                let attr = if op == "QuantizeLinear" {
+                    "precision"
+                } else {
+                    "output_dtype"
+                };
+                newer
+                    .attributes
+                    .insert(attr.into(), Attribute::Int(DataType::Float16 as i64));
+                assert!(
+                    unsupported_reason_at_opset(&newer, 21, &shapes, &dtypes, Standalone)
+                        .is_some_and(|reason| reason
+                            == format!("{op}: {attr} requires opset 23 or later (got 21)"))
                 );
                 assert!(
-                    unsupported_reason_at_opset(&node, 21, &shapes, &dtypes, OrtPlugin).is_some()
+                    unsupported_reason_at_opset(&newer, 23, &shapes, &dtypes, Standalone).is_none()
                 );
             }
 
@@ -441,6 +477,10 @@ mod linear_quantization_tests {
             let shapes = [vec![Dim::Static(2)], vec![Dim::Static(2)]];
             let dtypes = [DataType::Float32, DataType::Float32];
             assert!(unsupported_reason_at_opset(&q, 21, &shapes, &dtypes, Standalone).is_none());
+            assert!(
+                unsupported_reason_at_opset(&q, 20, &shapes, &dtypes, Standalone)
+                    .is_some_and(|reason| reason.contains("output_dtype requires opset 21"))
+            );
             assert_eq!(
                 unsupported_reason_at_opset(&q, 21, &shapes, &dtypes, OrtPlugin).as_deref(),
                 Some("QuantizeLinear CUDA coverage requires a scalar scale")

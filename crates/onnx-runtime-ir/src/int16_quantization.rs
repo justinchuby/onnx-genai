@@ -24,20 +24,52 @@ pub fn attribute_dtype(node: &Node, name: &str) -> Result<Option<DataType>, Stri
     }
 }
 
-pub fn validate_opset(node: &Node, opset: u64) -> Result<(), String> {
-    if opset < 21 {
+pub fn validate_revision(node: &Node, opset: u64, scale_rank: Option<usize>) -> Result<(), String> {
+    // Keep revision-specific forms and attributes, not the schema's storage-type floor.
+    let quantize = node.op_type == "QuantizeLinear";
+    for (name, since) in [
+        ("axis", 13),
+        ("block_size", 21),
+        ("output_dtype", if quantize { 21 } else { 23 }),
+        ("precision", 23),
+        ("saturate", 19),
+    ] {
+        if !quantize && matches!(name, "precision" | "saturate") {
+            continue;
+        }
+        if opset < since && node.attr(name).is_some() {
+            return Err(format!(
+                "{name} requires opset {since} or later (got {opset})"
+            ));
+        }
+    }
+    if opset < 13 && scale_rank.is_some_and(|rank| rank != 0) {
         return Err(format!(
-            "INT16 and UINT16 require opset 21 or later (got {opset})"
+            "opset {opset} requires a scalar scale; per-axis quantization requires opset 13 or later"
         ));
     }
-    let newer_attribute = if node.op_type == "QuantizeLinear" {
-        "precision"
-    } else {
-        "output_dtype"
-    };
-    if opset < 23 && node.attr(newer_attribute).is_some() {
+    Ok(())
+}
+
+pub fn validate_quantize_types(opset: u64, x: DataType, scale: DataType) -> Result<(), String> {
+    if opset < 19 {
+        if !matches!(x, DataType::Float32 | DataType::Int32) || scale != DataType::Float32 {
+            return Err(format!(
+                "opset {opset} requires FLOAT or INT32 x and FLOAT scale; got {x:?} and {scale:?}"
+            ));
+        }
+    } else if opset < 23 && x != scale {
         return Err(format!(
-            "{newer_attribute} requires opset 23 or later (got {opset})"
+            "opset {opset} requires x and scale to share a dtype; got {x:?} and {scale:?}"
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_dequantize_scale(opset: u64, scale: DataType) -> Result<(), String> {
+    if opset < 19 && scale != DataType::Float32 {
+        return Err(format!(
+            "opset {opset} requires FLOAT scale and output; got scale {scale:?}"
         ));
     }
     Ok(())

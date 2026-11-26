@@ -162,6 +162,7 @@ pub fn unsupported_reason(op: &Node, shapes: &[Shape], dtypes: &[DataType]) -> O
 pub(super) fn claim_int16(
     node: &Node,
     opset: u64,
+    shapes: &[Shape],
     dtypes: &[DataType],
 ) -> Option<std::result::Result<(), String>> {
     let quantize = node.op_type == "QuantizeLinear";
@@ -183,7 +184,7 @@ pub(super) fn claim_int16(
             .filter(|&dtype| q16::is_code(dtype))?
     };
     Some((|| {
-        q16::validate_opset(node, opset)?;
+        q16::validate_revision(node, opset, shapes.get(1).map(|shape| shape.len()))?;
         if !(2..=3).contains(&node.inputs.len())
             || node.inputs[..2].iter().any(Option::is_none)
             || !matches!(node.outputs.as_slice(), [Some(_)])
@@ -204,13 +205,10 @@ pub(super) fn claim_int16(
             {
                 return Err("output_dtype must match the INT16/UINT16 zero_point dtype".into());
             }
-            if opset < 23 && x != scale {
-                return Err(format!(
-                    "opset {opset} requires x and scale to share a dtype; got {x:?} and {scale:?}"
-                ));
-            }
+            q16::validate_quantize_types(opset, *x, *scale)?;
             q16::quantize_precision(q16::attribute_dtype(node, "precision")?, *x, *scale)?;
         } else {
+            q16::validate_dequantize_scale(opset, *scale)?;
             q16::dequantize_output(node, *scale)?;
         }
         Ok(())
@@ -246,7 +244,7 @@ pub(crate) fn register_linear_quantization(
                 Box::new(LinearQuantFactory {
                     op,
                     runtime: runtime.clone(),
-                    int16: native && version >= 21,
+                    int16: native,
                 }),
             );
         }

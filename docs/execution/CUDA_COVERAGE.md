@@ -272,10 +272,11 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `ConstantOfShape`, `OneHot`, `TensorScatter` | `` | ✅ | **NVRTC / device materialization** | Shape-driven construction and fixed-capacity scatter paths with explicit dtype, bounds, and capture checks. |
 | `QuantizeLinear`, `DequantizeLinear`, `QLinearMatMul`, `DynamicQuantizeLinear` | `` | ✅ | **NVRTC quantization** | Per-tensor/per-axis constraints and supported integer storage are enforced by each kernel's claim gate. |
 
-In the standalone runtime, `QuantizeLinear` and `DequantizeLinear` support INT16 and UINT16 at opset 21+
-with scalar, per-axis, or blocked scales. For those storage types, opset 23+
-also supports explicit division `precision` and independently typed floating
-dequantization output, respectively.
+Standalone INT16/UINT16 `QuantizeLinear` and `DequantizeLinear` support scalar
+scales from opset 10, per-axis scales from opset 13, and blocked scales from
+opset 21. Before opset 21, quantization needs a typed zero point to select
+16-bit storage. Opset 23 adds explicit division `precision` and independently
+typed floating dequantization output.
 | `DequantizePacked` | `` | ✅ | **NVRTC block decode** | All 27 opset-29 GGUF profiles decode directly from device-resident UINT8 payloads into FLOAT, FLOAT16, BFLOAT16, or DOUBLE. |
 | `Dropout`, `NonZero` | `` | ✅ | **NVRTC-custom** | Inference Dropout and bounded dynamic-output coordinate extraction; dynamic metadata paths decline capture where host materialization is required. |
 | `Resize`, `GridSample` | `` | ✅ | **NVRTC-custom** | Implemented interpolation/sampling subsets; unsupported coordinate modes and sampling policies fail closed. |

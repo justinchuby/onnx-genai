@@ -24,7 +24,7 @@ pub(crate) fn register_linear_quantization(
 ) {
     use onnx_runtime_ep_api::{OpKey, WorkspacePlanning};
     for version in [10, 13, 19, 21, 23, 25] {
-        let int16 = native && version >= 21;
+        let int16 = native;
         registry.register(
             OpKey::new("QuantizeLinear", "", version),
             WorkspacePlanning::None,
