@@ -53,6 +53,11 @@ impl CpuWorkerPlan {
     /// No memory budget is copied or created here. Engine integrations must
     /// supply resources over the same model-wide authorities, retain the fixed
     /// weight accounting owner, and admit their ordinary buffers/KV separately.
+    /// A governed resource set without a workspace pool is not rejected just
+    /// because it is incomplete for some kernels: the CPU provider validates
+    /// the pool at the first actual workspace demand and fails closed there.
+    /// Zero-workspace graphs can therefore use governed derived-weight resources
+    /// without constructing an otherwise unused workspace pool.
     pub fn build_worker(&self, resources: CpuMemoryResources) -> Result<InferenceSession> {
         if !resources.is_governed() {
             return Err(SessionError::UnsupportedCpuWorkerPlan {
