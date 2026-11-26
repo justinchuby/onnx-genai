@@ -2460,3 +2460,36 @@ reproduced on unmodified main 71ecaa373 before restoring this branch. This is
 recorded rather than claimed as a passing configuration. Checks are functional
 macOS ARM64 CPU evidence, with no Linux/GPU or performance claims. The wider
 compatibility goal remains open.
+
+### Graph-scoped keyed container weights
+
+Schema v1.17 adds explicit `graph_weights` entries for ONNX graphs, with
+package-relative GGUF/SafeTensors paths and container-key renames. One canonical
+resolver admits regular files beneath the package root and rejects escaping
+symlinks, missing artifacts and aliases that ambiguously bind the same graph.
+Decoder sessions, workflow components, MTP heads and target-initializer reuse
+consume the same bindings. Auto selects Native for this capability; explicit ORT
+and builds lacking Native fail with a configuration remedy.
+
+Execution retains the loader's exact dtype/shape and external-length checks.
+There is no inferred architecture, cast, transpose or quantization conversion.
+Memory evidence loads the actual keyed graph, and keyed placeholders use tensor
+geometry for byte estimates. Native portable state hashes declared container
+contents with portable package-relative labels, so relocation preserves identity
+and a changed container invalidates existing state before restoration publishes.
+
+Real GGUF and SafeTensors fixtures execute the decoder, a stateless workflow and
+three recurrent MTP steps. Decoder generation matches the original ONNX/ORT
+reference; saved-state continuation survives package relocation, while altered
+container contents are rejected without populating the destination session.
+Shape coercion, explicit ORT, missing files, graph aliases and escaping symlinks
+have refusal coverage. The complete engine library passed 1108 tests with one
+inherited ignore; metadata passed 484 tests, including generated-schema and
+extension-registry conformance. Evidence is functional macOS ARM64 CPU only.
+Bare GGUF executable-graph import, quantization selection and selective sidecar
+management remain open; this increment requires an authored ONNX graph/package.
+
+Default engine/server all-target strict Clippy and the Native-disabled server
+reference configuration (`--no-default-features --features metrics,cuda-13000`)
+passed, together with formatting and whole-change whitespace checks. The CUDA
+feature is a compile-time binding selector, not evidence of GPU execution.

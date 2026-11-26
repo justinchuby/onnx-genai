@@ -138,6 +138,24 @@ pub(crate) fn analyze_model_memory(model_path: &Path) -> GraphMemoryEvidence {
     }
 }
 
+#[cfg(feature = "native-backend")]
+pub(crate) fn analyze_model_memory_with_keyed_weights(
+    model_path: &Path,
+    files: &[onnx_runtime_loader::KeyedWeightFile],
+) -> GraphMemoryEvidence {
+    if files.is_empty() {
+        return analyze_model_memory(model_path);
+    }
+    match onnx_runtime_loader::load_model_with_keyed_weights(model_path, files) {
+        Ok((graph, _weights)) => analyze_graph_memory(&graph),
+        Err(error) => GraphMemoryEvidence {
+            access_pattern: WeightAccessPattern::Unknown,
+            per_layer_weight_bytes: Vec::new(),
+            reason: format!("ONNX graph/keyed-weight analysis was unavailable: {error}"),
+        },
+    }
+}
+
 pub(crate) fn combine_graph_memory(
     components: impl IntoIterator<Item = GraphMemoryEvidence>,
     pipeline_is_iterative: bool,

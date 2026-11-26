@@ -551,6 +551,10 @@ pub const CORE_CONFORMANCE: &[(SchemaVersion, &str)] = &[
         crate::version::AUDIO_FEATURE_INPUT_SCHEMA_VERSION,
         "Externally executed audio programs bind explicitly named float32 feature media inputs; analysis semantics and clip bounds come from the selected program output.",
     ),
+    (
+        crate::version::GRAPH_WEIGHTS_SCHEMA_VERSION,
+        "Each ONNX graph can declare immutable GGUF/SafeTensors containers with explicit tensor-key mappings; geometry and executable semantics stay in the graph.",
+    ),
 ];
 
 /// Look up a built-in extension by its exact declared identity and version.
