@@ -3116,3 +3116,45 @@ two nodes sharing one peak, dynamic channel counts, empty batch, one-byte-short
 refusal and trim/readmission. Real ORT fixtures require cpu_ep assignment with
 fallback disabled across dynamic shapes. These establish correctness and
 allocation invariants, not inference latency or CUDA execution.
+
+
+### Affine expert banks borrow validated storage without parameter copies
+
+The standalone affine MoE and affine grouped projection now share one private
+`affine_bank` module. It holds lifetime-bound, validated rank-three readers for
+packed code bytes, f32 scales and optional packed zero-point bytes. Contiguous,
+padded, reversed and unaligned storage are consumed directly; no bank-sized
+scale Vec or non-contiguous codes/zeros materialization remains in this reader.
+The corresponding bank operand slots advertise strided input support so the
+executor does not insert a gather before the reader.
+
+Every bank's dtype, shape, Host access, checked count and address span is
+validated before any scale or packed-byte reads. This fixes the old contiguous
+byte borrowing path's missing Host check. Checked pointer-domain extrema cover
+negative strides and singleton dimensions; actual allocation bounds and lifetime
+remain the owning EP's contract. Positive/finite scale validation retains the
+complete scan, including experts not selected by routing, with row/block/value
+context on failure.
+
+Each dot product resolves its expert/row origin once outside the weight loop.
+The dense route uses a flat row offset; strided storage resolves the two leading
+axes once. Within the loop, nibble order, zero-point subtraction, multiplication
+by scale and `sum + x * weight` order are unchanged. Affine grouped projection
+uses that same dot routine rather than recomputing a flattened expert index per
+weight. Both callers retain full Y staging and publish last, so parameter/X/Y
+alias safety is preserved. No owner, cache, lock or quota request is added.
+
+Bit-exact tests cover optional zeros, odd depths/block counts, padded/reversed
+strides, packed f32 origins and NaN/Inf activation values. Guard-only cases prove
+that even a late non-Host zero-point bank is refused before any scale read.
+A real allocator witness makes each bank much larger than its activation,
+route and output; separate allocating code/scale/zero controls verify the probe,
+then repeated grouped executions allocate no bank-sized copies. This scope does
+not claim zero allocations for the entire kernel or a measured latency gain.
+
+Affine MoE's activation/router copies, full output staging, routing indices and
+activation temporaries still need the planned whole-execution workspace. They
+are not made governed merely by borrowing their expert banks. The next step is
+one StepScoped mixed f32/usize layout, with row-sized activation/router scratch
+only when borrowing is impossible, reused across tokens without per-token or
+per-expert admission.

@@ -633,6 +633,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
 
 pub mod activations;
 pub mod add;
+pub(crate) mod affine_bank;
 pub(crate) mod affine_moe;
 pub mod attention;
 pub mod bit_cast;
