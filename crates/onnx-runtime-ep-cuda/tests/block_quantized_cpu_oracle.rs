@@ -14,7 +14,7 @@ fn cpu_block_matmul_oracle_refines_before_launch_without_cuda() {
     for rows in [1, 3] {
         let output = common::run_cpu(
             "BlockQuantizedMatMul",
-            "pkg.nxrt",
+            "pkg.nxrt._private",
             1,
             &[
                 common::input(DataType::Float32, &[rows, 32], &vec![1f32; rows * 32]),
@@ -40,7 +40,7 @@ fn cpu_block_moe_oracle_refines_before_launch_without_cuda() {
     for rows in [1, 3] {
         let output = common::run_cpu(
             "BlockQuantizedMoE",
-            "pkg.nxrt",
+            "pkg.nxrt._private",
             1,
             &[
                 common::input(DataType::Float32, &[rows, 32], &vec![1f32; rows * 32]),

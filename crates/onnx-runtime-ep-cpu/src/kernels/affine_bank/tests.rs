@@ -253,3 +253,94 @@ fn malformed_scales_shapes_and_address_spans_fail_with_context() {
         );
     }
 }
+
+#[test]
+fn block_parameters_preserve_scalar_rounding_across_odd_boundaries_and_mixed_storage() {
+    for (depth, block) in [(1usize, 1usize), (6, 3), (65, 5), (128, 32)] {
+        let (experts, width) = (2, 3);
+        let blocks = depth / block;
+        let codes = (0..experts * width * depth.div_ceil(2))
+            .map(|i| (i.wrapping_mul(73) ^ (i / 3)) as u8)
+            .collect::<Vec<_>>();
+        let zeros = (0..experts * width * blocks.div_ceil(2))
+            .map(|i| (i.wrapping_mul(29) ^ 0xb3) as u8)
+            .collect::<Vec<_>>();
+        for extreme in [false, true] {
+            let scales = (0..experts * width * blocks)
+                .map(|i| {
+                    if extreme {
+                        [f32::from_bits(1), f32::MIN_POSITIVE, f32::MAX, 0.1][i % 4]
+                    } else {
+                        [0.1, 1. / 3., 1.0000001, 0.7][i % 4]
+                    }
+                })
+                .collect::<Vec<_>>();
+            let input = (0..depth)
+                .map(|i| [-0., 0., 0.1, -1. / 7., 12345.67, f32::MIN_POSITIVE][i % 6])
+                .collect::<Vec<_>>();
+            // Codes, scales and zeros can independently be dense, padded,
+            // reversed or unaligned; the shared addressing mode must handle all.
+            for modes in [[0, 0, 0], [0, 2, 4], [1, 0, 3], [4, 4, 0], [2, 1, 2]] {
+                let c = Backing::new(
+                    DataType::Uint8,
+                    [experts, width, depth.div_ceil(2)],
+                    &codes,
+                    modes[0],
+                );
+                let s = Backing::new(
+                    DataType::Float32,
+                    [experts, width, blocks],
+                    &scale_bytes(&scales),
+                    modes[1],
+                );
+                let z = Backing::new(
+                    DataType::Uint8,
+                    [experts, width, blocks.div_ceil(2)],
+                    &zeros,
+                    modes[2],
+                );
+                let (cv, sv, zv) = (c.view(), s.view(), z.view());
+                for has_zero in [false, true] {
+                    let bank = AffineBank::prepare(
+                        &cv,
+                        &sv,
+                        has_zero.then_some(&zv),
+                        [experts, width, depth],
+                        block,
+                        7,
+                    )
+                    .unwrap()
+                    .validate()
+                    .unwrap();
+                    for row in 0..experts * width {
+                        // Frozen column-wise oracle: deliberately derive the
+                        // parameter index independently for each scalar term.
+                        let mut expected = 0.0f32;
+                        for (col, &x) in input.iter().enumerate() {
+                            let p = col / block;
+                            let q =
+                                (codes[row * depth.div_ceil(2) + col / 2] >> ((col % 2) * 4)) & 15;
+                            let zero = if has_zero {
+                                (zeros[row * blocks.div_ceil(2) + p / 2] >> ((p % 2) * 4)) & 15
+                            } else {
+                                7
+                            };
+                            let weight = f32::from(i16::from(q) - i16::from(zero))
+                                * scales[row * blocks + p];
+                            expected += x * weight;
+                        }
+                        let actual = bank.dot(row, &input);
+                        let context = format!(
+                            "depth={depth}, block={block}, modes={modes:?}, zero={has_zero}, extreme={extreme}, row={row}"
+                        );
+                        if expected.is_nan() {
+                            assert!(actual.is_nan(), "{context}");
+                        } else {
+                            assert_eq!(actual.to_bits(), expected.to_bits(), "{context}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

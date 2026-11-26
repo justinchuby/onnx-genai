@@ -51,7 +51,9 @@ impl Default for CpuWeightCacheLimits {
     }
 }
 
-/// Immutable CPU weight resources. Ordinary MatMul-family constant f32
+/// Immutable CPU execution resources, with optional managed ordinary buffers.
+///
+/// Ordinary MatMul-family constant f32
 /// materializations, full f32 block-format/NBits expansions,
 /// owned native/optional-MLAS NBits preparations, optional QLinearMatMul packs,
 /// and retained or transient QMoE experts
@@ -87,6 +89,7 @@ pub struct CpuMemoryResources {
     dense_bytes: usize,
     cache_retention: CpuCacheRetention,
     workspace: Option<onnx_runtime_memory_governor::HostWorkspacePool>,
+    buffers: Option<crate::CpuBufferMemory>,
 }
 
 impl Default for CpuMemoryResources {
@@ -117,6 +120,7 @@ impl CpuMemoryResources {
             dense_bytes: limits.dense_bytes,
             cache_retention: CpuCacheRetention::default(),
             workspace: None,
+            buffers: None,
         })
     }
 
@@ -141,6 +145,15 @@ impl CpuMemoryResources {
                 reason: "CPU weights and workspace use different Host authorities; construct both resources from the same model governor",
             });
         }
+        if let Some(buffers) = &self.buffers
+            && !buffers.matches_workspace(&pool)
+        {
+            return Err(MemoryError::InvalidRequest {
+                tier: Tier::Host.name(),
+                requested: 0,
+                reason: "CPU ordinary buffers and workspace require the same Host authority and exact process manager; construct both domains from the same model resources",
+            });
+        }
         self.workspace = Some(pool);
         Ok(self)
     }
@@ -148,6 +161,32 @@ impl CpuMemoryResources {
         &self,
     ) -> Option<&onnx_runtime_memory_governor::HostWorkspacePool> {
         self.workspace.as_ref()
+    }
+
+    /// Attach real ordinary Host payload ownership, independently of derived weights.
+    pub fn with_buffer_memory(
+        mut self,
+        memory: crate::CpuBufferMemory,
+    ) -> std::result::Result<Self, MemoryError> {
+        let weights = self.weight_memory().host_authority_id();
+        if weights.is_some_and(|id| id != memory.authority_id())
+            || self
+                .workspace
+                .as_ref()
+                .is_some_and(|pool| !memory.matches_workspace(pool))
+        {
+            return Err(MemoryError::InvalidRequest {
+                tier: Tier::Host.name(),
+                requested: 0,
+                reason: "CPU ordinary buffers, derived weights and workspace require one Host authority and workspace process manager; construct their resources from the same model books",
+            });
+        }
+        self.buffers = Some(memory);
+        Ok(self)
+    }
+    /// Actual ordinary-buffer capability; `is_governed` describes derived weights only.
+    pub fn buffer_memory(&self) -> Option<&crate::CpuBufferMemory> {
+        self.buffers.as_ref()
     }
 
     pub fn cache_retention(&self) -> &CpuCacheRetention {

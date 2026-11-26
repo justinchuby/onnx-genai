@@ -1720,7 +1720,7 @@ impl Kernel for FlashAttentionKernel {
 }
 ```
 
-#### `pkg.nxrt::VarlenAttention` v1 packed contract
+#### `pkg.nxrt._private::VarlenAttention` v1 packed contract
 
 The CPU reference path uses token-major packed tensors:
 

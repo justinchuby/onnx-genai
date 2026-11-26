@@ -134,7 +134,10 @@ impl ReasoningBudget {
         }
         let bytes = ByteStreamContract::resolve(tokenizer, SpecialTokenHandling::Preserve)
             .context("resolve reasoning-budget UTF-8 tokenizer contract")?;
-        if let Some(bytes) = bytes.as_ref().filter(|bytes| bytes.has_trailing_strip()) {
+        if let Some(bytes) = bytes
+            .as_ref()
+            .filter(|bytes| bytes.has_trailing_strip() || bytes.has_literal_replace())
+        {
             for (index, sequence) in spec.start_sequences.iter().enumerate() {
                 ensure!(
                     bytes.marker_stable(sequence, &spec.prefix_tokens)?,
@@ -435,7 +438,7 @@ impl BytesState {
             let piece = bytes.pieces.get(id as usize).with_context(|| {
                 format!("reasoning token {id} has no byte-decoder piece; repair tokenizer.json")
             })?;
-            let output = decoder.step(piece);
+            let output = decoder.step(piece, bytes.kinds[id as usize], 4 * 1024 * 1024)?;
             let mut joined = std::mem::take(&mut self.pending);
             joined.extend_from_slice(&output);
             let mut rest = joined.as_slice();
@@ -892,7 +895,7 @@ mod tests {
             reasoning_budget: Some(ReasoningBudget::resolve(&tokenizer, spec(Some(0))).unwrap()),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
         assert!(chain.names().contains(&"reasoning_budget"));
         assert!(!chain.preserves_argmax());
         let mut logits = vec![1.0; 32];
@@ -987,7 +990,7 @@ mod tests {
                 eos_token_id: Some(3),
                 ..Default::default()
             };
-            let chain = build_processor_chain(&options, Some(&tokenizer), false).unwrap();
+            let chain = build_processor_chain(&options, Some(&tokenizer), false, None).unwrap();
             let mut logits = vec![1.0; 32];
             chain
                 .process(&mut logits, &ProcessorContext::default())

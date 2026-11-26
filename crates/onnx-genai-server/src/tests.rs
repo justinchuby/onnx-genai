@@ -26,6 +26,62 @@ fn tiny_state() -> AppState {
     AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture")
 }
 
+/// A real tokenizer registration, rather than nonexistent FIM role spellings.
+fn tiny_fim_state() -> (tempfile::TempDir, AppState) {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    copy_tree(&source, scratch.path());
+    let path = scratch.path().join("tokenizer.json");
+    let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for (id, role) in [(29, "<PRE>"), (30, "<MID>"), (31, "<SUF>")] {
+        tokenizer["model"]["vocab"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&format!("tok{id}"));
+        tokenizer["model"]["vocab"][role] = json!(id);
+        tokenizer["added_tokens"].as_array_mut().unwrap().push(json!({"id":id,"content":role,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}));
+    }
+    std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+    let config = onnx_genai_engine::FimConfig {
+        prefix_token: "<PRE>".into(),
+        middle_token: "<MID>".into(),
+        suffix_token: "<SUF>".into(),
+        extra_context_template: None,
+        additional_stop_tokens: Vec::new(),
+        format: onnx_genai_engine::InfillOrder::Psm,
+    };
+    let tokenizer =
+        onnx_genai_ort::Tokenizer::from_file(scratch.path().join("tokenizer.json")).unwrap();
+    assert_eq!(
+        tokenizer
+            .encode_with_options(
+                &config.format_prompt("hello", "world"),
+                onnx_genai_ort::TokenizationOptions {
+                    add_special: false,
+                    parse_special: true
+                }
+            )
+            .unwrap(),
+        vec![29, 4, 31, 5, 30]
+    );
+    let state = AppState::load(scratch.path(), Some("tiny-llm".into()))
+        .expect("load registered FIM fixture")
+        .with_default_fim_config(Some(config));
+    (scratch, state)
+}
+
+async fn assert_fim_ok(response: axum::response::Response) -> axum::response::Response {
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        panic!(
+            "FIM request returned {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    response
+}
+
 #[tokio::test]
 async fn raw_grammar_strip_wire_matches_native_and_ort_publication() {
     for backend in [
@@ -4008,15 +4064,7 @@ async fn vision_request_routes_through_tiny_vlm_pipeline() {
 
 #[test]
 fn completion_suffix_maps_to_fim_generation() {
-    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
-    let state = AppState::load(&model_dir, Some("tiny-llm".to_string()))
-        .expect("load fixture")
-        .with_default_fim_config(Some(onnx_genai_engine::FimConfig {
-            prefix_token: "<PRE>".to_string(),
-            middle_token: "<MID>".to_string(),
-            suffix_token: "<SUF>".to_string(),
-            format: onnx_genai_engine::FimFormat::PSM,
-        }));
+    let (_package, state) = tiny_fim_state();
     let handle = state.registry.resolve("").unwrap().unwrap();
     let request: CompletionRequest = serde_json::from_value(json!({
         "model": "tiny-llm",
@@ -4031,13 +4079,20 @@ fn completion_suffix_maps_to_fim_generation() {
 
     let prepared = prepare_completion(&request, &handle, 4096).unwrap();
     match prepared.generation {
-        CompletionGeneration::Fim {
-            prefix,
-            suffix,
-            options,
-        } => {
-            assert_eq!(prefix, "prefix");
-            assert_eq!(suffix, "suffix");
+        CompletionGeneration::Fim { tokens, options } => {
+            assert_eq!(
+                tokens,
+                handle
+                    .tokenizer
+                    .encode(
+                        &handle
+                            .fim_config
+                            .as_ref()
+                            .unwrap()
+                            .format_prompt("prefix", "suffix")
+                    )
+                    .unwrap()
+            );
             assert_eq!(options.max_new_tokens, 7);
             assert_eq!(options.min_p, 0.2);
             assert_eq!(options.frequency_penalty, 0.3);
@@ -4049,15 +4104,7 @@ fn completion_suffix_maps_to_fim_generation() {
 
 #[tokio::test]
 async fn completion_suffix_uses_fim_and_returns_text_completion() {
-    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
-    let state = AppState::load(&model_dir, Some("tiny-llm".to_string()))
-        .expect("load fixture")
-        .with_default_fim_config(Some(onnx_genai_engine::FimConfig {
-            prefix_token: "<PRE>".to_string(),
-            middle_token: "<MID>".to_string(),
-            suffix_token: "<SUF>".to_string(),
-            format: onnx_genai_engine::FimFormat::PSM,
-        }));
+    let (_package, state) = tiny_fim_state();
 
     let response = app(state)
         .oneshot(
@@ -4079,6 +4126,7 @@ async fn completion_suffix_uses_fim_and_returns_text_completion() {
         .await
         .unwrap();
 
+    let response = assert_fim_ok(response).await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap();
@@ -4107,15 +4155,7 @@ fn stop_boundary_buffer_suppresses_matched_stop_sequence() {
 
 #[tokio::test]
 async fn fim_stream_returns_headers_before_generation_finishes() {
-    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
-    let state = AppState::load(&model_dir, Some("tiny-llm".to_string()))
-        .expect("load fixture")
-        .with_default_fim_config(Some(onnx_genai_engine::FimConfig {
-            prefix_token: "<PRE>".to_string(),
-            middle_token: "<MID>".to_string(),
-            suffix_token: "<SUF>".to_string(),
-            format: onnx_genai_engine::FimFormat::PSM,
-        }));
+    let (_package, state) = tiny_fim_state();
     let request = Request::builder()
         .method("POST")
         .uri("/v1/completions")
@@ -4147,6 +4187,7 @@ async fn fim_stream_returns_headers_before_generation_finishes() {
         .await
         .expect("SSE headers must follow admission, not completed FIM generation")
         .unwrap();
+    let response = assert_fim_ok(response).await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = timeout(
         Duration::from_secs(10),
@@ -6793,15 +6834,7 @@ async fn a_rejected_request_neither_opens_nor_evicts_a_session() {
 /// conversation once the registry is full — for a request that never touches it.
 #[tokio::test]
 async fn a_fim_completion_carrying_a_session_id_opens_no_session() {
-    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
-    let state = AppState::load(&model_dir, Some("tiny-llm".to_string()))
-        .expect("load fixture")
-        .with_default_fim_config(Some(onnx_genai_engine::FimConfig {
-            prefix_token: "<PRE>".to_string(),
-            middle_token: "<MID>".to_string(),
-            suffix_token: "<SUF>".to_string(),
-            format: onnx_genai_engine::FimFormat::PSM,
-        }));
+    let (_package, state) = tiny_fim_state();
     let router = app(state.clone());
 
     let response = router
@@ -6855,6 +6888,7 @@ async fn a_fim_completion_carrying_a_session_id_opens_no_session() {
         )
         .await
         .unwrap();
+    let plain = assert_fim_ok(plain).await;
     assert_eq!(plain.status(), StatusCode::OK);
 }
 
@@ -9381,6 +9415,7 @@ mod native_compat {
                     "temperature":0,"top_k":7,"top_p":0.5,"seed":17,"ignore_eos":true,
                     "samplers":["top_k","temperature"],"logit_bias":{"22":100},"stop":["tail",stop]});
                 let response = request(router.clone(), "/completion", body.clone()).await;
+                let response = assert_fim_ok(response).await;
                 assert_eq!(response.status(), StatusCode::OK);
                 let value = if stream {
                     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
@@ -9413,6 +9448,7 @@ mod native_compat {
                     "stopping_word"
                 ]);
                 let response = request(router.clone(), "/completion", projected).await;
+                let response = assert_fim_ok(response).await;
                 assert_eq!(response.status(), StatusCode::OK);
                 let projected = if stream {
                     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
@@ -9440,6 +9476,7 @@ mod native_compat {
                     body["logprobs"] = json!(1);
                 }
                 let response = request(router.clone(), path, body).await;
+                let response = assert_fim_ok(response).await;
                 assert_eq!(response.status(), StatusCode::OK);
                 if stream {
                     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
@@ -9483,6 +9520,7 @@ mod native_compat {
                 }),
             )
             .await;
+            let response = assert_fim_ok(response).await;
             assert_eq!(response.status(), StatusCode::OK);
             let rows = if stream {
                 let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
@@ -9499,14 +9537,8 @@ mod native_compat {
                 assert_eq!(row["generation_settings/n_predict"], 1);
             }
         }
-        let fim = app(
-            tiny_state().with_default_fim_config(Some(onnx_genai_engine::FimConfig {
-                prefix_token: "<PRE>".into(),
-                middle_token: "<MID>".into(),
-                suffix_token: "<SUF>".into(),
-                format: onnx_genai_engine::FimFormat::PSM,
-            })),
-        );
+        let (_package, state) = tiny_fim_state();
+        let fim = app(state);
         for stream in [false, true] {
             let response = request(
                 fim.clone(),
@@ -9517,6 +9549,7 @@ mod native_compat {
                 }),
             )
             .await;
+            let response = assert_fim_ok(response).await;
             assert_eq!(response.status(), StatusCode::OK);
             let row = if stream {
                 let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
@@ -9607,6 +9640,7 @@ mod native_compat {
         assert_eq!(baseline.status(), StatusCode::OK);
         let baseline = json_body(baseline).await;
         let response=request(router.clone(),"/completion",json!({"prompt":"hello","n_predict":1,"return_tokens":true,"response_fields":["content","tokens","timings/predicted_n","missing","tokens/0"]})).await;
+        let response = assert_fim_ok(response).await;
         assert_eq!(response.status(), StatusCode::OK);
         let selected = json_body(response).await;
         assert_eq!(
@@ -9615,6 +9649,7 @@ mod native_compat {
         );
         for stream in [false, true] {
             let response=request(router.clone(),"/completion",json!({"prompt":["hello","world"],"n_predict":1,"stream":stream,"response_fields":["tokens_predicted"]})).await;
+            let response = assert_fim_ok(response).await;
             assert_eq!(response.status(), StatusCode::OK);
             if stream {
                 let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
@@ -9639,6 +9674,7 @@ mod native_compat {
         }
         for stream in [false, true] {
             let response=request(router.clone(),"/completion",json!({"prompt":[2,4,3],"n_predict":0,"stream":stream,"response_fields":["tokens_predicted","timings/predicted_n"]})).await;
+            let response = assert_fim_ok(response).await;
             assert_eq!(response.status(), StatusCode::OK);
             let expected = json!({"tokens_predicted":0,"timings/predicted_n":0});
             if stream {
@@ -9648,15 +9684,10 @@ mod native_compat {
                 assert_eq!(json_body(response).await, expected);
             }
         }
-        let fim = app(
-            tiny_state().with_default_fim_config(Some(onnx_genai_engine::FimConfig {
-                prefix_token: "<PRE>".into(),
-                middle_token: "<MID>".into(),
-                suffix_token: "<SUF>".into(),
-                format: onnx_genai_engine::FimFormat::PSM,
-            })),
-        );
+        let (_package, state) = tiny_fim_state();
+        let fim = app(state);
         let response=request(fim,"/infill",json!({"input_prefix":"hello","input_suffix":"world","n_predict":1,"response_fields":["tokens_predicted"]})).await;
+        let response = assert_fim_ok(response).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(json_body(response).await, json!({"tokens_predicted":1}));
         for fields in [json!(null), json!("content"), json!(["content", 1])] {
@@ -10179,14 +10210,8 @@ mod native_compat {
 
     #[tokio::test]
     async fn prompt_progress_is_opt_in_and_reports_real_cold_and_cached_prompt_work() {
-        let router = app(tiny_state().with_default_fim_config(Some(
-            onnx_genai_engine::FimConfig {
-                prefix_token: "<PRE>".into(),
-                middle_token: "<MID>".into(),
-                suffix_token: "<SUF>".into(),
-                format: onnx_genai_engine::FimFormat::PSM,
-            },
-        )));
+        let (_package, state) = tiny_fim_state();
+        let router = app(state);
         for path in [
             "/completion",
             "/v1/completions",
@@ -10207,6 +10232,7 @@ mod native_compat {
                     _ => body["prompt"] = json!([2, 4, 3]),
                 }
                 let response = request(router.clone(), path, body).await;
+                let response = assert_fim_ok(response).await;
                 let status = response.status();
                 let values =
                     sse_json_events(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap());
@@ -14119,8 +14145,8 @@ mod ctc_transcription {
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
             assert!(error.contains("codec"), "{error}");
-            for opus in ["celt-1", "hybrid-2"] {
-                let bytes = std::fs::read(fixtures.join(format!("../opus/{opus}.ogg"))).unwrap();
+            for opus in ["celt-1.ogg", "hybrid-2.ogg", "celt-1.webm", "hybrid-2.webm"] {
+                let bytes = std::fs::read(fixtures.join(format!("../opus/{opus}"))).unwrap();
                 let (status, body) = send(
                     router.clone(),
                     "/v1/audio/transcriptions",
@@ -14131,6 +14157,48 @@ mod ctc_transcription {
                 assert_eq!(status, StatusCode::OK, "{name}/{opus}: {body}");
                 let body: Value = serde_json::from_str(&body).unwrap();
                 assert!(body["text"].is_string(), "{name}/{opus}: {body}");
+                let fixture_name = opus.rsplit_once('.').unwrap().0;
+                let channels = if fixture_name.ends_with("-1") { 1 } else { 2 };
+                let reference =
+                    std::fs::read(fixtures.join(format!("../opus/{fixture_name}.reference.f32")))
+                        .unwrap()
+                        .chunks_exact(4)
+                        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                let mono = reference
+                    .chunks_exact(channels)
+                    .map(|frame| {
+                        (frame.iter().map(|sample| f64::from(*sample)).sum::<f64>()
+                            / channels as f64) as f32
+                    })
+                    .collect::<Vec<_>>();
+                let wav = onnx_genai_preprocess::audio::encode_wav_f32(&mono, 48000, 1).unwrap();
+                let (status, expected) = send(
+                    router.clone(),
+                    "/v1/audio/transcriptions",
+                    &wav,
+                    &[("model", name)],
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "reference/{opus}: {expected}");
+                let expected: Value = serde_json::from_str(&expected).unwrap();
+                assert_eq!(
+                    body, expected,
+                    "{name}/{opus}: independent PCM transcription"
+                );
+                let (status, events) = send(
+                    router.clone(),
+                    "/v1/audio/transcriptions",
+                    &bytes,
+                    &[("model", name), ("stream", "true")],
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{name}/{opus}: {events}");
+                assert_eq!(
+                    transcript_events(&events).last().unwrap(),
+                    &expected,
+                    "{name}/{opus}: streamed independent PCM transcription"
+                );
             }
             for case in manifest["cases"].as_array().unwrap() {
                 let file = case["file"].as_str().unwrap();

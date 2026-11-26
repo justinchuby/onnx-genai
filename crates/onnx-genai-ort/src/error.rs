@@ -75,8 +75,8 @@ pub(crate) fn api() -> Result<&'static onnx_genai_ort_sys::OrtApi> {
                  Fix: set ONNX_GENAI_ORT_LIB to the full path of the ORT {ort_version} library \
                  (for example a conda env's onnxruntime.dll), set ONNX_GENAI_ORT_LIB_DIR \
                  to its containing directory, activate that conda env and put its library \
-                 directory first on PATH/LD_LIBRARY_PATH/DYLD_LIBRARY_PATH, or rebuild so \
-                 ort-sys downloads ORT {ort_version}.",
+                 directory first on PATH/LD_LIBRARY_PATH/DYLD_LIBRARY_PATH, or explicitly \
+                 install an ORT {ort_version} runtime.",
                 onnx_genai_ort_sys::ORT_API_VERSION,
                 ort_version = onnx_genai_ort_sys::ORT_VERSION
             )));

@@ -93,7 +93,7 @@ graph {
       s: "mxfp4"
       type: STRING
     }
-    domain: "pkg.nxrt"
+    domain: "pkg.nxrt._private"
   }
   node {
     input: "attention_mask"
@@ -469,6 +469,6 @@ opset_import {
   version: 24
 }
 opset_import {
-  domain: "pkg.nxrt"
+  domain: "pkg.nxrt._private"
   version: 1
 }

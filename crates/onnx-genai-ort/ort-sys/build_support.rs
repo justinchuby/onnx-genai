@@ -42,7 +42,7 @@ pub fn artifact_for(os: &str, arch: &str) -> Result<Artifact, String> {
         },
         _ => {
             return Err(format!(
-                "no pinned ONNX Runtime PyPI wheel for target {os}/{arch}; supported targets are Linux x86_64/aarch64, macOS aarch64 (14+), and Windows x86_64/aarch64. Set ORT_ROOT to a matching local ONNX Runtime install to build this target"
+                "no pinned ONNX Runtime PyPI wheel for target {os}/{arch}; supported targets are Linux x86_64/aarch64, macOS aarch64 (14+), and Windows x86_64/aarch64. Install a matching local ONNX Runtime and set ONNX_GENAI_ORT_LIB to its shared library for reference execution; Native builds require no ORT binary"
             ));
         }
     })
@@ -116,7 +116,7 @@ pub fn extract_native_libraries(
     }
     if !libraries.iter().any(|(_, name)| name == required) {
         return Err(format!(
-            "ONNX Runtime wheel {} does not contain onnxruntime/capi/{required}; choose the pinned artifact for the target or set ORT_ROOT",
+            "ONNX Runtime wheel {} does not contain onnxruntime/capi/{required}; choose the pinned artifact for the target or install the target runtime explicitly and set ONNX_GENAI_ORT_LIB",
             wheel.display()
         ));
     }

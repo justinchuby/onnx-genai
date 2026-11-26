@@ -430,6 +430,7 @@ fn hex(bytes: &[u8]) -> String {
 pub struct ServerConfig {
     pub sse_ping_interval: crate::SsePingInterval,
     pub api_keys: crate::ApiKeys,
+    pub cors: crate::CorsPolicy,
     /// Node-level identifier reported by `GET /v1/status` for the cluster router
     /// (§34.8). Independent of any model; defaults to the hostname or a generated id.
     pub node_id: String,
@@ -453,6 +454,10 @@ pub struct ServerConfig {
 
     /// Maximum completion prompts admitted by one native or OpenAI request.
     pub max_completion_prompts: std::num::NonZeroUsize,
+    pub max_infill_files: std::num::NonZeroUsize,
+    pub max_infill_filename_bytes: std::num::NonZeroUsize,
+    pub max_infill_context_bytes: std::num::NonZeroUsize,
+    pub max_infill_template_operations: std::num::NonZeroU64,
     /// Per query/document pair input budget for non-generative scoring.
     pub max_rerank_input_tokens: std::num::NonZeroUsize,
     /// Maximum document count in one scoring request.
@@ -526,6 +531,7 @@ impl Default for ServerConfig {
         Self {
             sse_ping_interval: crate::SsePingInterval::default(),
             api_keys: crate::ApiKeys::default(),
+            cors: crate::CorsPolicy::default(),
             node_id: default_node_id(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             realtime: crate::realtime::RealtimeLimits::default(),
@@ -537,6 +543,13 @@ impl Default for ServerConfig {
             model_downloads: std::num::NonZeroUsize::new(2).unwrap(),
             max_completion_prompts: std::num::NonZeroUsize::new(128)
                 .expect("positive native prompt budget"),
+            max_infill_files: std::num::NonZeroUsize::new(128).expect("positive infill file limit"),
+            max_infill_filename_bytes: std::num::NonZeroUsize::new(4096)
+                .expect("positive infill filename limit"),
+            max_infill_context_bytes: std::num::NonZeroUsize::new(8 * 1024 * 1024)
+                .expect("positive infill context limit"),
+            max_infill_template_operations: std::num::NonZeroU64::new(100_000)
+                .expect("positive infill operation limit"),
             max_rerank_input_tokens: std::num::NonZeroUsize::new(8192)
                 .expect("positive default reranking token budget"),
             max_rerank_documents: std::num::NonZeroUsize::new(128)

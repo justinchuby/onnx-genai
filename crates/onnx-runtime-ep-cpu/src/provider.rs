@@ -113,7 +113,7 @@ impl CpuExecutionProvider {
 
     /// Construct all CPU factories with the same immutable session resources.
     pub fn with_resources(resources: CpuMemoryResources) -> Self {
-        let mut ep = Self::shared_kernels(resources);
+        let mut ep = Self::shared_kernels(resources, true);
         ep.registry.register(
             onnx_runtime_ep_api::OpKey::new(
                 onnx_runtime_optimizer::affine_moe::OP,
@@ -128,14 +128,17 @@ impl CpuExecutionProvider {
 
     /// CPU provider for the ORT plugin: exclude standalone-only registry entries and passes.
     pub fn for_ort_plugin() -> Self {
-        Self::shared_kernels(CpuMemoryResources::default())
+        Self::shared_kernels(CpuMemoryResources::default(), false)
     }
 
-    fn shared_kernels(resources: CpuMemoryResources) -> Self {
+    fn shared_kernels(resources: CpuMemoryResources, native_linear_quantization: bool) -> Self {
         Self {
             device: DeviceId::cpu(),
             initialized: false,
-            registry: build_cpu_registry_with_resources(resources.clone()),
+            registry: build_cpu_registry_with_resources(
+                resources.clone(),
+                native_linear_quantization,
+            ),
             resources,
             local_workspace: std::sync::OnceLock::new(),
             memory: default_cpu_memory(),
@@ -517,6 +520,22 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "Equal"
+            && onnx_runtime_ir::is_default_domain(&op.domain)
+            && input_dtypes.contains(&DataType::String)
+        {
+            let since = crate::kernels::logical::EQUAL_STRING_SINCE;
+            if opset < since {
+                deny!(
+                    "Equal does not accept tensor(string) at opset {opset}; export at opset {since} or later, or supply matching non-string operands"
+                );
+            }
+            if input_dtypes != [DataType::String, DataType::String] {
+                deny!(
+                    "Equal requires two tensor(string) operands when either operand is String; got {input_dtypes:?}"
+                );
+            }
+        }
         if let Some(reason) =
             onnx_runtime_ep_api::standard_activation::unsupported_reason(op, opset, input_dtypes)
         {
@@ -653,7 +672,17 @@ impl ExecutionProvider for CpuExecutionProvider {
         passes
     }
 
+    fn host_payload_funding(&self) -> Option<onnx_runtime_ep_api::HostPayloadFunding> {
+        self.resources
+            .buffer_memory()
+            .map(crate::CpuBufferMemory::host_payload_funding)
+    }
+
     fn allocate(&self, size: usize, alignment: usize) -> Result<DeviceBuffer> {
+        if let Some(memory) = self.resources.buffer_memory() {
+            return memory.allocate(size, alignment, self.device);
+        }
+
         if alignment == 0 || !alignment.is_power_of_two() {
             return Err(EpError::AlignmentError);
         }
@@ -727,6 +756,28 @@ impl ExecutionProvider for CpuExecutionProvider {
         if buffer.is_borrowed() {
             return Ok(());
         }
+        let buffer = match buffer.into_bound_ownership() {
+            Ok(onnx_runtime_ep_api::BoundBufferOwnership::Managed(owner)) => {
+                let outcome = owner.release_now().map_err(|source| EpError::Backend {
+                    operation: "release CPU ordinary managed Host payload",
+                    source: Box::new(source),
+                })?;
+                return if outcome.is_complete() {
+                    Ok(())
+                } else {
+                    Err(EpError::KernelFailed(format!(
+                        "CPU ordinary Host payload release retained funded ownership: {outcome:?}; inspect the process memory quarantine and resolve the backing release failure"
+                    )))
+                };
+            }
+            Ok(onnx_runtime_ep_api::BoundBufferOwnership::Binding(owner)) => {
+                // This provider never issues bare bound ordinary allocations.
+                // Dropping preserves the binding's unresolved ownership record.
+                drop(owner);
+                return Err(EpError::KernelFailed("CPU ordinary Host payload lacks a managed allocation token; return the complete owner issued by this provider".into()));
+            }
+            Err(buffer) => buffer,
+        };
         let size = buffer.len();
         let align = buffer.alignment();
         let ptr = buffer.into_raw() as *mut u8;
@@ -1152,7 +1203,7 @@ mod tests {
             })
             .collect();
         let mut node = Node::new(NodeId(0), "CompressedSparseAttention", inputs, outputs);
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes
             .insert("num_heads".into(), Attribute::Int(1));
         node.attributes
@@ -2069,6 +2120,7 @@ mod tests {
     #[test]
     fn qlinear_matmul_claim_gate_checks_quantized_dtypes() {
         let ep = CpuExecutionProvider::new();
+        let ort = CpuExecutionProvider::for_ort_plugin();
         let node = Node::new(onnx_runtime_ir::NodeId(0), "QLinearMatMul", vec![], vec![]);
         let valid = [
             DataType::Uint8,
@@ -2084,6 +2136,41 @@ mod tests {
             ep.supports_op(&node, 10, &[], &valid, &[]).is_supported(),
             "valid QLinearMatMul types should be claimed"
         );
+        assert!(ort.supports_op(&node, 21, &[], &valid, &[]).is_supported());
+        let (_, descriptors) = crate::build_cpu_registry_with_descriptors();
+        let versions: Vec<_> = descriptors
+            .iter()
+            .filter(|op| op.op_type == "QLinearMatMul" && op.domain.is_empty())
+            .map(|op| (op.since_version, op.end_version))
+            .collect();
+        assert_eq!(versions, [(10, u64::MAX)]);
+
+        for half in [DataType::Float16, DataType::BFloat16] {
+            let mut types = valid;
+            for index in [1, 4, 6] {
+                types[index] = half;
+            }
+            assert!(!ep.supports_op(&node, 9, &[], &types, &[]).is_supported());
+            for opset in [10, 21] {
+                assert!(
+                    ep.supports_op(&node, opset, &[], &types, &[])
+                        .is_supported()
+                );
+                let legacy = ort.supports_op(&node, opset, &[], &types, &[]);
+                let reason = legacy.reason().unwrap();
+                assert!(
+                    reason.contains("half scales are only supported by standalone nxrt"),
+                    "{reason}"
+                );
+            }
+            types[6] = DataType::Float32;
+            let mixed = ep.supports_op(&node, 21, &[], &types, &[]);
+            let reason = mixed.reason().unwrap();
+            assert!(
+                reason.contains("y_scale dtype to match a_scale"),
+                "{reason}"
+            );
+        }
 
         let mut invalid = valid;
         invalid[0] = DataType::Float32;
@@ -2216,7 +2303,7 @@ mod tests {
         }
     }
 
-    /// Builds a `pkg.nxrt::DsaIndexSelect` node plus the `(shapes, dtypes)`
+    /// Builds a `pkg.nxrt._private::DsaIndexSelect` node plus the `(shapes, dtypes)`
     /// claim metadata for a compatible baseline: batch=1, q_seq=2, heads=2,
     /// head_dim=4, key_seq=3, top_k=2. Each shape/dtype axis matches
     /// `DsaIndexSelectKernel::derive_dims`'s cross-input contract exactly, so
@@ -2238,7 +2325,7 @@ mod tests {
             static_shape([]),
         );
         let mut node = Node::new(NodeId(0), "DsaIndexSelect", inputs, vec![output]);
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes.insert("top_k".into(), Attribute::Int(2));
         node.attributes
             .insert("scale".into(), Attribute::Float(1.0));

@@ -269,7 +269,7 @@ fn block_quantized_moe_graph() -> (Graph, NodeId) {
     const MXFP4_BLOCK_BYTES: usize = 17;
 
     let mut graph = Graph::new();
-    graph.opset_imports.insert("pkg.nxrt".into(), 1);
+    graph.opset_imports.insert("pkg.nxrt._private".into(), 1);
     let input = graph.create_named_value("hidden", DataType::Float32, static_shape([ROWS, HIDDEN]));
     graph.add_input(input);
     let router = graph.create_named_value(
@@ -314,7 +314,7 @@ fn block_quantized_moe_graph() -> (Graph, NodeId) {
         ],
         vec![output],
     );
-    node.domain = "pkg.nxrt".to_string();
+    node.domain = "pkg.nxrt._private".to_string();
     for (name, value) in [
         ("k", Attribute::Int(2)),
         ("activation_type", Attribute::String(b"silu".to_vec())),
