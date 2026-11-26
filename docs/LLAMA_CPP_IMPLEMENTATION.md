@@ -2668,3 +2668,22 @@ all-target default engine/server and explicit ORT-reference server Clippy,
 format/diff and vendored compiler provenance checks passed. The compiler error
 export is available in the bundled source; registry-only Rust publication
 requires the patched compiler dependency to be published/upstreamed first.
+
+
+## Standalone power-spectrogram audio features
+
+Authored `spectrogram` operations now execute explicit power/Hann FFT geometry,
+preserve declared analysis rates and produce `[batch,bins,frames]` tensors with
+branch-local valid frames and masks. Shared streaming FFT/window analysis keeps
+log-mel projection and normalization intact; compiled Spectrum/Mel kinds reject
+Whisper normalization on linear power. Other DSP/window/centering conventions
+remain open. See [audio preprocessing](AUDIO_PREPROCESSING.md#linear-power-spectrograms).
+
+Independent review preserved checked mel dimension/allocation admission before
+FFT planning. Validation: all 120 preprocessing tests passed, including varied
+geometry against an independent f64 DFT; 6 Native spectrogram/waveform/reuse
+integration tests passed, including analytic spectrum energy at the actual head.
+Full server library: 629 passed, 2 inherited ignores. Strict all-target default
+preprocess/engine/server and explicit ORT-reference server Clippy, formatting and
+diff checks passed. This is functional macOS ARM64 CPU coverage; no device or
+performance claim and no completion of the broader acceptance list.
