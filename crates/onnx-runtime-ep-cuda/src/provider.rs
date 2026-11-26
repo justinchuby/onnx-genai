@@ -3715,7 +3715,7 @@ impl CudaExecutionProvider {
     }
 
     /// Build a live GPU weight pager (WEIGHT_OFFLOAD Phase 3b) that binds an
-    /// offloaded `pkg.nxrt::BlockQuantizedMoE` weight into a VRAM page, copying
+    /// offloaded `pkg.nxrt._private::BlockQuantizedMoE` weight into a VRAM page, copying
     /// its canonical bytes from `source` host→device. The returned binding is
     /// byte-identical to a resident upload of the same weight.
     pub fn weight_pager<'a, S: onnx_runtime_ep_api::MmapRegionSource>(
@@ -4432,20 +4432,20 @@ impl ExecutionProvider for CudaExecutionProvider {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "BlockQuantizedMatMul"
-            && op.domain == "pkg.nxrt"
+            && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && let Some(reason) = crate::kernels::block_quantized_matmul::unsupported_reason(op)
         {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "BlockQuantizedMoE"
-            && op.domain == "pkg.nxrt"
+            && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && let Some(reason) =
                 crate::kernels::block_quantized_moe::unsupported_reason(op, shapes, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "CompressedSparseAttention"
-            && op.domain == "pkg.nxrt"
+            && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && let Some(reason) = crate::kernels::compressed_sparse_attention::unsupported_reason(
                 op,
                 shapes,
@@ -4455,35 +4455,35 @@ impl ExecutionProvider for CudaExecutionProvider {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "KvCacheCapacityAppend"
-            && op.domain == "pkg.nxrt"
+            && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && let Some(reason) =
                 crate::kernels::kv_cache_capacity_append::unsupported_reason(shapes, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "IndexShare"
-            && op.domain == "pkg.nxrt"
+            && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && let Some(reason) =
                 crate::kernels::index_share::unsupported_reason(op, shapes, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "DsaIndexSelect"
-            && op.domain == "pkg.nxrt"
+            && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && let Some(reason) =
                 crate::kernels::dsa_index_select::unsupported_reason(op, shapes, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "PackedVarlenAttention"
-            && op.domain == "pkg.nxrt"
+            && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && let Some(reason) =
                 crate::kernels::packed_varlen_attention::unsupported_reason(op, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "VarlenAttention"
-            && op.domain == "pkg.nxrt"
+            && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && let Some(reason) =
                 crate::kernels::varlen_attention::unsupported_reason(op, input_dtypes)
         {

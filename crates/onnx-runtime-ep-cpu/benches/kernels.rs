@@ -232,7 +232,7 @@ fn block_quantized_matmul_kernel(
     n: usize,
 ) -> Box<dyn Kernel> {
     let mut node = Node::new(NodeId(0), "BlockQuantizedMatMul", vec![], vec![]);
-    node.domain = "pkg.nxrt".into();
+    node.domain = "pkg.nxrt._private".into();
     node.attributes.insert("K".into(), Attribute::Int(k as i64));
     node.attributes.insert("N".into(), Attribute::Int(n as i64));
     node.attributes
@@ -394,7 +394,7 @@ fn bench_block_quantized_matmul_cache(c: &mut Criterion) {
 
 fn block_quantized_moe_kernel(cpu: &CpuExecutionProvider, top_k: usize) -> Box<dyn Kernel> {
     let mut node = Node::new(NodeId(0), "BlockQuantizedMoE", vec![], vec![]);
-    node.domain = "pkg.nxrt".into();
+    node.domain = "pkg.nxrt._private".into();
     node.attributes
         .insert("k".into(), Attribute::Int(top_k as i64));
     node.attributes.insert(

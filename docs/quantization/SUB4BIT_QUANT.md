@@ -222,7 +222,7 @@ and GEMM kernels because materializing f32 weights is memory-bandwidth hostile.
 Incubate a private op, then propose it upstream:
 
 ```text
-pkg.nxrt::BlockQuantizedMatMul(
+pkg.nxrt._private::BlockQuantizedMatMul(
     A, packed_B, optional_bias
 ) -> Y
 
@@ -254,7 +254,7 @@ The op name intentionally says “block quantized”, not “NBits”: MXFP4 and
 indices are semantic formats, not merely bit widths. A future schema can add
 standardized layouts without changing the meaning of old models.
 
-The CPU v1 implementation registers this op in `pkg.nxrt`, accepts f32/f16/bf16
+The CPU v1 implementation registers this op in `pkg.nxrt._private`, accepts f32/f16/bf16
 `A`, native uint8 `packed_B`, and an optional same-dtype bias. It computes in
 f32. When the complete dense weight fits the per-kernel cache policy and its
 Host grant is admitted, it uses the shared CPU GEMM. Otherwise it decodes a bounded tile per worker shard and reuses it

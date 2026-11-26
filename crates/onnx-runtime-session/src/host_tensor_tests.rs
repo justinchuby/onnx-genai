@@ -49,10 +49,15 @@ fn initialized_fill_error_and_unwind_release_real_managed_backing() {
                 "safe callbacks may read every supplied byte"
             );
             bytes[0] = 77;
-            Err(SessionError::Internal("deliberate fill refusal".into()))
+            Err(SessionError::Internal("deliberate fill refusal".into()).into())
         })
         .unwrap_err();
     assert!(error.to_string().contains("deliberate fill refusal"));
+    assert!(matches!(
+        std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<SessionError>()),
+        Some(SessionError::Internal(message)) if message == "deliberate fill refusal"
+    ));
     assert_eq!(governor.used(Tier::Host), 0);
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = context.fill(DataType::Float32, vec![4], |bytes| {
@@ -244,7 +249,8 @@ fn strided_sequence_view_copies_directly_into_admitted_backing() {
     element.layout = TensorLayout::strided(vec![1, 2]);
     let copied = context
         .fill(DataType::Float32, vec![2, 2], |bytes| {
-            element.copy_host_contiguous_into(bytes)
+            element.copy_host_contiguous_into(bytes)?;
+            Ok(())
         })
         .unwrap();
     assert_eq!(copied.try_as_slice_f32().unwrap(), &[1.0, 3.0, 2.0, 4.0]);
