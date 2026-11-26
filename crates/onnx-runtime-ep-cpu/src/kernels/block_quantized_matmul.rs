@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, Result, TensorBacking, TensorMetadata, TensorMut, TensorView,
-    WorkspaceRequirement, WorkspaceView,
+    WorkspaceLayout, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
 use onnx_runtime_quantization::{
@@ -376,7 +376,7 @@ impl BlockQuantizedMatMulKernel {
         };
         let rows = self.projection_rows(a.shape)?;
         let plan = PackedProjectionPlan::for_current_pool(self.arithmetic);
-        let layout = plan.layout(rows, self.k, self.n)?;
+        let (layout, _) = self.execution_workspace_layout(rows, plan)?;
         Ok((
             plan,
             WorkspaceRequirement {
@@ -385,6 +385,24 @@ impl BlockQuantizedMatMulKernel {
                 ..WorkspaceRequirement::NONE
             },
         ))
+    }
+
+    fn execution_workspace_layout(
+        &self,
+        rows: usize,
+        plan: PackedProjectionPlan,
+    ) -> Result<(WorkspaceLayout<2>, usize)> {
+        let result_elements = rows.checked_mul(self.n).ok_or_else(|| error(format!(
+            "final output staging element count overflows for rows={rows}, N={}; reduce batch or projection dimensions", self.n
+        )))?;
+        let result = std::alloc::Layout::array::<f32>(result_elements).map_err(|_| error(format!(
+            "final f32 output staging for rows={rows}, N={} exceeds addressable capacity; reduce batch or projection dimensions", self.n
+        )))?;
+        // Both regions are live during a projection. Dense-cache hits only
+        // initialize the result region, while the complete admission continues
+        // to cover a later streamed fallback without changing arithmetic.
+        let projection = plan.maximum_layout(rows, [(self.k, self.n)])?;
+        Ok((WorkspaceLayout::new([projection, result])?, result_elements))
     }
 
     fn projection_rows(&self, shape: &[usize]) -> Result<usize> {
@@ -431,8 +449,17 @@ impl BlockQuantizedMatMulKernel {
                 self.k, a_shape
             )));
         }
-        let expected_output_shape = [&a_shape[..a_shape.len() - 1], &[self.n]].concat();
-        require_shape("Y", outputs[0].shape, &expected_output_shape)?;
+        let y_shape = outputs[0].shape;
+        if y_shape.len() != a_shape.len()
+            || y_shape.last() != Some(&self.n)
+            || y_shape[..y_shape.len() - 1] != a_shape[..a_shape.len() - 1]
+        {
+            return Err(error(format!(
+                "Y must have shape with leading dimensions {:?} followed by N={}, got {y_shape:?}; match A's leading dimensions and the configured output width",
+                &a_shape[..a_shape.len() - 1],
+                self.n
+            )));
+        }
 
         let blocks = self.k.div_ceil(self.format.qk());
         require_shape(
@@ -445,23 +472,8 @@ impl BlockQuantizedMatMulKernel {
         let plan = projection_plan.ok_or_else(|| error(
             "execution plan is absent or consumed; call workspace_requirement_for_execution in the selected execution context before workspace admission and launch"
         ))?;
-        // Q8 has no dense-cache alternative. Validate its complete admitted
-        // lane before materializing any activation, bias or packed payload.
-        let mut q8_scratch = if self.arithmetic == ActivationArithmetic::Q8_0 {
-            // SAFETY: the executor exclusively lends live Host storage for this
-            // dispatch. Binding checks capacity/alignment without reading it.
-            Some(unsafe {
-                ProjectionScratch::bind(
-                    "block-quantized streamed workspace binding",
-                    plan.layout(m, self.k, self.n)?.bytes(),
-                    workspace,
-                )
-            }?)
-        } else {
-            None
-        };
-
-        let bias = if let Some(bias) = inputs.get(2).filter(|input| !input.is_absent()) {
+        let bias_view = inputs.get(2).filter(|input| !input.is_absent());
+        if let Some(bias) = bias_view {
             require_compute_dtype("bias", bias.dtype)?;
             if bias.dtype != inputs[0].dtype {
                 return Err(error(format!(
@@ -470,10 +482,21 @@ impl BlockQuantizedMatMulKernel {
                 )));
             }
             require_shape("bias", bias.shape, &[self.n])?;
-            Some(to_dense_f32_widen(OP, bias)?.into_owned())
-        } else {
-            None
-        };
+        }
+        let (layout, result_elements) = self.execution_workspace_layout(m, plan)?;
+        // SAFETY: the executor exclusively lends live Host storage for this
+        // dispatch. Complete binding proves capacity, alignment and disjoint
+        // regions before materializing any activation, bias or packed payload.
+        let [mut scratch, mut output_staging] = unsafe {
+            ProjectionScratch::bind_layout(
+                "BlockQuantizedMatMul execution workspace binding",
+                layout,
+                workspace,
+            )
+        }?;
+        let bias = bias_view
+            .map(|view| to_dense_f32_widen(OP, view))
+            .transpose()?;
 
         let activations = to_dense_f32_widen(OP, &inputs[0])?;
         let dense = if self.arithmetic == ActivationArithmetic::Q8_0 {
@@ -554,24 +577,7 @@ impl BlockQuantizedMatMulKernel {
         };
         let Some((dense, dense_bytes, cache_budget)) = dense else {
             let packed = packed_tensor_bytes(&inputs[1])?;
-            let bytes = plan.layout(m, self.k, self.n)?.bytes();
-            // SAFETY: the executor lends valid exclusive Host storage for this
-            // dispatch. The scratch owner and all views stay within this call.
-            let mut scratch = match q8_scratch.take() {
-                Some(scratch) => scratch,
-                None => unsafe {
-                    ProjectionScratch::bind(
-                        "block-quantized streamed workspace binding",
-                        bytes,
-                        workspace,
-                    )
-                }?,
-            };
-            let elements = m.checked_mul(self.n).ok_or_else(|| {
-                error("streamed output element count overflows; reduce projection dimensions")
-            })?;
-            let mut result =
-                super::decoded_projection::zeroed_f32(OP, "final output staging", elements)?;
+            let result = output_staging.initialized_prefix(result_elements)?;
             plan.project(
                 self.format,
                 &packed,
@@ -581,9 +587,9 @@ impl BlockQuantizedMatMulKernel {
                 self.n,
                 bias.as_deref(),
                 &mut scratch,
-                &mut result,
+                result,
             )?;
-            return write_dense_f32_narrow(OP, &mut outputs[0], &result);
+            return write_dense_f32_narrow(OP, &mut outputs[0], result);
         };
         onnx_runtime_ep_api::record_kernel_variant!(
             "block_matmul.dense_resident_set",
@@ -591,22 +597,19 @@ impl BlockQuantizedMatMulKernel {
         );
         let weight_kn = dense.as_slice();
 
-        let result_elements = m
-            .checked_mul(self.n)
-            .ok_or_else(|| error("Y element count overflow"))?;
-        let mut result = vec![0.0f32; result_elements];
+        let result = output_staging.initialized_prefix(result_elements)?;
         #[cfg(test)]
         BLOCK_QUANTIZED_MATMUL_DENSE_F32_TEST_HITS
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        gemm(&activations, weight_kn, &mut result, m, self.k, self.n)?;
-        if let Some(bias) = bias {
+        gemm(&activations, weight_kn, result, m, self.k, self.n)?;
+        if let Some(bias) = bias.as_deref() {
             for row in result.chunks_exact_mut(self.n) {
-                for (value, bias) in row.iter_mut().zip(&bias) {
+                for (value, bias) in row.iter_mut().zip(bias) {
                     *value += bias;
                 }
             }
         }
-        write_dense_f32_narrow(OP, &mut outputs[0], &result)
+        write_dense_f32_narrow(OP, &mut outputs[0], result)
     }
 
     #[cfg(test)]
@@ -1981,7 +1984,7 @@ mod tests {
                 } else {
                     1
                 };
-                let expected = (R * N + width * tile * K) * 4;
+                let expected = (2 * R * N + width * tile * K) * 4;
                 assert_eq!(req.bytes, expected as u64);
                 let mut scratch = vec![f32::NAN; expected / 4 + 7];
                 scratch[expected / 4..].fill(83.);
@@ -2915,6 +2918,7 @@ mod tests {
         use onnx_runtime_memory_governor::{HolderId, HostWorkspacePool, ProcessMemoryManager};
         for (arithmetic, format, budget) in [
             (ActivationArithmetic::Float32, BlockFormat::Mxfp4, 0),
+            (ActivationArithmetic::Float32, BlockFormat::Q8_0, 1 << 20),
             (ActivationArithmetic::Q8_0, BlockFormat::Q8_0, 0),
             (ActivationArithmetic::Q8_0, BlockFormat::Q8_0, 1 << 20),
             (
@@ -2944,7 +2948,7 @@ mod tests {
                 k,
                 n,
                 format,
-                packed_b_constant: false,
+                packed_b_constant: true,
                 weight_identity: DenseWeightIdentity::default(),
                 prepared_projection: std::cell::Cell::new(None),
                 weight_cache: WeightCache::new(memory, budget),
@@ -2979,7 +2983,9 @@ mod tests {
                 .execute(&[a.view(), b.view()], &mut [y.view_mut()])
                 .unwrap_err();
             assert!(
-                error.to_string().contains("streamed workspace binding"),
+                error
+                    .to_string()
+                    .contains("BlockQuantizedMatMul execution workspace binding"),
                 "{error}"
             );
             let mut expected = vec![0.; m * n];
@@ -3033,7 +3039,19 @@ mod tests {
                 );
                 assert_eq!(y.to_f32(), expected);
             }
-            assert_eq!(kernel.weight_cache.activity(), (0, 0));
+            if arithmetic == ActivationArithmetic::Float32 && budget != 0 {
+                assert_eq!(
+                    kernel.weight_cache.stats().0,
+                    1,
+                    "dense route must retain its admitted weight"
+                );
+                assert!(
+                    kernel.weight_cache.activity().1 > 0,
+                    "dense positive control must exercise expansion"
+                );
+            } else {
+                assert_eq!(kernel.weight_cache.activity(), (0, 0));
+            }
             drop(cpu);
             pool.trim_idle(u64::MAX).unwrap();
             assert!(
@@ -3943,3 +3961,6 @@ mod packed_dot_contract;
 
 #[cfg(test)]
 mod q8_execution_tests;
+
+#[cfg(test)]
+mod output_workspace_tests;
