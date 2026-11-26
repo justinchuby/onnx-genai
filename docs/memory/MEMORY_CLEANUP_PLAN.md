@@ -3316,10 +3316,10 @@ this same helper. The Native multiply/add loop, transposed weight indexing and
 output conversion remain unchanged. FLOAT16/BFLOAT16 with bias still round the
 MatMul sum to storage precision before adding widened bias; DOUBLE stays f64.
 
-Aligned contiguous FLOAT X/W/bias retain the existing zero-copy borrow. Metadata
-therefore reports Deferred for nonempty FLOAT; execution checks actual views and
-charges only snapshots actually needed. DOUBLE keeps its previous full snapshot
-path. Half/bfloat conversion uses the existing bulk widening helpers once per
+Aligned contiguous FLOAT/DOUBLE X/W/bias use zero-copy borrowing when storage and
+accumulator types match. Metadata therefore reports Deferred for these nonempty
+native-storage routes; execution checks actual views and charges only snapshots
+actually needed. Half/bfloat conversion uses the existing bulk widening helpers once per
 source, preserving architecture-selected conversion paths rather than widening
 weights repeatedly per route. All supported source strides are admitted directly;
 there is no upstream gather for these four operands.
@@ -3338,11 +3338,15 @@ transposes, optional/absent bias slots and dense/padded/reversed/unaligned input
 They also cover half rounding before bias, DOUBLE precision, shifted overlaps
 with strided Y/padding, missing/short/misaligned scratch, invalid routes, stale
 metadata, non-Host and unaddressable sources, zero output and zero reduction.
-Exact and one-byte-short Session budgets exercise Deferred FLOAT versus Ready
-other types, changing logical shapes, physical strides, trim and readmission.
+Exact and one-byte-short Session budgets exercise Deferred FLOAT/DOUBLE versus
+Ready half/bfloat, changing logical shapes, physical strides, trim and readmission.
 Allocator positive controls cover the former payload sizes; a retained-owner
 witness exercises 4096 calls with no additional issuer callbacks, including
 zero-byte controls. These establish accounting/correctness, not measured latency.
-Typed snapshot storage is initialized before copying; the former DOUBLE Vec
-collector wrote each element once, so DOUBLE snapshot traffic needs measurement
-before making any speed claim.
+DOUBLE now shares the typed dense-borrow predicate with FLOAT and the existing
+widening/Softmax paths; aligned native storage eliminates full source snapshots
+and their initialization writes. Strided or unaligned views still need initialized
+snapshots. Final-origin alignment (base plus byte_offset), signed zeros, subnormal,
+infinity and NaN storage bits, source/Y aliases and same-shape layout changes are
+covered explicitly. Neither removal of copies nor callback counts is a latency
+measurement.

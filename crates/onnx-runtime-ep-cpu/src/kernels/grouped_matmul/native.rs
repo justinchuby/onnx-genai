@@ -13,15 +13,19 @@ pub(super) struct Native(pub(super) Op);
 trait Accumulator:
     dtype::NumericElem + Default + std::ops::Add<Output = Self> + std::ops::Mul<Output = Self>
 {
-    fn borrows(view: &TensorView) -> bool;
+    fn can_borrow_dtype(dtype: DataType) -> bool {
+        dtype == Self::DTYPE
+    }
+    fn borrows(view: &TensorView) -> bool {
+        // A native representation needs no conversion. The caller separately
+        // establishes Host access and the full checked address span.
+        !view.shape.contains(&0) && dtype::can_borrow_dense::<Self>(view)
+    }
     fn copy(op: &str, view: &TensorView, target: &mut [Self]) -> Result<()>;
     fn publish(op: &str, out: &mut TensorMut, data: &[Self]) -> Result<()>;
     fn round(value: Self, dtype: DataType) -> Self;
 }
 impl Accumulator for f32 {
-    fn borrows(view: &TensorView) -> bool {
-        !view.shape.contains(&0) && dtype::can_borrow_dense_f32(view)
-    }
     fn copy(op: &str, view: &TensorView, target: &mut [Self]) -> Result<()> {
         dtype::to_dense_f32_widen_into(op, view, target)
     }
@@ -37,10 +41,6 @@ impl Accumulator for f32 {
     }
 }
 impl Accumulator for f64 {
-    // Preserve the existing DOUBLE snapshot path; f32 keeps its borrowed path.
-    fn borrows(_: &TensorView) -> bool {
-        false
-    }
     fn copy(op: &str, view: &TensorView, target: &mut [Self]) -> Result<()> {
         dtype::to_dense_into(op, view, target)
     }
@@ -139,7 +139,7 @@ fn source<'a, F: Accumulator>(
         return Ok(&[]);
     }
     if F::borrows(view) {
-        // SAFETY: f32 borrowing requires aligned contiguous matching storage;
+        // SAFETY: borrowing requires aligned contiguous matching storage;
         // Host/span proofs precede binding, and Y is published after all reads.
         Ok(unsafe { std::slice::from_raw_parts(view.data_ptr::<F>(), view.numel()) })
     } else {
@@ -263,17 +263,26 @@ impl Kernel for Native {
         outputs: &[OutputMetadata<'_>],
     ) -> Result<WorkspacePreparation> {
         let l = group_metadata_layout(self.0, inputs, outputs)?;
-        if inputs[0].dtype == DataType::Float32 && l.lanes != 0 {
-            return Ok(WorkspacePreparation::Deferred);
-        }
-        Ok(WorkspacePreparation::Ready(
-            if inputs[0].dtype == DataType::Float64 {
-                plan::<f64>(self.0, l, inputs, [false; 3])?.requirement()
+        fn prepare<F: Accumulator>(
+            op: Op,
+            l: GroupLayout,
+            inputs: &[TensorMetadata],
+        ) -> Result<WorkspacePreparation> {
+            if l.lanes != 0 && F::can_borrow_dtype(inputs[0].dtype) {
+                Ok(WorkspacePreparation::Deferred)
             } else {
-                plan::<f32>(self.0, l, inputs, [false; 3])?.requirement()
-            },
-        ))
+                Ok(WorkspacePreparation::Ready(
+                    plan::<F>(op, l, inputs, [false; 3])?.requirement(),
+                ))
+            }
+        }
+        if inputs[0].dtype == DataType::Float64 {
+            prepare::<f64>(self.0, l, inputs)
+        } else {
+            prepare::<f32>(self.0, l, inputs)
+        }
     }
+
     fn workspace_requirement_for_execution(
         &self,
         inputs: &[TensorView],

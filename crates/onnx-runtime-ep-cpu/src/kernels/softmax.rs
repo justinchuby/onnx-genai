@@ -22,9 +22,8 @@
 //! logits (e.g. masked-attention `-inf`/`1e9` fills) never overflow.
 
 use crate::dtype::{
-    can_borrow_dense_f32, output_direct_write_eligible, to_dense_f32_widen,
-    to_dense_f32_widen_into, validate_f32_widen_input, validate_host_output,
-    write_dense_f32_narrow,
+    can_borrow_dense, output_direct_write_eligible, to_dense_f32_widen, to_dense_f32_widen_into,
+    validate_f32_widen_input, validate_host_output, write_dense_f32_narrow,
 };
 use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut, TensorView,
@@ -1075,7 +1074,7 @@ impl SoftmaxKernel {
         Ok(())
     }
     fn direct(input: &TensorView, output: &TensorMut, count: usize) -> Result<bool> {
-        if can_borrow_dense_f32(input) {
+        if can_borrow_dense::<f32>(input) {
             let start = input.data_ptr::<f32>() as usize;
             let end = start.checked_add(count * size_of::<f32>()).ok_or_else(|| {
                 EpError::KernelFailed(
@@ -1132,7 +1131,7 @@ impl SoftmaxKernel {
             // Complete binding validation precedes all input reads/output writes.
             unsafe {
                 geometry.workspace.with_buffers(workspace, |[y]| {
-                    if can_borrow_dense_f32(&inputs[0]) {
+                    if can_borrow_dense::<f32>(&inputs[0]) {
                         let x = to_dense_f32_widen("Softmax", &inputs[0])?;
                         softmax_slices(&x, y, geometry.outer, geometry.width, geometry.inner);
                     } else {

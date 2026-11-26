@@ -212,48 +212,51 @@ fn half_bias_rounds_matmul_before_add_and_double_keeps_precision() {
     assert_eq!(y.to_f64(), [f64::EPSILON]);
 }
 #[test]
-fn execution_refines_each_f32_borrow_without_snapshot_charges() {
+fn execution_refines_each_native_borrow_without_snapshot_charges() {
     let k = op(false);
-    let f = fixture(DataType::Float32, false, false);
-    let mut y = output(DataType::Float32);
-    for flags in 0..8 {
-        let storage = f
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                Repacked::new(
-                    v,
-                    if [0, 1, 3]
-                        .iter()
-                        .position(|&j| j == i)
-                        .is_some_and(|bit| flags & (1 << bit) != 0)
-                    {
-                        1
-                    } else {
-                        0
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        let inputs = storage.iter().map(Repacked::view).collect::<Vec<_>>();
-        let m = metadata(&inputs);
-        let out = [OutputMetadata::from_view(&y.view_mut())];
-        assert_eq!(
-            k.workspace_requirement(&m, &out).unwrap(),
-            WorkspacePreparation::Deferred
-        );
-        let snapshots = [8, 36, 9]
-            .into_iter()
-            .enumerate()
-            .filter(|(i, _)| flags & (1 << i) != 0)
-            .map(|(_, n)| n)
-            .sum::<usize>();
-        assert_eq!(
-            request(&k, &inputs, &y.view_mut()).bytes,
-            bytes(12 + snapshots, 4, 4)
-        );
+    for dt in [DataType::Float32, DataType::Float64] {
+        let width = dt.byte_size();
+        let f = fixture(dt, false, false);
+        let mut y = output(dt);
+        for flags in 0..8 {
+            let storage = f
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    Repacked::new(
+                        v,
+                        if [0, 1, 3]
+                            .iter()
+                            .position(|&j| j == i)
+                            .is_some_and(|bit| flags & (1 << bit) != 0)
+                        {
+                            1
+                        } else {
+                            0
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let inputs = storage.iter().map(Repacked::view).collect::<Vec<_>>();
+            let m = metadata(&inputs);
+            let out = [OutputMetadata::from_view(&y.view_mut())];
+            assert_eq!(
+                k.workspace_requirement(&m, &out).unwrap(),
+                WorkspacePreparation::Deferred
+            );
+            let snapshots = [8, 36, 9]
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| flags & (1 << i) != 0)
+                .map(|(_, n)| n)
+                .sum::<usize>();
+            assert_eq!(
+                request(&k, &inputs, &y.view_mut()).bytes,
+                bytes(12 + snapshots, width, 4)
+            );
+        }
     }
-    for dt in [DataType::Float64, DataType::Float16, DataType::BFloat16] {
+    for dt in [DataType::Float16, DataType::BFloat16] {
         let f = fixture(dt, false, false);
         let inputs = f.iter().map(Owned::view).collect::<Vec<_>>();
         let m = metadata(&inputs);
@@ -263,14 +266,7 @@ fn execution_refines_each_f32_borrow_without_snapshot_charges() {
             .unwrap()
             .require_ready()
             .unwrap();
-        assert_eq!(
-            r.bytes,
-            bytes(
-                12 + 8 + 36 + 9,
-                if dt == DataType::Float64 { 8 } else { 4 },
-                4
-            )
-        );
+        assert_eq!(r.bytes, bytes(12 + 8 + 36 + 9, 4, 4));
         assert_eq!(request(&k, &inputs, &y.view_mut()), r);
     }
 }
@@ -506,66 +502,74 @@ fn one_retained_native_workspace_has_no_warm_issuer_callbacks_and_trims_exactly(
         HolderId, HostWorkspacePool, MemoryGovernor, ProcessMemoryManager,
     };
     use std::sync::Arc;
-    let expected = bytes(12, 4, 4) as usize;
-    let books = Arc::new(RecordingGovernor::new_host(expected as u64));
-    let manager = ProcessMemoryManager::new().unwrap();
-    let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
-    let resources =
-        crate::CpuMemoryResources::new(books.weight_memory(HolderId::new(13)), Default::default())
-            .unwrap()
-            .with_workspace_pool(pool.clone())
-            .unwrap();
-    let provider = crate::CpuExecutionProvider::initialized_with_resources(resources).unwrap();
-    let k = op(false);
-    let f = fixture(DataType::Float32, false, false);
-    let inputs = f.iter().map(Owned::view).collect::<Vec<_>>();
-    let mut y = output(DataType::Float32);
-    let req = request(&k, &inputs, &y.view_mut());
-    assert_eq!(req.bytes, expected as u64);
-    let first = provider
-        .allocate_workspace(expected, req.alignment, req.role())
+    for dt in [DataType::Float32, DataType::Float64] {
+        let expected = bytes(12, dt.byte_size(), 4) as usize;
+        let books = Arc::new(RecordingGovernor::new_host(expected as u64));
+        let manager = ProcessMemoryManager::new().unwrap();
+        let pool = HostWorkspacePool::governed(&manager, books.clone()).unwrap();
+        let resources = crate::CpuMemoryResources::new(
+            books.weight_memory(HolderId::new(13)),
+            Default::default(),
+        )
+        .unwrap()
+        .with_workspace_pool(pool.clone())
         .unwrap();
-    let identity = first.managed_owner().unwrap().identity();
-    assert!(
-        provider
-            .allocate_workspace(expected, req.alignment, req.role())
-            .is_err()
-    );
-    provider.deallocate_workspace(first).unwrap();
-    let before = (books.claims(), books.releases());
-    drop(
-        books
-            .reserve(Tier::Host, 0, req.role(), HolderId::new(99))
-            .unwrap(),
-    );
-    books.probe_zero_release();
-    assert_eq!(
-        (books.claims(), books.releases()),
-        (before.0 + 1, before.1 + 1)
-    );
-    let calls = (books.claims(), books.releases());
-    for _ in 0..4096 {
+        let provider = crate::CpuExecutionProvider::initialized_with_resources(resources).unwrap();
+        let k = op(false);
+        let f = fixture(dt, false, false);
+        let storage = f.iter().map(|v| Repacked::new(v, 0)).collect::<Vec<_>>();
+        let inputs = storage.iter().map(Repacked::view).collect::<Vec<_>>();
+        let mut y = output(dt);
         let req = request(&k, &inputs, &y.view_mut());
         assert_eq!(req.bytes, expected as u64);
-        let mut allocation = provider
+        let first = provider
             .allocate_workspace(expected, req.alignment, req.role())
             .unwrap();
-        assert_eq!(allocation.managed_owner().unwrap().identity(), identity);
-        let workspace = WorkspaceView::new(DevicePtrMut(allocation.as_mut_ptr()), allocation.len());
-        k.execute_with_workspace(&inputs, &mut [y.view_mut()], Some(workspace))
-            .unwrap();
-        provider.deallocate_workspace(allocation).unwrap();
+        let identity = first.managed_owner().unwrap().identity();
+        assert!(
+            provider
+                .allocate_workspace(expected, req.alignment, req.role())
+                .is_err()
+        );
+        provider.deallocate_workspace(first).unwrap();
+        let before = (books.claims(), books.releases());
+        drop(
+            books
+                .reserve(Tier::Host, 0, req.role(), HolderId::new(99))
+                .unwrap(),
+        );
+        books.probe_zero_release();
+        assert_eq!(
+            (books.claims(), books.releases()),
+            (before.0 + 1, before.1 + 1)
+        );
+        let calls = (books.claims(), books.releases());
+        for _ in 0..4096 {
+            let req = request(&k, &inputs, &y.view_mut());
+            assert_eq!(req.bytes, expected as u64);
+            let mut allocation = provider
+                .allocate_workspace(expected, req.alignment, req.role())
+                .unwrap();
+            assert_eq!(allocation.managed_owner().unwrap().identity(), identity);
+            let workspace =
+                WorkspaceView::new(DevicePtrMut(allocation.as_mut_ptr()), allocation.len());
+            k.execute_with_workspace(&inputs, &mut [y.view_mut()], Some(workspace))
+                .unwrap();
+            provider.deallocate_workspace(allocation).unwrap();
+        }
+        assert_eq!(
+            (books.claims(), books.releases()),
+            calls,
+            "including zero-byte callbacks"
+        );
+        assert_eq!(books.used(Tier::Host), expected as u64);
+        let mut expected_y = output(dt);
+        reference(&inputs, false, &mut expected_y.view_mut());
+        assert_eq!(y.bytes, expected_y.bytes);
+        pool.trim_idle(u64::MAX).unwrap();
+        assert_eq!(books.used(Tier::Host), 0);
+        assert_eq!(manager.process_used(Tier::Host), 0);
     }
-    assert_eq!(
-        (books.claims(), books.releases()),
-        calls,
-        "including zero-byte callbacks"
-    );
-    assert_eq!(books.used(Tier::Host), expected as u64);
-    assert!(y.to_f32().iter().all(|v| v.is_finite()));
-    pool.trim_idle(u64::MAX).unwrap();
-    assert_eq!(books.used(Tier::Host), 0);
-    assert_eq!(manager.process_used(Tier::Host), 0);
 }
 
 #[test]
@@ -613,4 +617,103 @@ fn bad_routes_and_stale_preparation_never_publish_or_read_float_sources() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("unaddressable span"), "{error}");
+}
+
+#[test]
+fn double_borrow_uses_final_origin_and_preserves_storage_bits() {
+    let bits = [
+        0,
+        1u64 << 63,
+        1,
+        0x0010_0000_0000_0000,
+        f64::INFINITY.to_bits(),
+        f64::NEG_INFINITY.to_bits(),
+        0x7ff0_0000_0000_0042,
+        0xfff8_0000_0000_1234,
+    ];
+    for aligned in [false, true] {
+        let mut backing = [0u128; 6];
+        let base = backing.as_mut_ptr().cast::<u8>();
+        let base_offset = usize::from(!aligned);
+        let byte_offset = 8;
+        let origin = unsafe { base.add(base_offset + byte_offset).cast::<u64>() };
+        for (i, value) in bits.into_iter().enumerate() {
+            unsafe {
+                origin.add(i).write_unaligned(value);
+            }
+        }
+        let view = TensorView::new(
+            DevicePtr(unsafe { base.add(base_offset).cast() }),
+            DataType::Float64,
+            &[2, 4],
+            &[4, 1],
+            DeviceId::cpu(),
+        )
+        .with_byte_offset(byte_offset);
+        host(op(false).0, "X", &view).unwrap();
+        let invalid_offset = TensorView::new(
+            DevicePtr(unsafe { base.add(1).cast() }),
+            DataType::Float64,
+            &[2, 4],
+            &[4, 1],
+            DeviceId::cpu(),
+        )
+        .with_byte_offset(7);
+        assert!(
+            host(op(false).0, "X", &invalid_offset)
+                .unwrap_err()
+                .to_string()
+                .contains("byte_offset 7")
+        );
+        assert_eq!(<f64 as Accumulator>::borrows(&view), aligned);
+        assert!(!<f32 as Accumulator>::borrows(&view));
+        let mut scratch = [123f64; 8];
+        let scratch_ptr = scratch.as_ptr();
+        let values = source::<f64>(
+            op(false).0,
+            &view,
+            if aligned { &mut [] } else { &mut scratch },
+        )
+        .unwrap();
+        assert_eq!(
+            values.as_ptr(),
+            if aligned {
+                origin.cast::<f64>()
+            } else {
+                scratch_ptr
+            }
+        );
+        assert_eq!(values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), bits);
+        if aligned {
+            assert_eq!(scratch, [123.; 8]);
+        }
+    }
+}
+#[test]
+fn cached_preparation_never_freezes_same_shape_source_borrow_flags() {
+    let k = op(false);
+    let f = fixture(DataType::Float64, false, false);
+    let mut y = output(DataType::Float64);
+    let mut cached = None;
+    for mode in [0, 4, 3, 0] {
+        let storage = f
+            .iter()
+            .enumerate()
+            .map(|(i, v)| Repacked::new(v, if i == 1 { mode } else { 0 }))
+            .collect::<Vec<_>>();
+        let inputs = storage.iter().map(Repacked::view).collect::<Vec<_>>();
+        let m = metadata(&inputs);
+        let facts = [OutputMetadata::from_view(&y.view_mut())];
+        let req = k
+            .workspace_requirement_for_execution(&inputs, &[], &m, &facts, cached)
+            .unwrap()
+            .require_ready()
+            .unwrap();
+        assert_eq!(req.bytes, bytes(12 + if mode == 0 { 0 } else { 36 }, 8, 4));
+        cached = Some(WorkspacePreparation::Ready(req));
+        let mut expected = output(DataType::Float64);
+        reference(&inputs, false, &mut expected.view_mut());
+        k.execute_prepared(&inputs, &mut [y.view_mut()]).unwrap();
+        assert_eq!(y.bytes, expected.bytes);
+    }
 }

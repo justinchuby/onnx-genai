@@ -10,7 +10,7 @@ fn bytes(t: usize, dt: DataType, strided: bool) -> u64 {
         0
     } else {
         4 * t
-            + if dt != DataType::Float32 {
+            + if matches!(dt, DataType::Float16 | DataType::BFloat16) {
                 64 * t + 384
             } else if strided {
                 64 * t
@@ -120,7 +120,7 @@ fn setup(
 }
 
 #[test]
-fn exact_budgets_dynamic_shapes_and_trim_cover_deferred_f32_and_ready_other_floats() {
+fn exact_budgets_dynamic_shapes_and_trim_cover_deferred_native_and_ready_converted_floats() {
     for dt in [
         DataType::Float32,
         DataType::Float64,
@@ -137,7 +137,7 @@ fn exact_budgets_dynamic_shapes_and_trim_cover_deferred_f32_and_ready_other_floa
                     let b = banks(t, int32, dt);
                     let inputs = [("x", &x), ("weights", &b[0]), ("routes", &b[1])];
                     if short {
-                        if dt == DataType::Float32 {
+                        if matches!(dt, DataType::Float32 | DataType::Float64) {
                             assert!(matches!(
                                 session
                                     .prepare_with_device_bindings(&inputs, &mut [])
@@ -159,7 +159,7 @@ fn exact_budgets_dynamic_shapes_and_trim_cover_deferred_f32_and_ready_other_floa
                     let report = session
                         .prepare_with_device_bindings(&inputs, &mut [])
                         .unwrap();
-                    if dt == DataType::Float32 && t != 0 {
+                    if matches!(dt, DataType::Float32 | DataType::Float64) && t != 0 {
                         assert!(matches!(
                             report,
                             WorkspacePreparationReport::Deferred { .. }
@@ -201,61 +201,71 @@ fn exact_budgets_dynamic_shapes_and_trim_cover_deferred_f32_and_ready_other_floa
 }
 #[test]
 fn fixed_outer_strides_are_charged_exactly_and_never_gathered_upstream() {
-    let dt = DataType::Float32;
-    for short in [false, true] {
-        let (mut session, books, pool, manager) =
-            setup(bytes(3, dt, true) - u64::from(short), false, true, dt);
-        let mut binding = session
-            .allocate_device_binding_fixed_strides("x", "x", dt, vec![3, 128], vec![3, 64])
-            .unwrap();
-        let mut physical = vec![123f32; 3 * 128];
-        for row in 0..3 {
-            physical[row * 128..row * 128 + 64].fill(0.25);
-        }
-        binding
-            .write_bytes(
-                0,
-                &physical
-                    .iter()
-                    .flat_map(|v| v.to_ne_bytes())
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap();
-        let mut identity = None;
-        let capacity = banks(3, false, dt);
-        let capacity_inputs = [("weights", &capacity[0]), ("routes", &capacity[1])];
-        for t in [3, 1, 3] {
-            binding.set_logical_shape(vec![t, 64]).unwrap();
-            let b = banks(t, false, dt);
-            let inputs = [("weights", &b[0]), ("routes", &b[1])];
-            let report = session
-                .prepare_with_device_bindings(&capacity_inputs, std::slice::from_mut(&mut binding))
+    for dt in [DataType::Float32, DataType::Float64] {
+        for short in [false, true] {
+            let (mut session, books, pool, manager) =
+                setup(bytes(3, dt, true) - u64::from(short), false, true, dt);
+            let mut binding = session
+                .allocate_device_binding_fixed_strides("x", "x", dt, vec![3, 128], vec![3, 64])
                 .unwrap();
-            assert!(matches!(
-                report,
-                WorkspacePreparationReport::Deferred { .. }
-            ));
-            let result =
-                session.run_with_device_bindings(&inputs, std::slice::from_mut(&mut binding));
-            if short {
-                assert!(result.is_err());
-                assert_eq!(books.used(Tier::Host), 0);
-                assert!(manager.snapshot().unwrap().allocations.is_empty());
-                break;
+            let mut physical = vec![123f32; 3 * 128];
+            for row in 0..3 {
+                physical[row * 128..row * 128 + 64].fill(0.25);
             }
-            let output = result.unwrap();
-            check(output[0].as_ref().unwrap(), t, dt);
-            let snapshot = manager.snapshot().unwrap();
-            assert_eq!(snapshot.allocations.len(), 1);
-            assert_eq!(
-                snapshot.allocations[0].identity,
-                *identity.get_or_insert(snapshot.allocations[0].identity)
-            );
-            assert_eq!(books.used(Tier::Host), bytes(3, dt, true));
+            binding
+                .write_bytes(
+                    0,
+                    &physical
+                        .iter()
+                        .flat_map(|&v| {
+                            if dt == DataType::Float64 {
+                                f64::from(v).to_ne_bytes().to_vec()
+                            } else {
+                                v.to_ne_bytes().to_vec()
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            let mut identity = None;
+            let capacity = banks(3, false, dt);
+            let capacity_inputs = [("weights", &capacity[0]), ("routes", &capacity[1])];
+            for t in [3, 1, 3] {
+                binding.set_logical_shape(vec![t, 64]).unwrap();
+                let b = banks(t, false, dt);
+                let inputs = [("weights", &b[0]), ("routes", &b[1])];
+                let report = session
+                    .prepare_with_device_bindings(
+                        &capacity_inputs,
+                        std::slice::from_mut(&mut binding),
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    report,
+                    WorkspacePreparationReport::Deferred { .. }
+                ));
+                let result =
+                    session.run_with_device_bindings(&inputs, std::slice::from_mut(&mut binding));
+                if short {
+                    assert!(result.is_err());
+                    assert_eq!(books.used(Tier::Host), 0);
+                    assert!(manager.snapshot().unwrap().allocations.is_empty());
+                    break;
+                }
+                let output = result.unwrap();
+                check(output[0].as_ref().unwrap(), t, dt);
+                let snapshot = manager.snapshot().unwrap();
+                assert_eq!(snapshot.allocations.len(), 1);
+                assert_eq!(
+                    snapshot.allocations[0].identity,
+                    *identity.get_or_insert(snapshot.allocations[0].identity)
+                );
+                assert_eq!(books.used(Tier::Host), bytes(3, dt, true));
+            }
+            drop(binding);
+            drop(session);
+            pool.trim_idle(u64::MAX).unwrap();
+            assert_eq!(books.used(Tier::Host), 0);
         }
-        drop(binding);
-        drop(session);
-        pool.trim_idle(u64::MAX).unwrap();
-        assert_eq!(books.used(Tier::Host), 0);
     }
 }
