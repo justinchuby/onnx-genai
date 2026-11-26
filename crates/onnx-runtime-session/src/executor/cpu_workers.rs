@@ -83,8 +83,9 @@ impl Executor {
                 });
             }
         }
-        // All initializer payloads are external descriptors. Tensor attributes,
-        // nested bodies and functions were refused before this structural clone.
+        // All initializer payloads are external descriptors. Heap-backed value
+        // attributes, nested bodies and functions were refused before cloning.
+        // Scalar/type-descriptor IR metadata is not covered by a payload lease.
         Ok(())
     }
 }
@@ -111,18 +112,37 @@ fn validate_graph(graph: &Graph) -> Result<()> {
             )));
         }
         for (name, attribute) in &node.attributes {
-            if matches!(
-                attribute,
-                Attribute::Tensor(_)
-                    | Attribute::Tensors(_)
-                    | Attribute::SparseTensor(_)
-                    | Attribute::SparseTensors(_)
-                    | Attribute::Graph(_)
-                    | Attribute::Graphs(_)
-            ) {
+            // This is a value-kind boundary, not an operator/content heuristic.
+            // In particular STRING can contain an opaque compiled blob, and
+            // INTS/FLOATS can contain numerical model payloads. Even an empty
+            // instance belongs to an unsupported ownership kind.
+            let owns_value_payload = match attribute {
+                Attribute::Int(_)
+                | Attribute::Float(_)
+                | Attribute::TypeProto(_)
+                | Attribute::TypeProtos(_) => false,
+                Attribute::Ref { .. } => {
+                    return Err(refusal(format!(
+                        "node {:?} attribute {name:?} retains an unresolved function-attribute reference; lower function attributes before requesting CPU workers",
+                        node.name
+                    )));
+                }
+                Attribute::String(_)
+                | Attribute::Ints(_)
+                | Attribute::Floats(_)
+                | Attribute::Strings(_)
+                | Attribute::Tensor(_)
+                | Attribute::Tensors(_)
+                | Attribute::SparseTensor(_)
+                | Attribute::SparseTensors(_)
+                | Attribute::Graph(_)
+                | Attribute::Graphs(_) => true,
+            };
+            if owns_value_payload {
                 return Err(refusal(format!(
-                    "node {:?} attribute {name:?} owns tensor or graph payload; this profile cannot clone that payload under the shared fixed-weight reservation",
-                    node.name
+                    "node {:?} attribute {name:?} of kind {:?} owns heap-backed value payload; this profile admits only scalar/type-descriptor attributes and cannot clone value payload under the shared fixed-weight reservation; keep one executor or use an ownership-admitted representation",
+                    node.name,
+                    attribute.kind()
                 )));
             }
         }
@@ -319,5 +339,70 @@ mod mapped_range_tests {
         drop(result);
         drop(executor);
         drop(fixture);
+    }
+}
+
+#[cfg(test)]
+mod attribute_value_kind_tests {
+    use super::*;
+
+    #[test]
+    fn opaque_and_numeric_value_lists_are_refused_by_kind_on_same_identity_operator() {
+        for (name, attribute) in [
+            ("opaque_blob", Attribute::String(vec![0, 0xff, 0x7f, 0x80])),
+            (
+                "numeric_coefficients",
+                Attribute::Ints(vec![65_537, -32_769]),
+            ),
+            (
+                "floating_coefficients",
+                Attribute::Floats(vec![0.125, -3.25]),
+            ),
+            (
+                "opaque_parts",
+                Attribute::Strings(vec![b"compiled-payload".to_vec(), vec![0xff, 0]]),
+            ),
+            ("empty_blob", Attribute::String(vec![])),
+            ("empty_integer_values", Attribute::Ints(vec![])),
+            ("empty_float_values", Attribute::Floats(vec![])),
+            ("empty_blob_list", Attribute::Strings(vec![])),
+        ] {
+            let mut graph = Graph::new();
+            let mut node = Node::new(NodeId(0), "Identity", vec![], vec![]);
+            node.attributes.insert(name.into(), attribute);
+            graph.insert_node(node);
+            let error =
+                validate_graph(&graph).expect_err("owned value kinds must not reach Graph::clone");
+            let text = error.to_string();
+            assert!(
+                text.contains(name) && text.contains("heap-backed value payload"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_and_type_descriptors_remain_explicit_unmetered_ir_metadata() {
+        let mut graph = Graph::new();
+        let mut node = Node::new(NodeId(0), "Identity", vec![], vec![]);
+        node.attributes
+            .insert("integer_metadata".into(), Attribute::Int(42));
+        node.attributes
+            .insert("float_metadata".into(), Attribute::Float(0.125));
+        node.attributes.insert(
+            "type_metadata".into(),
+            Attribute::TypeProto(onnx_runtime_ir::onnx::TypeProto::default()),
+        );
+        node.attributes.insert(
+            "type_list_metadata".into(),
+            Attribute::TypeProtos(vec![
+                onnx_runtime_ir::onnx::TypeProto::default(),
+                onnx_runtime_ir::onnx::TypeProto::default(),
+            ]),
+        );
+        graph.insert_node(node);
+        // Ownership admission is separate from operator/schema validation.
+        // This does not claim Identity accepts these invented attribute names.
+        validate_graph(&graph).unwrap();
     }
 }

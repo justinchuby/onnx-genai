@@ -13,8 +13,13 @@ use crate::{ExecutionProviderOrder, InferenceSession, SessionError, error::Resul
 /// Each worker has a fresh provider, executor identity, scratch, kernel caches,
 /// bindings, outputs and trace state. Only the already loaded external weight
 /// store is shared. No model files or external weights are reopened or reparsed.
-/// Inline payloads, Constant kernels, nested graphs/functions, sparse data,
-/// EPContext and existing decode-inline/verify siblings are explicitly refused.
+/// Inline payloads, heap-backed value attributes (including strings/opaque
+/// bytes and numeric lists), Constant kernels, nested graphs/functions, sparse
+/// data, unresolved attribute references, EPContext and existing decode-inline/
+/// verify siblings are explicitly refused, independent of payload contents.
+/// Scalar and type-descriptor attributes remain metadata. Their descriptors,
+/// type lists, node/value names and model metadata can still allocate IR heap;
+/// cloning that descriptive heap is not payload admission or a whole-heap limit.
 ///
 /// `CpuMemoryResources` governs workspace and derived/packed weight caches. It
 /// does NOT newly meter ordinary provider allocations, IR or session buffers.
