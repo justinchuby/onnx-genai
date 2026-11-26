@@ -2441,18 +2441,24 @@ node { input: "starting" input: "operation""#);
     }
     #[cfg(feature = "native-backend")]
     async fn duplex_audio(client: &mut Client) {
+        duplex_audio_sample(client, 100).await;
+    }
+    #[cfg(feature = "native-backend")]
+    async fn duplex_audio_sample(client: &mut Client, sample: i16) {
         use base64::Engine as _;
-        let pcm: Vec<u8> = (0..320).flat_map(|_| 100_i16.to_le_bytes()).collect();
+        let pcm: Vec<u8> = (0..320).flat_map(|_| sample.to_le_bytes()).collect();
         send(client,json!({"type":"input_audio_buffer.append","audio":base64::engine::general_purpose::STANDARD.encode(pcm)})).await;
     }
     #[cfg(feature = "native-backend")]
     async fn duplex_tools(client: &mut Client, city: &str) {
         send(client,json!({"type":"session.update","session":{"output_modalities":["text"],"max_output_tokens":1,"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"city":{"const":city}},"required":["city"],"additionalProperties":false}}],"tool_choice":"required"}})).await;
-        assert_eq!(event(client).await["type"], "session.updated");
+        let updated = event(client).await;
+        assert_eq!(updated["type"], "session.updated", "{updated}");
     }
     #[cfg(feature = "native-backend")]
     async fn duplex_prefix(client: &mut Client) {
         duplex_audio(client).await;
+        let mut response_id = None;
         loop {
             let output = event(client).await;
             assert_ne!(output["type"], "error", "{output}");
@@ -2460,8 +2466,17 @@ node { input: "starting" input: "operation""#);
                 output["type"], "response.done",
                 "prefix must stay incomplete: {output}"
             );
+            if output["type"] == "response.created" {
+                assert_eq!(
+                    output["response"]["output_modalities"],
+                    json!(["text"]),
+                    "{output}"
+                );
+                response_id = Some(output["response"]["id"].clone());
+            }
             if output["type"] == "response.function_call_arguments.delta" {
-                assert_eq!(output["delta"], r#"{"city":""#);
+                assert_eq!(Some(output["response_id"].clone()), response_id, "{output}");
+                assert_eq!(output["delta"], r#"{"city":""#, "{output}");
                 break;
             }
         }
@@ -2491,30 +2506,78 @@ node { input: "starting" input: "operation""#);
         let (state, address, task) =
             server_for_package_with_config(package.path(), native_constraint_config()).await;
         let mut client = connect(address).await;
-        assert_eq!(event(&mut client).await["type"], "session.created");
+        let created = event(&mut client).await;
+        assert_eq!(created["type"], "session.created", "{created}");
         duplex_tools(&mut client, "Paris").await;
         duplex_prefix(&mut client).await;
-        // Future defaults change, but both active native masking and final
-        // parameter admission retain Paris. The next response uses Rome.
-        duplex_tools(&mut client, "Rome").await;
+        // Tool definitions are part of frozen model conditioning. A rejected
+        // update must not alter either Native masking or parameter admission.
+        send(&mut client,json!({"type":"session.update","session":{"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"city":{"const":"Rome"}},"required":["city"],"additionalProperties":false}}],"tool_choice":"none"}})).await;
+        let rejected = event(&mut client).await;
+        assert_eq!(rejected["type"], "error", "{rejected}");
+        assert_eq!(
+            rejected["error"]["type"], "invalid_request_error",
+            "{rejected}"
+        );
+        assert!(
+            rejected["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("session.tools cannot change"),
+            "{rejected}"
+        );
+        // Only response defaults may change after input. The active response
+        // retains its Required/Paris constraint and original text modality.
+        send(&mut client,json!({"type":"session.update","session":{"tool_choice":"none","output_modalities":["audio"],"max_output_tokens":1}})).await;
+        let updated = event(&mut client).await;
+        assert_eq!(updated["type"], "session.updated", "{updated}");
+        assert_eq!(updated["session"]["tool_choice"], "none", "{updated}");
+        assert_eq!(
+            updated["session"]["output_modalities"],
+            json!(["audio"]),
+            "{updated}"
+        );
+        assert_eq!(updated["session"]["max_output_tokens"], 1, "{updated}");
         duplex_audio(&mut client).await;
-        let done = duplex_done(&mut client, "completed").await;
+        let done = loop {
+            let output = event(&mut client).await;
+            assert_ne!(output["type"], "error", "{output}");
+            assert_ne!(
+                output["type"], "response.output_audio.delta",
+                "active text modality must remain frozen: {output}"
+            );
+            if output["type"] == "response.done" {
+                assert_eq!(output["response"]["status"], "completed", "{output}");
+                break output;
+            }
+        };
         assert_eq!(
             done["response"]["output"][0]["arguments"],
             r#"{"city":"Paris"}"#
+        );
+        assert_eq!(done["response"]["usage"]["output_tokens"], 2, "{done}");
+        send(&mut client,json!({"type":"session.update","session":{"tool_choice":"required","output_modalities":["text"]}})).await;
+        let restored = event(&mut client).await;
+        assert_eq!(restored["type"], "session.updated", "{restored}");
+        assert_eq!(restored["session"]["tool_choice"], "required", "{restored}");
+        assert_eq!(
+            restored["session"]["output_modalities"],
+            json!(["text"]),
+            "{restored}"
         );
         duplex_prefix(&mut client).await;
         send(&mut client, json!({"type":"response.cancel"})).await;
         let cancelled = duplex_done(&mut client, "cancelled").await;
         let call = cancelled["response"]["output"][0]["call_id"].clone();
         send(&mut client,json!({"type":"conversation.item.create","item":{"type":"function_call_output","call_id":call,"output":"not admitted"}})).await;
-        assert_eq!(event(&mut client).await["type"], "error");
+        let rejected_result = event(&mut client).await;
+        assert_eq!(rejected_result["type"], "error", "{rejected_result}");
         duplex_prefix(&mut client).await;
         duplex_audio(&mut client).await;
         let done = duplex_done(&mut client, "completed").await;
         assert_eq!(
             done["response"]["output"][0]["arguments"],
-            r#"{"city":"Rome"}"#
+            r#"{"city":"Paris"}"#
         );
         drop(client);
         let model = state.registry.resolve("native-realtime").unwrap().unwrap();
@@ -2784,6 +2847,7 @@ node { input: "starting" input: "operation""#);
     #[cfg(feature = "native-backend")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn websocket_duplex_rejects_missing_mask_and_unsupported_forcing_before_audio() {
+        use base64::Engine as _;
         for xml in [false, true] {
             let package = duplex_constraint_package();
             let path = package.path().join("inference_metadata.yaml");
@@ -2824,12 +2888,16 @@ node { input: "starting" input: "operation""#);
             let (state, address, task) =
                 server_for_package_with_config(package.path(), native_constraint_config()).await;
             let mut client = connect(address).await;
-            assert_eq!(event(&mut client).await["type"], "session.created");
+            let created = event(&mut client).await;
+            assert_eq!(created["type"], "session.created", "xml={xml}: {created}");
             duplex_tools(&mut client, "Paris").await;
             duplex_audio(&mut client).await;
             let error = event(&mut client).await;
-            assert_eq!(error["type"], "error");
-            assert_eq!(error["error"]["type"], "invalid_request_error");
+            assert_eq!(error["type"], "error", "xml={xml}: {error}");
+            assert_eq!(
+                error["error"]["type"], "invalid_request_error",
+                "xml={xml}: {error}"
+            );
             assert!(
                 error["error"]["message"]
                     .as_str()
@@ -2837,21 +2905,60 @@ node { input: "starting" input: "operation""#);
                     .contains(if xml { "forcing plan" } else { "token_mask" }),
                 "{error}"
             );
-            // An unadmitted append did not queue PCM or start the conversation.
-            send(&mut client, json!({"type":"input_audio_buffer.commit"})).await;
-            let empty = event(&mut client).await;
-            assert_eq!(
-                empty["error"]["type"], "input_audio_buffer_commit_empty",
-                "{empty}"
-            );
-            send(
-                &mut client,
-                json!({"type":"session.update","session":{"tool_choice":"none"}}),
-            )
-            .await;
-            assert_eq!(event(&mut client).await["type"], "session.updated");
-            duplex_audio(&mut client).await;
-            duplex_done(&mut client, "completed").await;
+            // A legal instructions update proves the rejected append did not
+            // start/freeze the conversation. Duplex commit is always rejected,
+            // so an empty-commit error would not prove this property.
+            send(&mut client,json!({"type":"session.update","session":{"instructions":"hello","tool_choice":"none","output_modalities":["audio"]}})).await;
+            let updated = event(&mut client).await;
+            assert_eq!(updated["type"], "session.updated", "xml={xml}: {updated}");
+            assert_eq!(updated["session"]["instructions"], "hello", "{updated}");
+            assert_eq!(updated["session"]["tool_choice"], "none", "{updated}");
+            // Rejected PCM was 100. A single accepted 300-valued frame must be
+            // the first Native output: queued rejected PCM would emit 100, and
+            // previously executed PCM would contaminate the fixture's KV sum.
+            duplex_audio_sample(&mut client, 300).await;
+            let mut frames = Vec::new();
+            let mut response_id = None;
+            let done = loop {
+                let output = event(&mut client).await;
+                assert_ne!(output["type"], "error", "xml={xml}: {output}");
+                assert_ne!(
+                    output["type"], "response.function_call_arguments.done",
+                    "{output}"
+                );
+                if output["type"] == "response.created" {
+                    assert_eq!(
+                        output["response"]["output_modalities"],
+                        json!(["audio"]),
+                        "{output}"
+                    );
+                    response_id = Some(output["response"]["id"].clone());
+                }
+                if output["type"] == "response.output_audio.delta" {
+                    assert_eq!(Some(output["response_id"].clone()), response_id, "{output}");
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(output["delta"].as_str().unwrap())
+                        .unwrap();
+                    assert_eq!(bytes.len(), 320 * 2, "{output}");
+                    frames.push(
+                        bytes
+                            .chunks_exact(2)
+                            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                if output["type"] == "response.done" {
+                    assert_eq!(
+                        Some(output["response"]["id"].clone()),
+                        response_id,
+                        "{output}"
+                    );
+                    assert_eq!(output["response"]["status"], "completed", "{output}");
+                    assert_eq!(output["response"]["usage"]["output_tokens"], 1, "{output}");
+                    break output;
+                }
+            };
+            assert_eq!(frames, vec![vec![300; 320]], "xml={xml}: {done}");
             drop(client);
             let model = state.registry.resolve("native-realtime").unwrap().unwrap();
             tokio::task::spawn_blocking(move || model.engine.shutdown())

@@ -2761,9 +2761,11 @@ performance claim or broader acceptance completion is implied.
 Input-driven duplex responses now arm the admitted constraint on the native
 owner after Configure and before their first Audio quantum. Arming performs no
 workflow quantum and does not consume usage; subsequent Audio/Poll retains the
-same grammar cursor. Active responses own immutable tool/schema snapshots, so
-session updates affect the following response rather than its current sampling
-or result admission. Missing masks and unsupported forcing fail before PCM is
+same grammar cursor. Active responses own immutable tool/schema snapshots. Mutable response
+default updates affect the following response rather than current sampling or
+result admission; tool definitions remain frozen after first input because they
+participate in session-start conditioning. Dynamic tool-definition updates need
+a separate conditioning/state design and remain open. Missing masks and unsupported forcing fail before PCM is
 queued. Tool execution remains owned by the external harness.
 
 The exact old-code Native counterexample was reproduced: a higher-ranked invalid

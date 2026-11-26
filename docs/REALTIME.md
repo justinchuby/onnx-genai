@@ -197,9 +197,12 @@ Tagged-json tool forcing is connected for turn-based and input-driven duplex
 workflows declaring `inputs.token_mask`, using canonical decoder text and declared
 EOS roles. Automatic duplex responses arm the native owner once after conditioning
 and before the first Audio quantum; further Audio/Poll quanta retain grammar
-progress. Each active response shares an immutable compiled tool catalog: session
-updates change future defaults, while sampling and final admission retain the
-active response’s schema. Cancellation/completion discard its sampling state.
+progress. Each active response shares an immutable compiled tool catalog, so
+sampling and final admission use the same schemas. Tools remain part of frozen
+conditioning and cannot change after the first audio/message. Later session
+updates can change response defaults (tool choice, modalities and budget); the
+active response keeps its admitted options. Cancellation/completion discard its
+sampling state.
 Duplex `tool_choice: required` rejects missing mask bindings or a protocol without
 a supported forcing plan before admitting PCM; unforced duplex remains available.
 Turn-based profiles without that binding retain protocol/parameter postconditions.
