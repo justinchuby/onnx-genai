@@ -79,6 +79,42 @@ The CLI uses this proof for both file and live transcription after resolving the
 recording's actual source rate. Serving encoded audio binds the compiled program,
 not a guessed rank-3 mel output or a fixed hop/rate formula.
 
+## Linear power spectrograms
+
+`spectrogram` consumes its named waveform and publishes a float32 tensor with
+shape `[batch, n_fft / 2 + 1, floor(samples / hop_length)]`, in frequency-major
+order. Author `mode: power`, `window: hann`, positive `n_fft` (at least 2),
+`hop_length` and `win_length` (at most `n_fft`). It uses a periodic Hann window
+centered within the FFT input, centered/reflected sample boundaries, an
+unnormalized forward FFT and one-sided squared magnitudes. These are the fixed
+semantics of this operation; magnitude and other window selectors are rejected.
+Complex and uncentered analyses have no operation/selector in this contract.
+Odd FFT lengths and windows shorter than the FFT are supported.
+
+The analysis rate comes from `sample_rate` or a preceding declared `resample`.
+It must match the input rate; the operation does not implicitly resample.
+`audio_features`/`features` outputs select the resulting matrix. The spectrum
+retains its own valid-frame interval for `emit_valid_frames` and
+`emit_validity_mask`, including padding and clipping on the selected branch.
+An unpadded ragged batch fails with padding guidance. `whisper_log_mel`
+normalization requires a `log_mel` source and rejects a linear power spectrum.
+The FFT/window implementation is shared with log-mel, which retains its existing
+projection and normalization recipe without materializing a full intermediate
+spectrum.
+
+```yaml
+- {op: decode, outputs: [decoded]}
+- {op: resample, sample_rate: 16000, outputs: [samples]}
+- op: spectrogram
+  mode: power
+  window: hann
+  n_fft: 512
+  hop_length: 160
+  win_length: 400
+  outputs: [power]
+- {op: emit_valid_frames, inputs: [power], outputs: [frames]}
+```
+
 ## Log-mel and normalization
 
 `log_mel` consumes its named waveform, using the declared mel count, sample rate,
@@ -99,8 +135,8 @@ Sample and frame length output roles are checked as different units.
 
 The public `LogMelExtractor` convenience API still returns normalized features;
 the executable program applies only the transforms it actually declares.
-Unsupported operations such as standalone `spectrogram` fail explicitly instead
-of being accepted as no-ops. More DSP operations, windows/scales, codecs and the
+Unsupported operations fail explicitly instead of being accepted as no-ops.
+More DSP operations, windows/scales, codecs and the
 server's remaining legacy feature-input path still require compatibility work.
 Declared pure-waveform CTC/greedy packages execute through the
 [file transcription API](TRANSCRIPTION.md).
