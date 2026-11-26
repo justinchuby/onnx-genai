@@ -47,7 +47,11 @@ fn package(format: &str, storage: &str, embedding: bool) -> tempfile::TempDir {
         .unwrap()
         .len();
     let mut b = vec![0f32; width];
-    let magnitude = if format == "hf_peft" { 8192.0 } else { 10000.0 };
+    let magnitude = if format == "hf_peft" || storage != "F32" {
+        8192.0
+    } else {
+        10000.0
+    };
     b[4] = magnitude;
     b[6] = -magnitude;
     // Deterministic actual Native base projection: only appended constant feature
@@ -76,39 +80,39 @@ fn package(format: &str, storage: &str, embedding: bool) -> tempfile::TempDir {
         "adapters/red/adapter_model.safetensors"
     };
     let mut weight = json!({"format":format,"location":filename,"scale_encoding":"alpha_over_rank","loader_capability":if format=="gguf" {"onnx-genai.adapters.gguf@1"} else {"onnx-genai.adapters.hf-peft@1"}});
+    artifact["dtype"] = serde_yaml::to_value(match storage {
+        "F32" => "float32",
+        "F16" => "float16",
+        "BF16" => "bfloat16",
+        _ => unreachable!(),
+    })
+    .unwrap();
+    // Independent exact wire patterns for the fixture's 0, 1 and +/-8192.
+    // These are not produced by the runtime's half conversion implementation.
+    let mut payload = Vec::new();
+    let element_bytes = if storage == "F32" { 4 } else { 2 };
+    for value in a.iter().chain(&b) {
+        if storage == "F32" {
+            payload.extend(value.to_le_bytes());
+            continue;
+        }
+        let bits: u16 = match (storage, value.to_bits()) {
+            ("F16", 0) | ("BF16", 0) => 0,
+            ("F16", 0x3f800000) => 0x3c00,
+            ("BF16", 0x3f800000) => 0x3f80,
+            ("F16", 0x46000000) => 0x7000,
+            ("BF16", 0x46000000) => 0x4600,
+            ("F16", 0xc6000000) => 0xf000,
+            ("BF16", 0xc6000000) => 0xc600,
+            _ => panic!(
+                "fixture requires an independently specified exact half pattern: {storage} {value}"
+            ),
+        };
+        payload.extend(bits.to_le_bytes());
+    }
     if format == "hf_peft" {
         weight["config_location"] = json!("adapters/red/adapter_config.json");
         std::fs::write(root.path().join("adapters/red/adapter_config.json"),serde_json::to_vec(&json!({"peft_type":"LORA","r":1,"lora_alpha":1,"target_modules":["projection"],"bias":"none","fan_in_fan_out":false})).unwrap()).unwrap();
-        artifact["dtype"] = serde_yaml::to_value(match storage {
-            "F32" => "float32",
-            "F16" => "float16",
-            "BF16" => "bfloat16",
-            _ => unreachable!(),
-        })
-        .unwrap();
-        // Independent exact wire patterns for the fixture's 0, 1 and +/-8192.
-        // These are not produced by the runtime's half conversion implementation.
-        let mut payload = Vec::new();
-        let element_bytes = if storage == "F32" { 4 } else { 2 };
-        for value in a.iter().chain(&b) {
-            if storage == "F32" {
-                payload.extend(value.to_le_bytes());
-                continue;
-            }
-            let bits: u16 = match (storage, value.to_bits()) {
-                ("F16", 0) | ("BF16", 0) => 0,
-                ("F16", 0x3f800000) => 0x3c00,
-                ("BF16", 0x3f800000) => 0x3f80,
-                ("F16", 0x46000000) => 0x7000,
-                ("BF16", 0x46000000) => 0x4600,
-                ("F16", 0xc6000000) => 0xf000,
-                ("BF16", 0xc6000000) => 0xc600,
-                _ => panic!(
-                    "fixture requires an independently specified exact half pattern: {storage} {value}"
-                ),
-            };
-            payload.extend(bits.to_le_bytes());
-        }
         let header=serde_json::to_vec(&json!({format!("{prefix}.lora_A.weight"):{"dtype":storage,"shape":[1,a.len()],"data_offsets":[0,a.len()*element_bytes]},format!("{prefix}.lora_B.weight"):{"dtype":storage,"shape":[width,1],"data_offsets":[a.len()*element_bytes,(a.len()+b.len())*element_bytes]}})).unwrap();
         let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
         bytes.extend(header);
@@ -124,15 +128,25 @@ fn package(format: &str, storage: &str, embedding: bool) -> tempfile::TempDir {
         let tensors = vec![
             (
                 format!("{prefix}.lora_a"),
-                0,
+                match storage {
+                    "F32" => 0,
+                    "F16" => 1,
+                    "BF16" => 30,
+                    _ => unreachable!(),
+                },
                 vec![1, a.len() as u64],
-                a.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                payload[..a.len() * element_bytes].to_vec(),
             ),
             (
                 format!("{prefix}.lora_b"),
-                0,
+                match storage {
+                    "F32" => 0,
+                    "F16" => 1,
+                    "BF16" => 30,
+                    _ => unreachable!(),
+                },
                 vec![width as u64, 1],
-                b.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                payload[a.len() * element_bytes..].to_vec(),
             ),
         ];
         std::fs::write(
@@ -291,12 +305,26 @@ async fn exercise(format: &str, storage: &str) {
         assert_eq!(status, StatusCode::OK, "{result}");
         assert_eq!(
             result[0]["embedding"][0][4],
-            json!(scale * if format == "hf_peft" { 8192.0 } else { 10000.0 }),
+            json!(
+                scale
+                    * if format == "hf_peft" || storage != "F32" {
+                        8192.0
+                    } else {
+                        10000.0
+                    }
+            ),
             "{format}: raw Native embedding positive factor"
         );
         assert_eq!(
             result[0]["embedding"][0][6],
-            json!(-scale * if format == "hf_peft" { 8192.0 } else { 10000.0 }),
+            json!(
+                -scale
+                    * if format == "hf_peft" || storage != "F32" {
+                        8192.0
+                    } else {
+                        10000.0
+                    }
+            ),
             "{format}: raw Native embedding negative factor"
         );
         assert_eq!(
@@ -314,5 +342,7 @@ async fn native_http_hf_peft_only_catalogue_defaults_and_request_scales_use_actu
 }
 #[tokio::test]
 async fn native_http_gguf_only_catalogue_defaults_and_request_scales_use_actual_factors() {
-    exercise("gguf", "F32").await;
+    for storage in ["F32", "F16", "BF16"] {
+        exercise("gguf", storage).await;
+    }
 }

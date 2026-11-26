@@ -1,5 +1,5 @@
 //! Canonical, explicitly mapped positive-alpha unquantized GGUF LoRA factors.
-use super::{Holder, JsonTarget, MemoryGovernor};
+use super::{Holder, JsonTarget, MemoryGovernor, factor_storage::FactorStorage};
 use anyhow::{Context, ensure};
 use onnx_genai_metadata::{
     AdapterArtifact, AdapterScaleEncoding, AdapterServiceContract, AdapterWeightArtifact,
@@ -36,12 +36,7 @@ pub(super) fn load(
     weight: &AdapterWeightArtifact,
     bytes: &[u8],
 ) -> anyhow::Result<HashMap<String, JsonTarget>> {
-    ensure!(
-        matches!(artifact.dtype.as_str(), "float32" | "fp32"),
-        "GGUF LoRA adapter {}@{} requires declared F32 storage; F16/BF16 and quantized GGUF factor normalization are not supported",
-        artifact.identity,
-        artifact.version
-    );
+    let storage = FactorStorage::declared(artifact)?;
     ensure!(
         weight.scale_encoding == AdapterScaleEncoding::AlphaOverRank,
         "GGUF LoRA requires alpha_over_rank; zero/missing alpha or baked scaling requires separate explicit support"
@@ -110,10 +105,13 @@ pub(super) fn load(
             );
             let view=views.tensors.get(&name).with_context(||format!("GGUF factor {name:?} is missing; binding.weight_key must be the exact saved parameter prefix for the standard .lora_a/.lora_b pair"))?;
             ensure!(
-                view.dtype == onnx_runtime_ir::DataType::Float32 && view.packed_format.is_none(),
-                "GGUF factor {name:?} dtype {:?}/packing {:?} is unsupported; this loader admits only unquantized F32 factors, not F16/BF16 or quantized blocks",
+                view.dtype == storage.dtype() && view.packed_format.is_none(),
+                "GGUF adapter {}@{} factor {name:?} dtype {:?}/packing {:?} is unsupported; saved A/B factors must exactly match the declared storage dtype {:?}; correct the manifest or export matching unquantized factors; quantized blocks are unsupported",
+                artifact.identity,
+                artifact.version,
                 view.dtype,
-                view.packed_format
+                view.packed_format,
+                storage.dtype()
             );
             ensure!(
                 view.shape == shape,
@@ -121,12 +119,12 @@ pub(super) fn load(
                 view.shape
             );
             let mut factor = Vec::new();
-            factor.try_reserve_exact(view.data.len()/4).with_context(||format!("allocate governed F32 GGUF factor {name:?} from {:?}; free host memory or export smaller factor tensors",weight.location))?;
-            for value in view.data.chunks_exact(4) {
-                let value = f32::from_le_bytes(value.try_into().unwrap());
+            factor.try_reserve_exact(view.data.len()/storage.width()).with_context(||format!("allocate governed F32 GGUF factor {name:?} from {:?}; free host memory or export smaller factor tensors",weight.location))?;
+            for value in view.data.chunks_exact(storage.width()) {
+                let value = storage.decode(value);
                 ensure!(
                     value.is_finite(),
-                    "GGUF factor {name:?} contains nonfinite F32 values; export finite ordinary LoRA factors"
+                    "GGUF factor {name:?} contains nonfinite saved values; export finite ordinary LoRA factors"
                 );
                 factor.push(value);
             }
