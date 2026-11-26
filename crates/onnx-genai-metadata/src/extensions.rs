@@ -555,6 +555,10 @@ pub const CORE_CONFORMANCE: &[(SchemaVersion, &str)] = &[
         crate::version::GRAPH_WEIGHTS_SCHEMA_VERSION,
         "Each ONNX graph can declare immutable GGUF/SafeTensors containers with explicit tensor-key mappings; geometry and executable semantics stay in the graph.",
     ),
+    (
+        crate::version::INFILL_CONTEXT_SCHEMA_VERSION,
+        "Explicit infill control roles, ordering and additional terminators are package facts; native /infill renders authored ordered file context even for an empty list, with no filesystem lookup or guessed separators.",
+    ),
 ];
 
 /// Look up a built-in extension by its exact declared identity and version.
