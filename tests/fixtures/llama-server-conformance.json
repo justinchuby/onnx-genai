@@ -133,10 +133,14 @@
         "peft_http_storage",
         "gguf_http_storage",
         "gguf_native_half",
-        "gguf_native_half_rejection"
+        "gguf_native_half_rejection",
+        "gguf_native_unity",
+        "gguf_native_unity_rejection",
+        "gguf_unity_metadata",
+        "gguf_http_unity"
       ],
       "remaining": [
-        "Device/multi-sequence persistence and additional Native workers remain open. Explicitly mapped PEFT F32/F16/BF16 and positive-alpha unquantized F32/F16/BF16 GGUF factors have bounded Native CPU source-linked evidence, including HTTP generation/embedding; this is not general model import or fresh full-matrix execution. GGUF quantized/zero-or-missing-alpha, automatic target discovery, composite/nonordinary adapter semantics, broader storage/computation combinations and device-fused LoRA remain unsupported or unverified."
+        "Device/multi-sequence persistence and additional Native workers remain open. Explicitly mapped PEFT F32/F16/BF16 and unquantized F32/F16/BF16 GGUF factors with positive-alpha or explicitly Baked unity scaling have bounded Native CPU source-linked evidence, including HTTP generation/embedding; this is not general model import or fresh full-matrix execution. Negative source alpha, GGUF quantized factors, automatic target discovery, composite/nonordinary adapter semantics, broader storage/computation combinations and device-fused LoRA remain unsupported or unverified."
       ]
     },
     {
@@ -1002,7 +1006,7 @@
       "target": "test:gguf_adapter",
       "test": "gguf_adapter_format_has_explicit_schema_floor_and_exact_loader_contract",
       "execution_contract": "Metadata parsing/validation only; no artifact read or inference",
-      "assertions": "GGUF requires schema1.19 and its exact semantic loader capability; older raw/typed declarations, wrong capability, PEFT config_location and baked scaling reject.",
+      "assertions": "GGUF requires schema1.19 and its exact semantic loader capability; older raw/typed declarations, wrong capability and PEFT config_location reject; explicit Baked metadata admission has a separate positive-alpha-policy case.",
       "source_markers": []
     },
     "peft_native_half": {
@@ -1190,6 +1194,50 @@
       "test": "cors::tests::cors_socket_context_failure_fails_closed_and_nonloopback_does_not_gain_host_guard",
       "execution_contract": "In-process captured socket-context failure and synthetic nonloopback context; no inference or socket resolver fault injection",
       "assertions": "Socket-context resolution failure returns actionable500 without handler; authoritative nonloopback context retains exemption and takes precedence over unrelated manual listener extension.",
+      "source_markers": []
+    },
+    "gguf_native_unity": {
+      "kind": "rust",
+      "package": "onnx-genai-engine",
+      "package_manifest": "crates/onnx-genai-engine/Cargo.toml",
+      "source": "crates/onnx-genai-engine/tests/gguf_lora.rs",
+      "target": "test:gguf_lora",
+      "test": "native_gguf_explicit_baked_zero_or_missing_alpha_uses_unity_across_storage",
+      "execution_contract": "Independently authored F32/F16/BF16 GGUF factors through explicit Baked metadata and synthetic Native CPU ONNX MatMul; not bare GGUF import or device-fused inference",
+      "assertions": "Rank-two analytical signed/zero row outputs bypass deliberately nonunity manifest alpha/r for zero, negative-zero and missing FLOAT32 source alpha; changing zero/missing metadata invalidates cached selection, and restoring bytes recovers actual inference.",
+      "source_markers": []
+    },
+    "gguf_native_unity_rejection": {
+      "kind": "rust",
+      "package": "onnx-genai-engine",
+      "package_manifest": "crates/onnx-genai-engine/Cargo.toml",
+      "source": "crates/onnx-genai-engine/tests/gguf_lora.rs",
+      "target": "test:gguf_lora",
+      "test": "native_gguf_baked_rejects_nonzero_nonfinite_and_wrong_type_then_recovers",
+      "execution_contract": "Independent F32/F16/BF16 GGUF containers through explicit Baked metadata and synthetic Native CPU ONNX MatMul",
+      "assertions": "Positive/negative nonzero source alpha, NaN and wrong alpha wire type reject Baked activation. Base inference remains usable and restoring the original missing-alpha container recovers independently expected scaled output.",
+      "source_markers": []
+    },
+    "gguf_unity_metadata": {
+      "kind": "rust",
+      "package": "onnx-genai-metadata",
+      "package_manifest": "crates/onnx-genai-metadata/Cargo.toml",
+      "source": "crates/onnx-genai-metadata/tests/gguf_adapter.rs",
+      "target": "test:gguf_adapter",
+      "test": "gguf_baked_is_explicit_while_manifest_alpha_policies_stay_positive",
+      "execution_contract": "Metadata parsing/validation only; no container read, inference or HTTP execution",
+      "assertions": "Explicit GGUF Baked declaration validates while zero manifest alpha still fails the existing positive finite-alpha policy; source-header unity semantics are tested by separate Native cases.",
+      "source_markers": []
+    },
+    "gguf_http_unity": {
+      "kind": "rust",
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml",
+      "source": "crates/onnx-genai-server/tests/lora_container_http.rs",
+      "target": "test:lora_container_http",
+      "test": "native_http_gguf_baked_zero_and_missing_alpha_drive_generation_and_raw_embeddings",
+      "execution_contract": "Actual synthetic Native CPU generation and raw embedding through in-process HTTP with explicitly Baked GGUF-only F32/F16/BF16 sources and zero/missing source alpha; no installed launcher or device-fused proof",
+      "assertions": "Catalogue/default/request scale flows change actual generated tokens and independently expected raw embedding coordinates without applying deliberately nonunity manifest alpha. Signed/zero scales preserve base projection, request overrides leave defaults intact, and invalid IDs preserve subsequent generation. F32 +/-10000 and independently authored half +/-8192 embedding coordinates distinguish incorrect static scaling.",
       "source_markers": []
     }
   },
