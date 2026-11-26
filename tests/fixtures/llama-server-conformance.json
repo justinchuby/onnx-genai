@@ -113,10 +113,17 @@
         "peft_native_rejection",
         "peft_native_config_error",
         "peft_native_rank_rows",
-        "peft_native_governor"
+        "peft_native_governor",
+        "gguf_typed_views",
+        "gguf_schema_floor",
+        "peft_native_half",
+        "gguf_native_scale",
+        "gguf_native_cache",
+        "peft_http_storage",
+        "gguf_http_storage"
       ],
       "remaining": [
-        "Device/multi-sequence persistence; generic GGUF import; PEFT discovery/import without explicit target metadata, the full storage/computation dtype cross-product, nonordinary variants and device-fused LoRA remain open. The linked PEFT fixtures exercise engine loading/inference, not HTTP PEFT import or catalogue transactions."
+        "Device/multi-sequence persistence and additional Native workers remain open. Explicitly mapped PEFT F32/F16/BF16 and positive-alpha unquantized F32 GGUF factors have bounded Native CPU source-linked evidence, including HTTP generation/embedding; this is not general model import or fresh full-matrix execution. GGUF half/quantized/zero-or-missing-alpha, automatic target discovery, composite/nonordinary adapter semantics, broader storage/computation combinations and device-fused LoRA remain unsupported or unverified."
       ]
     },
     {
@@ -962,6 +969,83 @@
         "infill_resource_limits_have_shared_defaults_and_positive_overrides",
         "--max-infill-template-operations"
       ]
+    },
+    "gguf_typed_views": {
+      "kind": "rust",
+      "package": "onnx-runtime-loader",
+      "package_manifest": "crates/onnx-runtime-loader/Cargo.toml",
+      "source": "crates/onnx-runtime-loader/tests/gguf_views.rs",
+      "target": "test:gguf_views",
+      "test": "gguf_views_preserve_typed_facts_canonical_rectangular_shape_and_borrowed_payload",
+      "execution_contract": "Independent hand-authored GGUF v3 bytes through the canonical borrowed container-view API; no inference or HTTP execution",
+      "assertions": "Typed STRING/FLOAT32 adapter facts are retained, harmless provenance is accepted, reversed GGML dimensions yield canonical rectangular shape and factor payloads borrow the original bytes.",
+      "source_markers": []
+    },
+    "gguf_schema_floor": {
+      "kind": "rust",
+      "package": "onnx-genai-metadata",
+      "package_manifest": "crates/onnx-genai-metadata/Cargo.toml",
+      "source": "crates/onnx-genai-metadata/tests/gguf_adapter.rs",
+      "target": "test:gguf_adapter",
+      "test": "gguf_adapter_format_has_explicit_schema_floor_and_exact_loader_contract",
+      "execution_contract": "Metadata parsing/validation only; no artifact read or inference",
+      "assertions": "GGUF requires schema1.19 and its exact semantic loader capability; older raw/typed declarations, wrong capability, PEFT config_location and baked scaling reject.",
+      "source_markers": []
+    },
+    "peft_native_half": {
+      "kind": "rust",
+      "package": "onnx-genai-engine",
+      "package_manifest": "crates/onnx-genai-engine/Cargo.toml",
+      "source": "crates/onnx-genai-engine/tests/peft_lora.rs",
+      "target": "test:peft_lora",
+      "test": "native_peft_f16_bf16_rank_two_storage_preserves_f32_computation_and_row_scales",
+      "execution_contract": "Independent hand-authored F16/BF16 SafeTensors factors through explicit target mapping and synthetic Native CPU ONNX MatMul; F32 base/input/computation",
+      "assertions": "Both half storage formats preserve rank-two rectangular factor values and independent positive/negative/zero row scales against analytical F32 output, with base inference recovery.",
+      "source_markers": []
+    },
+    "gguf_native_scale": {
+      "kind": "rust",
+      "package": "onnx-genai-engine",
+      "package_manifest": "crates/onnx-genai-engine/Cargo.toml",
+      "source": "crates/onnx-genai-engine/tests/gguf_lora.rs",
+      "target": "test:gguf_lora",
+      "test": "native_gguf_rank_two_rectangular_factors_preserve_alpha_and_independent_row_scales",
+      "execution_contract": "Independent hand-authored unquantized F32 GGUF with explicit saved prefixes through synthetic Native CPU ONNX MatMul and parameter overlay; not bare GGUF model inference",
+      "assertions": "Rank-two rectangular factors and positive embedded alpha/r produce independently calculated outputs for multiple rows with positive/negative/zero request scales; base remains valid.",
+      "source_markers": []
+    },
+    "gguf_native_cache": {
+      "kind": "rust",
+      "package": "onnx-genai-engine",
+      "package_manifest": "crates/onnx-genai-engine/Cargo.toml",
+      "source": "crates/onnx-genai-engine/tests/gguf_lora.rs",
+      "target": "test:gguf_lora",
+      "test": "native_gguf_embedded_metadata_changes_cannot_hide_behind_cached_factors",
+      "execution_contract": "Real F32 GGUF factors and actual synthetic Native CPU inference across cached selections",
+      "assertions": "Same-length embedded alpha and factor-only payload mutations reject cached activation through whole-container content identity; restoring original bytes recovers valid scaled inference and base output.",
+      "source_markers": []
+    },
+    "peft_http_storage": {
+      "kind": "rust",
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml",
+      "source": "crates/onnx-genai-server/tests/lora_container_http.rs",
+      "target": "test:lora_container_http",
+      "test": "native_http_hf_peft_only_catalogue_defaults_and_request_scales_use_actual_factors",
+      "execution_contract": "Actual synthetic Native CPU generation and raw embedding through in-process HTTP with HF PEFT F32/F16/BF16-only sources, no JSON duplicate; no installed launcher/device-fused proof",
+      "assertions": "Catalogue chooses the declared container, global defaults and positive/negative/zero request scales change actual generated tokens and independently expected raw embedding coordinates; request overrides preserve defaults and invalid IDs leave subsequent valid generation usable.",
+      "source_markers": []
+    },
+    "gguf_http_storage": {
+      "kind": "rust",
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml",
+      "source": "crates/onnx-genai-server/tests/lora_container_http.rs",
+      "target": "test:lora_container_http",
+      "test": "native_http_gguf_only_catalogue_defaults_and_request_scales_use_actual_factors",
+      "execution_contract": "Actual synthetic Native CPU generation and raw embedding through in-process HTTP with GGUF F32-only sources, no JSON duplicate; no installed launcher/device-fused proof",
+      "assertions": "Catalogue chooses the declared container, global defaults and positive/negative/zero request scales change actual generated tokens and independently expected raw embedding coordinates; request overrides preserve defaults and invalid IDs leave subsequent valid generation usable.",
+      "source_markers": []
     }
   },
   "routes": [
@@ -1019,11 +1103,13 @@
       "path": "/lora-adapters",
       "scope": "server",
       "evidence": [
-        "lora"
+        "lora",
+        "peft_http_storage",
+        "gguf_http_storage"
       ],
-      "assertions": "Model-bound adapter catalogue corresponds to actual selectable weights.",
+      "assertions": "Declared HF PEFT (F32/F16/BF16) and GGUF F32-only catalogues/defaults/request scales drive actual Native generation and raw embedding; invalid selection preserves valid defaults.",
       "remaining": [
-        "Arbitrary GGUF/PEFT imports and device-fused LoRA."
+        "GGUF half/quantized/zero-or-missing-alpha and nonordinary/composite adapter semantics; automatic target discovery, device-fused LoRA and broader state/cache/model combinations."
       ]
     },
     {
@@ -1299,11 +1385,13 @@
       "scope": "server",
       "evidence": [
         "lora",
-        "lora_atomic"
+        "lora_atomic",
+        "peft_http_storage",
+        "gguf_http_storage"
       ],
-      "assertions": "Default scales change actual inference; invalid updates are atomic.",
+      "assertions": "Declared HF PEFT (F32/F16/BF16) and GGUF F32-only catalogues/defaults/request scales drive actual Native generation and raw embedding; invalid selection preserves valid defaults.",
       "remaining": [
-        "Arbitrary imports/device-fused LoRA and broader state/cache combinations."
+        "GGUF half/quantized/zero-or-missing-alpha and nonordinary/composite adapter semantics; automatic target discovery, device-fused LoRA and broader state/cache/model combinations."
       ]
     },
     {
