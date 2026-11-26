@@ -966,8 +966,8 @@ pub fn narrow_bf16_slice_into(src: &[f32], dst: &mut [u16]) {
 /// Storage geometry used by widening and address-only execution refinement.
 /// Callers separately validate view geometry and Host accessibility.
 #[inline]
-pub(crate) fn can_borrow_dense_f32(view: &TensorView<'_>) -> bool {
-    view.dtype == DataType::Float32 && view.is_contiguous() && view.data_ptr::<f32>().is_aligned()
+pub(crate) fn can_borrow_dense<T: NumericElem>(view: &TensorView<'_>) -> bool {
+    view.dtype == T::DTYPE && view.is_contiguous() && view.data_ptr::<T>().is_aligned()
 }
 
 /// Borrow a contiguous f32 view zero-copy, or materialize/widen any other
@@ -976,7 +976,7 @@ pub(crate) fn can_borrow_dense_f32(view: &TensorView<'_>) -> bool {
 pub fn to_dense_f32_widen<'a>(op: &str, view: &'a TensorView<'_>) -> Result<Cow<'a, [f32]>> {
     validate_f32_widen_input(op, view)?;
     let len = view.numel();
-    if can_borrow_dense_f32(view) {
+    if can_borrow_dense::<f32>(view) {
         if len == 0 {
             return Ok(Cow::Borrowed(&[]));
         }
