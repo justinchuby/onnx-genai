@@ -352,7 +352,7 @@ mod error {
             "initialize Host tensor {dtype:?} {shape:?} payload: {source}; repair the initializer or release memory before retrying"
         )]
         HostTensorInitialization {
-            dtype: DataType,
+            dtype: onnx_runtime_ir::DataType,
             shape: Vec<usize>,
             #[source]
             source: Box<dyn std::error::Error + Send + Sync>,

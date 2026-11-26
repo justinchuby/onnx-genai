@@ -385,7 +385,8 @@ impl Executor {
                 |bytes| {
                     self.ep
                         .copy_to_host(&buffer, bytes)
-                        .map_err(SessionError::from)
+                        .map_err(SessionError::from)?;
+                    Ok(())
                 },
             );
         }
@@ -513,7 +514,8 @@ impl Executor {
             )?;
             let tensor = crate::tensor::HostTensorAllocator::new(self.output_host_allocator())?
                 .fill(dtype, shape.to_vec(), |bytes| {
-                    element.copy_host_contiguous_into(bytes)
+                    element.copy_host_contiguous_into(bytes)?;
+                    Ok(())
                 })?;
             return Ok((tensor, n));
         }
@@ -561,7 +563,8 @@ impl Executor {
                 .fill(dtype, shape.to_vec(), |bytes| {
                     self.ep
                         .copy_to_host(source, bytes)
-                        .map_err(SessionError::from)
+                        .map_err(SessionError::from)?;
+                    Ok(())
                 })?;
             return Ok((tensor, n));
         }
