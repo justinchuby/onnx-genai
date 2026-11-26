@@ -175,8 +175,11 @@ The frozen surface downstream builds against:
 - **Shape:** `Shape = Vec<Dim>`, `Dim::{Static,Symbolic}`, `SymbolId`,
   `SymbolConstraints` (min/max/divisible), static-shape helpers.
 - **Layout (§5):** `TensorLayout` (optional strides, `MemoryFormat`, alignment),
-  `compute_contiguous_strides`, `is_contiguous`, `broadcast_shapes`, lazy
-  `transpose`, `storage_size`.
+  `ContiguousStridePlan`, fallible `compute_contiguous_strides` and
+  `resolved_strides`, `is_contiguous`, `broadcast_shapes`, and fallible lazy
+  `transpose`. Logical dense bytes use `checked_expected_bytes`; strided
+  address bounds are checked against actual backing storage at execution
+  boundaries, and memory charges use owner capacity.
 - **Graph model:** `Graph` (arena nodes/values, inputs/outputs, initializers,
   symbol constraints, opset imports, subgraphs), `Node`, `Attribute`, `Value`,
   `TensorData`/`SparseTensorData`/`TypeProto`/`WeightRef`, `Arena`/`ArenaKey`.

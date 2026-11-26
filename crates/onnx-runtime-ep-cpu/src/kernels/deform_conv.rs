@@ -21,6 +21,18 @@ fn fail(detail: String) -> EpError {
 }
 
 impl KernelFactory for Factory {
+    fn unsupported_reason(
+        &self,
+        node: &Node,
+        _opset: u64,
+        shapes: &[onnx_runtime_ir::Shape],
+        input_dtypes: &[DataType],
+    ) -> Option<String> {
+        onnx_runtime_ir::deform_conv::validate_claim(node, self.0, shapes, input_dtypes)
+            .err()
+            .map(|reason| format!("DeformConv: {reason}"))
+    }
+
     fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(DeformConv {
             attrs: Attributes::parse(node).map_err(fail)?,

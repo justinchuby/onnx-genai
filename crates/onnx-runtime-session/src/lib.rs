@@ -42,13 +42,16 @@ pub use onnx_runtime_ep_api::DeviceBuffer;
 pub use onnx_runtime_ep_api::DeviceGraphSlot;
 pub use onnx_runtime_ep_api::WorkspaceRequirement;
 pub use workspace::{WorkspaceBounds, WorkspacePreparationReport};
+mod cpu_workers;
 mod workspace;
+pub use cpu_workers::CpuWorkerPlan;
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
 };
 pub use plugin_provider::{PluginExecutionProvider, is_plugin_fused_node};
 pub use tensor::{
-    DeviceBindingTransferStats, DeviceIoBinding, ExternalMemorySpec, Tensor, cpu_allocator,
+    DeviceBindingTransferStats, DeviceIoBinding, ExternalMemorySpec, HostTensorAllocator, Tensor,
+    cpu_allocator,
 };
 /// Device-bound graph outputs, stored inline for the common fixed-output case.
 pub type DeviceBindingOutputs = smallvec::SmallVec<[Option<Tensor>; 16]>;
@@ -113,6 +116,16 @@ pub enum OpsetVersion {
     Undeclared,
 }
 
+impl From<u64> for OpsetVersion {
+    fn from(version: u64) -> Self {
+        if version == u64::MAX {
+            Self::Undeclared
+        } else {
+            Self::Known(version)
+        }
+    }
+}
+
 impl std::fmt::Display for OpsetVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -157,6 +170,10 @@ mod error {
     #[derive(Debug, thiserror::Error)]
     pub enum SessionError {
         #[error(
+            "CPU worker plan is unsupported: {reason}; keep a single executor or supply a supported external-mapped CPU graph"
+        )]
+        UnsupportedCpuWorkerPlan { reason: String },
+        #[error(
             "fallback_execution_provider '{provider}' is bound to {device:?}; pass a CPU provider initialized with this session's memory resources"
         )]
         InvalidFallbackProvider {
@@ -190,6 +207,14 @@ mod error {
              {unsupported_nodes}"
         )]
         HeterogeneousPlacementRequired { unsupported_nodes: String },
+
+        #[error("CUDA kernel creation failed for {op_type} at {node}, opset {opset}: {source}")]
+        CudaKernelCreationFailed {
+            node: String,
+            op_type: String,
+            opset: OpsetVersion,
+            source: onnx_runtime_ep_api::EpError,
+        },
 
         #[error("the ordered provider cannot cover the whole graph: {reason}")]
         OrderedProviderDeclined { reason: String },
@@ -325,6 +350,8 @@ mod error {
 
         #[error("Sequence op {op}: {reason}")]
         SequenceOp { op: String, reason: String },
+        #[error("ONNX Optional operator {op}: {reason}")]
+        OptionalOp { op: String, reason: String },
 
         #[error("control-flow op {op}: {reason}")]
         ControlFlow { op: String, reason: String },
@@ -391,11 +418,7 @@ mod error {
             } else {
                 format!("{:?}", node.name)
             };
-            let opset = if opset == u64::MAX {
-                OpsetVersion::Undeclared
-            } else {
-                OpsetVersion::Known(opset)
-            };
+            let opset = OpsetVersion::from(opset);
             Self::UnsupportedOp {
                 op_type: node.op_type.clone(),
                 domain,
@@ -2023,6 +2046,13 @@ impl InferenceSession {
         self.exec.max_lazy_weight_working_set_bytes()
     }
 
+    /// Construct owned host tensors through this session's allocation domain.
+    /// Returned tensors retain their provider and allocation owners independently
+    /// of the session lifetime. No implicit cross-device transfer is performed.
+    pub fn host_tensor_allocator(&self) -> Result<HostTensorAllocator> {
+        self.exec.host_tensor_allocator()
+    }
+
     pub fn device_id(&self) -> onnx_runtime_ir::DeviceId {
         self.exec.device_id()
     }
@@ -2037,6 +2067,13 @@ impl InferenceSession {
     /// heterogeneous session. `None` for the single-EP path.
     pub fn heterogeneous_placement_report(&self) -> Option<&str> {
         self.exec.heterogeneous_placement_report()
+    }
+
+    /// The first graph operation dispatched by the session's host executor
+    /// rather than through an EP kernel, if any. Host-side tensor transfers
+    /// are not graph operations.
+    pub fn host_graph_op(&self) -> Option<&onnx_runtime_ir::Node> {
+        self.exec.host_graph_op()
     }
 
     /// Input metadata.
@@ -2946,3 +2983,6 @@ mod option_tests {
         assert_eq!(ctx.embed_mode, 0);
     }
 }
+
+#[cfg(test)]
+mod host_tensor_tests;

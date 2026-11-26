@@ -871,6 +871,10 @@ pub(crate) fn is_sequence_op(op_type: &str, domain: &str) -> bool {
         )
 }
 
+pub(crate) fn is_container_op(op_type: &str, domain: &str) -> bool {
+    is_sequence_op(op_type, domain) || optional_ops::is_optional_op(op_type, domain)
+}
+
 fn heterogeneous_api_error(operation: &str) -> SessionError {
     SessionError::HeterogeneousExecutionUnsupported {
         placement_summary: format!(
@@ -1069,6 +1073,7 @@ impl Drop for Executor {
     }
 }
 
+mod cpu_workers;
 mod state;
 use state::*;
 pub(crate) use state::{ChildExecutor, ChildExecutorStats, Executor};
@@ -1103,6 +1108,7 @@ mod capture;
 mod control_flow;
 mod dispatch;
 pub(crate) mod host_strings;
+mod optional_ops;
 mod platform;
 mod prefetch;
 mod run;
@@ -1112,6 +1118,9 @@ pub use prefetch::{PrefetchStep, drive_double_buffer, plan_double_buffer};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod resize_recovery_tests;
 
 #[cfg(test)]
 mod graph_kernel_tests;

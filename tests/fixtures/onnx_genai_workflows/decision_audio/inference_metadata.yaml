@@ -1,0 +1,445 @@
+{
+  "schema_version": "v1.15",
+  "package": {
+    "tokenizer": {
+      "algorithm": "word_level",
+      "vocab_size": 32,
+      "artifacts": [
+        {
+          "location": "tokenizer.json"
+        }
+      ],
+      "special_tokens": {
+        "bos_token_id": 2,
+        "eos_token_id": [
+          3
+        ]
+      }
+    }
+  },
+  "profiles": {
+    "decision_head": {
+      "kind": "decision",
+      "version": "3",
+      "outputs": {
+        "probabilities": "probabilities",
+        "prompt_tokens": "usage"
+      },
+      "decision": {
+        "media": [
+          {
+            "kind": "image",
+            "input": "state.picture"
+          },
+          {
+            "kind": "audio",
+            "input": "state.audio"
+          }
+        ],
+        "spoken_instructions": "question.audio",
+        "prompt_template": "{{ state | tojson }} {% if spoken_instructions %}spoken{% else %}{{ instructions }}{% endif %} {{ media_types | tojson }}",
+        "input_policy": {
+          "state": "payload_or_null",
+          "instructions": {
+            "kind": "required",
+            "payload": "text"
+          },
+          "default_type": "choice",
+          "choice": {
+            "kind": "dynamic",
+            "minimum": 2,
+            "order": "request",
+            "descriptions": "payload",
+            "nonempty_keys": true
+          }
+        },
+        "max_options": 2,
+        "variants": "direct",
+        "choice_confidence": "uniform_margin",
+        "score_confidence": "mode_distance",
+        "score": "expected_level"
+      }
+    }
+  },
+  "preprocessing": {
+    "image": {
+      "transforms": [
+        {
+          "op": "decode",
+          "outputs": [
+            "decoded"
+          ]
+        },
+        {
+          "op": "convert_rgb",
+          "inputs": [
+            "decoded"
+          ],
+          "outputs": [
+            "rgb"
+          ]
+        },
+        {
+          "op": "resize",
+          "inputs": [
+            "rgb"
+          ],
+          "outputs": [
+            "resized"
+          ],
+          "size": 2,
+          "mode": "stretch",
+          "interpolation": "bilinear"
+        },
+        {
+          "op": "rescale",
+          "inputs": [
+            "resized"
+          ],
+          "outputs": [
+            "pixels"
+          ],
+          "scale": 0.00392156862745098
+        }
+      ],
+      "outputs": [
+        {
+          "source": "pixels",
+          "name": "pixel_values",
+          "content": "pixels",
+          "dtype": "float32",
+          "contract": {
+            "dtype": "float32",
+            "shape": [
+              "image_batch",
+              3,
+              2,
+              2
+            ]
+          }
+        }
+      ]
+    },
+    "audio": {
+      "transforms": [
+        {
+          "op": "decode",
+          "outputs": [
+            "decoded"
+          ]
+        },
+        {
+          "op": "resample",
+          "sample_rate": 16000,
+          "inputs": [
+            "decoded"
+          ],
+          "outputs": [
+            "resampled"
+          ]
+        },
+        {
+          "op": "log_mel",
+          "num_mel_bins": 80,
+          "n_fft": 400,
+          "hop_length": 160,
+          "inputs": [
+            "resampled"
+          ],
+          "outputs": [
+            "mel"
+          ]
+        },
+        {
+          "op": "emit_valid_samples",
+          "inputs": [
+            "resampled"
+          ],
+          "outputs": [
+            "length"
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "features",
+          "source": "mel",
+          "content": "audio_features",
+          "dtype": "float32",
+          "contract": {
+            "dtype": "float32",
+            "shape": [
+              "audio_batch",
+              80,
+              "frames"
+            ]
+          }
+        },
+        {
+          "name": "valid_samples",
+          "source": "length",
+          "content": "valid_samples",
+          "dtype": "int64",
+          "contract": {
+            "dtype": "int64",
+            "shape": [
+              "audio_batch"
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "pipeline": {
+    "workflow": {
+      "publication_mode": "commit_only",
+      "manifest": {
+        "adapter_abis": {
+          "onnx-genai.image-preprocess": "2",
+          "onnx-genai.audio-preprocess": "2"
+        }
+      },
+      "inputs": {
+        "question.ids": {
+          "contract": {
+            "dtype": "int64",
+            "shape": [
+              1,
+              "sequence"
+            ]
+          },
+          "role": {
+            "kind": "runtime",
+            "version": "1.0",
+            "role": "prompt_tokens"
+          },
+          "source": {
+            "kind": "request"
+          }
+        },
+        "question.mask": {
+          "contract": {
+            "dtype": "int64",
+            "shape": [
+              1,
+              "sequence"
+            ]
+          },
+          "role": {
+            "kind": "opaque"
+          },
+          "source": {
+            "kind": "application",
+            "name": "attention_mask"
+          }
+        },
+        "state.picture": {
+          "contract": {
+            "dtype": "uint8",
+            "shape": [
+              "state_picture_bytes"
+            ]
+          },
+          "role": {
+            "kind": "opaque"
+          },
+          "source": {
+            "kind": "application",
+            "name": "state.picture"
+          },
+          "required": true
+        },
+        "state.audio": {
+          "contract": {
+            "dtype": "uint8",
+            "shape": [
+              "state_audio_bytes"
+            ]
+          },
+          "role": {
+            "kind": "opaque"
+          },
+          "source": {
+            "kind": "application",
+            "name": "state.audio"
+          },
+          "required": true
+        },
+        "question.audio": {
+          "contract": {
+            "dtype": "uint8",
+            "shape": [
+              "question_audio_bytes"
+            ]
+          },
+          "role": {
+            "kind": "opaque"
+          },
+          "source": {
+            "kind": "application",
+            "name": "question.audio"
+          },
+          "required": true
+        }
+      },
+      "outputs": {
+        "probabilities": {
+          "contract": {
+            "dtype": "float32",
+            "shape": [
+              2
+            ]
+          },
+          "family": {
+            "kind": "materialized"
+          },
+          "role": "tensor",
+          "stage": "pre_adapter"
+        },
+        "usage": {
+          "contract": {
+            "dtype": "int64",
+            "shape": [
+              1
+            ]
+          },
+          "family": {
+            "kind": "materialized"
+          },
+          "role": "tensor",
+          "stage": "pre_adapter"
+        }
+      },
+      "components": {
+        "image": {
+          "implementation": {
+            "kind": "adapter",
+            "abi": "onnx-genai.image-preprocess",
+            "version": "2"
+          },
+          "ports": {
+            "inputs": {
+              "encoded": {
+                "dtype": "uint8",
+                "shape": [
+                  "encoded_bytes"
+                ]
+              }
+            },
+            "outputs": {
+              "pixel_values": {
+                "dtype": "float32",
+                "shape": [
+                  "image_batch",
+                  3,
+                  2,
+                  2
+                ]
+              }
+            }
+          }
+        },
+        "audio": {
+          "implementation": {
+            "kind": "adapter",
+            "abi": "onnx-genai.audio-preprocess",
+            "version": "2"
+          },
+          "ports": {
+            "inputs": {
+              "encoded": {
+                "dtype": "uint8",
+                "shape": [
+                  "encoded_bytes"
+                ]
+              }
+            },
+            "outputs": {
+              "features": {
+                "dtype": "float32",
+                "shape": [
+                  "audio_batch",
+                  80,
+                  "frames"
+                ]
+              },
+              "valid_samples": {
+                "dtype": "int64",
+                "shape": [
+                  "audio_batch"
+                ]
+              }
+            }
+          }
+        },
+        "head": {
+          "implementation": {
+            "kind": "onnx",
+            "artifact": "model.onnx.textproto"
+          }
+        }
+      },
+      "steps": [
+        {
+          "kind": "invoke",
+          "component": "image",
+          "inputs": {
+            "encoded": "state.picture"
+          },
+          "outputs": {
+            "pixel_values": "state.pixels"
+          }
+        },
+        {
+          "kind": "invoke",
+          "component": "audio",
+          "inputs": {
+            "encoded": "state.audio"
+          },
+          "outputs": {
+            "features": "state.features",
+            "valid_samples": "state.valid_samples"
+          }
+        },
+        {
+          "kind": "invoke",
+          "component": "audio",
+          "inputs": {
+            "encoded": "question.audio"
+          },
+          "outputs": {
+            "features": "question.features",
+            "valid_samples": "question.valid_samples"
+          }
+        },
+        {
+          "kind": "invoke",
+          "component": "head",
+          "inputs": {
+            "ids": "question.ids",
+            "mask": "question.mask",
+            "pixels": "state.pixels",
+            "state_features": "state.features",
+            "question_features": "question.features"
+          },
+          "outputs": {
+            "probabilities": "head.probabilities",
+            "usage": "head.usage"
+          }
+        },
+        {
+          "kind": "emit",
+          "value": "head.probabilities",
+          "output": "probabilities",
+          "mode": "replace"
+        },
+        {
+          "kind": "emit",
+          "value": "head.usage",
+          "output": "usage",
+          "mode": "replace"
+        }
+      ]
+    }
+  }
+}

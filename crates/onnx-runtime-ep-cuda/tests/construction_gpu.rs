@@ -192,7 +192,10 @@ fn run(
         .collect::<Vec<_>>();
     let input_strides = inputs
         .iter()
-        .map(|input| compute_contiguous_strides(&input.shape))
+        .map(|input| {
+            compute_contiguous_strides(&input.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let input_views = inputs
         .iter()
@@ -218,7 +221,10 @@ fn run(
         .collect::<Vec<DeviceBuffer>>();
     let output_strides = outputs
         .iter()
-        .map(|(_, shape)| compute_contiguous_strides(shape))
+        .map(|(_, shape)| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let output_views = outputs
         .iter()
@@ -535,9 +541,12 @@ fn where_metadata_rewarm_is_transactional_and_preserves_captured_payload() {
         .get_kernel(&Node::new(NodeId(0), "Where", vec![], vec![]), &[], 13)
         .unwrap();
     let execute = |condition_shape: &[usize], x_shape: &[usize], out_shape: &[usize]| {
-        let condition_strides = compute_contiguous_strides(condition_shape);
-        let x_strides = compute_contiguous_strides(x_shape);
-        let out_strides = compute_contiguous_strides(out_shape);
+        let condition_strides = compute_contiguous_strides(condition_shape)
+            .expect("fixture shape has representable contiguous strides");
+        let x_strides = compute_contiguous_strides(x_shape)
+            .expect("fixture shape has representable contiguous strides");
+        let out_strides = compute_contiguous_strides(out_shape)
+            .expect("fixture shape has representable contiguous strides");
         kernel.execute(
             &[
                 TensorView::new(
@@ -814,7 +823,8 @@ fn split_static_even_num_outputs_matches_eager_bytes() {
             .htod(&initial, cuptr(input_buffer.as_ptr()))
             .unwrap();
     };
-    let input_strides = compute_contiguous_strides(&input_shape);
+    let input_strides = compute_contiguous_strides(&input_shape)
+        .expect("fixture shape has representable contiguous strides");
     let input = TensorView::new(
         DevicePtr(input_buffer.as_ptr()),
         DataType::Float32,
@@ -831,7 +841,10 @@ fn split_static_even_num_outputs_matches_eager_bytes() {
         .collect::<Vec<_>>();
     let output_strides = output_shapes
         .iter()
-        .map(|shape| compute_contiguous_strides(shape))
+        .map(|shape| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
 
     macro_rules! execute {
@@ -948,8 +961,10 @@ fn split_constant_input_warms_and_captures() {
             .htod(&split_bytes, cuptr(split_buffer.as_ptr()))
             .unwrap();
     }
-    let data_strides = compute_contiguous_strides(&data_shape);
-    let split_strides = compute_contiguous_strides(&split_shape);
+    let data_strides = compute_contiguous_strides(&data_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let split_strides = compute_contiguous_strides(&split_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [
         TensorView::new(
             DevicePtr(data_buffer.as_ptr()),
@@ -975,7 +990,10 @@ fn split_constant_input_warms_and_captures() {
         .collect::<Vec<_>>();
     let output_strides = output_shapes
         .iter()
-        .map(|shape| compute_contiguous_strides(shape))
+        .map(|shape| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
 
     let mut execute = || {
@@ -1091,8 +1109,10 @@ fn split_runtime_sizes_with_resolved_outputs_warms_and_captures() {
             .htod(&split_bytes, cuptr(split_buffer.as_ptr()))
             .unwrap();
     }
-    let data_strides = compute_contiguous_strides(&data_shape);
-    let split_strides = compute_contiguous_strides(&split_shape);
+    let data_strides = compute_contiguous_strides(&data_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let split_strides = compute_contiguous_strides(&split_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [
         TensorView::new(
             DevicePtr(data_buffer.as_ptr()),
@@ -1118,7 +1138,10 @@ fn split_runtime_sizes_with_resolved_outputs_warms_and_captures() {
         .collect::<Vec<_>>();
     let output_strides = output_shapes
         .iter()
-        .map(|shape| compute_contiguous_strides(shape))
+        .map(|shape| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
 
     macro_rules! execute {
@@ -1295,7 +1318,10 @@ fn concat_fixed_shape_captures_and_matches_eager() {
         .collect::<Vec<_>>();
     let input_strides = input_shapes
         .iter()
-        .map(|shape| compute_contiguous_strides(shape))
+        .map(|shape| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let inputs = input_buffers
         .iter()
@@ -1314,7 +1340,8 @@ fn concat_fixed_shape_captures_and_matches_eager() {
     let mut output_buffer = ep
         .allocate(16 * 192 * std::mem::size_of::<f32>(), 256)
         .unwrap();
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut execute = || {
         let mut output = [TensorMut::new(
             DevicePtrMut(output_buffer.as_mut_ptr()),
@@ -1388,8 +1415,10 @@ fn reshape_exact_signature_captures_async_copy() {
             .htod(&shape_bytes, cuptr(shape_buffer.as_ptr()))
             .unwrap();
     }
-    let input_strides = compute_contiguous_strides(&input_shape);
-    let shape_strides = compute_contiguous_strides(&shape_shape);
+    let input_strides = compute_contiguous_strides(&input_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let shape_strides = compute_contiguous_strides(&shape_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [
         TensorView::new(
             DevicePtr(data_buffer.as_ptr()),
@@ -1407,7 +1436,8 @@ fn reshape_exact_signature_captures_async_copy() {
         ),
     ];
     let mut output_buffer = ep.allocate(data_bytes.len(), 256).unwrap();
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut execute = || {
         let mut outputs = [TensorMut::new(
             DevicePtrMut(output_buffer.as_mut_ptr()),
@@ -1445,7 +1475,8 @@ fn reshape_exact_signature_captures_async_copy() {
     assert!(runtime.reset_graph().unwrap());
 
     let changed_output_shape = [1, 1, 8, 384];
-    let changed_output_strides = compute_contiguous_strides(&changed_output_shape);
+    let changed_output_strides = compute_contiguous_strides(&changed_output_shape)
+        .expect("fixture shape has representable contiguous strides");
     runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
     let mut changed_output = [TensorMut::new(
         DevicePtrMut(output_buffer.as_mut_ptr()),
@@ -1497,8 +1528,10 @@ fn expand_warmed_metadata_captures_and_matches_eager() {
             .htod(&shape_bytes, cuptr(shape_buffer.as_ptr()))
             .unwrap();
     }
-    let input_strides = compute_contiguous_strides(&input_shape);
-    let shape_strides = compute_contiguous_strides(&shape_shape);
+    let input_strides = compute_contiguous_strides(&input_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let shape_strides = compute_contiguous_strides(&shape_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [
         TensorView::new(
             DevicePtr(data_buffer.as_ptr()),
@@ -1518,7 +1551,8 @@ fn expand_warmed_metadata_captures_and_matches_eager() {
     let mut output_buffer = ep
         .allocate(16 * 64 * std::mem::size_of::<f32>(), 256)
         .unwrap();
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut execute = || {
         let mut output = [TensorMut::new(
             DevicePtrMut(output_buffer.as_mut_ptr()),
@@ -1582,7 +1616,8 @@ fn transpose_warmed_metadata_captures_and_matches_eager() {
             .htod(&data_bytes, cuptr(data_buffer.as_ptr()))
             .unwrap();
     }
-    let input_strides = compute_contiguous_strides(&input_shape);
+    let input_strides = compute_contiguous_strides(&input_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [TensorView::new(
         DevicePtr(data_buffer.as_ptr()),
         DataType::Float32,
@@ -1591,7 +1626,8 @@ fn transpose_warmed_metadata_captures_and_matches_eager() {
         device,
     )];
     let mut output_buffer = ep.allocate(6 * std::mem::size_of::<f32>(), 256).unwrap();
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut execute = || {
         let mut output = [TensorMut::new(
             DevicePtrMut(output_buffer.as_mut_ptr()),
@@ -1636,6 +1672,74 @@ fn transpose_warmed_metadata_captures_and_matches_eager() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
+fn transpose_packed_cuda_replays_odd_tail_exactly() {
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let device = ep.device_id();
+    let input_shape = [3, 5];
+    let output_shape = [5, 3];
+    let mut node = Node::new(NodeId(0), "Transpose", vec![], vec![]);
+    node.attributes
+        .insert("perm".into(), Attribute::Ints(vec![1, 0]));
+    let kernel = ep.get_kernel(&node, &[input_shape.to_vec()], 25).unwrap();
+    let data = ep.allocate(4, 256).unwrap();
+    let mut output = ep.allocate(4, 256).unwrap();
+    unsafe {
+        runtime
+            .htod(&[0xac, 0xc1, 0x1a, 0xec], cuptr(data.as_ptr()))
+            .unwrap();
+    }
+    let input_strides = compute_contiguous_strides(&input_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let inputs = [TensorView::new(
+        DevicePtr(data.as_ptr()),
+        DataType::Uint2,
+        &input_shape,
+        &input_strides,
+        device,
+    )];
+    let execute = |output: &mut DeviceBuffer| {
+        kernel
+            .execute(
+                &inputs,
+                &mut [TensorMut::new(
+                    DevicePtrMut(output.as_mut_ptr()),
+                    DataType::Uint2,
+                    &output_shape,
+                    &output_strides,
+                    device,
+                )],
+            )
+            .unwrap();
+    };
+    execute(&mut output);
+    assert_eq!(kernel.capture_support(), CaptureSupport::Supported);
+    assert_eq!(kernel.device_graph_resources().len(), 1);
+    runtime.begin_graph_capture(&[kernel.as_ref()]).unwrap();
+    execute(&mut output);
+    runtime.end_graph_capture().unwrap();
+    // Poison the warm output so an omitted replay launch cannot pass.
+    unsafe {
+        runtime.htod(&[0xff; 4], cuptr(output.as_ptr())).unwrap();
+    }
+    runtime.replay_graph().unwrap();
+    let mut actual = [0; 4];
+    unsafe {
+        runtime.dtoh(&mut actual, cuptr(output.as_ptr())).unwrap();
+    }
+    assert_eq!(actual, [0xd0, 0xe0, 0xe8, 0x29]);
+    assert!(runtime.reset_graph().unwrap());
+    ep.deallocate(data).unwrap();
+    ep.deallocate(output).unwrap();
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
 fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop() {
     #[cfg(feature = "gpu-tests")]
     transpose_captured_metadata_outlives_rewarm_and_kernel_drop_gpu();
@@ -1666,8 +1770,10 @@ fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop_gpu() {
             .htod(&raw(&a_data), cuptr(a_data_buffer.as_ptr()))
             .unwrap();
     }
-    let a_input_strides = compute_contiguous_strides(&a_input_shape);
-    let a_output_strides = compute_contiguous_strides(&a_output_shape);
+    let a_input_strides = compute_contiguous_strides(&a_input_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let a_output_strides = compute_contiguous_strides(&a_output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let a_inputs = [TensorView::new(
         DevicePtr(a_data_buffer.as_ptr()),
         DataType::Float32,
@@ -1713,8 +1819,10 @@ fn transpose_captured_metadata_outlives_rewarm_and_kernel_drop_gpu() {
             .htod(&raw(&b_data), cuptr(b_data_buffer.as_ptr()))
             .unwrap();
     }
-    let b_input_strides = compute_contiguous_strides(&b_input_shape);
-    let b_output_strides = compute_contiguous_strides(&b_output_shape);
+    let b_input_strides = compute_contiguous_strides(&b_input_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let b_output_strides = compute_contiguous_strides(&b_output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let b_inputs = [TensorView::new(
         DevicePtr(b_data_buffer.as_ptr()),
         DataType::Float32,
@@ -1886,9 +1994,12 @@ fn slice_captured_metadata_outlives_rewarm_and_kernel_drop() {
             .htod(&raw(&a_data), cuptr(a_data_buffer.as_ptr()))
             .unwrap();
     }
-    let a_data_strides = compute_contiguous_strides(&a_data_shape);
-    let bounds_strides = compute_contiguous_strides(&bounds_shape);
-    let a_output_strides = compute_contiguous_strides(&a_output_shape);
+    let a_data_strides = compute_contiguous_strides(&a_data_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let bounds_strides = compute_contiguous_strides(&bounds_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let a_output_strides = compute_contiguous_strides(&a_output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let a_inputs = std::iter::once(TensorView::new(
         DevicePtr(a_data_buffer.as_ptr()),
         DataType::Float32,
@@ -1996,8 +2107,10 @@ fn slice_captured_metadata_outlives_rewarm_and_kernel_drop() {
             .htod(&raw(&b_data), cuptr(b_data_buffer.as_ptr()))
             .unwrap();
     }
-    let b_data_strides = compute_contiguous_strides(&b_data_shape);
-    let b_output_strides = compute_contiguous_strides(&b_output_shape);
+    let b_data_strides = compute_contiguous_strides(&b_data_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let b_output_strides = compute_contiguous_strides(&b_output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let b_inputs = std::iter::once(TensorView::new(
         DevicePtr(b_data_buffer.as_ptr()),
         DataType::Float32,
@@ -2147,8 +2260,10 @@ fn transpose_rejects_signature_change_during_capture() {
             .htod(&a_data_bytes, cuptr(a_data_buffer.as_ptr()))
             .unwrap();
     }
-    let a_input_strides = compute_contiguous_strides(&a_input_shape);
-    let a_output_strides = compute_contiguous_strides(&a_output_shape);
+    let a_input_strides = compute_contiguous_strides(&a_input_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let a_output_strides = compute_contiguous_strides(&a_output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let a_inputs = [TensorView::new(
         DevicePtr(a_data_buffer.as_ptr()),
         DataType::Float32,
@@ -2179,8 +2294,10 @@ fn transpose_rejects_signature_change_during_capture() {
             .htod(&b_data_bytes, cuptr(b_data_buffer.as_ptr()))
             .unwrap();
     }
-    let b_input_strides = compute_contiguous_strides(&b_input_shape);
-    let b_output_strides = compute_contiguous_strides(&b_output_shape);
+    let b_input_strides = compute_contiguous_strides(&b_input_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let b_output_strides = compute_contiguous_strides(&b_output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let b_inputs = [TensorView::new(
         DevicePtr(b_data_buffer.as_ptr()),
         DataType::Float32,
@@ -2258,8 +2375,10 @@ fn tile_warmed_metadata_captures_and_matches_eager() {
             .htod(&repeats_bytes, cuptr(repeats_buffer.as_ptr()))
             .unwrap();
     }
-    let input_strides = compute_contiguous_strides(&input_shape);
-    let repeats_strides = compute_contiguous_strides(&repeats_shape);
+    let input_strides = compute_contiguous_strides(&input_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let repeats_strides = compute_contiguous_strides(&repeats_shape)
+        .expect("fixture shape has representable contiguous strides");
     let inputs = [
         TensorView::new(
             DevicePtr(data_buffer.as_ptr()),
@@ -2277,7 +2396,8 @@ fn tile_warmed_metadata_captures_and_matches_eager() {
         ),
     ];
     let mut output_buffer = ep.allocate(12 * std::mem::size_of::<f32>(), 256).unwrap();
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut execute = || {
         let mut output = [TensorMut::new(
             DevicePtrMut(output_buffer.as_mut_ptr()),
@@ -2361,8 +2481,10 @@ fn tile_rejects_signature_change_during_capture() {
             .htod(&b_repeats_bytes, cuptr(b_repeats_buffer.as_ptr()))
             .unwrap();
     }
-    let input_strides = compute_contiguous_strides(&input_shape);
-    let repeats_strides = compute_contiguous_strides(&repeats_shape);
+    let input_strides = compute_contiguous_strides(&input_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let repeats_strides = compute_contiguous_strides(&repeats_shape)
+        .expect("fixture shape has representable contiguous strides");
     let a_inputs = [
         TensorView::new(
             DevicePtr(data_buffer.as_ptr()),
@@ -2396,10 +2518,12 @@ fn tile_rejects_signature_change_during_capture() {
         ),
     ];
     let mut a_output_buffer = ep.allocate(12 * std::mem::size_of::<f32>(), 256).unwrap();
-    let a_output_strides = compute_contiguous_strides(&a_output_shape);
+    let a_output_strides = compute_contiguous_strides(&a_output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let b_output_shape = [4usize, 2];
     let mut b_output_buffer = ep.allocate(8 * std::mem::size_of::<f32>(), 256).unwrap();
-    let b_output_strides = compute_contiguous_strides(&b_output_shape);
+    let b_output_strides = compute_contiguous_strides(&b_output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut run_a = || {
         let mut output = [TensorMut::new(
             DevicePtrMut(a_output_buffer.as_mut_ptr()),
@@ -2473,9 +2597,12 @@ fn binary_metadata_and_signature_publish_together_and_preserve_old_graph() {
         ..Default::default()
     });
     let execute = |a_shape: &[usize], b_shape: &[usize], out_shape: &[usize]| {
-        let a_strides = compute_contiguous_strides(a_shape);
-        let b_strides = compute_contiguous_strides(b_shape);
-        let out_strides = compute_contiguous_strides(out_shape);
+        let a_strides = compute_contiguous_strides(a_shape)
+            .expect("fixture shape has representable contiguous strides");
+        let b_strides = compute_contiguous_strides(b_shape)
+            .expect("fixture shape has representable contiguous strides");
+        let out_strides = compute_contiguous_strides(out_shape)
+            .expect("fixture shape has representable contiguous strides");
         kernel.execute(
             &[
                 TensorView::new(

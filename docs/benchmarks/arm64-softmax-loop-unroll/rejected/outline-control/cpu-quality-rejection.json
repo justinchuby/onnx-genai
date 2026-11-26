@@ -1,0 +1,9 @@
+{
+  "phase": "outline-control",
+  "raw_samples": 10800,
+  "impossible_cpu_windows": 51,
+  "physical_guard": "CPU_ns <= wall_ns * (10 verified logical CPUs + 1 margin)",
+  "max_cpu_over_wall": 861.2667114795728,
+  "cpu_claims_rejected": true,
+  "reason": "getrusage short-window counters exceed physical CPU capacity; A/A acceptance alone does not establish clock validity"
+}

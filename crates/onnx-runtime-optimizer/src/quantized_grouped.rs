@@ -257,7 +257,7 @@ impl OptimizationPass for QuantizedGroupedFusion {
     }
 }
 
-fn literal(graph: &Graph, ctx: &PassContext, id: ValueId) -> Option<Vec<i64>> {
+pub(crate) fn literal(graph: &Graph, ctx: &PassContext, id: ValueId) -> Option<Vec<i64>> {
     let value = graph.value(id);
     if value
         .tensor_shape()?

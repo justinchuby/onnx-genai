@@ -932,16 +932,24 @@ fn execute_over_arenas(
     let device_id = ep.device_id();
     let hidden = fixture.shape.hidden;
     let experts = fixture.shape.experts;
-    let strides_2d_hidden = compute_contiguous_strides(&[output_shape[0], hidden]);
-    let strides_2d_experts = compute_contiguous_strides(&[output_shape[0], experts]);
+    let strides_2d_hidden = compute_contiguous_strides(&[output_shape[0], hidden])
+        .expect("fixture shape has representable contiguous strides");
+    let strides_2d_experts = compute_contiguous_strides(&[output_shape[0], experts])
+        .expect("fixture shape has representable contiguous strides");
     let shape_2d_hidden = [output_shape[0], hidden];
     let shape_2d_experts = [output_shape[0], experts];
-    let fc1_packed_strides = compute_contiguous_strides(&fixture.fc1.packed_shape);
-    let fc1_scales_strides = compute_contiguous_strides(&fixture.fc1.scales_shape);
-    let fc2_packed_strides = compute_contiguous_strides(&fixture.fc2.packed_shape);
-    let fc2_scales_strides = compute_contiguous_strides(&fixture.fc2.scales_shape);
-    let fc3_packed_strides = compute_contiguous_strides(&fixture.fc3.packed_shape);
-    let fc3_scales_strides = compute_contiguous_strides(&fixture.fc3.scales_shape);
+    let fc1_packed_strides = compute_contiguous_strides(&fixture.fc1.packed_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let fc1_scales_strides = compute_contiguous_strides(&fixture.fc1.scales_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let fc2_packed_strides = compute_contiguous_strides(&fixture.fc2.packed_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let fc2_scales_strides = compute_contiguous_strides(&fixture.fc2.scales_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let fc3_packed_strides = compute_contiguous_strides(&fixture.fc3.packed_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let fc3_scales_strides = compute_contiguous_strides(&fixture.fc3.scales_shape)
+        .expect("fixture shape has representable contiguous strides");
 
     let views = vec![
         TensorView::new(
@@ -1017,7 +1025,8 @@ fn execute_over_arenas(
 
     let output_bytes = output_shape[0] * hidden * 4;
     let mut output_buf = ep.allocate(output_bytes, 256).unwrap();
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut workspace = None;
     let caller_view = {
         let output = TensorMut::new(
@@ -1778,14 +1787,22 @@ fn run_performance_sweep(shape: QmoeShape) {
         let device_id = ep.device_id();
         let hidden = fixture.shape.hidden;
         let experts = fixture.shape.experts;
-        let strides_2d_hidden = compute_contiguous_strides(&[output_shape[0], hidden]);
-        let strides_2d_experts = compute_contiguous_strides(&[output_shape[0], experts]);
-        let fc1_packed_strides = compute_contiguous_strides(&fixture.fc1.packed_shape);
-        let fc1_scales_strides = compute_contiguous_strides(&fixture.fc1.scales_shape);
-        let fc2_packed_strides = compute_contiguous_strides(&fixture.fc2.packed_shape);
-        let fc2_scales_strides = compute_contiguous_strides(&fixture.fc2.scales_shape);
-        let fc3_packed_strides = compute_contiguous_strides(&fixture.fc3.packed_shape);
-        let fc3_scales_strides = compute_contiguous_strides(&fixture.fc3.scales_shape);
+        let strides_2d_hidden = compute_contiguous_strides(&[output_shape[0], hidden])
+            .expect("fixture shape has representable contiguous strides");
+        let strides_2d_experts = compute_contiguous_strides(&[output_shape[0], experts])
+            .expect("fixture shape has representable contiguous strides");
+        let fc1_packed_strides = compute_contiguous_strides(&fixture.fc1.packed_shape)
+            .expect("fixture shape has representable contiguous strides");
+        let fc1_scales_strides = compute_contiguous_strides(&fixture.fc1.scales_shape)
+            .expect("fixture shape has representable contiguous strides");
+        let fc2_packed_strides = compute_contiguous_strides(&fixture.fc2.packed_shape)
+            .expect("fixture shape has representable contiguous strides");
+        let fc2_scales_strides = compute_contiguous_strides(&fixture.fc2.scales_shape)
+            .expect("fixture shape has representable contiguous strides");
+        let fc3_packed_strides = compute_contiguous_strides(&fixture.fc3.packed_shape)
+            .expect("fixture shape has representable contiguous strides");
+        let fc3_scales_strides = compute_contiguous_strides(&fixture.fc3.scales_shape)
+            .expect("fixture shape has representable contiguous strides");
         let shape_2d_hidden = [output_shape[0], hidden];
         let shape_2d_experts = [output_shape[0], experts];
         let views = vec![
@@ -1861,7 +1878,8 @@ fn run_performance_sweep(shape: QmoeShape) {
         ];
         let output_bytes = output_shape[0] * hidden * 4;
         let mut output_buf = ep.allocate(output_bytes, 256).unwrap();
-        let output_strides = compute_contiguous_strides(&output_shape);
+        let output_strides = compute_contiguous_strides(&output_shape)
+            .expect("fixture shape has representable contiguous strides");
         let mut workspace = None;
         let caller_view = {
             let output = TensorMut::new(

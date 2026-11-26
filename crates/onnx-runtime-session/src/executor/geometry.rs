@@ -80,6 +80,10 @@ pub(super) fn gather_view(
     byte_offset: usize,
     esize: usize,
 ) -> Vec<u8> {
+    // Empty geometry addresses no bytes, even after an overflowing prefix.
+    if shape.contains(&0) {
+        return Vec::new();
+    }
     let n: usize = shape.iter().product();
     let mut out = vec![0u8; n * esize];
     gather_view_into(&mut out, src, shape, strides, byte_offset, esize);
@@ -100,6 +104,10 @@ pub(super) fn gather_view_into(
     byte_offset: usize,
     esize: usize,
 ) {
+    if shape.contains(&0) {
+        debug_assert!(dst.is_empty());
+        return;
+    }
     let n: usize = shape.iter().product();
     debug_assert_eq!(dst.len(), n * esize);
     if n == 0 {
@@ -248,19 +256,10 @@ fn gather_collapsed(
 /// `iter().product()`, under-sizing the backing buffer. Returns
 /// [`SessionError::ShapeOverflow`] instead so the caller allocates nothing.
 pub(super) fn checked_numel(dims: &[usize], value: impl FnOnce() -> String) -> Result<usize> {
-    let mut acc = 1usize;
-    for &d in dims {
-        acc = match acc.checked_mul(d) {
-            Some(n) => n,
-            None => {
-                return Err(SessionError::ShapeOverflow {
-                    value: value(),
-                    dims: dims.to_vec(),
-                });
-            }
-        };
-    }
-    Ok(acc)
+    onnx_runtime_ir::checked_numel(dims).ok_or_else(|| SessionError::ShapeOverflow {
+        value: value(),
+        dims: dims.to_vec(),
+    })
 }
 
 /// Byte size of `numel` elements of `dtype` with overflow checking. Even when
@@ -1444,5 +1443,15 @@ mod gather_tests {
     fn an_empty_view_gathers_to_an_empty_buffer() {
         assert!(gather_view(&[], &[0, 4], &[4, 1], 0, 4).is_empty());
         assert!(gather_view(&[1, 2, 3, 4], &[3, 0], &[1, 1], 0, 4).is_empty());
+        for shape in [[0, usize::MAX, 2], [usize::MAX, 0, 2], [usize::MAX, 2, 0]] {
+            assert!(gather_view(&[], &shape, &[i64::MIN; 3], usize::MAX, 4).is_empty());
+            gather_view_into(&mut [], &[], &shape, &[i64::MIN; 3], usize::MAX, 4);
+        }
+        // Rank zero is one scalar, distinct from a shape with a zero axis.
+        let scalar = [1, 2, 3, 4];
+        assert_eq!(gather_view(&scalar, &[], &[], 0, 4), scalar);
+        let mut destination = [0; 4];
+        gather_view_into(&mut destination, &scalar, &[], &[], 0, 4);
+        assert_eq!(destination, scalar);
     }
 }

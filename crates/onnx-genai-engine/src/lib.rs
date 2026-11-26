@@ -19,7 +19,12 @@ pub mod embedding;
 pub mod engine;
 pub mod fim;
 pub mod gbnf;
+pub mod indentation;
 mod json_prefix;
+#[cfg(feature = "native-backend")]
+mod keyed_weights;
+#[cfg(all(test, feature = "native-backend"))]
+mod keyed_weights_tests;
 pub(crate) mod kv_bridge;
 pub(crate) mod kv_sizing;
 pub mod logits;
@@ -32,8 +37,10 @@ pub(crate) mod native_speculative;
 pub mod pipeline;
 pub mod pipeline_cache;
 pub(crate) mod platform_capacity;
+mod prediction_limit;
 pub(crate) mod processors;
 pub mod ranking;
+pub mod realtime;
 pub mod reasoning;
 mod response_constraint;
 pub mod response_template;
@@ -42,8 +49,10 @@ pub mod runtime_trace;
 pub mod sampling;
 pub(crate) mod session;
 pub mod speculative;
+mod task_inputs;
 mod text_projection;
 pub mod tokenization;
+pub mod transcription;
 
 #[cfg(feature = "native-backend")]
 pub use engine::{
@@ -52,7 +61,9 @@ pub use engine::{
 #[cfg(feature = "native-backend")]
 pub use native_decode::NativeStateFileLimits;
 
-pub use config::NativeStateFilePolicy;
+pub use config::{
+    NativeStateFilePolicy, ProcessorAdmissionRequirement, ProcessorConfigurationError,
+};
 pub use onnx_genai_scheduler::SchedulerAdmissionError;
 
 pub use batched::{
@@ -68,19 +79,20 @@ pub use engine::{
     DynamicTemperatureConfig, Eagle3Config, Engine, EngineConfig, EngineConfigError,
     EngineDecodeBackend, EngineGovernorError, EngineResourceGovernor, FinishReason,
     GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
-    GenerateToken, GenerateTokenCallback, GenerationBudgetCap, GrammarActivation, GrammarTrigger,
-    KvConnectorBackend, KvConnectorConfig, LayerWeightBytes, LimitParseError, LogprobSource,
-    MemoryPolicyApplication, MemoryStrategy, MemoryStrategyDecision, MemoryStrategyPlan,
-    MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
-    OrtEngineWorkerFactory, OrtSessionWorkerLoadError, PackageExecutionError, PrefillRequest,
-    PrefillResult, PrioritizedGenerateRequest, PrioritizedGenerateResult, RewindTokenCount,
-    SamplerSequence, SamplerStage, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint,
-    SessionForkError, SessionForkParticipant, SessionForkParticipantKind, SessionForkPlan,
-    SessionId, SessionPosition, SessionPrefillCarry, SpeculativeMode, TokenLogprob, ToolCallPolicy,
-    WeightAccessPattern, WeightPlacementReport, XtcConfig, package_execution_error,
-    parse_device_policy, parse_resource_limit, resolve_device_vram_limit_bytes,
+    GenerateToken, GenerateTokenCallback, GenerationBudgetCap, GenerationTimings,
+    GrammarActivation, GrammarCollation, GrammarTrigger, KvConnectorBackend, KvConnectorConfig,
+    LayerWeightBytes, LimitParseError, LogprobSource, MemoryPolicyApplication, MemoryStrategy,
+    MemoryStrategyDecision, MemoryStrategyPlan, MirostatConfig, MirostatVersion, MtpCacheScope,
+    MtpConfig, MtpHiddenLayout, MtpWeightSource, OrtEngineWorkerFactory, OrtSessionWorkerLoadError,
+    PackageExecutionError, PrefillRequest, PrefillResult, PrioritizedGenerateRequest,
+    PrioritizedGenerateResult, RewindTokenCount, SamplerSequence, SamplerStage, SamplingOverrides,
+    ScheduledGenerateArrival, SessionCheckpoint, SessionForkError, SessionForkParticipant,
+    SessionForkParticipantKind, SessionForkPlan, SessionId, SessionPosition, SessionPrefillCarry,
+    SpeculativeMode, TokenLogprob, ToolCallPolicy, WeightAccessPattern, WeightPlacementReport,
+    XtcConfig, package_execution_error, parse_device_policy, parse_resource_limit,
+    resolve_device_vram_limit_bytes,
 };
-pub use fim::{FimConfig, FimFormat};
+pub use fim::{FimConfig, InfillOrder};
 pub use logits::{
     Constraint, ConstraintPrefixError, ConstraintProcessor, LogitProcessor, ProcessorChain,
     ProcessorChainBuilder, ProcessorContext, ProcessorSignal, StopSequence, TokenId,
@@ -200,12 +212,12 @@ pub struct VmmArenaStats {
 #[cfg(feature = "native-backend")]
 pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{
-    AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection, EncodedAudio,
-    GenerationBoundary, GenerationCancelled, GenerationControl, GenerationStopReason,
+    AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection, AudioOutputFormat,
+    EncodedAudio, GenerationBoundary, GenerationCancelled, GenerationControl, GenerationStopReason,
     PipelineGenerateRequest, PipelineTensors, RowPlan, RowScopedState, RowTable,
     StagedOutputCheckpoint, StagedOutputObservation, StagedOutputObservationError,
     ToolCallStagedOutputObserver, WorkflowSessionCheckpoint, is_missing_required_input,
-    validate_pipeline_backend_request,
+    select_portable_adapter_source, validate_pipeline_backend_request,
 };
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{

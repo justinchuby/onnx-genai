@@ -89,6 +89,7 @@ pub(super) fn run_ep_scoped_passes(
         .is_ok()
     {
         *graph = refreshed;
+        onnx_runtime_loader::validate_split_to_sequence_nodes(graph)?;
     }
     Ok(())
 }
@@ -387,7 +388,7 @@ fn check_operator_coverage(
         if graph_claims.contains(node_id)
             || onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
             || is_control_flow_op(&node.op_type, &node.domain)
-            || is_sequence_op(&node.op_type, &node.domain)
+            || is_container_op(&node.op_type, &node.domain)
         {
             continue;
         }
@@ -466,6 +467,7 @@ pub(super) fn cuda_fallback_report(
     ep: &dyn ExecutionProvider,
     artifact_config: ExecutorArtifactConfig,
     ordered_probe: bool,
+    require_cuda: bool,
 ) -> Result<Option<ExecutionProviderFallbackReport>> {
     if ep.device_type() != DeviceType::Cuda {
         return Ok(None);
@@ -480,6 +482,7 @@ pub(super) fn cuda_fallback_report(
         "graph",
         &mut issues,
         ordered_probe,
+        require_cuda,
     )?;
     if issues.is_empty() {
         return Ok(None);
@@ -540,6 +543,7 @@ pub(super) fn format_cuda_coverage_issues(issues: &[ExecutionProviderDecline]) -
         .join("; ")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn collect_cuda_coverage_issues(
     graph: &Graph,
     opset_graph: &Graph,
@@ -548,6 +552,7 @@ pub(super) fn collect_cuda_coverage_issues(
     scope: &str,
     issues: &mut Vec<ExecutionProviderDecline>,
     ordered_probe: bool,
+    require_cuda: bool,
 ) -> Result<()> {
     let graph_claims = onnx_runtime_ep_api::GraphKernelClaims::query(ep, graph)?;
     for (node_id, node) in graph.nodes.iter() {
@@ -563,7 +568,7 @@ pub(super) fn collect_cuda_coverage_issues(
         if graph_claims.contains(node_id)
             || onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
             || is_control_flow_op(&node.op_type, &node.domain)
-            || is_sequence_op(&node.op_type, &node.domain)
+            || is_container_op(&node.op_type, &node.domain)
         {
             continue;
         }
@@ -624,6 +629,14 @@ pub(super) fn collect_cuda_coverage_issues(
             &concrete_shapes,
             opset,
         ) {
+            if require_cuda {
+                return Err(SessionError::CudaKernelCreationFailed {
+                    node: format_node_identity(scope, node_id, node),
+                    op_type: node.op_type.clone(),
+                    opset: opset.into(),
+                    source: error,
+                });
+            }
             if ordered_probe && !matches!(error, onnx_runtime_ep_api::EpError::NoEpForOp { .. }) {
                 return Err(SessionError::unsupported_op(
                     node,
@@ -655,6 +668,7 @@ pub(super) fn collect_cuda_coverage_issues(
             &sub_scope,
             issues,
             ordered_probe,
+            require_cuda,
         )?;
     }
     for value_id in super::host_strings::producerless_string_outputs(graph) {
@@ -987,6 +1001,13 @@ struct BuildPlacement {
 }
 
 impl Executor {
+    pub(crate) fn host_tensor_allocator(&self) -> Result<crate::tensor::HostTensorAllocator> {
+        if self.heterogeneous.is_some() {
+            return Err(SessionError::Internal("host tensor allocation requires an explicit single host provider; mixed-provider sessions must select their host allocation owner explicitly".into()));
+        }
+        crate::tensor::HostTensorAllocator::new(Arc::clone(&self.ep))
+    }
+
     /// Per-expert region candidates recorded for `com.microsoft::QMoE` lazy
     /// weights, keyed by initializer [`ValueId`]. See
     /// [`Executor::expert_region_candidates`](state) for the additive,
@@ -1387,8 +1408,10 @@ impl Executor {
         let has_symbols =
             Self::collect_value_metadata(&graph, &order, &mut value_shapes, &mut value_dtypes);
 
-        let (sequence_values, control_flow_output_values) =
+        let (mut sequence_values, control_flow_output_values) =
             Self::classify_special_values(&graph, &order);
+        let optional_values =
+            optional_ops::classify_optional_values(&graph, &order, &mut sequence_values)?;
         let all_value_ids = value_shapes.keys().copied().collect();
 
         // 3) Build the structural per-node plan.
@@ -1439,7 +1462,11 @@ impl Executor {
             string_initializers,
             string_values: HashMap::new(),
             buffer_shapes,
-            has_unknown_rank: value_shapes.values().any(Option::is_none),
+            has_unknown_rank: value_shapes.iter().any(|(vid, shape)| {
+                shape.is_none()
+                    && !sequence_values.contains(vid)
+                    && !optional_values.contains_key(vid)
+            }),
             value_shapes,
             value_dtypes,
             plan,
@@ -1460,6 +1487,8 @@ impl Executor {
             views: HashMap::new(),
             pinned: HashSet::new(),
             sequence_values,
+            optional_values,
+            optionals: HashMap::new(),
             activation_memory_plan: None,
             shared_buffers: HashMap::new(),
             parked_input_buffers: Vec::new(),
@@ -1739,7 +1768,9 @@ impl Executor {
         // (a wrapped `CycleDetected`, or an opset-import invariant instead of the
         // unsupported-operator error) with a structural error. Mirrors the
         // control-flow signature check above.
-        graph.topological_order()?;
+        let order = graph.topological_order()?;
+        let (mut sequences, _) = Self::classify_special_values(graph, &order);
+        optional_ops::classify_optional_values(graph, &order, &mut sequences)?;
         reject_unsupported_operators(graph, ep.as_ref(), ordered_probe)?;
         let graph_before_ep_passes = graph.clone();
         let ep_pass_nodes_before = graph.num_nodes();
@@ -1751,6 +1782,7 @@ impl Executor {
             ep.as_ref(),
             artifact_transaction.config(),
             ordered_probe,
+            require_cuda,
         )?;
         let fallback_declines = execution_provider_fallback_report
             .as_ref()
@@ -2228,20 +2260,35 @@ impl Executor {
         dtype: DataType,
         dims: &[usize],
     ) -> Result<()> {
-        if self.buffer_shapes.get(&vid).map(|s| s.as_slice()) == Some(dims) {
-            return Ok(()); // identical shape → reuse allocation
-        }
-        if let Some(old) = self.buffers.remove(&vid) {
-            self.ep.deallocate(old)?;
-        }
-        self.shared_buffers.remove(&vid);
         let numel = checked_numel(dims, || format!("value#{}", vid.0))?;
         let size = checked_storage_bytes(dtype, numel, || format!("value#{}", vid.0), dims)?;
-        let buf = self
+        let allocation_bytes = size.max(1);
+        if self.buffer_shapes.get(&vid).map(|s| s.as_slice()) == Some(dims)
+            && self
+                .buffers
+                .get(&vid)
+                .is_some_and(|buffer| buffer.len() >= allocation_bytes)
+        {
+            return Ok(()); // shape metadata alone is not evidence of live backing
+        }
+        let replacement_shape = dims.to_vec();
+        // Admission must cover the real old+new peak. In particular, a failed
+        // growth must not discard the old backing, shared owner or shape and
+        // then treat stale shape metadata as a live allocation on retry.
+        let replacement = self
             .ep
-            .allocate(size.max(1), TensorLayout::contiguous().alignment)?;
-        self.buffers.insert(vid, buf);
-        self.buffer_shapes.insert(vid, dims.to_vec());
+            .allocate(allocation_bytes, TensorLayout::contiguous().alignment)?;
+        let old = self.buffers.insert(vid, replacement);
+        self.buffer_shapes.insert(vid, replacement_shape);
+        // Keep a former alias's actual owner alive through deallocation of its
+        // borrowed descriptor. External views retain their own Arc as before.
+        let _old_shared = self.shared_buffers.remove(&vid);
+        if let Some(old) = old {
+            // This consumes old ownership. A provider may quarantine it on
+            // failure, so restoring its descriptor would be unsound. The new
+            // allocation and shape are already coherent even if release errs.
+            self.ep.deallocate(old)?;
+        }
         Ok(())
     }
 
@@ -2257,7 +2304,7 @@ impl Executor {
             // Sequence-typed values have no meaningful tensor shape and are
             // never buffer-sized; skip them so a static graph does not trip the
             // unresolved-shape check on a sequence value.
-            if self.sequence_values.contains(&vid) {
+            if self.is_container_value(vid) {
                 continue;
             }
             match shape.as_ref().and_then(|shape| substitute(shape, bindings)) {
@@ -2727,7 +2774,7 @@ impl Executor {
             }
             // Sequence-typed values own no tensor buffer (their list lives in
             // `sequences` at run time), so never size one for them.
-            if self.sequence_values.contains(&vid) {
+            if self.is_container_value(vid) {
                 continue;
             }
             let dtype = self.value_dtypes[&vid];
@@ -2806,7 +2853,7 @@ impl Executor {
             // Sequence ops are executor-handled (they operate on sequence-of-
             // tensor values, not tensor views) — they have no EP kernel and must
             // not be compiled here, exactly like control-flow ops.
-            if is_sequence_op(&node.op_type, &node.domain) {
+            if is_container_op(&node.op_type, &node.domain) {
                 if span.is_some() {
                     skipped_sequence += 1;
                 }
@@ -3260,6 +3307,16 @@ impl Executor {
     /// context-cache model with compiled partitions spliced out.
     pub(crate) fn graph(&self) -> &Graph {
         &self.graph
+    }
+
+    pub(crate) fn host_graph_op(&self) -> Option<&Node> {
+        self.plan.iter().find_map(|planned| {
+            let node = self.graph.node(planned.node_id);
+            (planned.managed_strings
+                || is_sequence_op(&node.op_type, &node.domain)
+                || (!planned.graph_kernel && is_control_flow_op(&node.op_type, &node.domain)))
+            .then_some(node)
+        })
     }
 
     pub(crate) fn execution_provider_fallback_report(

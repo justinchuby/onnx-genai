@@ -1,10 +1,13 @@
 //! Universal metadata-declared workflow runtime.
 
 use crate::decode::clone_value;
+#[cfg(not(feature = "native-backend"))]
+use crate::engine::analyze_model_memory;
 use crate::engine::{
-    EngineConfig, EngineResourceGovernor, Holder, MemoryStrategyPlanInput, analyze_model_memory,
-    build_memory_strategy_plan, combine_graph_memory, component_governor, log_memory_strategy_plan,
-    requested_decode_backend, resolve_memory_strategy_hot_tier_bytes, resolve_vram_limit_bytes,
+    EngineConfig, EngineResourceGovernor, Holder, MemoryStrategyPlanInput,
+    admit_keyed_weight_backend, build_memory_strategy_plan, combine_graph_memory,
+    component_governor, log_memory_strategy_plan, requested_decode_backend,
+    resolve_memory_strategy_hot_tier_bytes, resolve_vram_limit_bytes,
 };
 use crate::memory_authority::{MemoryAuthorityProvider, SharedMemoryAuthorityProvider};
 use crate::{EngineDecodeBackend, GeneratePrompt, GenerateRequest, MemoryStrategyPlan, TokenId};
@@ -43,9 +46,13 @@ mod tool_protocol;
 mod turn_transaction;
 mod workflow;
 
-pub use adapters::{AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection};
+pub use adapters::{
+    AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection, select_portable_adapter_source,
+};
 pub use arg_reduce::{ArgReduceRewrites, WideArgReduceLowering, lower_degenerate_arg_reductions};
-pub use audio::{EncodedAudio, encode_pcm16_wav, resample_planar};
+pub use audio::{
+    AudioOutputFormat, EncodedAudio, StreamingResampler, encode_pcm16_wav, resample_planar,
+};
 pub use batching::{
     BatchContractError, ComposedOwnership, OwnershipLevelValues, PackedOwnership,
     PackedRequestView, PackedTensor, PackedValueView, RebasedI64Slice, batch_contract_error,
@@ -135,6 +142,17 @@ pub struct GenerationCancelled {
     pub boundary: GenerationBoundary,
 }
 
+/// Observed prompt evaluation, independent of token/state publication.
+/// `processed` includes cached tokens, matching llama.cpp. A notification may
+/// precede a later transaction failure and never proves semantic commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptProgress {
+    pub total: usize,
+    pub cache: usize,
+    pub processed: usize,
+    pub elapsed: std::time::Duration,
+}
+
 /// Request-scoped cancellation and deterministic transaction checkpoints.
 ///
 /// `cancel` races with `begin_commit` through one atomic state transition. If
@@ -144,6 +162,8 @@ pub struct GenerationCancelled {
 #[derive(Clone)]
 pub struct GenerationControl {
     state: Arc<AtomicU8>,
+    prompt_progress:
+        Option<Arc<dyn Fn(PromptProgress) -> anyhow::Result<()> + Send + Sync + 'static>>,
     cancellation_probe: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     checkpoint:
         Option<Arc<dyn Fn(GenerationBoundary) -> anyhow::Result<()> + Send + Sync + 'static>>,
@@ -156,6 +176,7 @@ impl std::fmt::Debug for GenerationControl {
             .field("state", &self.state.load(Ordering::Acquire))
             .field("has_cancellation_probe", &self.cancellation_probe.is_some())
             .field("has_checkpoint", &self.checkpoint.is_some())
+            .field("has_prompt_progress", &self.prompt_progress.is_some())
             .finish()
     }
 }
@@ -164,6 +185,7 @@ impl Default for GenerationControl {
     fn default() -> Self {
         Self {
             state: Arc::new(AtomicU8::new(GENERATION_ACTIVE)),
+            prompt_progress: None,
             cancellation_probe: None,
             checkpoint: None,
         }
@@ -195,6 +217,25 @@ impl GenerationControl {
     ) -> Self {
         self.checkpoint = Some(Arc::new(checkpoint));
         self
+    }
+
+    /// Observe actual prompt-forward boundaries. This reports provisional work,
+    /// not committed output. An observer failure aborts through the same decoder
+    /// transaction and rollback path as any execution failure.
+    pub fn with_prompt_progress(
+        mut self,
+        observer: impl Fn(PromptProgress) -> anyhow::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.prompt_progress = Some(Arc::new(observer));
+        self
+    }
+
+    pub(crate) fn report_prompt_progress(&self, progress: PromptProgress) -> anyhow::Result<()> {
+        if let Some(observer) = &self.prompt_progress {
+            observer(progress)
+                .context("prompt-progress observer could not accept the execution update")?;
+        }
+        Ok(())
     }
 
     /// Request cancellation. Returns true only when cancellation wins the
@@ -730,6 +771,9 @@ impl WorkflowRuntime {
                 movable_emit_values,
                 device_bridge_components,
                 memory_strategy_plan,
+                audio_memory: None,
+                audio_decode_limits:
+                    onnx_genai_preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY,
                 decode_backend,
                 execution_admission,
                 adapter_service: None,
@@ -764,11 +808,21 @@ impl WorkflowRuntime {
         session_options: SessionOptions,
         authority_provider: Option<SharedMemoryAuthorityProvider>,
     ) -> anyhow::Result<(Self, EngineResourceGovernor)> {
-        let decode_backend = validate_pipeline_backend_request(config.decode_backend)?;
+        let mut decode_backend = validate_pipeline_backend_request(config.decode_backend)?;
         let mut capability_error = None;
         let mut admitted_execution = None;
-        let directory =
-            match PipelineModelDirectory::load_with_metadata_preflight(pipeline_dir, |metadata| {
+        let directory = match PipelineModelDirectory::load_with_metadata_preflight_and_selection(
+            pipeline_dir,
+            &onnx_genai_ort::ModelPackageSelection {
+                variant: config.package_variant.clone(),
+                ..Default::default()
+            },
+            |metadata| {
+                decode_backend =
+                    admit_keyed_weight_backend(decode_backend, !metadata.graph_weights.is_empty())
+                        .map_err(|error| {
+                            onnx_genai_ort::OrtError::InvalidArgument(format!("{error:#}"))
+                        })?;
                 let admission = WorkflowExecutionAdmission::from_metadata(metadata, decode_backend);
                 admission.require_supported().map_err(|error| {
                     capability_error = Some(error.clone());
@@ -776,17 +830,18 @@ impl WorkflowRuntime {
                 })?;
                 admitted_execution = Some(admission);
                 Ok(())
-            }) {
-                Ok(directory) => directory,
-                Err(_) if capability_error.is_some() => {
-                    return Err(capability_error.expect("guarded by is_some").into());
-                }
-                Err(error) => {
-                    return Err(anyhow::anyhow!(
-                        "Failed to resolve workflow package: {error}"
-                    ));
-                }
-            };
+            },
+        ) {
+            Ok(directory) => directory,
+            Err(_) if capability_error.is_some() => {
+                return Err(capability_error.expect("guarded by is_some").into());
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to resolve workflow package: {error}"
+                ));
+            }
+        };
         let execution_admission = if directory.metadata.is_some() {
             admitted_execution
                 .expect("metadata preflight stores the typed execution admission before loading")
@@ -810,6 +865,15 @@ impl WorkflowRuntime {
             }
         }
 
+        #[cfg(feature = "native-backend")]
+        let graph_weights = directory
+            .metadata
+            .as_ref()
+            .map(|metadata| {
+                crate::keyed_weights::GraphWeightFiles::resolve(&directory.root, metadata)
+            })
+            .transpose()?
+            .unwrap_or_default();
         let model_weights_bytes =
             directory
                 .model_paths
@@ -823,7 +887,21 @@ impl WorkflowRuntime {
             directory
                 .model_paths
                 .values()
-                .map(|path| analyze_model_memory(path)),
+                .map(|path| {
+                    #[cfg(feature = "native-backend")]
+                    {
+                        let files = graph_weights.for_graph(path)?;
+                        Ok(crate::engine::analyze_model_memory_with_keyed_weights(
+                            path,
+                            files.map_or(&[][..], |files| files.containers.as_slice()),
+                        ))
+                    }
+                    #[cfg(not(feature = "native-backend"))]
+                    {
+                        Ok(analyze_model_memory(path))
+                    }
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
             false,
         );
         let minimum_useful_weight_budget_bytes = graph_memory
@@ -1098,6 +1176,7 @@ impl WorkflowRuntime {
                 .expect("native device is resolved when the decode backend is Native");
             Some(RefCell::new(native_component::NativeComponentSet::load(
                 &directory.model_paths,
+                &graph_weights,
                 device,
                 resource_governor.cpu_memory_resources(
                     onnx_runtime_ep_cpu::CpuCacheRetention::new(
@@ -1124,6 +1203,8 @@ impl WorkflowRuntime {
                     movable_emit_values,
                     device_bridge_components,
                     memory_strategy_plan,
+                    audio_memory: Some(resource_governor.memory_accounting()),
+                    audio_decode_limits: config.audio_decode_limits,
                     decode_backend,
                     execution_admission,
                     adapter_service: directory.adapters,

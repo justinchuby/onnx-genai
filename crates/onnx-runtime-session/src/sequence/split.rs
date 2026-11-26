@@ -57,7 +57,13 @@ pub fn split_tensor(
     let axis = normalize_axis(OP, axis, rank, false)?;
     let axis_dim = input.shape[axis];
     let (sizes, squeeze) = split_sizes(OP, axis, axis_dim, split, keepdims, &input.shape)?;
-    let input_strides = input.layout.resolved_strides(&input.shape);
+    let input_strides = input
+        .layout
+        .resolved_strides(&input.shape)
+        .map_err(|source| SequenceError::TensorCreation {
+            op: OP,
+            source: source.into(),
+        })?;
     let esize = input.dtype.byte_size();
     if esize == 0 {
         return Err(SequenceError::UnsupportedDtype {

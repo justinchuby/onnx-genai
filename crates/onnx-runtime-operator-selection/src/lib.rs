@@ -71,6 +71,7 @@ pub const CPU_OPERATOR_CATALOG: &[OperatorCatalogEntry] = &[
     entry("", "GlobalLpPool", 2, OPS_CNN),
     entry("", "GroupNormalization", 18, OPS_CNN),
     entry("", "GridSample", 16, OPS_CNN),
+    entry("", "RoiAlign", 10, OPS_CNN),
     entry("", "InstanceNormalization", 6, OPS_CNN),
     entry("", "LpPool", 18, OPS_CNN),
     entry("", "MaxPool", 1, OPS_CNN),

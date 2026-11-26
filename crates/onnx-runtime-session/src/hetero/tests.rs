@@ -1882,7 +1882,7 @@ fn control_flow_and_sequence_fail_during_planning() {
 
     let sequence = build_chain(&["SequenceEmpty"]);
     let error = plan(&sequence, &providers).unwrap_err().to_string();
-    assert!(error.contains("sequence"), "{error}");
+    assert!(error.contains("structural container operator"), "{error}");
     assert!(error.contains("SequenceEmpty"), "{error}");
 }
 
@@ -1897,6 +1897,22 @@ fn view_producing_kernel_is_rejected_before_partition_execution() {
         .to_string();
     assert!(error.contains("Transpose"), "{error}");
     assert!(error.contains("aliased/view output"), "{error}");
+}
+
+#[test]
+fn transpose_packed_cpu_is_admitted_by_heterogeneous_preflight() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 25);
+    let x = graph.create_named_value("x", DataType::Uint2, static_shape([3, 5]));
+    let y = graph.create_named_value("y", DataType::Uint2, static_shape([5, 3]));
+    graph.add_input(x);
+    graph.insert_node(Node::new(NodeId(0), "Transpose", vec![Some(x)], vec![y]));
+    graph.add_output(y);
+    let providers = vec![cpu_slot(0)];
+    let packed = Tensor::from_raw(DataType::Uint2, vec![3, 5], &[0xac, 0xc1, 0x1a, 0xec]).unwrap();
+    let plan = plan(&graph, &providers).unwrap();
+    let outputs = execute(&plan, &graph, &weights(), &providers, &[("x", &packed)]).unwrap();
+    assert_eq!(outputs[0].as_bytes(), &[0xd0, 0xe0, 0xe8, 0x29]);
 }
 
 #[test]

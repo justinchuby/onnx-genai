@@ -5,7 +5,7 @@
 //! canonical `1`/`0` bytes.
 
 use onnx_runtime_ep_api::{
-    EpError, HostKernelData, HostKernelOutput, HostStringInput, Kernel, KernelFactory, Result,
+    EpError, HostKernelData, HostKernelInput, HostKernelOutput, Kernel, KernelFactory, Result,
     TensorMut, TensorView,
 };
 use onnx_runtime_ir::{DataType, Node};
@@ -180,9 +180,9 @@ impl Kernel for LogicalKernel {
 }
 
 impl Kernel for EqualKernel {
-    fn execute_host_strings(
+    fn execute_managed_host(
         &self,
-        inputs: &[HostStringInput<'_>],
+        inputs: &[HostKernelInput<'_>],
     ) -> Result<Vec<HostKernelOutput>> {
         let (shape, bytes) =
             super::text::broadcast_string_pairs("Equal", inputs, |lhs, rhs| u8::from(lhs == rhs))?;

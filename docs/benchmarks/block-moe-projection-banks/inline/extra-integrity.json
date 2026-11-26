@@ -1,0 +1,60 @@
+{
+  "nxrt-block-banks-study": {
+    "cpu_features": {
+      "baseline": [
+        "default",
+        "full",
+        "ops-cnn",
+        "ops-core",
+        "ops-elementwise",
+        "ops-quantized",
+        "ops-reduction",
+        "ops-sequence",
+        "ops-transformer"
+      ],
+      "candidate": [
+        "default",
+        "full",
+        "ops-cnn",
+        "ops-core",
+        "ops-elementwise",
+        "ops-quantized",
+        "ops-reduction",
+        "ops-sequence",
+        "ops-transformer"
+      ]
+    },
+    "binary_hashes_match": true,
+    "probe_hash_matches": true,
+    "processes": 144
+  },
+  "nxrt-block-banks-inline-study": {
+    "cpu_features": {
+      "baseline": [
+        "default",
+        "full",
+        "ops-cnn",
+        "ops-core",
+        "ops-elementwise",
+        "ops-quantized",
+        "ops-reduction",
+        "ops-sequence",
+        "ops-transformer"
+      ],
+      "candidate": [
+        "default",
+        "full",
+        "ops-cnn",
+        "ops-core",
+        "ops-elementwise",
+        "ops-quantized",
+        "ops-reduction",
+        "ops-sequence",
+        "ops-transformer"
+      ]
+    },
+    "binary_hashes_match": true,
+    "probe_hash_matches": true,
+    "processes": 144
+  }
+}

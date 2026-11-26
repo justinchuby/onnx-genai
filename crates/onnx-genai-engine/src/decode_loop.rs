@@ -14,7 +14,153 @@ use crate::processors::{
 use crate::sampling::{Sampler, SamplingRng};
 use onnx_genai_ort::Tokenizer;
 
+/// A physical prefix can come from an older request or be evaluated during
+/// this request to capture a semantic boundary. Only the former is cache reuse.
+#[derive(Clone, Copy)]
+// Only Native constructs prepared prefixes; the shared clock also builds in
+// reference-only ORT configurations.
+#[cfg_attr(not(feature = "native-backend"), allow(dead_code))]
+pub(crate) enum PreparedPrompt {
+    Reused {
+        tokens: usize,
+    },
+    Evaluated {
+        tokens: usize,
+        elapsed: std::time::Duration,
+    },
+}
+impl PreparedPrompt {
+    pub(crate) fn tokens(self) -> usize {
+        match self {
+            Self::Reused { tokens } | Self::Evaluated { tokens, .. } => tokens,
+        }
+    }
+    #[cfg(any(feature = "native-backend", test))]
+    pub(crate) fn cached_tokens(self) -> usize {
+        match self {
+            Self::Reused { tokens } => tokens,
+            Self::Evaluated { .. } => 0,
+        }
+    }
+    fn elapsed(self) -> std::time::Duration {
+        match self {
+            Self::Reused { .. } => std::time::Duration::ZERO,
+            Self::Evaluated { elapsed, .. } => elapsed,
+        }
+    }
+}
+
+/// Carries only active decoder work across scheduler turns. Every step closes
+/// before invoking the caller's callback, so delayed publication cannot inflate
+/// model throughput measurements.
+#[derive(Clone, Default)]
+pub(crate) struct GenerationClock {
+    prepared: Option<PreparedPrompt>,
+    step_started: Option<std::time::Instant>,
+    sample: Option<crate::config::GenerationTimings>,
+    prompt_finished: bool,
+}
+impl GenerationClock {
+    #[cfg(any(feature = "native-backend", test))]
+    pub(crate) fn prepare_prompt(&mut self, prefix: PreparedPrompt) {
+        self.prepared = Some(prefix);
+    }
+    pub(crate) fn has_finished_prompt(&self) -> bool {
+        self.prompt_finished
+    }
+    pub(crate) fn initial_progress(
+        &self,
+        total: usize,
+        cache: usize,
+    ) -> crate::pipeline::PromptProgress {
+        crate::pipeline::PromptProgress {
+            total,
+            cache,
+            processed: self.prepared.map_or(cache, PreparedPrompt::tokens),
+            elapsed: self
+                .prepared
+                .map_or(std::time::Duration::ZERO, PreparedPrompt::elapsed),
+        }
+    }
+
+    pub(crate) fn begin_forward(&mut self, prompt_tokens: usize, cached_prompt_tokens: usize) {
+        self.begin_forward_at(
+            std::time::Instant::now(),
+            prompt_tokens,
+            cached_prompt_tokens,
+        );
+    }
+    fn begin_forward_at(
+        &mut self,
+        now: std::time::Instant,
+        prompt_tokens: usize,
+        cached_prompt_tokens: usize,
+    ) {
+        self.step_started = Some(now);
+        self.sample.get_or_insert(crate::config::GenerationTimings {
+            speculative: None,
+            prompt_tokens: prompt_tokens.saturating_sub(cached_prompt_tokens),
+            cached_prompt_tokens,
+            generated_tokens: 0,
+            prompt_elapsed: self
+                .prepared
+                .map_or(std::time::Duration::ZERO, PreparedPrompt::elapsed),
+            generation_elapsed: std::time::Duration::ZERO,
+        });
+    }
+    pub(crate) fn finish_forward(&mut self) {
+        self.finish_forward_at(std::time::Instant::now());
+    }
+    fn finish_forward_at(&mut self, now: std::time::Instant) {
+        if !self.prompt_finished {
+            if let (Some(start), Some(sample)) = (self.step_started, self.sample.as_mut()) {
+                sample.prompt_elapsed += now.duration_since(start);
+                self.step_started = Some(now);
+            }
+            self.prompt_finished = true;
+        }
+    }
+    fn token_selected(&mut self, generated_tokens: usize) {
+        self.token_selected_at(std::time::Instant::now(), generated_tokens);
+    }
+    fn token_selected_at(&mut self, now: std::time::Instant, generated_tokens: usize) {
+        self.pause_work_at(now);
+        if let Some(sample) = self.sample.as_mut() {
+            sample.generated_tokens = generated_tokens;
+        }
+    }
+    /// Multi-token verification shares work across accepted tokens. Pause at
+    /// observer boundaries, then resume only when active execution continues.
+    #[cfg(feature = "native-backend")]
+    pub(crate) fn resume_work(&mut self) {
+        self.resume_work_at(std::time::Instant::now());
+    }
+    #[cfg(any(feature = "native-backend", test))]
+    fn resume_work_at(&mut self, now: std::time::Instant) {
+        self.step_started.get_or_insert(now);
+    }
+    #[cfg(feature = "native-backend")]
+    pub(crate) fn pause_work(&mut self) {
+        self.pause_work_at(std::time::Instant::now());
+    }
+    fn pause_work_at(&mut self, now: std::time::Instant) {
+        if let (Some(start), Some(sample)) = (self.step_started.take(), self.sample.as_mut()) {
+            sample.generation_elapsed += now.duration_since(start);
+        }
+    }
+    #[cfg(feature = "native-backend")]
+    pub(crate) fn record_speculative(&mut self, stats: crate::SpeculativeStats) {
+        if let Some(sample) = self.sample.as_mut() {
+            sample.speculative = Some(stats);
+        }
+    }
+    pub(crate) fn snapshot(&self) -> Option<crate::config::GenerationTimings> {
+        self.sample
+    }
+}
+
 pub(crate) struct DecodeLoopState {
+    pub(crate) clock: GenerationClock,
     pub(crate) generated_tokens: Vec<TokenId>,
     pub(crate) generated_text: String,
     pub(crate) text_decoder: crate::tokenization::TokenTextDecoder,
@@ -45,6 +191,7 @@ impl DecodeLoopState {
         top_logprobs: Option<usize>,
     ) -> Self {
         Self {
+            clock: GenerationClock::default(),
             generated_tokens: Vec::new(),
             generated_text: String::new(),
             text_decoder: Default::default(),
@@ -118,6 +265,23 @@ pub(crate) struct ForwardOutcome {
 
 /// Run one decoder forward pass, taking the device fast path when it applies.
 pub(crate) fn forward_step<B: DecodeLoopBackend + ?Sized>(
+    backend: &mut B,
+    state: &mut DecodeLoopState,
+    options: &GenerateOptions,
+    chain: &ProcessorChain,
+) -> anyhow::Result<ForwardOutcome> {
+    state.clock.begin_forward(
+        backend
+            .context_len()
+            .saturating_sub(state.generated_tokens.len()),
+        state.prefix_cache_hit_len,
+    );
+    let outcome = forward_step_inner(backend, state, options, chain)?;
+    state.clock.finish_forward();
+    Ok(outcome)
+}
+
+fn forward_step_inner<B: DecodeLoopBackend + ?Sized>(
     backend: &mut B,
     state: &mut DecodeLoopState,
     options: &GenerateOptions,
@@ -255,10 +419,17 @@ pub(crate) fn select_and_commit_step<B: DecodeLoopBackend + ?Sized>(
         chain,
         tokenizer,
         callback,
+        None,
     )?;
     Ok((token_id, finish))
 }
 
+pub(crate) type SelectedTokenFinalizer<'a> =
+    dyn FnMut(Option<&FinishReason>) -> anyhow::Result<()> + 'a;
+
+// Physical finalization must run after stop selection and before publication;
+// keep its fallible hook explicit at this shared commit boundary.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn commit_selected_token(
     state: &mut DecodeLoopState,
     prompt_tokens: &[TokenId],
@@ -267,11 +438,23 @@ pub(crate) fn commit_selected_token(
     chain: &ProcessorChain,
     tokenizer: &Tokenizer,
     callback: Option<&mut GenerateTokenCallback<'_>>,
+    before_publish: Option<&mut SelectedTokenFinalizer<'_>>,
 ) -> anyhow::Result<Option<FinishReason>> {
     if state.step == 0 {
         state.text_decoder = crate::tokenization::TokenTextDecoder::with_preserved_tokens(
             &options.effective_preserved_tokens(),
         );
+        state
+            .text_decoder
+            .set_byte_limit(options.max_constraint_bytes);
+        if let Some(contract) = chain.publication_decoder() {
+            state
+                .text_decoder
+                .bind_literal_decoder(contract.clone(), options.max_constraint_bytes);
+            state
+                .text_decoder
+                .retain_shared_workspace(chain.publication_workspace());
+        }
     }
     state.generated_tokens.push(token_id);
     // Which token this step produced. Without it a timeline shows that a step
@@ -281,7 +464,10 @@ pub(crate) fn commit_selected_token(
     // decodes exactly as often as an untraced one.
     let mut commit_span = onnx_genai_ort::prof_span!("loop.commit_selected_token");
     commit_span.set_arg("token_id", token_id);
-    let decode_text = callback.is_some() || !chain.is_empty() || state.custom_sampler.is_some();
+    let decode_text = callback.is_some()
+        || !chain.is_empty()
+        || state.custom_sampler.is_some()
+        || chain.publication_decoder().is_some();
     let mut token_text = if decode_text {
         let _span = onnx_genai_ort::prof_span!("loop.detokenize");
         state.text_decoder.step(tokenizer, token_id)?
@@ -312,8 +498,15 @@ pub(crate) fn commit_selected_token(
             finish_reason = finish_reason_after_token(token_id, options, chain, &context);
         }
     }
+    if let Some(finalize) = before_publish {
+        finalize(finish_reason.as_ref()).with_context(|| {
+            format!("finalize selected token {token_id} physical state before publication")
+        })?;
+    }
+    state.clock.token_selected(state.generated_tokens.len());
     if let Some(callback) = callback {
         callback(GenerateToken {
+            timings: state.clock.snapshot(),
             logprob: state
                 .logprobs
                 .as_ref()
@@ -334,11 +527,13 @@ pub(crate) fn finish_result(
     finish_reason: FinishReason,
     prefix_cache_hit_len: usize,
     logprobs: Option<&[TokenLogprob]>,
-    preserved_tokens: &std::collections::BTreeSet<TokenId>,
+    options: &GenerateOptions,
 ) -> anyhow::Result<GenerateResult> {
     Ok(GenerateResult {
-        text: crate::tokenization::decode_output(tokenizer, generated_tokens, preserved_tokens)?,
-        preserved_tokens: preserved_tokens.clone(),
+        timings: None,
+        retained_cache_tokens: 0,
+        text: crate::tokenization::decode_generation_output(tokenizer, generated_tokens, options)?,
+        preserved_tokens: options.effective_preserved_tokens(),
         token_ids: generated_tokens.to_vec(),
         finish_reason,
         tool_calls: Vec::new(),
@@ -656,6 +851,7 @@ mod tests {
                     &ProcessorChain::new(),
                     &tokenizer,
                     Some(&mut callback),
+                    None,
                 )?;
                 assert_eq!(finish, stop_on_eos.then_some(FinishReason::EosToken));
                 assert_eq!(state.generated_tokens, [3]);
@@ -678,7 +874,7 @@ mod tests {
                         finish,
                         0,
                         None,
-                        &options.effective_preserved_tokens(),
+                        &options,
                     )?;
                     assert_eq!(result.token_ids, [3]);
                     assert_eq!(result.text, text);
@@ -696,7 +892,7 @@ mod tests {
             stop_sequences: vec![crate::logits::StopSequence::Text("tok22 tok22".into())],
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, Some(&tokenizer), false)?;
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None)?;
         let mut state = DecodeLoopState::new(0, None, None);
         let mut chunks = Vec::new();
         let mut callback = |token: GenerateToken| {
@@ -711,7 +907,8 @@ mod tests {
                 &options,
                 &chain,
                 &tokenizer,
-                Some(&mut callback)
+                Some(&mut callback),
+                None
             )?,
             None
         );
@@ -723,7 +920,8 @@ mod tests {
                 &options,
                 &chain,
                 &tokenizer,
-                Some(&mut callback)
+                Some(&mut callback),
+                None
             )?,
             Some(FinishReason::StopSequence { index: 0 })
         );
@@ -753,7 +951,7 @@ mod tests {
             seed: Some(17),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         let tokenizer = tokenizer()?;
 
         let mut fallback_backend = MockBackend::new(true);
@@ -807,7 +1005,7 @@ mod tests {
                 seed: Some(seed),
                 ..Default::default()
             };
-            let chain = build_processor_chain(&options, None, false)?;
+            let chain = build_processor_chain(&options, None, false, None)?;
             let mut backend = MockBackend::with_logits(
                 false,
                 SampledOutcome::HardError,
@@ -863,7 +1061,7 @@ mod tests {
             seed: Some(17),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         let tokenizer = tokenizer()?;
 
         let mut na_backend = MockBackend::with_outcome(true, SampledOutcome::NotApplicable);
@@ -928,7 +1126,7 @@ mod tests {
             seed: Some(17),
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         let tokenizer = tokenizer()?;
 
         // `HardError` outcome would panic-latch if ever reached; assert it isn't.
@@ -964,7 +1162,7 @@ mod tests {
             stop_on_eos: false,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         assert!(chain.is_empty());
         let tokenizer = tokenizer()?;
 
@@ -1059,7 +1257,7 @@ mod tests {
             stop_on_eos: false,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         let mut backend =
             MockBackend::with_logits(false, SampledOutcome::HardError, logits_for_tokens(&tokens));
         let mut state = DecodeLoopState::new(0, options.seed, None);
@@ -1111,7 +1309,7 @@ mod tests {
             stop_on_eos: false,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         let mut backend =
             MockBackend::with_logits(false, SampledOutcome::HardError, logits_for_tokens(&tokens));
         let mut state = DecodeLoopState::new(0, options.seed, None);
@@ -1157,7 +1355,7 @@ mod tests {
             stop_on_eos: false,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false)?;
+        let chain = build_processor_chain(&options, None, false, None)?;
         let mut backend =
             MockBackend::with_logits(false, SampledOutcome::HardError, logits_for_tokens(&tokens));
         let mut state = DecodeLoopState::new(0, options.seed, None);
@@ -1190,5 +1388,103 @@ mod tests {
         assert_eq!(backend.committed, tokens);
         assert_eq!(observer.committed_calls().len(), 1);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod generation_clock_tests {
+    use super::GenerationClock;
+    use std::time::{Duration, Instant};
+    #[test]
+    fn generation_clock_attributes_prepared_prefix_work_to_its_actual_provenance() {
+        use super::PreparedPrompt;
+        for prefix in [
+            PreparedPrompt::Reused { tokens: 3 },
+            PreparedPrompt::Evaluated {
+                tokens: 3,
+                elapsed: Duration::from_millis(40),
+            },
+        ] {
+            let mut clock = GenerationClock::default();
+            clock.prepare_prompt(prefix);
+            let initial = clock.initial_progress(7, prefix.cached_tokens());
+            assert_eq!(initial.total, 7);
+            assert_eq!(initial.processed, 3);
+            assert_eq!(initial.cache, prefix.cached_tokens());
+            assert_eq!(initial.elapsed, prefix.elapsed());
+            let start = Instant::now();
+            clock.begin_forward_at(start, 7, prefix.cached_tokens());
+            clock.finish_forward_at(start + Duration::from_millis(10));
+            clock.token_selected_at(start + Duration::from_millis(12), 1);
+            let sample = clock.snapshot().unwrap();
+            assert_eq!(sample.prompt_tokens, 7 - prefix.cached_tokens());
+            assert_eq!(sample.cached_prompt_tokens, prefix.cached_tokens());
+            assert_eq!(
+                sample.prompt_elapsed,
+                prefix.elapsed() + Duration::from_millis(10)
+            );
+            assert_eq!(sample.generation_elapsed, Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn generation_clock_counts_multi_token_acceptance_and_excludes_observer_gaps() {
+        let mut clock = GenerationClock::default();
+        let start = Instant::now();
+        clock.begin_forward_at(start, 5, 0);
+        clock.finish_forward_at(start + Duration::from_millis(10));
+        clock.pause_work_at(start + Duration::from_millis(12));
+        // Progress notification takes arbitrary wall time before proposing.
+        clock.resume_work_at(start + Duration::from_millis(200));
+        clock.resume_work_at(start + Duration::from_millis(201));
+        clock.token_selected_at(start + Duration::from_millis(208), 1);
+        let first = clock.snapshot().unwrap();
+        assert_eq!(first.prompt_elapsed, Duration::from_millis(10));
+        assert_eq!(first.generation_elapsed, Duration::from_millis(10));
+        // Another token accepted by the same verify requires no new forward.
+        clock.token_selected_at(start + Duration::from_millis(300), 2);
+        let second = clock.snapshot().unwrap();
+        assert_eq!(second.generated_tokens, 2);
+        assert_eq!(second.generation_elapsed, first.generation_elapsed);
+        // Selection of the bonus resumes active work after delivery.
+        clock.resume_work_at(start + Duration::from_millis(400));
+        clock.token_selected_at(start + Duration::from_millis(403), 3);
+        assert_eq!(clock.snapshot().unwrap().generated_tokens, 3);
+        assert_eq!(
+            clock.snapshot().unwrap().generation_elapsed,
+            Duration::from_millis(13)
+        );
+        assert_eq!(clock.snapshot().unwrap().prompt_tokens, 5);
+        assert_eq!(clock.snapshot().unwrap().cached_prompt_tokens, 0);
+    }
+
+    #[test]
+    fn generation_clock_excludes_delivery_and_scheduler_gaps_from_decode_work() {
+        let mut clock = GenerationClock::default();
+        assert_eq!(clock.snapshot(), None);
+        let start = Instant::now();
+        clock.begin_forward_at(start, 7, 4);
+        clock.finish_forward_at(start + Duration::from_millis(10));
+        clock.token_selected_at(start + Duration::from_millis(12), 1);
+        let first = clock.snapshot().unwrap();
+        assert_eq!(first.prompt_tokens, 3);
+        assert_eq!(first.cached_prompt_tokens, 4);
+        assert_eq!(first.generated_tokens, 1);
+        assert_eq!(first.prompt_elapsed, Duration::from_millis(10));
+        assert_eq!(first.generation_elapsed, Duration::from_millis(2));
+        // Clone exactly as the prioritized drive suspends/restores its clock.
+        let mut resumed = clock.clone();
+        resumed.begin_forward_at(start + Duration::from_millis(100), 7, 4);
+        resumed.finish_forward_at(start + Duration::from_millis(103));
+        resumed.token_selected_at(start + Duration::from_millis(105), 2);
+        let second = resumed.snapshot().unwrap();
+        assert_eq!(second.prompt_elapsed, first.prompt_elapsed);
+        assert_eq!(second.generation_elapsed, Duration::from_millis(7));
+        assert_eq!(second.generated_tokens, 2);
+        assert_eq!(
+            clock.snapshot(),
+            Some(first),
+            "an earlier published snapshot is immutable"
+        );
     }
 }

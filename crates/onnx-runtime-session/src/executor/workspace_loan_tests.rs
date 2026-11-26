@@ -65,7 +65,7 @@ fn assert_children_returned_owners(executor: &Executor) -> usize {
 
 #[test]
 fn nested_workspace_loans_grow_one_root_owner_and_warm_calls_skip_the_issuer() {
-    let (base, ep, books, manager) = completed_workspace_fixture(true);
+    let (base, ep, books, manager) = completed_dynamic_workspace_fixture(true);
     let mut executor = Executor::build(
         nested_workspace_graph(),
         base.weights.clone(),
@@ -112,7 +112,7 @@ fn nested_workspace_loans_grow_one_root_owner_and_warm_calls_skip_the_issuer() {
 
 #[test]
 fn nested_workspace_growth_obeys_the_root_secondary_capture_slot() {
-    let (base, ep, books, _) = completed_workspace_fixture(true);
+    let (base, ep, books, _) = completed_dynamic_workspace_fixture(true);
     let mut executor = Executor::build(
         nested_workspace_graph(),
         base.weights.clone(),
@@ -165,7 +165,7 @@ fn nested_workspace_growth_obeys_the_root_secondary_capture_slot() {
 
 #[test]
 fn nested_workspace_replace_refusal_returns_final_slots_without_a_stale_address() {
-    let (base, ep, books, _) = completed_workspace_fixture(true);
+    let (base, ep, books, _) = completed_dynamic_workspace_fixture(true);
     let mut executor = Executor::build(
         nested_workspace_graph(),
         base.weights.clone(),
@@ -293,7 +293,7 @@ fn child_workspace_scope_returns_owners_on_planner_kernel_error_and_unwind() {
 
 #[test]
 fn child_workspace_scope_refuses_a_private_idle_owner_and_a_different_provider() {
-    let (mut child, ep, books, _) = completed_workspace_fixture(true);
+    let (mut child, ep, books, _) = completed_dynamic_workspace_fixture(true);
     child
         .run(&[("input", &completed_workspace_input(2))])
         .unwrap();

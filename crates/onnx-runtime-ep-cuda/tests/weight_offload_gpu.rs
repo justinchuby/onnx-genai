@@ -106,9 +106,12 @@ fn run_matmul_with_b_ptr(
     let a_shape = [m, k];
     let b_shape = [k, n];
     let out_shape = [m, n];
-    let a_strides = compute_contiguous_strides(&a_shape);
-    let b_strides = compute_contiguous_strides(&b_shape);
-    let out_strides = compute_contiguous_strides(&out_shape);
+    let a_strides = compute_contiguous_strides(&a_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let b_strides = compute_contiguous_strides(&b_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let out_strides = compute_contiguous_strides(&out_shape)
+        .expect("fixture shape has representable contiguous strides");
 
     let a_view = TensorView::new(
         DevicePtr(a_buf.as_ptr()),

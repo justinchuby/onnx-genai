@@ -197,6 +197,7 @@ jobs:
           publish_crate onnx-genai-metadata
           publish_crate onnx-runtime-session
           publish_crate onnx-runtime-capi
+          publish_crate onnx-genai-symphonia-mkv
           publish_crate onnx-genai-preprocess
           publish_crate onnx-genai-router
           publish_crate onnx-genai-genai-config
@@ -205,6 +206,7 @@ jobs:
           publish_crate onnx-runtime-protocol-trace
           publish_crate onnx-genai-scheduler
           publish_crate onnx-genai-ort
+          publish_crate onnx-genai-llguidance
           publish_crate onnx-genai-engine
           publish_crate onnx-genai
           publish_crate onnx-genai-server
@@ -354,6 +356,8 @@ jobs:
         run: maturin sdist --manifest-path crates/onnx-genai-python/Cargo.toml --out dist
       - name: Build onnx-genai-server source distribution
         run: maturin sdist --manifest-path crates/onnx-genai-cli/Cargo.toml --out dist
+      - name: Check GenAI source distribution notices and corresponding reader source
+        run: python crates/onnx-genai-symphonia-mkv/verify_distribution.py --source-root . --directory dist
       - name: Publish onnx-genai source distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
@@ -362,11 +366,10 @@ jobs:
 
   # Build the onnx-genai / onnx-genai-server wheels here (rather than in
   # wheels.yml) so they publish under publish.yml's PyPI trusted publisher, the
-  # same one that already publishes the sdists. These wheels deliberately DO NOT
-  # bundle libonnxruntime: it is loaded at runtime from the installed onnxruntime
-  # / onnxruntime-gpu pip wheel. Windows/Linux wheels compile the `cuda` Cargo
-  # feature (dynamically loaded ORT CUDAExecutionProvider); the nvidia runtime is
-  # a `[cuda]` pip extra. macOS is Apple Silicon only.
+  # same one that already publishes the sdists. Native is the default and neither
+  # wheel requires or bundles ORT. Windows/Linux builds include `ort-cuda` for
+  # explicit reference execution; its runtime is an optional `[ort-cuda]` extra.
+  # Native acceptance runs without ORT on every platform.
   build-onnx-genai-wheels:
     name: Build ${{ matrix.package }} (${{ matrix.platform.name }})
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_onnx_genai)
@@ -405,17 +408,10 @@ jobs:
       CIBW_ARCHS: ${{ matrix.platform.archs }}
       CIBW_BUILD: "cp312-*"
       CIBW_SKIP: "*-musllinux_*"
-      # Do NOT vendor libonnxruntime. Windows/macOS wheel tags are already valid
-      # for PyPI, so skip repair there; on Linux auditwheel retags the wheel
-      # manylinux-compliant but excludes libonnxruntime so it stays an unresolved
-      # runtime dependency the loader shim satisfies from the onnxruntime package.
+      # ORT is loaded only for explicit reference execution; neither wheel links it.
       CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: ""
       CIBW_REPAIR_WHEEL_COMMAND_MACOS: ""
       CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair --exclude libonnxruntime.so.1 -w {dest_dir} {wheel}"
-      # macOS wheels still bake an absolute ONNX Runtime install-name that needs a
-      # runtime fixup, so skip the on-macOS smoke test until that lands. Windows
-      # arm64 has no guaranteed onnxruntime wheel in the test env, so skip there too.
-      CIBW_TEST_SKIP: "*-macosx_* *-win_arm64"
 
     steps:
       - uses: actions/checkout@v7
@@ -433,35 +429,40 @@ jobs:
           rustup default stable
 
       # maturin's CLI --features REPLACES pyproject [tool.maturin] features, so
-      # when we add `cuda` we must re-add every feature the package needs to build
-      # its pyo3 module. onnx-genai (extension) has non-optional pyo3, so `cuda`
-      # alone is enough. onnx-genai-server (CLI) has optional pyo3 behind the
+      # when we add `ort-cuda` we must re-add every feature needed to build
+      # the pyo3 module. Preserve the complete abi3 feature list for both
+      # packages. onnx-genai-server (CLI) has optional pyo3 behind the
       # `python` feature; preserve the complete abi3 extension feature list when
       # adding `ort-cuda`. macOS uses the pyproject feature list directly.
       - name: Select build features
         shell: bash
         run: |
-          if [ "${{ matrix.package }}" = "onnx-genai-server" ]; then
-            # Native CLI startup requires no installed ORT wheel on any platform.
-            echo "CIBW_TEST_SKIP=" >> "$GITHUB_ENV"
-          fi
+          # Native startup requires no installed ORT wheel for either GenAI package.
+          echo "CIBW_TEST_SKIP=" >> "$GITHUB_ENV"
           if [ "${{ matrix.platform.cuda }}" != "true" ]; then
             echo "CIBW_CONFIG_SETTINGS=" >> "$GITHUB_ENV"
           elif [ "${{ matrix.package }}" = "onnx-genai-server" ]; then
             echo "CIBW_CONFIG_SETTINGS=build-args=--features build-args=python,ort-cuda,pyo3/abi3-py310,pyo3/extension-module" >> "$GITHUB_ENV"
           else
-            echo "CIBW_CONFIG_SETTINGS=build-args=--features build-args=cuda" >> "$GITHUB_ENV"
+            echo "CIBW_CONFIG_SETTINGS=build-args=--features build-args=ort-cuda,pyo3/abi3-py310,pyo3/extension-module" >> "$GITHUB_ENV"
           fi
 
       - name: Check Native CLI optional-library discovery
         if: matrix.package == 'onnx-genai-server'
-        run: python -m unittest discover -s crates/onnx-genai-cli/tests -p test_python_launcher.py -v
+        run: python -m unittest discover -s crates/onnx-genai-cli/tests -p 'test_python_*.py' -v
+
+      - name: Check Native binding optional-library discovery
+        if: matrix.package == 'onnx-genai'
+        run: python -m unittest discover -s crates/onnx-genai-python/tests -p test_python_loader.py -v
 
       - name: Build and smoke-test wheel
         uses: pypa/cibuildwheel@v4.3.5
         with:
           package-dir: ${{ matrix.package_dir }}
           output-dir: wheelhouse
+
+      - name: Check wheel notices and corresponding reader source
+        run: python crates/onnx-genai-symphonia-mkv/verify_distribution.py --source-root . --directory wheelhouse
 
       - name: Upload wheel
         uses: actions/upload-artifact@v7

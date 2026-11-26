@@ -1,0 +1,17 @@
+{
+  "runtime_commit": "7a012a5fc7dda0dd214932a27fa54e8f115e7f30",
+  "binary_sha256": "556621dbad80baae203de3186fbf34dc59ebde574fd1e96e69ad41519a79dfbb",
+  "profile": "release",
+  "cpu_codegen_units": 1,
+  "cpu_features": "default full, no MLAS feature",
+  "dynamic_dependencies": "/tmp/nxrt-q8-study-target/release/packed-activation-study:\n\t/System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate (compatibility version 1.0.0, current version 4.0.0)\n\t/usr/lib/libc++.1.dylib (compatibility version 1.0.0, current version 2200.32.0)\n\t/usr/lib/libiconv.2.dylib (compatibility version 7.0.0, current version 7.0.0)\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1359.40.3)\n",
+  "build_log_sha256": "196088d1f2323b933c47a150ffc0627d2423b0d88d7c7a7166278ecaa0f1cb92",
+  "clippy_exit_code": 0,
+  "clippy_log_sha256": "83ba00bf0dd4336f1745adcadae4d45c21855e08ee5309417fdc30fd5cd1a307",
+  "local_ort_bootstrap_version": "1.32.0",
+  "sdk_header_sha256": {
+    "host_info.h": "4b0d40d08ea62da23ed80a6cce3f0cc45bd595a81b17c86348a289342983e1b0",
+    "processor_info.h": "b22be20287a4e4a852227901a51da5029fcf85661bf619ede10e51a09c97d7f7",
+    "machine.h": "00d57dcf5a8332ba5a759b447f8305b3ef8bf15a9025c142af04e13c2a5b14f5"
+  }
+}

@@ -51,7 +51,9 @@ impl Default for CpuWeightCacheLimits {
     }
 }
 
-/// Immutable CPU weight resources. Ordinary MatMul-family constant f32
+/// Immutable CPU execution resources, with optional managed ordinary buffers.
+///
+/// Ordinary MatMul-family constant f32
 /// materializations, full f32 block-format/NBits expansions,
 /// owned native/optional-MLAS NBits preparations, optional QLinearMatMul packs,
 /// and retained or transient QMoE experts
@@ -87,6 +89,7 @@ pub struct CpuMemoryResources {
     dense_bytes: usize,
     cache_retention: CpuCacheRetention,
     workspace: Option<onnx_runtime_memory_governor::HostWorkspacePool>,
+    buffers: Option<crate::CpuBufferMemory>,
 }
 
 impl Default for CpuMemoryResources {
@@ -117,6 +120,7 @@ impl CpuMemoryResources {
             dense_bytes: limits.dense_bytes,
             cache_retention: CpuCacheRetention::default(),
             workspace: None,
+            buffers: None,
         })
     }
 
@@ -141,6 +145,15 @@ impl CpuMemoryResources {
                 reason: "CPU weights and workspace use different Host authorities; construct both resources from the same model governor",
             });
         }
+        if let Some(buffers) = &self.buffers
+            && !buffers.matches_workspace(&pool)
+        {
+            return Err(MemoryError::InvalidRequest {
+                tier: Tier::Host.name(),
+                requested: 0,
+                reason: "CPU ordinary buffers and workspace require the same Host authority and exact process manager; construct both domains from the same model resources",
+            });
+        }
         self.workspace = Some(pool);
         Ok(self)
     }
@@ -148,6 +161,32 @@ impl CpuMemoryResources {
         &self,
     ) -> Option<&onnx_runtime_memory_governor::HostWorkspacePool> {
         self.workspace.as_ref()
+    }
+
+    /// Attach real ordinary Host payload ownership, independently of derived weights.
+    pub fn with_buffer_memory(
+        mut self,
+        memory: crate::CpuBufferMemory,
+    ) -> std::result::Result<Self, MemoryError> {
+        let weights = self.weight_memory().host_authority_id();
+        if weights.is_some_and(|id| id != memory.authority_id())
+            || self
+                .workspace
+                .as_ref()
+                .is_some_and(|pool| !memory.matches_workspace(pool))
+        {
+            return Err(MemoryError::InvalidRequest {
+                tier: Tier::Host.name(),
+                requested: 0,
+                reason: "CPU ordinary buffers, derived weights and workspace require one Host authority and workspace process manager; construct their resources from the same model books",
+            });
+        }
+        self.buffers = Some(memory);
+        Ok(self)
+    }
+    /// Actual ordinary-buffer capability; `is_governed` describes derived weights only.
+    pub fn buffer_memory(&self) -> Option<&crate::CpuBufferMemory> {
+        self.buffers.as_ref()
     }
 
     pub fn cache_retention(&self) -> &CpuCacheRetention {
@@ -316,6 +355,11 @@ impl DerivedWeightMemory {
     }
 
     pub(crate) fn try_grant(&self, bytes: usize) -> Result<WeightAdmission> {
+        if bytes == 0 {
+            // Payload admission is distinct from the validated source anchor:
+            // no physical bytes means no issuer callback or ownership ticket.
+            return Ok(WeightAdmission::Granted(DerivedWeightGrant::Empty));
+        }
         let Some(owner) = &self.owner else {
             return Ok(WeightAdmission::Granted(DerivedWeightGrant::Local));
         };
@@ -374,23 +418,31 @@ pub(crate) enum WeightAdmission {
 }
 
 pub(crate) enum DerivedWeightGrant {
+    /// Exactly zero capacity, independent of whether the source is governed.
+    Empty,
+    /// Explicitly ungoverned positive payload ownership.
     Local,
     Governed(MemoryLease),
 }
 
 impl DerivedWeightGrant {
     pub(crate) fn split_off(&mut self, bytes: usize) -> Result<Self> {
+        if bytes == 0 {
+            return Ok(Self::Empty);
+        }
+        let requested = u64::try_from(bytes).map_err(|_| {
+            EpError::KernelFailed(
+                "derived weight slice exceeds u64; use addressable projection dimensions".into(),
+            )
+        })?;
         match self {
+            Self::Empty => Err(EpError::Memory(MemoryError::InvalidRequest {
+                tier: Tier::Host.name(),
+                requested,
+                reason: "an empty derived-weight grant has zero capacity; request the complete positive payload grant before splitting",
+            })),
             Self::Local => Ok(Self::Local),
-            Self::Governed(lease) => {
-                let bytes = u64::try_from(bytes).map_err(|_| {
-                    EpError::KernelFailed(
-                        "derived weight slice exceeds u64; use addressable projection dimensions"
-                            .into(),
-                    )
-                })?;
-                Ok(Self::Governed(lease.split_off(bytes)?))
-            }
+            Self::Governed(lease) => Ok(Self::Governed(lease.split_off(requested)?)),
         }
     }
 }
@@ -790,5 +842,68 @@ mod tests {
                 "an authority without pressure support must not be followed by a CPU-only eviction pass"
             );
         }
+    }
+    #[test]
+    fn zero_derived_grants_and_splits_never_call_the_issuer() {
+        use crate::kernels::testutil::RecordingGovernor;
+        let books = RecordingGovernor::new_host(16);
+        let source = books.weight_memory(HolderId::new(13));
+        // Construction still validates its real zero-byte authority anchor.
+        let baseline = (books.claims(), books.releases());
+        assert_eq!(baseline.0, 1);
+        for _ in 0..32 {
+            let WeightAdmission::Granted(mut grant) = source.try_grant(0).unwrap() else {
+                panic!("empty payload must require no capacity");
+            };
+            assert!(matches!(grant, DerivedWeightGrant::Empty));
+            assert!(matches!(
+                grant.split_off(0).unwrap(),
+                DerivedWeightGrant::Empty
+            ));
+            let error = grant
+                .split_off(1)
+                .err()
+                .expect("zero capacity cannot fund a positive child");
+            assert!(matches!(
+                &error,
+                EpError::Memory(MemoryError::InvalidRequest { requested: 1, .. })
+            ));
+            assert!(error.to_string().contains("zero capacity"));
+            drop(grant);
+            assert_eq!((books.claims(), books.releases()), baseline);
+        }
+        let WeightAdmission::Granted(mut grant) = source.try_grant(16).unwrap() else {
+            panic!("positive control must claim actual capacity");
+        };
+        assert_eq!(books.used(Tier::Host), 16);
+        assert_eq!(books.claims(), baseline.0 + 1);
+        let full = (books.claims(), books.releases());
+        for _ in 0..32 {
+            drop(grant.split_off(0).unwrap());
+            let WeightAdmission::Granted(empty) = source.try_grant(0).unwrap() else {
+                panic!("empty payload must succeed while all capacity is held");
+            };
+            drop(empty);
+            assert_eq!((books.claims(), books.releases()), full);
+            assert_eq!(books.used(Tier::Host), 16);
+        }
+        assert!(grant.split_off(17).is_err());
+        assert_eq!((books.claims(), books.releases()), full);
+        assert_eq!(books.used(Tier::Host), 16);
+        let child = grant.split_off(6).unwrap();
+        assert_eq!((books.claims(), books.releases()), full);
+        drop(child);
+        assert_eq!(books.used(Tier::Host), 10);
+        assert_eq!(books.releases(), full.1 + 1);
+        drop(grant);
+        assert_eq!(books.used(Tier::Host), 0);
+        assert_eq!(books.releases(), full.1 + 2);
+        let WeightAdmission::Granted(mut empty) =
+            DerivedWeightMemory::default().try_grant(0).unwrap()
+        else {
+            panic!("local empty payload needs no capacity");
+        };
+        assert!(matches!(empty, DerivedWeightGrant::Empty));
+        assert!(empty.split_off(1).is_err());
     }
 }

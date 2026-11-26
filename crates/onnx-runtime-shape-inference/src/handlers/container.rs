@@ -10,6 +10,7 @@
 //! ops (`SplitToSequence` for tensor→sequence, `ConcatFromSequence` for the
 //! sequence→tensor direction of the seam).
 
+use onnx_runtime_ir::onnx::{TypeProto, tensor_shape_proto, type_proto};
 use onnx_runtime_ir::{Attribute, DataType};
 
 use crate::context::{InferenceContext, TensorType, ValueType, unify_tensor_type};
@@ -237,6 +238,103 @@ fn concat_from_sequence(ctx: &mut InferenceContext) -> Result<(), ShapeInferErro
     Ok(())
 }
 
+fn optional_element_type(ctx: &mut InferenceContext, tp: &TypeProto) -> Option<ValueType> {
+    match tp.value.as_ref()? {
+        type_proto::Value::TensorType(tensor) => {
+            let dtype = DataType::from_onnx(tensor.elem_type)?;
+            let shape = tensor.shape.as_ref().map(|shape| {
+                shape
+                    .dim
+                    .iter()
+                    .map(|dim| match &dim.value {
+                        Some(tensor_shape_proto::dimension::Value::DimValue(n)) => {
+                            DimExpr::constant(*n)
+                        }
+                        _ => ctx.fresh_dim(),
+                    })
+                    .collect()
+            });
+            Some(ValueType::Tensor(TensorType { dtype, shape }))
+        }
+        type_proto::Value::SequenceType(sequence) => {
+            let tensor = optional_element_type(ctx, sequence.elem_type.as_deref()?)?;
+            matches!(&tensor, ValueType::Tensor(_)).then(|| ValueType::sequence(tensor))
+        }
+        _ => None,
+    }
+}
+
+fn optional(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let element = if ctx.has_input(0) {
+        ctx.input_value_type(0).cloned().or_else(|| {
+            ctx.input_type(0)
+                .cloned()
+                .map(|tensor| ValueType::Tensor(tensor.into()))
+        })
+    } else if let Some(Attribute::TypeProto(tp)) = ctx.node.attr("type").cloned() {
+        optional_element_type(ctx, &tp)
+    } else {
+        None
+    };
+    if let Some(element @ (ValueType::Tensor(_) | ValueType::Sequence(_))) = element {
+        ctx.set_output_value_type(0, ValueType::Optional(Box::new(element)));
+    }
+    Ok(())
+}
+
+fn optional_has_element(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    validate_optional_operand(ctx, true)?;
+    ctx.set_output(0, DataType::Bool, vec![]);
+    Ok(())
+}
+
+fn optional_get_element(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    validate_optional_operand(ctx, false)?;
+    match ctx.input_value_type(0).cloned() {
+        Some(ValueType::Optional(element)) => match *element {
+            ValueType::Tensor(tensor) => {
+                if let Some(ty) = tensor.to_type_info() {
+                    ctx.set_output_type(0, ty);
+                }
+            }
+            sequence @ ValueType::Sequence(_) => ctx.set_output_value_type(0, sequence),
+            _ => {}
+        },
+        Some(sequence @ ValueType::Sequence(_)) => ctx.set_output_value_type(0, sequence),
+        None => {
+            if let Some(ty) = ctx.input_type(0).cloned() {
+                ctx.set_output_type(0, ty);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_optional_operand(
+    ctx: &InferenceContext,
+    allows_omission: bool,
+) -> Result<(), ShapeInferError> {
+    let before_18 = ctx.opset("") < 18;
+    let known_non_optional = match ctx.input_value_type(0) {
+        Some(ty) => !matches!(ty, ValueType::Optional(_)),
+        None => ctx.input_type(0).is_some(),
+    };
+    let detail = if ctx.num_inputs() > 1 {
+        "expected at most one input slot"
+    } else if before_18 && (!ctx.has_input(0) || known_non_optional) {
+        "requires an Optional input before opset 18"
+    } else if !allows_omission && !ctx.has_input(0) {
+        "requires an input; supply an Optional, tensor, or tensor sequence"
+    } else {
+        return Ok(());
+    };
+    Err(ShapeInferError::Invalid {
+        op: ctx.node.op_type.clone(),
+        detail: detail.into(),
+    })
+}
+
 /// Register the container-type rules.
 pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "SequenceEmpty", 11, sequence_empty);
@@ -247,4 +345,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "SequenceErase", 11, sequence_erase);
     reg.register("", "SplitToSequence", 11, split_to_sequence);
     reg.register("", "ConcatFromSequence", 11, concat_from_sequence);
+    reg.register("", "Optional", 15, optional);
+    reg.register("", "OptionalHasElement", 15, optional_has_element);
+    reg.register("", "OptionalGetElement", 15, optional_get_element);
 }

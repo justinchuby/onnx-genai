@@ -605,7 +605,7 @@ impl ResponseTemplate {
             )
         };
         let decode = |ids: &[u32]| {
-            llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            onnx_genai_llguidance::panic_utils::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 tokenizer.decode_with_special_tokens(ids).map_err(anyhow::Error::from)
             })).context("resolve response_template framing through tokenizer.decoder; repair tokenizer.json if decoding failed")
         };
@@ -1364,6 +1364,10 @@ impl ResponseParser {
     /// The original parser state is restored on both success and failure.
     pub fn preview(&mut self, text: &str, final_chunk: bool) -> anyhow::Result<ChatText> {
         self.preview_bytes(text.as_bytes(), final_chunk)
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.buffer.len() + self.utf8_tail.bytes().len()
     }
 
     /// Inspect lossless byte pieces; partial UTF-8 is retained only within the trial.

@@ -1,0 +1,21 @@
+{
+  "removed_private_consumed_executables": [
+    {
+      "path": "/tmp/nxrt-conv-gap-study/default-probe",
+      "sha256": "7234ae6c69f92cf7c1006263e0da94cbac5d8c32c0b5ca9bea195fe2bc974bf7",
+      "bytes": 828528
+    },
+    {
+      "path": "/tmp/nxrt-conv-gap-study/linked-probe",
+      "sha256": "6d546c47436301dd2d5536a8be913928507c795e9240587abb13c2a13271216c",
+      "bytes": 1446464
+    }
+  ],
+  "matrix_completed": true,
+  "formal_processes": 648,
+  "prior_archive_verifier_exit": 0,
+  "no_matching_executable_in_process_snapshot": true,
+  "cargo_dependency_caches_preserved": true,
+  "shared_lock_inode_at_cleanup": 344052582,
+  "lock_identity_scope": "Measurement plan/build share the recorded historical inode; archival cleanup observed a different current inode. No continuous lock identity across the pause is claimed. Cleanup code never unlinks the lock."
+}

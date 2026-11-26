@@ -21,6 +21,15 @@ fn generate_uses_scheduler(_backend: EngineDecodeBackend) -> bool {
     true
 }
 
+/// Inspect owned cache payloads, never merely a remembered token history.
+fn retained_prefix_cache_tokens(cache: &mut PrefixCache, tokens: &[TokenId]) -> usize {
+    let snapshot = cache
+        .lookup_snapshot::<OrtPrefixSnapshot>(tokens)
+        .map_or(0, |(length, _)| length);
+    let (paged, _) = cache.lookup(tokens);
+    snapshot.max(paged)
+}
+
 /// Logical token length of an ORT-backed session, the single source of the
 /// "session not found" answer for the ORT arm of the shared session policy.
 fn ort_logical_len(engine: &Engine, id: SessionId) -> Option<usize> {
@@ -213,6 +222,7 @@ impl DecoderTurnParticipant {
     fn publish_committed_tokens(
         tokenizer: &onnx_genai_ort::Tokenizer,
         result: &GenerateResult,
+        token_timings: &[(TokenId, Option<crate::config::GenerationTimings>)],
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<()> {
         let Some(callback) = callback else {
@@ -225,6 +235,7 @@ impl DecoderTurnParticipant {
         )?;
         for (index, (token_id, text)) in result.token_ids.iter().copied().zip(pieces).enumerate() {
             callback(crate::config::GenerateToken {
+                timings: token_timings.get(index).and_then(|(_, sample)| *sample),
                 logprob: result
                     .logprobs
                     .as_ref()
@@ -1024,6 +1035,31 @@ impl Engine {
         }))
     }
 
+    pub(crate) fn reserve_literal_decoder_workspace(
+        &self,
+        tokenizer: &Tokenizer,
+        options: &GenerateOptions,
+    ) -> anyhow::Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
+        crate::byte_stream::reserve_workspace(tokenizer, options, self.governor.memory())
+    }
+    fn build_governed_processor_chain(
+        &self,
+        options: &GenerateOptions,
+        custom_sampler: bool,
+    ) -> anyhow::Result<crate::ProcessorChain> {
+        let tokenizer = self.require_tokenizer()?;
+        let lease = self.reserve_literal_decoder_workspace(tokenizer, options)?;
+        let decoder = crate::byte_stream::prepare_literal_output(
+            tokenizer,
+            &options.effective_preserved_tokens(),
+        )
+        .map_err(crate::ProcessorConfigurationError::classify)?;
+        let mut chain = build_processor_chain(options, Some(tokenizer), custom_sampler, decoder)
+            .map_err(crate::ProcessorConfigurationError::classify)?;
+        chain.retain_decoder_workspace(lease);
+        Ok(chain)
+    }
+
     pub fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
         self.max_context_for_request(options)
     }
@@ -1059,7 +1095,7 @@ impl Engine {
             anyhow::bail!("prompt must contain at least one token");
         }
         options.max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
+        let chain = self.build_governed_processor_chain(&options, false)?;
         let mut tool_observer = self.tool_call_observer(&tool_call_policy, &options)?;
         // Speculation is an optimization. Until its accepted-token callback can
         // carry a normal host stop, tool-aware requests use the ordinary
@@ -1068,12 +1104,9 @@ impl Engine {
             .is_none()
             .then(|| native_speculation_plan(&options, &chain))
             .flatten();
-        let retained = if options.cold_start {
-            None
-        } else {
-            Some(self.default_native_session()?)
-        };
-        let scheduler_session_id = retained.unwrap_or_else(|| self.next_native_session_id());
+        // Cold describes input reuse, not retirement of newly evaluated state.
+        let retained = self.default_native_session()?;
+        let scheduler_session_id = retained;
         let scheduled = self.admit_generate_request_with_scheduler(
             scheduler_session_id,
             prompt_tokens.len(),
@@ -1210,6 +1243,7 @@ impl Engine {
                         tokenizer,
                         &block_runtime,
                         &mut stats,
+                        control,
                         Some(&mut stage_token),
                     )
                 })();
@@ -1244,22 +1278,23 @@ impl Engine {
             EngineDecodeBackend::Native,
         );
         let result = match result {
-            Ok(result) => {
-                if let Some(id) = retained {
-                    let stamp = self.touch_native_session();
-                    let state = self
-                        .native_sessions
-                        .get_mut(&id)
-                        .expect("admitted default cache remains until commit");
-                    state.tokens.clone_from(&prompt_tokens);
-                    state.tokens.extend_from_slice(&result.token_ids);
-                    state.last_access = stamp;
-                }
+            Ok(mut result) => {
+                let stamp = self.touch_native_session();
+                let state = self
+                    .native_sessions
+                    .get_mut(&retained)
+                    .expect("admitted default cache remains until commit");
+                state.tokens.clone_from(&prompt_tokens);
+                state.tokens.extend_from_slice(&result.token_ids);
+                state.last_access = stamp;
                 let _outcome = turn.commit()?;
-                if let Some(id) = retained {
-                    self.native_active_session = Some(id);
-                    self.evict_native_sessions(id);
-                }
+                self.native_active_session = Some(retained);
+                self.evict_native_sessions(retained);
+                result.retained_cache_tokens = self
+                    .native_session
+                    .as_ref()
+                    .context("committed Native cache is absent")?
+                    .current_len();
                 if let Some(control) = control {
                     control.finish_commit();
                 }
@@ -1539,7 +1574,7 @@ impl Engine {
         }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
-            return self.prefill_native(&tokens, control.as_ref(), admitted);
+            return self.prefill_native(&tokens, request.cold_start, control.as_ref(), admitted);
         }
         let session = self.create_session()?;
         let result = (|| -> anyhow::Result<PrefillResult> {
@@ -1569,6 +1604,15 @@ impl Engine {
                         } else {
                             self.prepare_session_prefix(session, &mut state, &tokens)?
                         };
+                        if let Some(control) = &control {
+                            control.report_prompt_progress(crate::pipeline::PromptProgress {
+                                total: tokens.len(),
+                                cache: prefix_cache_hit_len,
+                                processed: prefix_cache_hit_len,
+                                elapsed: std::time::Duration::ZERO,
+                            })?;
+                        }
+                        let started = std::time::Instant::now();
                         // This also runs a no-KV decoder: ensure_session_kv_current
                         // alone would skip its entire forward pass.
                         let _ = next_session_token_logits(
@@ -1579,18 +1623,34 @@ impl Engine {
                             &mut state,
                         )?;
                         self.ensure_session_kv_current(session, &mut state)?;
+                        let elapsed = started.elapsed();
                         if let Some(control) = &control {
                             control
                                 .check(crate::pipeline::GenerationBoundary::AfterDecoderForward)?;
+                            control.report_prompt_progress(crate::pipeline::PromptProgress {
+                                total: tokens.len(),
+                                cache: prefix_cache_hit_len,
+                                processed: tokens.len(),
+                                elapsed,
+                            })?;
                             control.require_commit()?;
                         }
                         Ok(PrefillResult {
+                            timings: crate::GenerationTimings {
+                                speculative: None,
+                                prompt_tokens: tokens.len() - prefix_cache_hit_len,
+                                cached_prompt_tokens: prefix_cache_hit_len,
+                                generated_tokens: 0,
+                                prompt_elapsed: elapsed,
+                                generation_elapsed: std::time::Duration::ZERO,
+                            },
                             prompt_tokens: tokens.len(),
                             prefix_cache_hit_len,
+                            retained_cache_tokens: 0,
                         })
                     })();
                     match result {
-                        Ok(result) => {
+                        Ok(mut result) => {
                             turn.commit()?;
                             if let Some(control) = &control {
                                 control.finish_commit();
@@ -1600,6 +1660,8 @@ impl Engine {
                             {
                                 tracing::debug!(%error, "prefill committed but optional prefix publication failed");
                             }
+                            result.retained_cache_tokens =
+                                retained_prefix_cache_tokens(&mut self.prefix_cache, &tokens);
                             Ok(result)
                         }
                         Err(error) => {
@@ -1636,6 +1698,7 @@ impl Engine {
     fn prefill_native(
         &mut self,
         tokens: &[TokenId],
+        cold_start: bool,
         control: Option<&crate::pipeline::GenerationControl>,
         mut admitted: Option<&mut dyn FnMut()>,
     ) -> anyhow::Result<PrefillResult> {
@@ -1652,23 +1715,79 @@ impl Engine {
                 if let Some(callback) = admitted.as_mut() {
                     callback();
                 }
+                let active_matches = self.native_active_session == Some(session);
+                let prefix_reusable = self.prefix_reuse_permitted();
+                let prefix = self
+                    .native_sessions
+                    .get(&session)
+                    .context("native prefill logical history disappeared before evaluation")?
+                    .tokens
+                    .as_slice();
+                let matched = common_prefix_len(prefix, tokens);
                 let native = self
                     .native_session
                     .as_mut()
                     .context("native prefill executor is unavailable")?;
-                let workspace = native.prepare_generation_workspace_preserving_state(tokens)?;
-                crate::native_decode::accept_eager_workspace_preparation(workspace);
-                native.reset()?;
-                native.bind_logical_state(identity)?;
-                self.native_active_session = Some(session);
-                native.prefill_prefix(tokens)?;
+                let mut reused = if active_matches && !cold_start && prefix_reusable {
+                    native.ensure_logical_state(identity)?;
+                    matched.min(native.current_len())
+                } else {
+                    0
+                };
+                // A complete carried prefix may be appended to. State without
+                // sliceable history cannot reconstruct a shorter prefix, so it
+                // must recompute instead of advertising a token-only cache hit.
+                if reused < native.current_len() && native.has_recurrent_state() {
+                    reused = 0;
+                }
+                if reused == 0 {
+                    native.reset()?;
+                    native.bind_logical_state(identity)?;
+                    self.native_active_session = Some(session);
+                } else if reused < native.current_len() {
+                    native.rewind(reused)?;
+                }
+                let pending = &tokens[reused..];
+                if let Some(control) = control {
+                    control.report_prompt_progress(crate::pipeline::PromptProgress {
+                        total: tokens.len(),
+                        cache: reused,
+                        processed: reused,
+                        elapsed: std::time::Duration::ZERO,
+                    })?;
+                }
+                let elapsed = if !pending.is_empty() {
+                    let workspace =
+                        native.prepare_generation_workspace_preserving_state(pending)?;
+                    crate::native_decode::accept_eager_workspace_preparation(workspace);
+                    let started = std::time::Instant::now();
+                    native.prefill_prefix(pending)?;
+                    started.elapsed()
+                } else {
+                    std::time::Duration::ZERO
+                };
                 if let Some(control) = control {
                     control.check(crate::pipeline::GenerationBoundary::AfterDecoderForward)?;
+                    control.report_prompt_progress(crate::pipeline::PromptProgress {
+                        total: tokens.len(),
+                        cache: reused,
+                        processed: tokens.len(),
+                        elapsed,
+                    })?;
                     control.require_commit()?;
                 }
                 Ok(PrefillResult {
+                    timings: crate::GenerationTimings {
+                        speculative: None,
+                        prompt_tokens: tokens.len() - reused,
+                        cached_prompt_tokens: reused,
+                        generated_tokens: 0,
+                        prompt_elapsed: elapsed,
+                        generation_elapsed: std::time::Duration::ZERO,
+                    },
                     prompt_tokens: tokens.len(),
-                    prefix_cache_hit_len: 0,
+                    prefix_cache_hit_len: reused,
+                    retained_cache_tokens: native.current_len(),
                 })
             })();
             match result {
@@ -1730,7 +1849,11 @@ impl Engine {
             anyhow::bail!("custom samplers are not supported on the native single-session backend");
         }
         let session_id = self.create_session()?;
-        let result = self.generate_in_session_with_sampler(session_id, request, sampler);
+        let mut result = self.generate_in_session_with_sampler(session_id, request, sampler);
+        if let (Ok(result), Some(state)) = (&mut result, self.sessions.get(&session_id)) {
+            result.retained_cache_tokens =
+                retained_prefix_cache_tokens(&mut self.prefix_cache, &state.tokens);
+        }
         let close_result = self.close_session(session_id);
         match (result, close_result) {
             (Ok(result), Ok(())) => Ok(result),
@@ -2096,23 +2219,53 @@ impl Engine {
         options: GenerateOptions,
         fim_config: &FimConfig,
     ) -> anyhow::Result<GenerateResult> {
-        self.generate_fim_with_config_and_callbacks(prefix, suffix, options, fim_config, None, None)
+        self.generate_fim_with_config_and_callbacks(
+            prefix, suffix, options, fim_config, None, None, None,
+        )
     }
 
     /// Generate FIM text and notify the caller immediately after scheduler admission.
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_fim_with_config_and_callbacks(
         &mut self,
         prefix: impl AsRef<str>,
         suffix: impl AsRef<str>,
         options: GenerateOptions,
         fim_config: &FimConfig,
+        control: Option<crate::pipeline::GenerationControl>,
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         let prompt = fim_config.format_prompt(prefix.as_ref(), suffix.as_ref());
         let mut request = GenerateRequest::new(prompt);
-        request.options = self.fim_options(fim_config, options)?;
-        self.generate_with_callbacks(request, admission_callback, token_callback)
+        request.options = options;
+        self.generate_fim_request_with_config_and_callbacks(
+            request,
+            fim_config,
+            control,
+            admission_callback,
+            token_callback,
+        )
+    }
+
+    /// Execute a completely prepared FIM prompt, preserving its exact token IDs
+    /// for native HTTP prompt accounting and actual execution.
+    pub fn generate_fim_request_with_config_and_callbacks(
+        &mut self,
+        mut request: GenerateRequest,
+        fim_config: &FimConfig,
+        control: Option<crate::pipeline::GenerationControl>,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        request.options = self.fim_options(fim_config, request.options)?;
+        self.generate_with_tool_policy_callbacks(
+            request,
+            ToolCallPolicy::Disabled,
+            control,
+            admission_callback,
+            token_callback,
+        )
     }
 
     /// Generate text and optionally stream each generated token to `callback`.
@@ -2188,7 +2341,6 @@ impl Engine {
                 || request.options.num_speculative_tokens.is_some()
                 || self.mtp.is_some();
             if request.options.cold_start || native_spec_requested {
-                let retain_cache = !request.options.cold_start;
                 let result = self.generate_native_cold_with_callback(
                     request,
                     tool_call_policy,
@@ -2196,7 +2348,7 @@ impl Engine {
                     admission_callback,
                     token_callback,
                 );
-                if !retain_cache || result.is_err() {
+                if result.is_err() {
                     self.native_active_session = None;
                 }
                 return result;
@@ -2225,7 +2377,7 @@ impl Engine {
         }
 
         let session_id = self.create_session()?;
-        let result = self.generate_in_session_with_priority_and_callback(
+        let mut result = self.generate_in_session_with_priority_and_callback(
             session_id,
             request,
             Priority::Normal,
@@ -2235,6 +2387,10 @@ impl Engine {
             admission_callback,
             token_callback,
         );
+        if let (Ok(result), Some(state)) = (&mut result, self.sessions.get(&session_id)) {
+            result.retained_cache_tokens =
+                retained_prefix_cache_tokens(&mut self.prefix_cache, &state.tokens);
+        }
         let close_result = self.close_session(session_id);
         match (result, close_result) {
             (Ok(result), Ok(())) => Ok(result),
@@ -2463,11 +2619,7 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(
-            &options,
-            Some(self.require_tokenizer()?),
-            custom_sampler.is_some(),
-        )?;
+        let chain = self.build_governed_processor_chain(&options, custom_sampler.is_some())?;
 
         let scheduled = self.admit_generate_request_with_scheduler(
             session_id,
@@ -2500,12 +2652,28 @@ impl Engine {
         };
         self.last_speculative_stats = SpeculativeStats::default();
 
+        let record_timings = callback.is_some();
+        let mut token_timings = Vec::new();
+        let mut record_token = |token: crate::config::GenerateToken| -> anyhow::Result<()> {
+            token_timings
+                .try_reserve(1)
+                .context("failed to reserve a committed token timing entry")?;
+            token_timings.push((token.token_id, token.timings));
+            Ok(())
+        };
         let result = (|| -> anyhow::Result<GenerateResult> {
             if let Some(control) = &control {
                 control.check(crate::pipeline::GenerationBoundary::BeforeWorkflowNode)?;
             }
-            let prefix_cache_hit_len =
-                self.prepare_session_prefix(session_id, &mut state, &prompt_tokens)?;
+            let prefix_cache_hit_len = if options.cold_start && state.tokens.is_empty() {
+                if self.connector.is_active() {
+                    self.connector.reset_stats();
+                }
+                state.tokens.extend_from_slice(&prompt_tokens);
+                0
+            } else {
+                self.prepare_session_prefix(session_id, &mut state, &prompt_tokens)?
+            };
             let mut loop_state =
                 DecodeLoopState::new(prefix_cache_hit_len, options.seed, options.top_logprobs);
             let has_custom_sampler = custom_sampler.is_some();
@@ -2571,14 +2739,24 @@ impl Engine {
                     max_context,
                 },
                 tool_observer.as_mut(),
-                None,
+                if record_timings { Some(&mut record_token) } else { None },
             )
         })()
         .and_then(|mut result| {
+            if record_timings && result.timings.is_some() {
+                anyhow::ensure!(token_timings.len() == result.token_ids.len()
+                    && token_timings.iter().zip(&result.token_ids).all(|((id,_),expected)| id == expected),
+                    "decoder timing journal does not match the generated token stream; refusing to commit divergent measurements");
+            }
             if !exceeded_context_limit(state.tokens.len(), max_context) {
                 self.ensure_session_kv_current(session_id, &mut state)?;
             }
             result.budget_cap = budget_cap;
+            result.retained_cache_tokens = if self.kv_model.is_some() {
+                state.kv_token_count
+            } else {
+                0
+            };
             if let Some(control) = &control {
                 control.require_commit()?;
             }
@@ -2632,6 +2810,7 @@ impl Engine {
             DecoderTurnParticipant::publish_committed_tokens(
                 self.require_tokenizer()?,
                 &result,
+                &token_timings,
                 callback,
             )?;
             Ok(result)
@@ -2778,9 +2957,9 @@ impl Engine {
                     }
                 };
                 generated_steps += 1;
-                if let Some(result) = step_result {
+                if let Some(mut result) = step_result {
                     let session_id = active_request.session_id;
-                    self.finish_active_generate(active_request)?;
+                    result.retained_cache_tokens = self.finish_active_generate(active_request)?;
                     results.push(PrioritizedGenerateResult { session_id, result });
                 } else {
                     active.insert(session_id, active_request);
@@ -3249,24 +3428,23 @@ impl Engine {
         mut options: GenerateOptions,
     ) -> anyhow::Result<GenerateOptions> {
         self.apply_eos_defaults(&mut options)?;
-        for token in [
-            fim_config.prefix_token.as_str(),
-            fim_config.middle_token.as_str(),
-            fim_config.suffix_token.as_str(),
-            "<|fim_pad|>",
-            "<|endoftext|>",
-            "<|file_sep|>",
-        ] {
-            if let Some(token_id) = self
-                .tokenizer
-                .as_ref()
-                .and_then(|tokenizer| tokenizer.token_id(token))
-            {
-                push_unique_stop_sequence(
-                    &mut options.stop_sequences,
-                    StopSequence::Tokens(vec![token_id]),
-                );
-            }
+        for (role, token) in [
+            ("prefix_token", fim_config.prefix_token.as_str()),
+            ("middle_token", fim_config.middle_token.as_str()),
+            ("suffix_token", fim_config.suffix_token.as_str()),
+        ]
+        .into_iter()
+        .chain(
+            fim_config
+                .additional_stop_tokens
+                .iter()
+                .map(|token| ("additional_stop_tokens", token.as_str())),
+        ) {
+            let token_id = self.tokenizer.as_ref().and_then(|tokenizer| tokenizer.token_id(token)).with_context(|| format!("FimConfig.{role} {token:?} is absent from the active tokenizer; register this exact token or repair the declared FIM configuration"))?;
+            push_unique_stop_sequence(
+                &mut options.stop_sequences,
+                StopSequence::Tokens(vec![token_id]),
+            );
         }
         Ok(options)
     }
@@ -3594,7 +3772,7 @@ impl Engine {
         }
 
         let max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
+        let chain = self.build_governed_processor_chain(&options, false)?;
         crate::pipeline::WorkflowGenerationCursor::validate_per_token_capability(&self.workflow)?;
         let mut state = self
             .sessions
@@ -3613,8 +3791,15 @@ impl Engine {
             }
         };
         let prepared = (|| -> anyhow::Result<_> {
-            let prefix_cache_hit_len =
-                self.prepare_session_prefix(request.session_id, &mut state, &prompt_tokens)?;
+            let prefix_cache_hit_len = if options.cold_start && state.tokens.is_empty() {
+                if self.connector.is_active() {
+                    self.connector.reset_stats();
+                }
+                state.tokens.extend_from_slice(&prompt_tokens);
+                0
+            } else {
+                self.prepare_session_prefix(request.session_id, &mut state, &prompt_tokens)?
+            };
             let mut loop_state =
                 DecodeLoopState::new(prefix_cache_hit_len, options.seed, options.top_logprobs);
             let (cursor, setup_finish) = {
@@ -3694,6 +3879,7 @@ impl Engine {
             request.priority,
         );
         Ok(ActiveGenerate {
+            clock: loop_state.clock,
             cursor,
             turn,
             session_id: request.session_id,
@@ -3719,6 +3905,7 @@ impl Engine {
         active: &mut ActiveGenerate,
     ) -> anyhow::Result<Option<GenerateResult>> {
         let mut loop_state = DecodeLoopState {
+            clock: active.clock.clone(),
             generated_tokens: std::mem::take(&mut active.generated_tokens),
             generated_text: std::mem::take(&mut active.generated_text),
             text_decoder: std::mem::take(&mut active.text_decoder),
@@ -3740,7 +3927,7 @@ impl Engine {
                 finish_reason,
                 loop_state.prefix_cache_hit_len,
                 loop_state.logprobs.as_deref(),
-                &active.options.effective_preserved_tokens(),
+                &active.options,
             )?)
         } else {
             // Borrowed before the disjoint mutable borrows the backend takes.
@@ -3803,11 +3990,12 @@ impl Engine {
                     finish_reason,
                     loop_state.prefix_cache_hit_len,
                     loop_state.logprobs.as_deref(),
-                    &active.options.effective_preserved_tokens(),
+                    &active.options,
                 )?),
                 None => None,
             }
         };
+        active.clock = loop_state.clock;
         active.generated_tokens = loop_state.generated_tokens;
         active.generated_text = loop_state.generated_text;
         active.text_decoder = loop_state.text_decoder;
@@ -3815,6 +4003,7 @@ impl Engine {
         active.step = loop_state.step;
         active.rng = loop_state.rng;
         if let Some(mut result) = step_result {
+            result.timings = active.clock.snapshot();
             result.budget_cap = active.budget_cap;
             return Ok(Some(result));
         }
@@ -3825,9 +4014,10 @@ impl Engine {
                     FinishReason::MaxTokens,
                     active.prefix_cache_hit_len,
                     active.logprobs.as_deref(),
-                    &active.options.effective_preserved_tokens(),
+                    &active.options,
                 )
                 .map(|mut result| {
+                    result.timings = active.clock.snapshot();
                     result.budget_cap = active.budget_cap;
                     Some(result)
                 });
@@ -3836,7 +4026,7 @@ impl Engine {
         Ok(None)
     }
 
-    fn finish_active_generate(&mut self, mut active: ActiveGenerate) -> anyhow::Result<()> {
+    fn finish_active_generate(&mut self, mut active: ActiveGenerate) -> anyhow::Result<usize> {
         let session_id = active.session_id;
         let result = (|| -> anyhow::Result<()> {
             // The workflow's own emit and the tokens this drive committed describe
@@ -3868,7 +4058,11 @@ impl Engine {
                         "committed prioritized turn could not publish optional prefix-cache state"
                     );
                 }
-                Ok(())
+                Ok(if self.kv_model.is_some() {
+                    active.state.kv_token_count
+                } else {
+                    0
+                })
             }
             Err(error) => match active.turn.abort(
                 self,
@@ -4081,15 +4275,17 @@ impl Engine {
         finish_reason: FinishReason,
         prefix_cache_hit_len: usize,
         logprobs: Option<&[crate::config::TokenLogprob]>,
-        preserved_tokens: &std::collections::BTreeSet<TokenId>,
+        options: &GenerateOptions,
     ) -> anyhow::Result<GenerateResult> {
         Ok(GenerateResult {
-            text: crate::tokenization::decode_output(
+            timings: None,
+            retained_cache_tokens: 0,
+            text: crate::tokenization::decode_generation_output(
                 self.require_tokenizer()?,
                 generated_tokens,
-                preserved_tokens,
+                options,
             )?,
-            preserved_tokens: preserved_tokens.clone(),
+            preserved_tokens: options.effective_preserved_tokens(),
             token_ids: generated_tokens.to_vec(),
             finish_reason,
             tool_calls: Vec::new(),
@@ -4207,7 +4403,7 @@ impl Engine {
             anyhow::bail!("prompt must contain at least one token");
         }
         options.max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(self.require_tokenizer()?), false)?;
+        let chain = self.build_governed_processor_chain(&options, false)?;
         let mut tool_observer = self.tool_call_observer(&tool_call_policy, &options)?;
         if native_speculation_plan(&options, &chain).is_some() {
             anyhow::bail!(
@@ -4256,6 +4452,7 @@ impl Engine {
             callback();
         }
 
+        let mut pending_semantic_snapshot = None;
         let result = (|| -> anyhow::Result<GenerateResult> {
             let active_matches = self.native_active_session == Some(session_id);
             let semantic_prefix_len = options
@@ -4293,6 +4490,7 @@ impl Engine {
                     native.has_recurrent_state() && native.supports_past_snapshots()
                 });
             let mut restored_prefix_len = None;
+            let mut evaluated_semantic_prefix = None;
             let mut should_store_semantic_snapshot = false;
             if !active_matches
                 && supports_past_snapshots
@@ -4330,6 +4528,15 @@ impl Engine {
                 && supports_past_snapshots
                 && let Some(boundary) = semantic_prefix_len
             {
+                if let Some(control) = control {
+                    control.report_prompt_progress(crate::pipeline::PromptProgress {
+                        total: prompt_tokens.len(),
+                        cache: 0,
+                        processed: 0,
+                        elapsed: std::time::Duration::ZERO,
+                    })?;
+                }
+                let preparation_started = std::time::Instant::now();
                 let snapshot = {
                     let native = self
                         .native_session
@@ -4380,16 +4587,16 @@ impl Engine {
                             }
                         };
                         if let Some(lease) = lease {
-                            self.prefix_cache.insert_snapshot(
-                                &prompt_tokens[..boundary],
+                            pending_semantic_snapshot = Some((
+                                boundary,
                                 Arc::new(NativePrefixSnapshot {
                                     snapshot,
                                     _lease: lease,
                                 }),
-                            );
-                            self.native_recurrent_prefix_stats.stores += 1;
+                            ));
                         }
                         restored_prefix_len = Some(boundary);
+                        evaluated_semantic_prefix = Some((boundary, preparation_started.elapsed()));
                     }
                     Err(error) => {
                         tracing::debug!(
@@ -4440,7 +4647,17 @@ impl Engine {
 
                 native.generate_incremental_with_callback_and_staged_observer(
                     &prompt_tokens,
-                    resume_from,
+                    match evaluated_semantic_prefix {
+                        Some((boundary, elapsed)) if boundary == resume_from => {
+                            crate::decode_loop::PreparedPrompt::Evaluated {
+                                tokens: resume_from,
+                                elapsed,
+                            }
+                        }
+                        _ => crate::decode_loop::PreparedPrompt::Reused {
+                            tokens: resume_from,
+                        },
+                    },
                     &options,
                     &chain,
                     tokenizer,
@@ -4461,7 +4678,7 @@ impl Engine {
             Ok(result)
         });
         let result = match result {
-            Ok(result) => {
+            Ok(mut result) => {
                 // Staging validation and cancellation must finish before any
                 // durable history or retention policy changes. The exclusive
                 // engine borrow keeps this admitted session present until here.
@@ -4474,10 +4691,20 @@ impl Engine {
                 state.tokens.extend_from_slice(&result.token_ids);
                 state.last_access = last_access;
                 let _outcome = turn.commit()?;
+                if let Some((boundary, snapshot)) = pending_semantic_snapshot.take() {
+                    self.prefix_cache
+                        .insert_snapshot(&prompt_tokens[..boundary], snapshot);
+                    self.native_recurrent_prefix_stats.stores += 1;
+                }
                 if let Some(control) = control {
                     control.finish_commit();
                 }
                 self.evict_native_sessions(session_id);
+                result.retained_cache_tokens = self
+                    .native_session
+                    .as_ref()
+                    .context("committed Native cache is absent")?
+                    .current_len();
                 Ok(result)
             }
             Err(error) => {
@@ -4707,6 +4934,39 @@ mod tests {
     }
 
     #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_fim_rejects_unknown_public_additional_stop_tokens() -> anyhow::Result<()> {
+        let engine = tiny_native_cold_engine()?;
+        let config = FimConfig {
+            prefix_token: "hello".into(),
+            middle_token: "world".into(),
+            suffix_token: "the".into(),
+            format: crate::InfillOrder::Psm,
+            extra_context_template: None,
+            additional_stop_tokens: vec!["missing-explicit-fim-terminator".into()],
+        };
+        let error = engine
+            .fim_options(&config, GenerateOptions::default())
+            .unwrap_err();
+        let error = error.to_string();
+        assert!(
+            error.contains("FimConfig.additional_stop_tokens"),
+            "{error}"
+        );
+        assert!(error.contains("missing-explicit-fim-terminator"), "{error}");
+        let mut invalid_role = config;
+        invalid_role.additional_stop_tokens.clear();
+        invalid_role.prefix_token = "missing-explicit-fim-prefix".into();
+        let error = engine
+            .fim_options(&invalid_role, GenerateOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("FimConfig.prefix_token"), "{error}");
+        assert!(error.contains("missing-explicit-fim-prefix"), "{error}");
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
     fn tiny_native_cold_engine() -> anyhow::Result<Engine> {
         let fixture =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
@@ -4718,6 +4978,298 @@ mod tests {
                 ..EngineConfig::default()
             },
         )
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn indentation_stops_commit_real_native_and_reference_decoder_prefixes() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        drop(native_speculative_per_position_fixture(directory.path())?);
+        let path = directory.path().join("tokenizer.json");
+        let mut tokenizer: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let vocabulary = tokenizer["model"]["vocab"]
+            .as_object_mut()
+            .context("fixture vocabulary")?;
+        let original = vocabulary
+            .iter()
+            .find(|(_, id)| **id == serde_json::json!(1))
+            .map(|(word, _)| word.clone())
+            .context("fixture token 1")?;
+        vocabulary.remove(&original);
+        vocabulary.insert("head\n bad".into(), serde_json::json!(1));
+        if tokenizer["model"]["unk_token"] == original {
+            tokenizer["model"]["unk_token"] = serde_json::json!("head\n bad");
+        }
+        if let Some(tokens) = tokenizer["added_tokens"].as_array_mut() {
+            tokens.retain(|token| token["id"] != 1);
+        }
+        std::fs::write(path, serde_json::to_vec(&tokenizer)?)?;
+        for (backend, speculative) in [
+            (EngineDecodeBackend::Native, false),
+            (EngineDecodeBackend::Native, true),
+            (EngineDecodeBackend::Ort, false),
+        ] {
+            for streaming in [false, true] {
+                let mut engine = Engine::from_dir(
+                    directory.path(),
+                    EngineConfig {
+                        decode_backend: backend,
+                        native_device: Some(crate::NativeDecodeDevice::Cpu),
+                        ..Default::default()
+                    },
+                )?;
+                let mut request = tiny_native_cold_request(speculative);
+                request.prompt = GeneratePrompt::TokenIds(vec![0, 1, 1, 1, 0]);
+                request.options.max_new_tokens = 8;
+                request.options.minimum_indent = 2;
+                request.options.cold_start = true;
+                request.options.num_speculative_tokens = speculative.then_some(4);
+                let mut reference = Engine::from_dir(
+                    directory.path(),
+                    EngineConfig {
+                        decode_backend: backend,
+                        native_device: Some(crate::NativeDecodeDevice::Cpu),
+                        ..Default::default()
+                    },
+                )?;
+                let mut reference_request = request.clone();
+                reference_request.options.minimum_indent = 0;
+                reference_request.options.max_new_tokens = 3;
+                let reference_result = reference.generate(reference_request)?;
+                assert_eq!(reference_result.token_ids, [1, 1, 1]);
+                let mut delivered = Vec::new();
+                let mut callback = |token| {
+                    delivered.push(token);
+                    Ok(())
+                };
+                let result = engine.generate_with_callbacks(
+                    request.clone(),
+                    None,
+                    if streaming { Some(&mut callback) } else { None },
+                )?;
+                assert_eq!(
+                    result.token_ids,
+                    [1, 1, 1],
+                    "{backend:?} speculative={speculative}"
+                );
+                assert_eq!(result.text, "head\n ");
+                assert_eq!(result.finish_reason, FinishReason::IndentationLimit);
+                if backend == EngineDecodeBackend::Native {
+                    assert_eq!(
+                        result.retained_cache_tokens,
+                        reference_result.retained_cache_tokens
+                    );
+                    assert_eq!(
+                        engine
+                            .native_slot_state()
+                            .context("Native indentation prefix")?
+                            .materialized_tokens,
+                        reference_result.retained_cache_tokens
+                    );
+                }
+                if streaming {
+                    assert_eq!(delivered.len(), 3);
+                    assert_eq!(
+                        delivered.last().unwrap().finish_reason,
+                        Some(FinishReason::IndentationLimit)
+                    );
+                }
+                request.options.minimum_indent = 0;
+                request.options.max_new_tokens = 2;
+                request.options.speculative_mode = None;
+                request.options.num_speculative_tokens = None;
+                assert_eq!(engine.generate(request)?.token_ids, [1, 1]);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prediction_time_limit_commits_real_decoder_output_and_preserves_retry_state()
+    -> anyhow::Result<()> {
+        use std::time::Duration;
+        let directory = tempfile::tempdir()?;
+        drop(native_speculative_per_position_fixture(directory.path())?);
+        let tokenizer_path = directory.path().join("tokenizer.json");
+        let mut tokenizer: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&tokenizer_path)?)?;
+        let vocabulary = tokenizer["model"]["vocab"]
+            .as_object_mut()
+            .context("test WordLevel vocabulary")?;
+        let original = vocabulary
+            .iter()
+            .find(|(_, id)| **id == serde_json::json!(1))
+            .map(|(token, _)| token.clone())
+            .context("fixture target token 1")?;
+        vocabulary.remove(&original);
+        vocabulary.insert("\n".into(), serde_json::json!(1));
+        if tokenizer["model"]["unk_token"] == original {
+            tokenizer["model"]["unk_token"] = serde_json::json!("\n");
+        }
+        if let Some(tokens) = tokenizer["added_tokens"].as_array_mut() {
+            tokens.retain(|token| token["id"] != 1);
+        }
+        std::fs::write(&tokenizer_path, serde_json::to_vec(&tokenizer)?)?;
+        for (backend, speculative) in [
+            (EngineDecodeBackend::Native, false),
+            (EngineDecodeBackend::Native, true),
+            (EngineDecodeBackend::Ort, false),
+        ] {
+            for streaming in [false, true] {
+                let mut engine = Engine::from_dir(
+                    directory.path(),
+                    EngineConfig {
+                        decode_backend: backend,
+                        native_device: Some(crate::NativeDecodeDevice::Cpu),
+                        ..Default::default()
+                    },
+                )?;
+                let mut request = tiny_native_cold_request(speculative);
+                request.prompt = GeneratePrompt::TokenIds(vec![0, 1, 1, 1, 0]);
+                request.options.max_new_tokens = 8;
+                request.options.cold_start = true;
+                request.options.num_speculative_tokens = speculative.then_some(2);
+                request.options.max_prediction_time =
+                    Some(Duration::from_millis(if speculative { 50 } else { 1 }));
+                let delay = Duration::from_millis(if speculative { 60 } else { 10 });
+                let control = crate::GenerationControl::new().with_checkpoint(move |boundary| {
+                    if matches!(
+                        boundary,
+                        crate::GenerationBoundary::AfterDecoderForward
+                            | crate::GenerationBoundary::BeforeProposer
+                    ) {
+                        std::thread::sleep(delay);
+                    }
+                    Ok(())
+                });
+                let mut events = Vec::new();
+                let mut callback = |token| {
+                    events.push(token);
+                    Ok(())
+                };
+                let result = engine.generate_with_control_callbacks(
+                    request.clone(),
+                    control,
+                    None,
+                    if streaming { Some(&mut callback) } else { None },
+                )?;
+                assert_eq!(
+                    result.finish_reason,
+                    FinishReason::PredictionTimeLimit,
+                    "{backend:?}, speculative={speculative}"
+                );
+                assert!(
+                    result.token_ids.len() >= 2 && result.token_ids.len() < 8,
+                    "{result:?}"
+                );
+                assert!(result.text.contains('\n'));
+                assert!(result.token_ids.iter().all(|id| *id == 1));
+                assert_eq!(engine.scheduler.running_count(), 0);
+                if speculative {
+                    assert!(
+                        engine.last_speculative_stats().multi_token_accepts > 0,
+                        "{:?}",
+                        engine.last_speculative_stats()
+                    );
+                }
+
+                if backend == EngineDecodeBackend::Native {
+                    assert_eq!(
+                        result.retained_cache_tokens,
+                        engine
+                            .native_slot_state()
+                            .context("Native slot after timed commit")?
+                            .materialized_tokens
+                    );
+                }
+                if streaming {
+                    assert_eq!(
+                        events
+                            .iter()
+                            .map(|token: &crate::GenerateToken| token.token_id)
+                            .collect::<Vec<_>>(),
+                        result.token_ids
+                    );
+                    assert_eq!(
+                        events.last().unwrap().finish_reason,
+                        Some(FinishReason::PredictionTimeLimit)
+                    );
+                }
+                request.options.max_prediction_time = None;
+                request.options.max_new_tokens = 2;
+                request.options.speculative_mode = None;
+                request.options.num_speculative_tokens = None;
+                assert_eq!(engine.generate(request)?.token_ids, vec![1, 1]);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prediction_time_limit_stop_observers_trim_unpublished_speculative_kv_before_commit()
+    -> anyhow::Result<()> {
+        use crate::logits::StopSequence;
+        for (stop, fail_repair) in [
+            (StopSequence::Tokens(vec![1]), false),
+            (StopSequence::Tokens(vec![1]), true),
+            (StopSequence::Text("unk".into()), false),
+            (StopSequence::Text("unk".into()), true),
+        ] {
+            let directory = tempfile::tempdir()?;
+            let mut engine = native_speculative_per_position_fixture(directory.path())?;
+            let mut request = tiny_native_cold_request(true);
+            request.prompt = GeneratePrompt::TokenIds(vec![0, 1, 1, 1, 0]);
+            request.options.max_new_tokens = 8;
+            request.options.num_speculative_tokens = Some(2);
+            request.options.stop_sequences = vec![stop];
+            if fail_repair {
+                engine
+                    .native_session
+                    .as_mut()
+                    .context("Native decoder")?
+                    .fail_rewind_after_for_test(2);
+            }
+            let mut events = Vec::new();
+            let result = engine.generate_with_callbacks(
+                request.clone(),
+                None,
+                Some(&mut |token| {
+                    events.push(token);
+                    Ok(())
+                }),
+            );
+            if fail_repair {
+                let error =
+                    result.expect_err("the stop-prefix rewind must encounter the injected failure");
+                assert!(
+                    format!("{error:#}").contains("injected native decoder rewind failure"),
+                    "{error:#}"
+                );
+                assert!(events.is_empty());
+                assert_eq!(engine.scheduler.running_count(), 0);
+                let retry = engine.generate(request)?;
+                assert_eq!(retry.token_ids, vec![1]);
+                assert_eq!(retry.retained_cache_tokens, 6);
+            } else {
+                let result = result?;
+                assert_eq!(result.token_ids, vec![1]);
+                assert_eq!(
+                    result.finish_reason,
+                    FinishReason::StopSequence { index: 0 }
+                );
+                assert!(engine.last_speculative_stats().multi_token_accepts > 0);
+                assert_eq!(
+                    result.retained_cache_tokens, 6,
+                    "only five prompt tokens and the one published accepted token may remain materialized"
+                );
+                assert_eq!(engine.native_slot_state().unwrap().materialized_tokens, 6);
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].timings, result.timings);
+            }
+        }
+        Ok(())
     }
 
     #[cfg(feature = "native-backend")]
@@ -4892,14 +5444,11 @@ mod tests {
     }
 
     #[cfg(feature = "native-backend")]
-    #[test]
-    fn native_compressed_prompt_replacement_cancellation_restores_complete_state()
-    -> anyhow::Result<()> {
+    fn compressed_native_engine(directory: &Path, prefix_reusable: bool) -> anyhow::Result<Engine> {
         let source =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-deepseek-v4-csa");
-        let directory = tempfile::tempdir()?;
         for name in ["inference_metadata.yaml", "model.onnx.textproto"] {
-            std::fs::copy(source.join(name), directory.path().join(name))?;
+            std::fs::copy(source.join(name), directory.join(name))?;
         }
         let metadata: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(
             source.join("inference_metadata.yaml"),
@@ -4911,21 +5460,41 @@ mod tests {
             .map(|token| (format!("t{token}"), serde_json::json!(token)))
             .collect();
         std::fs::write(
-            directory.path().join("tokenizer.json"),
+            directory.join("tokenizer.json"),
             serde_json::to_vec(&serde_json::json!({
                 "version":"1.0", "truncation":null, "padding":null, "added_tokens":[], "normalizer":null,
                 "pre_tokenizer":{"type":"Whitespace"}, "post_processor":null, "decoder":null,
                 "model":{"type":"WordLevel", "vocab":vocab, "unk_token":"t0"}
             }))?,
         )?;
-        let mut engine = Engine::from_dir(
-            directory.path(),
+        if prefix_reusable {
+            let path = directory.join("inference_metadata.yaml");
+            let metadata = std::fs::read_to_string(&path)?;
+            anyhow::ensure!(
+                metadata.contains("prefix_reusable: false"),
+                "compressed fixture must declare prefix-reuse authority"
+            );
+            std::fs::write(
+                path,
+                metadata.replace("prefix_reusable: false", "prefix_reusable: true"),
+            )?;
+        }
+        Engine::from_dir(
+            directory,
             EngineConfig {
                 decode_backend: EngineDecodeBackend::Native,
                 native_device: Some(crate::NativeDecodeDevice::Cpu),
                 ..EngineConfig::default()
             },
-        )?;
+        )
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_compressed_prompt_replacement_cancellation_restores_complete_state()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut engine = compressed_native_engine(directory.path(), false)?;
         let session = engine.create_session()?;
         let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1, 2, 3, 4, 5, 6, 7]));
         request.options.max_new_tokens = 1;
@@ -5094,6 +5663,349 @@ mod tests {
 
     #[cfg(feature = "native-backend")]
     #[test]
+    fn prompt_progress_failure_does_not_publish_a_provisional_semantic_snapshot()
+    -> anyhow::Result<()> {
+        use crate::pipeline::GenerationControl;
+        let prompt = vec![1, 2, 3, 4, 5, 6, 7];
+        for failure_at in [0, 3, prompt.len()] {
+            let directory = tempfile::tempdir()?;
+            let mut engine = compressed_native_engine(directory.path(), true)?;
+            let session = engine.create_session()?;
+            let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.clone()));
+            request.options.max_new_tokens = 1;
+            request.options.greedy = true;
+            request.options.stop_on_eos = false;
+            request.options.semantic_prefix_len = Some(3);
+            let control = GenerationControl::new().with_prompt_progress(move |progress| {
+                if progress.processed == failure_at {
+                    anyhow::bail!("injected semantic-prefix progress failure");
+                }
+                Ok(())
+            });
+            let error = engine
+                .generate_in_session_with_tool_policy_callbacks(
+                    session,
+                    request.clone(),
+                    ToolCallPolicy::Disabled,
+                    Some(control),
+                    None,
+                    None,
+                )
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("injected semantic-prefix progress failure"),
+                "{error:#}"
+            );
+            assert_eq!(engine.session_token_count(session)?, 0);
+            assert_eq!(engine.scheduler.running_count(), 0);
+            assert_eq!(engine.native_recurrent_prefix_stats.stores, 0);
+            assert!(
+                engine
+                    .prefix_cache
+                    .lookup_snapshot::<NativePrefixSnapshot>(&prompt)
+                    .is_none(),
+                "an aborted turn must not publish its provisional semantic prefix"
+            );
+            let retry = engine.generate_in_session(session, request)?;
+            assert_eq!(retry.token_ids.len(), 1);
+            assert_eq!(retry.prefix_cache_hit_len, 0);
+            assert_eq!(engine.native_recurrent_prefix_stats.stores, 1);
+            assert!(
+                engine
+                    .prefix_cache
+                    .lookup_snapshot::<NativePrefixSnapshot>(&prompt)
+                    .is_some()
+            );
+            engine.close_session(session)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prompt_progress_distinguishes_new_semantic_prefill_from_reused_snapshot()
+    -> anyhow::Result<()> {
+        use crate::pipeline::GenerationControl;
+        use std::sync::{Arc, Mutex};
+        let directory = tempfile::tempdir()?;
+        let mut engine = compressed_native_engine(directory.path(), true)?;
+        assert!(engine.prefix_reuse_permitted());
+        assert!(
+            engine
+                .native_session
+                .as_ref()
+                .unwrap()
+                .has_recurrent_state()
+        );
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1, 2, 3, 4, 5, 6, 7]));
+        request.options.max_new_tokens = 1;
+        request.options.greedy = true;
+        request.options.stop_on_eos = false;
+        request.options.semantic_prefix_len = Some(3);
+        let mut results = Vec::new();
+        for reused in [false, true] {
+            let session = engine.create_session()?;
+            let updates = Arc::new(Mutex::new(Vec::new()));
+            let sink = updates.clone();
+            let control = GenerationControl::new().with_prompt_progress(move |progress| {
+                sink.lock().unwrap().push(progress);
+                Ok(())
+            });
+            let result = engine.generate_in_session_with_tool_policy_callbacks(
+                session,
+                request.clone(),
+                ToolCallPolicy::Disabled,
+                Some(control),
+                None,
+                None,
+            )?;
+            let updates = updates.lock().unwrap();
+            assert_eq!(updates.len(), if reused { 2 } else { 3 });
+            assert_eq!(updates[0].processed, if reused { 3 } else { 0 });
+            for update in updates.iter() {
+                assert_eq!(update.total, 7);
+                assert_eq!(update.cache, if reused { 3 } else { 0 });
+            }
+            assert_eq!(updates.last().unwrap().processed, 7);
+            if !reused {
+                assert_eq!(updates[1].processed, 3);
+                assert!(updates[1].elapsed > std::time::Duration::ZERO);
+            }
+            assert_eq!(result.prefix_cache_hit_len, if reused { 3 } else { 0 });
+            let timing = result.timings.unwrap();
+            assert_eq!(timing.cached_prompt_tokens, result.prefix_cache_hit_len);
+            assert_eq!(timing.prompt_tokens, if reused { 4 } else { 7 });
+            assert_eq!(timing.prompt_elapsed, updates.last().unwrap().elapsed);
+            results.push(result.token_ids);
+        }
+        assert_eq!(engine.native_recurrent_prefix_stats.stores, 1);
+        assert_eq!(engine.native_recurrent_prefix_stats.hits, 1);
+        assert_eq!(
+            results[0], results[1],
+            "restored record partial-carry state must match its freshly evaluated prefix"
+        );
+        let mut oracle = compressed_native_engine(directory.path(), true)?;
+        request.options.semantic_prefix_len = None;
+        assert_eq!(oracle.generate(request)?.token_ids, results[0]);
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prompt_progress_observes_real_forwards_and_precedes_committed_output() -> anyhow::Result<()>
+    {
+        use crate::pipeline::{GenerationBoundary, GenerationControl};
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for backend in [EngineDecodeBackend::Native, EngineDecodeBackend::Ort] {
+            let mut engine = Engine::from_dir(
+                &fixture,
+                EngineConfig {
+                    decode_backend: backend,
+                    native_device: Some(crate::NativeDecodeDevice::Cpu),
+                    ..Default::default()
+                },
+            )?;
+            for cold in [true, false] {
+                let updates = Arc::new(Mutex::new(Vec::new()));
+                let forward_seen = Arc::new(AtomicBool::new(false));
+                let output_seen = Arc::new(AtomicBool::new(false));
+                let seen = forward_seen.clone();
+                let observed = updates.clone();
+                let forwarded = forward_seen.clone();
+                let published = output_seen.clone();
+                let control = GenerationControl::new()
+                    .with_checkpoint(move |boundary| {
+                        if boundary == GenerationBoundary::AfterDecoderForward {
+                            seen.store(true, Ordering::SeqCst);
+                        }
+                        Ok(())
+                    })
+                    .with_prompt_progress(move |progress| {
+                        assert!(!published.load(Ordering::SeqCst));
+                        assert_eq!(
+                            forwarded.load(Ordering::SeqCst),
+                            progress.processed == progress.total
+                        );
+                        observed.lock().unwrap().push(progress);
+                        Ok(())
+                    });
+                let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
+                request.options.max_new_tokens = 2;
+                request.options.greedy = true;
+                request.options.stop_on_eos = false;
+                request.options.cold_start = cold;
+                let mut callback = |_: crate::config::GenerateToken| {
+                    output_seen.store(true, Ordering::SeqCst);
+                    Ok(())
+                };
+                let result = engine.generate_with_tool_policy_callbacks(
+                    request,
+                    ToolCallPolicy::Disabled,
+                    Some(control),
+                    None,
+                    Some(&mut callback),
+                )?;
+                let updates = updates.lock().unwrap();
+                assert_eq!(updates.len(), 2);
+                assert_eq!(updates[0].total, 3);
+                assert_eq!(updates[0].cache, result.prefix_cache_hit_len);
+                assert_eq!(updates[0].processed, updates[0].cache);
+                assert_eq!(updates[0].elapsed, std::time::Duration::ZERO);
+                assert_eq!(updates[1].total, 3);
+                assert_eq!(updates[1].cache, updates[0].cache);
+                assert_eq!(updates[1].processed, 3);
+                assert_eq!(updates[1].elapsed, result.timings.unwrap().prompt_elapsed);
+                assert!(output_seen.load(Ordering::SeqCst));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prompt_progress_observer_failures_abort_without_publishing_tokens_or_history()
+    -> anyhow::Result<()> {
+        use crate::pipeline::GenerationControl;
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for backend in [EngineDecodeBackend::Native, EngineDecodeBackend::Ort] {
+            for fail_after_forward in [false, true] {
+                let mut engine = Engine::from_dir(
+                    &fixture,
+                    EngineConfig {
+                        decode_backend: backend,
+                        native_device: Some(crate::NativeDecodeDevice::Cpu),
+                        ..Default::default()
+                    },
+                )?;
+                let session = engine.create_session()?;
+                let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
+                request.options.max_new_tokens = 2;
+                request.options.greedy = true;
+                request.options.stop_on_eos = false;
+                let control = GenerationControl::new().with_prompt_progress(move |progress| {
+                    if (progress.processed == progress.total) == fail_after_forward {
+                        anyhow::bail!("injected prompt progress receiver failure");
+                    }
+                    Ok(())
+                });
+                let mut published = Vec::new();
+                let mut callback = |token: crate::config::GenerateToken| {
+                    published.push(token.token_id);
+                    Ok(())
+                };
+                let error = engine
+                    .generate_in_session_with_tool_policy_callbacks(
+                        session,
+                        request.clone(),
+                        ToolCallPolicy::Disabled,
+                        Some(control),
+                        None,
+                        Some(&mut callback),
+                    )
+                    .unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("injected prompt progress receiver failure"),
+                    "{error:#}"
+                );
+                assert!(published.is_empty());
+                assert_eq!(engine.session_token_count(session)?, 0);
+                assert_eq!(engine.scheduler.running_count(), 0);
+                assert_eq!(
+                    engine
+                        .generate_in_session(session, request)?
+                        .token_ids
+                        .len(),
+                    2
+                );
+                engine.close_session(session)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn generation_timings_survive_commit_only_native_and_ort_publication() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for backend in [EngineDecodeBackend::Native, EngineDecodeBackend::Ort] {
+            let mut engine = Engine::from_dir(
+                &fixture,
+                EngineConfig {
+                    decode_backend: backend,
+                    native_device: Some(crate::NativeDecodeDevice::Cpu),
+                    ..Default::default()
+                },
+            )?;
+            for cold in [true, false] {
+                let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
+                request.options.max_new_tokens = 3;
+                request.options.greedy = true;
+                request.options.stop_on_eos = false;
+                request.options.cold_start = cold;
+                let mut snapshots = Vec::new();
+                let mut callback = |token: crate::config::GenerateToken| {
+                    snapshots.push(token.timings);
+                    Ok(())
+                };
+                let result = engine.generate_with_callback(request, Some(&mut callback))?;
+                assert_eq!(snapshots.len(), 3);
+                assert_eq!(snapshots.last().copied().flatten(), result.timings);
+                for (index, sample) in snapshots.into_iter().enumerate() {
+                    let sample =
+                        sample.context("ordinary decoder must preserve measured token timing")?;
+                    assert_eq!(sample.generated_tokens, index + 1);
+                    assert_eq!(sample.prompt_tokens + sample.cached_prompt_tokens, 3);
+                    assert!(!sample.prompt_elapsed.is_zero());
+                    assert!(!sample.generation_elapsed.is_zero());
+                    if cold {
+                        assert_eq!(sample.cached_prompt_tokens, 0);
+                    }
+                }
+                let last = result.timings.unwrap();
+                assert_eq!(last.cached_prompt_tokens, result.prefix_cache_hit_len);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn generation_cache_reports_materialized_retention_after_cold_and_warm_turns()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut engine = native_prefill_content_engine(directory.path(), true)?;
+        let mut request = tiny_native_cold_request(false);
+        request.prompt = GeneratePrompt::TokenIds(vec![0, 1, 2]);
+        request.options.cold_start = true;
+        let first = engine.generate(request.clone())?;
+        assert_eq!(first.prefix_cache_hit_len, 0);
+        assert_eq!(
+            first.retained_cache_tokens,
+            engine.native_session.as_ref().unwrap().current_len()
+        );
+        assert!(first.retained_cache_tokens > 0);
+        let second = engine.generate(request.clone())?;
+        assert_eq!(second.prefix_cache_hit_len, 0);
+        assert_eq!(second.token_ids, first.token_ids);
+        assert_eq!(second.retained_cache_tokens, first.retained_cache_tokens);
+        assert!(engine.native_active_session.is_some());
+        request.options.cold_start = false;
+        let warm = engine.generate(request)?;
+        assert!(warm.prefix_cache_hit_len > 0);
+        assert_eq!(warm.token_ids, first.token_ids);
+        assert_eq!(
+            warm.retained_cache_tokens,
+            engine.native_session.as_ref().unwrap().current_len()
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
     fn request_cancellation_stops_cold_native_and_prompt_lookup_without_publication()
     -> anyhow::Result<()> {
         use crate::pipeline::{GenerationBoundary, GenerationCancelled, GenerationControl};
@@ -5137,6 +6049,304 @@ mod tests {
             assert_eq!(
                 actual.token_ids, expected.token_ids,
                 "cancelled cold state leaked into retry"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn native_speculative_per_position_fixture(directory: &Path) -> anyhow::Result<Engine> {
+        use onnx_runtime_loader::proto::onnx::{self, AttributeProto, NodeProto, TensorProto};
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+        for file in ["inference_metadata.yaml", "tokenizer.json"] {
+            std::fs::copy(source.join(file), directory.join(file))?;
+        }
+        let mut model = onnx_std::textproto::from_textproto(&std::fs::read_to_string(
+            source.join("model.onnx.textproto"),
+        )?)?
+        .to_proto()?;
+        let graph = model.graph.as_mut().context("speculative fixture graph")?;
+        let constant = graph
+            .node
+            .iter_mut()
+            .find(|node| node.output == ["logits"])
+            .context("fixture logits constant")?;
+        constant.output = vec!["base_logits".into()];
+        graph.initializer.push(TensorProto {
+            name: "vocab_width".into(),
+            dims: vec![1],
+            data_type: onnx::tensor_proto::DataType::Int64 as i32,
+            int64_data: vec![2],
+            ..Default::default()
+        });
+        graph.node.extend([
+            NodeProto {
+                op_type: "Shape".into(),
+                input: vec!["input_ids".into()],
+                output: vec!["token_shape".into()],
+                ..Default::default()
+            },
+            NodeProto {
+                op_type: "Concat".into(),
+                input: vec!["token_shape".into(), "vocab_width".into()],
+                output: vec!["logits_shape".into()],
+                attribute: vec![AttributeProto {
+                    name: "axis".into(),
+                    i: 0,
+                    r#type: onnx::attribute_proto::AttributeType::Int as i32,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            NodeProto {
+                op_type: "Expand".into(),
+                input: vec!["base_logits".into(), "logits_shape".into()],
+                output: vec!["logits".into()],
+                ..Default::default()
+            },
+        ]);
+        let output = graph
+            .output
+            .iter_mut()
+            .find(|port| port.name == "logits")
+            .context("fixture logits output")?;
+        let Some(onnx::type_proto::Value::TensorType(tensor)) =
+            output.r#type.as_mut().and_then(|kind| kind.value.as_mut())
+        else {
+            anyhow::bail!("fixture logits tensor type");
+        };
+        tensor.shape.as_mut().context("fixture logits shape")?.dim[1].value = Some(
+            onnx::tensor_shape_proto::dimension::Value::DimParam("sequence".into()),
+        );
+        std::fs::write(
+            directory.join("model.onnx.textproto"),
+            onnx_std::textproto::to_textproto(&onnx_std::Model::from_proto(model)?)?,
+        )?;
+        Engine::from_dir(
+            directory,
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                native_device: Some(crate::NativeDecodeDevice::Cpu),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_speculative_reporting_rejects_last_only_verify_rows_without_panicking_or_publication()
+    -> anyhow::Result<()> {
+        let mut engine = tiny_native_cold_engine()?;
+        let mut request = tiny_native_cold_request(true);
+        request.prompt = GeneratePrompt::TokenIds(vec![0, 1, 1, 1, 0]);
+        request.options.max_new_tokens = 8;
+        let mut output = Vec::new();
+        let error = engine
+            .generate_with_callback(
+                request.clone(),
+                Some(&mut |token| {
+                    output.push(token);
+                    Ok(())
+                }),
+            )
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("1 logits row(s) for 2 draft tokens"),
+            "{message}"
+        );
+        assert!(message.contains("num_speculative_tokens=1"), "{message}");
+        assert!(output.is_empty());
+        assert_eq!(engine.scheduler.running_count(), 0);
+        request.options.speculative_mode = None;
+        assert_eq!(
+            engine.generate(request.clone())?.token_ids,
+            tiny_native_cold_engine()?.generate(request)?.token_ids
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_speculative_reporting_preserves_multi_token_counts_and_commit_only_delivery()
+    -> anyhow::Result<()> {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+        let directory = tempfile::tempdir()?;
+        let mut engine = native_speculative_per_position_fixture(directory.path())?;
+        let mut request = tiny_native_cold_request(true);
+        request.prompt = GeneratePrompt::TokenIds(vec![0, 1, 1, 1, 0]);
+        request.options.max_new_tokens = 8;
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let published = Arc::new(AtomicBool::new(false));
+        let progress = updates.clone();
+        let publication = published.clone();
+        let control = crate::GenerationControl::new().with_prompt_progress(move |update| {
+            assert!(
+                !publication.load(Ordering::SeqCst),
+                "progress must precede committed output"
+            );
+            progress.lock().unwrap().push(update);
+            Ok(())
+        });
+        let mut tokens = Vec::new();
+        let result = engine.generate_with_control_callbacks(
+            request.clone(),
+            control,
+            None,
+            Some(&mut |token| {
+                published.store(true, Ordering::SeqCst);
+                tokens.push(token);
+                Ok(())
+            }),
+        )?;
+        assert!(engine.last_speculative_stats().multi_token_accepts > 0);
+        assert_eq!(
+            result.token_ids,
+            native_speculative_per_position_fixture(directory.path())?
+                .generate({
+                    request.options.speculative_mode = None;
+                    request
+                })?
+                .token_ids
+        );
+        assert_eq!(tokens.len(), 8);
+        let updates = updates.lock().unwrap();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].processed, 0);
+        assert_eq!(updates[1].processed, 5);
+        for update in updates.iter() {
+            assert_eq!(update.total, 5);
+            assert_eq!(update.cache, 0);
+        }
+        let timing = result.timings.context("native speculative final timing")?;
+        assert_eq!(timing.prompt_tokens, 5);
+        assert_eq!(timing.cached_prompt_tokens, 0);
+        assert_eq!(timing.generated_tokens, 8);
+        assert_eq!(timing.speculative, Some(engine.last_speculative_stats()));
+        assert!(timing.speculative.unwrap().proposed_tokens > 0);
+        assert_eq!(timing.prompt_elapsed, updates[1].elapsed);
+        assert!(!timing.prompt_elapsed.is_zero());
+        assert!(!timing.generation_elapsed.is_zero());
+        for (index, token) in tokens.iter().enumerate() {
+            let sample = token.timings.context("native speculative token timing")?;
+            assert_eq!(sample.generated_tokens, index + 1);
+            let stats = sample
+                .speculative
+                .context("committed speculative counters")?;
+            assert!(stats.proposed_tokens >= stats.accepted_tokens);
+            assert!(stats.proposed_tokens <= timing.speculative.unwrap().proposed_tokens);
+            if index > 0 {
+                let previous = tokens[index - 1].timings.unwrap().speculative.unwrap();
+                assert!(stats.proposed_tokens >= previous.proposed_tokens);
+                assert!(stats.accepted_tokens >= previous.accepted_tokens);
+            }
+            assert_eq!(sample.prompt_elapsed, timing.prompt_elapsed);
+            if index > 0 {
+                assert!(
+                    sample.generation_elapsed
+                        >= tokens[index - 1].timings.unwrap().generation_elapsed
+                );
+            }
+        }
+        assert_eq!(tokens.last().unwrap().timings, result.timings);
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_speculative_reporting_failures_and_phase_cancellation_abort_without_output()
+    -> anyhow::Result<()> {
+        for at in [0, 3] {
+            for cancel in [false, true] {
+                let mut engine = tiny_native_cold_engine()?;
+                let mut request = tiny_native_cold_request(true);
+                request.prompt = GeneratePrompt::TokenIds(vec![1, 1, 1]);
+                let authority = crate::GenerationControl::new();
+                let cancellation = authority.clone();
+                let control = authority.with_prompt_progress(move |update| {
+                    if update.processed == at {
+                        if cancel {
+                            cancellation.cancel();
+                        } else {
+                            anyhow::bail!("injected speculative progress failure");
+                        }
+                    }
+                    Ok(())
+                });
+                let mut output = Vec::new();
+                let error = engine
+                    .generate_with_control_callbacks(
+                        request.clone(),
+                        control,
+                        None,
+                        Some(&mut |token| {
+                            output.push(token);
+                            Ok(())
+                        }),
+                    )
+                    .unwrap_err();
+                assert!(output.is_empty());
+                assert_eq!(engine.scheduler.running_count(), 0);
+                if cancel {
+                    assert!(
+                        error.downcast_ref::<crate::GenerationCancelled>().is_some(),
+                        "{error:#}"
+                    );
+                } else {
+                    assert!(format!("{error:#}").contains("injected speculative progress failure"));
+                }
+                let retry = engine.generate(request.clone())?;
+                let clean = tiny_native_cold_engine()?.generate(request)?;
+                assert_eq!(retry.token_ids, clean.token_ids);
+                assert_eq!(
+                    retry.timings.unwrap().speculative,
+                    clean.timings.unwrap().speculative
+                );
+            }
+        }
+        for boundary in [
+            crate::GenerationBoundary::AfterProposer,
+            crate::GenerationBoundary::AfterVerifier,
+        ] {
+            let mut engine = tiny_native_cold_engine()?;
+            let authority = crate::GenerationControl::new();
+            let cancellation = authority.clone();
+            let control = authority.with_checkpoint(move |at| {
+                if at == boundary {
+                    cancellation.cancel();
+                }
+                Ok(())
+            });
+            let mut output = Vec::new();
+            let mut request = tiny_native_cold_request(true);
+            request.prompt = GeneratePrompt::TokenIds(vec![1, 1, 1]);
+            let error = engine
+                .generate_with_control_callbacks(
+                    request.clone(),
+                    control,
+                    None,
+                    Some(&mut |token| {
+                        output.push(token);
+                        Ok(())
+                    }),
+                )
+                .unwrap_err();
+            assert!(
+                error.downcast_ref::<crate::GenerationCancelled>().is_some(),
+                "{error:#}"
+            );
+            assert!(output.is_empty());
+            assert_eq!(engine.scheduler.running_count(), 0);
+            let retry = engine.generate(request.clone())?;
+            let clean = tiny_native_cold_engine()?.generate(request)?;
+            assert_eq!(retry.token_ids, clean.token_ids);
+            assert_eq!(
+                retry.timings.unwrap().speculative,
+                clean.timings.unwrap().speculative
             );
         }
         Ok(())
@@ -5480,6 +6690,161 @@ mod tests {
     }
 
     #[test]
+    fn generation_cache_prioritized_result_captures_committed_session_state() -> anyhow::Result<()>
+    {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let mut engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Ort,
+                ..Default::default()
+            },
+        )?;
+        let session_id = engine.create_session()?;
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
+        request.options.max_new_tokens = 2;
+        request.options.greedy = true;
+        request.options.stop_on_eos = false;
+        let results = engine.drive_prioritized_requests(vec![PrioritizedGenerateRequest {
+            session_id,
+            request,
+            priority: Priority::Normal,
+        }])?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].result.prefix_cache_hit_len, 0);
+        let timing = results[0]
+            .result
+            .timings
+            .context("prioritized decoder timing")?;
+        assert_eq!(timing.prompt_tokens, 3);
+        assert_eq!(timing.generated_tokens, 2);
+        assert!(!timing.prompt_elapsed.is_zero());
+        let state = &engine.sessions[&session_id];
+        assert!(state.kv_token_count >= 3);
+        assert_eq!(
+            results[0].result.retained_cache_tokens,
+            state.kv_token_count
+        );
+        engine.close_session(session_id)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prompt_only_progress_reports_actual_work_without_observer_time_or_generated_tokens()
+    -> anyhow::Result<()> {
+        use std::sync::{Arc, Mutex};
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for backend in [EngineDecodeBackend::Native, EngineDecodeBackend::Ort] {
+            let mut engine = Engine::from_dir(
+                &fixture,
+                EngineConfig {
+                    decode_backend: backend,
+                    native_device: Some(crate::NativeDecodeDevice::Cpu),
+                    ..Default::default()
+                },
+            )?;
+            for cold in [true, false] {
+                let updates = Arc::new(Mutex::new(Vec::new()));
+                let sink = updates.clone();
+                let control =
+                    crate::GenerationControl::new().with_prompt_progress(move |progress| {
+                        sink.lock().unwrap().push(progress);
+                        // Observer work is not model work and must not enter the
+                        // accumulated execution time reported by later updates.
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        Ok(())
+                    });
+                let mut request = prefill_request(&[2, 4, 3]);
+                request.cold_start = cold;
+                let result = engine.prefill_with_callbacks(request, Some(control), None)?;
+                let updates = updates.lock().unwrap();
+                assert_eq!(updates.len(), 2);
+                let cache = if cold {
+                    0
+                } else if backend == EngineDecodeBackend::Native {
+                    3
+                } else {
+                    2
+                };
+                assert_eq!(result.prefix_cache_hit_len, cache);
+                assert_eq!(result.timings.cached_prompt_tokens, cache);
+                assert_eq!(result.timings.prompt_tokens, 3 - cache);
+                assert_eq!(result.timings.generated_tokens, 0);
+                assert_eq!(result.timings.generation_elapsed, std::time::Duration::ZERO);
+                assert_eq!(updates[0].processed, cache);
+                assert_eq!(updates[0].elapsed, std::time::Duration::ZERO);
+                assert_eq!(updates[1].processed, 3);
+                assert_eq!(updates[1].elapsed, result.timings.prompt_elapsed);
+                for progress in updates.iter() {
+                    assert_eq!(progress.total, 3);
+                    assert_eq!(progress.cache, cache);
+                }
+                if cache == 3 {
+                    assert_eq!(result.timings.prompt_elapsed, std::time::Duration::ZERO);
+                } else {
+                    assert!(!result.timings.prompt_elapsed.is_zero());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prompt_only_progress_observer_error_or_cancel_never_publishes_provisional_cache()
+    -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        for backend in [EngineDecodeBackend::Native, EngineDecodeBackend::Ort] {
+            for at in [0, 3] {
+                for cancel in [false, true] {
+                    let mut engine = Engine::from_dir(
+                        &fixture,
+                        EngineConfig {
+                            decode_backend: backend,
+                            native_device: Some(crate::NativeDecodeDevice::Cpu),
+                            ..Default::default()
+                        },
+                    )?;
+                    let authority = crate::GenerationControl::new();
+                    let cancellation = authority.clone();
+                    let control = authority.with_prompt_progress(move |progress| {
+                        if progress.processed == at {
+                            if cancel {
+                                cancellation.cancel();
+                            } else {
+                                anyhow::bail!("injected prompt-only progress failure");
+                            }
+                        }
+                        Ok(())
+                    });
+                    let error = engine
+                        .prefill_with_callbacks(prefill_request(&[2, 4, 3]), Some(control), None)
+                        .unwrap_err();
+                    if cancel {
+                        assert!(
+                            error.downcast_ref::<crate::GenerationCancelled>().is_some(),
+                            "{error:#}"
+                        );
+                    } else {
+                        assert!(
+                            format!("{error:#}").contains("injected prompt-only progress failure")
+                        );
+                    }
+                    assert_eq!(engine.scheduler.running_count(), 0);
+                    let result = engine.prefill(prefill_request(&[2, 4, 3]))?;
+                    assert_eq!(
+                        result.prefix_cache_hit_len, 0,
+                        "failed work must be recomputed: {backend:?}, {at}, {cancel}"
+                    );
+                    assert_eq!(result.retained_cache_tokens, 3);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn prompt_only_prefill_publishes_real_ort_cache_without_output() -> anyhow::Result<()> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
         let mut engine = Engine::from_dir(
@@ -5494,8 +6859,10 @@ mod tests {
         assert_eq!(
             result,
             PrefillResult {
+                timings: result.timings,
                 prompt_tokens: 3,
-                prefix_cache_hit_len: 0
+                prefix_cache_hit_len: 0,
+                retained_cache_tokens: 3,
             }
         );
         assert!(
@@ -5570,6 +6937,14 @@ mod tests {
         request.options.stop_on_eos = false;
         let generated = engine.generate(request.clone())?;
         assert!(generated.prefix_cache_hit_len > 0);
+        assert!(generated.retained_cache_tokens >= prompt.len());
+        let mut cold = request.clone();
+        cold.options.cold_start = true;
+        let cold_result = engine.generate(cold)?;
+        assert_eq!(cold_result.prefix_cache_hit_len, 0);
+        assert!(cold_result.retained_cache_tokens >= prompt.len());
+        assert_eq!(cold_result.token_ids, generated.token_ids);
+        assert!(engine.generate(request.clone())?.prefix_cache_hit_len > 0);
         let oracle = Engine::from_dir(
             &fixture,
             EngineConfig {
@@ -5593,7 +6968,13 @@ mod tests {
         let metadata = std::fs::read_to_string(source.join("inference_metadata.yaml"))?
             .replace("prefix_reusable: true", "prefix_reusable: false");
         std::fs::write(directory.path().join("inference_metadata.yaml"), metadata)?;
-        let mut engine = Engine::from_dir(directory.path(), EngineConfig::default())?;
+        let mut engine = Engine::from_dir(
+            directory.path(),
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?;
         let prompt = [2, 4, 3];
         engine.prefill(prefill_request(&prompt))?;
         assert!(
@@ -5615,7 +6996,13 @@ mod tests {
     fn prompt_only_prefill_cache_restore_budget_shortfall_recomputes_honestly() -> anyhow::Result<()>
     {
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
-        let mut engine = Engine::from_dir(&source, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(
+            &source,
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?;
         let prompt = [2, 4, 3];
         engine.prefill(prefill_request(&prompt))?;
         let memory = engine.governor.memory();
@@ -5672,7 +7059,13 @@ mod tests {
     fn cancelled_prompt_only_prefill_restores_ort_and_does_not_publish_prefix() -> anyhow::Result<()>
     {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Ort,
+                ..EngineConfig::default()
+            },
+        )?;
         let prompt = [2, 4, 3];
         let authority = crate::GenerationControl::new();
         let cancel = authority.clone();
@@ -5706,6 +7099,156 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "native-backend")]
+    fn native_prefill_content_engine(directory: &Path, reusable: bool) -> anyhow::Result<Engine> {
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+        let metadata = std::fs::read_to_string(source.join("inference_metadata.yaml"))?;
+        let metadata = if reusable {
+            metadata
+        } else {
+            anyhow::ensure!(
+                metadata.contains("prefix_reusable: true"),
+                "fixture must declare its reuse policy"
+            );
+            metadata.replace("prefix_reusable: true", "prefix_reusable: false")
+        };
+        std::fs::write(directory.join("inference_metadata.yaml"), metadata)?;
+        std::fs::copy(
+            source.join("tokenizer.json"),
+            directory.join("tokenizer.json"),
+        )?;
+        std::fs::write(
+            directory.join("model.onnx.textproto"),
+            content_dependent_kv_fixture(&std::fs::read_to_string(
+                source.join("model.onnx.textproto"),
+            )?)?,
+        )?;
+        Engine::from_dir(
+            directory,
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                native_device: Some(crate::NativeDecodeDevice::Cpu),
+                ..Default::default()
+            },
+        )
+    }
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prompt_only_prefill_native_cache_reuses_real_kv_and_recomputes_changed_suffixes()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut engine = native_prefill_content_engine(directory.path(), true)?;
+        for (tokens, expected, cold) in [
+            (vec![4, 5, 6], 0, false),
+            (vec![4, 5, 6], 3, false),
+            (vec![4, 5, 6, 7, 8], 3, false),
+            (vec![4, 5, 9, 10], 2, false),
+            (vec![4, 5], 2, false),
+            (vec![11, 12, 13], 0, false),
+            (vec![11, 12, 13], 0, true),
+            (vec![14; 16], 0, false),
+            (vec![14; 16], 16, false),
+        ] {
+            let mut request = prefill_request(&tokens);
+            request.cold_start = cold;
+            let result = engine.prefill(request.clone())?;
+            assert_eq!(result.prompt_tokens, tokens.len());
+            assert_eq!(result.retained_cache_tokens, tokens.len());
+            assert_eq!(
+                result.prefix_cache_hit_len, expected,
+                "{tokens:?}, cold={cold}"
+            );
+            let mut oracle = Engine::from_dir(
+                directory.path(),
+                EngineConfig {
+                    decode_backend: EngineDecodeBackend::Native,
+                    native_device: Some(crate::NativeDecodeDevice::Cpu),
+                    ..Default::default()
+                },
+            )?;
+            request.cold_start = true;
+            oracle.prefill(request)?;
+            for port in ["past_key_values.0.key", "past_key_values.0.value"] {
+                let actual = engine
+                    .native_session
+                    .as_ref()
+                    .unwrap()
+                    .host_present_kv(port)
+                    .context("materialized native prefill KV")?;
+                let expected = oracle
+                    .native_session
+                    .as_ref()
+                    .unwrap()
+                    .host_present_kv(port)
+                    .context("cold prefill oracle KV")?;
+                assert_eq!(actual, expected, "physical KV {port} for {tokens:?}");
+            }
+            assert_eq!(
+                engine.native_session.as_ref().unwrap().current_len(),
+                tokens.len()
+            );
+            assert_eq!(engine.scheduler.running_count(), 0);
+        }
+        Ok(())
+    }
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn prompt_only_prefill_native_cache_honors_policy_and_does_not_reset_a_full_hit()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut engine = native_prefill_content_engine(directory.path(), false)?;
+        for _ in 0..2 {
+            assert_eq!(
+                engine
+                    .prefill(prefill_request(&[4, 5, 6]))?
+                    .prefix_cache_hit_len,
+                0
+            );
+        }
+        let directory = tempfile::tempdir()?;
+        let mut engine = native_prefill_content_engine(directory.path(), true)?;
+        let request = prefill_request(&[4, 5, 6]);
+        engine.prefill(request.clone())?;
+        engine
+            .native_session
+            .as_mut()
+            .unwrap()
+            .fail_next_reset_for_test();
+        assert_eq!(engine.prefill(request.clone())?.prefix_cache_hit_len, 3);
+        let mut cold = request.clone();
+        cold.cold_start = true;
+        let error = engine.prefill(cold).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("injected native decoder reset failure"),
+            "{error:#}"
+        );
+        assert_eq!(engine.scheduler.running_count(), 0);
+        assert_eq!(engine.prefill(request)?.prefix_cache_hit_len, 0);
+        let other = engine.create_session()?;
+        let mut generation = GenerateRequest::new(GeneratePrompt::TokenIds(vec![4, 5, 6]));
+        generation.options.max_new_tokens = 1;
+        generation.options.temperature = 0.0;
+        generation.options.stop_on_eos = false;
+        engine.generate_in_session(other, generation)?;
+        let other_history = engine.native_sessions[&other].tokens.clone();
+        assert_eq!(engine.native_active_session, Some(other));
+        assert_eq!(
+            engine
+                .prefill(prefill_request(&[4, 5, 6]))?
+                .prefix_cache_hit_len,
+            0,
+            "matching logical tokens owned by another physical session cannot count as reuse"
+        );
+        assert_eq!(engine.native_sessions[&other].tokens, other_history);
+        assert_eq!(
+            engine
+                .prefill(prefill_request(&[4, 5, 6]))?
+                .prefix_cache_hit_len,
+            3
+        );
+        Ok(())
+    }
     #[cfg(feature = "native-backend")]
     #[test]
     fn prompt_only_prefill_retains_exact_native_prompt_and_cancellation_is_atomic()
@@ -6807,5 +8350,137 @@ mod end_token_policy_tests {
                 .contains("effective eos_token_id")
         );
         assert!(EndTokenPolicy::new(vec![3], Some(4)).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "native-backend"))]
+mod literal_rollback_tests {
+    use super::*;
+    mod fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/build_literal_decoder.rs"
+        ));
+    }
+    #[test]
+    fn native_literal_active_budget_failure_restores_kv_and_same_session_retry()
+    -> anyhow::Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for (retained_run, short_source) in [(false, false), (false, true), (true, false)] {
+            let root = tempfile::tempdir()?;
+            let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+            if retained_run {
+                fixture::invalid_group(root.path(), &fixtures, false);
+            } else {
+                fixture::build(root.path(), &fixtures, false);
+            }
+            let path = root.path().join("tokenizer.json");
+            let mut tokenizer: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            if short_source {
+                // Ensure the active failure is expansion, not the raw-input bound.
+                let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+                assert_eq!(vocab.remove("@source@"), Some(serde_json::json!(22)));
+                vocab.insert("a".into(), serde_json::json!(22));
+                tokenizer["decoder"]["decoders"][2]["pattern"] = serde_json::json!({"String":"a"});
+            }
+            tokenizer["decoder"]["decoders"][2]["content"] = serde_json::json!("12345678");
+            std::fs::write(path, serde_json::to_vec(&tokenizer)?)?;
+            let config = EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                native_device: Some(crate::NativeDecodeDevice::Cpu),
+                ..Default::default()
+            };
+            let mut engine = Engine::from_dir(root.path(), config.clone())?;
+            let session = engine.create_session()?;
+            let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1]));
+            request.options.max_new_tokens = if retained_run { 3 } else { 1 };
+            request.options.greedy = true;
+            request.options.temperature = 0.;
+            request.options.stop_on_eos = false;
+            request.options.max_constraint_bytes = 4096;
+            if !retained_run {
+                request
+                    .options
+                    .logit_bias
+                    .insert(22, crate::logits::LogitBias::Add(1000.));
+            }
+            assert_eq!(
+                engine.generate_in_session(session, request.clone())?.text,
+                "12345678"
+            );
+            let before = engine.native_session.as_mut().unwrap().snapshot_past()?;
+            let length = engine.native_session.as_ref().unwrap().current_len();
+            let tokens = engine.native_sessions[&session].tokens.clone();
+            let host = engine.resource_snapshot().host_ram.used;
+            assert!(
+                !before.host_contents().is_empty() || before.cpu_kv_snapshot().is_some(),
+                "oracle must contain actual materialized Native KV"
+            );
+            let forwards = Arc::new(AtomicUsize::new(0));
+            let observed = forwards.clone();
+            let control = crate::GenerationControl::new().with_checkpoint(move |boundary| {
+                if boundary == crate::GenerationBoundary::AfterDecoderForward {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            });
+            let mut visible = String::new();
+            let mut callback = |token: crate::GenerateToken| {
+                visible.push_str(&token.text);
+                Ok(())
+            };
+            let mut failing = request.clone();
+            failing.options.max_constraint_bytes = 7;
+            let error = engine
+                .generate_in_session_with_control_callbacks(
+                    session,
+                    failing,
+                    control,
+                    None,
+                    Some(&mut callback),
+                )
+                .expect_err("active decoder expansion/run must exceed its explicit buffer");
+            if retained_run || short_source {
+                assert!(format!("{error:#}").contains("budget"), "{error:#}");
+            } else {
+                assert!(
+                    error.is::<crate::byte_stream::ByteStreamBufferExceeded>(),
+                    "raw input delta must retain its typed budget error: {error:#}"
+                );
+            }
+            assert!(
+                forwards.load(Ordering::SeqCst) > 0,
+                "failure must follow real Native execution/KV advance"
+            );
+            assert!(
+                visible.is_empty(),
+                "failed transform must not publish a partial response"
+            );
+            let after = engine.native_session.as_mut().unwrap().snapshot_past()?;
+            assert_eq!(after.host_contents(), before.host_contents());
+            assert_eq!(after.cpu_kv_snapshot(), before.cpu_kv_snapshot());
+            assert_eq!(
+                engine.native_session.as_ref().unwrap().current_len(),
+                length
+            );
+            assert_eq!(engine.native_sessions[&session].tokens, tokens);
+            assert_eq!(engine.scheduler.running_count(), 0);
+            assert_eq!(
+                engine.resource_snapshot().host_ram.used,
+                host,
+                "failed active turn releases decoder workspace/snapshot leases"
+            );
+            let recovered = engine.generate_in_session(session, request.clone())?;
+            let mut fresh = Engine::from_dir(root.path(), config)?;
+            let fresh_session = fresh.create_session()?;
+            let expected = fresh.generate_in_session(fresh_session, request)?;
+            assert_eq!(recovered.token_ids, expected.token_ids);
+            assert_eq!(recovered.text, expected.text);
+            assert_eq!(recovered.text, "12345678");
+        }
+        Ok(())
     }
 }

@@ -1,0 +1,14 @@
+[package]
+name="nxrt-qmoe-fc-banks-probe"
+version="0.0.0"
+edition="2024"
+[dependencies]
+rayon="1"
+onnx-runtime-ep-api={path="/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-ep-api"}
+onnx-runtime-ep-cpu={path="/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-ep-cpu"}
+onnx-runtime-ir={path="/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-ir"}
+onnx-runtime-loader={path="/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-loader"}
+onnx-runtime-memory-api={path="/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-memory-api"}
+onnx-runtime-memory-governor={path="/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-memory-governor"}
+onnx-runtime-session={path="/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-session"}
+onnx-runtime-tracer={path="/tmp/nxrt-qmoe-workspace/crates/onnx-runtime-tracer"}

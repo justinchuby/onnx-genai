@@ -1,0 +1,160 @@
+{
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/weight_offload.rs": "b646a0aa1d0523b810ec801cd34572aff7a8b0ebb9dfbb615ca79c976b341b04",
+    "crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs": "3da9a6e84023971a910f75c57ba64f1eaf93b0e7bf300acf01cf9f125d3b1f3e"
+  },
+  "results": [
+    {
+      "name": "list-metrics",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "weight_offload::tests::",
+        "--",
+        "--list"
+      ],
+      "exit": 0,
+      "log_sha256": "0c8353d09c5f18cafe9327930aa6dbc211cac99692ff0f08e88a1efa24353963"
+    },
+    {
+      "name": "list-qmoe",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::qmoe::tests::",
+        "--",
+        "--list"
+      ],
+      "exit": 0,
+      "log_sha256": "0fec9d0d2fec8911343d5aa46706f432d0979cb45137fef6ff640a8a37b2cc75"
+    },
+    {
+      "name": "metrics",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "weight_offload::tests::"
+      ],
+      "exit": 0,
+      "log_sha256": "4e410a93b4175c4b78a37207b39aff37d8b95a6e5901f6a8869b82ec9b580a03",
+      "counts": [
+        [
+          "5",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "qmoe",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "kernels::qmoe::tests::"
+      ],
+      "exit": 0,
+      "log_sha256": "55d8a0a866f2029f09a10d9af598cf3b055baa9bcfcb31794914d39e3ef27114",
+      "counts": [
+        [
+          "62",
+          "0",
+          "1"
+        ]
+      ]
+    },
+    {
+      "name": "qmoe-mlas",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--lib",
+        "--features",
+        "mlas",
+        "kernels::qmoe::tests::"
+      ],
+      "exit": 0,
+      "log_sha256": "4dd7a9bde4be10630dae90f493963d57812bbe2b0d80cd931e1349fc017c7ad2",
+      "counts": [
+        [
+          "62",
+          "0",
+          "1"
+        ]
+      ]
+    },
+    {
+      "name": "oracle",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cuda",
+        "--test",
+        "qmoe_cpu_oracle"
+      ],
+      "exit": 0,
+      "log_sha256": "f58e944e38cdf3aabf37a6f71fee949507b58b405d6d852898f03e5989e2db21",
+      "counts": [
+        [
+          "1",
+          "0",
+          "0"
+        ]
+      ]
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit": 0,
+      "log_sha256": "595903191fabf132561f7ec237ab7805f2dc63dd2190be6510a0016f896ebf9c"
+    },
+    {
+      "name": "clippy-mlas",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "-p",
+        "onnx-runtime-ep-cpu",
+        "--all-targets",
+        "--features",
+        "mlas",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit": 0,
+      "log_sha256": "e13010cabd6d7039190c42f1bd24e39a5b657c602fce374c8e1ae9e086513592"
+    }
+  ]
+}

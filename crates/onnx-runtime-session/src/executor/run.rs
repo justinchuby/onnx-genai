@@ -424,6 +424,7 @@ impl Executor {
         // Sequence values and their zero-copy element-backed tensors are equally
         // run-scoped (element Arcs from a prior run must not leak in).
         self.sequences.clear();
+        self.optionals.clear();
         self.seq_elem_values.clear();
         self.string_values.clear();
         self.restore_shared_buffers()?;
