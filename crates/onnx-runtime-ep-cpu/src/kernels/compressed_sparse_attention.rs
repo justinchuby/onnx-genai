@@ -1,4 +1,4 @@
-//! Correctness-first reference paths for `pkg.nxrt::CompressedSparseAttention`
+//! Correctness-first reference paths for `pkg.nxrt._private::CompressedSparseAttention`
 //! v1.
 //!
 //! The registered operator exposes the complete frozen stateful v1 boundary.
@@ -3478,7 +3478,7 @@ mod tests {
         shapes: &[Vec<usize>],
     ) -> Result<Box<dyn Kernel>> {
         let mut graph = Graph::new();
-        graph.opset_imports.insert("pkg.nxrt".into(), 1);
+        graph.opset_imports.insert("pkg.nxrt._private".into(), 1);
         let cache_dtype = if cache_format.unwrap_or("f32") == "f32" {
             DataType::Float32
         } else {
@@ -3503,7 +3503,7 @@ mod tests {
             static_shape(shapes[0].iter().copied()),
         );
         let mut node = onnx_runtime_ir::Node::new(NodeId(0), OP, inputs, vec![output]);
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes
             .insert("num_heads".into(), Attribute::Int(shapes[0][2] as i64));
         node.attributes
@@ -3554,7 +3554,7 @@ mod tests {
             })
             .collect();
         let mut node = Node::new(NodeId(0), OP, inputs, outputs);
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes
             .insert("num_heads".into(), Attribute::Int(1));
         node.attributes
@@ -3642,7 +3642,7 @@ mod tests {
             sink,
         ];
         let mut graph = Graph::new();
-        graph.opset_imports.insert("pkg.nxrt".into(), 1);
+        graph.opset_imports.insert("pkg.nxrt._private".into(), 1);
         let node_inputs = FROZEN_V1_REQUIRED_INPUT_NAMES
             .iter()
             .zip(inputs)
@@ -3673,7 +3673,7 @@ mod tests {
             ),
         ];
         let mut node = Node::new(NodeId(0), OP, node_inputs, outputs.to_vec());
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes
             .insert("num_heads".into(), Attribute::Int(query.shape[2] as i64));
         node.attributes
@@ -3760,7 +3760,7 @@ mod tests {
             past_index_carry,
         ];
         let mut graph = Graph::new();
-        graph.opset_imports.insert("pkg.nxrt".into(), 1);
+        graph.opset_imports.insert("pkg.nxrt._private".into(), 1);
         let names = [
             "query",
             "current_kv",
@@ -3833,7 +3833,7 @@ mod tests {
             ),
         ];
         let mut node = Node::new(NodeId(0), OP, node_inputs, outputs.to_vec());
-        node.domain = "pkg.nxrt".into();
+        node.domain = "pkg.nxrt._private".into();
         node.attributes
             .insert("num_heads".into(), Attribute::Int(query.shape[2] as i64));
         node.attributes

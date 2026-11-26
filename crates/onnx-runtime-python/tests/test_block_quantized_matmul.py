@@ -8,7 +8,7 @@ from onnxscript import ir
 import nxrt
 
 
-DOMAIN = "pkg.nxrt"
+DOMAIN = "pkg.nxrt._private"
 
 
 def _value(name: str, dtype: ir.DataType, shape: list[int]) -> ir.Value:

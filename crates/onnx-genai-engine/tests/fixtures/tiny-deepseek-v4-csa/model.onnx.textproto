@@ -2178,7 +2178,7 @@ graph {
       f: 0.0
       type: FLOAT
     }
-    domain: "pkg.nxrt"
+    domain: "pkg.nxrt._private"
     metadata_props {
       key: "namespace"
       value: "model: DeepSeekV4TextModel/layers.0: DeepSeekV4DecoderLayer/self_attn: DeepSeekV4Attention"
@@ -6465,7 +6465,7 @@ graph {
       f: 0.0
       type: FLOAT
     }
-    domain: "pkg.nxrt"
+    domain: "pkg.nxrt._private"
     metadata_props {
       key: "namespace"
       value: "model: DeepSeekV4TextModel/layers.1: DeepSeekV4DecoderLayer/self_attn: DeepSeekV4Attention"
@@ -19907,6 +19907,6 @@ opset_import {
   version: 24
 }
 opset_import {
-  domain: "pkg.nxrt"
+  domain: "pkg.nxrt._private"
   version: 1
 }

@@ -86,6 +86,18 @@ def main() -> None:
     model = package["model"]
     graph = model.graph
 
+    # The pinned external exporter predates the runtime's private-domain rename.
+    # Author current fixtures; this is not a runtime compatibility registration.
+    for exported in package.values():
+        export_graph = exported.graph
+        for node in export_graph:
+            if node.op_type in {'CompressedSparseAttention'} and node.domain == "pkg.nxrt":
+                node.domain = "pkg.nxrt._private"
+        if not any(node.domain == "pkg.nxrt" for node in export_graph):
+            version = export_graph.opset_imports.pop("pkg.nxrt", None)
+            if version is not None:
+                export_graph.opset_imports["pkg.nxrt._private"] = version
+
     # Materialize small synthetic weights directly onto every initializer that
     # the build left without a constant value (build_from_module references the
     # torch params lazily). Random small values are enough to prove attention/
@@ -95,7 +107,7 @@ def main() -> None:
     # Report the CSA nodes + full IO so the onnx-genai side can author canonical
     # workflow state groups against the real typed ports.
     csa_nodes = [
-        n for n in graph if n.op_type == "CompressedSparseAttention" and n.domain == "pkg.nxrt"
+        n for n in graph if n.op_type == "CompressedSparseAttention" and n.domain == "pkg.nxrt._private"
     ]
     report = {
         "csa_node_count": len(csa_nodes),

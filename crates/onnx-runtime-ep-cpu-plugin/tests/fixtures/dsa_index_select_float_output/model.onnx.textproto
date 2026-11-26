@@ -17,7 +17,7 @@ graph {
       f: 1
       type: FLOAT
     }
-    domain: "pkg.nxrt"
+    domain: "pkg.nxrt._private"
   }
   name: "dsa_index_select_float_output"
   input {
@@ -94,6 +94,6 @@ opset_import {
   version: 24
 }
 opset_import {
-  domain: "pkg.nxrt"
+  domain: "pkg.nxrt._private"
   version: 2
 }

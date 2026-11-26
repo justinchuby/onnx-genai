@@ -65,7 +65,7 @@ mod cuda_impl {
         _context: *mut ort::OrtKernelContext,
     ) -> *mut ort::OrtStatus {
         onnx_runtime_ep_plugin::status::fail_status(
-            "pkg.nxrt::DsaIndexSelect schema fallback executed; cuda_ep must compile this node",
+            "pkg.nxrt._private::DsaIndexSelect schema fallback executed; cuda_ep must compile this node",
         )
     }
 
@@ -183,7 +183,7 @@ mod cuda_impl {
             );
         };
         let mut domain = ptr::null_mut();
-        let status = unsafe { create_domain(c"pkg.nxrt".as_ptr(), &mut domain) };
+        let status = unsafe { create_domain(c"pkg.nxrt._private".as_ptr(), &mut domain) };
         if !status.is_null() {
             return status;
         }
@@ -378,9 +378,9 @@ mod cuda_impl {
         #[test]
         fn advertised_schema_ranges_end_before_the_next_registered_version() {
             let mut descriptors = vec![
-                descriptor("DsaIndexSelect", "pkg.nxrt", 1),
-                descriptor("DsaIndexSelect", "pkg.nxrt", 3),
-                descriptor("Other", "pkg.nxrt", 1),
+                descriptor("DsaIndexSelect", "pkg.nxrt._private", 1),
+                descriptor("DsaIndexSelect", "pkg.nxrt._private", 3),
+                descriptor("Other", "pkg.nxrt._private", 1),
             ];
 
             assert_eq!(schema_end_version(&descriptors, 0), 2);
