@@ -137,6 +137,37 @@ fn core_conformance_covers_every_supported_schema_floor() {
 }
 
 #[test]
+fn explicit_infill_is_mandatory_core_conformance_with_a_valid_fixture() {
+    let obligations = CORE_CONFORMANCE
+        .iter()
+        .find_map(|(version, obligations)| {
+            (*version == onnx_genai_metadata::INFILL_CONTEXT_SCHEMA_VERSION).then_some(*obligations)
+        })
+        .expect("infill schema floor has a core-conformance row");
+    for required in [
+        "control roles",
+        "additional terminators",
+        "empty list",
+        "no filesystem lookup",
+        "guessed separators",
+    ] {
+        assert!(
+            obligations.contains(required),
+            "missing {required}: {obligations}"
+        );
+    }
+    let metadata = parse_metadata(
+        include_str!("fixtures/infill_context_v1_18.json"),
+        Some("json"),
+    )
+    .unwrap();
+    onnx_genai_metadata::validate_metadata(&metadata).unwrap();
+    let infill = metadata.package.unwrap().infill.unwrap();
+    assert_eq!(infill.order, onnx_genai_metadata::InfillOrder::Spm);
+    assert_eq!(infill.additional_stop_tokens, vec!["<END>"]);
+}
+
+#[test]
 fn publication_mode_is_mandatory_core_conformance() {
     let obligation = CORE_CONFORMANCE
         .iter()
@@ -304,5 +335,39 @@ fn retired_capability_lists_have_actionable_typed_extension_migration() {
     assert!(
         error.contains("manifest.capabilities") && error.contains("typed workflow"),
         "{error}"
+    );
+}
+
+#[test]
+fn gguf_adapter_bindings_have_mandatory_core_obligations_and_a_valid_fixture() {
+    let floor = onnx_genai_metadata::GGUF_ADAPTER_SCHEMA_VERSION;
+    let row = CORE_CONFORMANCE
+        .iter()
+        .find_map(|(version, row)| (*version == floor).then_some(*row))
+        .expect("GGUF adapter schema floor has a core row");
+    for required in [
+        "GGUF LoRA",
+        "exact source/target bindings",
+        "factor storage",
+        "alpha/rank",
+        "unsupported adapter variants fail closed",
+    ] {
+        assert!(row.contains(required), "missing {required}: {row}");
+    }
+    assert_eq!(
+        find("onnx-genai.adapters.gguf", "1").unwrap().schema_floor,
+        floor
+    );
+    let metadata = parse_metadata(
+        include_str!("fixtures/gguf_adapter_v1_19.json"),
+        Some("json"),
+    )
+    .unwrap();
+    onnx_genai_metadata::validate_metadata(&metadata).unwrap();
+    let adapter = &metadata.adapters.as_ref().unwrap().artifacts["mapped"];
+    assert_eq!(adapter.bindings[0].weight_key, "explicit.saved.projection");
+    assert_eq!(
+        adapter.weights[0].format,
+        onnx_genai_metadata::AdapterWeightFormat::Gguf
     );
 }

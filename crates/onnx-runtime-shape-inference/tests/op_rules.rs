@@ -1394,6 +1394,34 @@ fn block_quantized_matmul_uses_n_and_preserves_leading_dims() {
 }
 
 #[test]
+fn packed_activation_arithmetic_validates_the_explicit_abi_before_shape_work() {
+    for op in ["BlockQuantizedMatMul", "BlockQuantizedMoE"] {
+        for (mode, version, detail) in [
+            ("q8_0", 1, "integer 2"),
+            ("float32", 2, "integer 1"),
+            ("auto", 1, "activation_arithmetic"),
+        ] {
+            let mut n = with_domain(node(op, 0, 1), "pkg.nxrt");
+            n.attributes.insert(
+                "activation_arithmetic".into(),
+                Attribute::String(mode.as_bytes().to_vec()),
+            );
+            n.attributes
+                .insert("block_layout_version".into(), Attribute::Int(version));
+            assert_invalid(try_run(&n, vec![], 1).unwrap_err(), op, detail);
+        }
+    }
+    let mut n = quantized_matmul_node("BlockQuantizedMatMul", "pkg.nxrt", 2, 4864);
+    n.attributes.insert(
+        "activation_arithmetic".into(),
+        Attribute::String(b"q8_0".to_vec()),
+    );
+    n.attributes
+        .insert("block_layout_version".into(), Attribute::Int(2));
+    assert_quantized_matmul_shapes(&n, 2);
+}
+
+#[test]
 fn matmul_nbits_uses_n_and_preserves_leading_dims() {
     let n = quantized_matmul_node("MatMulNBits", "com.microsoft", 3, 4864);
     assert_quantized_matmul_shapes(&n, 3);

@@ -166,9 +166,9 @@ impl Kernel for WhereKernel {
             },
             || {
                 let mut values = expected.iter().map(|&d| d as u64).collect::<Vec<_>>();
-                values.extend(broadcast_strides(condition.shape, &expected));
-                values.extend(broadcast_strides(x.shape, &expected));
-                values.extend(broadcast_strides(y.shape, &expected));
+                values.extend(broadcast_strides(condition.shape, &expected)?);
+                values.extend(broadcast_strides(x.shape, &expected)?);
+                values.extend(broadcast_strides(y.shape, &expected)?);
                 if values.is_empty() {
                     values.push(0);
                 }

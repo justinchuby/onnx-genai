@@ -90,7 +90,7 @@ pub use engine::{
     XtcConfig, package_execution_error, parse_device_policy, parse_resource_limit,
     resolve_device_vram_limit_bytes,
 };
-pub use fim::{FimConfig, FimFormat};
+pub use fim::{FimConfig, InfillOrder};
 pub use logits::{
     Constraint, ConstraintPrefixError, ConstraintProcessor, LogitProcessor, ProcessorChain,
     ProcessorChainBuilder, ProcessorContext, ProcessorSignal, StopSequence, TokenId,
@@ -215,7 +215,7 @@ pub use pipeline::{
     PipelineGenerateRequest, PipelineTensors, RowPlan, RowScopedState, RowTable,
     StagedOutputCheckpoint, StagedOutputObservation, StagedOutputObservationError,
     ToolCallStagedOutputObserver, WorkflowSessionCheckpoint, is_missing_required_input,
-    validate_pipeline_backend_request,
+    select_portable_adapter_source, validate_pipeline_backend_request,
 };
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{

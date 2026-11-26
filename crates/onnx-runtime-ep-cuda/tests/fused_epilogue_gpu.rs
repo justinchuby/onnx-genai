@@ -118,9 +118,13 @@ fn run_model(
         .unwrap();
     let strides: Vec<Vec<i64>> = shapes
         .iter()
-        .map(|shape| compute_contiguous_strides(shape))
+        .map(|shape| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect();
-    let out_strides = compute_contiguous_strides(&out_shape);
+    let out_strides = compute_contiguous_strides(&out_shape)
+        .expect("fixture shape has representable contiguous strides");
     let device = ep.device_id();
     let inputs = [
         TensorView::new(

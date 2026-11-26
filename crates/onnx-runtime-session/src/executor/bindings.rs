@@ -798,6 +798,8 @@ impl Executor {
                     shape_facts,
                 )
                 .expect("workspace kernel resolved immediately before lookup");
+            let compiled = kernel;
+            let kernel = compiled.kernel.as_ref();
             let metadata = input_shapes
                 .iter()
                 .zip(&self.plan[pi].input_dtypes)
@@ -809,7 +811,11 @@ impl Executor {
             } else {
                 workspace_output_metadata(&self.graph, node, &symbols, Some(&external))
             };
-            let requirement = match kernel.workspace_requirement(&metadata, &output_metadata)? {
+            let requirement = match compiled.workspace_preparation(
+                workspace_context,
+                &metadata,
+                &output_metadata,
+            )? {
                 onnx_runtime_ep_api::WorkspacePreparation::Ready(requirement) => requirement,
                 onnx_runtime_ep_api::WorkspacePreparation::Deferred => {
                     pending.push(format!(
@@ -1867,7 +1873,7 @@ impl Executor {
                     dispatch::refill_contiguous_strides(
                         value.strides.get_or_insert_default(),
                         physical_shape,
-                    );
+                    )?;
                     let stable_shape = value.fixed_stride_shape.get_or_insert_default();
                     stable_shape.clear();
                     stable_shape.extend_from_slice(physical_shape);
@@ -1929,7 +1935,7 @@ impl Executor {
                     dispatch::refill_contiguous_strides(
                         value.strides.get_or_insert_default(),
                         physical_shape,
-                    );
+                    )?;
                     let stable_shape = value.fixed_stride_shape.get_or_insert_default();
                     stable_shape.clear();
                     stable_shape.extend_from_slice(physical_shape);

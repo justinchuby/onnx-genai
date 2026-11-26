@@ -441,7 +441,8 @@ mod tests {
     fn contiguous_view_roundtrips_invariants() {
         let buf = vec![0u8; 6 * 4];
         let shape = [2usize, 3];
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let v = TensorView::new(
             ptr(&buf),
             DataType::Float32,

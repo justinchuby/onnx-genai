@@ -30,7 +30,7 @@ impl KernelFactory for AddFactory {
 /// share exactly the same numpy right-alignment and compatibility checks.
 pub fn broadcast_effective_strides(src_shape: &[usize], out_shape: &[usize]) -> Result<Vec<i64>> {
     let out_rank = out_shape.len();
-    let src_strides = compute_contiguous_strides(src_shape);
+    let src_strides = compute_contiguous_strides(src_shape)?;
     let mut eff = vec![0i64; out_rank];
     for axis in 0..out_rank {
         // Corresponding axis in src (right-aligned); absent => broadcast.

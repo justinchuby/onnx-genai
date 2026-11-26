@@ -5171,7 +5171,8 @@ mod tests {
         vbuf: &mut [f32],
     ) -> Vec<f32> {
         let kv_shape = [1usize, IP_KV_HEADS, capacity, IP_DIM];
-        let kv_strides = compute_contiguous_strides(&kv_shape);
+        let kv_strides = compute_contiguous_strides(&kv_shape)
+            .expect("fixture shape has representable contiguous strides");
         let k_ptr = kbuf.as_mut_ptr();
         let v_ptr = vbuf.as_mut_ptr();
         let query_owned = Owned::f32(&[1, q_seq, IP_NUM_HEADS * IP_DIM], query);
@@ -5345,7 +5346,8 @@ mod tests {
         vbuf: &mut [u16],
     ) -> Vec<f32> {
         let kv_shape = [1usize, IP_KV_HEADS, capacity, IP_DIM];
-        let kv_strides = compute_contiguous_strides(&kv_shape);
+        let kv_strides = compute_contiguous_strides(&kv_shape)
+            .expect("fixture shape has representable contiguous strides");
         let k_ptr = kbuf.as_mut_ptr() as *mut std::ffi::c_void;
         let v_ptr = vbuf.as_mut_ptr() as *mut std::ffi::c_void;
         let dt = kind.dtype();
@@ -5719,7 +5721,8 @@ mod tests {
         let capacity = 4usize;
         let present_len = IP_KV_HEADS * capacity * IP_DIM;
         let kv_shape = [1usize, IP_KV_HEADS, capacity, IP_DIM];
-        let kv_strides = compute_contiguous_strides(&kv_shape);
+        let kv_strides = compute_contiguous_strides(&kv_shape)
+            .expect("fixture shape has representable contiguous strides");
         let cpu = onnx_runtime_ir::DeviceId::cpu();
         let mut kbuf = vec![0u16; present_len];
         let mut vbuf = vec![0u16; present_len];
@@ -5796,7 +5799,8 @@ mod tests {
         let capacity = 4usize;
         let present_len = IP_KV_HEADS * capacity * IP_DIM;
         let kv_shape = [1usize, IP_KV_HEADS, capacity, IP_DIM];
-        let kv_strides = compute_contiguous_strides(&kv_shape);
+        let kv_strides = compute_contiguous_strides(&kv_shape)
+            .expect("fixture shape has representable contiguous strides");
         let cpu = onnx_runtime_ir::DeviceId::cpu();
         let mut kbuf = vec![0u16; present_len];
         let mut vbuf = vec![0u16; present_len];
@@ -5948,7 +5952,8 @@ mod tests {
         kind.narrow_into(&dense_v, &mut vbuf);
 
         let cap_shape = [batch, IP_KV_HEADS, capacity, cache_dim];
-        let cap_strides = compute_contiguous_strides(&cap_shape);
+        let cap_strides = compute_contiguous_strides(&cap_shape)
+            .expect("fixture shape has representable contiguous strides");
         let kp = kbuf.as_mut_ptr() as *mut std::ffi::c_void;
         let vp = vbuf.as_mut_ptr() as *mut std::ffi::c_void;
         let mut half_out = Owned::zeros_f32(&[batch, q_seq, IP_NUM_HEADS * cache_dim]);
@@ -6226,7 +6231,8 @@ mod tests {
         let present_seq = capacity; // == cache.seq for the aliased buffer
         let present_len = IP_KV_HEADS * present_seq * IP_DIM;
         let kv_shape = [1usize, IP_KV_HEADS, capacity, IP_DIM];
-        let kv_strides = compute_contiguous_strides(&kv_shape);
+        let kv_strides = compute_contiguous_strides(&kv_shape)
+            .expect("fixture shape has representable contiguous strides");
         let mut kbuf = vec![0.0f32; present_len];
         let mut vbuf = vec![0.0f32; present_len];
         let k_ptr = kbuf.as_mut_ptr();
@@ -6327,7 +6333,8 @@ mod tests {
         let present_seq = capacity;
         let present_len = IP_KV_HEADS * present_seq * IP_DIM;
         let kv_shape = [1usize, IP_KV_HEADS, capacity, IP_DIM];
-        let kv_strides = compute_contiguous_strides(&kv_shape);
+        let kv_strides = compute_contiguous_strides(&kv_shape)
+            .expect("fixture shape has representable contiguous strides");
         let cpu = onnx_runtime_ir::DeviceId::cpu();
         // f16 aliased buffer: the *f32* append path is contiguous-f32 only, so
         // this gate must reject it. Half-precision aliasing is handled by
@@ -6726,7 +6733,8 @@ mod tests {
         // A present output that aliases the past input it reads from must
         // decline here; exact aliasing is the in-place path's job.
         let cpu = onnx_runtime_ir::DeviceId::cpu();
-        let strides = compute_contiguous_strides(&shape);
+        let strides = compute_contiguous_strides(&shape)
+            .expect("fixture shape has representable contiguous strides");
         let aliased = TensorMut::new(
             DevicePtrMut(past_k.bytes.as_ptr() as *mut std::ffi::c_void),
             DataType::Float32,

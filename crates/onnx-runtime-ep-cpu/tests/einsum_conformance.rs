@@ -51,7 +51,8 @@ impl AlignedTensor {
         Self {
             storage,
             shape: tensor.shape().to_vec(),
-            strides: compute_contiguous_strides(tensor.shape()),
+            strides: compute_contiguous_strides(tensor.shape())
+                .expect("fixture shape has representable contiguous strides"),
             dtype,
         }
     }
@@ -60,7 +61,8 @@ impl AlignedTensor {
         let byte_len = shape.iter().product::<usize>() * dtype.byte_size();
         Self {
             storage: vec![0u64; byte_len.div_ceil(8).max(1)],
-            strides: compute_contiguous_strides(&shape),
+            strides: compute_contiguous_strides(&shape)
+                .expect("fixture shape has representable contiguous strides"),
             shape,
             dtype: data_type(dtype),
         }

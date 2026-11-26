@@ -48,8 +48,8 @@ The same executable program semantics apply to both.
 Decoding runs in portable Rust without external binaries, preserving the
 source sample rate and applying declared codec delay/padding metadata. Invalid
 packets and changing rate/channel layouts fail with context. An explicit
-`downmix` therefore supports `channels: 1`; multichannel waveform outputs and
-other codecs are not yet implemented. `resample` changes the rate at its declared position in the program.
+`downmix` therefore supports `channels: 1`; multichannel waveform outputs
+are not yet implemented. `resample` changes the rate at its declared position in the program.
 `rescale` multiplies samples by the declared finite scale.
 `zero_mean_unit_variance` (also selected by `normalize` with that mode) uses the
 valid samples' population variance plus a positive finite epsilon. Existing
@@ -172,7 +172,90 @@ be supported. Chat `input_audio.format` is a nonempty descriptive label; bytes
 determine the actual format. Decoding preserves the source sample rate and uses
 the arithmetic channel mean; internal WAV transport uses float32.
 
-Opus is unsupported in Symphonia 0.6.1. MP4 edit lists are not applied, so priming
+Admitted Ogg and WebM Opus use the published pure-Rust `symphonia-opus` 0.1.3 decoder with the
+same Symphonia content probe. This decoder is constructed only after the probe
+identifies an admitted container and Opus; it is never globally registered.
+Ogg retains its own clip-level contract below; WebM uses normalized packet trims.
+Its raw 48 kHz PCM is presented by one clip-level cursor: `OpusHead` pre-skip
+can span packets, the exact typed track final granule removes end padding, and
+the decoder applies Q7.8 output gain once. Family 0 mono/stereo and fully routed
+family 1 layouts with 1–8 output channels are admitted. Family 1's Vorbis plane
+order is converted to canonical positioned-channel order before arithmetic
+mono averaging. The original recording-rate header does not change the 48 kHz
+decoding clock; authored `resample` still controls subsequent conversion.
+
+This is a bounded Ogg Opus capability, not every Opus presentation convention.
+It requires a complete seekable recording with a zero-origin `1/48000` track
+clock and matching exact duration/frame-count metadata. Cropped/nonzero-origin
+streams, missing final granules, unreferenced elementary channels and other
+mapping families fail explicitly. Ogg code 3 packets with 32–48 frames also fail:
+Symphonia 0.6.1 masks their frame count to five bits, damaging page timestamps.
+The runtime independently checks the six-bit RFC count and refuses those packets
+until a published demuxer repair is available. It never trusts the damaged packet
+duration to cut PCM. Typed packet PTS and valid-duration/end-trim metadata must
+agree with the independent raw TOC cursor and final granule; a final granule
+preceding already declared valid audio is rejected.
+
+WebM/Matroska Opus uses the maintained MPL-2.0 `onnx-genai-symphonia-mkv` reader,
+registered in one private content probe with unchanged published Symphonia core
+and other format factories. Only the canonical default audio track is normalized;
+other tracks retain upstream metadata/packet behavior. Full-file playback requires
+a zero coded origin, unit track scale, exact integral frame conversion of CodecDelay/DiscardPadding,
+explicit CodecDelay matching pre-skip, known matching original recording rate,
+no lacing/CodecState changes, and no seeking. The raw 48 kHz decoder output is
+cropped once using normalized packet trims. Priming and signed padding intersect
+in raw coordinates, so overlaps do not subtract samples twice.
+
+The waveform API concatenates valid decoded packet intervals, as it does for
+other codecs: it does not render an A/V timeline or fill timestamp gaps. Actual
+container PTS minus CodecDelay is preserved precisely in the normalized packet
+clock, independently of the cumulative raw cursor that distributes priming.
+Quantized millisecond PTS therefore neither inserts silence nor crops extra PCM.
+BlockDuration/DefaultDuration describe presentation timing; their original values
+remain in reader debug diagnostics, but never choose decoded sample cuts (see
+[Matroska BlockDuration and DiscardPadding](https://www.matroska.org/technical/elements.html#BlockDuration)). TOC
+geometry and exact discard padding determine those cuts. Approximate
+Segment.Duration is not an endpoint: track duration/frame-count and aggregate
+padding stay unknown. Nonintegral conversions and backwards timestamps fail
+explicitly rather than being rounded; positive end padding must be terminal.
+
+The real FFmpeg stream-copy WebM fixtures preserve their original 0,21,41,... ms
+coded timestamps, rounded final BlockDuration, and unchanged Opus packets. Their
+full-channel PCM references use the same fixed independent libopus oracle as Ogg.
+This is a bounded packet-concatenation capability, not full Matroska A/V playback
+or browser-producer certification. MP4 Opus remains unsupported because its
+identification-header and edit-list presentation need their own repair. Existing
+non-Opus codecs in those containers remain available. The maintained package ships
+original notices, exact upstream source archive/hash and modified covered source;
+see its README and `verify_upstream.py` for provenance.
+
+`decode_audio(bytes, limits)` and `AudioProgram::run(encoded, limits)` require
+an explicit `AudioDecodeLimits`. `max_decoded_bytes` bounds cumulative raw
+multichannel float32 PCM work (including samples later skipped/trimmed) and the
+simultaneously retained mono waveform, interleaved staging and codec PCM packet
+capacity. It also bounds packet progress at one packet per four budget bytes;
+zero-frame packets cannot evade this bound. The maximum 120 ms Opus packet PCM
+allocation is checked before decoder construction, and each Opus packet's exact
+TOC duration is checked before decode/growth. Other codecs retain their existing
+decoder path: packet PCM capacity is checked after `decoder.decode`, before our
+interleaved/mono buffers grow. This does not bound a non-Opus decoder's first
+internal allocation. Codec-private fixed-size state and container metadata are
+not exact heap accounting under this PCM policy.
+
+The CLI `generate --audio`, file/stdin transcription and server expose `--max-decoded-audio-bytes` with a finite
+64 MiB default. Engine-backed admission additionally intersects the policy with
+live host-memory ledger headroom; zero headroom fails. This is an admission
+snapshot, not a PCM memory lease: concurrent requests can observe the same
+headroom, so it does not guarantee atomic aggregate host occupancy. Workflow audio uses the same
+configured `EngineConfig.audio_decode_limits` and its existing shared host
+authority. A program divides its caller budget across its declared decode
+invocations and encoded batch rows. These bounds do not cover every later
+authored DSP tensor or all request allocations. The API provides no unbounded
+default or compressed-byte expansion guess. Encoding/generation tools are only used to prepare independent test
+fixtures, never during runtime decoding. Dependency license/source information
+is recorded in [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
+
+MP4 edit lists are not applied, so priming
 that depends on an edit list remains audible to preprocessing. Midstream rate or
 channel changes are rejected. Convert such inputs to a supported WAV file first.
 Live stdin framing continues to use its documented WAV/PCM16 protocol.

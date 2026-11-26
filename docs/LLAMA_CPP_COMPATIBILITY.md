@@ -605,8 +605,9 @@ completion, so a later request cannot change an earlier response's count.
 The count comes from the materialized cursor, not prompt-plus-output token
 arithmetic: the final sampled token may not yet have been consumed by a forward.
 OpenAI cached-prompt usage continues to report input reuse separately.
-Native multimodal prompt objects and infill extra files still require further
-engine support. Native embedding normalization supports -1, 0 and positive integer p-norms; zero vectors
+Native multimodal prompt objects still require further engine support.
+`/infill` extra file context is supported for packages declaring the explicit
+`package.infill` control roles and extra-context template (schema v1.18). Native embedding normalization supports -1, 0 and positive integer p-norms; zero vectors
 remain zero. Token-counting routes use the same prompt renderer and declared media expansion
 as generation. They validate attachments and tool capability without executing a
 generation. Anthropic streaming receives
@@ -668,9 +669,9 @@ including actual native image preprocessing and model-owned token usage. See
 This is a functional Llama Chat integration, not a claim of complete llama-server
 parity. These upstream capabilities remain incomplete:
 
-- Realtime grammar forcing beyond declared turn-based tagged-json mask workflows,
-  broader pressure/overlap acceptance and
-  device-backed wire acceptance; see [realtime](REALTIME.md) for the implemented
+- Broader realtime pressure/overlap and device-backed wire acceptance;
+  declared turn-based/duplex tagged-json forcing and canonical named-parameter
+  XML forcing are implemented; see [realtime](REALTIME.md) for the implemented
   WebSocket session modes, resource bounds and Native CPU evidence.
 - Video decision inputs, broader audio codecs and additional DSP operations/conventions,
   joint/packed decision heads and shared generation/decision entry points.
@@ -931,14 +932,26 @@ logprob delivery and transactional publication. UTF-8 decoder lookbehind remains
 request-local. Raw grammar recognition continues to inspect model bytes and IDs.
 
 Audio preprocessing admits package-authored mel counts, sample rates, FFT/hop
-and Hann-window lengths through the executable log-mel program. Numerical
-acceptance includes an independent direct DFT and Native workflows using
-nonstandard geometry. Feature-tensor serving also executes the model-authored
-audio program, with explicit named output binding and runtime shape checks;
-rank-3 shapes never select a hidden default analysis recipe. Pure-waveform normalization, named transform dataflow and validity publication
-execute as described in [audio preprocessing](AUDIO_PREPROCESSING.md). Additional
-DSP operations, window/mel conventions and codecs remain open; this does not imply
-full audio parity.
+and Hann-window lengths through the executable log-mel program. Standalone
+spectrograms additionally admit explicit power/magnitude and periodic
+Hann/Hamming/rectangular selectors. Numerical acceptance includes an independent
+direct DFT and Native workflows using nonstandard geometry. Feature-tensor
+serving also executes the model-authored audio program, with explicit named
+output binding and runtime shape checks; rank-3 shapes never select a hidden
+default analysis recipe. Pure-waveform normalization, named transform dataflow
+and validity publication execute as described in
+[audio preprocessing](AUDIO_PREPROCESSING.md).
+
+Content-probed encoded audio includes bounded Ogg Opus with canonical channel
+routing and one raw-clock owner for pre-skip/final-granule trimming. CLI file/stdin
+transcription and feature-bound `generate --audio` propagate configured finite PCM
+policies. Engine-backed admission intersects them with a live host-ledger
+snapshot; this is not a PCM memory lease or an atomic concurrent-memory guarantee.
+WebM/MP4 Opus, cropped/nonzero-origin Ogg and code 3 packets with 32–48 frames
+remain explicitly unsupported; see the full
+[encoded-audio contract](AUDIO_PREPROCESSING.md#encoded-audio-formats) for all
+capability and resource limits. Additional DSP operations, window/mel conventions
+and codecs remain open; this does not imply full audio parity.
 
 File transcription now executes declared one-pass CTC/greedy acoustic workflows
 as well as the existing generative speech path. Both aliases expose typed
@@ -955,3 +968,90 @@ serving accepts waveform outputs without a mel shape. See [transcription](TRANSC
 
 Encoded audio support and decoder limitations are documented in
 [audio preprocessing](AUDIO_PREPROCESSING.md#encoded-audio-formats).
+
+## Infill file context
+
+`/infill` accepts `input_extra: [{"filename":"helpers.rs","text":"..."}]`
+when the package declares `package.infill.extra_context_template`. File order,
+filenames and text are passed to this bounded model-authored Jinja template as
+`input_extra`; its output precedes the FIM control envelope. A filename is a
+caller-owned label: the server never opens or resolves that name. No repository
+or file separator token is inferred. Without a declared template, an absent/empty
+list leaves ordinary FIM prompts unchanged. A declared template also renders the
+empty list. A nonempty list without a template fails before streaming.
+
+The package explicitly declares `prefix_token`, `middle_token`, `suffix_token`
+and `order` (`psm` or `spm`); each spelling must resolve to one registered model
+token. The declaration takes precedence over the existing tokenizer-only FIM
+detection. Request file count, filename bytes, total filename/text UTF-8 bytes,
+template output bytes and interpreter operations have configurable server
+bounds (`ServerConfig.max_infill_*`). Token count, context admission, prefill-only and actual
+FIM execution share the same prepared token IDs, including BOS/EOS handling and
+the extra context. Existing FIM sampling and ending-role behavior is retained.
+
+The file-context wire shape follows the pinned llama.cpp implementation: `text`
+is required and may be empty; `filename` is optional (default `tmp`) and may
+be empty. Additional object fields are ignored. Supplied filenames must remain
+within the configured byte limit. See the [upstream request checks](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-context.cpp#L5394-L5411)
+and [filename default](https://github.com/ggml-org/llama.cpp/blob/8d60873dfb8619f2b5ed31adfbab07cccb40db5c/tools/server/server-common.cpp#L1904-L1905).
+
+`extra_context_template` serializes the native `/infill` file-context list,
+including an empty list. OpenAI completion `suffix` and engine FIM convenience
+methods use the declared control roles without this wire-specific template.
+Prepared-token FIM execution can carry the already rendered context.
+
+### Browser origins and preflight
+
+`--cors-origins`, `--cors-methods`, `--cors-headers`, and
+`--cors-credentials` / `--no-cors-credentials` configure browser transport.
+Their defaults match llama-server: `*`, `GET, POST, DELETE, OPTIONS`, `*`,
+and credentials enabled. The corresponding `LLAMA_ARG_CORS_ORIGINS`,
+`LLAMA_ARG_CORS_METHODS`, `LLAMA_ARG_CORS_HEADERS`,
+`LLAMA_ARG_CORS_CREDENTIALS`, and `LLAMA_ARG_NO_CORS_CREDENTIALS` environment
+variables are supported. These options do not enable the excluded CORS proxy,
+MCP, tool execution, or server-side remote-media fetching.
+
+With credentials enabled, an allowed browser Origin is reflected rather than
+sending the incompatible `Access-Control-Allow-Origin: *`. A comma-separated
+origin list selects the requesting allowed origin. Wildcard request headers
+reflect the requested names so `Authorization` and credentialed JSON requests
+work in browsers. Responses vary by Origin; wildcard-header preflights also vary
+by requested headers and method. Credential permission is present on actual
+responses as well as preflights, including readable authentication/validation
+errors. Preflights bypass API-key admission, replay, routing, and generation;
+actual requests still require the configured key. Allowed methods and headers
+are browser preflight permissions, not changes to the server's HTTP routes.
+
+`--cors-origins localhost` means **same origin**, including the port; it does not
+allow arbitrary localhost applications. Explicit origin lists and this mode
+reject disallowed actual browser requests, including cross-site simple requests
+that browsers might otherwise send without a preflight. Requests without Origin
+remain available to native clients unless their browser Fetch Metadata marks
+them cross-site; navigation to a shipped frontend asset is allowed. As in
+upstream, restricted modes check Host for loopback listeners to prevent DNS
+rebinding; the default `*` mode does not impose this guard. Non-loopback
+listeners do not impose a Host allowlist, preserving reverse-proxy deployments.
+Use an explicit origin list for a separately hosted browser client.
+
+`serve` resolves the local address of **each accepted TCP socket** through
+`CorsConnectionInfo`; a wildcard bind reached through loopback therefore still
+gets the loopback Host guard. Failure to resolve that address returns an
+actionable error before routing or generation. Custom axum TCP adapters can use
+`app(state).into_make_service_with_connect_info::<CorsConnectionInfo>()`.
+Other network adapters must insert `CorsListeningAddress` from their accepted
+socket, not their listener bind address. In-process router calls without either
+context still enforce Origin/Fetch Metadata, but cannot infer a socket address
+or claim DNS-rebinding protection. Actual connection context takes precedence
+over the explicit adapter extension. No forwarded header is trusted to supply
+that address.
+
+The embedded maintained Llama Chat uses same-origin API paths; this change also
+permits independently hosted browser clients to call the API. Its standalone
+Chrome check is `scripts/test_llama_cors.mjs`: two page origins, an authenticated
+Native CPU fixture server, actual JSON and incremental SSE bodies, readable
+401/400 errors, forbidden-origin browser rejection, and an embedded-UI load.
+The driver is maintained acceptance code; its presence alone is not evidence
+that a particular revision, browser, platform or execution provider passed.
+
+Upstream policy and flags: [HTTP middleware](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/server-http.cpp)
+and [argument definitions](https://github.com/ggml-org/llama.cpp/blob/master/common/arg.cpp).

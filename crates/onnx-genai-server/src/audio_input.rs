@@ -113,13 +113,17 @@ pub(crate) fn decode_chat_audio(input: &InputAudio) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Execute the package's selected feature output, retaining authored analysis semantics.
-pub fn preprocess_audio(bytes: &[u8], spec: &AudioInputSpec) -> anyhow::Result<AudioTensor> {
+pub fn preprocess_audio(
+    bytes: &[u8],
+    spec: &AudioInputSpec,
+    limits: onnx_genai_preprocess::audio::AudioDecodeLimits,
+) -> anyhow::Result<AudioTensor> {
     let AudioInputBinding::Features { program, shape } = &spec.binding else {
         anyhow::bail!(
             "encoded audio preprocessing belongs to the workflow; bind encoded bytes with MultimodalInput instead of extracting features"
         );
     };
-    let tensor = program.run(&[bytes])?.into_iter().next().context(
+    let tensor = program.run(&[bytes], limits)?.into_iter().next().context(
         "selected audio preprocessing output is absent; repair the package's output binding",
     )?;
     anyhow::ensure!(
@@ -147,14 +151,49 @@ pub fn preprocess_samples(
     samples: &[f32],
     sample_rate: u32,
     spec: &AudioInputSpec,
+    limits: onnx_genai_preprocess::audio::AudioDecodeLimits,
 ) -> anyhow::Result<AudioTensor> {
-    preprocess_audio(&encode_wav_f32(samples, sample_rate, 1)?, spec)
+    preprocess_audio(
+        &encode_samples_wav(samples, sample_rate, limits)?,
+        spec,
+        limits,
+    )
 }
 
 /// Re-encodes finite mono samples into a float32 WAV container.
 ///
 /// A package whose preprocessing program starts at `decode` accepts a container,
 /// not bare samples, so a stream segment has to be wrapped before it is bound.
-pub fn encode_samples_wav(samples: &[f32], sample_rate: u32) -> anyhow::Result<Vec<u8>> {
+pub fn encode_samples_wav(
+    samples: &[f32],
+    sample_rate: u32,
+    limits: onnx_genai_preprocess::audio::AudioDecodeLimits,
+) -> anyhow::Result<Vec<u8>> {
+    let bytes = samples
+        .len()
+        .checked_mul(size_of::<f32>())
+        .context("mono sample PCM byte count overflows; shorten the input segment")?;
+    anyhow::ensure!(
+        bytes <= limits.max_decoded_bytes.get(),
+        "mono sample PCM requires {bytes} bytes, exceeding max_decoded_bytes={}; shorten the segment or raise the caller decoded-audio policy",
+        limits.max_decoded_bytes
+    );
     Ok(encode_wav_f32(samples, sample_rate, 1)?)
+}
+
+/// Resolve an explicit audio policy against the engine's current host headroom.
+pub(crate) async fn decode_limits(
+    handle: &crate::registry::ModelHandle,
+    maximum: std::num::NonZeroUsize,
+) -> anyhow::Result<onnx_genai_preprocess::audio::AudioDecodeLimits> {
+    let snapshot = handle
+        .engine
+        .resource_snapshot()
+        .await
+        .context("read host headroom before admitting decoded audio")?;
+    onnx_genai_preprocess::audio::AudioDecodeLimits {
+        max_decoded_bytes: maximum,
+    }
+    .within_host(snapshot.host_ram.headroom)
+    .context("admit audio decoded PCM under host resource policy")
 }

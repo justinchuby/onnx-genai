@@ -1,0 +1,27 @@
+{
+  "negative_controls": [
+    {
+      "mutation": "fake-summary",
+      "reason": "summary must reproduce byte-for-byte",
+      "rejected": true
+    },
+    {
+      "mutation": "missing-process",
+      "reason": "incomplete process cardinality; require all 64 confirmatory processes and 16 calibrations",
+      "rejected": true
+    },
+    {
+      "mutation": "fake-fixture",
+      "reason": "cal-00: independent oracle digest mismatch",
+      "rejected": true
+    }
+  ],
+  "valid": {
+    "calibrations": 16,
+    "independent_oracle_fixtures": 16,
+    "processes": 64,
+    "qualified_cells": 2,
+    "summary_reproduced": true,
+    "windows": 704
+  }
+}

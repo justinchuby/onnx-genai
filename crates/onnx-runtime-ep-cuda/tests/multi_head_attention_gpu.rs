@@ -537,9 +537,11 @@ fn mha_prepared_workspace_reuses_backing_and_preserves_present_output_holes() {
     let ep = require_cuda();
     let shape = [1usize, 2, 4];
     let input_shapes = vec![shape.to_vec(); 3];
-    let strides = compute_contiguous_strides(&shape);
+    let strides = compute_contiguous_strides(&shape)
+        .expect("fixture shape has representable contiguous strides");
     let cache_shape = [1usize, 1, 2, 4];
-    let cache_strides = compute_contiguous_strides(&cache_shape);
+    let cache_strides = compute_contiguous_strides(&cache_shape)
+        .expect("fixture shape has representable contiguous strides");
     let mut qk = ep.allocate(32, 256).unwrap();
     let mut value = ep.allocate(32, 256).unwrap();
     let mut output = ep.allocate(32, 256).unwrap();
