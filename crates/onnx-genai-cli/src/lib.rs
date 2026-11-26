@@ -1118,4 +1118,85 @@ mod webui_cli_tests {
         assert_eq!(args.cpu.cpu_cores.map(NonZeroUsize::get), Some(4));
         assert_eq!(args.sampling.max_context.map(NonZeroUsize::get), Some(128));
     }
+
+    #[test]
+    fn transcribe_files_keep_format_conditioning_and_cpu_controls() {
+        let cli = Cli::try_parse_from([
+            "onnx-genai",
+            "transcribe",
+            "./model",
+            "first.wav",
+            "second.mp3",
+            "--language",
+            "zh",
+            "--prompt",
+            "prior transcript",
+            "--format",
+            "json",
+            "--sample-rate",
+            "48000",
+            "--channels",
+            "2",
+            "--max-new-tokens",
+            "12",
+            "--cpu-cores",
+            "2",
+            "--backend",
+            "native",
+        ])
+        .unwrap();
+        let Commands::Transcribe(args) = cli.command else {
+            panic!("expected transcribe command");
+        };
+        assert_eq!(args.model, PathBuf::from("./model"));
+        assert_eq!(
+            args.audio,
+            vec![PathBuf::from("first.wav"), PathBuf::from("second.mp3")]
+        );
+        assert_eq!(args.language.as_deref(), Some("zh"));
+        assert_eq!(args.prompt.as_deref(), Some("prior transcript"));
+        assert_eq!(args.format, TranscriptFormat::Json);
+        assert_eq!(args.sample_rate, 48000);
+        assert_eq!(args.channels, 2);
+        assert_eq!(args.max_new_tokens, Some(12));
+        assert_eq!(args.cpu.cpu_cores.map(NonZeroUsize::get), Some(2));
+        assert_eq!(args.engine.backend, EngineDecodeBackend::Native);
+        assert_eq!(
+            args.engine.to_config().decode_backend,
+            EngineDecodeBackend::Native
+        );
+    }
+
+    #[test]
+    fn global_profiling_flags_are_retained_for_noninteractive_commands() {
+        for command in [
+            vec!["generate", "./model", "hello"],
+            vec!["transcribe", "./model", "clip.wav"],
+        ] {
+            let mut argv = vec![
+                "onnx-genai",
+                "--profile",
+                "--profile-json",
+                "report.json",
+                "--profile-trace",
+                "trace.json",
+            ];
+            argv.extend(command);
+            let cli = Cli::try_parse_from(argv).unwrap();
+            assert!(cli.profiling.profile);
+            assert!(cli.profiling.requested());
+            assert_eq!(
+                cli.profiling.profile_json,
+                Some(PathBuf::from("report.json"))
+            );
+            assert_eq!(
+                cli.profiling.profile_trace,
+                Some(PathBuf::from("trace.json"))
+            );
+            assert!(matches!(
+                cli.command,
+                Commands::Generate(_) | Commands::Transcribe(_)
+            ));
+        }
+    }
 }

@@ -1,0 +1,1361 @@
+{
+  "version": 1,
+  "upstream_commit": "8d60873dfb8619f2b5ed31adfbab07cccb40db5c",
+  "acceptance": [
+    {
+      "id": "frontend_cli",
+      "requirement": "Official frontend embedding, REPL removal and retained noninteractive commands",
+      "evidence": [
+        "browser",
+        "cli_removed_repl",
+        "cli_generate_controls",
+        "cli_native_default",
+        "cli_transcribe_controls",
+        "cli_profiling_flags"
+      ],
+      "remaining": [
+        "Fresh complete browser acceptance on the final revision; source-linked drivers are not current results.",
+        "CLI evidence establishes parser removal/defaults/retained flags only. End-to-end generation/transcription, emitted profile JSON/trace files and packaged console launcher behavior still require runtime acceptance."
+      ]
+    },
+    {
+      "id": "discovery_templates_token_counts",
+      "requirement": "Discovery, properties, model lifecycle, tokenizer/templates and inference-path counters",
+      "evidence": [
+        "discovery",
+        "router_lifecycle",
+        "tokenizer",
+        "templates",
+        "aliases_counts",
+        "counts_media"
+      ],
+      "remaining": [
+        "Fresh full frontend/schema/default/error and cross-capability acceptance; linked fixtures do not establish general parity."
+      ]
+    },
+    {
+      "id": "replay_cancellation_rollback",
+      "requirement": "Byte-exact replay, cancellation, replacement, bounded retention/expiry and frontend reload",
+      "evidence": [
+        "replay",
+        "browser"
+      ],
+      "remaining": [
+        "Finish destructive native-cache rollback audit for device-owned state; refresh full expiry/pressure/cancellation acceptance."
+      ]
+    },
+    {
+      "id": "completion_embedding_infill",
+      "requirement": "Native/OpenAI completion, embedding, infill and request parameters",
+      "evidence": [
+        "native_completion",
+        "legacy_completion",
+        "infill",
+        "aliases_embeddings"
+      ],
+      "remaining": [
+        "Complete protocol/parameter/default/model/backend cross-product."
+      ]
+    },
+    {
+      "id": "responses_messages_tools",
+      "requirement": "Responses and Anthropic tools, reasoning and streamed event contracts",
+      "evidence": [
+        "aliases_responses",
+        "aliases_stream",
+        "alternate_protocols",
+        "messages_errors",
+        "tool_roundtrip"
+      ],
+      "remaining": [
+        "Cross-protocol tools/reasoning/cancellation event conformance; chat-only assertions cannot close alternate-protocol rows."
+      ]
+    },
+    {
+      "id": "sampling_constraints_reporting",
+      "requirement": "Generation controls, sampling, constraints, usage and timings/progress",
+      "evidence": [
+        "sampling",
+        "grammar_native",
+        "progress"
+      ],
+      "remaining": [
+        "Remaining contextual decoder/DFA assertions; continuous batching progress; full control/default/reporting cross-product."
+      ]
+    },
+    {
+      "id": "ranking_lora_slots",
+      "requirement": "Capability-backed real ranking, adapter selection and slot/state transactions",
+      "evidence": [
+        "rerank",
+        "lora",
+        "lora_atomic",
+        "slot_status",
+        "slot_roundtrip",
+        "slot_errors"
+      ],
+      "remaining": [
+        "Device/multi-sequence persistence; generic GGUF/PEFT import and device-fused LoRA."
+      ]
+    },
+    {
+      "id": "model_sources_audio",
+      "requirement": "Complete source/variant catalogue, bounded model management and media transports",
+      "evidence": [
+        "model_download",
+        "model_resume",
+        "model_gates",
+        "transcription",
+        "transcription_stream",
+        "speech",
+        "decision_media",
+        "realtime"
+      ],
+      "remaining": [
+        "Bare GGUF import, filename quantization, selective sidecars; more codecs/DSP/video/joint decision heads; realtime forcing/pressure/device acceptance."
+      ]
+    },
+    {
+      "id": "full_acceptance_publication",
+      "requirement": "Full executable behavioral matrix, fresh tests/browser checks, adversarial review, template PR and merge",
+      "evidence": [
+        "browser",
+        "aliases_responses",
+        "aliases_stream",
+        "aliases_counts",
+        "aliases_embeddings"
+      ],
+      "remaining": [
+        "Collect current revision-bound runtime receipts and browser evidence; finish all open requirements; self-review and merge according to repository/user rules."
+      ]
+    }
+  ],
+  "evidence": {
+    "discovery": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::llama_compat::discovery_and_properties_describe_the_admitted_model",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Both health aliases return ok; model/props metadata and no-load polling preserve registry/LRU state.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "router_lifecycle": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::llama_router_compat::router_discovery_lifecycle_and_events_follow_registry_state",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "v1 model list, status SSE, synchronous load/unload, no autoload on discovery, invalid extra_args rejection.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "props_ack": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::llama_router_compat::props_acknowledgement_matches_upstream_without_loading_or_mutation",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "POST props opt-in gate, acknowledgement-only behavior and no model/settings mutation.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "harness_exclusion": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::llama_router_compat::tools_are_owned_by_external_harnesses_not_server_routes",
+      "execution_contract": "HTTP routing/admission; no tool execution",
+      "assertions": "GET/POST tools/proxy return 404; no CORS wildcard; props advertises server_tools false.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "tokenizer": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::llama_compat::tokenizer_round_trip_and_invalid_ids_are_explicit",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Encode/decode round trip, token pieces, actionable unknown token ID.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "templates": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::llama_compat::template_endpoint_renders_model_template_and_protects_structural_variables",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Actual model template rendering and protected template variables.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "chat": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::llama_compat::upstream_chat_payload_streams_usage_and_rejects_unsupported_controls",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Upstream chat payload, streamed usage and explicit unsupported-control rejection.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "counts_media": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::native_compat::media_input_token_counts_match_real_multimodal_inference",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Chat/Responses/Messages counters equal inference prompt usage including actual image expansion.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "native_completion": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::native_compat::native_completion_aliases_return_real_counts_tokens_and_stop_state",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "completion/completions aliases execute generation; token IDs/counts and stop state match actual output.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "legacy_completion": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::native_compat::legacy_completion_batches_preserve_indices_token_inputs_and_total_usage",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Text/token prompt batches preserve result indices, stream framing and aggregate usage.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "infill": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::native_compat::native_response_fields_project_actual_results_and_preserve_stream_batch_completion",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Response-field selection preserves required stream batch completion and executes declared FIM.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "openai_embeddings": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::embeddings_success_path_returns_openai_compatible_response",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Actual embedding output shape, batching and float/base64 serialization on tiny-mtp-full.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "rerank": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::native_compat::reranking_aliases_execute_real_pairs_and_return_native_jina_and_tei_shapes",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "All four rerank aliases execute pair scores/order/top_n, native/Jina/TEI shapes and prompt usage.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "alternate_protocols": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::native_compat::alternate_protocols_use_real_generation_and_usage",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Responses/Messages buffered generation, positive usage, typed streamed terminal events and counters.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "messages_errors": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::native_compat::messages_errors_include_anthropic_envelopes_for_handlers_and_extractors",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Anthropic handler/extractor failures use protocol-specific error envelopes.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "replay": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::native_compat::conversation_replay_http_contract_is_byte_exact_and_non_enumerable",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Replay bytes equal original events; lookup is model-qualified/non-enumerable and DELETE removes retained history.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "control": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/completion_control.rs",
+      "target": "lib",
+      "test": "completion_control::tests::canonical_control_routes_model_scopes_without_loading_idle_models",
+      "execution_contract": "HTTP control service and registry admission",
+      "assertions": "Control targets the correct loaded model, reports missing/busy IDs and does not autoload.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "slot_status": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::native_slots_http::busy_slot_is_visible_and_save_waits_for_owner",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Real Native busy status and serialized save owner ordering.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "slot_roundtrip": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::native_slots_http::generated_cache_round_trips_and_resumes",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Generated CPU cache save/restore round trip and continued generation use real state files.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "slot_errors": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::native_slots_http::rejects_invalid_actions_paths_and_missing_or_corrupt_files",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Malformed actions, traversal, missing/corrupt files fail before unsafe publication.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "lora": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::lora_http::global_defaults_and_request_override_execute_selected_adapters",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Catalog/default scale selection changes actual generation; request overrides select authored weights.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "lora_atomic": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::lora_http::empty_selection_disables_all_and_invalid_updates_are_atomic",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Empty selection disables adapters; invalid global updates leave defaults unchanged.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "decision": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::systemone_decisions::systemone_evaluates_choice_score_and_noul_without_generated_tokens",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Native non-generative choice/score/noul outputs and zero generated-token accounting.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "decision_media": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::systemone_audio::systemone_codec_matrix_preserves_state_and_spoken_question_results",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Supported encoded audio codecs preserve Native decision state and spoken-question results.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "transcription": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::ctc_transcription::ctc_http_transcription_is_native_audio_dependent_and_supports_both_aliases",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Both transcription aliases depend on actual Native waveform input and return counted transcripts.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "transcription_stream": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::ctc_transcription::ctc_transcription_streams_typed_events_and_honors_per_request_output_limits",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Transcription emits typed SSE and obeys per-request output limits.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "speech": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::native_compat::speech_pcm_formats_preserve_declared_rate_channels_and_sample_values",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Speech aliases emit declared PCM types/rates/channels and expected sample values.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "tts": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::native_compat::native_tts_executes_declared_speech_and_rejects_ignored_controls",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "tts input/prompt/raw-prompt produces actual WAV; unsupported controls fail clearly.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "model_download": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/model_management.rs",
+      "target": "lib",
+      "test": "model_management::tests::http_download_stream_load_native_inference_and_delete_form_one_workflow",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Immutable local-hub package download reports per-file progress, loads Native inference and deletes only owned artifacts.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "model_resume": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/model_management.rs",
+      "target": "lib",
+      "test": "model_management::tests::http_pause_restart_and_resume_preserve_incomplete_downloads",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Paused downloads retain reserved bounds across restart and resume their original transfer.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "model_gates": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/model_management.rs",
+      "target": "lib",
+      "test": "model_management::tests::http_cache_opt_in_and_unsupported_sources_fail_before_work",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Cache is opt-in and unsupported source selectors fail before filesystem/network transfer.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "metrics": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::metrics_exposes_prometheus_families_and_request_counter_increments",
+      "execution_contract": "Server metrics feature and HTTP fixture",
+      "assertions": "Prometheus families exist and request counters change after actual requests.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "realtime": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/realtime/websocket.rs",
+      "target": "lib",
+      "test": "realtime::websocket::tests::websocket_runs_native_text_with_exact_budget_and_preserves_nonfatal_errors",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Real websocket Native text output budgets, nonfatal errors and session recovery.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "realtime_duplex": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/realtime/websocket.rs",
+      "target": "lib",
+      "test": "realtime::websocket::tests::websocket_duplex_publishes_audio_before_commit_and_acknowledges_native_cancel",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Native duplex audio is published before commit and cancellation acknowledged.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "sampling": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::native_compat::native_sampler_order_changes_actual_generation_across_protocols",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Sampler ordering changes real Native selected tokens consistently across generation protocols.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "progress": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::native_compat::prompt_progress_is_opt_in_and_reports_real_cold_and_cached_prompt_work",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Opt-in progress describes real cold/cached prompt execution, not synthetic percentages.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "grammar_native": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/src/tests.rs",
+      "target": "lib",
+      "test": "tests::gbnf_wire::gbnf_wire_native_preserves_raw_framing_and_validates_before_sse",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Native GBNF wire keeps raw grammar framing and rejects invalid controls before stream admission.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "tool_roundtrip": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/tests/http.rs",
+      "target": "test:http",
+      "test": "tool_result_chain_commits_typed_calls_and_accepts_reordered_results_over_http",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Typed tool-call results commit and reordered harness tool results match the original call IDs.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "aliases_responses": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/tests/llama_aliases.rs",
+      "target": "test:llama_aliases",
+      "test": "responses_alias_executes_native_generation_and_preserves_usage_and_errors",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Responses alias/canonical execute explicit Native CPU generation with equal text/status/positive usage and malformed-field errors.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "aliases_stream": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/tests/llama_aliases.rs",
+      "target": "test:llama_aliases",
+      "test": "response_alias_stream_preserves_typed_events_text_and_terminal_usage",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Responses alias/canonical SSE preserve the same complete typed-event sequence, contiguous sequence numbers, stable response/item IDs, output/content indices, generated text and terminal usage; only repeated adjacent text-delta chunks may collapse.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "aliases_counts": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/tests/llama_aliases.rs",
+      "target": "test:llama_aliases",
+      "test": "input_count_aliases_match_native_inference_and_reject_malformed_input",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Both shortened counter aliases equal actual Native inference prompt usage and reject malformed messages/input.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "aliases_embeddings": {
+      "kind": "rust",
+      "source": "crates/onnx-genai-server/tests/llama_aliases.rs",
+      "target": "test:llama_aliases",
+      "test": "native_embedding_aliases_execute_pooled_values_and_normalization",
+      "execution_contract": "Native CPU fixture through in-process HTTP router",
+      "assertions": "Both native embedding aliases execute nonzero finite pooled values, equal results and unit L2 normalization; invalid norm rejected.",
+      "source_markers": [],
+      "package": "onnx-genai-server",
+      "package_manifest": "crates/onnx-genai-server/Cargo.toml"
+    },
+    "browser": {
+      "kind": "browser",
+      "source": "scripts/test_llama_chat.mjs",
+      "execution_contract": "Real Chrome + built fixture server; separate driver under shared workload lock",
+      "assertions": "Chat rendering, no undeclared browser tools, persisted conversation, byte-identical replay, active reload, reader network recovery and Stop cancellation.",
+      "source_markers": [
+        "activeReload:",
+        "browser replay changed the original streamed bytes"
+      ]
+    },
+    "cli_removed_repl": {
+      "kind": "rust",
+      "package": "onnx-genai-cli",
+      "package_manifest": "crates/onnx-genai-cli/Cargo.toml",
+      "source": "crates/onnx-genai-cli/src/lib.rs",
+      "target": "lib",
+      "test": "webui_cli_tests::removed_repl_is_not_a_cli_command",
+      "execution_contract": "Public Clap parser/unit test only; no model loading, runtime inference or profile output files",
+      "assertions": "The public CLI parser rejects the removed run REPL subcommand.",
+      "source_markers": []
+    },
+    "cli_generate_controls": {
+      "kind": "rust",
+      "package": "onnx-genai-cli",
+      "package_manifest": "crates/onnx-genai-cli/Cargo.toml",
+      "source": "crates/onnx-genai-cli/src/lib.rs",
+      "target": "lib",
+      "test": "webui_cli_tests::noninteractive_commands_keep_cpu_and_context_controls",
+      "execution_contract": "Public Clap parser/unit test only; no model loading, runtime inference or profile output files",
+      "assertions": "Retained generate accepts and preserves explicit CPU core and context-window controls.",
+      "source_markers": []
+    },
+    "cli_native_default": {
+      "kind": "rust",
+      "package": "onnx-genai-cli",
+      "package_manifest": "crates/onnx-genai-cli/Cargo.toml",
+      "source": "crates/onnx-genai-cli/src/lib.rs",
+      "target": "lib",
+      "test": "tests::backend_defaults_to_native",
+      "execution_contract": "Public Clap parser/unit test only; no model loading, runtime inference or profile output files",
+      "assertions": "Generate defaults and lowered EngineConfig both select Native; no inference is executed.",
+      "source_markers": []
+    },
+    "cli_transcribe_controls": {
+      "kind": "rust",
+      "package": "onnx-genai-cli",
+      "package_manifest": "crates/onnx-genai-cli/Cargo.toml",
+      "source": "crates/onnx-genai-cli/src/lib.rs",
+      "target": "lib",
+      "test": "webui_cli_tests::transcribe_files_keep_format_conditioning_and_cpu_controls",
+      "execution_contract": "Public Clap parser/unit test only; no model loading, runtime inference or profile output files",
+      "assertions": "Retained transcribe parses multiple encoded files, format/language/prompt/PCM controls, CPU cores and explicit Native backend.",
+      "source_markers": []
+    },
+    "cli_profiling_flags": {
+      "kind": "rust",
+      "package": "onnx-genai-cli",
+      "package_manifest": "crates/onnx-genai-cli/Cargo.toml",
+      "source": "crates/onnx-genai-cli/src/lib.rs",
+      "target": "lib",
+      "test": "webui_cli_tests::global_profiling_flags_are_retained_for_noninteractive_commands",
+      "execution_contract": "Public Clap parser/unit test only; no model loading, runtime inference or profile output files",
+      "assertions": "Top-level profiling/report/trace arguments survive generate and transcribe parsing without installing tracing or writing files.",
+      "source_markers": []
+    }
+  },
+  "routes": [
+    {
+      "method": "DELETE",
+      "path": "/models",
+      "scope": "server",
+      "evidence": [
+        "model_download",
+        "model_gates"
+      ],
+      "assertions": "Owned downloaded artifacts can be removed; operator paths remain protected.",
+      "remaining": [
+        "Selective sidecar deletion and broader concurrent reader/removal acceptance."
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/stream",
+      "scope": "server",
+      "evidence": [
+        "replay"
+      ],
+      "assertions": "Producer cancellation/removal rejects future replay.",
+      "remaining": [
+        "Fresh active producer cancellation races and device-state rollback acceptance."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/cors-proxy",
+      "scope": "external_harness",
+      "evidence": [
+        "harness_exclusion"
+      ],
+      "assertions": "Explicit exclusion: server rejects execution routes and advertises server_tools false.",
+      "remaining": [
+        "No inference-server execution/MCP/proxy implementation required; the external harness owns it."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/health",
+      "scope": "server",
+      "evidence": [
+        "discovery"
+      ],
+      "assertions": "Admitted metadata, no-load polling and health aliases.",
+      "remaining": [
+        "Fresh full frontend/schema/default/error and cross-capability acceptance; linked fixtures do not establish general parity."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/lora-adapters",
+      "scope": "server",
+      "evidence": [
+        "lora"
+      ],
+      "assertions": "Model-bound adapter catalogue corresponds to actual selectable weights.",
+      "remaining": [
+        "Arbitrary GGUF/PEFT imports and device-fused LoRA."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/metrics",
+      "scope": "server",
+      "evidence": [
+        "metrics"
+      ],
+      "assertions": "Real request counters and declared Prometheus families.",
+      "remaining": [
+        "Metrics names remain nxrt-specific; no upstream-name parity claim."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/models",
+      "scope": "server",
+      "evidence": [
+        "discovery"
+      ],
+      "assertions": "Admitted metadata, no-load polling and health aliases.",
+      "remaining": [
+        "Fresh full frontend/schema/default/error and cross-capability acceptance; linked fixtures do not establish general parity."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/models/sse",
+      "scope": "server",
+      "evidence": [
+        "router_lifecycle",
+        "model_download"
+      ],
+      "assertions": "Model lifecycle/status events and real package per-file transfer progress.",
+      "remaining": [
+        "Fresh browser catalogue/reconnect acceptance; bare GGUF and selective sidecars remain open."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/props",
+      "scope": "server",
+      "evidence": [
+        "discovery"
+      ],
+      "assertions": "Admitted metadata, no-load polling and health aliases.",
+      "remaining": [
+        "Fresh full frontend/schema/default/error and cross-capability acceptance; linked fixtures do not establish general parity."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/slots",
+      "scope": "server",
+      "evidence": [
+        "slot_status"
+      ],
+      "assertions": "Actual serial Native lane busy/owner state.",
+      "remaining": [
+        "Multi-sequence/device slot execution and persistence."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/tools",
+      "scope": "external_harness",
+      "evidence": [
+        "harness_exclusion"
+      ],
+      "assertions": "Explicit exclusion: server rejects execution routes and advertises server_tools false.",
+      "remaining": [
+        "No inference-server execution/MCP/proxy implementation required; the external harness owns it."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/health",
+      "scope": "server",
+      "evidence": [
+        "discovery"
+      ],
+      "assertions": "Admitted metadata, no-load polling and health aliases.",
+      "remaining": [
+        "Fresh full frontend/schema/default/error and cross-capability acceptance; linked fixtures do not establish general parity."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/models",
+      "scope": "server",
+      "evidence": [
+        "router_lifecycle",
+        "model_download"
+      ],
+      "assertions": "Model lifecycle/status events and real package per-file transfer progress.",
+      "remaining": [
+        "Fresh browser catalogue/reconnect acceptance; bare GGUF and selective sidecars remain open."
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/stream",
+      "scope": "server",
+      "evidence": [
+        "replay"
+      ],
+      "assertions": "Byte-exact retained event replay and model-qualified lookup.",
+      "remaining": [
+        "Destructive replacement rollback on remaining device-state backends; fresh browser reconnect/expiry/pressure acceptance."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/apply-template",
+      "scope": "server",
+      "evidence": [
+        "templates",
+        "counts_media"
+      ],
+      "assertions": "Declared model template, protected variables and declared-media prompt counts.",
+      "remaining": [
+        "Fresh full frontend/schema/default/error and cross-capability acceptance; linked fixtures do not establish general parity."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/audio/speech",
+      "scope": "server",
+      "evidence": [
+        "speech"
+      ],
+      "assertions": "Speech aliases preserve PCM rates/channels/sample values.",
+      "remaining": [
+        "Broader streaming synthesis and model/device format acceptance."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/audio/transcriptions",
+      "scope": "server",
+      "evidence": [
+        "transcription",
+        "transcription_stream"
+      ],
+      "assertions": "Both aliases execute waveform-dependent Native transcription with typed SSE and budgets.",
+      "remaining": [
+        "Additional codecs/DSP conventions; broader generative media accounting."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/chat/completions",
+      "scope": "server",
+      "evidence": [
+        "chat",
+        "tool_roundtrip",
+        "grammar_native"
+      ],
+      "assertions": "Actual streamed generation/usage, tools and raw constrained output.",
+      "remaining": [
+        "Full reasoning/tool/error/cancellation/default cross-product and contextual decoder limitations."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/chat/completions/input_tokens",
+      "scope": "server",
+      "evidence": [
+        "aliases_counts",
+        "counts_media"
+      ],
+      "assertions": "Alias/canonical counters equal Native inference preparation, including linked declared-image checks.",
+      "remaining": [
+        "Broader all declared-media/tool/template/default combinations."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/completion",
+      "scope": "server",
+      "evidence": [
+        "native_completion",
+        "progress",
+        "sampling"
+      ],
+      "assertions": "Actual completion output tokens/counts, stop state and progress.",
+      "remaining": [
+        "Continuous batching progress and full parameter/backend acceptance."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/completions",
+      "scope": "server",
+      "evidence": [
+        "native_completion",
+        "progress",
+        "sampling"
+      ],
+      "assertions": "Actual completion output tokens/counts, stop state and progress.",
+      "remaining": [
+        "Continuous batching progress and full parameter/backend acceptance."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/cors-proxy",
+      "scope": "external_harness",
+      "evidence": [
+        "harness_exclusion"
+      ],
+      "assertions": "Explicit exclusion: server rejects execution routes and advertises server_tools false.",
+      "remaining": [
+        "No inference-server execution/MCP/proxy implementation required; the external harness owns it."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/detokenize",
+      "scope": "server",
+      "evidence": [
+        "tokenizer"
+      ],
+      "assertions": "Actual tokenizer round trip/pieces and unknown-ID errors.",
+      "remaining": [
+        "Fresh full frontend/schema/default/error and cross-capability acceptance; linked fixtures do not establish general parity."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/embedding",
+      "scope": "server",
+      "evidence": [
+        "aliases_embeddings"
+      ],
+      "assertions": "Explicit Native pooled embeddings, alias equality and normalization.",
+      "remaining": [
+        "Broader pooling modes/model dimensions/device acceptance."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/embeddings",
+      "scope": "server",
+      "evidence": [
+        "aliases_embeddings"
+      ],
+      "assertions": "Explicit Native pooled embeddings, alias equality and normalization.",
+      "remaining": [
+        "Broader pooling modes/model dimensions/device acceptance."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/infill",
+      "scope": "server",
+      "evidence": [
+        "infill"
+      ],
+      "assertions": "Declared FIM executes through Native generation and response projection.",
+      "remaining": [
+        "Broader prefix/suffix/extra-context and malformed-input cross-product."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/lora-adapters",
+      "scope": "server",
+      "evidence": [
+        "lora",
+        "lora_atomic"
+      ],
+      "assertions": "Default scales change actual inference; invalid updates are atomic.",
+      "remaining": [
+        "Arbitrary imports/device-fused LoRA and broader state/cache combinations."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/models",
+      "scope": "server",
+      "evidence": [
+        "model_download",
+        "model_resume",
+        "model_gates"
+      ],
+      "assertions": "Opt-in bounded package download, progress, immutable retry and resume.",
+      "remaining": [
+        "Bare GGUF graph inference, filename quantization and sidecar selection."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/models/load",
+      "scope": "server",
+      "evidence": [
+        "router_lifecycle",
+        "model_download"
+      ],
+      "assertions": "Load/unload registry state is committed before acknowledgement.",
+      "remaining": [
+        "Broader concurrent download/load/unload/reader acceptance."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/models/unload",
+      "scope": "server",
+      "evidence": [
+        "router_lifecycle",
+        "model_download"
+      ],
+      "assertions": "Load/unload registry state is committed before acknowledgement.",
+      "remaining": [
+        "Broader concurrent download/load/unload/reader acceptance."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/props",
+      "scope": "server",
+      "evidence": [
+        "props_ack"
+      ],
+      "assertions": "Explicit enable gate and acknowledgement-only contract.",
+      "remaining": [
+        "Fresh full frontend/schema/default/error and cross-capability acceptance; linked fixtures do not establish general parity."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/rerank",
+      "scope": "server",
+      "evidence": [
+        "rerank"
+      ],
+      "assertions": "All four aliases execute ordered pair scores and native/Jina/TEI shapes.",
+      "remaining": [
+        "Fresh multimodal resource/error and device acceptance."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/reranking",
+      "scope": "server",
+      "evidence": [
+        "rerank"
+      ],
+      "assertions": "All four aliases execute ordered pair scores and native/Jina/TEI shapes.",
+      "remaining": [
+        "Fresh multimodal resource/error and device acceptance."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/responses",
+      "scope": "server",
+      "evidence": [
+        "aliases_responses",
+        "aliases_stream",
+        "alternate_protocols",
+        "tool_roundtrip"
+      ],
+      "assertions": "Buffered/typed streamed Native text, usage and malformed-input aliases; shared tool transaction.",
+      "remaining": [
+        "Full Responses tool/reasoning/event/cancellation cross-product; source link to chat tool tests is not Responses tool proof."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/responses/input_tokens",
+      "scope": "server",
+      "evidence": [
+        "aliases_counts",
+        "counts_media"
+      ],
+      "assertions": "Alias/canonical counters equal Native inference preparation, including linked declared-image checks.",
+      "remaining": [
+        "Broader all declared-media/tool/template/default combinations."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/slots/{id_slot}",
+      "scope": "server",
+      "evidence": [
+        "slot_roundtrip",
+        "slot_errors"
+      ],
+      "assertions": "CPU cache files round-trip and continue real generation; unsafe/corrupt requests fail.",
+      "remaining": [
+        "Device/multi-sequence persistence; format remains nxrt-specific, not llama.cpp binary-compatible."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/tokenize",
+      "scope": "server",
+      "evidence": [
+        "tokenizer"
+      ],
+      "assertions": "Actual tokenizer round trip/pieces and unknown-ID errors.",
+      "remaining": [
+        "Fresh full frontend/schema/default/error and cross-capability acceptance; linked fixtures do not establish general parity."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/tools",
+      "scope": "external_harness",
+      "evidence": [
+        "harness_exclusion"
+      ],
+      "assertions": "Explicit exclusion: server rejects execution routes and advertises server_tools false.",
+      "remaining": [
+        "No inference-server execution/MCP/proxy implementation required; the external harness owns it."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/tts",
+      "scope": "server",
+      "evidence": [
+        "tts",
+        "speech"
+      ],
+      "assertions": "Actual WAV/PCM synthesis and rejected unsupported controls.",
+      "remaining": [
+        "Broader synthesis voices/formats/streaming capability acceptance."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/audio/speech",
+      "scope": "server",
+      "evidence": [
+        "speech"
+      ],
+      "assertions": "Speech aliases preserve PCM rates/channels/sample values.",
+      "remaining": [
+        "Broader streaming synthesis and model/device format acceptance."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/audio/transcriptions",
+      "scope": "server",
+      "evidence": [
+        "transcription",
+        "transcription_stream"
+      ],
+      "assertions": "Both aliases execute waveform-dependent Native transcription with typed SSE and budgets.",
+      "remaining": [
+        "Additional codecs/DSP conventions; broader generative media accounting."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "scope": "server",
+      "evidence": [
+        "chat",
+        "tool_roundtrip",
+        "grammar_native"
+      ],
+      "assertions": "Actual streamed generation/usage, tools and raw constrained output.",
+      "remaining": [
+        "Full reasoning/tool/error/cancellation/default cross-product and contextual decoder limitations."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/chat/completions/control",
+      "scope": "server",
+      "evidence": [
+        "control"
+      ],
+      "assertions": "Correct model/ID routing without loading idle models.",
+      "remaining": [
+        "Broader armed/unarmed/cancelled/completed stream timing acceptance."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/chat/completions/input_tokens",
+      "scope": "server",
+      "evidence": [
+        "aliases_counts",
+        "counts_media"
+      ],
+      "assertions": "Alias/canonical counters equal Native inference preparation, including linked declared-image checks.",
+      "remaining": [
+        "Broader all declared-media/tool/template/default combinations."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/completions",
+      "scope": "server",
+      "evidence": [
+        "legacy_completion",
+        "sampling"
+      ],
+      "assertions": "Mixed prompt batches, result indices, usage and real sampling.",
+      "remaining": [
+        "Fresh full frontend/schema/default/error and cross-capability acceptance; linked fixtures do not establish general parity."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/embeddings",
+      "scope": "server",
+      "evidence": [
+        "openai_embeddings"
+      ],
+      "assertions": "Actual embedding values and OpenAI response shapes.",
+      "remaining": [
+        "Broader pooling/batching/device acceptance."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/messages",
+      "scope": "server",
+      "evidence": [
+        "alternate_protocols",
+        "messages_errors",
+        "tool_roundtrip"
+      ],
+      "assertions": "Actual buffered/streamed generation, usage and Anthropic error envelopes.",
+      "remaining": [
+        "Full Anthropic tool/reasoning/event/cancellation cross-product; chat tool tests alone are insufficient."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/messages/count_tokens",
+      "scope": "server",
+      "evidence": [
+        "alternate_protocols",
+        "counts_media"
+      ],
+      "assertions": "Anthropic text/media counts equal actual inference prompt preparation.",
+      "remaining": [
+        "Fresh full frontend/schema/default/error and cross-capability acceptance; linked fixtures do not establish general parity."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/rerank",
+      "scope": "server",
+      "evidence": [
+        "rerank"
+      ],
+      "assertions": "All four aliases execute ordered pair scores and native/Jina/TEI shapes.",
+      "remaining": [
+        "Fresh multimodal resource/error and device acceptance."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/reranking",
+      "scope": "server",
+      "evidence": [
+        "rerank"
+      ],
+      "assertions": "All four aliases execute ordered pair scores and native/Jina/TEI shapes.",
+      "remaining": [
+        "Fresh multimodal resource/error and device acceptance."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/responses",
+      "scope": "server",
+      "evidence": [
+        "aliases_responses",
+        "aliases_stream",
+        "alternate_protocols",
+        "tool_roundtrip"
+      ],
+      "assertions": "Buffered/typed streamed Native text, usage and malformed-input aliases; shared tool transaction.",
+      "remaining": [
+        "Full Responses tool/reasoning/event/cancellation cross-product; source link to chat tool tests is not Responses tool proof."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/responses/input_tokens",
+      "scope": "server",
+      "evidence": [
+        "aliases_counts",
+        "counts_media"
+      ],
+      "assertions": "Alias/canonical counters equal Native inference preparation, including linked declared-image checks.",
+      "remaining": [
+        "Broader all declared-media/tool/template/default combinations."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/streams/lookup",
+      "scope": "server",
+      "evidence": [
+        "replay"
+      ],
+      "assertions": "Lookup returns only requested, model-qualified conversation IDs.",
+      "remaining": [
+        "Fresh frontend refresh/expiry and bounded retention acceptance."
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/systemone",
+      "scope": "server",
+      "evidence": [
+        "decision",
+        "decision_media"
+      ],
+      "assertions": "Actual non-generative decisions and supported encoded audio state.",
+      "remaining": [
+        "Video, additional codecs/DSP, joint/packed heads and shared generation/decision entry points."
+      ]
+    },
+    {
+      "method": "WS",
+      "path": "/v1/realtime",
+      "scope": "server",
+      "evidence": [
+        "realtime",
+        "realtime_duplex"
+      ],
+      "assertions": "Real Native websocket text/duplex cancellation and budget behavior.",
+      "remaining": [
+        "Forcing beyond declared turn-based tagged-json token-mask workflows, duplex tools, pressure/overlap and device wire acceptance."
+      ]
+    }
+  ]
+}

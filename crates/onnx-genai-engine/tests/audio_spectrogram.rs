@@ -8,8 +8,7 @@ use onnx_genai_ort::{DataType, Value};
 use serde_json::json;
 use std::path::PathBuf;
 
-#[test]
-fn native_spectrogram_features_validity_and_waveform_energy_reach_the_head() {
+fn spectrum_package(mode: &str, window: &str) -> tempfile::TempDir {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/onnx_genai_workflows/audio_waveform");
     let package = tempfile::tempdir().unwrap();
@@ -30,7 +29,7 @@ fn native_spectrogram_features_validity_and_waveform_energy_reach_the_head() {
             .unwrap();
     let program = &mut metadata["preprocessing"]["audio"];
     program["transforms"].as_array_mut().unwrap().extend([
-        json!({"op":"spectrogram","inputs":["raw"],"outputs":["power"],"mode":"power","window":"hann","sample_rate":16000,"n_fft":4,"hop_length":1,"win_length":4}),
+        json!({"op":"spectrogram","inputs":["raw"],"outputs":["power"],"mode":mode,"window":window,"sample_rate":16000,"n_fft":4,"hop_length":1,"win_length":4}),
         json!({"op":"emit_valid_frames","inputs":["power"],"outputs":["power_length"]}),
         json!({"op":"emit_validity_mask","inputs":["power"],"outputs":["power_mask"]}),
     ]);
@@ -74,67 +73,97 @@ fn native_spectrogram_features_validity_and_waveform_energy_reach_the_head() {
         serde_json::to_vec_pretty(&metadata).unwrap(),
     )
     .unwrap();
-    let mut engine = Engine::from_dir(
-        package.path(),
-        EngineConfig {
-            decode_backend: EngineDecodeBackend::Native,
-            ..EngineConfig::default()
-        },
-    )
-    .unwrap();
-    for (amplitude, samples) in [(0.25, 5), (0.5, 3)] {
-        let bytes =
-            onnx_genai_preprocess::audio::encode_wav_pcm16(&vec![amplitude; samples], 16000, 1)
+    package
+}
+
+#[test]
+fn native_spectrogram_features_validity_and_waveform_energy_reach_the_head() {
+    for mode in ["power", "magnitude"] {
+        for window in ["hann", "hamming", "rectangular"] {
+            let package = spectrum_package(mode, window);
+            let mut engine = Engine::from_dir(
+                package.path(),
+                EngineConfig {
+                    decode_backend: EngineDecodeBackend::Native,
+                    ..EngineConfig::default()
+                },
+            )
+            .unwrap();
+            for (amplitude, samples) in [(0.25, 5), (0.5, 3)] {
+                let bytes = onnx_genai_preprocess::audio::encode_wav_pcm16(
+                    &vec![amplitude; samples],
+                    16000,
+                    1,
+                )
                 .unwrap();
-        let len = bytes.len() as i64;
-        let request = PipelineGenerateRequest::new(GenerateRequest {
-            prompt: GeneratePrompt::TokenIds(vec![]),
-            options: GenerateOptions {
-                max_new_tokens: 0,
-                ..Default::default()
-            },
-        })
-        .with_input(
-            "encoded",
-            Value::from_raw_bytes(bytes, &[len], DataType::Uint8).unwrap(),
-        );
-        let outputs = engine.run_pipeline_outputs(request).unwrap();
-        let spectrum = outputs.aggregate("audio.spectrum").unwrap();
-        assert_eq!(spectrum.shape(), [1, 3, samples as i64]);
-        // A constant waveform times periodic Hann(4) has DFT magnitudes
-        // [2A, A, 0] in its one-sided bins, independent of reflection/frame.
-        for (bin, row) in spectrum
-            .to_vec_f32()
-            .unwrap()
-            .chunks_exact(samples)
-            .enumerate()
-        {
-            let expected = [4.0, 1.0, 0.0][bin] * amplitude * amplitude;
-            assert!(
-                row.iter().all(|value| (value - expected).abs() < 1e-6),
-                "bin {bin}: {row:?} != {expected}"
-            );
+                let len = bytes.len() as i64;
+                let request = PipelineGenerateRequest::new(GenerateRequest {
+                    prompt: GeneratePrompt::TokenIds(vec![]),
+                    options: GenerateOptions {
+                        max_new_tokens: 0,
+                        ..Default::default()
+                    },
+                })
+                .with_input(
+                    "encoded",
+                    Value::from_raw_bytes(bytes, &[len], DataType::Uint8).unwrap(),
+                );
+                let outputs = engine.run_pipeline_outputs(request).unwrap();
+                let spectrum = outputs.aggregate("audio.spectrum").unwrap();
+                assert_eq!(spectrum.shape(), [1, 3, samples as i64]);
+                // Analytical DFT magnitudes for a constant A under each explicit
+                // periodic window, independent of reflection and frame index.
+                let coefficients = match window {
+                    "hann" => [2.0, 1.0, 0.0],
+                    "hamming" => [2.16, 0.92, 0.0],
+                    "rectangular" => [4.0, 0.0, 0.0],
+                    _ => unreachable!("test windows are explicit"),
+                };
+                let expected: Vec<f32> = coefficients
+                    .into_iter()
+                    .map(|coefficient| {
+                        let magnitude = coefficient * amplitude;
+                        if mode == "power" {
+                            magnitude * magnitude
+                        } else {
+                            magnitude
+                        }
+                    })
+                    .collect();
+                for (bin, row) in spectrum
+                    .to_vec_f32()
+                    .unwrap()
+                    .chunks_exact(samples)
+                    .enumerate()
+                {
+                    let expected = expected[bin];
+                    assert!(
+                        row.iter().all(|value| (value - expected).abs() < 1e-6),
+                        "bin {bin}: {row:?} != {expected}"
+                    );
+                }
+                assert_eq!(
+                    outputs
+                        .aggregate("audio.power_frames")
+                        .unwrap()
+                        .to_vec_i64()
+                        .unwrap(),
+                    [samples as i64]
+                );
+                assert_eq!(
+                    outputs
+                        .aggregate("audio.power_mask")
+                        .unwrap()
+                        .to_vec_i64()
+                        .unwrap(),
+                    vec![1; samples]
+                );
+                let score = outputs.aggregate("score").unwrap().to_vec_f32().unwrap()[0];
+                assert!(
+                    (score - expected.iter().sum::<f32>() / 3.0).abs() < 1e-6,
+                    "{score}"
+                );
+            }
         }
-        assert_eq!(
-            outputs
-                .aggregate("audio.power_frames")
-                .unwrap()
-                .to_vec_i64()
-                .unwrap(),
-            [samples as i64]
-        );
-        assert_eq!(
-            outputs
-                .aggregate("audio.power_mask")
-                .unwrap()
-                .to_vec_i64()
-                .unwrap(),
-            vec![1; samples]
-        );
-        let score = outputs.aggregate("score").unwrap().to_vec_f32().unwrap()[0];
-        assert!(
-            (score - (5.0 / 3.0) * amplitude * amplitude).abs() < 1e-6,
-            "{score}"
-        );
     }
 }
