@@ -13,7 +13,7 @@
     clippy::clone_on_copy
 )]
 //! GPU parity tests for the issue #67 CUDA op-coverage batch: the
-//! trigonometric/hyperbolic unary-math family (`Tan`, `Sinh`, `Cosh`, `Asin`,
+//! trigonometric/hyperbolic unary-math family (`Sin`, `Cos`, `Tan`, `Sinh`, `Cosh`, `Asin`,
 //! `Acos`, `Atan`, `Asinh`, `Acosh`, `Atanh`), the metadata/movement ops
 //! `Identity`, `Flatten`, `Size`, and the triangular mask `Trilu`.
 //!
@@ -204,7 +204,10 @@ fn run_cuda(
         .collect::<Vec<_>>();
     let input_strides = inputs
         .iter()
-        .map(|tensor| compute_contiguous_strides(&tensor.shape))
+        .map(|tensor| {
+            compute_contiguous_strides(&tensor.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let input_views = inputs
         .iter()
@@ -229,7 +232,10 @@ fn run_cuda(
         .collect::<Vec<DeviceBuffer>>();
     let output_strides = outputs
         .iter()
-        .map(|(_, shape)| compute_contiguous_strides(shape))
+        .map(|(_, shape)| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let mut output_views = outputs
         .iter()
@@ -302,7 +308,10 @@ fn run_cpu(
         .unwrap();
     let input_strides = inputs
         .iter()
-        .map(|tensor| compute_contiguous_strides(&tensor.shape))
+        .map(|tensor| {
+            compute_contiguous_strides(&tensor.shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let input_views = inputs
         .iter()
@@ -319,7 +328,10 @@ fn run_cpu(
         .collect::<Vec<_>>();
     let output_strides = outputs
         .iter()
-        .map(|(_, shape)| compute_contiguous_strides(shape))
+        .map(|(_, shape)| {
+            compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides")
+        })
         .collect::<Vec<_>>();
     let mut output_bytes = outputs
         .iter()
@@ -377,6 +389,8 @@ fn trig_hyperbolic_unary_matches_cpu() {
     let ep = require_cuda();
     // (op, domain-safe inputs).
     let cases: &[(&str, &[f32])] = &[
+        ("Sin", &[-3.0, -1.0, 0.0, 1.0, 3.0]),
+        ("Cos", &[-3.0, -1.0, 0.0, 1.0, 3.0]),
         ("Tan", &[-1.2, -0.4, 0.0, 0.5, 1.1]),
         ("Sinh", &[-2.0, -0.7, 0.0, 0.9, 2.5]),
         ("Cosh", &[-2.0, -0.7, 0.0, 0.9, 2.5]),
@@ -388,7 +402,18 @@ fn trig_hyperbolic_unary_matches_cpu() {
         ("Atanh", &[-0.9, -0.4, 0.0, 0.5, 0.85]),
     ];
     for &(op, values) in cases {
+        let node = Node::new(NodeId(0), op, vec![], vec![]);
+        let shapes = [static_shape([values.len()])];
+        let rejected = ep.supports_op(&node, 21, &shapes, &[DataType::BFloat16], &[]);
+        let reason = format!("{op} does not accept BF16 (BFloat16) at opset 21");
+        assert!(
+            rejected.reason().is_some_and(|s| s.contains(&reason)),
+            "{op}: expected an opset-specific CUDA rejection, got {:?}",
+            rejected.reason()
+        );
+        assert_cuda_trig_execution_rejects_bf16(&ep, &node, &reason);
         for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            let opset = if dtype == DataType::BFloat16 { 22 } else { 17 };
             let shape = vec![values.len()];
             let inputs = [Tensor {
                 dtype,
@@ -396,8 +421,8 @@ fn trig_hyperbolic_unary_matches_cpu() {
                 bytes: encode_floats(values, dtype),
             }];
             let outputs = [(dtype, shape.clone())];
-            let cuda = run_cuda(&ep, op, 17, &inputs, &outputs, &[]);
-            let cpu = run_cpu(op, 17, &inputs, &outputs, &[]);
+            let cuda = run_cuda(&ep, op, opset, &inputs, &outputs, &[]);
+            let cpu = run_cpu(op, opset, &inputs, &outputs, &[]);
             let cuda_f = decode_floats(&cuda[0], dtype);
             let cpu_f = decode_floats(&cpu[0], dtype);
             // f32 device intrinsics vs host libm agree to a few ulp; the half
@@ -412,6 +437,38 @@ fn trig_hyperbolic_unary_matches_cpu() {
         }
         eprintln!("{op}: CUDA matches CPU EP across f32/f16/bf16");
     }
+}
+
+fn assert_cuda_trig_execution_rejects_bf16(ep: &CudaExecutionProvider, node: &Node, reason: &str) {
+    let shape = [1];
+    let stride = [1];
+    let dtype = DataType::BFloat16;
+    let input = ep.allocate(2, 256).unwrap();
+    let mut output = ep.allocate(2, 256).unwrap();
+    // SAFETY: the CUDA buffer is live and holds one BF16 value.
+    unsafe { ep.runtime().htod(&[0, 0], cuptr(input.as_ptr())) }.unwrap();
+    let kernel = ep.get_kernel(node, &[shape.to_vec()], 21).unwrap();
+    let error = kernel
+        .execute(
+            &[TensorView::new(
+                DevicePtr(input.as_ptr()),
+                dtype,
+                &shape,
+                &stride,
+                ep.device_id(),
+            )],
+            &mut [TensorMut::new(
+                DevicePtrMut(output.as_mut_ptr()),
+                dtype,
+                &shape,
+                &stride,
+                ep.device_id(),
+            )],
+        )
+        .unwrap_err();
+    ep.deallocate(input).unwrap();
+    ep.deallocate(output).unwrap();
+    assert!(error.to_string().contains(reason), "{error}");
 }
 
 /// `Identity` and `Flatten` are dtype-agnostic byte copies; assert exact byte

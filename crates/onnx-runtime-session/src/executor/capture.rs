@@ -506,6 +506,19 @@ impl Executor {
         self.capture_growing_symbols =
             compute_capture_disqualifying_symbols_excluding(&self.graph, &pinned);
         let count = pinned.len();
+        let classifier = ShapeEvolutionClassifier::new(&self.graph, &pinned);
+        self.kernel_shape_facts = self
+            .plan
+            .iter()
+            .map(|entry| {
+                classifier.facts(
+                    &self.graph,
+                    self.graph.node(entry.node_id),
+                    &self.capture_growing_symbols,
+                )
+            })
+            .collect();
+        self.workspace_preparation_memo = None;
         self.capacity_pinned_kv_symbols = pinned;
         if std::env::var("ONNX_GENAI_LOG_GROWING_SYMBOLS").is_ok() {
             eprintln!(
@@ -601,7 +614,7 @@ impl Executor {
             if resolved.contains_key(&vid)
                 || external_values.contains(&vid)
                 || self.graph.initializers.contains_key(&vid)
-                || self.sequence_values.contains(&vid)
+                || self.is_container_value(vid)
             {
                 continue;
             }
@@ -637,9 +650,10 @@ impl Executor {
 
     pub(super) fn node_capture_reason(
         &self,
-        plan: &NodePlan,
+        pi: usize,
         resolved: &HashMap<ValueId, Vec<usize>>,
     ) -> Option<CaptureDecline> {
+        let plan = &self.plan[pi];
         let node = self.graph.node(plan.node_id);
         if plan.managed_strings {
             return Some(CaptureDecline::node(
@@ -727,6 +741,7 @@ impl Executor {
         let key = KernelKey {
             node: plan.node_id.0,
             shapes: input_shapes,
+            shape_facts: self.kernel_shape_facts[pi],
         };
         let Some(kernel) = self.cache.entries.get(&key) else {
             return Some(CaptureDecline::node(
@@ -736,7 +751,7 @@ impl Executor {
                 "kernel has not been warmed for the requested capture shape",
             ));
         };
-        kernel_capture_decline(plan.node_id, node, kernel.as_ref())
+        kernel_capture_decline(plan.node_id, node, kernel.kernel.as_ref())
     }
 
     /// Partition the plan into maximal contiguous captured segments separated by
@@ -767,7 +782,8 @@ impl Executor {
         let declines: Vec<Option<CaptureDecline>> = self
             .plan
             .iter()
-            .map(|plan| self.node_capture_reason(plan, resolved))
+            .enumerate()
+            .map(|(pi, _)| self.node_capture_reason(pi, resolved))
             .collect();
 
         let mut segments: Vec<ScheduledSegment> = Vec::new();
@@ -838,6 +854,7 @@ impl Executor {
             let key = KernelKey {
                 node: plan.node_id.0,
                 shapes: input_shapes,
+                shape_facts: self.kernel_shape_facts[pi],
             };
             let kernel = self.cache.entries.get(&key).ok_or_else(|| {
                 SessionError::Internal(format!(
@@ -845,7 +862,7 @@ impl Executor {
                     plan.node_id.0
                 ))
             })?;
-            kernels.push(kernel.as_ref());
+            kernels.push(kernel.kernel.as_ref());
         }
         Ok(kernels)
     }

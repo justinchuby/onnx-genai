@@ -1,5 +1,34 @@
 use super::*;
 
+/// Capacity describes possible logical growth, not padding on a statically
+/// declared axis. This applies only when execution exposes a logical prefix.
+fn refill_binding_capacity_shape(
+    name: &str,
+    decl: Option<&[Dim]>,
+    physical: &[usize],
+    logical: &[usize],
+    exposes_logical: bool,
+    out: &mut Vec<usize>,
+) -> Result<()> {
+    out.clear();
+    out.extend_from_slice(physical);
+    if !exposes_logical {
+        return Ok(());
+    }
+    let Some(decl) = decl.filter(|d| d.len() == physical.len()) else {
+        return Ok(());
+    };
+    for (axis, dimension) in decl.iter().enumerate() {
+        if let Dim::Static(n) = dimension {
+            if logical.get(axis) != Some(n) || physical[axis] < *n {
+                return Err(EpError::InvalidTensorView{reason:format!("input binding '{name}' axis {axis} must expose static logical extent {n}, with physical capacity at least {n}; got logical {logical:?}, physical {physical:?}. Bind a model-compatible logical shape and sufficient backing")}.into());
+            }
+            out[axis] = *n;
+        }
+    }
+    Ok(())
+}
+
 /// Consume the selected implementation's shape-independent promise before
 /// attempting concrete shape resolution. Unsupported executor-owned structural
 /// nodes have no leaf-kernel requirement. Accepted graph kernels are planned as
@@ -16,7 +45,7 @@ pub(super) fn workspace_planning_for_node(
         return WorkspacePlanning::Metadata;
     }
     if is_control_flow_op(&node.op_type, &node.domain)
-        || is_sequence_op(&node.op_type, &node.domain)
+        || is_container_op(&node.op_type, &node.domain)
     {
         return WorkspacePlanning::None;
     }
@@ -621,11 +650,13 @@ impl Executor {
         let external = self.prepare_external_bindings_mode(bindings, true)?;
         let symbols = self.bind_symbols(inputs, &external)?;
         let stats = self.cache.stats();
+        let workspace_context = self.ep.workspace_preparation_context().read();
         // Input/external-binding validation above always runs. The immutable
         // graph and weights plus this exact symbol map determine every planned
         // shape (including nested shapes and capacity bounds). New/evicted
         // specializations conservatively invalidate the metadata-only plan.
         if let Some(memo) = &self.workspace_preparation_memo
+            && memo.context == workspace_context
             && memo.symbols == symbols
             && memo.output_bindings.matches(&external)
             && memo.growing_symbols == self.capture_growing_symbols
@@ -694,9 +725,10 @@ impl Executor {
             // Preparation uses the same specialization binding as dispatch.
             // Reuse it before resolving constants or constructing a cache key:
             // both are cold-path work when concrete metadata has not changed.
-            let prebound = self.kernel_bindings[pi]
-                .as_ref()
-                .is_some_and(|binding| self.cache.has_prebound(binding, &input_shapes));
+            let shape_facts = self.kernel_shape_facts[pi];
+            let prebound = self.kernel_bindings[pi].as_ref().is_some_and(|binding| {
+                self.cache.has_prebound(binding, &input_shapes, shape_facts)
+            });
             if !prebound {
                 let constant_inputs = self.plan[pi]
                     .inputs
@@ -714,8 +746,6 @@ impl Executor {
                 let opset = effective_opset(&self.graph, node);
                 // Must match what dispatch computes for this node, or prepare-only
                 // planning would key a different kernel than execution uses.
-                let seq_independent =
-                    node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols);
                 let graph_tokens = std::array::from_fn(|index| {
                     let capture = &self.slot_capture[index];
                     capture
@@ -737,7 +767,7 @@ impl Executor {
                     &constant_inputs,
                     &constant_values,
                     opset,
-                    seq_independent,
+                    shape_facts,
                     self.artifact_config,
                     &mut self.provider_artifact_readiness,
                     self.ep.as_ref(),
@@ -765,8 +795,11 @@ impl Executor {
                         .as_ref()
                         .expect("workspace kernel binding installed"),
                     &input_shapes,
+                    shape_facts,
                 )
                 .expect("workspace kernel resolved immediately before lookup");
+            let compiled = kernel;
+            let kernel = compiled.kernel.as_ref();
             let metadata = input_shapes
                 .iter()
                 .zip(&self.plan[pi].input_dtypes)
@@ -778,7 +811,11 @@ impl Executor {
             } else {
                 workspace_output_metadata(&self.graph, node, &symbols, Some(&external))
             };
-            let requirement = match kernel.workspace_requirement(&metadata, &output_metadata)? {
+            let requirement = match compiled.workspace_preparation(
+                workspace_context,
+                &metadata,
+                &output_metadata,
+            )? {
                 onnx_runtime_ep_api::WorkspacePreparation::Ready(requirement) => requirement,
                 onnx_runtime_ep_api::WorkspacePreparation::Deferred => {
                     pending.push(format!(
@@ -830,6 +867,7 @@ impl Executor {
         }
         let stats = self.cache.stats();
         self.workspace_preparation_memo = Some(WorkspacePreparationMemo {
+            context: workspace_context,
             output_bindings: WorkspaceOutputBindings::from_external(&external),
             symbols,
             growing_symbols: self.capture_growing_symbols.clone(),
@@ -1089,6 +1127,15 @@ impl Executor {
                 .ok_or_else(|| SessionError::InputNotFound {
                     name: (*name).to_string(),
                 })?;
+            // Ordinary host uploads borrow/copy a contiguous byte prefix. A
+            // custom strided Tensor must never be silently reinterpreted as
+            // dense storage; explicit fixed-stride bindings carry that layout.
+            if !tensor.layout.is_contiguous(&tensor.shape) {
+                return Err(SessionError::Internal(format!(
+                    "host input '{name}' has non-contiguous strides {:?} for {:?} shape {:?}; ordinary Tensor uploads require contiguous storage: materialize a contiguous host tensor or use allocate_device_binding_fixed_strides to preserve a physical layout",
+                    tensor.layout.strides, tensor.dtype, tensor.shape
+                )));
+            }
             self.bind_input_shape(name, vid, tensor.dtype, &tensor.shape, &mut bindings)?;
         }
         for (&vid, value) in &external.inputs {
@@ -1276,6 +1323,13 @@ impl Executor {
         if self.heterogeneous.is_some() {
             return Err(heterogeneous_api_error(
                 "mixed-provider device-graph capture",
+            ));
+        }
+        if optional_ops::graph_uses_optional_ops(&self.graph) {
+            return Ok(DeviceGraphCaptureResult::NotCapturable(
+                CaptureDeclineReport::one(CaptureDecline::graph(
+                    "Optional operators use host orchestration and may alias run-scoped payload storage; run this graph eagerly",
+                )),
             ));
         }
         if self.cap().device_graph_token.is_some() {
@@ -1706,7 +1760,9 @@ impl Executor {
     /// decode consumes and later steps fault on the workspace invariant (#1179).
     /// Sizing against physical capacity over-reserves (reserve ≥ consume), which
     /// is exactly correct for a reservation; execution still binds the logical
-    /// prefix and fits under it.
+    /// prefix and fits under it. For logical-exposing bindings, declared static
+    /// axes remain fixed after logical/capacity validation; padding on those
+    /// axes still contributes to physical strides/backing, not logical growth.
     pub(super) fn prepare_external_bindings_mode(
         &self,
         bindings: &mut [DeviceIoBinding],
@@ -1799,18 +1855,25 @@ impl Executor {
                         device,
                     });
                 value.dtype = dtype;
-                value.shape.clear();
-                value.shape.extend_from_slice(if plan_capacity {
-                    binding.physical_shape()
+                if plan_capacity {
+                    refill_binding_capacity_shape(
+                        input_name,
+                        self.value_shapes.get(&input_vid).and_then(|s| s.as_deref()),
+                        physical_shape,
+                        binding.logical_shape(),
+                        binding.exposes_logical_input_shape(),
+                        &mut value.shape,
+                    )?;
                 } else {
-                    binding.kernel_input_shape()
-                });
+                    value.shape.clear();
+                    value.shape.extend_from_slice(binding.kernel_input_shape());
+                }
                 value.accepts_subshape = false;
                 if fixed_physical_strides {
                     dispatch::refill_contiguous_strides(
                         value.strides.get_or_insert_default(),
                         physical_shape,
-                    );
+                    )?;
                     let stable_shape = value.fixed_stride_shape.get_or_insert_default();
                     stable_shape.clear();
                     stable_shape.extend_from_slice(physical_shape);
@@ -1872,7 +1935,7 @@ impl Executor {
                     dispatch::refill_contiguous_strides(
                         value.strides.get_or_insert_default(),
                         physical_shape,
-                    );
+                    )?;
                     let stable_shape = value.fixed_stride_shape.get_or_insert_default();
                     stable_shape.clear();
                     stable_shape.extend_from_slice(physical_shape);
@@ -2077,5 +2140,55 @@ mod output_workspace_metadata_tests {
             ),
             "storage bounds cannot invent the unknown logical view"
         );
+    }
+}
+
+#[cfg(test)]
+mod binding_capacity_shape_tests {
+    use super::*;
+    #[test]
+    fn logical_exposure_preserves_static_axes_without_losing_symbolic_capacity() {
+        let decl = [Dim::Symbolic(SymbolId(0)), Dim::Static(4)];
+        let mut shape = Vec::new();
+        refill_binding_capacity_shape("X", Some(&decl), &[3, 8], &[1, 4], true, &mut shape)
+            .unwrap();
+        assert_eq!(shape, [3, 4]);
+        refill_binding_capacity_shape("X", Some(&decl), &[3, 8], &[1, 4], false, &mut shape)
+            .unwrap();
+        assert_eq!(shape, [3, 8]);
+        refill_binding_capacity_shape("X", None, &[3, 8], &[1, 4], true, &mut shape).unwrap();
+        assert_eq!(shape, [3, 8]);
+        let symbolic = [Dim::Symbolic(SymbolId(0)), Dim::Symbolic(SymbolId(1))];
+        refill_binding_capacity_shape("X", Some(&symbolic), &[3, 8], &[1, 4], true, &mut shape)
+            .unwrap();
+        assert_eq!(shape, [3, 8]);
+        refill_binding_capacity_shape("X", Some(&decl), &[24], &[12], true, &mut shape).unwrap();
+        assert_eq!(shape, [24]); // normal rank validation still owns rank mismatch
+    }
+    #[test]
+    fn static_logical_and_capacity_mismatches_name_the_binding_axis_and_extents() {
+        let decl = [Dim::Symbolic(SymbolId(0)), Dim::Static(4)];
+        for (physical, logical) in [([3, 8], [1, 3]), ([3, 3], [1, 4])] {
+            let text = refill_binding_capacity_shape(
+                "X",
+                Some(&decl),
+                &physical,
+                &logical,
+                true,
+                &mut Vec::new(),
+            )
+            .unwrap_err()
+            .to_string();
+            for detail in [
+                "X",
+                "axis 1",
+                "extent 4",
+                "logical",
+                "physical",
+                "model-compatible",
+            ] {
+                assert!(text.contains(detail), "{text}");
+            }
+        }
     }
 }

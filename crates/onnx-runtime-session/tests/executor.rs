@@ -289,8 +289,8 @@ impl Kernel for FinalizationCheckingKernel {
         self.inner.set_constant_inputs(constant_inputs);
     }
 
-    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
-        self.inner.set_capture_seq_independent(seq_independent);
+    fn configure_shape_facts(&mut self, facts: onnx_runtime_ep_api::KernelShapeFacts) {
+        self.inner.configure_shape_facts(facts);
     }
 
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> EpResult<()> {
@@ -328,8 +328,8 @@ impl Kernel for FinalizationCheckingKernel {
         self.inner.view_outputs(inputs, output_shapes, num_outputs)
     }
 
-    fn may_produce_views(&self) -> bool {
-        self.inner.may_produce_views()
+    fn may_produce_views(&self, input_dtypes: &[DataType]) -> bool {
+        self.inner.may_produce_views(input_dtypes)
     }
 
     fn capture_support(&self) -> CaptureSupport {
@@ -1382,6 +1382,37 @@ fn standard_gelu_graph(opset: u64) -> Graph {
     graph.insert_node(Node::new(NodeId(0), "Gelu", vec![Some(x)], vec![y]));
     graph.add_output(y);
     graph
+}
+
+#[test]
+fn session_topk_bfloat16_requires_opset_24() {
+    let graph = |opset| {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), opset);
+        let x = input(&mut graph, "x", DataType::BFloat16, &[2]);
+        let k = i64_init(&mut graph, "k", &[1], &[1]);
+        let values = graph.create_named_value("values", DataType::BFloat16, static_shape([1]));
+        let indices = graph.create_named_value("indices", DataType::Int64, static_shape([1]));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "TopK",
+            vec![Some(x), Some(k)],
+            vec![values, indices],
+        ));
+        graph.add_output(values);
+        graph.add_output(indices);
+        graph
+    };
+
+    let reason = match InferenceSession::from_graph(graph(23)) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("a native session must reject BF16 TopK at opset 23"),
+    };
+    assert!(
+        reason.contains("TopK") && reason.contains("BFloat16") && reason.contains("opset 24"),
+        "{reason}"
+    );
+    InferenceSession::from_graph(graph(24)).expect("a native session must admit BF16 TopK-24");
 }
 
 #[test]

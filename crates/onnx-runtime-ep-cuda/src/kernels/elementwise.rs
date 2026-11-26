@@ -670,8 +670,14 @@ impl Kernel for UnaryKernel {
         }
     }
 
-    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
-        self.capture_seq_independent = seq_independent;
+    fn configure_shape_facts(&mut self, facts: onnx_runtime_ep_api::KernelShapeFacts) {
+        if self.capture_seq_independent != facts.capture_eligible {
+            *self
+                .last_capture_safe_signature
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+        self.capture_seq_independent = facts.capture_eligible;
     }
 }
 
@@ -756,7 +762,7 @@ impl BroadcastMetadataCache {
             "binary broadcast metadata",
             |key| key.a_shape == a_shape && key.b_shape == b_shape && key.out_shape == out_shape,
             || {
-                let metadata = broadcast_metadata(a_shape, b_shape, out_shape);
+                let metadata = broadcast_metadata(a_shape, b_shape, out_shape)?;
                 Ok((
                     BroadcastMetadataKey {
                         a_shape: a_shape.to_vec(),
@@ -939,8 +945,14 @@ impl Kernel for BinaryKernel {
         }
     }
 
-    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
-        self.capture_seq_independent = seq_independent;
+    fn configure_shape_facts(&mut self, facts: onnx_runtime_ep_api::KernelShapeFacts) {
+        if self.capture_seq_independent != facts.capture_eligible {
+            self.warm
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .signature = None;
+        }
+        self.capture_seq_independent = facts.capture_eligible;
     }
 }
 
@@ -1066,8 +1078,14 @@ impl Kernel for SiluMulKernel {
         }
     }
 
-    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
-        self.capture_seq_independent = seq_independent;
+    fn configure_shape_facts(&mut self, facts: onnx_runtime_ep_api::KernelShapeFacts) {
+        if self.capture_seq_independent != facts.capture_eligible {
+            *self
+                .last_capture_safe_signature
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+        self.capture_seq_independent = facts.capture_eligible;
     }
 }
 
@@ -1089,7 +1107,7 @@ pub(crate) fn require_matching_capture_signature<T: PartialEq>(
 ///
 /// The build-time growing-symbol classifier
 /// (`compute_capture_disqualifying_symbols` →
-/// `node_capture_seq_independent` → `set_capture_seq_independent`) is the sole,
+/// `node_capture_seq_independent` → `configure_shape_facts`) is the sole,
 /// authoritative authority here: `seq_independent == true` means every symbol on
 /// this node's output shape is *provably* pinned (fail-safe classifier) / not
 /// proven growing (denylist classifier), so the captured launch geometry stays
@@ -1112,20 +1130,20 @@ pub(crate) fn capture_shape_eligible(seq_independent: bool, _shape: &[usize]) ->
     seq_independent
 }
 
-pub(crate) fn broadcast_metadata(a: &[usize], b: &[usize], out: &[usize]) -> Vec<u64> {
+pub(crate) fn broadcast_metadata(a: &[usize], b: &[usize], out: &[usize]) -> Result<Vec<u64>> {
     let mut metadata = out.iter().map(|&d| d as u64).collect::<Vec<_>>();
-    metadata.extend(broadcast_strides(a, out));
-    metadata.extend(broadcast_strides(b, out));
+    metadata.extend(broadcast_strides(a, out)?);
+    metadata.extend(broadcast_strides(b, out)?);
     if metadata.is_empty() {
         metadata.push(0);
     }
-    metadata
+    Ok(metadata)
 }
 
-pub(crate) fn broadcast_strides(input: &[usize], out: &[usize]) -> Vec<u64> {
-    let contiguous = onnx_runtime_ir::compute_contiguous_strides(input);
+pub(crate) fn broadcast_strides(input: &[usize], out: &[usize]) -> Result<Vec<u64>> {
+    let contiguous = onnx_runtime_ir::compute_contiguous_strides(input)?;
     let leading = out.len() - input.len();
-    (0..out.len())
+    Ok((0..out.len())
         .map(|axis| {
             if axis < leading {
                 0
@@ -1138,7 +1156,7 @@ pub(crate) fn broadcast_strides(input: &[usize], out: &[usize]) -> Vec<u64> {
                 }
             }
         })
-        .collect()
+        .collect())
 }
 
 pub(crate) fn u64_bytes(values: &[u64]) -> &[u8] {
@@ -1245,9 +1263,21 @@ mod tests {
 
     #[test]
     fn broadcast_strides_are_right_aligned_and_zero_for_expanded_axes() {
-        assert_eq!(broadcast_strides(&[4, 1, 3], &[4, 5, 3]), [3, 0, 1]);
-        assert_eq!(broadcast_strides(&[1, 5, 3], &[4, 5, 3]), [0, 3, 1]);
-        assert_eq!(broadcast_strides(&[3], &[4, 5, 3]), [0, 0, 1]);
+        assert_eq!(
+            broadcast_strides(&[4, 1, 3], &[4, 5, 3])
+                .expect("fixture shape has representable contiguous strides"),
+            [3, 0, 1]
+        );
+        assert_eq!(
+            broadcast_strides(&[1, 5, 3], &[4, 5, 3])
+                .expect("fixture shape has representable contiguous strides"),
+            [0, 3, 1]
+        );
+        assert_eq!(
+            broadcast_strides(&[3], &[4, 5, 3])
+                .expect("fixture shape has representable contiguous strides"),
+            [0, 0, 1]
+        );
     }
 
     #[test]
@@ -1749,7 +1779,11 @@ extern "C" __global__ void read_after_delay(
         let new_a = [1usize, 4];
         let new_b = [4usize];
         let new_out = [1usize, 4];
-        let metadata_bytes = u64_bytes(&broadcast_metadata(&old_a, &old_b, &old_out)).len();
+        let metadata_bytes = u64_bytes(
+            &broadcast_metadata(&old_a, &old_b, &old_out)
+                .expect("fixture shape has representable contiguous strides"),
+        )
+        .len();
 
         let mut cache = BroadcastMetadataCache::new(runtime.clone());
         let old_ptr = cache.prepare(&old_a, &old_b, &old_out).unwrap();

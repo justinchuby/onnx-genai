@@ -318,7 +318,7 @@ struct AttachmentArgs {
     #[arg(long = "image", value_name = "PATH")]
     images: Vec<PathBuf>,
 
-    /// PCM16 WAV file sent with the prompt. Requires a pipeline package that
+    /// Supported encoded audio file sent with the prompt. Requires a pipeline package that
     /// declares an `input_features` audio input.
     #[arg(long = "audio", value_name = "PATH")]
     audio: Vec<PathBuf>,
@@ -326,6 +326,9 @@ struct AttachmentArgs {
 
 #[derive(Debug, Args)]
 struct GenerateArgs {
+    /// Maximum raw decoded PCM work and resident PCM bytes per audio attachment.
+    #[arg(long, default_value_t = onnx_genai::preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY.max_decoded_bytes)]
+    max_decoded_audio_bytes: std::num::NonZeroUsize,
     /// Model directory, or a config file inside it (e.g. inference_metadata.yaml).
     model: PathBuf,
 
@@ -396,18 +399,37 @@ enum TranscriptFormat {
 
 #[derive(Debug, Args)]
 struct TranscribeArgs {
+    /// Maximum raw decoded PCM work and resident PCM bytes per audio file.
+    #[arg(long, default_value_t = onnx_genai::preprocess::audio::AudioDecodeLimits::APPLICATION_POLICY.max_decoded_bytes)]
+    max_decoded_audio_bytes: std::num::NonZeroUsize,
     /// Model directory, or a config file inside it (e.g. inference_metadata.yaml).
     model: PathBuf,
 
-    /// PCM16 WAV files to transcribe. Use `-` to read a stream from standard
+    /// Supported encoded audio files to transcribe. Use `-` to read PCM16/WAV from standard
     /// input, which is transcribed live: each segment is printed as soon as it
     /// is recognized. Defaults to `-` when no path is given.
     #[arg(value_name = "AUDIO")]
     audio: Vec<PathBuf>,
 
-    /// Spoken language token, e.g. `en` or `zh`. Defaults to the model's own choice.
+    /// Model-declared spoken language label, e.g. `en` or `zh`. Defaults to the model's own choice.
     #[arg(long)]
     language: Option<String>,
+
+    /// Optional prior transcript/context, when the model declares prompt conditioning.
+    #[arg(long)]
+    prompt: Option<String>,
+    /// Maximum tokens in one generative decoder prompt.
+    #[arg(long, default_value_t=onnx_genai::engine::transcription::generative::PromptLimits::default().max_input_tokens)]
+    max_input_tokens: std::num::NonZeroUsize,
+    /// Maximum rendered decoder prompt bytes.
+    #[arg(long, default_value_t=onnx_genai::engine::transcription::generative::PromptLimits::default().template.max_output_bytes)]
+    max_prompt_bytes: std::num::NonZeroUsize,
+    /// Maximum interpreter operations in one decoder prompt template.
+    #[arg(long, default_value_t=onnx_genai::engine::transcription::generative::PromptLimits::default().template.max_operations)]
+    max_template_operations: std::num::NonZeroU64,
+    /// Maximum retained raw/projected transcript bytes per segment.
+    #[arg(long, default_value_t=onnx_genai::engine::transcription::TranscriptionLimits::default().max_text_bytes)]
+    max_text_bytes: std::num::NonZeroUsize,
 
     /// Transcript format.
     #[arg(long, value_enum, default_value_t = TranscriptFormat::Text)]
@@ -1101,5 +1123,86 @@ mod webui_cli_tests {
         };
         assert_eq!(args.cpu.cpu_cores.map(NonZeroUsize::get), Some(4));
         assert_eq!(args.sampling.max_context.map(NonZeroUsize::get), Some(128));
+    }
+
+    #[test]
+    fn transcribe_files_keep_format_conditioning_and_cpu_controls() {
+        let cli = Cli::try_parse_from([
+            "onnx-genai",
+            "transcribe",
+            "./model",
+            "first.wav",
+            "second.mp3",
+            "--language",
+            "zh",
+            "--prompt",
+            "prior transcript",
+            "--format",
+            "json",
+            "--sample-rate",
+            "48000",
+            "--channels",
+            "2",
+            "--max-new-tokens",
+            "12",
+            "--cpu-cores",
+            "2",
+            "--backend",
+            "native",
+        ])
+        .unwrap();
+        let Commands::Transcribe(args) = cli.command else {
+            panic!("expected transcribe command");
+        };
+        assert_eq!(args.model, PathBuf::from("./model"));
+        assert_eq!(
+            args.audio,
+            vec![PathBuf::from("first.wav"), PathBuf::from("second.mp3")]
+        );
+        assert_eq!(args.language.as_deref(), Some("zh"));
+        assert_eq!(args.prompt.as_deref(), Some("prior transcript"));
+        assert_eq!(args.format, TranscriptFormat::Json);
+        assert_eq!(args.sample_rate, 48000);
+        assert_eq!(args.channels, 2);
+        assert_eq!(args.max_new_tokens, Some(12));
+        assert_eq!(args.cpu.cpu_cores.map(NonZeroUsize::get), Some(2));
+        assert_eq!(args.engine.backend, EngineDecodeBackend::Native);
+        assert_eq!(
+            args.engine.to_config().decode_backend,
+            EngineDecodeBackend::Native
+        );
+    }
+
+    #[test]
+    fn global_profiling_flags_are_retained_for_noninteractive_commands() {
+        for command in [
+            vec!["generate", "./model", "hello"],
+            vec!["transcribe", "./model", "clip.wav"],
+        ] {
+            let mut argv = vec![
+                "onnx-genai",
+                "--profile",
+                "--profile-json",
+                "report.json",
+                "--profile-trace",
+                "trace.json",
+            ];
+            argv.extend(command);
+            let cli = Cli::try_parse_from(argv).unwrap();
+            assert!(cli.profiling.profile);
+            assert!(cli.profiling.requested());
+            assert_eq!(
+                cli.profiling.profile_json,
+                Some(PathBuf::from("report.json"))
+            );
+            assert_eq!(
+                cli.profiling.profile_trace,
+                Some(PathBuf::from("trace.json"))
+            );
+            assert!(matches!(
+                cli.command,
+                Commands::Generate(_) | Commands::Transcribe(_)
+            ));
+        }
     }
 }

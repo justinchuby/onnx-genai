@@ -59,6 +59,39 @@ fn build_kernel_registry_entries() -> Vec<KernelRegistryEntry> {
         .collect()
 }
 
+#[cfg(test)]
+#[test]
+fn cast_keeps_shipped_ort_descriptors() {
+    use onnx_runtime_ir::DataType::*;
+
+    let entries = build_kernel_registry_entries();
+    let mut ranges = Vec::new();
+    for entry in entries
+        .iter()
+        .filter(|e| matches!(e.op_type, "Cast" | "CastLike"))
+    {
+        assert_eq!(entry.domain, "");
+        assert_eq!(
+            entry.supported_dtypes,
+            &[
+                Float32, Float16, BFloat16, Float64, Int8, Int16, Int32, Int64, Uint8, Uint16,
+                Uint32, Uint64, Bool
+            ]
+        );
+        assert!(entry.input_dtype_constraints.is_empty());
+        assert!(entry.output_dtype_constraints.is_empty());
+        ranges.push((entry.op_type, entry.since_version, entry.end_version));
+    }
+    assert_eq!(
+        ranges,
+        [
+            ("Cast", 1, i32::MAX),
+            ("Cast", 28, i32::MAX),
+            ("CastLike", 15, i32::MAX)
+        ]
+    );
+}
+
 /// Opt this process out of the persistent SPMD decode pool.
 ///
 /// That pool exists for `onnx-genai-engine`'s native decode loop, which runs a
@@ -159,7 +192,7 @@ pub unsafe extern "C" fn CreateEpFactories(
                 out_factories_raw,
                 max_factories,
                 out_num_raw,
-                || Box::new(CpuExecutionProvider::new()),
+                || Box::new(CpuExecutionProvider::for_ort_plugin()),
                 entries,
             )
         };

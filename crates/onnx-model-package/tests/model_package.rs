@@ -356,3 +356,76 @@ fn package_under_symlinked_root_still_loads() {
     let package = ModelPackage::open(&link).unwrap();
     package.validate().unwrap();
 }
+
+#[test]
+fn remote_index_and_local_package_select_the_same_authored_variant() {
+    use onnx_model_package::{ComponentReference, Manifest};
+    let index: Manifest = serde_json::from_slice(
+        &std::fs::read(fixture("valid-package").join("manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let name = index.model_component_name().unwrap();
+    assert_eq!(name, "model");
+    let ComponentReference::Inline(component) = &index.components[name] else {
+        panic!("fixture inline component")
+    };
+    component.validate_index(name).unwrap();
+    for request in [
+        SelectionRequest::named("cpu-fp16"),
+        SelectionRequest::for_execution_provider("CUDAExecutionProvider"),
+        SelectionRequest::default(),
+    ] {
+        let (selected, _) = component.select_variant(&request).unwrap();
+        let local = ModelPackage::open(fixture("valid-package"))
+            .unwrap()
+            .select(name, &request)
+            .unwrap();
+        assert_eq!(selected, local.variant_name);
+    }
+    assert!(
+        component
+            .select_variant(&SelectionRequest::named("unpublished-quant"))
+            .is_err()
+    );
+}
+
+#[test]
+fn portable_download_index_paths_share_asset_rules_without_allowing_escape() {
+    use onnx_model_package::Manifest;
+    let mut index: Manifest = serde_json::from_slice(
+        &std::fs::read(fixture("valid-package").join("manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let digest = "a".repeat(64);
+    let reference = format!("sha256:{digest}/tokenizer.json");
+    assert_eq!(
+        index.portable_reference(&reference).unwrap(),
+        PathBuf::from(format!("shared_assets/sha256-{digest}/tokenizer.json"))
+    );
+    assert_eq!(index.portable_reference(".").unwrap(), PathBuf::new());
+    for path in [
+        "../outside",
+        "/outside",
+        "C:/outside",
+        "x\\outside",
+        "x\nfile",
+    ] {
+        assert!(index.portable_reference(path).is_err(), "{path:?}");
+    }
+    assert!(
+        index
+            .portable_reference(&format!("sha256:{digest}/../../../outside"))
+            .is_err()
+    );
+    index
+        .shared_assets
+        .insert(format!("sha256:{digest}"), "assets/tokenizer".into());
+    assert_eq!(
+        index.portable_reference(&reference).unwrap(),
+        PathBuf::from("assets/tokenizer/tokenizer.json")
+    );
+    index
+        .shared_assets
+        .insert(format!("sha256:{digest}"), "../outside".into());
+    assert!(index.portable_reference(&reference).is_err());
+}

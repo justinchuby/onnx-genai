@@ -1,5 +1,102 @@
 use super::*;
 
+/// CPU-owned execution payloads use the actual session domain. CUDA's existing
+/// Host staging remains explicitly standalone until its own migration.
+pub(crate) fn host_tensors_for_session(
+    session: &InferenceSession,
+) -> anyhow::Result<onnx_runtime_session::HostTensorAllocator> {
+    if session.device_id().is_host_accessible() {
+        Ok(session.host_tensor_allocator()?)
+    } else {
+        Ok(onnx_runtime_session::HostTensorAllocator::standalone())
+    }
+}
+pub(super) fn copy_step_tensor(
+    allocator: &onnx_runtime_session::HostTensorAllocator,
+    source: &Tensor,
+) -> anyhow::Result<Tensor> {
+    if source.dtype == DataType::String {
+        // Preserve current text operations; admitted text slabs are a later
+        // payload migration, not part of this numeric-array capability.
+        return Ok(source.try_clone()?);
+    }
+    anyhow::ensure!(
+        source.device().is_host_accessible(),
+        "CPU routed input requires explicit Host transfer, got {:?}",
+        source.device()
+    );
+    Ok(allocator.copy_tensor(source)?)
+}
+pub(super) fn i64_tensor_with(
+    allocator: &onnx_runtime_session::HostTensorAllocator,
+    shape: Vec<usize>,
+    mut value: impl FnMut(usize) -> i64,
+) -> anyhow::Result<Tensor> {
+    Ok(allocator.fill(DataType::Int64, shape, |bytes| {
+        for (index, target) in bytes.chunks_exact_mut(8).enumerate() {
+            target.copy_from_slice(&value(index).to_le_bytes());
+        }
+        Ok(())
+    })?)
+}
+
+fn owned_f32_values(
+    tensor: Tensor,
+    allocator: &onnx_runtime_session::HostTensorAllocator,
+) -> anyhow::Result<onnx_runtime_session::OwnedHostArray<f32>> {
+    anyhow::ensure!(
+        tensor.layout.is_contiguous(&tensor.shape),
+        "Native owned logits require contiguous output storage; gather the declared output layout first"
+    );
+    if tensor.dtype == DataType::Float32 {
+        return Ok(onnx_runtime_session::OwnedHostArray::from_tensor(tensor)?);
+    }
+    anyhow::ensure!(
+        matches!(tensor.dtype, DataType::Float16 | DataType::BFloat16),
+        "native logits must be Float32, Float16, or BFloat16, got {:?}",
+        tensor.dtype
+    );
+    let count = onnx_runtime_ir::checked_numel(&tensor.shape)
+        .context("native owned logits shape overflows")?;
+    let mut output = allocator.array::<f32>(count)?;
+    let source = tensor.as_bytes();
+    for (target, bytes) in output.as_mut_slice().iter_mut().zip(source.chunks_exact(2)) {
+        let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+        *target = if tensor.dtype == DataType::Float16 {
+            f16_to_f32(bits)
+        } else {
+            f32::from_bits(u32::from(bits) << 16)
+        };
+    }
+    Ok(output)
+}
+pub(super) fn extract_owned_logits(
+    tensor: Tensor,
+    allocator: &onnx_runtime_session::HostTensorAllocator,
+) -> anyhow::Result<LogitsBatch> {
+    let (rows, width) = match tensor.shape.as_slice() {
+        [vocab] if *vocab > 0 => (1, *vocab),
+        [seq, vocab] if *seq > 0 && *vocab > 0 => (*seq, *vocab),
+        [batch, seq, vocab] if *batch > 0 && *seq > 0 && *vocab > 0 => (*seq, *vocab),
+        shape => bail!("unsupported logits tensor shape: {shape:?}"),
+    };
+    LogitsBatch::from_array(owned_f32_values(tensor, allocator)?, rows, width)
+}
+pub(super) fn extract_owned_batch_row_logits(
+    tensor: Tensor,
+    batch: usize,
+    allocator: &onnx_runtime_session::HostTensorAllocator,
+) -> anyhow::Result<LogitsBatch> {
+    let width = match tensor.shape.as_slice() {
+        [b, seq, vocab] if *b == batch && *seq == 1 && *vocab > 0 => *vocab,
+        [b, vocab] if *b == batch && *vocab > 0 => *vocab,
+        shape => bail!(
+            "unsupported batched logits tensor shape {shape:?} for batch {batch}; expected [{batch}, 1, vocab] or [{batch}, vocab]"
+        ),
+    };
+    LogitsBatch::from_array(owned_f32_values(tensor, allocator)?, batch, width)
+}
+
 pub(crate) fn extract_logits(tensor: &Tensor) -> anyhow::Result<Vec<Vec<f32>>> {
     let values = tensor_to_f32(tensor)?;
     match tensor.shape.as_slice() {
@@ -190,7 +287,7 @@ where
     Ok(best_index - row_start)
 }
 
-pub(crate) fn extract_last_row(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
+fn last_row_values(tensor: &Tensor) -> anyhow::Result<impl ExactSizeIterator<Item = f32> + '_> {
     let width = *tensor
         .shape
         .last()
@@ -198,14 +295,53 @@ pub(crate) fn extract_last_row(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
     if width == 0 {
         bail!("tensor final feature dimension must be positive");
     }
-    let values = tensor_to_f32(tensor)?;
-    if values.len() < width || !values.len().is_multiple_of(width) {
+    let count = onnx_runtime_ir::checked_numel(&tensor.shape)
+        .context("native hidden output shape overflows")?;
+    if count < width || !count.is_multiple_of(width) {
         bail!(
-            "tensor element count {} is not a positive multiple of final feature width {width}",
-            values.len()
+            "tensor element count {count} is not a positive multiple of final feature width {width}"
         );
     }
-    Ok(values[values.len() - width..].to_vec())
+    let element_bytes = match tensor.dtype {
+        DataType::Float32 => 4,
+        DataType::Float16 | DataType::BFloat16 => 2,
+        dtype => bail!("native logits must be Float32, Float16, or BFloat16, got {dtype:?}"),
+    };
+    let start = (count - width)
+        .checked_mul(element_bytes)
+        .context("native final row offset overflows")?;
+    let row = tensor
+        .as_bytes()
+        .get(start..)
+        .context("native final row exceeds output backing")?;
+    Ok(row
+        .chunks_exact(element_bytes)
+        .map(move |bytes| match tensor.dtype {
+            DataType::Float32 => f32::from_le_bytes(bytes.try_into().expect("f32 row element")),
+            DataType::Float16 => f16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]])),
+            DataType::BFloat16 => {
+                f32::from_bits(u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) << 16)
+            }
+            _ => unreachable!("dtype checked above"),
+        }))
+}
+
+pub(crate) fn extract_last_row(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
+    Ok(last_row_values(tensor)?.collect())
+}
+
+pub(super) fn extract_owned_last_row(
+    tensor: &Tensor,
+    allocator: &onnx_runtime_session::HostTensorAllocator,
+) -> anyhow::Result<onnx_runtime_session::OwnedHostArray<f32>> {
+    let values = last_row_values(tensor)?;
+    let mut owned = allocator.array::<f32>(values.len()).context(
+        "admit Native hidden final row before copying output values; release Host headroom",
+    )?;
+    for (destination, value) in owned.as_mut_slice().iter_mut().zip(values) {
+        *destination = value;
+    }
+    Ok(owned)
 }
 
 pub(super) fn tensor_to_f32(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
@@ -618,14 +754,18 @@ pub(crate) fn make_past_input_tensor_batched(
         };
         shape.push(value);
     }
-    let numel: usize = shape.iter().product();
+    let numel = shape
+        .iter()
+        .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+        .context("native KV element count overflow")?;
     // Sized rather than built: `from_raw` with a zeroed `Vec` allocates these
     // bytes twice and memcpys between them, and a hybrid decoder seeds one of
     // these per recurrent layer per sequence.
     meta.dtype
         .checked_storage_bytes(numel)
         .with_context(|| format!("unsupported KV dtype {:?} for '{name}'", meta.dtype))?;
-    Tensor::zeros(meta.dtype, shape)
+    host_tensors_for_session(session)?
+        .zeros(meta.dtype, shape)
         .with_context(|| format!("create empty native KV tensor '{name}'"))
 }
 
@@ -646,7 +786,12 @@ fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(value)
 }
 
-pub(crate) fn prefix_slice(tensor: &Tensor, axis: usize, len: usize) -> anyhow::Result<Tensor> {
+pub(crate) fn prefix_slice(
+    allocator: &onnx_runtime_session::HostTensorAllocator,
+    tensor: &Tensor,
+    axis: usize,
+    len: usize,
+) -> anyhow::Result<Tensor> {
     if !tensor.layout.is_contiguous(&tensor.shape) {
         bail!(
             "native KV prefix slicing requires contiguous row-major storage, got layout {:?} for \
@@ -687,28 +832,28 @@ pub(crate) fn prefix_slice(tensor: &Tensor, axis: usize, len: usize) -> anyhow::
         .checked_mul(kept_stride)
         .context("native KV prefix retained byte count overflow")?;
     let source = tensor.as_bytes();
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(retained_bytes)
-        .context("allocate native KV prefix bytes")?;
-    for index in 0..outer {
-        let start = index
-            .checked_mul(source_stride)
-            .context("native KV prefix source offset overflow")?;
-        let end = start
-            .checked_add(kept_stride)
-            .context("native KV prefix source end overflow")?;
-        let row = source.get(start..end).with_context(|| {
-            format!(
-                "native KV prefix source range {start}..{end} exceeds {} bytes",
-                source.len()
-            )
-        })?;
-        bytes.extend_from_slice(row);
+    let required_source = outer
+        .checked_mul(source_stride)
+        .context("native KV prefix source byte count overflow")?;
+    if required_source > source.len() {
+        bail!(
+            "native KV source geometry needs {required_source} bytes but backing has {}; match the declared cache shape",
+            source.len()
+        );
     }
     let mut shape = tensor.shape.clone();
     shape[axis] = len;
-    Tensor::from_raw(tensor.dtype, shape, &bytes).context("create sliced native KV tensor")
+    allocator.fill(tensor.dtype, shape, |destination| {
+        if destination.len() != retained_bytes { return Err(onnx_runtime_session::SessionError::Internal("native KV prefix dtype requires different byte packing; use a byte-addressable cache representation".into()).into()); }
+        for index in 0..outer {
+            // Geometry above checked all products before backing admission.
+            let start = index * source_stride;
+            let end = start + kept_stride;
+            let row = source.get(start..end).ok_or_else(|| onnx_runtime_session::SessionError::Internal(format!("native KV prefix source range {start}..{end} exceeds {} bytes; match the cache geometry", source.len())))?;
+            destination[index * kept_stride..(index + 1) * kept_stride].copy_from_slice(row);
+        }
+        Ok(())
+    }).context("create sliced native KV tensor")
 }
 
 /// Whether the model's decode dispatches work through the shared CPU decode

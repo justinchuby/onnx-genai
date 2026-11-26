@@ -290,6 +290,7 @@ mod tests {
         let fixture =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
         let specs = ["model-a", "model-b", "idle-model"].map(|id| crate::ModelSpec {
+            package_variant: None,
             id: id.into(),
             path: fixture.clone(),
             eager: id != "idle-model",

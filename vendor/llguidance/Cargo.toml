@@ -1,0 +1,101 @@
+# Repository-maintained fork of the audited llguidance source snapshot.
+# Published packages must resolve this package, not unpatched llguidance.
+[package]
+name = "onnx-genai-llguidance"
+version.workspace = true
+edition = "2021"
+rust-version = "1.87"
+license = "MIT"
+repository.workspace = true
+description = "Audited llguidance compiler with nxrt schema correctness fixes"
+readme = "NXRT-PATCHES.md"
+build = "build.rs"
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+name = "onnx_genai_llguidance"
+crate-type = ["staticlib", "rlib", "cdylib"]
+path = "src/lib.rs"
+
+# The archive's integration sources depend on an unpublished test utility.
+# Keep them as provenance, not executable claims. Source unit tests and this
+# public registry-surface target exercise the maintained compiler directly.
+[[test]]
+name = "registry_surface"
+path = "tests/registry_surface.rs"
+
+[features]
+ahash = ["derivre/ahash"]
+default = [
+    "lark",
+    "rayon",
+    "referencing",
+    "ahash",
+]
+generate-header = ["dep:cbindgen"]
+jsonschema_validation = [
+    "dep:jsonschema",
+    "dep:lazy_static",
+]
+lark = []
+logging = []
+rayon = ["dep:rayon"]
+referencing = ["dep:referencing"]
+wasm = ["dep:instant"]
+
+[dependencies.anyhow]
+version = "1.0.95"
+
+[dependencies.derivre]
+version = "=0.3.13"
+features = ["compress"]
+default-features = false
+
+[dependencies.indexmap]
+version = "2.7.1"
+
+[dependencies.instant]
+version = "0.1.13"
+optional = true
+
+[dependencies.jsonschema]
+version = "0.29.0"
+optional = true
+default-features = false
+
+[dependencies.lazy_static]
+version = "1.5.0"
+optional = true
+
+[dependencies.rayon]
+version = "1.10.0"
+optional = true
+
+[dependencies.referencing]
+version = "0.29.0"
+optional = true
+
+[dependencies.regex-syntax]
+version = "0.8.5"
+
+[dependencies.serde]
+version = "1.0.217"
+features = ["derive"]
+
+[dependencies.serde_json]
+version = "1.0.138"
+features = ["preserve_order"]
+
+[dependencies.toktrie]
+version = "1.9.1"
+
+[dev-dependencies.regex]
+version = "1.11.1"
+
+[build-dependencies.cbindgen]
+version = "0.29"
+optional = true

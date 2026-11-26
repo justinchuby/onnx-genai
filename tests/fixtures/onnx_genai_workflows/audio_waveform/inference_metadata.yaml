@@ -1,0 +1,441 @@
+{
+  "schema_version": "v1.14",
+  "package": {
+    "tokenizer": {
+      "algorithm": "word_level",
+      "vocab_size": 32,
+      "artifacts": [
+        {
+          "location": "tokenizer.json"
+        }
+      ],
+      "special_tokens": {
+        "bos_token_id": 2,
+        "eos_token_id": [
+          3
+        ]
+      }
+    }
+  },
+  "preprocessing": {
+    "audio": {
+      "transforms": [
+        {
+          "op": "decode",
+          "outputs": [
+            "raw"
+          ]
+        },
+        {
+          "op": "resample",
+          "inputs": [
+            "raw"
+          ],
+          "outputs": [
+            "resampled"
+          ],
+          "sample_rate": 16000
+        },
+        {
+          "op": "downmix",
+          "channels": 1,
+          "inputs": [
+            "resampled"
+          ],
+          "outputs": [
+            "mono"
+          ]
+        },
+        {
+          "op": "zero_mean_unit_variance",
+          "epsilon": 1e-07,
+          "inputs": [
+            "mono"
+          ],
+          "outputs": [
+            "normalized"
+          ]
+        },
+        {
+          "op": "rescale",
+          "scale": 2.0,
+          "inputs": [
+            "raw"
+          ],
+          "outputs": [
+            "scaled"
+          ]
+        },
+        {
+          "op": "pad",
+          "mode": "right",
+          "target_length": 8,
+          "pad_value": 0.75,
+          "inputs": [
+            "normalized"
+          ],
+          "outputs": [
+            "padded"
+          ]
+        },
+        {
+          "op": "emit_validity_mask",
+          "inputs": [
+            "padded"
+          ],
+          "outputs": [
+            "mask"
+          ]
+        },
+        {
+          "op": "emit_valid_samples",
+          "inputs": [
+            "padded"
+          ],
+          "outputs": [
+            "length"
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "raw",
+          "source": "raw",
+          "content": "waveform",
+          "dtype": "float32",
+          "contract": {
+            "dtype": "float32",
+            "shape": [
+              "audio_batch",
+              "raw_samples"
+            ]
+          }
+        },
+        {
+          "name": "scaled",
+          "source": "scaled",
+          "content": "waveform",
+          "dtype": "float32",
+          "contract": {
+            "dtype": "float32",
+            "shape": [
+              "audio_batch",
+              "raw_samples"
+            ]
+          }
+        },
+        {
+          "name": "normalized",
+          "source": "normalized",
+          "content": "waveform",
+          "dtype": "float32",
+          "contract": {
+            "dtype": "float32",
+            "shape": [
+              "audio_batch",
+              "raw_samples"
+            ]
+          }
+        },
+        {
+          "name": "features",
+          "source": "padded",
+          "content": "waveform",
+          "dtype": "float32",
+          "contract": {
+            "dtype": "float32",
+            "shape": [
+              "audio_batch",
+              8
+            ]
+          }
+        },
+        {
+          "name": "mask",
+          "source": "mask",
+          "content": "validity_mask",
+          "dtype": "int64",
+          "contract": {
+            "dtype": "int64",
+            "shape": [
+              "audio_batch",
+              8
+            ]
+          }
+        },
+        {
+          "name": "valid_samples",
+          "source": "length",
+          "content": "valid_samples",
+          "dtype": "int64",
+          "contract": {
+            "dtype": "int64",
+            "shape": [
+              "audio_batch"
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "pipeline": {
+    "workflow": {
+      "publication_mode": "commit_only",
+      "manifest": {
+        "adapter_abis": {
+          "onnx-genai.audio-preprocess": "2"
+        }
+      },
+      "inputs": {
+        "encoded": {
+          "contract": {
+            "dtype": "uint8",
+            "shape": [
+              "first_bytes"
+            ]
+          },
+          "role": {
+            "kind": "opaque"
+          },
+          "source": {
+            "kind": "application",
+            "name": "first_audio"
+          }
+        }
+      },
+      "outputs": {
+        "audio.raw": {
+          "contract": {
+            "dtype": "float32",
+            "shape": [
+              "audio_batch",
+              "raw_samples"
+            ]
+          },
+          "family": {
+            "kind": "materialized"
+          },
+          "role": "tensor",
+          "stage": "pre_adapter"
+        },
+        "audio.scaled": {
+          "contract": {
+            "dtype": "float32",
+            "shape": [
+              "audio_batch",
+              "raw_samples"
+            ]
+          },
+          "family": {
+            "kind": "materialized"
+          },
+          "role": "tensor",
+          "stage": "pre_adapter"
+        },
+        "audio.normalized": {
+          "contract": {
+            "dtype": "float32",
+            "shape": [
+              "audio_batch",
+              "raw_samples"
+            ]
+          },
+          "family": {
+            "kind": "materialized"
+          },
+          "role": "tensor",
+          "stage": "pre_adapter"
+        },
+        "audio.features": {
+          "contract": {
+            "dtype": "float32",
+            "shape": [
+              "audio_batch",
+              8
+            ]
+          },
+          "family": {
+            "kind": "materialized"
+          },
+          "role": "tensor",
+          "stage": "pre_adapter"
+        },
+        "audio.mask": {
+          "contract": {
+            "dtype": "int64",
+            "shape": [
+              "audio_batch",
+              8
+            ]
+          },
+          "family": {
+            "kind": "materialized"
+          },
+          "role": "tensor",
+          "stage": "pre_adapter"
+        },
+        "audio.valid_samples": {
+          "contract": {
+            "dtype": "int64",
+            "shape": [
+              "audio_batch"
+            ]
+          },
+          "family": {
+            "kind": "materialized"
+          },
+          "role": "tensor",
+          "stage": "pre_adapter"
+        },
+        "score": {
+          "contract": {
+            "dtype": "float32",
+            "shape": []
+          },
+          "family": {
+            "kind": "materialized"
+          },
+          "role": "tensor",
+          "stage": "pre_adapter"
+        }
+      },
+      "components": {
+        "audio": {
+          "implementation": {
+            "kind": "adapter",
+            "abi": "onnx-genai.audio-preprocess",
+            "version": "2"
+          },
+          "ports": {
+            "inputs": {
+              "encoded": {
+                "dtype": "uint8",
+                "shape": [
+                  "encoded_bytes"
+                ]
+              }
+            },
+            "outputs": {
+              "raw": {
+                "dtype": "float32",
+                "shape": [
+                  "audio_batch",
+                  "raw_samples"
+                ]
+              },
+              "scaled": {
+                "dtype": "float32",
+                "shape": [
+                  "audio_batch",
+                  "raw_samples"
+                ]
+              },
+              "normalized": {
+                "dtype": "float32",
+                "shape": [
+                  "audio_batch",
+                  "raw_samples"
+                ]
+              },
+              "features": {
+                "dtype": "float32",
+                "shape": [
+                  "audio_batch",
+                  8
+                ]
+              },
+              "mask": {
+                "dtype": "int64",
+                "shape": [
+                  "audio_batch",
+                  8
+                ]
+              },
+              "valid_samples": {
+                "dtype": "int64",
+                "shape": [
+                  "audio_batch"
+                ]
+              }
+            }
+          }
+        },
+        "head": {
+          "implementation": {
+            "kind": "onnx",
+            "artifact": "model.onnx.textproto"
+          }
+        }
+      },
+      "steps": [
+        {
+          "kind": "invoke",
+          "component": "audio",
+          "inputs": {
+            "encoded": "encoded"
+          },
+          "outputs": {
+            "raw": "audio.raw",
+            "scaled": "audio.scaled",
+            "normalized": "audio.normalized",
+            "features": "audio.features",
+            "mask": "audio.mask",
+            "valid_samples": "audio.valid_samples"
+          }
+        },
+        {
+          "kind": "invoke",
+          "component": "head",
+          "inputs": {
+            "features": "audio.features"
+          },
+          "outputs": {
+            "score": "score"
+          }
+        },
+        {
+          "kind": "emit",
+          "value": "audio.raw",
+          "output": "audio.raw",
+          "mode": "replace"
+        },
+        {
+          "kind": "emit",
+          "value": "audio.scaled",
+          "output": "audio.scaled",
+          "mode": "replace"
+        },
+        {
+          "kind": "emit",
+          "value": "audio.normalized",
+          "output": "audio.normalized",
+          "mode": "replace"
+        },
+        {
+          "kind": "emit",
+          "value": "audio.features",
+          "output": "audio.features",
+          "mode": "replace"
+        },
+        {
+          "kind": "emit",
+          "value": "audio.mask",
+          "output": "audio.mask",
+          "mode": "replace"
+        },
+        {
+          "kind": "emit",
+          "value": "audio.valid_samples",
+          "output": "audio.valid_samples",
+          "mode": "replace"
+        },
+        {
+          "kind": "emit",
+          "value": "score",
+          "output": "score",
+          "mode": "replace"
+        }
+      ]
+    }
+  }
+}

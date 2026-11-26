@@ -1,4 +1,8 @@
-# `pkg.nxrt::BlockQuantizedMoE` — Operator Design Note (mixed-projection ABI)
+# `pkg.nxrt._private::BlockQuantizedMoE` — Operator Design Note (mixed-projection ABI)
+
+The default arithmetic described here is `float32`. The explicit CPU Q8
+activation mode, its version-2 numerical contract and whole-operation workspace
+are documented in [Packed activation arithmetic](PACKED_ACTIVATION_ARITHMETIC.md).
 
 **Status:** Mixed-projection ABI — CPU oracle and native CUDA decode/prefill
 execution implemented for the verified GLM-5.2 UD-IQ1_S formats. This
@@ -95,7 +99,7 @@ single `format` attribute is replaced by three per-projection format attributes
 `fc1_format`, `fc2_format`, `fc3_format` (see §1.3). This is a breaking change
 with no compatibility shim.
 
-- **Domain:** `pkg.nxrt`
+- **Domain:** `pkg.nxrt._private`
 - **Op type:** `BlockQuantizedMoE` (exact string the seam matches at
   [weight.rs:101-105](../../crates/onnx-runtime-ep-api/src/weight.rs#L101-L105))
 - **Version:** 1
@@ -397,7 +401,7 @@ pub fn block_quantized_moe(ctx):
 
 Registered alongside the others
 ([custom_ops.rs:297-313](../../crates/onnx-runtime-shape-inference/src/handlers/custom_ops.rs#L297-L313)):
-`reg.register("pkg.nxrt", "BlockQuantizedMoE", 1, block_quantized_moe)`.
+`reg.register("pkg.nxrt._private", "BlockQuantizedMoE", 1, block_quantized_moe)`.
 
 **Derived by inference:** output rank/dims/dtype = `input`.
 **Deliberately left unresolved (kernel-time only):** `E`, `inter`, and
@@ -587,7 +591,7 @@ Each item lists a recommended default. Sign-off requested before kernel work.
    **Default: resident-first correctness for the GLM/IQ profile; require that
    seam extension before paging or production-scale K3 claims.**
 
-8. **Op version: ship as `pkg.nxrt::BlockQuantizedMoE` v1 now?**
+8. **Op version: ship as `pkg.nxrt._private::BlockQuantizedMoE` v1 now?**
    *Recommend:* yes — freeze this ABI as v1 for the currently verified GLM/IQ
    and BlockQuantizedMatMul layouts so the CPU parity oracle and the `weight.rs`
    seam are backed by a stable contract. Native K3/Moonshot formats remain out

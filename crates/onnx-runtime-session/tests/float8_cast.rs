@@ -338,6 +338,23 @@ fn check_float8_casts(device: DevicePreference) {
         vec![],
         &[0, 60, 123],
     );
+
+    // FP8 factories must still reach both packed-output CUDA entry points and
+    // the packed-source load path after opset selection.
+    let ints = Tensor::from_raw(Uint8, vec![5], &[0, 1, 7, 8, 255]).unwrap();
+    check(
+        &device,
+        21,
+        false,
+        &ints,
+        Uint4,
+        vec![],
+        &[0x10, 0x87, 0x0f],
+    );
+    let half = Tensor::from_raw(Float16, vec![3], &[0, 0x3c, 0, 0xc0, 0, 0x42]).unwrap();
+    check(&device, 25, true, &half, Int2, vec![], &[0x39]);
+    let packed = Tensor::from_raw(Int2, vec![3], &[0x39]).unwrap();
+    check(&device, 28, false, &packed, Int8, vec![], &[1, 254, 255]);
 }
 
 #[test]

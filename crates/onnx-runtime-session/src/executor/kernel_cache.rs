@@ -65,15 +65,14 @@ pub(super) fn resolve_kernel_constant_inputs<'a>(
 }
 
 /// Cache key for a compiled kernel (§11.1). Keyed by the concrete node and its
-/// **resolved** (concrete) input shapes: attributes are fixed per node, so this
-/// is correct, and the shape component makes it *shape-keyed* — a re-run with
-/// the same resolved shapes hits, a different shape (e.g. a new batch/seq)
-/// misses and re-compiles. This preserves Chew's guarantee: a kernel is never
-/// reused for a shape it was not compiled for.
+/// **resolved** (concrete) input shapes and cold shape facts. Attributes are
+/// fixed per node; changed shapes or binding-derived facts compile a distinct
+/// kernel, including capacity pinning that leaves concrete shapes unchanged.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(super) struct KernelKey {
     pub(super) node: u32,
     pub(super) shapes: Vec<Vec<usize>>,
+    pub(super) shape_facts: KernelShapeFacts,
 }
 
 impl KernelKey {
@@ -99,10 +98,10 @@ impl KernelKey {
 /// the authoritative structural list in
 /// [`kernel_input_uses_physical_capacity`](super::geometry::kernel_input_uses_physical_capacity):
 /// GQA past_key/value = inputs 3,4; default-domain `Attention` = inputs 4,5;
-/// `pkg.nxrt::IndexShare` = inputs 3,4. `present_key`/`present_value` are the
+/// `pkg.nxrt._private::IndexShare` = inputs 3,4. `present_key`/`present_value` are the
 /// GQA-family `outputs[1]`/`outputs[2]`.
 ///
-/// `pkg.nxrt`/`com.microsoft`::`CompressedSparseAttention` (CSA) has no separate
+/// `pkg.nxrt._private`/`com.microsoft`::`CompressedSparseAttention` (CSA) has no separate
 /// past-KV inputs (its cache is stateful device state); instead its
 /// total-sequence-length-derived cache records land on `outputs[1]`/`outputs[3]`
 /// (`[query[0], records, width]`, penultimate = `records`). Dynamic ratio-4 CSA
@@ -142,14 +141,14 @@ fn attention_kv_cache_slots(node: &Node) -> Option<KvCacheSlots> {
             last_axis_outputs: &[],
         });
     }
-    if node.domain == "pkg.nxrt" && node.op_type == "IndexShare" {
+    if node.domain == "pkg.nxrt._private" && node.op_type == "IndexShare" {
         return Some(KvCacheSlots {
             past_inputs: &[3, 4],
             present_outputs: &[1, 2],
             last_axis_outputs: &[],
         });
     }
-    if (node.domain == "pkg.nxrt" || node.domain == "com.microsoft")
+    if (node.domain == "pkg.nxrt._private" || node.domain == "com.microsoft")
         && node.op_type == "CompressedSparseAttention"
     {
         // CSA cache records (derived from total_sequence_length) live on the
@@ -759,6 +758,67 @@ pub(super) fn node_capture_seq_independent(
             .all(|input| input.is_none_or(edge_free_of_growing))
 }
 
+/// Positive evolution evidence is deliberately separate from the capture
+/// denylist, which also contains opaque/untraceable (merely unknown) symbols.
+#[derive(Debug)]
+pub(super) struct ShapeEvolutionClassifier {
+    growing: HashSet<SymbolId>,
+    unproven: HashSet<SymbolId>,
+}
+
+impl ShapeEvolutionClassifier {
+    pub(super) fn new(graph: &Graph, pinned: &HashSet<SymbolId>) -> Self {
+        let mut growing = collect_structural_growing_symbols_excluding(graph, pinned);
+        close_disqualifying_set(graph, &mut growing);
+        growing.retain(|symbol| !pinned.contains(symbol));
+        let mut unproven = compute_not_pinned_symbols_excluding(graph, pinned);
+        // Capture's legacy no-floor fallback remains unchanged, but absence of
+        // provenance cannot establish positive shape stability for resource policy.
+        if graph.inference_symbol_floor.is_none() {
+            unproven.extend(
+                graph
+                    .symbol_constraints
+                    .keys()
+                    .filter(|symbol| !pinned.contains(symbol))
+                    .copied(),
+            );
+        }
+        Self { growing, unproven }
+    }
+
+    pub(super) fn facts(
+        &self,
+        graph: &Graph,
+        node: &Node,
+        capture_disqualifying: &HashSet<SymbolId>,
+    ) -> KernelShapeFacts {
+        let mut unknown = node.outputs.iter().all(Option::is_none);
+        let mut growing = false;
+        for value in node.inputs.iter().chain(&node.outputs).flatten() {
+            match graph
+                .try_value(*value)
+                .and_then(|value| value.tensor_shape())
+            {
+                Some(shape) => {
+                    growing |= shape_references_any(shape, &self.growing);
+                    unknown |= shape_references_any(shape, &self.unproven);
+                }
+                None => unknown = true,
+            }
+        }
+        KernelShapeFacts {
+            evolution: if growing {
+                ShapeEvolution::Growing
+            } else if unknown {
+                ShapeEvolution::Unknown
+            } else {
+                ShapeEvolution::Stable
+            },
+            capture_eligible: node_capture_seq_independent(graph, node, capture_disqualifying),
+        }
+    }
+}
+
 /// Observable kernel-cache statistics (§11.1) — enough to prove reuse in tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CacheStats {
@@ -774,10 +834,96 @@ pub struct CacheStats {
     pub evictions: u64,
 }
 
+/// Pure metadata preparation belongs to exactly one compiled kernel. No raw
+/// pointer, execution plan, workspace owner or admission proof enters this memo.
+/// Boxing the cold memo keeps entries without workspace metadata compact.
+pub(super) struct CachedKernel {
+    pub(super) kernel: Box<dyn Kernel>,
+    workspace: std::cell::RefCell<Option<Box<KernelWorkspaceMemo>>>,
+}
+
+struct KernelWorkspaceInput {
+    dtype: DataType,
+    shape: Vec<usize>,
+    present: bool,
+}
+struct KernelWorkspaceMemo {
+    context: onnx_runtime_ep_api::WorkspaceContextKey,
+    inputs: Vec<KernelWorkspaceInput>,
+    outputs: Vec<OutputMetadata<'static>>,
+    preparation: onnx_runtime_ep_api::WorkspacePreparation,
+}
+impl KernelWorkspaceMemo {
+    fn matches(
+        &self,
+        context: onnx_runtime_ep_api::WorkspaceContextKey,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> bool {
+        self.context == context
+            && self.inputs.len() == inputs.len()
+            && self.inputs.iter().zip(inputs).all(|(saved, input)| {
+                saved.dtype == input.dtype
+                    && saved.present == input.present
+                    && saved.shape == input.shape
+            })
+            && self.outputs == outputs
+    }
+}
+impl CachedKernel {
+    pub(super) fn new(kernel: Box<dyn Kernel>) -> Self {
+        Self {
+            kernel,
+            workspace: std::cell::RefCell::new(None),
+        }
+    }
+
+    pub(super) fn workspace_preparation(
+        &self,
+        context: onnx_runtime_ep_api::WorkspaceContextKey,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> onnx_runtime_ep_api::Result<onnx_runtime_ep_api::WorkspacePreparation> {
+        if let Some(memo) = self.workspace.borrow().as_ref()
+            && memo.matches(context, inputs, outputs)
+        {
+            return Ok(memo.preparation);
+        }
+        // Never hold a RefCell loan across provider code, and never publish a
+        // failed query. A previous successful metadata key may remain usable.
+        let preparation = self.kernel.workspace_requirement(inputs, outputs)?;
+        *self.workspace.borrow_mut() = Some(Box::new(KernelWorkspaceMemo {
+            context,
+            inputs: inputs
+                .iter()
+                .map(|input| KernelWorkspaceInput {
+                    dtype: input.dtype,
+                    shape: input.shape.to_vec(),
+                    present: input.present,
+                })
+                .collect(),
+            outputs: outputs
+                .iter()
+                .cloned()
+                .map(OutputMetadata::into_owned)
+                .collect(),
+            preparation,
+        }));
+        Ok(preparation)
+    }
+
+    fn kernel_mut(&mut self) -> &mut dyn Kernel {
+        // Explicit reconfiguration is not the same fixed compiled kernel
+        // contract. Mutable controls invalidate metadata before calling the EP.
+        *self.workspace.get_mut() = None;
+        self.kernel.as_mut()
+    }
+}
+
 /// Shape-keyed kernel cache (§11.1). Owns the compiled kernels for the session.
 #[derive(Default)]
 pub(crate) struct KernelCache {
-    pub(super) entries: HashMap<KernelKey, Box<dyn onnx_runtime_ep_api::Kernel>>,
+    pub(super) entries: HashMap<KernelKey, CachedKernel>,
     /// Node-scoped load-time owners survive specialization/variant eviction and
     /// are offered to the first kernel, including fully static materialization.
     pub(super) static_constant_states: HashMap<NodeId, StaticConstantState>,
@@ -845,7 +991,10 @@ impl KernelCache {
         let mut failure = None;
         for (key, kernel) in &mut self.entries {
             if visited.insert(key.node) {
-                match kernel.arm_block_quantized_moe_traffic(request_id) {
+                match kernel
+                    .kernel_mut()
+                    .arm_block_quantized_moe_traffic(request_id)
+                {
                     Ok(true) => armed += 1,
                     Ok(false) => {}
                     Err(error) => {
@@ -859,7 +1008,7 @@ impl KernelCache {
             let mut rollback = HashSet::new();
             for (key, kernel) in &mut self.entries {
                 if rollback.insert(key.node) {
-                    let _ = kernel.disarm_block_quantized_moe_traffic();
+                    let _ = kernel.kernel_mut().disarm_block_quantized_moe_traffic();
                 }
             }
             return Err(error.into());
@@ -872,7 +1021,7 @@ impl KernelCache {
         let mut visited = HashSet::new();
         for (key, kernel) in &mut self.entries {
             if visited.insert(key.node) {
-                kernel.reset_block_quantized_moe_traffic()?;
+                kernel.kernel_mut().reset_block_quantized_moe_traffic()?;
             }
         }
         Ok(())
@@ -890,7 +1039,7 @@ impl KernelCache {
             if !visited.insert(key.node) {
                 continue;
             }
-            let Some(snapshot) = kernel.snapshot_block_quantized_moe_traffic()? else {
+            let Some(snapshot) = kernel.kernel.snapshot_block_quantized_moe_traffic()? else {
                 continue;
             };
             observed = true;
@@ -943,7 +1092,7 @@ impl KernelCache {
             if !visited.insert(key.node) {
                 continue;
             }
-            let Some(kernel) = kernel
+            let Some(kernel) = kernel.kernel
                 .as_any()
                 .downcast_ref::<onnx_runtime_ep_cuda::kernels::block_quantized_moe::BlockQuantizedMoEKernel>()
             else {
@@ -964,7 +1113,7 @@ impl KernelCache {
         let mut visited = HashSet::new();
         for (key, kernel) in &mut self.entries {
             if visited.insert(key.node) {
-                kernel.disarm_block_quantized_moe_traffic()?;
+                kernel.kernel_mut().disarm_block_quantized_moe_traffic()?;
             }
         }
         self.block_quantized_moe_traffic_request = None;
@@ -1044,7 +1193,7 @@ impl KernelCache {
 
     /// Zero-allocation kernel lookup via a pre-stored binding key.
     ///
-    /// Returns `Some` when `binding` shapes match the current `input_shapes`
+    /// Returns `Some` when `binding` shapes and facts match the current inputs
     /// and the compiled kernel is present in the cache. Returns `None` on any
     /// mismatch — caller falls through to `get_or_create`. This is the
     /// **pre-bound fast path**: during steady-state decode (fixed shapes), it
@@ -1055,11 +1204,12 @@ impl KernelCache {
         &'a self,
         binding: &KernelKey,
         input_shapes: &[Vec<usize>],
-    ) -> Option<&'a dyn onnx_runtime_ep_api::Kernel> {
-        if !binding.matches_shapes(input_shapes) {
+        shape_facts: KernelShapeFacts,
+    ) -> Option<&'a CachedKernel> {
+        if binding.shape_facts != shape_facts || !binding.matches_shapes(input_shapes) {
             return None;
         }
-        let kernel = self.entries.get(binding)?.as_ref();
+        let kernel = self.entries.get(binding)?;
         self.touch(binding);
         self.prebind_hits.fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
@@ -1068,11 +1218,18 @@ impl KernelCache {
     }
 
     #[inline]
-    pub(super) fn has_prebound(&self, binding: &KernelKey, input_shapes: &[Vec<usize>]) -> bool {
-        binding.matches_shapes(input_shapes) && self.entries.contains_key(binding)
+    pub(super) fn has_prebound(
+        &self,
+        binding: &KernelKey,
+        input_shapes: &[Vec<usize>],
+        shape_facts: KernelShapeFacts,
+    ) -> bool {
+        binding.shape_facts == shape_facts
+            && binding.matches_shapes(input_shapes)
+            && self.entries.contains_key(binding)
     }
 
-    /// Return the cached kernel for `(node, resolved_input_shapes)`, verifying
+    /// Return the cached kernel for `(node, resolved_input_shapes, shape_facts)`, verifying
     /// EP support and compiling+inserting it on a miss. Also returns the
     /// [`KernelKey`] so the caller can store it as a pre-binding for future
     /// zero-alloc lookups.
@@ -1089,16 +1246,17 @@ impl KernelCache {
         constant_inputs: &[bool],
         constant_values: &[Option<KernelConstantInput<'_>>],
         opset: u64,
-        capture_seq_independent: bool,
+        shape_facts: KernelShapeFacts,
         artifact_config: ExecutorArtifactConfig,
         artifact_readiness: &mut ProviderArtifactReadiness,
         ep: &dyn ExecutionProvider,
         graph_tokens: [Option<DeviceGraphToken>; DeviceGraphSlot::COUNT],
         graph_request: Option<onnx_runtime_ep_api::GraphKernelRequest<'_>>,
-    ) -> Result<(&dyn onnx_runtime_ep_api::Kernel, KernelKey)> {
+    ) -> Result<(&CachedKernel, KernelKey)> {
         let key = KernelKey {
             node: node_id.0,
             shapes: input_shapes.to_vec(),
+            shape_facts,
         };
         if self.entries.contains_key(&key) {
             self.hits += 1;
@@ -1115,7 +1273,7 @@ impl KernelCache {
                 .entries
                 .iter()
                 .filter(|(existing, _)| existing.node == key.node)
-                .find_map(|(_, kernel)| kernel.shareable_constant_state());
+                .find_map(|(_, kernel)| kernel.kernel.shareable_constant_state());
             // Verify the EP claims this op at these concrete shapes/layouts
             // before compiling — same gate the static path used at build.
             let shape_dims: Vec<Shape> = input_shapes
@@ -1148,6 +1306,16 @@ impl KernelCache {
             };
             let mut kernel = match compiled {
                 Ok(kernel) => kernel,
+                Err(source @ EpError::NoEpForOp { .. }) if ep.device_type() == DeviceType::Cuda => {
+                    // This is reached only after admission, so a missing CUDA
+                    // handler is a creation failure, not a capability decline.
+                    return Err(SessionError::CudaKernelCreationFailed {
+                        node: build::format_node_identity("graph", node_id, node),
+                        op_type: node.op_type.clone(),
+                        opset: opset.into(),
+                        source,
+                    });
+                }
                 Err(EpError::NoEpForOp {
                     domain,
                     op_type,
@@ -1167,6 +1335,7 @@ impl KernelCache {
                 }
                 Err(error) => return Err(error.into()),
             };
+            kernel.configure_shape_facts(shape_facts);
             kernel.set_constant_inputs(constant_inputs);
             let mut adopted = if let Some(state) = shared_constant_state {
                 kernel.adopt_shareable_constant_state(state)?
@@ -1185,8 +1354,7 @@ impl KernelCache {
             if !adopted && let Some(request_id) = self.block_quantized_moe_traffic_request {
                 kernel.arm_block_quantized_moe_traffic(request_id)?;
             }
-            kernel.set_capture_seq_independent(capture_seq_independent);
-            self.entries.insert(key.clone(), kernel);
+            self.entries.insert(key.clone(), CachedKernel::new(kernel));
             self.last_used
                 .insert(key.clone(), AtomicU64::new(self.tick()));
             self.misses = next_misses;
@@ -1200,7 +1368,11 @@ impl KernelCache {
         self.touch(&key);
         #[cfg(test)]
         PREBIND_FALLBACK_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let kernel_ref = self.entries.get(&key).expect("just inserted").as_ref();
+        let kernel_ref = self.entries.get(&key).expect("just inserted");
         Ok((kernel_ref, key))
     }
 }
+
+#[cfg(test)]
+#[path = "workspace_metadata_tests.rs"]
+mod workspace_metadata_tests;

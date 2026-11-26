@@ -409,9 +409,10 @@ impl Engine {
         &self,
         outputs: &PipelineOutputs,
         output_name: &str,
+        format: crate::pipeline::AudioOutputFormat,
     ) -> anyhow::Result<crate::pipeline::EncodedAudio> {
         self.workflow_runtime()
-            .encode_audio_output(outputs, output_name)
+            .encode_audio_output(outputs, output_name, format)
     }
 
     pub fn models(&self) -> anyhow::Result<&PipelineModels> {

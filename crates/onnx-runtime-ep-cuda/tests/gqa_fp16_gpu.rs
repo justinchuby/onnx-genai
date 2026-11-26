@@ -247,7 +247,7 @@ fn fp16_zero_append_shared_cache_matches_cpu_and_replays() {
         0.0,
     )
     .unwrap()
-    .with_backend(GroupQueryAttentionBackend::Phase2a);
+    .with_backend(GroupQueryAttentionBackend::NoFlashPrefill);
 
     let query: Vec<f16> = (0..QUERY_HEADS * HEAD_DIM)
         .map(|index| f16::from_f32(((index * 17 % 97) as f32 - 48.0) / 1024.0))
@@ -296,13 +296,20 @@ fn fp16_zero_append_shared_cache_matches_cpu_and_replays() {
     let scalar_shape: [usize; 0] = [];
     let rotary_shape = [ROTARY_ROWS, HEAD_DIM / 2];
     let output_shape = query_shape;
-    let query_strides = compute_contiguous_strides(&query_shape);
-    let current_strides = compute_contiguous_strides(&current_shape);
-    let cache_strides = compute_contiguous_strides(&cache_shape);
-    let seqlens_strides = compute_contiguous_strides(&seqlens_shape);
-    let scalar_strides = compute_contiguous_strides(&scalar_shape);
-    let rotary_strides = compute_contiguous_strides(&rotary_shape);
-    let output_strides = compute_contiguous_strides(&output_shape);
+    let query_strides = compute_contiguous_strides(&query_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let current_strides = compute_contiguous_strides(&current_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let cache_strides = compute_contiguous_strides(&cache_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let seqlens_strides = compute_contiguous_strides(&seqlens_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let scalar_strides = compute_contiguous_strides(&scalar_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let rotary_strides = compute_contiguous_strides(&rotary_shape)
+        .expect("fixture shape has representable contiguous strides");
+    let output_strides = compute_contiguous_strides(&output_shape)
+        .expect("fixture shape has representable contiguous strides");
     let device = ep.device_id();
 
     let mut workspace = None;

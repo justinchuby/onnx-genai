@@ -11,7 +11,8 @@ use thiserror::Error;
 
 const MANIFEST_FILE: &str = "manifest.json";
 const COMPONENT_FILE: &str = "component.json";
-const MAX_JSON_BYTES: u64 = 4 * 1024 * 1024;
+/// Maximum bytes in one package-index or executor JSON document.
+pub const MAX_JSON_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Errors produced while opening, selecting, resolving, or validating a package.
 #[derive(Debug, Error)]
@@ -90,6 +91,110 @@ pub struct Manifest {
     pub unknown_fields: Map<String, Value>,
 }
 
+impl Manifest {
+    /// Admit a package index without resolving or downloading its payloads.
+    pub fn validate_index(&self) -> Result<(), PackageError> {
+        validate_version(&self.schema_version, "package")?;
+        if self.components.is_empty() {
+            return Err(PackageError::Invalid(
+                "manifest components must not be empty".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve a manifest-relative reference for a portable download index,
+    /// without filesystem I/O. Local loading still canonicalizes every selected
+    /// artifact to reject symlink escapes before execution.
+    pub fn portable_reference(&self, reference: &str) -> Result<PathBuf, PackageError> {
+        let path = if let Some(asset) = reference.strip_prefix("sha256:") {
+            self.shared_asset_path(Path::new(""), asset, true)?
+        } else {
+            validate_portable_reference(Path::new(reference))?;
+            PathBuf::from(reference)
+        };
+        if path.to_string_lossy().contains(['\\', ':'])
+            || path.to_string_lossy().chars().any(char::is_control)
+        {
+            return Err(PackageError::Invalid(format!(
+                "download reference is not portable across platforms: {reference}"
+            )));
+        }
+        let mut result = PathBuf::new();
+        for part in path.components() {
+            match part {
+                PathComponent::Normal(value) => result.push(value),
+                PathComponent::CurDir => {}
+                PathComponent::ParentDir if result.pop() => {}
+                _ => {
+                    return Err(PackageError::Invalid(format!(
+                        "download reference escapes package root: {reference}"
+                    )));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn shared_asset_path(
+        &self,
+        package_root: &Path,
+        reference: &str,
+        confined: bool,
+    ) -> Result<PathBuf, PackageError> {
+        let (digest, tail) = reference
+            .split_once('/')
+            .map_or((reference, None), |(digest, tail)| (digest, Some(tail)));
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(PackageError::Invalid(format!(
+                "invalid sha256 shared-asset reference: sha256:{reference}"
+            )));
+        }
+        let override_path = self
+            .shared_assets
+            .get(&format!("sha256:{digest}"))
+            .or_else(|| self.shared_assets.get(digest));
+        let asset_root = override_path.map_or_else(
+            || {
+                Ok(package_root
+                    .join("shared_assets")
+                    .join(format!("sha256-{digest}")))
+            },
+            |reference| {
+                let path = Path::new(reference);
+                if confined {
+                    validate_portable_reference(path)?;
+                }
+                Ok(if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    package_root.join(path)
+                })
+            },
+        )?;
+        Ok(tail.map_or(asset_root.clone(), |tail| asset_root.join(tail)))
+    }
+
+    /// The canonical executable model component, independent of storage layout.
+    pub fn model_component_name(&self) -> Result<&str, PackageError> {
+        self.validate_index()?;
+        if self.components.contains_key("model") {
+            Ok("model")
+        } else if self.components.len() == 1 {
+            Ok(self.components.first().expect("nonempty index validated").0)
+        } else {
+            Err(PackageError::Invalid(
+                "model package must contain a 'model' component when multiple components exist"
+                    .into(),
+            ))
+        }
+    }
+}
+
 /// An inline component or a path to a component JSON file/directory.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
@@ -107,6 +212,51 @@ pub struct Component {
     pub additional_metadata: Map<String, Value>,
     #[serde(flatten)]
     pub unknown_fields: Map<String, Value>,
+}
+
+impl Component {
+    /// Validate index facts without requiring unselected artifacts to exist.
+    pub fn validate_index(&self, expected_name: &str) -> Result<(), PackageError> {
+        if self.component_name != expected_name {
+            return Err(PackageError::Invalid(format!(
+                "component map key '{expected_name}' does not match component_name '{}'",
+                self.component_name
+            )));
+        }
+        if self.variants.is_empty() {
+            return Err(PackageError::Invalid(format!(
+                "component '{expected_name}' has no variants"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Select only from authored variant names and attributes. This operation
+    /// needs no filesystem and is shared by download planning and local loading.
+    pub fn select_variant(
+        &self,
+        request: &SelectionRequest,
+    ) -> Result<(&str, &Variant), PackageError> {
+        self.validate_index(&self.component_name)?;
+        let selected = if let Some(requested_name) = &request.variant {
+            self.variants.get_key_value(requested_name).ok_or_else(|| {
+                PackageError::UnknownVariant {
+                    component: self.component_name.clone(),
+                    variant: requested_name.clone(),
+                }
+            })?
+        } else {
+            self.variants
+                .iter()
+                .find(|(_, variant)| variant_matches(variant, request))
+                .ok_or_else(|| PackageError::NoMatchingVariant {
+                    component: self.component_name.clone(),
+                    request: describe_request(request),
+                })?
+        };
+
+        Ok((selected.0.as_str(), selected.1))
+    }
 }
 
 /// A named component variant.
@@ -181,6 +331,129 @@ pub struct SelectedVariant {
     pub tokenizer_directory: Option<PathBuf>,
 }
 
+/// Selected index facts whose executable payloads have not yet been inspected.
+/// The borrow binds every later path resolution to its admitted package owner.
+#[derive(Debug)]
+pub struct SelectedVariantIndex<'a> {
+    package: &'a ModelPackage,
+    component_name: String,
+    variant_name: String,
+    variant_directory: PathBuf,
+    executor_info: ExecutorInfo,
+}
+
+impl SelectedVariantIndex<'_> {
+    pub fn variant_directory(&self) -> &Path {
+        &self.variant_directory
+    }
+    pub fn inference_metadata_path(&self) -> Result<Option<PathBuf>, PackageError> {
+        self.package.resolve_optional_file(
+            &self.variant_directory,
+            self.executor_info.inference_metadata.as_deref(),
+            "inference_metadata",
+        )
+    }
+    pub fn genai_config_path(&self) -> Result<Option<PathBuf>, PackageError> {
+        self.package.resolve_optional_file(
+            &self.variant_directory,
+            self.executor_info.genai_config.as_deref(),
+            "genai_config",
+        )
+    }
+
+    /// Resolve one declared workflow payload beneath the selected package.
+    pub fn resolve_artifact(&self, reference: &str) -> Result<PathBuf, PackageError> {
+        let path = self
+            .package
+            .resolve_path(&self.variant_directory, reference, true)?;
+        ensure_file(&path, "workflow artifact")?;
+        Ok(path)
+    }
+
+    /// Discover one implicit, adjacent metadata file without following an
+    /// escaping or broken symlink as though the sidecar were absent.
+    pub fn optional_adjacent_file(&self, name: &str) -> Result<Option<PathBuf>, PackageError> {
+        let mut parts = Path::new(name).components();
+        if !matches!(parts.next(), Some(PathComponent::Normal(_)))
+            || parts.next().is_some()
+            || name.contains(['\\', ':'])
+            || name.chars().any(char::is_control)
+        {
+            return Err(PackageError::Invalid(format!(
+                "optional package artifact {name:?} must name one adjacent file"
+            )));
+        }
+        let path = self.variant_directory.join(name);
+        match path.symlink_metadata() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(PackageError::Io { path, source }),
+            Ok(_) => self.resolve_artifact(name).map(Some),
+        }
+    }
+
+    fn tokenizer_directory(&self) -> Result<Option<PathBuf>, PackageError> {
+        let directory = self
+            .executor_info
+            .tokenizer
+            .as_deref()
+            .map(|reference| {
+                self.package
+                    .resolve_path(&self.variant_directory, reference, true)
+            })
+            .transpose()?;
+        if let Some(path) = &directory
+            && !path.is_dir()
+        {
+            return Err(PackageError::Invalid(format!(
+                "tokenizer reference is not a directory: {}",
+                path.display()
+            )));
+        }
+        Ok(directory)
+    }
+
+    /// Resolve a tokenizer file with the package's canonical containment guard.
+    pub fn tokenizer_artifact(&self, reference: &str) -> Result<PathBuf, PackageError> {
+        let directory = self
+            .tokenizer_directory()?
+            .unwrap_or_else(|| self.variant_directory.clone());
+        let path = self.package.resolve_path(&directory, reference, true)?;
+        ensure_file(&path, "tokenizer artifact")?;
+        Ok(path)
+    }
+
+    /// Validate and resolve all selected executable payloads after admission.
+    pub fn resolve(&self) -> Result<SelectedVariant, PackageError> {
+        let model_path = self.package.resolve_path(
+            &self.variant_directory,
+            &self.executor_info.model_file,
+            true,
+        )?;
+        ensure_file(&model_path, "model_file")?;
+        let genai_config_path = self.genai_config_path()?;
+        let inference_metadata_path = self.inference_metadata_path()?;
+        let tokenizer_directory = self.tokenizer_directory()?;
+        for (key, reference) in &self.executor_info.session_options {
+            if matches!(
+                key.as_str(),
+                "session.model_external_initializers_file_folder_path" | "ep.context_file_path"
+            ) {
+                self.package
+                    .resolve_path(&self.variant_directory, reference, true)?;
+            }
+        }
+        Ok(SelectedVariant {
+            component_name: self.component_name.clone(),
+            variant_name: self.variant_name.clone(),
+            variant_directory: self.variant_directory.clone(),
+            model_path,
+            genai_config_path,
+            inference_metadata_path,
+            tokenizer_directory,
+        })
+    }
+}
+
 /// Open, parsed ORT model-package directory.
 #[derive(Debug, Clone)]
 pub struct ModelPackage {
@@ -215,12 +488,7 @@ impl ModelPackage {
         }
         let manifest_path = root.join(MANIFEST_FILE);
         let manifest: Manifest = read_json(&manifest_path)?;
-        validate_version(&manifest.schema_version, "package")?;
-        if manifest.components.is_empty() {
-            return Err(PackageError::Invalid(
-                "manifest components must not be empty".to_string(),
-            ));
-        }
+        manifest.validate_index()?;
         let root = root.canonicalize().map_err(|source| PackageError::Io {
             path: root.to_path_buf(),
             source,
@@ -244,46 +512,27 @@ impl ModelPackage {
         component_name: &str,
         request: &SelectionRequest,
     ) -> Result<SelectedVariant, PackageError> {
-        let component = self.load_component(component_name)?;
-        let (variant_name, variant) = if let Some(requested_name) = &request.variant {
-            component
-                .variants
-                .get_key_value(requested_name)
-                .ok_or_else(|| PackageError::UnknownVariant {
-                    component: component_name.to_string(),
-                    variant: requested_name.clone(),
-                })?
-        } else {
-            component
-                .variants
-                .iter()
-                .find(|(_, variant)| variant_matches(variant, request))
-                .ok_or_else(|| PackageError::NoMatchingVariant {
-                    component: component_name.to_string(),
-                    request: describe_request(request),
-                })?
-        };
+        self.select_index(component_name, request)?.resolve()
+    }
 
-        self.resolve_selected(component_name, variant_name, variant)
+    /// Select only directory/index facts, leaving executable payloads untouched.
+    pub fn select_index(
+        &self,
+        component_name: &str,
+        request: &SelectionRequest,
+    ) -> Result<SelectedVariantIndex<'_>, PackageError> {
+        let component = self.load_component(component_name)?;
+        let (variant_name, variant) = component.select_variant(request)?;
+        self.describe_selected(component_name, variant_name, variant)
     }
 
     /// Validate every component, variant, executor payload, and referenced file.
     pub fn validate(&self) -> Result<(), PackageError> {
         for component_name in self.manifest.components.keys() {
             let component = self.load_component(component_name)?;
-            if component.component_name != *component_name {
-                return Err(PackageError::Invalid(format!(
-                    "component map key '{component_name}' does not match component_name '{}'",
-                    component.component_name
-                )));
-            }
-            if component.variants.is_empty() {
-                return Err(PackageError::Invalid(format!(
-                    "component '{component_name}' has no variants"
-                )));
-            }
             for (variant_name, variant) in &component.variants {
-                self.resolve_selected(component_name, variant_name, variant)?;
+                self.describe_selected(component_name, variant_name, variant)?
+                    .resolve()?;
             }
         }
         Ok(())
@@ -295,7 +544,7 @@ impl ModelPackage {
             .components
             .get(name)
             .ok_or_else(|| PackageError::UnknownComponent(name.to_string()))?;
-        match reference {
+        let component: Component = match reference {
             ComponentReference::Inline(component) => Ok(component.as_ref().clone()),
             ComponentReference::External(reference) => {
                 let mut path = self.resolve_path(&self.root, reference, true)?;
@@ -308,15 +557,17 @@ impl ModelPackage {
                 }
                 read_json(&path)
             }
-        }
+        }?;
+        component.validate_index(name)?;
+        Ok(component)
     }
 
-    fn resolve_selected(
+    fn describe_selected(
         &self,
         component_name: &str,
         variant_name: &str,
         variant: &Variant,
-    ) -> Result<SelectedVariant, PackageError> {
+    ) -> Result<SelectedVariantIndex<'_>, PackageError> {
         let variant_directory = self.resolve_path(&self.root, &variant.variant_directory, true)?;
         if !variant_directory.is_dir() {
             return Err(PackageError::Invalid(format!(
@@ -328,47 +579,12 @@ impl ModelPackage {
         if let Some(version) = &executor_info.schema_version {
             validate_version(version, "executor")?;
         }
-        let model_path = self.resolve_path(&variant_directory, &executor_info.model_file, true)?;
-        ensure_file(&model_path, "model_file")?;
-        let genai_config_path = self.resolve_optional_file(
-            &variant_directory,
-            executor_info.genai_config.as_deref(),
-            "genai_config",
-        )?;
-        let inference_metadata_path = self.resolve_optional_file(
-            &variant_directory,
-            executor_info.inference_metadata.as_deref(),
-            "inference_metadata",
-        )?;
-        let tokenizer_directory = executor_info
-            .tokenizer
-            .as_deref()
-            .map(|reference| self.resolve_path(&variant_directory, reference, true))
-            .transpose()?;
-        if let Some(path) = &tokenizer_directory
-            && !path.is_dir()
-        {
-            return Err(PackageError::Invalid(format!(
-                "tokenizer reference is not a directory: {}",
-                path.display()
-            )));
-        }
-        for (key, reference) in &executor_info.session_options {
-            if matches!(
-                key.as_str(),
-                "session.model_external_initializers_file_folder_path" | "ep.context_file_path"
-            ) {
-                self.resolve_path(&variant_directory, reference, true)?;
-            }
-        }
-        Ok(SelectedVariant {
-            component_name: component_name.to_string(),
-            variant_name: variant_name.to_string(),
+        Ok(SelectedVariantIndex {
+            package: self,
+            component_name: component_name.to_owned(),
+            variant_name: variant_name.to_owned(),
             variant_directory,
-            model_path,
-            genai_config_path,
-            inference_metadata_path,
-            tokenizer_directory,
+            executor_info,
         })
     }
 
@@ -477,43 +693,9 @@ impl ModelPackage {
     }
 
     fn resolve_shared_asset(&self, reference: &str) -> Result<PathBuf, PackageError> {
-        let (digest, tail) = reference
-            .split_once('/')
-            .map_or((reference, None), |(digest, tail)| (digest, Some(tail)));
-        if digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(PackageError::Invalid(format!(
-                "invalid sha256 shared-asset reference: sha256:{reference}"
-            )));
-        }
-        let override_path = self
-            .manifest
-            .shared_assets
-            .get(&format!("sha256:{digest}"))
-            .or_else(|| self.manifest.shared_assets.get(digest));
-        let root = override_path.map_or_else(
-            || {
-                Ok(self
-                    .root
-                    .join("shared_assets")
-                    .join(format!("sha256-{digest}")))
-            },
-            |reference| {
-                let path = Path::new(reference);
-                if self.confinement_enforced() {
-                    validate_portable_reference(path)?;
-                }
-                Ok(if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    self.root.join(path)
-                })
-            },
-        )?;
-        let path = tail.map_or(root.clone(), |tail| root.join(tail));
+        let path =
+            self.manifest
+                .shared_asset_path(&self.root, reference, self.confinement_enforced())?;
         self.canonicalize_confined(&path)
     }
 }

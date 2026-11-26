@@ -1,6 +1,6 @@
-//! Native Jina/TEI reranking over declared token-pair scoring workflows.
+//! Native Jina/TEI reranking over declared text/image-pair workflows.
 use super::*;
-use onnx_genai_engine::ranking::PreparedTokenPair;
+use onnx_genai_engine::ranking::{PreparedRerankingPair, RerankingInput};
 use serde_json::{Value, json};
 
 #[derive(Deserialize)]
@@ -18,9 +18,16 @@ pub(crate) struct RerankRequest {
     #[serde(default)]
     return_text: bool,
 }
-fn item_text(item: Value, field: &str) -> Result<String, ApiError> {
+struct Item {
+    text: String,
+    images: Vec<String>,
+}
+fn item(item: Value, field: &str) -> Result<Item, ApiError> {
     if let Value::String(text) = item {
-        return Ok(text);
+        return Ok(Item {
+            text,
+            images: Vec::new(),
+        });
     }
     let Value::Object(mut object) = item else {
         return Err(ApiError::invalid_request(format!(
@@ -46,21 +53,21 @@ fn item_text(item: Value, field: &str) -> Result<String, ApiError> {
             )));
         }
     };
-    if let Some(image) = object.remove("image")
-        && !image.is_null()
-        && image != json!([])
-    {
-        return Err(ApiError::invalid_request(format!(
-            "{field}.image requires a multimodal reranking contract; this package's reranking v1 profile accepts text pairs"
-        )));
-    }
+    let images = match object.remove("image") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(image)) => vec![image],
+        Some(Value::Array(images)) => images.into_iter().enumerate().map(|(index,image)| {
+            image.as_str().map(str::to_owned).ok_or_else(|| ApiError::invalid_request(format!("{field}.image[{index}] must be an HTTP(S) URL, image data URI or raw base64 string")))
+        }).collect::<Result<Vec<_>,_>>()?,
+        Some(_) => return Err(ApiError::invalid_request(format!("{field}.image must be an image string or ordered array of image strings"))),
+    };
     if !object.is_empty() {
         return Err(ApiError::invalid_request(format!(
-            "{field} contains unsupported fields {:?}; use text and omit media for a text-pair profile",
+            "{field} contains unsupported fields {:?}; use text and image (video/fps/max_frames are not reranking inputs)",
             object.keys().collect::<Vec<_>>()
         )));
     }
-    Ok(text)
+    Ok(Item { text, images })
 }
 
 pub(crate) async fn rerank(
@@ -81,14 +88,50 @@ pub(crate) async fn rerank(
             state.config.max_rerank_documents
         )));
     }
-    let query = item_text(request.query, "query")?;
+    let query = item(request.query, "query")?;
     let documents = documents
         .into_iter()
         .enumerate()
-        .map(|(index, value)| item_text(value, &format!("documents[{index}]")))
+        .map(|(index, value)| item(value, &format!("documents[{index}]")))
         .collect::<Result<Vec<_>, _>>()?;
     let handle = resolve_model(&state.registry, &request.model).await?;
-    let contract=handle.engine.reranking.as_deref().ok_or_else(||ApiError::invalid_request(format!("model '{}' declares no reranking v1 profile; load a package with a token-pair workflow and profiles.<name>.outputs.score",handle.id)))?;
+    let contract=handle.engine.reranking.as_deref().ok_or_else(||ApiError::invalid_request(format!("model '{}' declares no reranking profile; load a package with a pair-scoring workflow and profiles.<name>.outputs.score",handle.id)))?;
+    // Admit all image positions before any remote fetch or engine submission.
+    for (index, document) in documents.iter().enumerate() {
+        contract
+            .admit_images(query.images.len(), document.images.len())
+            .map_err(|error| {
+                ApiError::invalid_request(format!(
+                    "documents[{index}] could not be prepared for reranking: {error}"
+                ))
+            })?;
+    }
+    let mut media = crate::media_input::MediaRequest::new(
+        state.config.max_rerank_media_bytes,
+        "--max-rerank-media-bytes",
+        onnx_genai_preprocess::audio::AudioDecodeLimits {
+            max_decoded_bytes: state.config.max_decoded_audio_bytes,
+        },
+    );
+    let query_images = media
+        .load(
+            onnx_genai_metadata::EncodedMediaKind::Image,
+            &query.images,
+            "query.image",
+        )
+        .await?;
+    let mut document_images = Vec::with_capacity(documents.len());
+    for (index, document) in documents.iter().enumerate() {
+        document_images.push(
+            media
+                .load(
+                    onnx_genai_metadata::EncodedMediaKind::Image,
+                    &document.images,
+                    &format!("documents[{index}].image"),
+                )
+                .await?,
+        );
+    }
     let limit = state
         .config
         .max_rerank_input_tokens
@@ -101,12 +144,24 @@ pub(crate) async fn rerank(
         .iter()
         .enumerate()
         .map(|(index, document)| {
-            PreparedTokenPair::prepare(&handle.tokenizer, contract, &query, document, limit)
-                .map_err(|err| {
-                    ApiError::invalid_request(format!(
-                        "documents[{index}] could not be prepared for reranking: {err:#}"
-                    ))
-                })
+            PreparedRerankingPair::prepare(
+                &handle.tokenizer,
+                contract,
+                RerankingInput {
+                    text: &query.text,
+                    images: &query_images,
+                },
+                RerankingInput {
+                    text: &document.text,
+                    images: &document_images[index],
+                },
+                limit,
+            )
+            .map_err(|err| {
+                ApiError::invalid_request(format!(
+                    "documents[{index}] could not be prepared for reranking: {err:#}"
+                ))
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut ranked = Vec::with_capacity(pairs.len());
@@ -136,7 +191,7 @@ pub(crate) async fn rerank(
             if tei {
                 let mut row = json!({"index":index,"score":score});
                 if request.return_text {
-                    row["text"] = json!(documents[index]);
+                    row["text"] = json!(documents[index].text);
                 }
                 row
             } else {

@@ -42,14 +42,16 @@ pub mod float8_cast;
 pub mod gemm;
 pub mod host_parallel;
 pub mod kernel;
+pub mod mean_variance_normalization;
 pub mod packed_routed;
 pub mod provider;
 pub mod registry;
+pub mod standard_activation;
 pub mod standard_math;
 pub mod tensor;
 pub mod weight;
 pub mod workspace;
-pub use workspace::WorkspaceLayout;
+pub use workspace::{WorkspaceContextKey, WorkspaceContextReader, WorkspaceLayout};
 
 pub use abi::{LegacyOrtEp, PluginCompiledKernel, PluginExecutionPlan, SubgraphClaim};
 pub use epcontext::{EpContext, EpContextRegistry, build_ep_context_registry};
@@ -58,9 +60,10 @@ pub use host_parallel::HostParallel;
 pub use kernel::{
     ARG_BYTES, ARG_DEVICE, ARG_FLOPS, ARG_KERNEL_VARIANT, ARG_KERNEL_VARIANT_REASON,
     BlockQuantizedMoeTraffic, CAT_KERNEL_WORKER, CaptureSupport, Cost, DeviceGraphResource,
-    HostKernelData, HostKernelOutput, HostStringInput, Kernel, KernelConstantInput, KernelInput,
-    KernelMatch, KernelSizedOutput, KernelSizedOutputMetadata, KernelSizedOutputPolicy,
-    KernelVariantSelection, OutputMetadata, TensorMetadata, ViewOutput, WorkspaceCaptureSpan,
+    HostKernelData, HostKernelInput, HostKernelOutput, HostStringInput, Kernel,
+    KernelConstantInput, KernelInput, KernelMatch, KernelShapeFacts, KernelSizedOutput,
+    KernelSizedOutputMetadata, KernelSizedOutputPolicy, KernelVariantSelection, OutputMetadata,
+    ShapeEvolution, TensorMetadata, ViewOutput, WorkspaceCaptureSpan,
     WorkspaceExecutionPreparation, WorkspaceLifetime, WorkspacePlanning, WorkspacePreparation,
     WorkspaceRequirement, WorkspaceView, kernel_variant_tracing_enabled, kernel_worker_span,
     record_kernel_metrics, record_kernel_variant_selection, record_kernel_variant_stage_selection,
@@ -75,9 +78,9 @@ pub use provider::{
     ExecutorArtifactProviderId, ExecutorArtifactReadinessEpoch, ExecutorArtifactReport,
     ExecutorArtifactRequirementState, ExecutorArtifactState, ExecutorArtifactUseGuard,
     ExecutorInstanceId, ExecutorKernelScope, ExecutorRouteResidencyConfig, Fence,
-    GraphKernelClaims, GraphKernelRequest, GraphKernelScope, HostToDeviceCopier,
-    RawDeviceAllocationSiteStats, SealedDeviceAllocation, StructuralCaptureDecline,
-    WorkspaceAllocation,
+    GraphKernelClaims, GraphKernelRequest, GraphKernelScope, HostPayloadFunding,
+    HostToDeviceCopier, RawDeviceAllocationSiteStats, SealedDeviceAllocation,
+    StructuralCaptureDecline, WorkspaceAllocation,
 };
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
 pub use tensor::{

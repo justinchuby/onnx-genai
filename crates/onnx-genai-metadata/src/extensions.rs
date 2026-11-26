@@ -226,12 +226,39 @@ pub const GRAMMAR_GUIDANCE_V1: ExtensionId = ExtensionId::new("onnx-genai.gramma
 pub const TELEMETRY_V1: ExtensionId = ExtensionId::new("onnx-genai.telemetry", "1");
 pub const PARAMETER_OVERLAY_V1: ExtensionId = ExtensionId::new("onnx-genai.parameter-overlay", "1");
 pub const IMAGE_PREPROCESS_V1: ExtensionId = ExtensionId::new("onnx-genai.image-preprocess", "1");
+pub const IMAGE_PREPROCESS_V2: ExtensionId = ExtensionId::new("onnx-genai.image-preprocess", "2");
+
+/// Whether program output names belong to the workflow or the invoked component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreprocessingOutputScope {
+    WorkflowValue,
+    ComponentPort,
+}
+impl PreprocessingOutputScope {
+    pub fn for_version(version: &str) -> Result<Self, String> {
+        match version {
+            "1" => Ok(Self::WorkflowValue),
+            "2" => Ok(Self::ComponentPort),
+            _ => Err(format!(
+                "preprocessing adapter version '{version}' has no supported output-name scope; select a registered adapter version"
+            )),
+        }
+    }
+    pub fn output_name<'a>(self, port: &'a str, workflow_value: &'a str) -> &'a str {
+        match self {
+            Self::WorkflowValue => workflow_value,
+            Self::ComponentPort => port,
+        }
+    }
+}
 pub const VIDEO_PREPROCESS_V1: ExtensionId = ExtensionId::new("onnx-genai.video-preprocess", "1");
 pub const AUDIO_PREPROCESS_V1: ExtensionId = ExtensionId::new("onnx-genai.audio-preprocess", "1");
+pub const AUDIO_PREPROCESS_V2: ExtensionId = ExtensionId::new("onnx-genai.audio-preprocess", "2");
 pub const TEXT_ASSEMBLY_V1: ExtensionId = ExtensionId::new("onnx-genai.text-assembly", "1");
 pub const ADAPTERS_V1: ExtensionId = ExtensionId::new("onnx-genai.adapters", "1");
 pub const ADAPTERS_JSON_V1: ExtensionId = ExtensionId::new("onnx-genai.adapters.json", "1");
 pub const ORT_LORA_ADAPTER_V1: ExtensionId = ExtensionId::new("onnxruntime.lora-adapter", "1");
+pub const ADAPTERS_GGUF_V1: ExtensionId = ExtensionId::new("onnx-genai.adapters.gguf", "1");
 pub const ADAPTERS_HF_PEFT_V1: ExtensionId = ExtensionId::new("onnx-genai.adapters.hf-peft", "1");
 pub const ADAPTERS_SAFETENSORS_V1: ExtensionId =
     ExtensionId::new("onnx-genai.adapters.safetensors", "1");
@@ -344,6 +371,16 @@ pub const BUILTIN_EXTENSIONS: &[ExtensionDescriptor] = &[
         status: SupportStatus::Implemented,
     },
     ExtensionDescriptor {
+        id: IMAGE_PREPROCESS_V2,
+        surface: ExtensionSurface::ComponentAdapter,
+        schema_floor: crate::version::MULTIMODAL_RERANKING_SCHEMA_VERSION,
+        declaration: "pipeline.workflow.components.<name>.implementation { kind: adapter }",
+        normative_reference: "§10.5, §15",
+        admission_consumer: "onnx_genai_engine::pipeline::workflow",
+        fallback: FallbackClass::SemanticRequired,
+        status: SupportStatus::Implemented,
+    },
+    ExtensionDescriptor {
         id: VIDEO_PREPROCESS_V1,
         surface: ExtensionSurface::ComponentAdapter,
         schema_floor: V1,
@@ -359,6 +396,16 @@ pub const BUILTIN_EXTENSIONS: &[ExtensionDescriptor] = &[
         schema_floor: V1,
         declaration: "pipeline.workflow.components.<name>.implementation { kind: adapter }",
         normative_reference: "§10, §15",
+        admission_consumer: "onnx_genai_engine::pipeline::workflow",
+        fallback: FallbackClass::SemanticRequired,
+        status: SupportStatus::Implemented,
+    },
+    ExtensionDescriptor {
+        id: AUDIO_PREPROCESS_V2,
+        surface: ExtensionSurface::ComponentAdapter,
+        schema_floor: V1,
+        declaration: "pipeline.workflow.components.<name>.implementation { kind: adapter }",
+        normative_reference: "§10.8, §15",
         admission_consumer: "onnx_genai_engine::pipeline::workflow",
         fallback: FallbackClass::SemanticRequired,
         status: SupportStatus::Implemented,
@@ -397,6 +444,16 @@ pub const BUILTIN_EXTENSIONS: &[ExtensionDescriptor] = &[
         id: ORT_LORA_ADAPTER_V1,
         surface: ExtensionSurface::AdapterLoader,
         schema_floor: V1,
+        declaration: "adapters.artifacts.<name>.weights[].loader_capability",
+        normative_reference: "§9",
+        admission_consumer: "onnx_genai_metadata::validate_adapter_service",
+        fallback: FallbackClass::SemanticRequired,
+        status: SupportStatus::Implemented,
+    },
+    ExtensionDescriptor {
+        id: ADAPTERS_GGUF_V1,
+        surface: ExtensionSurface::AdapterLoader,
+        schema_floor: crate::version::GGUF_ADAPTER_SCHEMA_VERSION,
         declaration: "adapters.artifacts.<name>.weights[].loader_capability",
         normative_reference: "§9",
         admission_consumer: "onnx_genai_metadata::validate_adapter_service",
@@ -476,6 +533,46 @@ pub const CORE_CONFORMANCE: &[(SchemaVersion, &str)] = &[
     (
         crate::version::PREFERRED_ENDING_SCHEMA_VERSION,
         "preferred `eot_token_id` is a member of the package EOS set, with explicit ending-role inheritance and authoritative request EOS overrides",
+    ),
+    (
+        crate::version::DECISION_SCHEMA_VERSION,
+        "Non-generative decision profiles: explicit prompting, tokenizer inputs, calibrated probability heads and answer policies; no architecture inference.",
+    ),
+    (
+        crate::version::DECISION_INPUT_SCHEMA_VERSION,
+        "Decision request policies declare defaults, payloads, supported question kinds, option/score bounds, ordering and legend semantics explicitly.",
+    ),
+    (
+        crate::version::MULTIMODAL_RERANKING_SCHEMA_VERSION,
+        "Reranking v2 profiles declare ordered query/document encoded-image inputs; reusable image preprocessing v2 names component-local output ports.",
+    ),
+    (
+        crate::version::REALTIME_SCHEMA_VERSION,
+        "Realtime v1 profiles declare session-owned bounded audio/text quanta, native rates, frame bounds, control operations and actual per-quantum usage.",
+    ),
+    (
+        crate::version::MULTIMODAL_DECISION_SCHEMA_VERSION,
+        "Decision v2 profiles declare ordered encoded-image inputs and authoritative text/media token usage; decision v1 remains text-only.",
+    ),
+    (
+        crate::version::DECISION_AUDIO_SCHEMA_VERSION,
+        "Decision v3 profiles declare typed mixed state-media inputs and an explicit spoken-question audio endpoint with authoritative per-variant usage.",
+    ),
+    (
+        crate::version::AUDIO_FEATURE_INPUT_SCHEMA_VERSION,
+        "Externally executed audio programs bind explicitly named float32 feature media inputs; analysis semantics and clip bounds come from the selected program output.",
+    ),
+    (
+        crate::version::GRAPH_WEIGHTS_SCHEMA_VERSION,
+        "Each ONNX graph can declare immutable GGUF/SafeTensors containers with explicit tensor-key mappings; geometry and executable semantics stay in the graph.",
+    ),
+    (
+        crate::version::INFILL_CONTEXT_SCHEMA_VERSION,
+        "Explicit infill control roles, ordering and additional terminators are package facts; native /infill renders authored ordered file context even for an empty list, with no filesystem lookup or guessed separators.",
+    ),
+    (
+        crate::version::GGUF_ADAPTER_SCHEMA_VERSION,
+        "GGUF LoRA sources declare exact source/target bindings, factor storage and explicit alpha/rank composition; the loader is a semantic-required extension and unsupported adapter variants fail closed.",
     ),
 ];
 

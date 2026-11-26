@@ -352,6 +352,19 @@ type WorkflowAdapterExecutor = fn(
     &mut HashMap<String, i64>,
 ) -> anyhow::Result<()>;
 
+fn preprocessing_output_scope(
+    component: &str,
+    declaration: &onnx_genai_metadata::WorkflowComponent,
+) -> anyhow::Result<onnx_genai_metadata::extensions::PreprocessingOutputScope> {
+    let ComponentImplementation::Adapter { version, .. } = &declaration.implementation else {
+        anyhow::bail!(
+            "preprocessing component '{component}' must declare an adapter implementation"
+        );
+    };
+    onnx_genai_metadata::extensions::PreprocessingOutputScope::for_version(version)
+        .map_err(anyhow::Error::msg)
+}
+
 fn workflow_adapter_registry()
 -> &'static HashMap<(&'static str, &'static str), WorkflowAdapterExecutor> {
     static REGISTRY: std::sync::LazyLock<
@@ -363,11 +376,19 @@ fn workflow_adapter_registry()
                 WorkflowRuntime::run_image_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
+                ("onnx-genai.image-preprocess", "2"),
+                WorkflowRuntime::run_image_preprocess_adapter as WorkflowAdapterExecutor,
+            ),
+            (
                 ("onnx-genai.video-preprocess", "1"),
                 WorkflowRuntime::run_video_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
                 ("onnx-genai.audio-preprocess", "1"),
+                WorkflowRuntime::run_audio_preprocess_adapter as WorkflowAdapterExecutor,
+            ),
+            (
+                ("onnx-genai.audio-preprocess", "2"),
                 WorkflowRuntime::run_audio_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
@@ -1010,7 +1031,9 @@ impl<'a> WorkflowExecutionPlan<'a> {
         engine.require_execution_admitted()?;
         // The specialized host owns its control's semantic commit race.
         request.generation_control = None;
-        Self::new_hosted(engine, request, &[])
+        let plan = Self::new_hosted(engine, request, &[])?;
+        plan.ensure_single_stream_generation()?;
+        Ok(plan)
     }
 
     pub(super) fn new_dflash_driver(
@@ -1019,7 +1042,9 @@ impl<'a> WorkflowExecutionPlan<'a> {
     ) -> anyhow::Result<Self> {
         engine.require_execution_admitted()?;
         request.generation_control = None;
-        Self::new_hosted(engine, request, &[])
+        let plan = Self::new_hosted(engine, request, &[])?;
+        plan.ensure_single_stream_generation()?;
+        Ok(plan)
     }
 
     /// Consume a prepared request before execution and return exactly the
@@ -1029,6 +1054,34 @@ impl<'a> WorkflowExecutionPlan<'a> {
     /// committed before the construct's transaction is admitted.
     pub(crate) fn into_bound_values(self) -> (PipelineTensors, Option<String>) {
         (self.values, self.session_id)
+    }
+
+    pub(crate) fn ensure_single_stream_generation(&self) -> anyhow::Result<()> {
+        let workflow = &self.engine.plan.workflow;
+        let output = workflow
+            .outputs
+            .iter()
+            .find(|(_, output)| output.role == WorkflowOutputRole::Tokens)
+            .map(|(name, _)| name)
+            .context("generation requires one package output with role: tokens")?;
+        let serving = workflow
+            .serving
+            .as_ref()
+            .context("generation requires a workflow serving contract")?;
+        let active = workflow
+            .state
+            .get(&serving.active)
+            .map_or(serving.active.as_str(), |state| state.initializer.as_str());
+        let active_rows = workflow_bool_rows(&self.values, active)?;
+        let row_plan = workflow_row_plan(workflow, &self.values, self.request_count)?;
+        let active_requests =
+            active_generation_request_count(&active_rows, row_plan.as_ref(), self.request_count)?;
+        anyhow::ensure!(
+            active_requests <= 1,
+            "generation cannot flatten multi-row ragged output '{output}'; consume semantic row \
+             streams with the tensor workflow API instead"
+        );
+        Ok(())
     }
 
     /// Prepare a pass in which `hosted` contracts are executed by the caller.
@@ -1369,9 +1422,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
         // selected batch.
         let mut values = clone_pipeline_tensors(&self.values)?;
         let row_selection_name = workflow_row_selection_name(workflow);
-        let row_plan = workflow_row_selection(workflow, &values)?
-            .map(|selection| super::RowPlan::select(self.request_count, selection))
-            .transpose()?;
+        let row_plan = workflow_row_plan(workflow, &values, self.request_count)?;
         let execution_request_count = row_plan
             .as_ref()
             .map_or(self.request_count, |plan| plan.selected_rows().len());
@@ -3880,6 +3931,7 @@ impl WorkflowRuntime {
         package_symbols: &HashMap<String, i64>,
         component_symbols: &mut HashMap<String, i64>,
     ) -> anyhow::Result<()> {
+        let output_scope = preprocessing_output_scope(component, declaration)?;
         let program = self
             .plan
             .preprocessing
@@ -3946,11 +3998,9 @@ impl WorkflowRuntime {
             .map(|tensor| (tensor.name.clone(), tensor))
             .collect::<HashMap<_, _>>();
         for (port, value_ref) in outputs {
-            let tensor = tensors.remove(value_ref).with_context(|| {
-                format!(
-                    "image preprocessing adapter '{component}' did not produce declared SSA \
-                     output '{value_ref}'"
-                )
+            let output_name = output_scope.output_name(port, value_ref);
+            let tensor = tensors.remove(output_name).with_context(|| {
+                format!("image preprocessing adapter '{component}' did not produce output '{output_name}' for port '{port}' and workflow value '{value_ref}'; align preprocessing.image.outputs with the adapter output bindings")
             })?;
             let contract = declaration.ports.outputs.get(port).with_context(|| {
                 format!(
@@ -4054,6 +4104,7 @@ impl WorkflowRuntime {
         _package_symbols: &HashMap<String, i64>,
         component_symbols: &mut HashMap<String, i64>,
     ) -> anyhow::Result<()> {
+        let output_scope = preprocessing_output_scope(component, declaration)?;
         let program = self
             .plan
             .preprocessing
@@ -4091,19 +4142,27 @@ impl WorkflowRuntime {
                  uint8 rank 1"
             );
         }
-        let executable = onnx_genai_preprocess::audio::AudioProgram::from_program(program)?;
-        let encoded_bytes = encoded.as_raw_bytes()?;
+        let executable = onnx_genai_preprocess::audio::AudioProgram::from_program(program)
+            .with_context(|| format!("compile preprocessing.audio for component '{component}'; repair the declared audio transform parameters"))?;
+        let encoded_bytes = encoded.as_raw_bytes().with_context(|| format!(
+            "read audio component '{component}' input 'encoded' from workflow value '{encoded_ref}'; provide host-readable encoded audio bytes"
+        ))?;
+        let audio_headroom = self.plan.audio_memory.as_ref().context("audio preprocessing requires a configured host memory authority; construct the workflow with engine resource limits")?.host_snapshot().headroom;
+        let decode_limits = self
+            .plan
+            .audio_decode_limits
+            .within_host(audio_headroom)
+            .with_context(|| format!("admit decoded audio for component '{component}'"))?;
         let mut tensors = executable
-            .run(&[encoded_bytes])?
+            .run(&[encoded_bytes], decode_limits)
+            .with_context(|| format!("preprocess audio component '{component}' input 'encoded' from workflow value '{encoded_ref}'; provide valid supported encoded audio and the declared audio program"))?
             .into_iter()
             .map(|tensor| (tensor.name.clone(), tensor))
             .collect::<HashMap<_, _>>();
         for (port, value_ref) in outputs {
-            let tensor = tensors.remove(value_ref).with_context(|| {
-                format!(
-                    "audio preprocessing adapter '{component}' did not produce declared SSA \
-                     output '{value_ref}'"
-                )
+            let output_name = output_scope.output_name(port, value_ref);
+            let tensor = tensors.remove(output_name).with_context(|| {
+                format!("audio preprocessing adapter '{component}' did not produce output '{output_name}' for port '{port}' and workflow value '{value_ref}'; align preprocessing.audio.outputs with the adapter output bindings")
             })?;
             let contract = declaration.ports.outputs.get(port).with_context(|| {
                 format!(
@@ -6341,6 +6400,40 @@ fn workflow_row_selection(
         .map(Some)
 }
 
+fn workflow_row_plan(
+    workflow: &onnx_genai_metadata::WorkflowSpec,
+    values: &PipelineTensors,
+    request_count: usize,
+) -> anyhow::Result<Option<super::RowPlan>> {
+    workflow_row_selection(workflow, values)?
+        .map(|selection| super::RowPlan::select(request_count, selection))
+        .transpose()
+}
+
+fn active_generation_request_count(
+    active_rows: &[bool],
+    row_plan: Option<&super::RowPlan>,
+    request_count: usize,
+) -> anyhow::Result<usize> {
+    let active_rows = match active_rows {
+        [active] => vec![*active; request_count],
+        rows if rows.len() == request_count => rows.to_vec(),
+        rows => anyhow::bail!(
+            "workflow serving active control has {} rows for {request_count} logical requests; \
+             provide one broadcast value or one value per request",
+            rows.len()
+        ),
+    };
+    Ok(match row_plan {
+        Some(plan) => plan
+            .selected_rows()
+            .into_iter()
+            .filter(|row| active_rows[*row])
+            .count(),
+        None => active_rows.into_iter().filter(|active| *active).count(),
+    })
+}
+
 fn workflow_row_selection_name(workflow: &onnx_genai_metadata::WorkflowSpec) -> Option<&str> {
     workflow
         .inputs
@@ -6444,6 +6537,43 @@ fn workflow_scalar_key(values: &PipelineTensors, name: &str) -> anyhow::Result<S
 #[cfg(test)]
 mod workflow_scalar_tests {
     use super::*;
+
+    #[test]
+    fn scalar_active_control_broadcasts_across_generation_requests() {
+        assert_eq!(
+            active_generation_request_count(&[true], None, 2).expect("broadcast active rows"),
+            2
+        );
+        assert_eq!(
+            active_generation_request_count(&[false], None, 2).expect("broadcast inactive rows"),
+            0
+        );
+    }
+
+    #[test]
+    fn generation_activity_applies_row_selection_after_broadcast() {
+        let row_plan = RowPlan::select(3, vec![2, 0]).expect("valid row selection");
+        assert_eq!(
+            active_generation_request_count(&[true], Some(&row_plan), 3)
+                .expect("selected broadcast active rows"),
+            2
+        );
+        assert_eq!(
+            active_generation_request_count(&[true, false, false], Some(&row_plan), 3)
+                .expect("selected per-request active rows"),
+            1
+        );
+    }
+
+    #[test]
+    fn generation_activity_rejects_mismatched_cardinality() {
+        let error = active_generation_request_count(&[true, false], None, 3)
+            .expect_err("mismatched active cardinality must fail");
+        assert!(
+            error.to_string().contains("2 rows for 3 logical requests"),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn text_assembly_is_admitted_as_an_api_boundary_adapter() {

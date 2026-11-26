@@ -1,0 +1,14 @@
+{
+  "phase": "causal outline control",
+  "reason": "Matched-entry initial study preserves candidate benefit, but binary-bound disassembly shows native entry calls an independent vector row while old control embeds it. A new arm retains original arithmetic and forces only the row boundary to stay separate. This is a distinct predeclared causal control, not rerunning until favorable.",
+  "expected_arms": {
+    "0": "matched original inline body",
+    "1": "unrolled native",
+    "2": "unrolled native duplicate",
+    "3": "MLAS reference",
+    "4": "matched original with independent row function"
+  },
+  "samples_expected": 10800,
+  "validations_expected": 720,
+  "runtime_source_change": "none relative to matched-entry candidate; only diagnostic controls change"
+}

@@ -48,15 +48,16 @@ pub use crate::config::{
     AdaptivePConfig, DecisionSource, DevicePolicy, DevicePolicyParseError, DryConfig,
     DynamicTemperatureConfig, Eagle3Config, EngineConfig, EngineConfigError, EngineDecodeBackend,
     FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest,
-    GenerateResult, GenerateToken, GenerateTokenCallback, GenerationBudgetCap, GrammarActivation,
-    GrammarTrigger, KvConnectorBackend, KvConnectorConfig, LayerWeightBytes, LimitParseError,
-    LogprobSource, MemoryPolicyApplication, MemoryStrategy, MemoryStrategyDecision,
-    MemoryStrategyPlan, MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout,
-    MtpWeightSource, PrefillRequest, PrefillResult, PrioritizedGenerateRequest,
-    PrioritizedGenerateResult, RecurrentPrefixCacheStats, RewindTokenCount, SamplerSequence,
-    SamplerStage, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint, SessionId,
-    SessionPosition, SpeculativeMode, TokenLogprob, ToolCallPolicy, WeightAccessPattern,
-    WeightPlacementReport, XtcConfig, parse_device_policy, parse_resource_limit,
+    GenerateResult, GenerateToken, GenerateTokenCallback, GenerationBudgetCap, GenerationTimings,
+    GrammarActivation, GrammarCollation, GrammarTrigger, KvConnectorBackend, KvConnectorConfig,
+    LayerWeightBytes, LimitParseError, LogprobSource, MemoryPolicyApplication, MemoryStrategy,
+    MemoryStrategyDecision, MemoryStrategyPlan, MirostatConfig, MirostatVersion, MtpCacheScope,
+    MtpConfig, MtpHiddenLayout, MtpWeightSource, PrefillRequest, PrefillResult,
+    PrioritizedGenerateRequest, PrioritizedGenerateResult, RecurrentPrefixCacheStats,
+    RewindTokenCount, SamplerSequence, SamplerStage, SamplingOverrides, ScheduledGenerateArrival,
+    SessionCheckpoint, SessionId, SessionPosition, SpeculativeMode, TokenLogprob, ToolCallPolicy,
+    WeightAccessPattern, WeightPlacementReport, XtcConfig, parse_device_policy,
+    parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{
@@ -74,6 +75,10 @@ mod metadata;
 mod model;
 #[cfg(feature = "native-backend")]
 mod native_session_snapshot;
+#[cfg(feature = "native-backend")]
+mod token_history;
+#[cfg(feature = "native-backend")]
+pub(crate) use token_history::NativeTokenHistory;
 #[cfg(feature = "native-backend")]
 mod native_slot;
 #[cfg(feature = "native-backend")]
@@ -193,7 +198,7 @@ mod tests {
         Ok(())
     }
 
-    fn model_free_rewind_test_engine(
+    pub(super) fn model_free_rewind_test_engine(
         kv_cache: PagedKvCache,
         sessions: HashMap<SessionId, EngineSession>,
     ) -> anyhow::Result<Engine> {
@@ -483,7 +488,7 @@ mod tests {
     }
 
     #[cfg(feature = "native-backend")]
-    fn tiny_dense_native_decoder() -> onnx_runtime_session::InferenceSession {
+    pub(super) fn tiny_dense_native_decoder() -> onnx_runtime_session::InferenceSession {
         let mut graph = Graph::new();
         graph.opset_imports.insert(String::new(), 11);
         let batch = graph.intern_symbol("batch");
@@ -600,7 +605,7 @@ mod tests {
     }
 
     #[cfg(feature = "native-backend")]
-    fn tiny_dense_decoder_io() -> DecoderAbi {
+    pub(super) fn tiny_dense_decoder_io() -> DecoderAbi {
         DecoderAbi {
             sequence_source: Some(SequenceInputKind::TokenIds),
             kv_ownership: Some(KvOwnership::Owned),
@@ -1161,12 +1166,12 @@ mod tests {
         assert!(!model_proto_requires_native_backend(&model));
 
         model.graph.as_mut().unwrap().node.push(NodeProto {
-            domain: "pkg.nxrt".to_string(),
+            domain: "pkg.nxrt._private".to_string(),
             op_type: "BlockQuantizedMatMul".to_string(),
             ..NodeProto::default()
         });
         model.opset_import.push(OperatorSetIdProto {
-            domain: "pkg.nxrt".to_string(),
+            domain: "pkg.nxrt._private".to_string(),
             version: 1,
         });
         assert!(model_proto_requires_native_backend(&model));
@@ -1174,7 +1179,7 @@ mod tests {
         model.graph.as_mut().unwrap().node[0].domain = "example.wrong.domain".to_string();
         assert!(!model_proto_requires_native_backend(&model));
 
-        model.graph.as_mut().unwrap().node[0].domain = "pkg.nxrt".to_string();
+        model.graph.as_mut().unwrap().node[0].domain = "pkg.nxrt._private".to_string();
         model.opset_import[0].version = 2;
         assert!(!model_proto_requires_native_backend(&model));
     }
@@ -1351,9 +1356,10 @@ mod tests {
     #[cfg(not(feature = "native-backend"))]
     #[test]
     fn forced_native_without_feature_reports_how_to_switch() {
-        let error = resolve_decode_backend(Path::new("unused.onnx"), EngineDecodeBackend::Native)
-            .unwrap_err()
-            .to_string();
+        let error =
+            resolve_decode_backend(Path::new("unused.onnx"), EngineDecodeBackend::Native, false)
+                .unwrap_err()
+                .to_string();
         assert!(error.contains("ONNX_GENAI_BACKEND=ort"), "{error}");
         assert!(error.contains("EngineDecodeBackend::Ort"), "{error}");
     }
@@ -1596,7 +1602,7 @@ mod tests {
             stop_sequences: vec![StopSequence::Tokens(vec![42])],
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         assert_eq!(
             chain.names(),
             vec![
@@ -1638,7 +1644,7 @@ mod tests {
             ..Default::default()
         };
 
-        let chain = build_processor_chain(&options, Some(&tokenizer), false)?;
+        let chain = build_processor_chain(&options, Some(&tokenizer), false, None)?;
 
         assert_eq!(
             chain.names(),
@@ -1663,7 +1669,7 @@ mod tests {
             top_k: 2,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         let context = ProcessorContext::default();
         let mut logits = vec![0.0, 2.0, 4.0, 3.0];
         assert_eq!(
@@ -1678,7 +1684,7 @@ mod tests {
             greedy: false,
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         let context = ProcessorContext::default();
         let mut logits = vec![0.0, 0.0];
         assert_eq!(
@@ -1707,7 +1713,7 @@ mod tests {
         };
         // A custom sampler is not necessarily greedy, so it keeps the warpers
         // even on these (greedy-by-default) options.
-        let chain = build_processor_chain(&options, None, true).unwrap();
+        let chain = build_processor_chain(&options, None, true, None).unwrap();
         let context = ProcessorContext::default();
         let mut logits = vec![0.0, 2.0, 4.0, 3.0];
         let mut sampler = LastTokenSampler;
@@ -1723,7 +1729,7 @@ mod tests {
     #[test]
     fn default_processor_chain_is_empty_for_unchanged_defaults() {
         let options = GenerateOptions::default();
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         assert!(chain.names().is_empty());
     }
 
@@ -1734,7 +1740,7 @@ mod tests {
             stop_sequences: vec![StopSequence::Tokens(vec![7])],
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         let context = ProcessorContext {
             generated_tokens: vec![7],
             ..Default::default()
@@ -1751,7 +1757,7 @@ mod tests {
             stop_sequences: vec![StopSequence::Tokens(vec![2, 3])],
             ..Default::default()
         };
-        let chain = build_processor_chain(&options, None, false).unwrap();
+        let chain = build_processor_chain(&options, None, false, None).unwrap();
         let context = ProcessorContext {
             generated_tokens: vec![1, 2, 3],
             ..Default::default()
@@ -1778,6 +1784,7 @@ mod tests {
             },
             None,
             false,
+            None,
         )
         .unwrap();
         let context = ProcessorContext {
@@ -1802,7 +1809,7 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&fixture, crate::fixture_engine_config())?;
         let mut request = GenerateRequest::new("hello");
         request.options.max_new_tokens = 3;
         request.options.temperature = 0.0;
@@ -1849,7 +1856,7 @@ mod tests {
                     &format!("max_sequence_length: {max_context}"),
                 ),
             )?;
-            let mut engine = Engine::from_dir(scratch.path(), EngineConfig::default())?;
+            let mut engine = Engine::from_dir(scratch.path(), crate::fixture_engine_config())?;
             for constraint in [
                 GenerateConstraint::Json {
                     prefix: String::new(),
@@ -1883,7 +1890,7 @@ mod tests {
             .canonicalize()?;
         let mut engine = Engine::from_dir_with_session_options(
             &fixture,
-            EngineConfig::default(),
+            crate::fixture_engine_config(),
             SessionOptions::default().with_intra_op_threads(1),
         )?;
         let mut request = GenerateRequest::new("hello");
@@ -2080,7 +2087,7 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&fixture, crate::fixture_engine_config())?;
         let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
         request.options.max_new_tokens = 32;
         request.options.temperature = 0.0;
@@ -2101,7 +2108,7 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut engine = Engine::from_dir(&fixture, crate::fixture_engine_config())?;
         let session_id = engine.create_session()?;
         let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
         request.options.max_new_tokens = 32;
@@ -2602,7 +2609,7 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
-        let mut baseline = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let mut baseline = Engine::from_dir(&fixture, crate::fixture_engine_config())?;
         assert!(!baseline.connector.is_active());
 
         let mut request =
@@ -2633,7 +2640,7 @@ mod tests {
         request.options.stop_on_eos = false;
 
         let baseline_ids = {
-            let mut baseline = Engine::from_dir(&fixture, EngineConfig::default())?;
+            let mut baseline = Engine::from_dir(&fixture, crate::fixture_engine_config())?;
             baseline.generate(request.clone())?.token_ids
         };
 
@@ -2692,7 +2699,7 @@ mod tests {
         // (b) Output is byte-for-byte identical to full recompute with a Null
         // connector — proving the materialized KV is correct, not just present.
         let baseline_ids = {
-            let mut baseline = Engine::from_dir(&fixture, EngineConfig::default())?;
+            let mut baseline = Engine::from_dir(&fixture, crate::fixture_engine_config())?;
             let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.clone()));
             request.options.max_new_tokens = 4;
             request.options.temperature = 0.0;
@@ -2736,3 +2743,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(all(test, feature = "native-backend"))]
+mod owned_logits_tests;

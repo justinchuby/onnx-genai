@@ -1,7 +1,6 @@
-//! The [`CudaExecutionProvider`]: a GPU execution provider backed by cudarc +
-//! cuBLASLt (`docs/architecture/ORT2.md` §15). Phase 2a wires standard GEMM (`MatMul`) only;
-//! everything else returns an actionable "not implemented in CUDA EP Phase 2a"
-//! error rather than silently falling back or panicking.
+//! The [`CudaExecutionProvider`]: a GPU execution provider backed by cudarc,
+//! dynamically loaded NVIDIA libraries, and NVRTC kernels. See
+//! `docs/execution/CUDA_COVERAGE.md` for current operator coverage.
 //!
 //! # Memory & safety model
 //!
@@ -69,7 +68,8 @@ use crate::deferred_release::{
     CudaDeferredReleaseQueue, CudaStreamFences, DEFAULT_DEFERRED_RELEASE_CAPACITY,
     DeferredActionOutcome, DeferredReleaseAction, ReleaseObserver, StreamOrderedKeepAlive,
 };
-use crate::kernels::build_cuda_registry_with_metrics;
+use crate::kernels::build_cuda_registry_for_contract;
+use crate::kernels::conv_transpose::Contract as ConvTransposeContract;
 use crate::kernels::csa_checkpoint::CsaMetrics;
 use crate::optimizer::cuda_optimization_passes;
 use crate::route_residency::{
@@ -1721,7 +1721,7 @@ impl CudaAllocationDomain {
     }
 }
 
-/// CUDA execution provider (Phase 2a: cudarc + cuBLASLt GEMM).
+/// CUDA execution provider.
 ///
 /// Unlike the always-available CPU EP, this provider needs a real device, so
 /// [`CudaExecutionProvider::new`] is **fallible** — it returns an error when no
@@ -1734,6 +1734,7 @@ pub struct CudaExecutionProvider {
     memory_cleanup_armed: AtomicBool,
     workspace_release_barrier: WorkspaceReleaseBarrier,
     registry: OpRegistry,
+    conv_transpose_contract: ConvTransposeContract,
     csa_metrics: Arc<CsaMetrics>,
     /// Device weight-offload policy resolved from the environment. When enabled,
     /// the EP advertises the `nxrt` weight-paging capability and pages lazy
@@ -1916,7 +1917,7 @@ impl CudaExecutionProvider {
         drop(self.lock_route_executors());
     }
 
-    /// Construct a CUDA EP bound to `CUDA:ordinal` with the Phase-2a kernels
+    /// Construct a CUDA EP bound to `CUDA:ordinal` with the CUDA kernels
     /// registered. Fails if the device or CUDA libraries are unavailable.
     pub fn new(ordinal: u32) -> Result<Self> {
         Self::new_with_offload_policy(ordinal, DeviceOffloadPolicy::from_env())
@@ -1932,7 +1933,19 @@ impl CudaExecutionProvider {
         ordinal: u32,
         offload_policy: DeviceOffloadPolicy,
     ) -> Result<Self> {
-        Self::from_config(
+        Self::new_with_offload_policy_and_contract(
+            ordinal,
+            offload_policy,
+            ConvTransposeContract::Standalone,
+        )
+    }
+
+    fn new_with_offload_policy_and_contract(
+        ordinal: u32,
+        offload_policy: DeviceOffloadPolicy,
+        conv_transpose_contract: ConvTransposeContract,
+    ) -> Result<Self> {
+        Self::from_config_with_contract(
             ordinal,
             CudaProviderConfig {
                 offload_policy,
@@ -1941,6 +1954,7 @@ impl CudaExecutionProvider {
                 route_residency_config: Self::route_residency_config_from_env(),
                 memory: None,
             },
+            conv_transpose_contract,
         )
     }
 
@@ -2016,6 +2030,14 @@ impl CudaExecutionProvider {
     /// Construct with allocator selection complete before any runtime is exposed.
     /// An injected allocator is authoritative: the built-in VMM is never created.
     pub fn from_config(ordinal: u32, config: CudaProviderConfig) -> Result<Self> {
+        Self::from_config_with_contract(ordinal, config, ConvTransposeContract::Standalone)
+    }
+
+    fn from_config_with_contract(
+        ordinal: u32,
+        config: CudaProviderConfig,
+        conv_transpose_contract: ConvTransposeContract,
+    ) -> Result<Self> {
         let CudaProviderConfig {
             offload_policy,
             governor,
@@ -2037,11 +2059,15 @@ impl CudaExecutionProvider {
         let route_telemetry_registry = Arc::new(
             crate::kernels::qmoe::RouteTelemetrySourceRegistry::new(route_residency_config),
         );
-        let registry = build_cuda_registry_with_metrics(
+        let mut registry = build_cuda_registry_for_contract(
             runtime.clone(),
             csa_metrics.clone(),
             Arc::clone(&route_telemetry_registry),
+            conv_transpose_contract,
         );
+        if matches!(conv_transpose_contract, ConvTransposeContract::Standalone) {
+            crate::kernels::register_standalone_kernels(&mut registry, runtime.clone());
+        }
         let auto_dynamic_lending = auto_dynamic_lending_for(
             governor.is_some(),
             &offload_policy,
@@ -2201,6 +2227,7 @@ impl CudaExecutionProvider {
             memory_cleanup_armed: AtomicBool::new(false),
             workspace_release_barrier: WorkspaceReleaseBarrier::default(),
             registry,
+            conv_transpose_contract,
             csa_metrics,
             offload_policy,
             residency,
@@ -2700,6 +2727,15 @@ impl CudaExecutionProvider {
     /// Construct a CUDA EP on the default device (`CUDA:0`).
     pub fn new_default() -> Result<Self> {
         Self::new(0)
+    }
+
+    /// Construct the provider behind the ORT CUDA plugin's existing contract.
+    pub fn new_for_ort_plugin() -> Result<Self> {
+        Self::new_with_offload_policy_and_contract(
+            0,
+            DeviceOffloadPolicy::from_env(),
+            ConvTransposeContract::OrtPlugin,
+        )
     }
 
     /// Return whether a fully initialized CUDA EP can be constructed for this
@@ -3681,7 +3717,7 @@ impl CudaExecutionProvider {
     }
 
     /// Build a live GPU weight pager (WEIGHT_OFFLOAD Phase 3b) that binds an
-    /// offloaded `pkg.nxrt::BlockQuantizedMoE` weight into a VRAM page, copying
+    /// offloaded `pkg.nxrt._private::BlockQuantizedMoE` weight into a VRAM page, copying
     /// its canonical bytes from `source` host→device. The returned binding is
     /// byte-identical to a resident upload of the same weight.
     pub fn weight_pager<'a, S: onnx_runtime_ep_api::MmapRegionSource>(
@@ -4264,7 +4300,7 @@ impl ExecutionProvider for CudaExecutionProvider {
     ) -> KernelMatch {
         // Keyed on (op_type, domain, opset) via the registry, the same single
         // source of truth the CPU EP uses.
-        if !self.registry.supports(&op.op_type, &op.domain, opset) {
+        let Some(factory) = self.registry.lookup(&op.op_type, &op.domain, opset) else {
             let domain = if op.domain.is_empty() {
                 "ai.onnx"
             } else {
@@ -4289,14 +4325,46 @@ impl ExecutionProvider for CudaExecutionProvider {
                 op.op_type,
                 opset
             );
+        };
+        if let Some(reason) = factory.unsupported_reason(op, opset, shapes, input_dtypes) {
+            return KernelMatch::unsupported(reason);
+        }
+        if op.is_default_domain()
+            && op.op_type == "Transpose"
+            && let Some(&dtype) = input_dtypes.first()
+            && let Err(reason) = onnx_runtime_ir::transpose::validate_dtype(dtype, opset)
+        {
+            return KernelMatch::unsupported(reason);
         }
         if let Some(reason) =
             onnx_runtime_ep_api::packed_routed::unsupported_reason(op, shapes, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }
+        if let Some(reason) = input_dtypes.first().and_then(|&dtype| {
+            onnx_runtime_ir::trig::bf16_unsupported_reason(&op.op_type, &op.domain, opset, dtype)
+        }) {
+            return KernelMatch::unsupported(reason);
+        }
         if let Some(reason) =
             onnx_runtime_ep_api::standard_math::unsupported_reason(op, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if let Some(reason) =
+            onnx_runtime_ep_api::standard_activation::unsupported_reason(op, opset, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if let Some(reason) = onnx_runtime_ep_api::mean_variance_normalization::unsupported_reason(
+            op,
+            shapes,
+            input_dtypes,
+        ) {
+            return KernelMatch::unsupported(reason);
+        }
+        if let Some(reason) =
+            onnx_runtime_ir::roi_align::unsupported_reason(op, opset, shapes, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }
@@ -4345,6 +4413,7 @@ impl ExecutionProvider for CudaExecutionProvider {
             && (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(reason) = crate::kernels::unique::unsupported_reason(
                 op,
+                opset,
                 shapes,
                 input_dtypes,
                 layouts,
@@ -4365,20 +4434,20 @@ impl ExecutionProvider for CudaExecutionProvider {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "BlockQuantizedMatMul"
-            && op.domain == "pkg.nxrt"
+            && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && let Some(reason) = crate::kernels::block_quantized_matmul::unsupported_reason(op)
         {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "BlockQuantizedMoE"
-            && op.domain == "pkg.nxrt"
+            && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && let Some(reason) =
                 crate::kernels::block_quantized_moe::unsupported_reason(op, shapes, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "CompressedSparseAttention"
-            && op.domain == "pkg.nxrt"
+            && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && let Some(reason) = crate::kernels::compressed_sparse_attention::unsupported_reason(
                 op,
                 shapes,
@@ -4388,35 +4457,35 @@ impl ExecutionProvider for CudaExecutionProvider {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "KvCacheCapacityAppend"
-            && op.domain == "pkg.nxrt"
+            && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && let Some(reason) =
                 crate::kernels::kv_cache_capacity_append::unsupported_reason(shapes, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "IndexShare"
-            && op.domain == "pkg.nxrt"
+            && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && let Some(reason) =
                 crate::kernels::index_share::unsupported_reason(op, shapes, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "DsaIndexSelect"
-            && op.domain == "pkg.nxrt"
+            && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && let Some(reason) =
                 crate::kernels::dsa_index_select::unsupported_reason(op, shapes, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "PackedVarlenAttention"
-            && op.domain == "pkg.nxrt"
+            && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && let Some(reason) =
                 crate::kernels::packed_varlen_attention::unsupported_reason(op, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }
         if op.op_type == "VarlenAttention"
-            && op.domain == "pkg.nxrt"
+            && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && let Some(reason) =
                 crate::kernels::varlen_attention::unsupported_reason(op, input_dtypes)
         {
@@ -4495,6 +4564,7 @@ impl ExecutionProvider for CudaExecutionProvider {
                 opset,
                 shapes,
                 input_dtypes,
+                self.conv_transpose_contract,
             )
         {
             return KernelMatch::unsupported(reason);
@@ -4563,7 +4633,16 @@ impl ExecutionProvider for CudaExecutionProvider {
                 .workspace_planning(&op.op_type, &op.domain, opset)
                 .expect("supported kernel has a versioned registration"),
             cost,
-            required_input_layouts: None,
+            required_input_layouts: match (op.domain.as_str(), op.op_type.as_str()) {
+                (
+                    onnx_runtime_ir::RUNTIME_DOMAIN,
+                    onnx_runtime_optimizer::affine_moe::softmax_first::OP,
+                ) => Some(vec![TensorLayout::contiguous(); op.inputs.len()]),
+                (_, onnx_runtime_ep_api::mean_variance_normalization::OP) => {
+                    Some(vec![TensorLayout::contiguous()])
+                }
+                _ => None,
+            },
             output_layouts,
         }
     }
@@ -4614,7 +4693,23 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn custom_passes(&self) -> Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> {
-        cuda_optimization_passes(Some(self.runtime.capabilities()))
+        let caps = self.runtime.capabilities();
+        let mut passes = cuda_optimization_passes(Some(caps));
+        if self.registry.supports(
+            onnx_runtime_optimizer::affine_moe::softmax_first::OP,
+            onnx_runtime_ir::RUNTIME_DOMAIN,
+            1,
+        ) && caps.max_grid_dim_x() > 0
+            && caps.max_threads_per_block()
+                >= onnx_runtime_optimizer::affine_moe::softmax_first::MAX_ROUTES_PER_TOKEN as u32
+        {
+            // Before other passes rewrite the explicit SiLU and identity casts.
+            passes.insert(
+                1,
+                Box::new(onnx_runtime_optimizer::affine_moe::softmax_first::Fusion),
+            );
+        }
+        passes
     }
 
     fn mapped_bytes_for_allocation(&self, bytes: usize, alignment: usize) -> Result<u64> {
@@ -7457,8 +7552,8 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
     }
 
     /// Criterion 1 and 8, on the plugin construction path: the provider built
-    /// exactly as the CUDA plugin builds it (`CudaExecutionProvider::new_default`
-    /// == `new(0)`) routes every device allocation — including the ORT scratch
+    /// exactly as the CUDA plugin builds it (`CudaExecutionProvider::new_for_ort_plugin`)
+    /// routes every device allocation — including the ORT scratch
     /// the plugin projects through `allocate`/`deallocate` — through the pooled
     /// VMM arena.
     ///
@@ -7472,8 +7567,8 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
     )]
     #[test]
     fn plugin_construction_path_routes_device_memory_through_pooled_vmm_arena() {
-        let provider =
-            CudaExecutionProvider::new(0).expect("plugin-path CUDA provider under VMM arena");
+        let provider = CudaExecutionProvider::new_for_ort_plugin()
+            .expect("plugin-path CUDA provider under VMM arena");
         assert!(
             provider.commits_on_demand(),
             "the VMM arena, not the cuMemAlloc path, must serve allocations on the plugin path"

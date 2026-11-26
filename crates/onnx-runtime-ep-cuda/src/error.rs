@@ -4,8 +4,8 @@
 //! ## KEY PROJECT RULE — actionable errors (`docs/architecture/ORT2.md` §15.1)
 //!
 //! Every failure on the dispatch path is turned into an [`EpError`] that states
-//! **what** failed, **why**, and — for unsupported cases — that it is a
-//! *CUDA-EP Phase-2a* limitation with the concrete op / shape / dtype in hand.
+//! **what** failed and **why**, including the concrete op / shape / dtype
+//! when a case is unsupported on the CUDA EP.
 //! There are **no bare panics** on the execution path.
 
 use onnx_runtime_ep_api::EpError;
@@ -53,7 +53,7 @@ pub(crate) fn nvrtc_err(context: &str, e: cudarc::nvrtc::CompileError) -> EpErro
 }
 
 /// Build a "not implemented on CUDA yet" error for an op/dtype/rank/layout the
-/// CUDA EP does **not** cover in the current slice. The message is deliberately
+/// CUDA EP does **not** cover. The message is deliberately
 /// explicit and actionable (RULES.md #1: what/why/how) — it names the missing
 /// case and points at the coverage roadmap and the CPU-EP fallback, rather than
 /// silently falling back or panicking.

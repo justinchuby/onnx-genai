@@ -1,0 +1,49 @@
+{
+  "schema": 4,
+  "protocol_phase": "independent-focused-repeat-width8-case5",
+  "source_sha256": {
+    "crates/onnx-runtime-ep-cpu/src/kernels/softmax_neon.rs": "a03ec3cdfa7f7df5fae4a48328593adc6eb5283b62dc4ed828fedf6524565da8",
+    "crates/onnx-runtime-ep-cpu/src/kernels/softmax_neon_unroll_tests.rs": "73ffcfaefefa7aea5a6714b9facdc4cb9fa1ffde84755d194cc254e9c8c9e5a6"
+  },
+  "parent": "4aae0c84dbfc056754b3f467dddfc23902132fbc",
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "lock": "/tmp/onnx-genai-hostlock-darwin.flock",
+  "lock_inode": 339651569,
+  "lock_parent_pid": 61722,
+  "lock_busy_control": true,
+  "load_before": [
+    1.771484375,
+    1.99462890625,
+    2.23193359375
+  ],
+  "foreign_cpu_instrument": "unavailable on Darwin; no claim of foreign CPU absence",
+  "receipts": [],
+  "arms": {
+    "0": "original_same_arithmetic",
+    "1": "unrolled_native",
+    "2": "unrolled_native_aa",
+    "3": "mlas",
+    "4": "original_outlined"
+  },
+  "cpu_unit": "seconds; terminal wait4 child user+system CPU, all threads, includes setup and validation",
+  "repetitions": 3,
+  "work_elements": 134217728,
+  "machdep.cpu.brand_string": "Apple M1 Max",
+  "hw.memsize": "34359738368",
+  "hw.logicalcpu": "10",
+  "hardware_read_command": "/usr/sbin/sysctl -n machdep.cpu.brand_string hw.memsize hw.logicalcpu",
+  "hardware_read_exit": 0,
+  "hardware_read_authority": "separate escalated read-only command; sandbox sysctl was denied before any build or timing",
+  "hardware_read_time_utc": "2026-11-24T19:43:28.315736+00:00",
+  "binary": "/tmp/nxrt-erf-nan-target/release/deps/onnx_runtime_ep_cpu-6ee16d18d97c5fef",
+  "binary_sha256": "f5b3b4b946617ca6a2f573a6619f0e6b1909029b33ef3f4270af6f3b05b8edc3",
+  "load_after": [
+    1.70947265625,
+    1.97802734375,
+    2.224609375
+  ],
+  "runner_sha256": "b929c0b750ada5efdfa7d984d0bbe7b3e01d95ac7ba9f7fcfdb0e01647de3606",
+  "receipts_sha256": "c5744ad46a443fa909219a301b3f352de5b7487743086521de33fa3ef434c24f",
+  "processes": 36
+}

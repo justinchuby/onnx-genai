@@ -1,10 +1,18 @@
 //! `Compress` selection along an optional axis.
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Attribute, DataType, Node};
+use std::ops::Range;
+
+use onnx_runtime_ep_api::{
+    EpError, HostKernelData, HostKernelInput, HostKernelOutput, Kernel, KernelFactory, Result,
+    TensorMut, TensorView,
+};
+use onnx_runtime_ir::{Attribute, DataType, Node, checked_numel};
 
 use super::{check_arity, elem_size, to_dense_bytes, write_dense_bytes};
-use crate::strided::numel;
+
+fn error(detail: impl std::fmt::Display) -> EpError {
+    EpError::KernelFailed(format!("Compress: {detail}"))
+}
 
 pub struct CompressKernel {
     axis: Option<i64>,
@@ -20,63 +28,150 @@ impl KernelFactory for CompressFactory {
     }
 }
 
+struct Selection {
+    shape: Vec<usize>,
+    axis_len: usize,
+    selected: Vec<usize>,
+    outer: usize,
+    inner: usize,
+    count: usize,
+}
+
+impl Selection {
+    fn ranges(&self) -> impl Iterator<Item = Range<usize>> + '_ {
+        // Avoid walking logical blocks when a zero dimension leaves no data to move.
+        let outer = if self.count == 0 { 0 } else { self.outer };
+        (0..outer).flat_map(move |outer| {
+            self.selected.iter().map(move |&index| {
+                let start = (outer * self.axis_len + index) * self.inner;
+                start..start + self.inner
+            })
+        })
+    }
+}
+
+impl CompressKernel {
+    fn selection(&self, shape: &[usize], condition: &[u8]) -> Result<Selection> {
+        let numel = |dims: &[usize]| {
+            checked_numel(dims).ok_or_else(|| {
+                error(format!(
+                    "shape {shape:?} overflows addressable element count"
+                ))
+            })
+        };
+        let (mut output, axis) = match self.axis {
+            Some(requested) => {
+                let rank = shape.len();
+                let axis = if requested < 0 {
+                    requested + rank as i64
+                } else {
+                    requested
+                };
+                if !(0..rank as i64).contains(&axis) {
+                    return Err(error(format!(
+                        "axis {requested} is outside [-{rank}, {rank}); supply an axis within the input rank"
+                    )));
+                }
+                (shape.to_vec(), axis as usize)
+            }
+            None => (vec![numel(shape)?], 0),
+        };
+        let axis_len = output[axis];
+        let selected: Vec<_> = condition
+            .iter()
+            .take(axis_len)
+            .enumerate()
+            .filter_map(|(index, &keep)| (keep != 0).then_some(index))
+            .collect();
+        output[axis] = selected.len();
+        let count = numel(&output)?;
+        let (outer, inner) = if count == 0 {
+            (0, 0)
+        } else {
+            numel(shape)?;
+            (numel(&output[..axis])?, numel(&output[axis + 1..])?)
+        };
+        Ok(Selection {
+            shape: output,
+            axis_len,
+            selected,
+            outer,
+            inner,
+            count,
+        })
+    }
+}
+
 impl Kernel for CompressKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Compress", inputs, outputs, 2, 2, 1)?;
         let input = &inputs[0];
         let condition = &inputs[1];
         if condition.dtype != DataType::Bool || condition.shape.len() != 1 {
-            return Err(EpError::KernelFailed(
-                "Compress: condition must be a one-dimensional Bool tensor".into(),
-            ));
+            return Err(error("condition must be a one-dimensional Bool tensor"));
         }
         if outputs[0].dtype != input.dtype {
-            return Err(EpError::KernelFailed(
-                "Compress: output dtype must match input dtype".into(),
-            ));
+            return Err(error("output dtype must match input dtype"));
         }
 
-        let (input_shape, axis) = match self.axis {
-            Some(axis) => {
-                let rank = input.shape.len();
-                let axis = if axis < 0 { axis + rank as i64 } else { axis };
-                if axis < 0 || axis as usize >= rank {
-                    return Err(EpError::KernelFailed("Compress: axis out of range".into()));
-                }
-                (input.shape.to_vec(), axis as usize)
-            }
-            None => (vec![numel(input.shape)], 0),
-        };
-        let condition = to_dense_bytes(condition)?;
-        let axis_len = input_shape[axis];
-        let selected: Vec<usize> = (0..axis_len)
-            .filter(|&i| i < condition.len() && condition[i] != 0)
-            .collect();
-
-        let mut expected_shape = input_shape.clone();
-        expected_shape[axis] = selected.len();
-        if outputs[0].shape != expected_shape {
-            return Err(EpError::KernelFailed(
-                "Compress: output shape does not match the selected condition elements".into(),
+        let selection = self.selection(input.shape, &to_dense_bytes(condition)?)?;
+        if outputs[0].shape != selection.shape {
+            return Err(error(
+                "output shape does not match the selected condition elements",
             ));
         }
 
         let element_size = elem_size(input.dtype)?;
         let src = to_dense_bytes(input)?;
-        let outer = numel(&input_shape[..axis]);
-        let inner = numel(&input_shape[axis + 1..]);
-        let mut out = vec![0; numel(&expected_shape) * element_size];
-        for outer_index in 0..outer {
-            for (output_axis, &input_axis) in selected.iter().enumerate() {
-                let src_offset = (outer_index * axis_len + input_axis) * inner * element_size;
-                let dst_offset =
-                    (outer_index * selected.len() + output_axis) * inner * element_size;
-                let bytes = inner * element_size;
-                out[dst_offset..dst_offset + bytes]
-                    .copy_from_slice(&src[src_offset..src_offset + bytes]);
-            }
+        let byte_count = selection
+            .count
+            .checked_mul(element_size)
+            .ok_or_else(|| error("output shape overflows addressable bytes"))?;
+        let mut out = Vec::with_capacity(byte_count);
+        for range in selection.ranges() {
+            out.extend_from_slice(&src[range.start * element_size..range.end * element_size]);
         }
         write_dense_bytes(&mut outputs[0], &out)
+    }
+
+    fn execute_managed_host(
+        &self,
+        inputs: &[HostKernelInput<'_>],
+    ) -> Result<Vec<HostKernelOutput>> {
+        let [HostKernelInput::Strings(input), condition] = inputs else {
+            return Err(error(
+                "expected managed tensor(string) data and a one-dimensional Bool condition",
+            ));
+        };
+        let HostKernelInput::Bool {
+            shape: [len],
+            bytes,
+        } = condition
+        else {
+            return Err(error("condition must be a one-dimensional Bool tensor"));
+        };
+        if *len != bytes.len() {
+            return Err(error(format!(
+                "condition shape [{len}] requires {len} Bool bytes, got {}",
+                bytes.len()
+            )));
+        }
+        if checked_numel(input.shape) != Some(input.values.len()) {
+            return Err(error(format!(
+                "input shape {:?} does not match the supplied {} strings; provide one string per element",
+                input.shape,
+                input.values.len()
+            )));
+        }
+        let selection = self.selection(input.shape, bytes)?;
+        let mut strings = Vec::with_capacity(selection.count);
+        for range in selection.ranges() {
+            strings.extend_from_slice(&input.values[range]);
+        }
+        Ok(vec![HostKernelOutput {
+            shape: selection.shape,
+            data: HostKernelData::Strings(strings),
+        }])
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {

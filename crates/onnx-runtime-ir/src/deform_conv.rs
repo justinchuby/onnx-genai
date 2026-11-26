@@ -24,7 +24,8 @@ pub fn validate_claim(
         None,
     )?;
     for (i, shape) in shapes.iter().take(5).enumerate() {
-        if !present(i) {
+        // Empty claim shapes also encode unknown rank in the current IR.
+        if !present(i) || shape.is_empty() {
             continue;
         }
         let valid = match i {
@@ -35,11 +36,11 @@ pub fn validate_claim(
             return Err(format!("{} has invalid rank {}", INPUTS[i], shape.len()));
         }
     }
-    if let Some(x) = shapes.first() {
+    if let Some(x) = shapes.first().filter(|shape| !shape.is_empty()) {
         attrs.validate_rank(x.len() - 2)?;
         for i in [1, 2, 4] {
             if present(i)
-                && let Some(s) = shapes.get(i)
+                && let Some(s) = shapes.get(i).filter(|shape| !shape.is_empty())
                 && s.len() != x.len()
             {
                 return Err(format!(
@@ -54,7 +55,7 @@ pub fn validate_claim(
     let concrete: [Option<Vec<usize>>; 5] = std::array::from_fn(|i| {
         shapes
             .get(i)
-            .filter(|_| present(i))
+            .filter(|shape| present(i) && !shape.is_empty())
             .and_then(|s| as_static_shape(s))
     });
     if node
@@ -135,11 +136,19 @@ pub struct Geometry {
 
 impl Attributes {
     pub fn parse(node: &Node) -> Result<Self, String> {
-        if !(3..=5).contains(&node.inputs.len())
-            || node.inputs[..3].iter().any(Option::is_none)
-            || node.outputs.len() != 1
-        {
-            return Err("expected X, W, offset, optional B and mask, and one output".into());
+        if !(3..=5).contains(&node.inputs.len()) {
+            return Err(format!(
+                "requires 3 to 5 positional inputs, got {}",
+                node.inputs.len()
+            ));
+        }
+        for (i, name) in INPUTS.iter().take(3).enumerate() {
+            if node.inputs[i].is_none() {
+                return Err(format!("required input {i} ('{name}') is absent"));
+            }
+        }
+        if node.outputs.len() != 1 {
+            return Err(format!("requires one output Y, got {}", node.outputs.len()));
         }
         let group = |name| match node.attr(name) {
             None => Ok(1),
@@ -305,4 +314,63 @@ fn product(name: &str, dims: &[usize]) -> Result<usize, String> {
     dims.iter()
         .try_fold(1usize, |a, &b| a.checked_mul(b))
         .ok_or_else(|| format!("{name} shape {dims:?} overflows element count"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{NodeId, ValueId, static_shape};
+
+    fn node() -> Node {
+        Node::new(
+            NodeId(0),
+            "DeformConv",
+            (0..3).map(|i| Some(ValueId(i))).collect(),
+            vec![ValueId(3)],
+        )
+    }
+
+    #[test]
+    fn claim_rejects_missing_required_slots_and_excess_arity() {
+        for missing in 0..3 {
+            let mut n = node();
+            n.inputs[missing] = None;
+            let error = validate_claim(&n, 19, &[], &[]).unwrap_err();
+            assert!(
+                error.contains(&format!("required input {missing}")),
+                "{error}"
+            );
+        }
+        let mut n = node();
+        n.inputs.truncate(2);
+        assert!(
+            validate_claim(&n, 19, &[], &[])
+                .unwrap_err()
+                .contains("3 to 5")
+        );
+        n.inputs.resize(6, Some(ValueId(0)));
+        assert!(
+            validate_claim(&n, 19, &[], &[])
+                .unwrap_err()
+                .contains("got 6")
+        );
+    }
+
+    #[test]
+    fn unknown_claim_rank_defers_but_concrete_scalar_remains_invalid() {
+        let n = node();
+        validate_claim(&n, 19, &[vec![], vec![], vec![]], &[DataType::Float32; 3]).unwrap();
+        let known_bad = [vec![], static_shape([1, 1]), vec![]];
+        assert!(
+            validate_claim(&n, 19, &known_bad, &[DataType::Float32; 3])
+                .unwrap_err()
+                .contains("W has invalid rank 2")
+        );
+        let attrs = Attributes::parse(&n).unwrap();
+        assert!(
+            attrs
+                .resolve([Some(&[]), Some(&[]), Some(&[]), None, None])
+                .is_err()
+        );
+    }
 }

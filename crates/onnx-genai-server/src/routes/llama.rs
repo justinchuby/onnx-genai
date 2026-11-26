@@ -3,6 +3,14 @@ use super::*;
 use axum::extract::Query;
 use serde_json::{Value, json};
 
+fn managed_model_formats(state: &AppState) -> &'static [&'static str] {
+    if state.model_manager.is_some() {
+        &["nxrt_package", "ort_model_package"]
+    } else {
+        &[]
+    }
+}
+
 #[derive(Default, Deserialize)]
 pub(crate) struct ModelQuery {
     #[serde(default)]
@@ -44,10 +52,13 @@ pub(crate) async fn props(
             "invalid /props query: {err}; use model=<model-id> and autoload=true or autoload=false"
         ))
     })?;
-    if query.model.is_empty() && state.registry.is_router().map_err(map_registry_error)? {
+    if query.model.is_empty()
+        && (state.model_manager.is_some()
+            || state.registry.is_router().map_err(map_registry_error)?)
+    {
         return Ok(Json(json!({
             "role": "router", "ui": true, "ui_settings": {},
-            "nxrt_capabilities": {"tool_protocol_per_model": true, "reasoning_control": true, "resumable_streams": true, "server_tools": false},
+            "nxrt_capabilities": {"tool_protocol_per_model": true, "reasoning_control": true, "resumable_streams": true, "server_tools": false, "model_management": state.model_manager.is_some(), "managed_model_formats": managed_model_formats(&state)},
             "cors_proxy_enabled": false, "endpoint_slots": true,
             "endpoint_props": state.config.endpoint_props, "endpoint_metrics": cfg!(feature = "metrics"),
             "build_info": concat!("nxrt ", env!("CARGO_PKG_VERSION"))
@@ -67,6 +78,9 @@ pub(crate) async fn props(
             "n_ctx": handle.model_max_context,
             "params": {
                 "n_predict": state.config.max_output_tokens,
+                "t_max_predict_ms": -1,
+                "n_indent": options.minimum_indent,
+                "grammar_trigger_collation": onnx_genai_engine::GrammarCollation::default(),
                 "seed": -1,
                 "temperature": if options.greedy { 0.0 } else { options.temperature },
                 "top_k": options.top_k, "top_p": options.top_p, "min_p": options.min_p,
@@ -81,12 +95,13 @@ pub(crate) async fn props(
                 "top_n_sigma": -1.0, "adaptive_target": -1.0, "adaptive_decay": 0.9,
                 "samplers": onnx_genai_engine::SamplerSequence::DEFAULT.iter().filter(|&&stage| stage != onnx_genai_engine::SamplerStage::TopA).collect::<Vec<_>>(),
                 "backend_sampling": false, "timings_per_token": false,
+                "sse_ping_interval":state.config.sse_ping_interval.seconds(),
                 "stop": []
             }
         },
         "modalities": {
             "vision": modalities.is_some_and(|m| m.vision.is_some()),
-            "audio": modalities.is_some_and(|m| m.audio.is_some()), "video": false
+            "audio": handle.engine.transcription.is_some() || modalities.is_some_and(|m| m.audio.is_some()), "video": false
         },
         "chat_template": handle.chat_template.as_ref().map_or("", |t| t.source()),
         "chat_template_caps": {},
@@ -96,13 +111,23 @@ pub(crate) async fn props(
         "cors_proxy_enabled": false,
         "build_info": concat!("nxrt ", env!("CARGO_PKG_VERSION")),
         "nxrt_capabilities": {
+            "grammar_trigger_collations": [onnx_genai_engine::GrammarCollation::Libcxx,onnx_genai_engine::GrammarCollation::Libstdcxx],
             "server_tools": false,
+            "model_management": state.model_manager.is_some(), "managed_model_formats": managed_model_formats(&state),
             "resumable_streams": true, "reasoning_control": true,
             "tools": handle.tool_protocol.is_some(), "custom_sampler_order": handle.engine.runtime_sampling,
             "lora": handle.engine.adapters.is_some(),
             "lora_embeddings": handle.engine.adapters.as_ref().is_some_and(|state|state.capabilities.embeddings),
             "lora_sessions": handle.engine.adapters.as_ref().is_some_and(|state|state.capabilities.sessions),
-            "reranking": handle.engine.reranking.is_some()
+            "frame_transcription": handle.engine.transcription.is_some(),
+            "generative_transcription": handle.multimodal.as_ref().and_then(|specs|specs.audio.as_ref()).is_some_and(|audio|audio.transcription().is_some()),
+            "decision": handle.engine.decision.is_some(),
+            "decision_image_limit": handle.engine.decision.as_ref().map(|contract| contract.media().iter().filter(|m| m.kind==onnx_genai_metadata::EncodedMediaKind::Image).count()),
+            "decision_media_order": handle.engine.decision.as_ref().map(|contract|contract.media().iter().map(|m|m.kind).collect::<Vec<_>>()),
+            "decision_audio_limit": handle.engine.decision.as_ref().map(|contract|contract.media().iter().filter(|m|m.kind==onnx_genai_metadata::EncodedMediaKind::Audio).count()),
+            "decision_spoken_instructions": handle.engine.decision.as_ref().is_some_and(|contract|contract.spoken_input().is_some()),
+            "reranking": handle.engine.reranking.is_some(),
+            "reranking_image_limits": handle.engine.reranking.as_ref().map(|contract|json!({"query":contract.query_images().len(),"document":contract.document_images().len()}))
         }
     });
     let lora = match &handle.engine.adapters {
@@ -246,7 +271,10 @@ pub(super) fn validate_extensions(request: &ChatCompletionRequest) -> Result<(),
             "reasoning_format" => value == "auto" || value == "deepseek",
             // These opt into optional progress/control facilities, not a different decoding algorithm.
             "return_progress" | "timings_per_token" => value.is_boolean(),
-            "sse_ping_interval" => value.as_f64().is_some_and(|n| n >= 0.0),
+            "sse_ping_interval" => {
+                let _ = crate::SsePingInterval::parse(value)?;
+                true
+            }
             "cache_prompt" | "ignore_eos" => value.is_boolean(),
             "logit_bias" => value.is_object() || value.is_array(),
             "dry_penalty_last_n" => value
@@ -285,10 +313,6 @@ pub(crate) async fn post_props(State(state): State<AppState>) -> Result<Json<Val
     Ok(Json(json!({"success": true})))
 }
 
-pub(crate) async fn disabled_feature() -> Response {
-    (StatusCode::FORBIDDEN, Json(json!({"error": {"type": "feature_disabled", "message": "this feature is unavailable in nxrt; use the capabilities reported by /props"}}))).into_response()
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ManageModelRequest {
@@ -306,7 +330,18 @@ pub(crate) async fn load_model(
             "extra_args cannot configure an in-process nxrt model; configure the model in --models-config instead",
         ));
     }
-    let _ = super::admin::admin_load_model(State(state), AxumPath(request.model)).await?;
+    if let Some(manager) = &state.model_manager
+        && manager.has_transfer(&request.model)?
+    {
+        return Err(ApiError::unavailable(
+            "model has an incomplete download; POST /models with its model id to resume it before loading",
+        ));
+    }
+    let id = request.model;
+    let _ = super::admin::admin_load_model(State(state.clone()), AxumPath(id.clone())).await?;
+    if let Some(manager) = &state.model_manager {
+        manager.loaded_changed(&id, true);
+    }
     Ok(Json(json!({"success": true})))
 }
 
@@ -319,43 +354,106 @@ pub(crate) async fn unload_model(
             "extra_args is not valid when unloading a model; remove the field",
         ));
     }
-    super::admin::admin_unload_model(State(state), AxumPath(request.model)).await?;
+    if let Some(manager) = &state.model_manager
+        && manager.pause(&request.model).await?
+    {
+        return Ok(Json(json!({"success":true})));
+    }
+    let id = request.model;
+    super::admin::admin_unload_model(State(state.clone()), AxumPath(id.clone())).await?;
+    if let Some(manager) = &state.model_manager {
+        manager.loaded_changed(&id, false);
+    }
     Ok(Json(json!({"success": true})))
 }
 
+async fn send_model_event(tx: &mpsc::Sender<Result<Event, Infallible>>, value: Value) -> bool {
+    tx.send(Ok(Event::default().data(value.to_string())))
+        .await
+        .is_ok()
+}
+async fn poll_model_statuses(
+    state: &AppState,
+    last: &mut std::collections::BTreeMap<String, bool>,
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+) -> bool {
+    let statuses = match state.registry.statuses() {
+        Ok(statuses) => statuses,
+        Err(error) => {
+            tracing::warn!(%error,"model status stream stopped");
+            return false;
+        }
+    };
+    let mut present = std::collections::BTreeSet::new();
+    for status in statuses {
+        if status.transfer.is_some() {
+            continue;
+        }
+        present.insert(status.id.clone());
+        if last.insert(status.id.clone(), status.loaded) == Some(status.loaded) {
+            continue;
+        }
+        if !send_model_event(tx,json!({"model":status.id,"event":"model_status","data":{"status":if status.loaded {"loaded"} else {"unloaded"}}})).await {return false;}
+    }
+    last.retain(|id, _| present.contains(id));
+    true
+}
 pub(crate) async fn model_events(State(state): State<AppState>) -> Result<Response, ApiError> {
-    // Use committed registry state, never invented load percentages. Polling also
-    // sees model changes made through the existing nxrt administration API.
+    use crate::model_management::ManagementEvent;
     state.registry.statuses().map_err(map_registry_error)?;
-    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(16);
+    let mut incoming = state
+        .model_manager
+        .as_ref()
+        .map(|manager| manager.subscribe());
+    let initial = state
+        .model_manager
+        .as_ref()
+        .map(|manager| manager.initial_events())
+        .transpose()?
+        .unwrap_or_default();
+    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(1);
     tokio::spawn(async move {
-        let mut last = std::collections::BTreeMap::new();
-        loop {
-            let statuses = match state.registry.statuses() {
-                Ok(statuses) => statuses,
-                Err(error) => {
-                    tracing::warn!(%error, "model status stream stopped");
-                    return;
-                }
-            };
-            for status in statuses {
-                if last.insert(status.id.clone(), status.loaded) == Some(status.loaded) {
-                    continue;
-                }
-                let event = Event::default().data(
-                    json!({
-                        "model": status.id, "event": "status_update",
-                        "data": {"status": if status.loaded {"loaded"} else {"unloaded"}}
-                    })
-                    .to_string(),
-                );
-                if tx.send(Ok(event)).await.is_err() {
-                    return;
-                }
+        for value in initial {
+            if !send_model_event(&tx, value).await {
+                return;
             }
+        }
+        let mut last = std::collections::BTreeMap::new();
+        let mut seen = std::collections::HashMap::new();
+        let mut pending =
+            std::collections::BTreeMap::<String, Arc<crate::model_management::TransferJob>>::new();
+        let mut statuses = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut progress = tokio::time::interval(std::time::Duration::from_millis(100));
+        progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
             tokio::select! {
-                _ = tx.closed() => return,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                _=tx.closed()=>return,
+                _=statuses.tick()=>{if !poll_model_statuses(&state,&mut last,&tx).await {return;}},
+                _=progress.tick(),if !pending.is_empty()=>{
+                    for (_,job) in std::mem::take(&mut pending) {
+                        if let Some(value)=ManagementEvent::Progress(job).materialize(&mut seen)
+                            && !send_model_event(&tx,value).await {return;}
+                    }
+                },
+                event=async {match incoming.as_mut() {Some(receiver)=>receiver.recv().await,None=>std::future::pending().await}}=>{
+                    match event {
+                        Ok(ManagementEvent::Progress(job))=>{pending.insert(job.id().into(),job);},
+                        Ok(event@ManagementEvent::Protocol(_))=>{
+                            // Flush this model's latest bytes before its lifecycle event.
+                            if let ManagementEvent::Protocol(value)=&event && let Some(model)=value["model"].as_str() && let Some(job)=pending.remove(model)
+                                && let Some(value)=ManagementEvent::Progress(job).materialize(&mut seen) && !send_model_event(&tx,value).await {return;}
+                            if let Some(value)=event.materialize(&mut seen) && !send_model_event(&tx,value).await {return;}
+                        },
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>{
+                            pending.clear();seen.clear();
+                            if !send_model_event(&tx,json!({"model":"*","event":"models_reload","data":{}})).await {return;}
+                            if let Some(manager)=&state.model_manager {
+                                match manager.initial_events() {Ok(values)=>for value in values {if !send_model_event(&tx,value).await {return;}},Err(error)=>{tracing::warn!(error=%error.message,"model status snapshot failed");return;}}
+                            }
+                        },
+                        Err(tokio::sync::broadcast::error::RecvError::Closed)=>return,
+                    }
+                }
             }
         }
     });

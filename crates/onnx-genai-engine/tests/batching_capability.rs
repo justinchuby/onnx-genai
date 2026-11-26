@@ -2,6 +2,10 @@
 //! selected for bare decoder metadata. Workflow KV services cover composite
 //! shared/paged serving; the native path has a unit test in `engine::runtime`.
 
+#[path = "support/measurements.rs"]
+mod measurements;
+use measurements::{results_without_timings, without_timings};
+
 use onnx_genai_engine::{Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest};
 use onnx_genai_ort::SessionOptions;
 use std::path::{Path, PathBuf};
@@ -16,7 +20,10 @@ fn fixture(name: &str) -> anyhow::Result<PathBuf> {
 fn cpu_engine(model_dir: &Path) -> anyhow::Result<Engine> {
     Engine::from_dir_with_session_options(
         model_dir,
-        EngineConfig::default(),
+        EngineConfig {
+            decode_backend: onnx_genai_engine::EngineDecodeBackend::Ort,
+            ..Default::default()
+        },
         SessionOptions::default().with_intra_op_threads(1),
     )
 }
@@ -80,11 +87,11 @@ fn unsupported_shared_forward_falls_back_to_isolated_requests() -> anyhow::Resul
     let expected = requests
         .iter()
         .cloned()
-        .map(|request| isolated.generate(request))
+        .map(|request| isolated.generate(request).map(without_timings))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     let mut batched = cpu_engine(&fixture)?;
-    let actual = batched.generate_batched_static(requests.clone())?;
+    let actual = results_without_timings(batched.generate_batched_static(requests.clone())?);
 
     assert_eq!(actual, expected);
     assert!(
@@ -94,7 +101,7 @@ fn unsupported_shared_forward_falls_back_to_isolated_requests() -> anyhow::Resul
 
     let mut scheduled = cpu_engine(&fixture)?;
     assert_eq!(
-        scheduled.run_continuous_batch_scheduled(requests, 2)?,
+        results_without_timings(scheduled.run_continuous_batch_scheduled(requests, 2)?),
         expected,
         "scheduler admission must also decline unsupported shared forwarding before \
          request-visible work and preserve isolated results"

@@ -105,7 +105,7 @@ pub(crate) fn next_session_token_logits(
     kv_cache: &mut PagedKvCache,
     seq: SessionId,
     state: &mut EngineSession,
-) -> anyhow::Result<Vec<f32>> {
+) -> anyhow::Result<LogitsRow> {
     let (mut input_tokens, mut past_len) = session_decode_input_tokens(state)?;
     consume_windowed_prefix(
         session,
@@ -159,6 +159,7 @@ pub(crate) fn next_session_token_logits(
         &outputs,
         state.decode_state.io.logits_output.as_deref(),
     )
+    .map(LogitsRow::from_host_row)
 }
 
 pub(crate) fn next_session_token_logits_and_hidden(
@@ -168,7 +169,7 @@ pub(crate) fn next_session_token_logits_and_hidden(
     seq: SessionId,
     state: &mut EngineSession,
     hidden_output: &str,
-) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+) -> anyhow::Result<(LogitsRow, Vec<f32>)> {
     let (logits, mut hidden) = next_session_token_logits_and_hiddens(
         session,
         kv_model,
@@ -192,7 +193,7 @@ pub(crate) fn next_session_token_logits_and_hiddens(
     seq: SessionId,
     state: &mut EngineSession,
     hidden_outputs: &[String],
-) -> anyhow::Result<(Vec<f32>, Vec<Vec<f32>>)> {
+) -> anyhow::Result<(LogitsRow, Vec<Vec<f32>>)> {
     if state.decode_state.has_runner() {
         anyhow::bail!(
             "speculative hidden-state outputs {hidden_outputs:?} are not exposed by the optimized decode runner; initialize the target with the legacy output-preserving decode path"
@@ -244,13 +245,13 @@ pub(crate) fn next_session_token_logits_and_hiddens(
         .iter()
         .map(|output| extract_last_hidden(session, &outputs, output))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok((logits, hidden))
+    Ok((LogitsRow::from_host_row(logits), hidden))
 }
 
 pub(crate) fn next_draft_token_logits(
     draft_model: &mut DraftModel,
     draft_state: &mut DraftSession,
-) -> anyhow::Result<Vec<f32>> {
+) -> anyhow::Result<LogitsRow> {
     let (input_tokens, past_len) = draft_decode_input_tokens(draft_state)?;
     let input_len = input_tokens.len();
     if draft_state.decode_state.has_runner() {
@@ -304,6 +305,7 @@ pub(crate) fn next_draft_token_logits(
         &outputs,
         draft_state.decode_state.io.logits_output.as_deref(),
     )
+    .map(LogitsRow::from_host_row)
 }
 
 pub(crate) fn apply_paged_sliding_window(
@@ -422,7 +424,7 @@ pub(crate) fn propose_draft_tokens(
             generated_text: draft_text.clone(),
             step: first_step + offset,
         };
-        let token = select_next_token_with_rng(&mut logits, &context, options, chain, rng)?;
+        let token = select_next_token_with_rng(logits.try_mut()?, &context, options, chain, rng)?;
         proposed.push(token);
         draft_generated.push(token);
         draft_state.tokens.push(token);

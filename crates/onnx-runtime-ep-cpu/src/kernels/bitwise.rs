@@ -203,7 +203,8 @@ mod tests {
         Owned {
             bytes: vec![byte; shape.iter().product::<usize>() * dtype.byte_size()],
             shape: shape.to_vec(),
-            strides: compute_contiguous_strides(shape),
+            strides: compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides"),
             dtype,
         }
     }
@@ -217,7 +218,8 @@ mod tests {
         Owned {
             bytes: values,
             shape: shape.to_vec(),
-            strides: compute_contiguous_strides(shape),
+            strides: compute_contiguous_strides(shape)
+                .expect("fixture shape has representable contiguous strides"),
             dtype,
         }
     }

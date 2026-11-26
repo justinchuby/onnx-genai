@@ -201,7 +201,7 @@ pub fn load_metadata_from_dir(
 }
 
 /// Recognized inference-metadata filenames, in the order they are preferred.
-const METADATA_FILE_NAMES: [&str; 3] = [
+pub const METADATA_FILE_NAMES: [&str; 3] = [
     "inference_metadata.yaml",
     "inference_metadata.yml",
     "inference_metadata.json",
@@ -295,6 +295,52 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
     })?;
     if document
         .get("package")
+        .and_then(|package| package.get("infill"))
+        .is_some()
+    {
+        crate::version::gate_feature_use(
+            version,
+            crate::version::SchemaFeature::InfillContext,
+            "package.infill",
+        )
+        .map_err(crate::MetadataError::Parse)?;
+    }
+    if let Some(artifacts) = document
+        .get("adapters")
+        .and_then(|v| v.get("artifacts"))
+        .and_then(serde_yaml::Value::as_mapping)
+    {
+        for (name, artifact) in artifacts {
+            if let Some(weights) = artifact
+                .get("weights")
+                .and_then(serde_yaml::Value::as_sequence)
+            {
+                for (index, weight) in weights.iter().enumerate() {
+                    if weight.get("format").and_then(serde_yaml::Value::as_str) == Some("gguf") {
+                        crate::version::gate_feature_use(
+                            version,
+                            crate::version::SchemaFeature::GgufAdapter,
+                            &format!(
+                                "adapters.artifacts.{}.weights[{index}].format",
+                                name.as_str().unwrap_or("<invalid-name>")
+                            ),
+                        )
+                        .map_err(crate::MetadataError::Parse)?;
+                    }
+                }
+            }
+        }
+    }
+    if document.get("graph_weights").is_some() {
+        crate::version::gate_feature_use(
+            version,
+            crate::version::SchemaFeature::GraphWeights,
+            "graph_weights",
+        )
+        .map_err(crate::MetadataError::Parse)?;
+    }
+    if document
+        .get("package")
         .and_then(|p| p.get("tokenizer"))
         .and_then(|t| t.get("special_tokens"))
         .and_then(|t| t.get("eot_token_id"))
@@ -306,6 +352,94 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
             "package.tokenizer.special_tokens.eot_token_id",
         )
         .map_err(crate::MetadataError::Parse)?;
+    }
+    if let Some(profiles) = document
+        .get("profiles")
+        .and_then(serde_yaml::Value::as_mapping)
+    {
+        for (name, profile) in profiles {
+            if profile.get("realtime").is_some()
+                || profile.get("kind").and_then(serde_yaml::Value::as_str) == Some("realtime")
+            {
+                crate::version::gate_feature_use(
+                    version,
+                    crate::version::SchemaFeature::RealtimeSessions,
+                    &format!(
+                        "profiles.{}.realtime",
+                        name.as_str().unwrap_or("<invalid-name>")
+                    ),
+                )
+                .map_err(crate::MetadataError::Parse)?;
+            }
+            if profile.get("reranking").is_some() {
+                crate::version::gate_feature_use(
+                    version,
+                    crate::version::SchemaFeature::MultimodalReranking,
+                    &format!(
+                        "profiles.{}.reranking",
+                        name.as_str().unwrap_or("<invalid-name>")
+                    ),
+                )
+                .map_err(crate::MetadataError::Parse)?;
+            }
+            if profile
+                .get("decision")
+                .and_then(|d| d.get("images"))
+                .is_some()
+                || (profile.get("kind").and_then(|k| k.as_str()) == Some("decision")
+                    && profile.get("version").and_then(|v| v.as_str()) == Some("2"))
+            {
+                crate::version::gate_feature_use(
+                    version,
+                    crate::version::SchemaFeature::MultimodalDecisions,
+                    &format!(
+                        "profiles.{}.decision.images",
+                        name.as_str().unwrap_or("<invalid-name>")
+                    ),
+                )
+                .map_err(crate::MetadataError::Parse)?;
+            }
+            if profile
+                .get("decision")
+                .is_some_and(|d| d.get("media").is_some() || d.get("spoken_instructions").is_some())
+                || (profile.get("kind").and_then(|k| k.as_str()) == Some("decision")
+                    && profile.get("version").and_then(|v| v.as_str()) == Some("3"))
+            {
+                crate::version::gate_feature_use(
+                    version,
+                    crate::version::SchemaFeature::DecisionAudio,
+                    &format!(
+                        "profiles.{}.decision.media",
+                        name.as_str().unwrap_or("<invalid-name>")
+                    ),
+                )
+                .map_err(crate::MetadataError::Parse)?;
+            }
+            if profile.get("decision").is_some() {
+                crate::version::gate_feature_use(
+                    version,
+                    crate::version::SchemaFeature::DecisionProfiles,
+                    &format!(
+                        "profiles.{}.decision",
+                        name.as_str().unwrap_or("<invalid-name>")
+                    ),
+                )
+                .map_err(crate::MetadataError::Parse)?;
+                crate::version::gate_feature_field(
+                    version,
+                    crate::version::SchemaFeature::DecisionInputPolicies,
+                    &format!(
+                        "profiles.{}.decision.input_policy",
+                        name.as_str().unwrap_or("<invalid-name>")
+                    ),
+                    profile
+                        .get("decision")
+                        .and_then(|d| d.get("input_policy"))
+                        .is_some(),
+                )
+                .map_err(crate::MetadataError::Parse)?;
+            }
+        }
     }
     gate_output_protocol_features(document, version)?;
     gate_compressed_state_features(document, version)?;

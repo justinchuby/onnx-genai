@@ -16,6 +16,16 @@ pub fn moe(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+fn packed_moe(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    onnx_runtime_ir::packed_arithmetic::ActivationArithmetic::from_node(ctx.node).map_err(
+        |detail| ShapeInferError::Invalid {
+            op: ctx.node.op_type.clone(),
+            detail,
+        },
+    )?;
+    moe(ctx)
+}
+
 /// `SparseKvGather`: cache `[B,G,C,D]` and indices `[B,G,Q,K]` produce
 /// selected KV `[B,G,Q,K,D]`.
 pub fn sparse_kv_gather(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
@@ -41,7 +51,7 @@ pub fn sparse_kv_gather(ctx: &mut InferenceContext) -> Result<(), ShapeInferErro
     Ok(())
 }
 
-/// `pkg.nxrt::KvCacheCapacityAppend`: the CUDA-only in-place capacity-write
+/// `pkg.nxrt._private::KvCacheCapacityAppend`: the CUDA-only in-place capacity-write
 /// replacement for a KV-cache-growth `Concat` (inputs `[past, current,
 /// position_ids]`, aliasing `present == past`). Its output shape is always
 /// exactly `past`'s shape -- the whole point of the physical-capacity write is
@@ -55,7 +65,7 @@ pub fn kv_cache_capacity_append(ctx: &mut InferenceContext) -> Result<(), ShapeI
     Ok(())
 }
 
-/// `pkg.nxrt::IndexShare`: selected-token attention. Output 0 mirrors the query
+/// `pkg.nxrt._private::IndexShare`: selected-token attention. Output 0 mirrors the query
 /// `[B, num_heads, S_q, H]`. When the present KV cache is also returned (3
 /// outputs), outputs 1/2 are `[B, kv_num_heads, S_past + S_cur, H]`.
 pub fn index_share(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
@@ -80,7 +90,7 @@ pub fn index_share(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
-/// `pkg.nxrt::VarlenAttention`: packed token-major attention. The output keeps
+/// `pkg.nxrt._private::VarlenAttention`: packed token-major attention. The output keeps
 /// query's total-token/head dimensions and uses value's head width.
 pub fn varlen_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     require_outputs(ctx, 1)?;
@@ -589,18 +599,38 @@ pub fn register(reg: &mut InferenceRegistry) {
         gather_block_quantized,
     );
     reg.register("com.microsoft", "RotaryEmbedding", 1, rotary_embedding);
-    reg.register("pkg.nxrt", "BlockQuantizedMoE", 1, moe);
-    reg.register("pkg.nxrt", "SparseKvGather", 1, sparse_kv_gather);
-    reg.register("pkg.nxrt", "IndexShare", 1, index_share);
     reg.register(
-        "pkg.nxrt",
+        onnx_runtime_ir::RUNTIME_DOMAIN,
+        "BlockQuantizedMoE",
+        1,
+        packed_moe,
+    );
+    reg.register(
+        onnx_runtime_ir::RUNTIME_DOMAIN,
+        "SparseKvGather",
+        1,
+        sparse_kv_gather,
+    );
+    reg.register(
+        onnx_runtime_ir::RUNTIME_DOMAIN,
+        "IndexShare",
+        1,
+        index_share,
+    );
+    reg.register(
+        onnx_runtime_ir::RUNTIME_DOMAIN,
         "KvCacheCapacityAppend",
         1,
         kv_cache_capacity_append,
     );
-    reg.register("pkg.nxrt", "VarlenAttention", 1, varlen_attention);
     reg.register(
-        "pkg.nxrt",
+        onnx_runtime_ir::RUNTIME_DOMAIN,
+        "VarlenAttention",
+        1,
+        varlen_attention,
+    );
+    reg.register(
+        onnx_runtime_ir::RUNTIME_DOMAIN,
         "CompressedSparseAttention",
         1,
         compressed_sparse_attention,

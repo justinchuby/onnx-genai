@@ -123,6 +123,51 @@ pub fn constant(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 /// the `value` attribute (default float32).
 pub fn constant_of_shape(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let (dtype, fill) = value_attr_scalar(ctx.node);
+    // The value tensor determines T2, even when the shape is a runtime input.
+    let since = match dtype {
+        DataType::Float16
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Uint8
+        | DataType::Uint16
+        | DataType::Uint32
+        | DataType::Uint64
+        | DataType::Bool => 9,
+        DataType::BFloat16
+        | DataType::Float8E4M3FN
+        | DataType::Float8E4M3FNUZ
+        | DataType::Float8E5M2
+        | DataType::Float8E5M2FNUZ => 20,
+        DataType::Int4 | DataType::Uint4 => 21,
+        DataType::Float4E2M1 => 23,
+        DataType::Float8E8M0 => 24,
+        DataType::Int2 | DataType::Uint2 => 25,
+        _ => {
+            return Err(ShapeInferError::Invalid {
+                op: "ConstantOfShape".into(),
+                detail: format!(
+                    "the 'value' tensor dtype {dtype:?} is not admitted at opset {}; \
+                     use a numeric or bool dtype supported by that ConstantOfShape revision",
+                    ctx.opset("")
+                ),
+            });
+        }
+    };
+    let opset = ctx.opset("");
+    if opset < since {
+        return Err(ShapeInferError::Invalid {
+            op: "ConstantOfShape".into(),
+            detail: format!(
+                "the 'value' tensor dtype {dtype:?} requires opset {since} or later, \
+                 but this node uses opset {opset}; export with opset {since} or later \
+                 or choose a dtype supported at opset {opset}"
+            ),
+        });
+    }
     if let Some(rank) = ctx.input_rank(0)
         && rank != 1
     {

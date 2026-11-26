@@ -22,6 +22,63 @@ pub struct CastOptions {
     opset: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct CastAttributes {
+    opset: u64,
+    saturate: Option<std::result::Result<bool, ()>>,
+    round: Option<std::result::Result<RoundMode, ()>>,
+}
+
+impl CastAttributes {
+    pub const fn defaults(opset: u64) -> Self {
+        Self {
+            opset,
+            saturate: None,
+            round: None,
+        }
+    }
+
+    pub fn from_node(node: &Node, opset: u64) -> Self {
+        let saturate = node.attr("saturate").map(|attr| match attr.as_int() {
+            Some(0) if opset >= 19 => Ok(false),
+            Some(1) if opset >= 19 => Ok(true),
+            _ => Err(()),
+        });
+        let round = node.attr("round_mode").map(|attr| match attr.as_str() {
+            Some("up") if opset >= 24 => Ok(RoundMode::Up),
+            Some("down") if opset >= 24 => Ok(RoundMode::Down),
+            Some("nearest") if opset >= 24 => Ok(RoundMode::Nearest),
+            _ => Err(()),
+        });
+        Self {
+            opset,
+            saturate,
+            round,
+        }
+    }
+
+    pub fn resolve(self, op: &str, src: DataType, dst: DataType) -> Result<CastOptions> {
+        let mut options = CastOptions::defaults(self.opset);
+        options.validate_pair(op, src, dst)?;
+        let invalid =
+            |help: &str| EpError::KernelFailed(format!("{op} at opset {}: {help}", self.opset));
+        if Float8::of(dst).is_some()
+            && let Some(saturate) = self.saturate
+        {
+            options.saturate = saturate
+                .map_err(|()| invalid("`saturate` requires opset 19+ and must be 0 or 1"))?;
+        }
+        if Float8::of(dst) == Some(Float8::E8M0)
+            && let Some(round) = self.round
+        {
+            options.round = round.map_err(|()| {
+                invalid("`round_mode` requires opset 24+ and must be `up`, `down`, or `nearest`")
+            })?;
+        }
+        Ok(options)
+    }
+}
+
 impl CastOptions {
     pub const fn defaults(opset: u64) -> Self {
         Self {
@@ -31,47 +88,33 @@ impl CastOptions {
         }
     }
 
-    pub fn from_node(node: &Node, opset: u64) -> Result<Self> {
-        let invalid = |help: &str| {
-            EpError::KernelFailed(format!("{} at opset {opset}: {help}", node.op_type))
-        };
-        let mut options = Self::defaults(opset);
-        if let Some(attr) = node.attr("saturate") {
-            options.saturate = match (opset >= 19, attr.as_int()) {
-                (true, Some(0)) => false,
-                (true, Some(1)) => true,
-                _ => return Err(invalid("`saturate` requires opset 19+ and must be 0 or 1")),
-            };
-        }
-        if let Some(attr) = node.attr("round_mode") {
-            options.round = match (opset >= 24, attr.as_str()) {
-                (true, Some("up")) => RoundMode::Up,
-                (true, Some("down")) => RoundMode::Down,
-                (true, Some("nearest")) => RoundMode::Nearest,
-                _ => {
-                    return Err(invalid(
-                        "`round_mode` requires opset 24+ and must be `up`, `down`, or `nearest`",
-                    ));
-                }
-            };
-        }
-        Ok(options)
-    }
-
     pub fn validate_pair(self, op: &str, src: DataType, dst: DataType) -> Result<()> {
-        for dtype in [src, dst] {
-            if let Some(format) = Float8::of(dtype) {
-                let min_opset = if format == Float8::E8M0 { 24 } else { 19 };
-                if self.opset < min_opset {
-                    return Err(EpError::KernelFailed(format!(
-                        "{op}: {src:?} -> {dst:?} uses {dtype:?}, which requires opset {min_opset} or newer (got {})",
-                        self.opset
-                    )));
-                }
-            }
+        if let Some(reason) = unsupported_reason(op, self.opset, Some(src), Some(dst)) {
+            return Err(EpError::KernelFailed(reason));
         }
         Ok(())
     }
+}
+
+pub fn unsupported_reason(
+    op: &str,
+    opset: u64,
+    src: Option<DataType>,
+    dst: Option<DataType>,
+) -> Option<String> {
+    for (role, dtype) in [("source", src), ("target", dst)] {
+        if let Some(dtype) = dtype
+            && let Some(format) = Float8::of(dtype)
+        {
+            let min_opset = if format == Float8::E8M0 { 24 } else { 19 };
+            if opset < min_opset {
+                return Some(format!(
+                    "{op}: {role} dtype {dtype:?} requires opset {min_opset} or newer (got {opset}); export the node at a supported revision"
+                ));
+            }
+        }
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -374,18 +417,30 @@ mod tests {
         node.attributes
             .insert("round_mode".into(), Attribute::String(b"closest".to_vec()));
         assert!(
-            CastOptions::from_node(&node, 24)
+            CastAttributes::from_node(&node, 24)
+                .resolve("CastLike", DataType::Float32, DataType::Float8E8M0)
                 .unwrap_err()
                 .to_string()
                 .contains("`up`, `down`, or `nearest`")
         );
+        assert!(
+            CastAttributes::from_node(&node, 24)
+                .resolve("CastLike", DataType::Float32, DataType::Float8E4M3FN)
+                .is_ok()
+        );
         node.attributes.clear();
         node.attributes.insert("saturate".into(), Attribute::Int(2));
         assert!(
-            CastOptions::from_node(&node, 24)
+            CastAttributes::from_node(&node, 24)
+                .resolve("CastLike", DataType::Float32, DataType::Float8E4M3FN)
                 .unwrap_err()
                 .to_string()
                 .contains("0 or 1")
+        );
+        assert!(
+            CastAttributes::from_node(&node, 24)
+                .resolve("CastLike", DataType::Float8E4M3FN, DataType::Float32)
+                .is_ok()
         );
     }
 

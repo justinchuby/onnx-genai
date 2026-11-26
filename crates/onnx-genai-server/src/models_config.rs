@@ -47,6 +47,9 @@ pub struct ModelSpec {
     pub id: String,
     /// Filesystem path to the model directory.
     pub path: PathBuf,
+    /// Explicit named variant in an authored model-package manifest.
+    #[serde(default)]
+    pub package_variant: Option<String>,
     /// If `true` (the default), the model is loaded immediately at server startup.
     /// If `false`, the model is recorded as available but not loaded; it is lazily
     /// loaded on the first request that routes to it (or via the admin load endpoint).
@@ -157,6 +160,7 @@ pub fn from_models_dir(dir: &Path) -> anyhow::Result<Vec<ModelSpec>> {
             continue;
         }
         specs.push(ModelSpec {
+            package_variant: None,
             id,
             path,
             eager: true,

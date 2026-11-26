@@ -144,11 +144,20 @@ fn shape_specific_diagnostics_are_uniform() -> anyhow::Result<()> {
     let workflow = Engine::from_dir(&workflow_package(), EngineConfig::default())?;
     assert!(!workflow.execution_provider_status().is_empty());
     let _ = workflow.resource_snapshot();
-    // Both answer the same question about their component models. A package
-    // whose one graph the decode core executes has no interpreter component
-    // sessions, and reports exactly that — an empty set is the honest answer,
-    // where an error would have been a caller-visible package kind.
-    assert!(!workflow.models()?.sessions.is_empty());
+    // Both answer the same question about their component models. Native
+    // components intentionally build no ORT sessions, but retain their
+    // backend-neutral graph I/O diagnostics.
+    let workflow_models = workflow.models()?;
+    assert!(workflow_models.sessions.is_empty());
+    assert_eq!(
+        workflow_models.graph_io_metadata.keys().collect::<Vec<_>>(),
+        workflow_models
+            .directory
+            .model_paths
+            .keys()
+            .collect::<Vec<_>>(),
+        "Native retains graph diagnostics for every declared workflow component"
+    );
     assert!(
         decoder.models()?.sessions.is_empty(),
         "the decode core holds this package's one graph, so the interpreter builds no component \

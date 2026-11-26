@@ -726,6 +726,55 @@ semantics to make items compatible, and unsupported grouped execution falls back
 to isolated execution. Placement, host/device transfers, allocation, group size,
 and scheduling remain runtime policy.
 
+### 10.5 Multimodal relevance profiles and reusable image preprocessing (v1.12)
+
+A required `kind: reranking`, `version: '2'` profile declares `reranking` with
+ordered `query_images` and `document_images` workflow-input names. At least one
+list is nonempty; names are unique across both lists. Each input is opaque,
+application-sourced and a uint8 encoded-byte vector. Its required/default and
+`present_as` declarations retain their ordinary workflow meaning. The task ABI
+supplies tokenizer pair rows and binds supplied images to the ordered endpoints;
+it never guesses model names, vision geometry, placeholders or calibration.
+The workflow owns decoding and feature fusion.
+
+`outputs.score` names a final floating scalar relevance probability in [0,1].
+`outputs.prompt_tokens` is required and names a single int64 token-usage count,
+including media-token expansion authored inside the workflow. Negative or
+unrepresentable counts fail. Version 1 text-pair profiles retain tokenizer-owned
+non-padding counts and do not admit images.
+
+The `onnx-genai.image-preprocess@2` component adapter requires schema v1.12.
+`preprocessing.image.outputs[].name` names an adapter output port, scoped to that
+component; each invocation maps it to a distinct workflow SSA value. The adapter
+may be invoked repeatedly, including inside branches, while every invocation
+binds every declared program output and preserves its exact typed contract.
+Version 1 retains workflow-scoped names and its exactly-one-invocation rule.
+These are explicit adapter ABIs, not alternative inference of output names.
+
+### 10.6 Realtime session quanta (v1.13)
+
+The `realtime` v1 task ABI declares rates, frame bounds, supported modes and
+opaque application input bindings for operation, mono PCM, discrete text
+IDs and the remaining output-token budget. An optional bool `token_mask`
+binds one admission bit per tokenizer ID before native selection; its empty
+vector means unconstrained selection. A constrained quantum emits at most one
+text token so the next mask follows actual committed token history. Token
+endings derive from declared package token roles, independently of added-token
+registration. The host verifies membership and completion before publication;
+a native contract violation requires state reset. It declares a default mode and
+model-authored conditioning template with explicit voice/language policies.
+Its outputs are final PCM/token vectors, response completion and input-readiness
+bools, and actual per-quantum token counts. The exact operation and tensor contracts are
+specified in [Realtime audio](../REALTIME.md). These fields require v1.13 at
+both parser and typed admission boundaries, including unsupported ignorable
+versions; newer ignorable task ABIs are otherwise skipped.
+
+The workflow owns all codec/conversation state and numerical computation.
+State persists under an exclusively owned native session, while every bounded
+invocation commits independently. No model identity, codec rate, frame geometry
+or silence/end-of-turn rule is inferred by the runtime. Transport cancellation
+and empty publications cannot silently close or reset model state.
+
 ## 11. Cache correctness dependencies
 
 ### 11.1 Derived, not declared
@@ -1609,10 +1658,21 @@ This server currently supplies these exact v1 adapters:
 | `tagged-json@v1` | Supplies the offered OpenAI `tools` JSON value to a chat template; without a template, prefixes it with `<\|tools\|>\n`. It emits the caller's `tool_choice` after `<\|tool_choice\|>\n`. | One or more adjacent `<tool_call>{...}</tool_call>` envelopes, separated only by whitespace. Every object has `name`, optionally `id`, and `arguments` or `parameters`. |
 | `atem-xml@v1` | Supplies the same `tools` JSON template value; without a template, prefixes it with `<atem:tools>\n`. It uses the same explicit `tool_choice` placement. | One or more adjacent `<atem:invoke name="...">...</atem:invoke>` envelopes. Each argument is `<atem:parameter name="...">JSON-or-text</atem:parameter>`; `&quot;`, `&apos;`, `&lt;`, `&gt;`, and `&amp;` are unescaped exactly once. |
 
-For both adapters, explicit IDs are preserved and absent IDs become stable
-`call_<index>` values in envelope order. Duplicate IDs, empty/oversized names
+For complete model calls, tagged JSON explicit IDs are preserved; absent IDs
+(including XML invokes) become stable `call_<index>` values in envelope order. Duplicate IDs, empty/oversized names
 or IDs, excess calls, non-whitespace envelope interstitials, invalid JSON, and
-text outside XML parameters are malformed. Neither v1 protocol declares an
+text outside XML parameters are malformed.
+Tagged JSON call fields must be unique. Its envelope boundary is determined by
+JSON parsing, so a `</tool_call>` string inside an argument is ordinary data.
+`ToolCallStream.fragments` exposes cumulative provisional snapshots with an
+optional model ID and raw argument spelling; it does not admit a completed call.
+Atem XML retains an open parameter until its JSON-or-text value is resolved.
+Its complete and provisional parses share one scanner. Quoted attributes accept
+single or double quotes, and `>` inside a quoted attribute is not a tag end.
+Duplicate attributes, missing exact `name` attributes, incompatible parameter
+prefixes and incomplete parameters inside a closed invoke are rejected.
+Streaming transports may assign an opaque wire ID before a model ID is known,
+but must retain a mapping back to the complete model ID for tool-result prompting. Neither v1 protocol declares an
 unambiguous end marker for a sequence containing one or more adjacent calls.
 Before an opening envelope parsing is `NoCall`; after an unclosed opening
 envelope it is `Incomplete`; one or more closed envelopes are `CompleteSoFar`
@@ -2152,3 +2212,87 @@ The package's target manifest states which parameters are adaptable. The
 runtime owns loading, caching, eviction, and kernel selection. Because adapter
 selection participates in dataflow and cache dependencies, two requests with
 different adapters cannot accidentally share an incompatible prefix cache.
+
+### 10.7 Decision image workflows (v1.14)
+
+Decision v2 adds explicit `decision.images` endpoint order and requires a
+`prompt_tokens` output alongside calibrated probabilities. Encoded image inputs
+are opaque application uint8 vectors; workflow steps own vision preprocessing.
+Both typed admission and parser gates require core v1.14. The shared encoded-image
+endpoint resolver also serves reranking, with no model-name inference or
+backward aliases. Task-owned media does not become an ordinary chat Media role.
+See [SystemOne](../SYSTEMONE.md) for preparation, request order, limits and usage.
+
+### 10.8 Reusable audio preprocessing
+
+`onnx-genai.audio-preprocess@2` gives program output names component-local
+meaning, like image-preprocess@2. Each invocation explicitly maps those ports
+to independent workflow SSA values. Feature tensors and valid-length outputs
+therefore survive repeated clips with different encoded lengths and frame
+counts. The adapter uses the existing audio transform executor and its explicit
+format/algorithm limits; reuse does not imply new codec or transform support.
+ABI v1 retains its single-invocation, workflow-output-name contract. Unknown
+output-scope versions fail with a component/ABI/version diagnostic.
+
+This optional semantic extension uses existing core fields and needs no new
+core schema version. Its registry floor is v1; the fixture uses the current
+explicit publication contract. This is a prerequisite for state audio and spoken
+decision questions; the SystemOne HTTP audio contract is declared by decision v3
+below.
+
+## Decision v3: explicit mixed media and spoken input (core v1.15)
+
+V3 declares ordered typed `media` bindings and a separate optional
+`spoken_instructions` encoded-audio endpoint. It omits v2 `images`; v1/v2 retain
+their exact contracts. All media endpoints share canonical opaque application
+uint8-vector admission, including reranking images. Duplicate endpoint ownership,
+missing required inputs, kind/order mismatches, forbidden spoken instructions,
+and missing actual-usage outputs fail before execution. Rendering receives counts
+and kind order, never encoded spoken bytes. Workflow metadata owns preprocessing
+and expansion accounting; transport supports PCM16 WAV and does not infer a model
+family or fetch remote decision media. Video requires executable support before
+its kind can be declared.
+
+## Audio analysis geometry is runtime data
+
+The log-mel extractor accepts explicit `LogMelConfig`: mel count, target sample
+rate, FFT size, hop and periodic-Hann window length. Audio programs consume the
+existing metadata fields rather than accepting only 80/128 bins and a fixed
+16 kHz / 400 / 160 recipe. Invalid or unallocatable dimensions return actionable
+errors. The established convenience recipe and Slaney filter reference values
+remain numerically unchanged. Centered reflection and terminal-frame discard
+remain explicit implementation conventions; other windows/scales fail closed.
+No new serialized field or adapter ABI is needed for this geometry change.
+Transform SSA/source execution and pure-waveform programs follow the explicit
+semantics below.
+
+## Audio programs execute typed processor-local values
+
+Audio compilation resolves each transform's explicit input or preceding value
+to a typed value ID. Names have unique producers; output `source` binds the exact
+computed result. Output roles validate waveform/features/mask/sample-length/frame-
+length types rather than selecting a global final tensor. Branches, omitted
+inputs, population-variance waveform normalization, rescaling, left/right/batch
+padding, trimming and validity publication now execute directly. Raw log-mel and
+its separately declared normalization are distinct values; no implicit resample
+or normalization is applied by the program. `emit_valid_frames` requires a hop
+when reading waveform instead of borrowing an unrelated branch's analysis rate.
+Unsupported operations fail during compilation instead of silently doing nothing.
+These existing fields need no schema bump; pre-release metadata callers must
+author the transforms they need. Both admitted audio adapter ABIs execute these
+semantics. See [executable audio preprocessing](../AUDIO_PREPROCESSING.md).
+
+## Executable frame transcription profiles
+
+The existing transcription profile v1.0 is admitted as a non-generative task: one
+request-authorized encoded media input, explicit time/class axes and vocabulary,
+and authoritative valid-frame prefixes. Core metadata may describe broader
+sequence/batch contracts; the file executor admits one audio row and rejects
+undeclared conditioning rather than inferring inputs. Encoded byte-vector shape
+proof is shared with decision/reranking, while each task separately admits its
+input authority. The executing package resolves tokenizer class names itself.
+CTC repeat/blank order, ignored classes, delimiter rendering and per-request
+output budgets execute independently of any autoregressive generation path.
+The existing serialized fields require no schema or adapter ABI bump. See
+[file transcription](../TRANSCRIPTION.md) for the wire protocol, usage units,
+resource bounds and remaining generative-audio work.
