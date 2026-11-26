@@ -120,7 +120,7 @@ impl CpuExecutionProvider {
                 onnx_runtime_ir::RUNTIME_DOMAIN,
                 1,
             ),
-            onnx_runtime_ep_api::WorkspacePlanning::None,
+            onnx_runtime_ep_api::WorkspacePlanning::Metadata,
             Box::new(crate::kernels::affine_moe::Factory),
         );
         ep

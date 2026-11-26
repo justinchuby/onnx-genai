@@ -2556,3 +2556,134 @@ compilation, formatting and whitespace checks passed. The offline route audit
 remains 51 present / four external-harness contracts, without claiming that
 registration establishes semantic parity. Evidence is functional macOS ARM64
 CPU only, with no Linux/GPU execution or performance claims.
+
+
+## Realtime provisional function argument projection
+
+The declared shared tool parser now exposes bounded cumulative call prefixes.
+Tagged JSON uses the same JSON-aware envelope scan for full parsing and prefix
+projection, so marker strings inside argument data do not terminate a call.
+Duplicate top-level call fields and impossible argument-object starts fail
+before provisional publication. Atem XML shares its complete/provisional scanner, retains an open parameter until
+its JSON-or-text type is known, then streams fields without waiting for invoke
+end. Quoted tag boundaries and exact, unique attributes are resolved before a
+prefix is published; incompatible XML text cannot become invented empty args.
+
+Realtime parameter-prefix admission returns a borrowed proof consumed by the
+wire renderer. Prefixes can only append, repeated snapshots emit no duplicates,
+and completed batch admission checks the raw streamed JSON representation and
+its value-equivalence to the authoritative protocol parse before argument-done
+or pending harness-call registration. Raw spelling survives canonical parse
+reordering/escape normalization. The existing raw byte, call-count, identity and
+response-text bounds remain enforced.
+
+The response owns stable wire/model call identity bindings. Early explicit IDs
+stay unchanged; a late model ID cannot rename an already published item. The
+conversation owns pending wire-ID to complete model-call mappings, so an external
+result uses its wire ID while the authored tool-result prompt receives the model
+ID. Cancellation/limits do not register unfinished calls. Unfinished limit items
+are incomplete and omit argument-done events, while response-level token-limit
+status remains completed. Tool execution stays exclusively in the harness.
+
+Forced tagged JSON schemas admit every ordering of the envelope's name, optional
+ID and arguments fields, preserving required fields, ID limits and rejection of
+extra fields. Parameter validation still uses the backend's supported schema
+language rather than claiming a general JSON Schema validator. Broader realtime
+forcing, pressure/overlap and device wire acceptance remain open.
+
+
+Final CPU validation on the #2757 provider/ORT-constructor baseline: metadata
+library 106 passed; engine library 1112 passed (1 inherited ignore); realtime
+server selection 42 passed; full server library 621 passed (2 inherited ignores).
+The Native wire cases include mid-argument waiting/cancellation, late model-ID
+round trip with a template assertion, XML parameters before invoke close, and
+all six envelope-field orders plus the absent-ID form under actual native masks.
+Strict all-target metadata/engine/server Clippy passed with defaults, as did
+strict server Clippy with `--no-default-features --features metrics,cuda-13000`.
+Formatting/diff checks passed. These are CPU functional checks; device wire
+acceptance and performance remain unclaimed. Broader acceptance rows above stay
+open; this increment does not complete the overall compatibility objective.
+
+
+## Tool parameter object-domain consistency
+
+A real Native constrained-workflow counterexample showed `parameters: true`
+allowing a higher-ranked array-argument token, only for the declared model
+protocol to reject it after selection. Forced envelope grammars and realtime
+parameter admission now share object-domain composition. Missing/null/true
+schemas resolve to objects, while other documents retain their conditions and
+root definitions/references under conjunction with the object requirement.
+Existing object-only schemas stay unchanged; invalid allOf/documents and
+contradictory constraints are not replaced with permissive fallbacks.
+
+The former failing Native case now selects the lower-ranked valid object for
+true, empty, array/object-union and null declarations. Full server validation:
+625 passed, 2 inherited ignores. Grammar tests preserve local root references,
+required/constant/additional-property conditions and impossible-schema failures.
+Strict all-target engine/server Clippy and the explicit ORT reference server
+configuration passed, as did formatting/diff checks. This is CPU functional
+coverage, without device or performance claims; the overall acceptance list
+remains open.
+
+
+## Tool parameter reference scope
+
+Forced tagged-JSON calls compile each parameter document as its own `%json`
+rule. Its root URI, dialect, local pointers, anchors and recursive references
+therefore have the same meaning as in standalone parameter admission. Tool
+schemas may reuse resource IDs without sharing a registry. Absolute references
+to the standalone default root also retain their target.
+
+The outer Lark grammar owns only the call envelope: required name/arguments,
+optional bounded ID, exact fields and every field ordering. Keys and identity
+values use JSON rules; argument documents occur once and are never rewritten
+or embedded under another schema root. The backend's supported schema language
+and response byte bounds remain enforced, and no external retrieval is added.
+
+Validation: the Native websocket regression covers local and absolute default-root
+references, escaped JSON pointers and Draft 4. Compiled grammar cases additionally
+cover anchors, relative resources, recursive roots, duplicate IDs across tools,
+literal reference-like annotation data, JSON whitespace, invalid extra/duplicate
+fields, required arguments and ID limits. The complete server library passed
+627 tests (2 inherited ignores); strict all-target engine/server Clippy with
+defaults and strict server Clippy with explicit ORT-reference features
+`--no-default-features --features metrics,cuda-13000` passed. Formatting/diff
+checks passed. Evidence is functional macOS ARM64 Native CPU, with no device or
+performance claims; the broader compatibility acceptance list remains open.
+
+Independent review additionally reproduced a required-tool union regression:
+a backend-proven impossible parameter schema must not poison another viable
+tool. Multi-tool forced selection now uses the same compiler's typed
+unsatisfiability classification to prune only impossible branches. Invalid,
+unsupported and unresolved schemas still fail with function context; specifically
+selected or wholly impossible choices still fail. Single-tool forcing retains
+its direct compilation path. Vendor provenance records the minimal typed-error
+export used by this classification.
+
+Final validation including the reviewed union-pruning fix: engine library
+1115 passed (1 inherited ignore), server library 629 passed (2 inherited
+ignores), and complete HTTP integration target 39 passed. The Native HTTP
+case generates a valid tool call with an impossible competing schema. Strict
+all-target default engine/server and explicit ORT-reference server Clippy,
+format/diff and vendored compiler provenance checks passed. The compiler error
+export is available in the bundled source; registry-only Rust publication
+requires the patched compiler dependency to be published/upstreamed first.
+
+
+## Standalone power-spectrogram audio features
+
+Authored `spectrogram` operations now execute explicit power/Hann FFT geometry,
+preserve declared analysis rates and produce `[batch,bins,frames]` tensors with
+branch-local valid frames and masks. Shared streaming FFT/window analysis keeps
+log-mel projection and normalization intact; compiled Spectrum/Mel kinds reject
+Whisper normalization on linear power. Other DSP/window/centering conventions
+remain open. See [audio preprocessing](AUDIO_PREPROCESSING.md#linear-power-spectrograms).
+
+Independent review preserved checked mel dimension/allocation admission before
+FFT planning. Validation: all 120 preprocessing tests passed, including varied
+geometry against an independent f64 DFT; 6 Native spectrogram/waveform/reuse
+integration tests passed, including analytic spectrum energy at the actual head.
+Full server library: 629 passed, 2 inherited ignores. Strict all-target default
+preprocess/engine/server and explicit ORT-reference server Clippy, formatting and
+diff checks passed. This is functional macOS ARM64 CPU coverage; no device or
+performance claim and no completion of the broader acceptance list.

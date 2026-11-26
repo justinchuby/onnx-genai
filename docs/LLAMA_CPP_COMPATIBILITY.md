@@ -666,7 +666,7 @@ This is a functional Llama Chat integration, not a claim of complete llama-serve
 parity. These upstream capabilities remain incomplete:
 
 - Realtime grammar forcing beyond declared turn-based tagged-json mask workflows,
-  partial function-call fragment projection, broader pressure/overlap acceptance and
+  broader pressure/overlap acceptance and
   device-backed wire acceptance; see [realtime](REALTIME.md) for the implemented
   WebSocket session modes, resource bounds and Native CPU evidence.
 - Video decision inputs, broader audio codecs and additional DSP operations/conventions,
@@ -706,6 +706,15 @@ Docker/Podman/SSH tool runtimes. These are deliberate scope exclusions, not
 pending compatibility work. `/props` reports `server_tools: false` in
 `nxrt_capabilities` and `cors_proxy_enabled: false` in both router and model modes.
 The former tool/MCP/proxy CLI options and library configuration types are removed.
+
+The supplied model tool protocols require object arguments. Forced tool grammars
+and realtime parameter admission share that domain restriction even for `true`,
+empty, omitted/null or union parameter schemas. Existing schema conditions and
+root reference locations are retained; contradictory schemas are not relaxed. Forced
+JSON calls compile parameter documents independently, preserving their standalone
+root URI, dialect, pointers and anchors. Per-tool registries remain separate,
+including tools reusing the same `$id`. References do not fetch external
+resources. This remains the grammar backend's supported schema language.
 
 Chat tool calling remains supported: clients send `tools`/`tool_choice`, consume
 assistant `tool_calls` (including streaming deltas), execute those calls in their

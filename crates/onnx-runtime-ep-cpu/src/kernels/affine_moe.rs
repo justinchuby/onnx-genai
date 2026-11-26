@@ -1,8 +1,21 @@
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    DevicePtr, EpError, Kernel, KernelFactory, OutputMetadata, Result, TensorMetadata, TensorMut,
+    TensorView, WorkspaceExecutionPreparation, WorkspacePreparation, WorkspaceView,
+};
 use onnx_runtime_ir::{Attribute, DataType, Node, Shape};
 use onnx_runtime_optimizer::affine_moe::{OP, THRESHOLD};
 
-use super::grouped_matmul::AffineBank;
+use super::affine_bank::{AffineBank, PreparedAffineBank};
+mod geometry;
+mod workspace;
+use geometry::Geometry;
+use workspace::Rows;
+struct Actual<'a> {
+    x: Rows<'a>,
+    router: Rows<'a>,
+    first: PreparedAffineBank<'a>,
+    down: PreparedAffineBank<'a>,
+}
 
 pub(crate) struct Factory;
 
@@ -73,117 +86,269 @@ impl AffineMoe {
     }
 }
 
-impl Kernel for AffineMoe {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        let [x, router, w1, s1, z1, w2, s2, z2] = inputs else {
-            return Err(error(
-                "expected activation, router and two packed expert banks (each with an optional zero-point slot)",
-            ));
-        };
-        let [out] = outputs else {
-            return Err(error("expected one FLOAT output"));
-        };
-        let &[tokens, experts] = router.shape else {
-            return Err(error("router must be [tokens, experts]"));
-        };
-        let &[_, _, packed_intermediate] = w2.shape else {
-            return Err(error(
-                "second packed bank must be [experts, hidden, packed_intermediate]",
-            ));
-        };
-        let intermediate = packed_intermediate
-            .checked_mul(2)
-            .ok_or_else(|| error("intermediate width overflows"))?;
-        let inter2 = intermediate
-            .checked_mul(2)
-            .ok_or_else(|| error("interleaved width overflows"))?;
-        let Some((&hidden, leading)) = x.shape.split_last() else {
-            return Err(error("input has no hidden axis"));
-        };
-        if !(1..=2).contains(&leading.len())
-            || hidden == 0
-            || tokens == 0
-            || intermediate == 0
-            || leading.iter().try_fold(1usize, |a, b| a.checked_mul(*b)) != Some(tokens)
-            || self.k > experts
-            || x.shape != out.shape
-            || [x.dtype, router.dtype, out.dtype]
-                .iter()
-                .any(|&d| d != DataType::Float32)
-        {
-            return Err(error(format!(
-                "expected FLOAT input and output with matching token geometry; input={:?}, router={:?}, output={:?}, k={}",
-                x.shape, router.shape, out.shape, self.k
-            )));
-        }
-        let first = AffineBank::new(
-            w1,
-            s1,
-            (!z1.is_absent()).then_some(z1),
-            [experts, inter2, hidden],
+impl AffineMoe {
+    fn actual<'a>(
+        &self,
+        inputs: &'a [TensorView<'a>],
+        out: &TensorMut,
+        g: &Geometry,
+    ) -> Result<Actual<'a>> {
+        let x = Rows::new("X", &inputs[0])?;
+        let router = Rows::new("router", &inputs[1])?;
+        let output = TensorView::new(
+            DevicePtr(out.data.0.cast_const()),
+            out.dtype,
+            out.shape,
+            out.strides,
+            out.device,
+        )
+        .with_byte_offset(out.byte_offset);
+        crate::strided::validate_host_storage::<f32>(OP, "Y", &output)?;
+        let first = AffineBank::prepare(
+            &inputs[2],
+            &inputs[3],
+            (!inputs[4].is_absent()).then_some(&inputs[4]),
+            [g.experts, g.inter2, g.hidden],
             self.first.block,
             self.first.zero,
-        )?;
-        let down = AffineBank::new(
-            w2,
-            s2,
-            (!z2.is_absent()).then_some(z2),
-            [experts, hidden, intermediate],
+        )
+        .map_err(|e| error(format!("first expert bank (inputs 2..4): {e}")))?;
+        let down = AffineBank::prepare(
+            &inputs[5],
+            &inputs[6],
+            (!inputs[7].is_absent()).then_some(&inputs[7]),
+            [g.experts, g.hidden, g.intermediate],
             self.down.block,
             self.down.zero,
-        )?;
-        let x = super::to_dense_f32(x)?;
-        let scores = super::to_dense_f32(router)?;
-        let mut y = vec![0.0; x.len()];
-        let mut indices: Vec<_> = (0..experts).collect();
-        let mut selected_logits = vec![0.0; self.k];
-        let mut probabilities = vec![0.0; self.k];
-        let mut activated = vec![0.0; intermediate];
-        for ((token, logits), output) in x
-            .chunks_exact(hidden)
-            .zip(scores.chunks_exact(experts))
-            .zip(y.chunks_exact_mut(hidden))
-        {
-            // TopK on the reversed expert axis picks larger original IDs on ties.
-            let order =
-                |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]).then_with(|| b.cmp(a));
-            if self.k < experts {
-                indices.select_nth_unstable_by(self.k, order);
-            }
-            let selected = &mut indices[..self.k];
-            selected.sort_unstable_by(order);
-            for (p, &id) in selected_logits.iter_mut().zip(selected.iter()) {
-                *p = logits[id];
-            }
-            super::softmax::softmax_rows(&selected_logits, &mut probabilities, 1, self.k);
-            for (&expert, &p) in selected.iter().zip(&probabilities) {
-                if p.partial_cmp(&THRESHOLD) != Some(std::cmp::Ordering::Greater) {
-                    continue;
-                }
-                for (col, act) in activated.iter_mut().enumerate() {
-                    let row = expert * inter2 + col * 2;
-                    let gate = first.dot(row, token);
-                    // ONNX Min propagates NaN, unlike f32::min.
-                    let gate = if gate > self.limit { self.limit } else { gate };
-                    let up = first.dot(row + 1, token).clamp(-self.limit, self.limit) + self.beta;
-                    let z = self.alpha * gate;
-                    let exp = (-z.abs()).exp();
-                    let sigmoid = if z >= 0.0 {
-                        1.0 / (1.0 + exp)
-                    } else {
-                        exp / (1.0 + exp)
-                    };
-                    *act = (gate * sigmoid) * up;
-                }
-                for (col, sum) in output.iter_mut().enumerate() {
-                    *sum += down.dot(expert * hidden + col, &activated) * p;
-                }
-            }
+        )
+        .map_err(|e| error(format!("down expert bank (inputs 5..7): {e}")))?;
+        Ok(Actual {
+            x,
+            router,
+            first,
+            down,
+        })
+    }
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        let metadata = inputs
+            .iter()
+            .map(|x| TensorMetadata::new(x.dtype, x.shape, !x.is_absent()))
+            .collect::<smallvec::SmallVec<[_; 8]>>();
+        let facts = outputs
+            .iter()
+            .map(OutputMetadata::from_view)
+            .collect::<smallvec::SmallVec<[_; 1]>>();
+        let g = Geometry::new(self, &metadata, &facts)?;
+        let actual = self.actual(inputs, &outputs[0], &g)?;
+        let plan = g.plan(self.k, actual.x.scratch_len(), actual.router.scratch_len())?;
+        // SAFETY: execution owner supplies exclusive Host workspace disjoint
+        // from tensors. Complete binding precedes every source value read.
+        unsafe {
+            plan.with_buffers(
+                workspace,
+                |[
+                    y,
+                    x_scratch,
+                    router_scratch,
+                    selected_logits,
+                    probabilities,
+                    activated,
+                ],
+                 indices| {
+                    let first = actual
+                        .first
+                        .validate()
+                        .map_err(|e| error(format!("first expert bank (inputs 2..4): {e}")))?;
+                    let down = actual
+                        .down
+                        .validate()
+                        .map_err(|e| error(format!("down expert bank (inputs 5..7): {e}")))?;
+                    for (id, index) in indices.iter_mut().enumerate() {
+                        *index = id;
+                    }
+                    let hidden = g.hidden;
+                    let experts = g.experts;
+                    let inter2 = g.inter2;
+                    for (row, output) in y.chunks_exact_mut(hidden).enumerate() {
+                        let token = actual.x.get(row, x_scratch)?;
+                        let logits = actual.router.get(row, router_scratch)?;
+                        // TopK on the reversed expert axis picks larger original IDs on ties.
+                        let order = |a: &usize, b: &usize| {
+                            logits[*b].total_cmp(&logits[*a]).then_with(|| b.cmp(a))
+                        };
+                        if self.k < experts {
+                            indices.select_nth_unstable_by(self.k, order);
+                        }
+                        let selected = &mut indices[..self.k];
+                        selected.sort_unstable_by(order);
+                        for (p, &id) in selected_logits.iter_mut().zip(selected.iter()) {
+                            *p = logits[id];
+                        }
+                        super::softmax::softmax_rows(selected_logits, probabilities, 1, self.k);
+                        for (&expert, &p) in selected.iter().zip(probabilities.iter()) {
+                            if p.partial_cmp(&THRESHOLD) != Some(std::cmp::Ordering::Greater) {
+                                continue;
+                            }
+                            for (col, act) in activated.iter_mut().enumerate() {
+                                let row = expert * inter2 + col * 2;
+                                let gate = first.dot(row, token);
+                                // ONNX Min propagates NaN, unlike f32::min.
+                                let gate = if gate > self.limit { self.limit } else { gate };
+                                let up = first.dot(row + 1, token).clamp(-self.limit, self.limit)
+                                    + self.beta;
+                                let z = self.alpha * gate;
+                                let exp = (-z.abs()).exp();
+                                let sigmoid = if z >= 0.0 {
+                                    1.0 / (1.0 + exp)
+                                } else {
+                                    exp / (1.0 + exp)
+                                };
+                                *act = (gate * sigmoid) * up;
+                            }
+                            for (col, sum) in output.iter_mut().enumerate() {
+                                *sum += down.dot(expert * hidden + col, activated) * p;
+                            }
+                        }
+                    }
+                    super::write_dense_f32(&mut outputs[0], y)
+                },
+            )
         }
-        super::write_dense_f32(out, &y)
+    }
+}
+impl Kernel for AffineMoe {
+    fn supports_strided_input(&self, index: usize) -> bool {
+        index < 8
+    }
+    fn workspace_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+        outputs: &[OutputMetadata<'_>],
+    ) -> Result<WorkspacePreparation> {
+        Geometry::new(self, inputs, outputs)?.conservative(self.k)?;
+        Ok(WorkspacePreparation::Deferred)
+    }
+    fn workspace_requirement_for_execution(
+        &self,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+        metadata: &[TensorMetadata<'_>],
+        facts: &[OutputMetadata<'_>],
+        _cached: Option<WorkspacePreparation>,
+    ) -> Result<WorkspaceExecutionPreparation> {
+        let g = Geometry::new(self, metadata, facts)?;
+        if inputs.len() == 8 && outputs.len() == 1 {
+            for (index, (view, meta)) in inputs.iter().zip(metadata).enumerate() {
+                if !view.is_absent() != meta.present
+                    || meta.present && (view.dtype != meta.dtype || view.shape != meta.shape)
+                {
+                    return Err(error(format!(
+                        "input {index} differs from prepared metadata; refresh workspace for the actual bindings"
+                    )));
+                }
+            }
+            if outputs[0].is_absent()
+                || outputs[0].dtype != DataType::Float32
+                || outputs[0].shape != metadata[0].shape
+            {
+                return Err(error(
+                    "Y differs from prepared FLOAT X geometry; bind a matching output and refresh metadata",
+                ));
+            }
+            let actual = self.actual(inputs, &outputs[0], &g)?;
+            return Ok(WorkspaceExecutionPreparation::Ready(
+                g.plan(self.k, actual.x.scratch_len(), actual.router.scratch_len())?
+                    .requirement(),
+            ));
+        }
+        Ok(WorkspaceExecutionPreparation::Ready(
+            g.conservative(self.k)?.requirement(),
+        ))
+    }
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run(inputs, outputs, None)
+    }
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
     }
 }
 
 fn error(message: impl std::fmt::Display) -> EpError {
     EpError::KernelFailed(format!("{OP}: {message}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernels::testutil::Owned;
+    use crate::kernels::testutil::PreparedTestKernel;
+    #[test]
+    fn malformed_scale_reports_the_actual_projection_before_output_writes() {
+        let kernel = AffineMoe {
+            k: 1,
+            alpha: 1.,
+            beta: 0.,
+            limit: 7.,
+            first: BankFormat { block: 1, zero: 7 },
+            down: BankFormat { block: 1, zero: 7 },
+        };
+        for first_bad in [true, false] {
+            let x = Owned::f32(&[1, 2], &[1., 2.]);
+            let router = Owned::f32(&[1, 1], &[0.]);
+            let w1 = Owned::u8(&[1, 4, 1], &[0x88; 4]);
+            let z1 = Owned::u8(&[1, 4, 1], &[0x77; 4]);
+            let w2 = Owned::u8(&[1, 2, 1], &[0x88; 2]);
+            let z2 = Owned::u8(&[1, 2, 1], &[0x77; 2]);
+            let mut scales1 = [1.; 8];
+            let mut scales2 = [1.; 4];
+            if first_bad {
+                scales1[0] = 0.;
+            } else {
+                scales2[0] = 0.;
+            }
+            let s1 = Owned::f32(&[1, 4, 2], &scales1);
+            let s2 = Owned::f32(&[1, 2, 2], &scales2);
+            let mut out = Owned::f32(&[1, 2], &[123.; 2]);
+            let error = kernel
+                .execute_prepared(
+                    &[
+                        x.view(),
+                        router.view(),
+                        w1.view(),
+                        s1.view(),
+                        z1.view(),
+                        w2.view(),
+                        s2.view(),
+                        z2.view(),
+                    ],
+                    &mut [out.view_mut()],
+                )
+                .unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains(if first_bad {
+                    "first expert bank (inputs 2..4)"
+                } else {
+                    "down expert bank (inputs 5..7)"
+                }),
+                "{message}"
+            );
+            assert!(message.contains("positive and finite"), "{message}");
+            assert_eq!(out.to_f32(), [123.; 2]);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "affine_moe/tests.rs"]
+mod workspace_tests;
