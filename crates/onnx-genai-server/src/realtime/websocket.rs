@@ -1721,11 +1721,144 @@ mod tests {
         let _ = task.await;
     }
 
+    #[cfg(feature = "native-backend")]
+    async fn native_xml_string_number_mask(ignore_mask: bool, duplex: bool) {
+        let good = r#"<atem:invoke name="lookup"><atem:parameter name="city">&quot;1&quot;</atem:parameter></atem:invoke>"#;
+        let bad = r#"<atem:invoke name="lookup"><atem:parameter name="city">1</atem:parameter></atem:invoke>"#;
+        let package = if duplex {
+            duplex_constraint_package()
+        } else {
+            tool_package_from("realtime-constrained", good)
+        };
+        let path = package.path().join("tokenizer.json");
+        let mut tokenizer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for (id, piece) in [(16_u64, good), (17, bad)] {
+            let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+            vocab.retain(|_, value| value.as_u64() != Some(id));
+            vocab.insert(piece.into(), json!(id));
+            let added = tokenizer["added_tokens"].as_array_mut().unwrap();
+            added.retain(|token| token["id"].as_u64() != Some(id));
+            added.push(json!({"id":id,"content":piece,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}));
+        }
+        std::fs::write(path, serde_json::to_vec(&tokenizer).unwrap()).unwrap();
+        let path = package.path().join("inference_metadata.yaml");
+        let mut metadata: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        metadata["package"]["tool_protocol"] =
+            serde_yaml::to_value(json!({"identity":"atem-xml","version":"v1"})).unwrap();
+        std::fs::write(path, serde_yaml::to_string(&metadata).unwrap()).unwrap();
+        let path = package.path().join("model.onnx.textproto");
+        let graph = std::fs::read_to_string(&path).unwrap();
+        let line = graph
+            .lines()
+            .find(|line| line.starts_with("initializer { name: \"ranked_logits\""))
+            .unwrap();
+        let logits = (0..32)
+            .map(|id| {
+                format!(
+                    " float_data: {}",
+                    match id {
+                        16 => 1,
+                        17 => 2,
+                        _ => -1000,
+                    }
+                )
+            })
+            .collect::<String>();
+        let mut graph = graph.replace(
+            line,
+            &format!("initializer {{ name: \"ranked_logits\" data_type: 1 dims: 32{logits} }}"),
+        );
+        if ignore_mask {
+            let masked = "node { input: \"effective_mask\" input: \"ranked_logits\" input: \"banned\" output: \"masked_logits\" op_type: \"Where\" }";
+            assert!(graph.contains(masked));
+            graph = graph.replace(masked, "node { input: \"all_allowed\" input: \"ranked_logits\" input: \"banned\" output: \"masked_logits\" op_type: \"Where\" }");
+        }
+        std::fs::write(path, graph).unwrap();
+        let (state, address, task) = server_for_package_with_config(
+            package.path(),
+            crate::ServerConfig {
+                engine_config: onnx_genai_engine::EngineConfig {
+                    decode_backend: onnx_genai_engine::EngineDecodeBackend::Native,
+                    native_device: Some(onnx_genai_engine::NativeDecodeDevice::Cpu),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await;
+        let mut client = connect(address).await;
+        assert_eq!(event(&mut client).await["type"], "session.created");
+        send(&mut client,json!({"type":"session.update","session":{"output_modalities":["text"],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"city":{"const":"1"}},"required":["city"],"additionalProperties":false}}],"tool_choice":"required"}})).await;
+        assert_eq!(event(&mut client).await["type"], "session.updated");
+        if duplex {
+            // Input-driven Audio must use the same XML mask as Generate.
+            duplex_audio(&mut client).await;
+        } else {
+            send(&mut client,json!({"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}})).await;
+            assert_eq!(event(&mut client).await["type"], "conversation.item.added");
+            assert_eq!(event(&mut client).await["type"], "conversation.item.done");
+            send(&mut client, json!({"type":"response.create"})).await;
+        }
+        loop {
+            let output = event(&mut client).await;
+            if ignore_mask {
+                assert_ne!(
+                    output["type"], "response.function_call_arguments.done",
+                    "{output}"
+                );
+                assert_ne!(output["type"], "response.done", "{output}");
+                if output["type"] == "error" {
+                    assert_eq!(output["error"]["type"], "server_error");
+                    assert!(
+                        output["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("token 17 forbidden by token_mask"),
+                        "{output}"
+                    );
+                    break;
+                }
+            } else {
+                assert_ne!(output["type"], "error", "{output}");
+                if output["type"] == "response.done" {
+                    assert_eq!(output["response"]["status"], "completed");
+                    assert_eq!(output["response"]["usage"]["output_tokens"], 1);
+                    assert_eq!(
+                        output["response"]["output"][0]["arguments"],
+                        r#"{"city":"1"}"#
+                    );
+                    break;
+                }
+            }
+        }
+        drop(client);
+        let model = state.registry.resolve("native-realtime").unwrap().unwrap();
+        tokio::task::spawn_blocking(move || model.engine.shutdown())
+            .await
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+    }
+    #[cfg(feature = "native-backend")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_native_xml_masks_numeric_raw_value_before_selection_for_string_schema() {
+        for duplex in [false, true] {
+            native_xml_string_number_mask(false, duplex).await;
+        }
+    }
+    #[cfg(feature = "native-backend")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_native_xml_rejects_graph_which_ignores_string_schema_mask() {
+        for duplex in [false, true] {
+            native_xml_string_number_mask(true, duplex).await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn websocket_xml_parameter_streams_before_invoke_end_in_a_waiting_native_workflow() {
-        let prefix =
-            r#"<atem:invoke name="lookup"><atem:parameter name="city">"Paris"</atem:parameter>"#;
-        let package = tool_package_from("realtime", prefix);
+        let prefix = r#"<atem:invoke name="lookup"><atem:parameter name="city">&quot;Paris&quot;</atem:parameter>"#;
+        let package = tool_package_from("realtime-constrained", prefix);
         let path = package.path().join("inference_metadata.yaml");
         let mut metadata: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -2891,6 +3024,13 @@ node { input: "starting" input: "operation""#);
             let created = event(&mut client).await;
             assert_eq!(created["type"], "session.created", "xml={xml}: {created}");
             duplex_tools(&mut client, "Paris").await;
+            if xml {
+                // XML forcing is supported now. This valid JSON schema needs
+                // an empty parameter name, outside the declared XML capability.
+                send(&mut client,json!({"type":"session.update","session":{"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"":{"const":"Paris"}},"required":[""],"additionalProperties":false}}],"tool_choice":"required"}})).await;
+                let updated = event(&mut client).await;
+                assert_eq!(updated["type"], "session.updated", "{updated}");
+            }
             duplex_audio(&mut client).await;
             let error = event(&mut client).await;
             assert_eq!(error["type"], "error", "xml={xml}: {error}");
@@ -2902,7 +3042,11 @@ node { input: "starting" input: "operation""#);
                 error["error"]["message"]
                     .as_str()
                     .unwrap()
-                    .contains(if xml { "forcing plan" } else { "token_mask" }),
+                    .contains(if xml {
+                        "key-encoding capability"
+                    } else {
+                        "token_mask"
+                    }),
                 "{error}"
             );
             // A legal instructions update proves the rejected append did not

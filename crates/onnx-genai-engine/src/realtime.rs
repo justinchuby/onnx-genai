@@ -218,6 +218,17 @@ impl RealtimeSession<'_> {
                 )
             };
             let logical = match options.constraint.as_ref() {
+                Some(crate::GenerateConstraint::XmlToolCall { grammar, prefix }) => Some(
+                    crate::response_constraint::ContentConstraint::xml_tool_call(
+                        tokenizer,
+                        grammar,
+                        crate::text_projection::ProjectionKind::Plain,
+                        prefix,
+                        options.max_constraint_bytes,
+                        endings.clone(),
+                        &options.effective_preserved_tokens(),
+                    )?,
+                ),
                 Some(crate::GenerateConstraint::Regex { pattern, prefix }) => Some(text(
                     &crate::config::TextGrammar::Regex(pattern.clone()),
                     prefix,

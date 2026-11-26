@@ -82,8 +82,8 @@
     "tests/test_stop.rs": "4b3fd99884e1ba2a32af4890593a5b3087dd70b26580238a28bb371c9df62044"
   },
   "patched_file_sha256": {
-    "src/json/compiler.rs": "9dc4b06813e83e47ddec25456cef655280b91ba2d6458f2d7003abe151b4d755",
-    "src/lib.rs": "ed8b561d1b5458911069bbdb771339d1558b89235b1f1fe2da781abf4ea9aa1a",
+    "src/json/compiler.rs": "625588ec417666fa09ae53806bb609e70f1d650e770eafa27a95a21384ac19c6",
+    "src/lib.rs": "6f8e8f8fbcd1104bb047fd878fc88877ba3df58dca2e5b0a960c08f69696c662",
     "src/grammar_builder.rs": "f65bb07cf49ad8463d9d4b6ff98b5a6b16dd3f5aec7423c0003c5fdf530e6847"
   },
   "omitted_files": {

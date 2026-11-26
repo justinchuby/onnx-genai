@@ -55,24 +55,28 @@ impl DecoderState {
 
 #[derive(Clone, Copy)]
 enum Normalization {
+    CanonicalXml,
     Json,
     Literal,
 }
 impl Normalization {
     fn parse(self, text: &str) -> anyhow::Result<LogicalPrefix> {
         match self {
+            Self::CanonicalXml => Ok(LogicalPrefix::CanonicalXml(text.to_owned())),
             Self::Json => JsonPrefix::parse(text).map(LogicalPrefix::Json),
             Self::Literal => Ok(LogicalPrefix::Literal(text.to_owned())),
         }
     }
 }
 enum LogicalPrefix {
+    CanonicalXml(String),
     Json(JsonPrefix),
     Literal(String),
 }
 impl LogicalPrefix {
     fn canonical(&self) -> &str {
         match self {
+            Self::CanonicalXml(_) => "",
             Self::Json(prefix) => &prefix.canonical,
             Self::Literal(text) => text,
         }
@@ -83,7 +87,7 @@ impl LogicalPrefix {
     fn pending_piece_syntax_viable(&self, piece: &[u8]) -> bool {
         match self {
             Self::Json(prefix) => prefix.pending_piece_syntax_viable(piece),
-            Self::Literal(_) => true,
+            Self::CanonicalXml(_) | Self::Literal(_) => true,
         }
     }
     fn preview(
@@ -93,6 +97,26 @@ impl LogicalPrefix {
         pending: &[u8],
     ) -> anyhow::Result<GrammarCandidate> {
         match self {
+            Self::CanonicalXml(text) => {
+                let Some(projected) =
+                    onnx_genai_metadata::tool_protocol::canonical_xml_prefix(text)
+                else {
+                    return Ok(GrammarCandidate::Rejected { byte_offset: 0 });
+                };
+                if !pending.is_empty() && !projected.permits_pending_utf8 {
+                    return Ok(GrammarCandidate::Rejected { byte_offset: 0 });
+                }
+                for prefix in projected.alternatives {
+                    let mut bytes = prefix.into_bytes();
+                    bytes.extend_from_slice(pending);
+                    if let GrammarCandidate::Viable { complete } = cursor.preview_root(&bytes)? {
+                        return Ok(GrammarCandidate::Viable {
+                            complete: complete && projected.complete && pending.is_empty(),
+                        });
+                    }
+                }
+                Ok(GrammarCandidate::Rejected { byte_offset: 0 })
+            }
             Self::Json(prefix) => prefix.preview(cursor, committed, pending),
             Self::Literal(text) => {
                 if let Some(suffix) = text.strip_prefix(committed) {
@@ -183,6 +207,30 @@ impl ContentConstraint {
         )
     }
 
+    pub(crate) fn xml_tool_call(
+        tokenizer: &Tokenizer,
+        grammar: &str,
+        projection_kind: ProjectionKind,
+        prefix: &str,
+        max_bytes: usize,
+        endings: Vec<TokenId>,
+        preserved: &std::collections::BTreeSet<u32>,
+    ) -> anyhow::Result<Self> {
+        Self::new(
+            tokenizer,
+            GrammarByteCursor::lark(grammar, max_bytes)?,
+            Normalization::CanonicalXml,
+            projection_kind,
+            prefix,
+            max_bytes,
+            ConstraintTokens {
+                raw: None,
+                endings,
+                preserved: preserved.clone(),
+            },
+        )
+    }
+
     pub(crate) fn text(
         tokenizer: &Tokenizer,
         grammar: &crate::config::TextGrammar,
@@ -252,7 +300,9 @@ impl ContentConstraint {
             Ok(normalized)
         })().map_err(|source| ConstraintPrefixError { source })?;
         let plain_vocabulary = match (&projection_kind, &codec) {
-            (ProjectionKind::Plain, Codec::Bytes(contract)) => {
+            (ProjectionKind::Plain, Codec::Bytes(contract))
+                if !matches!(normalization, Normalization::CanonicalXml) =>
+            {
                 Some(GrammarTokenVocabulary::new(&contract.pieces)?)
             }
             _ => None,
@@ -1890,5 +1940,188 @@ mod tests {
             )
             .unwrap();
         assert!(logits[3].is_finite());
+    }
+}
+
+#[cfg(test)]
+mod canonical_xml_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn cursor(mut schema: serde_json::Value) -> GrammarByteCursor {
+        schema["x-guidance"] = json!({"root_object_key_policy":{"min":1,"max":256}});
+        GrammarByteCursor::lark(&format!(
+            "start: \"<tool_call>\\n{{\\\"name\\\":\\\"lookup\\\",\\\"arguments\\\":\" arguments \"}}\\n</tool_call>\"\narguments: %json {schema}\n"
+        ), 65536).unwrap()
+    }
+    fn admitted(cursor: &mut GrammarByteCursor, text: &str, terminal: bool) -> bool {
+        matches!(LogicalPrefix::CanonicalXml(text.into()).preview(cursor, "", b"").unwrap(),
+            GrammarCandidate::Viable { complete } if !terminal || complete)
+    }
+    fn schema(value: serde_json::Value) -> serde_json::Value {
+        json!({"type":"object","properties":{"city":{"const":value}},"required":["city"],"additionalProperties":false})
+    }
+    const OPEN: &str = "<atem:invoke name=\"lookup\"><atem:parameter name=\"city\">";
+    const CLOSE: &str = "</atem:parameter></atem:invoke>";
+
+    #[test]
+    fn canonical_xml_masks_raw_json_looking_strings_before_selection() {
+        for (value, raw) in [
+            (json!("1"), "1"),
+            (json!("true"), "true"),
+            (json!("null"), "null"),
+            (json!("1x"), "1x"),
+            (json!("Paris"), "Paris"),
+        ] {
+            let mut grammar = cursor(schema(value));
+            assert!(
+                !admitted(&mut grammar, &format!("{OPEN}{raw}"), false),
+                "{raw}"
+            );
+            let good = format!("{OPEN}&quot;{raw}&quot;{CLOSE}");
+            for (index, _) in good.char_indices() {
+                assert!(
+                    admitted(&mut grammar, &good[..index], false),
+                    "{raw}: {}",
+                    &good[..index]
+                );
+            }
+            assert!(admitted(&mut grammar, &good, true), "{raw}");
+        }
+    }
+
+    #[test]
+    fn canonical_xml_closing_parameter_cannot_extend_a_fixed_json_number() {
+        let mut grammar = cursor(schema(json!(12)));
+        assert!(admitted(&mut grammar, &format!("{OPEN}1"), false));
+        assert!(!admitted(&mut grammar, &format!("{OPEN}1<"), false));
+        assert!(!admitted(
+            &mut grammar,
+            &format!("{OPEN}1</atem:param"),
+            false
+        ));
+        assert!(admitted(&mut grammar, &format!("{OPEN}12{CLOSE}"), true));
+        assert!(!admitted(
+            &mut grammar,
+            &format!("{OPEN}&quot;12&quot;{CLOSE}"),
+            true
+        ));
+    }
+
+    #[test]
+    fn canonical_xml_preserves_schema_roots_order_types_and_entities() {
+        let root = json!({"$defs":{"Args":{"type":"object","properties":{"z":{"const":" é<>&\"' "},"a":{"const":null}},"required":["z","a"],"additionalProperties":false}},"$ref":"#/$defs/Args"});
+        let mut grammar = cursor(root);
+        let fields = "<atem:parameter name=\"z\">&quot; é&lt;&gt;&amp;\\&quot;&apos; &quot;</atem:parameter><atem:parameter name=\"a\">null</atem:parameter>";
+        let good = format!("<atem:invoke name=\"lookup\">{fields}</atem:invoke>");
+        for (index, _) in good.char_indices() {
+            assert!(
+                admitted(&mut grammar, &good[..index], false),
+                "{}",
+                &good[..index]
+            );
+        }
+        assert!(admitted(&mut grammar, &good, true));
+        let reversed = "<atem:invoke name=\"lookup\"><atem:parameter name=\"a\">null</atem:parameter><atem:parameter name=\"z\">&quot; é&lt;&gt;&amp;\\&quot;&apos; &quot;</atem:parameter></atem:invoke>";
+        assert!(!admitted(&mut grammar, reversed, true));
+        assert!(matches!(
+            onnx_genai_metadata::tool_protocol::ToolProtocol::AtemXmlV1.parse(reversed),
+            onnx_genai_metadata::tool_protocol::ToolParseOutcome::CompleteSoFar(_)
+        ));
+        assert!(!admitted(
+            &mut grammar,
+            "<atem:invoke name=\"wrong\">",
+            false
+        ));
+        assert!(!admitted(
+            &mut grammar,
+            "<atem:invoke name=\"lookup\"></atem:invoke>",
+            true
+        ));
+        assert!(!admitted(
+            &mut grammar,
+            "<atem:invoke name=\"lookup\"><atem:parameter name=\"extra\">",
+            false
+        ));
+    }
+    #[test]
+    fn canonical_xml_cannot_enter_an_unencodable_property_name_prefix() {
+        let mut grammar = cursor(
+            json!({"type":"object","properties":{"":{"type":"integer"}},"additionalProperties":false}),
+        );
+        assert!(admitted(
+            &mut grammar,
+            "<atem:invoke name=\"lookup\"></atem:invoke>",
+            true
+        ));
+        assert!(!admitted(
+            &mut grammar,
+            "<atem:invoke name=\"lookup\"><atem:parameter",
+            false
+        ));
+    }
+
+    #[test]
+    fn canonical_xml_preserves_quoted_control_and_unicode_parameter_names() {
+        let key = "\"&<\0é";
+        let mut grammar = cursor(
+            json!({"type":"object","properties":{key:{"const":"</atem:invoke>"}},"required":[key],"additionalProperties":false}),
+        );
+        let good = "<atem:invoke name=\"lookup\"><atem:parameter name=\"&quot;&amp;&lt;\0é\">&quot;&lt;/atem:invoke&gt;&quot;</atem:parameter></atem:invoke>";
+        for (index, _) in good.char_indices() {
+            assert!(
+                admitted(&mut grammar, &good[..index], false),
+                "{:?}",
+                &good[..index]
+            );
+        }
+        assert!(admitted(&mut grammar, good, true));
+        let mut grammar = cursor(schema(json!("é")));
+        let text = format!("{OPEN}&quot;");
+        assert!(matches!(
+            LogicalPrefix::CanonicalXml(text)
+                .preview(&mut grammar, "", &[0xc3])
+                .unwrap(),
+            GrammarCandidate::Viable { complete: false }
+        ));
+    }
+    #[test]
+    fn canonical_xml_rejects_dead_partial_entities_before_the_semicolon() {
+        let mut grammar = cursor(schema(json!("1")));
+        assert!(admitted(&mut grammar, &format!("{OPEN}&"), false));
+        assert!(admitted(&mut grammar, &format!("{OPEN}&q"), false));
+        assert!(!admitted(&mut grammar, &format!("{OPEN}&a"), false));
+        assert!(!admitted(&mut grammar, &format!("{OPEN}&#"), false));
+        assert!(!admitted(&mut grammar, "<atem:invoke name=\"&a", false));
+        assert!(!admitted(
+            &mut grammar,
+            "<atem:invoke name=\"lookup\"><atem:parameter name=\"&a",
+            false
+        ));
+    }
+    #[test]
+    fn canonical_xml_named_fields_preserve_cardinality_without_dynamic_names() {
+        let mut grammar = cursor(
+            json!({"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}},"required":["a","b"],"minProperties":2,"maxProperties":2}),
+        );
+        let good = "<atem:invoke name=\"lookup\"><atem:parameter name=\"a\">1</atem:parameter><atem:parameter name=\"b\">2</atem:parameter></atem:invoke>";
+        for (index, _) in good.char_indices() {
+            assert!(
+                admitted(&mut grammar, &good[..index], false),
+                "{}",
+                &good[..index]
+            );
+        }
+        assert!(admitted(&mut grammar, good, true));
+        assert!(!admitted(
+            &mut grammar,
+            "<atem:invoke name=\"lookup\"></atem:invoke>",
+            true
+        ));
+        assert!(!admitted(
+            &mut grammar,
+            "<atem:invoke name=\"lookup\"><atem:parameter name=\"extra\">",
+            false
+        ));
     }
 }

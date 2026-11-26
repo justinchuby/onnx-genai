@@ -2332,7 +2332,8 @@ fn prepare_generate_request(
             GenerateConstraint::Json { prefix }
             | GenerateConstraint::JsonSchema { prefix, .. }
             | GenerateConstraint::Regex { prefix, .. }
-            | GenerateConstraint::Lark { prefix, .. },
+            | GenerateConstraint::Lark { prefix, .. }
+            | GenerateConstraint::XmlToolCall { prefix, .. },
         ) = options.constraint.as_mut()
         {
             prefix.clear();
@@ -3553,7 +3554,10 @@ mod prompt_rendering_tests {
         )
         .expect("production preparation");
 
-        assert_eq!(prepared.request.options.constraint, None);
+        assert!(matches!(
+            prepared.request.options.constraint,
+            Some(GenerateConstraint::XmlToolCall { .. })
+        ));
         assert_eq!(
             tool_protocol::request_policy(&request),
             onnx_genai_engine::ToolCallPolicy::Required

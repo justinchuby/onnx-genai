@@ -67,14 +67,58 @@ impl ToolProtocol {
         request: &ChatCompletionRequest,
     ) -> Result<ToolOutputConstraint, ToolProtocolError> {
         match self.0 {
-            ParsedToolProtocol::TaggedJsonV1 => {
+            ParsedToolProtocol::TaggedJsonV1 | ParsedToolProtocol::AtemXmlV1 => {
                 let Some(mut schemas) = forced_tool_choice_schemas(request)? else {
                     return Ok(ToolOutputConstraint::Unchanged);
                 };
+                if self.0 == ParsedToolProtocol::AtemXmlV1 {
+                    for (tool, schema) in &mut schemas {
+                        if tool.function.name.is_empty()
+                            || tool.function.name.len() > onnx_genai_metadata::MAX_TOOL_NAME_BYTES
+                        {
+                            return Err(ToolProtocolError("canonical XML generation requires nonempty function names within the UTF-8 byte limit".into()));
+                        }
+                        // Preserve the actual standalone root, including its
+                        // URI/dialect and existing compiler options. This owned
+                        // option only restricts root keys to the inbound XML
+                        // attribute encoding capability; nested JSON is intact.
+                        if schema == &serde_json::Value::Bool(false) {
+                            continue;
+                        }
+                        let root = schema.as_object_mut().ok_or_else(|| {
+                            ToolProtocolError("XML argument schema must have an object root".into())
+                        })?;
+                        let options = root
+                            .entry("x-guidance")
+                            .or_insert_with(|| serde_json::json!({}));
+                        let options = options.as_object_mut().ok_or_else(|| {
+                            ToolProtocolError(
+                                "XML argument schema x-guidance must be an options object".into(),
+                            )
+                        })?;
+                        for (key, standard) in [("item_separator", ","), ("key_separator", ":")] {
+                            if options
+                                .get(key)
+                                .is_some_and(|value| value.as_str() != Some(standard))
+                            {
+                                return Err(ToolProtocolError(format!(
+                                    "canonical XML generation requires standard JSON {key}; remove its x-guidance lexical override"
+                                )));
+                            }
+                        }
+                        if options
+                            .get("whitespace_pattern")
+                            .is_some_and(|value| !value.is_null())
+                        {
+                            return Err(ToolProtocolError("canonical XML generation requires the default JSON whitespace language; remove x-guidance.whitespace_pattern".into()));
+                        }
+                        options.insert("root_object_key_policy".into(), serde_json::json!({"min":1,"max":onnx_genai_metadata::MAX_TOOL_NAME_BYTES}));
+                    }
+                }
                 // JSON anyOf prunes backend-proven impossible branches. Retain
                 // that behavior when each alternative owns a standalone root.
                 // A single selected tool keeps its direct compilation path.
-                if schemas.len() > 1 {
+                if schemas.len() > 1 || self.0 == ParsedToolProtocol::AtemXmlV1 {
                     let mut viable = Vec::with_capacity(schemas.len());
                     for (tool, schema) in schemas {
                         let satisfiable =
@@ -90,7 +134,12 @@ impl ToolProtocol {
                         }
                     }
                     if viable.is_empty() {
-                        return Err(ToolProtocolError("all required tool parameter schemas are unsatisfiable; revise tools[*].function.parameters or select a usable function".into()));
+                        let reason = if self.0 == ParsedToolProtocol::AtemXmlV1 {
+                            "all required XML tool schemas have no instances within the named-parameter generation key-encoding capability (declared nonempty parameter names within the UTF-8 byte limit); revise tools[*].function.parameters or select a usable function"
+                        } else {
+                            "all required tool parameter schemas are unsatisfiable; revise tools[*].function.parameters or select a usable function"
+                        };
+                        return Err(ToolProtocolError(reason.into()));
                     }
                     schemas = viable;
                 }
@@ -148,17 +197,18 @@ impl ToolProtocol {
                         alternatives.join(" | "), serde_json::json!({"enum":[tool.function.name]})
                     ));
                 }
-                Ok(ToolOutputConstraint::Set(Some(GenerateConstraint::Lark {
-                    grammar,
-                    prefix: String::new(),
-                })))
-            }
-            ParsedToolProtocol::AtemXmlV1 => {
-                Ok(if forced_tool_choice_schemas(request)?.is_some() {
-                    ToolOutputConstraint::Set(None)
+                let constraint = if self.0 == ParsedToolProtocol::AtemXmlV1 {
+                    GenerateConstraint::XmlToolCall {
+                        grammar,
+                        prefix: String::new(),
+                    }
                 } else {
-                    ToolOutputConstraint::Unchanged
-                })
+                    GenerateConstraint::Lark {
+                        grammar,
+                        prefix: String::new(),
+                    }
+                };
+                Ok(ToolOutputConstraint::Set(Some(constraint)))
             }
         }
     }
@@ -1059,8 +1109,134 @@ mod tests {
         assert!(rendered.fallback_prefix.contains("<|tool_choice|>"));
         assert!(matches!(
             atem.output_constraint(&request).unwrap(),
-            ToolOutputConstraint::Set(None)
+            ToolOutputConstraint::Set(Some(GenerateConstraint::XmlToolCall { .. }))
         ));
+    }
+
+    #[test]
+    fn xml_forcing_rejects_only_backend_proven_unencodable_roots_and_keeps_auto_unforced() {
+        let request = |schema: serde_json::Value, choice: &str| {
+            serde_json::from_value::<ChatCompletionRequest>(serde_json::json!({"messages":[],"tools":[{"type":"function","function":{"name":"lookup","parameters":schema}}],"tool_choice":choice})).unwrap()
+        };
+        let xml = protocol("atem-xml");
+        let schema = serde_json::json!({"$defs":{"Args":{"const":{"":1}}},"$ref":"#/$defs/Args"});
+        let error = xml
+            .output_constraint(&request(schema.clone(), "required"))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("generation key-encoding capability"),
+            "{error}"
+        );
+        assert!(matches!(
+            xml.output_constraint(&request(schema, "auto")).unwrap(),
+            ToolOutputConstraint::Unchanged
+        ));
+        for minimum in [1, 2] {
+            let dynamic = serde_json::json!({"type":"object","patternProperties":{"^a$":{"type":"integer"}},"additionalProperties":false,"minProperties":minimum});
+            let error = xml
+                .output_constraint(&request(dynamic, "required"))
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("generation key-encoding capability"),
+                "{error}"
+            );
+        }
+        let lexical = serde_json::json!({"type":"object","x-guidance":{"key_separator":"="}});
+        let error = xml
+            .output_constraint(&request(lexical, "required"))
+            .unwrap_err();
+        assert!(error.to_string().contains("standard JSON"), "{error}");
+        let invalid = serde_json::json!({"$ref":"#/$defs/missing"});
+        let error = xml
+            .output_constraint(&request(invalid, "required"))
+            .unwrap_err();
+        assert!(
+            !error
+                .to_string()
+                .contains("generation key-encoding capability"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn xml_mixed_tools_do_not_prune_policy_or_unsupported_value_errors() {
+        let xml = protocol("atem-xml");
+        let request = |schema: serde_json::Value, mixed: bool| {
+            let mut tools = vec![
+                serde_json::json!({"type":"function","function":{"name":"broken","parameters":schema}}),
+            ];
+            if mixed {
+                tools.push(serde_json::json!({"type":"function","function":{"name":"usable","parameters":{"type":"object"}}}));
+            }
+            serde_json::from_value::<ChatCompletionRequest>(
+                serde_json::json!({"messages":[],"tools":tools,"tool_choice":"required"}),
+            )
+            .unwrap()
+        };
+        let unsupported = serde_json::json!({"oneOf":[{"type":"integer"},{"type":"string"}]});
+        for required in [false, true] {
+            for referenced in [false, true] {
+                let mut schema = serde_json::json!({"$id":"https://example.invalid/tool-policy","$defs":{"Value":unsupported},"type":"object","properties":{"":if referenced {serde_json::json!({"$ref":"#/$defs/Value"})} else {unsupported.clone()}},"additionalProperties":false});
+                if required {
+                    schema["required"] = serde_json::json!([""]);
+                }
+                let single = xml
+                    .output_constraint(&request(schema.clone(), false))
+                    .unwrap_err();
+                let mixed = xml.output_constraint(&request(schema, true)).unwrap_err();
+                assert_eq!(single.to_string(), mixed.to_string());
+                assert!(
+                    !mixed
+                        .to_string()
+                        .contains("generation key-encoding capability"),
+                    "{mixed}"
+                );
+            }
+        }
+        let policy_only = serde_json::json!({"type":"object","properties":{"":{"type":"integer"}},"required":[""],"additionalProperties":false});
+        let single = xml
+            .output_constraint(&request(policy_only.clone(), false))
+            .unwrap_err();
+        let mixed = xml
+            .output_constraint(&request(policy_only, true))
+            .unwrap_err();
+        assert_eq!(single.to_string(), mixed.to_string());
+        assert!(
+            mixed
+                .to_string()
+                .contains("generation key-encoding capability"),
+            "{mixed}"
+        );
+        assert!(matches!(
+            xml.output_constraint(&request(serde_json::Value::Bool(false), true))
+                .unwrap(),
+            ToolOutputConstraint::Set(Some(GenerateConstraint::XmlToolCall { .. }))
+        ));
+    }
+
+    #[test]
+    fn xml_mixed_tools_prune_only_original_empty_cardinality_languages() {
+        let xml = protocol("atem-xml");
+        for schema in [
+            serde_json::json!({"type":"object","additionalProperties":false,"minProperties":1}),
+            serde_json::json!({"type":"object","properties":{"ok":false},"additionalProperties":false,"minProperties":1}),
+            serde_json::json!({"type":"object","minProperties":2,"maxProperties":1}),
+            serde_json::json!({"anyOf":[false,{"type":"object","additionalProperties":false,"minProperties":1}]}),
+        ] {
+            let request = serde_json::from_value::<ChatCompletionRequest>(serde_json::json!({"messages":[],"tools":[{"type":"function","function":{"name":"impossible","parameters":schema}},{"type":"function","function":{"name":"usable","parameters":{"type":"object"}}}],"tool_choice":"required"})).unwrap();
+            let ToolOutputConstraint::Set(Some(GenerateConstraint::XmlToolCall {
+                grammar, ..
+            })) = xml.output_constraint(&request).unwrap()
+            else {
+                panic!("usable tool was not retained");
+            };
+            assert!(grammar.contains("usable"));
+            assert!(!grammar.contains("impossible"));
+        }
     }
 
     #[test]

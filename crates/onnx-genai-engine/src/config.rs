@@ -1817,6 +1817,9 @@ impl GrammarActivation {
 /// leave them empty when response_projection owns the declared assistant prefill.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerateConstraint {
+    /// Generate one canonical JSON-valued Atem XML call. The grammar describes
+    /// its logical tagged-JSON projection, with standalone parameter schemas.
+    XmlToolCall { grammar: String, prefix: String },
     /// llama.cpp GBNF over the raw newly generated stream, including channel
     /// markers and model-token references. Assistant prefill is not consumed.
     Gbnf {
