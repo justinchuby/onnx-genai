@@ -12,6 +12,8 @@ use crate::{FinishReason, TokenId, ToolCallPolicy};
 /// A normal host stop that prevents a later workflow-loop body entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerationStopReason {
+    IndentationLimit,
+    StopSequence { index: usize },
     PredictionTimeLimit,
     BudgetExhausted,
     EosCommitted,
@@ -23,6 +25,8 @@ impl GenerationStopReason {
     /// The transport-facing completion label for this committed normal stop.
     pub fn finish_reason(&self) -> FinishReason {
         match self {
+            Self::IndentationLimit => FinishReason::IndentationLimit,
+            Self::StopSequence { index } => FinishReason::StopSequence { index: *index },
             Self::PredictionTimeLimit => FinishReason::PredictionTimeLimit,
             Self::BudgetExhausted => FinishReason::MaxTokens,
             Self::EosCommitted => FinishReason::EosToken,

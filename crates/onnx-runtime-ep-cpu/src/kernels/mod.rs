@@ -157,6 +157,17 @@ static I64_ONLY: &[DataType] = &[DataType::Int64];
 /// Integer index/length inputs, matching `to_dense_i64`'s acceptance set.
 static INDEX_DTYPES: &[DataType] = &[DataType::Int64, DataType::Int32];
 
+/// DFT storage floats plus integer transform-length/axis controls. Per-slot
+/// constraints prevent integer signals or outputs from entering the float kernel.
+static DFT_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Float64,
+    DataType::Int32,
+    DataType::Int64,
+];
+
 /// STFT edges mix f32-compute signal/output tensors with integer scalar inputs.
 static STFT_DTYPES: &[DataType] = &[
     DataType::Float32,
@@ -269,6 +280,9 @@ pub fn input_dtype_constraints_for_op(
         (12, U8_ONLY),
         (13, U8_ONLY),
     ];
+    // signal, dft_length?, axis? (DFT-20 axis is strictly int64).
+    static DFT_SLOTS: &[(usize, &[DataType])] =
+        &[(0, FLOAT_DTYPES), (1, INDEX_DTYPES), (2, I64_ONLY)];
     // signal, frame_step, window?, frame_length?
     static STFT_SLOTS: &[(usize, &[DataType])] = &[
         (0, FLOAT_COMPUTE_DTYPES),
@@ -303,6 +317,7 @@ pub fn input_dtype_constraints_for_op(
         ("Attention", "com.microsoft") => MSFT_ATTENTION_SLOTS,
         ("PackedMultiHeadAttention", "com.microsoft") => PACKED_MHA_SLOTS,
         ("QMoE", "com.microsoft") => QMOE_SLOTS,
+        ("DFT", "") => DFT_SLOTS,
         ("STFT", "") => STFT_SLOTS,
         ("CumProd", "") => onnx_runtime_ir::opset26::CUM_PROD_INPUT_TYPES,
         ("NonMaxSuppression", "") => NMS_SLOTS,
@@ -321,10 +336,12 @@ pub fn output_dtype_constraints_for_op(
     op_type: &str,
     domain: &str,
 ) -> &'static [(usize, &'static [DataType])] {
+    static DFT_OUTPUTS: &[(usize, &[DataType])] = &[(0, FLOAT_DTYPES)];
     static DSA_INDEX_SELECT_OUTPUTS: &[(usize, &[DataType])] = &[(0, I64_ONLY)];
     static REGEX_OUTPUTS: &[(usize, &[DataType])] = &[(0, &[DataType::Bool])];
     static STRING_SPLIT_OUTPUTS: &[(usize, &[DataType])] = &[(0, STRING_ONLY), (1, I64_ONLY)];
     match (op_type, domain) {
+        ("DFT", "") => DFT_OUTPUTS,
         ("DequantizePacked", "") => onnx_runtime_ir::dequantize_packed::OUTPUT_DTYPES,
         ("DsaIndexSelect", "pkg.nxrt") => DSA_INDEX_SELECT_OUTPUTS,
         ("RegexFullMatch", "") => REGEX_OUTPUTS,
@@ -535,9 +552,8 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         ("BitCast", "") => BIT_CAST_TYPES,
 
         // Window functions.
-        ("HannWindow", "") | ("HammingWindow", "") | ("BlackmanWindow", "") | ("DFT", "") => {
-            FLOAT_DTYPES
-        }
+        ("HannWindow", "") | ("HammingWindow", "") | ("BlackmanWindow", "") => FLOAT_DTYPES,
+        ("DFT", "") => DFT_DTYPES,
         ("STFT", "") => STFT_DTYPES,
 
         // com.microsoft contrib ops.
@@ -582,6 +598,7 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         // rejects f64 in `ConvKernel::execute`, so it must not advertise it.
         ("Conv", "") => FLOAT_COMPUTE_DTYPES,
         ("DeformConv", "") => onnx_runtime_ir::deform_conv::DTYPES,
+        ("RoiAlign", "") => onnx_runtime_ir::roi_align::DTYPES,
 
         // The rest of the CNN family dispatches through `dispatch_float!` and
         // does handle f64.
@@ -616,6 +633,8 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
 
 pub mod activations;
 pub mod add;
+pub(crate) mod affine_bank;
+pub(crate) mod affine_moe;
 pub mod attention;
 pub mod bit_cast;
 mod bit_packing;
@@ -703,12 +722,14 @@ pub mod simd_sumsq;
 pub mod skip_simplified_layernorm;
 pub mod slice;
 pub mod softmax;
+mod softmax_geometry;
 pub mod sparse_kv_gather;
 pub mod split;
 pub mod stft;
 pub mod tensor_scatter;
 pub mod text;
 pub mod transpose;
+mod typed_workspace;
 pub mod unary_math;
 pub mod unique;
 pub mod unsqueeze;
@@ -729,14 +750,17 @@ macro_rules! operator_group_modules {
 operator_group_modules!(
     "ops-cnn";
     affine_grid,
+    batch_normalization,
     center_crop_pad,
     col2im,
     conv_transpose,
     deform_conv,
     grid_sample,
+    mean_variance_normalization,
     norm_ops,
     pooling,
     resize,
+    roi_align,
     space_to_depth,
 );
 
@@ -942,6 +966,13 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
         onnx_runtime_ep_api::WorkspacePlanning::None,
         Box::new(grid_sample::GridSampleFactory { since_version: 20 }),
     );
+    for version in onnx_runtime_ir::roi_align::VERSIONS {
+        registry.register(
+            OpKey::new("RoiAlign", "", version),
+            onnx_runtime_ep_api::WorkspacePlanning::None,
+            Box::new(roi_align::Factory(version)),
+        );
+    }
     registry.register(
         OpKey::new("Resize", "", 10),
         onnx_runtime_ep_api::WorkspacePlanning::None,
@@ -1027,8 +1058,8 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
     // the legacy `is_test` attribute was removed.
     registry.register(
         OpKey::new("BatchNormalization", "", 7),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(norm_ops::BatchNormFactory),
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+        Box::new(batch_normalization::BatchNormalizationFactory),
     );
     registry.register(
         OpKey::new("InstanceNormalization", "", 6),
@@ -1037,8 +1068,8 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
     );
     registry.register(
         OpKey::new("MeanVarianceNormalization", "", 29),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
-        Box::new(norm_ops::MeanVarianceNormalizationFactory),
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
+        Box::new(mean_variance_normalization::MeanVarianceNormalizationFactory),
     );
     registry.register(
         OpKey::new("GroupNormalization", "", 18),
@@ -1095,6 +1126,8 @@ pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor
 fn descriptors_from_registry(reg: &OpRegistry) -> Vec<CpuOpDescriptor> {
     let mut descriptors: Vec<CpuOpDescriptor> = reg
         .keys()
+        // RoiAlign is currently supported only in standalone nxrt.
+        .filter(|key| !(key.op_type == "RoiAlign" && key.domain.is_empty()))
         .filter(|key| !onnx_runtime_ep_api::bitshift::standalone_only_registration(key))
         .map(|key| {
             let supports_raw_tensor_abi = input_dtype_constraints_for_op(&key.op_type, &key.domain)
@@ -1283,7 +1316,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("LayerNormalization", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(layernorm::LayerNormFactory),
     );
     // The optimizer emits fused `LayerNormalization` in the private contrib
@@ -1292,7 +1325,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     // still serves standard ONNX `LayerNormalization`.
     rec.register(
         OpKey::new("LayerNormalization", "com.microsoft", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(layernorm::LayerNormFactory),
     );
     // The optimizer's `MatMul + Add(bias)` fusion emits `FusedMatMulBias` in the
@@ -1427,17 +1460,17 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("SkipLayerNormalization", "com.microsoft", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(contrib_fused::SkipLayerNormFactory),
     );
     rec.register(
         OpKey::new("SimplifiedLayerNormalization", "com.microsoft", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(contrib_fused::SimplifiedLayerNormFactory),
     );
     rec.register(
         OpKey::new("SimplifiedLayerNormalization", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(contrib_fused::SimplifiedLayerNormFactory),
     );
     rec.register(
@@ -1470,12 +1503,12 @@ pub(crate) fn build_cpu_registry_with_resources(
     // `ai.onnx::RMSNormalization` added at opset 23.
     rec.register(
         OpKey::new("RMSNormalization", "", 23),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(rmsnorm::RmsNormFactory),
     );
     rec.register(
         OpKey::new("LpNormalization", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(lp_normalization::LpNormalizationFactory),
     );
     // `ai.onnx::RotaryEmbedding` added at opset 23.
@@ -1609,24 +1642,24 @@ pub(crate) fn build_cpu_registry_with_resources(
     // provider's opset-aware lookup selects the version-correct kernel.
     rec.register(
         OpKey::new("Softmax", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(softmax::SoftmaxLegacyFactory),
     );
     rec.register(
         OpKey::new("Softmax", "", 13),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(softmax::SoftmaxFactory),
     );
     // LogSoftmax shares Softmax's opset split: legacy flattened trailing axes
     // through opset 12, then one-axis normalization from opset 13.
     rec.register(
         OpKey::new("LogSoftmax", "", 1),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(log_softmax::LogSoftmaxLegacyFactory),
     );
     rec.register(
         OpKey::new("LogSoftmax", "", 13),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(log_softmax::LogSoftmaxFactory),
     );
     // Shape / data movement.
@@ -2137,7 +2170,7 @@ pub(crate) fn build_cpu_registry_with_resources(
     );
     rec.register(
         OpKey::new("DFT", "", 17),
-        onnx_runtime_ep_api::WorkspacePlanning::None,
+        onnx_runtime_ep_api::WorkspacePlanning::Metadata,
         Box::new(dft::DftFactory),
     );
     rec.register(
@@ -3111,6 +3144,19 @@ mod tests {
     }
 
     #[test]
+    fn dft_advertises_floating_signal_output_and_integer_control_roles() {
+        assert_eq!(supported_dtypes_for_op("DFT", ""), DFT_DTYPES);
+        assert_eq!(
+            input_dtype_constraints_for_op("DFT", ""),
+            [(0, FLOAT_DTYPES), (1, INDEX_DTYPES), (2, I64_ONLY),]
+        );
+        assert_eq!(
+            output_dtype_constraints_for_op("DFT", ""),
+            [(0, FLOAT_DTYPES)]
+        );
+    }
+
+    #[test]
     fn stft_advertises_only_its_f32_compute_and_scalar_edge_dtypes() {
         let dtypes = supported_dtypes_for_op("STFT", "");
         assert_eq!(dtypes, STFT_DTYPES);
@@ -3557,7 +3603,13 @@ mod tests {
         // Opset-28 Cast adds one registration.
         // MeanVarianceNormalization-29 adds one registration.
         // BitShift-28 adds one registration.
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 126 + mlas_registrations);
+        assert_eq!(
+            reg.len(),
+            PHASE1_OPS.len()
+                + 126
+                + mlas_registrations
+                + onnx_runtime_ir::roi_align::VERSIONS.len()
+        );
         for op in PHASE1_OPS {
             let since = reg
                 .earliest_since_version(op, "")
@@ -3820,16 +3872,30 @@ mod tests {
             .iter()
             .map(|d| (d.op_type.as_str(), d.domain.as_str(), d.since_version))
             .collect();
-        let expected: std::collections::BTreeSet<_> = reg
+        let missing: std::collections::BTreeSet<_> = reg
             .keys()
-            .filter(|key| !onnx_runtime_ep_api::bitshift::standalone_only_registration(key))
-            .map(|key| (key.op_type.as_str(), key.domain.as_str(), key.since_version))
+            .filter(|k| {
+                !described.contains(&(k.op_type.as_str(), k.domain.as_str(), k.since_version))
+            })
+            .map(|k| (k.op_type.as_str(), k.domain.as_str(), k.since_version))
             .collect();
-        assert_eq!(described, expected);
+        let mut expected = std::collections::BTreeSet::from([(
+            "BitShift",
+            "",
+            onnx_runtime_ep_api::bitshift::SIGNED_SINCE,
+        )]);
+        if cfg!(feature = "ops-cnn") {
+            expected.extend(
+                onnx_runtime_ir::roi_align::VERSIONS
+                    .into_iter()
+                    .map(|version| ("RoiAlign", "", version)),
+            );
+        }
+        assert_eq!(missing, expected);
         assert_eq!(
-            descriptors.len(),
-            expected.len(),
-            "plugin descriptor inventory must not contain duplicates"
+            descriptors.len() + missing.len(),
+            reg.len(),
+            "plugin descriptors plus standalone-only entries must match the registry exactly"
         );
     }
 

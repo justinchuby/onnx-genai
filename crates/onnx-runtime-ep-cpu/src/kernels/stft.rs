@@ -4,18 +4,18 @@
 //! does not pad the signal. Power-of-two frame lengths share DFT's O(N log N)
 //! radix-2/vDSP path. Other lengths currently use the shared O(N²) scalar DFT.
 
-use std::alloc::Layout;
-
 use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
-    WorkspaceExecutionPreparation, WorkspaceLayout, WorkspacePreparation, WorkspaceRequirement,
-    WorkspaceView,
+    WorkspaceExecutionPreparation, WorkspacePreparation, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
 use super::dft::DftPlan;
-use crate::dtype::{to_dense_f32_widen, validate_f32_widen_input, write_dense_f32_narrow};
+use super::typed_workspace::TypedWorkspace;
+use crate::dtype::{
+    scalar_i64, to_dense_f32_widen, validate_f32_widen_input, write_dense_f32_narrow,
+};
 
 pub struct StftFactory;
 
@@ -179,21 +179,21 @@ impl StftKernel {
         Ok(frame_length)
     }
 
-    fn scratch_layout(frame_length: usize, batch: usize) -> Result<WorkspaceLayout<4>> {
+    fn scratch_layout(frame_length: usize, batch: usize) -> Result<TypedWorkspace<f32, 4>> {
         let len = if batch == 0 { 0 } else { frame_length };
-        let region = Layout::array::<f32>(len).map_err(|_| EpError::KernelFailed(format!(
-            "STFT: frame length {frame_length} exceeds addressable f32 scratch; reduce frame_length"
-        )))?;
-        WorkspaceLayout::new([region; 4])
+        TypedWorkspace::<f32, _>::new(
+            "STFT",
+            [
+                ("frame real", len),
+                ("frame imaginary", len),
+                ("spectrum real", len),
+                ("spectrum imaginary", len),
+            ],
+        )
     }
 
     fn requirement(frame_length: usize, batch: usize) -> Result<WorkspaceRequirement> {
-        let layout = Self::scratch_layout(frame_length, batch)?;
-        Ok(WorkspaceRequirement {
-            bytes: layout.bytes() as u64,
-            alignment: layout.alignment(),
-            ..WorkspaceRequirement::NONE
-        })
+        Ok(Self::scratch_layout(frame_length, batch)?.requirement())
     }
 }
 
@@ -299,53 +299,55 @@ impl StftKernel {
         if let Some(window) = window {
             validate_f32_widen_input("STFT window", window)?;
         }
-        // Bind before materializing inputs, building DSP state or writing output.
-        let regions = Self::scratch_layout(frame_length, signal.shape[0])?.bind(workspace)?;
+        let plan = Self::scratch_layout(frame_length, signal.shape[0])?;
         if output_elements == 0 {
             return write_dense_f32_narrow("STFT", output, &[]);
         }
-        // SAFETY: the CPU caller supplies exclusive, live Host backing. The
-        // checked composite gives four disjoint aligned regions. Initialize raw
-        // storage before creating f32 references, preserving the old zero-fill.
-        let [frame_real, frame_imag, spectrum_real, spectrum_imag] = regions.map(|region| unsafe {
-            let pointer = region.ptr().0.cast::<f32>();
-            pointer.write_bytes(0, frame_length);
-            std::slice::from_raw_parts_mut(pointer, frame_length)
-        });
-        let signal_data = to_dense_f32_widen("STFT signal", signal)?;
-        let window_data = window
-            .map(|window| to_dense_f32_widen("STFT window", window))
-            .transpose()?;
-        let mut output_data = vec![0.0f32; output_elements];
+        // SAFETY: CPU execution owns exclusive live Host backing until this
+        // synchronous closure returns. The shared helper checks and initializes
+        // the four regions before forming f32 references.
+        unsafe {
+            plan.with_buffers(
+                workspace,
+                |[frame_real, frame_imag, spectrum_real, spectrum_imag]| {
+                    let signal_data = to_dense_f32_widen("STFT signal", signal)?;
+                    let window_data = window
+                        .map(|window| to_dense_f32_widen("STFT window", window))
+                        .transpose()?;
+                    let mut output_data = vec![0.0f32; output_elements];
 
-        let dft = DftPlan::new(frame_length, false);
+                    let dft = DftPlan::new(frame_length, false);
 
-        for batch in 0..signal.shape[0] {
-            for frame in 0..frames {
-                let signal_start =
-                    batch * signal_length * components + frame * frame_step * components;
-                for sample in 0..frame_length {
-                    let weight = window_data.as_ref().map_or(1.0, |values| values[sample]);
-                    let input = signal_start + sample * components;
-                    frame_real[sample] = signal_data[input] * weight;
-                    frame_imag[sample] = if components == 2 {
-                        signal_data[input + 1] * weight
-                    } else {
-                        0.0
-                    };
-                }
+                    for batch in 0..signal.shape[0] {
+                        for frame in 0..frames {
+                            let signal_start = batch * signal_length * components
+                                + frame * frame_step * components;
+                            for sample in 0..frame_length {
+                                let weight =
+                                    window_data.as_ref().map_or(1.0, |values| values[sample]);
+                                let input = signal_start + sample * components;
+                                frame_real[sample] = signal_data[input] * weight;
+                                frame_imag[sample] = if components == 2 {
+                                    signal_data[input + 1] * weight
+                                } else {
+                                    0.0
+                                };
+                            }
 
-                dft.transform(frame_real, frame_imag, spectrum_real, spectrum_imag);
+                            dft.transform(frame_real, frame_imag, spectrum_real, spectrum_imag);
 
-                let output_start = (batch * frames + frame) * bins * 2;
-                for bin in 0..bins {
-                    output_data[output_start + bin * 2] = spectrum_real[bin];
-                    output_data[output_start + bin * 2 + 1] = spectrum_imag[bin];
-                }
-            }
+                            let output_start = (batch * frames + frame) * bins * 2;
+                            for bin in 0..bins {
+                                output_data[output_start + bin * 2] = spectrum_real[bin];
+                                output_data[output_start + bin * 2 + 1] = spectrum_imag[bin];
+                            }
+                        }
+                    }
+
+                    write_dense_f32_narrow("STFT", output, &output_data)
+                },
+            )
         }
-
-        write_dense_f32_narrow("STFT", output, &output_data)
     }
 }
 
@@ -364,37 +366,7 @@ fn require_compute_dtype(argument: &str, dtype: DataType) -> Result<()> {
 }
 
 fn positive_scalar(name: &str, input: &TensorView<'_>) -> Result<usize> {
-    if input.is_absent() {
-        return Err(EpError::KernelFailed(format!(
-            "STFT: required `{name}` input is absent"
-        )));
-    }
-    if !input.shape.is_empty() {
-        return Err(EpError::KernelFailed(format!(
-            "STFT: `{name}` must be a scalar, got shape {:?}",
-            input.shape
-        )));
-    }
-    input.validate()?;
-    if !input.device.is_host_accessible() {
-        return Err(EpError::KernelFailed(format!(
-            "STFT: `{name}` must be a Host scalar, got device {:?}; copy it to CPU before execution",
-            input.device
-        )));
-    }
-    // SAFETY: validated scalar Host view describes one readable element;
-    // data_ptr applies its byte offset, and unaligned reads support packed input.
-    let value = unsafe {
-        match input.dtype {
-            DataType::Int32 => input.data_ptr::<i32>().read_unaligned() as i64,
-            DataType::Int64 => input.data_ptr::<i64>().read_unaligned(),
-            dtype => {
-                return Err(EpError::KernelFailed(format!(
-                    "STFT: `{name}` must be int32 or int64, got {dtype:?}"
-                )));
-            }
-        }
-    };
+    let value = scalar_i64("STFT", name, input)?;
     if value <= 0 {
         return Err(EpError::KernelFailed(format!(
             "STFT: `{name}` must be greater than zero, got {value}"

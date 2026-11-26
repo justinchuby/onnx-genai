@@ -1,4 +1,5 @@
 //! Immutable Hub download plans. Remote names never become unvalidated local paths.
+mod package;
 use anyhow::{Context, ensure};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -32,15 +33,34 @@ async fn until_paused<F: std::future::Future>(
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HubModel {
+    id: String,
     repository: String,
+    variant: Option<String>,
     revision: String,
 }
 impl HubModel {
-    pub(crate) fn new(repository: String, revision: String) -> anyhow::Result<Self> {
+    pub(crate) fn new(id: String, revision: String) -> anyhow::Result<Self> {
+        let (repository, variant) = match id.split_once(':') {
+            Some((repository, variant)) => (repository.to_owned(), Some(variant.to_owned())),
+            None => (id, None),
+        };
+        Self::from_parts(repository, variant, revision)
+    }
+    fn from_parts(
+        repository: String,
+        variant: Option<String>,
+        revision: String,
+    ) -> anyhow::Result<Self> {
+        if let Some(variant) = &variant {
+            ensure!(
+                valid_component(variant),
+                "model variant {variant:?} must be a nonempty package variant identifier using letters, digits, '.', '_' or '-'; use an explicitly published manifest variant"
+            );
+        }
         let parts = repository.split('/').collect::<Vec<_>>();
         ensure!(
             (1..=2).contains(&parts.len()) && parts.iter().all(|part| valid_component(part)),
-            "model {repository:?} must be a Hugging Face repository or owner/repository identifier; URLs, local paths and GGUF quantization selectors are not package identifiers"
+            "model {repository:?} must be a Hugging Face repository or owner/repository identifier; URLs and local paths are not package identifiers; use owner/repository[:variant] with an explicitly published model-package variant"
         );
         ensure!(
             !revision.is_empty()
@@ -48,13 +68,28 @@ impl HubModel {
                 && !revision.chars().any(char::is_control),
             "model revision must be a nonempty Git branch, tag or commit of at most 255 bytes"
         );
+        let id = variant.as_ref().map_or_else(
+            || repository.clone(),
+            |variant| format!("{repository}:{variant}"),
+        );
         Ok(Self {
+            id,
             repository,
+            variant,
             revision,
         })
     }
     pub(crate) fn id(&self) -> &str {
-        &self.repository
+        &self.id
+    }
+    pub(crate) fn variant(&self) -> Option<&str> {
+        self.variant.as_deref()
+    }
+    pub(crate) fn package_selection(&self) -> onnx_genai_ort::ModelPackageSelection {
+        onnx_genai_ort::ModelPackageSelection {
+            variant: self.variant.clone(),
+            ..Default::default()
+        }
     }
 }
 fn valid_component(value: &str) -> bool {
@@ -110,7 +145,7 @@ impl DownloadPlan {
             "lfs":file.sha256.as_ref().map(|hash|serde_json::json!({"size":file.bytes,"sha256":hash}))
         })).collect::<Vec<_>>();
         let bytes = serde_json::to_vec(&serde_json::json!({
-            "version":1, "repository":self.model.repository, "revision":self.model.revision,
+            "version":2, "repository":self.model.repository, "variant":self.model.variant, "revision":self.model.revision,
             "sha":self.commit, "siblings":siblings
         }))
         .context("encode immutable cached model manifest")?;
@@ -126,6 +161,7 @@ impl DownloadPlan {
         struct Stored {
             version: u32,
             repository: String,
+            variant: Option<String>,
             revision: String,
             sha: String,
             siblings: Vec<RepositoryFile>,
@@ -135,14 +171,14 @@ impl DownloadPlan {
             "cached model manifest exceeds {INFO_BYTES} bytes; restore a valid bounded cache manifest"
         );
         let stored: Stored = serde_json::from_slice(bytes)
-            .context("parse cached model manifest; restore valid version-1 cache metadata")?;
+            .context("parse cached model manifest; restore valid version-2 cache metadata")?;
         ensure!(
-            stored.version == 1,
+            stored.version == 2,
             "unsupported cached model manifest version {}; use a compatible nxrt build or a separate cache",
             stored.version
         );
         Self::from_info(
-            HubModel::new(stored.repository, stored.revision)?,
+            HubModel::from_parts(stored.repository, stored.variant, stored.revision)?,
             RepositoryInfo {
                 sha: stored.sha,
                 siblings: stored.siblings,
@@ -156,11 +192,7 @@ impl DownloadPlan {
             .map(|file| (file.name.as_str(), file.bytes))
     }
     fn from_info(model: HubModel, info: RepositoryInfo, limits: HubLimits) -> anyhow::Result<Self> {
-        ensure!(
-            info.sha.len() == 40 && info.sha.bytes().all(|b| b.is_ascii_hexdigit()),
-            "Hub model '{}' returned an invalid immutable Git commit; retry or repair the Hub endpoint",
-            model.id()
-        );
+        validate_commit(&info.sha, model.id())?;
         ensure!(
             !info.siblings.is_empty() && info.siblings.len() <= limits.files,
             "Hub model '{}' contains {} files; require 1..={} files under the configured download limit",
@@ -186,11 +218,7 @@ impl DownloadPlan {
                 "Hub package exceeds configured download limit {} bytes; choose a smaller package or raise --model-cache-max-bytes",
                 limits.bytes
             );
-            let sha256 = file.lfs.map(|lfs| {
-                ensure!(lfs.size == size && lfs.sha256.len() == 64 && lfs.sha256.bytes().all(|b|b.is_ascii_hexdigit()),
-                    "Hub file {name:?} has inconsistent LFS size/hash metadata; repair the repository before downloading");
-                Ok::<_, anyhow::Error>(lfs.sha256.to_ascii_lowercase())
-            }).transpose()?;
+            let sha256 = admit_lfs(&name, size, file.lfs.as_ref())?;
             files.push(DownloadFile {
                 name,
                 bytes: size,
@@ -201,8 +229,14 @@ impl DownloadPlan {
             onnx_genai_metadata::METADATA_FILE_NAMES
                 .iter()
                 .any(|name| names.contains(*name))
-                || names.contains("genai_config.json"),
-            "Hub model '{}' is not an nxrt model package: no supported inference_metadata.yaml/yml/json or genai_config.json; export an ONNX package with explicit metadata before downloading it for serving",
+                || names.contains("genai_config.json")
+                || names.contains("manifest.json"),
+            "Hub model '{}' is not an nxrt model package: no supported inference_metadata.yaml/yml/json, genai_config.json or model-package manifest.json; export an ONNX package with explicit metadata before downloading it for serving",
+            model.id()
+        );
+        ensure!(
+            model.variant().is_none() || names.contains("manifest.json"),
+            "Hub model '{}' requests a named variant but has no model-package manifest.json; publish the selected variant explicitly instead of inferring a graph or quantization from filenames",
             model.id()
         );
         Ok(Self {
@@ -213,6 +247,22 @@ impl DownloadPlan {
         })
     }
 }
+fn admit_lfs(name: &str, size: u64, lfs: Option<&LfsFile>) -> anyhow::Result<Option<String>> {
+    lfs.map(|lfs| {
+        ensure!(lfs.size == size && lfs.sha256.len() == 64 && lfs.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "Hub file {name:?} has inconsistent LFS size/hash metadata; repair the repository before downloading");
+        Ok(lfs.sha256.to_ascii_lowercase())
+    }).transpose()
+}
+
+fn validate_commit(commit: &str, model: &str) -> anyhow::Result<()> {
+    ensure!(
+        commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Hub model {model:?} returned an invalid immutable Git commit; retry or repair the Hub endpoint"
+    );
+    Ok(())
+}
+
 fn valid_file(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 4096
@@ -312,13 +362,17 @@ impl HubClient {
             );
             data.extend_from_slice(&chunk);
         }
-        let info = serde_json::from_slice(&data)
+        let mut info: RepositoryInfo = serde_json::from_slice(&data)
             .context("parse Hub repository metadata; expected sha and sized file siblings")?;
+        self.select_package_files(&model, &mut info).await?;
         DownloadPlan::from_info(model, info, limits)
     }
     pub(crate) fn file_url(&self, plan: &DownloadPlan, name: &str) -> reqwest::Url {
-        let mut segments = plan.model.repository.split('/').collect::<Vec<_>>();
-        segments.extend(["resolve", &plan.commit]);
+        self.immutable_file_url(&plan.model, &plan.commit, name)
+    }
+    fn immutable_file_url(&self, model: &HubModel, commit: &str, name: &str) -> reqwest::Url {
+        let mut segments = model.repository.split('/').collect::<Vec<_>>();
+        segments.extend(["resolve", commit]);
         segments.extend(name.split('/'));
         self.url(&segments)
     }
@@ -520,6 +574,8 @@ impl HubClient {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[cfg(feature = "native-backend")]
+    pub(crate) use super::package::tests::variant_hub;
     use super::*;
     use serde_json::json;
     use std::path::Path;
@@ -540,12 +596,41 @@ pub(crate) mod tests {
         DownloadPlan::from_info(model(), serde_json::from_value(value).unwrap(), limits)
     }
     #[test]
+    fn persisted_package_selectors_have_one_identity_and_an_explicit_cache_version() {
+        let plan = parse(info(), limits()).unwrap();
+        let encoded = plan.encode().unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(value["version"], 2);
+        for version in [1, 3] {
+            value["version"] = json!(version);
+            let error =
+                DownloadPlan::decode(&serde_json::to_vec(&value).unwrap(), limits()).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("unsupported cached model manifest version"),
+                "{error:#}"
+            );
+        }
+        value["version"] = json!(2);
+        value["repository"] = json!("owner/package:hidden");
+        let error =
+            DownloadPlan::decode(&serde_json::to_vec(&value).unwrap(), limits()).unwrap_err();
+        assert!(format!("{error:#}").contains("repository"), "{error:#}");
+        value["repository"] = json!("owner/package");
+        value["variant"] = json!("");
+        let error =
+            DownloadPlan::decode(&serde_json::to_vec(&value).unwrap(), limits()).unwrap_err();
+        assert!(format!("{error:#}").contains("model variant"), "{error:#}");
+    }
+
+    #[test]
     fn hub_identifiers_and_remote_paths_cannot_escape_the_package() {
         for name in [
             "../package",
             "owner/../package",
             "https://host/repo",
-            "owner/repo:Q4",
+            "owner/repo:../Q4",
+            "owner/repo:",
+            "owner/repo:Q4:extra",
             "owner/repo\\file",
             "owner/",
             "owner/..",

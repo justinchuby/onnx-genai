@@ -2,7 +2,7 @@
 use super::settings::{ResponseOptions, SessionSettings};
 use onnx_genai_metadata::{RealtimeMode, ToolCall};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ResponseId(String);
@@ -61,6 +61,16 @@ impl ProtocolError {
         }
     }
 }
+/// A completed, admitted model call and its stable transport identity.
+pub(super) struct CompletedToolCall {
+    pub(super) wire_id: String,
+    pub(super) model_call: ToolCall,
+}
+pub(super) struct ToolResultAdmission {
+    pub(super) events: Vec<Value>,
+    pub(super) model_call_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ResponseKind {
     Realtime,
@@ -88,7 +98,7 @@ pub(super) struct Conversation {
     tool_results: bool,
     last_item: Option<ItemId>,
     active: Option<ActiveResponse>,
-    pending_calls: BTreeSet<String>,
+    pending_calls: BTreeMap<String, ToolCall>,
 }
 impl Conversation {
     pub(super) fn discard_duplex_input(&mut self) {
@@ -164,23 +174,25 @@ impl Conversation {
         call_id: &str,
         output: &str,
         settings: &SessionSettings,
-    ) -> Result<Vec<Value>, ProtocolError> {
-        if settings.mode != RealtimeMode::Realtime
-            || self.active.is_some()
-            || self.input_turn
-            || !self.pending_calls.contains(call_id)
-        {
-            return Err(ProtocolError::invalid(format!(
+    ) -> Result<ToolResultAdmission, ProtocolError> {
+        let invalid = || {
+            ProtocolError::invalid(format!(
                 "conversation.item.create: function_call_output.call_id {call_id:?} must answer an outstanding call of the completed previous response, before a new user turn"
-            )));
+            ))
+        };
+        if settings.mode != RealtimeMode::Realtime || self.active.is_some() || self.input_turn {
+            return Err(invalid());
         }
-        self.pending_calls.remove(call_id);
+        let model_call = self.pending_calls.remove(call_id).ok_or_else(invalid)?;
         self.tool_results = true;
-        Ok(self.item_events(
-            item,
-            "function_call_output",
-            json!({"call_id":call_id,"output":output}),
-        ))
+        Ok(ToolResultAdmission {
+            model_call_id: model_call.id,
+            events: self.item_events(
+                item,
+                "function_call_output",
+                json!({"call_id":call_id,"output":output}),
+            ),
+        })
     }
     fn item_events(&mut self, id: ItemId, kind: &str, fields: Value) -> Vec<Value> {
         let previous = self.last_item.as_ref().map(ItemId::as_str);
@@ -301,7 +313,7 @@ impl Conversation {
     pub(super) fn complete(
         &mut self,
         id: &ResponseId,
-        calls: &[ToolCall],
+        calls: &[CompletedToolCall],
         last_output_item: Option<ItemId>,
     ) -> Result<(), ProtocolError> {
         let Some(active) = self.active.as_ref() else {
@@ -319,9 +331,16 @@ impl Conversation {
                 "transcription workflow emitted tool calls; select a compatible transcription profile",
             ));
         }
-        let mut pending = BTreeSet::new();
+        let mut pending = BTreeMap::new();
+        let mut model_ids = BTreeSet::new();
         for call in calls {
-            if call.id.is_empty() || !pending.insert(call.id.clone()) {
+            if call.wire_id.is_empty()
+                || call.model_call.id.is_empty()
+                || !model_ids.insert(call.model_call.id.clone())
+                || pending
+                    .insert(call.wire_id.clone(), call.model_call.clone())
+                    .is_some()
+            {
                 return Err(ProtocolError::invalid(
                     "native realtime response contains empty or duplicate tool call IDs; repair the declared tool protocol",
                 ));
@@ -473,10 +492,13 @@ mod tests {
                 .tool_result(item("early"), "call1", "x", &settings)
                 .is_err()
         );
-        let calls = vec![ToolCall {
-            id: "call1".into(),
-            name: "weather".into(),
-            arguments: "{}".into(),
+        let calls = vec![CompletedToolCall {
+            wire_id: "call1".into(),
+            model_call: ToolCall {
+                id: "model_late_id".into(),
+                name: "weather".into(),
+                arguments: "{}".into(),
+            },
         }];
         conversation
             .complete(&response("first"), &calls, Some(item("assistant_call")))
@@ -489,8 +511,9 @@ mod tests {
         let events = conversation
             .tool_result(item("result"), "call1", "sunny", &settings)
             .unwrap();
-        assert_eq!(events[0]["item"]["type"], "function_call_output");
-        assert_eq!(events[0]["item"]["call_id"], "call1");
+        assert_eq!(events.events[0]["item"]["type"], "function_call_output");
+        assert_eq!(events.events[0]["item"]["call_id"], "call1");
+        assert_eq!(events.model_call_id, "model_late_id");
         assert!(
             conversation
                 .tool_result(item("duplicate"), "call1", "again", &settings)

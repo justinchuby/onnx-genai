@@ -725,70 +725,6 @@ fn control_flow_schema_error(
     }
 }
 
-#[cfg(test)]
-mod control_flow_schema_tests {
-    use super::*;
-    use onnx_runtime_ir::NodeId;
-
-    fn schema_node(op_type: &str) -> Node {
-        Node::new(NodeId(0), op_type, Vec::new(), Vec::new())
-    }
-
-    fn tensor_value(dtype: DataType) -> ValueType {
-        ValueType::Tensor(TensorType::new(dtype, Vec::new()))
-    }
-
-    #[test]
-    fn optional_tensor_uses_revision_dtype_boundaries() {
-        let node = schema_node("If");
-        let int4 = ValueType::Optional(Box::new(tensor_value(DataType::Int4)));
-        assert!(validate_control_flow_value(&node, 20, "output", 0, &int4, true).is_err());
-        validate_control_flow_value(&node, 21, "output", 0, &int4, true)
-            .expect("If-21 admits Optional<Tensor<int4>>");
-    }
-
-    #[test]
-    fn optional_sequence_keeps_ir4_tensor_element_types() {
-        let node = schema_node("Loop");
-        let float = ValueType::Optional(Box::new(ValueType::sequence(tensor_value(
-            DataType::Float32,
-        ))));
-        validate_control_flow_value(&node, 25, "output", 0, &float, true)
-            .expect("Optional<Sequence<Tensor<float>>> is admitted");
-
-        let float8 = ValueType::Optional(Box::new(ValueType::sequence(tensor_value(
-            DataType::Float8E4M3FN,
-        ))));
-        let error = validate_control_flow_value(&node, 25, "output", 0, &float8, true)
-            .expect_err("optional sequences retain the IRv4 tensor-element set");
-        assert!(
-            error
-                .to_string()
-                .contains("optional sequences are limited to IRv4")
-        );
-    }
-
-    #[test]
-    fn loop_scan_outputs_are_tensor_only() {
-        let node = Node::new(
-            NodeId(0),
-            "Loop",
-            vec![None, None, Some(ValueId(0))],
-            vec![ValueId(1), ValueId(2)],
-        );
-        let outputs = vec![
-            CfOutput::Unresolved,
-            CfOutput::Container(ValueType::sequence(tensor_value(DataType::Float32))),
-        ];
-        let error =
-            validate_control_flow_schema(&node, 25, &outputs, &HashMap::new(), &HashMap::new())
-                .expect_err("Loop scan outputs cannot be containers");
-        assert!(
-            error.to_string().contains("output #1") && error.to_string().contains("tensor-only")
-        );
-    }
-}
-
 fn infer_if_outputs(
     graph: &Graph,
     node: &Node,
@@ -1846,4 +1782,68 @@ fn seed_next_symbol(graph: &Graph) -> u32 {
         }
     }
     max.saturating_add(1)
+}
+
+#[cfg(test)]
+mod control_flow_schema_tests {
+    use super::*;
+    use onnx_runtime_ir::NodeId;
+
+    fn schema_node(op_type: &str) -> Node {
+        Node::new(NodeId(0), op_type, Vec::new(), Vec::new())
+    }
+
+    fn tensor_value(dtype: DataType) -> ValueType {
+        ValueType::Tensor(TensorType::new(dtype, Vec::new()))
+    }
+
+    #[test]
+    fn optional_tensor_uses_revision_dtype_boundaries() {
+        let node = schema_node("If");
+        let int4 = ValueType::Optional(Box::new(tensor_value(DataType::Int4)));
+        assert!(validate_control_flow_value(&node, 20, "output", 0, &int4, true).is_err());
+        validate_control_flow_value(&node, 21, "output", 0, &int4, true)
+            .expect("If-21 admits Optional<Tensor<int4>>");
+    }
+
+    #[test]
+    fn optional_sequence_keeps_ir4_tensor_element_types() {
+        let node = schema_node("Loop");
+        let float = ValueType::Optional(Box::new(ValueType::sequence(tensor_value(
+            DataType::Float32,
+        ))));
+        validate_control_flow_value(&node, 25, "output", 0, &float, true)
+            .expect("Optional<Sequence<Tensor<float>>> is admitted");
+
+        let float8 = ValueType::Optional(Box::new(ValueType::sequence(tensor_value(
+            DataType::Float8E4M3FN,
+        ))));
+        let error = validate_control_flow_value(&node, 25, "output", 0, &float8, true)
+            .expect_err("optional sequences retain the IRv4 tensor-element set");
+        assert!(
+            error
+                .to_string()
+                .contains("optional sequences are limited to IRv4")
+        );
+    }
+
+    #[test]
+    fn loop_scan_outputs_are_tensor_only() {
+        let node = Node::new(
+            NodeId(0),
+            "Loop",
+            vec![None, None, Some(ValueId(0))],
+            vec![ValueId(1), ValueId(2)],
+        );
+        let outputs = vec![
+            CfOutput::Unresolved,
+            CfOutput::Container(ValueType::sequence(tensor_value(DataType::Float32))),
+        ];
+        let error =
+            validate_control_flow_schema(&node, 25, &outputs, &HashMap::new(), &HashMap::new())
+                .expect_err("Loop scan outputs cannot be containers");
+        assert!(
+            error.to_string().contains("output #1") && error.to_string().contains("tensor-only")
+        );
+    }
 }
